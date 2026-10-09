@@ -142,6 +142,50 @@ fn cursor_file_path_is_the_same_for_every_spelling_of_a_log() {
     assert_eq!(at(ghost.clone()), at(ghost));
 }
 
+/// A cursor written under the name derived from the path as configured (before names were derived
+/// from the resolved path) is picked up once, moved to the resolved name, and the old file removed.
+#[test]
+fn a_cursor_named_by_the_configured_path_is_migrated_not_lost() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    std::fs::write(real.join("events.jsonl"), "a\nb\nc\nd\n").unwrap();
+    let configured = dir.path().join("link/events.jsonl");
+    let cursor_dir = dir.path().join("cursors");
+    std::fs::create_dir_all(&cursor_dir).unwrap();
+
+    let legacy_hash: String = Sha256::digest(configured.as_os_str().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let legacy = cursor_dir.join(format!("{legacy_hash}.json"));
+    let inode = get_inode(&configured);
+    let fingerprint = compute_fingerprint(&configured);
+    let state = CursorState {
+        inode,
+        offset: 4,
+        fingerprint,
+    };
+    std::fs::write(&legacy, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let mut tailer = LogTailer::new(configured.clone(), cursor_dir.clone());
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["c", "d"],
+        "resumed, not re-read"
+    );
+    let cursor = DurableCursor::new(configured, cursor_dir);
+    assert!(
+        cursor.cursor_file_path().exists(),
+        "saved under the resolved name"
+    );
+    assert!(!legacy.exists(), "the configured-name file is gone");
+    assert_eq!(cursor.load().unwrap(), Some(state));
+}
+
 #[test]
 fn cursor_file_path_differs_for_different_log_paths() {
     let dir = tempfile::tempdir().unwrap();

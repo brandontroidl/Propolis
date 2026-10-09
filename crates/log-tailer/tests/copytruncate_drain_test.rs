@@ -531,10 +531,114 @@ fn a_second_copytruncate_mid_drain_then_a_restart_reports_the_compressed_generat
     tailer.persist_cursor().unwrap();
     drop(tailer);
 
+    // `.2.gz` here is not gzip at all: the first generation cannot be found. `.1` (B) was rotated
+    // after it, so it is unread and is read rather than skipped; only A's remainder is lost.
     let mut tailer = LogTailer::new(log.clone(), cursors);
     let seen = drain(&mut tailer, 100, u64::MAX);
-    assert_eq!(seen, lines("C", 0..2));
+    let mut expected = lines("B", 0..10);
+    expected.extend(lines("C", 0..2));
+    assert_eq!(seen, expected);
     assert_eq!(tailer.rotation_loss().events, 1, "the loss is reported");
+}
+
+fn gzip(path: &Path, content: &[u8]) {
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(path).unwrap(),
+        flate2::Compression::default(),
+    );
+    encoder.write_all(content).unwrap();
+    encoder.finish().unwrap();
+}
+
+/// The shipped policy (`compress` + `delaycompress`): the second rotation compresses the first
+/// copy, so after it the first generation is only `.2.gz`. A restart finds the generation the
+/// cursor names inside it, reads its remainder, then B from `.1`, then the live file: no loss.
+#[test]
+fn a_second_copytruncate_mid_drain_then_a_restart_resumes_from_the_gzip_of_the_first_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    std::fs::write(&log, text(&lines("A", 0..10))).unwrap();
+    let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+    assert_eq!(tailer.read_batch(2).len(), 2);
+    tailer.commit_batch();
+    copytruncate(&log);
+    append(&log, &text(&lines("B", 0..10)));
+    assert_eq!(tailer.read_batch(1), lines("A", 2..3));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+
+    // What logrotate does at the second rotation: `.1` is compressed to `.2.gz`, then B is
+    // copied to a fresh `.1`.
+    let first = std::fs::read(rotated_copy(&log)).unwrap();
+    gzip(&dir.path().join("events.jsonl.2.gz"), &first);
+    std::fs::remove_file(rotated_copy(&log)).unwrap();
+    copytruncate(&log);
+    append(&log, &text(&lines("C", 0..2)));
+    assert_eq!(tailer.read_batch(3), lines("A", 3..6));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    drop(tailer);
+
+    let mut tailer = LogTailer::new(log.clone(), cursors);
+    let mut expected = lines("A", 6..10);
+    expected.extend(lines("B", 0..10));
+    expected.extend(lines("C", 0..2));
+    assert_eq!(drain(&mut tailer, 7, u64::MAX), expected);
+    assert_eq!(tailer.rotation_loss(), RotationLoss::default());
+}
+
+/// The same restart with a `.2.gz` cut short: the stream cannot be expanded to the end, so the
+/// first generation is reported as lost, and B and the live file are still read.
+#[test]
+fn a_truncated_gzip_of_the_first_generation_is_a_reported_loss_and_the_rest_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    std::fs::write(&log, text(&lines("A", 0..40))).unwrap();
+    let mut tailer = LogTailer::new(log.clone(), cursors.clone());
+    assert_eq!(tailer.read_batch(2).len(), 2);
+    tailer.commit_batch();
+    copytruncate(&log);
+    append(&log, &text(&lines("B", 0..10)));
+    assert_eq!(tailer.read_batch(1), lines("A", 2..3));
+    tailer.commit_batch();
+    tailer.persist_cursor().unwrap();
+    let first = std::fs::read(rotated_copy(&log)).unwrap();
+    let gz = dir.path().join("events.jsonl.2.gz");
+    gzip(&gz, &first);
+    let bytes = std::fs::read(&gz).unwrap();
+    // Keep the header and the start of the stream (enough for the first 256 bytes), drop the tail.
+    std::fs::write(&gz, &bytes[..bytes.len() - 12]).unwrap();
+    std::fs::remove_file(rotated_copy(&log)).unwrap();
+    copytruncate(&log);
+    append(&log, &text(&lines("C", 0..2)));
+    tailer.persist_cursor().unwrap();
+    drop(tailer);
+
+    let mut tailer = LogTailer::new(log.clone(), cursors);
+    let mut expected = lines("B", 0..10);
+    expected.extend(lines("C", 0..2));
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), expected);
+    assert_eq!(tailer.rotation_loss().events, 1);
+}
+
+/// A stale `.1` is not read by a RUNNING tailer when the generation it follows is unfindable (it
+/// is an older generation, already ingested), unlike the first poll after a start.
+#[test]
+fn a_running_tailer_does_not_read_a_stale_rotated_copy_when_its_generation_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let mut tailer = behind_tailer(dir.path(), &log, 30, 10);
+    std::fs::write(rotated_copy(&log), text(&lines("stale", 0..40))).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .unwrap();
+    append(&log, &text(&lines("new", 0..2)));
+    assert_eq!(drain(&mut tailer, 100, u64::MAX), lines("new", 0..2));
+    assert_eq!(tailer.rotation_loss().events, 1);
 }
 
 /// A restart after a truncation with nothing to resume from: the old size was never observed, so

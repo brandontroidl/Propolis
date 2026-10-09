@@ -103,13 +103,55 @@ impl DurableCursor {
     /// callers always fail closed to offset 0 rather than branching on which happened. An
     /// `Err` is reserved for a read failure that is neither (e.g. permission denied), which is
     /// worth surfacing rather than silently folding into "missing".
+    ///
+    /// One-time migration: cursors written before the file name was derived from the resolved
+    /// path were named by the path exactly as configured. When the resolved name has no cursor and
+    /// the as-configured name does (a symlinked or non-normalized spelling, or a log whose parent
+    /// directory did not exist when the name was first derived), that cursor is loaded, saved under
+    /// the resolved name and the old file removed, so one canonical path remains. Remove this
+    /// fallback (and `legacy_file_path`) once every deployment has restarted on this version.
     pub fn load(&self) -> io::Result<Option<CursorState>> {
         let bytes = match std::fs::read(self.cursor_file_path()) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return self.migrate_legacy(),
+            Err(e) => return Err(e),
+        };
+        Ok(serde_json::from_slice(&bytes).ok())
+    }
+
+    /// The cursor file name derived from the log path as configured, before resolution.
+    fn legacy_file_path(&self) -> PathBuf {
+        let mut hasher = Sha256::new();
+        hasher.update(self.log_path.as_os_str().as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        self.cursor_dir
+            .join(format!("{}.json", hex_encode(&digest)))
+    }
+
+    fn migrate_legacy(&self) -> io::Result<Option<CursorState>> {
+        let legacy = self.legacy_file_path();
+        if legacy == self.cursor_file_path() {
+            return Ok(None);
+        }
+        let bytes = match std::fs::read(&legacy) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(serde_json::from_slice(&bytes).ok())
+        let Some(state) = serde_json::from_slice::<CursorState>(&bytes).ok() else {
+            return Ok(None);
+        };
+        // Only drop the old file once the new one is durably in place.
+        if self.save(&state).is_ok() {
+            let _ = std::fs::remove_file(&legacy);
+        }
+        Ok(Some(state))
+    }
+
+    /// The directory cursor files live in; the tailer also expands a compressed rotated copy
+    /// there (as an unlinked file), the one place it is known to be able to write.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.cursor_dir
     }
 
     /// Persists `state` atomically: write JSON to a temp file in the same directory, fsync it,

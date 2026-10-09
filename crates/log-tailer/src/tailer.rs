@@ -375,7 +375,7 @@ impl LogTailer {
         // A copytruncate whose old content is still in `<log>.1` is accepted: moving the offset
         // forward over the prefix makes the next read drain `.1` from there, so the committed
         // prefix is not read again. Without a verifiable copy the prefix cannot be placed.
-        if changed && find_generations(&self.log_path, &self.state).is_err() {
+        if changed && find_generations(&self.log_path, &self.state, None).is_err() {
             return false;
         }
         let spans = uncommitted.spans[..lines].to_vec();
@@ -521,7 +521,7 @@ impl LogTailer {
                 // A rotated copy that carries the stored fingerprint is proof of a copytruncate,
                 // and outranks the growth explanation: a restart mid-drain stores the OLD
                 // fingerprint, so a live file still under 256 bytes always mismatches it.
-                if find_generations(&self.log_path, &self.state).is_err()
+                if find_generations(&self.log_path, &self.state, None).is_err()
                     && self.maybe_false_positive_replaced()
                 {
                     // Ordinary growth of a still-small file, not a real replacement (see
@@ -573,34 +573,64 @@ impl LogTailer {
     /// reading the wrong file would ingest another generation's lines; it is reported as a loss
     /// instead. Without a `.1` the new file is simply read from 0, as it always was.
     fn recover_copytruncated(&mut self) {
-        match find_generations(&self.log_path, &self.state) {
-            Ok(found) => {
-                let queued: Vec<u64> = self
-                    .pending_drains
-                    .iter()
-                    .filter_map(|(file, _)| file.metadata().ok().map(|m| m.ino()))
-                    .collect();
-                self.resumes.retain(|(ino, _)| queued.contains(ino));
-                for generation in found.generations {
-                    if let Some(uncommitted) = &mut self.uncommitted {
-                        let rewind_to = if generation.is_stored {
-                            uncommitted.offset
-                        } else {
-                            0
-                        };
-                        uncommitted.drain_offsets.push(rewind_to);
+        let scratch = self
+            .cursor
+            .as_ref()
+            .map(|c| c.dir().to_path_buf())
+            .unwrap_or_else(std::env::temp_dir);
+        let (generations, lost) =
+            match find_generations(&self.log_path, &self.state, Some(&scratch)) {
+                Ok(found) => (found.generations, found.newer_missing),
+                Err(reason) => {
+                    // The generation the state points into cannot be found. Seen on the first poll
+                    // after a start, the rotated files that remain are newer than it (the state was
+                    // saved while it was being read, and rotation pushes older copies to higher
+                    // numbers), so they are unread: read them from 0, accepting a repeat of anything a
+                    // stale `.1` holds over losing it. In a running tailer the state was following
+                    // the live file, so a copy that does not match it is an older generation or not
+                    // ours, and is left alone.
+                    let mut unread = Vec::new();
+                    if !self.size_observed {
+                        for n in [2u32, 1] {
+                            if let Ok((file, size, fingerprint)) =
+                                open_generation(&self.log_path, n)
+                                && size > 0
+                            {
+                                unread.push(Generation {
+                                    file,
+                                    offset: 0,
+                                    fingerprint,
+                                    is_stored: false,
+                                });
+                            }
+                        }
                     }
-                    if let Ok(meta) = generation.file.metadata() {
-                        self.resumes.push((meta.ino(), generation.fingerprint));
-                    }
-                    self.pending_drains
-                        .push_back((generation.file, generation.offset));
+                    (unread, Some(reason))
                 }
-                if let Some(reason) = found.newer_missing {
-                    self.record_loss(reason);
-                }
+            };
+        let queued: Vec<u64> = self
+            .pending_drains
+            .iter()
+            .filter_map(|(file, _)| file.metadata().ok().map(|m| m.ino()))
+            .collect();
+        self.resumes.retain(|(ino, _)| queued.contains(ino));
+        for generation in generations {
+            if let Some(uncommitted) = &mut self.uncommitted {
+                let rewind_to = if generation.is_stored {
+                    uncommitted.offset
+                } else {
+                    0
+                };
+                uncommitted.drain_offsets.push(rewind_to);
             }
-            Err(reason) => self.record_loss(reason),
+            if let Ok(meta) = generation.file.metadata() {
+                self.resumes.push((meta.ino(), generation.fingerprint));
+            }
+            self.pending_drains
+                .push_back((generation.file, generation.offset));
+        }
+        if let Some(reason) = lost {
+            self.record_loss(reason);
         }
         self.reset_to_current_file();
     }
@@ -705,12 +735,17 @@ fn open_generation(log_path: &Path, n: u32) -> Result<(File, u64, [u8; 32]), &'s
 }
 
 /// Finds the generation of the log that `state` points into, in `<log>.1` or, when a second
-/// rotation has already pushed it back, `<log>.2`: its first `min(256, size)` bytes must hash to
+/// rotation has already pushed it back, `<log>.2` or `<log>.2.gz` (expanded into `scratch` when
+/// given, see [`match_gzip_generation`]): its first `min(256, size)` bytes must hash to
 /// the stored fingerprint and it must reach the read offset. Every generation rotated after it
 /// (`.1` when it is `.2`) is unread by construction, since the reader works through generations
 /// in order, and is returned too. `Err(reason)` when the stored generation cannot be found; the
 /// reason is `.1`'s, the likelier home.
-fn find_generations(log_path: &Path, state: &CursorState) -> Result<Found, &'static str> {
+fn find_generations(
+    log_path: &Path,
+    state: &CursorState,
+    scratch: Option<&Path>,
+) -> Result<Found, &'static str> {
     let mut why = "there is no rotated copy";
     for n in [1u32, 2] {
         let (file, size, fingerprint) = match open_generation(log_path, n) {
@@ -743,28 +778,149 @@ fn find_generations(log_path: &Path, state: &CursorState) -> Result<Found, &'sta
                 is_stored: true,
             });
         }
-        let mut newer_missing = None;
-        for m in (1..n).rev() {
-            match open_generation(log_path, m) {
-                Ok((file, size, fingerprint)) => {
-                    if size > 0 {
-                        generations.push(Generation {
-                            file,
-                            offset: 0,
-                            fingerprint,
-                            is_stored: false,
-                        });
-                    }
-                }
-                Err(reason) => newer_missing = Some(reason),
-            }
-        }
+        let newer_missing = push_newer(log_path, n, &mut generations);
         return Ok(Found {
             generations,
             newer_missing,
         });
     }
+    // The shipped `compress` + `delaycompress` policy compresses a copy at the rotation after the
+    // one that made it, so a second rotation leaves the first generation only as `.2.gz`.
+    match match_gzip_generation(log_path, state, scratch) {
+        Ok(GzipMatch::Absent) => {}
+        Ok(GzipMatch::Present) => {
+            return Ok(Found {
+                generations: Vec::new(),
+                newer_missing: None,
+            });
+        }
+        Ok(GzipMatch::Materialized(file, size)) => {
+            let mut generations = Vec::new();
+            if size > state.offset {
+                generations.push(Generation {
+                    file,
+                    offset: state.offset,
+                    fingerprint: state.fingerprint,
+                    is_stored: true,
+                });
+            }
+            let newer_missing = push_newer(log_path, 2, &mut generations);
+            return Ok(Found {
+                generations,
+                newer_missing,
+            });
+        }
+        Err(reason) => why = reason,
+    }
     Err(why)
+}
+
+/// Appends the generations rotated after `<log>.<n>`, oldest first, that have bytes to read.
+/// Returns the reason when one cannot be opened.
+fn push_newer(log_path: &Path, n: u32, out: &mut Vec<Generation>) -> Option<&'static str> {
+    let mut missing = None;
+    for m in (1..n).rev() {
+        match open_generation(log_path, m) {
+            Ok((file, size, fingerprint)) => {
+                if size > 0 {
+                    out.push(Generation {
+                        file,
+                        offset: 0,
+                        fingerprint,
+                        is_stored: false,
+                    });
+                }
+            }
+            Err(reason) => missing = Some(reason),
+        }
+    }
+    missing
+}
+
+/// The most decompressed bytes a `.2.gz` is expanded to when the reader resumes from it: five
+/// times the shipped `size 100M`. A bigger generation (a log the guard let grow while intake was
+/// behind) is reported as a loss rather than expanded without bound.
+const GZIP_EXPANSION_CAP: u64 = 512 * 1024 * 1024;
+
+enum GzipMatch {
+    /// No `<log>.2.gz`, or it is not the stored generation.
+    Absent,
+    /// It is the stored generation; not expanded (a probe, `scratch` was `None`).
+    Present,
+    /// It is the stored generation, expanded into an unlinked scratch file of this many bytes.
+    Materialized(File, u64),
+}
+
+/// Whether `<log>.2.gz` decompresses to the generation `state` points into: the first
+/// `min(256, size)` decompressed bytes must hash to the stored fingerprint. With a `scratch`
+/// directory the whole generation is then expanded, streaming, into an unlinked file there (so a
+/// resumed position is simply a decompressed offset into an ordinary seekable file, and a crash
+/// leaves nothing behind); without one this is only the cheap check.
+fn match_gzip_generation(
+    log_path: &Path,
+    state: &CursorState,
+    scratch: Option<&Path>,
+) -> Result<GzipMatch, &'static str> {
+    use flate2::read::GzDecoder;
+    let mut path = rotated_path(log_path, 2).into_os_string();
+    path.push(".gz");
+    let Ok(file) = File::open(&path) else {
+        return Ok(GzipMatch::Absent);
+    };
+    let mut head = Vec::with_capacity(256);
+    if GzDecoder::new(&file)
+        .take(256)
+        .read_to_end(&mut head)
+        .is_err()
+    {
+        return Ok(GzipMatch::Absent);
+    }
+    let fingerprint: [u8; 32] = Sha256::digest(&head).into();
+    if fingerprint != state.fingerprint {
+        return Ok(GzipMatch::Absent);
+    }
+    let Some(scratch) = scratch else {
+        return Ok(GzipMatch::Present);
+    };
+    let Ok(file) = File::open(&path) else {
+        return Err("the compressed rotated copy cannot be read");
+    };
+    let mut out =
+        scratch_file(scratch).map_err(|_| "no scratch space to expand the compressed copy")?;
+    let copied = io::copy(
+        &mut GzDecoder::new(file).take(GZIP_EXPANSION_CAP + 1),
+        &mut out,
+    )
+    .map_err(|_| "the compressed rotated copy is truncated or corrupt")?;
+    if copied > GZIP_EXPANSION_CAP {
+        return Err("the compressed rotated copy is larger than the expansion cap");
+    }
+    if copied < state.offset {
+        return Err("the rotated copy ends before the read offset");
+    }
+    Ok(GzipMatch::Materialized(out, copied))
+}
+
+/// A read-write file in `dir` (the system temp directory when `dir` cannot be written) that is
+/// already unlinked: it lives only as long as the descriptor.
+fn scratch_file(dir: &Path) -> io::Result<File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let attempt = |dir: &Path| -> io::Result<File> {
+        let path = dir.join(format!(
+            ".propolis-gzdrain-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        std::fs::remove_file(&path)?;
+        Ok(file)
+    };
+    attempt(dir).or_else(|_| attempt(&std::env::temp_dir()))
 }
 
 /// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields

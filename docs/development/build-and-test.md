@@ -107,6 +107,9 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
   suite can only check that the guarding code ships. Run by hand when the console's
   polled panels or the vendored HTMX change; see
   [browser-fixtures](browser-fixtures.md).
+- **Outside the suite as well: the intake soak.** Hours of sustained load through the real intake
+  path, with rotation and faults, is a harness you run by hand
+  (`crates/propolis/examples/soak/main.rs`); see [intake-soak](intake-soak.md).
 
 These are static attribute counts, not a live `cargo test --list` run. Every figure
 in this section, and the table below row for row, is recomputed from the source and

@@ -39,7 +39,8 @@ for everything else.
   [build and test](development/build-and-test.md),
   [adding a sensor](development/adding-a-sensor.md),
   [schema and migrations](development/schema-and-migrations.md),
-  [browser fixtures](development/browser-fixtures.md).
+  [browser fixtures](development/browser-fixtures.md),
+  [intake soak test](development/intake-soak.md).
 - **Look something up** - [environment variables](reference/environment-variables.md),
   [ports](reference/ports-and-protocols.md),
   [filesystem paths](reference/filesystem-paths.md),

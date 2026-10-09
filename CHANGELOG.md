@@ -289,6 +289,12 @@
 
 ### Added
 
+- **An intake soak harness** - `crates/propolis/examples/soak` drives sustained synthetic sensor
+  traffic (telnet-dominated, long and over-length lines, copytruncate and rename rotation, a
+  backdated multi-gigabyte backlog) through the real intake runner and the review submission loop
+  against a scratch database, samples lag, memory, append-lock wait and ledger growth, accounts
+  every line written against the ledger, and ends in a PASS/FAIL report with fault injection (kill,
+  cursor loss, a poison line). See `docs/development/intake-soak.md`. Run by hand; not in the suite.
 - **Intake appends a batch of lines in one transaction** - after the dedup index (migration `0013`)
   and the incremental breadth sets (migration `0014`) removed the costs that grew with lag and with
   a source's history, what remained was one transaction, one lock acquisition and one commit per

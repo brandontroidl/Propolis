@@ -58,6 +58,7 @@ use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::feed::read_manifest;
 use crate::routes::format::{format_relative_time, format_sensor_label, format_timestamp};
+use crate::routes::rowcount::{Count, capped_total};
 
 /// How far back the capture-completeness panel looks. Long enough that a low-traffic sensor still
 /// has a denominator, short enough that a fix made this week is visible in the rate.
@@ -156,6 +157,8 @@ struct FeedFreshness {
 #[derive(Debug, Serialize)]
 struct LedgerStatus {
     events: Option<i64>,
+    /// `events` is the planner's estimate, not a count: the ledger is past the counting cap.
+    events_estimate: bool,
     newest_ingested_ago: Option<String>,
     dot: &'static str,
 }
@@ -344,6 +347,20 @@ fn attribute(
         out.by_listener.entry(key).or_default().merge(seen);
     }
     out
+}
+
+/// The ledger panel's two facts without scanning the ledger: how many events (counted up to the
+/// cap, then the planner's estimate, flagged as one) and when the newest was ingested. `count(*)`
+/// and `max(ingested_at)` each read every row of a table that only grows, on a panel that polls;
+/// the newest ingest is read off the newest row by `id` (the primary key, assigned in append
+/// order under the chain lock), which is the newest ingest.
+async fn ledger_head(db: &PgPool) -> Result<(Count, Option<DateTime<Utc>>), sqlx::Error> {
+    let count = capped_total(db, "event").await?;
+    let newest: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT ingested_at FROM event ORDER BY id DESC LIMIT 1")
+            .fetch_optional(db)
+            .await?;
+    Ok((count, newest))
 }
 
 /// The LAST EVENT cell's words.
@@ -1004,18 +1021,21 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         }
     }
 
-    let ledger_result =
-        sqlx::query("SELECT count(*) AS events, max(ingested_at) AS newest_ingested_at FROM event")
-            .fetch_one(&state.db)
-            .await
-            .and_then(|r| {
-                Ok((
-                    r.try_get::<i64, _>("events")?,
-                    r.try_get::<Option<DateTime<Utc>>, _>("newest_ingested_at")?,
-                ))
-            });
+    let ledger_result = ledger_head(&state.db).await;
     let ledger_unavailable = ledger_result.is_err();
-    let ledger_row = degraded.soft_or("ledger head", ledger_result, (0, None));
+    let ledger_row = degraded.soft_or(
+        "ledger head",
+        ledger_result,
+        (
+            Count {
+                value: 0,
+                exact: true,
+            },
+            None,
+        ),
+    );
+    let (ledger_count, ledger_newest) = ledger_row;
+    let ledger_row = (ledger_count.value, ledger_newest);
     let ledger_level = match ledger_row.1 {
         // A failed query and an empty ledger are both `Unknown`, which is right - neither proves
         // health - but the WORDS beside the dot have to differ, hence `ledger_unavailable`.
@@ -1027,6 +1047,7 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         // `None` for a failed count: rendering the `0` placeholder as a number is the console
         // asserting an empty ledger it never managed to read.
         events: (!ledger_unavailable).then_some(ledger_row.0),
+        events_estimate: !ledger_unavailable && !ledger_count.exact,
         newest_ingested_ago: ledger_row.1.map(format_relative_time),
         dot: dot_class(ledger_level),
     };

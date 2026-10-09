@@ -53,6 +53,12 @@
 
 ### Changed
 
+- **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
+  `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
+  The count is exact up to 100,000 events and shown bare; past that it is the planner's row
+  estimate, shown as `about N` and labelled `(estimate)`. The newest ingest is read off the
+  newest row by `id`. The Attackers total shares the rule (`routes::rowcount`) and skips its
+  bounded scan once statistics put the table past the cap. The integrity page still counts on load.
 - **The evidence timeline's header says what it counts** - it read "54 events", which looked like
   the address's total or its commands. It now reads, for example, `newest 200 events: 199
   commands, 1 session, 1 outside any session`: ledger rows on the page, of which command

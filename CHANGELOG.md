@@ -21,6 +21,14 @@
 
 ### Fixed
 
+- **The phone's toybox applets print their help before an option refusal** - read from the
+  source of Android 6.0.1's toybox (not captured from a device): `get_optflags` raises
+  `toys.exithelp` before it parses, `error_exit` then calls `show_help`, and the build has
+  `CFG_TOYBOX_HELP 1`, so `tr` with no operand writes `usage: tr [-cds] SET1 [SET2]` and its
+  description to standard error before `tr: Needs 1 argument`. Done for `tr`, `wc`, `base64`,
+  `md5sum`, `sha1sum`, `cut`, `od`, `which`, `getprop` and `setprop`, with the strings of
+  `generated/help.h`. Errors raised after parsing print no help.
+
 - **A dash script's errors name the script, as dash words them** - every error of a script run
   with `sh FILE` read `sh: 3: ./x: not found`, where Ubuntu 22.04's dash prints the script as it
   was typed: `.s: 3: ./x: not found`, `./x.sh: 1: ...`, `sub/x.sh: 1: ...`, `/tmp/x.sh: 2: Syntax

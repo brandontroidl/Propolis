@@ -185,7 +185,10 @@ fn the_property_tools_count_operands_in_toyboxs_words() {
         ("getprop -x", "getprop: Unknown option x\n"),
         ("setprop -x a b", "setprop: Unknown option x\n"),
     ] {
-        assert_eq!(answer(&mut sh, line), ("".into(), want.into(), 1), "{line}");
+        // Each is an option-parsing refusal, so the applet's help text comes first.
+        let applet = line.split(' ').next().unwrap();
+        let want = format!("{}{want}", super::toyopt::help_text(applet));
+        assert_eq!(answer(&mut sh, line), ("".into(), want, 1), "{line}");
     }
     // With no option letters the first operand ends the options, so a later dash is data.
     assert_eq!(out(&mut sh, "getprop ro.nonesuch -x"), "-x\n");

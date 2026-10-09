@@ -339,14 +339,20 @@ mod tests {
     #[test]
     fn it_refuses_in_toyboxs_words() {
         let mut sh = phone();
+        let help = crate::shell::toyopt::help_text("tr");
+        // The first three are option-parsing refusals, which print the applet's help first; the
+        // last two come from the applet itself, after parsing, and do not.
         for (line, want) in [
-            ("tr", "tr: Needs 1 argument\n"),
-            ("tr a b c", "tr: Max 2 arguments\n"),
-            ("tr -z a", "tr: Unknown option z\n"),
-            ("tr a ''", "tr: set2 can't be empty string\n"),
-            ("tr z-a b", "tr: reverse colating order: Success\n"),
+            ("tr", format!("{help}tr: Needs 1 argument\n")),
+            ("tr a b c", format!("{help}tr: Max 2 arguments\n")),
+            ("tr -z a", format!("{help}tr: Unknown option z\n")),
+            ("tr a ''", "tr: set2 can't be empty string\n".to_string()),
+            (
+                "tr z-a b",
+                "tr: reverse colating order: Success\n".to_string(),
+            ),
         ] {
-            assert_eq!(run(&mut sh, line), (want.into(), 1), "{line}");
+            assert_eq!(run(&mut sh, line), (want, 1), "{line}");
         }
     }
 

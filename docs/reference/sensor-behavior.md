@@ -526,7 +526,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   a stray byte drops the rest of that read and the status stays 0, and `=` ends the decode. The
   names and the source of each applet's presence are in the module doc of `multicall.rs`:
   `base64` and `sha256sum` are linked here although that release links neither, and `xxd`, `dd`,
-  `settings` and `monkey` are not offered. `getprop`, `setprop` and `ifconfig` are toybox's too
+  `settings` and `monkey` are not offered. A refusal from that parser is preceded by the applet's
+  own help text on standard error (`tr: Needs 1 argument` follows `usage: tr [-cds] SET1 [SET2]`
+  and its description), because `get_optflags` raises `toys.exithelp` before parsing and
+  `error_exit` then calls `show_help`; the strings are `generated/help.h` at the tag
+  (`crates/sensor-framework/src/shell/toyopt.rs#help_text`). This is source-verified (`lib/args.c`
+  `get_optflags`, `lib/lib.c` `error_exit`, `generated/config.h` `CFG_TOYBOX_HELP 1`), not
+  captured from a device; `sha256sum`, which that release lacks, borrows `sha1sum`'s text
+  [unverified]. Errors an applet raises after parsing (`tr: set2 can't be empty string`) print no
+  help. `getprop`, `setprop` and `ifconfig` are toybox's too
   (in its `ALL_TOOLS` at tag `android-6.0.1_r81`; the release's toolbox has no source for them), so
   `toybox getprop` runs and `toolbox getprop` is `toolbox: no such tool getprop`; `setprop` counts
   its operands as toybox does (`setprop: Need 2 arguments`) and refuses a long or malformed name or

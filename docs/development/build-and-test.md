@@ -86,9 +86,9 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 3727 test functions** (2354 unit + 1373 integration).
-- **DB-backed (`sqlx::test`): 277** - console 188, core-scoring 44, review 19,
-  intake 13, propolis 7, fleet 6. These provision a fresh database per test.
+- **Total: 3752 test functions** (2369 unit + 1383 integration).
+- **DB-backed (`sqlx::test`): 282** - console 188, core-scoring 44, review 19,
+  intake 18, propolis 7, fleet 6. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -123,9 +123,9 @@ Per-crate breakdown:
 | fleet | 23 | 32 | deploy_inventory_test, probe_test, store_test |
 | gateway | 11 | 13 | handshake, spool, verify |
 | geoip | 4 | 0 | - |
-| intake | 18 | 26 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter |
-| log-tailer | 3 | 54 | cursor_test, cursorless_test, tailer_test |
-| propolis | 133 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| intake | 29 | 32 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine |
+| log-tailer | 4 | 58 | cursor_test, cursorless_test, tailer_test |
+| propolis | 136 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
 | review | 147 | 90 | campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test |
 | sensor-adb | 61 | 44 | arrival, env_strict, integration |
@@ -144,7 +144,7 @@ Per-crate breakdown:
 | sensor-wire | 12 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2354** | **1373** | |
+| **Total** | **2369** | **1383** | |
 
 ### Test styles by layer
 
@@ -154,7 +154,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (43 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (231 uses) - needed wherever a test needs more than
+  applies migrations manually (236 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

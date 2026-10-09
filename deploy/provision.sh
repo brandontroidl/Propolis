@@ -134,6 +134,9 @@ ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
 # its own children below (cursors/, feed/, spool/), never this shared root, so it loses nothing.
 ensure_dir /var/lib/propolis              0755 root              root
 ensure_dir /var/lib/propolis/cursors      0750 propolis          propolis
+# Log lines the database always refuses, set aside by intake (crates/intake/src/quarantine.rs). The
+# daemon cannot create it itself: its parent above is root-owned. Capped by the daemon, not cleaned.
+ensure_dir /var/lib/propolis/quarantine   0750 propolis          propolis
 # 0755, not cursors' 0750: this is feed's PUBLIC output tree (see deploy/propolis.service's own
 # UMask=0022 comment) - the operator's out-of-band distribution mechanism, typically a different
 # unrelated user, must be able to traverse in and read it.

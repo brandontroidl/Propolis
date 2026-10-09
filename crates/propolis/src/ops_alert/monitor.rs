@@ -195,12 +195,13 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All fourteen operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// All fifteen operational conditions, in a stable order. Built fresh on each (re)start so per-
 /// condition state (backlog history, the chain-verify cache, intake lag tracks) resets cleanly
 /// after a supervised restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
     use super::conditions::{
-        backlog, capacity, chain, feed, intake, intake_lag, malware, sensor_log, subsystem, vendor,
+        backlog, capacity, chain, feed, intake, intake_lag, intake_quarantine, malware, sensor_log,
+        subsystem, vendor,
     };
     vec![
         Box::new(subsystem::SubsystemGaveUp),
@@ -210,6 +211,7 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(chain::ChainVerify::new()),
         Box::new(intake::IntakeStalled),
         Box::new(intake_lag::IntakeLagging::new()),
+        Box::new(intake_quarantine::IntakeLineQuarantined),
         Box::new(feed::FeedStale),
         Box::new(feed::FeedPushStale::new()),
         Box::new(vendor::VendorFailures),
@@ -412,7 +414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_fourteen_expected_ids() {
+    async fn default_conditions_are_the_fifteen_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -424,6 +426,7 @@ mod tests {
                 "chain-verify",
                 "intake-stalled",
                 "intake-lagging",
+                "intake-line-quarantined",
                 "feed-stale",
                 "feed-push-stale",
                 "vendor-failures",

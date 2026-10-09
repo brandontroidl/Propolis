@@ -103,13 +103,24 @@ written. If the log file changed under the failed batch (a `copytruncate` or an 
 replacement landed while the append was in flight) the position cannot be trusted, so the whole
 batch is read again from its start: replayed, never skipped. A failure at the first line of a
 batch reports nothing ingested, so the intake loop sleeps its poll interval instead of retrying at
-once. An event the database always refuses therefore holds that sensor's intake at that line
-until it is removed from the log, as it did one event at a time; the third consecutive poll
-refusing the same line logs `intake wedged at <sensor>` with the event's `observed_at` and the
-SQLSTATE, and `intake-stalled` quotes the same text when it fires. Nothing skips or quarantines
-the line: that is the operator's decision. An error that is not about one event (a lost
-connection, a lock timeout) is returned without splitting the batch and is retried on the next
-poll; it neither counts toward the three polls nor resets them.
+once. An event the database always refuses holds that sensor's intake at that line for two more
+polls; the third consecutive poll refusing the same line (by line hash) logs `intake wedged at
+<sensor>` with the event's `observed_at` and the SQLSTATE, and then quarantines it in the same
+call (`crates/intake/src/runner.rs#quarantine_line`). The line is appended to
+`<quarantine dir>/<sensor>.jsonl` and fsynced FIRST; only then does the tailer move past exactly
+that one line, by the same recorded line lengths as the committed prefix
+(`LogTailer::commit_batch_through`, never a second read, so a `copytruncate` landing during the
+append still cannot make it skip a line of the new file), and the cursor is saved. If the log
+did change under the batch, the record stays, the batch is read again from its start, and
+nothing is skipped. If the record cannot be written (full disk, bad permissions) or the store
+is at its cap, intake does not skip: it stays on the line, retries each poll, and the wedge text
+that `intake-stalled` quotes ends with the reason (fail closed). A run that never reaches the
+threshold, or a runner built without a quarantine, behaves as before: reported, never skipped.
+An error that is not about one event (a lost connection, a lock timeout) is returned without
+splitting the batch and is retried on the next poll; it neither counts toward the three polls
+nor resets them, and it never quarantines anything. The quarantine's format, caps and the
+`intake-line-quarantined` alert are in [health and
+observability](../operations/health-and-observability.md#quarantined-intake-lines).
 
 An event can enter the ledger twice in three cases, the price of at-least-once delivery: the
 connection drops after Postgres committed a batch but before the acknowledgement arrives (the

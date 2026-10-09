@@ -86,6 +86,9 @@ pub struct SensorIntake {
     /// Set while the database keeps refusing the same line of this log (`IntakeRunner::wedged`);
     /// `intake-stalled` quotes it, so the page says why the cursor is not moving.
     pub wedge: Option<String>,
+    /// When this log's intake last set a refused line aside (`IntakeRunner::last_quarantine`) and
+    /// what it said about it; `intake-line-quarantined` fires on it for a while after.
+    pub last_quarantine: Option<(Instant, String)>,
 }
 
 impl SensorIntake {
@@ -98,6 +101,7 @@ impl SensorIntake {
             last_ingested_observed_at: None,
             reported_sensors: Vec::new(),
             wedge: None,
+            last_quarantine: None,
         }
     }
 }

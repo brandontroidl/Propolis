@@ -507,6 +507,10 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
   (`crates/shipper/src/client.rs#ship_cycle`).
 - Delivery is at least once, and a line delivered twice becomes a second event row; the dedup
   window only keeps it from adding score (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`).
+- A line the control plane's database refuses is quarantined on the control plane, in
+  `/var/lib/propolis/quarantine` (`PROPOLIS_QUARANTINE_DIR`), under the collector's label: the
+  collector's own log is not touched, and the gateway has already acknowledged the line
+  ([quarantined intake lines](health-and-observability.md#quarantined-intake-lines)).
 - Nothing alerts when a collector goes quiet, the shipper stops or the gateway is down:
   `intake-stalled` fires only when intake falls behind a file it can read
   (`crates/propolis/src/ops_alert/monitor.rs#default_conditions`,

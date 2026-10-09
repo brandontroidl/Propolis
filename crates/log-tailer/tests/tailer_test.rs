@@ -705,3 +705,83 @@ fn commit_batch_through_spans_a_draining_inode_and_the_new_file() {
         assert_eq!(rest.len(), 9 - prefix, "prefix {prefix}");
     }
 }
+
+/// Where a line of the uncommitted batch started, from the recorded lengths.
+#[test]
+fn uncommitted_line_gives_each_lines_start_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaa\nbbbb\ncc\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert!(tailer.uncommitted_line(0).is_none(), "nothing read yet");
+    assert_eq!(tailer.read_batch(3).len(), 3);
+    let offsets: Vec<u64> = (0..3)
+        .map(|i| tailer.uncommitted_line(i).unwrap().offset)
+        .collect();
+    assert_eq!(offsets, [0, 4, 9]);
+    assert!(tailer.uncommitted_line(3).is_none(), "past the batch");
+    tailer.commit_batch();
+    assert!(tailer.uncommitted_line(0).is_none(), "committed");
+}
+
+/// A batch that starts mid-file, and a line that follows an over-length discard: the offset is the
+/// line's own first byte, not the start of the bytes charged to it.
+#[test]
+fn uncommitted_line_offsets_account_for_prior_batches_and_discards() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let over = log_tailer::MAX_LINE_BYTES as usize + 5;
+    let mut content = b"ok\nsecond\n".to_vec();
+    content.extend(std::iter::repeat_n(b'x', over));
+    content.extend(b"\nnext\n");
+    std::fs::write(&log_path, &content).unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(1), vec!["ok"]);
+    tailer.commit_batch();
+    assert_eq!(tailer.read_batch(5), vec!["second", "next"]);
+    assert_eq!(tailer.uncommitted_line(0).unwrap().offset, 3);
+    assert_eq!(
+        tailer.uncommitted_line(1).unwrap().offset,
+        (content.len() - "next\n".len()) as u64
+    );
+}
+
+/// The `String` a batch returns is lossy for bytes that are not UTF-8; the batch still knows the
+/// line's real bytes, and only for those lines.
+#[test]
+fn uncommitted_line_keeps_the_raw_bytes_of_a_line_that_is_not_utf8() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, b"good\n\xff\xfebad\nfine\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    let lines = tailer.read_batch(3);
+    assert_eq!(lines[1], "\u{fffd}\u{fffd}bad");
+    assert_eq!(tailer.uncommitted_line(0).unwrap().raw, None);
+    let bad = tailer.uncommitted_line(1).unwrap();
+    assert_eq!(bad.raw.as_deref(), Some(&b"\xff\xfebad"[..]));
+    assert_eq!(bad.offset, 5);
+    assert_eq!(tailer.uncommitted_line(2).unwrap().raw, None);
+    assert_eq!(tailer.uncommitted_line(2).unwrap().offset, 11);
+}
+
+/// Across a rotated-out inode still being drained, a line's offset is within the file it came
+/// from: the old one for its lines, the new one for the rest.
+#[test]
+fn uncommitted_line_offsets_follow_the_file_each_line_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, numbered("old", 6)).unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(1).len(), 1);
+    tailer.commit_batch();
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, numbered("new", 4)).unwrap();
+
+    // old-001 .. old-005 then new-000 .. new-003.
+    assert_eq!(tailer.read_batch(9).len(), 9);
+    let width = line_of("old", 0).len() as u64 + 1;
+    assert_eq!(tailer.uncommitted_line(0).unwrap().offset, width);
+    assert_eq!(tailer.uncommitted_line(4).unwrap().offset, 5 * width);
+    assert_eq!(tailer.uncommitted_line(5).unwrap().offset, 0, "new-000");
+    assert_eq!(tailer.uncommitted_line(8).unwrap().offset, 3 * width);
+}

@@ -48,7 +48,7 @@ for the complete set and exact values.
 | Area | Configures | Key variables |
 |---|---|---|
 | Database | PgPool connection and size | `DATABASE_URL` (required), `PROPOLIS_DB_MAX_CONNECTIONS` |
-| Intake | which sensor logs to tail, cursor state, poll cadence | `PROPOLIS_SENSOR_LOGS` (required), `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS` |
+| Intake | which sensor logs to tail, cursor state, quarantine directory, poll cadence | `PROPOLIS_SENSOR_LOGS` (required), `PROPOLIS_CURSOR_DIR`, `PROPOLIS_QUARANTINE_DIR`, `PROPOLIS_POLL_INTERVAL_MS` |
 | Review | scoring/review loop cadence and vendor submitters | `PROPOLIS_REVIEW_ENABLED`, `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_VENDOR_<V>_*` |
 | Feed | blocklist output dir, build cadence, tiers/windows, allow/delist | `PROPOLIS_FEED_ENABLED`, `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`, `PROPOLIS_FEED_WINDOWS`, `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_FEED_DELIST` |
 | Console | bind address, auth, session, enrichment | `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (required), `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED` |

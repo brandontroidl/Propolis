@@ -233,6 +233,7 @@ mod tests {
             last_ingested_observed_at: last,
             reported_sensors: vec!["telnet".into()],
             wedge: None,
+            last_quarantine: None,
         }
     }
 

@@ -366,6 +366,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   -h -H -m -e -f -A -B -C -r -Z -a`, GNU's compile-error wordings and status 0/1/2,
   `crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`, `crates/sensor-framework/src/shell/regex.rs#Regex`),
   `cut` (`-b -c -f -d -s --complement --output-delimiter`, `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_cut`),
+  `tr` (GNU coreutils 8.32 over standard input: `-c -C -d -s -t`, the long options and their
+  abbreviations, `-A`, `--help` and `--version`; `\NNN` and the C escapes, ranges, the twelve
+  `[:class:]` names, `[=c=]`, `[c*n]` and `[c*]` repeats, `[:lower:]`/`[:upper:]` case conversion;
+  `-s` squeezes what the last SET names after translation or deletion; every refusal in GNU's words
+  with typographic quotes, as the persona's `LANG=C.UTF-8` gives, and the tool names itself as it was
+  run. Checked against `/usr/bin/tr` of an `ubuntu:22.04` container. It differs from the phone's
+  toybox `tr` in the escapes (`\x41`, `\e`), the classes' order, repeats, `-t` and the wording;
+  `crates/sensor-framework/src/shell/tr_gnu.rs#FakeShell::cmd_tr_gnu`; under `busybox` it stays a
+  silent success because that applet's refusals are not captured),
   `tee` (`-a`; its files are written like a redirection, so a body it saves from the session input is captured,
   `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_tee`), `awk`/`mawk` (an interpreter for mawk 1.3.4's
   language: patterns, `BEGIN`/`END`, fields, arrays, user functions, the string and math built-ins, `printf` through

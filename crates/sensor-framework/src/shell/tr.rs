@@ -5,9 +5,10 @@
 //! reads only standard input, `-C` is accepted and does nothing (only `-c` complements), a `-s`
 //! squeeze compares the previous output byte's whole map entry, a SET2 shorter than SET1 repeats
 //! its last byte, and a `[=c=]` class leaves `c` in the set twice. The option and operand
-//! refusals (`Needs 1 argument`, `Unknown option`) are `toyopt`'s. The Ubuntu shell has no `tr`
-//! here. `reverse colating order` is printed by `perror_exit`, whose errno text is not known;
-//! `Success` is [unverified].
+//! refusals (`Needs 1 argument`, `Unknown option`) are `toyopt`'s. The Ubuntu shell's `tr` is
+//! GNU coreutils 8.32 and lives in `tr_gnu.rs`; the two share only the registry name and the
+//! bounded read of standard input. `reverse colating order` is printed by `perror_exit`, whose
+//! errno text is not known; `Success` is [unverified].
 //!
 //! Output is never longer than the input, so reading through the shared bounded reader bounds it.
 #![deny(
@@ -22,10 +23,17 @@ use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 
 pub(super) fn register(r: &mut Registry) {
     r.register_if("tr", android, HandlerId::Tr, FakeShell::cmd_tr);
+    r.register_if("tr", ubuntu, HandlerId::Tr, FakeShell::cmd_tr_gnu);
 }
 
 fn android(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.flavor == ShellFlavor::AndroidSh
+}
+
+/// Bash has the coreutils file; `busybox tr` is BusyBox's applet, whose usage and refusals are
+/// not captured, so under `busybox` the name stays a silent success as every uncaptured applet.
+fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
+    shell.flavor == ShellFlavor::Bash && shell.busybox_depth == 0
 }
 
 const DELETE: u16 = 0x100;

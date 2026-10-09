@@ -101,6 +101,7 @@ mod tftp;
 mod timing;
 mod toyopt;
 mod tr;
+mod tr_gnu;
 mod trace;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
@@ -3416,3 +3417,5 @@ mod texttools_tests;
 mod tftp_tests;
 #[cfg(test)]
 mod timing_tests;
+#[cfg(test)]
+mod tr_gnu_tests;

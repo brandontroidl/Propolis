@@ -21,6 +21,19 @@
 
 ### Fixed
 
+- **The Ubuntu persona's `tr` exists, as GNU coreutils 8.32** - it answered `tr: command not
+  found`, which no Ubuntu server does, so a loader that strips line breaks with `tr -d '\n'` before
+  decoding stopped there. It now translates, deletes, squeezes and complements standard input with
+  GNU's rules: `-c -C -d -s -t`, the long options and their abbreviations, `\NNN` and the C
+  escapes, ranges, the twelve classes, `[=c=]`, `[c*n]` repeats and `[:lower:]`/`[:upper:]` case
+  conversion; `--help` and `--version` print 8.32's text; and every refusal is GNU's (`tr: missing
+  operand`, `tr: extra operand ‘c’`, `Try 'tr --help' for more information.`, the set errors and
+  the octal and trailing-backslash warnings), with the typographic quotes the persona's
+  `LANG=C.UTF-8` gives. Checked line by line against `/usr/bin/tr` of an `ubuntu:22.04` container,
+  including 16,000 generated option and set combinations, none differing. The phone's toybox `tr`
+  is unchanged; where the two differ (`\x41`, `\e`, repeats, `-t`, the classes' order) is listed in
+  the module doc of `crates/sensor-framework/src/shell/tr_gnu.rs`.
+
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
   live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
   keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns

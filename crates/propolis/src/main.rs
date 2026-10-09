@@ -211,6 +211,7 @@ async fn run_intake_sensor(
             entry.backlog = backlog;
             entry.bytes_behind = Some(bytes_behind);
             entry.last_ingested_observed_at = runner.last_ingested_observed_at();
+            entry.wedge = runner.wedged();
             // The set only grows, so an unchanged length is an unchanged set.
             if entry.reported_sensors.len() != runner.reported_sensors().len() {
                 entry.reported_sensors = runner.reported_sensors().iter().cloned().collect();
@@ -239,7 +240,7 @@ async fn run_intake_sensor(
             );
         }
 
-        if result.errors == 0
+        if result.cursor_moved()
             && let Err(e) = runner.persist_cursor()
         {
             tracing::error!(sensor = %name, error = %e, "intake: cursor persist failed");

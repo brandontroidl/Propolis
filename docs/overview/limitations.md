@@ -61,18 +61,23 @@ shipped systemd timer or cron**. Without operator configuration, the feed is bui
 locally but not pushed anywhere. See
 [`../operations/routine-procedures.md`](../operations/routine-procedures.md).
 
-## Intake appends one event per transaction
+## One lock orders every append
 
-Open item. Intake appends one event per transaction under a single lock that keeps the hash
-chain in order, so the per-event cost sets the pace for every sensor
-(`crates/core-scoring/src/repository/events.rs#append_event`). That cost no longer grows with
-intake lag (migration `0013`, the dedup read; see [intake backlog](../troubleshooting/intake-backlog.md))
-or with a source's history (migration `0014`, the breadth sets; see
-[database reference](../reference/database.md#breadth-sets)): on a 7.5M-row test ledger held in
-RAM an append took about 3 ms for a source with 1.5M earlier events, the same as for a source
-never seen. What remains is each append's own round trips and commit, which caps the node at a
-few hundred events a second, lower where each commit waits on a disk flush `[inferred]`. Appending a batch of
-lines in one transaction, still one event at a time in order, is the next change `[planned]`.
+The hash chain is one sequence, so every append, from every sensor, takes a single lock and
+waits its turn; a faster writer would not change that. What bounds the rate is how long each
+turn lasts. A turn used to be one event, and the cost of an event grew with intake lag
+(migration `0013`, the dedup read; see [intake backlog](../troubleshooting/intake-backlog.md))
+and with a source's history (migration `0014`, the breadth sets; see
+[database reference](../reference/database.md#breadth-sets)). Neither grows now, and a turn is
+a batch of up to 1000 lines in one transaction
+(`crates/core-scoring/src/repository/batch.rs#append_events`). On a 1M-row test ledger with a
+200k-event source on a RAM-backed server, intake appended 11,000 to 13,600 events a second in
+batches of 1000, against 350 to 470 one at a time; where each commit waits on a disk flush the
+one-at-a-time figure is lower and the batched one barely moves `[inferred]`. While a batch
+commits, other sensors' writers wait: about 70 to 90 ms at 1000 lines. An event the database
+refuses on every attempt (a NUL character in a command, which `jsonb` cannot store) still holds
+that sensor's intake at its line, as it did before batching
+([concurrency and failure](../architecture/concurrency-and-failure.md#serialized-single-writer-append)).
 
 The `intake-lagging` alert and the fleet pane's behind badge make a backlog visible;
 they do not remove it. While intake is behind, a `copytruncate` rotation of the log drops the

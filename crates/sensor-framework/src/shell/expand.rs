@@ -83,6 +83,35 @@ impl FakeShell {
         Ok(out)
     }
 
+    /// [`Self::expand_argv`], and for each field whether the word it came from held a variable
+    /// that is not set, which expands to nothing and so cannot be told from an empty value.
+    pub(super) fn expand_argv_flagged(
+        &mut self,
+        words: &[Word],
+    ) -> Result<(Vec<String>, Vec<bool>), ExpandError> {
+        let mut out = Vec::new();
+        let mut unset = Vec::new();
+        let outer = std::mem::take(&mut self.unset_seen);
+        for word in words {
+            self.unset_seen = false;
+            let fields = match self.expand_fields(word) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    self.unset_seen = outer;
+                    return Err(error);
+                }
+            };
+            unset.extend(fields.iter().map(|_| self.unset_seen));
+            out.extend(fields);
+            if self.line.exhausted() {
+                self.unset_seen = outer;
+                return Err(ExpandError::Refused);
+            }
+        }
+        self.unset_seen = outer;
+        Ok((out, unset))
+    }
+
     /// One word through all six steps.
     pub(super) fn expand_fields(&mut self, word: &Word) -> Result<Vec<String>, ExpandError> {
         let segs = self.parts_segs(&word.parts, false)?;
@@ -111,6 +140,29 @@ impl FakeShell {
         let segs = self.parts_segs(&word.parts, false)?;
         self.charge_segs(&segs)?;
         Ok(join_segs(&segs))
+    }
+
+    /// Whether a `case` pattern matches `subject`. The pattern is expanded without splitting or
+    /// pathname expansion; its unquoted `*`, `?` and `[..]` are special and, unlike a pathname,
+    /// match a `/` too.
+    pub(super) fn case_pattern_matches(
+        &mut self,
+        pattern: &Word,
+        subject: &str,
+    ) -> Result<bool, ExpandError> {
+        let segs = self.parts_segs(&pattern.parts, false)?;
+        self.charge_segs(&segs)?;
+        let mut chars: Vec<(char, bool)> = Vec::new();
+        for seg in &segs {
+            match seg {
+                Seg::Text { text, quoted, .. } => {
+                    chars.extend(text.chars().map(|c| (c, *quoted)));
+                }
+                Seg::Break => chars.push((' ', true)),
+            }
+        }
+        let name: Vec<char> = subject.chars().collect();
+        Ok(glob_match(&compile_glob(&chars), &name))
     }
 
     /// Text expanded the way the inside of double quotes is: a here-document body.
@@ -274,6 +326,7 @@ impl FakeShell {
                 return Ok(());
             }
         }
+        self.unset_seen |= value.is_none();
         segs.push(text_seg(value.unwrap_or_default()));
         Ok(())
     }

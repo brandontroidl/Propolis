@@ -85,8 +85,8 @@ default-off** egress.
 4. **Intake.** The intake binary tails each sensor log on its own task against a shared
    `PgPool`, validates the wire record's `signal_type`/`protocol` against the known
    set, derives weight/confidence/category (the sensor never computes them), and calls
-   `append_event`. Appends are serialized by a Postgres advisory lock and the DB-layer
-   chain trigger rejects any bad linkage fail-closed. See
+   `append_events`, a batch per transaction. Appends are serialized by a Postgres advisory
+   lock and the DB-layer chain trigger rejects any bad linkage fail-closed. See
    [storage](./storage.md).
 
 Note the transport: **sensors never talk to intake directly.** The only channel is

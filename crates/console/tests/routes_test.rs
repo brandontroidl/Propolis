@@ -1449,6 +1449,77 @@ async fn relist_clears_the_latch_and_rederives_the_gates(pool: PgPool) {
     );
 }
 
+/// An append in flight reads an address's projection and writes it back at commit, so a console
+/// change to `ip_score` that lands in between is overwritten (a delete is undone, a delist loses
+/// its flags). Holding the append lock stands in for a batch mid-transaction: delist, relist and
+/// delete must all wait for it, change nothing while they wait, and complete once it is released.
+#[sqlx::test(migrations = false)]
+async fn delist_relist_and_delete_wait_for_an_append_in_flight(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.211", 60).await;
+    seed_recommended(&pool, "203.0.113.212", 60).await;
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let in_flight = core_scoring::begin_exclusive(&pool).await.unwrap();
+    for (action, ip) in [
+        ("delist", "203.0.113.211"),
+        ("delete", "203.0.113.212"),
+        ("relist", "203.0.113.212"),
+    ] {
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(400),
+            app.clone().oneshot(form_request(
+                &format!("/ip/{ip}/{action}"),
+                format!("csrf_token={csrf_token}"),
+                Some(&cookie_header),
+            )),
+        )
+        .await;
+        assert!(blocked.is_err(), "{action} must wait for the append lock");
+    }
+    let untouched = sqlx::query(
+        "SELECT source_ip::text AS ip, delisted, eligible FROM ip_score ORDER BY source_ip",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(untouched.len(), 2, "a waiting delete must not have deleted");
+    assert!(
+        untouched
+            .iter()
+            .all(|r| !r.get::<bool, _>("delisted") && r.get::<bool, _>("eligible")),
+        "a waiting delist must not have changed the flags"
+    );
+
+    in_flight.commit().await.unwrap();
+    for (action, ip, status) in [
+        ("delist", "203.0.113.211", StatusCode::SEE_OTHER),
+        ("delete", "203.0.113.212", StatusCode::SEE_OTHER),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(form_request(
+                &format!("/ip/{ip}/{action}"),
+                format!("csrf_token={csrf_token}"),
+                Some(&cookie_header),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{action} after release");
+    }
+    let remaining: Vec<(String, bool)> =
+        sqlx::query_as("SELECT source_ip::text, delisted FROM ip_score")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, vec![("203.0.113.211/32".to_string(), true)]);
+}
+
 #[sqlx::test(migrations = false)]
 async fn delist_rolls_back_queue_removal_when_projection_update_fails(pool: PgPool) {
     migrate(&pool).await;
@@ -7679,7 +7750,9 @@ async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool
         "{a}"
     );
     assert!(
-        a.contains(r#"first command</span> <code class="mono">cat &#x2f;proc&#x2f;mounts</code>"#),
+        a.contains(
+            r#"ran</span> <code class="mono ctx-code" title="cat &#x2f;proc&#x2f;mounts">cat &#x2f;proc&#x2f;mounts</code>"#
+        ),
         "{a}"
     );
     assert!(!a.contains("counts from"), "{a}");
@@ -7690,7 +7763,9 @@ async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool
         "{b}"
     );
     assert!(
-        b.contains(r#"uploaded</span> <code class="mono">.i (abababababab..., 5.0 KB)</code>"#),
+        b.contains(
+            r#"uploaded</span> <code class="mono ctx-code" title=".i (abababababab..., 5.0 KB)">.i (abababababab..., 5.0 KB)</code>"#
+        ),
         "{b}"
     );
 }

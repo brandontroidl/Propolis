@@ -157,6 +157,24 @@ async fn reset_ip(pool: &PgPool, ip: &str) {
         .unwrap();
 }
 
+/// A delisted address is never queued, even while its eligibility flags still read true (a
+/// projection written by an append that raced the delist, say).
+#[tokio::test]
+async fn populate_never_queues_a_delisted_address() {
+    let pool = setup_pool().await;
+    let test_ip = "192.0.2.239";
+    reset_ip(&pool, test_ip).await;
+    seed_recommended(&pool, test_ip).await;
+    sqlx::query("UPDATE ip_score SET delisted = TRUE WHERE source_ip = $1::inet")
+        .bind(test_ip)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    ReviewQueue::new().populate(&pool).await.unwrap();
+    assert_eq!(row_count(&pool, test_ip).await, 0);
+}
+
 #[tokio::test]
 async fn populate_surfaces_recommended_ip() {
     let pool = setup_pool().await;

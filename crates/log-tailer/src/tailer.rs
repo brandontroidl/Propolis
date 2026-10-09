@@ -57,6 +57,15 @@ struct UncommittedRead {
     /// dropping one before the caller has accepted the batch would make a rewind unable to
     /// recover the lines it already handed out.
     exhausted: VecDeque<File>,
+    /// For each line the batch returned, in order: which source it came from (an index into the
+    /// drains as they stood before the batch, or `snapshot_drains` for the current file) and the
+    /// bytes it consumed there, discards before it included. What lets
+    /// [`LogTailer::commit_batch_through`] move the positions over a prefix without reading.
+    spans: Vec<(usize, u64)>,
+    /// Number of drains queued before the batch; the source index of the current file.
+    snapshot_drains: usize,
+    /// False once a second read joined the batch: the spans no longer describe all of it.
+    spans_valid: bool,
 }
 
 /// Tails one sensor's NDJSON log file. Holds the in-memory [`CursorState`] for the lifetime of
@@ -157,7 +166,16 @@ impl LogTailer {
     /// cursor stays at its start so the next call re-reads it once it is complete. A missing log
     /// file yields an empty batch, not an error (the sensor may not have started yet).
     pub fn read_batch(&mut self, max_lines: usize) -> Vec<String> {
-        self.read_batch_entries(max_lines)
+        self.read_batch_bounded(max_lines, u64::MAX)
+    }
+
+    /// [`Self::read_batch`] that also stops before a line that would take the batch past
+    /// `max_bytes` of line content (newlines included), so a batch's memory is bounded by bytes
+    /// and not only by line count. The first line of a batch is always returned, whatever its
+    /// size (it is at most [`MAX_LINE_BYTES`]), so a budget smaller than one line cannot stall
+    /// the reader. The line that did not fit is not consumed; the next read starts at it.
+    pub fn read_batch_bounded(&mut self, max_lines: usize, max_bytes: u64) -> Vec<String> {
+        self.read_entries(max_lines, max_bytes)
             .into_iter()
             .filter_map(|entry| match entry {
                 TailEntry::Line(line) => Some(line),
@@ -169,6 +187,10 @@ impl LogTailer {
     /// [`Self::read_batch`] with each over-length discard reported in place. `max_lines` counts
     /// lines only; discards ride along uncounted.
     pub fn read_batch_entries(&mut self, max_lines: usize) -> Vec<TailEntry> {
+        self.read_entries(max_lines, u64::MAX)
+    }
+
+    fn read_entries(&mut self, max_lines: usize, max_bytes: u64) -> Vec<TailEntry> {
         if max_lines == 0 {
             return Vec::new();
         }
@@ -180,11 +202,16 @@ impl LogTailer {
         // new inode's pre-batch position is wherever rotation left it). What a rewind must
         // restore is the reads this batch is about to perform, not the rotation that preceded
         // them.
-        if self.uncommitted.is_none() {
+        if let Some(uncommitted) = &mut self.uncommitted {
+            uncommitted.spans_valid = false;
+        } else {
             self.uncommitted = Some(UncommittedRead {
                 offset: self.state.offset,
                 drain_offsets: self.pending_drains.iter().map(|&(_, off)| off).collect(),
                 exhausted: VecDeque::new(),
+                spans: Vec::new(),
+                snapshot_drains: self.pending_drains.len(),
+                spans_valid: true,
             });
         }
 
@@ -192,18 +219,32 @@ impl LogTailer {
         //    current file - otherwise a backlog larger than one batch is lost across a rotation.
         let mut entries = Vec::new();
         let mut line_count = 0;
-        while line_count < max_lines {
+        let mut bytes_taken: u64 = 0;
+        let mut budget_hit = false;
+        while line_count < max_lines && !budget_hit {
             let want = max_lines - line_count;
             let exhausted = match self.pending_drains.front_mut() {
                 None => break,
                 Some((old_file, old_offset)) => {
-                    match read_lines_from(old_file, *old_offset, want) {
-                        Ok((drained, consumed)) => {
-                            *old_offset += consumed;
-                            let got = count_lines(&drained);
+                    let budget = LineBudget {
+                        left: max_bytes.saturating_sub(bytes_taken),
+                        first_is_free: line_count == 0,
+                    };
+                    match read_lines_from(old_file, *old_offset, want, budget) {
+                        Ok(read) => {
+                            *old_offset += read.consumed;
+                            let got = count_lines(&read.entries);
                             line_count += got;
-                            entries.extend(drained);
-                            got < want // fewer than requested => this old inode has no more lines
+                            bytes_taken += read.line_bytes;
+                            budget_hit = read.budget_hit;
+                            if let Some(u) = &mut self.uncommitted {
+                                let source = u.exhausted.len();
+                                u.spans.extend(read.spans.iter().map(|&b| (source, b)));
+                            }
+                            entries.extend(read.entries);
+                            // Fewer than requested means this old inode has no more lines,
+                            // unless the byte budget is what stopped the read.
+                            got < want && !budget_hit
                         }
                         // Unreadable old handle: abandon it (its data is unrecoverable regardless).
                         Err(_) => true,
@@ -219,7 +260,7 @@ impl LogTailer {
                 }
             }
         }
-        if line_count >= max_lines {
+        if line_count >= max_lines || budget_hit {
             self.refresh_last_known_size();
             return entries;
         }
@@ -231,11 +272,17 @@ impl LogTailer {
         };
 
         let remaining = max_lines - line_count;
-        if let Ok((new_entries, consumed)) =
-            read_lines_from(&mut file, self.state.offset, remaining)
-        {
-            self.advance(consumed as usize);
-            entries.extend(new_entries);
+        let budget = LineBudget {
+            left: max_bytes.saturating_sub(bytes_taken),
+            first_is_free: line_count == 0,
+        };
+        if let Ok(read) = read_lines_from(&mut file, self.state.offset, remaining, budget) {
+            self.advance(read.consumed as usize);
+            if let Some(u) = &mut self.uncommitted {
+                let source = u.snapshot_drains;
+                u.spans.extend(read.spans.iter().map(|&b| (source, b)));
+            }
+            entries.extend(read.entries);
         }
         self.file = Some(file);
         self.refresh_last_known_size();
@@ -259,6 +306,53 @@ impl LogTailer {
         self.uncommitted = None;
     }
 
+    /// Accepts only the first `lines` lines of the uncommitted batch and puts the positions back
+    /// to just after them, so the next read starts at line `lines`. Returns `false`, changing
+    /// nothing, when it cannot do that safely; the caller then calls [`Self::rewind_batch`] and the
+    /// whole batch is read again (replayed, never skipped).
+    ///
+    /// The positions are computed from the byte lengths recorded while the batch was READ, not by
+    /// reading again. A second read goes through rotation handling, and a `copytruncate` that
+    /// landed after the batch was read (while the caller was appending it) would make that read
+    /// return the first lines of the NEW file in place of the lines already handed out, which the
+    /// caller would then commit unread. So this refuses, with `false`, if the log file is no
+    /// longer the one the batch was read from: truncated, or its content replaced in place.
+    /// A rename rotation is fine: the old inode is still held and its offset is still right.
+    ///
+    /// Not possible (`false`) when more than one read joined the batch, or `lines` is more than
+    /// the batch returned.
+    pub fn commit_batch_through(&mut self, lines: usize) -> bool {
+        let Some(uncommitted) = &self.uncommitted else {
+            return false;
+        };
+        if !uncommitted.spans_valid || lines > uncommitted.spans.len() {
+            return false;
+        }
+        // The same judgement `handle_rotation` makes: a content mismatch on a file that was under
+        // the fingerprint window and has only grown is ordinary appending, not a replacement.
+        let changed = match detect_rotation(&self.log_path, &self.state) {
+            RotationEvent::Truncated => true,
+            RotationEvent::Replaced => !self.maybe_false_positive_replaced(),
+            RotationEvent::None | RotationEvent::InodeChanged => false,
+        };
+        if changed {
+            return false;
+        }
+        let spans = uncommitted.spans[..lines].to_vec();
+        let snapshot_drains = uncommitted.snapshot_drains;
+        self.rewind_batch();
+        for (source, bytes) in spans {
+            if source < snapshot_drains {
+                if let Some(drain) = self.pending_drains.get_mut(source) {
+                    drain.1 += bytes;
+                }
+            } else {
+                self.state.offset += bytes;
+            }
+        }
+        true
+    }
+
     /// Puts every read since the last commit back, so the next [`Self::read_batch`] returns the
     /// same lines again.
     ///
@@ -275,6 +369,7 @@ impl LogTailer {
             offset,
             drain_offsets,
             exhausted,
+            ..
         }) = self.uncommitted.take()
         else {
             return;
@@ -461,12 +556,18 @@ fn read_lines_from(
     file: &mut File,
     start_offset: u64,
     max_lines: usize,
-) -> io::Result<(Vec<TailEntry>, u64)> {
+    budget: LineBudget,
+) -> io::Result<LineRead> {
     file.seek(SeekFrom::Start(start_offset))?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
     let mut lines = 0;
     let mut consumed: u64 = 0;
+    let mut line_bytes: u64 = 0;
+    let mut budget_hit = false;
+    let mut spans: Vec<u64> = Vec::new();
+    // Bytes of discarded over-length lines since the last accepted line, charged to the next one.
+    let mut discarded: u64 = 0;
 
     while lines < max_lines {
         let mut buf = Vec::new();
@@ -476,6 +577,15 @@ fn read_lines_from(
             .read_until(b'\n', &mut buf)?;
         if bytes_read == 0 {
             break; // EOF - nothing consumed.
+        }
+        // A complete line that would take the batch past its byte budget stays unread, unless it
+        // is the batch's first line, which always goes through.
+        if buf.last() == Some(&b'\n')
+            && !(budget.first_is_free && lines == 0)
+            && line_bytes + bytes_read as u64 > budget.left
+        {
+            budget_hit = true;
+            break;
         }
         if buf.last() != Some(&b'\n') {
             if buf.len() as u64 > MAX_LINE_BYTES {
@@ -487,6 +597,7 @@ fn read_lines_from(
                     Some(skipped) => {
                         let bytes = bytes_read as u64 + skipped;
                         consumed += bytes;
+                        discarded += bytes;
                         tracing::warn!(
                             max_bytes = MAX_LINE_BYTES,
                             "intake: discarded an over-length log line from a sensor (low-trust boundary)"
@@ -500,6 +611,9 @@ fn read_lines_from(
             break; // A genuine short incomplete trailing line - leave it unconsumed.
         }
         consumed += bytes_read as u64;
+        line_bytes += bytes_read as u64;
+        spans.push(discarded + bytes_read as u64);
+        discarded = 0;
         buf.pop(); // drop the trailing '\n'
         // Lossy rather than a hard error: a corrupt line should not crash the tailer. The
         // converter (Task 1) applies the real, fail-closed NDJSON validation downstream.
@@ -507,7 +621,32 @@ fn read_lines_from(
         lines += 1;
     }
 
-    Ok((entries, consumed))
+    Ok(LineRead {
+        entries,
+        consumed,
+        line_bytes,
+        budget_hit,
+        spans,
+    })
+}
+
+/// How many bytes of line content a read may still take, and whether the first line is exempt.
+#[derive(Clone, Copy)]
+struct LineBudget {
+    left: u64,
+    first_is_free: bool,
+}
+
+struct LineRead {
+    entries: Vec<TailEntry>,
+    /// Bytes to advance the offset by: every accepted or discarded line, newlines included.
+    consumed: u64,
+    /// Bytes of accepted lines only (discards are not buffered, so they do not count).
+    line_bytes: u64,
+    /// The read stopped before a complete line because it would not fit the byte budget.
+    budget_hit: bool,
+    /// Bytes consumed by each accepted line, discards before it included.
+    spans: Vec<u64>,
 }
 
 /// The offset just past the last `\n` in `path`, so a reader starting there never begins inside

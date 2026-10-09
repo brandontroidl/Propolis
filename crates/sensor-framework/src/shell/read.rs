@@ -171,6 +171,12 @@ impl FakeShell {
         } else {
             operands.to_vec()
         };
+        // Output that is one file's bytes untouched carries that file's origin to the file it is
+        // redirected into (`cat loader.mips > box`).
+        let single = match (tool, sources.as_slice()) {
+            (Tool::Cat, [only]) if *only != "-" => Some(self.resolve_logical(only)),
+            _ => None,
+        };
         for path in sources {
             if left == 0 {
                 break;
@@ -209,6 +215,9 @@ impl FakeShell {
             }
         }
         acc.status = u8::from(failed);
+        if !failed {
+            self.cat_origin = single.and_then(|path| self.origin_of(&path));
+        }
         acc
     }
 

@@ -89,6 +89,34 @@ append that reads them, and the dedup-window read cannot be bypassed by an inter
 insert. The lock auto-releases at transaction end, so a rolled-back append
 never leaves it held. See [storage](./storage.md).
 
+Intake takes the lock once per **batch**, not once per line: `append_events`
+(`crates/core-scoring/src/repository/batch.rs#append_events`) runs the same critical section for
+up to 1000 events in one transaction and leaves exactly the state the per-event path would
+([storage](./storage.md#batched-append)). A batch that fails rolls back whole. If one event
+caused the failure (an invalid event, a stored projection that will not decode, a data
+exception or constraint violation), the batch is retried in halves so the events before it
+commit. Intake then counts one error and moves its read position past exactly the lines that
+committed (and any rejected or probe lines among them), computed from the line lengths recorded
+when they were read, and the loop persists the cursor there. The next poll starts at the failed
+line: committed events are not appended a second time, and nothing after the failing event is
+written. If the log file changed under the failed batch (a `copytruncate` or an in-place
+replacement landed while the append was in flight) the position cannot be trusted, so the whole
+batch is read again from its start: replayed, never skipped. A failure at the first line of a
+batch reports nothing ingested, so the intake loop sleeps its poll interval instead of retrying at
+once. An event the database always refuses therefore holds that sensor's intake at that line
+until it is removed from the log, as it did one event at a time; the third consecutive poll
+refusing the same line logs `intake wedged at <sensor>` with the event's `observed_at` and the
+SQLSTATE, and `intake-stalled` quotes the same text when it fires. Nothing skips or quarantines
+the line: that is the operator's decision. An error that is not about one event (a lost
+connection, a lock timeout) is returned without splitting the batch and is retried on the next
+poll; it neither counts toward the three polls nor resets them.
+
+An event can enter the ledger twice in three cases, the price of at-least-once delivery: the
+connection drops after Postgres committed a batch but before the acknowledgement arrives (the
+batch is reported as failed and read again); the process stops between a commit and the cursor
+being persisted; or the log file changed under a failed batch, as above. The dedup window absorbs
+the replayed events' score weight but not the extra ledger rows or the source's event counters.
+
 Concurrent NDJSON log appends (multiple connections through one `EventEmitter` behind an
 `Arc`) are serialized by the OS: one `O_APPEND` `write_all` of the whole line is atomic
 on a local filesystem, so lines are never interleaved or overwritten. This guarantee
@@ -133,13 +161,14 @@ missing or malformed input.
   per-source cap (a quarter of `max_concurrent` by default) for any single source IP -
   they do not queue.
 - **Capture** sheds load by dropping jobs past the bounded queue - it does not block.
-- **Intake** reads each sensor log 100 lines a batch, advancing a per-sensor cursor, and
+- **Intake** reads each sensor log 100 lines a batch, growing to 1000 while the log keeps
+  filling a whole batch, advancing a per-sensor cursor, and
   reads again at once while lines remain; it sleeps for the poll interval only when a batch
   comes back empty (`crates/propolis/src/main.rs#run_intake_sensor`). Its rate is set by the
-  serialized append lock: one append at a time across every sensor, so a slow append for one
+  serialized append lock: one batch at a time across every sensor, so a slow batch for one
   source holds up all of them. No read inside the lock grows with a source's history or with
-  intake lag, so an append costs a few milliseconds whichever source it is for
-  ([storage](./storage.md#serialized-single-writer-append)). Intake does not shed load; when a sensor writes faster than
+  intake lag, and a batch holds the lock for tens of milliseconds
+  ([storage](./storage.md#batched-append)). Intake does not shed load; when a sensor writes faster than
   intake appends, the backlog stays in the log, and the `intake-lagging` alert and the fleet
   pane's behind badge report it ([intake backlog](../troubleshooting/intake-backlog.md)).
 - The **console** binds loopback-only by default and derives metrics from live DB

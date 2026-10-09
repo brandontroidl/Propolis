@@ -562,14 +562,15 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
 
     let (status, queue) = console.get("/queue").await;
     assert_eq!(status, StatusCode::OK);
+    // Two pending members make a group whose header links the campaign and its approval.
     assert!(
         queue.contains(&format!(
-            "part of <a href=\"/campaigns/{sample}\">campaign {sample}</a>, 5 hosts"
+            "<a href=\"/campaigns/{sample}\">campaign {sample}</a>"
         )),
         "{queue}"
     );
     assert!(queue.contains(&format!(
-        "<a href=\"/campaigns/{sample}/approve\">approve all 2 pending"
+        "<a class=\"qg-approve\" href=\"/campaigns/{sample}/approve\">Approve all 2"
     )));
 
     let (status, ip_page) = console.get("/ip/192.0.2.1").await;
@@ -619,4 +620,327 @@ async fn a_self_propagating_sample_calls_its_members_infected_hosts(pool: PgPool
     );
     let (_, list) = console.get("/campaigns").await;
     assert!(list.contains(">worm</span>"));
+}
+
+/// The text of `page` from the first `start` to the next `end` after it.
+fn between<'a>(page: &'a str, start: &str, end: &str) -> &'a str {
+    let from = page
+        .find(start)
+        .unwrap_or_else(|| panic!("`{start}` not in page: {page}"));
+    let rest = &page[from..];
+    let to = rest
+        .find(end)
+        .unwrap_or_else(|| panic!("`{end}` not after `{start}`: {page}"));
+    &rest[..to]
+}
+
+/// The hidden CSRF token the rendered row for `ip` carries.
+fn row_csrf(page: &str, ip: &str) -> String {
+    let row = between(page, &format!("id=\"row-{ip}\""), "</tr>");
+    between(row, "name=\"csrf_token\" value=\"", "\">")
+        .trim_start_matches("name=\"csrf_token\" value=\"")
+        .to_string()
+}
+
+#[sqlx::test(migrations = false)]
+async fn pending_members_of_one_campaign_form_one_group_and_singles_stay_rows(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho worm five\n").await;
+    let sample = campaign_id(&pool, "sample").await;
+    let sequence = campaign_id(&pool, "command_sequence").await;
+    // 192.0.2.1-3 belong to the sample campaign (5 hosts) AND the command-sequence campaign
+    // (3 hosts), each with 3 pending: the pending counts tie, so the larger campaign is the home.
+    for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.3", "198.51.100.200"] {
+        pend(&pool, ip).await;
+    }
+    let console = Console::new(pool.clone());
+    let (status, page) = console.get("/queue").await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(page.matches("class=\"queue-group\"").count(), 1, "{page}");
+    assert!(page.contains(&format!("id=\"group-{sample}\"")), "{page}");
+    assert!(
+        !page.contains(&format!("id=\"group-{sequence}\"")),
+        "an address is listed under one home campaign only: {page}"
+    );
+    // Ends at the member table's close: the rows hold <details> of their own.
+    let group = between(&page, "<details class=\"qgroup\">", "</table>");
+    for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
+        assert!(
+            group.contains(&format!("id=\"row-{ip}\"")),
+            "{ip} not in group"
+        );
+    }
+    assert!(
+        group.contains("<span class=\"qg-count\">3 pending</span>"),
+        "{group}"
+    );
+    assert!(group.contains("5 hosts"), "{group}");
+    assert!(
+        group.contains(&format!(
+            "<a class=\"qg-approve\" href=\"/campaigns/{sample}/approve\">Approve all 3"
+        )),
+        "{group}"
+    );
+    assert!(
+        !group.contains("part of <a"),
+        "a member line must not repeat its group's campaign: {group}"
+    );
+    // The address in no campaign is a plain row, outside the group.
+    assert!(!group.contains("198.51.100.200"));
+    assert_eq!(
+        page.matches("id=\"row-198.51.100.200\"").count(),
+        1,
+        "{page}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_lone_pending_member_stays_a_row_with_its_campaign_link(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho worm six\n").await;
+    let sample = campaign_id(&pool, "sample").await;
+    pend(&pool, "192.0.2.4").await;
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get("/queue").await;
+    assert!(!page.contains("class=\"queue-group\""), "{page}");
+    assert!(page.contains("id=\"row-192.0.2.4\""));
+    assert!(
+        page.contains(&format!(
+            "part of <a href=\"/campaigns/{sample}\">campaign {sample}</a>, 5 hosts"
+        )),
+        "{page}"
+    );
+    assert!(
+        !page.contains("approve all"),
+        "one pending member has nothing to approve together"
+    );
+}
+
+/// The campaign has two pending members, but only one can be listed (the other has no score
+/// projection, so the page leaves it out): one row under a header would be a group of one.
+#[sqlx::test(migrations = false)]
+async fn a_campaign_with_one_listed_member_is_not_a_group_of_one(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho worm ten\n").await;
+    let sample = campaign_id(&pool, "sample").await;
+    for ip in ["192.0.2.4", "192.0.2.5"] {
+        pend(&pool, ip).await;
+    }
+    sqlx::query("DELETE FROM ip_score WHERE source_ip = '192.0.2.5'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get("/queue").await;
+    assert!(page.contains("id=\"row-192.0.2.4\""), "{page}");
+    assert!(!page.contains("id=\"row-192.0.2.5\""), "{page}");
+    assert!(!page.contains("class=\"queue-group\""), "{page}");
+    assert!(
+        page.contains(&format!(
+            "<a href=\"/campaigns/{sample}/approve\">approve all 2 pending"
+        )),
+        "{page}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_group_sits_where_its_top_member_does_under_the_current_sort(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho worm seven\n").await;
+    for ip in ["192.0.2.1", "192.0.2.2", "198.51.100.200"] {
+        pend(&pool, ip).await;
+    }
+    let console = Console::new(pool.clone());
+    // The group's members were first seen minutes after t0 and the single two hours after.
+    let (_, oldest_first) = console.get("/queue?sort=first_seen").await;
+    assert!(
+        oldest_first.find("class=\"queue-group\"").unwrap()
+            < oldest_first.find("id=\"row-198.51.100.200\"").unwrap(),
+        "{oldest_first}"
+    );
+    let (_, newest_active) = console.get("/queue?sort=last_seen").await;
+    assert!(
+        newest_active.find("id=\"row-198.51.100.200\"").unwrap()
+            < newest_active.find("class=\"queue-group\"").unwrap(),
+        "{newest_active}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn decisions_inside_a_group_use_the_same_endpoints_csrf_and_note_field(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho worm eight\n").await;
+    for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.3"] {
+        pend(&pool, ip).await;
+    }
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get("/queue").await;
+    let group = between(&page, "<details class=\"qgroup\">", "</table>");
+    let row = between(group, "id=\"row-192.0.2.1\"", "</tr>");
+    for action in ["approve", "reject", "snooze"] {
+        assert!(
+            row.contains(&format!(
+                "hx-post=\"/queue/192.0.2.1/{action}\" hx-include=\"closest tr\" hx-target=\"closest tr\" hx-swap=\"outerHTML\""
+            )),
+            "{action}: {row}"
+        );
+    }
+    // The note field is inside the same row the buttons include, closed or open.
+    assert!(row.contains("<details class=\"qnote\">"), "{row}");
+    assert!(row.contains("<textarea name=\"notes\""), "{row}");
+    let token = row_csrf(&page, "192.0.2.1");
+    assert!(!token.is_empty());
+
+    // A forged token decides nothing.
+    let (status, _) = console
+        .post(
+            "/queue/192.0.2.2/approve",
+            &[("csrf_token", "forged"), ("notes", "x")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(review_state(&pool, "192.0.2.2").await, "pending");
+
+    // What the toggle's textarea posts is stored with the decision, and the answer is the row.
+    let (status, answer) = console
+        .post(
+            "/queue/192.0.2.1/approve",
+            &[("csrf_token", &token), ("notes", "checked by hand")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(answer.contains("id=\"row-192.0.2.1\""), "{answer}");
+    assert!(answer.contains("state-approved"), "{answer}");
+    let notes: String =
+        sqlx::query_scalar("SELECT notes FROM review_queue WHERE source_ip = '192.0.2.1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notes, "checked by hand");
+    for (ip, action, state) in [
+        ("192.0.2.2", "reject", "rejected"),
+        ("192.0.2.3", "snooze", "snoozed"),
+    ] {
+        let (status, _) = console
+            .post(
+                &format!("/queue/{ip}/{action}"),
+                &[("csrf_token", &token), ("notes", "")],
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{action}");
+        assert_eq!(review_state(&pool, ip).await, state);
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn attacker_text_in_a_group_label_and_a_context_line_is_escaped(pool: PgPool) {
+    migrate(&pool).await;
+    seed(&pool, b"#!/bin/sh\necho worm nine\n").await;
+    let sample = campaign_id(&pool, "sample").await;
+    sqlx::query("UPDATE campaign SET label = $2 WHERE id = $1")
+        .bind(sample)
+        .bind("<b>x</b> \"quoted\"")
+        .execute(&pool)
+        .await
+        .unwrap();
+    append(
+        &pool,
+        "198.51.100.50",
+        "ssh",
+        SignalType::HoneypotFileDownload,
+        t0() + Duration::minutes(30),
+        serde_json::json!({ "url": "http://203.0.113.9/\"><img src=x onerror=alert(1)>" }),
+        None,
+    )
+    .await;
+    for ip in ["192.0.2.1", "192.0.2.2", "198.51.100.50"] {
+        pend(&pool, ip).await;
+    }
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get("/queue").await;
+    assert!(page.contains("class=\"queue-group\""), "{page}");
+    assert!(!page.contains("<b>x</b>"), "unescaped group label: {page}");
+    assert!(
+        page.contains("&lt;b&gt;x&lt;/b&gt; &quot;quoted&quot;"),
+        "{page}"
+    );
+    assert!(
+        !page.contains("<img src=x"),
+        "unescaped context text: {page}"
+    );
+    assert!(
+        page.contains("title=\"http://203.0.113.9/&quot;&gt;&lt;img src=x onerror=alert(1)&gt;\""),
+        "the full text in the title attribute must be escaped too: {page}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_active_cell_shows_a_clock_range_within_a_day_and_a_length_across_days(pool: PgPool) {
+    migrate(&pool).await;
+    let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+    for (ip, first, last) in [
+        (
+            "203.0.113.90",
+            "2026-01-05T10:58:12Z",
+            "2026-01-05T18:11:40Z",
+        ),
+        (
+            "203.0.113.91",
+            "2026-01-01T09:00:00Z",
+            "2026-01-04T10:00:00Z",
+        ),
+    ] {
+        append(
+            &pool,
+            ip,
+            "ssh",
+            SignalType::HoneypotConnection,
+            at(first),
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        append(
+            &pool,
+            ip,
+            "ssh",
+            SignalType::HoneypotConnection,
+            at(last),
+            serde_json::json!({}),
+            None,
+        )
+        .await;
+        pend(&pool, ip).await;
+    }
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get("/queue").await;
+    let same_day = between(&page, "id=\"row-203.0.113.90\"", "</tr>");
+    assert!(
+        same_day.contains(
+            "title=\"first 2026-01-05 10:58 UTC, last 2026-01-05 18:11 UTC\">Jan 5, 10:58-18:11 UTC<"
+        ),
+        "{same_day}"
+    );
+    let multi_day = between(&page, "id=\"row-203.0.113.91\"", "</tr>");
+    assert!(
+        multi_day
+            .contains("title=\"first 2026-01-01 09:00 UTC, last 2026-01-04 10:00 UTC\">3d, last "),
+        "{multi_day}"
+    );
+    // The retired columns are gone and every sort key is still reachable.
+    for gone in [
+        "Categories",
+        "First seen</th>",
+        "Last seen</th>",
+        "class=\"meter\"",
+    ] {
+        assert!(!page.contains(gone), "{gone} should be gone: {page}");
+    }
+    for key in ["score", "event_count", "first_seen", "last_seen"] {
+        assert!(
+            page.contains(&format!("href=\"/queue?sort={key}\"")),
+            "{key}"
+        );
+    }
 }

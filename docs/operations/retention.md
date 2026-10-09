@@ -57,7 +57,9 @@ subsystem: `cleanup_old_samples(spool_dirs, 30)` runs hourly over every body dir
 `crates/review/src/virustotal.rs` `cleanup_old_samples`, wired in `crates/propolis/src/main.rs`
 as `SAMPLE_RETENTION_DAYS` / `SAMPLE_RETENTION_INTERVAL`). The 30-day age and the hourly cadence
 are compile-time constants, not env vars. The cleanup itself performs no egress (it is local
-file deletion).
+file deletion). It has no hold mechanism: a file that must be kept (for example one that may
+be illegal material) has to be moved out of the spool first, see [captured content
+handling](./captured-content-handling.md#quarantine-one-sample).
 
 The subsystem is always spawned, independent of VirusTotal. It used to be a step of the VT scan
 cycle, so a deployment without a VT key never aged out a sample and its spools were bounded only

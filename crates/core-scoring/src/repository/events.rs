@@ -32,6 +32,11 @@
 //! `pg_advisory_xact_lock` auto-releases at transaction end (commit or
 //! rollback), so a failed/rolled-back append never leaves the lock held.
 //!
+//! [`append_events`](super::batch::append_events) takes the same lock once for a whole batch and
+//! leaves the state these per-event functions would; it is the reference these functions are
+//! proven against, so a change to one path's rules must reach the other
+//! (`tests/batch_equivalence.rs` fails if they diverge).
+//!
 //! This implements the design's "projection advancement is single-writer per
 //! deployment" assumption at the database level. It serializes appends within
 //! ONE Postgres instance; it does not decide WHICH process/node is the writer
@@ -89,6 +94,42 @@ macro_rules! exclude_telemetry {
 }
 pub(crate) use exclude_telemetry;
 
+/// The `ip_score` columns [`score_from_row`] decodes, shared by the single and batched reads so
+/// the two cannot select different things. A macro for the same reason as `exclude_telemetry!`.
+macro_rules! stored_score_columns {
+    () => {
+        "host(source_ip) AS source_ip, raw_score, decay_anchor, max_confidence, \
+         event_count, established_event_count, distinct_categories, category_breakdown, \
+         has_confirmed_real, distinct_wan_count, distinct_sensor_count, first_seen, last_seen, \
+         eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
+         active_days, last_active_day"
+    };
+}
+pub(crate) use stored_score_columns;
+
+/// Open a transaction that holds the append lock, for a writer OUTSIDE this module that changes
+/// `ip_score` (the console's delist, relist and delete). An append reads an address's projection
+/// when it starts and writes it back when it commits; a change made in between is overwritten by
+/// that write (a delete is undone, a delist loses its flags). Taking the same lock makes the
+/// change land either entirely before the append's read or entirely after its commit, for both
+/// the single and the batched path. The lock is released at commit or rollback.
+///
+/// READ COMMITTED is pinned first for the reason `append_event` pins it: each later statement
+/// must take a fresh snapshot after the lock is granted.
+pub async fn begin_exclusive(
+    pool: &PgPool,
+) -> Result<sqlx::Transaction<'static, Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(APPEND_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 // Manual `From` (not thiserror `#[from]`) so we do not require `ValidationError`
 // to implement `std::error::Error`; it stays a plain domain value type.
 impl From<ValidationError> for RepoError {
@@ -103,7 +144,7 @@ impl From<ValidationError> for RepoError {
 /// value is never accidentally reused for an unrelated lock. Held for the
 /// lifetime of the append transaction via `pg_advisory_xact_lock`, which
 /// auto-releases on commit or rollback.
-const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
+pub(super) const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 
 /// The dedup read: the newest prior observation of this source and signal. Runs inside the append
 /// lock on every scored event, so its plan decides intake throughput. Migration 0013's
@@ -120,6 +161,68 @@ const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 /// index.
 const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
      WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND id < $3";
+
+/// Normalize the storage-lossy fields to their STORED precision BEFORE both hashing and
+/// inserting, so the bytes we hash are byte-identical to the bytes storage returns on read.
+/// `verify_chain` reconstructs each event FROM storage and re-hashes; if we hashed a value more
+/// precise than the column can hold, the re-hash would never match and an UNTAMPERED chain would
+/// falsely verify as `Broken`. The principle is "hash what you store":
+///   - `observed_at` is `TIMESTAMPTZ` (microsecond precision) -> truncate the sub-µs nanoseconds
+///     so the inserted value already carries no precision the column would drop (e.g. a raw
+///     `Utc::now()` carries nanoseconds).
+///   - `confidence` is `NUMERIC(4,3)` (scale 3) -> rescale to exactly 3 decimal places.
+///     `round_dp(3)` only trims excess scale, it never pads (dec!(0.9).round_dp(3) stays "0.9"),
+///     so a value-equal low-scale confidence would hash as "0.9" here but read back as "0.900"
+///     from storage and false-break verify_chain. `rescale(3)` pads (and rounds if >3dp,
+///     unreachable after validate()).
+///   - `metadata` is `JSONB` and is intentionally NOT rewritten here: the documented canonical
+///     metadata form (JSON integers, strings, and nested objects/arrays thereof) round-trips
+///     unchanged, because sqlx re-parses stored `JSONB` into a `BTreeMap`-backed
+///     `serde_json::Value` whose lexicographic key order already matches the in-memory value's
+///     (this crate does not enable serde_json's `preserve_order`). Floating-point JSON numbers
+///     are NOT guaranteed stable across the `JSONB` round-trip and are outside that canonical
+///     form. Verified by `verify_chain_intact_with_rich_metadata`.
+///
+/// `canonical_bytes`/`chain_hash` stay unchanged (deterministic already); normalization belongs
+/// at the append boundary, and every append path (single, telemetry, batch) goes through here.
+pub(super) fn normalize_event(mut event: EventInput) -> EventInput {
+    normalize_in_place(&mut event);
+    event
+}
+
+/// [`normalize_event`] without moving the event, for a batch that owns a thousand of them.
+pub(super) fn normalize_in_place(event: &mut EventInput) {
+    event.confidence.rescale(3);
+    event.observed_at = event.observed_at.trunc_subsecs(6);
+}
+
+impl RepoError {
+    /// Whether one bad event can cause this error, so that retrying a smaller slice of a batch
+    /// can isolate the event: a failed validation, a stored-state or decode failure met while
+    /// reading that event's source (one-at-a-time ingestion commits everything before the first
+    /// such event too), a data exception (SQLSTATE class 22, such as a NUL character in metadata
+    /// that `jsonb` rejects) or a constraint violation (class 23). A connection error, a pool
+    /// timeout or the chain trigger's own exception says nothing about any one event, and
+    /// retrying smaller would only repeat it.
+    pub fn is_event_specific(&self) -> bool {
+        match self {
+            RepoError::Invalid(_) | RepoError::Corrupt(_) => true,
+            RepoError::Db(sqlx::Error::Database(db)) => db
+                .code()
+                .is_some_and(|code| code.starts_with("22") || code.starts_with("23")),
+            RepoError::Db(sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The SQLSTATE of a database error, for an operator reading why an event is refused.
+    pub fn sqlstate(&self) -> Option<String> {
+        match self {
+            RepoError::Db(sqlx::Error::Database(db)) => db.code().map(|c| c.to_string()),
+            _ => None,
+        }
+    }
+}
 
 /// Append one event to the ledger and update the `ip_score` projection in a
 /// single transaction, returning the new projection.
@@ -139,39 +242,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
         return Err(RepoError::NotScorable(event.signal_type));
     }
 
-    // 1b. Normalize the storage-lossy fields to their STORED precision BEFORE
-    // both hashing and inserting, so the bytes we hash are byte-identical to the
-    // bytes storage returns on read. `verify_chain` reconstructs each event FROM
-    // storage and re-hashes; if we hashed a value more precise than the column
-    // can hold, the re-hash would never match and an UNTAMPERED chain would
-    // falsely verify as `Broken`. The principle is "hash what you store":
-    //   - `observed_at` is `TIMESTAMPTZ` (microsecond precision) -> truncate the
-    //     sub-µs nanoseconds so the inserted value already carries no precision
-    //     the column would drop (e.g. a raw `Utc::now()` carries nanoseconds).
-    //   - `confidence` is `NUMERIC(4,3)` (scale 3) -> round to 3 decimal places
-    //     so the inserted value already has the scale the column returns.
-    //   - `metadata` is `JSONB` and is intentionally NOT rewritten here: the
-    //     documented canonical metadata form (JSON integers, strings, and nested
-    //     objects/arrays thereof) round-trips unchanged, because sqlx re-parses
-    //     stored `JSONB` into a `BTreeMap`-backed `serde_json::Value` whose
-    //     lexicographic key order already matches the in-memory value's (this
-    //     crate does not enable serde_json's `preserve_order`). Floating-point
-    //     JSON numbers are NOT guaranteed stable across the `JSONB` round-trip
-    //     and are outside that canonical form. Verified by
-    //     `verify_chain_intact_with_rich_metadata`.
-    // `canonical_bytes`/`chain_hash` stay unchanged (deterministic already);
-    // normalization belongs here at the append boundary.
-    // Normalize confidence to EXACTLY scale-3 to match the NUMERIC(4,3) column. `round_dp(3)`
-    // only trims excess scale, it never pads (dec!(0.9).round_dp(3) stays "0.9"), so a value-equal
-    // low-scale confidence would hash as "0.9" here but read back as "0.900" from storage and
-    // false-break verify_chain. `rescale(3)` pads (and rounds if >3dp, unreachable after validate()).
-    let mut confidence = event.confidence;
-    confidence.rescale(3);
-    let event = EventInput {
-        observed_at: event.observed_at.trunc_subsecs(6),
-        confidence,
-        ..event
-    };
+    let event = normalize_event(event);
 
     let mut tx = pool.begin().await?;
 
@@ -406,13 +477,7 @@ pub async fn append_telemetry_event(pool: &PgPool, event: EventInput) -> Result<
     if !event.signal_type.is_telemetry() {
         return Err(RepoError::NotScorable(event.signal_type));
     }
-    let mut confidence = event.confidence;
-    confidence.rescale(3);
-    let event = EventInput {
-        observed_at: event.observed_at.trunc_subsecs(6),
-        confidence,
-        ..event
-    };
+    let event = normalize_event(event);
 
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
@@ -465,22 +530,20 @@ async fn read_stored_ip_score<'e, E>(exec: E, ip: IpAddr) -> Result<Option<IpSco
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    let row = sqlx::query(
-        "SELECT host(source_ip) AS source_ip, raw_score, decay_anchor, max_confidence, \
-                event_count, established_event_count, distinct_categories, category_breakdown, \
-                has_confirmed_real, distinct_wan_count, distinct_sensor_count, first_seen, last_seen, \
-                eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
-                active_days, last_active_day \
-         FROM ip_score WHERE source_ip = $1::inet",
-    )
+    let row = sqlx::query(concat!(
+        "SELECT ",
+        stored_score_columns!(),
+        " FROM ip_score WHERE source_ip = $1::inet"
+    ))
     .bind(ip.to_string())
     .fetch_optional(exec)
     .await?;
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
+    row.as_ref().map(score_from_row).transpose()
+}
 
+/// Decode one `ip_score` row selected with [`stored_score_columns!`].
+pub(super) fn score_from_row(row: &sqlx::postgres::PgRow) -> Result<IpScore, RepoError> {
     let source_ip_txt: String = row.try_get("source_ip")?;
     let source_ip: IpAddr = source_ip_txt
         .parse()
@@ -492,7 +555,7 @@ where
     serde_json::from_value::<BTreeMap<Category, CategoryStat>>(category_breakdown.clone())
         .map_err(|e| RepoError::Corrupt(format!("category_breakdown for {source_ip}: {e}")))?;
 
-    Ok(Some(IpScore {
+    Ok(IpScore {
         source_ip,
         raw_score: row.try_get("raw_score")?,
         decay_anchor: row.try_get("decay_anchor")?,
@@ -521,7 +584,7 @@ where
         recommended_for_blocklist: row.try_get("recommended_for_blocklist")?,
         tier: row.try_get("tier")?,
         delisted: row.try_get("delisted")?,
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -647,6 +710,32 @@ mod tests {
             incident.iter().any(|n| n == "event_observed_at_idx"),
             "the incident's statement and schema must walk event_observed_at_idx on this ledger, \
              or the guard above proves nothing; plan read {incident:?}"
+        );
+        Ok(())
+    }
+
+    /// The batched dedup read answers every (source, signal) key from `event_dedup_idx` on the
+    /// same incident-shaped ledger, for the hot source and a cold one, never by walking
+    /// `event_observed_at_idx`. The ledger is the one the guard above proves provokes that walk.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn batch_dedup_read_plan_uses_the_dedup_index(pool: PgPool) -> sqlx::Result<()> {
+        load_incident_ledger(&pool).await?;
+        let sql = super::super::batch::DEDUP_PRIORS_SQL;
+        let plan: serde_json::Value =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT JSON) {sql}")))
+                .bind(vec![HOT.to_string(), "10.0.0.7".to_string()])
+                .bind(vec![SignalType::HoneypotCommandExec; 2])
+                .fetch_one(&pool)
+                .await?;
+        let mut names = Vec::new();
+        index_names(&plan, &mut names);
+        assert!(
+            names.iter().any(|n| n == "event_dedup_idx"),
+            "the batched dedup read must use event_dedup_idx, plan read {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "event_observed_at_idx"),
+            "the batched dedup read must not walk event_observed_at_idx, plan read {names:?}"
         );
         Ok(())
     }

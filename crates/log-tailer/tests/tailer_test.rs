@@ -555,3 +555,153 @@ fn backlog_of_a_missing_file_or_a_reader_started_at_the_end_is_zero() {
     append(&log_path, "later\n");
     assert_eq!(tailer.backlog_bytes(), 6);
 }
+
+/// A batch stops BEFORE the line that would pass the byte budget, and that line is not consumed:
+/// the next read starts at it.
+#[test]
+fn a_byte_budget_stops_the_batch_before_the_line_that_would_pass_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaa\nbbbb\ncccc\ndddd\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    // 5 bytes a line with its newline: 12 bytes holds two.
+    assert_eq!(tailer.read_batch_bounded(100, 12), vec!["aaaa", "bbbb"]);
+    assert_eq!(tailer.read_batch_bounded(100, 12), vec!["cccc", "dddd"]);
+    assert!(tailer.read_batch_bounded(100, 12).is_empty());
+}
+
+/// The first line of a batch goes through whatever the budget, so a budget below one line cannot
+/// stall the reader.
+#[test]
+fn a_budget_smaller_than_one_line_still_returns_one_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaa\nbbbb\n").unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch_bounded(100, 1), vec!["aaaa"]);
+    assert_eq!(tailer.read_batch_bounded(100, 0), vec!["bbbb"]);
+}
+
+/// The budget spans a rotated-out inode being drained and the new file: the batch stops inside the
+/// drain at the budget, and nothing is lost or repeated across the batches.
+#[test]
+fn a_byte_budget_applies_across_a_draining_inode_and_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "old1\nold2\nold3\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(1), vec!["old1"]);
+    tailer.commit_batch();
+    std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+    std::fs::write(&log_path, "new1\nnew2\n").unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..10 {
+        let batch = tailer.read_batch_bounded(100, 10);
+        if batch.is_empty() {
+            break;
+        }
+        assert!(batch.len() <= 2, "{batch:?}");
+        seen.extend(batch);
+        tailer.commit_batch();
+    }
+    assert_eq!(seen, vec!["old2", "old3", "new1", "new2"]);
+}
+
+fn numbered(prefix: &str, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("{prefix}-{i:03}-padding-padding-padding-padding\n"))
+        .collect()
+}
+
+fn line_of(prefix: &str, i: usize) -> String {
+    format!("{prefix}-{i:03}-padding-padding-padding-padding")
+}
+
+/// Accepting a prefix moves the positions over exactly those lines without reading them again;
+/// the next read starts at the first line not accepted.
+#[test]
+fn commit_batch_through_starts_the_next_read_after_the_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, numbered("l", 12)).unwrap();
+    let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(8).len(), 8);
+    assert!(tailer.commit_batch_through(5));
+    assert_eq!(tailer.read_batch(100)[0], line_of("l", 5));
+    // Nothing to accept past what the batch returned, and nothing uncommitted after a commit.
+    tailer.commit_batch();
+    assert!(!tailer.commit_batch_through(1));
+}
+
+/// A `copytruncate` that lands between the read and the accept (the append is in flight) must
+/// not make the accept skip lines: the tailer refuses, and after a rewind the next read starts
+/// at the NEW file's first line, not at the line count of the old batch.
+/// A file under the 256-byte fingerprint window changes its fingerprint with every append, so an
+/// ordinary append between the read and the accept must not read as a replacement: the prefix is
+/// accepted and nothing is replayed.
+#[test]
+fn commit_batch_through_accepts_a_small_file_that_only_grew() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "aaaaaaaaa\nbbbbbbbbb\nccccccccc\nddddddddd\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(4).len(), 4);
+    append(&log_path, "eeeeeeeee\nfffffffff\n");
+    assert!(
+        tailer.commit_batch_through(2),
+        "an append is not a rotation"
+    );
+    assert_eq!(
+        tailer.read_batch(10),
+        vec!["ccccccccc", "ddddddddd", "eeeeeeeee", "fffffffff"]
+    );
+}
+
+#[test]
+fn commit_batch_through_refuses_after_a_copytruncate_and_skips_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, numbered("old", 13)).unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+    assert_eq!(tailer.read_batch(3).len(), 3);
+    tailer.commit_batch();
+    assert_eq!(tailer.read_batch(10).len(), 10);
+
+    // copytruncate: the same inode is emptied and refilled.
+    std::fs::write(&log_path, "").unwrap();
+    append(&log_path, &numbered("new", 20));
+
+    assert!(
+        !tailer.commit_batch_through(5),
+        "must not accept over a replaced file"
+    );
+    tailer.rewind_batch();
+    assert_eq!(
+        tailer.read_batch(3),
+        vec![line_of("new", 0), line_of("new", 1), line_of("new", 2)]
+    );
+}
+
+/// The positions are right across a rotated-out inode that is still being drained: the prefix may
+/// end inside the drain or in the new file.
+#[test]
+fn commit_batch_through_spans_a_draining_inode_and_the_new_file() {
+    for (prefix, next) in [(2usize, line_of("old", 3)), (6, line_of("new", 1))] {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        std::fs::write(&log_path, numbered("old", 6)).unwrap();
+        let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
+        assert_eq!(tailer.read_batch(1).len(), 1);
+        tailer.commit_batch();
+        std::fs::rename(&log_path, dir.path().join("events.jsonl.1")).unwrap();
+        std::fs::write(&log_path, numbered("new", 4)).unwrap();
+
+        // old-001 .. old-005 then new-000 .. new-003.
+        assert_eq!(tailer.read_batch(9).len(), 9);
+        assert!(tailer.commit_batch_through(prefix), "prefix {prefix}");
+        let rest = tailer.read_batch(100);
+        assert_eq!(rest[0], next, "prefix {prefix}");
+        assert_eq!(rest.len(), 9 - prefix, "prefix {prefix}");
+    }
+}

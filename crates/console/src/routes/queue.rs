@@ -14,7 +14,7 @@
 //! deliberately has no CSRF check - see that module's doc comment for why that is a considered
 //! omission, not a gap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
 use axum::extract::{Path, Query, State};
@@ -23,10 +23,9 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Form, Router};
 use chrono::{DateTime, Utc};
-use core_scoring::{Category, IpScore, ReviewState, read_score};
+use core_scoring::{IpScore, ReviewState, begin_exclusive, read_score};
 use minijinja::context;
 use review::queue::ReviewQueue;
-use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
@@ -37,8 +36,8 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::detail::extract_detail;
 use crate::routes::error::AppError;
 use crate::routes::format::{
-    format_sensor_label, format_timestamp, group_digits, signal_severity, signal_tag_label,
-    tier_label,
+    format_active, format_sensor_label, format_timestamp, group_digits, signal_severity,
+    signal_tag_label, tier_label,
 };
 
 pub fn router() -> Router<AppState> {
@@ -170,12 +169,11 @@ struct QueueRowView {
     state: &'static str,
     is_pending: bool,
     score: String,
-    score_pct: u32,
     tier: &'static str,
-    categories: String,
     event_count: i32,
-    first_seen: String,
-    last_seen: String,
+    /// The pending tab's "Active" cell ([`format_active`]) and its exact-timestamps `title`.
+    active: String,
+    active_title: String,
     decided_at: String,
     submissions: String,
     notes: String,
@@ -211,11 +209,42 @@ struct SignalCount {
     count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Notable {
     /// `upload`, `fetch` or `command`.
     kind: &'static str,
+    /// Cut to [`CONTEXT_TEXT_CHARS`] for the line itself.
     text: String,
+    /// Longer form for the `title` attribute, cut to [`CONTEXT_TITLE_CHARS`].
+    full: String,
+}
+
+/// A campaign with two or more pending members on the page, shown as one expandable row.
+#[derive(Debug, Serialize)]
+struct QueueGroup {
+    id: i64,
+    label: String,
+    kind: &'static str,
+    /// Hosts in the campaign.
+    members: i32,
+    /// Pending members in the campaign overall: what the approve confirmation will list.
+    pending: i64,
+    /// Members listed under this group (a member whose home is another campaign is listed there).
+    shown: usize,
+    infected: bool,
+    /// What the first member that did something notable did.
+    what: Option<Notable>,
+    /// The group's top member, which also fixes its position under the current sort.
+    top_score: String,
+    top_tier: &'static str,
+    rows: Vec<QueueRowView>,
+}
+
+/// One entry of the pending list: a campaign group or a single row.
+#[derive(Debug, Serialize)]
+struct QueueItem {
+    group: Option<QueueGroup>,
+    row: Option<QueueRowView>,
 }
 
 /// Events read per row for the context line's counts. Most addresses have fewer, and the line is
@@ -230,6 +259,9 @@ const CONTEXT_COMMANDS: i64 = 64;
 
 /// Longest command or URL shown on the context line, in characters.
 const CONTEXT_TEXT_CHARS: usize = 96;
+
+/// Longest command or URL carried in the line's `title` attribute, in characters.
+const CONTEXT_TITLE_CHARS: usize = 600;
 
 /// The lines Mirai-family telnet loaders send to reach a shell before doing anything (see
 /// `crates/sensor-telnet/tests/echo_loader.rs`). Every such session starts with them, so the
@@ -322,14 +354,14 @@ async fn notable_action(pool: &PgPool, ip: &str) -> Result<Option<Notable>, AppE
     if let Some(row) = transfer {
         let signal: String = row.try_get("signal_type")?;
         let metadata: serde_json::Value = row.try_get("metadata")?;
-        return Ok(Some(Notable {
-            kind: if signal == "honeypot_malware_upload" {
+        return Ok(Some(notable(
+            if signal == "honeypot_malware_upload" {
                 "upload"
             } else {
                 "fetch"
             },
-            text: clip(&extract_detail(&signal, &metadata)),
-        }));
+            &extract_detail(&signal, &metadata),
+        )));
     }
 
     let commands: Vec<serde_json::Value> = sqlx::query_scalar(
@@ -348,15 +380,20 @@ async fn notable_action(pool: &PgPool, ip: &str) -> Result<Option<Notable>, AppE
             let c = c.trim().to_ascii_lowercase();
             c != "-" && !c.is_empty() && !SHELL_ENTRY_PREAMBLE.contains(&c.as_str())
         })
-        .map(|c| Notable {
-            kind: "command",
-            text: clip(c.trim()),
-        }))
+        .map(|c| notable("command", c.trim())))
 }
 
-/// `text` cut to [`CONTEXT_TEXT_CHARS`] characters, with an ellipsis when cut.
-fn clip(text: &str) -> String {
-    match text.char_indices().nth(CONTEXT_TEXT_CHARS) {
+fn notable(kind: &'static str, text: &str) -> Notable {
+    Notable {
+        kind,
+        text: clip(text, CONTEXT_TEXT_CHARS),
+        full: clip(text, CONTEXT_TITLE_CHARS),
+    }
+}
+
+/// `text` cut to `max` characters, with an ellipsis when cut.
+fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
         Some((at, _)) => format!("{}...", &text[..at]),
         None => text.to_string(),
     }
@@ -401,13 +438,12 @@ async fn queue_page(
         "campaign membership",
         campaigns_by_ip(&state.db, &ips).await,
     );
-    for row in &mut rows {
-        if let Some(context) = row.context.as_mut() {
-            context.campaign = campaigns
-                .remove(&row.ip)
-                .and_then(|list| list.into_iter().next());
-        }
-    }
+    // Only the pending tab groups; the history tabs carry no context line.
+    let items = if query.tab == Tab::Pending {
+        group_pending(std::mem::take(&mut rows), &mut campaigns)
+    } else {
+        Vec::new()
+    };
 
     let tmpl = state.templates.get_template("queue.html")?;
     let html = tmpl.render(context! {
@@ -418,10 +454,100 @@ async fn queue_page(
         version,
         degraded => degraded.names(),
         rows,
+        items,
         sort => query.sort.as_str(),
         tab => query.tab.as_str(),
     })?;
     Ok(Html(html))
+}
+
+/// The campaign a pending address is listed under, when it is in any with two or more pending
+/// members: the one with the most pending members, then the most hosts, then the lowest id. The
+/// rule depends only on the campaigns' own counts, so the same address lands in the same group on
+/// every render and under every sort. Its other campaigns are shown on its IP page only.
+fn group_home(campaigns: &[CampaignRef]) -> Option<&CampaignRef> {
+    campaigns
+        .iter()
+        .filter(|c| c.pending >= 2)
+        .max_by_key(|c| (c.pending, c.members, std::cmp::Reverse(c.id)))
+}
+
+/// Turns the sorted pending rows into list items. Rows sharing a home campaign
+/// ([`group_home`]) become one [`QueueGroup`] at the position of the first of them, so the current
+/// sort applies to a group through its top member; a campaign with only one row on the page, and
+/// an address in no such campaign, stay single rows (which keep their campaign link, the largest
+/// campaign by hosts, and its "approve all" link on the context line).
+fn group_pending(
+    rows: Vec<QueueRowView>,
+    campaigns: &mut HashMap<String, Vec<CampaignRef>>,
+) -> Vec<QueueItem> {
+    let homes: Vec<Option<CampaignRef>> = rows
+        .iter()
+        .map(|r| {
+            campaigns
+                .get(&r.ip)
+                .and_then(|list| group_home(list))
+                .cloned()
+        })
+        .collect();
+    let mut on_page: HashMap<i64, usize> = HashMap::new();
+    for home in homes.iter().flatten() {
+        *on_page.entry(home.id).or_default() += 1;
+    }
+
+    let mut items: Vec<QueueItem> = Vec::new();
+    let mut group_at: HashMap<i64, usize> = HashMap::new();
+    for (mut row, home) in rows.into_iter().zip(homes) {
+        let grouped = home.filter(|h| on_page.get(&h.id).copied().unwrap_or(0) >= 2);
+        let Some(home) = grouped else {
+            if let Some(context) = row.context.as_mut() {
+                context.campaign = campaigns
+                    .remove(&row.ip)
+                    .and_then(|list| list.into_iter().next());
+            }
+            items.push(QueueItem {
+                group: None,
+                row: Some(row),
+            });
+            continue;
+        };
+        let at = *group_at.entry(home.id).or_insert_with(|| {
+            items.push(QueueItem {
+                group: Some(QueueGroup {
+                    id: home.id,
+                    label: home.label.clone(),
+                    kind: home.kind,
+                    members: home.members,
+                    pending: home.pending,
+                    shown: 0,
+                    infected: home.role == "infected host",
+                    what: None,
+                    top_score: row.score.clone(),
+                    top_tier: row.tier,
+                    rows: Vec::new(),
+                }),
+                row: None,
+            });
+            items.len() - 1
+        });
+        let group = items[at].group.as_mut().expect("index names a group");
+        if group.what.is_none() {
+            group.what = row.context.as_ref().and_then(|c| c.notable.clone());
+        }
+        // The header already says what the group did; a member that did exactly that does not
+        // repeat it, so what remains on its line is what sets it apart.
+        if let (Some(what), Some(context)) = (&group.what, row.context.as_mut())
+            && context
+                .notable
+                .as_ref()
+                .is_some_and(|n| n.kind == what.kind && n.text == what.text)
+        {
+            context.notable = None;
+        }
+        group.shown += 1;
+        group.rows.push(row);
+    }
+    items
 }
 
 fn sort_pending(rows: &mut [(IpAddr, Option<String>, IpScore)], key: SortKey) {
@@ -686,7 +812,9 @@ async fn delist(
         return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
     }
 
-    let mut tx = state.db.begin().await?;
+    // Under the append lock: an append in flight reads this address's projection and writes it
+    // back, and would overwrite the flags set here (see `begin_exclusive`).
+    let mut tx = begin_exclusive(&state.db).await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
         .bind(ip.to_string())
         .execute(&mut *tx)
@@ -730,7 +858,8 @@ async fn relist(
         return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
     }
 
-    let mut tx = state.db.begin().await?;
+    // Under the append lock, so the re-derived flags are not overwritten by an append in flight.
+    let mut tx = begin_exclusive(&state.db).await?;
     let cleared = sqlx::query("UPDATE ip_score SET delisted = FALSE WHERE source_ip = $1::inet")
         .bind(ip.to_string())
         .execute(&mut *tx)
@@ -789,7 +918,8 @@ async fn delete_ip(
     // Literal statements (sqlx requires a static SQL string, and it is the right guard here): the
     // ONLY dynamic value is the bound `$1` IP, never the table name.
     let ip_str = ip.to_string();
-    let mut tx = state.db.begin().await?;
+    // Under the append lock, so an append in flight cannot write the purged row back.
+    let mut tx = begin_exclusive(&state.db).await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
         .bind(&ip_str)
         .execute(&mut *tx)
@@ -816,18 +946,16 @@ fn row_view(
     score: &IpScore,
     csrf_token: &str,
 ) -> QueueRowView {
-    let score_f64 = score.raw_score.to_f64().unwrap_or(0.0);
+    let (active, active_title) = format_active(score.first_seen, score.last_seen, Utc::now());
     QueueRowView {
         ip: ip.to_string(),
         state: review_state_label(review_state),
         is_pending: review_state == ReviewState::Pending,
         score: format!("{:.1}", score.raw_score),
-        score_pct: score_f64.clamp(0.0, 100.0).round() as u32,
         tier: score.tier.map(tier_label).unwrap_or("-"),
-        categories: live_categories(&score.category_breakdown),
         event_count: score.event_count,
-        first_seen: format_timestamp(score.first_seen),
-        last_seen: format_timestamp(score.last_seen),
+        active,
+        active_title,
         decided_at: String::new(),
         submissions: String::new(),
         notes: notes.unwrap_or_default().to_string(),
@@ -863,19 +991,40 @@ fn review_state_label(s: ReviewState) -> &'static str {
     }
 }
 
-/// The comma-joined, lowercased set of categories with currently-live weight, derived from
-/// `IpScore.category_breakdown` (a JSON object keyed by `Category`'s default - i.e. bare
-/// PascalCase-identifier - `Serialize` output; matches how `review::submit` parses the same
-/// column). `BTreeMap<Category, _>` iterates in `Category`'s declared (and derived-`Ord`) order,
-/// so the joined string is deterministic.
-fn live_categories(breakdown: &serde_json::Value) -> String {
-    let Ok(map) =
-        serde_json::from_value::<BTreeMap<Category, serde_json::Value>>(breakdown.clone())
-    else {
-        return String::new();
-    };
-    map.keys()
-        .map(|c| format!("{c:?}").to_lowercase())
-        .collect::<Vec<_>>()
-        .join(", ")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn campaign(id: i64, members: i32, pending: i64) -> CampaignRef {
+        CampaignRef {
+            id,
+            kind: "same commands",
+            label: format!("campaign {id}"),
+            members,
+            role: "attacker",
+            pending,
+        }
+    }
+
+    fn home(list: &[CampaignRef]) -> Option<i64> {
+        group_home(list).map(|c| c.id)
+    }
+
+    #[test]
+    fn home_is_the_campaign_with_the_most_pending_members_not_the_most_hosts() {
+        let list = [campaign(1, 50, 3), campaign(2, 5, 5)];
+        assert_eq!(home(&list), Some(2));
+    }
+
+    #[test]
+    fn home_ties_on_pending_go_to_more_hosts_then_the_lower_id() {
+        assert_eq!(home(&[campaign(1, 5, 4), campaign(2, 9, 4)]), Some(2));
+        assert_eq!(home(&[campaign(7, 9, 4), campaign(3, 9, 4)]), Some(3));
+    }
+
+    #[test]
+    fn a_campaign_with_one_pending_member_is_never_a_home() {
+        assert_eq!(home(&[campaign(1, 50, 1), campaign(2, 5, 1)]), None);
+        assert_eq!(home(&[]), None);
+    }
 }

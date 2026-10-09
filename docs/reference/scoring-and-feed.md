@@ -223,6 +223,36 @@ The publisher re-validates every entry against exclusions at publish time; the
 FIRST violation rejects the WHOLE build, unlike the builder which drops
 offending rows (`revalidate`, `crates/feed/src/publisher.rs#revalidate`).
 
+### Declared crawlers
+
+Research and AI crawlers (ClaudeBot, Claude-User, Claude-SearchBot, Googlebot,
+CensysInspect and similar) reach the HTTP sensor. Two separate mechanisms apply,
+and only the first can change what is published:
+
+- **Exemption is by address, from a file the operator maintains.**
+  `PROPOLIS_FEED_ALLOWLIST_FILE` names a local text file with one CIDR per line
+  (blank lines and `#` comments allowed). Its entries are merged into
+  `PROPOLIS_FEED_ALLOWLIST`. To exempt a crawler, copy the address ranges its
+  operator publishes into that file and restart; the daemon never fetches them.
+  The file is read once at startup and is all-or-nothing
+  (`crates/feed/src/exclusion.rs#parse_allowlist_text`,
+  `crates/feed/src/exclusion.rs#load_allowlist_file`): an unreadable file, a
+  line that is not a CIDR (a bare address is rejected), an entry wider than /8
+  (IPv4) or /16 (IPv6), more than 50,000 entries, more than 1 MiB, or non-UTF-8
+  content refuses to start the daemon. A corrupted list therefore cannot exclude
+  everything, and cannot silently exclude nothing either.
+- **A User-Agent exempts nothing.** The HTTP sensor adds `claimed_crawler` to the
+  event metadata when the User-Agent contains a known crawler token
+  (`crates/sensor-http/src/crawler.rs#claimed_crawler`). The value is a fixed
+  label, shown in the event's raw metadata; no scoring, queue or feed code reads
+  it. Any client can send "ClaudeBot", so such a request from an address outside
+  the file is scored and published like any other
+  (`crates/feed/tests/builder_test.rs#a_claimed_crawler_is_published_unless_its_address_is_in_an_operator_range_file`).
+
+The allowlist is applied when the feed is built and published. It does not stop
+an address from being scored or queued for review, and the vendor submission
+path does not consult it.
+
 ## Reserved-range guard (`crates/core-scoring/src/net.rs`)
 
 `is_reserved_ip(ip)` is one definition shared by BOTH outbound paths (feed

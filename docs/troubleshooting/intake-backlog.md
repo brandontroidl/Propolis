@@ -37,8 +37,10 @@ because all appends share one lock (see [why it happens](#why-it-happens)).
   past the threshold for ten minutes. `intake-stalled` stays silent, by design: it fires only
   when intake stops, and a lagging intake keeps moving
   ([ops-alert monitor](../operations/health-and-observability.md#ops-alert-monitor-opt-in)).
-- The journal shows that sensor's batches arriving full and slowly: `intake: batch processed`
-  with `ingested=100` every minute or two, where a caught-up sensor shows small batches.
+- The journal shows that sensor's batches arriving full: `intake: batch processed` with
+  `ingested` at 1000 (batches grow from 100 to 1000 while the log keeps filling them), where a
+  caught-up sensor shows small batches. Full batches that arrive every minute or two, rather
+  than back to back, mean an append is slow again.
 
   ```
   journalctl -u propolis --since '1 hour ago' | grep 'batch processed' | grep 'sensor=telnet'
@@ -46,9 +48,10 @@ because all appends share one lock (see [why it happens](#why-it-happens)).
 
 ## Why it happens
 
-Intake appends one event at a time, each in its own transaction under a single append lock
-that keeps the hash chain in order (`crates/core-scoring/src/repository/events.rs#append_event`).
-Whatever one append costs, every sensor waits for. Two costs used to grow without bound:
+Intake appends a batch of lines in one transaction under a single append lock that keeps the
+hash chain in order (`crates/core-scoring/src/repository/batch.rs#append_events`). Whatever one
+batch costs, every sensor waits for. It used to append one event per transaction, and two costs
+grew without bound:
 
 1. **The dedup read, while behind. Fixed by migration `0013`.** Each scored append looks up the
    newest prior event of the same source and signal. Before `event_dedup_idx` existed the
@@ -75,10 +78,11 @@ Whatever one append costs, every sensor waits for. Two costs used to grow withou
    psql "$DATABASE_URL" -c "SELECT to_regclass('ip_vantage'), to_regclass('ip_sensor')"
    ```
 
-What is left is the per-event round trips and commit, one transaction per line, which holds the
-node to a few hundred events a second in total
-([limitations](../overview/limitations.md#intake-appends-one-event-per-transaction)). A sensor
-whose log grows faster than that falls behind, and the badge and `intake-lagging` show it.
+The per-event round trips and commit, which held the node to a few hundred events a second, are
+now shared by the lines of a batch: on the test ledger above a batch of 1000 appended 11,000 to
+13,600 events a second ([limitations](../overview/limitations.md#one-lock-orders-every-append)).
+A sensor whose log grows faster than that falls behind, and the badge and `intake-lagging`
+show it.
 
 A log that is not rotated makes it worse but does not cause it: rotation caps the file size,
 not the rate. If `/var/log/propolis/<sensor>/events.jsonl` is far past the 100 MB rotation size,

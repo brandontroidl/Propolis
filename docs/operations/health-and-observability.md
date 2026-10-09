@@ -200,7 +200,12 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   since the daemon started, since without the flag the monitor cannot tell a broken
   cron from no cron and a fresh deployment must not page before its first cron run);
 - an intake falling behind its log (`intake-lagging`, Warning). `intake-stalled` fires only when
-  a sensor's cursor stops moving with input waiting; an intake that keeps moving but more slowly
+  a sensor's cursor stops moving with input waiting. When the database refused the same line on
+  three consecutive polls, its detail quotes `intake wedged at <sensor>` with that event's
+  `observed_at` and the SQLSTATE: one line the ledger will not accept (for example a NUL
+  character in a command, which `jsonb` cannot store) is holding that sensor, and intake does
+  not skip or quarantine it, so the line has to be removed from the log by the operator. An
+  intake that keeps moving but more slowly
   than its sensor writes never trips it, and that is how a telnet log once grew to 6.6 GB over
   eleven days unnoticed. `intake-lagging` reads the two intake metrics above and fires when
   either rule holds for a log

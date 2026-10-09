@@ -210,6 +210,12 @@ hold a `GET <path> HTTP/1.x` request line, emits a `honeypot_file_download` whos
 The event counts against the connection's download allowance like any other
 (`crates/sensor-framework/src/shell/loader.rs#FakeShell::flush_loader`).
 
+A shell `honeypot_file_download` otherwise carries `url` (the address a fetch the line executed
+named, after expansion) or, when that address could not be read or still held an unexpanded
+variable, `command` (the fetch as written) and no `url`. Text that only contains a fetch, such as
+an `echo` writing a script, emits none
+(`crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
+
 #### Command summary keys
 
 A shell command event (ssh, telnet, adb) over its source network's command-event budget is not

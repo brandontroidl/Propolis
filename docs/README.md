@@ -25,6 +25,7 @@ for everything else.
   [live watch](operations/live-watch.md),
   [campaigns and indicators](operations/campaigns.md),
   [retention](operations/retention.md),
+  [captured content handling](operations/captured-content-handling.md),
   [backup and restore](operations/backup-and-restore.md),
   [upgrade, rollback and DR](operations/upgrade-rollback-and-dr.md).
 - **Understand what it is safe to expose** - [threat model](security/threat-model.md),

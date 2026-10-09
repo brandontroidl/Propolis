@@ -55,14 +55,17 @@ impl Condition for IntakeStalled {
     async fn evaluate(&self, ctx: &MonitorCtx) -> Outcome {
         let now = Instant::now();
         let stall_for = ctx.cfg.stall_for;
-        let mut stalled: Vec<&str> = {
+        let mut stalled: Vec<String> = {
             let map = ctx
                 .intake_progress
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             map.iter()
                 .filter(|(_, s)| is_stalled(s.last_advanced_at, now, stall_for, s.backlog))
-                .map(|(name, _)| *name)
+                .map(|(name, s)| match &s.wedge {
+                    Some(why) => format!("{name} [{why}]"),
+                    None => (*name).to_string(),
+                })
                 .collect()
         };
         if stalled.is_empty() {

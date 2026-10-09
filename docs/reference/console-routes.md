@@ -64,7 +64,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 |---|---|---|---|---|
 | GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts; Recent activity reads the newest 1,000 events and folds runs from one source, sensor and signal into 20 rows | `crates/console/src/routes/dashboard.rs#dashboard`, `crates/console/src/routes/dashboard.rs#fold_recent` |
 | GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed -> `24h` | `crates/console/src/routes/dashboard.rs#dashboard_chart_fragment` |
-| GET | `/queue` | `queue_page` | review queue; each pending row carries a context line built from at most 5,000 of its events, and the largest campaign it belongs to with a link to approve that campaign's pending members | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
+| GET | `/queue` | `queue_page` | review queue; pending entries with two or more listed members in one campaign are one expandable group row under that campaign's "Approve all N" link (the existing two-step confirmation), everything else is a row; each row carries a context line built from at most 5,000 of its events; `?sort=` is score, event_count, first_seen or last_seen, applied to a group through its top member | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#group_pending`, `crates/console/src/routes/queue.rs#group_home`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `crates/console/src/routes/queue.rs#approve` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `crates/console/src/routes/queue.rs#reject` |
 | POST | `/queue/{ip}/snooze` | `snooze` | CSRF required | `crates/console/src/routes/queue.rs#snooze` |
@@ -133,6 +133,10 @@ and the POST intersects that list with the campaign's pending members at the mom
 (`crates/console/src/routes/campaigns.rs#approve_members`). A member that became pending after the
 confirmation was shown, or a listed address that is no longer pending, is not approved
 (`crates/console/tests/campaigns_test.rs#approving_a_campaign_confirms_the_list_first_and_approves_only_it`).
+
+A pending row's note is a toggle (`<details class="qnote">`) holding the `notes` textarea inside the same
+`<tr>` the buttons `hx-include`, so a note typed under the toggle posts with the decision whether or not
+it is open; a decision made from inside a campaign group posts to the same endpoints and swaps the same row.
 
 Approve/reject/snooze converge in `act` (`crates/console/src/routes/queue.rs#act`), then re-read the score and
 render the `queue_row.html` partial (`queue_moved_row.html` when the decision came from a history tab,

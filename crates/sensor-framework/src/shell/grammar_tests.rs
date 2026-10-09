@@ -750,6 +750,98 @@ mod compound_commands {
     }
 }
 
+mod case_commands {
+    use super::*;
+
+    #[test]
+    fn the_first_matching_arm_runs_and_only_it() {
+        assert_eq!(
+            once("case b in a) echo A;; b) echo B;; b) echo again;; esac"),
+            "B\n"
+        );
+        assert_eq!(
+            once("case zzz in a) echo A;; *) echo other;; esac"),
+            "other\n"
+        );
+        assert_eq!(once("case zzz in a) echo A;; esac"), "");
+    }
+
+    #[test]
+    fn patterns_alternate_glob_and_honour_quotes() {
+        assert_eq!(once("case i386 in i686|i386) echo x86;; esac"), "x86\n");
+        assert_eq!(once("case aarch64 in a*64) echo wide;; esac"), "wide\n");
+        assert_eq!(once("case a/b in a?b) echo slash;; esac"), "slash\n");
+        assert_eq!(once("case x in [a-z]) echo class;; esac"), "class\n");
+        // A quoted star is a plain character.
+        assert_eq!(
+            once("case abc in '*') echo no;; *) echo yes;; esac"),
+            "yes\n"
+        );
+        assert_eq!(once("case '*' in '*') echo literal;; esac"), "literal\n");
+        // A pattern held in a variable globs when unquoted, not when quoted.
+        assert_eq!(once("p='a*'; case abc in $p) echo glob;; esac"), "glob\n");
+        assert_eq!(
+            once("p='a*'; case abc in \"$p\") echo glob;; *) echo no;; esac"),
+            "no\n"
+        );
+    }
+
+    #[test]
+    fn the_subject_expands_without_splitting() {
+        assert_eq!(
+            once("v='a b'; case $v in 'a b') echo whole;; esac"),
+            "whole\n"
+        );
+        assert_eq!(once("case $(echo hi) in hi) echo sub;; esac"), "sub\n");
+    }
+
+    #[test]
+    fn an_arm_can_assign_and_the_status_is_the_arms() {
+        let mut sh = shell();
+        assert_eq!(
+            run(&mut sh, "case x in x) U=chosen;; esac; echo $U"),
+            "chosen\n"
+        );
+        assert_eq!(status_of(&mut sh, "case x in x) false;; esac"), 1);
+        assert_eq!(status_of(&mut sh, "case x in y) false;; esac"), 0);
+        assert_eq!(status_of(&mut sh, "case x in x) ;; esac"), 0);
+    }
+
+    #[test]
+    fn a_case_spans_lines_and_nests() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "case x in"), "");
+        assert_eq!(run(&mut sh, "  x)"), "");
+        assert_eq!(run(&mut sh, "    case y in y) echo inner;; esac"), "");
+        assert_eq!(run(&mut sh, "    ;;"), "");
+        assert_eq!(run(&mut sh, "esac"), "inner\n");
+    }
+
+    #[test]
+    fn a_case_redirects_and_pipes_like_any_compound() {
+        let mut sh = shell();
+        assert_eq!(
+            run(&mut sh, "case x in x) echo hi;; esac > /tmp/c; cat /tmp/c"),
+            "hi\n"
+        );
+        assert_eq!(run(&mut sh, "case x in x) echo hi;; esac | cat"), "hi\n");
+    }
+
+    /// The architecture probe an IoT dropper runs before it picks a binary: `uname -m` in a
+    /// substitution, a `case` mapping it to a name, and a variable in the URL.
+    #[test]
+    fn an_architecture_probe_picks_the_arm_for_the_persona() {
+        let mut sh = shell();
+        assert_eq!(
+            run(
+                &mut sh,
+                "A=$(uname -m);case $A in x86_64)U=amd;;i686|i386)U=x86;;aarch64|arm64)U=arm64;;*)U=other;;esac; echo $A $U"
+            ),
+            "x86_64 amd\n"
+        );
+    }
+}
+
 mod unsupported_constructs {
     use super::*;
 
@@ -758,8 +850,7 @@ mod unsupported_constructs {
     #[test]
     fn every_unsupported_construct_degrades_to_a_silent_success() {
         for line in [
-            "case x in x) echo hi;; esac",
-            "case $HOME in /root) echo r;; *) echo o;; esac",
+            "case ${x##*/} in x) echo hi;; esac",
             "[[ -f /etc/hostname && -d /tmp ]]",
             "f() { echo hi; }",
             "function g { echo hi; }",
@@ -786,7 +877,7 @@ mod unsupported_constructs {
     fn an_unsupported_command_in_a_list_does_not_stop_the_rest() {
         let mut sh = shell();
         assert_eq!(
-            run(&mut sh, "case x in x) echo no;; esac; echo after"),
+            run(&mut sh, "case ${x##*/} in x) echo no;; esac; echo after"),
             "after\n"
         );
         assert_eq!(run(&mut sh, "echo a && [[ x ]] && echo b"), "a\nb\n");

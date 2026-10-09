@@ -99,6 +99,20 @@
   `upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again` failed in 7 of
   200 parallel runs. Writing an executable and spawning a child now share one lock, held across
   the spawn and never the wait; 0 of 200 afterwards. Test-only.
+- **An upload in flight at SIGTERM is recorded, not dropped** - the capture shutdown drain only
+  wrote jobs already queued; a capture still being assembled on a live connection was lost when
+  the runtime dropped the connection after the queue had closed. Each capturing sensor (ssh,
+  telnet, adb, ftp, mqtt, tftp) now registers its connections in the hand-off's tracker
+  (`run_tcp_listener_tracked`, `run_tls_listener_tracked`, tftp's request loop), and
+  `CaptureHandoff::drain` first gives them up to 3 s to finish, cancels the rest (their capture
+  guard submits the fragment, stored with `complete` false and `end_reason` `session_cancelled`),
+  waits for them to end, and only then drains the queue, all inside the one 10 s deadline
+  (grace and cancel wait are at most a quarter of it each). `drain` now returns a `DrainReport`
+  with a per-phase outcome. A task wedged in blocking code still cannot be cut; the drain logs a
+  WARN and stays inside the deadline.
+- **Docs listed the wrong body-spooling sensors** - the sample lifecycle page named three (SSH,
+  FTP, ADB), the capacity and environment pages five; the code has six (ssh, ftp, adb, telnet,
+  tftp, mqtt). MQTT's spool row is added, and DNS is listed among the sensors that spool nothing.
 - **The fetcher never dials a public DNS resolver** - observed 2026-10-08: a telnet bot tested
   wget, curl, tftp and ftpget against `http://1.1.1.1/wget.sh` and its siblings, and the fetcher
   followed the URLs to Cloudflare. The never-dial check now also refuses the published addresses

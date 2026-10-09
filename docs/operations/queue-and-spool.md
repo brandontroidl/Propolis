@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-08
+last-verified: 2026-10-09
 -->
 
 # Queue and spool behavior
@@ -45,6 +45,14 @@ Key properties:
   (`crates/sensor-framework/src/handoff.rs#start_worker`).
 - **Panic isolation.** A panicking event builder is caught (`catch_unwind`) and the worker
   continues (`crates/sensor-framework/src/handoff.rs#process_job`).
+- **Shutdown is bounded and loses nothing it can reach.** On SIGTERM each capturing sensor stops
+  its listeners, then `CaptureHandoff::drain` runs once inside a 10 s deadline
+  (`crates/sensor-framework/src/handoff.rs#SHUTDOWN_DRAIN_TIMEOUT`). Connections still open get
+  a short grace to finish, then are cut: an upload that was mid-transfer is stored as a fragment
+  and recorded with `complete` false and `end_reason` `session_cancelled`. The queue is then
+  written out. Only a task wedged in blocking code, or a spool that cannot finish inside the
+  deadline, loses a capture, and the drain logs a WARN when that happens
+  (`capture hand-off: connections still live after cancellation` or `shutdown drain incomplete`).
 
 ## What an operator sees under overload
 

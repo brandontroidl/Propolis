@@ -16,7 +16,7 @@ use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
     Arrival, CaptureHandoff, CaptureMemoryBudget, CommandEventConfig, CommandEventGate,
     ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EventEmitter, OutboxManifest,
-    QuarantineSpool, WanResolver, command_flood, run_tcp_listener,
+    QuarantineSpool, WanResolver, command_flood, run_tcp_listener_tracked,
 };
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -110,10 +110,12 @@ pub async fn start_test_server_with_handoff(
         bounds.max_concurrent,
     ));
     let drain_handle = handoff.clone();
-    let (bound, handle) = run_tcp_listener(
+    let tracker = handoff.connections().clone();
+    let (bound, handle) = run_tcp_listener_tracked(
         addr,
         bounds.clone(),
         per_source_cap,
+        Some(tracker),
         move |stream, peer, session_id| {
             let local_addr = stream.local_addr().ok();
             let emitter = emitter.clone();

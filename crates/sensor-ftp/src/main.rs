@@ -335,7 +335,7 @@ async fn main() {
     for (_, handle) in &started {
         handle.abort();
     }
-    // Queued captures only; a connection cancelled mid-capture never submits (see handoff.rs).
+    // Cuts live connections (their captures are recorded as truncated), then drains the queue.
     handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 

@@ -373,7 +373,7 @@ async fn main() {
     if let Some(tls_handle) = tls_handle {
         tls_handle.abort();
     }
-    // Queued captures only; a connection cancelled mid-packet never submits (see handoff.rs).
+    // Cuts live connections (their captures are recorded as truncated), then drains the queue.
     handoff.drain(SHUTDOWN_DRAIN_TIMEOUT).await;
 }
 

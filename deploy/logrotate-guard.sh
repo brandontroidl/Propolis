@@ -105,6 +105,17 @@ if [ -f "$copy2" ]; then
     copy2_hash="$(head -c 256 -- "$copy2" | sha256sum | cut -d' ' -f1)"
 fi
 
+# Under compress + delaycompress a second rotation leaves the first generation only as `.2.gz`.
+# Only the first 256 decompressed bytes are read (head closes the pipe, gzip stops). The hash of
+# nothing is not a match: an unreadable archive, or a cursor over an empty file, would equal it.
+copy2gz_hash=""
+if [ -f "$copy2.gz" ] && command -v gzip >/dev/null 2>&1; then
+    copy2gz_hash="$(gzip -dc -- "$copy2.gz" 2>/dev/null | head -c 256 | sha256sum | cut -d' ' -f1)"
+    if [ "$copy2gz_hash" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]; then
+        copy2gz_hash=""
+    fi
+fi
+
 copy_size=0
 copy_hash=""
 if [ -f "$copy" ]; then
@@ -138,6 +149,9 @@ for dir in "$intake_dir" "$shipper_dir"; do
         # A second rotation already pushed the generation the cursor names back to `.2`, and `.1`
         # (rotated after it) has not been read at all. Rotating again would compress both.
         skip "the cursor in $file is still in $copy2, and $copy has not been read"
+    fi
+    if [ -n "$copy2gz_hash" ] && [ "$c_hash" = "$copy2gz_hash" ]; then
+        skip "the cursor in $file is still in $copy2.gz, and $copy has not been read"
     fi
     if [ -n "$copy_hash" ] && [ "$c_hash" = "$copy_hash" ]; then
         # The cursor is still inside the old content: the reader has not finished with `.1`, or has

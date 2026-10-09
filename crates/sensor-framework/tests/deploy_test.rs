@@ -2985,6 +2985,55 @@ fn the_guard_skips_a_log_whose_cursor_is_still_in_the_second_generation() {
     );
 }
 
+/// Under the shipped compress + delaycompress policy the first generation is `.2.gz` after a
+/// second rotation; a cursor still inside it means `.1` was never read.
+#[test]
+fn the_guard_skips_a_log_whose_cursor_is_still_in_the_gzipped_second_generation() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let (log, _copy) = log_with_copy(dir.path());
+    let content = vec![b'z'; 4096];
+    let mut gzip = match std::process::Command::new("gzip")
+        .arg("-c")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            eprintln!("gzip is not installed here; skipping");
+            return;
+        }
+    };
+    gzip.stdin.take().unwrap().write_all(&content).unwrap();
+    let compressed = gzip.wait_with_output().unwrap().stdout;
+    std::fs::write(dir.path().join("events.jsonl.2.gz"), compressed).unwrap();
+    let plain = dir.path().join("plain");
+    std::fs::write(&plain, &content).unwrap();
+    save_cursor(&cursors, &log, inode_of(&log), 10, &fingerprint_of(&plain));
+
+    let out = run_guard_reading(&log, &cursors, "67108864");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("events.jsonl.2.gz"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // A cursor over an EMPTY live file must not match an unreadable archive (the hash of nothing).
+    std::fs::write(dir.path().join("events.jsonl.2.gz"), b"not gzip").unwrap();
+    let empty = dir.path().join("empty");
+    std::fs::write(&empty, b"").unwrap();
+    save_cursor(&cursors, &log, inode_of(&log), 0, &fingerprint_of(&empty));
+    assert!(
+        run_guard_reading(&log, &cursors, "67108864")
+            .status
+            .success(),
+        "an unreadable archive is not a match"
+    );
+}
+
 /// Rotating without having seen a cursor is a blind spot: it reaches the journal at warning
 /// priority, not only the unit's stderr.
 #[test]

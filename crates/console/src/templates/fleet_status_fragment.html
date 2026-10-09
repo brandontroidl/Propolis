@@ -33,8 +33,8 @@
   </div>
   <div class="cell">
     <span class="label">Ledger</span>
-    <div class="v">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}{{ ledger.events }}{% endif %}</div>
-    <div class="foot">{% if ledger_unavailable %}the event count could not be read{% else %}events recorded{% endif %} &middot; <a href="/integrity">verify the chain</a></div>
+    <div class="v">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}{% if ledger.events_estimate %}about {% endif %}{{ ledger.events }}{% endif %}</div>
+    <div class="foot">{% if ledger_unavailable %}the event count could not be read{% elif ledger.events_estimate %}events recorded (estimate){% else %}events recorded{% endif %} &middot; <a href="/integrity">verify the chain</a></div>
   </div>
 </div>
 
@@ -129,7 +129,7 @@
   <div class="panel">
     <div class="panel-head">Evidence chain</div>
     <div class="panel-body">
-      <p><span class="label">Events</span> {% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{{ ledger.events }}</span>{% endif %}</p>
+      <p><span class="label">Events</span> {% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{% if ledger.events_estimate %}about {% endif %}{{ ledger.events }}</span>{% if ledger.events_estimate %} <span class="dim">(estimate)</span>{% endif %}{% endif %}</p>
       <p><span class="label">Newest ingest</span> <span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
       {# No verdict is shown here because none is retained anywhere: `/integrity/verify` reports its
          result in that one response and nothing persists it, so a verification cannot populate this

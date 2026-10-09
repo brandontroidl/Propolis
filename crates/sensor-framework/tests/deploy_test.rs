@@ -30,6 +30,50 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Mutex;
+
+/// Keeps a freshly written executable from being exec'd while some child still holds its write
+/// descriptor (ETXTBSY, "Text file busy"). Tests run on parallel threads: if one forks while
+/// another has a script open for writing, the child carries a copy of that descriptor until its
+/// own exec, and the other thread's exec of the script fails in that window. Renaming the file
+/// into place does not help, because the child's copy is on the same inode. Writing an
+/// executable and spawning any child therefore take this lock, and a spawn returns only once the
+/// child has exec'd, so no fork can overlap an open write descriptor. It is held across the
+/// spawn, never across the wait.
+static EXEC_FENCE: Mutex<()> = Mutex::new(());
+
+fn exec_fence() -> std::sync::MutexGuard<'static, ()> {
+    EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `Command` runners that spawn under [`EXEC_FENCE`] and wait outside it. Every child this file
+/// starts goes through one of these.
+trait Fenced {
+    fn fenced_spawn(&mut self) -> std::io::Result<Child>;
+    /// Like `Command::output`: stdin is null, stdout and stderr are captured.
+    fn fenced_output(&mut self) -> std::io::Result<Output>;
+    /// Like `Command::status`: stdio is inherited.
+    fn fenced_status(&mut self) -> std::io::Result<ExitStatus>;
+}
+
+impl Fenced for Command {
+    fn fenced_spawn(&mut self) -> std::io::Result<Child> {
+        let _fence = exec_fence();
+        self.spawn()
+    }
+
+    fn fenced_output(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        self.fenced_spawn()?.wait_with_output()
+    }
+
+    fn fenced_status(&mut self) -> std::io::Result<ExitStatus> {
+        self.fenced_spawn()?.wait()
+    }
+}
 
 #[test]
 fn catchall_unit_has_hardening_directives() {
@@ -626,7 +670,7 @@ fn install_script_is_valid_bash() {
     let status = std::process::Command::new("bash")
         .arg("-n")
         .arg(script)
-        .status()
+        .fenced_status()
         .expect("failed to invoke `bash -n` on deploy/install.sh");
     assert!(
         status.success(),
@@ -646,7 +690,7 @@ fn install_script_dry_run_reports_expected_actions() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
     let output = std::process::Command::new(script)
         .arg("--dry-run")
-        .output()
+        .fenced_output()
         .expect("failed to run deploy/install.sh --dry-run");
     assert!(
         output.status.success(),
@@ -717,7 +761,7 @@ fn install_script_var_lib_root_is_root_owned() {
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
     let output = std::process::Command::new(script)
         .arg("--dry-run")
-        .output()
+        .fenced_output()
         .expect("failed to run deploy/install.sh --dry-run");
     assert!(
         output.status.success(),
@@ -862,7 +906,7 @@ fn deploy_stamp_script_is_valid_bash_and_both_deploy_scripts_run_it() {
     let status = std::process::Command::new("bash")
         .arg("-n")
         .arg(script)
-        .status()
+        .fenced_status()
         .expect("failed to invoke `bash -n` on deploy/deploy-stamp.sh");
     assert!(
         status.success(),
@@ -956,7 +1000,7 @@ fn fixture_repo(dir: &Path) -> String {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
-            .output()
+            .fenced_output()
             .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
         assert!(
             out.status.success(),
@@ -972,8 +1016,11 @@ fn fixture_repo(dir: &Path) -> String {
     git(&["rev-parse", "HEAD"])
 }
 
+/// Writes `script` and makes it executable. The write descriptor is closed before the fence is
+/// released, so nothing spawned afterwards can inherit it; see [`EXEC_FENCE`].
 fn write_executable(path: &Path, script: &str) {
     use std::os::unix::fs::PermissionsExt;
+    let _fence = exec_fence();
     std::fs::write(path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -1001,7 +1048,7 @@ fn run_deploy_stamp(repo: &Path, out_file: &Path, bin_dir: &Path) -> std::proces
         .arg(repo)
         .arg(out_file)
         .arg(bin_dir)
-        .output()
+        .fenced_output()
         .expect("failed to run deploy/deploy-stamp.sh")
 }
 
@@ -1225,7 +1272,7 @@ fn upgrade_script_is_valid_bash() {
     let status = std::process::Command::new("bash")
         .arg("-n")
         .arg(script)
-        .status()
+        .fenced_status()
         .expect("failed to invoke `bash -n` on deploy/upgrade.sh");
     assert!(
         status.success(),
@@ -1543,7 +1590,7 @@ fn provision_tls_script_is_valid_bash_and_mints_for_provisioned_users() {
     let status = std::process::Command::new("bash")
         .arg("-n")
         .arg(script)
-        .status()
+        .fenced_status()
         .unwrap();
     assert!(
         status.success(),
@@ -1602,7 +1649,7 @@ fn install_dry_run_mints_and_locks_down_a_pair_per_tls_sensor() {
         "/../../deploy/install.sh"
     ))
     .arg("--dry-run")
-    .output()
+    .fenced_output()
     .expect("failed to run install.sh --dry-run");
     assert!(
         out.status.success(),
@@ -2002,7 +2049,9 @@ fn run_pull_and_reexec(pull_rewrites_script: bool, env: &[(&str, &str)]) -> Reex
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let output = cmd.output().expect("failed to run the fixture upgrade.sh");
+    let output = cmd
+        .fenced_output()
+        .expect("failed to run the fixture upgrade.sh");
     let pulls = std::fs::read_to_string(&pull_log)
         .map(|s| s.lines().count())
         .unwrap_or(0);
@@ -2184,7 +2233,7 @@ fn run_watch_env(source: Option<&str>, dry_run: bool) -> (tempfile::TempDir, std
     .arg(&src)
     .arg(dir.path().join("watch.env"))
     .env("DRY_RUN", if dry_run { "1" } else { "0" })
-    .output()
+    .fenced_output()
     .expect("run deploy/watch-env.sh");
     assert!(
         out.status.success(),
@@ -2385,7 +2434,7 @@ fn install_dry_run_installs_the_guard_and_enables_the_rotation_timer() {
         "/../../deploy/install.sh"
     ))
     .arg("--dry-run")
-    .output()
+    .fenced_output()
     .expect("failed to run deploy/install.sh --dry-run");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2425,19 +2474,15 @@ fn the_logrotate_policy_runs_the_free_space_guard_per_log_before_rotating() {
 /// A `logger` that records its arguments instead of writing to the host's journal: PATH for the
 /// guard, with the recording file at `<dir>/logger.out`.
 fn stub_logger_path(dir: &Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("stubbin");
     std::fs::create_dir_all(&bin).unwrap();
-    let stub = bin.join("logger");
-    std::fs::write(
-        &stub,
-        format!(
+    write_executable(
+        &bin.join("logger"),
+        &format!(
             "#!/bin/sh\necho \"$*\" >> '{}'\n",
             dir.join("logger.out").display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     format!(
         "{}:{}",
         bin.display(),
@@ -2453,7 +2498,7 @@ fn run_guard(log: &Path, reserve: &str) -> std::process::Output {
     .arg(log)
     .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", reserve)
     .env("PATH", stub_logger_path(log.parent().unwrap()))
-    .output()
+    .fenced_output()
     .expect("failed to run deploy/logrotate-guard.sh")
 }
 
@@ -2500,7 +2545,7 @@ fn the_guard_admits_a_log_that_fits_and_refuses_one_that_does_not() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/logrotate-guard.sh"
     ))
-    .output()
+    .fenced_output()
     .unwrap();
     assert!(
         !no_arg.status.success(),
@@ -2515,7 +2560,7 @@ fn the_guard_admits_a_log_that_fits_and_refuses_one_that_does_not() {
 fn logrotate_skips_only_the_log_the_guard_refuses() {
     if std::process::Command::new("logrotate")
         .arg("--version")
-        .output()
+        .fenced_output()
         .is_err()
     {
         eprintln!("logrotate is not installed here; skipping the end-to-end rotation check");
@@ -2562,7 +2607,7 @@ fn logrotate_skips_only_the_log_the_guard_refuses() {
         .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .fenced_spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
@@ -2665,7 +2710,7 @@ fn run_guard_reading(log: &Path, cursors: &Path, max_unread: &str) -> std::proce
         cursors.join("shipper-unused"),
     )
     .env("PATH", stub_logger_path(log.parent().unwrap()))
-    .output()
+    .fenced_output()
     .expect("failed to run deploy/logrotate-guard.sh")
 }
 
@@ -2792,7 +2837,7 @@ fn the_guard_reads_the_shipper_cursor_directory_as_well() {
     .env("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES", "5000")
     .env("PROPOLIS_CURSOR_DIR", dir.path().join("no-intake"))
     .env("PROPOLIS_SHIPPER_CURSOR_DIR", &shipper)
-    .output()
+    .fenced_output()
     .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
 }
@@ -2887,7 +2932,7 @@ fn the_guards_default_unread_bound_is_sixty_four_mebibytes() {
             "PROPOLIS_SHIPPER_CURSOR_DIR",
             cursors.join("shipper-unused"),
         )
-        .output()
+        .fenced_output()
         .unwrap()
     };
     let over = guard(96 * 1024 * 1024 - 1);
@@ -2915,7 +2960,7 @@ fn the_guard_still_refuses_for_free_space_before_reading_a_cursor() {
     .arg(&log)
     .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "999999999999999")
     .env("PROPOLIS_CURSOR_DIR", &cursors)
-    .output()
+    .fenced_output()
     .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(
@@ -2998,7 +3043,7 @@ fn the_guard_skips_a_log_whose_cursor_is_still_in_the_gzipped_second_generation(
         .arg("-c")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .spawn()
+        .fenced_spawn()
     {
         Ok(child) => child,
         Err(_) => {
@@ -3106,7 +3151,7 @@ fn the_guard_reads_a_cursor_with_a_fingerprint_window() {
 fn a_log_skipped_for_unread_input_still_refreshes_the_state_file_and_fails_the_run() {
     if std::process::Command::new("logrotate")
         .arg("--version")
-        .output()
+        .fenced_output()
         .is_err()
     {
         eprintln!("logrotate is not installed here; skipping");
@@ -3139,7 +3184,7 @@ fn a_log_skipped_for_unread_input_still_refreshes_the_state_file_and_fails_the_r
         .env("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES", "100")
         .env("PROPOLIS_CURSOR_DIR", &cursors)
         .env("PATH", stub_logger_path(dir.path()))
-        .output()
+        .fenced_output()
         .unwrap();
     assert!(!out.status.success(), "a skipped log fails the run");
     assert!(

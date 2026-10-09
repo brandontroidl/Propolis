@@ -37,7 +37,7 @@
 
 {# Most active - the signature: each row's 24-cell strip shows the last 24h of activity, cell colour
    = worst signal that hour (severity height-floor + cap in the CSS), height = volume. #}
-<div class="panel">
+<div class="panel active-panel">
   <div class="panel-head">Most active <span class="dim">last 24h</span></div>
   {% if most_active %}
   <table class="table-compact">
@@ -50,12 +50,12 @@
     </tr></thead>
     <tbody>
       {% for r in most_active %}
-      <tr>
-        <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
-        <td><span class="strip">{% for c in r.strip %}<i class="h-{{ c.height }}{% if c.class %} {{ c.class }}{% endif %}"></i>{% endfor %}</span></td>
-        <td class="count">{{ r.event_count }}</td>
-        <td><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
-        <td class="seen dim">{{ r.last_seen }}</td>
+      <tr class="arow">
+        <td class="ip a-ip">{{ m.ip_evidence_link(r.ip) }}</td>
+        <td class="a-strip"><span class="strip">{% for c in r.strip %}<i class="h-{{ c.height }}{% if c.class %} {{ c.class }}{% endif %}"></i>{% endfor %}</span></td>
+        <td class="count a-events">{{ r.event_count }}</td>
+        <td class="a-what"><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
+        <td class="seen dim a-last">{{ r.last_seen }}</td>
       </tr>
       {% endfor %}
     </tbody>

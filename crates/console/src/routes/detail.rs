@@ -119,6 +119,10 @@ struct EventRow {
     /// obfuscation; drives a small "de-obfuscated (xor 0xNN)" badge in the timeline. `None` for a
     /// plaintext command (minijinja has no hex filter, so this is formatted here).
     xor_badge: Option<String>,
+    /// What the review fetcher did with the URL a `honeypot_file_download` event named; `None` for
+    /// every other event and for a download event that carries no `url` (see
+    /// [`attach_fetch_outcomes`]).
+    fetch: Option<FetchOutcome>,
     protocol: String,
     authenticated: bool,
     wan_ip: String,
@@ -132,6 +136,39 @@ struct EventRow {
     signal_type_raw: String,
     #[serde(skip)]
     metadata: serde_json::Value,
+}
+
+/// What the evidence timeline's first page holds, by unit, for its header. The header used to say
+/// "N events" alone, which read as the address's total (the stat above counts scored events) or as
+/// its commands; it is the number of ledger rows on the page.
+#[derive(Debug, PartialEq, Serialize)]
+struct TimelineCounts {
+    /// Ledger rows on the page.
+    events: usize,
+    /// Of those, `honeypot_command_exec` rows.
+    commands: usize,
+    /// Distinct `session_id`s among them.
+    sessions: usize,
+    /// Rows with no `session_id` (they predate session tracking).
+    ungrouped: usize,
+}
+
+impl TimelineCounts {
+    fn of(events: &[EventRow]) -> Self {
+        let sessions: std::collections::BTreeSet<&str> = events
+            .iter()
+            .filter_map(|e| e.session_id.as_deref())
+            .collect();
+        Self {
+            events: events.len(),
+            commands: events
+                .iter()
+                .filter(|e| e.signal_type_raw == "honeypot_command_exec")
+                .count(),
+            sessions: sessions.len(),
+            ungrouped: events.iter().filter(|e| e.session_id.is_none()).count(),
+        }
+    }
 }
 
 /// One collapsible session card: every `EventRow` sharing a non-null `session_id`, in
@@ -291,6 +328,191 @@ struct UrlRow {
     vt_link: Option<String>,
 }
 
+/// The review fetcher's record of one URL, as [`classify_fetch`] reads it. Absent (`None` at the
+/// call sites) when the fetcher has no row for the URL.
+struct FetchRecord {
+    status: String,
+    reject_reason: Option<String>,
+    attempts: i32,
+    last_attempt: DateTime<Utc>,
+    sha256_hex: Option<String>,
+    bytes: Option<i32>,
+}
+
+/// The longest fetcher reason shown on the timeline. A reason can quote an error string from the
+/// attacker's server, so it is capped here and auto-escaped by the template like every value.
+const FETCH_REASON_MAX_CHARS: usize = 160;
+
+/// A `fetch_attempt` outcome as the timeline renders it beside a download event.
+#[derive(Debug, PartialEq, Serialize)]
+struct FetchOutcome {
+    /// `captured`, `refused`, `failed`, `pending`, `unsupported` or `unqueued`: drives the style.
+    kind: &'static str,
+    /// The outcome in words, without the reason.
+    label: String,
+    /// Why, when the fetcher recorded it (or, for an unsupported URL, which scheme).
+    reason: Option<String>,
+    /// When the last attempt happened; absent when none did.
+    when: Option<String>,
+    /// The captured sample, linked to its page; set only for `captured`.
+    sample: Option<SampleLink>,
+    bytes: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct SampleLink {
+    sha256: String,
+    short: String,
+}
+
+/// Classifies the fetcher's record of `url` (`None`: no row). Shared by the URL panel and the
+/// evidence timeline so the two cannot disagree about what happened to a URL.
+///
+/// `refused` is the SSRF guard (or the hop limit) turning an attempt away; every other non-success
+/// is `failed`. A row that exhausted its retries is `dead` whatever the last attempt's cause was,
+/// so a refusal that hit the cap reads as a failure that gave up; the reason it carries is the
+/// last attempt's.
+fn classify_fetch(url: &str, record: Option<&FetchRecord>) -> (&'static str, String) {
+    let Some(r) = record else {
+        return if review::fetcher::store::parse_url_parts(url).is_some() {
+            ("unqueued", "not queued".to_string())
+        } else {
+            let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
+            ("unsupported", format!("unsupported scheme ({scheme})"))
+        };
+    };
+    let attempted = format_timestamp(r.last_attempt);
+    match r.status.as_str() {
+        "success" => ("captured", format!("captured {attempted}")),
+        "pending" => ("pending", format!("pending ({} attempts)", r.attempts)),
+        other => {
+            let reason = r
+                .reject_reason
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            let kind = if other == "rejected" {
+                "refused"
+            } else {
+                "failed"
+            };
+            (kind, format!("{other}{reason} {attempted}"))
+        }
+    }
+}
+
+/// The timeline's view of [`classify_fetch`]: the same classification, as a label, a reason and a
+/// link to the captured sample rather than one sentence.
+fn fetch_outcome(url: &str, record: Option<&FetchRecord>) -> FetchOutcome {
+    let (kind, _) = classify_fetch(url, record);
+    let reason = record
+        .and_then(|r| r.reject_reason.as_deref())
+        .map(|r| r.chars().take(FETCH_REASON_MAX_CHARS).collect::<String>())
+        .filter(|r| !r.is_empty());
+    let when = record.map(|r| format_timestamp(r.last_attempt));
+    let label = match (kind, record) {
+        ("captured", _) => "fetched".to_string(),
+        ("refused", _) => "refused".to_string(),
+        ("pending", Some(r)) => format!("pending, {} attempts so far", r.attempts),
+        ("failed", Some(r)) => match r.status.as_str() {
+            "dead" => format!("gave up after {} attempts", r.attempts),
+            "timeout" => "failed: timed out, will retry".to_string(),
+            "too_big" => "failed: too big, will retry".to_string(),
+            "empty" => "failed: empty body, will retry".to_string(),
+            other => format!("failed: {other}"),
+        },
+        ("unsupported", _) => "not fetched".to_string(),
+        _ => "not queued".to_string(),
+    };
+    let reason = match kind {
+        "unsupported" => Some(
+            url.split("://")
+                .next()
+                .map(|s| format!("unsupported scheme ({})", s.to_ascii_lowercase()))
+                .unwrap_or_default(),
+        ),
+        "captured" | "unqueued" => None,
+        _ => reason,
+    };
+    let (sample, bytes) = match (kind, record) {
+        ("captured", Some(r)) => (
+            r.sha256_hex.as_ref().map(|s| SampleLink {
+                sha256: s.clone(),
+                short: s.chars().take(12).collect(),
+            }),
+            r.bytes.map(|b| format_bytes(b.max(0) as u64)),
+        ),
+        _ => (None, None),
+    };
+    FetchOutcome {
+        kind,
+        label,
+        reason,
+        when: if kind == "unsupported" || kind == "unqueued" {
+            None
+        } else {
+            when
+        },
+        sample,
+        bytes,
+    }
+}
+
+/// The trimmed `url` a download event names, when it names one.
+fn download_url(event: &EventRow) -> Option<&str> {
+    if event.signal_type_raw != "honeypot_file_download" {
+        return None;
+    }
+    let url = event.metadata.get("url")?.as_str()?.trim();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Sets [`EventRow::fetch`] on every download event in `events`, from one query keyed by the
+/// fetcher's own `url_hash` (`review::fetcher::store::url_hash`), so the match is the fetcher's
+/// own equivalence class and not a re-spelling of it. The outcome is the URL's current record,
+/// whoever reported it first: a later attacker's download shows the capture the URL already
+/// produced, dated.
+async fn attach_fetch_outcomes(db: &PgPool, events: &mut [EventRow]) -> Result<(), sqlx::Error> {
+    let hashes: Vec<Vec<u8>> = events
+        .iter()
+        .filter_map(download_url)
+        .map(review::fetcher::store::url_hash)
+        .collect();
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT url_hash, status, reject_reason, attempts, last_attempt, bytes, \
+                encode(sha256, 'hex') AS sha256_hex \
+         FROM fetch_attempt WHERE url_hash = ANY($1)",
+    )
+    .bind(&hashes)
+    .fetch_all(db)
+    .await?;
+    let mut records: BTreeMap<Vec<u8>, FetchRecord> = BTreeMap::new();
+    for row in rows {
+        records.insert(
+            row.try_get("url_hash")?,
+            FetchRecord {
+                status: row.try_get("status")?,
+                reject_reason: row.try_get("reject_reason")?,
+                attempts: row.try_get("attempts")?,
+                last_attempt: row.try_get("last_attempt")?,
+                sha256_hex: row.try_get("sha256_hex")?,
+                bytes: row.try_get("bytes")?,
+            },
+        );
+    }
+    for event in events.iter_mut() {
+        let Some(url) = download_url(event) else {
+            continue;
+        };
+        let outcome = fetch_outcome(url, records.get(&review::fetcher::store::url_hash(url)));
+        event.fetch = Some(outcome);
+    }
+    Ok(())
+}
+
 /// An operator-initiated external lookup link. The operator's browser makes the request, never the
 /// honeypot, so the box never leaks which addresses it has captured (egress-free enrichment).
 #[derive(Debug, Serialize)]
@@ -335,8 +557,15 @@ async fn detail(
     let raw_f64 = score.raw_score.to_f64().unwrap_or(0.0);
     let effective_f64 = effective.to_f64().unwrap_or(0.0);
 
-    let all_events = fetch_evidence_rows(&state.db, ip, None).await?;
-    let total_event_count = all_events.len();
+    let mut degraded = Degraded::new();
+    let mut all_events = fetch_evidence_rows(&state.db, ip, None).await?;
+    // Supplementary: a failed lookup leaves the timeline without outcome lines and names the panel
+    // in the banner, rather than rendering "no outcome" as if the fetcher had recorded none.
+    degraded.soft(
+        "download outcomes",
+        attach_fetch_outcomes(&state.db, &mut all_events).await,
+    );
+    let timeline_counts = TimelineCounts::of(&all_events);
     let has_more_events = all_events.len() as i64 == EVIDENCE_PAGE_SIZE;
     let next_cursor = all_events
         .last()
@@ -447,7 +676,6 @@ async fn detail(
     // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
     // chart rather than the whole page, per the module doc comment. `chart_fragment` (below) reuses
     // the same helper for the adjustable-range HTMX endpoint the "24h/7d/30d" buttons hit.
-    let mut degraded = Degraded::new();
     let (ip_timeline_labels, ip_timeline_data) = degraded.soft(
         "activity timeline",
         detail_daily_series(&state.db, ip, 6).await,
@@ -522,7 +750,7 @@ async fn detail(
         last_seen => format_timestamp(score.last_seen),
         session_folds,
         ungrouped,
-        total_event_count,
+        timeline_counts,
         has_more_events,
         next_cursor,
         per_wan,
@@ -566,7 +794,12 @@ async fn events_fragment(
         },
     };
 
-    let events = fetch_evidence_rows(&state.db, ip, cursor).await?;
+    let mut events = fetch_evidence_rows(&state.db, ip, cursor).await?;
+    // A fragment has no page banner; the failure is logged and the full page names the panel.
+    Degraded::new().soft(
+        "download outcomes",
+        attach_fetch_outcomes(&state.db, &mut events).await,
+    );
     let has_more_events = events.len() as i64 == EVIDENCE_PAGE_SIZE;
     let next_cursor = events
         .last()
@@ -798,6 +1031,7 @@ async fn fetch_evidence_rows(
                 .get("xor_key")
                 .and_then(|v| v.as_u64())
                 .map(|k| format!("0x{k:02x}")),
+            fetch: None,
             protocol: protocol_label(protocol).to_string(),
             authenticated: row.try_get("authenticated")?,
             wan_ip: row
@@ -1003,29 +1237,19 @@ async fn fetch_url_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<UrlRow>, AppError
         let first_seen: DateTime<Utc> = row.try_get("first_seen")?;
         let last_seen: DateTime<Utc> = row.try_get("last_seen")?;
 
-        let attempted = last_attempt.map(format_timestamp).unwrap_or_default();
-        let (kind, outcome) = match status.as_deref() {
-            None => {
-                if review::fetcher::store::parse_url_parts(&url).is_some() {
-                    ("unqueued", "not queued".to_string())
-                } else {
-                    let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
-                    ("unsupported", format!("unsupported scheme ({scheme})"))
-                }
-            }
-            Some("success") => ("captured", format!("captured {attempted}")),
-            Some("pending") => (
-                "pending",
-                format!("pending ({} attempts)", attempts.unwrap_or(0)),
-            ),
-            Some(other) => {
-                let reason = reject_reason
-                    .as_deref()
-                    .map(|r| format!(": {r}"))
-                    .unwrap_or_default();
-                ("failed", format!("{other}{reason} {attempted}"))
-            }
+        // `last_attempt` is NOT NULL, so it is present exactly when the join found a row.
+        let record = match (status, last_attempt) {
+            (Some(status), Some(last_attempt)) => Some(FetchRecord {
+                status,
+                reject_reason,
+                attempts: attempts.unwrap_or(0),
+                last_attempt,
+                sha256_hex: None,
+                bytes: None,
+            }),
+            _ => None,
         };
+        let (kind, outcome) = classify_fetch(&url, record.as_ref());
         urls.push(UrlRow {
             url,
             seen_count: row.try_get("seen_count")?,
@@ -1444,6 +1668,7 @@ mod tests {
             activity: format_activity("ssh", signal_type),
             detail: extract_detail(signal_type, &metadata),
             xor_badge: None,
+            fetch: None,
             protocol: "TCP".into(),
             authenticated: true,
             wan_ip: "203.0.113.9".into(),

@@ -15,28 +15,47 @@ pub enum EgressReject {
     PublicResolver,
 }
 
-/// Addresses the operators publish as their public resolver service: Cloudflare
-/// (developers.cloudflare.com/1.1.1.1/ip-addresses/), Google Public DNS
-/// (developers.google.com/speed/public-dns/docs/using), Quad9
-/// (quad9.net/service/service-addresses-and-features/), and OpenDNS/Cisco Umbrella
-/// (208.67.222.222, 208.67.220.220, 2620:119:35::35, 2620:119:53::53).
-const PUBLIC_RESOLVERS: [&str; 16] = [
-    "1.1.1.1",
-    "1.0.0.1",
-    "8.8.8.8",
-    "8.8.4.4",
-    "9.9.9.9",
-    "149.112.112.112",
-    "208.67.222.222",
-    "208.67.220.220",
-    "2606:4700:4700::1111",
-    "2606:4700:4700::1001",
-    "2001:4860:4860::8888",
-    "2001:4860:4860::8844",
-    "2620:fe::fe",
-    "2620:fe::9",
-    "2620:119:35::35",
-    "2620:119:53::53",
+const SRC_CLOUDFLARE: &str = "https://developers.cloudflare.com/1.1.1.1/ip-addresses/";
+const SRC_GOOGLE: &str = "https://developers.google.com/speed/public-dns/docs/using";
+const SRC_QUAD9: &str = "https://quad9.net/service/service-addresses-and-features/";
+const SRC_UMBRELLA_V4: &str = "https://umbrella.cisco.com/products/recursive-dns-services";
+const SRC_UMBRELLA_V6: &str = "https://www.cisco.com/c/en/us/support/docs/security/umbrella/225331-understand-umbrella-support-for-ipv6.html";
+
+/// Addresses the operators publish as their public resolver service, each with the operator's own
+/// page that lists it. All sixteen were read from those pages on 2026-10-09:
+///
+/// - Cloudflare, "1.1.1.1 (standard resolver)": 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111 and
+///   2606:4700:4700::1001. The same page lists the malware-blocking (1.1.1.2, 1.0.0.2,
+///   2606:4700:4700::1112, ::1002) and adult-content-blocking (1.1.1.3, 1.0.0.3, ::1113, ::1003)
+///   variants, which are deliberately not blocked here.
+/// - Google Public DNS: 8.8.8.8, 8.8.4.4, 2001:4860:4860::8888 and 2001:4860:4860::8844.
+/// - Quad9, "Recommended: Malware Blocking, DNSSEC Validation": 9.9.9.9, 149.112.112.112,
+///   2620:fe::fe and 2620:fe::9. The page also lists the ECS (9.9.9.11, 149.112.112.11,
+///   2620:fe::11, 2620:fe::fe:11) and unsecured (9.9.9.10, 149.112.112.10, 2620:fe::10,
+///   2620:fe::fe:10) services, also not blocked here.
+/// - Cisco Umbrella (OpenDNS): "Our IPv4 addresses are: 208.67.222.222 208.67.220.220" on the
+///   recursive DNS services page; "Umbrella's IPv6 DNS server addresses are: 2620:119:35::35
+///   2620:119:53::53" on Cisco's IPv6 support article. Cisco's ASA guide repeats all four. The
+///   old support.opendns.com pages now redirect to a Cisco community forum and are not a source.
+///   The IPv6 pair could not be queried from the verifying host (no IPv6 route), so Cisco's
+///   published text is the evidence for it; the IPv4 pair answered `debug.opendns.com` there.
+const PUBLIC_RESOLVERS: [(&str, &str); 16] = [
+    ("1.1.1.1", SRC_CLOUDFLARE),
+    ("1.0.0.1", SRC_CLOUDFLARE),
+    ("8.8.8.8", SRC_GOOGLE),
+    ("8.8.4.4", SRC_GOOGLE),
+    ("9.9.9.9", SRC_QUAD9),
+    ("149.112.112.112", SRC_QUAD9),
+    ("208.67.222.222", SRC_UMBRELLA_V4),
+    ("208.67.220.220", SRC_UMBRELLA_V4),
+    ("2606:4700:4700::1111", SRC_CLOUDFLARE),
+    ("2606:4700:4700::1001", SRC_CLOUDFLARE),
+    ("2001:4860:4860::8888", SRC_GOOGLE),
+    ("2001:4860:4860::8844", SRC_GOOGLE),
+    ("2620:fe::fe", SRC_QUAD9),
+    ("2620:fe::9", SRC_QUAD9),
+    ("2620:119:35::35", SRC_UMBRELLA_V6),
+    ("2620:119:53::53", SRC_UMBRELLA_V6),
 ];
 
 /// Matches against the canonicalized address, so v4-mapped, 6to4 and NAT64 forms of a resolver
@@ -44,7 +63,7 @@ const PUBLIC_RESOLVERS: [&str; 16] = [
 fn is_public_resolver(ip: IpAddr) -> bool {
     PUBLIC_RESOLVERS
         .iter()
-        .any(|s| s.parse::<IpAddr>().is_ok_and(|r| r == ip))
+        .any(|(s, _)| s.parse::<IpAddr>().is_ok_and(|r| r == ip))
 }
 
 fn canonicalize(ip: IpAddr) -> Result<IpAddr, EgressReject> {
@@ -613,6 +632,34 @@ mod tests {
 
     fn is_resolver_reject(r: Result<Pinned, GuardReject>) -> bool {
         matches!(r, Err(GuardReject::Forbidden(EgressReject::PublicResolver)))
+    }
+
+    #[test]
+    fn every_listed_resolver_cites_an_operator_page_and_the_list_is_exactly_the_verified_set() {
+        let listed: Vec<&str> = PUBLIC_RESOLVERS.iter().map(|(a, _)| *a).collect();
+        let verified: Vec<&str> = RESOLVER_V4
+            .iter()
+            .chain(RESOLVER_V6.iter())
+            .copied()
+            .collect();
+        assert_eq!(listed, verified);
+        for (addr, source) in PUBLIC_RESOLVERS {
+            assert!(
+                source.starts_with("https://") && source.len() > "https://".len(),
+                "{addr} has no source"
+            );
+            // Each family's source page is its operator's, not a third-party listing.
+            let host_ok = [
+                "developers.cloudflare.com",
+                "developers.google.com",
+                "quad9.net",
+                "umbrella.cisco.com",
+                "www.cisco.com",
+            ]
+            .iter()
+            .any(|h| source.starts_with(&format!("https://{h}/")));
+            assert!(host_ok, "{addr}: {source}");
+        }
     }
 
     #[test]

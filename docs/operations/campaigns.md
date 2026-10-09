@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-08
+last-verified: 2026-10-09
 -->
 
 # Campaigns and indicators
@@ -125,7 +125,8 @@ running other test suites, so the figures are indicative):
 
 ### Rebuilding
 
-The campaign tables are derived state. To rebuild them all, stop the daemon, empty them and set
+The campaign tables are derived state. To rebuild them all, stop the daemon, empty them (the
+ATT&CK tag tables `attack_tag` and `campaign_attack_tag` too) and set
 `campaign_cursor.last_event_id` to 0; on the next start the indexer reads the whole ledger again.
 
 A change to the command-sequence fingerprint does not need that. `campaign_cursor.fingerprint_version`
@@ -182,6 +183,17 @@ copy itself (`sshpass`, `scp`) is marked self-propagating
 rather than attacker (`crates/console/src/routes/campaigns.rs#member_role`). This is console
 metadata only: vendor submission text does not use it yet `[planned]`, and that wording is a
 separate decision.
+
+## ATT&CK tags
+
+The same pass labels what it reads with MITRE ATT&CK technique ids, by fixed rules over exact
+evidence: a command's name and operands (never a substring), a download, an upload, a signal type,
+and the miner indicators below. Each tag keeps the rule, the event and the matched token. A
+command-sequence campaign carries the union of its runs' tags and a sample campaign the tags of how
+its sample arrived and what its text carried. The rules, the matrix version and what is left
+untagged are in [ATT&CK tagging](../reference/attack-tagging.md). Tags are not published to the feed
+or to vendors, and apply to events indexed after migration 0017; the full rebuild above tags the
+earlier ones.
 
 ## Indicators
 

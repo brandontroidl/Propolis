@@ -1,7 +1,7 @@
 //! The samples page's Transport column joins spooled files to the fetcher's records by digest: the
 //! file is named by its lowercase hex SHA-256, `fetch_attempt.sha256` holds the raw bytes, and the
 //! query encodes them to match. Nothing else checks that join end to end; a mismatch would show
-//! every fetched sample as "not fetched" without failing anything.
+//! every fetched sample as "not recorded" without failing anything.
 //!
 //! A test binary of its own because the spool location comes from `PROPOLIS_SPOOL_ROOT`, a process
 //! environment variable, and nothing else in this binary reads the environment.
@@ -138,6 +138,7 @@ async fn each_sample_row_shows_how_its_fetches_were_authenticated(pool: PgPool) 
 
     // Captured by a sensor, never fetched. A failed fetch attempt naming the same bytes must not
     // make it look fetched.
+    let orphan = spool(root.path(), "fetched", b"body whose fetch record is gone");
     let captured = spool(root.path(), "ssh", b"sample a sensor captured");
     fetched(
         &pool,
@@ -218,5 +219,20 @@ async fn each_sample_row_shows_how_its_fetches_were_authenticated(pool: PgPool) 
     assert!(!row.contains("TLS verified"), "{row}");
 
     let row = row_for(&page, &captured);
-    assert!(row.contains("not fetched"), "{row}");
+    assert!(
+        row.contains("n/a, uploaded") && !row.contains("not fetched"),
+        "a sensor upload is labelled an upload: {row}"
+    );
+    assert!(
+        !row.contains("TLS") && !row.contains("plaintext"),
+        "a failed fetch naming the same bytes must not give an upload a transport: {row}"
+    );
+
+    // A body in the fetcher's bucket that no successful fetch record names is a missing record,
+    // not an upload.
+    let orphan = row_for(&page, &orphan);
+    assert!(
+        orphan.contains("not recorded") && !orphan.contains("uploaded"),
+        "{orphan}"
+    );
 }

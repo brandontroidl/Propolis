@@ -4,13 +4,38 @@
 
 ### Added
 
+- **The evidence timeline shows what the fetcher did with each download** - a
+  `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
+  hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded
+  reason, `gave up after N attempts`, `pending`, or `not fetched` for a scheme outside the
+  fetcher. The outcome is the URL's current `fetch_attempt` record, matched by the fetcher's own
+  `url_hash`, so a later reporter's download shows the capture the first reporter's produced.
+  Reasons are length-capped and escaped. A failed lookup names "download outcomes" in the
+  page's degraded banner. The "URLs this IP tried to fetch" panel shares the classifier and
+  shows a guard rejection as refused.
+- **ATT&CK technique tags on sessions, sources and campaigns** - deterministic rules over exact
+  evidence, no model: a shell line is parsed into commands and a rule reads a command's name,
+  operands and redirection targets, so `echo crontab` and a URL containing `cron` are not tagged.
+  Eighteen rules cover brute force (the `ssh_brute_force` signal), ingress tool transfer (downloads,
+  `wget`/`curl`/`tftp`/`ftpget`, uploads), Unix shell, cron, systemd units, rc scripts, authorized
+  keys, system, file and process discovery, permission changes, file deletion, miner indicators
+  and impaired defenses. Each tag keeps its rule, the event and the matched token. Checked against
+  ATT&CK Enterprise v19.2, which moved Impair Defenses: security-tool kills are T1685 and firewall
+  flushes T1686. T1078 and T1110.001 are not tagged (the honeypot accepts every credential and
+  stores no password). Migration `0017` adds `attack_tag`, `campaign_attack_tag` and
+  `campaign_session.attack_pending`; a command-sequence campaign carries the union of its runs'
+  tags. Read through `review::attack::{campaign_tags, source_tags, session_tags}`; the console
+  does not show them yet. No backfill: events indexed before the migration are tagged by the full
+  rebuild. Not published to the feed or to vendors.
+  See [ATT&CK tagging](docs/reference/attack-tagging.md).
 - **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
   analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
   (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or
   `CoinHive.User(` call is an embedded-credentials flag `CoinHive site key`, never the key
   itself; and a zip carrying the public AOSP test key certificate (SHA-256 `A4:0D:A8:0A...:F5:DC`)
   is an RSA-key indicator naming it. The certificate is seen when it is stored uncompressed, as
-  in the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` of a v1-only APK is not.
+  in the APK Signing Block of v2 and later, and inside a deflated `META-INF/*.RSA` entry of a
+  v1-signed APK, which is inflated in memory up to 256 KiB (a signature block is a few KiB).
   No schema change: the three reuse existing indicator kinds.
 - **CI lints the shell scripts** - a `shellcheck` job (the v0.11.0 image, pinned by digest) runs
   over `deploy/*.sh` and `scripts/**/*.sh`. Its nine findings in `deploy/config-check.sh` and
@@ -44,6 +69,17 @@
 
 ### Changed
 
+- **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
+  `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
+  The count is exact up to 100,000 events and shown bare; past that it is the planner's row
+  estimate, shown as `about N` and labelled `(estimate)`. The newest ingest is read off the
+  newest row by `id`. The Attackers total shares the rule (`routes::rowcount`) and skips its
+  bounded scan once statistics put the table past the cap. The integrity page still counts on load.
+- **The evidence timeline's header says what it counts** - it read "54 events", which looked like
+  the address's total or its commands. It now reads, for example, `newest 200 events: 199
+  commands, 1 session, 1 outside any session`: ledger rows on the page, of which command
+  events, the distinct sessions, and rows that predate session tracking. "newest" appears only
+  when older events wait behind Load more.
 - **Campaigns and Samples say what the bots are doing and what they dropped** - the Campaigns list
   was a wall of "same sample" and "same commands" rows, one per host and per command count, and
   Samples repeated it. The list now sorts by hosts (then last seen; links for last and first
@@ -97,6 +133,27 @@
   directory` (`not found` under dash and mksh) instead of silently running the applet of that
   name. A saved copy of busybox named `busybox*` still fetches. Wording unchanged, checked
   against Ubuntu 22.04.
+- **Most active on the dashboard no longer runs off a phone screen** - at 390 px the table's last
+  two columns (what it did, last seen) were clipped. Below 640 px each row is now a card, the
+  same pattern the queue, campaigns and samples lists use: address and events on top, the 24-hour
+  strip and last seen under, the tags last.
+- **Samples no longer says "not fetched" for every uploaded file** - the Transport column describes
+  how the fetcher's connection was authenticated, which means nothing for a body a sensor took
+  from the address that sent it. Those rows now read `n/a, uploaded`; a body in the fetcher's
+  bucket with no successful fetch record reads `not recorded`; fetched files show their
+  transport as before.
+- **The soak harness counts rejected lines from the ledger** - the intake child's rejected
+  counter reached the harness only through a status file written once a second, so a SIGKILL
+  lost the last increments (one kill run printed "rejected 112 of 113 malformed" with nothing
+  lost; a 2026-10-09 kill run showed 171 against 180). The report now derives the rejected
+  malformed lines from the ledger and shows the child's counter beside it, short only after a
+  restart. Harness only.
+- **A flaky "Text file busy" in the deploy tests** - `deploy_test` wrote fixture scripts and ran
+  them while another test thread's fork could still hold the write descriptor, so
+  `upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp` and
+  `upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again` failed in 7 of
+  200 parallel runs. Writing an executable and spawning a child now share one lock, held across
+  the spawn and never the wait; 0 of 200 afterwards. Test-only.
 - **An upload in flight at SIGTERM is recorded, not dropped** - the capture shutdown drain only
   wrote jobs already queued; a capture still being assembled on a live connection was lost when
   the runtime dropped the connection after the queue had closed. Each capturing sensor (ssh,
@@ -117,7 +174,10 @@
   of Cloudflare, Google Public DNS, Quad9 and OpenDNS, IPv4 and IPv6 (sixteen in all), including
   their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
   recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
-  shows beside the status.
+  shows beside the status. All sixteen addresses were checked on 2026-10-09 against the
+  operators' own pages, and each table entry now carries its source URL (the OpenDNS IPv6 pair
+  against Cisco's Umbrella IPv6 article); none was wrong. The operators also publish filtered
+  variants (Cloudflare `1.1.1.2`/`1.1.1.3`, Quad9 `9.9.9.10`/`9.9.9.11`), which are not blocked.
 - **A `copytruncate` rotation no longer discards what intake had not yet read** - found by the
   intake soak: with intake behind when the log rotated, the tailer restarted at offset 0 of the
   emptied file and every unread line of the old content, which by then existed only in

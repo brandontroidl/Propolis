@@ -64,8 +64,10 @@
       <td class="s-tr">
         {% if s.transport %}
           <span class="sev-tags">{% for t in s.transport %}{% if t.sev %}<span class="sev sev--{{ t.sev }}"{% if t.detail %} title="{{ t.detail }}"{% endif %}>{{ t.label }}</span>{% else %}<span class="dim">{{ t.label }}</span>{% endif %}{% endfor %}</span>
+        {% elif s.uploaded %}
+          <span class="dim" title="A sensor took this file from the address that sent it. Nothing was fetched, so there is no connection to authenticate.">n/a, uploaded</span>
         {% else %}
-          <span class="dim">not fetched</span>
+          <span class="dim" title="The file is in the fetcher's bucket but no successful fetch record names it.">not recorded</span>
         {% endif %}
       </td>
       <td class="s-vt">

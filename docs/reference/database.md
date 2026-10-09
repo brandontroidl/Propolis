@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-09
 -->
 
 # Database reference
@@ -322,6 +322,22 @@ and `campaign_session.payload`, the shapes folded into a run's key
 and a `credentials` row names only how a credential was carried, never its value. The working-state tables are pruned two
 days behind their sensor's clock (`crates/review/src/campaign/mod.rs#prune`).
 
+<a id="attack-tag-tables"></a>
+## ATT&CK tag tables (`0017_attack_tags.sql`)
+
+Derived by the same indexer, in the same transaction as each batch; the rules are in
+[attack-tagging](attack-tagging.md). They are emptied with the campaign tables in a full rebuild
+(`campaign_attack_tag` goes with its campaign).
+
+| table | holds | key | source |
+|---|---|---|---|
+| `attack_tag` | one row per source, session and rule: `technique_id`, the lowest `event_id` that satisfied the rule, the `matched` token (at most 256 characters), first and last seen, sightings; `session_id` is NULL for an event with none | `id`; partial UNIQUE `(source_ip, session_id, rule_id)` and `(source_ip, rule_id)` | `crates/core-scoring/migrations/0017_attack_tags.sql#attack_tag_session_uq` |
+| `campaign_attack_tag` | a campaign's tags: one row per rule, with the lowest `event_id` or the `artifact_sha256` that was the evidence | `(campaign_id, technique_id, rule_id)` | `crates/core-scoring/migrations/0017_attack_tags.sql#campaign_attack_tag` |
+
+`campaign_session.attack_pending` holds a shell run's tags (a JSON array of rule, event id and
+matched token) until the run joins a campaign
+(`crates/core-scoring/migrations/0017_attack_tags.sql#attack_pending`).
+
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)
 
 VirusTotal-style verdict per captured sample, keyed by SHA-256; links to a
@@ -440,6 +456,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0014` | tables `ip_vantage (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, the [breadth sets](#breadth-sets) the append path counts from; backfilled from the ledger under a `SHARE` lock on `event` |
 | `0015` | the [campaign and indicator tables](#campaign-tables) and the indexer's cursor (starting at 0, no backfill: the indexer reads the ledger in batches after startup) |
 | `0016` | `campaign_cursor.fingerprint_version` and `rebuild_until`, `campaign.min_shapes` and `max_shapes`, `campaign_session.payload` (see [campaign tables](#campaign-tables)); no data is rewritten, the indexer rebuilds the command-sequence campaigns itself on its next batch |
+| `0017` | the [ATT&CK tag tables](#attack-tag-tables) `attack_tag` and `campaign_attack_tag`, and `campaign_session.attack_pending`; no backfill |
 
 **review** (`crates/review/migrations/`):
 

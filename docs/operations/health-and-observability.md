@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-08
+last-verified: 2026-10-09
 -->
 
 # Health and observability
@@ -52,6 +52,14 @@ Both columns read bounded ranges of the ledger, never the whole of it, on every 
 |---|---|---|
 | 24h | events with `observed_at` in the last 24 hours | not counted |
 | Last event | the newest event in the last 30 days (`crates/console/src/routes/fleet.rs#ACTIVITY_LOOKBACK`) | `none in 30d`, which is also what a listener that never produced an event shows: the pane cannot tell the two apart without reading the whole ledger, so it does not claim `never` |
+
+The **Ledger** cell and the Evidence chain panel's **Events** row do not count the table either
+(`crates/console/src/routes/fleet.rs#ledger_head`, `crates/console/src/routes/rowcount.rs#capped_total`).
+Up to 100,000 events the number is a count and is shown bare. Past that it is the planner's row
+estimate (`pg_class.reltuples`, refreshed by autovacuum), shown as `about N` with the label
+`(estimate)`; it is never below the rows a count had already seen. The newest-ingest time is read
+off the newest row by `id` rather than `max(ingested_at)`, which has no index and reads every row.
+The Attackers page's total uses the same rule.
 
 Events recorded before sensors stamped `local_port` have no port. A sensor whose inventory
 declares exactly one listener received all of them there, so they count on that row. A sensor

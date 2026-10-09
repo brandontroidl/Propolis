@@ -620,6 +620,16 @@ td.score a { color: inherit; }
   tr.srow > td.s-tr { grid-area: tr; }
   tr.srow > td.s-dl { grid-area: dl; text-align: right; }
   .samples-panel .na { display: none; }
+  /* Most active: address and event count on top, the 24h strip and last seen under, the tags last. */
+  .active-panel table, .active-panel tbody, .active-panel tr, .active-panel td { display: block; width: auto; }
+  .active-panel thead, .active-panel colgroup { display: none; }
+  tr.arow { display: grid; gap: 0.35rem 0.8rem; align-items: center; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "ip events" "strip last" "what what"; }
+  tr.arow > td { padding: 0; border: none; }
+  tr.arow > td.a-ip { grid-area: ip; }
+  tr.arow > td.a-events { grid-area: events; text-align: right; }
+  tr.arow > td.a-strip { grid-area: strip; }
+  tr.arow > td.a-last { grid-area: last; text-align: right; white-space: normal; }
+  tr.arow > td.a-what { grid-area: what; }
 }
 
 /* -- Attackers paging and the tier/score note above the table -- */

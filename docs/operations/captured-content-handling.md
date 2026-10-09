@@ -64,11 +64,16 @@ Know these before an incident, because each one is the opposite of what you need
 1. **VirusTotal upload sends the file to a third party, automatically.** With
    `PROPOLIS_VT_ENABLED` and a key, every spooled body is looked up by hash. With
    `PROPOLIS_VT_UPLOAD=true` (default `false`), a body VirusTotal does not know is uploaded
-   in full, with no file-type filter and no per-sample approval
-   (`crates/review/src/virustotal.rs#scan_spool`, `crates/review/src/virustotal.rs#upload_sample`).
-   If a CSAM image arrives while upload is on, the node can distribute it to a third party
-   within one scan cycle (default 300 s). **Leave `PROPOLIS_VT_UPLOAD` off.** Hash lookup alone
-   sends only the digest.
+   in full, with no per-sample approval, if its content is executable or script content
+   (ELF, PE, Mach-O, Java class, DEX, scripts, and archives with such a member). Images,
+   video, audio, PDF, office documents and unrecognised types are kept local, decided from
+   the bytes and not from the file name
+   (`crates/review/src/virustotal.rs#scan_spool`, `crates/review/src/upload_filter.rs#decide`;
+   details in [malware custody](../security/malware-custody.md#virustotal-path-lookup-and-an-opt-in-type-filtered-upload)).
+   The filter is a heuristic on content, not a legal determination: an archive holding an
+   executable and an image goes out whole, and a misdetected body would too. **Leave
+   `PROPOLIS_VT_UPLOAD` off** if captures of illegal material are a concern. Hash lookup
+   alone sends only the digest.
 2. **Samples are deleted automatically after 30 days**, by age, with no hold mechanism
    (`crates/review/src/virustotal.rs#cleanup_old_samples`). Where a preservation duty may
    apply, an automatic delete is the wrong default; see "Quarantine one sample" for how to
@@ -104,8 +109,8 @@ Know these before an incident, because each one is the opposite of what you need
    - set `PROPOLIS_VT_UPLOAD` to `false` (or unset) and restart, or take the file out of the
      spool first (below). Check whether the digest was already sent:
      `SELECT sha256, detected, analyzed_at FROM sample_analysis WHERE sha256 = '<digest>';`
-     (`detected = -1` is "uploaded, no verdict yet", see
-     `crates/review/src/virustotal.rs#AnalysisState`). A row that exists means VirusTotal has
+     (`detected = -1` is "uploaded, no verdict yet", `detected = -2` is "looked up by hash,
+     not uploaded because of its type", see `crates/review/src/virustotal.rs#AnalysisState`). A row that exists means VirusTotal has
      been asked about it; whether it was uploaded is in the service journal (`vt: sample uploaded
      for analysis`).
    - do not Approve the source address in the review queue on the strength of that sample if

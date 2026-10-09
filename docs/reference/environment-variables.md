@@ -308,7 +308,7 @@ Opt-in egress, default off. See [integrations](integrations.md) and
 |---|---|---|---|
 | `PROPOLIS_VT_KEY` | no | `""` (`crates/propolis/src/config.rs#load_config`) | empty → VT disabled regardless of `_ENABLED` |
 | `PROPOLIS_VT_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
-| `PROPOLIS_VT_UPLOAD` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; upload-unknown-samples opt-in |
+| `PROPOLIS_VT_UPLOAD` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; upload-unknown-samples opt-in. Only executable or script content is uploaded, decided from the bytes (`crates/review/src/upload_filter.rs#decide`); images, video, audio, PDF, office documents and unknown types stay local. Hash lookups (digest only) happen for every type regardless. See [malware custody](../security/malware-custody.md#virustotal-path-lookup-and-an-opt-in-type-filtered-upload) |
 | `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`crates/propolis/src/config.rs#load_config`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
 | `PROPOLIS_VT_PENDING_RECHECK_SECS` | no | `900` | parse_u32; how long an uploaded sample with no verdict yet (`detected = -1`) waits before its hash is looked up again. Each recheck costs one daily-budget unit. Zero → every scan cycle. unparseable → abort. |
 

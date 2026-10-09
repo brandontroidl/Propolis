@@ -21,6 +21,20 @@
 
 ### Fixed
 
+- **VirusTotal upload sends only executable or script content** - with `PROPOLIS_VT_UPLOAD=true`
+  the scanner uploaded any captured file VirusTotal did not know, so an image or video an
+  attacker pushed (potentially illegal material) would have been sent to a third party within
+  one scan cycle. The upload now needs the body's CONTENT to be an ELF, PE, Mach-O, Java class,
+  DEX, a script (shell, Python, Perl, PHP, PowerShell or batch, by shebang or at least two strong
+  signatures), or a zip, tar or gzip archive in which a bounded look (64 entries, 1 MiB
+  decompressed, two levels deep) finds such a member; names and extensions are never consulted.
+  Images, video, audio, PDF, office documents, 7z, rar, bzip2, xz, zstd and anything unrecognised
+  stay local, and any detection error, limit or panic refuses. A refused body is still looked up by
+  hash (the request carries only the digest), is logged at INFO with its SHA-256 and detected type,
+  and gets a `sample_analysis` row `detected = -2, total = -2` so it is not looked up again. The
+  console renders negative values as "pending" and counts them in the pending metrics, so it needs a
+  companion change to tell `-2` from `-1`. The malware custody page no longer implies nothing
+  leaves without approval: it now describes the opt-in, type-filtered upload and the hash lookups.
 - **Command-sequence campaigns are one per tool, not one per session length** - observed on the
   live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
   keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns

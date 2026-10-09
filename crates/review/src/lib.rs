@@ -13,6 +13,7 @@ pub mod ioc;
 pub mod queue;
 pub mod spool;
 pub mod submit;
+pub mod upload_filter;
 pub mod vendor;
 pub mod virustotal;
 

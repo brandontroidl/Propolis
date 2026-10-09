@@ -1,5 +1,7 @@
 //! VirusTotal file analysis integration. Scans captured malware samples by
-//! SHA-256 lookup, optionally uploads unknown samples for analysis.
+//! SHA-256 lookup, optionally uploads unknown samples for analysis. A lookup sends only the
+//! hash; an upload (opt-in, `PROPOLIS_VT_UPLOAD`) sends only executable or script content, as
+//! decided from the bytes by [`crate::upload_filter`].
 //! Verified live against the VT v3 API 2026-08-19.
 //!
 //! Rate limit: VT free tier allows 4 requests/minute, 500/day. The scanner
@@ -32,7 +34,17 @@ pub enum AnalysisState {
     Pending(DateTime<Utc>),
     /// A real verdict is stored.
     Done,
+    /// VT did not know the hash and the body's content type is not eligible for upload, so it
+    /// stays local (see [`crate::upload_filter`]); the hash was already looked up once.
+    NotUploaded,
 }
+
+/// `sample_analysis.detected`/`total` of an uploaded sample still awaiting its verdict. The
+/// console renders `-1` as "pending".
+const STATUS_PENDING: i32 = -1;
+/// `sample_analysis.detected`/`total` of a body that was looked up but deliberately not uploaded
+/// because its content is not executable or script content.
+pub const STATUS_NOT_UPLOADED_TYPE: i32 = -2;
 
 /// Whether a body should cost a lookup this cycle. `Done` never does; `Unknown` always does; a
 /// pending upload does once its recheck window has elapsed. Before this, any row at all counted
@@ -40,7 +52,7 @@ pub enum AnalysisState {
 pub fn needs_lookup(state: &AnalysisState, now: DateTime<Utc>, recheck_secs: u64) -> bool {
     match state {
         AnalysisState::Unknown => true,
-        AnalysisState::Done => false,
+        AnalysisState::Done | AnalysisState::NotUploaded => false,
         AnalysisState::Pending(since) => {
             now.signed_duration_since(*since) >= chrono::Duration::seconds(recheck_secs as i64)
         }
@@ -138,6 +150,10 @@ mod tests {
         assert!(needs_lookup(&AnalysisState::Unknown, now, 900));
         assert!(!needs_lookup(&AnalysisState::Done, now, 900));
         assert!(
+            !needs_lookup(&AnalysisState::NotUploaded, now, 0),
+            "a body kept local for its type is never looked up again"
+        );
+        assert!(
             !needs_lookup(&AnalysisState::Pending(fresh), now, 900),
             "a pending row inside its window must not spend a budget unit"
         );
@@ -168,16 +184,53 @@ pub struct VtResult {
     pub link: String,
 }
 
+/// The two VirusTotal requests the scanner makes. A seam so tests drive the scan loop without a
+/// network: the lookup carries only the hash, the upload carries the body.
+#[async_trait::async_trait]
+pub trait VtApi: Send + Sync {
+    async fn lookup(&self, sha256: &str) -> Result<Option<VtResult>, String>;
+    async fn upload(&self, bytes: Vec<u8>, sha256: &str) -> Result<(), String>;
+}
+
+struct HttpVt {
+    client: reqwest::Client,
+    api_key: String,
+}
+
+#[async_trait::async_trait]
+impl VtApi for HttpVt {
+    async fn lookup(&self, sha256: &str) -> Result<Option<VtResult>, String> {
+        lookup_hash(&self.client, &self.api_key, sha256).await
+    }
+
+    async fn upload(&self, bytes: Vec<u8>, sha256: &str) -> Result<(), String> {
+        upload_sample(&self.client, &self.api_key, bytes, sha256).await
+    }
+}
+
 pub async fn scan_spool(
     pool: &PgPool,
     config: &VtConfig,
     spool_dirs: &[(&str, PathBuf)],
     budget: &mut DailyBudget,
 ) -> Vec<VtResult> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    let api = HttpVt {
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default(),
+        api_key: config.api_key.clone(),
+    };
+    scan_spool_with(&api, pool, config, spool_dirs, budget).await
+}
+
+pub async fn scan_spool_with(
+    api: &dyn VtApi,
+    pool: &PgPool,
+    config: &VtConfig,
+    spool_dirs: &[(&str, PathBuf)],
+    budget: &mut DailyBudget,
+) -> Vec<VtResult> {
     let mut results = Vec::new();
 
     for (sensor, dir) in spool_dirs {
@@ -199,7 +252,7 @@ pub async fn scan_spool(
 
             tokio::time::sleep(tokio::time::Duration::from_millis(config.request_delay_ms)).await;
 
-            match lookup_hash(&client, &config.api_key, &name).await {
+            match api.lookup(&name).await {
                 Ok(Some(result)) => {
                     if let Err(e) = store_result(pool, &result, sensor).await {
                         tracing::error!(sha256 = %name, error = %e, "vt: failed to store result");
@@ -221,6 +274,31 @@ pub async fn scan_spool(
                         tracing::info!(sha256 = %name[..12], "vt: sample not in VT database");
                     }
                     NextStep::Upload => {
+                        // Uploaded bytes are exactly the ones that hash to the name: a link or
+                        // swapped content in the spool must never send some other local file to
+                        // a third party.
+                        let bytes = match crate::spool::read_sample(dir, &name).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(sha256 = %name[..12], sensor, error = %e, "vt: sample failed verification, not uploaded");
+                                continue;
+                            }
+                        };
+                        // Only executable or script content leaves the host, decided from the
+                        // bytes. A refused body costs no budget and is never looked up again.
+                        let verdict = crate::upload_filter::decide(&bytes);
+                        if !verdict.upload {
+                            tracing::info!(
+                                sha256 = %name, kind = %verdict.kind,
+                                "vt: sample type not eligible for upload, kept local"
+                            );
+                            if let Err(e) =
+                                store_result(pool, &not_uploaded_result(&name), sensor).await
+                            {
+                                tracing::error!(sha256 = %name, error = %e, "vt: failed to store not-uploaded status");
+                            }
+                            continue;
+                        }
                         // The upload is a second API request: it draws on the same daily budget
                         // and keeps the same spacing as the lookup that preceded it.
                         if !budget.try_consume(Utc::now()) {
@@ -234,19 +312,9 @@ pub async fn scan_spool(
                             config.request_delay_ms,
                         ))
                         .await;
-                        // Uploaded bytes are exactly the ones that hash to the name: a link or
-                        // swapped content in the spool must never send some other local file to
-                        // a third party.
-                        let bytes = match crate::spool::read_sample(dir, &name).await {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(sha256 = %name[..12], sensor, error = %e, "vt: sample failed verification, not uploaded");
-                                continue;
-                            }
-                        };
-                        match upload_sample(&client, &config.api_key, bytes, &name).await {
+                        match api.upload(bytes, &name).await {
                             Ok(()) => {
-                                tracing::info!(sha256 = %name[..12], "vt: sample uploaded for analysis");
+                                tracing::info!(sha256 = %name[..12], kind = %verdict.kind, "vt: sample uploaded for analysis");
                                 let pending = pending_result(&name);
                                 let _ = store_result(pool, &pending, sensor).await;
                                 results.push(pending);
@@ -278,6 +346,7 @@ async fn analysis_state(pool: &PgPool, sha256: &str) -> AnalysisState {
     .await;
     match row {
         Ok(None) => AnalysisState::Unknown,
+        Ok(Some((STATUS_NOT_UPLOADED_TYPE, _))) => AnalysisState::NotUploaded,
         Ok(Some((detected, at))) if detected < 0 => AnalysisState::Pending(at),
         Ok(Some(_)) => AnalysisState::Done,
         Err(e) => {
@@ -292,9 +361,20 @@ async fn analysis_state(pool: &PgPool, sha256: &str) -> AnalysisState {
 fn pending_result(sha256: &str) -> VtResult {
     VtResult {
         sha256: sha256.to_string(),
-        detected: -1,
-        total: -1,
+        detected: STATUS_PENDING,
+        total: STATUS_PENDING,
         link: format!("https://www.virustotal.com/gui/file/{sha256}"),
+    }
+}
+
+/// The row for a body VT did not know and that was kept local because of its type. Its link is
+/// empty on purpose: nothing was sent, so there is no VT page for it.
+fn not_uploaded_result(sha256: &str) -> VtResult {
+    VtResult {
+        sha256: sha256.to_string(),
+        detected: STATUS_NOT_UPLOADED_TYPE,
+        total: STATUS_NOT_UPLOADED_TYPE,
+        link: String::new(),
     }
 }
 

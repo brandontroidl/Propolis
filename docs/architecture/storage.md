@@ -198,7 +198,10 @@ formulas owned by [reference/scoring-and-feed.md](../reference/scoring-and-feed.
   the feed.
 
 `sample_analysis` is a per-sample verdict table (detected/total engine hits, keyed by
-SHA-256) linking a captured sample to its VirusTotal-style result.
+SHA-256) linking a captured sample to its VirusTotal-style result. Two negative values are
+status markers, not counts: `-1/-1` is "uploaded, no verdict yet" and `-2/-2` is "looked up,
+not uploaded because the content is not executable or script content"
+(`crates/review/src/virustotal.rs#AnalysisState`).
 
 The scoring formula lives in Rust, not SQL. Exactly one migration embeds a scoring
 formula in SQL (a one-time eligibility backfill); a later migration explicitly refuses

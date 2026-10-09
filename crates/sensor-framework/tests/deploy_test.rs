@@ -2422,6 +2422,29 @@ fn the_logrotate_policy_runs_the_free_space_guard_per_log_before_rotating() {
     assert!(conf.contains("copytruncate"));
 }
 
+/// A `logger` that records its arguments instead of writing to the host's journal: PATH for the
+/// guard, with the recording file at `<dir>/logger.out`.
+fn stub_logger_path(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("stubbin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stub = bin.join("logger");
+    std::fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\n",
+            dir.join("logger.out").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 fn run_guard(log: &Path, reserve: &str) -> std::process::Output {
     std::process::Command::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2429,6 +2452,7 @@ fn run_guard(log: &Path, reserve: &str) -> std::process::Output {
     ))
     .arg(log)
     .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", reserve)
+    .env("PATH", stub_logger_path(log.parent().unwrap()))
     .output()
     .expect("failed to run deploy/logrotate-guard.sh")
 }
@@ -2640,6 +2664,7 @@ fn run_guard_reading(log: &Path, cursors: &Path, max_unread: &str) -> std::proce
         "PROPOLIS_SHIPPER_CURSOR_DIR",
         cursors.join("shipper-unused"),
     )
+    .env("PATH", stub_logger_path(log.parent().unwrap()))
     .output()
     .expect("failed to run deploy/logrotate-guard.sh")
 }
@@ -2898,4 +2923,133 @@ fn the_guard_still_refuses_for_free_space_before_reading_a_cursor() {
         "{}",
         stderr_of(&out)
     );
+}
+
+/// The daemon names the cursor by the resolved path, so a log reached through a symlinked
+/// directory finds the same cursor.
+#[test]
+fn the_guard_finds_the_cursor_of_a_log_reached_through_a_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    let log = real.join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 10_000]).unwrap();
+    // The cursor the daemon wrote: keyed by the resolved path.
+    save_cursor(&cursors, &log, inode_of(&log), 0, &fingerprint_of(&log));
+
+    for spelled in [
+        dir.path().join("link/events.jsonl"),
+        PathBuf::from(format!("{}//real/./events.jsonl", dir.path().display())),
+    ] {
+        let out = run_guard_reading(&spelled, &cursors, "5000");
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{spelled:?}: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("10000 unread bytes"),
+            "{}",
+            stderr_of(&out)
+        );
+    }
+}
+
+/// A second rotation pushed the generation the cursor names back to `.2`, so `.1` was never read:
+/// rotating would compress both.
+#[test]
+fn the_guard_skips_a_log_whose_cursor_is_still_in_the_second_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let (log, copy) = log_with_copy(dir.path());
+    let second = dir.path().join("events.jsonl.2");
+    std::fs::write(&second, vec![b'z'; 4096]).unwrap();
+    save_cursor(
+        &cursors,
+        &log,
+        inode_of(&log),
+        4096,
+        &fingerprint_of(&second),
+    );
+    assert_ne!(fingerprint_of(&second), fingerprint_of(&copy));
+
+    let out = run_guard_reading(&log, &cursors, "67108864");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("is still in"),
+        "{}",
+        stderr_of(&out)
+    );
+}
+
+/// Rotating without having seen a cursor is a blind spot: it reaches the journal at warning
+/// priority, not only the unit's stderr.
+#[test]
+fn the_guard_logs_a_warning_when_it_rotates_without_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    std::fs::write(&log, vec![b'x'; 4096]).unwrap();
+
+    let out = run_guard_reading(&log, &dir.path().join("cursors"), "5000");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let logged = std::fs::read_to_string(dir.path().join("logger.out")).unwrap_or_default();
+    assert!(logged.contains("-p daemon.warning"), "{logged}");
+    assert!(logged.contains("no usable intake cursor"), "{logged}");
+}
+
+/// A skip is an error exit to logrotate, but logrotate still writes its state file, which is what
+/// the daemon's `rotation-stale` alert reads: skipping for unread input is not "rotation stopped".
+#[test]
+fn a_log_skipped_for_unread_input_still_refreshes_the_state_file_and_fails_the_run() {
+    if std::process::Command::new("logrotate")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("logrotate is not installed here; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("cursors");
+    let log = dir.path().join("behind.jsonl");
+    std::fs::write(&log, vec![b'x'; 8192]).unwrap();
+    save_cursor(&cursors, &log, inode_of(&log), 0, &fingerprint_of(&log));
+
+    let shipped = deploy_file("logrotate-sensors.conf");
+    let stanza = &shipped[shipped.find('{').expect("policy has no stanza")..];
+    let guard = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/logrotate-guard.sh"
+    );
+    let stanza = stanza
+        .replace("/usr/local/sbin/propolis-logrotate-guard", guard)
+        .replace("size 100M", "size 1k");
+    let conf = dir.path().join("policy.conf");
+    std::fs::write(&conf, format!("{}\n{stanza}", log.display())).unwrap();
+    let state = dir.path().join("logrotate.state");
+
+    let out = std::process::Command::new("logrotate")
+        .arg("--state")
+        .arg(&state)
+        .arg(&conf)
+        .env("PROPOLIS_LOGROTATE_RESERVE_BYTES", "0")
+        .env("PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES", "100")
+        .env("PROPOLIS_CURSOR_DIR", &cursors)
+        .env("PATH", stub_logger_path(dir.path()))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a skipped log fails the run");
+    assert!(
+        !dir.path().join("behind.jsonl.1").exists(),
+        "the skipped log was not copied"
+    );
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().len(),
+        8192,
+        "left untouched"
+    );
+    assert!(state.exists(), "the state file is still written");
 }

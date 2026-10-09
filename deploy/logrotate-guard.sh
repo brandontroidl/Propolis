@@ -40,7 +40,9 @@
 #
 # When no cursor can be read (no cursor file under the intake or shipper cursor directory, an
 # unreadable or malformed one, or one for a different inode of the log) the log is ROTATED, as it
-# was before this check existed, and the reason is written to stderr. The alternative, refusing,
+# was before this check existed, and the reason is written to stderr and, at warning priority, to
+# the journal through logger(1) (config-check.sh also flags a log with no cursor). The cursor file
+# is named by the log path resolved with readlink -f, matching the daemon. The alternative, refusing,
 # would turn a missing or misplaced cursor (intake never started, a cursor directory moved off the
 # default and not visible to this unit) into a rotation that never runs: the exact disk-fill the
 # 6.6 GB incident was. Rotating keeps five generations on disk and loses nothing the tailer's own
@@ -72,6 +74,15 @@ note() {
     echo "propolis-logrotate-guard: $*" >&2
 }
 
+# A rotation that goes ahead because the guard could not see a cursor is a blind spot, not routine:
+# it also goes to the journal at warning priority, where a filter on priority finds it.
+warn() {
+    note "$*"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t propolis-logrotate-guard -p daemon.warning -- "$*" 2>/dev/null || true
+    fi
+}
+
 skip() {
     echo "propolis-logrotate-guard: skipping rotation of $log: $*. It is rotated on a later run once the reader has caught up; docs/operations/retention.md, 'Rotation while intake is behind'." >&2
     exit 1
@@ -79,10 +90,19 @@ skip() {
 
 copy="$log.1"
 live_inode="$(stat -c %i -- "$log")"
-path_hash="$(printf '%s' "$log" | sha256sum | cut -d' ' -f1)"
+# The daemon names the cursor file by the RESOLVED path (DurableCursor::cursor_file_path), so a
+# log reached through a symlink or a `//` finds the same cursor; readlink -f resolves the same way.
+resolved="$(readlink -f -- "$log" 2>/dev/null || true)"
+path_hash="$(printf '%s' "${resolved:-$log}" | sha256sum | cut -d' ' -f1)"
 if [ -z "$path_hash" ]; then
-    note "cannot derive the cursor file name for $log; rotating"
+    warn "cannot derive the cursor file name for $log; rotating"
     exit 0
+fi
+
+copy2="$log.2"
+copy2_hash=""
+if [ -f "$copy2" ]; then
+    copy2_hash="$(head -c 256 -- "$copy2" | sha256sum | cut -d' ' -f1)"
 fi
 
 copy_size=0
@@ -114,6 +134,11 @@ for dir in "$intake_dir" "$shipper_dir"; do
     usable=$((usable + 1))
     c_hash="$(printf '%s' "$c_fp" | tr ',' ' ' | awk '{ for (i = 1; i <= NF; i++) printf "%02x", $i }')"
 
+    if [ -n "$copy2_hash" ] && [ "$c_hash" = "$copy2_hash" ]; then
+        # A second rotation already pushed the generation the cursor names back to `.2`, and `.1`
+        # (rotated after it) has not been read at all. Rotating again would compress both.
+        skip "the cursor in $file is still in $copy2, and $copy has not been read"
+    fi
     if [ -n "$copy_hash" ] && [ "$c_hash" = "$copy_hash" ]; then
         # The cursor is still inside the old content: the reader has not finished with `.1`, or has
         # finished it and not yet seen the truncation. Its offset is a position in `.1`.
@@ -136,6 +161,6 @@ for dir in "$intake_dir" "$shipper_dir"; do
 done
 
 if [ "$usable" -eq 0 ]; then
-    note "no usable intake cursor for $log under $intake_dir or $shipper_dir; rotating without an unread-input check"
+    warn "no usable intake cursor for $log under $intake_dir or $shipper_dir; rotating without an unread-input check (docs/operations/retention.md, 'Rotation while intake is behind')"
 fi
 exit 0

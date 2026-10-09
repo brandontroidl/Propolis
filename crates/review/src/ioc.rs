@@ -31,8 +31,9 @@
 //! - `credentials` also carries `CoinHive site key`, from a `CoinHive.Anonymous(` or
 //!   `CoinHive.User(` call: that the miner is configured, never the key.
 //! - `rsa_key` also carries the SHA-256 of a known signing certificate found in a zip-format
-//!   artifact (an APK): today the public AOSP test key. Only a certificate stored uncompressed
-//!   is seen (the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` is not).
+//!   artifact (an APK): today the public AOSP test key. A certificate stored uncompressed is seen
+//!   (the APK Signing Block of v2 and later), and so is one inside a deflated `META-INF/*.RSA`
+//!   entry, inflated up to a small cap.
 //!
 //! A captured artifact that is not small UTF-8 text (a compiled bot) is scanned through its
 //! printable strings, the way `strings -a` lists them: runs of at least [`MIN_STRING_LEN`]
@@ -256,13 +257,37 @@ const MAX_CERT_CANDIDATES: usize = 64;
 /// The names of the `known` certificates whose DER appears whole inside `bytes`, when `bytes` is a
 /// zip (an APK is). A DER certificate is a SEQUENCE with a two-byte length (`30 82 LL LL`), so
 /// each place that starts one with a known total length is hashed and compared.
+///
+/// A v1 signature block (`META-INF/*.RSA`) that the zip deflated is inflated, up to
+/// [`MAX_SIG_BLOCK_INFLATE`], and scanned the same way; see [`deflated_signature_blocks`].
 fn known_signing_certs(bytes: &[u8], known: &[KnownCert]) -> Vec<&'static str> {
     if !bytes.starts_with(b"PK\x03\x04") {
         return Vec::new();
     }
     let mut found = Vec::new();
     let mut hashed = 0;
+    scan_for_certs(bytes, known, &mut hashed, &mut found);
+    for block in deflated_signature_blocks(bytes) {
+        if hashed >= MAX_CERT_CANDIDATES {
+            break;
+        }
+        scan_for_certs(&block, known, &mut hashed, &mut found);
+    }
+    found
+}
+
+/// Hash each place in `bytes` that starts a known-length DER certificate, adding matches to
+/// `found`. `hashed` is the candidate budget shared across every buffer of one artifact.
+fn scan_for_certs(
+    bytes: &[u8],
+    known: &[KnownCert],
+    hashed: &mut usize,
+    found: &mut Vec<&'static str>,
+) {
     for (at, window) in bytes.windows(4).enumerate() {
+        if *hashed >= MAX_CERT_CANDIDATES {
+            return;
+        }
         if window[0] != 0x30 || window[1] != 0x82 {
             continue;
         }
@@ -273,15 +298,127 @@ fn known_signing_certs(bytes: &[u8], known: &[KnownCert]) -> Vec<&'static str> {
         let Some(der) = bytes.get(at..at + total) else {
             continue;
         };
-        hashed += 1;
+        *hashed += 1;
         if Sha256::digest(der).as_slice() == cert.sha256 && !found.contains(&cert.name) {
             found.push(cert.name);
         }
-        if hashed >= MAX_CERT_CANDIDATES {
+    }
+}
+
+/// Most inflated bytes read from one deflated signature block. A v1 `.RSA` file is a PKCS#7
+/// SignedData holding the signer's certificate chain: a few KiB in practice (the AOSP test key's
+/// is about 1.7 KiB). 256 KiB is two orders of magnitude of headroom for a long chain and still
+/// bounds a decompression bomb to a fixed, small allocation.
+const MAX_SIG_BLOCK_INFLATE: usize = 256 * 1024;
+
+/// Most signature blocks inflated per artifact: an APK has one per signer.
+const MAX_SIG_BLOCKS: usize = 8;
+
+fn le16(d: &[u8], at: usize) -> Option<usize> {
+    Some(usize::from(u16::from_le_bytes(
+        d.get(at..at.checked_add(2)?)?.try_into().ok()?,
+    )))
+}
+
+fn le32(d: &[u8], at: usize) -> Option<usize> {
+    usize::try_from(u32::from_le_bytes(
+        d.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+    .ok()
+}
+
+/// The inflated contents of each deflated `META-INF/*.RSA` entry of the zip `data`, found through
+/// its central directory (the local headers of a streamed entry carry no sizes). An entry that is
+/// encrypted, cut off, corrupt or in another method is skipped, and a stored entry is already
+/// covered by the raw scan. The bytes are only hashed in memory; nothing is written or run.
+fn deflated_signature_blocks(data: &[u8]) -> Vec<Vec<u8>> {
+    use std::io::Read;
+    let mut blocks = Vec::new();
+    let tail_start = data.len().saturating_sub(22 + 65535);
+    let Some(eocd) = (tail_start..data.len().saturating_sub(21))
+        .rev()
+        .find(|&i| data[i..].starts_with(b"PK\x05\x06"))
+    else {
+        return blocks;
+    };
+    let (Some(total), Some(cd_size), Some(cd_off)) = (
+        le16(data, eocd + 10),
+        le32(data, eocd + 12),
+        le32(data, eocd + 16),
+    ) else {
+        return blocks;
+    };
+    let Some(cd_end) = cd_off.checked_add(cd_size).filter(|&e| e <= data.len()) else {
+        return blocks;
+    };
+    let mut pos = cd_off;
+    for _ in 0..total {
+        let Some(fixed_end) = pos.checked_add(46).filter(|&e| e <= cd_end) else {
+            break;
+        };
+        if &data[pos..pos + 4] != b"PK\x01\x02" {
+            break;
+        }
+        let (
+            Some(flags),
+            Some(method),
+            Some(csize),
+            Some(nlen),
+            Some(elen),
+            Some(clen),
+            Some(local),
+        ) = (
+            le16(data, pos + 8),
+            le16(data, pos + 10),
+            le32(data, pos + 20),
+            le16(data, pos + 28),
+            le16(data, pos + 30),
+            le16(data, pos + 32),
+            le32(data, pos + 42),
+        )
+        else {
+            break;
+        };
+        let Some(name_end) = fixed_end.checked_add(nlen).filter(|&e| e <= cd_end) else {
+            break;
+        };
+        let name = data[fixed_end..name_end].to_ascii_uppercase();
+        let Some(next) = name_end.checked_add(elen).and_then(|p| p.checked_add(clen)) else {
+            break;
+        };
+        pos = next;
+        if flags & 1 != 0
+            || method != 8
+            || !name.starts_with(b"META-INF/")
+            || !name.ends_with(b".RSA")
+        {
+            continue;
+        }
+        let raw = (|| {
+            if data.get(local..local.checked_add(4)?)? != b"PK\x03\x04" {
+                return None;
+            }
+            let start = local
+                .checked_add(30)?
+                .checked_add(le16(data, local + 26)?)?
+                .checked_add(le16(data, local + 28)?)?;
+            data.get(start..start.checked_add(csize)?)
+        })();
+        let Some(raw) = raw else {
+            continue;
+        };
+        let mut inflated = Vec::new();
+        // `take` stops the decoder at the cap, which is what bounds a bomb; a stream cut short
+        // still yields what was read before the error.
+        let _ = flate2::read::DeflateDecoder::new(raw)
+            .take(MAX_SIG_BLOCK_INFLATE as u64)
+            .read_to_end(&mut inflated);
+        blocks.push(inflated);
+        if blocks.len() >= MAX_SIG_BLOCKS {
             break;
         }
     }
-    found
+    blocks
 }
 
 fn signing_certs(text: &str, out: &mut Collector) {
@@ -1933,6 +2070,143 @@ Jx4u80n/q0WquQbw1QIDAQAB
         body.extend_from_slice(&der);
         assert_eq!(known_signing_certs(&body, &known), vec!["synthetic"]);
         assert!(known_signing_certs(&apk_like(&aosp_der()), &known).is_empty());
+    }
+
+    /// A zip built from `(name, method, stored bytes)` members: local headers, central
+    /// directory, end record. Method 8 members must already be raw deflate.
+    fn zip_of(members: &[(&str, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, method, data) in members {
+            let offset = out.len() as u32;
+            let size = (data.len() as u32).to_le_bytes();
+            out.extend_from_slice(b"PK\x03\x04");
+            out.extend_from_slice(&[20, 0, 0, 0]);
+            out.extend_from_slice(&method.to_le_bytes());
+            out.extend_from_slice(&[0; 4]); // time, date
+            out.extend_from_slice(&[0; 4]); // crc, unchecked by the reader
+            out.extend_from_slice(&size);
+            out.extend_from_slice(&size);
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(b"PK\x01\x02");
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+            central.extend_from_slice(&method.to_le_bytes());
+            central.extend_from_slice(&[0; 8]);
+            central.extend_from_slice(&size);
+            central.extend_from_slice(&size);
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0; 12]); // extra, comment, disk, attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_off = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+        out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(members.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    fn deflate(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A stand-in for a PKCS#7 signature block: framing bytes around the certificate.
+    fn signature_block(cert: &[u8]) -> Vec<u8> {
+        let mut block = vec![0x30, 0x80, 0x06, 0x09, 0x2A];
+        block.extend_from_slice(cert);
+        block.extend_from_slice(&[0xA1, 0x00, 0x31, 0x00]);
+        block
+    }
+
+    #[test]
+    fn a_deflated_signature_block_carrying_the_test_key_is_flagged() {
+        let block = signature_block(&aosp_der());
+        let deflated = deflate(&block);
+        assert!(
+            !deflated.windows(4).any(|w| w == [0x30, 0x82, 0x04, 0xA8]),
+            "fixture must hide the certificate from a raw scan"
+        );
+        let apk = zip_of(&[
+            ("classes.dex", 0, b"dex\n035\0".to_vec()),
+            ("META-INF/CERT.RSA", 8, deflated),
+        ]);
+        let (_, found) = extract_from_artifact(&apk).expect("scanned");
+        assert_eq!(
+            of(IocKind::RsaKey, &found),
+            vec![AOSP_FINGERPRINT.to_string()]
+        );
+    }
+
+    #[test]
+    fn only_a_deflated_signature_entry_is_inflated() {
+        let deflated = deflate(&signature_block(&aosp_der()));
+        for name in ["classes.dex", "assets/CERT.RSA", "META-INF/CERT.SF"] {
+            let apk = zip_of(&[(name, 8, deflated.clone())]);
+            assert!(
+                known_signing_certs(&apk, &KNOWN_SIGNING_CERTS).is_empty(),
+                "{name}"
+            );
+        }
+        // Names are matched without regard to case, as the platform's own signer lookup is.
+        let apk = zip_of(&[("meta-inf/release.rsa", 8, deflated)]);
+        assert_eq!(
+            known_signing_certs(&apk, &KNOWN_SIGNING_CERTS),
+            vec!["aosp-testkey"]
+        );
+    }
+
+    #[test]
+    fn a_signature_block_is_inflated_only_up_to_the_cap() {
+        let der = aosp_der();
+        let mut inside = vec![0u8; MAX_SIG_BLOCK_INFLATE - der.len()];
+        inside.extend_from_slice(&der);
+        assert_eq!(inside.len(), MAX_SIG_BLOCK_INFLATE);
+        let apk = zip_of(&[("META-INF/A.RSA", 8, deflate(&inside))]);
+        assert_eq!(
+            known_signing_certs(&apk, &KNOWN_SIGNING_CERTS),
+            vec!["aosp-testkey"]
+        );
+        // One byte too far: the stream is a few hundred bytes deflated, and the part beyond the
+        // cap is never produced.
+        let mut beyond = vec![0u8; MAX_SIG_BLOCK_INFLATE - der.len() + 1];
+        beyond.extend_from_slice(&der);
+        let packed = deflate(&beyond);
+        assert!(packed.len() < 2048, "{}", packed.len());
+        let apk = zip_of(&[("META-INF/A.RSA", 8, packed)]);
+        assert!(known_signing_certs(&apk, &KNOWN_SIGNING_CERTS).is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_or_cut_signature_entry_is_skipped_not_fatal() {
+        let deflated = deflate(&signature_block(&aosp_der()));
+        let cut = deflated[..deflated.len() / 2].to_vec();
+        let garbage = vec![0xFF; 64];
+        let apk = zip_of(&[
+            ("META-INF/A.RSA", 8, garbage),
+            ("META-INF/B.RSA", 8, cut),
+            ("META-INF/C.RSA", 8, deflated),
+        ]);
+        assert_eq!(
+            known_signing_certs(&apk, &KNOWN_SIGNING_CERTS),
+            vec!["aosp-testkey"]
+        );
+        // A central directory that points outside the body ends the walk quietly.
+        let mut broken = zip_of(&[("META-INF/A.RSA", 8, vec![1, 2, 3])]);
+        let at = broken.len() - 6;
+        broken[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(known_signing_certs(&broken, &KNOWN_SIGNING_CERTS).is_empty());
     }
 
     #[test]

@@ -10,7 +10,8 @@
   `CoinHive.User(` call is an embedded-credentials flag `CoinHive site key`, never the key
   itself; and a zip carrying the public AOSP test key certificate (SHA-256 `A4:0D:A8:0A...:F5:DC`)
   is an RSA-key indicator naming it. The certificate is seen when it is stored uncompressed, as
-  in the APK Signing Block of v2 and later; a deflated `META-INF/*.RSA` of a v1-only APK is not.
+  in the APK Signing Block of v2 and later, and inside a deflated `META-INF/*.RSA` entry of a
+  v1-signed APK, which is inflated in memory up to 256 KiB (a signature block is a few KiB).
   No schema change: the three reuse existing indicator kinds.
 - **CI lints the shell scripts** - a `shellcheck` job (the v0.11.0 image, pinned by digest) runs
   over `deploy/*.sh` and `scripts/**/*.sh`. Its nine findings in `deploy/config-check.sh` and

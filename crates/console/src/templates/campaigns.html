@@ -56,7 +56,7 @@
       <td class="active-cell c-active" title="{{ c.active_title }}">{{ c.active }}</td>
       <td class="c-sensors"><span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>
       <td class="c-delivers">
-        {% if c.first_sample %}<a class="mono" href="/samples/{{ c.first_sample.sha256 }}" title="{{ c.first_sample.sha256 }}">{{ c.first_sample.short }}</a>{% if c.sample_count > 1 %} <span class="dim">+{{ c.sample_count - 1 }} more</span>{% endif %}{% if c.worm %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
+        {% if c.first_sample %}{{ m.hash_link(c.first_sample.sha256) }}{% if c.sample_count > 1 %} <span class="dim">+{{ c.sample_count - 1 }} more</span>{% endif %}{% if c.worm %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
         {% else %}<span class="dim">-</span>{% endif %}
       </td>
     </tr>

@@ -1,6 +1,7 @@
+{% import "macros.html" as m %}
 {#- What the review fetcher did with the URL a download event named, beside that event. -#}
 {% macro fetch_line(f) -%}
-<span class="c-sub"><span class="sev sev--{% if f.kind == "captured" %}high{% elif f.kind == "unsupported" or f.kind == "unqueued" %}low{% else %}watch{% endif %}">{{ f.label }}</span>{% if f.reason %} {{ f.reason }}{% endif %}{% if f.sample %} <a href="/samples/{{ f.sample.sha256 }}" title="{{ f.sample.sha256 }}">{{ f.sample.short }}...</a>{% if f.bytes %}, {{ f.bytes }}{% endif %}{% endif %}{% if f.when %}, {{ f.when }}{% endif %}</span>
+<span class="c-sub">{{ m.fetch_tag(f.kind, f.label) }}{% if f.reason %} {{ f.reason }}{% endif %}{% if f.sample %} {{ m.hash_link(f.sample.sha256) }}{% if f.bytes %}, {{ f.bytes }}{% endif %}{% endif %}{% if f.when %}, {{ f.when }}{% endif %}</span>
 {%- endmacro %}
 
 {#- A command that had line breaks reads as its lines, numbered, like an echo loader's chunk list;

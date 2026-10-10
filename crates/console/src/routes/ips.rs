@@ -34,7 +34,7 @@ use sqlx::PgPool;
 use crate::AppState;
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
-use crate::routes::format::{format_relative_time, format_timestamp, group_digits};
+use crate::routes::format::{format_relative_time, format_timestamp, group_digits, score_pct};
 use crate::routes::rowcount::{COUNT_CAP, Count, capped_total};
 
 pub fn router() -> Router<AppState> {
@@ -113,6 +113,7 @@ enum Cursor {
 struct IpRow {
     ip: String,
     raw_score: String,
+    score_pct: u32,
     tier: String,
     event_count: i32,
     distinct_categories: i32,
@@ -172,6 +173,7 @@ async fn ip_list(
         .map(|r| IpRow {
             ip: r.ip,
             raw_score: format!("{:.1}", r.score),
+            score_pct: score_pct(r.score),
             tier: if r.tier.is_empty() {
                 "-".into()
             } else {

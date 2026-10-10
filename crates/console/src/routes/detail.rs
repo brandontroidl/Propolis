@@ -842,9 +842,9 @@ async fn detail(
         degraded,
         ip => ip.to_string(),
         raw_score => format!("{:.1}", score.raw_score),
-        raw_score_pct => raw_f64.clamp(0.0, 100.0).round() as u32,
+        raw_score_pct => crate::routes::format::score_pct(raw_f64),
         effective_score => format!("{:.1}", effective),
-        effective_score_pct => effective_f64.clamp(0.0, 100.0).round() as u32,
+        effective_score_pct => crate::routes::format::score_pct(effective_f64),
         tier => score.tier.map(tier_label).unwrap_or("-"),
         eligible => score.eligible,
         // Which way the delist control points. Delisting is reversible by design ("until you say

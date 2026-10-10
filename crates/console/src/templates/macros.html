@@ -12,6 +12,12 @@
 <code class="ioc-value">{{ i.defanged }}</code> <span class="ioc-copy"><button type="button" class="copy-btn" data-copy="{{ i.defanged }}" title="Copy the defanged form">copy</button> <button type="button" class="copy-btn copy-btn--live" data-copy="{{ i.value }}" title="Copy the live, followable value">copy original</button></span>
 {%- endmacro %}
 
+{#- A sample by its SHA-256: the first 12 hex characters, linked to its page, the whole digest in
+    the title. One form everywhere, so a hash reads the same on every page that names it. -#}
+{% macro hash_link(sha) -%}
+<a class="mono" href="/samples/{{ sha }}" title="{{ sha }}">{{ sha[:12] }}&hellip;</a>
+{%- endmacro %}
+
 {#- ATT&CK techniques with the evidence that tagged each (`routes::attack`), as one list: the
     technique id as a neutral `.sev` chip (no severity class: a technique is a label, not a
     verdict), its name, then one dim line per rule with the token it matched. `matched` is
@@ -20,16 +26,35 @@
 <ul class="campaign-refs technique-list">
   {% for t in techniques %}
   <li><span class="sev" title="ATT&amp;CK {{ t.matrix }}">{{ t.id }}</span> {{ t.name }}
-    {% for e in t.evidence %}<span class="c-sub"><span class="dim">{{ e.rule }}</span> <code class="ioc-value">{{ e.matched }}</code>{% if e.event_id %} <span class="dim">event {{ e.event_id }}</span>{% endif %}{% if e.artifact %} <a class="mono" href="/samples/{{ e.artifact }}">sample {{ e.artifact[:12] }}</a>{% endif %}</span>{% endfor %}
+    {% for e in t.evidence %}<span class="c-sub"><span class="dim">{{ e.rule }}</span> <code class="ioc-value">{{ e.matched }}</code>{% if e.event_id %} <span class="dim">event {{ e.event_id }}</span>{% endif %}{% if e.artifact %} sample {{ hash_link(e.artifact) }}{% endif %}</span>{% endfor %}
     {% if t.more > 0 %}<span class="c-sub dim">+{{ t.more }} more</span>{% endif %}
   </li>
   {% endfor %}
 </ul>
 {%- endmacro %}
 
-{#- The class that colours a score by its feed tier, shared by the pending and history rows. -#}
-{% macro score_class(tier) -%}
-{% if tier == "aggressive" %}score--aggressive{% elif tier == "standard" %}score--standard{% else %}score--none{% endif %}
+{#- A score as the redesign drew it on every page: a short meter on the heat ramp (grey under 50,
+    then amber, orange, red at 90) and the number in ink. `pct` is the score clamped to 0-100. -#}
+{% macro score_meter(score, pct) -%}
+<span class="meter"><span class="meter-fill{% if pct >= 90 %} meter-fill--crit{% elif pct >= 75 %} meter-fill--high{% elif pct >= 50 %} meter-fill--warn{% endif %} pct-{{ pct }}"></span></span>{{ score }}
+{%- endmacro %}
+
+{#- A VirusTotal verdict, one wording on every page. Detections are a finding, on the same rung as
+    a captured fetch; zero detections is a neutral count, because no engine flagging a file is not
+    proof it is harmless; the states with no verdict are quiet words. -#}
+{% macro vt_verdict(detected, total, link, has_sha) -%}
+{% if detected is defined and detected is not none %}{% if detected > 0 %}<a class="sev sev--high" href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ detected }}/{{ total }} detected</a>{% elif detected == -1 %}<a class="dim" href="{{ link }}" target="_blank" rel="noopener noreferrer">pending</a>{% elif detected == -2 %}<span class="dim" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>{% else %}<a class="sev" href="{{ link }}" target="_blank" rel="noopener noreferrer" title="No engine flagged it. That is not proof the file is harmless.">0/{{ total }} detections</a>{% endif %}{% elif has_sha %}<span class="dim">not scanned</span>{% else %}<span class="dim">-</span>{% endif %}
+{%- endmacro %}
+
+{#- What the review fetcher did with a URL (`kind` from `routes::detail`'s fetch classification):
+    a capture is the high rung, a URL outside the fetcher's reach is low, the rest want a look. -#}
+{% macro fetch_tag(kind, label) -%}
+<span class="sev sev--{% if kind == "captured" %}high{% elif kind == "unsupported" or kind == "unqueued" %}low{% else %}watch{% endif %}">{{ label }}</span>
+{%- endmacro %}
+
+{#- A campaign an address or sample belongs to, phrased the same wherever it is listed. -#}
+{% macro campaign_ref(c) -%}
+<a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}{% if c.role == "infected host" %}, likely infected hosts{% endif %}{% if c.pending and c.pending > 0 %}, {{ c.pending }} pending review{% endif %}</span>
 {%- endmacro %}
 
 {#- The feed tier, the one way every page shows it: a Title-case pill on the severity ramp. -#}

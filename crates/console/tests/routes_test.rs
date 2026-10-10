@@ -2553,10 +2553,10 @@ async fn detail_malware_panel_groups_repeated_uploads_of_one_sha(pool: PgPool) {
         panel.contains("bbbb3ba075a5"),
         "the distinct sample must not be crowded off the panel by repeats of another: {panel}"
     );
-    // The table cell renders the 12-char short form followed by "..."; the full sha in the
+    // The table cell renders the 12-char short form followed by an ellipsis; the full sha in the
     // title attribute does not match this string, so this counts rows.
     assert_eq!(
-        panel.matches("aaaa3ba075a5...").count(),
+        panel.matches("aaaa3ba075a5&hellip;").count(),
         1,
         "the repeated sha must render as ONE row, not one per upload: {panel}"
     );
@@ -3023,7 +3023,7 @@ async fn detail_renders_a_pending_vt_upload_as_pending_not_clean(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains("pending VT analysis"),
+        body.contains("rel=\"noopener noreferrer\">pending</a>"),
         "a -1 verdict must render as pending: {body}"
     );
     assert!(
@@ -3058,7 +3058,7 @@ async fn detail_renders_a_sample_kept_local_for_its_type_as_not_uploaded(pool: P
     let panel = &body[start..];
     let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
     assert!(panel.contains("not uploaded (type)"), "{panel}");
-    assert!(!panel.contains("pending VT analysis"), "{panel}");
+    assert!(!panel.contains(">pending</a>"), "{panel}");
     assert!(!panel.contains("detections"), "{panel}");
 }
 
@@ -7550,9 +7550,12 @@ fn listed_ips(body: &str) -> Vec<String> {
 
 /// The scores an Attackers page lists, in order.
 fn listed_scores(body: &str) -> Vec<f64> {
-    body.split(r#"<td class="count"><strong>"#)
+    body.split(r#"<td class="count score">"#)
         .skip(1)
-        .map(|rest| rest[..rest.find('<').unwrap()].parse().unwrap())
+        .map(|rest| {
+            let number = &rest[rest.find("</span></span>").unwrap() + "</span></span>".len()..];
+            number[..number.find('<').unwrap()].parse().unwrap()
+        })
         .collect()
 }
 

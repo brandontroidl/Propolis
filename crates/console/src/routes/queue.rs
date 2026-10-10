@@ -36,9 +36,10 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::detail::extract_detail;
 use crate::routes::error::AppError;
 use crate::routes::format::{
-    format_active, format_sensor_label, format_timestamp, group_digits, signal_severity,
+    format_active, format_sensor_label, format_timestamp, group_digits, score_pct, signal_severity,
     signal_tag_label, tier_label,
 };
+use rust_decimal::prelude::ToPrimitive;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -169,6 +170,8 @@ struct QueueRowView {
     state: &'static str,
     is_pending: bool,
     score: String,
+    /// The score's meter width (`format::score_pct`).
+    score_pct: u32,
     tier: &'static str,
     event_count: i32,
     /// The pending tab's "Active" cell ([`format_active`]) and its exact-timestamps `title`.
@@ -236,7 +239,7 @@ struct QueueGroup {
     what: Option<Notable>,
     /// The group's top member, which also fixes its position under the current sort.
     top_score: String,
-    top_tier: &'static str,
+    top_pct: u32,
     rows: Vec<QueueRowView>,
 }
 
@@ -523,7 +526,7 @@ fn group_pending(
                     infected: home.role == "infected host",
                     what: None,
                     top_score: row.score.clone(),
-                    top_tier: row.tier,
+                    top_pct: row.score_pct,
                     rows: Vec::new(),
                 }),
                 row: None,
@@ -952,6 +955,7 @@ fn row_view(
         state: review_state_label(review_state),
         is_pending: review_state == ReviewState::Pending,
         score: format!("{:.1}", score.raw_score),
+        score_pct: score_pct(score.raw_score.to_f64().unwrap_or(0.0)),
         tier: score.tier.map(tier_label).unwrap_or("-"),
         event_count: score.event_count,
         active,

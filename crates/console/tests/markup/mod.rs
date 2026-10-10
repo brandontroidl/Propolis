@@ -138,11 +138,21 @@ pub fn panel_violations(html: &str) -> Vec<String> {
     out
 }
 
-/// Every place `html` uses a chip outside its job: a tier is the `.tier` pill, never a bare
-/// `.tier-*` colour, and the chip and count styles later work invented beside the system's own
-/// are gone.
+/// Every place `html` uses a chip outside its job. A review-state pill says approved, rejected
+/// or snoozed and nothing else (it had spread over yes/no answers and VirusTotal verdicts,
+/// painting benign negatives in alarm red); a tier is the `.tier` pill, never a bare `.tier-*`
+/// colour; a score is never coloured by tier; and the chip and count styles later work invented
+/// beside the system's own are gone.
 pub fn vocabulary_violations(html: &str) -> Vec<String> {
     let mut out = Vec::new();
+    for (at, _) in html.match_indices("class=\"state-pill ") {
+        let rest = &html[at..];
+        let text = &rest[rest.find('>').unwrap() + 1..];
+        let text = &text[..text.find('<').unwrap()];
+        if !["approved", "rejected", "snoozed", "pending"].contains(&text) {
+            out.push(format!("review-state pill used for {text:?}"));
+        }
+    }
     walk(
         html,
         |_, e| {
@@ -157,6 +167,9 @@ pub fn vocabulary_violations(html: &str) -> Vec<String> {
                 "fold-count",
                 "log-count",
                 "chunk-count",
+                "score--aggressive",
+                "score--standard",
+                "score--none",
             ] {
                 if e.has(retired) {
                     out.push(format!("retired style .{retired}: {}", e.describe()));

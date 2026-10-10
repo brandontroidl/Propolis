@@ -27,11 +27,11 @@
 <div class="stat-row">
   <div class="stat-card stat-card--attention">
     <div class="label">Raw score</div>
-    <div class="value"><span class="meter"><span class="meter-fill{% if raw_score_pct >= 90 %} meter-fill--crit{% elif raw_score_pct >= 75 %} meter-fill--high{% elif raw_score_pct >= 50 %} meter-fill--warn{% endif %} pct-{{ raw_score_pct }}"></span></span>{{ raw_score }}</div>
+    <div class="value">{{ m.score_meter(raw_score, raw_score_pct) }}</div>
   </div>
   <div class="stat-card stat-card--attention">
     <div class="label">Effective score</div>
-    <div class="value"><span class="meter"><span class="meter-fill{% if effective_score_pct >= 90 %} meter-fill--crit{% elif effective_score_pct >= 75 %} meter-fill--high{% elif effective_score_pct >= 50 %} meter-fill--warn{% endif %} pct-{{ effective_score_pct }}"></span></span>{{ effective_score }}</div>
+    <div class="value">{{ m.score_meter(effective_score, effective_score_pct) }}</div>
   </div>
   <div class="stat-card">
     <div class="label">Tier</div>
@@ -73,7 +73,7 @@
   <div class="panel-body">
   <ul class="campaign-refs">
     {% for c in campaigns %}
-    <li><a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}{% if c.role == "infected host" %}, members are likely infected hosts{% endif %}{% if c.pending > 0 %}, {{ c.pending }} pending review{% endif %}</span></li>
+    <li>{{ m.campaign_ref(c) }}</li>
     {% endfor %}
   </ul>
   </div>
@@ -149,7 +149,7 @@
      "every malicious url this IP referenced".
    The Origin column and the dim caveat keep that difference visible. #}
 {% macro via_note(lead) -%}
-<p class="table-note">{{ lead }}{{ via_other_reporters | length }} sample{% if via_other_reporters | length != 1 %}s{% endif %} via a URL first reported by another address: {% for v in via_other_reporters %}<a class="mono" href="/samples/{{ v.sha256 }}" title="{{ v.sha256 }}">{{ v.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}. This address asked for the same URL later; see the table below.</p>
+<p class="table-note">{{ lead }}{{ via_other_reporters | length }} sample{% if via_other_reporters | length != 1 %}s{% endif %} via a URL first reported by another address: {% for v in via_other_reporters %}{{ m.hash_link(v.sha256) }}{% if not loop.last %} {% endif %}{% endfor %}. This address asked for the same URL later; see the table below.</p>
 {%- endmacro %}
 <div class="panel">
   <div class="panel-head">Malware from this IP <span class="dim">uploaded, or first to report the URL</span></div>
@@ -157,32 +157,16 @@
   <table class="table-compact">
     <thead><tr><th>Origin</th><th>File / URL</th><th>Sensor / payload host</th><th>Size</th><th>SHA-256</th><th>Status</th><th>VirusTotal</th><th>Scanned</th></tr></thead>
     <tbody>
-      {% for m in malware %}
+      {% for mw in malware %}
       <tr>
-        <td><span class="sev">{% if m.origin == "uploaded" %}uploaded{% else %}fetched{% endif %}</span></td>
-        <td class="mono wrap-24">{% if m.url %}{{ m.url }}{% else %}<span class="dim">(no name)</span>{% endif %}</td>
-        <td class="mono">{{ m.host }}{% if m.pinned_ip and m.pinned_ip != m.host %} <span class="dim">({{ m.pinned_ip }})</span>{% endif %}</td>
-        <td class="mono">{% if m.bytes %}{{ m.bytes }}{% else %}<span class="dim">-</span>{% endif %}</td>
-        <td class="mono">{% if m.sha256_short %}<span title="{{ m.sha256 }}">{{ m.sha256_short }}...</span>{% else %}<span class="dim">-</span>{% endif %}</td>
-        <td>{{ m.status }}{% if m.end_reason %} <span class="dim">({{ m.end_reason }})</span>{% endif %}</td>
-        <td>
-          {% if m.detected is defined and m.detected is not none %}
-            {% if m.detected > 0 %}
-            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ m.detected }}/{{ m.total }} detected</a>
-            {% elif m.detected == -1 %}
-            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
-            {% elif m.detected == -2 %}
-            <span class="state-pill state-snoozed" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
-            {% else %}
-            <a href="{{ m.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ m.total }} detections</a>
-            {% endif %}
-          {% elif m.sha256_short %}
-            <span class="state-pill state-snoozed">not yet scanned</span>
-          {% else %}
-            <span class="dim">-</span>
-          {% endif %}
-        </td>
-        <td class="seen">{% if m.analyzed_at %}{{ m.analyzed_at }}{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td><span class="sev">{% if mw.origin == "uploaded" %}uploaded{% else %}fetched{% endif %}</span></td>
+        <td class="mono wrap-24">{% if mw.url %}{{ mw.url }}{% else %}<span class="dim">(no name)</span>{% endif %}</td>
+        <td class="mono">{{ mw.host }}{% if mw.pinned_ip and mw.pinned_ip != mw.host %} <span class="dim">({{ mw.pinned_ip }})</span>{% endif %}</td>
+        <td class="mono">{% if mw.bytes %}{{ mw.bytes }}{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td>{% if mw.sha256_short %}{{ m.hash_link(mw.sha256) }}{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td>{{ mw.status }}{% if mw.end_reason %} <span class="dim">({{ mw.end_reason }})</span>{% endif %}</td>
+        <td>{{ m.vt_verdict(mw.detected, mw.total, mw.vt_link, mw.sha256_short) }}</td>
+        <td class="seen">{% if mw.analyzed_at %}{{ mw.analyzed_at }}{% else %}<span class="dim">-</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -208,30 +192,10 @@
       <tr>
         <td class="mono wrap-24">{{ u.url }}</td>
         <td class="seen"><span class="run-count">x{{ u.seen_count }}</span> <span class="dim">{{ u.first_seen }}{% if u.last_seen != u.first_seen %} to {{ u.last_seen }}{% endif %}</span></td>
-        <td>
-          {% if u.kind == "captured" %}<span class="state-pill state-rejected">{{ u.outcome }}</span>
-          {% elif u.kind == "failed" or u.kind == "refused" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
-          {% else %}<span class="dim">{{ u.outcome }}</span>{% endif %}
-        </td>
-        <td class="mono">{% if u.first_reporter %}<a href="/ip/{{ u.first_reporter }}">{{ u.first_reporter }}</a> <span class="dim">{{ u.queued_at }}</span>{% elif u.queued_at %}<span class="dim">this address, {{ u.queued_at }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
-        <td class="mono">{% if u.sha256_short %}<span title="{{ u.sha256 }}">{{ u.sha256_short }}...</span>{% if u.bytes %} <span class="dim">{{ u.bytes }}</span>{% endif %}{% else %}<span class="dim">-</span>{% endif %}</td>
-        <td>
-          {% if u.detected is defined and u.detected is not none %}
-            {% if u.detected > 0 %}
-            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-rejected">{{ u.detected }}/{{ u.total }} detected</a>
-            {% elif u.detected == -1 %}
-            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-snoozed">pending VT analysis</a>
-            {% elif u.detected == -2 %}
-            <span class="state-pill state-snoozed" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
-            {% else %}
-            <a href="{{ u.vt_link }}" target="_blank" rel="noopener noreferrer" class="state-pill state-approved" title="No engine flagged it. That is not proof the file is harmless.">0/{{ u.total }} detections</a>
-            {% endif %}
-          {% elif u.sha256_short %}
-            <span class="state-pill state-snoozed">not yet scanned</span>
-          {% else %}
-            <span class="dim">-</span>
-          {% endif %}
-        </td>
+        <td>{{ m.fetch_tag(u.kind, u.outcome) }}</td>
+        <td class="mono">{% if u.first_reporter %}{{ m.ip_evidence_link(u.first_reporter) }} <span class="dim">{{ u.queued_at }}</span>{% elif u.queued_at %}<span class="dim">this address, {{ u.queued_at }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td>{% if u.sha256_short %}{{ m.hash_link(u.sha256) }}{% if u.bytes %} <span class="dim">{{ u.bytes }}</span>{% endif %}{% else %}<span class="dim">-</span>{% endif %}</td>
+        <td>{{ m.vt_verdict(u.detected, u.total, u.vt_link, u.sha256_short) }}</td>
       </tr>
       {% endfor %}
     </tbody>

@@ -495,12 +495,9 @@ tr.queue-context .sev-tags { display: inline-flex; }
 /* Fixed layout with shared column widths so the member tables nested in a group line up under the
    page's headers; the widths come from the <colgroup> in macros.html. */
 .queue-panel--pending table { table-layout: fixed; }
-.qc-ip { width: 17%; } .qc-score { width: 7%; } .qc-tier { width: 10%; } .qc-events { width: 7%; } .qc-active { width: 21%; } .qc-actions { width: 38%; }
+.qc-ip { width: 16%; } .qc-score { width: 11%; } .qc-tier { width: 10%; } .qc-events { width: 7%; } .qc-active { width: 21%; } .qc-actions { width: 35%; }
 .queue-panel td.ip { white-space: normal; overflow-wrap: anywhere; }
 td.score { font-weight: 600; }
-.score--aggressive { color: var(--alert-text); }
-.score--standard { color: var(--attention-text); }
-.score--none { color: var(--text-muted); }
 td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted); white-space: nowrap; }
 /* A group is one item: a grey rail down its whole left edge (header and, when open, the members)
    and a heavier rule under it, so where it ends is as plain as where it starts. Grey, because a
@@ -588,7 +585,6 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .c-unit { display: none; font-size: 0.74rem; font-weight: 400; color: var(--text-muted); }
 .c-sub { display: block; font-size: 0.72rem; color: var(--text-faint); }
 .s-hash a { color: var(--text); }
-td.score a { color: inherit; }
 .samples-panel td.ip { white-space: normal; }
 @media (max-width: 640px) {
   .campaigns-panel table, .campaigns-panel tbody, .campaigns-panel tr, .campaigns-panel td,

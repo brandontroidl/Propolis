@@ -12,7 +12,7 @@
   <div class="panel-body">
   <ul class="campaign-refs">
     {% for c in campaigns %}
-    <li><a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}, members treated as {{ c.role }}</span></li>
+    <li>{{ m.campaign_ref(c) }}</li>
     {% endfor %}
   </ul>
   </div>

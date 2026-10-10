@@ -1,7 +1,7 @@
 {% import "macros.html" as m %}
 <tr id="row-{{ row.ip }}">
   <td class="ip">{{ m.ip_evidence_link(row.ip) }}</td>
-  <td class="score {{ m.score_class(row.tier) }}">{{ row.score }}</td>
+  <td class="score">{{ m.score_meter(row.score, row.score_pct) }}</td>
   <td>
     {{ m.tier_pill(row.tier) }}
   </td>

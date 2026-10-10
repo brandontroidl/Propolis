@@ -26,6 +26,15 @@ pub(crate) fn group_digits(n: i64) -> String {
     out
 }
 
+/// A score as the whole percent its meter is drawn at (`macros.html#score_meter`, whose `pct-N`
+/// classes run 0 to 100), so every page fills the same score to the same width.
+pub(crate) fn score_pct(score: f64) -> u32 {
+    if score.is_nan() {
+        return 0;
+    }
+    score.clamp(0.0, 100.0).round() as u32
+}
+
 /// The lowercase display label for a feed tier, matching the CSS class suffixes in
 /// `templates/base_head.html` (`.tier-aggressive` / `.tier-standard`).
 pub(crate) fn tier_label(t: FeedTier) -> &'static str {
@@ -292,6 +301,20 @@ mod tests {
         assert_eq!(group_digits(29296), "29,296");
         assert_eq!(group_digits(1234567), "1,234,567");
         assert_eq!(group_digits(-1234), "-1,234");
+    }
+
+    /// The meter draws `pct-N` for N in 0..=100 only, so every score must land in that range: a
+    /// live score past 100 (breadth weighting) or a NaN would name a class that does not exist and
+    /// render an empty meter.
+    #[test]
+    fn score_pct_always_names_an_existing_meter_width() {
+        assert_eq!(super::score_pct(0.0), 0);
+        assert_eq!(super::score_pct(49.4), 49);
+        assert_eq!(super::score_pct(89.5), 90);
+        assert_eq!(super::score_pct(100.0), 100);
+        assert_eq!(super::score_pct(134.2), 100);
+        assert_eq!(super::score_pct(-3.0), 0);
+        assert_eq!(super::score_pct(f64::NAN), 0);
     }
 
     fn at(s: &str) -> DateTime<Utc> {

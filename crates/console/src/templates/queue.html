@@ -48,7 +48,7 @@ rest.</p>
             </span>
             {% if g.what %}<span class="ctx-what qg-what"><span class="ctx-verb">{% if g.what.kind == "upload" %}uploaded{% elif g.what.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ g.what.full }}">{{ g.what.text }}</code></span>{% endif %}
             <span class="qg-side">
-              <span class="qg-top"><span class="dim">top</span> <span class="score {{ m.score_class(g.top_tier) }}">{{ g.top_score }}</span></span>
+              <span class="qg-top"><span class="dim">top</span> <span class="score">{{ m.score_meter(g.top_score, g.top_pct) }}</span></span>
               <a class="qg-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending }}&hellip;</a>
             </span>
           </summary>

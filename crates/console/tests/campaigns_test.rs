@@ -623,7 +623,11 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
     let (status, samples) = console.get("/samples").await;
     assert_eq!(status, StatusCode::OK);
     assert!(samples.contains(&format!("href=\"/samples/{sha}\"")));
-    let row = between(&samples, &format!("href=\"/samples/{sha}\">"), "</tr>");
+    let row = between(
+        &samples,
+        &format!("href=\"/samples/{sha}\" title="),
+        "</tr>",
+    );
     assert!(
         row.contains(&format!(
             "<a href=\"/campaigns/{sample}\">5<span class=\"c-unit\"> hosts</span></a>"
@@ -641,14 +645,20 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
         "delivered by the command sequence that uploaded it: {row}"
     );
     // A file nobody linked has no host count, no activity and no campaign.
-    let lone_row = between(&samples, &format!("href=\"/samples/{lone_sha}\">"), "</tr>");
+    let lone_row = between(
+        &samples,
+        &format!("href=\"/samples/{lone_sha}\" title="),
+        "</tr>",
+    );
     assert!(lone_row.contains("not linked"), "{lone_row}");
     assert!(!lone_row.contains("/campaigns/"), "{lone_row}");
     assert!(!lone_row.contains("<svg"), "{lone_row}");
     assert!(
-        samples.find(&format!("href=\"/samples/{sha}\">")).unwrap()
+        samples
+            .find(&format!("href=\"/samples/{sha}\" title="))
+            .unwrap()
             < samples
-                .find(&format!("href=\"/samples/{lone_sha}\">"))
+                .find(&format!("href=\"/samples/{lone_sha}\" title="))
                 .unwrap(),
         "the most widely delivered file sorts first"
     );
@@ -992,13 +1002,13 @@ async fn the_active_cell_shows_a_clock_range_within_a_day_and_a_length_across_da
             .contains("title=\"first 2026-01-01 09:00 UTC, last 2026-01-04 10:00 UTC\">3d, last "),
         "{multi_day}"
     );
-    // The retired columns are gone and every sort key is still reachable.
-    for gone in [
-        "Categories",
-        "First seen</th>",
-        "Last seen</th>",
-        "class=\"meter\"",
-    ] {
+    // The retired columns are gone and every sort key is still reachable. The score carries the
+    // same meter it does on every other page, inside its own column.
+    assert!(
+        same_day.contains("<td class=\"score\"><span class=\"meter\">"),
+        "{same_day}"
+    );
+    for gone in ["Categories", "First seen</th>", "Last seen</th>"] {
         assert!(!page.contains(gone), "{gone} should be gone: {page}");
     }
     for key in ["score", "event_count", "first_seen", "last_seen"] {
@@ -1280,7 +1290,10 @@ async fn delivers_shows_the_sample_count_and_the_first_sample(pool: PgPool) {
     let (_, page) = console.get("/campaigns").await;
     let row = between(&page, &format!("href=\"/campaigns/{sequence}\""), "</tr>");
     assert!(row.contains(&format!("href=\"/samples/{sha}\"")), "{row}");
-    assert!(row.contains(&format!(">{}</a>", &sha[..12])), "{row}");
+    assert!(
+        row.contains(&format!(">{}&hellip;</a>", &sha[..12])),
+        "{row}"
+    );
     assert!(!row.contains("more</span>"), "one sample, no count: {row}");
 
     // Two more linked samples: the first (by digest) is named, the rest are counted.
@@ -1630,6 +1643,9 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
         <span class="tier tier-standard">Standard</span><span class="sev">commands</span>"#;
     assert_eq!(markup::vocabulary_violations(ok), Vec::<String>::new());
     for bad in [
+        r#"<span class="state-pill state-rejected">No</span>"#,
+        r#"<a class="state-pill state-snoozed" href="/vt">pending VT analysis</a>"#,
+        r#"<td class="score score--aggressive">97.0</td>"#,
         r#"<span class="tier-aggressive">aggressive</span>"#,
         r#"<span class="rule rule--commands">commands</span>"#,
         r#"<a class="filter-toggle on" href="/x">shown</a>"#,

@@ -35,7 +35,7 @@
   <tbody>
     {% for s in samples %}
     <tr class="srow">
-      <td class="mono s-hash" title="{{ s.sha256 }}"><a href="/samples/{{ s.sha256 }}">{{ s.sha256_short }}...</a><span class="c-sub">{{ s.sensor }}, {{ s.size }}</span></td>
+      <td class="s-hash">{{ m.hash_link(s.sha256) }}<span class="c-sub">{{ s.sensor }}, {{ s.size }}</span></td>
       <td class="count s-hosts">
         {% if s.campaign %}<a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members }}<span class="c-unit"> host{% if s.campaign.members != 1 %}s{% endif %}</span></a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
         {% else %}<span class="dim na">-</span>{% endif %}
@@ -69,19 +69,7 @@
         {% endif %}
       </td>
       <td class="s-vt">
-        {% if s.vt_detected is defined and s.vt_detected is not none %}
-          {% if s.vt_detected == -1 %}
-            <span class="dim">pending</span>
-          {% elif s.vt_detected == -2 %}
-            <span class="dim" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>
-          {% elif s.vt_detected > 0 %}
-            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" class="text-alert">{{ s.vt_detected }}/{{ s.vt_total }} detected</a>
-          {% else %}
-            <a href="{{ s.vt_link }}" target="_blank" rel="noopener noreferrer" class="text-good" title="No engine flagged it. That is not proof the file is harmless.">0/{{ s.vt_total }} detections</a>
-          {% endif %}
-        {% else %}
-          <span class="dim">not scanned</span>
-        {% endif %}
+        {{ m.vt_verdict(s.vt_detected, s.vt_total, s.vt_link, s.sha256) }}
       </td>
       <td class="s-dl"><a href="/samples/download/{{ s.sha256 }}" class="range-btn">Download</a></td>
     </tr>

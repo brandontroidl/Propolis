@@ -44,7 +44,7 @@
   <ul class="shape-list mono">{% for e in r.encoded %}<li>{{ e.raw }} <span class="dim">sent XOR-encoded, key {{ e.key }}, decoded</span> {{ e.decoded }}</li>{% endfor %}</ul>
   {% endif %}
   {% if r.sha256 %}
-  <p>Sample <a class="mono" href="/samples/{{ r.sha256 }}">{{ r.sha256 }}</a>{% if r.orig_name %} <span class="dim">named</span> <code>{{ r.orig_name }}</code>{% endif %}{% if r.origin %} <span class="dim">({{ r.origin }})</span>{% endif %}</p>
+  <p>Sample {{ m.hash_link(r.sha256) }}{% if r.orig_name %} <span class="dim">named</span> <code>{{ r.orig_name }}</code>{% endif %}{% if r.origin %} <span class="dim">({{ r.origin }})</span>{% endif %}</p>
   {% if r.url %}<p><span class="dim">fetched from</span> <code class="ioc-value">{{ r.url }}</code></p>{% endif %}
   {% endif %}
   {% if r.sensors %}<p>Sensors reached within one hour: <span class="ctx-dim">{% for s in r.sensors %}<span class="ctx-chip">{{ s }}</span>{% endfor %}</span></p>{% endif %}
@@ -64,7 +64,7 @@
   <div class="panel-head">Linked samples</div>
   {% if samples %}
   <div class="panel-body">
-    <p class="mono">{% for s in samples %}<a href="/samples/{{ s.sha256 }}" title="{{ s.sha256 }}">{{ s.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}{% if more_samples > 0 %} <span class="dim">+{{ more_samples }} more</span>{% endif %}</p>
+    <p>{% for s in samples %}{{ m.hash_link(s.sha256) }}{% if not loop.last %} {% endif %}{% endfor %}{% if more_samples > 0 %} <span class="dim">+{{ more_samples }} more</span>{% endif %}</p>
   </div>
   {% else %}
   <p class="empty-line">no linked samples</p>
@@ -81,7 +81,7 @@
     <thead><tr><th>Kind</th><th>Value</th><th>Detail</th><th>From</th></tr></thead>
     <tbody>
       {% for i in artifact_iocs %}
-      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono"><a href="/samples/{{ i.sample }}">sample {{ i.sample[:12] }}</a></td></tr>
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td>sample {{ m.hash_link(i.sample) }}</td></tr>
       {% endfor %}
       {% for i in command_iocs %}
       <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts }} host{% if i.hosts != 1 %}s{% endif %}, <span class="run-count">x{{ i.sightings }}</span> <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>

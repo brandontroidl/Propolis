@@ -36,7 +36,7 @@
   <tbody>
     {% for ip in ips %}
     <tr>
-      <td class="count"><strong>{{ ip.raw_score }}</strong></td>
+      <td class="count score">{{ m.score_meter(ip.raw_score, ip.score_pct) }}</td>
       <td class="ip">{{ m.ip_evidence_link(ip.ip) }}</td>
       <td>{{ m.tier_pill(ip.tier) }}</td>
       <td class="count">{{ ip.event_count }}</td>

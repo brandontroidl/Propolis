@@ -624,14 +624,11 @@ async fn fetch_search_ips(db: &PgPool, filters: &Filters) -> Result<Vec<SearchIp
 
         let (score, score_pct, tier) = match ip_str.parse::<IpAddr>() {
             Ok(ip) => match read_score(db, ip).await {
-                Ok(Some(s)) => {
-                    let f = s.raw_score.to_f64().unwrap_or(0.0);
-                    (
-                        format!("{:.1}", s.raw_score),
-                        f.clamp(0.0, 100.0).round() as u32,
-                        s.tier.map(tier_label).unwrap_or("-"),
-                    )
-                }
+                Ok(Some(s)) => (
+                    format!("{:.1}", s.raw_score),
+                    crate::routes::format::score_pct(s.raw_score.to_f64().unwrap_or(0.0)),
+                    s.tier.map(tier_label).unwrap_or("-"),
+                ),
                 // No projection yet, or the read itself failed - either way this is
                 // supplementary context on top of a real match, not a reason to hide the row.
                 _ => ("-".to_string(), 0, "-"),

@@ -93,7 +93,9 @@ what is on the page by unit, for example `newest 200 events: 199 commands, 1 ses
 numbered list of its lines rather than one fused line (commands recorded before the sensors
 kept the lines still show the fused form). What the shell answered folds under its command as
 `reply, N B` in the same expander the row's raw JSON uses, shown as escaped text; commands
-recorded before replies were kept show none. Below that,
+recorded before replies were kept show none. The ATT&CK techniques the indexer tagged appear as
+a panel above the network profile and as chips on each session card, and on the Campaigns list
+and a campaign's page ([ATT&CK tagging](../reference/attack-tagging.md)). Below that,
 which of your WAN addresses it hit, which services it probed, vendor submissions, and
 the malware linked to it, marked as uploaded directly or fetched from a URL it
 reported. A truncated upload is labelled as such.

@@ -569,6 +569,7 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .shape-list li { overflow-wrap: anywhere; margin: 0.1rem 0; }
 .approve-list { columns: 3 14rem; margin: 0.6rem 0 1rem 1.2rem; padding: 0; font-size: 0.8rem; }
 .campaign-refs { margin: 0.2rem 0 0.2rem 1.2rem; padding: 0; }
+.technique-list li + li { margin-top: 0.4rem; }
 
 /* -- Campaigns and Samples lists: the review queue's vocabulary (tier-coloured counts, the Active
    cell, dotted chips) in one table that becomes cards on a narrow screen. -- */

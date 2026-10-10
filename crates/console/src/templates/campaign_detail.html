@@ -46,6 +46,15 @@
 </div>
 
 <div class="panel">
+  <div class="panel-head">ATT&amp;CK techniques <span class="dim">fixed rules matched against what its members ran and delivered; a label, not a verdict</span></div>
+  {% if techniques %}
+  {{ m.technique_list(techniques) }}
+  {% else %}
+  <p class="dim">none tagged</p>
+  {% endif %}
+</div>
+
+<div class="panel">
   <div class="panel-head">Linked samples</div>
   {% if samples %}
   <p class="mono">{% for s in samples %}<a href="/samples/{{ s.sha256 }}" title="{{ s.sha256 }}">{{ s.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}{% if more_samples > 0 %} <span class="dim">+{{ more_samples }} more</span>{% endif %}</p>

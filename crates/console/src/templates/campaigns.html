@@ -45,7 +45,7 @@
     <tr class="crow">
       <td class="c-what">
         <a class="c-text mono campaign-label" href="/campaigns/{{ c.id }}" title="{{ c.text }}">{{ c.text }}</a>
-        <span class="c-meta"><span class="rule rule--{{ c.badge | replace(" ", "-") }}">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}</span>
+        <span class="c-meta"><span class="rule rule--{{ c.badge | replace(" ", "-") }}">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ c.tags | length - 4 }}</span>{% endif %}</span>{% endif %}</span>
       </td>
       <td class="count c-hosts score {{ m.score_class(c.tier) }}">{{ c.members }}<span class="c-unit"> host{% if c.members != 1 %}s{% endif %}</span></td>
       <td class="c-spark">

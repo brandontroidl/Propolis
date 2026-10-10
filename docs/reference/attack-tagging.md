@@ -118,6 +118,11 @@ per rule: `crates/review/src/attack/mod.rs#campaign_tags`,
 `crates/review/src/attack/mod.rs#session_tags`. They are `Serialize`, so a JSON surface is one
 `serde_json::to_value` away.
 
-The console does not show tags yet. The hook is `campaign_tags` called with the page's campaign
-ids from `crates/console/src/routes/campaigns.rs#detail_page` and `list_page`, and `source_tags`
-from the per-address detail page.
+The console shows them in four places, all through `crates/console/src/routes/attack.rs`: an
+"ATT&CK techniques" panel on the per-address page (`source_tags`, with each rule that tagged a
+technique and the token it matched, at most three per technique); a chip per technique in the
+header of each session card there (`session_tags`, for the newest 40 sessions that ran a command);
+a chip row under each campaign on the campaign list (`campaign_tags`, four shown and a count of the
+rest); and the same panel on a campaign's page. The chip is the technique id with its name and the
+matrix release on hover. Tokens are attacker data and are shown as escaped text. A lookup that
+fails names the panel in the page's degraded banner rather than showing "none tagged".

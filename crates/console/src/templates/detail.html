@@ -1,6 +1,7 @@
 {% extends layout %}
 {% block title %}{{ ip }} - Propolis{% endblock %}
 {% block content %}
+{% import "macros.html" as m %}
 {% if is_drawer %}<p><a class="btn" href="/ip/{{ ip }}">Open full page &nearr;</a></p>{% else %}<p><a href="/ips" data-history-back>&larr; Back</a></p>{% endif %}
 <div class="row-center">
 <h1 class="mono m-0">{{ ip }}</h1>
@@ -79,6 +80,15 @@
   </ul>
   {% else %}
   <p class="dim">not part of a campaign{% if campaign_indexer_behind > 0 %} yet; the campaign indexer is {{ campaign_indexer_behind }} events behind the ledger{% endif %}</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">ATT&amp;CK techniques <span class="dim">fixed rules matched against its commands and downloads; a label, not a verdict</span></div>
+  {% if techniques %}
+  {{ m.technique_list(techniques) }}
+  {% else %}
+  <p class="dim">none tagged</p>
   {% endif %}
 </div>
 

@@ -75,6 +75,7 @@ use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::attack::{self, TagChip};
 use crate::routes::campaigns::{campaigns_by_ip, indexer_progress};
 use crate::routes::context::{BaseContext, base_context};
 use crate::routes::degraded::Degraded;
@@ -200,6 +201,9 @@ struct SessionGroup {
     /// chunk writes to one file is one row ([`timeline_items`]).
     items: Vec<TimelineItem>,
     expanded: bool,
+    /// The ATT&CK techniques tagged in this session, as chips in the card header; empty when it
+    /// has none (see [`attach_session_tags`]).
+    tags: Vec<TagChip>,
     /// The latest `observed_at` in the group. Not rendered by the template (there's no "session end" field in the card header - `duration` already conveys
     /// the span) - it exists purely as [`group_into_sessions`]'s sort key, per the design spec's
     /// "Order sessions by most recent first (latest `observed_at` in each group)": sorting on
@@ -468,6 +472,27 @@ fn fetch_outcome(url: &str, record: Option<&FetchRecord>) -> FetchOutcome {
     }
 }
 
+/// Sessions that get a tag lookup per page. Each is one indexed query, so a page of many short
+/// sessions is bounded; the newest sessions come first and are the ones kept.
+const SESSION_TAG_LOOKUPS: usize = 40;
+
+/// Sets [`SessionGroup::tags`] for the newest sessions that ran a command (only a shell session
+/// carries tags). A failed lookup leaves that card without chips.
+async fn attach_session_tags(
+    db: &PgPool,
+    sessions: &mut [SessionGroup],
+) -> Result<(), sqlx::Error> {
+    for session in sessions
+        .iter_mut()
+        .filter(|s| s.command_count > 0)
+        .take(SESSION_TAG_LOOKUPS)
+    {
+        let tags = review::attack::session_tags(db, &session.session_id).await?;
+        session.tags = attack::chips(&tags);
+    }
+    Ok(())
+}
+
 /// A command's reply as the timeline shows it, folded under the command.
 #[derive(Debug, Serialize)]
 struct ReplyView {
@@ -650,7 +675,11 @@ async fn detail(
     let next_cursor = all_events
         .last()
         .map(|e| format_cursor(e.raw_observed_at, e.id));
-    let (sessions, ungrouped) = group_into_sessions(all_events, 3);
+    let (mut sessions, ungrouped) = group_into_sessions(all_events, 3);
+    degraded.soft(
+        "session techniques",
+        attach_session_tags(&state.db, &mut sessions).await,
+    );
     let session_folds = fold_repeated_sessions(sessions);
 
     let wan_rows = sqlx::query(
@@ -772,6 +801,15 @@ async fn detail(
         "campaign indexer progress",
         indexer_progress(&state.db).await,
     );
+    let techniques = attack::techniques(
+        degraded
+            .soft(
+                "ATT&CK techniques",
+                review::attack::source_tags(&state.db, &[ip.to_string()]).await,
+            )
+            .remove(&ip.to_string())
+            .unwrap_or_default(),
+    );
 
     let csrf_token = state
         .sessions
@@ -847,6 +885,7 @@ async fn detail(
         ip_timeline_data,
         current_range,
         campaigns,
+        techniques,
         campaign_indexer_behind => newest.saturating_sub(indexed),
     })?;
     Ok(Html(html).into_response())
@@ -891,7 +930,11 @@ async fn events_fragment(
     // No auto-expanded card on a "Load more" page - `recent_expanded: 0` - unlike the initial
     // page load's newest-first cards, these are all strictly older than what is already on
     // screen, so none of them is "the current activity" an operator lands on an open view of.
-    let (sessions, ungrouped) = group_into_sessions(events, 0);
+    let (mut sessions, ungrouped) = group_into_sessions(events, 0);
+    Degraded::new().soft(
+        "session techniques",
+        attach_session_tags(&state.db, &mut sessions).await,
+    );
     let session_folds = fold_repeated_sessions(sessions);
 
     let tmpl = state.templates.get_template("events_fragment.html")?;
@@ -1626,6 +1669,7 @@ fn group_into_sessions(
                 items: timeline_items(&events),
                 events,
                 expanded: false,
+                tags: Vec::new(),
                 commands,
             }
         })

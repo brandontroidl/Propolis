@@ -8,7 +8,7 @@
     What the shell answered folds under it in the same raw toggle the row's JSON uses. -#}
 {% macro detail_text(event) -%}
 {% if event.lines %}<ol class="chunk-lines">{% for l in event.lines %}<li>{{ l }}</li>{% endfor %}</ol>{% if event.lines_truncated %}<span class="c-sub">more lines were sent than are kept</span>{% endif %}{% else %}{{ event.detail }}{% endif %}{% if event.reply %}
-<details class="raw-toggle"><summary>{{ event.reply.label }}</summary><pre class="raw-json">{{ event.reply.text }}</pre></details>{% endif %}
+<div class="c-sub"><details class="raw-toggle"><summary>{{ event.reply.label }}</summary><pre class="raw-json">{{ event.reply.text }}</pre></details></div>{% endif %}
 {%- endmacro %}
 
 {% macro event_row(event) -%}
@@ -33,6 +33,7 @@
     <span class="session-meta">{{ session.sensor }} / {{ session.protocol }}</span>
     {% if session.username %}<span class="session-user mono">user: {{ session.username }}</span>{% endif %}
     {% if session.command_count > 0 %}<span class="dim">{{ session.command_count }} command{% if session.command_count != 1 %}s{% endif %}</span>{% endif %}
+    {% if session.tags %}<span class="sev-tags">{% for t in session.tags %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}</span>{% endif %}
     <span class="session-count dim">{{ session.event_count }} event{% if session.event_count != 1 %}s{% endif %}, {{ session.duration }}</span>
   </summary>
   <div class="table-wrap">

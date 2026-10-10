@@ -32,6 +32,7 @@ use sqlx::{PgPool, Row};
 
 use crate::AppState;
 use crate::auth::Session;
+use crate::routes::attack::{self, TagChip};
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
 use crate::routes::format::{format_active, format_sensor_label, format_timestamp, group_digits};
@@ -468,6 +469,8 @@ struct ListRow {
     sample_count: usize,
     first_sample: Option<SampleLink>,
     worm: bool,
+    /// The ATT&CK techniques tagged on the campaign, as chips.
+    tags: Vec<TagChip>,
 }
 
 #[derive(Debug, Serialize)]
@@ -588,6 +591,10 @@ async fn list_page(
         campaigns_by_sample(&state.db, &first_shas).await,
     );
     let (indexed, newest) = degraded.soft("indexer progress", indexer_progress(&state.db).await);
+    let mut tags = degraded.soft(
+        "ATT&CK techniques",
+        review::attack::campaign_tags(&state.db, &ids).await,
+    );
 
     let now = Utc::now();
     let mut campaigns = Vec::with_capacity(rows.len());
@@ -627,6 +634,7 @@ async fn list_page(
             sample_count,
             first_sample,
             worm,
+            tags: attack::chips(&tags.remove(&id).unwrap_or_default()),
         });
     }
 
@@ -918,6 +926,16 @@ async fn detail_page(
         .await,
     );
 
+    let techniques = attack::techniques(
+        degraded
+            .soft(
+                "ATT&CK techniques",
+                review::attack::campaign_tags(&state.db, &[id]).await,
+            )
+            .remove(&id)
+            .unwrap_or_default(),
+    );
+
     let self_propagating: bool = c.try_get("self_propagating")?;
     let tmpl = state.templates.get_template("campaign_detail.html")?;
     let html = tmpl.render(context! {
@@ -950,6 +968,7 @@ async fn detail_page(
         more_samples,
         artifact_iocs,
         command_iocs,
+        techniques,
     })?;
     Ok(Html(html).into_response())
 }

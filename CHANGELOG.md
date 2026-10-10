@@ -4,6 +4,11 @@
 
 ### Added
 
+- **ATT&CK techniques on the address and campaign pages** - the per-address page gets an "ATT&CK
+  techniques" panel (each rule that tagged a technique and the token it matched) and technique
+  chips in each session card's header; the campaign list shows chips under each campaign and a
+  campaign's page the same panel. Built from the existing `.sev` chip and panel components, with
+  attacker tokens escaped. No migration; the tags were already written by the campaign indexer.
 - **The evidence timeline shows what the shell answered** - the sensor now records a command's
   reply (what the line printed, sanitized per line, at most 4 KiB, with its length and a
   truncation flag) on the command event. Intake folds `output_sha256`, `output_len` and

@@ -12,6 +12,21 @@
 <code class="ioc-value">{{ i.defanged }}</code> <span class="ioc-copy"><button type="button" class="copy-btn" data-copy="{{ i.defanged }}" title="Copy the defanged form">copy</button> <button type="button" class="copy-btn copy-btn--live" data-copy="{{ i.value }}" title="Copy the live, followable value">copy original</button></span>
 {%- endmacro %}
 
+{#- ATT&CK techniques with the evidence that tagged each (`routes::attack`), as one list: the
+    technique id as a neutral `.sev` chip (no severity class: a technique is a label, not a
+    verdict), its name, then one dim line per rule with the token it matched. `matched` is
+    attacker data and is escaped like every value. -#}
+{% macro technique_list(techniques) -%}
+<ul class="campaign-refs technique-list">
+  {% for t in techniques %}
+  <li><span class="sev" title="ATT&amp;CK {{ t.matrix }}">{{ t.id }}</span> {{ t.name }}
+    {% for e in t.evidence %}<span class="c-sub"><span class="dim">{{ e.rule }}</span> <code class="ioc-value">{{ e.matched }}</code>{% if e.event_id %} <span class="dim">event {{ e.event_id }}</span>{% endif %}{% if e.artifact %} <a class="mono" href="/samples/{{ e.artifact }}">sample {{ e.artifact[:12] }}</a>{% endif %}</span>{% endfor %}
+    {% if t.more > 0 %}<span class="c-sub dim">+{{ t.more }} more</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{%- endmacro %}
+
 {#- The class that colours a score by its feed tier, shared by the pending and history rows. -#}
 {% macro score_class(tier) -%}
 {% if tier == "aggressive" %}score--aggressive{% elif tier == "standard" %}score--standard{% else %}score--none{% endif %}

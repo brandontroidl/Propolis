@@ -7,6 +7,7 @@
 //! session-gated automatically.
 
 pub mod assets;
+pub(crate) mod attack;
 pub mod campaigns;
 pub(crate) mod context;
 pub mod dashboard;

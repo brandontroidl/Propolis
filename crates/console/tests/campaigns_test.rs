@@ -1374,3 +1374,190 @@ async fn the_ip_page_names_a_sample_captured_through_another_address_report(pool
         "{none}"
     );
 }
+
+/// The ATT&CK panel, session chips and campaign chips, from tags the real indexer wrote: a sample
+/// upload tags T1105 on the uploading session, its source and the campaigns that session joined.
+#[sqlx::test(migrations = false)]
+async fn indexer_written_techniques_show_on_the_ip_page_and_both_campaign_pages(pool: PgPool) {
+    migrate(&pool).await;
+    let sha = seed(&pool, b"#!/bin/sh\necho tagged\n").await;
+    let console = Console::new(pool.clone());
+
+    let (_, ip) = console.get("/ip/192.0.2.1").await;
+    let panel = between(&ip, "ATT&amp;CK techniques", "Network profile");
+    assert!(
+        panel.contains(
+            r#"<span class="sev" title="ATT&amp;CK v19.2">T1105</span> Ingress Tool Transfer"#
+        ) && panel.contains("upload-sample")
+            && panel.contains(&sha),
+        "{panel}"
+    );
+    // The session that ran commands and uploaded carries the chip in its card header.
+    let header = between(&ip, r#"<summary class="session-header">"#, "</summary>");
+    assert!(
+        header.contains(
+            r#"<span class="sev" title="Ingress Tool Transfer, ATT&amp;CK v19.2">T1105</span>"#
+        ),
+        "{header}"
+    );
+
+    let sample = campaign_id(&pool, "sample").await;
+    let (_, page) = console.get(&format!("/campaigns/{sample}")).await;
+    let panel = between(&page, "ATT&amp;CK techniques", "Linked samples");
+    assert!(
+        panel.contains("T1105") && panel.contains("Ingress Tool Transfer"),
+        "{panel}"
+    );
+}
+
+/// An address and a campaign with no tags say so instead of showing an empty panel; the list rows
+/// carry chips only for campaigns that have tags.
+#[sqlx::test(migrations = false)]
+async fn untagged_pages_say_so_and_list_rows_show_chips_only_when_tagged(pool: PgPool) {
+    migrate(&pool).await;
+    let tagged = insert_campaign(
+        &pool,
+        "command_sequence",
+        "2: wget http://198.51.100.9/x",
+        3,
+        5,
+        1,
+    )
+    .await;
+    let plain = insert_campaign(&pool, "command_sequence", "2: uname", 2, 5, 1).await;
+    for (rule, technique) in [("download-command", "T1105"), ("unix-shell", "T1059.004")] {
+        sqlx::query(
+            "INSERT INTO campaign_attack_tag (campaign_id, technique_id, rule_id, event_id, matched) \
+             VALUES ($1, $2, $3, 7, 'wget')",
+        )
+        .bind(tagged)
+        .bind(technique)
+        .bind(rule)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let console = Console::new(pool.clone());
+
+    let (_, list) = console.get("/campaigns").await;
+    let row_of = |id: i64| {
+        let at = position(&list, &format!("href=\"/campaigns/{id}\""));
+        let end = at + list[at..].find("</tr>").unwrap();
+        list[at..end].to_string()
+    };
+    let t = row_of(tagged);
+    assert!(
+        t.contains(
+            r#"<span class="sev" title="Ingress Tool Transfer, ATT&amp;CK v19.2">T1105</span>"#
+        ) && t.contains("T1059.004"),
+        "{t}"
+    );
+    assert!(
+        !row_of(plain).contains("class=\"sev\""),
+        "{}",
+        row_of(plain)
+    );
+
+    let (_, none) = console.get(&format!("/campaigns/{plain}")).await;
+    assert!(
+        between(&none, "ATT&amp;CK techniques", "Linked samples").contains("none tagged"),
+        "{none}"
+    );
+    let (_, quiet) = {
+        scored_ip(&pool, "192.0.2.77").await;
+        console.get("/ip/192.0.2.77").await
+    };
+    assert!(
+        between(&quiet, "ATT&amp;CK techniques", "Network profile").contains("none tagged"),
+        "{quiet}"
+    );
+}
+
+/// A campaign with more techniques than fit shows the first four chips (by technique id) and a
+/// count of the rest, so a row stays one line of chips.
+#[sqlx::test(migrations = false)]
+async fn a_list_row_shows_four_chips_and_counts_the_rest(pool: PgPool) {
+    migrate(&pool).await;
+    let id = insert_campaign(&pool, "command_sequence", "2: busy", 3, 5, 1).await;
+    for (rule, technique) in [
+        ("system-info", "T1082"),
+        ("file-discovery", "T1083"),
+        ("process-discovery", "T1057"),
+        ("unix-shell", "T1059.004"),
+        ("download-command", "T1105"),
+        ("cron-install", "T1053.003"),
+    ] {
+        sqlx::query(
+            "INSERT INTO campaign_attack_tag (campaign_id, technique_id, rule_id, event_id, matched) \
+             VALUES ($1, $2, $3, 1, 'x')",
+        )
+        .bind(id)
+        .bind(technique)
+        .bind(rule)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let console = Console::new(pool.clone());
+    let (_, list) = console.get("/campaigns").await;
+    let at = position(&list, &format!("href=\"/campaigns/{id}\""));
+    let row = &list[at..at + list[at..].find("</tr>").unwrap()];
+    assert_eq!(row.matches("class=\"sev\"").count(), 4, "{row}");
+    assert!(row.contains("<span class=\"dim\">+2</span>"), "{row}");
+    // Ordered by technique id: T1053.003, T1057, T1059.004, T1082 are the four; T1083, T1105 wait.
+    assert!(
+        row.contains("T1053.003") && row.contains("T1082") && !row.contains("T1105"),
+        "{row}"
+    );
+}
+
+/// What matched is attacker data: rendered as escaped text, in the panel and (as a title) never
+/// able to break out of an attribute.
+#[sqlx::test(migrations = false)]
+async fn the_matched_token_is_escaped_on_the_ip_and_campaign_pages(pool: PgPool) {
+    migrate(&pool).await;
+    let evil = r#"</code><script>alert("x")</script>"#;
+    scored_ip(&pool, "192.0.2.78").await;
+    sqlx::query(
+        "INSERT INTO attack_tag (source_ip, session_id, technique_id, rule_id, event_id, matched, \
+                                 first_seen, last_seen) \
+         VALUES ('192.0.2.78', NULL, 'T1105', 'download-event', 3, $1, now(), now())",
+    )
+    .bind(evil)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let id = insert_campaign(&pool, "command_sequence", "2: x", 2, 5, 1).await;
+    sqlx::query(
+        "INSERT INTO campaign_attack_tag (campaign_id, technique_id, rule_id, event_id, matched) \
+         VALUES ($1, 'T1105', 'download-event', 3, $2)",
+    )
+    .bind(id)
+    .bind(evil)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let console = Console::new(pool.clone());
+    for uri in ["/ip/192.0.2.78".to_string(), format!("/campaigns/{id}")] {
+        let (_, page) = console.get(&uri).await;
+        assert!(!page.contains("<script>alert"), "{uri}: {page}");
+        assert!(
+            page.contains("&lt;&#x2f;code&gt;&lt;script&gt;")
+                || page.contains("&lt;/code&gt;&lt;script&gt;"),
+            "{uri}: {page}"
+        );
+    }
+}
+
+async fn scored_ip(pool: &PgPool, ip: &str) {
+    append(
+        pool,
+        ip,
+        "ssh",
+        SignalType::HoneypotLoginAttempt,
+        Utc::now() - Duration::minutes(10),
+        serde_json::json!({ "username": "root" }),
+        None,
+    )
+    .await;
+}

@@ -17,7 +17,7 @@ use crate::routes::campaigns::{
 };
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
-use crate::routes::format::format_active;
+use crate::routes::format::{format_active, format_bytes, format_sensor_label};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -32,7 +32,6 @@ const FETCHED_BUCKET: &str = "fetched";
 #[derive(Debug, Serialize)]
 struct SampleRow {
     sha256: String,
-    sha256_short: String,
     size: String,
     sensor: String,
     vt_detected: Option<i32>,
@@ -318,7 +317,6 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 )
             });
             samples.push(SampleRow {
-                sha256_short: file.sha256[..12].to_string(),
                 size: format_bytes(file.size),
                 delivered_by: delivering
                     .get(&file.sha256)
@@ -328,7 +326,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 spark,
                 campaign,
                 sha256: file.sha256,
-                sensor: sensor.to_string(),
+                sensor: format_sensor_label(sensor),
                 vt_detected: vt.map(|(d, _, _)| *d),
                 vt_total: vt.map(|(_, t, _)| *t),
                 vt_link: vt.map(|(_, _, l)| l.clone()).unwrap_or_default(),
@@ -483,16 +481,6 @@ fn spool_dirs() -> Vec<(&'static str, PathBuf)> {
     // The one canonical list (sensor spools + the fetcher's bucket), shared with the VT scan and
     // sample retention so this view never walks a different set than they do.
     review::spool::all_body_dirs()
-}
-
-fn format_bytes(b: u64) -> String {
-    if b < 1024 {
-        format!("{b} B")
-    } else if b < 1024 * 1024 {
-        format!("{:.1} KB", b as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
-    }
 }
 
 #[cfg(test)]

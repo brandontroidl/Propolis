@@ -81,8 +81,8 @@ use crate::routes::context::{BaseContext, base_context};
 use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::format::{
-    format_activity, format_relative_time, format_sensor_label, format_timestamp, protocol_label,
-    tier_label,
+    format_activity, format_bytes, format_relative_time, format_sensor_label, format_timestamp,
+    protocol_label, tier_label,
 };
 use crate::templates::script_json;
 
@@ -1587,18 +1587,6 @@ pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) ->
     }
 }
 
-/// Human-readable byte count for the malware-upload detail column (`4.2 KB`, `1.1 MB`).
-/// `pub(crate)` because the review queue's row context names upload sizes the same way.
-pub(crate) fn format_bytes(b: u64) -> String {
-    if b < 1024 {
-        format!("{b} B")
-    } else if b < 1024 * 1024 {
-        format!("{:.1} KB", b as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
-    }
-}
-
 /// Human-readable elapsed time for a session card's duration (`12s`, `3m05s`, `1h02m`).
 fn format_duration(d: chrono::Duration) -> String {
     let total_secs = d.num_seconds().max(0);
@@ -1962,13 +1950,6 @@ mod tests {
             signal_type_snake(SignalType::CatchallProbe),
             "catchall_probe"
         );
-    }
-
-    #[test]
-    fn format_bytes_picks_the_right_unit() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(4300), "4.2 KB");
-        assert_eq!(format_bytes(5_242_880), "5.0 MB");
     }
 
     #[test]

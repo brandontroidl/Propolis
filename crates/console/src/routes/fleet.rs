@@ -721,8 +721,10 @@ fn feed_freshness(state: &AppState) -> FeedFreshness {
         .ok()
         .map(|t| t.with_timezone(&Utc));
     let (expires_in, level, note) = match valid_until {
+        // Beside the "Expires in" label: a past expiry reads "expired 5m ago", never "Expires in
+        // 5m ago".
         Some(until) if until <= now => (
-            Some(format_relative_time(until)),
+            Some(format!("expired {}", format_relative_time(until))),
             Level::Alarm,
             "the published feed has expired",
         ),

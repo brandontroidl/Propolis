@@ -200,7 +200,7 @@ pub(crate) fn severity_rank(severity: &str) -> u8 {
 ///
 /// Within one UTC day the span reads as a clock range (`10:58-18:11 UTC`, prefixed with the date
 /// unless it is `now`'s date, so an old row is not mistaken for today's). Across midnight a clock
-/// range would not say how long, so it reads as a length plus recency (`2d, last 3 min ago`).
+/// range would not say how long, so it reads as a length plus recency (`2d, last 3m ago`).
 /// `now` is a parameter so the boundaries can be tested.
 pub(crate) fn format_active(
     first: DateTime<Utc>,
@@ -233,16 +233,7 @@ pub(crate) fn format_active(
     } else {
         format!("{}d", span.num_days())
     };
-    let ago = (now - last).max(chrono::Duration::zero());
-    let ago = if ago.num_seconds() < 60 {
-        "just now".to_string()
-    } else if ago.num_minutes() < 60 {
-        format!("{} min ago", ago.num_minutes())
-    } else if ago.num_hours() < 24 {
-        format!("{} h ago", ago.num_hours())
-    } else {
-        format!("{} d ago", ago.num_days())
-    };
+    let ago = elapsed_ago((now - last).max(chrono::Duration::zero()));
     (format!("{length}, last {ago}"), title)
 }
 
@@ -250,7 +241,11 @@ pub(crate) fn format_active(
 /// dashboard's recent-activity table, where an exact `format_timestamp` value is more precision
 /// than an operator scanning twenty rows needs.
 pub(crate) fn format_relative_time(dt: DateTime<Utc>) -> String {
-    let elapsed = Utc::now() - dt;
+    elapsed_ago(Utc::now() - dt)
+}
+
+/// The one spelling of recency on every page: `45s ago`, `5m ago`, `3h ago`, `2d ago`.
+fn elapsed_ago(elapsed: chrono::Duration) -> String {
     if elapsed.num_seconds() < 60 {
         return format!("{}s ago", elapsed.num_seconds());
     }
@@ -261,6 +256,22 @@ pub(crate) fn format_relative_time(dt: DateTime<Utc>) -> String {
         return format!("{}h ago", elapsed.num_hours());
     }
     format!("{}d ago", elapsed.num_days())
+}
+
+/// A byte count the same way on every page (`512 B`, `4.2 KB`, `5.0 MB`, `1.3 GB`), in binary
+/// steps of 1024.
+pub(crate) fn format_bytes(b: u64) -> String {
+    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
+    if b < 1024 {
+        return format!("{b} B");
+    }
+    let mut value = b as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 #[cfg(test)]
@@ -351,7 +362,7 @@ mod tests {
     fn active_across_midnight_under_an_hour_is_minutes_not_zero_days() {
         let now = at("2026-10-08T00:13:30Z");
         let (text, _) = format_active(at("2026-10-07T23:50:00Z"), at("2026-10-08T00:10:00Z"), now);
-        assert_eq!(text, "20m, last 3 min ago");
+        assert_eq!(text, "20m, last 3m ago");
     }
 
     #[test]
@@ -361,23 +372,23 @@ mod tests {
         let last = at("2026-10-09T00:30:00Z");
         assert_eq!(
             format_active(last - Duration::minutes(59), last, now).0,
-            "59m, last 1 h ago"
+            "59m, last 1h ago"
         );
         assert_eq!(
             format_active(last - Duration::minutes(60), last, now).0,
-            "1h, last 1 h ago"
+            "1h, last 1h ago"
         );
         assert_eq!(
             format_active(last - Duration::minutes(24 * 60 - 1), last, now).0,
-            "23h, last 1 h ago"
+            "23h, last 1h ago"
         );
         assert_eq!(
             format_active(last - Duration::hours(24), last, now).0,
-            "1d, last 1 h ago"
+            "1d, last 1h ago"
         );
         assert_eq!(
             format_active(last - Duration::hours(50), last, now).0,
-            "2d, last 1 h ago"
+            "2d, last 1h ago"
         );
     }
 
@@ -386,12 +397,22 @@ mod tests {
         let first = at("2026-10-01T00:00:00Z");
         let last = at("2026-10-05T12:00:00Z");
         let ago = |d: Duration| format_active(first, last, last + d).0;
-        assert_eq!(ago(Duration::seconds(59)), "4d, last just now");
-        assert_eq!(ago(Duration::seconds(60)), "4d, last 1 min ago");
-        assert_eq!(ago(Duration::minutes(59)), "4d, last 59 min ago");
-        assert_eq!(ago(Duration::minutes(60)), "4d, last 1 h ago");
-        assert_eq!(ago(Duration::hours(24)), "4d, last 1 d ago");
-        assert_eq!(ago(Duration::seconds(-30)), "4d, last just now");
+        // The same spelling as `format_relative_time`, so Review's Active cell and the
+        // dashboard's recent activity read alike one click apart.
+        assert_eq!(ago(Duration::seconds(59)), "4d, last 59s ago");
+        assert_eq!(ago(Duration::seconds(60)), "4d, last 1m ago");
+        assert_eq!(ago(Duration::minutes(59)), "4d, last 59m ago");
+        assert_eq!(ago(Duration::minutes(60)), "4d, last 1h ago");
+        assert_eq!(ago(Duration::hours(24)), "4d, last 1d ago");
+        assert_eq!(ago(Duration::seconds(-30)), "4d, last 0s ago");
+    }
+
+    #[test]
+    fn bytes_read_the_same_on_every_page() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(4300), "4.2 KB");
+        assert_eq!(format_bytes(5_242_880), "5.0 MB");
+        assert_eq!(format_bytes(6_600_000_000), "6.1 GB");
     }
 
     #[test]

@@ -42,7 +42,7 @@
   {% if most_active %}
   <table class="table-compact stack">
     <thead><tr>
-      <th class="w-150">Address</th>
+      <th class="w-150">IP</th>
       <th class="w-190">Activity &middot; 24h</th>
       <th class="count w-70">Events</th>
       <th>What it did</th>
@@ -106,7 +106,7 @@
   <div class="panel-head">Recent activity <span class="dim">repeats folded</span></div>
   {% if recent_events %}
   <table class="table-compact stack">
-    <thead><tr><th>Last</th><th>Activity</th><th class="count">Events</th><th>Source</th></tr></thead>
+    <thead><tr><th>Last</th><th>Activity</th><th class="count">Events</th><th>IP</th></tr></thead>
     <tbody>
       {% for e in recent_events %}
       <tr>

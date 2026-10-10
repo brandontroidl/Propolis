@@ -146,6 +146,12 @@ html, body {
 a { color: var(--link); text-decoration: none; }
 a:hover { color: var(--link-hover); text-decoration: underline; }
 :focus-visible { outline: 2px solid var(--link-hover); outline-offset: 2px; border-radius: 2px; }
+/* Disclosure: every <details> opens with the session card's hand-drawn caret, muted, turning a
+   quarter on open. The native marker differs per browser and vanishes on a flex summary. */
+summary { list-style: none; cursor: pointer; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "\25B8"; display: inline-block; margin-right: 0.4rem; color: var(--text-muted); font-size: 0.7rem; transition: transform 120ms ease; }
+details[open] > summary::before { transform: rotate(90deg); }
 
 /* -- Type utilities: labels recede (wide-tracked micro-caps), data advances (mono, tabular) -- */
 .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
@@ -368,19 +374,20 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 /* Selected view = calm cool accent, not a warm fill. A view switch is wayfinding, not an alert. */
 .range-btn.active { color: var(--text); border-color: var(--link); background: var(--surface-raised); font-weight: 600; }
 
-/* -- Download control: two dropdowns + one button, not ten buttons repeated -- */
+/* -- Download control: two dropdowns + one button, not ten buttons repeated. .dl-go is every
+   download link in the console (feeds, samples), with or without the format select beside it. -- */
 .dl { display: inline-flex; align-items: center; gap: 0.4rem; }
 .dl select {
   background: var(--bg); color: var(--text-muted); border: 1px solid var(--border-bright);
   border-radius: var(--radius-sm); padding: 0.25rem 0.45rem; font-family: var(--font-mono); font-size: 0.68rem;
 }
 .dl select:focus { border-color: var(--brand); outline: none; color: var(--text); }
-.dl .dl-go {
-  background: var(--bg); border: 1px solid var(--border-bright); border-radius: var(--radius-sm);
+.dl-go {
+  display: inline-block; background: var(--bg); border: 1px solid var(--border-bright); border-radius: var(--radius-sm);
   padding: 0.25rem 0.7rem; font-size: 0.66rem; color: var(--text-muted); text-decoration: none;
   font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; font-family: var(--font-sans); cursor: pointer;
 }
-.dl .dl-go:hover { border-color: var(--brand); color: var(--text); text-decoration: none; }
+.dl-go:hover { border-color: var(--brand); color: var(--text); text-decoration: none; }
 
 /* -- Tab bar -- */
 .tab-bar { display: flex; gap: 0.25rem; margin: 0.9rem 0 1.1rem; border-bottom: 1px solid var(--border); }
@@ -425,10 +432,6 @@ td.ip a:hover { color: var(--brand); }
   display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem;
   padding: 0.6rem 0.9rem; cursor: pointer; font-size: 0.8rem; background: var(--surface-raised); list-style: none;
 }
-/* `display:flex` drops the native <summary> triangle; redraw it by hand. */
-.session-card > summary.session-header::-webkit-details-marker { display: none; }
-.session-card > summary.session-header::before { content: "\25B8"; flex: 0 0 auto; color: var(--text-muted); font-size: 0.7rem; transition: transform 120ms ease; }
-.session-card[open] > summary.session-header::before { transform: rotate(90deg); }
 .session-card > summary.session-header:hover { background: var(--border); }
 .session-card[open] > summary.session-header { border-bottom: 1px solid var(--border); }
 .session-time { color: var(--text); }
@@ -439,12 +442,11 @@ td.ip a:hover { color: var(--brand); }
 /* Repeated identical sessions: one card holding the members, each still its own card. */
 .fold-members { padding: 0.6rem 0.6rem 0.6rem 1.2rem; }
 /* A run of echo-loader chunk writes: one row, the lines behind an expander. */
-.chunk-toggle > summary { cursor: pointer; }
 .chunk-toggle > summary:hover { color: var(--text); }
 .chunk-lines { margin: 0.4rem 0 0; padding-left: 2.2rem; font-size: 0.72rem; max-height: 22rem; overflow-y: auto; }
 .chunk-lines li { white-space: pre-wrap; word-break: break-all; padding: 0.05rem 0; }
 .raw-toggle { display: inline-block; }
-.raw-toggle > summary { cursor: pointer; color: var(--text-muted); font-size: 0.72rem; }
+.raw-toggle > summary { color: var(--text-muted); font-size: 0.72rem; }
 .raw-toggle > summary:hover { color: var(--text); }
 .raw-json { font-family: var(--font-mono); font-size: 0.72rem; white-space: pre-wrap; word-break: break-all; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.5rem 0.6rem; margin: 0.4rem 0 0; max-width: 520px; }
 
@@ -509,9 +511,7 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
   padding: 0.65rem 0.9rem 0.65rem 2rem; position: relative; cursor: pointer; list-style: none;
 }
 .qg-head { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
-.qgroup > summary::-webkit-details-marker { display: none; }
-.qgroup > summary::before { content: "\25b8"; position: absolute; left: 0.8rem; top: 0.7rem; color: var(--text-muted); }
-.qgroup[open] > summary::before { content: "\25be"; }
+.qgroup > summary::before { position: absolute; left: 0.8rem; top: 0.85rem; }
 .qgroup[open] > summary { border-bottom: 1px solid var(--border); }
 .qg-title { min-width: 0; }
 .qg-label { display: block; min-width: 0; font-size: 0.86rem; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -521,8 +521,6 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .qg-side { display: flex; align-items: center; gap: 0.9rem; white-space: nowrap; }
 .qg-top { font-size: 0.74rem; }
 .qg-top .score { font-family: var(--font-mono); font-weight: 600; }
-.qg-approve { border: 1px solid var(--good); color: var(--good-text); border-radius: var(--radius-sm); padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; }
-.qg-approve:hover { background: var(--good-dim); text-decoration: none; }
 /* Open members sit on a darker inset under the header and are indented, so they read as inside it. */
 .qmembers { background: var(--bg); }
 @media (min-width: 641px) {
@@ -557,9 +555,6 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .campaign-label { overflow-wrap: anywhere; }
 .ioc-value { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text); overflow-wrap: anywhere; }
 .ioc-copy { white-space: nowrap; margin-left: 0.4rem; }
-.copy-btn { font-size: 0.68rem; padding: 0.05rem 0.4rem; border-radius: var(--radius-sm); background: var(--surface-raised); border: 1px solid var(--border); color: var(--text-muted); cursor: pointer; }
-.copy-btn:hover { color: var(--text); border-color: var(--border-bright); }
-.copy-btn--live { color: var(--alert-text); }
 .offscreen-copy { position: fixed; left: -9999px; top: 0; opacity: 0; }
 .shape-list { margin: 0.4rem 0 0.4rem 1.4rem; padding: 0; font-size: 0.78rem; }
 .shape-list li { overflow-wrap: anywhere; margin: 0.1rem 0; }
@@ -642,10 +637,7 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.6rem; }
 .actions .buttons { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 /* The note toggle: collapsed it is a quiet word beside the buttons; open it takes its own line. */
-.qnote > summary { list-style: none; cursor: pointer; color: var(--text-faint); font-size: 0.76rem; padding: 0.2rem 0.3rem; border-radius: var(--radius-sm); }
-.qnote > summary::-webkit-details-marker { display: none; }
-.qnote > summary::before { content: "+ "; }
-.qnote[open] > summary::before { content: "\2212  "; }
+.qnote > summary { color: var(--text-faint); font-size: 0.76rem; padding: 0.2rem 0.3rem; border-radius: var(--radius-sm); }
 .qnote > summary:hover { color: var(--text); }
 .qnote[open] { flex: 1 1 100%; }
 .qnote textarea {
@@ -660,7 +652,8 @@ button, .btn {
   border-radius: var(--radius-sm); padding: 0.35rem 0.7rem; cursor: pointer;
   transition: background-color 100ms ease, border-color 100ms ease;
 }
-button:hover { border-color: var(--text-muted); }
+button:hover, .btn:hover { border-color: var(--text-muted); text-decoration: none; }
+a.btn { display: inline-block; }
 .btn-approve { border-color: var(--good); color: var(--good-text); background: transparent; }
 .btn-approve:hover { background: var(--good-dim); }
 .btn-reject { border-color: var(--alert); color: var(--alert-text); background: transparent; }
@@ -694,12 +687,10 @@ button:hover { border-color: var(--text-muted); }
   display: flex; align-items: baseline; gap: 0.6rem; padding: 0.15rem 0.9rem 0.15rem 1.5rem;
   white-space: pre-wrap; word-break: break-word; list-style: none;
 }
-/* An expandable row (one with fields, or a fold) carries a hand-drawn caret in the gutter, as the
-   session cards do; a plain row keeps the same indent so the columns still line up. */
-summary.log-summary { cursor: pointer; position: relative; }
-summary.log-summary::-webkit-details-marker { display: none; }
-summary.log-summary::before { content: "\25B8"; position: absolute; left: 0.75rem; color: var(--text-faint); font-size: 0.65rem; transition: transform 120ms ease; }
-.log-entry[open] > summary.log-summary::before { transform: rotate(90deg); }
+/* An expandable row (one with fields, or a fold) carries the disclosure caret in the gutter; a
+   plain row keeps the same indent so the columns still line up. */
+summary.log-summary { position: relative; }
+summary.log-summary::before { position: absolute; left: 0.75rem; }
 summary.log-summary:hover { background: var(--surface-raised); }
 .log-kv { white-space: nowrap; }
 /* Inline on the row each value is cut to a readable width; the expanded row shows it whole. */

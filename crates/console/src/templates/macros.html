@@ -5,11 +5,11 @@
     it did: Review, Feed, and Search shipped plain links that navigated instead of opening the
     drawer. Session-anchor links (`/ip/{ip}#session-...`) are a deliberate exception (the drawer
     request does not preserve the anchor) and stay plain full-page links. -#}
-{#- An indicator, shown defanged and never as a link (`review::ioc::defang`). "copy" copies the
-    defanged form; "copy original" is the separate, explicit way to get the live value. The
+{#- An indicator, shown defanged and never as a link (`review::ioc::defang`). "Copy" copies the
+    defanged form; "Copy original" is the separate, explicit way to get the live value. The
     buttons work through the delegated `data-copy` handler in assets/console.js. -#}
 {% macro ioc_value(i) -%}
-<code class="ioc-value">{{ i.defanged }}</code> <span class="ioc-copy"><button type="button" class="copy-btn" data-copy="{{ i.defanged }}" title="Copy the defanged form">copy</button> <button type="button" class="copy-btn copy-btn--live" data-copy="{{ i.value }}" title="Copy the live, followable value">copy original</button></span>
+<code class="ioc-value">{{ i.defanged }}</code> <span class="ioc-copy"><button type="button" class="range-btn" data-copy="{{ i.defanged }}" title="Copy the defanged form">Copy</button> <button type="button" class="range-btn text-alert" data-copy="{{ i.value }}" title="Copy the live, followable value">Copy original</button></span>
 {%- endmacro %}
 
 {#- A sample by its SHA-256: the first 12 hex characters, linked to its page, the whole digest in

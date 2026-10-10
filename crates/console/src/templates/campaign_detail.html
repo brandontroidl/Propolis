@@ -13,7 +13,7 @@
   <div class="panel-head">Review</div>
   {% if pending_members > 0 %}
   <div class="panel-body">
-    <p>{{ pending_members }} member{% if pending_members != 1 %}s are{% else %} is{% endif %} pending review. <a class="btn" href="/campaigns/{{ id }}/approve">Review and approve all {{ pending_members }}&hellip;</a> <span class="dim">shows the list first; nothing is approved until you confirm</span></p>
+    <p>{{ pending_members }} member{% if pending_members != 1 %}s are{% else %} is{% endif %} pending review. <a class="btn btn-approve" href="/campaigns/{{ id }}/approve">Approve all {{ pending_members }}&hellip;</a> <span class="dim">shows the list first; nothing is approved until you confirm</span></p>
   </div>
   {% else %}
   <p class="empty-line">no member is pending review</p>

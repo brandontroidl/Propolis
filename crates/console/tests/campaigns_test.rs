@@ -438,14 +438,14 @@ async fn the_campaign_page_shows_members_representative_and_indicators(pool: PgP
     assert!(page.contains(&format!("href=\"/campaigns/{sequence}/approve\"")));
 
     let (_, page) = console.get(&format!("/campaigns/{sample}")).await;
-    // Shown defanged, the live value only behind the explicit "copy original" action.
+    // Shown defanged, the live value only behind the explicit "Copy original" action.
     assert!(
         page.contains("<code class=\"ioc-value\">127[.]0[.]0[.]1 rival[.]example[.]net</code>"),
         "{page}"
     );
     assert!(page.contains("data-copy=\"127[.]0[.]0[.]1 rival[.]example[.]net\""));
     assert!(page.contains("data-copy=\"127.0.0.1 rival.example.net\""));
-    assert!(page.contains(">copy original</button>"));
+    assert!(page.contains(">Copy original</button>"));
     assert!(page.contains("hosts entry"));
 
     // One indicator carried by three members' commands is one row, not three.
@@ -600,7 +600,7 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
         "{queue}"
     );
     assert!(queue.contains(&format!(
-        "<a class=\"qg-approve\" href=\"/campaigns/{sample}/approve\">Approve all 2"
+        "<a class=\"btn btn-approve\" href=\"/campaigns/{sample}/approve\">Approve all 2"
     )));
 
     let (status, ip_page) = console.get("/ip/192.0.2.1").await;
@@ -752,7 +752,7 @@ async fn pending_members_of_one_campaign_form_one_group_and_singles_stay_rows(po
     assert!(group.contains("5 hosts"), "{group}");
     assert!(
         group.contains(&format!(
-            "<a class=\"qg-approve\" href=\"/campaigns/{sample}/approve\">Approve all 3"
+            "<a class=\"btn btn-approve\" href=\"/campaigns/{sample}/approve\">Approve all 3"
         )),
         "{group}"
     );
@@ -786,7 +786,7 @@ async fn a_lone_pending_member_stays_a_row_with_its_campaign_link(pool: PgPool) 
         "{page}"
     );
     assert!(
-        !page.contains("approve all"),
+        !page.contains("/approve\">Approve all"),
         "one pending member has nothing to approve together"
     );
 }
@@ -812,7 +812,7 @@ async fn a_campaign_with_one_listed_member_is_not_a_group_of_one(pool: PgPool) {
     assert!(!page.contains("class=\"queue-group\""), "{page}");
     assert!(
         page.contains(&format!(
-            "<a href=\"/campaigns/{sample}/approve\">approve all 2 pending"
+            "<a class=\"btn btn-approve\" href=\"/campaigns/{sample}/approve\">Approve all 2&hellip;"
         )),
         "{page}"
     );

@@ -20,7 +20,7 @@
           whether or not the toggle is open (a closed <details> still has its textarea in the
           form data). Open by default only when the entry already carries a note. -#}
       <details class="qnote"{% if row.notes %} open{% endif %}>
-        <summary>note</summary>
+        <summary>Note</summary>
         <textarea name="notes" placeholder="Notes (optional)" aria-label="Note for {{ row.ip }}">{{ row.notes }}</textarea>
       </details>
     </div>
@@ -38,7 +38,7 @@
 <tr class="queue-context" id="context-{{ row.ip }}">
   <td colspan="6">
     {% if c.notable %}<span class="ctx-what"><span class="ctx-verb">{% if c.notable.kind == "upload" %}uploaded{% elif c.notable.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ c.notable.full }}">{{ c.notable.text }}</code></span>{% endif %}
-    {% if c.campaign and c.campaign.members > 1 %}<span class="ctx-campaign">part of <a href="/campaigns/{{ c.campaign.id }}">campaign {{ c.campaign.id }}</a>, {{ c.campaign.members }} host{% if c.campaign.members != 1 %}s{% endif %}{% if c.campaign.role == "infected host" %} <span class="dim">(infected hosts)</span>{% endif %}{% if c.campaign.pending > 1 %} <a href="/campaigns/{{ c.campaign.id }}/approve">approve all {{ c.campaign.pending }} pending&hellip;</a>{% endif %}</span>{% endif %}
+    {% if c.campaign and c.campaign.members > 1 %}<span class="ctx-campaign">part of <a href="/campaigns/{{ c.campaign.id }}">campaign {{ c.campaign.id }}</a>, {{ c.campaign.members }} host{% if c.campaign.members != 1 %}s{% endif %}{% if c.campaign.role == "infected host" %} <span class="dim">(likely infected hosts)</span>{% endif %}{% if c.campaign.pending > 1 %} <a class="btn btn-approve" href="/campaigns/{{ c.campaign.id }}/approve">Approve all {{ c.campaign.pending }}&hellip;</a>{% endif %}</span>{% endif %}
     <span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s }}</span>{% endfor %}{% if c.sessions > 0 %}<span>{{ c.sessions }} session{% if c.sessions != 1 %}s{% endif %}</span>{% endif %}</span>
     {% if c.signals %}<span class="sev-tags"{% if c.sampled %} title="counts from {{ c.sampled }} events"{% endif %}>{% for s in c.signals %}<span class="sev sev--{{ s.sev }}">{{ s.label }} {{ s.count }}</span>{% endfor %}</span>{% endif %}
   </td>

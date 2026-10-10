@@ -44,12 +44,12 @@ rest.</p>
           <summary>
             <span class="qg-title">
               <span class="qg-head"><span class="run-count">{{ g.shown }} pending</span><span class="qg-label campaign-label">{{ g.label }}</span></span>
-              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}){% if g.pending != g.shown %} &middot; {{ g.pending }} pending campaign-wide{% endif %} &middot; {{ g.members }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(infected hosts)</span>{% endif %}</span>
+              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}){% if g.pending != g.shown %} &middot; {{ g.pending }} pending campaign-wide{% endif %} &middot; {{ g.members }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(likely infected hosts)</span>{% endif %}</span>
             </span>
             {% if g.what %}<span class="ctx-what qg-what"><span class="ctx-verb">{% if g.what.kind == "upload" %}uploaded{% elif g.what.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ g.what.full }}">{{ g.what.text }}</code></span>{% endif %}
             <span class="qg-side">
               <span class="qg-top"><span class="dim">top</span> <span class="score">{{ m.score_meter(g.top_score, g.top_pct) }}</span></span>
-              <a class="qg-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending }}&hellip;</a>
+              <a class="btn btn-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending }}&hellip;</a>
             </span>
           </summary>
           <table class="table-compact qmembers">

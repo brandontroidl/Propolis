@@ -144,7 +144,7 @@
     function done(ok) {
       var label = button.getAttribute('data-label') || button.textContent;
       button.setAttribute('data-label', label);
-      button.textContent = ok ? 'copied' : 'copy failed';
+      button.textContent = ok ? 'Copied' : 'Copy failed';
       setTimeout(function () { button.textContent = label; }, 1500);
     }
     if (navigator.clipboard && window.isSecureContext) {

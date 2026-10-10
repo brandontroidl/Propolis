@@ -564,17 +564,13 @@ mod transport_auth_tests {
 /// DB-backed `run_cycle` orchestration tests: dedup/sync, reject/spool, backoff/terminal,
 /// per-host bucket, recursion depth cap, empty-body handling, and panic isolation.
 ///
-/// Shares the persistent `propolis_test` database with other crates' tests (see
-/// `queue_test.rs`/`gatekeeper_test.rs`'s module docs for the same convention). Because
-/// `claim_candidates` is deliberately GLOBAL - it selects across the whole `fetch_attempt`
-/// table, not scoped to any one test - these tests MUST run serially:
-/// `cargo test -p review --lib fetcher::orchestration_tests -- --test-threads=1`. Run in
-/// parallel, one test's `reset_all` wipe (or its `run_cycle_with` call, which can select rows
-/// another concurrently-running test just inserted) races another test's fixtures and produces
-/// spurious counts - verified empirically (three consecutive default-parallelism runs each
-/// failed with different, non-reproducible mismatched counts; three consecutive
-/// `--test-threads=1` runs were all clean). `--test-threads=1` is required for this crate's
-/// existing DB-backed integration tests for the identical reason.
+/// Every test owns a fresh database (`#[sqlx::test]`), migrated by [`migrate`]. This is
+/// load-bearing: `claim_candidates` is deliberately GLOBAL - it syncs every `honeypot_file_download`
+/// event and selects across the whole `fetch_attempt` table - so on a database shared with
+/// other tests or crates, any leftover row (a never-terminal `pending` row, another suite's
+/// event) is claimed ahead of a test's own fixtures and skews its counts. A hand-written
+/// partial reset cannot cover every table and host another suite may have touched, so no test
+/// here shares state with anything.
 #[cfg(test)]
 mod orchestration_tests {
     use super::*;
@@ -590,47 +586,21 @@ mod orchestration_tests {
     use crate::fetcher::guard::HostResolver;
     use crate::fetcher::http::FetchLimits;
 
-    async fn test_pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-        let pool = PgPool::connect(&url).await.unwrap();
+    /// Applies core-scoring's then this crate's migrations to the test's own database.
+    async fn migrate(pool: &PgPool) {
         sqlx::migrate!("../core-scoring/migrations")
-            .run(&pool)
+            .run(pool)
             .await
             .unwrap();
-        crate::migrator().run(&pool).await.unwrap();
-        pool
+        crate::migrator().run(pool).await.unwrap();
     }
 
-    /// Wipes every row this whole test suite could have left behind, from THIS run or a prior
-    /// one - not just the calling test's own host. `propolis_test` is a persistent shared
-    /// database (matches `queue_test.rs`'s `reset_ip` convention), and `claim_candidates` is
-    /// deliberately GLOBAL (it has to be, to serve the whole table each cycle) - so a row any
-    /// other test in this file leaves non-terminal (still `pending`, or backed off with an
-    /// elapsed `next_attempt`) is visible to every later `claim_candidates` call in the same
-    /// process, not just its own test. Two concrete leaks this closes: the per-host-bucket test
-    /// intentionally leaves 40 of its 50 rows `pending` (only `per_host_hour` get attempted),
-    /// and the panic-isolation test's "boom" row never reaches an upsert at all (the panic fires
-    /// before `record_failure`/`record_success` runs), so it too stays `pending` forever. Both
-    /// are exactly the kind of row a later test's own `claim_candidates` batch would otherwise
-    /// scoop up ahead of its own freshly-seeded one (`ORDER BY first_seen` sorts the older,
-    /// leaked-in row first). The shared daily-usage counter is cleared too, so one test's
-    /// charges never leave the next with less daily budget than it set up. Called at the start
-    /// of every test so each is self-contained regardless of run order or which tests ran
-    /// before it.
-    async fn reset_all(pool: &PgPool) {
-        sqlx::query("DELETE FROM fetch_attempt WHERE host LIKE 'fetch8%.example'")
-            .execute(pool)
+    /// A second pool onto the same test database: its own connections, nothing shared but the
+    /// database, which is the position two review nodes are in.
+    async fn second_node(pool: &PgPool) -> PgPool {
+        PgPool::connect_with((*pool.connect_options()).clone())
             .await
-            .unwrap();
-        sqlx::query("DELETE FROM event WHERE source_ip::text LIKE '203.0.113.%'")
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM fetch_daily_usage")
-            .execute(pool)
-            .await
-            .unwrap();
+            .unwrap()
     }
 
     /// The rows a claim would hand out, with a zero lease so they stay claimable afterwards -
@@ -748,13 +718,12 @@ mod orchestration_tests {
 
     // (a) a honeypot_file_download event with a public-resolving URL -> spool gets the sample,
     // fetch_attempt.status='success'.
-    #[tokio::test]
-    async fn captured_body_is_spooled_and_recorded_success() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn captured_body_is_spooled_and_recorded_success(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8a.example";
         let ip = "203.0.113.10";
         let url = format!("http://{host}/mal.bin");
-        reset_all(&pool).await;
 
         append_event(
             &pool,
@@ -807,10 +776,9 @@ mod orchestration_tests {
 
     // Audit P-08: each captured body records how its transport was authenticated, a certificate
     // failure keeps its error, and a row with no body never reads as anything but 'unknown'.
-    #[tokio::test]
-    async fn captured_bodies_record_how_their_transport_was_authenticated() {
-        let pool = test_pool().await;
-        reset_all(&pool).await;
+    #[sqlx::test(migrations = false)]
+    async fn captured_bodies_record_how_their_transport_was_authenticated(pool: PgPool) {
+        migrate(&pool).await;
         let urls = seed_pending(&pool, "fetch8auth.example", 4).await;
 
         let captured = |tag: &str, transport_auth| RawOutcome::Captured {
@@ -872,11 +840,10 @@ mod orchestration_tests {
     // `source_ip::text` + `.parse::<IpAddr>().ok()` always failed the parse and the `.ok()`
     // swallowed it, writing NULL. That severed every IP -> fetched-malware link. `host()` emits
     // the bare address. This test fails against the `::text` spelling and passes with `host()`.
-    #[tokio::test]
-    async fn synced_rows_carry_the_reporting_attacker_ip() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn synced_rows_carry_the_reporting_attacker_ip(pool: PgPool) {
+        migrate(&pool).await;
         let ip = "203.0.113.77";
-        reset_all(&pool).await;
 
         let url = "http://fetch8z.example/payload.bin".to_string();
         append_event(
@@ -916,11 +883,10 @@ mod orchestration_tests {
     // Rejected("unsupported_scheme"), burning a backoff cycle and a daily-cap/per-host-bucket
     // slot for something that will never be fetched. sync_new_events must skip it outright,
     // while still syncing the schemes the fetcher actually handles.
-    #[tokio::test]
-    async fn sync_skips_unsupported_schemes_but_still_syncs_supported_ones() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn sync_skips_unsupported_schemes_but_still_syncs_supported_ones(pool: PgPool) {
+        migrate(&pool).await;
         let ip = "203.0.113.14";
-        reset_all(&pool).await;
 
         let ftp_url = "ftp://fetch8m.example/mal.bin".to_string();
         let http_url = "http://fetch8n.example/mal.bin".to_string();
@@ -973,13 +939,12 @@ mod orchestration_tests {
     }
 
     // (b) a forbidden URL -> status='rejected', reject_reason set, no spool write.
-    #[tokio::test]
-    async fn rejected_url_is_recorded_with_no_spool_write() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn rejected_url_is_recorded_with_no_spool_write(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8b.example";
         let ip = "203.0.113.11";
         let url = format!("http://{host}/x");
-        reset_all(&pool).await;
 
         append_event(
             &pool,
@@ -1028,23 +993,14 @@ mod orchestration_tests {
 
     // A bot's dummy probe URLs on a public resolver go through the real fetcher: recorded as
     // rejected with the PublicResolver reason, never dialed, nothing spooled.
-    #[tokio::test]
-    async fn public_resolver_probe_urls_are_recorded_as_rejected_and_never_fetched() {
-        let pool = test_pool().await;
-        reset_all(&pool).await;
+    #[sqlx::test(migrations = false)]
+    async fn public_resolver_probe_urls_are_recorded_as_rejected_and_never_fetched(pool: PgPool) {
+        migrate(&pool).await;
         let urls = [
             "http://1.1.1.1/wget.sh",
             "tftp://1.1.1.1/tftp.sh",
             "http://[2606:4700:4700::1111]/curl.sh",
         ];
-        // reset_all only clears the fetch8*.example hosts, and these rows are keyed by IP literal.
-        for url in urls {
-            sqlx::query("DELETE FROM fetch_attempt WHERE url = $1")
-                .bind(url)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
         for url in urls {
             append_event(
                 &pool,
@@ -1084,12 +1040,11 @@ mod orchestration_tests {
 
     // (c) a failed URL writes a backoff row and is not re-selected before next_attempt; terminal
     // after 3 attempts.
-    #[tokio::test]
-    async fn backoff_row_is_not_reselected_early_and_goes_terminal_after_three() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn backoff_row_is_not_reselected_early_and_goes_terminal_after_three(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8c.example";
         let url = format!("http://{host}/y");
-        reset_all(&pool).await;
 
         store::upsert_attempt(
             &pool,
@@ -1175,11 +1130,10 @@ mod orchestration_tests {
     }
 
     // (d) 50 URLs on one host -> at most per_host_hour fetched.
-    #[tokio::test]
-    async fn per_host_hourly_bucket_caps_fetches() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn per_host_hourly_bucket_caps_fetches(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8d.example";
-        reset_all(&pool).await;
 
         for i in 0..50 {
             let url = format!("http://{host}/f{i}");
@@ -1240,12 +1194,11 @@ mod orchestration_tests {
     }
 
     // (e) a fetched script body enqueues depth-1 synthetic rows; depth 3 is never enqueued.
-    #[tokio::test]
-    async fn recursion_enqueues_children_but_never_past_max_depth() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn recursion_enqueues_children_but_never_past_max_depth(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8e.example";
         let ip = "203.0.113.12";
-        reset_all(&pool).await;
 
         // Depth 0 -> 1: a real event-sourced download whose body is a dropper script.
         let loader_url = format!("http://{host}/loader.sh");
@@ -1348,11 +1301,10 @@ mod orchestration_tests {
     // reset that row - regardless of its current status. A -> B -> A must settle after both
     // succeed once, not ping-pong forever (the depth cap alone cannot stop a cycle if
     // re-discovering an already-`success` url resets it back to `pending`/depth 0).
-    #[tokio::test]
-    async fn recursion_cycle_a_to_b_to_a_terminates_without_perpetual_repending() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn recursion_cycle_a_to_b_to_a_terminates_without_perpetual_repending(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8i.example";
-        reset_all(&pool).await;
 
         let url_a = format!("http://{host}/a.sh");
         let url_b = format!("http://{host}/b.sh");
@@ -1456,11 +1408,10 @@ mod orchestration_tests {
 
     // Fix round 1, #1 (critical): a script that lists an already-`dead` url as a child must not
     // resurrect it - defeats the terminal-after-3-attempts guarantee otherwise.
-    #[tokio::test]
-    async fn recursion_never_resurrects_an_already_dead_child() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn recursion_never_resurrects_an_already_dead_child(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8j.example";
-        reset_all(&pool).await;
 
         let dead_url = format!("http://{host}/dead.bin");
         let loader_url = format!("http://{host}/loader.sh");
@@ -1560,11 +1511,10 @@ mod orchestration_tests {
     // Fix round 1, #1 (critical): a script that lists an already-`success` url as a child must
     // not reset it back to pending - would wipe sha256/bytes/content_type/pinned_ip for a sample
     // already safely spooled.
-    #[tokio::test]
-    async fn recursion_never_resets_an_already_successful_child() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn recursion_never_resets_an_already_successful_child(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8k.example";
-        reset_all(&pool).await;
 
         let done_url = format!("http://{host}/done.bin");
         let loader_url = format!("http://{host}/loader2.sh");
@@ -1653,13 +1603,12 @@ mod orchestration_tests {
     }
 
     // (f) a zero-byte body -> status='empty', no spool write, not re-fetched.
-    #[tokio::test]
-    async fn empty_body_is_recorded_with_no_spool_write_and_backs_off() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn empty_body_is_recorded_with_no_spool_write_and_backs_off(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8f.example";
         let ip = "203.0.113.13";
         let url = format!("http://{host}/empty.bin");
-        reset_all(&pool).await;
 
         append_event(
             &pool,
@@ -1716,11 +1665,10 @@ mod orchestration_tests {
     }
 
     // Bonus: one URL's fetcher panic never aborts the batch (never-panic-the-caller requirement).
-    #[tokio::test]
-    async fn a_panicking_fetch_is_isolated_and_the_batch_continues() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn a_panicking_fetch_is_isolated_and_the_batch_continues(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8g.example";
-        reset_all(&pool).await;
 
         let boom_url = format!("http://{host}/boom");
         let ok_url = format!("http://{host}/ok");
@@ -1780,11 +1728,10 @@ mod orchestration_tests {
     // Fix round 1, #2 (important): spec section 9 - selection is newest-first. Payload URLs die
     // within minutes, so a stale-first order starves live captures behind a backlog of urls that
     // are probably already gone.
-    #[tokio::test]
-    async fn select_candidates_orders_newest_first_under_a_backlog() {
-        let pool = test_pool().await;
+    #[sqlx::test(migrations = false)]
+    async fn select_candidates_orders_newest_first_under_a_backlog(pool: PgPool) {
+        migrate(&pool).await;
         let host = "fetch8l.example";
-        reset_all(&pool).await;
 
         let base = Utc::now();
         // Insert 5 rows with explicit, staggered first_seen timestamps directly via SQL (the
@@ -1863,11 +1810,10 @@ mod orchestration_tests {
         }
     }
 
-    #[tokio::test]
-    async fn two_nodes_racing_one_backlog_claim_disjoint_rows() {
-        let node_a = test_pool().await;
-        let node_b = test_pool().await;
-        reset_all(&node_a).await;
+    #[sqlx::test(migrations = false)]
+    async fn two_nodes_racing_one_backlog_claim_disjoint_rows(node_a: PgPool) {
+        migrate(&node_a).await;
+        let node_b = second_node(&node_a).await;
         let mut seeded = seed_pending(&node_a, "fetch8p.example", 10).await;
         seeded.extend(seed_pending(&node_a, "fetch8q.example", 10).await);
 
@@ -1887,11 +1833,10 @@ mod orchestration_tests {
         assert_eq!(union, seeded.into_iter().collect::<HashSet<_>>());
     }
 
-    #[tokio::test]
-    async fn the_per_host_hourly_cap_holds_across_nodes() {
-        let node_a = test_pool().await;
-        let node_b = test_pool().await;
-        reset_all(&node_a).await;
+    #[sqlx::test(migrations = false)]
+    async fn the_per_host_hourly_cap_holds_across_nodes(node_a: PgPool) {
+        migrate(&node_a).await;
+        let node_b = second_node(&node_a).await;
         seed_pending(&node_a, "fetch8r.example", 10).await;
 
         let (a, b) = tokio::join!(
@@ -1913,11 +1858,10 @@ mod orchestration_tests {
         assert_eq!(c.skipped_bucket, 6);
     }
 
-    #[tokio::test]
-    async fn the_daily_cap_holds_across_nodes_and_charges_only_claimed_rows() {
-        let node_a = test_pool().await;
-        let node_b = test_pool().await;
-        reset_all(&node_a).await;
+    #[sqlx::test(migrations = false)]
+    async fn the_daily_cap_holds_across_nodes_and_charges_only_claimed_rows(node_a: PgPool) {
+        migrate(&node_a).await;
+        let node_b = second_node(&node_a).await;
         seed_pending(&node_a, "fetch8s.example", 3).await;
         seed_pending(&node_a, "fetch8t.example", 3).await;
         seed_pending(&node_a, "fetch8u.example", 3).await;
@@ -1941,10 +1885,9 @@ mod orchestration_tests {
         assert_eq!(used, 5, "the daily cap is charged exactly what was claimed");
     }
 
-    #[tokio::test]
-    async fn an_idle_claim_costs_the_daily_budget_nothing() {
-        let pool = test_pool().await;
-        reset_all(&pool).await;
+    #[sqlx::test(migrations = false)]
+    async fn an_idle_claim_costs_the_daily_budget_nothing(pool: PgPool) {
+        migrate(&pool).await;
         for _ in 0..50 {
             let claim = store::claim_candidates(&pool, leased(20, 100, 10))
                 .await
@@ -1962,10 +1905,9 @@ mod orchestration_tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_daily_cap_resets_on_a_new_utc_day() {
-        let pool = test_pool().await;
-        reset_all(&pool).await;
+    #[sqlx::test(migrations = false)]
+    async fn the_daily_cap_resets_on_a_new_utc_day(pool: PgPool) {
+        migrate(&pool).await;
         sqlx::query(
             "INSERT INTO fetch_daily_usage (day, used) \
              VALUES ((now() AT TIME ZONE 'UTC')::date - 1, 1000)",
@@ -1985,10 +1927,9 @@ mod orchestration_tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_claim_hides_its_rows_until_recorded_or_the_lease_lapses() {
-        let pool = test_pool().await;
-        reset_all(&pool).await;
+    #[sqlx::test(migrations = false)]
+    async fn a_claim_hides_its_rows_until_recorded_or_the_lease_lapses(pool: PgPool) {
+        migrate(&pool).await;
         let urls = seed_pending(&pool, "fetch8x.example", 1).await;
 
         let first = store::claim_candidates(&pool, leased(5, 100, 100))
@@ -2040,11 +1981,10 @@ mod orchestration_tests {
 
     /// The side effect itself: two concurrent cycles on two nodes fetch each URL once, and the
     /// recorded outcome releases the claim.
-    #[tokio::test]
-    async fn concurrent_cycles_on_two_nodes_fetch_each_url_exactly_once() {
-        let node_a = test_pool().await;
-        let node_b = test_pool().await;
-        reset_all(&node_a).await;
+    #[sqlx::test(migrations = false)]
+    async fn concurrent_cycles_on_two_nodes_fetch_each_url_exactly_once(node_a: PgPool) {
+        migrate(&node_a).await;
+        let node_b = second_node(&node_a).await;
         seed_pending(&node_a, "fetch8y.example", 8).await;
         seed_pending(&node_a, "fetch8k.example", 8).await;
 

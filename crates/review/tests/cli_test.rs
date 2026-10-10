@@ -7,20 +7,15 @@
 //! wiring end to end: env config -> `PgPool::connect` -> `cli::execute`/
 //! `run_daemon` -> real database rows.
 //!
-//! Shares the persistent `propolis_test` database with the other crates'
-//! tests (see the project's `local-gate-toolchain` note). Every test uses a
-//! distinct source IP (RFC5737 documentation range `203.0.113.248-253`,
-//! disjoint from `queue_test.rs`'s `192.0.2.210-214`/`198.51.100.215/217`/
-//! `203.0.113.216`, `gatekeeper_test.rs`'s `203.0.113.230-239`, and
-//! `submit_test.rs`'s `203.0.113.240-247`). Run with `--test-threads=1`
-//! (matches every other test file in this crate: `core_scoring::append_event`
-//! serializes every append through a single Postgres advisory lock).
+//! Each test owns a fresh database (`#[sqlx::test]`); the subprocess is pointed at it by
+//! `database_url`, which swaps the test database's name into the caller's `DATABASE_URL` so
+//! the credentials and host carry over. The `daemon` test in particular populates from the whole
+//! `ip_score` table, so a shared database would let other tests' rows reach it.
 //!
-//! The subprocess inherits the test process's environment (so `DATABASE_URL`,
-//! if the caller set one, flows through unchanged) plus whatever this file
-//! explicitly overrides via `Command::env`. No vendor API key is ever set, so
-//! every vendor stays disabled (`load_vendor_config`'s fail-closed default) -
-//! the daemon smoke test below never attempts a real outbound HTTP call.
+//! The subprocess inherits the test process's environment plus whatever this file explicitly
+//! overrides via `Command::env`. No vendor API key is ever set, so every vendor stays disabled
+//! (`load_vendor_config`'s fail-closed default) - the daemon smoke test below never attempts a
+//! real outbound HTTP call.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -30,19 +25,22 @@ use sqlx::{PgPool, Row};
 
 use review::queue::ReviewQueue;
 
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into())
+/// The connection string for the subprocess: the caller's `DATABASE_URL` with `pool`'s own
+/// database substituted.
+fn database_url(pool: &PgPool) -> String {
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for DB tests");
+    let mut url = url::Url::parse(&base).unwrap();
+    let database = pool.connect_options().get_database().unwrap().to_string();
+    url.set_path(&database);
+    url.to_string()
 }
 
-async fn setup_pool() -> PgPool {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    review::migrator().run(&pool).await.unwrap();
-    pool
+    review::migrator().run(pool).await.unwrap();
 }
 
 /// Builds an `EventInput` via the public `from_signal` constructor, matching
@@ -110,45 +108,6 @@ async fn seed_recommended(pool: &PgPool, ip: &str) {
     .unwrap();
 }
 
-/// Wipes any leftover state for `ip` from a previous run of this suite,
-/// INCLUDING `event` (matching `queue_test.rs`'s `reset_ip`, not
-/// `submit_test.rs`'s narrower `reset`): `seed_recommended` below reuses the
-/// same fixed timestamps on every run, and `core_scoring::append_event`
-/// dedups on `(source_ip, signal_type)` within `DEDUP_WINDOW_SECONDS` (60s;
-/// same signal_type, delta 0 on a rerun) - confirmed empirically, a first
-/// draft of this file that skipped the `event` delete left
-/// `category_breakdown` empty and `raw_score = 0` on the second run (every
-/// event deduped against its own same-timestamp predecessor from the first
-/// run), so `populate` correctly found nothing eligible and every downstream
-/// assertion in this file failed. Deleting from the globally hash-chained
-/// `event` table is a known, already-broken, pre-existing condition on this
-/// shared database (`task-2-report.md`: `queue_test.rs`'s own `reset_ip`
-/// already broke `core_scoring::verify_chain`'s whole-table check the first
-/// time it ran) - this file's own deletes cannot make an already-`Broken`
-/// chain any more broken, and reproducible tests take priority here.
-async fn reset(pool: &PgPool, ip: &str) {
-    sqlx::query("DELETE FROM vendor_submission WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM event WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
 async fn queue_state(pool: &PgPool, ip: &str) -> Option<String> {
     sqlx::query("SELECT state::text FROM review_queue WHERE source_ip = $1::inet")
         .bind(ip)
@@ -189,17 +148,16 @@ fn no_subcommand_exits_nonzero() {
     assert!(!output.status.success());
 }
 
-#[tokio::test]
-async fn list_shows_seeded_pending_entry() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn list_shows_seeded_pending_entry(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.248";
-    reset(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
     ReviewQueue::new().populate(&pool).await.unwrap();
 
     let output = Command::new(review_bin())
         .arg("list")
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -210,17 +168,16 @@ async fn list_shows_seeded_pending_entry() {
     );
 }
 
-#[tokio::test]
-async fn approve_transitions_state_and_records_notes() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn approve_transitions_state_and_records_notes(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.249";
-    reset(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
     ReviewQueue::new().populate(&pool).await.unwrap();
 
     let output = Command::new(review_bin())
         .args(["approve", test_ip, "--notes", "confirmed malicious scan"])
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -239,17 +196,16 @@ async fn approve_transitions_state_and_records_notes() {
     assert_eq!(notes.as_deref(), Some("confirmed malicious scan"));
 }
 
-#[tokio::test]
-async fn reject_transitions_state() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn reject_transitions_state(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.250";
-    reset(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
     ReviewQueue::new().populate(&pool).await.unwrap();
 
     let output = Command::new(review_bin())
         .args(["reject", test_ip])
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -259,17 +215,16 @@ async fn reject_transitions_state() {
     );
 }
 
-#[tokio::test]
-async fn snooze_transitions_state() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn snooze_transitions_state(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.251";
-    reset(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
     ReviewQueue::new().populate(&pool).await.unwrap();
 
     let output = Command::new(review_bin())
         .args(["snooze", test_ip])
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -284,16 +239,15 @@ async fn snooze_transitions_state() {
 /// IP with no queue row must fail loudly, not silently no-op. Confirms
 /// `main.rs` surfaces that as a nonzero exit plus a stderr message, not a
 /// panic or a silent success.
-#[tokio::test]
-async fn approve_nonexistent_ip_fails_loudly() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn approve_nonexistent_ip_fails_loudly(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.252";
-    reset(&pool, test_ip).await;
     assert!(queue_state(&pool, test_ip).await.is_none());
 
     let output = Command::new(review_bin())
         .args(["approve", test_ip])
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -304,11 +258,10 @@ async fn approve_nonexistent_ip_fails_loudly() {
     );
 }
 
-#[tokio::test]
-async fn history_shows_submission_row() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn history_shows_submission_row(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.253";
-    reset(&pool, test_ip).await;
 
     sqlx::query(
         "INSERT INTO vendor_submission \
@@ -323,7 +276,7 @@ async fn history_shows_submission_row() {
 
     let output = Command::new(review_bin())
         .args(["history", test_ip])
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -338,15 +291,14 @@ async fn history_shows_submission_row() {
     );
 }
 
-#[tokio::test]
-async fn history_reports_no_history_for_unsubmitted_ip() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn history_reports_no_history_for_unsubmitted_ip(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.254";
-    reset(&pool, test_ip).await;
 
     let output = Command::new(review_bin())
         .args(["history", test_ip])
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -366,17 +318,16 @@ async fn history_reports_no_history_for_unsubmitted_ip() {
 /// Polls for up to 5s rather than a single fixed sleep, to stay robust
 /// against a loaded test machine: `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS=1` means
 /// the first populate pass should land well within that window.
-#[tokio::test]
-async fn daemon_populates_seeded_ip_into_pending_queue() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "203.0.113.255";
-    reset(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
     assert!(queue_state(&pool, test_ip).await.is_none());
 
     let mut child = Command::new(review_bin())
         .arg("daemon")
-        .env("DATABASE_URL", database_url())
+        .env("DATABASE_URL", database_url(&pool))
         .env("PROPOLIS_QUEUE_SCAN_INTERVAL_SECS", "1")
         .env("PROPOLIS_SUBMIT_POLL_INTERVAL_SECS", "1")
         .spawn()

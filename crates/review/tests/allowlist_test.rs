@@ -2,13 +2,12 @@
 //! never queued, a pending one is withdrawn with its reason logged, and the submission runner
 //! refuses one even if it was queued and approved before the allowlist covered it.
 //!
-//! Shares the persistent test database with the other review tests. Every test uses addresses from
-//! `45.10.33.0/24` (ordinary public-looking addresses, never reused by another file: the
-//! gatekeeper refuses reserved ranges outright, so a documentation-range fixture would be held as
-//! `Reserved` before the allowlist behaviour under test was reached). The allowlisted block is
-//! `45.10.33.16/29`; the control addresses sit outside it. Assertions are scoped to this file's own
-//! addresses because `populate` and `run_once` act on the whole shared table. Run with
-//! `--test-threads=1`.
+//! Each test owns a fresh database (`#[sqlx::test]`), so `populate` and `run_once`, which act on
+//! the whole table, only ever see the test's own rows. Addresses come from `45.10.33.0/24`
+//! (ordinary public-looking addresses: the gatekeeper refuses reserved ranges outright, so a
+//! documentation-range fixture would be held as `Reserved` before the allowlist behaviour under
+//! test was reached). The allowlisted block is `45.10.33.16/29`; the control addresses sit
+//! outside it.
 
 use std::io::Write;
 use std::net::IpAddr;
@@ -33,27 +32,12 @@ fn allowlist() -> Arc<OperatorAllowlist> {
     ]))
 }
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    review::migrator().run(&pool).await.unwrap();
-    pool
-}
-
-async fn reset(pool: &PgPool, ip: &str) {
-    for sql in [
-        "DELETE FROM vendor_submission WHERE source_ip = $1::inet",
-        "DELETE FROM review_queue WHERE source_ip = $1::inet",
-        "DELETE FROM ip_score WHERE source_ip = $1::inet",
-        "DELETE FROM event WHERE source_ip = $1::inet",
-    ] {
-        sqlx::query(sql).bind(ip).execute(pool).await.unwrap();
-    }
+    review::migrator().run(pool).await.unwrap();
 }
 
 /// Seeds an eligible, vendor-recommended, recently active projection for `ip`: a confirmed-real
@@ -144,12 +128,11 @@ impl VendorAdapter for RecordingVendor {
     }
 }
 
-#[tokio::test]
-async fn an_allowlisted_address_meeting_the_threshold_is_not_queued() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn an_allowlisted_address_meeting_the_threshold_is_not_queued(pool: PgPool) {
+    migrate(&pool).await;
     let (listed, control) = ("45.10.33.17", "45.10.33.40");
     for ip in [listed, control] {
-        reset(&pool, ip).await;
         seed_recommended(&pool, ip).await;
     }
 
@@ -180,12 +163,11 @@ async fn an_allowlisted_address_meeting_the_threshold_is_not_queued() {
     assert!(recommended);
 }
 
-#[tokio::test]
-async fn an_already_pending_allowlisted_address_is_withdrawn_with_its_reason() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn an_already_pending_allowlisted_address_is_withdrawn_with_its_reason(pool: PgPool) {
+    migrate(&pool).await;
     let (listed, approved_listed, control) = ("45.10.33.18", "45.10.33.19", "45.10.33.41");
     for ip in [listed, approved_listed, control] {
-        reset(&pool, ip).await;
         seed_recommended(&pool, ip).await;
     }
     // Queued while no allowlist covered them.
@@ -229,11 +211,10 @@ async fn an_already_pending_allowlisted_address_is_withdrawn_with_its_reason() {
     );
 }
 
-#[tokio::test]
-async fn a_withdrawn_address_is_surfaced_again_when_it_leaves_the_allowlist() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn a_withdrawn_address_is_surfaced_again_when_it_leaves_the_allowlist(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.33.21";
-    reset(&pool, ip).await;
     seed_recommended(&pool, ip).await;
     let listed = ReviewQueue::new().with_allowlist(allowlist());
     listed.populate(&pool).await.unwrap();
@@ -243,12 +224,13 @@ async fn a_withdrawn_address_is_surfaced_again_when_it_leaves_the_allowlist() {
     assert_eq!(state_of(&pool, ip).await, Some(ReviewState::Pending));
 }
 
-#[tokio::test]
-async fn the_runner_refuses_an_allowlisted_address_queued_before_the_allowlist_changed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn the_runner_refuses_an_allowlisted_address_queued_before_the_allowlist_changed(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
     let (listed, control) = ("45.10.33.20", "45.10.33.42");
     for ip in [listed, control] {
-        reset(&pool, ip).await;
         seed_recommended(&pool, ip).await;
     }
     // Queued and approved while the allowlist was empty.

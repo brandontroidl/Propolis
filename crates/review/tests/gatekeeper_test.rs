@@ -1,10 +1,7 @@
 //! Real-Postgres tests for the gatekeeper's per-vendor check sequence.
 //!
-//! Shares the persistent `propolis_test` database with other crates' tests
-//! (see the project's `local-gate-toolchain` note). Every test uses a distinct
-//! source IP from `45.10.31.0/24` and a distinct vendor name, so tests never
-//! interfere with each other or with leftover rows from other crates' test
-//! runs.
+//! Each test owns a fresh database (`#[sqlx::test]`), so no row from another test or crate can
+//! reach a cooldown or rate-limit count.
 //!
 //! These fixtures are ordinary public addresses rather than the RFC5737
 //! documentation ranges used elsewhere in the project, and must stay that way:
@@ -12,10 +9,6 @@
 //! documentation-range fixture is held as `Reserved` before reaching the check
 //! actually under test. That is the gate working, not a fixture accident - see
 //! `reserved_ranges_are_refused_ahead_of_every_configurable_check`.
-//! `reset_vendor` deletes any
-//! leftover `vendor_submission` rows for a test's vendor name before seeding,
-//! matching `queue_test.rs`'s `reset_ip` discipline for rerun-safety against
-//! the persistent, never-reset database. Run with `--test-threads=1`.
 //!
 //! `current_score` is a caller-supplied `IpScore`, not something `check` reads
 //! from the database itself, so most tests build one directly in memory via
@@ -32,18 +25,13 @@ use sqlx::PgPool;
 
 use review::gatekeeper::{GateReason, GateResult, VendorConfig, check};
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
-    // Run core-scoring migrations first (review_state_enum, etc. must exist).
+async fn migrate(pool: &PgPool) {
+    // Core-scoring first (review_state_enum, etc. must exist), then this crate's own.
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    // Then this crate's own.
-    review::migrator().run(&pool).await.unwrap();
-    pool
+    review::migrator().run(pool).await.unwrap();
 }
 
 /// A permissive baseline config: enabled, generous cooldown/rate limit, no
@@ -98,18 +86,6 @@ fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
     }
 }
 
-/// Wipes any leftover `vendor_submission` rows for `vendor` from a previous
-/// run of this suite against the persistent, shared `propolis_test` database.
-/// `idempotency_key` is UNIQUE, so re-inserting the same key on a second run
-/// without cleanup would fail the insert rather than the intended assertion.
-async fn reset_vendor(pool: &PgPool, vendor: &str) {
-    sqlx::query("DELETE FROM vendor_submission WHERE vendor = $1")
-        .bind(vendor)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
 async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: DateTime<Utc>) {
     let key = format!(
         "{ip}:{vendor}:{}",
@@ -131,9 +107,9 @@ async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: 
     .unwrap();
 }
 
-#[tokio::test]
-async fn stale_last_seen_is_held() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn stale_last_seen_is_held(pool: PgPool) {
+    migrate(&pool).await;
     let ip: IpAddr = "45.10.31.243".parse().unwrap();
     let config = permissive_config("stale-vendor");
     // Active three days ago: older than the freshness window, so it must not be submitted (a
@@ -145,12 +121,11 @@ async fn stale_last_seen_is_held() {
     assert_eq!(result, GateResult::Held(GateReason::Stale));
 }
 
-#[tokio::test]
-async fn recent_last_seen_passes_the_freshness_gate() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn recent_last_seen_passes_the_freshness_gate(pool: PgPool) {
+    migrate(&pool).await;
     let vendor = "fresh-vendor";
     let ip: IpAddr = "45.10.31.244".parse().unwrap();
-    reset_vendor(&pool, vendor).await;
     let config = permissive_config(vendor);
     // Active one hour ago: comfortably inside the freshness window, so every other check applies.
     let mut score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
@@ -160,9 +135,9 @@ async fn recent_last_seen_passes_the_freshness_gate() {
     assert_eq!(result, GateResult::Pass);
 }
 
-#[tokio::test]
-async fn vendor_disabled_is_held() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn vendor_disabled_is_held(pool: PgPool) {
+    migrate(&pool).await;
     let ip: IpAddr = "45.10.31.230".parse().unwrap();
     let config = VendorConfig {
         enabled: false,
@@ -174,12 +149,11 @@ async fn vendor_disabled_is_held() {
     assert_eq!(result, GateResult::Held(GateReason::Disabled));
 }
 
-#[tokio::test]
-async fn within_cooldown_is_held() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn within_cooldown_is_held(pool: PgPool) {
+    migrate(&pool).await;
     let vendor = "cooldown-active-vendor";
     let ip = "45.10.31.231";
-    reset_vendor(&pool, vendor).await;
     // A successful submission 1 hour ago, well inside a 24-hour cooldown.
     insert_submission(&pool, ip, vendor, Utc::now() - Duration::hours(1)).await;
 
@@ -190,12 +164,11 @@ async fn within_cooldown_is_held() {
     assert_eq!(result, GateResult::Held(GateReason::Cooldown));
 }
 
-#[tokio::test]
-async fn cooldown_expired_allows_pass() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn cooldown_expired_allows_pass(pool: PgPool) {
+    migrate(&pool).await;
     let vendor = "cooldown-expired-vendor";
     let ip = "45.10.31.232";
-    reset_vendor(&pool, vendor).await;
     // A successful submission 48 hours ago, outside a 24-hour cooldown.
     insert_submission(&pool, ip, vendor, Utc::now() - Duration::hours(48)).await;
 
@@ -206,11 +179,10 @@ async fn cooldown_expired_allows_pass() {
     assert_eq!(result, GateResult::Pass);
 }
 
-#[tokio::test]
-async fn rate_limit_exceeded_is_held() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn rate_limit_exceeded_is_held(pool: PgPool) {
+    migrate(&pool).await;
     let vendor = "ratelimit-vendor";
-    reset_vendor(&pool, vendor).await;
     // Two successful submissions to this vendor from OTHER IPs within the
     // window - rate limit is vendor-wide, not per-IP.
     insert_submission(
@@ -240,9 +212,9 @@ async fn rate_limit_exceeded_is_held() {
     assert_eq!(result, GateResult::Held(GateReason::RateLimit));
 }
 
-#[tokio::test]
-async fn score_below_floor_is_held() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn score_below_floor_is_held(pool: PgPool) {
+    migrate(&pool).await;
     let ip: IpAddr = "45.10.31.236".parse().unwrap();
     let config = VendorConfig {
         score_floor: Some(Decimal::from(50)),
@@ -254,9 +226,9 @@ async fn score_below_floor_is_held() {
     assert_eq!(result, GateResult::Held(GateReason::ScoreFloor));
 }
 
-#[tokio::test]
-async fn no_matching_category_is_held() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn no_matching_category_is_held(pool: PgPool) {
+    migrate(&pool).await;
     let ip: IpAddr = "45.10.31.237".parse().unwrap();
     let config = VendorConfig {
         category_filter: Some(vec!["Waf".to_string()]),
@@ -268,9 +240,9 @@ async fn no_matching_category_is_held() {
     assert_eq!(result, GateResult::Held(GateReason::CategoryFilter));
 }
 
-#[tokio::test]
-async fn all_checks_pass() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn all_checks_pass(pool: PgPool) {
+    migrate(&pool).await;
     let ip: IpAddr = "45.10.31.238".parse().unwrap();
     let config = VendorConfig {
         score_floor: Some(Decimal::from(50)),
@@ -283,9 +255,9 @@ async fn all_checks_pass() {
     assert_eq!(result, GateResult::Pass);
 }
 
-#[tokio::test]
-async fn db_error_during_check_fails_closed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn db_error_during_check_fails_closed(pool: PgPool) {
+    migrate(&pool).await;
     pool.close().await;
     let ip: IpAddr = "45.10.31.239".parse().unwrap();
     let config = permissive_config("dberror-vendor");
@@ -298,14 +270,14 @@ async fn db_error_during_check_fails_closed() {
     );
 }
 
-#[tokio::test]
-async fn reserved_ranges_are_refused_ahead_of_every_configurable_check() {
+#[sqlx::test(migrations = false)]
+async fn reserved_ranges_are_refused_ahead_of_every_configurable_check(pool: PgPool) {
     // The operator's own workstation, 10.20.30.109, reached eligible and recommended_for_vendor
     // purely from local SSH testing against the honeypot. Nothing in the gate stopped it: the
     // sequence ran enabled -> cooldown -> rate limit -> score floor -> category filter, all of
     // them operator-configurable, none of them about the address itself. One Approve click would
     // have reported a private LAN address to AbuseIPDB, DShield and OTX as an attacker.
-    let pool = setup_pool().await;
+    migrate(&pool).await;
     let config = permissive_config("reserved-vendor");
 
     for addr in [
@@ -337,7 +309,6 @@ async fn reserved_ranges_are_refused_ahead_of_every_configurable_check() {
     // The check must be specific: an ordinary public address still passes. A guard verified only
     // on its deny branch is half-verified, and over-blocking real reports is its own failure.
     let public: IpAddr = "45.10.31.240".parse().unwrap();
-    reset_vendor(&pool, "reserved-vendor").await;
     assert_eq!(
         check(
             &pool,

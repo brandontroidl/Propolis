@@ -73,6 +73,16 @@ add state to existing rows rather than requiring a destructive transform (see
 The supported direction is **forward**: restore an older database, start a newer
 binary, let it migrate. There is no shipped down-migration.
 
+### Upgrade the intake side before the sensors
+
+The sensor-to-intake log line gains optional fields over time, and an intake that predates one
+ignores it rather than refusing the line. When sensors and intake run on different hosts
+([split deployment](split-deployment.md#upgrading)), upgrade the control plane (intake) first and
+the collectors after. The shell reply field is the current case: a reply recorded while a sensor
+is newer than intake is dropped, the event is still ingested and the chain is unaffected, and the
+console shows no reply for that command. On one host the daemon runs sensors' intake and the
+sensors together, so the order only matters when the sensors are upgraded separately.
+
 ## Rollback
 
 Rollback of the **binaries** is straightforward: reinstall the previous release

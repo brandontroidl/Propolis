@@ -350,6 +350,11 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
 
 ### Upgrading
 
+- **Order: control plane first, collectors after.** A sensor that records a shell reply puts it in
+  a new field of its log line. An intake that predates the field ignores it, so a reply recorded
+  while the collector runs the new build and the control plane the old one is dropped: the event
+  is ingested without it and the console shows no reply for that command. Nothing else is
+  affected and the hash chain stays intact. Upgrading the control plane first avoids the gap.
 - **Control plane.** `deploy/upgrade.sh` works as on a single host: it reinstalls and restarts
   `gateway.service` because the unit is enabled, then restarts `propolis`.
 - **Collector.** Do not run `deploy/upgrade.sh`. It restarts `propolis.service` on every host

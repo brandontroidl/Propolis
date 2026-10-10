@@ -30,17 +30,17 @@ pub struct Converted {
     pub reply: Option<(String, String)>,
 }
 
-/// Converts one wire-format sensor event into a validated `core-scoring` domain event.
+/// Converts one wire-format sensor event into a validated `core-scoring` domain event, and returns
+/// the shell reply text its metadata now names, for the caller to store.
+///
+/// This is the only public conversion: a variant that returned the event alone would drop the
+/// reply text while keeping its digest in the metadata, a reference to a row nobody stored. The
+/// digest, length and truncation flag are in the returned event's metadata, so the hash chain
+/// covers them.
 ///
 /// `weight`, `confidence`, and `category` are derived solely from `signal_type` via
 /// `EventInput::from_signal` (the signal weight table) - a sensor never supplies them, and
 /// this function can never let one drift out of sync with the others.
-pub fn convert(event: SensorEvent) -> Result<EventInput, ConvertError> {
-    convert_event(event).map(|c| c.input)
-}
-
-/// [`convert`], also returning the reply text for the caller to store. The digest, length and
-/// truncation flag are in the returned event's metadata either way, so the hash chain covers them.
 pub fn convert_event(mut event: SensorEvent) -> Result<Converted, ConvertError> {
     let reply = fold_reply(&mut event)?;
     let input = convert_folded(event)?;

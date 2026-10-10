@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use core_scoring::{ChainStatus, output_digest, verify_chain};
-use intake::converter::{ConvertError, convert, convert_event};
+use intake::converter::{ConvertError, convert_event};
 use intake::runner::IntakeRunner;
 use log_tailer::LogTailer;
 use sensor_wire::*;
@@ -62,10 +62,14 @@ fn the_digest_length_and_truncation_are_folded_into_the_metadata() {
 }
 
 #[test]
-fn an_untruncated_reply_writes_no_truncated_key_and_convert_agrees() {
-    let md = convert(event(0, Some(reply("x")))).unwrap().metadata;
-    assert!(md.get("output_truncated").is_none());
-    assert!(md.get("output_sha256").is_some(), "convert folds it too");
+fn an_untruncated_reply_writes_no_truncated_key_and_a_digest_always_comes_with_its_text() {
+    let converted = convert_event(event(0, Some(reply("x")))).unwrap();
+    assert!(converted.input.metadata.get("output_truncated").is_none());
+    assert!(converted.input.metadata.get("output_sha256").is_some());
+    assert!(
+        converted.reply.is_some(),
+        "the conversion never names a reply it does not hand back"
+    );
 }
 
 #[test]

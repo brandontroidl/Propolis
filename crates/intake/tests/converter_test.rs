@@ -1,5 +1,12 @@
-use intake::converter::{ConvertError, convert};
+use core_scoring::EventInput;
+use intake::converter::{ConvertError, convert_event};
 use sensor_wire::*;
+
+/// The converted event alone; these tests are about it, not about a reply's text (see
+/// `shell_reply.rs`).
+fn convert(event: SensorEvent) -> Result<EventInput, ConvertError> {
+    convert_event(event).map(|converted| converted.input)
+}
 
 fn sample_wire_event() -> SensorEvent {
     SensorEvent {

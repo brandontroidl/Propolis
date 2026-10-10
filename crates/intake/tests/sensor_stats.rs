@@ -244,7 +244,7 @@ async fn one_logs_stats_cannot_write_another_sensors_row(pool: PgPool) {
 fn the_converter_would_refuse_a_stats_line_even_if_the_intercept_failed() {
     let event = stats("ssh", 1).to_event("2026-10-09T00:00:00Z".parse().unwrap());
     assert!(matches!(
-        intake::converter::convert(event),
+        intake::converter::convert_event(event),
         Err(intake::converter::ConvertError::UnknownSignalType(_))
     ));
 }

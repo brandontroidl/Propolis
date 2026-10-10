@@ -107,7 +107,8 @@ fn allowed_in_panel(e: &Element) -> bool {
 }
 
 /// Every way `html` breaks the panel contract: content placed directly in a `.panel` that is not
-/// one of the padded parts.
+/// one of the padded parts, an `.empty-line` outside any panel (the panel stays when empty), and
+/// the retired dashed `.empty` box and `.panel-note`.
 pub fn panel_violations(html: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut stray_text = Vec::new();
@@ -116,6 +117,15 @@ pub fn panel_violations(html: &str) -> Vec<String> {
         |chain, e| {
             if chain.last().is_some_and(is_panel) && !allowed_in_panel(e) {
                 out.push(format!("flush in a panel: {}", e.describe()));
+            }
+            if e.has("empty-line") && !chain.iter().any(is_panel) {
+                out.push(format!("empty state outside a panel: {}", e.describe()));
+            }
+            if e.has("empty") || e.has("panel-note") {
+                out.push(format!(
+                    "retired empty-state or note style: {}",
+                    e.describe()
+                ));
             }
         },
         |chain, t| {

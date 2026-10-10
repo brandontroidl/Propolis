@@ -757,8 +757,8 @@ summary.log-summary:hover { background: var(--surface-raised); }
 #log-connection-status { margin-left: 0.6rem; text-transform: none; letter-spacing: 0; }
 #log-pause-toggle.active { border-color: var(--brand); color: var(--brand); }
 
-/* -- Empty states -- */
-.empty { color: var(--text-muted); padding: 2rem 1rem; text-align: center; border: 1px dashed var(--border); border-radius: var(--radius); }
+/* -- Empty state: the one idiom. The panel stays, with its head, and says in a lowercase fragment
+   what is not there; a panel that vanishes when empty reads as a page that lost a section. -- */
 .empty-line { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.82rem; padding: 1.25rem 0.9rem; }
 /* Soft-failed panels banner (routes::degraded): amber = "wants the operator", same ramp as review. */
 .degraded { background: var(--high-dim); border: 1px solid var(--high); color: var(--high-text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.6rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }
@@ -865,7 +865,6 @@ summary.log-summary:hover { background: var(--surface-raised); }
    generated pct-N and h-N classes below. */
 .m-0 { margin: 0; }
 .mt-1 { margin-top: 1rem; }
-.mt-15 { margin-top: 1.5rem; }
 .row-center { display: flex; align-items: center; gap: 1rem; }
 .chip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .mt-06-flush { margin-top: 0.6rem; margin-bottom: 0; }

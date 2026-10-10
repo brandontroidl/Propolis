@@ -9,7 +9,7 @@
   {% endfor %}
 </div>
 {% if tab == "snoozed" %}
-<p class="dim">Snoozed entries stay here until you decide them - nothing puts them back in the
+<p class="table-note">Snoozed entries stay here until you decide them - nothing puts them back in the
 pending queue on its own. Decide one below, or return it to pending to deal with it alongside the
 rest.</p>
 {% endif %}
@@ -87,10 +87,12 @@ rest.</p>
 </table>
 </div>
 {% else %}
+<div class="panel queue-panel">
 {% if tab == "pending" %}
 <p class="empty-line">queue empty - no IPs have crossed the recommendation threshold yet</p>
 {% else %}
 <p class="empty-line">no {{ tab }} entries yet</p>
 {% endif %}
+</div>
 {% endif %}
 {% endblock %}

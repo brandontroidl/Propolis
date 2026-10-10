@@ -4,15 +4,17 @@
 <h1>Captured samples <span class="dim">({{ total }})</span></h1>
 <p class="page-sub">The files the sensors captured, most widely delivered first. Hosts counts every address that uploaded a file, or reported a URL it was fetched from. A file delivered by a command sequence names that <a href="/campaigns">campaign</a>.</p>
 
-{% if fetch_attempts_total > 0 %}
 <div class="panel">
   <div class="panel-head">Fetch attempts <span class="dim">{{ fetch_attempts_total }}</span></div>
+  {% if fetch_attempts_total > 0 %}
   <table class="table-compact">
     <thead><tr>{% for sc in status_counts %}<th class="count">{{ sc.label }}</th>{% endfor %}</tr></thead>
     <tbody><tr>{% for sc in status_counts %}<td class="count">{{ sc.count }}</td>{% endfor %}</tr></tbody>
   </table>
+  {% else %}
+  <p class="empty-line">no fetch attempts recorded</p>
+  {% endif %}
 </div>
-{% endif %}
 
 {% if samples %}
 {% import "macros.html" as m %}
@@ -88,6 +90,6 @@
 </table>
 </div>
 {% else %}
-<p class="empty-line">no captured samples in the spool</p>
+<div class="panel samples-panel"><p class="empty-line">no captured samples in the spool</p></div>
 {% endif %}
 {% endblock %}

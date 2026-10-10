@@ -140,7 +140,7 @@
     </tbody>
   </table>
   {% else %}
-  <p class="empty-line">No service activity recorded for this IP.</p>
+  <p class="empty-line">no service activity recorded</p>
   {% endif %}
 </div>
 
@@ -275,7 +275,7 @@
     </tbody>
   </table>
   {% else %}
-  <p class="empty-line">No category data.</p>
+  <p class="empty-line">no category data</p>
   {% endif %}
 </div>
 
@@ -295,7 +295,7 @@
     </tbody>
   </table>
   {% else %}
-  <p class="empty-line">No WAN vantage recorded for this IP.</p>
+  <p class="empty-line">no WAN vantage recorded</p>
   {% endif %}
 </div>
 
@@ -305,15 +305,15 @@
     {% include "session_cards.html" %}
 
     {% if not session_folds and not ungrouped %}
-    <p class="empty-line">No events recorded for this IP.</p>
+    <p class="empty-line">no events recorded</p>
     {% endif %}
   </div>
   <div id="load-more-container">{% if has_more_events %}<button hx-get="/ip/{{ ip }}/events?cursor={{ next_cursor }}" hx-target="#evidence-timeline" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
 </div>
 
-{% if submissions %}
 <div class="panel">
   <div class="panel-head">Submission history</div>
+  {% if submissions %}
   <table class="table-compact">
     <thead><tr><th>Submitted</th><th>Vendor</th><th>Categories</th><th>Response</th><th>Result</th></tr></thead>
     <tbody>
@@ -328,8 +328,8 @@
       {% endfor %}
     </tbody>
   </table>
+  {% else %}
+  <p class="empty-line">no vendor submissions for this address</p>
+  {% endif %}
 </div>
-{% else %}
-<p class="empty mt-15">No vendor submissions for this IP.</p>
-{% endif %}
 {% endblock %}

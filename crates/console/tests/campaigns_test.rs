@@ -1620,6 +1620,8 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
         r#"<div class="panel"><div class="stat-row"></div></div>"#,
         r#"<div class="panel"><svg class="spark"></svg></div>"#,
         r#"<div class="panel">loose words</div>"#,
+        r#"<p class="empty-line">nothing here</p>"#,
+        r#"<p class="empty mt-15">No vendor submissions.</p>"#,
     ] {
         assert_eq!(markup::panel_violations(bad).len(), 1, "{bad}");
     }
@@ -1671,6 +1673,8 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
         "/queue".to_string(),
         "/queue?tab=approved".to_string(),
         "/queue?tab=snoozed".to_string(),
+        "/queue?tab=rejected".to_string(),
+        "/campaigns?kind=scan".to_string(),
         "/ips".to_string(),
         "/ip/192.0.2.1".to_string(),
         "/ip/198.51.100.200".to_string(),

@@ -5181,7 +5181,7 @@ async fn samples_page_loads_the_fetch_transport_panel_on_a_healthy_database(pool
 }
 
 #[sqlx::test(migrations = false)]
-async fn samples_page_hides_fetch_attempts_panel_when_empty(pool: PgPool) {
+async fn samples_page_keeps_the_fetch_attempts_panel_and_says_it_is_empty(pool: PgPool) {
     migrate(&pool).await;
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -5197,9 +5197,16 @@ async fn samples_page_hides_fetch_attempts_panel_when_empty(pool: PgPool) {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
+    // Every panel stays and says it is empty, as the IP page's panels do; a panel that vanishes
+    // when empty reads as a page that lost a section.
+    assert!(body.contains("Fetch attempts"), "the panel stays: {body}");
     assert!(
-        !body.contains("Fetch attempts"),
-        "no fetch_attempt rows exist, so the status strip must not render: {body}"
+        body.contains(r#"<p class="empty-line">no fetch attempts recorded</p>"#),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<th class="count">Success</th>"#),
+        "{body}"
     );
 }
 

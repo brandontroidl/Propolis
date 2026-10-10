@@ -46,11 +46,11 @@
 </div>
 
 {% if mode == "ips" %}
-  {% if not searched %}
-  <p class="empty-line">Enter at least one filter to search.</p>
-  {% elif ip_rows %}
   <div class="panel">
-    <div class="panel-head">Matching addresses <span class="dim">{{ ip_rows | length }}</span></div>
+    <div class="panel-head">Matching addresses{% if ip_rows %} <span class="dim">{{ ip_rows | length }}</span>{% endif %}</div>
+  {% if not searched %}
+  <p class="empty-line">enter at least one filter to search</p>
+  {% elif ip_rows %}
     <table class="table-compact">
       <thead><tr><th>IP</th><th class="count">Matches</th><th>Score</th><th>Tier</th><th>First seen</th><th>Last seen</th></tr></thead>
       <tbody>
@@ -70,16 +70,16 @@
         {% endfor %}
       </tbody>
     </table>
-  </div>
   {% else %}
   <p class="empty-line">no IPs match these filters</p>
   {% endif %}
+  </div>
 {% else %}
-  {% if not searched %}
-  <p class="empty-line">Enter at least one filter to search.</p>
-  {% elif rows %}
   <div class="panel">
-    <div class="panel-head">Matching events <span class="dim">newest first</span></div>
+    <div class="panel-head">Matching events{% if rows %} <span class="dim">newest first</span>{% endif %}</div>
+  {% if not searched %}
+  <p class="empty-line">enter at least one filter to search</p>
+  {% elif rows %}
     <table class="table-compact">
       <thead><tr><th>Time</th><th>Source IP</th><th>Activity</th><th>Detail</th><th>Session</th></tr></thead>
       <tbody id="search-results-body">
@@ -87,9 +87,9 @@
       </tbody>
     </table>
     <div id="load-more-container">{% if has_more %}<button hx-get="/search/events" hx-include="#search-filter-form" hx-vals='{"cursor": "{{ next_cursor }}"}' hx-target="#search-results-body" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
-  </div>
   {% else %}
   <p class="empty-line">no events match these filters</p>
   {% endif %}
+  </div>
 {% endif %}
 {% endblock %}

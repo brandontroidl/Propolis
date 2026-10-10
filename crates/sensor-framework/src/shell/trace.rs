@@ -71,6 +71,8 @@ pub enum ParseNode {
     For,
     While,
     Case,
+    /// `name() { ... }`: storing the function; its body runs when it is called.
+    FunctionDef,
     /// A construct outside the grammar subset, skipped with status 0.
     Unsupported,
 }
@@ -228,6 +230,13 @@ pub enum HandlerId {
     Umask,
     Break,
     Continue,
+    /// `return` and `local`: the builtins a function's body uses on its own scope.
+    Return,
+    Local,
+    /// bash's `builtin NAME`: runs the shell builtin, skipping a function of that name.
+    BuiltinBuiltin,
+    /// A function the session defined, called by name; its commands are the call's `reentry`.
+    ShellFunction,
     /// `.`, `source` and `eval`: recorded, never run.
     SourceEval,
     /// The `command` builtin: `-v`/`-V` describe a name, anything else runs it.

@@ -30,12 +30,14 @@
 //!
 //! **The grammar.** An input line is tokenized (`lex`), parsed into a tree (`parse`, `ast`),
 //! expanded (`expand`, `arith`) and evaluated (`eval`) with real quoting, redirections,
-//! pipelines, lists, subshells and `if`/`for`/`while`/`until`; each simple command then
-//! dispatches through the `registry` to the handlers in this file and in `builtins`. Constructs
-//! outside that subset (`case`, `[[ ]]`, functions, `$'..'`, brace expansion, here-strings,
-//! arrays) parse and are skipped with status 0, so they never raise an error a real shell would
-//! not. Words are `String`s; migrating every handler to byte-string arguments is deferred until a
-//! command family needs it (F1 and F2 did not: file contents and pipe data are already bytes).
+//! pipelines, lists, subshells, `if`/`for`/`while`/`until`/`case` and function definitions and
+//! calls; each simple command then dispatches through the `registry` to the handlers in this
+//! file and in `builtins`, unless a function of that name answers first. Constructs outside that
+//! subset parse and are skipped with status 0, so they never raise an error a real shell would
+//! not: `[[ ]]`, `(( ))`, `coproc`, `$'..'`, parameter operators (`${x##*/}`), brace expansion,
+//! here-strings, arrays and process substitution. Words are `String`s; migrating every handler
+//! to byte-string arguments is deferred until a command family needs it (F1 and F2 did not: file
+//! contents and pipe data are already bytes).
 #![forbid(unsafe_code)]
 
 use std::net::IpAddr;
@@ -74,6 +76,7 @@ mod fetch;
 #[cfg(test)]
 mod fetch_tests;
 mod fileinfo;
+mod fnprint;
 mod fsops;
 mod grep;
 mod hashing;
@@ -258,6 +261,8 @@ enum Flow {
     Continue(u32),
     /// `exit` inside a subshell, a pipeline stage or a script run by `sh -c`.
     ExitSubshell,
+    /// `return` inside a function: unwinds to the call, which takes its status.
+    Return,
 }
 
 /// The observable result of one command or command list. Status is authoritative for shell
@@ -925,13 +930,33 @@ impl FakeShell {
     }
 
     fn error_prefix(&self) -> String {
+        // A non-interactive bash names the file a command comes from, and for a function defined
+        // in text given to `-c` that file is called `environment`. An interactive bash says
+        // `-bash` wherever the command is.
+        let in_function = !self.state().calls.is_empty();
         match (self.context, self.active_level()) {
+            (ShellContext::ExecC, ShellLevel::Bash { .. }) if in_function => {
+                "environment: line 1".to_string()
+            }
             (ShellContext::ExecC, ShellLevel::Bash { .. }) => "bash: line 1".to_string(),
+            (_, ShellLevel::Bash { login: false }) if in_function && self.in_script() => {
+                "environment: line 1".to_string()
+            }
             (_, ShellLevel::Bash { login: true }) => "-bash".to_string(),
             (_, ShellLevel::Bash { login: false }) => "bash".to_string(),
             (_, ShellLevel::Dash { line }) => format!("{}: {line}", self.dash_name()),
             (_, ShellLevel::AndroidMksh) => "sh".to_string(),
         }
+    }
+
+    /// Whether the innermost shell is one running a script (`bash -c`, `sh FILE`) rather than
+    /// reading the terminal.
+    fn in_script(&self) -> bool {
+        self.frames
+            .iter()
+            .rev()
+            .find(|frame| !matches!(frame.kind, FrameKind::Subshell))
+            .is_some_and(|frame| matches!(frame.kind, FrameKind::Script(_)))
     }
 
     /// What dash calls itself in a diagnostic: `$0`, which is the script as it was typed for
@@ -971,7 +996,7 @@ impl FakeShell {
     fn not_found(&self, what: &str) -> String {
         match (self.context, self.active_level()) {
             (ShellContext::ExecC, ShellLevel::Bash { .. }) => {
-                format!("bash: line 1: {what}: command not found\n")
+                format!("{}: {what}: command not found\n", self.error_prefix())
             }
             (_, ShellLevel::Bash { .. }) => login_command_not_found(what)
                 .map(str::to_string)
@@ -2188,8 +2213,7 @@ impl FakeShell {
     /// Open a shell level that reads the terminal, the way `sh` and `su` do: it inherits the
     /// exported variables and the working directory, and has a process id of its own.
     fn push_level(&mut self, level: ShellLevel) {
-        let pid = self.pids.next();
-        let state = self.state().child(pid);
+        let state = self.child_state(level);
         self.frames.push(Frame {
             kind: FrameKind::Level(level),
             state,
@@ -2198,12 +2222,28 @@ impl FakeShell {
 
     /// Open a shell level that runs one script and ends with it.
     fn push_script_level(&mut self, level: ShellLevel) {
-        let pid = self.pids.next();
-        let state = self.state().child(pid);
+        let state = self.child_state(level);
         self.frames.push(Frame {
             kind: FrameKind::Script(level),
             state,
         });
+    }
+
+    /// The state of a shell started from this one: the environment, plus, for a bash, the
+    /// functions `export -f` put in it.
+    fn child_state(&mut self, level: ShellLevel) -> ShellState {
+        let pid = self.pids.next();
+        let parent = self.state();
+        let mut state = parent.child(pid);
+        if matches!(level, ShellLevel::Bash { .. }) {
+            state.functions = parent
+                .functions
+                .iter()
+                .filter(|(_, held)| held.exported)
+                .map(|(name, held)| (name.clone(), held.clone()))
+                .collect();
+        }
+        state
     }
 
     /// Leave the innermost shell level that reads the terminal, or end the session from the login
@@ -3575,6 +3615,8 @@ mod envtools_tests;
 mod fileinfo_tests;
 #[cfg(test)]
 mod fsops_tests;
+#[cfg(test)]
+mod functions_tests;
 #[cfg(test)]
 mod grammar_tests;
 #[cfg(test)]

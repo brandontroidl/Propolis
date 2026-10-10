@@ -357,11 +357,45 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   prints `[N] PID`. An unfinished construct waits for more input under the PS2 prompt `> ` (64
   lines or 64 KiB at most). `case WORD in pat|pat) list ;; ... esac` runs the first arm whose
   pattern matches (unquoted `*`, `?` and `[..]` glob, a quoted one is literal, a `/` matches);
-  no match is status 0. Constructs outside this subset (`[[ ]]`, functions, `$'..'`,
-  `${x##*/}`, brace expansion, `<<<`, arrays) parse and are skipped with status 0 and no output;
-  what bash and dash also reject prints their syntax error and status 2. `read`, `export`,
-  `unset`, `set`, `shift`, `umask`, `break`, `continue`, `cd`, `exit` act on the shell itself
+  no match is status 0. Constructs outside this subset (`[[ ]]`, `(( ))`, `coproc`, `$'..'`,
+  `${x##*/}`, brace expansion, `<<<`, arrays, process substitution) parse and are skipped with
+  status 0 and no output; what bash and dash also reject prints their syntax error and status 2.
+  `read`, `export`, `unset`, `set`, `shift`, `umask`, `break`, `continue`, `return`, `local`,
+  `builtin`, `cd`, `exit` act on the shell itself
   (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.
+  Shell functions run (`crates/sensor-framework/src/shell/eval.rs#FakeShell::call_function`).
+  `name() body` and, in bash, `function name [()] body` store the body; a call runs it in the same
+  shell with its own `$1`..`$n`, `$#` and `$@` (put back afterwards, `$0` unchanged), its own
+  `local` variables (restored on return; dash keeps the value of a bare `local x`, bash unsets
+  it), no enclosing loop for `break`, and `return [n]` for the status, which otherwise is the
+  last command's. A function is found before a builtin or a file; `command` and `builtin` skip
+  it, and a program another command starts (`env f`, `sh -c f`) does not see it. A redirection
+  written after the body applies at each call. A subshell, a pipeline stage and `$( )` get a copy
+  of the functions and lose what they define. dash refuses a special builtin (`set`, `export`,
+  `:`, `return`, `local` ...) or a name that is not an identifier as
+  `Syntax error: Bad function name`, before running anything on that line, and has no `function`
+  keyword; bash takes any
+  literal word as a name (a quoted or expanded one is "not a valid identifier"), needs a compound
+  command for the body and rejects the rest with its syntax error, and defines functions named
+  like builtins. `type f` and `command -V f` say `f is a function` and print the parsed body in
+  bash's own layout (`crates/sensor-framework/src/shell/fnprint.rs#bash_function_text`), and
+  `f is a shell function` in dash; `set` lists bash's functions after its variables; `unset -f`
+  removes one (bash's `unset f` does too when no variable has the name); `export -f` hands one to a
+  bash started afterwards (dash has no such option); `$FUNCNAME` and `FUNCNEST` are bash's. In a
+  `bash -c` shell a diagnostic made inside a function is prefixed `environment: line 1:`.
+  Recursion and work are bounded: at most 10 functions run at once and each call costs the line
+  256 steps of its allowance. Past the cap dash says `Maximum function recursion depth (1000)
+  reached` and exits 2 (its wording, at a limit far deeper than the shell's), and bash, which
+  without `FUNCNEST` has no limit and dies of a stack overflow without a word, ends the process
+  with status 139 and no output (the session keeps going; only the rest of the line is dropped);
+  `FUNCNEST=N` gives bash's `f: maximum function nesting level exceeded (N)`. A fork bomb
+  `:(){ :|:& };:` therefore returns at once in bash, and dash refuses the name `:`. A shell holds
+  128 functions at most, their text counts against the connection's content allowance with the
+  variables, and a refused definition is silent with status 1. Not modeled: `declare -f` and
+  `typeset -f` (the commands do not exist), `readonly -f`, aliases, a dash status above 255 from
+  `return`, bash's per-command line numbers in `environment: line N:`, and the exported function
+  entries `BASH_FUNC_name%%` in `env`. mksh follows bash's grammar and bash's `local` only inside
+  `function name {` bodies; no mksh was available to check it against `[inferred]`.
   bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
   the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
   dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it
@@ -477,9 +511,12 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   file (`No such file or directory`; `not found` under dash and mksh) rather than as the applet of
   that name. A saved copy of busybox named `busybox*` is still the multi-call binary and fetches.
   A lexical pass over the line's text is kept as a fallback for evidence the evaluator did not
-  reach: a branch the fake's answers skipped (`test -f x && wget URL`), functions and the other
-  constructs outside the grammar subset (functions never run, so a fetch in one is found only
-  here), a syntax error, an exhausted budget. It reads the text with the shell's own tokenizer
+  reach: a branch the fake's answers skipped (`test -f x && wget URL`), a function that is defined
+  and never called (a called one runs, so the evaluator reports its fetches with the URL they
+  expanded to: `f() { wget "$1"; }; f URL` is one event), the constructs outside the grammar
+  subset, a syntax error, an exhausted budget. A function named like a fetcher runs as the
+  function and is not an executed fetch; the text of a line that names one still is reported by
+  this pass. It reads the text with the shell's own tokenizer
   (quotes and here-documents honoured), looks only at command position (after `if`/`then`/`do`,
   assignments and `nohup`/`env`/`sudo`/`toybox`-style wrappers) and inside `sh -c 'script'`, and
   adds nothing for a URL the line also executed; a fallback command holding `$name` is reported

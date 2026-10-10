@@ -5,14 +5,17 @@
 //! list     := and_or (( ';' | '&' | newline ) and_or)*
 //! and_or   := pipeline (( '&&' | '||' ) newline* pipeline)*
 //! pipeline := '!'? command ( '|' newline* command )*
-//! command  := simple | '(' list ')' | '{' list '}' | if | for | while | until | unsupported
+//! command  := simple | '(' list ')' | '{' list '}' | if | for | while | until | case
+//!           | function | unsupported
+//! function := name '(' ')' newline* command | 'function' name ('(' ')')? newline* command
 //! ```
 //!
-//! Redirections attach to the command they follow. A construct outside the subset (`case`,
-//! `[[ ]]`, a function definition, `((..))`, a here-string, a word the lexer marked unsupported)
-//! is consumed to a safe boundary and returned as [`Command::Unsupported`], never as an error.
-//! What is left as an error is what bash and dash also reject: a stray `)` or `;`, a reserved word
-//! where a command must start, a redirection with no target.
+//! Redirections attach to the command they follow. A construct outside the subset (`[[ ]]`,
+//! `((..))`, a here-string, a word the lexer marked unsupported) is consumed to a safe boundary
+//! and returned as [`Command::Unsupported`], never as an error. What is left as an error is what
+//! bash and dash also reject: a stray `)` or `;`, a reserved word where a command must start, a
+//! redirection with no target, and, per [`Dialect`], dash's `Bad function name` and bash's
+//! function body that is not a compound command.
 //!
 //! Text that ends inside a construct is [`Tail::NeedMore`] while more input may arrive.
 #![deny(
@@ -21,9 +24,12 @@
     clippy::indexing_slicing
 )]
 
+use std::sync::Arc;
+
 use super::ast::{
-    AndOr, AndOrOp, Assign, CaseArm, Command, Line, List, ListItem, Near, Pipeline, Redir, RedirOp,
-    RedirTarget, SimpleCommand, SyntaxError, UnsupportedKind, Word, WordPart, word_unsupported,
+    AndOr, AndOrOp, Assign, CaseArm, Command, Dialect, FunctionDef, Line, List, ListItem, Near,
+    POSIX_SPECIAL, Pipeline, Redir, RedirOp, RedirTarget, SimpleCommand, SyntaxError,
+    UnsupportedKind, Word, WordPart, word_unsupported,
 };
 use super::eval::LineBudget;
 use super::lex::{HereDoc, LexError, Op, Tok, Token, lex};
@@ -54,10 +60,11 @@ pub(super) fn parse_unit(
     src: &str,
     at_eof: bool,
     max_depth: u32,
+    dialect: Dialect,
     budget: &mut LineBudget,
     base_line: Line,
 ) -> Parsed {
-    let lexed = match lex(src, at_eof, base_line, 0, max_depth, budget) {
+    let lexed = match lex(src, at_eof, base_line, 0, max_depth, dialect, budget) {
         Ok(lexed) => lexed,
         Err(LexError::NeedMore) => {
             return Parsed {
@@ -85,12 +92,14 @@ pub(super) fn parse_unit(
         }
     };
     let mut parser = Parser {
+        src,
         toks: &lexed.tokens,
         heredocs: &lexed.heredocs,
         pos: 0,
         depth: 0,
         max_depth,
         base_line,
+        dialect,
     };
     let (items, outcome) = parser.program();
     let tail = match outcome {
@@ -112,19 +121,22 @@ pub(super) fn parse_nested(
     base_line: Line,
     depth: u32,
     max_depth: u32,
+    dialect: Dialect,
     budget: &mut LineBudget,
 ) -> Result<List, LexError> {
     if depth > max_depth {
         return Err(LexError::TooDeep);
     }
-    let lexed = lex(text, true, base_line, depth, max_depth, budget)?;
+    let lexed = lex(text, true, base_line, depth, max_depth, dialect, budget)?;
     let mut parser = Parser {
+        src: text,
         toks: &lexed.tokens,
         heredocs: &lexed.heredocs,
         pos: 0,
         depth,
         max_depth,
         base_line,
+        dialect,
     };
     let (items, outcome) = parser.program();
     match outcome {
@@ -162,12 +174,14 @@ enum Stop {
 }
 
 struct Parser<'a> {
+    src: &'a str,
     toks: &'a [Token],
     heredocs: &'a [HereDoc],
     pos: usize,
     depth: u32,
     max_depth: u32,
     base_line: Line,
+    dialect: Dialect,
 }
 
 /// The reserved word a token spells, when it is one unquoted literal.
@@ -465,7 +479,7 @@ impl Parser<'_> {
                 Some("{") => self.brace_command(),
                 Some("case") => self.case_command(),
                 Some("[[") => self.skip_double_bracket(),
-                Some("function") => self.function_keyword(),
+                Some("function") if self.dialect == Dialect::Bash => self.function_keyword(),
                 Some("coproc") => self.skip_coproc(),
                 Some("then" | "do" | "done" | "fi" | "elif" | "else" | "esac" | "}") => {
                     Err(self.unexpected())
@@ -510,13 +524,14 @@ impl Parser<'_> {
                     words.push(word);
                     if words.len() == 1
                         && assigns.is_empty()
+                        && redirs.is_empty()
                         && matches!(self.peek_op(), Some(Op::LParen))
                         && matches!(
                             self.peek_ahead(1).map(|t| &t.tok),
                             Some(Tok::Op(Op::RParen))
                         )
                     {
-                        return self.function_definition();
+                        return self.function_definition(self.pos.saturating_sub(1));
                     }
                 }
                 Tok::IoNumber(n) => {
@@ -596,6 +611,8 @@ impl Parser<'_> {
                     target: RedirTarget::HereBody {
                         text: body.text,
                         expand: body.expand,
+                        delim: target.raw,
+                        strip: body.strip,
                     },
                 }));
             }
@@ -977,9 +994,11 @@ impl Parser<'_> {
         }
     }
 
-    /// `function name [()] { ... }`: parsed, then skipped.
+    /// bash's `function name [()] body`, at the `function` word.
     fn function_keyword(&mut self) -> PResult<Command> {
+        let start = self.pos;
         self.pos = self.pos.saturating_add(1);
+        let name_at = self.pos;
         match self.peek() {
             None => return Err(PErr::Need),
             Some(tok) if matches!(tok.tok, Tok::Word(_)) => {
@@ -990,26 +1009,90 @@ impl Parser<'_> {
         if matches!(self.peek_op(), Some(Op::LParen)) {
             self.pos = self.pos.saturating_add(1);
             if !matches!(self.peek_op(), Some(Op::RParen)) {
-                return Err(self.unexpected());
+                return Err(if self.peek().is_none() {
+                    PErr::Need
+                } else {
+                    self.unexpected()
+                });
             }
             self.pos = self.pos.saturating_add(1);
         }
-        self.function_body()
+        self.function_rest(start, name_at, true)
     }
 
-    /// After `name` with `(` `)` next.
-    fn function_definition(&mut self) -> PResult<Command> {
+    /// `name ( ) body`, with the name word already consumed at `name_at` and `(` `)` next.
+    fn function_definition(&mut self, name_at: usize) -> PResult<Command> {
         self.pos = self.pos.saturating_add(2);
-        self.function_body()
+        self.function_rest(name_at, name_at, false)
     }
 
-    fn function_body(&mut self) -> PResult<Command> {
+    /// The body of a definition whose name word is at `name_at` and whose text starts at the
+    /// token `start`.
+    fn function_rest(&mut self, start: usize, name_at: usize, keyword: bool) -> PResult<Command> {
+        let Some(name_tok) = self.toks.get(name_at) else {
+            return Err(PErr::Need);
+        };
+        let Tok::Word(name_word) = &name_tok.tok else {
+            return Err(self.unexpected());
+        };
+        let literal = match name_word.parts.as_slice() {
+            [WordPart::Literal(text)] => Some(text.as_str()),
+            _ => None,
+        };
+        let (name, valid) = match (self.dialect, literal) {
+            (Dialect::Posix, Some(text)) if is_name(text) && !POSIX_SPECIAL.contains(&text) => {
+                (text.to_string(), true)
+            }
+            (Dialect::Posix, _) => {
+                return Err(PErr::Syntax(SyntaxError {
+                    near: Near::BadFunctionName,
+                    line: name_tok.line,
+                }));
+            }
+            (Dialect::Bash, Some(text)) => (text.to_string(), true),
+            (Dialect::Bash, None) => (name_word.raw.clone(), false),
+        };
+        let from = name_tok.pos;
+        let from = self.toks.get(start).map_or(from, |t| t.pos);
         self.skip_newlines();
         if self.peek().is_none() {
             return Err(PErr::Need);
         }
-        self.command()?;
-        Ok(Command::Unsupported(UnsupportedKind::Function))
+        if self.dialect == Dialect::Bash && !self.at_compound_command() {
+            return Err(self.unexpected());
+        }
+        self.enter()?;
+        let body = self.command();
+        self.leave();
+        let body = body?;
+        let to = self
+            .toks
+            .get(self.pos.saturating_sub(1))
+            .map_or(from, |t| t.end);
+        let source = self.src.get(from..to).unwrap_or("").to_string();
+        Ok(Command::Function(Arc::new(FunctionDef {
+            name,
+            valid,
+            keyword,
+            body,
+            source,
+        })))
+    }
+
+    /// Whether the next token starts a compound command, which is all bash takes as a function
+    /// body.
+    fn at_compound_command(&self) -> bool {
+        match self.peek() {
+            Some(tok) => match &tok.tok {
+                Tok::Op(Op::LParen) => true,
+                Tok::Word(_) => matches!(
+                    keyword(tok),
+                    Some("{" | "if" | "for" | "while" | "until" | "case" | "[[")
+                ),
+                _ => false,
+            },
+            None => false,
+        }
     }
 
     /// `coproc ...`: the rest of the command is skipped.
@@ -1046,7 +1129,7 @@ fn add_stderr_merge(command: &mut Command) {
         | Command::For { redirs, .. }
         | Command::Case { redirs, .. }
         | Command::While { redirs, .. } => redirs.push(merge),
-        Command::Unsupported(_) => {}
+        Command::Function(_) | Command::Unsupported(_) => {}
     }
 }
 
@@ -1099,7 +1182,12 @@ mod tests {
 
     fn parse(src: &str) -> Parsed {
         let mut budget = LineBudget::new(1 << 20);
-        parse_unit(src, false, 16, &mut budget, 1)
+        parse_unit(src, false, 16, Dialect::Bash, &mut budget, 1)
+    }
+
+    fn parse_posix(src: &str) -> Parsed {
+        let mut budget = LineBudget::new(1 << 20);
+        parse_unit(src, false, 16, Dialect::Posix, &mut budget, 1)
     }
 
     fn items(src: &str) -> Vec<ListItem> {
@@ -1224,7 +1312,9 @@ mod tests {
             cmd.redirs[0].target,
             RedirTarget::HereBody {
                 text: "hi $x\n".to_string(),
-                expand: true
+                expand: true,
+                delim: "EOF".to_string(),
+                strip: false,
             }
         );
     }
@@ -1234,8 +1324,6 @@ mod tests {
         for (src, kind) in [
             ("case ${x##*/} in a) :;; esac", UnsupportedKind::ParamOp),
             ("[[ -f x && -d y ]]", UnsupportedKind::DoubleBracket),
-            ("f() { echo hi; }", UnsupportedKind::Function),
-            ("function f { echo hi; }", UnsupportedKind::Function),
             ("echo $'a'", UnsupportedKind::AnsiCQuote),
             ("((i = 1 + 2))", UnsupportedKind::ArithCommand),
             ("echo ${x##*/}", UnsupportedKind::ParamOp),
@@ -1312,7 +1400,7 @@ mod tests {
         }
         // Once no more input can come the same text is a syntax error.
         let mut budget = LineBudget::new(1 << 20);
-        let done = parse_unit("if a; then b", true, 16, &mut budget, 1);
+        let done = parse_unit("if a; then b", true, 16, Dialect::Bash, &mut budget, 1);
         assert!(matches!(
             done.tail,
             Tail::Error(SyntaxError {
@@ -1375,5 +1463,176 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn function_of(src: &str) -> Arc<FunctionDef> {
+        match only_command(src) {
+            Command::Function(def) => def,
+            other => panic!("{src}: not a function: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_function_definition_parses_in_every_spelling() {
+        for src in [
+            "f() { :; }",
+            "f () { :; }",
+            "f ( ) { :; }",
+            "f()\n{ :; }",
+            "f()\n\n  { :; }",
+            "function f { :; }",
+            "function f() { :; }",
+            "function f ()\n{ :; }",
+            "f() ( : )",
+            "f() if :; then :; fi",
+            "f() for i in 1; do :; done",
+            "f() while :; do :; done",
+            "f() case x in x) :;; esac",
+        ] {
+            let def = function_of(src);
+            assert_eq!(def.name, "f", "{src}");
+            assert!(def.valid, "{src}");
+            assert_eq!(def.keyword, src.starts_with("function"), "{src}");
+        }
+        assert_eq!(function_of("f() { :; }").source, "f() { :; }");
+        assert_eq!(function_of("function f { :; }").source, "function f { :; }");
+    }
+
+    #[test]
+    fn a_redirection_after_the_body_belongs_to_the_body() {
+        let def = function_of("f() { echo hi; } > /tmp/o 2>&1");
+        let Command::Brace { redirs, .. } = &def.body else {
+            panic!("not a group: {:?}", def.body);
+        };
+        assert_eq!(redirs.len(), 2);
+    }
+
+    #[test]
+    fn bash_takes_a_compound_body_only_and_dash_any_command() {
+        // The error names the first word of the body, as bash does.
+        assert_eq!(syntax_near("f() echo hi"), Near::Token("echo".to_string()));
+        assert_eq!(syntax_near("f() [ 1 = 1 ]"), Near::Token("[".to_string()));
+        let parsed = parse_posix("f() echo hi");
+        assert_eq!(parsed.tail, Tail::Done);
+        let [item] = parsed.items.as_slice() else {
+            panic!("one item");
+        };
+        assert!(matches!(
+            item.and_or.first.stages.as_slice(),
+            [Command::Function(def)] if matches!(def.body, Command::Simple(_))
+        ));
+    }
+
+    #[test]
+    fn a_definition_needs_its_name_to_be_the_whole_command() {
+        // bash -c '>/tmp/x f() { :; }' and dash alike stop at the `(`; so do `A=1 f()` and
+        // `echo a f()`.
+        for src in [">/tmp/x f() { :; }", "A=1 f() { :; }", "echo a f() { :; }"] {
+            assert_eq!(syntax_near(src), Near::Token("(".to_string()), "{src}");
+            let Tail::Error(error) = parse_posix(src).tail else {
+                panic!("{src}: not a syntax error");
+            };
+            assert_eq!(error.near, Near::Token("(".to_string()), "{src}");
+        }
+    }
+
+    #[test]
+    fn dash_has_no_function_keyword() {
+        // The words are an ordinary command in dash, so the first thing it cannot parse is what
+        // it names.
+        let error = |src: &str| match parse_posix(src).tail {
+            Tail::Error(error) => error.near,
+            other => panic!("{src}: {other:?}"),
+        };
+        assert_eq!(
+            error("function f { echo hi; }"),
+            Near::Token("}".to_string())
+        );
+        assert_eq!(
+            error("function f() { echo hi; }"),
+            Near::Token("(".to_string())
+        );
+    }
+
+    #[test]
+    fn dash_refuses_a_name_that_is_not_an_identifier_or_is_a_special_builtin() {
+        for src in [
+            "f-g() { :; }",
+            "a.b() { :; }",
+            "1f() { :; }",
+            "a/b() { :; }",
+            "f*() { :; }",
+            "\"f\"() { :; }",
+            "$x() { :; }",
+            "set() { :; }",
+            ":() { :; }",
+            "export() { :; }",
+            "return() { :; }",
+            "local() { :; }",
+            ".() { :; }",
+        ] {
+            assert_eq!(
+                parse_posix(src).tail,
+                Tail::Error(SyntaxError {
+                    near: Near::BadFunctionName,
+                    line: 1
+                }),
+                "{src}"
+            );
+        }
+        // Builtins that are not special, and ordinary words, are fine.
+        for src in [
+            "cd() { :; }",
+            "echo() { :; }",
+            "type() { :; }",
+            "_a1() { :; }",
+        ] {
+            assert_eq!(parse_posix(src).tail, Tail::Done, "{src}");
+        }
+    }
+
+    #[test]
+    fn bash_takes_any_literal_word_and_flags_one_that_is_not() {
+        for (src, name) in [
+            ("f-g() { :; }", "f-g"),
+            ("a.b() { :; }", "a.b"),
+            ("1f() { :; }", "1f"),
+            ("a/b() { :; }", "a/b"),
+            ("set() { :; }", "set"),
+            (":() { :; }", ":"),
+        ] {
+            let def = function_of(src);
+            assert_eq!((def.name.as_str(), def.valid), (name, true), "{src}");
+        }
+        for (src, raw) in [("\"f\"() { :; }", "\"f\""), ("$x() { :; }", "$x")] {
+            let def = function_of(src);
+            assert_eq!((def.name.as_str(), def.valid), (raw, false), "{src}");
+        }
+    }
+
+    #[test]
+    fn an_open_function_definition_needs_more_input() {
+        for src in [
+            "f() {",
+            "f()",
+            "f() {\n",
+            "function f",
+            "function f()",
+            "f() if :; then",
+        ] {
+            assert_eq!(parse(src).tail, Tail::NeedMore, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_definition_inside_a_definition_is_bounded_by_the_depth_cap() {
+        let src = format!("{}:", "f() ".repeat(40));
+        assert_eq!(parse_posix(&src).tail, Tail::TooDeep);
+    }
+
+    #[test]
+    fn a_function_is_not_a_redirection_stage_for_a_stderr_pipe() {
+        // `|&` adds its stderr merge to a command with redirections; a definition has none.
+        assert_eq!(parse("f() { :; } |& cat").tail, Tail::Done);
     }
 }

@@ -1,0 +1,465 @@
+# How Ubuntu 22.04's bash prints a function back (`type f`). bash does not echo the definition: it
+# prints the command it parsed, in its own layout (four spaces a level, `;` and a newline between
+# commands, `elif` as a nested `else if`, a `function` keyword in front of a function defined
+# inside another, here-documents after the line that holds them, a pipeline's second stage on a
+# line indented by two after a here-document). Every shape below is one the emulator rebuilds from
+# its syntax tree. Each reply was produced by `bash --noprofile --norc --noediting -i` started as
+# a login shell (`exec -a -bash`) in the localhost/propolis-survey-ref:jammy container (bash
+# 5.1.16), run with `--network none`, PS1 and PS2 set to markers and these lines fed one at a time
+# on standard input. Lines of the listing that end in a blank are written with `\x20`, which an
+# editor cannot strip.
+# source: ubuntu:22.04 container run of bash 5.1.16 (synthetic command shapes)
+# date: 2026-10-09
+# protocol: ssh
+# persona: ubuntu
+$ f() { A=1 B="two words" cmd -x 'q q' "d d" $v ${v:-x} $(sub) `bt` $((1+2)) ~/x; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     A=1 B="two words" cmd -x 'q q' "d d" $v ${v:-x} $(sub) `bt` $((1+2)) ~/x
+> }
+$ f() { echo a >f; echo b >>f; cat <f; echo c 2>f; echo d 2>&1; echo e >&2; cat <&3; echo g >|f; cat <>f; echo h 3>f 4>>g; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo a > f;
+>     echo b >> f;
+>     cat < f;
+>     echo c 2> f;
+>     echo d 2>&1;
+>     echo e 1>&2;
+>     cat 0<&3;
+>     echo g >| f;
+>     cat 0<> f;
+>     echo h 3> f 4>> g
+> }
+$ f() { a | b | c; ! a | b; a |& b; time a; time -p a | b; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     a | b | c;
+>     ! a | b;
+>     a 2>&1 | b;
+>     time a;
+>     time -p a | b
+> }
+$ f() { a && b || c && d; a || b; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     a && b || c && d;
+>     a || b
+> }
+$ f() { a; b & c; d &
+$ e; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     a;
+>     b & c;
+>     d & e
+> }
+$ f() { sleep 1 & }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     sleep 1 &
+> }
+$ f() { while a; do sleep 1 & done; if a; then b & fi; for i in 1; do c & d; done; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     while a; do
+>         sleep 1 &
+>     done;
+>     if a; then
+>         b &
+>     fi;
+>     for i in 1;
+>     do
+>         c & d;
+>     done
+> }
+$ f() { ( a; b ); ( a ) ; (a) | b; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     ( a;
+>     b );
+>     ( a );
+>     ( a ) | b
+> }
+$ f() { { a; b; }; { a; } 2>&1; { a; b; } > out; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>e     {\x20
+>         a;
+>         b
+>     };
+>e     {\x20
+>         a
+>     } 2>&1;
+>e     {\x20
+>         a;
+>         b
+>     } > out
+> }
+$ f() { if a; then b; fi; if a; then b; else c; fi; if a; then b; elif c; then d; fi; if a; then b; elif c; then d; else e; fi; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     if a; then
+>         b;
+>     fi;
+>     if a; then
+>         b;
+>     else
+>         c;
+>     fi;
+>     if a; then
+>         b;
+>     else
+>         if c; then
+>             d;
+>         fi;
+>     fi;
+>     if a; then
+>         b;
+>     else
+>         if c; then
+>             d;
+>         else
+>             e;
+>         fi;
+>     fi
+> }
+$ f() { while a; do b; done; until a; do b; c; done; while a; do b; done < in; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     while a; do
+>         b;
+>     done;
+>     until a; do
+>         b;
+>         c;
+>     done;
+>     while a; do
+>         b;
+>     done < in
+> }
+$ f() { for i in 1 2 3; do echo $i; done; for j; do echo $j; done; for k in; do :; done; for m in "$@" a*; do echo; done; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     for i in 1 2 3;
+>     do
+>         echo $i;
+>     done;
+>     for j in "$@";
+>     do
+>         echo $j;
+>     done;
+>     for k in ;
+>     do
+>         :;
+>     done;
+>     for m in "$@" a*;
+>     do
+>         echo;
+>     done
+> }
+$ f() { case $x in a) echo A;; b|c) echo BC; echo D;; *) ;; esac; case x in esac; case $1 in (a) :;; esac; case y in a) echo; esac; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>e     case $x in\x20
+>         a)
+>             echo A
+>         ;;
+>         b | c)
+>             echo BC;
+>             echo D
+>         ;;
+>         *)
+>
+>         ;;
+>     esac;
+>e     case x in\x20
+>     esac;
+>e     case $1 in\x20
+>         a)
+>             :
+>         ;;
+>     esac;
+>e     case y in\x20
+>         a)
+>             echo
+>         ;;
+>     esac
+> }
+$ f() { g() { echo in; }; g; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>e     function g ()\x20
+>e     {\x20
+>         echo in
+>     };
+>     g
+> }
+$ f() ( echo sub; echo two )
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     ( echo sub;
+>     echo two )
+> }
+$ f() if a; then b; fi
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     if a; then
+>         b;
+>     fi
+> }
+$ f() for i in 1; do echo; done
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     for i in 1;
+>     do
+>         echo;
+>     done
+> }
+$ f() while a; do b; done
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     while a; do
+>         b;
+>     done
+> }
+$ f() case x in a) b;; esac
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>e     case x in\x20
+>         a)
+>             b
+>         ;;
+>     esac
+> }
+$ f() { echo hi; } > /tmp/o 2>&1
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo hi
+> } > /tmp/o 2>&1
+$ f() ( a ) > /tmp/o
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     ( a ) > /tmp/o
+> }
+$ f() { if a; then if b; then c; fi; fi; for i in 1; do while a; do b; done; done; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     if a; then
+>         if b; then
+>             c;
+>         fi;
+>     fi;
+>     for i in 1;
+>     do
+>         while a; do
+>             b;
+>         done;
+>     done
+> }
+$ g() { b; c; }
+$ type g
+> g is a function
+>e g ()\x20
+>e {\x20
+>     b;
+>     c
+> }
+$ f() { if a; then b; fi | cat; for i in 1; do echo; done | sort; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     if a; then
+>         b;
+>     fi | cat;
+>     for i in 1;
+>     do
+>         echo;
+>     done | sort
+> }
+$ f() { echo "a  b" 'c  d' "$(echo "in ner")" "${v:-"x y"}"; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo "a  b" 'c  d' "$(echo "in ner")" "${v:-"x y"}"
+> }
+$ f() { echo one; # comment
+$ echo two; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo one;
+>     echo two
+> }
+$ f() { x=$(a; b); y=$(if a; then b; fi); }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     x=$(a; b);
+>     y=$(if a; then b; fi)
+> }
+$ function f { echo kw; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo kw
+> }
+$ function f() { echo kw2; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo kw2
+> }
+$ f() {
+$ echo multi
+$ echo line
+$ echo gap
+$ }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo multi;
+>     echo line;
+>     echo gap
+> }
+$ f() { cat <<EOF
+$ hello $USER
+$ EOF
+$ }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     cat <<EOF
+> hello $USER
+> EOF
+>
+> }
+$ f() { cat <<-EOF
+$ 	tabbed
+$ 	EOF
+$ cat <<'EOF'
+$ lit $x
+$ EOF
+$ echo after; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     cat <<-EOF
+> tabbed
+> EOF
+>
+>     cat <<'EOF'
+> lit $x
+> EOF
+>
+>     echo after
+> }
+$ f() { cat <<EOF | grep x
+$ body
+$ EOF
+$ echo after; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     cat <<EOF |
+> body
+> EOF
+>   grep x
+>     echo after
+> }
+$ f() {
+$ if a
+$ then
+$ b
+$ fi
+$ }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     if a; then
+>         b;
+>     fi
+> }
+$ f() { while a; b; do c; done; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     while a;
+>     b; do
+>         c;
+>     done
+> }
+$ f() { if a; b; then c; fi; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     if a;
+>     b; then
+>         c;
+>     fi
+> }
+$ f() { a; }
+$ f2() { f; }
+$ type f2
+> f2 is a function
+>e f2 ()\x20
+>e {\x20
+>     f
+> }

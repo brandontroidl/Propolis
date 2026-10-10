@@ -485,8 +485,9 @@ fn every_registered_name_is_looked_up_the_way_dispatch_runs_it() {
                     "{context}: {ty_out:?}"
                 );
                 // `which` finds files. A builtin has one only when the filesystem holds it.
+                // (dash words its special builtins `a special shell builtin`.)
                 let builtin_only =
-                    sentence.ends_with("is a shell builtin\n") && !sh_holds_file(&mut make(), name);
+                    sentence.ends_with("shell builtin\n") && !sh_holds_file(&mut make(), name);
                 if has_which {
                     assert_eq!(which_status == 0, !builtin_only, "which {context}");
                     if which_status == 0 {

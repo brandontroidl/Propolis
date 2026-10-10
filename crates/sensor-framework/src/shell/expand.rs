@@ -169,8 +169,15 @@ impl FakeShell {
     pub(super) fn expand_text(&mut self, text: &str) -> Result<String, ExpandError> {
         let max_depth = self.budget().limits().max_depth;
         let base = self.current_line();
-        let Ok(parts) = lex_body(text, base, self.depth.current(), max_depth, &mut self.line)
-        else {
+        let dialect = self.grammar();
+        let Ok(parts) = lex_body(
+            text,
+            base,
+            self.depth.current(),
+            max_depth,
+            dialect,
+            &mut self.line,
+        ) else {
             // A body that will not parse is text.
             return Ok(text.to_string());
         };
@@ -335,6 +342,10 @@ impl FakeShell {
     fn param_value(&self, name: &ParamName) -> Option<String> {
         let state: &ShellState = self.state();
         match name {
+            // bash's innermost running function; unset outside one.
+            ParamName::Var(var) if var == "FUNCNAME" && self.is_bash() => {
+                state.calls.last().map(|call| call.name.clone())
+            }
             ParamName::Var(var) => state.get(var).map(str::to_string),
             ParamName::Status => Some(state.last_status.to_string()),
             ParamName::Pid => Some(state.pid.to_string()),

@@ -222,6 +222,10 @@ fn is_bash(shell: &FakeShell, _parts: &[&str]) -> bool {
     shell.is_bash()
 }
 
+fn is_not_dash(shell: &FakeShell, _parts: &[&str]) -> bool {
+    !shell.is_dash()
+}
+
 /// A command that exists only as a BusyBox applet: `cmd_busybox` raises `busybox_depth` before it
 /// resolves the applet, so the bare name is not found.
 fn via_busybox(shell: &FakeShell, _parts: &[&str]) -> bool {
@@ -355,4 +359,13 @@ fn register_core(r: &mut Registry) {
         FakeShell::builtin_source,
     );
     r.register_builtin("eval", HandlerId::SourceEval, FakeShell::builtin_eval);
+    // The builtins of a function's body. `builtin` is bash's and mksh's; dash has none.
+    r.register_builtin("return", HandlerId::Return, FakeShell::builtin_return);
+    r.register_builtin("local", HandlerId::Local, FakeShell::builtin_local);
+    r.register_builtin_if(
+        "builtin",
+        is_not_dash,
+        HandlerId::BuiltinBuiltin,
+        FakeShell::builtin_builtin,
+    );
 }

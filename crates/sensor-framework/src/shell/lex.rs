@@ -17,7 +17,8 @@
 )]
 
 use super::ast::{
-    Line, List, Near, Param, ParamDefault, ParamName, SyntaxError, UnsupportedKind, Word, WordPart,
+    Dialect, Line, List, Near, Param, ParamDefault, ParamName, SyntaxError, UnsupportedKind, Word,
+    WordPart,
 };
 use super::eval::LineBudget;
 
@@ -100,6 +101,10 @@ pub(super) struct Token {
 pub(super) struct HereDoc {
     pub text: String,
     pub expand: bool,
+    /// The delimiter with its quoting removed, as the closing line spells it.
+    pub delim: String,
+    /// `<<-`: the body's leading tabs were stripped.
+    pub strip: bool,
 }
 
 #[derive(Debug, Default)]
@@ -164,6 +169,8 @@ struct Lexer<'a, 'b> {
     base_line: Line,
     depth: u32,
     max_depth: u32,
+    /// Handed to the parser of a substitution's text.
+    dialect: Dialect,
     budget: &'b mut LineBudget,
 }
 
@@ -175,6 +182,7 @@ pub(super) fn lex(
     base_line: Line,
     depth: u32,
     max_depth: u32,
+    dialect: Dialect,
     budget: &mut LineBudget,
 ) -> Result<Lexed, LexError> {
     let mut lexer = Lexer {
@@ -189,6 +197,7 @@ pub(super) fn lex(
         base_line,
         depth,
         max_depth,
+        dialect,
         budget,
     };
     lexer.run()?;
@@ -205,6 +214,7 @@ pub(super) fn lex_body(
     base_line: Line,
     depth: u32,
     max_depth: u32,
+    dialect: Dialect,
     budget: &mut LineBudget,
 ) -> Result<Vec<WordPart>, LexError> {
     let mut lexer = Lexer {
@@ -219,6 +229,7 @@ pub(super) fn lex_body(
         base_line,
         depth,
         max_depth,
+        dialect,
         budget,
     };
     lexer.scan_parts(Mode::Body)
@@ -273,6 +284,8 @@ impl Lexer<'_, '_> {
                     collect_delimiter(&word.parts, &mut delim, &mut quoted);
                     if let Some(slot) = self.heredocs.get_mut(idx) {
                         slot.expand = !quoted;
+                        slot.delim.clone_from(&delim);
+                        slot.strip = strip;
                     }
                     self.pending.push(PendingHere { idx, delim, strip });
                 }
@@ -649,6 +662,7 @@ impl Lexer<'_, '_> {
             line,
             self.depth.saturating_add(1),
             self.max_depth,
+            self.dialect,
             self.budget,
         )
     }
@@ -1050,7 +1064,7 @@ mod tests {
 
     fn lexed(src: &str) -> Lexed {
         let mut budget = LineBudget::new(1 << 20);
-        lex(src, true, 1, 0, 16, &mut budget).unwrap()
+        lex(src, true, 1, 0, 16, Dialect::Bash, &mut budget).unwrap()
     }
 
     fn words(src: &str) -> Vec<Vec<WordPart>> {
@@ -1233,23 +1247,26 @@ mod tests {
             "echo ${a",
         ] {
             assert_eq!(
-                lex(src, false, 1, 0, 16, &mut b).unwrap_err(),
+                lex(src, false, 1, 0, 16, Dialect::Bash, &mut b).unwrap_err(),
                 LexError::NeedMore,
                 "{src}"
             );
             // At the end of a script a here-document is empty and a trailing backslash is a
             // literal one; everything else is unterminated.
             if !matches!(src, "cat <<E" | "echo a\\") {
-                let error = lex(src, true, 1, 0, 16, &mut b).unwrap_err();
+                let error = lex(src, true, 1, 0, 16, Dialect::Bash, &mut b).unwrap_err();
                 assert!(matches!(error, LexError::Syntax(_)), "{src}");
             }
         }
         // A here-document with no body at the very end of a script is an empty one.
         assert_eq!(
-            lex("cat <<E", true, 1, 0, 16, &mut b).unwrap().heredocs[0].text,
+            lex("cat <<E", true, 1, 0, 16, Dialect::Bash, &mut b)
+                .unwrap()
+                .heredocs[0]
+                .text,
             ""
         );
-        assert!(lex("echo 'a'", false, 1, 0, 16, &mut b).is_ok());
+        assert!(lex("echo 'a'", false, 1, 0, 16, Dialect::Bash, &mut b).is_ok());
     }
 
     #[test]
@@ -1257,7 +1274,7 @@ mod tests {
         let mut b = LineBudget::new(1 << 20);
         let src = format!("{}id{}", "$(".repeat(20), ")".repeat(20));
         assert_eq!(
-            lex(&src, true, 1, 0, 16, &mut b).unwrap_err(),
+            lex(&src, true, 1, 0, 16, Dialect::Bash, &mut b).unwrap_err(),
             LexError::TooDeep
         );
     }

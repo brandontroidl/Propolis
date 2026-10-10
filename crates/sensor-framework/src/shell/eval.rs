@@ -21,10 +21,11 @@
 )]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::ast::{
-    AndOr, AndOrOp, CaseArm, Command, List, ListItem, Near, Pipeline, Redir, RedirOp, RedirTarget,
-    SimpleCommand, Word,
+    AndOr, AndOrOp, CaseArm, Command, Dialect, FunctionDef, List, ListItem, Near, Pipeline, Redir,
+    RedirOp, RedirTarget, SimpleCommand, Word,
 };
 use super::expand::ExpandError;
 use super::parse::{Parsed, Tail};
@@ -127,11 +128,42 @@ impl DepthGuard {
 /// nothing (`while :; do :; done`) still runs out of allowance quickly.
 const LOOP_STEP_COST: u64 = 256;
 
+/// Work charged for one call of a shell function, on top of what its body costs, so a function
+/// that calls itself twice (a fork bomb's `:|:`) runs out of allowance, not time.
+const FUNCTION_CALL_COST: u64 = 256;
+
+/// Most functions running at once in one shell. A real shell has no such limit (dash stops at
+/// 1000 and says so, bash segfaults); this is the stack and work guard of a shell that must never
+/// follow an attacker's recursion to its end.
+const FUNCTION_DEPTH_MAX: usize = 10;
+
+/// Most functions one shell holds.
+const FUNCTIONS_MAX: usize = 128;
+
 /// One shell variable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Var {
     pub value: String,
     pub exported: bool,
+}
+
+/// A function the shell holds.
+#[derive(Debug, Clone)]
+pub(super) struct ShellFunction {
+    pub def: Arc<FunctionDef>,
+    /// bash's `export -f`: a bash started from this shell has it too.
+    pub exported: bool,
+}
+
+/// A function that is running.
+#[derive(Debug, Clone)]
+pub(super) struct Call {
+    pub name: String,
+    /// Defined with `function name`: mksh scopes `local` to those alone.
+    pub keyword: bool,
+    /// What `local` shadowed in this call, restored when it returns: each name with the variable
+    /// it replaced, `None` if it was not set.
+    pub locals: Vec<(String, Option<Var>)>,
 }
 
 /// What a `( )`, a pipeline stage, a `$( )` and a background job each get a copy of. The
@@ -149,6 +181,12 @@ pub(super) struct ShellState {
     pub last_bg_pid: Option<u32>,
     /// `$$`.
     pub pid: u32,
+    /// Functions defined here. A subshell's copy of the state carries them and loses what it
+    /// defines, as a forked shell does.
+    pub functions: BTreeMap<String, ShellFunction>,
+    /// The functions running, outermost first. A subshell started inside one is still inside it
+    /// (`return` ends the subshell, `local` still scopes to the function).
+    pub calls: Vec<Call>,
 }
 
 const DEFAULT_IFS: &str = " \t\n";
@@ -166,6 +204,8 @@ impl ShellState {
             last_status: 0,
             last_bg_pid: None,
             pid,
+            functions: BTreeMap::new(),
+            calls: Vec::new(),
         };
         state.set_var("IFS", DEFAULT_IFS.to_string(), false);
         match flavor {
@@ -226,7 +266,22 @@ impl ShellState {
             last_status: 0,
             last_bg_pid: None,
             pid,
+            functions: BTreeMap::new(),
+            calls: Vec::new(),
         }
+    }
+
+    /// What the variables and functions hold, against the connection's content allowance.
+    pub(super) fn owned_bytes(&self) -> usize {
+        let vars = self
+            .vars
+            .iter()
+            .map(|(name, var)| name.len().saturating_add(var.value.len()));
+        let functions = self
+            .functions
+            .iter()
+            .map(|(name, held)| name.len().saturating_add(held.def.source.len()));
+        vars.chain(functions).fold(0, usize::saturating_add)
     }
 
     pub(super) fn get(&self, name: &str) -> Option<&str> {
@@ -484,7 +539,9 @@ impl FakeShell {
         });
         let base_line = u32::try_from(base).unwrap_or(u32::MAX);
         let max_depth = self.budget().limits().max_depth;
-        let parsed = super::parse::parse_unit(&text, false, max_depth, &mut self.line, base_line);
+        let dialect = self.grammar();
+        let parsed =
+            super::parse::parse_unit(&text, false, max_depth, dialect, &mut self.line, base_line);
         self.sync_budget_trace();
         if parsed.tail == Tail::NeedMore {
             if self.pending.len() > max_pending_lines || self.pending_bytes > max_pending_bytes {
@@ -550,6 +607,8 @@ impl FakeShell {
                 }
                 Near::Newline => self.shell_error("syntax error near unexpected token `newline'"),
                 Near::EndOfFile => self.shell_error("syntax error: unexpected end of file"),
+                // Only dash refuses a name at parse time.
+                Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
             ShellLevel::Dash { .. } => match near {
                 // Dash names every redirection operator alike.
@@ -566,6 +625,7 @@ impl FakeShell {
                 }
                 Near::Newline => self.shell_error("Syntax error: newline unexpected"),
                 Near::EndOfFile => self.shell_error("Syntax error: end of file unexpected"),
+                Near::BadFunctionName => self.shell_error("Syntax error: Bad function name"),
             },
             // [unverified] mksh's wording; no Android capture exists.
             ShellLevel::AndroidMksh => match near {
@@ -574,6 +634,7 @@ impl FakeShell {
                 }
                 Near::Newline => self.shell_error("syntax error: newline unexpected"),
                 Near::EndOfFile => self.shell_error("syntax error: unexpected EOF"),
+                Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
         }
     }
@@ -593,7 +654,8 @@ impl FakeShell {
     /// Parse and run complete text in the current shell level.
     pub(super) fn run_script_text(&mut self, text: &str) -> CommandResult {
         let max_depth = self.budget().limits().max_depth;
-        let parsed = super::parse::parse_unit(text, true, max_depth, &mut self.line, 1);
+        let dialect = self.grammar();
+        let parsed = super::parse::parse_unit(text, true, max_depth, dialect, &mut self.line, 1);
         self.sync_budget_trace();
         self.execute_unit(parsed, 1)
     }
@@ -786,6 +848,7 @@ impl FakeShell {
     fn eval_command(&mut self, command: &Command) -> CommandResult {
         match command {
             Command::Simple(simple) => self.eval_simple(simple),
+            Command::Function(def) => self.eval_function_def(def),
             Command::Unsupported(kind) => {
                 self.trace_open(&[], ParseNode::Unsupported, HandlerId::Compound);
                 self.trace_unsupported(*kind);
@@ -806,7 +869,9 @@ impl FakeShell {
             Command::For { redirs, .. } => (ParseNode::For, redirs),
             Command::While { redirs, .. } => (ParseNode::While, redirs),
             Command::Case { redirs, .. } => (ParseNode::Case, redirs),
-            Command::Simple(_) | Command::Unsupported(_) => return CommandResult::silent(0),
+            Command::Simple(_) | Command::Function(_) | Command::Unsupported(_) => {
+                return CommandResult::silent(0);
+            }
         };
         let max_depth = self.budget().limits().max_depth;
         if !self.depth.try_enter(max_depth) {
@@ -850,7 +915,9 @@ impl FakeShell {
                 cond, body, until, ..
             } => self.eval_while(cond, body, *until),
             Command::Case { word, arms, .. } => self.eval_case(word, arms),
-            Command::Simple(_) | Command::Unsupported(_) => CommandResult::silent(0),
+            Command::Simple(_) | Command::Function(_) | Command::Unsupported(_) => {
+                CommandResult::silent(0)
+            }
         };
         if let Some(previous) = saved {
             self.stdin = previous;
@@ -1018,12 +1085,22 @@ impl FakeShell {
             Err(error) => return self.expand_failure(error),
         };
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        // A function answers a bare command name before any builtin or file does. Only the
+        // shell's own lookup sees them: `command f`, `env f` and the other commands that start
+        // one are handed to `dispatch`, which does not.
+        let function = refs
+            .first()
+            .filter(|name| !name.contains('/'))
+            .and_then(|name| self.state().functions.get(*name))
+            .map(|held| Arc::clone(&held.def));
         if refs.is_empty() {
             self.trace_set(
                 &argv,
                 ParseNode::RedirectionOnly,
                 HandlerId::RedirectionOnly,
             );
+        } else if function.is_some() {
+            self.trace_set(&argv, ParseNode::Simple, HandlerId::ShellFunction);
         } else {
             let resolved = self.resolve_handler(&refs);
             self.trace_set(&argv, ParseNode::Simple, resolved);
@@ -1065,8 +1142,14 @@ impl FakeShell {
         let outer_mark = std::mem::replace(&mut self.input_mark, self.stdin.session_pos());
         let was_blocked = self.stdin.is_blocked();
         let outer_typed = std::mem::take(&mut self.typed_output);
-        self.note_fetch(&refs, &unset, &simple.words);
-        let mut result = self.dispatch(&refs);
+        // A function's own commands are noted as they run; the call is not a fetch.
+        let mut result = match &function {
+            Some(def) => self.call_function(def, &refs),
+            None => {
+                self.note_fetch(&refs, &unset, &simple.words);
+                self.dispatch(&refs)
+            }
+        };
         let typed = std::mem::replace(&mut self.typed_output, outer_typed);
         // A command whose input was cut off (Ctrl-C, a closed channel) dies at the read it was
         // waiting in, and the signal ends the rest of the line with it.
@@ -1149,7 +1232,7 @@ impl FakeShell {
                 continue;
             }
             match (&redir.op, &redir.target) {
-                (RedirOp::HereDoc, RedirTarget::HereBody { text, expand }) => {
+                (RedirOp::HereDoc, RedirTarget::HereBody { text, expand, .. }) => {
                     let body = if *expand {
                         match self.expand_text(text) {
                             Ok(body) => body,
@@ -1416,11 +1499,7 @@ impl FakeShell {
     pub(super) fn assign_var(&mut self, name: &str, value: String) -> bool {
         let cap = usize::try_from(self.budget().limits().owned_bytes).unwrap_or(usize::MAX);
         let state = self.state();
-        let held: usize = state
-            .vars
-            .iter()
-            .map(|(name, var)| name.len().saturating_add(var.value.len()))
-            .fold(0, usize::saturating_add);
+        let held = state.owned_bytes();
         let before = state
             .vars
             .get(name)
@@ -1466,6 +1545,182 @@ impl FakeShell {
     }
 }
 
+// ---- shell functions ---------------------------------------------------------------------------
+
+impl FakeShell {
+    /// Which grammar the active shell reads.
+    pub(super) fn grammar(&self) -> Dialect {
+        match self.active_level() {
+            ShellLevel::Dash { .. } => Dialect::Posix,
+            ShellLevel::Bash { .. } | ShellLevel::AndroidMksh => Dialect::Bash,
+        }
+    }
+
+    /// Running a definition stores the function; the body runs when it is called.
+    fn eval_function_def(&mut self, def: &Arc<FunctionDef>) -> CommandResult {
+        self.trace_open(&[], ParseNode::FunctionDef, HandlerId::Compound);
+        let result = self.store_function(def);
+        self.trace_close(result.status);
+        result
+    }
+
+    fn store_function(&mut self, def: &Arc<FunctionDef>) -> CommandResult {
+        if !def.valid {
+            return CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("`{}': not a valid identifier", def.name)),
+            );
+        }
+        let cap = usize::try_from(self.budget().limits().owned_bytes).unwrap_or(usize::MAX);
+        let state = self.state();
+        let before = state.functions.get(&def.name).map_or(0, |held| {
+            def.name.len().saturating_add(held.def.source.len())
+        });
+        let after = state
+            .owned_bytes()
+            .saturating_sub(before)
+            .saturating_add(def.name.len())
+            .saturating_add(def.source.len());
+        let is_new = !state.functions.contains_key(&def.name);
+        let full = is_new && state.functions.len() >= FUNCTIONS_MAX;
+        let exported = state
+            .functions
+            .get(&def.name)
+            .is_some_and(|held| held.exported);
+        if after > cap || full {
+            // Like a refused assignment: nothing is printed, since no real shell has the limit.
+            self.record_hit(BudgetHit::OwnedBytes);
+            return CommandResult::silent(1);
+        }
+        self.state_mut().functions.insert(
+            def.name.clone(),
+            ShellFunction {
+                def: Arc::clone(def),
+                exported,
+            },
+        );
+        CommandResult::silent(0)
+    }
+
+    /// bash's `FUNCNEST`: the nesting its functions may reach, when the session set a positive
+    /// number. Anything else leaves bash unlimited.
+    fn funcnest(&self) -> Option<usize> {
+        if !self.is_bash() {
+            return None;
+        }
+        self.state()
+            .get("FUNCNEST")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|limit| *limit > 0)
+    }
+
+    /// Run a function with `argv` (`argv[0]` is its name): its own positional parameters, its own
+    /// `local` scope and no enclosing loop, all put back when it returns. `return` ends it with
+    /// its status; otherwise the status is the last command's.
+    fn call_function(&mut self, def: &Arc<FunctionDef>, argv: &[&str]) -> CommandResult {
+        if !self.charge_work(FUNCTION_CALL_COST) {
+            let mut stopped = CommandResult::silent(1);
+            stopped.stop_line = true;
+            return stopped;
+        }
+        let running = self.state().calls.len();
+        if let Some(limit) = self.funcnest()
+            && running >= limit
+        {
+            let mut refused = CommandResult::stderr(
+                1,
+                self.shell_error(format_args!(
+                    "{}: maximum function nesting level exceeded ({limit})",
+                    def.name
+                )),
+            );
+            // bash drops the whole command list, not just this call.
+            refused.stop_line = true;
+            return refused;
+        }
+        if running >= FUNCTION_DEPTH_MAX {
+            return self.function_overflow();
+        }
+        let frames = self.frames.len();
+        let saved_args = std::mem::replace(
+            &mut self.state_mut().positional,
+            argv.iter().skip(1).map(|arg| (*arg).to_string()).collect(),
+        );
+        self.state_mut().calls.push(Call {
+            name: def.name.clone(),
+            keyword: def.keyword,
+            locals: Vec::new(),
+        });
+        let saved_loops = std::mem::take(&mut self.loop_depth);
+        let mut result = self.eval_command(&def.body);
+        self.loop_depth = saved_loops;
+        // An `exit` that left a shell level took this call's state with it.
+        if self.frames.len() == frames {
+            let state = self.state_mut();
+            if let Some(call) = state.calls.pop() {
+                for (name, previous) in call.locals.into_iter().rev() {
+                    match previous {
+                        Some(var) => {
+                            state.vars.insert(name, var);
+                        }
+                        None => {
+                            state.vars.remove(&name);
+                        }
+                    }
+                }
+            }
+            state.positional = saved_args;
+        }
+        if result.flow == Flow::Return {
+            result.flow = Flow::None;
+        }
+        result
+    }
+
+    /// The function stack reached its cap. dash words it and ends the shell with status 2; bash
+    /// without `FUNCNEST` has no limit and dies of a stack overflow, silently, with status 139,
+    /// which is what ending this shell here stands in for. Whichever shell it is, only the
+    /// process that overflowed ends: a subshell, a pipeline stage or a script ends alone, and the
+    /// login shell abandons the rest of the line but keeps the session.
+    fn function_overflow(&mut self) -> CommandResult {
+        self.record_hit(BudgetHit::Depth);
+        self.note_depth();
+        match self.active_level() {
+            ShellLevel::Dash { .. } => self.dash_fatal(
+                2,
+                format_args!("Maximum function recursion depth (1000) reached"),
+            ),
+            ShellLevel::Bash { .. } | ShellLevel::AndroidMksh => {
+                let mut crashed = CommandResult::silent(139);
+                self.end_process(&mut crashed);
+                crashed
+            }
+        }
+    }
+
+    /// An error dash makes fatal (its `sh_error`, which every special builtin's complaint is):
+    /// the shell process exits with `status`.
+    pub(super) fn dash_fatal(
+        &mut self,
+        status: u8,
+        message: impl std::fmt::Display,
+    ) -> CommandResult {
+        let mut result = CommandResult::stderr(status, self.shell_error(message));
+        self.end_process(&mut result);
+        result
+    }
+
+    /// End the process running now, as `exit` does: a subshell, a pipeline stage or a script
+    /// alone, or else the rest of the line.
+    pub(super) fn end_process(&self, result: &mut CommandResult) {
+        if self.top_frame_is_scoped() {
+            result.flow = Flow::ExitSubshell;
+        } else {
+            result.stop_line = true;
+        }
+    }
+}
+
 /// After a loop body or condition: whether the loop goes on. Consumes the `break` or `continue`
 /// aimed at this loop and passes one aimed further out up to the enclosing loop.
 fn loop_continues(acc: &mut CommandResult) -> bool {
@@ -1474,7 +1729,8 @@ fn loop_continues(acc: &mut CommandResult) -> bool {
     }
     match acc.flow {
         Flow::None => true,
-        Flow::ExitSubshell => false,
+        // Both leave the loop and keep going up: to the subshell's edge, to the function's call.
+        Flow::ExitSubshell | Flow::Return => false,
         Flow::Break(n) => {
             acc.flow = if n > 1 {
                 Flow::Break(n.saturating_sub(1))

@@ -7,6 +7,7 @@
 //! nothing is run, in keeping with the never-exec guarantee that no file is ever handed to an
 //! interpreter here.
 
+use super::registry::{CommandKind, Registry};
 use super::{CommandResult, FakeShell, Flow, FrameKind, ShellLevel};
 
 /// The default field separators: space, tab, newline.
@@ -74,6 +75,9 @@ impl FakeShell {
             // `/proc/<login pid>/cwd` is the login shell's directory.
             self.install_processes();
             CommandResult::stdout(out)
+        } else if self.is_dash() {
+            // Verified on Ubuntu 22.04's dash: its own wording, and status 2.
+            CommandResult::stderr(2, self.shell_error(format_args!("cd: can't cd to {typed}")))
         } else {
             CommandResult::stderr(
                 1,
@@ -208,7 +212,7 @@ impl FakeShell {
         self.history.push(line);
     }
 
-    fn top_frame_is_scoped(&self) -> bool {
+    pub(super) fn top_frame_is_scoped(&self) -> bool {
         self.frames
             .last()
             .is_some_and(|f| matches!(f.kind, FrameKind::Subshell | FrameKind::Script(_)))
@@ -216,16 +220,34 @@ impl FakeShell {
 
     // ---- variables and parameters ----------------------------------------------------------
 
-    /// `export [-p] [-n] [NAME[=value]]...`. Alone it lists what is exported.
+    /// `export [-p] [-n] [-f] [NAME[=value]]...`. Alone it lists what is exported. bash's `-f`
+    /// names functions instead, which a bash started afterwards inherits; dash has no such
+    /// option.
     pub(super) fn builtin_export(&mut self, parts: &[&str]) -> CommandResult {
         let mut unexport = false;
+        let mut functions = false;
         let mut operands: Vec<&str> = Vec::new();
         for arg in parts.iter().skip(1) {
             match *arg {
                 "-n" => unexport = true,
+                a if a.starts_with('-') && a.len() > 1 && operands.is_empty() => {
+                    for flag in a.chars().skip(1) {
+                        match flag {
+                            'n' => unexport = true,
+                            'f' if self.is_dash() => {
+                                return self.dash_fatal(2, "export: Illegal option -f");
+                            }
+                            'f' => functions = true,
+                            _ => {}
+                        }
+                    }
+                }
                 a if a.starts_with('-') && operands.is_empty() => {}
                 a => operands.push(a),
             }
+        }
+        if functions {
+            return self.export_functions(&operands, unexport);
         }
         if operands.is_empty() {
             return CommandResult::stdout(self.list_exported());
@@ -259,6 +281,27 @@ impl FakeShell {
         }
     }
 
+    /// `export -f NAME...`: mark functions for a bash started from this shell.
+    fn export_functions(&mut self, names: &[&str], unexport: bool) -> CommandResult {
+        let mut errors = String::new();
+        for name in names {
+            match self.state_mut().functions.get_mut(*name) {
+                Some(held) => held.exported = !unexport,
+                None => errors
+                    .push_str(&self.shell_error(format_args!("export: {name}: not a function"))),
+            }
+        }
+        if errors.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, errors)
+        }
+    }
+
+    pub(super) fn is_dash(&self) -> bool {
+        matches!(self.active_level(), ShellLevel::Dash { .. })
+    }
+
     fn list_exported(&self) -> String {
         let bash = self.is_bash();
         let mut out = String::new();
@@ -285,12 +328,197 @@ impl FakeShell {
         out
     }
 
-    /// `unset [-v] NAME...`.
+    /// `unset [-f|-v] NAME...`. Without an option dash unsets variables only, and bash a variable
+    /// or, when there is none by that name, a function.
     pub(super) fn builtin_unset(&mut self, parts: &[&str]) -> CommandResult {
-        for arg in parts.iter().skip(1).filter(|a| !a.starts_with('-')) {
-            self.state_mut().vars.remove(*arg);
+        let (mut functions, mut variables) = (false, false);
+        let mut at = 1;
+        while let Some(arg) = parts.get(at) {
+            if *arg == "--" {
+                at = at.saturating_add(1);
+                break;
+            }
+            let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                break;
+            };
+            for flag in flags.chars() {
+                match flag {
+                    'f' => {
+                        functions = true;
+                        // dash takes the last of the two; bash refuses both.
+                        variables &= !self.is_dash();
+                    }
+                    'v' => {
+                        variables = true;
+                        functions &= !self.is_dash();
+                    }
+                    'n' if !self.is_dash() => {}
+                    other if self.is_dash() => {
+                        return self.dash_fatal(2, format_args!("unset: Illegal option -{other}"));
+                    }
+                    other => {
+                        return CommandResult::stderr(
+                            2,
+                            format!(
+                                "{}unset: usage: unset [-f] [-v] [-n] [name ...]\n",
+                                self.shell_error(format_args!("unset: -{other}: invalid option"))
+                            ),
+                        );
+                    }
+                }
+            }
+            at = at.saturating_add(1);
+        }
+        if functions && variables {
+            return CommandResult::stderr(
+                1,
+                self.shell_error("unset: cannot simultaneously unset a function and a variable"),
+            );
+        }
+        let bash = !self.is_dash();
+        for name in parts.get(at..).unwrap_or(&[]) {
+            let state = self.state_mut();
+            if functions {
+                state.functions.remove(*name);
+            } else if variables || !bash || state.vars.contains_key(*name) {
+                state.vars.remove(*name);
+            } else {
+                state.functions.remove(*name);
+            }
         }
         CommandResult::silent(0)
+    }
+
+    // ---- functions: return, local, builtin -------------------------------------------------
+
+    /// `return [n]`: ends the running function with status `n` (default the last command's). A
+    /// subshell started inside the function ends alone, as it does for `exit`. Outside a function
+    /// bash refuses; dash treats it as `exit`, ending the shell or script (verified on Ubuntu
+    /// 22.04: `dash -c 'return 3'` exits 3).
+    pub(super) fn builtin_return(&mut self, parts: &[&str]) -> CommandResult {
+        let operands = parts.get(1..).unwrap_or(&[]);
+        let bash = !self.is_dash();
+        if bash && operands.len() > 1 {
+            // The only complaint of a builtin that drops the whole command list.
+            let mut refused =
+                CommandResult::stderr(1, self.shell_error("return: too many arguments"));
+            refused.stop_line = true;
+            return refused;
+        }
+        let mut complaint = None;
+        let status = match operands.first() {
+            None => self.state().last_status,
+            Some(arg) => match exit_number(arg, bash) {
+                Some(status) => status,
+                None if bash => {
+                    complaint = Some(
+                        self.shell_error(format_args!("return: {arg}: numeric argument required")),
+                    );
+                    2
+                }
+                None => {
+                    return self.dash_fatal(2, format_args!("return: Illegal number: {arg}"));
+                }
+            },
+        };
+        if self.state().calls.is_empty() {
+            if bash && matches!(self.active_level(), ShellLevel::Bash { .. }) {
+                return CommandResult::stderr(
+                    2,
+                    self.shell_error("return: can only `return' from a function or sourced script"),
+                );
+            }
+            let text = status.to_string();
+            return self.builtin_exit(&["exit", &text]);
+        }
+        let mut result = match complaint {
+            Some(message) => CommandResult::stderr(status, message),
+            None => CommandResult::silent(status),
+        };
+        result.flow = Flow::Return;
+        result
+    }
+
+    /// `local [NAME[=value]]...` (bash also takes options, which change nothing here). The
+    /// variable is put back, or unset again, when the function returns. dash keeps a variable's
+    /// value for `local NAME`; bash leaves it unset. mksh scopes only the functions written
+    /// `function name` ([unverified]: no mksh to check against).
+    pub(super) fn builtin_local(&mut self, parts: &[&str]) -> CommandResult {
+        let dash = self.is_dash();
+        let Some(call) = self.state().calls.last() else {
+            return if dash {
+                self.dash_fatal(2, "local: not in a function")
+            } else {
+                CommandResult::stderr(1, self.shell_error("local: can only be used in a function"))
+            };
+        };
+        let scoped = call.keyword || !matches!(self.active_level(), ShellLevel::AndroidMksh);
+        let mut errors = String::new();
+        for operand in parts.iter().skip(1) {
+            if operand.starts_with('-') && operand.len() > 1 {
+                if dash {
+                    return self.dash_fatal(2, format_args!("local: {operand}: bad variable name"));
+                }
+                continue;
+            }
+            let (name, value) = match operand.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (*operand, None),
+            };
+            if !is_name(name) {
+                if dash {
+                    // dash words a bad name with a value without the builtin's name.
+                    return if value.is_some() {
+                        self.dash_fatal(2, format_args!("{name}: bad variable name"))
+                    } else {
+                        self.dash_fatal(2, format_args!("local: {name}: bad variable name"))
+                    };
+                }
+                errors.push_str(
+                    &self.shell_error(format_args!("local: `{operand}': not a valid identifier")),
+                );
+                continue;
+            }
+            if scoped {
+                let previous = self.state().vars.get(name).cloned();
+                let state = self.state_mut();
+                if let Some(call) = state.calls.last_mut()
+                    && !call.locals.iter().any(|(held, _)| held == name)
+                {
+                    call.locals.push((name.to_string(), previous));
+                }
+                if value.is_none() && !dash {
+                    state.vars.remove(name);
+                }
+            }
+            if let Some(value) = value {
+                self.assign_var(name, value.to_string());
+            }
+        }
+        if errors.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, errors)
+        }
+    }
+
+    /// bash's `builtin NAME [ARG...]`: runs the shell builtin, never a function of that name.
+    pub(super) fn builtin_builtin(&mut self, parts: &[&str]) -> CommandResult {
+        let mut args = parts.get(1..).unwrap_or(&[]);
+        if args.first() == Some(&"--") {
+            args = args.get(1..).unwrap_or(&[]);
+        }
+        let Some(name) = args.first() else {
+            return CommandResult::silent(0);
+        };
+        if Registry::builtin().kind(name, self) == Some(CommandKind::Builtin) {
+            self.dispatch_nested(args)
+        } else {
+            CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("builtin: {name}: not a shell builtin")),
+            )
+        }
     }
 
     /// `set`: alone it lists the variables; `set -- a b` and `set a b` replace the positional
@@ -302,6 +530,13 @@ impl FakeShell {
             let mut out = String::new();
             for (name, var) in &self.state().vars {
                 out.push_str(&format!("{name}={}\n", quote_value(&var.value, !bash)));
+            }
+            // bash lists its functions after the variables, in the form `declare -f` prints;
+            // dash's `set` does not list them.
+            if bash {
+                for (name, held) in &self.state().functions {
+                    out.push_str(&super::fnprint::bash_function_text(name, &held.def));
+                }
             }
             return CommandResult::stdout(out);
         }
@@ -564,6 +799,26 @@ impl FakeShell {
             .take_script()
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+/// A status operand of `return`: digits, signed for bash, taken modulo 256 (dash keeps the whole
+/// number in `$?` but exits with it modulo 256, which a status of one byte cannot show).
+fn exit_number(arg: &str, signed: bool) -> Option<u8> {
+    let digits = if signed {
+        arg.strip_prefix(['+', '-']).unwrap_or(arg)
+    } else {
+        arg
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude: u64 = digits.parse().ok()?;
+    let value = if signed && arg.starts_with('-') {
+        0u64.wrapping_sub(magnitude)
+    } else {
+        magnitude
+    };
+    u8::try_from(value & 0xff).ok()
 }
 
 /// `\c` becomes `c`, as `read` without `-r` does.

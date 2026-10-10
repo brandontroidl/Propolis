@@ -23,7 +23,7 @@
 
 use sensor_wire::{PROTO_TCP, SIGNAL_HONEYPOT_FILE_DOWNLOAD, SensorEvent, WIRE_VERSION};
 
-use super::ast::{Word, WordPart};
+use super::ast::{Dialect, Word, WordPart};
 use super::eval::LineBudget;
 use super::lex::{Op, Tok, lex};
 use super::{
@@ -124,7 +124,8 @@ fn lexical_fetches(
     nesting: u32,
     out: &mut Vec<(Fetch, bool)>,
 ) {
-    let Ok(lexed) = lex(text, true, 1, 0, max_depth, budget) else {
+    // Either shell's text: the scan only reads tokens, and bash's is the wider grammar.
+    let Ok(lexed) = lex(text, true, 1, 0, max_depth, Dialect::Bash, budget) else {
         for fetch in download_targets(shell, text) {
             out.push(unexpanded_to_command(fetch, text));
         }

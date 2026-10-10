@@ -1524,6 +1524,19 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_needs_its_name_to_be_the_whole_command() {
+        // bash -c '>/tmp/x f() { :; }' and dash alike stop at the `(`; so do `A=1 f()` and
+        // `echo a f()`.
+        for src in [">/tmp/x f() { :; }", "A=1 f() { :; }", "echo a f() { :; }"] {
+            assert_eq!(syntax_near(src), Near::Token("(".to_string()), "{src}");
+            let Tail::Error(error) = parse_posix(src).tail else {
+                panic!("{src}: not a syntax error");
+            };
+            assert_eq!(error.near, Near::Token("(".to_string()), "{src}");
+        }
+    }
+
+    #[test]
     fn dash_has_no_function_keyword() {
         // The words are an ordinary command in dash, so the first thing it cannot parse is what
         // it names.

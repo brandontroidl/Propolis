@@ -71,6 +71,22 @@ $ type f
 >e {\x20
 >     sleep 1 &
 > }
+$ f() { while a; do sleep 1 & done; if a; then b & fi; for i in 1; do c & d; done; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     while a; do
+>         sleep 1 &
+>     done;
+>     if a; then
+>         b &
+>     fi;
+>     for i in 1;
+>     do
+>         c & d;
+>     done
+> }
 $ f() { ( a; b ); ( a ) ; (a) | b; }
 $ type f
 > f is a function

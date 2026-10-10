@@ -472,23 +472,23 @@ fn fetch_outcome(url: &str, record: Option<&FetchRecord>) -> FetchOutcome {
     }
 }
 
-/// Sessions that get a tag lookup per page. Each is one indexed query, so a page of many short
-/// sessions is bounded; the newest sessions come first and are the ones kept.
-const SESSION_TAG_LOOKUPS: usize = 40;
-
-/// Sets [`SessionGroup::tags`] for the newest sessions that ran a command (only a shell session
-/// carries tags). A failed lookup leaves that card without chips.
+/// Sets [`SessionGroup::tags`] for every session that ran a command (only a shell session carries
+/// tags), from one query. A page holds at most [`EVIDENCE_PAGE_SIZE`] events, so the id list is
+/// bounded by that. A failed lookup leaves the cards without chips.
 async fn attach_session_tags(
     db: &PgPool,
     sessions: &mut [SessionGroup],
 ) -> Result<(), sqlx::Error> {
-    for session in sessions
-        .iter_mut()
+    let ids: Vec<String> = sessions
+        .iter()
         .filter(|s| s.command_count > 0)
-        .take(SESSION_TAG_LOOKUPS)
-    {
-        let tags = review::attack::session_tags(db, &session.session_id).await?;
-        session.tags = attack::chips(&tags);
+        .map(|s| s.session_id.clone())
+        .collect();
+    let mut tags = review::attack::session_tags(db, &ids).await?;
+    for session in sessions.iter_mut() {
+        if let Some(found) = tags.remove(&session.session_id) {
+            session.tags = attack::chips(&found);
+        }
     }
     Ok(())
 }

@@ -1511,6 +1511,45 @@ async fn a_list_row_shows_four_chips_and_counts_the_rest(pool: PgPool) {
     );
 }
 
+/// Every session on the page gets its chips, however many there are: the tags come from one
+/// batched read, not a capped number of per-session reads.
+#[sqlx::test(migrations = false)]
+async fn every_session_card_shows_its_chips_however_many_sessions_there_are(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "192.0.2.90";
+    for i in 0..60 {
+        let session = Uuid::now_v7();
+        append(
+            &pool,
+            ip,
+            "ssh",
+            SignalType::HoneypotCommandExec,
+            Utc::now() - Duration::minutes(100 - i),
+            serde_json::json!({ "command": format!("uname -{i}") }),
+            Some(session),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO attack_tag (source_ip, session_id, technique_id, rule_id, event_id, matched, \
+                                     first_seen, last_seen) \
+             VALUES ($1::inet, $2, 'T1059.004', 'unix-shell', 1, 'sh', now(), now())",
+        )
+        .bind(ip)
+        .bind(session)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let console = Console::new(pool.clone());
+    let (_, page) = console.get(&format!("/ip/{ip}")).await;
+    let headers = page.matches(r#"<summary class="session-header">"#).count();
+    let chipped = between(&page, "Evidence timeline", "</body>")
+        .matches(">T1059.004</span>")
+        .count();
+    assert_eq!(headers, 60, "all sessions are cards");
+    assert_eq!(chipped, 60, "every card carries its chip");
+}
+
 /// What matched is attacker data: rendered as escaped text, in the panel and (as a title) never
 /// able to break out of an attribute.
 #[sqlx::test(migrations = false)]

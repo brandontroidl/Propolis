@@ -220,19 +220,28 @@ pub async fn source_tags(
     Ok(group(out))
 }
 
-/// The techniques tagged in one shell session.
-pub async fn session_tags(pool: &PgPool, session_id: &str) -> Result<Vec<TagView>, sqlx::Error> {
+/// The techniques tagged in each of the shell sessions `session_ids` (UUID text, as the pages
+/// carry them), by session id as given. A session with no tags is absent. One query for any number
+/// of sessions, like [`source_tags`] and [`campaign_tags`]; a string that is not a UUID fails the
+/// whole call.
+pub async fn session_tags(
+    pool: &PgPool,
+    session_ids: &[String],
+) -> Result<HashMap<String, Vec<TagView>>, sqlx::Error> {
+    if session_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let rows = sqlx::query(
-        "SELECT rule_id, event_id, matched FROM attack_tag WHERE session_id = $1::uuid \
-         ORDER BY technique_id, rule_id",
+        "SELECT session_id::text AS session_id, rule_id, event_id, matched FROM attack_tag \
+         WHERE session_id = ANY($1::uuid[]) ORDER BY session_id, technique_id, rule_id",
     )
-    .bind(session_id)
+    .bind(session_ids)
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         out.push((
-            (),
+            r.try_get::<String, _>("session_id")?,
             RuleEvidence {
                 rule: r.try_get("rule_id")?,
                 event_id: Some(r.try_get("event_id")?),
@@ -241,7 +250,7 @@ pub async fn session_tags(pool: &PgPool, session_id: &str) -> Result<Vec<TagView
             },
         ));
     }
-    Ok(group(out).remove(&()).unwrap_or_default())
+    Ok(group(out))
 }
 
 #[cfg(test)]

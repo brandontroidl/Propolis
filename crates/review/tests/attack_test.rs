@@ -191,7 +191,7 @@ async fn a_campaign_carries_the_union_of_its_sessions_tags_and_no_others(pool: P
         &["(crontab -l; echo '@reboot /tmp/x') | crontab -"],
     )
     .await;
-    let (_, b) = run(
+    let (sess_b, b) = run(
         &pool,
         "192.0.2.11",
         t0() + Duration::minutes(1),
@@ -272,10 +272,27 @@ async fn a_campaign_carries_the_union_of_its_sessions_tags_and_no_others(pool: P
     assert!(!tags[other_id].contains_key("cron-install"));
 
     // The sessions keep their own: session A never ran chmod.
-    let by_session = attack::session_tags(&pool, &sess_a.to_string())
+    let by_session = attack::session_tags(&pool, &[sess_a.to_string(), sess_b.to_string()])
         .await
         .unwrap();
-    let techniques: BTreeSet<&str> = by_session.iter().map(|t| t.technique.as_str()).collect();
+    assert_eq!(by_session.len(), 2, "both sessions answered by one call");
+    let techniques: BTreeSet<&str> = by_session[&sess_a.to_string()]
+        .iter()
+        .map(|t| t.technique.as_str())
+        .collect();
+    let b_techniques: BTreeSet<&str> = by_session[&sess_b.to_string()]
+        .iter()
+        .map(|t| t.technique.as_str())
+        .collect();
+    assert!(
+        b_techniques.contains("T1222.002"),
+        "session B ran chmod, session A did not: {b_techniques:?}"
+    );
+    assert!(!techniques.contains("T1222.002"));
+    assert!(
+        attack::session_tags(&pool, &[]).await.unwrap().is_empty(),
+        "no ids, no query"
+    );
     assert_eq!(
         techniques,
         BTreeSet::from(["T1053.003", "T1082", "T1083", "T1105"])
@@ -566,9 +583,9 @@ async fn tags_read_back_grouped_by_technique_with_the_matrix_version(pool: PgPoo
     assert_eq!(json["matrix_version"], "v19.2");
     assert_eq!(json["evidence"][0]["event_id"], ids[0]);
     assert_eq!(
-        attack::session_tags(&pool, &session.to_string())
+        attack::session_tags(&pool, &[session.to_string()])
             .await
-            .unwrap(),
+            .unwrap()[&session.to_string()],
         *view
     );
     assert!(attack::campaign_tags(&pool, &[]).await.unwrap().is_empty());

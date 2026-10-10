@@ -222,3 +222,30 @@ async fn storing_a_reply_again_keeps_the_first_row(pool: PgPool) {
     .unwrap();
     assert_eq!(found.len(), 2, "a digest with no row is absent");
 }
+
+/// Two runners storing the same new replies in opposite orders must not deadlock: rows are
+/// inserted in digest order whatever order they arrive in.
+#[sqlx::test(migrations = false)]
+async fn two_runners_storing_the_same_replies_in_opposite_orders_do_not_deadlock(pool: PgPool) {
+    migrate(&pool).await;
+    for round in 0..15 {
+        let forward: Vec<(String, String)> = (0..400)
+            .map(|i| {
+                let text = format!("reply {round} {i}");
+                (output_digest(&text), text)
+            })
+            .collect();
+        let mut backward = forward.clone();
+        backward.reverse();
+        let (a, b) = (pool.clone(), pool.clone());
+        let one = tokio::spawn(async move { core_scoring::store_outputs(&a, &forward).await });
+        let two = tokio::spawn(async move { core_scoring::store_outputs(&b, &backward).await });
+        one.await.unwrap().expect("forward store");
+        two.await.unwrap().expect("backward store");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM shell_output")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 15 * 400);
+}

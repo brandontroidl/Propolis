@@ -468,6 +468,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   no `url`. One event per distinct fetch per input line, the whole line (every script it runs)
   sharing the 8-per-line cap and the connection's 64, so a Mirai `(tftp ... || busybox tftp ...) >
   t` fallback chain yields one event.
+  A command word with a slash is the tool only where its path is the tool, decided by the one
+  function the executor also uses (`crates/sensor-framework/src/shell/mod.rs#FakeShell::exec_target`):
+  `/usr/bin/wget`, `/bin/wget`, `/usr/bin/curl` and `busybox` at its two paths are files the box
+  ships, and a relative path counts when the working directory makes it one (`bin/wget` from
+  `/usr`). A file the session wrote (`./tftp` after `... -l - > tftp`), a relative path from
+  anywhere else, and a path to nothing (`./wget`) are not fetches, and the last runs as a missing
+  file (`No such file or directory`; `not found` under dash and mksh) rather than as the applet of
+  that name. A saved copy of busybox named `busybox*` is still the multi-call binary and fetches.
   A lexical pass over the line's text is kept as a fallback for evidence the evaluator did not
   reach: a branch the fake's answers skipped (`test -f x && wget URL`), functions and the other
   constructs outside the grammar subset (functions never run, so a fetch in one is found only

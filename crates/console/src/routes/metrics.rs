@@ -322,6 +322,11 @@ async fn metrics(
     writeln!(out, "propolis_events_rejected_total {rejected}").unwrap();
 
     push_intake_lag(&mut out, (state.intake_lag)());
+    match fleet::stats::read_all(&state.db).await {
+        Ok(rows) => push_sensor_stats(&mut out, &rows, chrono::Utc::now()),
+        // Logged and left out, never a failed scrape: an absent series says nobody measured.
+        Err(e) => tracing::warn!(error = %e, "sensor_stats could not be read for /metrics"),
+    }
     push_counter(
         &mut out,
         "propolis_intake_lines_quarantined_total",
@@ -430,6 +435,115 @@ fn push_intake_lag(out: &mut String, mut logs: Vec<crate::intake_lag::IntakeLag>
     }
 }
 
+/// Each capturing sensor's latest `sensor_stats` line, labelled by sensor, with how old that line
+/// is. The values are the last ones reported and stay put when a sensor goes quiet; what changes
+/// is `propolis_sensor_stats_age_seconds` (and `_stale`), so a dead sensor reads as stale rather
+/// than as zeros. A sensor that never reported has no series at all.
+fn push_sensor_stats(
+    out: &mut String,
+    rows: &[fleet::stats::SensorStatsRow],
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    type Value = fn(&fleet::stats::SensorStatsRow) -> i64;
+    let series: [(&str, &str, &str, Value); 8] = [
+        (
+            "propolis_sensor_capture_queue_dropped_total",
+            "counter",
+            "Captures dropped because the sensor's hand-off queue was full, since the sensor started.",
+            |r| r.dropped,
+        ),
+        (
+            "propolis_sensor_capture_spool_refused_total",
+            "counter",
+            "Captures the sensor's spool refused (per-file cap or exhausted budget), since the sensor started.",
+            |r| r.spool_refused,
+        ),
+        (
+            "propolis_sensor_capture_truncated_total",
+            "counter",
+            "Captures kept as a prefix because the capture memory budget ran out, since the sensor started.",
+            |r| r.truncated,
+        ),
+        (
+            "propolis_sensor_capture_refused_total",
+            "counter",
+            "Captures refused with no bytes because the capture memory budget was full, since the sensor started.",
+            |r| r.refused,
+        ),
+        (
+            "propolis_sensor_capture_budget_bytes",
+            "gauge",
+            "Capture bytes the sensor held in memory at its last report.",
+            |r| r.budget_current,
+        ),
+        (
+            "propolis_sensor_capture_budget_high_water_bytes",
+            "gauge",
+            "Most capture bytes the sensor has held in memory at once since it started.",
+            |r| r.budget_high_water,
+        ),
+        (
+            "propolis_sensor_capture_budget_refused_total",
+            "counter",
+            "Capture memory reservations the budget refused, since the sensor started.",
+            |r| r.budget_refused,
+        ),
+        (
+            "propolis_sensor_uptime_seconds",
+            "gauge",
+            "Sensor uptime at its last report.",
+            |r| r.uptime_secs,
+        ),
+    ];
+    for (name, kind, help, value) in series {
+        writeln!(out, "# HELP {name} {help}").unwrap();
+        writeln!(out, "# TYPE {name} {kind}").unwrap();
+        for row in rows {
+            writeln!(
+                out,
+                "{name}{{sensor=\"{}\"}} {}",
+                escape_label(&row.sensor),
+                value(row)
+            )
+            .unwrap();
+        }
+    }
+    type Derived = fn(&fleet::stats::SensorStatsRow, chrono::DateTime<chrono::Utc>) -> i64;
+    let derived: [(&str, &str, Derived); 3] = [
+        (
+            "propolis_sensor_stats_age_seconds",
+            "Seconds since the sensor's last stats line, by the sensor's own clock.",
+            |r, now| r.age_seconds(now),
+        ),
+        (
+            "propolis_sensor_stats_stale",
+            "1 when the sensor's last stats line is older than three reporting intervals: the values above are then history, not current.",
+            |r, now| i64::from(r.is_stale(now)),
+        ),
+        (
+            "propolis_sensor_stats_final",
+            "1 when the sensor's last line was its shutdown line: a clean stop, as opposed to silence.",
+            |r, _| i64::from(r.is_final),
+        ),
+    ];
+    for (name, help, value) in derived {
+        writeln!(out, "# HELP {name} {help}").unwrap();
+        writeln!(out, "# TYPE {name} gauge").unwrap();
+        for row in rows {
+            writeln!(
+                out,
+                "{name}{{sensor=\"{}\"}} {}",
+                escape_label(&row.sensor),
+                value(row, now)
+            )
+            .unwrap();
+        }
+    }
+}
+
 fn push_counter(out: &mut String, name: &str, help: &str, value: u64) {
     writeln!(out, "# HELP {name} {help}").unwrap();
     writeln!(out, "# TYPE {name} counter").unwrap();
@@ -485,6 +599,120 @@ async fn spool_occupancy(dir: &std::path::Path) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stats_row(sensor: &str, reported: &str, is_final: bool) -> fleet::stats::SensorStatsRow {
+        fleet::stats::SensorStatsRow {
+            sensor: sensor.into(),
+            reported_at: reported.parse().unwrap(),
+            received_at: reported.parse().unwrap(),
+            uptime_secs: 3600,
+            is_final,
+            dropped: 11,
+            spool_refused: 12,
+            truncated: 13,
+            refused: 14,
+            budget_current: 15,
+            budget_high_water: 16,
+            budget_refused: 17,
+        }
+    }
+
+    #[test]
+    fn sensor_stats_are_published_by_sensor_with_their_age_and_staleness() {
+        let now: chrono::DateTime<chrono::Utc> = "2026-10-09T12:10:00Z".parse().unwrap();
+        let rows = [
+            stats_row("ssh", "2026-10-09T12:09:30Z", false),
+            // Silent for 6 minutes with no shutdown line: stale, and not a clean stop.
+            stats_row("telnet", "2026-10-09T12:04:00Z", false),
+            // A shutdown line 10 s ago: a clean stop that is not yet stale. The two rows differ in
+            // BOTH flags, so a swap of stale and final cannot pass.
+            stats_row("ftp", "2026-10-09T12:09:50Z", true),
+        ];
+        let mut out = String::new();
+        push_sensor_stats(&mut out, &rows, now);
+        for line in [
+            "propolis_sensor_capture_queue_dropped_total{sensor=\"ssh\"} 11",
+            "propolis_sensor_capture_spool_refused_total{sensor=\"ssh\"} 12",
+            "propolis_sensor_capture_truncated_total{sensor=\"ssh\"} 13",
+            "propolis_sensor_capture_refused_total{sensor=\"ssh\"} 14",
+            "propolis_sensor_capture_budget_bytes{sensor=\"ssh\"} 15",
+            "propolis_sensor_capture_budget_high_water_bytes{sensor=\"ssh\"} 16",
+            "propolis_sensor_capture_budget_refused_total{sensor=\"ssh\"} 17",
+            "propolis_sensor_uptime_seconds{sensor=\"ssh\"} 3600",
+            "propolis_sensor_stats_age_seconds{sensor=\"ssh\"} 30",
+            "propolis_sensor_stats_stale{sensor=\"ssh\"} 0",
+            "propolis_sensor_stats_final{sensor=\"ssh\"} 0",
+            "propolis_sensor_stats_age_seconds{sensor=\"telnet\"} 360",
+            "propolis_sensor_stats_stale{sensor=\"telnet\"} 1",
+            "propolis_sensor_stats_final{sensor=\"telnet\"} 0",
+            "propolis_sensor_stats_age_seconds{sensor=\"ftp\"} 10",
+            "propolis_sensor_stats_stale{sensor=\"ftp\"} 0",
+            "propolis_sensor_stats_final{sensor=\"ftp\"} 1",
+            // A stale sensor keeps its last values; staleness is what says they are history.
+            "propolis_sensor_capture_queue_dropped_total{sensor=\"telnet\"} 11",
+        ] {
+            assert!(
+                out.lines().any(|l| l == line),
+                "missing `{line}` in:\n{out}"
+            );
+        }
+        assert!(out.contains("# TYPE propolis_sensor_capture_queue_dropped_total counter"));
+        assert!(out.contains("# TYPE propolis_sensor_capture_budget_bytes gauge"));
+    }
+
+    #[test]
+    fn no_sensor_stats_means_no_series_not_zeros() {
+        let mut out = String::new();
+        push_sensor_stats(
+            &mut out,
+            &[],
+            "2026-10-09T12:10:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_sensor_name_cannot_break_the_exposition_format() {
+        let mut out = String::new();
+        push_sensor_stats(
+            &mut out,
+            &[stats_row("a\"b\nc", "2026-10-09T12:09:30Z", false)],
+            "2026-10-09T12:10:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        );
+        // Every series line, of every metric, carries the escaped name on one line; a raw newline
+        // or quote in any one of them would leave a line that is neither a comment nor a series.
+        let series: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(series.len(), 11, "one series per metric:\n{out}");
+        for line in series {
+            assert!(
+                line.starts_with("propolis_sensor_") && line.contains("{sensor=\"a\\\"b\\nc\"} "),
+                "malformed series line `{line}`"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn stats_stored_by_intake_are_what_the_scrape_renders(pool: sqlx::PgPool) {
+        fleet::migrator().run(&pool).await.unwrap();
+        fleet::stats::upsert(&pool, &stats_row("tftp", "2026-10-09T12:09:00Z", false))
+            .await
+            .unwrap();
+        let rows = fleet::stats::read_all(&pool).await.unwrap();
+        let mut out = String::new();
+        push_sensor_stats(
+            &mut out,
+            &rows,
+            "2026-10-09T12:09:10Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        );
+        assert!(out.contains("propolis_sensor_capture_truncated_total{sensor=\"tftp\"} 13"));
+        assert!(out.contains("propolis_sensor_stats_age_seconds{sensor=\"tftp\"} 10"));
+    }
 
     #[test]
     fn age_seconds_treats_null_and_skew_as_zero() {

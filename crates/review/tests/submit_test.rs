@@ -1,47 +1,19 @@
 //! Real-Postgres, mock-vendor tests for the submission runner (Task 4).
 //!
-//! Shares the persistent `propolis_test` database with the other crates'
-//! tests (see the project's `local-gate-toolchain` note). Every test uses a
-//! distinct source IP, `45.10.32.240-248`, disjoint from `queue_test.rs`'s
-//! RFC5737 fixtures and from `gatekeeper_test.rs`'s `45.10.31.230-240`.
-//!
-//! These are ordinary public addresses, not the RFC5737 documentation ranges
-//! used elsewhere, and must stay that way: the gatekeeper's first check
-//! refuses every reserved range outright, so a documentation-range fixture is
-//! held as `Reserved` before the runner behaviour under test is ever reached.
-//! Most
-//! tests use a vendor name unique to that test so no cross-run cleanup
-//! beyond the per-IP `reset` below is needed; the one test that exercises
-//! the REAL `"dshield"` name (to prove `submit::categories_for_vendor`'s
-//! dispatch fires end-to-end, not just in `submit.rs`'s own unit tests)
-//! also wipes any leftover rows under that literal name first, matching
-//! `gatekeeper_test.rs`'s `reset_vendor` discipline. Run with
-//! `--test-threads=1`.
-//!
-//! # Why every assertion here is scoped to the test's own IP
-//!
+//! Each test owns a fresh database (`#[sqlx::test]`). That matters because
 //! `SubmissionRunner::run_once` (unlike `gatekeeper::check` or
 //! `ReviewQueue::approve`) has no IP parameter at all - by design, it polls
-//! `review_queue` for EVERY Approved entry, table-wide. Against the
-//! persistent, shared `propolis_test` database, that table already holds
-//! Approved rows this suite does not own: `queue_test.rs`'s own
-//! `approve_sets_state_and_decided_at` (`192.0.2.212`) and
-//! `withdraw_never_removes_a_decided_entry` (`198.51.100.217`) leave their
-//! rows Approved forever once their test completes (verified live via
-//! `psql` while writing this suite), and this file's OWN earlier tests do
-//! the same for each other on any rerun. A permissively-configured mock
-//! vendor (no score floor, no category filter, a fresh cooldown/rate-limit
-//! history) holds nothing back from an unrelated approved IP, so it reaches
-//! `adapter.submit` right alongside this test's own IP - confirmed
-//! empirically: an early version of this suite asserted the raw
-//! `SubmitResult` and failed with e.g. `submitted: 5` where `1` was
-//! expected. Task 1's own report already named this exact class of bug
-//! ("asserting a row count for a specific IP rather than trusting the
-//! aggregate return value"); this file applies the same discipline
-//! throughout - never assert equality on the aggregate `SubmitResult` or on
-//! a mock's raw, unfiltered call count, only on `vendor_submission` rows
-//! and mock submissions scoped to `(this test's ip, this test's vendor
-//! name)`.
+//! `review_queue` for EVERY Approved entry, table-wide - so on a database
+//! shared with other tests or crates, rows those leave Approved would reach
+//! `adapter.submit` alongside the test's own IP.
+//!
+//! The fixture addresses are ordinary public addresses, not the RFC5737
+//! documentation ranges used elsewhere, and must stay that way: the
+//! gatekeeper's first check refuses every reserved range outright, so a
+//! documentation-range fixture is held as `Reserved` before the runner
+//! behaviour under test is ever reached. Assertions stay scoped to
+//! `(this test's ip, this test's vendor name)` rather than the aggregate
+//! `SubmitResult`, which keeps them independent of fixture count.
 //!
 //! [`MockVendor`] implements `VendorAdapter` directly (per the task brief)
 //! rather than standing up a mock HTTP server like `vendor_test.rs` does for
@@ -174,18 +146,13 @@ impl VendorAdapter for MockVendor {
 // Fixtures
 // ---------------------------------------------------------------------
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
-    // Run core-scoring migrations first (event/ip_score tables must exist).
+async fn migrate(pool: &PgPool) {
+    // Core-scoring first (event/ip_score tables must exist), then this crate's own.
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    // Then this crate's own.
-    review::migrator().run(&pool).await.unwrap();
-    pool
+    review::migrator().run(pool).await.unwrap();
 }
 
 fn ev(
@@ -285,44 +252,6 @@ fn permissive_config(vendor: &str) -> VendorConfig {
     }
 }
 
-/// Wipes any leftover state for `ip` (every table this suite touches) from a
-/// previous run against the persistent, shared `propolis_test` database -
-/// matching `queue_test.rs`'s `reset_ip` discipline.
-async fn reset(pool: &PgPool, ip: &str) {
-    sqlx::query("DELETE FROM vendor_submission WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM event WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
-/// Additionally wipes any leftover `vendor_submission` rows for `vendor`
-/// (regardless of IP) - only needed by the one test that reuses a literal
-/// vendor name (`"dshield"`) a real adapter/config would also use; see the
-/// module doc comment.
-async fn reset_vendor(pool: &PgPool, vendor: &str) {
-    sqlx::query("DELETE FROM vendor_submission WHERE vendor = $1")
-        .bind(vendor)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
 async fn count_submissions(pool: &PgPool, ip: &str, vendor: &str) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM vendor_submission WHERE source_ip = $1::inet AND vendor = $2",
@@ -376,13 +305,11 @@ async fn seed_and_approve(pool: &PgPool, ip: &str) {
 // Tests
 // ---------------------------------------------------------------------
 
-#[tokio::test]
-async fn run_once_submits_with_real_protocol_label_mapping() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_submits_with_real_protocol_label_mapping(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.240";
     let ip_addr: IpAddr = ip.parse().unwrap();
-    reset(&pool, ip).await;
-    reset_vendor(&pool, "dshield").await;
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("dshield");
@@ -417,11 +344,10 @@ async fn run_once_submits_with_real_protocol_label_mapping() {
     assert_eq!(row.response_status, Some(200));
 }
 
-#[tokio::test]
-async fn run_once_holds_disabled_vendor_without_writing_a_row() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_holds_disabled_vendor_without_writing_a_row(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.241";
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("mockvendor-disabled");
@@ -440,12 +366,11 @@ async fn run_once_holds_disabled_vendor_without_writing_a_row() {
     assert_eq!(count_submissions(&pool, ip, "mockvendor-disabled").await, 0);
 }
 
-#[tokio::test]
-async fn run_once_records_failed_submission() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_records_failed_submission(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.242";
     let ip_addr: IpAddr = ip.parse().unwrap();
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("mockvendor-failed");
@@ -471,12 +396,11 @@ async fn run_once_records_failed_submission() {
     assert_eq!(row.response_body.as_deref(), Some("invalid ip"));
 }
 
-#[tokio::test]
-async fn run_once_is_idempotent_across_a_failed_then_successful_retry() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_is_idempotent_across_a_failed_then_successful_retry(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.243";
     let ip_addr: IpAddr = ip.parse().unwrap();
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     // A transient failure never sets success = true, so neither the
@@ -531,13 +455,12 @@ async fn run_once_is_idempotent_across_a_failed_then_successful_retry() {
 /// The cooldown check filters on `success = TRUE`, so it cannot hold this; the runner must
 /// recognise the unrecorded outcome itself and not call the vendor again - the vendor may have
 /// accepted that report, and a second call would report the IP twice.
-#[tokio::test]
-async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_outcome() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_outcome(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.248";
     let ip_addr: IpAddr = ip.parse().unwrap();
     let vendor = "mockvendor-crashwindow";
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     // Today's row exactly as `insert_pending` leaves it before the vendor call.
@@ -583,12 +506,11 @@ async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_out
     assert_eq!(row.response_status, None);
 }
 
-#[tokio::test]
-async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.244";
     let ip_addr: IpAddr = ip.parse().unwrap();
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("mockvendor-cooldown");
@@ -623,12 +545,11 @@ async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted(
     assert_eq!(count_submissions(&pool, ip, "mockvendor-cooldown").await, 1);
 }
 
-#[tokio::test]
-async fn run_once_ignores_entries_that_are_not_approved() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_ignores_entries_that_are_not_approved(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.245";
     let ip_addr: IpAddr = ip.parse().unwrap();
-    reset(&pool, ip).await;
     seed_recommended_ssh(&pool, ip).await;
     // Populate only - left Pending, never approved.
     ReviewQueue::new().populate(&pool).await.unwrap();
@@ -656,12 +577,11 @@ async fn run_once_ignores_entries_that_are_not_approved() {
     );
 }
 
-#[tokio::test]
-async fn run_once_gates_each_configured_vendor_independently() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_gates_each_configured_vendor_independently(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.246";
     let ip_addr: IpAddr = ip.parse().unwrap();
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     let passing = MockVendor::new("mockvendor-multi-pass");
@@ -691,11 +611,10 @@ async fn run_once_gates_each_configured_vendor_independently() {
     assert_eq!(disabled.call_count(), 0);
 }
 
-#[tokio::test]
-async fn run_once_holds_vendor_with_no_matching_gatekeeper_config() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn run_once_holds_vendor_with_no_matching_gatekeeper_config(pool: PgPool) {
+    migrate(&pool).await;
     let ip = "45.10.32.247";
-    reset(&pool, ip).await;
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("mockvendor-unconfigured");

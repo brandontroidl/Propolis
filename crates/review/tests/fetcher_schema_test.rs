@@ -1,18 +1,14 @@
 use sqlx::PgPool;
-async fn pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    review::migrator().run(&pool).await.unwrap();
-    pool
+    review::migrator().run(pool).await.unwrap();
 }
-#[tokio::test]
-async fn fetch_attempt_table_exists_with_expected_columns() {
-    let pool = pool().await;
+#[sqlx::test(migrations = false)]
+async fn fetch_attempt_table_exists_with_expected_columns(pool: PgPool) {
+    migrate(&pool).await;
     let cols: Vec<String> = sqlx::query_scalar(
         "SELECT column_name FROM information_schema.columns \
          WHERE table_name='fetch_attempt' ORDER BY column_name",
@@ -50,9 +46,9 @@ async fn fetch_attempt_table_exists_with_expected_columns() {
 // F-5: claim_candidates orders the whole eligible set by `first_seen DESC` with no covering
 // index (only host/last_attempt and status/next_attempt existed) - under a backlog larger than
 // one cycle's batch this forces a sort over every qualifying row each cycle.
-#[tokio::test]
-async fn fetch_attempt_has_a_first_seen_index_for_the_selection_sort() {
-    let pool = pool().await;
+#[sqlx::test(migrations = false)]
+async fn fetch_attempt_has_a_first_seen_index_for_the_selection_sort(pool: PgPool) {
+    migrate(&pool).await;
     let indexdefs: Vec<String> =
         sqlx::query_scalar("SELECT indexdef FROM pg_indexes WHERE tablename = 'fetch_attempt'")
             .fetch_all(&pool)
@@ -64,15 +60,10 @@ async fn fetch_attempt_has_a_first_seen_index_for_the_selection_sort() {
     );
 }
 
-#[tokio::test]
-async fn fetch_daily_usage_is_one_non_negative_row_per_day() {
-    let pool = pool().await;
+#[sqlx::test(migrations = false)]
+async fn fetch_daily_usage_is_one_non_negative_row_per_day(pool: PgPool) {
+    migrate(&pool).await;
     let day = "1999-01-01";
-    sqlx::query("DELETE FROM fetch_daily_usage WHERE day = $1::date")
-        .bind(day)
-        .execute(&pool)
-        .await
-        .unwrap();
     sqlx::query("INSERT INTO fetch_daily_usage (day, used) VALUES ($1::date, 0)")
         .bind(day)
         .execute(&pool)
@@ -94,11 +85,6 @@ async fn fetch_daily_usage_is_one_non_negative_row_per_day() {
             .is_err(),
         "usage can never go negative"
     );
-    sqlx::query("DELETE FROM fetch_daily_usage WHERE day = $1::date")
-        .bind(day)
-        .execute(&pool)
-        .await
-        .unwrap();
 }
 
 // Audit P-08: 0007 lands on a database that already holds rows written by the client that

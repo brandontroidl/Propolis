@@ -2,7 +2,8 @@
 //!
 //! Real Postgres (`sample_analysis`) and a real spool directory; the VT API is a recording fake,
 //! so nothing here touches the network. Every body is a tiny synthetic fixture built in the test.
-//! Rows for the fixtures' digests are cleared first because the database outlives a run.
+//! Each test owns a fresh database (`#[sqlx::test]`), so no earlier run's `sample_analysis` rows
+//! can make a fixture look already analysed.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -40,15 +41,11 @@ fn hex(digest: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    pool
 }
 
 fn config(upload_unknown: bool) -> VtConfig {
@@ -211,14 +208,6 @@ async fn status_of(pool: &PgPool, sha: &str) -> Option<(i32, i32, String)> {
         .unwrap()
 }
 
-async fn clear(pool: &PgPool, shas: &[String]) {
-    sqlx::query("DELETE FROM sample_analysis WHERE sha256 = ANY($1)")
-        .bind(shas)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
 async fn run_scan(pool: &PgPool, fake: &FakeVt, dir: &Path, upload_unknown: bool) -> Vec<VtResult> {
     let mut budget = DailyBudget::new(1000, Utc::now().date_naive());
     scan_spool_with(
@@ -231,9 +220,9 @@ async fn run_scan(pool: &PgPool, fake: &FakeVt, dir: &Path, upload_unknown: bool
     .await
 }
 
-#[tokio::test]
-async fn only_executable_and_script_content_reaches_the_uploader() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn only_executable_and_script_content_reaches_the_uploader(pool: PgPool) {
+    migrate(&pool).await;
     let dir = tempfile::tempdir().unwrap();
 
     let dex = {
@@ -292,7 +281,6 @@ async fn only_executable_and_script_content_reaches_the_uploader() {
     refused_shas.sort();
     refused_shas.dedup();
     let all: Vec<String> = allowed_shas.iter().chain(&refused_shas).cloned().collect();
-    clear(&pool, &all).await;
 
     let fake = FakeVt::default();
     run_scan(&pool, &fake, dir.path(), true).await;
@@ -343,14 +331,13 @@ async fn only_executable_and_script_content_reaches_the_uploader() {
     assert!(again.uploads.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn nothing_is_uploaded_when_upload_is_off() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn nothing_is_uploaded_when_upload_is_off(pool: PgPool) {
+    migrate(&pool).await;
     let dir = tempfile::tempdir().unwrap();
     let mut body = elf();
     body.extend_from_slice(b"upload-off fixture");
     let sha = write_sample(dir.path(), &body);
-    clear(&pool, std::slice::from_ref(&sha)).await;
 
     let fake = FakeVt::default();
     run_scan(&pool, &fake, dir.path(), false).await;

@@ -320,6 +320,7 @@ async fn main() {
     };
 
     tracing::info!(local = %server.addr, "sensor-tftp: listening");
+    server.handoff.start_stats("tftp");
     shutdown_signal().await;
     tracing::info!("sensor-tftp: shutdown signal received; stopping");
     server.abort();

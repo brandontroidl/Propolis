@@ -79,7 +79,8 @@ a WARN **per refusal** (`crates/sensor-framework/src/handoff.rs#process_job`). T
 (`crates/sensor-framework/src/spool.rs#store`, `crates/sensor-framework/src/spool.rs#reserve_budget`):
 
 - **`FileSizeExceeded`** - the body is larger than the per-file cap (10 MB for the spooling
-  sensors) (`sensor-framework/src/spool.rs#store`).
+  sensors, 256 KiB for MQTT, whose body is one PUBLISH packet,
+  `crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) (`sensor-framework/src/spool.rs#store`).
 - **`BudgetExhausted`** - the global byte budget (100 MB per spooling sensor) is already
   reserved. Reservation is atomic (`compare_exchange`), so the budget is a hard ceiling
   (`sensor-framework/src/spool.rs#reserve_budget`).

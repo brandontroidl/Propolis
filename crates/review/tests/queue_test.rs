@@ -1,13 +1,8 @@
 //! Real-Postgres tests for the review queue state machine.
 //!
-//! Shares the persistent `propolis_test` database with other crates' tests
-//! (see the project's `local-gate-toolchain` note): core-scoring's migrations
-//! run first (`event`/`ip_score` tables), then this crate's own. Every test
-//! uses a distinct source IP (RFC5737 documentation ranges) never reused by
-//! another test in this file, so tests never interfere with each other or
-//! with leftover rows from other crates' test runs. Run with
-//! `--test-threads=1` (core-scoring's `append_event` serializes every append
-//! through a single Postgres advisory lock).
+//! Each test owns a fresh database (`#[sqlx::test]`): core-scoring's migrations run first
+//! (`event`/`ip_score` tables), then this crate's own. `populate` and `withdraw` act on the whole
+//! table, so a shared database would let another test's or crate's rows change their results.
 
 use std::net::IpAddr;
 
@@ -17,18 +12,13 @@ use sqlx::{PgPool, Row};
 
 use review::queue::{ReviewError, ReviewQueue};
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
-    // Run core-scoring migrations first (ip_score table must exist).
+async fn migrate(pool: &PgPool) {
+    // Core-scoring first (ip_score table must exist), then this crate's own.
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    // Then this crate's own.
-    review::migrator().run(&pool).await.unwrap();
-    pool
+    review::migrator().run(pool).await.unwrap();
 }
 
 /// Builds an `EventInput` via the public `from_signal` constructor, which
@@ -130,40 +120,12 @@ async fn row_count(pool: &PgPool, ip: &str) -> i64 {
         .unwrap()
 }
 
-/// Wipes any leftover state for `ip` from a previous run of this same test
-/// file. `propolis_test` is a persistent, shared database (not reset between
-/// runs or between crates' test suites - see `setup_pool`), and
-/// `core_scoring::append_event` always ADDS to a source IP's prior state
-/// rather than replacing it, so re-running this suite against the same IPs
-/// without cleanup would accumulate weight across runs and make a
-/// newly-inserted-row count from a prior run leak into this one. Called at
-/// the top of every test so each is self-contained regardless of how many
-/// times this suite has already run against this database.
-async fn reset_ip(pool: &PgPool, ip: &str) {
-    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM event WHERE source_ip = $1::inet")
-        .bind(ip)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
 /// A delisted address is never queued, even while its eligibility flags still read true (a
 /// projection written by an append that raced the delist, say).
-#[tokio::test]
-async fn populate_never_queues_a_delisted_address() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn populate_never_queues_a_delisted_address(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.239";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
     sqlx::query("UPDATE ip_score SET delisted = TRUE WHERE source_ip = $1::inet")
         .bind(test_ip)
@@ -175,11 +137,10 @@ async fn populate_never_queues_a_delisted_address() {
     assert_eq!(row_count(&pool, test_ip).await, 0);
 }
 
-#[tokio::test]
-async fn populate_surfaces_recommended_ip() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn populate_surfaces_recommended_ip(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.210";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -200,11 +161,10 @@ async fn populate_surfaces_recommended_ip() {
     );
 }
 
-#[tokio::test]
-async fn withdraw_removes_ineligible_pending_entry() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn withdraw_removes_ineligible_pending_entry(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.211";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -242,11 +202,10 @@ async fn withdraw_removes_ineligible_pending_entry() {
     );
 }
 
-#[tokio::test]
-async fn approve_sets_state_and_decided_at() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn approve_sets_state_and_decided_at(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.212";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -262,11 +221,10 @@ async fn approve_sets_state_and_decided_at() {
     assert_eq!(notes.as_deref(), Some("looks malicious"));
 }
 
-#[tokio::test]
-async fn reject_prevents_resurfacing() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn reject_prevents_resurfacing(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.213";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -302,11 +260,10 @@ async fn reject_prevents_resurfacing() {
     );
 }
 
-#[tokio::test]
-async fn duplicate_populate_is_idempotent() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn duplicate_populate_is_idempotent(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.214";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -316,11 +273,10 @@ async fn duplicate_populate_is_idempotent() {
     assert_eq!(row_count(&pool, test_ip).await, 1);
 }
 
-#[tokio::test]
-async fn snooze_sets_state_and_decided_at() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn snooze_sets_state_and_decided_at(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "198.51.100.215";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -336,12 +292,11 @@ async fn snooze_sets_state_and_decided_at() {
     assert_eq!(notes, None);
 }
 
-#[tokio::test]
-async fn deciding_an_unknown_ip_fails_closed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn deciding_an_unknown_ip_fails_closed(pool: PgPool) {
+    migrate(&pool).await;
     // Never seeded and never populated: no review_queue row exists for it.
     let test_ip: IpAddr = "203.0.113.216".parse().unwrap();
-    reset_ip(&pool, &test_ip.to_string()).await;
 
     let queue = ReviewQueue::new();
     let result = queue.approve(&pool, test_ip, None).await;
@@ -351,11 +306,10 @@ async fn deciding_an_unknown_ip_fails_closed() {
     );
 }
 
-#[tokio::test]
-async fn withdraw_never_removes_a_decided_entry() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn withdraw_never_removes_a_decided_entry(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "198.51.100.217";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -382,11 +336,10 @@ async fn withdraw_never_removes_a_decided_entry() {
 /// The promise `snooze`'s own doc comment makes - "an operator can act on it again later" - has to
 /// be reachable. `populate` never re-surfaces a decided entry, so the only route back is a listing
 /// of what is snoozed plus a decision that works on it. This exercises that whole round trip.
-#[tokio::test]
-async fn a_snoozed_entry_can_be_found_again_and_decided() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn a_snoozed_entry_can_be_found_again_and_decided(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.218";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -440,11 +393,10 @@ async fn a_snoozed_entry_can_be_found_again_and_decided() {
 /// `unsnooze` puts an entry back in the working queue rather than deciding it, and clears the
 /// decision timestamp with it: a Pending row carrying a `decided_at` reads as a decision that was
 /// taken and then ignored.
-#[tokio::test]
-async fn unsnooze_returns_an_entry_to_pending_and_clears_its_decision_timestamp() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn unsnooze_returns_an_entry_to_pending_and_clears_its_decision_timestamp(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.219";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();
@@ -483,11 +435,10 @@ async fn unsnooze_returns_an_entry_to_pending_and_clears_its_decision_timestamp(
     assert_eq!(row_count(&pool, test_ip).await, 1, "no duplicate row");
 }
 
-#[tokio::test]
-async fn unsnoozing_an_entry_that_does_not_exist_fails_closed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn unsnoozing_an_entry_that_does_not_exist_fails_closed(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip: IpAddr = "192.0.2.220".parse().unwrap();
-    reset_ip(&pool, &test_ip.to_string()).await;
 
     let result = ReviewQueue::new().unsnooze(&pool, test_ip).await;
     assert!(
@@ -500,11 +451,10 @@ async fn unsnoozing_an_entry_that_does_not_exist_fails_closed() {
 /// to retire it when its trigger lapses - exactly as it would for any other pending entry. The
 /// scan skips decided rows, so this proves `unsnooze` really restored Pending rather than leaving
 /// a row that merely displays as pending.
-#[tokio::test]
-async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(pool: PgPool) {
+    migrate(&pool).await;
     let test_ip = "192.0.2.221";
-    reset_ip(&pool, test_ip).await;
     seed_recommended(&pool, test_ip).await;
 
     let queue = ReviewQueue::new();

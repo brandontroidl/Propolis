@@ -15,7 +15,7 @@ use crate::quarantine::{Quarantine, QuarantinedLine};
 use chrono::{DateTime, Utc};
 use core_scoring::{EventInput, append_events};
 use log_tailer::LogTailer;
-use sensor_wire::SensorEvent;
+use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent, SensorStats};
 use sqlx::PgPool;
 
 /// Outcome of one [`IntakeRunner::run_batch`] call.
@@ -35,6 +35,11 @@ pub struct RunBatchResult {
     /// ingestion would keep a wedged tailer looking healthy. It still counts as cursor progress -
     /// see `progress_from_batch`.
     pub probe_confirmations: usize,
+    /// `sensor_stats` lines accepted and stored in `sensor_stats` instead of the ledger. Separate
+    /// from `ingested` for the reason `probe_confirmations` is: a sensor's own health line is not
+    /// ingestion, and counting it as such would make a wedged tailer look healthy. It still moves
+    /// the cursor (see `cursor_moved`). A refused `sensor_stats` line is counted in `rejected`.
+    pub stats_updates: usize,
     /// Non-zero only when the append itself failed (a database error) partway through the batch;
     /// the batch stops at the first failing event, so this is 0 or 1, never a running count of
     /// every failure. See `run_batch`'s doc comment for why the batch stops instead of skipping
@@ -57,6 +62,7 @@ impl RunBatchResult {
             || self.ingested > 0
             || self.rejected > 0
             || self.probe_confirmations > 0
+            || self.stats_updates > 0
             || self.quarantined > 0
     }
 }
@@ -346,6 +352,7 @@ impl IntakeRunner {
         let mut probes: Vec<(usize, String)> = Vec::new();
         // (digest, text) of each reply in the batch, stored before the append.
         let mut replies: Vec<(String, String)> = Vec::new();
+        let mut stats_lines: Vec<(usize, SensorStats, DateTime<Utc>)> = Vec::new();
         let mut bytes_read = 0usize;
 
         for (index, line) in lines.iter().enumerate() {
@@ -362,6 +369,38 @@ impl IntakeRunner {
                     continue;
                 }
             };
+
+            // A sensor's own health counters are not evidence. They are taken out here, BEFORE
+            // conversion, so they cannot reach the ledger, a score, the feed, a campaign or a
+            // vendor submission, and are stored in `sensor_stats` after the append (below). The
+            // intercept keys on the signal type alone; the sentinel source, the fixed field set,
+            // the bounds and the log's own sensor label are then ALL required
+            // (`SensorStats::from_event`), and a line that fails any of them is refused, never
+            // stored and never handed on to `convert`.
+            if event.signal_type == SIGNAL_SENSOR_STATS {
+                match SensorStats::from_event(&event) {
+                    Ok(stats) if stats.sensor == self.sensor_name => {
+                        stats_lines.push((index, stats, event.observed_at));
+                    }
+                    Ok(stats) => {
+                        tracing::warn!(
+                            sensor = %self.sensor_name,
+                            claimed = %stats.sensor,
+                            "sensor_stats line names a different sensor than this log's label, refused"
+                        );
+                        rejected_at.push(index);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            sensor = %self.sensor_name,
+                            error = %e,
+                            "malformed sensor_stats line, refused"
+                        );
+                        rejected_at.push(index);
+                    }
+                }
+                continue;
+            }
 
             // A synthetic reachability probe from this control plane's own egress address is not
             // attacker evidence. It is dropped BEFORE conversion, so it can never reach the ledger
@@ -457,6 +496,33 @@ impl IntakeRunner {
                 );
             }
             result.probe_confirmations += 1;
+        }
+
+        for (_, stats, observed_at) in stats_lines.iter().filter(|(i, _, _)| *i < reached) {
+            let row = fleet::stats::SensorStatsRow {
+                sensor: stats.sensor.clone(),
+                reported_at: *observed_at,
+                received_at: Utc::now(),
+                uptime_secs: stats.uptime_secs as i64,
+                is_final: stats.is_final,
+                dropped: stats.dropped as i64,
+                spool_refused: stats.spool_refused as i64,
+                truncated: stats.truncated as i64,
+                refused: stats.refused as i64,
+                budget_current: stats.budget_current as i64,
+                budget_high_water: stats.budget_high_water as i64,
+                budget_refused: stats.budget_refused as i64,
+            };
+            // Logged, not fatal: the next line supersedes this one, and the console reads a row
+            // that stops updating as stale.
+            if let Err(e) = fleet::stats::upsert(&self.pool, &row).await {
+                tracing::warn!(
+                    sensor = %self.sensor_name,
+                    error = %e,
+                    "sensor_stats could not be stored"
+                );
+            }
+            result.stats_updates += 1;
         }
 
         match outcome.failure {
@@ -723,9 +789,27 @@ mod tests {
                 probe_confirmations,
                 errors,
                 quarantined,
+                ..Default::default()
             }
             .cursor_moved()
         };
+        assert!(
+            RunBatchResult {
+                stats_updates: 1,
+                ..Default::default()
+            }
+            .cursor_moved(),
+            "a batch of nothing but stats lines moved the position"
+        );
+        assert!(
+            RunBatchResult {
+                stats_updates: 1,
+                errors: 1,
+                ..Default::default()
+            }
+            .cursor_moved(),
+            "stats lines reached before a refused line moved the position, like probe lines"
+        );
         assert!(moved(0, 0, 0, 0, 0), "a clean empty batch");
         assert!(moved(5, 0, 0, 0, 0));
         assert!(

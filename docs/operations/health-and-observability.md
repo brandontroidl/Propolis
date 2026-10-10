@@ -126,6 +126,17 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
     (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#oldest_unread_age`).
 
   There is no append-latency histogram: the metrics endpoint emits gauges and counters only.
+- Sensor capture health, one series per capturing sensor, labelled `sensor`, from the latest
+  `sensor_stats` line each wrote (see [Sensor stats](#sensor-stats); absent for a sensor that
+  never reported, never a zero; `crates/console/src/routes/metrics.rs#push_sensor_stats`):
+  counters `propolis_sensor_capture_queue_dropped_total`,
+  `propolis_sensor_capture_spool_refused_total`, `propolis_sensor_capture_truncated_total`,
+  `propolis_sensor_capture_refused_total`, `propolis_sensor_capture_budget_refused_total`;
+  gauges `propolis_sensor_capture_budget_bytes`,
+  `propolis_sensor_capture_budget_high_water_bytes`, `propolis_sensor_uptime_seconds`; and the
+  freshness trio `propolis_sensor_stats_age_seconds`, `propolis_sensor_stats_stale` (1 past 180 s)
+  and `propolis_sensor_stats_final` (1 when the last line was the sensor's shutdown line). The
+  counters count since the sensor started and reset when it restarts.
 - Console saturation counters, each moving only when a bound refused work (a steady rate
   means a login spray or a connection flood, not ordinary use):
   `propolis_console_login_refused_per_ip_total`, `propolis_console_login_refused_global_total`,
@@ -136,6 +147,29 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 `propolis_feed_last_build_timestamp` is the primary signal that the feed loop is still
 publishing; see [retention](./retention.md) and [scoring and feed
 reference](../reference/scoring-and-feed.md).
+
+### Sensor stats
+
+Each capturing sensor (ssh, telnet, adb, ftp, mqtt, tftp) appends a `sensor_stats` line to its
+own event log every 60 s and a last one, with `final` true, when it shuts down. The line carries
+the capture hand-off counters and the capture-memory budget that used to be readable only inside
+the process; intake stores the latest per sensor, and `/metrics` publishes them (above).
+
+- **Staleness, not zeros.** A sensor that stops writing keeps its last values and its age grows;
+  `propolis_sensor_stats_stale` turns 1 after 180 s (three missed lines). `propolis_sensor_stats_final`
+  says whether the last line was a clean shutdown, which separates a stop from silence. Age is
+  measured from the sensor's own clock, so a stalled shipper or intake shows as stale too.
+- **Not evidence.** The line is not in the ledger and not an event: its `source_ip` is the sentinel
+  `0.0.0.0`, intake stores it in the `sensor_stats` table instead of converting it, and nothing
+  that scores, feeds or reports reads that table.
+- **Refused lines.** A `sensor_stats` line from any other source, with extra or missing fields,
+  with a value past 2^53, or naming a sensor other than the log's `PROPOLIS_SENSOR_LOGS` label is
+  counted as a rejected line with a WARN `malformed sensor_stats line, refused` (or `names a
+  different sensor than this log's label`) and is not stored. The label rule means a sensor whose
+  log label differs from its event name (the cred sensors, which have no capture hand-off and
+  write no stats) would have its stats refused.
+- **Nothing to configure.** The interval is a constant
+  (`crates/sensor-framework/src/handoff.rs#STATS_INTERVAL`).
 
 ## Logging
 

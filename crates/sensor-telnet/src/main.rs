@@ -340,6 +340,7 @@ async fn main() {
     };
 
     tracing::info!(local = %bound, "sensor-telnet: listening");
+    handoff.start_stats("telnet");
 
     shutdown_signal().await;
     tracing::info!("sensor-telnet: shutdown signal received; stopping");

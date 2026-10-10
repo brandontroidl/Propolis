@@ -1436,19 +1436,11 @@ impl FakeShell {
         let Some(first) = parts.first() else {
             return (HandlerId::Empty, None);
         };
-        if first.contains('/') {
-            let absolute = if first.starts_with('/') {
-                (*first).to_string()
-            } else {
-                format!("{}/{first}", self.cwd().trim_end_matches('/'))
-            };
-            if self.fs.is_session_file(&absolute) {
-                return (HandlerId::PathInvoke, None);
-            }
-        }
-        if let Some((id, handler)) =
-            Registry::builtin().lookup(command_basename(first), self, parts)
-        {
+        let name = match self.exec_target(first) {
+            ExecTarget::Command(name) => name,
+            ExecTarget::File { .. } => return (HandlerId::PathInvoke, None),
+        };
+        if let Some((id, handler)) = Registry::builtin().lookup(name, self, parts) {
             return (id, Some(handler));
         }
         if first.contains('/') {
@@ -1456,6 +1448,46 @@ impl FakeShell {
         } else {
             (HandlerId::NotFound, None)
         }
+    }
+
+    /// What a command token executes: a modeled command, or the file its path names. The one
+    /// decision `dispatch` (through [`Self::resolve`]) and the download detector
+    /// ([`Self::fetch_attempt`]) both read, so a line the shell runs as a file is never recorded
+    /// as the fetch tool of the same name (`./tftp` after `... > tftp`, observed live 2026-10-09).
+    ///
+    /// A bare name is the command. A token with a slash names a path, and a real shell runs what
+    /// is at that path, not what shares its basename:
+    /// - a file the session wrote is that file, whatever its name (`/tmp/w` is not `w`);
+    /// - the download tools and busybox are files, so a path ending in one of them is the tool
+    ///   only where the box ships that executable (`/usr/bin/wget`, `/bin/wget` through the
+    ///   usrmerge link, a relative path from a directory that makes it one); anywhere else it is
+    ///   a missing file and "No such file or directory", as on the reference system;
+    /// - any other modeled command keeps resolving by basename: the box models more commands
+    ///   than it has files for.
+    fn exec_target<'a>(&self, token: &'a str) -> ExecTarget<'a> {
+        if !token.contains('/') {
+            return ExecTarget::Command(token);
+        }
+        let name = command_basename(token);
+        let (path, _) = self.normalized_path(token);
+        if self.fs.is_session_file(&path) {
+            // A saved copy of busybox named `busybox*` is still the multi-call binary: it takes
+            // its applet from the first argument (see `run_saved_executable`).
+            let busybox_copy = name.starts_with("busybox")
+                && self
+                    .fs
+                    .content_and_mode(&path)
+                    .ok()
+                    .and_then(|(blob, _)| blob.as_elf())
+                    .is_some_and(|image| binaries::is_busybox(&image));
+            return ExecTarget::File { busybox_copy };
+        }
+        if FILE_BACKED_TOOLS.contains(&name) && !self.fs.is_executable(&path) {
+            return ExecTarget::File {
+                busybox_copy: false,
+            };
+        }
+        ExecTarget::Command(name)
     }
 
     fn resolve_handler(&self, parts: &[&str]) -> HandlerId {
@@ -2095,14 +2127,23 @@ impl FakeShell {
 
     /// [`Self::resolve_logical`] without the `/proc/<pid>` alias.
     fn normalize_logical(&mut self, arg: &str) -> String {
+        let (resolved, segments) = self.normalized_path(arg);
+        // The result is already built and its size is bounded by the line; an exhausted allowance
+        // is noted here and stops the line at the next checkpoint.
+        self.charge_work(len_u64(segments));
+        resolved
+    }
+
+    /// `arg` as an absolute path against the working directory, and how many segments it has.
+    /// Normalised the way a kernel resolves a path: `.` and an empty segment (a trailing or
+    /// doubled slash) drop out, `..` climbs. Without this `./payload` - the form every loader runs
+    /// its dropped file with - resolved to a path the model never held.
+    fn normalized_path(&self, arg: &str) -> (String, usize) {
         let joined = if arg.starts_with('/') {
             arg.to_string()
         } else {
             format!("{}/{arg}", self.cwd().trim_end_matches('/'))
         };
-        // Normalise the way a kernel resolves a path: `.` and an empty segment (a trailing or
-        // doubled slash) drop out, `..` climbs. Without this `./payload` - the form every
-        // loader runs its dropped file with - resolved to a path the model never held.
         let mut segments: Vec<&str> = Vec::new();
         for segment in joined.split('/') {
             match segment {
@@ -2118,10 +2159,7 @@ impl FakeShell {
         } else {
             format!("/{}", segments.join("/"))
         };
-        // The result is already built and its size is bounded by the line; an exhausted allowance
-        // is noted here and stops the line at the next checkpoint.
-        self.charge_work(len_u64(segments.len()));
-        resolved
+        (resolved, segments.len())
     }
 
     /// Record the file a fetch command saved, with the body this shell claims to have fetched,
@@ -2135,7 +2173,7 @@ impl FakeShell {
         let path = self.resolve_logical(&name);
         match self.traced_write_file(&path, FETCHED_BODY.as_bytes()) {
             Ok(()) => {
-                let url = match fetch_attempt(parts) {
+                let url = match self.fetch_attempt(parts) {
                     Some(Fetch::Url(url)) => Some(url),
                     _ => None,
                 };
@@ -2603,15 +2641,15 @@ fn command_basename(token: &str) -> &str {
 ///
 /// A `tftp` whose server or file cannot be read (see [`tftp`]) is [`Fetch::Unparsed`], never a
 /// guessed URL; a `tftp` upload (`-p`, `put`) fetches nothing and is not a fetch at all.
-fn fetch_attempt(parts: &[&str]) -> Option<Fetch> {
+fn fetch_command(name: &str, parts: &[&str]) -> Option<Fetch> {
     const FETCHERS: [&str; 4] = ["wget", "curl", "tftp", "ftpget"];
     // BusyBox ships wget/tftp/ftpget applets but NOT curl, so `busybox curl` is "applet not found"
     // (see `busybox::applets`) and must not be recorded as a fetch the persona did not answer in
     // character - the same principle the full-path `busybox /bin/tftp` case relies on.
     const BUSYBOX_FETCHERS: [&str; 3] = ["wget", "tftp", "ftpget"];
-    let (cmd, args) = match parts.first().map(|c| command_basename(c)) {
-        Some(cmd) if FETCHERS.contains(&cmd) => (cmd, &parts[1..]),
-        Some("busybox") if parts.get(1).is_some_and(|a| BUSYBOX_FETCHERS.contains(a)) => {
+    let (cmd, args) = match name {
+        cmd if FETCHERS.contains(&cmd) => (cmd, &parts[1..]),
+        "busybox" if parts.get(1).is_some_and(|a| BUSYBOX_FETCHERS.contains(a)) => {
             (parts[1], &parts[2..])
         }
         _ => return None,
@@ -2630,6 +2668,34 @@ fn fetch_attempt(parts: &[&str]) -> Option<Fetch> {
     }
 }
 
+impl FakeShell {
+    /// The fetch the command `parts` makes. A path-qualified command token is a fetcher only when
+    /// [`Self::exec_target`] says the path is the tool: `./tftp`, `bin/wget` and a file the
+    /// session wrote are files, never fetches. [`fetch_command`] parses the arguments.
+    fn fetch_attempt(&self, parts: &[&str]) -> Option<Fetch> {
+        let name = match self.exec_target(parts.first()?) {
+            ExecTarget::Command(name) => name,
+            ExecTarget::File { busybox_copy: true } => "busybox",
+            ExecTarget::File { .. } => return None,
+        };
+        fetch_command(name, parts)
+    }
+}
+
+/// What a command token executes, decided by [`FakeShell::exec_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecTarget<'a> {
+    /// The modeled command of this name.
+    Command(&'a str),
+    /// The file the token's path names, run (or refused) as a file. `busybox_copy` is a saved
+    /// copy of busybox named `busybox*`, which is still the multi-call binary.
+    File { busybox_copy: bool },
+}
+
+/// Command names that are executable files on the persona, so a path ending in one is the command
+/// only where [`FakeShell::exec_target`] finds that file.
+const FILE_BACKED_TOOLS: [&str; 5] = ["wget", "curl", "tftp", "ftpget", "busybox"];
+
 /// A retrieval a command line attempts, as the `honeypot_file_download` event records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Fetch {
@@ -2638,6 +2704,12 @@ enum Fetch {
     /// A fetch whose server or file could not be read from the command line. The event carries
     /// the raw command and no `url`, so the fetcher never sees a guessed or malformed target.
     Unparsed(String),
+}
+
+/// The fetch of a command named by its basename alone, for tests of the argument parsing.
+#[cfg(test)]
+fn fetch_attempt(parts: &[&str]) -> Option<Fetch> {
+    fetch_command(command_basename(parts.first()?), parts)
 }
 
 /// The URL of a fetch, for tests that only care about the target.
@@ -2723,10 +2795,10 @@ const LONG_OPTIONS_WITH_VALUE: [&str; 18] = [
 /// examined on its own; the fallback pair `wget X || busybox wget X` names one URL and yields
 /// one event. The raw-line scheme scan stays as the last resort for a URL inside quotes
 /// (`sh -c "wget http://h/x; ..."`), where the separators belong to a quoted script.
-fn download_targets(decoded: &str) -> Vec<Fetch> {
+fn download_targets(shell: &FakeShell, decoded: &str) -> Vec<Fetch> {
     let mut fetches: Vec<Fetch> = Vec::new();
     for tokens in simple_commands(decoded) {
-        if let Some(fetch) = fetch_attempt(&tokens)
+        if let Some(fetch) = shell.fetch_attempt(&tokens)
             && !fetches.contains(&fetch)
         {
             fetches.push(fetch);

@@ -1028,24 +1028,74 @@ async fn a_second_network_is_answered_while_the_first_is_limited() {
 
 #[tokio::test]
 async fn the_global_budget_limits_many_networks_together() {
+    // No network comes near its own 1000/s, so only the global budget (1/s, burst 3) binds.
     let server = Server::start_rated(test_bounds(), HashMap::new(), rate(1000, 1000, 1, 3)).await;
-    let mut answered = 0;
+    let mut clients = Vec::new();
     for net in 1..=6u8 {
-        let client = Client {
+        clients.push(Client {
             socket: UdpSocket::bind(format!("127.0.{net}.1:0")).await.unwrap(),
-        };
+        });
+    }
+
+    let started = std::time::Instant::now();
+    for (i, client) in clients.iter().enumerate() {
         client
-            .send(server.listeners.udp, &example(u16::from(net)))
+            .send(server.listeners.udp, &example(i as u16 + 1))
             .await;
-        if client
-            .recv_within(Duration::from_millis(200))
-            .await
-            .is_some()
-        {
-            answered += 1;
+        // Lets the server drain its socket on this single-threaded test runtime.
+        tokio::task::yield_now().await;
+    }
+
+    // Count what the server did, not what a client saw within a timeout: every datagram ends up
+    // either answered (one event) or suppressed (counted in a summary). The deadline only
+    // guards a hang; it is not a timing assumption.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let events = loop {
+        server.listeners.flush_rate_limited().await;
+        let events = server.events();
+        if status_count(&events, "answered") as u64 + suppressed_total(&events) == 6 {
+            break events;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} answered and {} suppressed of 6 sent",
+            status_count(&events, "answered"),
+            suppressed_total(&events)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let elapsed = started.elapsed();
+
+    // The bucket starts full at the burst and earns one more reply per second elapsed, so the
+    // burst is a hard floor (six datagrams exceed it) and the ceiling grows only with the time
+    // the run actually took. A fast run must answer exactly the burst.
+    let answered = status_count(&events, "answered");
+    let ceiling = 3 + elapsed.as_secs() as usize;
+    assert!(
+        (3..=ceiling).contains(&answered),
+        "{answered} of 6 answered in {elapsed:?}; the global budget allows 3..={ceiling}"
+    );
+
+    // The replies match the events: each answered network gets its own query id back, and
+    // every other network got nothing.
+    let answered_ips: Vec<std::net::IpAddr> = events
+        .iter()
+        .filter(|e| md(e, "query_status") == "answered")
+        .map(|e| e.source_ip)
+        .collect();
+    for (i, client) in clients.iter().enumerate() {
+        let ip = client.socket.local_addr().unwrap().ip();
+        if answered_ips.contains(&ip) {
+            let (reply, _) = client.recv().await;
+            assert_eq!(u16::from_be_bytes([reply[0], reply[1]]), i as u16 + 1);
+        } else {
+            let mut buf = [0u8; 512];
+            assert!(
+                client.socket.try_recv_from(&mut buf).is_err(),
+                "{ip} was limited and must not be answered"
+            );
         }
     }
-    assert!((3..=4).contains(&answered), "{answered} of 6 answered");
 }
 
 #[tokio::test]

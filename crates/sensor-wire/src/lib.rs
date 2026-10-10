@@ -24,6 +24,139 @@ pub const SIGNAL_HONEYPOT_FILE_DOWNLOAD: &str = "honeypot_file_download";
 /// intake routes it to the unscored append path - see `core_scoring::SignalType::is_telemetry`.
 pub const SIGNAL_HONEYPOT_SESSION_END: &str = "honeypot_session_end";
 
+/// A sensor's own health counters. NOT attacker evidence and NOT a `core-scoring` signal type:
+/// intake recognises it by this string before conversion and stores it in `sensor_stats`, never in
+/// the ledger (see [`SensorStats`]).
+pub const SIGNAL_SENSOR_STATS: &str = "sensor_stats";
+
+/// The `source_ip` every `sensor_stats` event carries: the unspecified address, a sentinel that
+/// names no host. Intake refuses a `sensor_stats` line with any other source, so the signal can
+/// never be mistaken for, or smuggle in, an attacker address.
+pub const SENSOR_STATS_SOURCE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
+/// The largest value any counter field may carry. 2^53 is the last integer a Prometheus float
+/// holds exactly, and well inside the database's `bigint`.
+pub const SENSOR_STATS_MAX_VALUE: u64 = 1 << 53;
+
+/// The longest sensor name accepted in a `sensor_stats` event.
+pub const SENSOR_STATS_MAX_NAME_LEN: usize = 64;
+
+/// The metadata of a `sensor_stats` event: a fixed set of fields, no others (`deny_unknown_fields`),
+/// every one required. One definition for the producer (`sensor-framework`) and the consumer
+/// (`intake`), so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SensorStats {
+    pub sensor: String,
+    pub uptime_secs: u64,
+    /// True on the one event a sensor writes as it shuts down: the values are final.
+    #[serde(rename = "final")]
+    pub is_final: bool,
+    /// Captures `submit` refused because the queue was full.
+    pub dropped: u64,
+    /// Captures the spool refused (per-file cap or exhausted budget).
+    pub spool_refused: u64,
+    /// Captures kept as a prefix because the capture memory budget ran out.
+    pub truncated: u64,
+    /// Captures refused outright (zero bytes) because the capture memory budget was full.
+    pub refused: u64,
+    /// Capture bytes buffered in memory now.
+    pub budget_current: u64,
+    pub budget_high_water: u64,
+    /// Reservations the capture memory budget refused.
+    pub budget_refused: u64,
+}
+
+/// Why a `sensor_stats` line was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatsRejected {
+    NotStats,
+    BadSource(IpAddr),
+    BadMetadata(String),
+    BadName,
+    OutOfBounds(&'static str),
+}
+
+impl std::fmt::Display for StatsRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStats => write!(f, "not a sensor_stats event"),
+            Self::BadSource(ip) => write!(f, "source_ip {ip} is not the sentinel 0.0.0.0"),
+            Self::BadMetadata(e) => {
+                write!(f, "metadata is not the fixed sensor_stats field set: {e}")
+            }
+            Self::BadName => write!(
+                f,
+                "sensor name is empty, too long, not printable ASCII or differs from the event's"
+            ),
+            Self::OutOfBounds(field) => write!(f, "{field} is out of bounds"),
+        }
+    }
+}
+
+impl SensorStats {
+    /// Builds the wire event for these stats.
+    pub fn to_event(&self, observed_at: DateTime<Utc>) -> SensorEvent {
+        SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: SENSOR_STATS_SOURCE_IP,
+            wan_ip: None,
+            sensor: self.sensor.clone(),
+            signal_type: SIGNAL_SENSOR_STATS.to_string(),
+            protocol: PROTO_TCP.to_string(),
+            authenticated: false,
+            observed_at,
+            metadata: serde_json::to_value(self).unwrap_or(serde_json::Value::Null),
+            sample: None,
+            session_id: None,
+            occurrence_id: None,
+            reply: None,
+        }
+    }
+
+    /// Validates a `sensor_stats` event and returns its stats. Refuses: any other signal type, a
+    /// source other than [`SENSOR_STATS_SOURCE_IP`], a `sample`, metadata that is not exactly the
+    /// fixed field set, a name that is empty, over [`SENSOR_STATS_MAX_NAME_LEN`] or not printable
+    /// ASCII, a name that differs from the event's own `sensor`, and any value over
+    /// [`SENSOR_STATS_MAX_VALUE`]. Whether the name is the right sensor for the log it arrived in
+    /// is the caller's check; this cannot know the log.
+    pub fn from_event(event: &SensorEvent) -> Result<Self, StatsRejected> {
+        if event.signal_type != SIGNAL_SENSOR_STATS {
+            return Err(StatsRejected::NotStats);
+        }
+        if event.source_ip != SENSOR_STATS_SOURCE_IP {
+            return Err(StatsRejected::BadSource(event.source_ip));
+        }
+        if event.sample.is_some() {
+            return Err(StatsRejected::BadMetadata("carries a sample".into()));
+        }
+        let stats: SensorStats = serde_json::from_value(event.metadata.clone())
+            .map_err(|e| StatsRejected::BadMetadata(e.to_string()))?;
+        let name_ok = !stats.sensor.is_empty()
+            && stats.sensor.len() <= SENSOR_STATS_MAX_NAME_LEN
+            && stats.sensor.bytes().all(|b| b.is_ascii_graphic());
+        if !name_ok || stats.sensor != event.sensor {
+            return Err(StatsRejected::BadName);
+        }
+        let values = [
+            ("uptime_secs", stats.uptime_secs),
+            ("dropped", stats.dropped),
+            ("spool_refused", stats.spool_refused),
+            ("truncated", stats.truncated),
+            ("refused", stats.refused),
+            ("budget_current", stats.budget_current),
+            ("budget_high_water", stats.budget_high_water),
+            ("budget_refused", stats.budget_refused),
+        ];
+        for (field, value) in values {
+            if value > SENSOR_STATS_MAX_VALUE {
+                return Err(StatsRejected::OutOfBounds(field));
+            }
+        }
+        Ok(stats)
+    }
+}
+
 // Protocol constants - lowercase wire values matching core-scoring's Protocol serde.
 pub const PROTO_TCP: &str = "tcp";
 pub const PROTO_UDP: &str = "udp";
@@ -119,6 +252,126 @@ mod tests {
             occurrence_id: None,
             reply: None,
         }
+    }
+
+    fn stats() -> SensorStats {
+        SensorStats {
+            sensor: "ssh".into(),
+            uptime_secs: 61,
+            is_final: false,
+            dropped: 1,
+            spool_refused: 2,
+            truncated: 3,
+            refused: 4,
+            budget_current: 5,
+            budget_high_water: 6,
+            budget_refused: 7,
+        }
+    }
+
+    fn stats_event() -> SensorEvent {
+        stats().to_event("2026-10-09T00:00:00Z".parse().unwrap())
+    }
+
+    #[test]
+    fn a_stats_event_round_trips_through_the_wire_and_validation() {
+        let event = stats_event();
+        assert_eq!(event.source_ip.to_string(), "0.0.0.0");
+        let json = serde_json::to_string(&event).unwrap();
+        let back: SensorEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(SensorStats::from_event(&back), Ok(stats()));
+        assert_eq!(back.metadata["final"], false);
+    }
+
+    #[test]
+    fn a_stats_event_from_any_other_source_is_refused() {
+        for ip in ["203.0.113.7", "127.0.0.1", "::", "2001:db8::1"] {
+            let event = SensorEvent {
+                source_ip: ip.parse().unwrap(),
+                ..stats_event()
+            };
+            assert!(
+                matches!(
+                    SensorStats::from_event(&event),
+                    Err(StatsRejected::BadSource(_))
+                ),
+                "{ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn stats_metadata_must_be_exactly_the_fixed_field_set() {
+        let mut extra = stats_event();
+        extra.metadata["command"] = "rm -rf".into();
+        assert!(matches!(
+            SensorStats::from_event(&extra),
+            Err(StatsRejected::BadMetadata(_))
+        ));
+        let mut missing = stats_event();
+        missing.metadata.as_object_mut().unwrap().remove("dropped");
+        assert!(matches!(
+            SensorStats::from_event(&missing),
+            Err(StatsRejected::BadMetadata(_))
+        ));
+        let mut negative = stats_event();
+        negative.metadata["dropped"] = (-1).into();
+        assert!(SensorStats::from_event(&negative).is_err());
+        let with_sample = SensorEvent {
+            sample: Some(SampleRef {
+                sha256: "a".repeat(64),
+                size: 1,
+                orig_name: "x".into(),
+                capture_id: None,
+            }),
+            ..stats_event()
+        };
+        assert!(SensorStats::from_event(&with_sample).is_err());
+    }
+
+    #[test]
+    fn stats_names_and_values_are_bounded() {
+        let long = "x".repeat(SENSOR_STATS_MAX_NAME_LEN + 1);
+        for name in ["", long.as_str(), "ssh\n", "ssh node"] {
+            let s = SensorStats {
+                sensor: name.into(),
+                ..stats()
+            };
+            let event = s.to_event("2026-10-09T00:00:00Z".parse().unwrap());
+            assert_eq!(SensorStats::from_event(&event), Err(StatsRejected::BadName));
+        }
+        let mismatch = SensorEvent {
+            sensor: "telnet".into(),
+            ..stats_event()
+        };
+        assert_eq!(
+            SensorStats::from_event(&mismatch),
+            Err(StatsRejected::BadName)
+        );
+        let at_cap = SensorStats {
+            dropped: SENSOR_STATS_MAX_VALUE,
+            ..stats()
+        };
+        assert!(
+            SensorStats::from_event(&at_cap.to_event("2026-10-09T00:00:00Z".parse().unwrap()))
+                .is_ok()
+        );
+        let over = SensorStats {
+            budget_high_water: SENSOR_STATS_MAX_VALUE + 1,
+            ..stats()
+        };
+        assert_eq!(
+            SensorStats::from_event(&over.to_event("2026-10-09T00:00:00Z".parse().unwrap())),
+            Err(StatsRejected::OutOfBounds("budget_high_water"))
+        );
+    }
+
+    #[test]
+    fn another_signal_type_is_not_stats() {
+        assert_eq!(
+            SensorStats::from_event(&sample_event()),
+            Err(StatsRejected::NotStats)
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
    One operator watching one honeypot. The interface's whole job is to answer
    "does anything need me right now?" and otherwise stay quiet.
 
-   THESIS: temperature = attention. The floor is cool slate; a scan is just
-   noise and is rendered in the same grey as faint text. Warmth is spent only
+   THESIS: temperature = attention. The floor is a quiet neutral; a scan is
+   just noise and is rendered in the same grey as faint text. Warmth is spent only
    on things that want the operator - amber (review), orange (hands on the
    keyboard), red (live intrusion) - and green means handled. Colour is
    meaning here, never decoration: a grey row is a fine row.
@@ -32,7 +32,9 @@
 
    Token NAMES are held stable - the utility classes read
    --good / --alert-text / --attention etc. - and re-valued onto V12's palette
-   (V12 --accent->accent/attention, --crit->alert, --warn->high, --ok->good).
+   (V12 accent->attention, crit->alert, warn->high, ok->good). Each theme block
+   sets the same names; the design-system reference (docs/reference/
+   console-design-system.md) lists what each one is for.
    ============================================================================ */
 :root {
   /* -- Shape + type: shared across themes -- */
@@ -46,64 +48,55 @@
   /* color-scheme tells the browser which ground it is drawing native parts (date pickers,
      scrollbars, a textarea's defaults) on; without it they stay light on the dark themes. */
   color-scheme: dark;
-  --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d; --surface-2:#2a241d;
-  --border:#332c24; --border-bright:#493f34; --border-strong:#493f34;
-  --text:#ece3d3; --text-muted:#a79c8a; --text-dim:#a79c8a; --text-faint:#8a7f6a;
-  --accent:#e0a43f; --accent-hover:#efbf6a;
+  --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d;
+  --border:#332c24; --border-bright:#493f34;
+  --text:#ece3d3; --text-muted:#a79c8a; --text-faint:#8a7f6a;
   --link:#e0a43f; --link-hover:#efbf6a;
-  --brand:#e0a43f; --brand-hover:#efbf6a; --brand-ink:#1a1613;
-  --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13); --crit:#e2705d;
-  --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13); --warn:#e0a24a;
+  --brand:#e0a43f; --brand-ink:#1a1613;
+  --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13);
+  --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13);
   --attention:#e0a43f; --attention-text:#e8b96a; --attention-dim:rgba(224,164,63,0.13);
-  --good:#9fb168; --good-text:#b3c489; --good-dim:rgba(159,177,104,0.13); --ok:#9fb168;
+  --good:#9fb168; --good-text:#b3c489; --good-dim:rgba(159,177,104,0.13);
   --info:#86b0ad; --info-text:#a0c4c1; --info-dim:rgba(134,176,173,0.13);
-  --low:#8a7f6a; --low-dim:rgba(138,127,106,0.11);
+  --low:#8a7f6a;
   --chart-line:#e0a43f; --chart-fill:rgba(224,164,63,0.13); --chart-point-border:#1a1613;
-  --chart-blue:#86b0ad; --chart-orange:#e0a24a; --chart-aqua:#9fb168;
-  --trace-fill:rgba(224,164,63,0.13);
 }
 
 /* -- CREAM (light) + SYSTEM's light default -- */
 :root[data-theme="cream"], :root[data-theme="system"] {
   color-scheme: light;
-  --bg:#efe9dd; --surface:#f5efe3; --surface-raised:#e7e0cf; --surface-2:#e7e0cf;
-  --border:#ddd5c3; --border-bright:#c3b89e; --border-strong:#c3b89e;
-  --text:#231f16; --text-muted:#5c5545; --text-dim:#5c5545; --text-faint:#766c58;
-  --accent:#a2661a; --accent-hover:#8a5414;
+  --bg:#efe9dd; --surface:#f5efe3; --surface-raised:#e7e0cf;
+  --border:#ddd5c3; --border-bright:#c3b89e;
+  --text:#231f16; --text-muted:#5c5545; --text-faint:#766c58;
   --link:#a2661a; --link-hover:#8a5414;
-  --brand:#a2661a; --brand-hover:#8a5414; --brand-ink:#f5efe3;
-  --alert:#8c2e21; --alert-text:#8c2e21; --alert-dim:rgba(140,46,33,0.10); --crit:#8c2e21;
-  --high:#a8630f; --high-text:#8a520c; --high-dim:rgba(168,99,15,0.11); --warn:#a8630f;
+  --brand:#a2661a; --brand-ink:#f5efe3;
+  --alert:#8c2e21; --alert-text:#8c2e21; --alert-dim:rgba(140,46,33,0.10);
+  --high:#a8630f; --high-text:#8a520c; --high-dim:rgba(168,99,15,0.11);
   --attention:#a2661a; --attention-text:#7d4f14; --attention-dim:rgba(162,102,26,0.12);
-  --good:#5b6d2c; --good-text:#4a5a22; --good-dim:rgba(91,109,44,0.12); --ok:#5b6d2c;
+  --good:#5b6d2c; --good-text:#4a5a22; --good-dim:rgba(91,109,44,0.12);
   --info:#436565; --info-text:#436565; --info-dim:rgba(67,101,101,0.10);
-  --low:#766c58; --low-dim:rgba(118,108,88,0.10);
+  --low:#766c58;
   --shadow:0 1px 0 rgba(60,50,30,0.05), 0 3px 8px rgba(60,50,30,0.08);
   --chart-line:#a2661a; --chart-fill:rgba(162,102,26,0.14); --chart-point-border:#f5efe3;
-  --chart-blue:#436565; --chart-orange:#a8630f; --chart-aqua:#5b6d2c;
-  --trace-fill:rgba(162,102,26,0.14);
 }
 
 /* -- SYSTEM under a dark OS -> Graphite -- */
 @media (prefers-color-scheme: dark) {
   :root[data-theme="system"] {
     color-scheme: dark;
-    --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d; --surface-2:#2a241d;
-    --border:#332c24; --border-bright:#493f34; --border-strong:#493f34;
-    --text:#ece3d3; --text-muted:#a79c8a; --text-dim:#a79c8a; --text-faint:#8a7f6a;
-    --accent:#e0a43f; --accent-hover:#efbf6a;
+    --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d;
+    --border:#332c24; --border-bright:#493f34;
+    --text:#ece3d3; --text-muted:#a79c8a; --text-faint:#8a7f6a;
     --link:#e0a43f; --link-hover:#efbf6a;
-    --brand:#e0a43f; --brand-hover:#efbf6a; --brand-ink:#1a1613;
-    --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13); --crit:#e2705d;
-    --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13); --warn:#e0a24a;
+    --brand:#e0a43f; --brand-ink:#1a1613;
+    --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13);
+    --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13);
     --attention:#e0a43f; --attention-text:#e8b96a; --attention-dim:rgba(224,164,63,0.13);
-    --good:#9fb168; --good-text:#b3c489; --good-dim:rgba(159,177,104,0.13); --ok:#9fb168;
+    --good:#9fb168; --good-text:#b3c489; --good-dim:rgba(159,177,104,0.13);
     --info:#86b0ad; --info-text:#a0c4c1; --info-dim:rgba(134,176,173,0.13);
-    --low:#8a7f6a; --low-dim:rgba(138,127,106,0.11);
+    --low:#8a7f6a;
     --shadow:0 1px 0 rgba(0,0,0,0.28), 0 3px 8px rgba(0,0,0,0.20);
     --chart-line:#e0a43f; --chart-fill:rgba(224,164,63,0.13); --chart-point-border:#1a1613;
-    --chart-blue:#86b0ad; --chart-orange:#e0a24a; --chart-aqua:#9fb168;
-    --trace-fill:rgba(224,164,63,0.13);
   }
 }
 
@@ -111,22 +104,19 @@
 :root[data-theme="hacker"] {
   color-scheme: dark;
   --font-sans: "IBM Plex Mono", ui-monospace, "JetBrains Mono", Consolas, monospace;
-  --bg:#000000; --surface:#010c01; --surface-raised:#021402; --surface-2:#021402;
-  --border:#064006; --border-bright:#0a6a0a; --border-strong:#0a6a0a;
-  --text:#03a062; --text-muted:#02784a; --text-dim:#02784a; --text-faint:#015a37;
-  --accent:#05d67f; --accent-hover:#0affa0;
+  --bg:#000000; --surface:#010c01; --surface-raised:#021402;
+  --border:#064006; --border-bright:#0a6a0a;
+  --text:#03a062; --text-muted:#02784a; --text-faint:#015a37;
   --link:#05d67f; --link-hover:#0affa0;
-  --brand:#05d67f; --brand-hover:#0affa0; --brand-ink:#000000;
-  --alert:#05d67f; --alert-text:#05d67f; --alert-dim:rgba(5,214,127,0.14); --crit:#05d67f;
-  --high:#03a062; --high-text:#04c074; --high-dim:rgba(3,160,98,0.14); --warn:#03a062;
+  --brand:#05d67f; --brand-ink:#000000;
+  --alert:#05d67f; --alert-text:#05d67f; --alert-dim:rgba(5,214,127,0.14);
+  --high:#03a062; --high-text:#04c074; --high-dim:rgba(3,160,98,0.14);
   --attention:#03a062; --attention-text:#05d67f; --attention-dim:rgba(3,160,98,0.14);
-  --good:#03a062; --good-text:#05d67f; --good-dim:rgba(3,160,98,0.14); --ok:#03a062;
+  --good:#03a062; --good-text:#05d67f; --good-dim:rgba(3,160,98,0.14);
   --info:#03a062; --info-text:#04c074; --info-dim:rgba(3,160,98,0.14);
-  --low:#02784a; --low-dim:rgba(2,120,74,0.12);
+  --low:#02784a;
   --shadow:0 0 0 1px rgba(5,214,127,0.10);
   --chart-line:#05d67f; --chart-fill:rgba(5,214,127,0.15); --chart-point-border:#000000;
-  --chart-blue:#05d67f; --chart-orange:#03a062; --chart-aqua:#04c074;
-  --trace-fill:rgba(5,214,127,0.16);
 }
 /* Phosphor glow: hacker theme only, and suppressed under reduced-motion-insensitive is irrelevant
    (it is a static shadow), but kept subtle so text stays legible. */
@@ -164,7 +154,9 @@ details[open] > summary::before { transform: rotate(90deg); }
 .dim { color: var(--text-muted); }
 .faint { color: var(--text-faint); }
 .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
-.label {
+/* The one micro-caps label: band and card labels, column heads, panel heads, form labels, the
+   drawer's eyebrow. Each of these had drifted to its own size and tracking. */
+.label, th, .panel-head, .field > label, .drawer-eyebrow {
   font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.08em;
   color: var(--text-muted); font-weight: 600;
 }
@@ -229,7 +221,6 @@ main { max-width: 1180px; margin: 0 auto; padding: 1.6rem 1.5rem 4rem; }
    so 650/620 would render identical. Headings own weight 700; body/data stay 400-600 below them. */
 h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 0.35rem; }
 h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 1rem; }
-.page-title { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-muted); font-weight: 600; margin: 0 0 1rem; }
 .page-sub { color: var(--text-faint); font-size: 0.8rem; margin: 0 0 1.5rem; }
 
 /* ===================== Status band - the one thing read first ==============
@@ -247,7 +238,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
   box-shadow: var(--shadow);
 }
 .band .cell { background: var(--surface); padding: 0.95rem 1.1rem; }
-.band .cell--call { background: linear-gradient(180deg, rgba(234, 167, 44, 0.09), var(--surface)); }
+.band .cell--call { background: linear-gradient(180deg, var(--attention-dim), var(--surface)); }
 .band .cell--alarm { background: linear-gradient(180deg, var(--alert-dim), var(--surface)); }
 .band .cell .label { display: block; margin-bottom: 0.55rem; }
 /* Inventory numbers recede to muted ink; only an actionable cell (--call) or an alarm gets bright
@@ -259,27 +250,6 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .v--call { color: var(--attention-text); font-size: 2.3rem; }
 .v--alarm { color: var(--alert-text); font-size: 2.3rem; }
 .v--ok { color: var(--good-text); }
-
-/* -- Hero stat (dashboard/detail/feed still use it): the primary glance metric -- */
-.stat-hero {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1rem 1.25rem;
-  display: flex;
-  align-items: baseline;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
-  box-shadow: var(--shadow);
-}
-.stat-hero--attention { background: linear-gradient(180deg, var(--attention-dim), var(--surface)); border-color: rgba(234, 167, 44, 0.22); }
-.stat-hero--nominal { background: linear-gradient(180deg, var(--good-dim), var(--surface)); border-color: rgba(47, 169, 106, 0.18); }
-.stat-hero .stat-hero-value { font-family: var(--font-mono); font-size: 2rem; font-weight: 700; line-height: 1; letter-spacing: -0.02em; }
-.stat-hero--attention .stat-hero-value, .stat-hero--attention .stat-hero-value a { color: var(--attention-text); }
-.stat-hero--nominal .stat-hero-value, .stat-hero--nominal .stat-hero-value a { color: var(--good-text); }
-.stat-hero .stat-hero-label { font-size: 0.78rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; }
-.stat-hero .stat-hero-sub { margin-left: auto; display: flex; gap: 1.5rem; font-size: 0.78rem; color: var(--text-muted); }
-.stat-hero .stat-hero-sub strong { color: var(--text); font-family: var(--font-mono); }
 
 /* -- Stat row: secondary metrics. A left rule carries the one bit of state colour. -- */
 .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.7rem; margin-bottom: 1.4rem; }
@@ -293,11 +263,6 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1.1rem; overflow: hidden; box-shadow: var(--shadow); }
 .panel-head {
   padding: 0.6rem 0.95rem;
-  font-size: 0.7rem;
-  font-weight: 650;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-muted);
   background: var(--surface-raised);
   border-bottom: 1px solid var(--border);
   display: flex;
@@ -306,10 +271,8 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
   gap: 0.75rem;
 }
 .panel-head .dim, .field > label .dim { text-transform: none; letter-spacing: 0; font-weight: 500; }
-/* --blue/--orange were categorical chart chrome; --orange in particular reused the HIGH-severity
-   hue as decoration. Panel identity comes from the title, so those are neutral now. --alert stays:
-   a red-capped panel is a real signal (something in that panel is wrong). */
-.panel-head--blue, .panel-head--orange { }
+/* Panel identity comes from the title, never a colour. The one modifier is a real signal: a
+   red-capped panel has something wrong in it. */
 .panel-head--alert { box-shadow: inset 0 2px 0 var(--alert); color: var(--alert-text); }
 /* Everything in a panel that is not a table or an .empty-line sits in .panel-body, so nothing runs
    flush against the panel's border; the body's padding, not its children's margins, sets the edge. */
@@ -331,9 +294,9 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
   color: var(--text-muted);
   white-space: nowrap;
 }
-.sev--crit  { color: var(--alert-text);     border-color: rgba(229, 72, 77, 0.40);  background: var(--alert-dim); }
-.sev--high  { color: var(--high-text);      border-color: rgba(242, 117, 29, 0.38); background: var(--high-dim); }
-.sev--watch { color: var(--attention-text); border-color: rgba(234, 167, 44, 0.34); background: var(--attention-dim); }
+.sev--crit  { color: var(--alert-text);     border-color: color-mix(in srgb, var(--alert) 40%, transparent);     background: var(--alert-dim); }
+.sev--high  { color: var(--high-text);      border-color: color-mix(in srgb, var(--high) 40%, transparent);      background: var(--high-dim); }
+.sev--watch { color: var(--attention-text); border-color: color-mix(in srgb, var(--attention) 35%, transparent); background: var(--attention-dim); }
 .sev--low   { color: var(--text-muted);     border-color: var(--border-bright);     background: transparent; }
 /* A small solid dot for compact severity marking (e.g. a row's worst signal). */
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--low); vertical-align: 0.02em; }
@@ -404,13 +367,12 @@ table { width: 100%; border-collapse: collapse; }
 .panel table { border-collapse: collapse; }
 .panel .table-wrap { border: none; border-radius: 0; box-shadow: none; }
 th, td { padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
-th { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted); font-weight: 600; background: var(--surface-raised); white-space: nowrap; }
+th { background: var(--surface-raised); white-space: nowrap; }
 th a { color: var(--text-muted); }
 th a:hover { color: var(--text); }
-th a.active { color: var(--brand); }
 tbody tr { transition: background-color 90ms ease; }
 tbody tr:last-child td { border-bottom: none; }
-tbody tr:hover td { background: rgba(255, 255, 255, 0.022); }
+tbody tr:hover td { background: color-mix(in srgb, var(--surface-raised) 60%, transparent); }
 td.ip, td.score, td.seen, td.count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 /* Quantity columns right-align so digits stack by place value (tabular-nums only pays off then). */
 th.count, td.count { text-align: right; }
@@ -647,7 +609,6 @@ a.btn { display: inline-block; }
 }
 .field { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
 .filter-form .field { margin-bottom: 0; }
-.field > label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
 .field input[type="text"], .field input[type="date"], .field select, textarea {
   background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm);
   padding: 0.4rem 0.55rem; font-family: var(--font-sans); font-size: 0.82rem;
@@ -655,7 +616,6 @@ a.btn { display: inline-block; }
 .field input:focus, .field select:focus, textarea:focus { border-color: var(--border-bright); outline: none; }
 textarea { display: block; width: 100%; resize: vertical; min-height: 3rem; }
 code { font-family: var(--font-mono); }
-.search-mode-tabs { margin-bottom: 1rem; }
 
 /* =============================== Log viewer ================================ */
 .log-viewer { height: 65vh; min-height: 320px; overflow-y: auto; background: var(--bg); padding: 0.4rem 0; }
@@ -700,7 +660,7 @@ summary.log-summary:hover { background: var(--surface-raised); }
 .log-line.level-error { background: var(--alert-dim); border-left-color: var(--alert); }
 .log-line.level-warn { background: var(--attention-dim); border-left-color: var(--attention); }
 .log-time { color: var(--text-faint); flex: 0 0 auto; }
-.log-level-badge { flex: 0 0 auto; display: inline-block; min-width: 3.6em; text-align: center; font-weight: 700; font-size: 0.68rem; letter-spacing: 0.03em; padding: 0 0.3em; border-radius: 3px; color: var(--text-muted); }
+.log-level-badge { flex: 0 0 auto; display: inline-block; min-width: 3.6em; text-align: center; font-weight: 700; font-size: 0.68rem; letter-spacing: 0.03em; padding: 0 0.3em; border-radius: var(--radius-sm); color: var(--text-muted); }
 .log-level-badge-error { background: var(--alert-dim); color: var(--alert-text); }
 .log-level-badge-warn { background: var(--attention-dim); color: var(--attention-text); }
 .log-level-badge-info { color: var(--text-muted); }
@@ -717,7 +677,7 @@ summary.log-summary:hover { background: var(--surface-raised); }
    what is not there; a panel that vanishes when empty reads as a page that lost a section. -- */
 .empty-line { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.82rem; padding: 1.25rem 0.9rem; }
 /* Soft-failed panels banner (routes::degraded): amber = "wants the operator", same ramp as review. */
-.degraded { background: var(--high-dim); border: 1px solid var(--high); color: var(--high-text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.6rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }
+.degraded { background: var(--high-dim); border: 1px solid var(--high); color: var(--high-text); font-family: var(--font-mono); font-size: 0.82rem; padding: 0.6rem 0.9rem; border-radius: var(--radius-sm); margin-bottom: 1rem; }
 /* A polled panel whose refresh is failing. It still shows the last reading it managed to get, so
    it is dimmed to say the numbers below are frozen - the banner above it says since when. */
 [data-stale="true"] { opacity: 0.55; filter: saturate(0.4); }
@@ -729,7 +689,7 @@ summary.log-summary:hover { background: var(--surface-raised); }
 .login-card h1 { font-family: var(--font-mono); letter-spacing: 0.14em; font-size: 1rem; text-transform: uppercase; color: var(--text); text-align: center; margin-bottom: 1.5rem; }
 .login-card input[type="password"] { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm); padding: 0.55rem 0.7rem; font-size: 0.9rem; margin-bottom: 1rem; }
 .login-card input[type="password"]:focus { border-color: var(--border-bright); outline: none; }
-.login-card button { width: 100%; padding: 0.6rem; background: var(--link); border-color: var(--link); color: #0e1217; }
+.login-card button { width: 100%; padding: 0.6rem; background: var(--link); border-color: var(--link); color: var(--brand-ink); }
 .login-card button:hover { background: var(--link-hover); border-color: var(--link-hover); }
 .login-error { color: var(--alert-text); font-size: 0.82rem; margin-bottom: 1rem; }
 
@@ -739,8 +699,6 @@ summary.log-summary:hover { background: var(--surface-raised); }
 @media (max-width: 640px) {
   .topnav { flex-wrap: wrap; gap: 0.75rem; }
   main { padding: 1rem 1rem 2.5rem; }
-  .stat-hero { flex-wrap: wrap; }
-  .stat-hero .stat-hero-sub { margin-left: 0; width: 100%; }
   .grid-2 { grid-template-columns: 1fr; }
   .band { grid-template-columns: 1fr; }
   .actions { min-width: 0; }
@@ -789,7 +747,6 @@ summary.log-summary:hover { background: var(--surface-raised); }
 }
 .drawer.open { transform: translateX(0); }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.1rem; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg); z-index: 1; }
-.drawer-eyebrow { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-muted); font-weight: 600; }
 #drawer-body { padding: 1rem 1.1rem 3rem; }
 .iconbtn { background: none; border: 1px solid var(--border); color: var(--text-muted); border-radius: var(--radius-sm); width: 1.9rem; height: 1.9rem; line-height: 1; font-size: 1.1rem; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
 .iconbtn:hover { color: var(--text); border-color: var(--border-bright); }
@@ -831,7 +788,7 @@ summary.log-summary:hover { background: var(--surface-raised); }
 .login-foot { text-align: center; font-size: 0.72rem; margin-top: 1rem; }
 .text-good, a.text-good:hover { color: var(--good-text); }
 .text-alert, a.text-alert:hover { color: var(--alert-text); }
-.verdict { margin-top: 1rem; padding: 0.8rem; border: 1px solid var(--alert); border-radius: 4px; }
+.verdict { margin-top: 1rem; padding: 0.8rem; border: 1px solid var(--alert); border-radius: var(--radius-sm); }
 .verdict--good { border-color: var(--good); }
 .w-70 { width: 70px; }
 .w-80 { width: 80px; }

@@ -36,7 +36,7 @@ pub(crate) fn score_pct(score: f64) -> u32 {
 }
 
 /// The lowercase display label for a feed tier, matching the CSS class suffixes in
-/// `templates/base_head.html` (`.tier-aggressive` / `.tier-standard`).
+/// `assets/console.css` (`.tier-aggressive` / `.tier-standard`) that `macros.html#tier_pill` emits.
 pub(crate) fn tier_label(t: FeedTier) -> &'static str {
     match t {
         FeedTier::Aggressive => "aggressive",

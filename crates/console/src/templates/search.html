@@ -3,6 +3,10 @@
 {% block content %}
 {% import "macros.html" as m %}
 <h1>Search</h1>
+<div class="tab-bar">
+  <a href="/search/events{% if events_query_string %}?{{ events_query_string }}{% endif %}" class="tab {% if mode != "ips" %}active{% endif %}">Events</a>
+  <a href="/search/ips{% if ips_query_string %}?{{ ips_query_string }}{% endif %}" class="tab {% if mode == "ips" %}active{% endif %}">By IP</a>
+</div>
 
 <form id="search-filter-form" class="filter-form" method="get" action="{% if mode == "ips" %}/search/ips{% else %}/search/events{% endif %}">
   <div class="field">
@@ -39,11 +43,6 @@
   </div>
   <button type="submit">Search</button>
 </form>
-
-<div class="range-selector search-mode-tabs">
-  <a href="/search/events{% if events_query_string %}?{{ events_query_string }}{% endif %}" class="range-btn {% if mode != "ips" %}active{% endif %}">Events</a>
-  <a href="/search/ips{% if ips_query_string %}?{{ ips_query_string }}{% endif %}" class="range-btn {% if mode == "ips" %}active{% endif %}">By IP</a>
-</div>
 
 {% if mode == "ips" %}
   <div class="panel">

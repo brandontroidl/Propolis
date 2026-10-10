@@ -177,8 +177,8 @@ fn a_fetch_named_by_a_command_substitution_reports_what_it_printed() {
 
 #[test]
 fn a_fetch_inside_a_function_is_still_reported() {
-    // Functions are outside the grammar subset and never run, so the lexical fallback is what
-    // reports this one.
+    // The call runs the body, so the evaluator reports the fetch; the definition's own text names
+    // the same one, and the two are a single event.
     let mut sh = shell();
     assert_eq!(
         urls_of(

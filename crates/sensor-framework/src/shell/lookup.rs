@@ -21,6 +21,9 @@
     clippy::indexing_slicing
 )]
 
+use std::sync::Arc;
+
+use super::ast::{FunctionDef, POSIX_SPECIAL};
 use super::registry::{CommandKind, Registry};
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, ShellLevel, command_basename};
 
@@ -54,6 +57,8 @@ const DASH_KEYWORDS: &[&str] = &[
 /// What a name is to the running shell.
 struct Located {
     keyword: bool,
+    /// A function the session defined, which the shell finds before a builtin or a file.
+    function: Option<Arc<FunctionDef>>,
     builtin: bool,
     /// The files that answer the name, in `$PATH` order. Filled for a file command and, when every
     /// file was asked for, for a builtin that also has one (`echo`, `true`).
@@ -127,15 +132,21 @@ impl FakeShell {
             };
             return runs.then(|| Located {
                 keyword: false,
+                function: None,
                 builtin: false,
                 files: vec![name.to_string()],
             });
         }
         let keyword = self.keywords().contains(&name);
+        let function = self
+            .state()
+            .functions
+            .get(name)
+            .map(|held| Arc::clone(&held.def));
         let kind = Registry::builtin()
             .kind(name, self)
             .filter(|kind| *kind != CommandKind::Unresolved);
-        if kind.is_none() && !keyword {
+        if kind.is_none() && !keyword && function.is_none() {
             return None;
         }
         let files = match kind {
@@ -151,6 +162,7 @@ impl FakeShell {
         };
         Some(Located {
             keyword,
+            function,
             builtin: kind == Some(CommandKind::Builtin),
             files,
         })
@@ -165,8 +177,8 @@ impl FakeShell {
     }
 
     /// `command [-p] [-v|-V] NAME [ARG...]`. Described with `-v`/`-V`; otherwise `NAME` runs through
-    /// dispatch as it would bare, which is all `command` changes here: functions and aliases, the
-    /// two things it skips, are not modeled.
+    /// dispatch, which does not look at the session's functions: that is all `command` changes
+    /// here. Aliases, the other thing it skips, are not modeled.
     pub(super) fn builtin_command(&mut self, parts: &[&str]) -> CommandResult {
         let mut detail = None;
         let mut at = 1;
@@ -208,7 +220,7 @@ impl FakeShell {
             match self.locate(name, false) {
                 Some(located) => {
                     any_found = true;
-                    result.append(CommandResult::stdout(describe(name, &located, detail)));
+                    result.append(CommandResult::stdout(self.describe(name, &located, detail)));
                 }
                 None if detail == Detail::Sentence => {
                     result.append(self.not_found_report("command", name))
@@ -304,7 +316,7 @@ impl FakeShell {
             };
             if force_path || only_files {
                 // `-P` looks in `$PATH` only; `-p` prints a path only for what `-t` calls a file.
-                let is_file = !located.keyword && !located.builtin;
+                let is_file = !located.keyword && located.function.is_none() && !located.builtin;
                 if force_path || is_file {
                     for file in files {
                         result.append(CommandResult::stdout(format!("{file}\n")));
@@ -317,8 +329,11 @@ impl FakeShell {
             if located.keyword {
                 forms.push(("keyword", format!("{name} is a shell keyword\n")));
             }
+            if let Some(def) = &located.function {
+                forms.push(("function", function_sentence(name, def, bash)));
+            }
             if located.builtin {
-                forms.push(("builtin", format!("{name} is a shell builtin\n")));
+                forms.push(("builtin", self.builtin_sentence(name)));
             }
             for file in files {
                 forms.push(("file", format!("{name} is {file}\n")));
@@ -399,16 +414,52 @@ impl FakeShell {
     }
 }
 
-/// The line `command -v` or `-V` prints for a name that was found: a keyword or builtin by name,
-/// a file by path.
-fn describe(name: &str, located: &Located, detail: Detail) -> String {
-    let file = located.files.first();
-    match (detail, located.keyword, located.builtin, file) {
-        (Detail::Short, true, _, _) | (Detail::Short, _, true, _) => format!("{name}\n"),
-        (Detail::Short, _, _, Some(file)) => format!("{file}\n"),
-        (Detail::Sentence, true, _, _) => format!("{name} is a shell keyword\n"),
-        (Detail::Sentence, _, true, _) => format!("{name} is a shell builtin\n"),
-        (Detail::Sentence, _, _, Some(file)) => format!("{name} is {file}\n"),
-        (_, _, _, None) => String::new(),
+/// How `type` words a function: dash only says so, and bash prints the body it parsed.
+fn function_sentence(name: &str, def: &FunctionDef, bash: bool) -> String {
+    if bash {
+        format!(
+            "{name} is a function\n{}",
+            super::fnprint::bash_function_text(name, def)
+        )
+    } else {
+        format!("{name} is a shell function\n")
+    }
+}
+
+impl FakeShell {
+    /// dash tells a special builtin (`export`, `set`, `return`...) from the others; bash and
+    /// mksh do not.
+    fn builtin_sentence(&self, name: &str) -> String {
+        let special =
+            matches!(self.active_level(), ShellLevel::Dash { .. }) && POSIX_SPECIAL.contains(&name);
+        let kind = if special {
+            "special shell builtin"
+        } else {
+            "shell builtin"
+        };
+        format!("{name} is a {kind}\n")
+    }
+
+    /// The line `command -v` or `-V` prints for a name that was found: a keyword, function or
+    /// builtin by name, a file by path.
+    fn describe(&self, name: &str, located: &Located, detail: Detail) -> String {
+        let file = located.files.first();
+        match (
+            detail,
+            located.keyword,
+            &located.function,
+            located.builtin,
+            file,
+        ) {
+            (Detail::Short, true, _, _, _)
+            | (Detail::Short, _, Some(_), _, _)
+            | (Detail::Short, _, _, true, _) => format!("{name}\n"),
+            (Detail::Short, _, _, _, Some(file)) => format!("{file}\n"),
+            (Detail::Sentence, true, _, _, _) => format!("{name} is a shell keyword\n"),
+            (Detail::Sentence, _, Some(def), _, _) => function_sentence(name, def, self.is_bash()),
+            (Detail::Sentence, _, _, true, _) => self.builtin_sentence(name),
+            (Detail::Sentence, _, _, _, Some(file)) => format!("{name} is {file}\n"),
+            (_, _, _, _, None) => String::new(),
+        }
     }
 }

@@ -302,7 +302,11 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
    a red-capped panel is a real signal (something in that panel is wrong). */
 .panel-head--blue, .panel-head--orange { }
 .panel-head--alert { box-shadow: inset 0 2px 0 var(--alert); color: var(--alert-text); }
+/* Everything in a panel that is not a table or an .empty-line sits in .panel-body, so nothing runs
+   flush against the panel's border; the body's padding, not its children's margins, sets the edge. */
 .panel-body { padding: 0.75rem 0.95rem 0.95rem; }
+.panel-body > :first-child { margin-top: 0; }
+.panel-body > :last-child { margin-bottom: 0; }
 
 /* ===================== Severity tags - "what it did" =======================
    The vocabulary that makes colour mean something. Driven off signal_type on
@@ -593,7 +597,6 @@ td.c-hosts, td.s-hosts { font-size: 0.95rem; }
 .c-sub { display: block; font-size: 0.72rem; color: var(--text-faint); }
 .s-hash a { color: var(--text); }
 td.score a { color: inherit; }
-.panel-note { padding: 0.6rem 0.9rem 0.2rem; }
 .samples-panel td.ip { white-space: normal; }
 @media (max-width: 640px) {
   .campaigns-panel table, .campaigns-panel tbody, .campaigns-panel tr, .campaigns-panel td,
@@ -634,7 +637,6 @@ td.score a { color: inherit; }
 }
 
 /* -- Attackers paging and the tier/score note above the table -- */
-.ips-count { margin-bottom: 0.6rem; }
 .table-note { font-size: 0.78rem; color: var(--text-muted); margin: 0 0 0.75rem; max-width: 70rem; }
 .table-note strong { color: var(--text); font-weight: 600; }
 .pager { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.6rem 0; font-size: 0.8rem; }

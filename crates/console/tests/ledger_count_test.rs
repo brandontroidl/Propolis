@@ -108,8 +108,8 @@ fn band(page: &str) -> &str {
 
 /// The "Evidence chain" panel's Events row.
 fn events_row(page: &str) -> &str {
-    let at = page.find(r#"<span class="label">Events</span>"#).unwrap();
-    &page[at..at + page[at..].find("</p>").unwrap()]
+    let at = page.find("<td>Events</td>").unwrap();
+    &page[at..at + page[at..].find("</tr>").unwrap()]
 }
 
 #[sqlx::test(migrations = false)]

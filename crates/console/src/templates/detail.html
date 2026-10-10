@@ -71,24 +71,26 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Campaigns <span class="dim">other addresses doing the same thing</span></div>
+  <div class="panel-head">Campaigns <span class="dim">shared activity</span></div>
   {% if campaigns %}
+  <div class="panel-body">
   <ul class="campaign-refs">
     {% for c in campaigns %}
     <li><a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}{% if c.role == "infected host" %}, members are likely infected hosts{% endif %}{% if c.pending > 0 %}, {{ c.pending }} pending review{% endif %}</span></li>
     {% endfor %}
   </ul>
+  </div>
   {% else %}
-  <p class="dim">not part of a campaign{% if campaign_indexer_behind > 0 %} yet; the campaign indexer is {{ campaign_indexer_behind }} events behind the ledger{% endif %}</p>
+  <p class="empty-line">not part of a campaign{% if campaign_indexer_behind > 0 %} yet; the campaign indexer is {{ campaign_indexer_behind }} events behind the ledger{% endif %}</p>
   {% endif %}
 </div>
 
 <div class="panel">
-  <div class="panel-head">ATT&amp;CK techniques <span class="dim">fixed rules matched against its commands and downloads; a label, not a verdict</span></div>
+  <div class="panel-head">ATT&amp;CK techniques <span class="dim">labels, not verdicts</span></div>
   {% if techniques %}
-  {{ m.technique_list(techniques) }}
+  <div class="panel-body">{{ m.technique_list(techniques) }}</div>
   {% else %}
-  <p class="dim">none tagged</p>
+  <p class="empty-line">none tagged</p>
   {% endif %}
 </div>
 
@@ -120,7 +122,7 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Services probed <span class="dim">what this address did to us</span></div>
+  <div class="panel-head">Services probed</div>
   {% if services %}
   <table class="table-compact">
     <thead><tr><th>Service</th><th>Sensor</th><th>Events</th><th>Authenticated</th><th>First seen</th><th>Last seen</th></tr></thead>
@@ -149,8 +151,11 @@
      only the FIRST reporter of each url (ON CONFLICT (url_hash) DO NOTHING), so it is never
      "every malicious url this IP referenced".
    The Origin column and the dim caveat keep that difference visible. #}
+{% macro via_note(lead) -%}
+<p class="table-note">{{ lead }}{{ via_other_reporters | length }} sample{% if via_other_reporters | length != 1 %}s{% endif %} via a URL first reported by another address: {% for v in via_other_reporters %}<a class="mono" href="/samples/{{ v.sha256 }}" title="{{ v.sha256 }}">{{ v.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}. This address asked for the same URL later; see the table below.</p>
+{%- endmacro %}
 <div class="panel">
-  <div class="panel-head">Malware from this IP <span class="dim">uploaded directly, or fetched from a URL it was first to report</span></div>
+  <div class="panel-head">Malware from this IP <span class="dim">uploaded, or first to report the URL</span></div>
   {% if malware %}
   <table class="table-compact">
     <thead><tr><th>Origin</th><th>File / URL</th><th>Sensor / payload host</th><th>Size</th><th>SHA-256</th><th>Status</th><th>VirusTotal</th><th>Scanned</th></tr></thead>
@@ -187,7 +192,7 @@
   </table>
   {% endif %}
   {% if via_other_reporters %}
-  <p class="{% if malware %}table-note panel-note{% else %}empty-line{% endif %}">{% if not malware %}No sample uploaded by this address. {% endif %}{{ via_other_reporters | length }} sample{% if via_other_reporters | length != 1 %}s{% endif %} via a URL first reported by another address: {% for v in via_other_reporters %}<a class="mono" href="/samples/{{ v.sha256 }}" title="{{ v.sha256 }}">{{ v.short }}</a>{% if not loop.last %} {% endif %}{% endfor %}. This address asked for the same URL later; see the table below.</p>
+  <div class="panel-body">{{ via_note("" if malware else "No sample uploaded by this address. ") }}</div>
   {% elif not malware %}
   <p class="empty-line">no samples linked to this address</p>
   {% endif %}
@@ -197,7 +202,7 @@
    credits a capture to the first reporter only; this one shows a later attacker's URL with the
    capture it already produced, dated, because the URL may serve different bytes today. #}
 <div class="panel">
-  <div class="panel-head">URLs this IP tried to fetch <span class="dim">what the fetcher did with each, whoever reported it first</span></div>
+  <div class="panel-head">URLs this IP tried to fetch <span class="dim">fetcher outcome</span></div>
   {% if urls %}
   <table class="table-compact">
     <thead><tr><th>URL</th><th>Seen</th><th>Outcome</th><th>Queued by</th><th>Sample</th><th>VirusTotal</th></tr></thead>

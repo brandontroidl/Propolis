@@ -39,9 +39,8 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head{% if summary.alarm > 0 %} panel-head--alert{% endif %}">Listeners <span class="dim">reachability, and what each one has produced</span></div>
+  <div class="panel-head{% if summary.alarm > 0 %} panel-head--alert{% endif %}">Listeners <span class="dim">reachability and output</span></div>
   {% if listeners %}
-  <div class="table-wrap">
     <table class="table-compact">
       <thead><tr>
         <th class="w-90">Collector</th>
@@ -71,16 +70,14 @@
         {% endfor %}
       </tbody>
     </table>
-  </div>
   {% else %}
   <p class="empty-line">no listener inventory configured - set PROPOLIS_FLEET_LISTENERS, or run deploy/fleet-listeners.sh to derive it from the sensor env files</p>
   {% endif %}
 </div>
 
 <div class="panel">
-  <div class="panel-head">Capture completeness <span class="dim">malware uploads, last 7 days</span></div>
+  <div class="panel-head">Capture completeness <span class="dim">uploads, last 7 days</span></div>
   {% if captures %}
-  <div class="table-wrap">
     <table class="table-compact">
       <thead><tr>
         <th class="w-120">Sensor</th>
@@ -115,7 +112,6 @@
         {% endfor %}
       </tbody>
     </table>
-  </div>
   {% elif captures_unavailable %}
   {# A failed query and a quiet week both arrive here as an empty list. Saying "no captures" for
      the first is the console inventing a finding it never read. #}
@@ -128,9 +124,13 @@
 <div class="grid-2">
   <div class="panel">
     <div class="panel-head">Evidence chain</div>
+    <table class="table-compact">
+      <tbody>
+        <tr><td>Events</td><td>{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{% if ledger.events_estimate %}about {% endif %}{{ ledger.events }}</span>{% if ledger.events_estimate %} <span class="dim">(estimate)</span>{% endif %}{% endif %}</td></tr>
+        <tr><td>Newest ingest</td><td><span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></td></tr>
+      </tbody>
+    </table>
     <div class="panel-body">
-      <p><span class="label">Events</span> {% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{% if ledger.events_estimate %}about {% endif %}{{ ledger.events }}</span>{% if ledger.events_estimate %} <span class="dim">(estimate)</span>{% endif %}{% endif %}</p>
-      <p><span class="label">Newest ingest</span> <span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></p>
       {# No verdict is shown here because none is retained anywhere: `/integrity/verify` reports its
          result in that one response and nothing persists it, so a verification cannot populate this
          panel. The previous wording ("not stored yet ... run a verification to see it") invited
@@ -146,33 +146,42 @@
 
   <div class="panel">
     <div class="panel-head">Published feed</div>
+    {% if feed.disabled %}
     <div class="panel-body">
-      {% if feed.disabled %}
       <p><span class="{{ feed.dot }}" aria-hidden="true"></span> {{ feed.note }}</p>
       <p class="dim">This node publishes nothing, so there is no feed freshness to report. That is a configuration, not a fault.</p>
-      {% else %}
-      <p><span class="label">Entries</span> <span class="mono">{{ feed.entries }}</span></p>
-      <p><span class="label">Built</span> <span class="mono">{% if feed.build_ago %}{{ feed.build_ago }}{% else %}never{% endif %}</span>{% if feed.build_time %} <span class="dim">{{ feed.build_time }}</span>{% endif %}</p>
-      <p><span class="label">Expires in</span> <span class="{{ feed.dot }}" aria-hidden="true"></span> <span class="mono">{% if feed.expires_in %}{{ feed.expires_in }}{% else %}unknown{% endif %}</span></p>
-      <p class="dim">{{ feed.note }}</p>
-      {% endif %}
     </div>
+    {% else %}
+    <table class="table-compact">
+      <tbody>
+        <tr><td>Entries</td><td class="mono">{{ feed.entries }}</td></tr>
+        <tr><td>Built</td><td><span class="mono">{% if feed.build_ago %}{{ feed.build_ago }}{% else %}never{% endif %}</span>{% if feed.build_time %} <span class="dim">{{ feed.build_time }}</span>{% endif %}</td></tr>
+        <tr><td>Expires in</td><td><span class="{{ feed.dot }}" aria-hidden="true"></span> <span class="mono">{% if feed.expires_in %}{{ feed.expires_in }}{% else %}unknown{% endif %}</span></td></tr>
+      </tbody>
+    </table>
+    <div class="panel-body"><p class="dim">{{ feed.note }}</p></div>
+    {% endif %}
   </div>
 </div>
 
 <div class="panel">
   <div class="panel-head">Running version</div>
+  {# Four different identities, kept apart on purpose: what this PROCESS runs, what the deploy
+     left INSTALLED on disk for it, what was CHECKED OUT when that deploy built, and what main
+     held when it last fetched. Collapsing any two of them is the bug. #}
+  <table class="table-compact">
+    <tbody>
+      <tr><td>Version</td><td><span class="mono">v{{ version_status.running_version }}</span> <span class="{{ version_status.verdict_sev }}">{{ version_status.verdict }}</span></td></tr>
+      <tr><td>Running</td><td><span class="mono">{{ version_status.running_sha }}</span> <span class="dim">built {{ version_status.built_at }}</span></td></tr>
+      <tr><td>Installed</td><td>{% if version_status.installed_sha %}<span class="mono">{{ version_status.installed_sha }}</span> <span class="dim">{{ version_status.binary_name }} on disk</span>{% else %}<span class="faint">not recorded</span> <span class="dim">no deploy stamp records which {{ version_status.binary_name }} binary was installed</span>{% endif %}</td></tr>
+      {% if version_status.stamp_head_sha %}
+      <tr><td>Deploy stamp</td><td><span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">recorded {{ version_status.stamp_age }}</span>{% endif %}</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
   <div class="panel-body">
-    <p><span class="label">Version</span> <span class="mono">v{{ version_status.running_version }}</span> <span class="{{ version_status.verdict_sev }}">{{ version_status.verdict }}</span></p>
-    {# Four different identities, kept apart on purpose: what this PROCESS runs, what the deploy
-       left INSTALLED on disk for it, what was CHECKED OUT when that deploy built, and what main
-       held when it last fetched. Collapsing any two of them is the bug. #}
-    <p><span class="label">Running</span> <span class="mono">{{ version_status.running_sha }}</span> <span class="dim">built {{ version_status.built_at }}</span></p>
-    <p><span class="label">Installed</span> {% if version_status.installed_sha %}<span class="mono">{{ version_status.installed_sha }}</span> <span class="dim">{{ version_status.binary_name }} on disk</span>{% else %}<span class="faint">not recorded</span> <span class="dim">no deploy stamp records which {{ version_status.binary_name }} binary was installed</span>{% endif %}</p>
     <p class="dim">{{ version_status.note }}</p>
-    {% if version_status.stamp_head_sha %}
-    <p><span class="label">Deploy stamp</span> <span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">recorded {{ version_status.stamp_age }}</span>{% endif %}</p>
-    {% else %}
+    {% if not version_status.stamp_head_sha %}
     <p class="dim">No deploy stamp file was found, so there is nothing to compare against either.</p>
     {% endif %}
   </div>

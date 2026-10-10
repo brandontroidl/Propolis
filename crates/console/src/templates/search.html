@@ -50,6 +50,7 @@
   <p class="empty-line">Enter at least one filter to search.</p>
   {% elif ip_rows %}
   <div class="panel">
+    <div class="panel-head">Matching addresses <span class="dim">{{ ip_rows | length }}</span></div>
     <table class="table-compact">
       <thead><tr><th>IP</th><th class="count">Matches</th><th>Score</th><th>Tier</th><th>First seen</th><th>Last seen</th></tr></thead>
       <tbody>
@@ -78,6 +79,7 @@
   <p class="empty-line">Enter at least one filter to search.</p>
   {% elif rows %}
   <div class="panel">
+    <div class="panel-head">Matching events <span class="dim">newest first</span></div>
     <table class="table-compact">
       <thead><tr><th>Time</th><th>Source IP</th><th>Activity</th><th>Detail</th><th>Session</th></tr></thead>
       <tbody id="search-results-body">

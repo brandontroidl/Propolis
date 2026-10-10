@@ -4890,27 +4890,30 @@ async fn seed_fetch_attempt(pool: &PgPool, n: u32, status: &str) {
     .unwrap();
 }
 
-/// Reads the count rendered directly after a given status strip label - robust to the exact
-/// indentation/whitespace the template happens to use between the `.label` and `.value` divs
-/// (unlike a hardcoded whitespace-sensitive substring), while still precisely pairing each label
-/// with ITS OWN adjacent count rather than any other stat-card's.
+/// Reads the count under a given status column of the Fetch attempts table: the label's position
+/// among the header cells picks the body cell at the same position, so each label is paired with
+/// ITS OWN count rather than any other column's.
 fn strip_count(body: &str, label: &str) -> i64 {
-    let label_tag = format!("<div class=\"label\">{label}</div>");
-    let after_label = body
-        .find(&label_tag)
-        .map(|pos| &body[pos + label_tag.len()..])
-        .unwrap_or_else(|| panic!("status-strip label {label:?} missing: {body}"));
-    let value_tag = "<div class=\"value\">";
-    let value_start = after_label
-        .find(value_tag)
-        .unwrap_or_else(|| panic!("no value div after label {label:?}: {body}"))
-        + value_tag.len();
-    let value_end = after_label[value_start..]
-        .find("</div>")
-        .unwrap_or_else(|| panic!("unclosed value div after label {label:?}: {body}"));
-    after_label[value_start..value_start + value_end]
+    let panel = &body[body
+        .find("Fetch attempts")
+        .unwrap_or_else(|| panic!("no Fetch attempts panel: {body}"))..];
+    let table = &panel[..panel.find("</table>").expect("unclosed fetch table")];
+    let cells = |open: &str, close: &str| -> Vec<String> {
+        table
+            .split(open)
+            .skip(1)
+            .map(|c| c[..c.find(close).unwrap()].to_string())
+            .collect()
+    };
+    let labels = cells("<th class=\"count\">", "</th>");
+    let counts = cells("<td class=\"count\">", "</td>");
+    let at = labels
+        .iter()
+        .position(|l| l == label)
+        .unwrap_or_else(|| panic!("status label {label:?} missing: {table}"));
+    counts[at]
         .parse()
-        .unwrap_or_else(|_| panic!("non-numeric value after label {label:?}: {body}"))
+        .unwrap_or_else(|_| panic!("non-numeric count under {label:?}: {table}"))
 }
 
 /// The soft-fail policy used to render a failed query as data: "0 events in the ledger", an empty
@@ -5892,7 +5895,7 @@ async fn fleet_page_reports_the_feed_as_unknown_when_no_output_dir_is_configured
         "an unconfigured builder must say so rather than reporting an empty feed: {body}"
     );
     assert!(
-        !body.contains("<span class=\"label\">Entries</span> <span class=\"mono\">0</span>"),
+        !body.contains("<td>Entries</td><td class=\"mono\">0</td>"),
         "a disabled builder must never render as 0 published entries: {body}"
     );
 }
@@ -6595,7 +6598,7 @@ async fn fleet_expired_feed_renders_the_alarm_dot(pool: PgPool) {
     );
     assert!(
         body.contains(
-            r#"<span class="label">Expires in</span> <span class="dot dot--crit" aria-hidden="true"></span>"#
+            r#"<td>Expires in</td><td><span class="dot dot--crit" aria-hidden="true"></span>"#
         ),
         "an expired feed's Expires-in value must carry the alarm dot, not the dead panel-body attribute: {body}"
     );
@@ -6738,7 +6741,7 @@ async fn fleet_status_fragment_newest_ingest_carries_a_dot(pool: PgPool) {
 
     assert!(
         body.contains(
-            r#"<span class="label">Newest ingest</span> <span class="dot dot--low" aria-hidden="true"></span>"#
+            r#"<td>Newest ingest</td><td><span class="dot dot--low" aria-hidden="true"></span>"#
         ),
         "a recent ingest must carry the healthy dot on the refresh fragment, not a dead attribute: {body}"
     );
@@ -6778,7 +6781,7 @@ async fn fleet_page_shows_the_ingest_state_as_unknown_when_the_ledger_query_fail
     );
     assert!(
         body.contains(
-            r#"<span class="label">Newest ingest</span> <span class="dot dot--watch" aria-hidden="true"></span>"#
+            r#"<td>Newest ingest</td><td><span class="dot dot--watch" aria-hidden="true"></span>"#
         ),
         "a failed ledger query must render the unknown dot, not a healthy-looking dead attribute: {body}"
     );
@@ -6841,9 +6844,7 @@ async fn fleet_version_panel_reads_the_installed_entry_for_the_binary_serving_th
          {body}"
     );
     assert!(
-        body.contains(
-            r#"<span class="label">Installed</span> <span class="mono">abc123abc123</span>"#
-        ),
+        body.contains(r#"<td>Installed</td><td><span class="mono">abc123abc123</span>"#),
         "the panel must show the installed revision of the binary serving it: {body}"
     );
     assert!(
@@ -6946,9 +6947,7 @@ async fn fleet_version_panel_reports_an_older_stamp_as_installed_not_recorded(po
 
     let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(stamp))).await;
     assert!(
-        body.contains(
-            r#"<span class="label">Installed</span> <span class="faint">not recorded</span>"#
-        ),
+        body.contains(r#"<td>Installed</td><td><span class="faint">not recorded</span>"#),
         "an older stamp must say plainly that it does not record what was installed: {body}"
     );
     assert!(
@@ -7036,7 +7035,7 @@ async fn fleet_version_panel_reads_a_stamp_written_by_the_real_deploy_script(poo
     let body = fleet_body(as_daemon).await;
     assert!(
         body.contains(&format!(
-            r#"<span class="label">Installed</span> <span class="mono">{short}</span>"#
+            r#"<td>Installed</td><td><span class="mono">{short}</span>"#
         )),
         "the page must render the revision the deploy script read back off the daemon binary: \
          {body}"
@@ -7891,7 +7890,7 @@ async fn a_flooding_queue_entry_is_described_from_a_bounded_sample(pool: PgPool)
 
 /// The Recent activity rows of a dashboard page: (activity, events cell, source).
 fn recent_rows(body: &str) -> Vec<(String, String, String)> {
-    let panel = &body[body.find(">Recent activity<").unwrap()..];
+    let panel = &body[body.find(">Recent activity ").unwrap()..];
     let panel = &panel[..panel.find("</table>").unwrap()];
     panel
         .split("<tr>")

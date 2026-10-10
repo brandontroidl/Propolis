@@ -22,6 +22,8 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod markup;
+
 fn state(db: PgPool) -> AppState {
     AppState {
         db,
@@ -1599,4 +1601,98 @@ async fn scored_ip(pool: &PgPool, ip: &str) {
         None,
     )
     .await;
+}
+
+/// The check itself: it must flag what it is for and pass what the system allows, or a green
+/// page check means nothing.
+#[test]
+fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
+    let ok = r#"<div class="panel"><div class="panel-head">T <span class="dim">s</span></div>
+        <table class="table-compact"><tr><td>1</td></tr></table>
+        <div class="panel-body"><p>text</p><ul><li>x</li></ul></div>
+        <div id="load-more-container"></div></div>
+        <div class="panel"><div class="panel-head">E</div><p class="empty-line">none</p></div>
+        <p class="dim">outside any panel</p>"#;
+    assert_eq!(markup::panel_violations(ok), Vec::<String>::new());
+    for bad in [
+        r#"<div class="panel"><div class="panel-head">T</div><p class="dim">none</p></div>"#,
+        r#"<div class="panel"><ul class="campaign-refs"><li>x</li></ul></div>"#,
+        r#"<div class="panel"><div class="stat-row"></div></div>"#,
+        r#"<div class="panel"><svg class="spark"></svg></div>"#,
+        r#"<div class="panel">loose words</div>"#,
+    ] {
+        assert_eq!(markup::panel_violations(bad).len(), 1, "{bad}");
+    }
+}
+
+/// Every page the console serves, rendered from one database the real indexer filled, keeps the
+/// panel contract: nothing sits flush against a panel's border. Each page was right when the
+/// original design shipped; the pages added later broke it one panel at a time, so the check runs
+/// on all of them together rather than page by page.
+#[sqlx::test(migrations = false)]
+async fn every_page_keeps_the_panel_contract(pool: PgPool) {
+    migrate(&pool).await;
+    let root = tempfile::tempdir().unwrap();
+    // SAFETY: set before anything reads it, and nothing else in this binary reads the environment.
+    unsafe { std::env::set_var("PROPOLIS_SPOOL_ROOT", root.path()) };
+    let body = b"#!/bin/sh\necho \"127.0.0.1 rival.example.net\" >> /etc/hosts\n";
+    let sha = seed(&pool, body).await;
+    std::fs::create_dir_all(root.path().join("ssh")).unwrap();
+    std::fs::write(root.path().join("ssh").join(&sha), body).unwrap();
+    campaign::scan_artifacts(&pool, &[("ssh", root.path().join("ssh"))])
+        .await
+        .unwrap();
+    for ip in ["192.0.2.1", "192.0.2.2", "192.0.2.4"] {
+        pend(&pool, ip).await;
+    }
+    scored_ip(&pool, "198.51.100.9").await;
+    sqlx::query(
+        "INSERT INTO fetch_attempt (url_hash, url, host, scheme, status, last_attempt) \
+         VALUES ($1, 'http://198.51.100.70/w.sh', '198.51.100.70', 'http', 'dead', now())",
+    )
+    .bind(b"panel-contract-fetch".to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sample = campaign_id(&pool, "sample").await;
+    let sequence = campaign_id(&pool, "command_sequence").await;
+    let console = Console::new(pool.clone());
+    let (_, queue) = console.get("/queue").await;
+    let token = row_csrf(&queue, "192.0.2.4");
+    console
+        .post(
+            "/queue/192.0.2.4/approve",
+            &[("csrf_token", &token), ("notes", "")],
+        )
+        .await;
+
+    for uri in [
+        "/".to_string(),
+        "/queue".to_string(),
+        "/queue?tab=approved".to_string(),
+        "/queue?tab=snoozed".to_string(),
+        "/ips".to_string(),
+        "/ip/192.0.2.1".to_string(),
+        "/ip/198.51.100.200".to_string(),
+        "/campaigns".to_string(),
+        format!("/campaigns/{sample}"),
+        format!("/campaigns/{sequence}"),
+        format!("/campaigns/{sample}/approve"),
+        "/samples".to_string(),
+        format!("/samples/{sha}"),
+        "/search/events?q=uname".to_string(),
+        "/search/events?q=no-such-text".to_string(),
+        "/search/events".to_string(),
+        "/search/ips?sensor=ssh".to_string(),
+        "/feed".to_string(),
+        "/feed?tab=entries".to_string(),
+        "/fleet".to_string(),
+        "/logs".to_string(),
+        "/integrity".to_string(),
+    ] {
+        let (status, page) = console.get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let found = markup::panel_violations(&page);
+        assert!(found.is_empty(), "{uri}:\n{}", found.join("\n"));
+    }
 }

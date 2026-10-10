@@ -9,36 +9,36 @@
 <div class="panel">
   <div class="panel-head">Campaigns</div>
   {% if campaigns %}
-  <ul>
+  <div class="panel-body">
+  <ul class="campaign-refs">
     {% for c in campaigns %}
     <li><a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}, members treated as {{ c.role }}</span></li>
     {% endfor %}
   </ul>
+  </div>
   {% else %}
-  <p class="dim">not part of a campaign yet</p>
+  <p class="empty-line">not part of a campaign yet</p>
   {% endif %}
 </div>
 
 <div class="panel">
-  <div class="panel-head">Indicators <span class="dim">extracted from this artifact, not published; shown defanged</span></div>
+  <div class="panel-head">Indicators <span class="dim">defanged, not published</span></div>
   {% if scan_state == "done" %}
     {% if iocs %}
-    <div class="table-wrap">
     <table class="table-compact">
       <thead><tr><th>Kind</th><th>Value</th><th>Detail</th></tr></thead>
       <tbody>
         {% for i in iocs %}<tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td></tr>{% endfor %}
       </tbody>
     </table>
-    </div>
     {% else %}
-    <p class="dim">scanned; no indicators found</p>
+    <p class="empty-line">scanned; no indicators found</p>
     {% endif %}
-  {% elif scan_state == "not_text" %}<p class="dim">scanned; no printable strings to read</p>
-  {% elif scan_state == "too_big" %}<p class="dim">not scanned: larger than the indicator scan reads (8 MiB)</p>
-  {% elif scan_state == "missing" %}<p class="dim">not scanned: the body was never found in a spool</p>
-  {% elif scan_state == "pending" %}<p class="dim">queued for scanning</p>
-  {% else %}<p class="dim">not queued: no event has named this sample yet</p>
+  {% elif scan_state == "not_text" %}<p class="empty-line">scanned; no printable strings to read</p>
+  {% elif scan_state == "too_big" %}<p class="empty-line">not scanned: larger than the indicator scan reads (8 MiB)</p>
+  {% elif scan_state == "missing" %}<p class="empty-line">not scanned: the body was never found in a spool</p>
+  {% elif scan_state == "pending" %}<p class="empty-line">queued for scanning</p>
+  {% else %}<p class="empty-line">not queued: no event has named this sample yet</p>
   {% endif %}
 </div>
 {% endblock %}

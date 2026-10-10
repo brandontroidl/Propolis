@@ -139,26 +139,21 @@ async fn sample_transport(
 struct FetchStatusCount {
     label: &'static str,
     count: i64,
-    /// Appended as `stat-card--{variant}` (see `base_head.html`'s `.stat-card--*` rules); empty
-    /// means the plain, uncolored `.stat-card`.
-    variant: &'static str,
 }
 
-/// Display order + labels + color variant for each `fetch_attempt.status` value
+/// Display order + labels for each `fetch_attempt.status` value
 /// (`review::fetcher::FetchStatus::as_str()` - pending/success/dead/rejected/too_big/timeout/
 /// empty). Success first (the outcome an operator scans for), then the retryable failure classes,
-/// then the two terminal/in-progress states. Only `dead` (permanently failed after the retry cap)
-/// gets the alert color; `timeout`/`too_big` are still-retrying failures (attention); `rejected`/
-/// `empty` are expected, benign outcomes (the SSRF guard and empty-body responses are routine, not
-/// alarming) so they stay uncolored; `pending` is neutral in-progress work (info).
-const FETCH_STATUS_DISPLAY: [(&str, &str, &str); 7] = [
-    ("success", "Success", "good"),
-    ("rejected", "Rejected", ""),
-    ("timeout", "Timeout", "attention"),
-    ("too_big", "Too big", "attention"),
-    ("empty", "Empty", ""),
-    ("dead", "Dead", "alert"),
-    ("pending", "Pending", "info"),
+/// then the two terminal/in-progress states. The counts are inventory, so none is coloured: the
+/// console spends colour only on things that want the operator.
+const FETCH_STATUS_DISPLAY: [(&str, &str); 7] = [
+    ("success", "Success"),
+    ("rejected", "Rejected"),
+    ("timeout", "Timeout"),
+    ("too_big", "Too big"),
+    ("empty", "Empty"),
+    ("dead", "Dead"),
+    ("pending", "Pending"),
 ];
 
 /// `GROUP BY status` on `fetch_attempt` - parameterless, so there is no injection surface. Missing
@@ -175,10 +170,9 @@ async fn fetch_status_counts(pool: &sqlx::PgPool) -> Result<Vec<FetchStatusCount
 
     Ok(FETCH_STATUS_DISPLAY
         .iter()
-        .map(|(key, label, variant)| FetchStatusCount {
+        .map(|(key, label)| FetchStatusCount {
             label,
             count: *counts.get(*key).unwrap_or(&0),
-            variant,
         })
         .collect())
 }

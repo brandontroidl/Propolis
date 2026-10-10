@@ -51,19 +51,17 @@
   {% if not searched %}
   <p class="empty-line">enter at least one filter to search</p>
   {% elif ip_rows %}
-    <table class="table-compact">
+    <table class="table-compact stack">
       <thead><tr><th>IP</th><th class="count">Matches</th><th>Score</th><th>Tier</th><th>First seen</th><th>Last seen</th></tr></thead>
       <tbody>
         {% for r in ip_rows %}
         <tr>
-          <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
-          <td class="count">{{ r.match_count }}</td>
+          <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
+          <td class="count" data-label="Matches">{{ r.match_count }}</td>
           <td class="score">{{ m.score_meter(r.score, r.score_pct) }}</td>
-          <td>
-            {{ m.tier_pill(r.tier) }}
-          </td>
-          <td class="seen">{{ r.first_seen }}</td>
-          <td class="seen">{{ r.last_seen }}</td>
+          <td>{{ m.tier_pill(r.tier) }}</td>
+          <td class="seen" data-label="First seen">{{ r.first_seen }}</td>
+          <td class="seen" data-label="Last seen">{{ r.last_seen }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -78,7 +76,7 @@
   {% if not searched %}
   <p class="empty-line">enter at least one filter to search</p>
   {% elif rows %}
-    <table class="table-compact">
+    <table class="table-compact stack">
       <thead><tr><th>Time</th><th>Source IP</th><th>Activity</th><th>Detail</th><th>Session</th></tr></thead>
       <tbody id="search-results-body">
         {% include "search_events_rows.html" %}

@@ -35,25 +35,23 @@
 {% endif %}
 {% if campaigns %}
 <div class="panel campaigns-panel">
-<table class="table-compact">
+<table class="table-compact stack">
   <colgroup><col class="cc-what"><col class="cc-hosts"><col class="cc-spark"><col class="cc-active"><col class="cc-sensors"><col class="cc-delivers"></colgroup>
   <thead>
     <tr><th>Campaign</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Top sensors</th><th>Delivers</th></tr>
   </thead>
   <tbody>
     {% for c in campaigns %}
-    <tr class="crow">
-      <td class="c-what">
+    <tr>
+      <td class="stack-full">
         <a class="c-text mono campaign-label" href="/campaigns/{{ c.id }}" title="{{ c.text }}">{{ c.text }}</a>
         <span class="c-meta"><span class="sev">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ c.tags | length - 4 }}</span>{% endif %}</span>{% endif %}</span>
       </td>
-      <td class="count c-hosts">{{ c.members }}<span class="c-unit"> host{% if c.members != 1 %}s{% endif %}</span></td>
-      <td class="c-spark">
-        {{ m.day_strip(c.spark, spark_days) }}
-      </td>
-      <td class="active-cell c-active" title="{{ c.active_title }}">{{ c.active }}</td>
-      <td class="c-sensors"><span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>
-      <td class="c-delivers">
+      <td class="count" data-label="Hosts">{{ c.members }}</td>
+      <td>{{ m.day_strip(c.spark, spark_days) }}</td>
+      <td class="active-cell stack-end" title="{{ c.active_title }}">{{ c.active }}</td>
+      <td><span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>
+      <td class="stack-end">
         {% if c.first_sample %}{{ m.hash_link(c.first_sample.sha256) }}{% if c.sample_count > 1 %} <span class="dim">+{{ c.sample_count - 1 }} more</span>{% endif %}{% if c.worm %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
         {% else %}<span class="dim">-</span>{% endif %}
       </td>

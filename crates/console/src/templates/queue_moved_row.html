@@ -5,5 +5,5 @@
    underneath. This says where the entry went and links there, which is the one thing the operator
    needs next. #}
 <tr id="row-{{ row.ip }}">
-  <td colspan="8" class="dim"><span class="mono">{{ row.ip }}</span> is now <span class="state-pill state-{{ row.state }}">{{ row.state }}</span> &middot; <a href="/queue?tab={{ row.state }}">open the {{ row.state }} tab</a></td>
+  <td colspan="8" class="dim stack-full"><span class="mono">{{ row.ip }}</span> is now <span class="state-pill state-{{ row.state }}">{{ row.state }}</span> &middot; <a href="/queue?tab={{ row.state }}">open the {{ row.state }} tab</a></td>
 </tr>

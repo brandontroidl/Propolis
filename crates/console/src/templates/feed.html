@@ -32,16 +32,16 @@
 
 {% macro entry_table(rows, empty_text) %}
 {% if rows %}
-<table class="table-compact">
+<table class="table-compact stack">
   <thead><tr><th>IP</th><th>Events</th><th>Activity</th><th>First seen</th><th>Last seen</th></tr></thead>
   <tbody>
     {% for r in rows %}
     <tr>
-      <td class="ip">{{ m.ip_evidence_link(r.ip) }}</td>
-      <td class="mono">{{ r.event_count }}</td>
-      <td class="dim">{{ r.signals }}</td>
-      <td class="seen">{{ r.first_seen }}</td>
-      <td class="seen">{{ r.last_seen }}</td>
+      <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
+      <td class="mono" data-label="Events">{{ r.event_count }}</td>
+      <td class="dim stack-full">{{ r.signals }}</td>
+      <td class="seen" data-label="First seen">{{ r.first_seen }}</td>
+      <td class="seen" data-label="Last seen">{{ r.last_seen }}</td>
     </tr>
     {% endfor %}
   </tbody>

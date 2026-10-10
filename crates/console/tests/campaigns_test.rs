@@ -295,7 +295,7 @@ async fn the_campaign_list_shows_each_campaign_with_its_hosts_and_activity(pool:
     );
     // The command sequence's three hosts, all seen today, make one full-height bar.
     assert!(
-        page.contains("3<span class=\"c-unit\"> hosts</span>"),
+        page.contains("<td class=\"count\" data-label=\"Hosts\">3</td>"),
         "{page}"
     );
     assert!(
@@ -629,9 +629,7 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
         "</tr>",
     );
     assert!(
-        row.contains(&format!(
-            "<a href=\"/campaigns/{sample}\">5<span class=\"c-unit\"> hosts</span></a>"
-        )),
+        row.contains(&format!("<a href=\"/campaigns/{sample}\">5</a>")),
         "host count links the sample's own campaign: {row}"
     );
     assert!(
@@ -1654,6 +1652,18 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
     ] {
         assert_eq!(markup::vocabulary_violations(bad).len(), 1, "{bad}");
     }
+    let link = r#"<a class="insp" href="/ip/192.0.2.1">192.0.2.1</a>"#;
+    let stacked = format!(
+        r#"<table class="table-compact stack"><tbody><tr><td class="ip stack-lead">{link}</td></tr></tbody></table>"#
+    );
+    let scrolling = format!(
+        r#"<table class="table-compact"><tbody><tr><td class="ip">{link}</td></tr></tbody></table>"#
+    );
+    let not_a_row =
+        format!(r#"<table><tbody><tr><td class="mono">{link}</td></tr></tbody></table>"#);
+    assert_eq!(markup::stack_violations(&stacked), Vec::<String>::new());
+    assert_eq!(markup::stack_violations(&not_a_row), Vec::<String>::new());
+    assert_eq!(markup::stack_violations(&scrolling).len(), 1);
 }
 
 /// Every page the console serves, rendered from one database the real indexer filled, keeps the
@@ -1728,6 +1738,7 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
         assert_eq!(status, StatusCode::OK, "{uri}");
         let mut found = markup::panel_violations(&page);
         found.extend(markup::vocabulary_violations(&page));
+        found.extend(markup::stack_violations(&page));
         assert!(found.is_empty(), "{uri}:\n{}", found.join("\n"));
     }
 }

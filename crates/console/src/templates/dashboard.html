@@ -40,7 +40,7 @@
 <div class="panel active-panel">
   <div class="panel-head">Most active <span class="dim">last 24h</span></div>
   {% if most_active %}
-  <table class="table-compact">
+  <table class="table-compact stack">
     <thead><tr>
       <th class="w-150">Address</th>
       <th class="w-190">Activity &middot; 24h</th>
@@ -50,12 +50,12 @@
     </tr></thead>
     <tbody>
       {% for r in most_active %}
-      <tr class="arow">
-        <td class="ip a-ip">{{ m.ip_evidence_link(r.ip) }}</td>
-        <td class="a-strip"><span class="strip">{% for c in r.strip %}<i class="h-{{ c.height }}{% if c.class %} {{ c.class }}{% endif %}"></i>{% endfor %}</span></td>
-        <td class="count a-events">{{ r.event_count }}</td>
-        <td class="a-what"><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
-        <td class="seen dim a-last">{{ r.last_seen }}</td>
+      <tr>
+        <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
+        <td><span class="strip">{% for c in r.strip %}<i class="h-{{ c.height }}{% if c.class %} {{ c.class }}{% endif %}"></i>{% endfor %}</span></td>
+        <td class="count" data-label="Events">{{ r.event_count }}</td>
+        <td class="stack-full"><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
+        <td class="seen dim" data-label="Last seen">{{ r.last_seen }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -105,15 +105,15 @@
 <div class="panel">
   <div class="panel-head">Recent activity <span class="dim">repeats folded</span></div>
   {% if recent_events %}
-  <table class="table-compact">
+  <table class="table-compact stack">
     <thead><tr><th>Last</th><th>Activity</th><th class="count">Events</th><th>Source</th></tr></thead>
     <tbody>
       {% for e in recent_events %}
       <tr>
-        <td class="seen mono"{% if e.count > 1 %} title="{{ e.first_at }} to {{ e.last_at }}"{% endif %}>{{ e.relative_time }}</td>
+        <td class="seen mono stack-end"{% if e.count > 1 %} title="{{ e.first_at }} to {{ e.last_at }}"{% endif %}>{{ e.relative_time }}</td>
         <td>{{ e.activity }}</td>
-        <td class="count">{% if e.count > 1 or e.open_ended %}<span class="run-count">x{{ e.count }}{% if e.open_ended %}+{% endif %}</span>{% else %}<span class="faint">1</span>{% endif %}</td>
-        <td class="ip">{{ m.ip_evidence_link(e.source_ip) }}</td>
+        <td class="count" data-label="Events">{% if e.count > 1 or e.open_ended %}<span class="run-count">x{{ e.count }}{% if e.open_ended %}+{% endif %}</span>{% else %}<span class="faint">1</span>{% endif %}</td>
+        <td class="ip stack-lead">{{ m.ip_evidence_link(e.source_ip) }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -126,16 +126,16 @@
 <div class="panel">
   <div class="panel-head">Recent vendor submissions</div>
   {% if recent_submissions %}
-  <table class="table-compact">
+  <table class="table-compact stack">
     <thead><tr><th>IP</th><th>Vendor</th><th>Submitted</th><th>Result</th></tr></thead>
     <tbody>
       {% for s in recent_submissions %}
       {% if loop.index <= 3 %}
       <tr>
-        <td class="ip">{{ m.ip_evidence_link(s.source_ip) }}</td>
+        <td class="ip stack-lead">{{ m.ip_evidence_link(s.source_ip) }}</td>
         <td>{{ s.vendor }}</td>
         <td class="seen">{{ s.submitted_at }}</td>
-        <td>{% if s.success %}Sent{% else %}<span class="sev sev--watch">Failed</span>{% endif %}</td>
+        <td class="stack-end">{% if s.success %}Sent{% else %}<span class="sev sev--watch">Failed</span>{% endif %}</td>
       </tr>
       {% endif %}
       {% endfor %}

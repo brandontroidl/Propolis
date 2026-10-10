@@ -424,6 +424,25 @@ td.ip a:hover { color: var(--brand); }
 .meter-fill--crit { background: var(--alert); }
 .table-compact th, .table-compact td { padding: 0.45rem 0.75rem; font-size: 0.82rem; }
 .table-compact .meter { width: 44px; height: 4px; }
+/* -- Stacked rows: a table of things (addresses, campaigns, samples) opts in with .stack, and
+   below 640px each row becomes a card rather than a table that scrolls sideways. Cells flow in
+   source order and a cell's data-label names it once the header row is gone; .stack-lead is the
+   row's subject (first, taking the spare width), .stack-end sits at the right of its line,
+   .stack-full takes a line of its own. A header that sorts stays, as the row of its sort links.
+   Tables without .stack scroll inside their panel, as every table did in the original design. -- */
+@media (max-width: 640px) {
+  table.stack, table.stack > tbody, table.stack > thead, table.stack > tbody > tr > td { display: block; width: auto; }
+  table.stack > colgroup, table.stack > thead:not(:has(a)), table.stack > thead th:not(:has(a)) { display: none; }
+  table.stack > tbody > tr, table.stack > thead > tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 0.8rem; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); }
+  table.stack > thead > tr { padding: 0.4rem 0.75rem; background: var(--surface-raised); }
+  table.stack > thead th { padding: 0; border: none; }
+  table.stack > tbody > tr:last-child { border-bottom: none; }
+  table.stack > tbody > tr > td { padding: 0; border: none; text-align: left; white-space: normal; }
+  table.stack td[data-label]::before { content: attr(data-label) " "; font-family: var(--font-sans); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); }
+  table.stack .stack-lead { order: -1; flex: 1 1 auto; min-width: 0; }
+  table.stack .stack-end { margin-left: auto; text-align: right; }
+  table.stack .stack-full { flex-basis: 100%; }
+}
 
 /* -- Session cards (detail page evidence timeline) -- */
 .session-card { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 0.5rem; overflow: hidden; }
@@ -526,23 +545,13 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 @media (min-width: 641px) {
   .qmembers td:first-child { padding-left: 1.6rem; }
 }
-/* Narrow screens: each pending entry becomes a small card (address and score on top, counts under,
-   actions last) instead of a table that would have to scroll sideways. */
+/* Narrow screens: rows stack as .stack cards (Tables); a pending entry's context line stays with
+   it, and a group's header and members stay one block. */
 @media (max-width: 640px) {
-  .queue-panel--pending table, .queue-panel--pending tbody, .queue-panel--pending tr, .queue-panel--pending td { display: block; width: auto; }
-  .queue-panel--pending thead, .queue-panel--pending colgroup { display: none; }
   .queue-panel--pending .qmembers { border-left-width: 2px; }
-  tr.qrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.25rem 0.7rem; align-items: baseline; padding: 0.7rem 0.75rem 0.2rem; }
-  tr.qrow:not(.has-context) { border-bottom: 1px solid var(--border); padding-bottom: 0.7rem; }
-  tr.qrow > td { padding: 0; border: none; }
-  tr.qrow > td.ip { grid-column: 1; grid-row: 1; }
-  tr.qrow > td.score { grid-column: 2; grid-row: 1; }
-  tr.qrow > td.tier-cell { grid-column: 3; grid-row: 1; }
-  tr.qrow > td.count { grid-column: 1; grid-row: 2; text-align: left; font-size: 0.76rem; color: var(--text-muted); }
-  tr.qrow > td.count::after { content: " events"; }
-  tr.qrow > td.active-cell { grid-column: 2 / 4; grid-row: 2; text-align: right; white-space: normal; }
-  tr.qrow > td.actions-cell { grid-column: 1 / -1; grid-row: 3; margin-top: 0.35rem; }
-  tr.queue-context > td { padding: 0 0.75rem 0.7rem; border-bottom: 1px solid var(--border); }
+  table.stack > tbody > tr.has-context { border-bottom: none; padding-bottom: 0.2rem; }
+  table.stack > tbody > tr.queue-context { padding-top: 0; }
+  table.stack > tbody > tr.queue-group { padding: 0; }
   tr.queue-context > td > * { display: inline-block; margin: 0 0.8rem 0.2rem 0; }
   .ctx-what { white-space: normal; display: block !important; }
   .ctx-code { max-width: 100%; }
@@ -575,46 +584,12 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .c-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8rem; color: var(--text); }
 .c-text:hover { color: var(--brand); }
 .c-meta { display: flex; align-items: baseline; gap: 0.5rem; margin-top: 0.15rem; font-size: 0.72rem; }
-.c-unit { display: none; font-size: 0.74rem; font-weight: 400; color: var(--text-muted); }
 .c-sub { display: block; font-size: 0.72rem; color: var(--text-faint); }
 .s-hash a { color: var(--text); }
 .samples-panel td.ip { white-space: normal; }
 @media (max-width: 640px) {
-  .campaigns-panel table, .campaigns-panel tbody, .campaigns-panel tr, .campaigns-panel td,
-  .samples-panel table, .samples-panel tbody, .samples-panel tr, .samples-panel td { display: block; width: auto; }
-  .campaigns-panel thead, .campaigns-panel colgroup, .samples-panel thead, .samples-panel colgroup { display: none; }
-  tr.crow, tr.srow { display: grid; gap: 0.35rem 0.8rem; align-items: center; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); }
-  tr.crow > td, tr.srow > td { padding: 0; border: none; }
-  tr.crow { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "what what what" "hosts spark active" "sensors sensors delivers"; }
-  tr.crow > td.c-what { grid-area: what; }
-  tr.crow > td.c-hosts { grid-area: hosts; text-align: left; }
-  tr.crow > td.c-spark { grid-area: spark; }
-  tr.crow > td.c-active { grid-area: active; text-align: right; white-space: normal; }
-  tr.crow > td.c-sensors { grid-area: sensors; }
-  tr.crow > td.c-delivers { grid-area: delivers; text-align: right; }
-  .c-unit { display: inline; }
   .c-text { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-  tr.srow { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "hash vt" "hosts active" "spark by" "src src" "tr dl"; }
-  tr.srow > td.s-hash { grid-area: hash; }
-  tr.srow > td.s-vt { grid-area: vt; text-align: right; }
-  tr.srow > td.s-hosts { grid-area: hosts; text-align: left; }
-  tr.srow > td.s-active { grid-area: active; text-align: right; white-space: normal; }
-  tr.srow > td.s-spark { grid-area: spark; }
-  tr.srow > td.s-by { grid-area: by; text-align: right; }
-  tr.srow > td.s-src { grid-area: src; }
-  tr.srow > td.s-tr { grid-area: tr; }
-  tr.srow > td.s-dl { grid-area: dl; text-align: right; }
   .samples-panel .na { display: none; }
-  /* Most active: address and event count on top, the 24h strip and last seen under, the tags last. */
-  .active-panel table, .active-panel tbody, .active-panel tr, .active-panel td { display: block; width: auto; }
-  .active-panel thead, .active-panel colgroup { display: none; }
-  tr.arow { display: grid; gap: 0.35rem 0.8rem; align-items: center; padding: 0.7rem 0.75rem; border-bottom: 1px solid var(--border); grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "ip events" "strip last" "what what"; }
-  tr.arow > td { padding: 0; border: none; }
-  tr.arow > td.a-ip { grid-area: ip; }
-  tr.arow > td.a-events { grid-area: events; text-align: right; }
-  tr.arow > td.a-strip { grid-area: strip; }
-  tr.arow > td.a-last { grid-area: last; text-align: right; white-space: normal; }
-  tr.arow > td.a-what { grid-area: what; }
 }
 
 /* -- Attackers paging and the tier/score note above the table -- */

@@ -23,7 +23,7 @@ rest.</p>
   {% endfor %}
 </nav>
 <div class="panel queue-panel queue-panel--pending">
-<table class="table-compact">
+<table class="table-compact stack">
   {{ m.queue_cols() }}
   <thead>
     <tr>
@@ -39,7 +39,7 @@ rest.</p>
     {% for item in items %}
     {% if item.group %}{% set g = item.group %}
     <tr class="queue-group" id="group-{{ g.id }}">
-      <td colspan="6">
+      <td colspan="6" class="stack-full">
         <details class="qgroup">
           <summary>
             <span class="qg-title">
@@ -52,7 +52,7 @@ rest.</p>
               <a class="btn btn-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending }}&hellip;</a>
             </span>
           </summary>
-          <table class="table-compact qmembers">
+          <table class="table-compact stack qmembers">
             {{ m.queue_cols() }}
             <tbody>
               {% for row in g.rows %}{% include "queue_row.html" %}{% endfor %}
@@ -68,7 +68,7 @@ rest.</p>
 </div>
 {% elif tab != "pending" and rows %}
 <div class="panel queue-panel">
-<table class="table-compact">
+<table class="table-compact stack">
   <thead>
     <tr>
       <th>IP</th>

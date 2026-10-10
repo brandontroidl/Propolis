@@ -184,6 +184,32 @@ pub fn vocabulary_violations(html: &str) -> Vec<String> {
     out
 }
 
+/// Every table of addresses that would scroll sideways on a phone: a row whose address cell holds
+/// an evidence link is a row about an attacker, and every such table stacks as cards (`.stack`)
+/// so an address reads the same on Review, Attackers, Search and the dashboard. Four tables had
+/// hand-built card layouts and the rest scrolled.
+pub fn stack_violations(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    walk(
+        html,
+        |chain, e| {
+            let in_ip_cell = chain.last().is_some_and(|p| p.name == "td" && p.has("ip"));
+            if e.name == "a" && e.has("insp") && in_ip_cell {
+                let table = chain.iter().rev().find(|p| p.name == "table");
+                if !table.is_some_and(|t| t.has("stack")) {
+                    out.push(format!(
+                        "address table without .stack: {}",
+                        table.map_or("<none>".into(), Element::describe)
+                    ));
+                }
+            }
+        },
+        |_, _| {},
+    );
+    out.dedup();
+    out
+}
+
 /// Asserts the page keeps the panel contract, naming every violation at once.
 pub fn assert_panels(html: &str) {
     let found = panel_violations(html);

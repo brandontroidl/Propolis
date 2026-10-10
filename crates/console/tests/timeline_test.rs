@@ -519,8 +519,9 @@ async fn a_full_first_page_says_it_is_the_newest_events_and_uses_singulars(pool:
     );
 }
 
-/// Below 640 px the Most active table becomes one card per address (console.css, `tr.arow`): a
-/// row that lost its cell classes would fall back to a five-column table that overflows a phone.
+/// Below 640 px the Most active table becomes one card per address (console.css, `table.stack`):
+/// a table or row that lost its stacking roles would fall back to a five-column table that
+/// overflows a phone.
 #[sqlx::test(migrations = false)]
 async fn most_active_rows_carry_the_classes_the_narrow_layout_places(pool: PgPool) {
     migrate(&pool).await;
@@ -528,9 +529,18 @@ async fn most_active_rows_carry_the_classes_the_narrow_layout_places(pool: PgPoo
     scored(&pool, ip).await;
     let body = page(pool, "/").await;
     let panel = &body[body.find("active-panel").expect("panel class")..];
+    assert!(
+        panel.contains(r#"<table class="table-compact stack">"#),
+        "{panel}"
+    );
     let row = row(panel, ip);
-    for class in ["arow", "a-ip", "a-strip", "a-events", "a-what", "a-last"] {
-        assert!(row.contains(class), "{class} missing: {row}");
+    for role in [
+        r#"class="ip stack-lead""#,
+        r#"data-label="Events""#,
+        r#"class="stack-full""#,
+        r#"data-label="Last seen""#,
+    ] {
+        assert!(row.contains(role), "{role} missing: {row}");
     }
 }
 

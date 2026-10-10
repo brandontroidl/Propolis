@@ -19,7 +19,7 @@
 <div class="panel">
 <div class="panel-head">Addresses{% if shown > 0 %} <span class="dim">showing {{ shown_from }}-{{ shown_to }}{% if not position_exact %} (position estimated){% endif %} of {% if total_exact %}{{ total }}{% else %}about {{ total }} (estimate){% endif %} scored addresses</span>{% endif %}</div>
 {% if shown > 0 %}
-<table class="table-compact">
+<table class="table-compact stack">
   <thead>
     <tr>
       <th class="count"><a href="/ips?sort=score&dir={% if sort == 'score' and dir == 'desc' %}asc{% else %}desc{% endif %}">Score{% if sort == 'score' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
@@ -37,14 +37,14 @@
     {% for ip in ips %}
     <tr>
       <td class="count score">{{ m.score_meter(ip.raw_score, ip.score_pct) }}</td>
-      <td class="ip">{{ m.ip_evidence_link(ip.ip) }}</td>
+      <td class="ip stack-lead">{{ m.ip_evidence_link(ip.ip) }}</td>
       <td>{{ m.tier_pill(ip.tier) }}</td>
-      <td class="count">{{ ip.event_count }}</td>
-      <td class="mono">{{ ip.distinct_categories }}</td>
-      <td class="mono">{{ ip.distinct_wan_count }}</td>
-      <td class="dim">{{ ip.first_seen }}</td>
-      <td><span class="dim" title="{{ ip.last_seen }}">{{ ip.last_seen_relative }}</span></td>
-      <td>{{ m.yes_no(ip.eligible) }}</td>
+      <td class="count" data-label="Events">{{ ip.event_count }}</td>
+      <td class="mono" data-label="Categories">{{ ip.distinct_categories }}</td>
+      <td class="mono" data-label="WANs">{{ ip.distinct_wan_count }}</td>
+      <td class="dim" data-label="First seen">{{ ip.first_seen }}</td>
+      <td data-label="Last seen"><span class="dim" title="{{ ip.last_seen }}">{{ ip.last_seen_relative }}</span></td>
+      <td data-label="Eligible">{{ m.yes_no(ip.eligible) }}</td>
     </tr>
     {% endfor %}
   </tbody>

@@ -93,16 +93,16 @@
 
 <div class="panel">
   <div class="panel-head">Members <span class="dim">{{ member_count }}{% if member_count > member_limit %}, most recent {{ member_limit }} shown{% endif %}</span></div>
-  <table class="table-compact">
+  <table class="table-compact stack">
     <thead><tr><th>Address</th><th>First seen</th><th>Last seen</th><th class="count">Sightings</th><th>Review</th></tr></thead>
     <tbody>
       {% for mbr in members %}
       <tr>
-        <td class="ip">{{ m.ip_evidence_link(mbr.ip) }}{% if mbr.uploaded and kind_value == "sample" %} <span class="dim">uploaded</span>{% endif %}</td>
-        <td class="seen">{{ mbr.first_seen }}</td>
-        <td class="seen">{{ mbr.last_seen }}</td>
-        <td class="count">{{ mbr.sightings }}</td>
-        <td>{% if mbr.review %}<span class="state-pill state-{{ mbr.review }}">{{ mbr.review }}</span>{% else %}<span class="dim">not queued</span>{% endif %}</td>
+        <td class="ip stack-lead">{{ m.ip_evidence_link(mbr.ip) }}{% if mbr.uploaded and kind_value == "sample" %} <span class="dim">uploaded</span>{% endif %}</td>
+        <td class="seen" data-label="First seen">{{ mbr.first_seen }}</td>
+        <td class="seen" data-label="Last seen">{{ mbr.last_seen }}</td>
+        <td class="count" data-label="Sightings">{{ mbr.sightings }}</td>
+        <td class="stack-end">{% if mbr.review %}<span class="state-pill state-{{ mbr.review }}">{{ mbr.review }}</span>{% else %}<span class="dim">not queued</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

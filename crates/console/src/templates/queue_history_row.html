@@ -1,19 +1,19 @@
 {% import "macros.html" as m %}
 <tr id="row-{{ row.ip }}">
-  <td class="ip">{{ m.ip_evidence_link(row.ip) }}</td>
+  <td class="ip stack-lead">{{ m.ip_evidence_link(row.ip) }}</td>
   <td class="score">{{ m.score_meter(row.score, row.score_pct) }}</td>
   <td>
     {{ m.tier_pill(row.tier) }}
   </td>
-  <td class="count">{{ row.event_count }}</td>
-  <td class="seen">{{ row.decided_at }}</td>
-  {% if row.state == "approved" %}<td>{{ row.submissions }}</td>{% endif %}
-  <td class="dim">{{ row.notes }}</td>
+  <td class="count" data-label="Events">{{ row.event_count }}</td>
+  <td class="seen stack-end" data-label="Decided">{{ row.decided_at }}</td>
+  {% if row.state == "approved" %}<td data-label="Submissions">{{ row.submissions }}</td>{% endif %}
+  <td class="dim stack-full">{{ row.notes }}</td>
   {# A snooze promises a later decision, and nothing re-surfaces a decided entry on its own, so
      this tab is the only place that decision can be made. A Snoozed row without these controls
      turns "decide later" into "never" without ever saying so. #}
   {% if row.state == "snoozed" %}
-  <td>
+  <td class="stack-full">
     <div class="actions">
       <input type="hidden" name="csrf_token" value="{{ row.csrf_token }}">
       {# Tells the handler the row was acted on from a history tab, so it answers with the

@@ -1734,7 +1734,7 @@ async fn queue_page_table_uses_compact_class(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_text(response).await;
     assert!(
-        body.contains(r#"<table class="table-compact">"#),
+        body.contains(r#"<table class="table-compact stack">"#),
         "expected the queue table to use the compact density class: {body}"
     );
 }
@@ -1889,7 +1889,7 @@ async fn queue_approved_tab_shows_dash_when_no_submissions_yet(pool: PgPool) {
         "approved IP missing from the approved tab: {body}"
     );
     assert!(
-        body.contains("<td>-</td>"),
+        body.contains(r#"<td data-label="Submissions">-</td>"#),
         "expected a dash submission summary for an IP with no vendor_submission rows yet: {body}"
     );
 }
@@ -7542,7 +7542,7 @@ async fn seed_scored_population(pool: &PgPool, n: i32) {
 
 /// The addresses an Attackers page lists, in order.
 fn listed_ips(body: &str) -> Vec<String> {
-    body.split(r#"<td class="ip"><a class="insp" href="/ip/"#)
+    body.split(r#"<td class="ip stack-lead"><a class="insp" href="/ip/"#)
         .skip(1)
         .map(|rest| rest[..rest.find('"').unwrap()].to_string())
         .collect()
@@ -7661,7 +7661,7 @@ async fn attackers_pages_through_every_address_once_in_live_score_order(pool: Pg
     let after = pager_param(&ev1, "Next &rarr;", "after").unwrap();
     let (_, ev2) = get_page(state, &format!("/ips?sort=events&dir=asc&after={after}")).await;
     let counts = |body: &str| -> Vec<i64> {
-        body.split(r#"<td class="count">"#)
+        body.split(r#"<td class="count" data-label="Events">"#)
             .skip(1)
             .filter(|r| !r.starts_with('<'))
             .map(|r| r[..r.find('<').unwrap()].parse().unwrap())

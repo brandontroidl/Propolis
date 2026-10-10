@@ -1,10 +1,10 @@
 {% import "macros.html" as m %}
 {% for r in rows %}
 <tr>
-  <td class="seen">{{ r.observed_at }}</td>
-  <td class="ip">{{ m.ip_evidence_link(r.source_ip) }}</td>
+  <td class="seen stack-end">{{ r.observed_at }}</td>
+  <td class="ip stack-lead">{{ m.ip_evidence_link(r.source_ip) }}</td>
   <td>{{ r.activity }}</td>
-  <td class="mono">{{ r.detail }}</td>
-  <td>{% if r.session_id %}<a href="/ip/{{ r.source_ip }}#session-{{ r.session_id }}" class="mono">{{ r.session_short }}&hellip;</a>{% else %}<span class="dim">-</span>{% endif %}</td>
+  <td class="mono stack-full">{{ r.detail }}</td>
+  <td data-label="Session">{% if r.session_id %}<a href="/ip/{{ r.source_ip }}#session-{{ r.session_id }}" class="mono">{{ r.session_short }}&hellip;</a>{% else %}<span class="dim">-</span>{% endif %}</td>
 </tr>
 {% endfor %}

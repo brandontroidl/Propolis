@@ -236,7 +236,7 @@ pub(super) fn lex_body(
 }
 
 fn syntax(near: Near, line: Line) -> LexError {
-    LexError::Syntax(SyntaxError { near, line })
+    LexError::Syntax(SyntaxError::new(near, line))
 }
 
 impl Lexer<'_, '_> {
@@ -270,6 +270,29 @@ impl Lexer<'_, '_> {
             syntax(Near::EndOfFile, self.line)
         } else {
             LexError::NeedMore
+        }
+    }
+
+    /// [`Self::incomplete`] for a construct dash has its own complaint for when the text ends
+    /// inside it (`Unterminated quoted string`); the other shells just meet the end of the text.
+    fn incomplete_with(&self, dash: &'static str) -> LexError {
+        if self.at_eof && self.dialect == Dialect::Posix {
+            syntax(Near::Message(dash), self.line)
+        } else {
+            self.incomplete()
+        }
+    }
+
+    /// [`Self::incomplete`] for text that ends inside `$( ... )`, where dash names the `)` it
+    /// wanted.
+    fn incomplete_paren(&self) -> LexError {
+        if self.at_eof && self.dialect == Dialect::Posix {
+            LexError::Syntax(SyntaxError {
+                expecting: Some("\")\""),
+                ..SyntaxError::new(Near::EndOfFile, self.line)
+            })
+        } else {
+            self.incomplete()
         }
     }
 
@@ -366,7 +389,9 @@ impl Lexer<'_, '_> {
                         if !self.at_eof {
                             return Err(LexError::NeedMore);
                         }
-                        self.bump();
+                        // A lone backslash that ends a script is the word it is (`echo \` prints
+                        // it, in dash and in bash); the word scanner takes it from here.
+                        return Ok(());
                     }
                     Some(_) => return Ok(()),
                 },
@@ -379,7 +404,8 @@ impl Lexer<'_, '_> {
     fn io_number(&mut self) -> Option<u16> {
         let rest = self.src.get(self.i..)?;
         let digits = rest.chars().take_while(char::is_ascii_digit).count();
-        if digits == 0 {
+        // dash takes one digit for a descriptor; `10>f` is the word `10` and a redirection.
+        if digits == 0 || (self.dialect == Dialect::Posix && digits != 1) {
             return None;
         }
         let after = rest.chars().nth(digits)?;
@@ -394,7 +420,10 @@ impl Lexer<'_, '_> {
     /// `<(..)` and `>(..)`: a process substitution, outside the subset.
     fn process_substitution(&mut self) -> Result<Option<Word>, LexError> {
         let c = self.peek();
-        if !matches!(c, Some('<' | '>')) || self.peek_at(1) != Some('(') {
+        if self.dialect == Dialect::Posix
+            || !matches!(c, Some('<' | '>'))
+            || self.peek_at(1) != Some('(')
+        {
             return Ok(None);
         }
         let start = self.i;
@@ -444,14 +473,16 @@ impl Lexer<'_, '_> {
             ('&', Some('&')) => take(self, Op::AndIf),
             ('&', _) => Op::Amp,
             ('|', Some('|')) => take(self, Op::OrIf),
-            ('|', Some('&')) => take(self, Op::PipeAmp),
+            ('|', Some('&')) if self.dialect == Dialect::Bash => take(self, Op::PipeAmp),
             ('|', _) => Op::Pipe,
             ('(', _) => Op::LParen,
             (')', _) => Op::RParen,
             ('<', Some('<')) => {
                 self.bump();
                 match self.peek() {
-                    Some('<') => take(self, Op::TLess),
+                    // dash has no here-string: `<<<` is `<<` and then a `<` where its word
+                    // should be.
+                    Some('<') if self.dialect == Dialect::Bash => take(self, Op::TLess),
                     Some('-') => {
                         self.bump();
                         self.here_op(true)
@@ -527,7 +558,11 @@ impl Lexer<'_, '_> {
             match mode {
                 Mode::Word if is_meta(c) => {
                     // `name=(` opens an array value, which the word keeps consuming.
-                    if c == '(' && parts.is_empty() && is_array_assignment(&lit) {
+                    if c == '('
+                        && parts.is_empty()
+                        && self.dialect == Dialect::Bash
+                        && is_array_assignment(&lit)
+                    {
                         self.bump();
                         self.skip_balanced_parens()?;
                         flush(&mut lit, &mut parts);
@@ -579,7 +614,7 @@ impl Lexer<'_, '_> {
                     self.bump();
                     let rest = self.src.get(self.i..).unwrap_or("");
                     let Some(end) = rest.find('\'') else {
-                        return Err(self.incomplete());
+                        return Err(self.incomplete_with("Unterminated quoted string"));
                     };
                     let text = rest.get(..end).unwrap_or("").to_string();
                     self.advance_bytes(end.saturating_add(1));
@@ -590,7 +625,7 @@ impl Lexer<'_, '_> {
                     self.bump();
                     let inner = self.nested(|lexer| lexer.scan_parts(Mode::Double))?;
                     if self.peek() != Some('"') {
-                        return Err(self.incomplete());
+                        return Err(self.incomplete_with("Unterminated quoted string"));
                     }
                     self.bump();
                     flush(&mut lit, &mut parts);
@@ -599,7 +634,7 @@ impl Lexer<'_, '_> {
                 '`' => {
                     self.bump();
                     let inner = self.backtick_body()?;
-                    let list = self.nested_parse(&inner)?;
+                    let list = self.nested_parse(&inner, "`")?;
                     flush(&mut lit, &mut parts);
                     parts.push(WordPart::CmdSub(list));
                 }
@@ -619,7 +654,13 @@ impl Lexer<'_, '_> {
                     }
                 }
                 '{' if mode == Mode::Word => {
-                    if let Some(len) = self.brace_expansion_len() {
+                    // dash has no brace expansion: `{a,b}` stays the text it is.
+                    let expansion = if self.dialect == Dialect::Bash {
+                        self.brace_expansion_len()
+                    } else {
+                        None
+                    };
+                    if let Some(len) = expansion {
                         flush(&mut lit, &mut parts);
                         self.advance_bytes(len);
                         parts.push(WordPart::Unsupported(UnsupportedKind::BraceExpansion));
@@ -652,19 +693,33 @@ impl Lexer<'_, '_> {
         result
     }
 
-    fn nested_parse(&mut self, text: &str) -> Result<List, LexError> {
+    /// Parse the text of a substitution closed by `closer` (`)` or a backtick). dash's parser
+    /// reads the substitution inline, so the closer is the token it meets where the text stops
+    /// short, and the one every other complaint inside says it was waiting for.
+    fn nested_parse(&mut self, text: &str, closer: &'static str) -> Result<List, LexError> {
         if self.depth >= self.max_depth {
             return Err(LexError::TooDeep);
         }
         let line = self.base_line.saturating_add(self.line).saturating_sub(1);
-        super::parse::parse_nested(
+        let parsed = super::parse::parse_nested(
             text,
             line,
             self.depth.saturating_add(1),
             self.max_depth,
             self.dialect,
             self.budget,
-        )
+        );
+        match parsed {
+            Err(LexError::Syntax(mut error)) if self.dialect == Dialect::Posix => {
+                if error.near == Near::EndOfFile {
+                    error.near = Near::Token(closer.to_string());
+                } else if error.expecting.is_none() && !matches!(error.near, Near::Message(_)) {
+                    error.expecting = Some(if closer == ")" { "\")\"" } else { "\"`\"" });
+                }
+                Err(LexError::Syntax(error))
+            }
+            other => other,
+        }
     }
 
     /// The text of a backtick command substitution, with the backslash escapes it allows removed.
@@ -672,7 +727,7 @@ impl Lexer<'_, '_> {
         let mut body = String::new();
         loop {
             match self.bump() {
-                None => return Err(self.incomplete()),
+                None => return Err(self.incomplete_with("EOF in backquote substitution")),
                 Some('`') => return Ok(body),
                 Some('\\') => match self.peek() {
                     Some(next @ ('$' | '`' | '\\')) => {
@@ -714,10 +769,17 @@ impl Lexer<'_, '_> {
                 self.bump();
                 let rest = self.src.get(self.i..).unwrap_or("");
                 let Some(end) = scan_paren_end(rest) else {
-                    return Err(self.incomplete());
+                    // `$((` is dash's arithmetic opener, and it wants the `))`.
+                    return Err(if rest.starts_with('(') {
+                        self.incomplete_with("Missing '))'")
+                    } else if ends_inside_quote(rest) {
+                        self.incomplete_with("Unterminated quoted string")
+                    } else {
+                        self.incomplete_paren()
+                    });
                 };
                 let inner = rest.get(..end).unwrap_or("").to_string();
-                let list = self.nested_parse(&inner)?;
+                let list = self.nested_parse(&inner, ")")?;
                 self.advance_bytes(end.saturating_add(1));
                 Ok(vec![WordPart::CmdSub(list)])
             }
@@ -725,7 +787,7 @@ impl Lexer<'_, '_> {
                 self.bump();
                 self.braced_param()
             }
-            '\'' if matches!(mode, Mode::Word | Mode::Brace) => {
+            '\'' if matches!(mode, Mode::Word | Mode::Brace) && self.dialect == Dialect::Bash => {
                 self.bump();
                 let mut escaped = false;
                 loop {
@@ -835,12 +897,19 @@ impl Lexer<'_, '_> {
             }
             _ => None,
         };
-        let unsupported = |lexer: &mut Self| -> Result<Vec<WordPart>, LexError> {
+        let unsupported = |lexer: &mut Self, named: bool| -> Result<Vec<WordPart>, LexError> {
+            // dash refuses a `${` its parser cannot read (`${}`, `${a:1}`, `${a/x/y}`, `${a,,}`)
+            // when the word is expanded.
+            let bad = lexer.dialect == Dialect::Posix && !lexer.dash_param_op_follows(named);
             lexer.skip_braced()?;
-            Ok(vec![WordPart::Unsupported(UnsupportedKind::ParamOp)])
+            Ok(vec![WordPart::Unsupported(if bad {
+                UnsupportedKind::BadSubstitution
+            } else {
+                UnsupportedKind::ParamOp
+            })])
         };
         let Some(name) = parsed else {
-            return unsupported(self);
+            return unsupported(self, false);
         };
         match self.peek() {
             Some('}') => {
@@ -859,7 +928,29 @@ impl Lexer<'_, '_> {
                 self.bump();
                 self.param_default(name, false)
             }
-            _ => unsupported(self),
+            _ => unsupported(self, true),
+        }
+    }
+
+    /// Whether the text just after `${` (or after `${name`, when `named`) is a form dash's parser
+    /// reads, so that only the forms it refuses are `Bad substitution`.
+    fn dash_param_op_follows(&self, named: bool) -> bool {
+        let rest = self.src.get(self.i..).unwrap_or("");
+        let mut chars = rest.chars();
+        if named {
+            return match chars.next() {
+                Some('#' | '%' | '=' | '?' | '+') => true,
+                Some(':') => matches!(chars.next(), Some('-' | '=' | '?' | '+')),
+                _ => false,
+            };
+        }
+        match chars.next() {
+            Some('#') => chars.next().is_some_and(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '?' | '$' | '!' | '@' | '*' | '#' | '-')
+            }),
+            Some('-') => chars.next() == Some('}'),
+            _ => false,
         }
     }
 
@@ -867,7 +958,7 @@ impl Lexer<'_, '_> {
         let start = self.i;
         let parts = self.nested(|lexer| lexer.scan_parts(Mode::Brace))?;
         if self.peek() != Some('}') {
-            return Err(self.incomplete());
+            return Err(self.incomplete_with("Missing '}'"));
         }
         let raw = self.src.get(start..self.i).unwrap_or("").to_string();
         self.bump();
@@ -885,7 +976,7 @@ impl Lexer<'_, '_> {
         let mut depth = 1u32;
         loop {
             match self.bump() {
-                None => return Err(self.incomplete()),
+                None => return Err(self.incomplete_with("Missing '}'")),
                 Some('\\') => {
                     self.bump();
                 }
@@ -1029,6 +1120,23 @@ fn scan_paren_end(rest: &str) -> Option<usize> {
         prev = c;
     }
     None
+}
+
+/// Whether `rest`, the text of an unclosed `$(`, stops inside a quote.
+fn ends_inside_quote(rest: &str) -> bool {
+    let (mut single, mut double) = (false, false);
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !single => {
+                chars.next();
+            }
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ => {}
+        }
+    }
+    single || double
 }
 
 /// The length of the expression in `$(( expr ))` when `rest` (just after `$((`) closes with `))`.

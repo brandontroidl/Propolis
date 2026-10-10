@@ -359,7 +359,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   pattern matches (unquoted `*`, `?` and `[..]` glob, a quoted one is literal, a `/` matches);
   no match is status 0. Constructs outside this subset (`[[ ]]`, `(( ))`, `coproc`, `$'..'`,
   `${x##*/}`, brace expansion, `<<<`, arrays, process substitution) parse and are skipped with
-  status 0 and no output; what bash and dash also reject prints their syntax error and status 2.
+  status 0 and no output (under dash, which has none of `[[ ]]`, `(( ))`, `coproc`, `$'..'`,
+  brace expansion, `<<<`, `|&` or arrays, those read as the plain text or subshells dash reads); what
+  bash and dash also reject prints their syntax error and status 2. dash's wording is its own
+  (`crates/sensor-framework/src/shell/eval.rs#FakeShell::syntax_error_text`): `word unexpected`
+  for a plain word, a quoted name for a reserved word or operator, `(expecting "fi")` where the
+  grammar waited for one token, `end of file unexpected`, and the fixed complaints
+  `Bad for loop variable`, `Unterminated quoted string`, `EOF in backquote substitution`,
+  `Missing '}'` and `Missing '))'`; `Bad fd number`, `Bad substitution` and an arithmetic
+  division by zero end the shell with status 2 when the word runs.
   `read`, `export`, `unset`, `set`, `shift`, `umask`, `break`, `continue`, `return`, `local`,
   `builtin`, `cd`, `exit` act on the shell itself
   (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.

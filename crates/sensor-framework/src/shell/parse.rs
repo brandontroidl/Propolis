@@ -104,11 +104,26 @@ pub(super) fn parse_unit(
     let (items, outcome) = parser.program();
     let tail = match outcome {
         Ok(()) => Tail::Done,
-        Err(PErr::Need) if at_eof => Tail::Error(SyntaxError {
-            near: Near::EndOfFile,
-            line: last_line(&lexed.tokens),
+        Err(PErr::Need) if at_eof => {
+            Tail::Error(SyntaxError::new(Near::EndOfFile, last_line(&lexed.tokens)))
+        }
+        Err(PErr::NeedExp(expecting)) if at_eof => Tail::Error(SyntaxError {
+            expecting: Some(expecting),
+            ..SyntaxError::new(Near::EndOfFile, last_line(&lexed.tokens))
         }),
-        Err(PErr::Need) => Tail::NeedMore,
+        Err(PErr::NeedMsg(message)) if at_eof => Tail::Error(SyntaxError::new(
+            Near::Message(message),
+            last_line(&lexed.tokens),
+        )),
+        Err(PErr::EndOrNewline) => Tail::Error(SyntaxError::new(
+            if at_eof {
+                Near::EndOfFile
+            } else {
+                Near::Newline
+            },
+            last_line(&lexed.tokens),
+        )),
+        Err(PErr::Need | PErr::NeedExp(_) | PErr::NeedMsg(_)) => Tail::NeedMore,
         Err(PErr::Syntax(error)) => Tail::Error(error),
         Err(PErr::TooDeep) => Tail::TooDeep,
     };
@@ -142,9 +157,21 @@ pub(super) fn parse_nested(
     match outcome {
         Ok(()) => Ok(List { items }),
         Err(PErr::Syntax(error)) => Err(LexError::Syntax(error)),
-        Err(PErr::Need) => Err(LexError::Syntax(SyntaxError {
-            near: Near::EndOfFile,
-            line: last_line(&lexed.tokens),
+        Err(PErr::Need) => Err(LexError::Syntax(SyntaxError::new(
+            Near::EndOfFile,
+            last_line(&lexed.tokens),
+        ))),
+        Err(PErr::EndOrNewline) => Err(LexError::Syntax(SyntaxError::new(
+            Near::EndOfFile,
+            last_line(&lexed.tokens),
+        ))),
+        Err(PErr::NeedMsg(message)) => Err(LexError::Syntax(SyntaxError::new(
+            Near::Message(message),
+            last_line(&lexed.tokens),
+        ))),
+        Err(PErr::NeedExp(expecting)) => Err(LexError::Syntax(SyntaxError {
+            expecting: Some(expecting),
+            ..SyntaxError::new(Near::EndOfFile, last_line(&lexed.tokens))
         })),
         Err(PErr::TooDeep) => Err(LexError::TooDeep),
     }
@@ -158,6 +185,14 @@ fn last_line(tokens: &[Token]) -> Line {
 enum PErr {
     /// The tokens end before the construct does.
     Need,
+    /// The same, in a place where dash names what it was waiting for.
+    NeedExp(&'static str),
+    /// The same, where dash has a fixed complaint for the end of the text (`Bad for loop
+    /// variable`).
+    NeedMsg(&'static str),
+    /// A redirection with no target, in dash: the end of the text when it is a script's last word,
+    /// a newline when it is a typed line.
+    EndOrNewline,
     Syntax(SyntaxError),
     TooDeep,
 }
@@ -171,6 +206,35 @@ enum Stop {
     RParen,
     /// The body of a `case` arm: ends at `;;` or at `esac`.
     CaseArm,
+}
+
+/// What dash says a list was waiting for when it ended some other way: the keyword that closes
+/// the construct the list belongs to.
+fn stop_expecting(stop: Stop) -> &'static str {
+    match stop {
+        Stop::Words(words) => match words.first() {
+            Some(&"then") => "\"then\"",
+            Some(&"elif") | Some(&"fi") => "\"fi\"",
+            Some(&"do") => "\"do\"",
+            Some(&"done") => "\"done\"",
+            _ => "\"}\"",
+        },
+        Stop::RParen => "\")\"",
+        Stop::CaseArm => "\";;\"",
+    }
+}
+
+/// A keyword as dash's `(expecting ...)` writes it.
+fn quoted_keyword(word: &str) -> &'static str {
+    match word {
+        "then" => "\"then\"",
+        "fi" => "\"fi\"",
+        "do" => "\"do\"",
+        "done" => "\"done\"",
+        "in" => "\"in\"",
+        "esac" => "\"esac\"",
+        _ => "\"}\"",
+    }
 }
 
 struct Parser<'a> {
@@ -236,27 +300,85 @@ impl Parser<'_> {
     fn unexpected(&self) -> PErr {
         match self.peek() {
             None => PErr::Need,
+            Some(tok) => PErr::Syntax(SyntaxError::new(self.near_of(tok), tok.line)),
+        }
+    }
+
+    /// [`Self::unexpected`] where the grammar was waiting for `expecting` (dash's
+    /// `(expecting "fi")`; the end of the text is then a request for more input that names it).
+    fn unexpected_exp(&self, expecting: &'static str) -> PErr {
+        match self.peek() {
+            None => PErr::NeedExp(expecting),
             Some(tok) => PErr::Syntax(SyntaxError {
-                near: match &tok.tok {
-                    Tok::Newline => Near::Newline,
-                    Tok::Op(op) => Near::Token(op.text().to_string()),
-                    Tok::Word(word) => Near::Token(word.raw.clone()),
-                    Tok::IoNumber(n) => Near::Token(n.to_string()),
-                },
-                line: tok.line,
+                expecting: Some(expecting),
+                ..SyntaxError::new(self.near_of(tok), tok.line)
             }),
         }
+    }
+
+    /// How a token that cannot appear here is named. A word that is not a reserved word is
+    /// `Near::Word`: bash writes it out, dash only says `word`.
+    fn near_of(&self, tok: &Token) -> Near {
+        match &tok.tok {
+            Tok::Newline => Near::Newline,
+            Tok::Op(op) => Near::Token(op.text().to_string()),
+            Tok::Word(word) if keyword(tok).is_some_and(|k| self.is_reserved(k)) => {
+                Near::Token(word.raw.clone())
+            }
+            Tok::Word(word) => Near::Word(word.raw.clone()),
+            Tok::IoNumber(n) => Near::Token(n.to_string()),
+        }
+    }
+
+    /// The words dash's tokenizer returns as keywords where one may start a command.
+    fn is_reserved(&self, word: &str) -> bool {
+        matches!(
+            word,
+            "if" | "then"
+                | "elif"
+                | "else"
+                | "fi"
+                | "while"
+                | "until"
+                | "for"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "in"
+                | "!"
+                | "{"
+                | "}"
+        ) || (self.dialect == Dialect::Bash && matches!(word, "[[" | "]]" | "function" | "time"))
     }
 
     /// A redirection with no target is a complaint about the end of the line, as bash words it,
     /// not a request for more input.
     fn missing_target(&self) -> PErr {
         match self.peek() {
-            None => PErr::Syntax(SyntaxError {
-                near: Near::Newline,
-                line: last_line(self.toks),
-            }),
+            // dash meets the end of the text there, not a line end.
+            None if self.dialect == Dialect::Posix => PErr::EndOrNewline,
+            None => PErr::Syntax(SyntaxError::new(Near::Newline, last_line(self.toks))),
             Some(_) => self.unexpected(),
+        }
+    }
+
+    /// [`Self::unexpected_exp`] for a token dash read without checking for reserved words, which
+    /// it only does for the first token of a construct: it is a plain `word` however it is spelled.
+    fn unexpected_plain_exp(&self, expecting: &'static str) -> PErr {
+        match self.unexpected_exp(expecting) {
+            PErr::Syntax(SyntaxError {
+                near: Near::Token(text),
+                line,
+                expecting,
+            }) if self.peek().is_some_and(|tok| keyword(tok).is_some()) => {
+                PErr::Syntax(SyntaxError {
+                    near: Near::Word(text),
+                    line,
+                    expecting,
+                })
+            }
+            other => other,
         }
     }
 
@@ -277,7 +399,22 @@ impl Parser<'_> {
             self.pos = self.pos.saturating_add(1);
             Ok(())
         } else {
-            Err(self.unexpected())
+            Err(self.unexpected_exp(quoted_keyword(word)))
+        }
+    }
+
+    /// Whether `tok` ends a nested list in dash: a terminator word or operator, which it hands
+    /// to whatever construct is open, however far from where that wanted it.
+    fn ends_list(&self, tok: &Token) -> bool {
+        match &tok.tok {
+            Tok::Op(op) => matches!(op, Op::RParen | Op::DSemi),
+            Tok::Word(_) => keyword(tok).is_some_and(|k| {
+                matches!(
+                    k,
+                    "then" | "elif" | "else" | "fi" | "do" | "done" | "esac" | "}"
+                )
+            }),
+            _ => false,
         }
     }
 
@@ -331,7 +468,7 @@ impl Parser<'_> {
         loop {
             self.skip_newlines();
             let Some(tok) = self.peek() else {
-                return Err(PErr::Need);
+                return Err(PErr::NeedExp(stop_expecting(stop)));
             };
             let at_stop = match stop {
                 Stop::Words(words) => keyword(tok).is_some_and(|k| words.contains(&k)),
@@ -346,9 +483,12 @@ impl Parser<'_> {
                 }
                 return Ok(List { items });
             }
+            if self.dialect == Dialect::Posix && !items.is_empty() && self.ends_list(tok) {
+                return Err(self.unexpected_exp(stop_expecting(stop)));
+            }
             let and_or = self.and_or()?;
             let (background, end_line) = match self.peek() {
-                None => return Err(PErr::Need),
+                None => return Err(PErr::NeedExp(stop_expecting(stop))),
                 Some(tok) => {
                     let line = tok.line;
                     match tok.tok {
@@ -372,7 +512,11 @@ impl Parser<'_> {
                                 Stop::CaseArm => self.peek_keyword() == Some("esac"),
                             };
                             if !closes {
-                                return Err(self.unexpected());
+                                return Err(if self.dialect == Dialect::Posix {
+                                    self.unexpected_exp(stop_expecting(stop))
+                                } else {
+                                    self.unexpected()
+                                });
                             }
                             (false, line)
                         }
@@ -439,6 +583,10 @@ impl Parser<'_> {
             if self.peek().is_none() {
                 return Err(PErr::Need);
             }
+            // bash negates twice; dash takes the second `!` for a keyword where no command is.
+            if self.dialect == Dialect::Posix && self.peek_keyword() == Some("!") {
+                return Err(self.unexpected());
+            }
         }
         let mut stages = vec![self.command()?];
         loop {
@@ -478,12 +626,14 @@ impl Parser<'_> {
                 Some("until") => self.while_command(true),
                 Some("{") => self.brace_command(),
                 Some("case") => self.case_command(),
-                Some("[[") => self.skip_double_bracket(),
+                Some("[[") if self.dialect == Dialect::Bash => self.skip_double_bracket(),
                 Some("function") if self.dialect == Dialect::Bash => self.function_keyword(),
-                Some("coproc") => self.skip_coproc(),
+                Some("coproc") if self.dialect == Dialect::Bash => self.skip_coproc(),
                 Some("then" | "do" | "done" | "fi" | "elif" | "else" | "esac" | "}") => {
                     Err(self.unexpected())
                 }
+                // dash's tokenizer returns `in` as a keyword wherever a command may start.
+                Some("in") if self.dialect == Dialect::Posix => Err(self.unexpected()),
                 _ => self.simple_command(),
             },
             Tok::IoNumber(_) => self.simple_command(),
@@ -532,6 +682,17 @@ impl Parser<'_> {
                         )
                     {
                         return self.function_definition(self.pos.saturating_sub(1));
+                    }
+                    // dash reads `name (` as the start of a function definition and wants the
+                    // `)` next, whatever follows.
+                    if self.dialect == Dialect::Posix
+                        && words.len() == 1
+                        && assigns.is_empty()
+                        && redirs.is_empty()
+                        && matches!(self.peek_op(), Some(Op::LParen))
+                    {
+                        self.pos = self.pos.saturating_add(1);
+                        return Err(self.unexpected_exp("\")\""));
                     }
                 }
                 Tok::IoNumber(n) => {
@@ -716,9 +877,18 @@ impl Parser<'_> {
             return self.skip_arith_command(UnsupportedKind::ArithCommand);
         }
         let var = match self.peek() {
+            None if self.dialect == Dialect::Posix => {
+                return Err(PErr::NeedMsg("Bad for loop variable"));
+            }
             None => return Err(PErr::Need),
             Some(tok) => match keyword(tok) {
                 Some(name) if is_name(name) => name.to_string(),
+                _ if self.dialect == Dialect::Posix => {
+                    return Err(PErr::Syntax(SyntaxError::new(
+                        Near::Message("Bad for loop variable"),
+                        tok.line,
+                    )));
+                }
                 _ => return Err(self.unexpected()),
             },
         };
@@ -748,7 +918,7 @@ impl Parser<'_> {
         }
         self.skip_newlines();
         if self.peek().is_none() {
-            return Err(PErr::Need);
+            return Err(PErr::NeedExp("\"do\""));
         }
         self.expect_keyword("do")?;
         let body = self.list(Stop::Words(&["done"]))?;
@@ -814,7 +984,8 @@ impl Parser<'_> {
     fn subshell_inner(&mut self) -> PResult<Command> {
         let open = self.pos;
         // `((` with nothing between is an arithmetic command when it closes with `))`.
-        if let (Some(a), Some(b)) = (self.peek(), self.peek_ahead(1))
+        if self.dialect == Dialect::Bash
+            && let (Some(a), Some(b)) = (self.peek(), self.peek_ahead(1))
             && matches!(b.tok, Tok::Op(Op::LParen))
             && a.end == b.pos
         {
@@ -895,9 +1066,89 @@ impl Parser<'_> {
 
     fn case_command(&mut self) -> PResult<Command> {
         self.enter()?;
-        let result = self.case_inner();
+        let result = if self.dialect == Dialect::Posix {
+            self.case_posix()
+        } else {
+            self.case_inner()
+        };
         self.leave();
         result
+    }
+
+    /// `case` as dash's parser reads it, which is looser about the patterns than bash's and
+    /// names what it waited for when it fails: the first token after `in` (or `(`) is taken for a
+    /// pattern whatever it is, a `|` makes the next token a pattern too, and the token that ends
+    /// the run must be `)`.
+    fn case_posix(&mut self) -> PResult<Command> {
+        self.pos = self.pos.saturating_add(1);
+        let word = match self.peek().map(|t| &t.tok) {
+            None => return Err(PErr::NeedExp("word")),
+            Some(Tok::Word(word)) => word.clone(),
+            Some(_) => return Err(self.unexpected_exp("word")),
+        };
+        self.pos = self.pos.saturating_add(1);
+        self.skip_newlines();
+        match self.peek() {
+            None => return Err(PErr::NeedExp("\"in\"")),
+            Some(tok) if keyword(tok) == Some("in") => self.pos = self.pos.saturating_add(1),
+            Some(_) => return Err(self.unexpected_exp("\"in\"")),
+        }
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.peek_keyword() == Some("esac") {
+                self.pos = self.pos.saturating_add(1);
+                break;
+            }
+            if matches!(self.peek_op(), Some(Op::LParen)) {
+                self.pos = self.pos.saturating_add(1);
+            }
+            let mut patterns = Vec::new();
+            loop {
+                match self.peek().map(|t| &t.tok) {
+                    Some(Tok::Word(pattern)) => patterns.push(pattern.clone()),
+                    Some(_) => {}
+                    None => return Err(PErr::NeedExp("\")\"")),
+                }
+                self.pos = self.pos.saturating_add(1);
+                match self.peek_op() {
+                    Some(Op::Pipe) => self.pos = self.pos.saturating_add(1),
+                    Some(Op::RParen) => {
+                        self.pos = self.pos.saturating_add(1);
+                        break;
+                    }
+                    _ => return Err(self.unexpected_plain_exp("\")\"")),
+                }
+            }
+            self.skip_newlines();
+            let ends = |parser: &Self| {
+                matches!(parser.peek_op(), Some(Op::DSemi)) || parser.peek_keyword() == Some("esac")
+            };
+            let body = if self.peek().is_some() && ends(self) {
+                List::default()
+            } else {
+                self.list(Stop::CaseArm)?
+            };
+            arms.push(CaseArm { patterns, body });
+            if matches!(self.peek_op(), Some(Op::DSemi)) {
+                self.pos = self.pos.saturating_add(1);
+            } else if self.peek_keyword() == Some("esac") {
+                self.pos = self.pos.saturating_add(1);
+                break;
+            } else {
+                return Err(self.unexpected_exp("\";;\""));
+            }
+        }
+        let redirs = self.redirections()?;
+        let unsupported = word_unsupported(&word).or_else(|| {
+            arms.iter()
+                .flat_map(|arm| arm.patterns.iter())
+                .find_map(word_unsupported)
+        });
+        if let Some(kind) = unsupported {
+            return Ok(Command::Unsupported(kind));
+        }
+        Ok(Command::Case { word, arms, redirs })
     }
 
     /// `case WORD in [(] pattern [| pattern]... ) [list] ;; ... esac`. The last arm may end at
@@ -1044,10 +1295,10 @@ impl Parser<'_> {
                 (text.to_string(), true)
             }
             (Dialect::Posix, _) => {
-                return Err(PErr::Syntax(SyntaxError {
-                    near: Near::BadFunctionName,
-                    line: name_tok.line,
-                }));
+                return Err(PErr::Syntax(SyntaxError::new(
+                    Near::BadFunctionName,
+                    name_tok.line,
+                )));
             }
             (Dialect::Bash, Some(text)) => (text.to_string(), true),
             (Dialect::Bash, None) => (name_word.raw.clone(), false),
@@ -1510,8 +1761,8 @@ mod tests {
     #[test]
     fn bash_takes_a_compound_body_only_and_dash_any_command() {
         // The error names the first word of the body, as bash does.
-        assert_eq!(syntax_near("f() echo hi"), Near::Token("echo".to_string()));
-        assert_eq!(syntax_near("f() [ 1 = 1 ]"), Near::Token("[".to_string()));
+        assert_eq!(syntax_near("f() echo hi"), Near::Word("echo".to_string()));
+        assert_eq!(syntax_near("f() [ 1 = 1 ]"), Near::Word("[".to_string()));
         let parsed = parse_posix("f() echo hi");
         assert_eq!(parsed.tail, Tail::Done);
         let [item] = parsed.items.as_slice() else {
@@ -1573,10 +1824,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_posix(src).tail,
-                Tail::Error(SyntaxError {
-                    near: Near::BadFunctionName,
-                    line: 1
-                }),
+                Tail::Error(SyntaxError::new(Near::BadFunctionName, 1)),
                 "{src}"
             );
         }

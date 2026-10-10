@@ -199,6 +199,21 @@
 
 ### Fixed
 
+- **dash's syntax-error wording** - dash named an unexpected plain word as the word itself
+  (`Syntax error: "extra" unexpected`); dash says `word unexpected` and quotes only reserved words
+  and operators. It also names what the grammar was waiting for (`end of file unexpected
+  (expecting "fi")`, `"done" unexpected (expecting "do")`, `word unexpected (expecting "in")`,
+  inside `$( )` `(expecting ")")`), and has fixed complaints that name no token: `Bad for loop
+  variable`, `Unterminated quoted string`, `EOF in backquote substitution`, `Missing '}'`,
+  `Missing '))'`; a redirection with nothing after it at the end of a script is
+  `end of file unexpected`. `>&word` and `<&word` with anything but one digit or `-` are
+  `Syntax error: Bad fd number`, a `${...}` dash cannot read (`${}`, `${a:1}`, `${a/x/y}`) is
+  `Bad substitution`, and an arithmetic division by zero is `arithmetic expression: division by
+  zero: "1/0"`, each ending the shell with status 2. The grammar differences behind the
+  wording are now dash's too: `((` is two subshells, a descriptor is one digit (`10>f` writes
+  `10` into `f`), and brace expansion, `$'..'`, `[[`, `<<<`, `|&` and `name=(...)` are
+  plain text or errors instead of being skipped. Every reply was checked against dash 0.5.11 in
+  the reference container; `ubuntu-dash-syntax-errors.session` replays 77 of them.
 - **dash's `cd` error and `type` wording** - a failed `cd` under dash said bash's
   `cd: DIR: No such file or directory` with status 1; dash says `cd: can't cd to DIR` and exits 2.
   `type` and `command -V` called every builtin `a shell builtin`; dash calls its special builtins

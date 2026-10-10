@@ -87,6 +87,9 @@ pub enum UnsupportedKind {
     AnsiCQuote,
     ArithCommand,
     ParamOp,
+    /// A `${...}` that dash's parser does not read (`${}`, `${a:1}`, `${a/x/y}`): it refuses it
+    /// with `Bad substitution` when the word is expanded.
+    BadSubstitution,
     BraceExpansion,
     HereString,
     Array,
@@ -277,12 +280,31 @@ pub(super) enum RedirTarget {
 pub(super) struct SyntaxError {
     pub near: Near,
     pub line: Line,
+    /// The token the grammar wanted at that point, as dash's `(expecting "fi")` names it: a
+    /// quoted keyword or operator, or the bare `word`. Only dash prints it.
+    pub expecting: Option<&'static str>,
+}
+
+impl SyntaxError {
+    pub(super) fn new(near: Near, line: Line) -> Self {
+        Self {
+            near,
+            line,
+            expecting: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Near {
     /// An unexpected token, written as it appears (`)`, `fi`, `;;`).
     Token(String),
+    /// An unexpected word that is not a reserved word. bash writes it out; dash only says `word`.
+    Word(String),
+    /// dash's fixed complaints about text it cannot read as a whole (`Unterminated quoted
+    /// string`, `Missing '}'`), which name no token. bash and mksh have their own wording for
+    /// an unfinished construct and use the end-of-file one.
+    Message(&'static str),
     Newline,
     EndOfFile,
     /// dash's `Bad function name`: not a complaint about a token, so it has its own wording.

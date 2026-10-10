@@ -33,6 +33,8 @@ const DEFAULT_IFS: &str = " \t\n";
 pub(super) enum ExpandError {
     /// The shell's own complaint, already worded for the active level.
     Message(String),
+    /// A complaint that ends the shell process, as dash's expansion errors do: status 2.
+    Fatal(String),
     /// A cap (depth or the line's allowance) stopped it; nothing is printed.
     Refused,
 }
@@ -375,7 +377,15 @@ impl FakeShell {
                 self.record_hit(BudgetHit::Depth);
                 Err(ExpandError::Refused)
             }
-            Err(error) => Err(ExpandError::Message(self.arith_error_text(&expr, &error))),
+            Err(error) => {
+                let text = self.arith_error_text(&expr, &error);
+                // dash's `sh_error`: the shell process ends with status 2.
+                Err(if self.is_dash() {
+                    ExpandError::Fatal(text)
+                } else {
+                    ExpandError::Message(text)
+                })
+            }
         }
     }
 
@@ -390,9 +400,9 @@ impl FakeShell {
             (ShellLevel::Bash { .. }, ArithError::Syntax { token }) => self.shell_error(
                 format_args!("{expr}: syntax error: operand expected (error token is \"{token}\")"),
             ),
-            (ShellLevel::Dash { .. }, ArithError::DivByZero { .. }) => {
-                self.shell_error("arithmetic expression: division by zero")
-            }
+            (ShellLevel::Dash { .. }, ArithError::DivByZero { .. }) => self.shell_error(
+                format_args!("arithmetic expression: division by zero: \"{expr}\""),
+            ),
             (ShellLevel::Dash { .. }, ArithError::Syntax { .. }) => self.shell_error(format_args!(
                 "arithmetic expression: expecting primary: \"{expr}\""
             )),

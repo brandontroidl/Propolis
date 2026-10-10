@@ -942,6 +942,129 @@ mod syntax_errors {
         );
     }
 
+    /// Each reply is dash 0.5.11's for the same `sh -c` text, run in the jammy reference
+    /// container (`tests/fixtures/sessions/ubuntu-dash-syntax-errors.session` replays more).
+    #[test]
+    fn dash_says_word_for_a_plain_word_and_names_the_token_it_waited_for() {
+        let cases: [(&str, &str); 36] = [
+            ("(echo a) extra", "word unexpected"),
+            ("(echo a) then", "\"then\" unexpected"),
+            ("echo a; fi", "\"fi\" unexpected"),
+            (
+                "if true; then echo a",
+                "end of file unexpected (expecting \"fi\")",
+            ),
+            (
+                "if true; echo a; fi",
+                "\"fi\" unexpected (expecting \"then\")",
+            ),
+            ("if; then echo; fi", "\";\" unexpected"),
+            (
+                "while true; do echo a",
+                "end of file unexpected (expecting \"done\")",
+            ),
+            (
+                "while true; echo a; done",
+                "\"done\" unexpected (expecting \"do\")",
+            ),
+            (
+                "for i in 1 2; echo $i; done",
+                "word unexpected (expecting \"do\")",
+            ),
+            ("for; do echo; done", "Bad for loop variable"),
+            ("for 1 in a; do echo; done", "Bad for loop variable"),
+            ("for i in a b", "end of file unexpected"),
+            ("for i", "end of file unexpected (expecting \"do\")"),
+            (
+                "case x in a) echo a",
+                "end of file unexpected (expecting \";;\")",
+            ),
+            ("case x a) echo; esac", "word unexpected (expecting \"in\")"),
+            (
+                "case x in a echo; esac",
+                "word unexpected (expecting \")\")",
+            ),
+            ("case", "end of file unexpected (expecting word)"),
+            (
+                "case x in |a) echo;; esac",
+                "word unexpected (expecting \")\")",
+            ),
+            ("{ echo a", "end of file unexpected (expecting \"}\")"),
+            ("{ echo a; )", "\")\" unexpected (expecting \"}\")"),
+            ("( echo a }", "end of file unexpected (expecting \")\")"),
+            ("echo a |", "end of file unexpected"),
+            ("echo >", "end of file unexpected"),
+            ("echo > > f", "redirection unexpected"),
+            ("echo a <<<b", "redirection unexpected"),
+            ("echo $(echo a", "end of file unexpected (expecting \")\")"),
+            (
+                "echo $(if true; then echo a)",
+                "\")\" unexpected (expecting \"fi\")",
+            ),
+            ("echo $(fi)", "\"fi\" unexpected (expecting \")\")"),
+            ("echo `echo a", "EOF in backquote substitution"),
+            ("echo ${a", "Missing '}'"),
+            ("echo $((1+", "Missing '))'"),
+            ("echo (a)", "word unexpected (expecting \")\")"),
+            ("echo a (b)", "\"(\" unexpected"),
+            ("! ! echo x", "\"!\" unexpected"),
+            ("in", "\"in\" unexpected"),
+            ("x=(1 2)", "\"(\" unexpected"),
+        ];
+        for (script, message) in cases {
+            assert_eq!(
+                once(&format!("sh -c '{script}'")),
+                format!("sh: 1: Syntax error: {message}\n"),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn dash_refuses_a_bad_fd_and_a_bad_substitution_when_it_runs_them() {
+        for (script, reply, status) in [
+            (
+                "echo >&a; echo after",
+                "sh: 1: Syntax error: Bad fd number\n",
+                2,
+            ),
+            ("echo ${}; echo after", "sh: 1: Bad substitution\n", 2),
+            ("echo ${a:1}; echo after", "sh: 1: Bad substitution\n", 2),
+            ("echo ${a/x/y}", "sh: 1: Bad substitution\n", 2),
+            (
+                "echo a; echo ${}; echo after",
+                "a\nsh: 1: Bad substitution\n",
+                2,
+            ),
+            (
+                "echo $((1/0)); echo after",
+                "sh: 1: arithmetic expression: division by zero: \"1/0\"\n",
+                2,
+            ),
+        ] {
+            let mut sh = shell();
+            assert_eq!(
+                run(&mut sh, &format!("sh -c '{script}'")),
+                reply,
+                "{script}"
+            );
+            assert_eq!(sh.last_status(), status, "{script}");
+        }
+    }
+
+    #[test]
+    fn dash_reads_the_constructs_it_has_no_syntax_for_as_plain_text() {
+        // dash has no brace expansion, `$'..'`, `[[`, here-strings or `|&`; a descriptor is one digit.
+        assert_eq!(once("sh -c 'echo {a,b}'"), "{a,b}\n");
+        assert_eq!(once("sh -c \"echo \\$'a'\""), "$a\n");
+        assert_eq!(once("sh -c 'echo 12>f; cat f'"), "12\n");
+        assert_eq!(once("sh -c '(( 1+1 ))'"), "sh: 1: 1+1: not found\n");
+        assert_eq!(
+            once("sh -c 'echo a |& b'"),
+            "sh: 1: Syntax error: \"&\" unexpected\n"
+        );
+    }
+
     #[test]
     fn dash_and_the_exec_shell_word_the_same_error_their_own_way() {
         let mut sh = shell();
@@ -981,12 +1104,12 @@ mod syntax_errors {
         );
         assert_eq!(
             run(&mut sh, "sh -c 'if true; then echo x'"),
-            "sh: 1: Syntax error: end of file unexpected\n"
+            "sh: 1: Syntax error: end of file unexpected (expecting \"fi\")\n"
         );
         run(&mut sh, "sh");
         assert_eq!(
             run(&mut sh, "sh -c 'echo \"open'"),
-            "sh: 1: Syntax error: end of file unexpected\n"
+            "sh: 1: Syntax error: Unterminated quoted string\n"
         );
     }
 

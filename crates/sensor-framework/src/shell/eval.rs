@@ -574,7 +574,7 @@ impl FakeShell {
                 if !result.stop_line {
                     let line = base_line.saturating_add(error.line).saturating_sub(1);
                     self.set_dash_line(line);
-                    let message = self.syntax_error_text(&error.near);
+                    let message = self.syntax_error_text(&error);
                     result.append(CommandResult::stderr(2, message));
                     self.state_mut().last_status = 2;
                 }
@@ -599,41 +599,63 @@ impl FakeShell {
     }
 
     /// What the active level says about text it cannot parse.
-    fn syntax_error_text(&self, near: &Near) -> String {
+    fn syntax_error_text(&self, error: &super::ast::SyntaxError) -> String {
+        let near = &error.near;
         match self.active_level() {
             ShellLevel::Bash { .. } => match near {
-                Near::Token(token) => {
+                Near::Token(token) | Near::Word(token) => {
                     self.shell_error(format_args!("syntax error near unexpected token `{token}'"))
                 }
                 Near::Newline => self.shell_error("syntax error near unexpected token `newline'"),
-                Near::EndOfFile => self.shell_error("syntax error: unexpected end of file"),
+                Near::EndOfFile | Near::Message(_) => {
+                    self.shell_error("syntax error: unexpected end of file")
+                }
                 // Only dash refuses a name at parse time.
                 Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
-            ShellLevel::Dash { .. } => match near {
-                // Dash names every redirection operator alike.
-                Near::Token(token)
-                    if matches!(
-                        token.as_str(),
-                        "<" | ">" | ">>" | "<<" | "<<<" | "<&" | ">&" | "<>" | ">|"
-                    ) =>
-                {
-                    self.shell_error("Syntax error: redirection unexpected")
+            ShellLevel::Dash { .. } => {
+                // dash's `synexpect`: what was unexpected, and, where the grammar was waiting for
+                // one particular token, what that was.
+                let hint = error
+                    .expecting
+                    .map_or_else(String::new, |token| format!(" (expecting {token})"));
+                match near {
+                    // Dash names every redirection operator alike.
+                    Near::Token(token)
+                        if matches!(
+                            token.as_str(),
+                            "<" | ">" | ">>" | "<<" | "<<<" | "<&" | ">&" | "<>" | ">|"
+                        ) =>
+                    {
+                        self.shell_error(format_args!("Syntax error: redirection unexpected{hint}"))
+                    }
+                    Near::Token(token) => {
+                        self.shell_error(format_args!("Syntax error: \"{token}\" unexpected{hint}"))
+                    }
+                    Near::Word(_) => {
+                        self.shell_error(format_args!("Syntax error: word unexpected{hint}"))
+                    }
+                    Near::Newline => {
+                        self.shell_error(format_args!("Syntax error: newline unexpected{hint}"))
+                    }
+                    Near::EndOfFile => {
+                        self.shell_error(format_args!("Syntax error: end of file unexpected{hint}"))
+                    }
+                    Near::Message(message) => {
+                        self.shell_error(format_args!("Syntax error: {message}"))
+                    }
+                    Near::BadFunctionName => self.shell_error("Syntax error: Bad function name"),
                 }
-                Near::Token(token) => {
-                    self.shell_error(format_args!("Syntax error: \"{token}\" unexpected"))
-                }
-                Near::Newline => self.shell_error("Syntax error: newline unexpected"),
-                Near::EndOfFile => self.shell_error("Syntax error: end of file unexpected"),
-                Near::BadFunctionName => self.shell_error("Syntax error: Bad function name"),
-            },
+            }
             // [unverified] mksh's wording; no Android capture exists.
             ShellLevel::AndroidMksh => match near {
-                Near::Token(token) => {
+                Near::Token(token) | Near::Word(token) => {
                     self.shell_error(format_args!("syntax error: '{token}' unexpected"))
                 }
                 Near::Newline => self.shell_error("syntax error: newline unexpected"),
-                Near::EndOfFile => self.shell_error("syntax error: unexpected EOF"),
+                Near::EndOfFile | Near::Message(_) => {
+                    self.shell_error("syntax error: unexpected EOF")
+                }
                 Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
         }
@@ -852,8 +874,15 @@ impl FakeShell {
             Command::Unsupported(kind) => {
                 self.trace_open(&[], ParseNode::Unsupported, HandlerId::Compound);
                 self.trace_unsupported(*kind);
-                self.trace_close(0);
-                CommandResult::silent(0)
+                // dash's expansion error ends the shell (or the script, subshell or stage).
+                let refused = *kind == super::UnsupportedKind::BadSubstitution && self.is_dash();
+                let result = if refused {
+                    self.dash_bad_substitution()
+                } else {
+                    CommandResult::silent(0)
+                };
+                self.trace_close(result.status);
+                result
             }
             compound => self.eval_compound(compound),
         }
@@ -1201,6 +1230,11 @@ impl FakeShell {
     pub(super) fn expand_failure(&mut self, error: ExpandError) -> CommandResult {
         let mut result = match error {
             ExpandError::Message(message) => CommandResult::stderr(1, message),
+            ExpandError::Fatal(message) => {
+                let mut fatal = CommandResult::stderr(2, message);
+                self.end_process(&mut fatal);
+                fatal
+            }
             ExpandError::Refused => CommandResult::silent(1),
         };
         if self.line.exhausted() {
@@ -1356,6 +1390,14 @@ impl FakeShell {
         text: &str,
         output: bool,
     ) -> Result<(), CommandResult> {
+        // dash takes a descriptor number of one digit, or `-`, after `>&` and `<&`, and refuses
+        // anything else (bash opens a name as a file).
+        if self.is_dash()
+            && text != "-"
+            && !(text.len() == 1 && text.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(self.dash_fatal(2, "Syntax error: Bad fd number"));
+        }
         if text == "-" {
             if let Some(slot) = plan.sinks.get_mut(index) {
                 *slot = Sink::Discard;
@@ -1696,6 +1738,14 @@ impl FakeShell {
                 crashed
             }
         }
+    }
+
+    /// dash's refusal of a `${...}` it cannot read: no `Syntax error:` prefix, status 2, and the
+    /// shell process ends.
+    fn dash_bad_substitution(&mut self) -> CommandResult {
+        let mut result = CommandResult::stderr(2, self.shell_error("Bad substitution"));
+        self.end_process(&mut result);
+        result
     }
 
     /// An error dash makes fatal (its `sh_error`, which every special builtin's complaint is):

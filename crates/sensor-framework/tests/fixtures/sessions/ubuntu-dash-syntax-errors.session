@@ -1,0 +1,173 @@
+# dash 0.5.11 (/bin/sh on Ubuntu 22.04) refusing text it cannot parse, one `sh -c` per case. What
+# this records: a plain word is `word unexpected`, a reserved word or an operator is quoted; where
+# the grammar was waiting for one token dash adds `(expecting "fi")`; the end of the text is
+# `end of file unexpected`; and a few complaints name no token (`Bad for loop variable`,
+# `Unterminated quoted string`, `EOF in backquote substitution`, `Missing '}'`, `Missing '))'`).
+# `Bad fd number` and `Bad substitution` are refused when the word is run, status 2. Each reply was
+# produced by `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`)
+# in the localhost/propolis-survey-ref:jammy container (bash 5.1.16, dash 0.5.11), run with
+# `--network none`, PS1 and PS2 set to markers and these lines fed one at a time on standard input;
+# the `sh` they run is dash as /bin/sh.
+# source: ubuntu:22.04 container run of dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ sh -c '(echo a) extra'
+> sh: 1: Syntax error: word unexpected
+$ sh -c '(echo a) then'
+> sh: 1: Syntax error: "then" unexpected
+$ sh -c 'echo a; then'
+> sh: 1: Syntax error: "then" unexpected
+$ sh -c 'echo a; fi'
+> sh: 1: Syntax error: "fi" unexpected
+$ sh -c 'echo a; done'
+> sh: 1: Syntax error: "done" unexpected
+$ sh -c 'echo a; esac'
+> sh: 1: Syntax error: "esac" unexpected
+$ sh -c 'echo a; }'
+> sh: 1: Syntax error: "}" unexpected
+$ sh -c 'echo a; )'
+> sh: 1: Syntax error: ")" unexpected
+$ sh -c 'echo a; ;;'
+> sh: 1: Syntax error: ";;" unexpected
+$ sh -c 'echo a ;; echo b'
+> sh: 1: Syntax error: ";;" unexpected
+$ sh -c 'if true; then echo a'
+> sh: 1: Syntax error: end of file unexpected (expecting "fi")
+$ sh -c 'if true; then echo a; fi fi'
+> sh: 1: Syntax error: "fi" unexpected
+$ sh -c 'if true; echo a; fi'
+> sh: 1: Syntax error: "fi" unexpected (expecting "then")
+$ sh -c 'if; then echo; fi'
+> sh: 1: Syntax error: ";" unexpected
+$ sh -c 'while true; do echo a'
+> sh: 1: Syntax error: end of file unexpected (expecting "done")
+$ sh -c 'while true; echo a; done'
+> sh: 1: Syntax error: "done" unexpected (expecting "do")
+$ sh -c 'for i in 1 2; echo $i; done'
+> sh: 1: Syntax error: word unexpected (expecting "do")
+$ sh -c 'for; do echo; done'
+> sh: 1: Syntax error: Bad for loop variable
+$ sh -c 'for 1 in a; do echo; done'
+> sh: 1: Syntax error: Bad for loop variable
+$ sh -c 'for i in a; do echo'
+> sh: 1: Syntax error: end of file unexpected (expecting "done")
+$ sh -c 'for i in a b'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c 'for i'
+> sh: 1: Syntax error: end of file unexpected (expecting "do")
+$ sh -c 'case x in a) echo a'
+> sh: 1: Syntax error: end of file unexpected (expecting ";;")
+$ sh -c 'case x a) echo; esac'
+> sh: 1: Syntax error: word unexpected (expecting "in")
+$ sh -c 'case x in a echo; esac'
+> sh: 1: Syntax error: word unexpected (expecting ")")
+$ sh -c 'case x in a) echo; ;; ;; esac'
+> sh: 1: Syntax error: word unexpected (expecting ")")
+$ sh -c 'case'
+> sh: 1: Syntax error: end of file unexpected (expecting word)
+$ sh -c 'case x'
+> sh: 1: Syntax error: end of file unexpected (expecting "in")
+$ sh -c 'case x in'
+> sh: 1: Syntax error: end of file unexpected (expecting ")")
+$ sh -c '{ echo a'
+> sh: 1: Syntax error: end of file unexpected (expecting "}")
+$ sh -c '{ echo a; )'
+> sh: 1: Syntax error: ")" unexpected (expecting "}")
+$ sh -c '( echo a'
+> sh: 1: Syntax error: end of file unexpected (expecting ")")
+$ sh -c '( echo a }'
+> sh: 1: Syntax error: end of file unexpected (expecting ")")
+$ sh -c 'echo a |'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c 'echo a &&'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c '| echo a'
+> sh: 1: Syntax error: "|" unexpected
+$ sh -c '&& echo a'
+> sh: 1: Syntax error: "&&" unexpected
+$ sh -c 'echo a & & echo b'
+> sh: 1: Syntax error: "&" unexpected
+$ sh -c 'echo >'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c 'echo > ;'
+> sh: 1: Syntax error: ";" unexpected
+$ sh -c 'echo > > f'
+> sh: 1: Syntax error: redirection unexpected
+$ sh -c 'echo "unterminated'
+> sh: 1: Syntax error: Unterminated quoted string
+$ sh -c "echo 'unterminated"
+> sh: 1: Syntax error: Unterminated quoted string
+$ sh -c 'echo $(echo a'
+> sh: 1: Syntax error: end of file unexpected (expecting ")")
+$ sh -c 'echo `echo a'
+> sh: 1: Syntax error: EOF in backquote substitution
+$ sh -c 'echo ${a'
+> sh: 1: Syntax error: Missing '}'
+$ sh -c 'echo $((1+'
+> sh: 1: Syntax error: Missing '))'
+$ sh -c 'echo $((1+2)'
+> sh: 1: Syntax error: Missing '))'
+$ sh -c 'f('
+> sh: 1: Syntax error: end of file unexpected (expecting ")")
+$ sh -c 'f()'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c '!'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c '! ! echo x'
+> sh: 1: Syntax error: "!" unexpected
+$ sh -c 'in'
+> sh: 1: Syntax error: "in" unexpected
+$ sh -c 'until'
+> sh: 1: Syntax error: end of file unexpected (expecting "do")
+$ sh -c '(( 1+1 ))'
+> sh: 1: 1+1: not found
+$ sh -c 'a=1 (echo)'
+> sh: 1: Syntax error: "(" unexpected
+$ sh -c 'echo (a)'
+> sh: 1: Syntax error: word unexpected (expecting ")")
+$ sh -c 'echo a (b)'
+> sh: 1: Syntax error: "(" unexpected
+$ sh -c '{ echo a; } extra'
+> sh: 1: Syntax error: word unexpected
+$ sh -c 'if true; then echo; fi extra'
+> sh: 1: Syntax error: word unexpected
+$ sh -c 'case x in a) echo;; esac extra'
+> sh: 1: Syntax error: word unexpected
+$ sh -c '(echo) (echo)'
+> sh: 1: Syntax error: "(" unexpected
+$ sh -c 'echo a >& b c >&'
+> sh: 1: Syntax error: end of file unexpected
+$ sh -c 'echo a <<<b'
+> sh: 1: Syntax error: redirection unexpected
+$ sh -c 'echo <&a'
+> sh: 1: Syntax error: Bad fd number
+$ sh -c 'echo >&a; echo after'; echo "rc=$?"
+> sh: 1: Syntax error: Bad fd number
+> rc=2
+$ sh -c 'echo ${}; echo after'; echo "rc=$?"
+> sh: 1: Bad substitution
+> rc=2
+$ sh -c 'echo a; echo ${a:1}; echo after'; echo "rc=$?"
+> a
+> sh: 1: Bad substitution
+> rc=2
+$ sh -c 'echo $((1/0)); echo after'; echo "rc=$?"
+> sh: 1: arithmetic expression: division by zero: "1/0"
+> rc=2
+$ sh -c 'echo $(if true; then echo a)'
+> sh: 1: Syntax error: ")" unexpected (expecting "fi")
+$ sh -c 'echo $(fi)'
+> sh: 1: Syntax error: "fi" unexpected (expecting ")")
+$ sh -c 'echo "$(echo a"'
+> sh: 1: Syntax error: Unterminated quoted string
+$ sh -c 'echo {a,b}'
+> {a,b}
+$ sh -c 'echo 12>f; cat f'
+> 12
+$ sh -c 'echo a |& b'
+> sh: 1: Syntax error: "&" unexpected
+$ sh -c 'case x in a|) echo;; esac'
+> sh: 1: Syntax error: word unexpected (expecting ")")
+$ sh -c 'x=(1 2)'
+> sh: 1: Syntax error: "(" unexpected

@@ -1635,6 +1635,7 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
         r#"<p class="empty-line">nothing here</p>"#,
         r#"<p class="empty mt-15">No vendor submissions.</p>"#,
         r#"<div class="panel"><table><tr><td>Aggressive</td></tr></table></div>"#,
+        r#"<td class="stack-end">< href="/samples/download/x" class="dl-go">Download</a></td>"#,
     ] {
         assert_eq!(markup::panel_violations(bad).len(), 1, "{bad}");
     }

@@ -127,6 +127,11 @@ pub fn panel_violations(html: &str) -> Vec<String> {
             if e.has("empty-line") && !chain.iter().any(is_panel) {
                 out.push(format!("empty state outside a panel: {}", e.describe()));
             }
+            // A tag with no name is markup the browser prints as text (a template edit that lost
+            // the element name), which every class-based check above would walk past.
+            if e.name.is_empty() {
+                out.push("malformed tag with no element name".to_string());
+            }
             if e.has("empty") || e.has("panel-note") {
                 out.push(format!(
                     "retired empty-state or note style: {}",

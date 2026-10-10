@@ -16,7 +16,7 @@
   {% endfor %}
 </div>
 {% if indexer_behind > 0 %}
-<p class="table-note">The campaign indexer is {{ indexer_behind }} events behind the ledger (read through event {{ indexed }} of {{ newest }}), so the newest activity is not grouped yet.</p>
+<p class="table-note">The campaign indexer is {{ indexer_behind }} event{% if indexer_behind != 1 %}s{% endif %} behind the ledger (read through event {{ indexed }} of {{ newest }}), so the newest activity is not grouped yet.</p>
 {% endif %}
 <nav class="sortbar" aria-label="Sort the campaigns">
   <span class="dim">Sort by</span>

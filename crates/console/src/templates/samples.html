@@ -63,7 +63,7 @@
         {% endif %}
       </td>
       <td>{{ m.vt_verdict(s.vt_detected, s.vt_total, s.vt_link, s.sha256) }}</td>
-      <td class="stack-end">< href="/samples/download/{{ s.sha256 }}" class="dl-go">Download</a></td>
+      <td class="stack-end"><a href="/samples/download/{{ s.sha256 }}" class="dl-go">Download</a></td>
     </tr>
     {% endfor %}
   </tbody>

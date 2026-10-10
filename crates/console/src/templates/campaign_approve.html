@@ -19,7 +19,7 @@
         <label for="approve-notes">Notes <span class="dim">(optional, recorded on each entry)</span></label>
         <textarea id="approve-notes" name="notes" placeholder="approved with campaign {{ id }}"></textarea>
       </div>
-      <p class="actions"><button type="submit" class="btn-approve">Approve these {{ pending | length }}</button> <a href="/campaigns/{{ id }}">Cancel</a></p>
+      <div class="actions"><button type="submit" class="btn-approve">Approve these {{ pending | length }}</button> <a href="/campaigns/{{ id }}">Cancel</a></div>
     </form>
   </div>
   {% else %}

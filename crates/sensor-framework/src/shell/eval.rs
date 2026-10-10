@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::alias::Alias;
 use super::ast::{
     AndOr, AndOrOp, CaseArm, Command, Dialect, FunctionDef, List, ListItem, Near, Pipeline, Redir,
     RedirOp, RedirTarget, SimpleCommand, Word,
@@ -124,6 +125,12 @@ impl DepthGuard {
     }
 }
 
+/// Whether a script's text holds the word `alias`: the only way it can define one.
+fn mentions_alias(text: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == "alias")
+}
+
 /// Work charged for one trip round a loop, on top of what the body costs, so a body that costs
 /// nothing (`while :; do :; done`) still runs out of allowance quickly.
 const LOOP_STEP_COST: u64 = 256;
@@ -193,6 +200,12 @@ pub(super) struct ShellState {
     /// Where a script level's text came from, which a non-interactive bash words its syntax
     /// errors by.
     pub script: ScriptKind,
+    /// The aliases defined here, in the order they were first defined. A shell started from this
+    /// one has none; a subshell has a copy.
+    pub aliases: Vec<Alias>,
+    /// bash's `shopt` options changed from their defaults, and its `set -o` ones.
+    pub shopt: BTreeMap<String, bool>,
+    pub set_o: BTreeMap<String, bool>,
 }
 
 /// Where the text a non-interactive shell runs comes from.
@@ -226,6 +239,9 @@ impl ShellState {
             calls: Vec::new(),
             line: 1,
             script: ScriptKind::Command,
+            aliases: Vec::new(),
+            shopt: BTreeMap::new(),
+            set_o: BTreeMap::new(),
         };
         state.set_var("IFS", DEFAULT_IFS.to_string(), false);
         match flavor {
@@ -290,6 +306,9 @@ impl ShellState {
             calls: Vec::new(),
             line: 1,
             script: ScriptKind::Command,
+            aliases: Vec::new(),
+            shopt: BTreeMap::new(),
+            set_o: BTreeMap::new(),
         }
     }
 
@@ -303,7 +322,13 @@ impl ShellState {
             .functions
             .iter()
             .map(|(name, held)| name.len().saturating_add(held.def.source.len()));
-        vars.chain(functions).fold(0, usize::saturating_add)
+        let aliases = self
+            .aliases
+            .iter()
+            .map(|alias| alias.name.len().saturating_add(alias.value.len()));
+        vars.chain(functions)
+            .chain(aliases)
+            .fold(0, usize::saturating_add)
     }
 
     pub(super) fn get(&self, name: &str) -> Option<&str> {
@@ -562,8 +587,23 @@ impl FakeShell {
         let base_line = u32::try_from(base).unwrap_or(u32::MAX);
         let max_depth = self.budget().limits().max_depth;
         let dialect = self.grammar();
-        let parsed =
-            super::parse::parse_unit(&text, false, max_depth, dialect, &mut self.line, base_line);
+        let none: &[Alias] = &[];
+        let aliases = if self.aliases_expand() {
+            self.frames
+                .last()
+                .map_or(none, |f| f.state.aliases.as_slice())
+        } else {
+            none
+        };
+        let parsed = super::parse::parse_unit(
+            &text,
+            false,
+            max_depth,
+            dialect,
+            &mut self.line,
+            base_line,
+            aliases,
+        );
         self.sync_budget_trace();
         if parsed.tail == Tail::NeedMore {
             if self.pending.len() > max_pending_lines || self.pending_bytes > max_pending_bytes {
@@ -603,6 +643,7 @@ impl FakeShell {
                 if !result.stop_line {
                     let line = base_line.saturating_add(error.line).saturating_sub(1);
                     self.set_dash_line(line);
+                    let error = super::ast::SyntaxError { line, ..error };
                     let message = self.syntax_error_text(&error, text);
                     result.append(CommandResult::stderr(2, message));
                     self.state_mut().last_status = 2;
@@ -755,11 +796,68 @@ impl FakeShell {
 
     /// Parse and run complete text in the current shell level.
     pub(super) fn run_script_text(&mut self, text: &str) -> CommandResult {
+        // A script that defines an alias is read a command at a time, since the alias is in force
+        // from the next line; any other is parsed whole.
+        if (self.aliases_expand() || (self.is_bash() && text.contains("expand_aliases")))
+            && mentions_alias(text)
+        {
+            return self.run_script_lines(text);
+        }
         let max_depth = self.budget().limits().max_depth;
         let dialect = self.grammar();
-        let parsed = super::parse::parse_unit(text, true, max_depth, dialect, &mut self.line, 1);
+        let parsed =
+            super::parse::parse_unit(text, true, max_depth, dialect, &mut self.line, 1, &[]);
         self.sync_budget_trace();
         self.execute_unit(parsed, 1, Some(text))
+    }
+
+    /// Run `text` as a shell reads a script that may define aliases: each physical line joins the
+    /// lines of an unfinished construct and runs as soon as the text is complete, with the aliases
+    /// defined so far in force. The end of the text finishes whatever is left.
+    fn run_script_lines(&mut self, text: &str) -> CommandResult {
+        let max_depth = self.budget().limits().max_depth;
+        let dialect = self.grammar();
+        let mut acc = CommandResult::silent(0);
+        let mut pending: Vec<&str> = Vec::new();
+        let mut first_line: u32 = 1;
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let total = body.split('\n').count();
+        for (index, line) in body.split('\n').enumerate() {
+            pending.push(line);
+            let unit = pending.join("\n");
+            let last = index.saturating_add(1) == total;
+            let none: &[Alias] = &[];
+            let aliases = if self.aliases_expand() {
+                self.frames
+                    .last()
+                    .map_or(none, |f| f.state.aliases.as_slice())
+            } else {
+                none
+            };
+            let parsed = super::parse::parse_unit(
+                &unit,
+                last,
+                max_depth,
+                dialect,
+                &mut self.line,
+                first_line,
+                aliases,
+            );
+            self.sync_budget_trace();
+            if parsed.tail == Tail::NeedMore {
+                continue;
+            }
+            // The first text the shell cannot read ends the script.
+            let refused = !matches!(parsed.tail, Tail::Done);
+            let ran = self.execute_unit(parsed, first_line, Some(text));
+            pending.clear();
+            first_line = u32::try_from(index.saturating_add(2)).unwrap_or(u32::MAX);
+            acc.append(ran);
+            if refused || acc.stop_line || acc.flow != Flow::None {
+                break;
+            }
+        }
+        acc
     }
 
     // ---- lists ---------------------------------------------------------------------------------

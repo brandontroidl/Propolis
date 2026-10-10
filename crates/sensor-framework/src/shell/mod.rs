@@ -57,6 +57,7 @@ use crate::persona;
 use crate::{sanitize_value, to_hex_bounded};
 
 mod admin;
+mod alias;
 mod android;
 mod androidsys;
 mod arch;
@@ -99,6 +100,7 @@ mod read;
 mod readlink;
 mod regex;
 mod registry;
+mod shopt;
 mod sysres;
 mod test_builtin;
 mod textproc;
@@ -3606,6 +3608,8 @@ fn low_byte(value: u32) -> u8 {
 // the files that hold only tests.
 #[cfg(test)]
 mod admin_tests;
+#[cfg(test)]
+mod alias_tests;
 #[cfg(test)]
 mod android_tests;
 #[cfg(test)]

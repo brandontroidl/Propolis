@@ -405,10 +405,31 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `:(){ :|:& };:` therefore returns at once in bash, and dash refuses the name `:`. A shell holds
   128 functions at most, their text counts against the connection's content allowance with the
   variables, and a refused definition is silent with status 1. Not modeled: `declare -f` and
-  `typeset -f` (the commands do not exist), `readonly -f`, aliases, a dash status above 255 from
+  `typeset -f` (the commands do not exist), `readonly -f`, a dash status above 255 from
   `return`, bash's per-command line numbers in `environment: line N:`, and the exported function
   entries `BASH_FUNC_name%%` in `env`. mksh follows bash's grammar and bash's `local` only inside
   `function name {` bodies; no mksh was available to check it against `[inferred]`.
+  Aliases are text the lexer substitutes at command position while it reads a line
+  (`crates/sensor-framework/src/shell/lex.rs#lex_with_aliases`, `crates/sensor-framework/src/shell/alias.rs`),
+  so a value may hold operators, quotes or a here-document, an alias is in force from the next line
+  and never on the line that defines it, a value ending in a blank lets the next word be an alias,
+  a name is not expanded inside its own value, and a word that is quoted, a `case` pattern or a
+  redirection target is no alias. bash lists sorted as `alias NAME='VALUE'` (`alias -- -x=..` for
+  a name starting with `-`), refuses a name holding a blank, quote, `$`, `/`, backtick or shell
+  metacharacter, and its `alias -p` on an empty table ends before reading its operands; dash lists
+  `NAME='VALUE'` in the order of its 39-bucket hash table, takes any name and treats `-p` and `--`
+  as names to look up; `type` says `x is aliased to `echo hi'` (dash: `x is an alias for echo
+  hi`) and `command -v` prints the definition. A bash that runs a script (`bash -c`, an SSH exec,
+  `bash FILE`) expands none unless `shopt -s expand_aliases` ran, and dash always does; a script
+  that mentions `alias` is read a line at a time so a definition reaches the lines after it. A
+  shell started from another has no aliases, a subshell has a copy. At most 128 aliases of up to
+  4096 bytes each (names 255), counted against the content allowance; one text expands at most 64
+  aliases and grows to at most 256 KiB. `shopt` keeps and lists bash's 53 `shopt` and 27 `set -o`
+  settings with the container's defaults (`~/.bashrc` effects such as `histappend` are not applied
+  [unverified]); only `expand_aliases` changes behavior, and dash and the phone do not have it.
+  The phone's alias output is dash's, sorted [inferred]. Not modeled: `$'..'` values (the
+  command that holds one is skipped, as everywhere), and alias expansion inside `eval`, which runs
+  nothing.
   bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
   the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
   dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it

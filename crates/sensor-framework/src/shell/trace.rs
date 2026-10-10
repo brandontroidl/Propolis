@@ -239,6 +239,16 @@ pub enum HandlerId {
     ShellFunction,
     /// `.`, `source` and `eval`: recorded, never run.
     SourceEval,
+    /// `alias` and `unalias`: the table the lexer expands from.
+    Alias,
+    /// bash's `shopt`: option settings, of which `expand_aliases` changes what the lexer does.
+    Shopt,
+    /// `trap`: handlers kept and listed, the `EXIT` one run when the shell ends.
+    Trap,
+    /// `exec`: redirections of the shell itself, or the command that replaces it.
+    Exec,
+    /// `times`: the CPU time the shell and its children used.
+    Times,
     /// The `command` builtin: `-v`/`-V` describe a name, anything else runs it.
     CommandBuiltin,
     Type,

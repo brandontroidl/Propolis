@@ -1,0 +1,147 @@
+# Aliases as Ubuntu 22.04's dash (/bin/sh, 0.5.11) has them, each case a `sh -c` from the login
+# shell, its lines after the first typed as continuation lines (an alias is in force from the next
+# line, never on the line that defines it). What differs from bash: the listing is `NAME='VALUE'`
+# in the order of dash's 39-bucket hash table, not sorted; any name is accepted (`x y`, `a/b`);
+# `-p` and `--` are names to look up; `unalias` with no name does nothing; a reserved word is
+# recognised before an alias; and aliases are expanded in a script, where bash expands none. Each
+# reply was produced by `bash --noprofile --norc --noediting -i` started as a login shell
+# (`exec -a -bash`) in the localhost/propolis-survey-ref:jammy container (bash 5.1.16, dash
+# 0.5.11), run with `--network none`, PS1 and PS2 set to markers and these lines fed one at a time
+# on standard input; the `sh` they run is dash as /bin/sh.
+# source: ubuntu:22.04 container run of dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ sh -c 'alias'
+$ sh -c 'alias ll="ls -l"; alias'
+> ll='ls -l'
+$ sh -c 'alias nope; echo $?'
+> alias: nope not found
+> 1
+$ sh -c 'alias a=b c=d; alias a c'
+> a='b'
+> c='d'
+$ sh -c 'alias a b=c; echo $?'
+> alias: a not found
+> 1
+$ sh -c 'alias -p'
+> alias: -p not found
+$ sh -c 'alias -- -x=y; alias'
+> alias: -- not found
+> -x='y'
+$ sh -c 'alias =x=y; alias'
+> =x='y'
+$ sh -c 'alias B=1 a=2 Z=3 _u=4 9n=5 ab=6 ba=7 zz=8 aa=9; alias'
+> ba='7'
+> Z='3'
+> a='2'
+> zz='8'
+> _u='4'
+> 9n='5'
+> B='1'
+> aa='9'
+> ab='6'
+$ sh -c 'alias "x y=1" a/b=2 "a;b=3" "a\$b=4" e=1 z=2 x=3 w=4 y=5; alias'
+> a/b='2'
+> e='1'
+> z='2'
+> x y='1'
+> a;b='3'
+> x='3'
+> a$b='4'
+> y='5'
+> w='4'
+$ sh -c 'alias a=; alias a'
+> a=''
+$ sh -c 'unalias nope; echo $?'
+> unalias: nope not found
+> 1
+$ sh -c 'unalias; echo $?'
+> 0
+$ sh -c 'alias a=1 b=2; unalias a nosuch b; echo $?; alias'
+> unalias: nosuch not found
+> 1
+$ sh -c 'alias a=1 b=2; unalias -a nosuch; alias'
+$ sh -c 'unalias -x; echo after'
+> sh: 1: unalias: Illegal option -x
+> after
+$ sh -c 'alias y="echo yo"; y'
+> sh: 1: y: not found
+$ sh -c 'alias x="echo hi"
+$ x'
+> hi
+$ sh -c 'alias e=echo w=world
+$ e w
+$ alias e="echo "
+$ e w w'
+> w
+> world w
+$ sh -c 'alias x="echo hi"
+$ type x
+$ command -v x
+$ command -V x'
+> x is an alias for echo hi
+> alias x='echo hi'
+> x is an alias for echo hi
+$ sh -c 'alias t="printf \"%s\\n\""
+$ \t a
+$ "t" a
+$ t a b'
+> sh: 2: t: not found
+> sh: 3: t: not found
+> a
+> b
+$ sh -c 'alias nn=echo
+$ true && nn one
+$ (nn two)
+$ { nn three; }
+$ if true; then nn four; fi
+$ for i in 1; do nn five; done
+$ FOO=1 nn six
+$ > /dev/null nn seven
+$ nn=1 nn eight'
+> one
+> two
+> three
+> four
+> five
+> six
+> eight
+$ sh -c 'alias nn=echo
+$ case a in a) nn inmatch;; esac
+$ case nn in nn) nn pat;; esac
+$ for nn in nn; do nn loop; done
+$ echo $(nn sub)
+$ echo `nn back`
+$ nn a | nn b'
+> inmatch
+> pat
+> loop
+> sub
+> back
+> b
+$ sh -c 'alias if="echo IF"
+$ if true; then echo y; fi'
+> y
+$ sh -c 'alias ee="echo " aa=AAA
+$ ee aa aa'
+> AAA aa
+$ sh -c 'alias l1=ls l2="l1 -d"
+$ l2 /
+$ alias l1="echo L1 "
+$ alias l3="l1 l2"
+$ l3 l1'
+> /
+> L1 echo L1 -d l1
+$ sh -c 'alias r=r p=q q=p
+$ r
+$ p'
+> sh: 2: r: not found
+> sh: 3: p: not found
+$ sh -c 'alias hi="echo hello"
+$ f() { hi; }
+$ alias hi="echo hello2"
+$ f'
+> hello
+$ sh -c 'alias nn=echo; sh -c "nn z"'
+> sh: 1: nn: not found

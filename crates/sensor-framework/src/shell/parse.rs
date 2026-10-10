@@ -26,13 +26,14 @@
 
 use std::sync::Arc;
 
+use super::alias::Alias;
 use super::ast::{
     AndOr, AndOrOp, Assign, CaseArm, Command, Dialect, FunctionDef, Line, List, ListItem, Near,
     POSIX_SPECIAL, Pipeline, Redir, RedirOp, RedirTarget, SimpleCommand, SyntaxError,
     UnsupportedKind, Word, WordPart, word_unsupported,
 };
 use super::eval::LineBudget;
-use super::lex::{HereDoc, LexError, Op, Tok, Token, lex};
+use super::lex::{HereDoc, LexError, Op, Tok, Token, lex_with_aliases};
 
 /// What was left of the text after the items that parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +64,11 @@ pub(super) fn parse_unit(
     dialect: Dialect,
     budget: &mut LineBudget,
     base_line: Line,
+    aliases: &[Alias],
 ) -> Parsed {
-    let lexed = match lex(src, at_eof, base_line, 0, max_depth, dialect, budget) {
+    let lexed = match lex_with_aliases(
+        src, at_eof, base_line, 0, max_depth, dialect, budget, aliases,
+    ) {
         Ok(lexed) => lexed,
         Err(LexError::NeedMore) => {
             return Parsed {
@@ -84,7 +88,7 @@ pub(super) fn parse_unit(
                 tail: Tail::TooDeep,
             };
         }
-        Err(LexError::Budget) => {
+        Err(LexError::Budget | LexError::Splice { .. }) => {
             return Parsed {
                 items: Vec::new(),
                 tail: Tail::Budget,
@@ -92,7 +96,7 @@ pub(super) fn parse_unit(
         }
     };
     let mut parser = Parser {
-        src,
+        src: lexed.text.as_deref().unwrap_or(src),
         toks: &lexed.tokens,
         heredocs: &lexed.heredocs,
         pos: 0,
@@ -138,13 +142,16 @@ pub(super) fn parse_nested(
     max_depth: u32,
     dialect: Dialect,
     budget: &mut LineBudget,
+    aliases: &[Alias],
 ) -> Result<List, LexError> {
     if depth > max_depth {
         return Err(LexError::TooDeep);
     }
-    let lexed = lex(text, true, base_line, depth, max_depth, dialect, budget)?;
+    let lexed = lex_with_aliases(
+        text, true, base_line, depth, max_depth, dialect, budget, aliases,
+    )?;
     let mut parser = Parser {
-        src: text,
+        src: lexed.text.as_deref().unwrap_or(text),
         toks: &lexed.tokens,
         heredocs: &lexed.heredocs,
         pos: 0,
@@ -1433,12 +1440,12 @@ mod tests {
 
     fn parse(src: &str) -> Parsed {
         let mut budget = LineBudget::new(1 << 20);
-        parse_unit(src, false, 16, Dialect::Bash, &mut budget, 1)
+        parse_unit(src, false, 16, Dialect::Bash, &mut budget, 1, &[])
     }
 
     fn parse_posix(src: &str) -> Parsed {
         let mut budget = LineBudget::new(1 << 20);
-        parse_unit(src, false, 16, Dialect::Posix, &mut budget, 1)
+        parse_unit(src, false, 16, Dialect::Posix, &mut budget, 1, &[])
     }
 
     fn items(src: &str) -> Vec<ListItem> {
@@ -1651,7 +1658,7 @@ mod tests {
         }
         // Once no more input can come the same text is a syntax error.
         let mut budget = LineBudget::new(1 << 20);
-        let done = parse_unit("if a; then b", true, 16, Dialect::Bash, &mut budget, 1);
+        let done = parse_unit("if a; then b", true, 16, Dialect::Bash, &mut budget, 1, &[]);
         assert!(matches!(
             done.tail,
             Tail::Error(SyntaxError {

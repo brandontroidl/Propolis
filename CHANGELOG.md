@@ -143,6 +143,21 @@
   in a container, and three session fixtures replay them. The grammar note that listed `case` as
   skipped is corrected: only `[[ ]]`, `(( ))`, `coproc`, `$'..'`, `${x##*/}`, brace expansion,
   `<<<`, arrays and process substitution are skipped now.
+- **`alias`, `unalias` and `shopt`** - bots hide commands behind aliases (`alias ls='ls --color'`,
+  `alias wget='wget -q'`), and the fake shell answered `alias: command not found`. An alias is now
+  text the lexer substitutes at command position while it reads, as a shell does: a value may hold
+  operators, quotes or a here-document, an alias is in force from the next line, a trailing blank
+  lets the next word be an alias, a name is not expanded inside its own value, and a quoted word, a
+  `case` pattern or a redirection target is no alias. bash lists sorted (`alias ll='ls -l'`) and
+  refuses names with a blank, quote, `$`, `/` or metacharacter (`invalid alias name`); dash lists
+  `ll='ls -l'` in the order of its 39-bucket hash table (checked on 47 names), takes any name,
+  expands in a script (bash does not, unless `shopt -s expand_aliases`) and recognises a reserved
+  word before an alias. `type`, `command -v` and `command -V` name an alias first. `shopt` keeps
+  and lists bash's 53 options and the 27 `set -o` ones with the reference container's defaults; only
+  `expand_aliases` changes what the shell does. Bounded: 128 aliases of 4096 bytes (names 255) per
+  shell, counted against the content allowance, and a text expands at most 64 aliases and grows to
+  at most 256 KiB. Replies are from bash 5.1.16 and dash 0.5.11 in the reference container; two
+  session fixtures replay them. The phone's mksh output is [inferred].
 
 ### Changed
 

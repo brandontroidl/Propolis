@@ -36,16 +36,13 @@
   <div class="stat-card">
     <div class="label">Tier</div>
     <div class="value">
-      {% if tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
-      {% elif tier == "standard" %}<span class="tier tier-standard">Standard</span>
-      {% else %}<span class="tier tier-none">-</span>{% endif %}
+      {{ m.tier_pill(tier) }}
     </div>
   </div>
   <div class="stat-card">
     <div class="label">Eligible</div>
     <div class="value">
-      {% if eligible %}<span class="state-pill state-approved">Yes</span>
-      {% else %}<span class="state-pill state-rejected">No</span>{% endif %}
+      {{ m.yes_no(eligible) }}
     </div>
   </div>
 </div>
@@ -54,9 +51,9 @@
   <div class="panel-head">Recommendations and evidence summary</div>
   <table class="table-compact">
     <tbody>
-      <tr><td>Recommended for vendor report</td><td>{% if recommended_for_vendor %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
-      <tr><td>Recommended for blocklist (live score)</td><td>{% if recommended_for_blocklist %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span> <span class="dim">- may still be published via a retention window (by last seen), which does not use the live score</span>{% endif %}</td></tr>
-      <tr><td>Confirmed-real latch</td><td>{% if has_confirmed_real %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td></tr>
+      <tr><td>Recommended for vendor report</td><td>{{ m.yes_no(recommended_for_vendor) }}</td></tr>
+      <tr><td>Recommended for blocklist (live score)</td><td>{{ m.yes_no(recommended_for_blocklist) }}{% if not recommended_for_blocklist %} <span class="dim">- may still be published via a retention window (by last seen), which does not use the live score</span>{% endif %}</td></tr>
+      <tr><td>Confirmed-real latch</td><td>{{ m.yes_no(has_confirmed_real) }}</td></tr>
       <tr><td>Event count</td><td class="mono">{{ event_count }}</td></tr>
       <tr><td>Distinct categories (live)</td><td class="mono">{{ distinct_categories }}</td></tr>
       <tr><td>Distinct WAN vantages</td><td class="mono">{{ distinct_wan_count }}</td></tr>
@@ -107,7 +104,7 @@
       <tr><td>Geolocation &amp; ASN</td><td class="dim">GeoLite2 database not configured</td></tr>
       {% endif %}
       {% if rdns %}
-      <tr><td>Hostname (rDNS)</td><td>{% if rdns.hostname %}<span class="mono">{{ rdns.hostname }}</span> {% if rdns.verified %}<span class="state-pill state-approved" title="the PTR hostname forward-resolves back to this IP">verified</span>{% else %}<span class="state-pill state-rejected" title="the PTR hostname does NOT forward-resolve to this IP - possibly forged; display only, never trusted for suppression">unverified</span>{% endif %}{% else %}<span class="dim">no PTR record</span>{% endif %}</td></tr>
+      <tr><td>Hostname (rDNS)</td><td>{% if rdns.hostname %}<span class="mono">{{ rdns.hostname }}</span> {% if rdns.verified %}<span class="sev" title="the PTR hostname forward-resolves back to this IP">verified</span>{% else %}<span class="sev" title="the PTR hostname does NOT forward-resolve to this IP - possibly forged; display only, never trusted for suppression">unverified</span>{% endif %}{% else %}<span class="dim">no PTR record</span>{% endif %}</td></tr>
       {% endif %}
     </tbody>
   </table>
@@ -132,7 +129,7 @@
         <td>{{ s.service }}</td>
         <td class="mono dim">{{ s.sensor }}</td>
         <td class="mono">{{ s.event_count }}</td>
-        <td>{% if s.authenticated %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td>
+        <td>{{ m.yes_no(s.authenticated) }}</td>
         <td class="seen">{{ s.first_seen }}</td>
         <td class="seen">{{ s.last_seen }}</td>
       </tr>
@@ -162,7 +159,7 @@
     <tbody>
       {% for m in malware %}
       <tr>
-        <td>{% if m.origin == "uploaded" %}<span class="state-pill state-rejected">uploaded</span>{% else %}<span class="state-pill state-snoozed">fetched</span>{% endif %}</td>
+        <td><span class="sev">{% if m.origin == "uploaded" %}uploaded{% else %}fetched{% endif %}</span></td>
         <td class="mono wrap-24">{% if m.url %}{{ m.url }}{% else %}<span class="dim">(no name)</span>{% endif %}</td>
         <td class="mono">{{ m.host }}{% if m.pinned_ip and m.pinned_ip != m.host %} <span class="dim">({{ m.pinned_ip }})</span>{% endif %}</td>
         <td class="mono">{% if m.bytes %}{{ m.bytes }}{% else %}<span class="dim">-</span>{% endif %}</td>
@@ -210,7 +207,7 @@
       {% for u in urls %}
       <tr>
         <td class="mono wrap-24">{{ u.url }}</td>
-        <td class="seen">{{ u.seen_count }}&times; <span class="dim">{{ u.first_seen }}{% if u.last_seen != u.first_seen %} to {{ u.last_seen }}{% endif %}</span></td>
+        <td class="seen"><span class="run-count">x{{ u.seen_count }}</span> <span class="dim">{{ u.first_seen }}{% if u.last_seen != u.first_seen %} to {{ u.last_seen }}{% endif %}</span></td>
         <td>
           {% if u.kind == "captured" %}<span class="state-pill state-rejected">{{ u.outcome }}</span>
           {% elif u.kind == "failed" or u.kind == "refused" or u.kind == "pending" %}<span class="state-pill state-snoozed">{{ u.outcome }}</span>
@@ -289,7 +286,7 @@
       <tr>
         <td class="ip">{{ w.wan_ip }}</td>
         <td class="mono">{{ w.event_count }}</td>
-        <td>{% if w.has_authenticated %}<span class="state-pill state-approved">Yes</span>{% else %}<span class="state-pill state-rejected">No</span>{% endif %}</td>
+        <td>{{ m.yes_no(w.has_authenticated) }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -323,7 +320,7 @@
         <td>{{ s.vendor }}</td>
         <td>{{ s.categories }}</td>
         <td class="mono">{{ s.response_status }}</td>
-        <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>
+        <td>{% if s.success %}Sent{% else %}<span class="sev sev--watch">Failed</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

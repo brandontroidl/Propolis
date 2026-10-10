@@ -36,7 +36,7 @@
     {% for s in samples %}
     <tr class="srow">
       <td class="mono s-hash" title="{{ s.sha256 }}"><a href="/samples/{{ s.sha256 }}">{{ s.sha256_short }}...</a><span class="c-sub">{{ s.sensor }}, {{ s.size }}</span></td>
-      <td class="count s-hosts score {{ m.score_class(s.tier) }}">
+      <td class="count s-hosts">
         {% if s.campaign %}<a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members }}<span class="c-unit"> host{% if s.campaign.members != 1 %}s{% endif %}</span></a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
         {% else %}<span class="dim na">-</span>{% endif %}
       </td>

@@ -135,7 +135,7 @@
         <td class="ip">{{ m.ip_evidence_link(s.source_ip) }}</td>
         <td>{{ s.vendor }}</td>
         <td class="seen">{{ s.submitted_at }}</td>
-        <td>{% if s.success %}<span class="state-pill state-approved">Sent</span>{% else %}<span class="state-pill state-rejected">Failed</span>{% endif %}</td>
+        <td>{% if s.success %}Sent{% else %}<span class="sev sev--watch">Failed</span>{% endif %}</td>
       </tr>
       {% endif %}
       {% endfor %}

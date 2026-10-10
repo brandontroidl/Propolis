@@ -192,7 +192,7 @@
     table.appendChild(tbody);
     detail.appendChild(table);
     var message = summary.querySelector('.log-message');
-    var count = span('log-count', 'x1');
+    var count = span('run-count', 'x1');
     var firstKv = message.querySelector('.log-kv');
     if (firstKv) {
       message.insertBefore(count, firstKv);
@@ -243,7 +243,7 @@
     var time = summary.querySelector('.log-time');
     time.textContent = clockTime(entry.timestamp);
     time.title = entry.timestamp || '';
-    summary.querySelector('.log-count').textContent = 'x' + count;
+    summary.querySelector('.run-count').textContent = 'x' + count;
     var message = summary.querySelector('.log-message');
     (entry.fields || []).forEach(function (f) { addSummaryValue(message, f.key, f.value); });
     var tbody = line.querySelector('table.log-members tbody');

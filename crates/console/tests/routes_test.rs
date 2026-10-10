@@ -8043,7 +8043,7 @@ async fn detail_folds_retried_sessions_and_echo_loader_chunks(pool: PgPool) {
     // The five chunk writes are one row, the lines behind its expander; the commands around them
     // keep their own rows.
     assert!(
-        body.contains(r#"<span class="chunk-count">5 echo chunks</span> to <span class="mono">&#x2f;tmp&#x2f;.i</span> <span class="dim">(chunks 1-5)</span>"#),
+        body.contains(r#"<span class="run-count">5 echo chunks</span> to <span class="mono">&#x2f;tmp&#x2f;.i</span> <span class="dim">(chunks 1-5)</span>"#),
         "{body}"
     );
     assert_eq!(

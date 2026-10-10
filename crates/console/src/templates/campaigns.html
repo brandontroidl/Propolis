@@ -25,9 +25,9 @@
   {% endfor %}
   <span class="sortbar-gap"></span>
   {% if show_single %}
-  <a class="filter-toggle on" href="{{ href(kind, sort, false) }}" role="switch" aria-checked="true">single-host groups shown</a>
+  <a class="range-btn active" href="{{ href(kind, sort, false) }}" role="switch" aria-checked="true">single-host groups shown</a>
   {% elif single_hidden > 0 %}
-  <a class="filter-toggle" href="{{ href(kind, sort, true) }}" role="switch" aria-checked="false">show single-host groups ({{ single_hidden }})</a>
+  <a class="range-btn" href="{{ href(kind, sort, true) }}" role="switch" aria-checked="false">show single-host groups ({{ single_hidden }})</a>
   {% endif %}
 </nav>
 {% if total > shown_limit %}
@@ -35,7 +35,7 @@
 {% endif %}
 {% if campaigns %}
 <div class="panel campaigns-panel">
-<table class="table-compact campaigns-table">
+<table class="table-compact">
   <colgroup><col class="cc-what"><col class="cc-hosts"><col class="cc-spark"><col class="cc-active"><col class="cc-sensors"><col class="cc-delivers"></colgroup>
   <thead>
     <tr><th>Campaign</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Top sensors</th><th>Delivers</th></tr>
@@ -45,9 +45,9 @@
     <tr class="crow">
       <td class="c-what">
         <a class="c-text mono campaign-label" href="/campaigns/{{ c.id }}" title="{{ c.text }}">{{ c.text }}</a>
-        <span class="c-meta"><span class="rule rule--{{ c.badge | replace(" ", "-") }}">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ c.tags | length - 4 }}</span>{% endif %}</span>{% endif %}</span>
+        <span class="c-meta"><span class="sev">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ c.tags | length - 4 }}</span>{% endif %}</span>{% endif %}</span>
       </td>
-      <td class="count c-hosts score {{ m.score_class(c.tier) }}">{{ c.members }}<span class="c-unit"> host{% if c.members != 1 %}s{% endif %}</span></td>
+      <td class="count c-hosts">{{ c.members }}<span class="c-unit"> host{% if c.members != 1 %}s{% endif %}</span></td>
       <td class="c-spark">
         <svg class="spark" width="{{ spark_width }}" height="{{ spark_height }}" viewBox="0 0 {{ spark_width }} {{ spark_height }}" role="img" aria-label="distinct hosts per day">
           {% for b in c.spark %}<rect x="{{ b.x }}" y="{{ b.y }}" width="4" height="{{ b.h }}"><title>{{ b.day }}: {{ b.hosts }}</title></rect>{% endfor %}

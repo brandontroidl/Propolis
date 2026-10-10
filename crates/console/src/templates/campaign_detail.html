@@ -84,7 +84,7 @@
       <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono"><a href="/samples/{{ i.sample }}">sample {{ i.sample[:12] }}</a></td></tr>
       {% endfor %}
       {% for i in command_iocs %}
-      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts }} host{% if i.hosts != 1 %}s{% endif %}, {{ i.sightings }}&times; <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts }} host{% if i.hosts != 1 %}s{% endif %}, <span class="run-count">x{{ i.sightings }}</span> <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
       {% endfor %}
     </tbody>
   </table>

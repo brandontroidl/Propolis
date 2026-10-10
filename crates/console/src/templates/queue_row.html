@@ -3,9 +3,7 @@
   <td class="ip">{{ m.ip_evidence_link(row.ip) }}</td>
   <td class="score {{ m.score_class(row.tier) }}">{{ row.score }}</td>
   <td class="tier-cell">
-    {% if row.tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>
-    {% elif row.tier == "standard" %}<span class="tier tier-standard">Standard</span>
-    {% else %}<span class="tier tier-none">-</span>{% endif %}
+    {{ m.tier_pill(row.tier) }}
   </td>
   <td class="count">{{ row.event_count }}</td>
   <td class="active-cell"{% if row.active_title %} title="{{ row.active_title }}"{% endif %}>{{ row.active }}</td>

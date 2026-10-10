@@ -460,8 +460,6 @@ struct ListRow {
     range: String,
     badge: &'static str,
     members: i32,
-    /// The score class that colours the host count, shared with the review queue's numbers.
-    tier: &'static str,
     active: String,
     active_title: String,
     spark: Vec<Bar>,
@@ -478,18 +476,6 @@ struct KindTab {
     value: &'static str,
     label: &'static str,
     count: i64,
-}
-
-/// The review queue's tier colours, applied to a host count: a campaign of ten hosts is the kind
-/// an operator acts on, three is worth a look, fewer is background.
-pub(crate) fn hosts_tier(members: i32) -> &'static str {
-    if members >= 10 {
-        "aggressive"
-    } else if members >= 3 {
-        "standard"
-    } else {
-        "none"
-    }
 }
 
 /// A command-sequence label is `{count}: {opening}`; split it for the two-line cell.
@@ -622,7 +608,6 @@ async fn list_page(
             range,
             badge: Class::parse(&class).map_or("", Class::badge),
             members,
-            tier: hosts_tier(members),
             active,
             active_title,
             spark: sparkline(
@@ -1165,15 +1150,6 @@ mod tests {
             split_label("no prefix"),
             ("no prefix".to_string(), String::new())
         );
-    }
-
-    #[test]
-    fn host_counts_take_the_review_queues_tier_colours() {
-        assert_eq!(hosts_tier(10), "aggressive");
-        assert_eq!(hosts_tier(9), "standard");
-        assert_eq!(hosts_tier(3), "standard");
-        assert_eq!(hosts_tier(2), "none");
-        assert_eq!(hosts_tier(1), "none");
     }
 
     #[test]

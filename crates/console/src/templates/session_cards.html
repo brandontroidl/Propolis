@@ -48,7 +48,7 @@
           <td>{{ first.activity }}</td>
           <td>
             <details class="chunk-toggle">
-              <summary><span class="chunk-count">{{ item.end - item.start }} echo chunks</span> to <span class="mono">{{ item.chunk_file }}</span> <span class="dim">(chunks {{ item.first_chunk }}-{{ item.last_chunk }})</span></summary>
+              <summary><span class="run-count">{{ item.end - item.start }} echo chunks</span> to <span class="mono">{{ item.chunk_file }}</span> <span class="dim">(chunks {{ item.first_chunk }}-{{ item.last_chunk }})</span></summary>
               <ol class="chunk-lines mono">
                 {% for e in session.events[item.start:item.end] %}<li><span class="dim">{{ e.relative_time }}</span> {{ e.detail }}</li>{% endfor %}
               </ol>
@@ -77,7 +77,7 @@
     <span class="session-time mono">{{ fold.first_start }}</span>
     <span class="dim">latest {{ fold.latest_relative }}</span>
     <span class="session-meta">{{ fold.sensor }} / {{ fold.protocol }}</span>
-    <span class="fold-count">x{{ fold.repeat }} identical sessions</span>
+    <span class="run-count">x{{ fold.repeat }} identical sessions</span>
     {% if fold.users %}<span class="session-user mono">user{% if fold.users|length != 1 %}s{% endif %}: {{ fold.users|join(", ") }}</span>{% endif %}
     <span class="session-count dim">{{ fold.command_count }} command{% if fold.command_count != 1 %}s{% endif %} each</span>
   </summary>

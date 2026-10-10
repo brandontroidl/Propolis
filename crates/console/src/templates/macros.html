@@ -32,6 +32,17 @@
 {% if tier == "aggressive" %}score--aggressive{% elif tier == "standard" %}score--standard{% else %}score--none{% endif %}
 {%- endmacro %}
 
+{#- The feed tier, the one way every page shows it: a Title-case pill on the severity ramp. -#}
+{% macro tier_pill(tier) -%}
+{% if tier == "aggressive" %}<span class="tier tier-aggressive">Aggressive</span>{% elif tier == "standard" %}<span class="tier tier-standard">Standard</span>{% else %}<span class="tier tier-none">-</span>{% endif %}
+{%- endmacro %}
+
+{#- A yes/no fact. Neither answer wants the operator, so neither is coloured: a red "No" beside a
+    gate an address simply has not passed read as an alarm. -#}
+{% macro yes_no(b) -%}
+{% if b %}Yes{% else %}<span class="dim">No</span>{% endif %}
+{%- endmacro %}
+
 {#- Column widths shared by the pending table and the member tables nested inside campaign groups,
     so a group's rows line up under the page's column headers. -#}
 {% macro queue_cols() -%}

@@ -12,7 +12,7 @@
 {%- endmacro %}
 <h1>Attackers</h1>
 {% if cursor_lost %}
-<p class="degraded">That page started at an address that is no longer scored, so this is the first page.</p>
+<p class="table-note">That page started at an address that is no longer scored, so this is the first page.</p>
 {% endif %}
 <p class="table-note" id="tier-note"><strong>Tier</strong> is set when an address is scored, from its raw score and its strongest signal's confidence: aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70. <strong>Score</strong> is live, decayed since the last event and weighted for breadth, so a 100.0 can be standard while a 99.9 is aggressive. Rules: <span class="mono">docs/reference/scoring-and-feed.md#tier</span></p>
 {{ pager() }}
@@ -38,13 +38,13 @@
     <tr>
       <td class="count"><strong>{{ ip.raw_score }}</strong></td>
       <td class="ip">{{ m.ip_evidence_link(ip.ip) }}</td>
-      <td>{% if ip.tier != "-" %}<span class="tier-{{ ip.tier }}">{{ ip.tier }}</span>{% else %}<span class="dim">-</span>{% endif %}</td>
+      <td>{{ m.tier_pill(ip.tier) }}</td>
       <td class="count">{{ ip.event_count }}</td>
       <td class="mono">{{ ip.distinct_categories }}</td>
       <td class="mono">{{ ip.distinct_wan_count }}</td>
       <td class="dim">{{ ip.first_seen }}</td>
       <td><span class="dim" title="{{ ip.last_seen }}">{{ ip.last_seen_relative }}</span></td>
-      <td>{% if ip.eligible %}yes{% else %}<span class="dim">no</span>{% endif %}</td>
+      <td>{{ m.yes_no(ip.eligible) }}</td>
     </tr>
     {% endfor %}
   </tbody>

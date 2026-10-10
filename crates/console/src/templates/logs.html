@@ -36,7 +36,7 @@
             <span class="log-time mono" title="{{ r.timestamp }}">{{ r.time }}</span>
             <span class="log-level-badge log-level-badge-{{ r.level_slug }}">{{ r.level }}</span>
             <span class="log-target mono">{{ r.target }}</span>
-            <span class="log-message">{{ r.message }}{% if r.count > 1 %} <span class="log-count" title="{{ r.count }} identical entries in a row, {{ r.first_timestamp }} to {{ r.timestamp }}">x{{ r.count }}</span>{% endif %}{% for f in r.fields %} <span class="log-kv" data-key="{{ f.key }}" data-more="{{ f.more }}"><span class="log-k">{{ f.key }}</span>=<span class="log-vals">{% for v in f.values %}{% if not loop.first %}/{% endif %}<span class="log-v">{{ v }}</span>{% endfor %}</span>{% if f.more > 0 %}<span class="log-more">/+{{ f.more }}</span>{% endif %}</span>{% endfor %}</span>
+            <span class="log-message">{{ r.message }}{% if r.count > 1 %} <span class="run-count" title="{{ r.count }} identical entries in a row, {{ r.first_timestamp }} to {{ r.timestamp }}">x{{ r.count }}</span>{% endif %}{% for f in r.fields %} <span class="log-kv" data-key="{{ f.key }}" data-more="{{ f.more }}"><span class="log-k">{{ f.key }}</span>=<span class="log-vals">{% for v in f.values %}{% if not loop.first %}/{% endif %}<span class="log-v">{{ v }}</span>{% endfor %}</span>{% if f.more > 0 %}<span class="log-more">/+{{ f.more }}</span>{% endif %}</span>{% endfor %}</span>
           </summary>
           <div class="log-detail">
             {% if r.count > 1 %}

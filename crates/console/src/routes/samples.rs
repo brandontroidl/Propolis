@@ -13,7 +13,7 @@ use chrono::{Duration, Utc};
 
 use crate::routes::campaigns::{
     Bar, CampaignRef, LIST_SPARK_DAYS, SPARK_HEIGHT, SPARK_STEP, artifact_iocs,
-    campaigns_by_sample, campaigns_linking_sample, day_counts, delivering_campaigns, hosts_tier,
+    campaigns_by_sample, campaigns_linking_sample, day_counts, delivering_campaigns,
     sample_activity, sparkline,
 };
 use crate::routes::context::base_context;
@@ -51,9 +51,8 @@ struct SampleRow {
     uploaded: bool,
     /// The sample's own campaign: every address that uploaded it or reported a URL serving it.
     campaign: Option<CampaignRef>,
-    /// The host count's score class, and when the sample's hosts were active, from the same
-    /// campaign; empty when no address is linked to the sample.
-    tier: &'static str,
+    /// When the sample's hosts were active, from the same campaign; empty when no address is
+    /// linked to the sample.
     active: String,
     active_title: String,
     spark: Vec<Bar>,
@@ -322,7 +321,6 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
             samples.push(SampleRow {
                 sha256_short: file.sha256[..12].to_string(),
                 size: format_bytes(file.size),
-                tier: campaign.as_ref().map_or("none", |c| hosts_tier(c.members)),
                 delivered_by: delivering
                     .get(&file.sha256)
                     .map(|&(id, members)| DeliveredBy { id, members }),

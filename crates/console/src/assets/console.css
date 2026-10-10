@@ -436,12 +436,10 @@ td.ip a:hover { color: var(--brand); }
 .session-count { margin-left: auto; white-space: nowrap; }
 .evidence-table th, .evidence-table td { padding: 0.45rem 0.75rem; font-size: 0.8rem; }
 /* Repeated identical sessions: one card holding the members, each still its own card. */
-.fold-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); background: var(--bg); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); padding: 0 0.4rem; font-size: 0.74rem; }
 .fold-members { padding: 0.6rem 0.6rem 0.6rem 1.2rem; }
 /* A run of echo-loader chunk writes: one row, the lines behind an expander. */
 .chunk-toggle > summary { cursor: pointer; }
 .chunk-toggle > summary:hover { color: var(--text); }
-.chunk-count { font-weight: 600; color: var(--high-text); }
 .chunk-lines { margin: 0.4rem 0 0; padding-left: 2.2rem; font-size: 0.72rem; max-height: 22rem; overflow-y: auto; }
 .chunk-lines li { white-space: pre-wrap; word-break: break-all; padding: 0.05rem 0; }
 .raw-toggle { display: inline-block; }
@@ -469,7 +467,9 @@ td.ip a:hover { color: var(--brand); }
 .chart-box-sm { position: relative; height: 220px; }
 .chart-box-compact { position: relative; height: 110px; margin: 0.75rem 0 0.5rem; }
 
-/* -- Dashboard Recent activity: a folded run's count -- */
+/* -- Repeat count: the one marker for "this many folded into one" (a run of events, identical
+   sessions, echo chunks, log lines, a group's pending members). Ink, not colour: a count is
+   inventory, and the nav's .badge is the only count that asks for the operator. -- */
 .run-count { font-family: var(--font-mono); font-weight: 600; color: var(--text); }
 
 /* -- Review queue: the context line under each pending row -- */
@@ -486,9 +486,6 @@ tr.queue-context:hover td { background: transparent; }
 .ctx-dim > * + *::before { content: "\00b7"; margin: 0 0.4rem; }
 .ctx-chip { font-family: var(--font-mono); }
 tr.queue-context .sev-tags { display: inline-flex; }
-/* Signal counts are reference, not alarm: neutral chips, with colour kept only for the worst rung. */
-tr.queue-context .sev { font-size: 0.66rem; padding: 0 0.4rem; background: transparent; border-color: var(--border); color: var(--text-muted); }
-tr.queue-context .sev--crit { color: var(--alert-text); border-color: var(--alert-dim); background: var(--alert-dim); }
 
 /* -- Review queue: layout, score, active span, notes, campaign groups -- */
 .sortbar { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: baseline; font-size: 0.78rem; margin: 0 0 0.6rem; }
@@ -505,17 +502,17 @@ td.score { font-weight: 600; }
 .score--standard { color: var(--attention-text); }
 .score--none { color: var(--text-muted); }
 td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted); white-space: nowrap; }
-/* A group is one item: a tinted block with an accent rail down its whole left edge (header and, when
-   open, the members) and a heavier rule under it, so where it ends is as plain as where it starts. */
-.queue-group > td { padding: 0; background: var(--attention-dim); border-left: 4px solid var(--brand); border-bottom: 2px solid var(--border-bright); }
+/* A group is one item: a grey rail down its whole left edge (header and, when open, the members)
+   and a heavier rule under it, so where it ends is as plain as where it starts. Grey, because a
+   group is a way of listing rows, not a signal: its members carry their own scores. */
+.queue-group > td { padding: 0; border-left: 4px solid var(--border-bright); border-bottom: 2px solid var(--border-bright); }
 .qgroup > summary {
   display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto; gap: 0.2rem 1rem; align-items: center;
   padding: 0.65rem 0.9rem 0.65rem 2rem; position: relative; cursor: pointer; list-style: none;
 }
 .qg-head { display: flex; align-items: baseline; gap: 0.6rem; min-width: 0; }
-.qg-count { flex: none; font-size: 0.72rem; font-weight: 700; color: var(--brand-ink); background: var(--brand); border-radius: 999px; padding: 0.05rem 0.55rem; }
 .qgroup > summary::-webkit-details-marker { display: none; }
-.qgroup > summary::before { content: "\25b8"; position: absolute; left: 0.8rem; top: 0.7rem; color: var(--brand); }
+.qgroup > summary::before { content: "\25b8"; position: absolute; left: 0.8rem; top: 0.7rem; color: var(--text-muted); }
 .qgroup[open] > summary::before { content: "\25be"; }
 .qgroup[open] > summary { border-bottom: 1px solid var(--border); }
 .qg-title { min-width: 0; }
@@ -529,7 +526,7 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .qg-approve { border: 1px solid var(--good); color: var(--good-text); border-radius: var(--radius-sm); padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; }
 .qg-approve:hover { background: var(--good-dim); text-decoration: none; }
 /* Open members sit on a darker inset under the header and are indented, so they read as inside it. */
-.qmembers { background: rgba(0, 0, 0, 0.16); }
+.qmembers { background: var(--bg); }
 @media (min-width: 641px) {
   .qmembers td:first-child { padding-left: 1.6rem; }
 }
@@ -580,9 +577,6 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .tab-count { color: var(--text-faint); font-family: var(--font-mono); font-size: 0.72rem; margin-left: 0.15rem; }
 .tab.active .tab-count { color: var(--text-muted); }
 .sortbar-gap { flex: 1 1 auto; }
-.filter-toggle { border: 1px solid var(--border-bright); border-radius: 999px; padding: 0.05rem 0.7rem; color: var(--text-muted); }
-.filter-toggle:hover { color: var(--text); text-decoration: none; border-color: var(--text-faint); }
-.filter-toggle.on { color: var(--brand); border-color: var(--brand); background: var(--attention-dim); }
 .campaigns-panel table, .samples-panel table { table-layout: fixed; }
 .campaigns-panel td, .samples-panel td { overflow-wrap: anywhere; }
 .cc-what { width: 36%; } .cc-hosts { width: 8%; } .cc-spark { width: 13%; } .cc-active { width: 16%; } .cc-sensors { width: 14%; } .cc-delivers { width: 13%; }
@@ -591,8 +585,6 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .c-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8rem; color: var(--text); }
 .c-text:hover { color: var(--brand); }
 .c-meta { display: flex; align-items: baseline; gap: 0.5rem; margin-top: 0.15rem; font-size: 0.72rem; }
-.rule { display: inline-block; font-size: 0.64rem; letter-spacing: 0.05em; text-transform: uppercase; padding: 0 0.4rem; border: 1px solid var(--border-bright); border-radius: var(--radius-sm); color: var(--text-muted); }
-td.c-hosts, td.s-hosts { font-size: 0.95rem; }
 .c-unit { display: none; font-size: 0.74rem; font-weight: 400; color: var(--text-muted); }
 .c-sub { display: block; font-size: 0.72rem; color: var(--text-faint); }
 .s-hash a { color: var(--text); }
@@ -721,7 +713,6 @@ summary.log-summary:hover { background: var(--surface-raised); }
 .log-k { color: var(--text-faint); }
 .log-v { color: var(--info-text); }
 .log-more { color: var(--text-faint); }
-.log-count { display: inline-block; font-weight: 600; font-size: 0.7rem; color: var(--text); background: var(--surface-raised); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); padding: 0 0.35em; margin-right: 0.2rem; }
 .log-detail { padding: 0.3rem 0.9rem 0.6rem 1.5rem; }
 .log-fields { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.9rem; margin: 0; }
 .log-fields dt { color: var(--text-faint); }

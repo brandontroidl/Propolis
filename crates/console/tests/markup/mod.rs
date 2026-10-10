@@ -138,6 +138,36 @@ pub fn panel_violations(html: &str) -> Vec<String> {
     out
 }
 
+/// Every place `html` uses a chip outside its job: a tier is the `.tier` pill, never a bare
+/// `.tier-*` colour, and the chip and count styles later work invented beside the system's own
+/// are gone.
+pub fn vocabulary_violations(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    walk(
+        html,
+        |_, e| {
+            let tier_colour = ["tier-aggressive", "tier-standard", "tier-none"];
+            if tier_colour.iter().any(|c| e.has(c)) && !e.has("tier") {
+                out.push(format!("tier colour without the pill: {}", e.describe()));
+            }
+            for retired in [
+                "rule",
+                "filter-toggle",
+                "qg-count",
+                "fold-count",
+                "log-count",
+                "chunk-count",
+            ] {
+                if e.has(retired) {
+                    out.push(format!("retired style .{retired}: {}", e.describe()));
+                }
+            }
+        },
+        |_, _| {},
+    );
+    out
+}
+
 /// Asserts the page keeps the panel contract, naming every violation at once.
 pub fn assert_panels(html: &str) {
     let found = panel_violations(html);

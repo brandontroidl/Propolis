@@ -483,7 +483,7 @@ tr.queue-context .sev-tags { display: inline-flex; }
 /* Fixed layout with shared column widths so the member tables nested in a group line up under the
    page's headers; the widths come from the <colgroup> in macros.html. */
 .queue-panel--pending table { table-layout: fixed; }
-.qc-ip { width: 16%; } .qc-score { width: 11%; } .qc-tier { width: 10%; } .qc-events { width: 7%; } .qc-active { width: 21%; } .qc-actions { width: 35%; }
+.qc-ip { width: 17%; } .qc-score { width: 7%; } .qc-tier { width: 10%; } .qc-events { width: 7%; } .qc-active { width: 21%; } .qc-actions { width: 38%; }
 .queue-panel td.ip { white-space: normal; overflow-wrap: anywhere; }
 td.score { font-weight: 600; }
 td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted); white-space: nowrap; }

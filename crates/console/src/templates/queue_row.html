@@ -1,7 +1,7 @@
 {% import "macros.html" as m %}
 <tr id="row-{{ row.ip }}"{% if row.context %} class="has-context"{% endif %}>
   <td class="ip stack-lead">{{ m.ip_evidence_link(row.ip) }}</td>
-  <td class="score">{{ m.score_meter(row.score, row.score_pct) }}</td>
+  <td class="score">{{ row.score }}</td>
   <td>{{ m.tier_pill(row.tier) }}</td>
   <td class="count" data-label="Events">{{ row.event_count }}</td>
   <td class="active-cell stack-end"{% if row.active_title %} title="{{ row.active_title }}"{% endif %}>{{ row.active }}</td>

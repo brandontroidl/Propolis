@@ -92,7 +92,8 @@ hours and the campaign and sample pages' hosts per day (`macros.html#day_strip`)
 volume; colour is the worst signal, and a day of hosts is the neutral low rung.
 
 **Score.** `macros.html#score_meter`: a short meter on the heat ramp with the number in ink, on
-every page that shows a score.
+the IP page, Attackers and Search. The review queue shows the number alone, in ink: its rows
+were deliberately de-crowded, and the bar was one of the things removed.
 
 **Tier.** `macros.html#tier_pill`: the one Title-case `.tier` pill.
 

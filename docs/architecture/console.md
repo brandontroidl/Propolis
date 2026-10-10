@@ -130,7 +130,7 @@ becoming script execution.
   in a nested table sharing the page's `<colgroup>` widths (`macros.html#queue_cols`). An address
   in several campaigns is listed under the one with the most pending members, then the most hosts,
   then the lowest id (`routes/queue.rs#group_home`); its other campaigns appear on its IP page.
-  Scores carry the same meter as every other page, "Active" is one cell
+  Scores are plain numbers (the page carries no score bar, to keep each row quiet), "Active" is one cell
   (`routes/format.rs#format_active`: a clock range within one UTC day, a length plus recency
   across days, exact timestamps in the `title`), and below 640 px each entry stacks as a card,
   as every table of addresses does (all rules in `console.css`, no inline style). Group counts are rendered with the page and are not updated when a member is decided in

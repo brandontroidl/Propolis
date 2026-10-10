@@ -1000,13 +1000,13 @@ async fn the_active_cell_shows_a_clock_range_within_a_day_and_a_length_across_da
             .contains("title=\"first 2026-01-01 09:00 UTC, last 2026-01-04 10:00 UTC\">3d, last "),
         "{multi_day}"
     );
-    // The retired columns are gone and every sort key is still reachable. The score carries the
-    // same meter it does on every other page, inside its own column.
-    assert!(
-        same_day.contains("<td class=\"score\"><span class=\"meter\">"),
-        "{same_day}"
-    );
-    for gone in ["Categories", "First seen</th>", "Last seen</th>"] {
+    // The retired columns are gone and every sort key is still reachable.
+    for gone in [
+        "Categories",
+        "First seen</th>",
+        "Last seen</th>",
+        "class=\"meter\"",
+    ] {
         assert!(!page.contains(gone), "{gone} should be gone: {page}");
     }
     for key in ["score", "event_count", "first_seen", "last_seen"] {

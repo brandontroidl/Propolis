@@ -87,8 +87,8 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4120 test functions** (2614 unit + 1506 integration).
-- **DB-backed (`sqlx::test`): 411** - console 213, review 97, core-scoring 44,
+- **Total: 4129 test functions** (2622 unit + 1507 integration).
+- **DB-backed (`sqlx::test`): 412** - console 213, review 98, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -131,7 +131,7 @@ Per-crate breakdown:
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
 | propolis | 140 | 33 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 196 | 102 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
+| review | 204 | 103 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 61 | 45 | arrival, env_strict, integration, shutdown_tracking |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
@@ -148,7 +148,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2614** | **1506** | |
+| **Total** | **2622** | **1507** | |
 
 ### Test styles by layer
 
@@ -158,7 +158,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (43 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (365 uses) - needed wherever a test needs more than
+  applies migrations manually (366 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

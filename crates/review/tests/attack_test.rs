@@ -390,6 +390,112 @@ async fn only_shell_sensors_are_read_as_shell_lines(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn database_sensor_commands_are_tagged_and_the_secret_they_carry_is_not_stored(pool: PgPool) {
+    migrate(&pool).await;
+    let s = Uuid::now_v7();
+    let version = command(
+        &pool,
+        "192.0.2.31",
+        "postgresql",
+        t0(),
+        s,
+        "SELECT version();",
+    )
+    .await;
+    let alter = command(
+        &pool,
+        "192.0.2.31",
+        "postgresql",
+        t0() + Duration::seconds(2),
+        s,
+        "ALTER USER fixture_acct WITH PASSWORD 'fixture-secret-9'",
+    )
+    .await;
+    let r = Uuid::now_v7();
+    let config = append(
+        &pool,
+        "192.0.2.31",
+        "redis",
+        SignalType::HoneypotCommandExec,
+        t0(),
+        json!({ "command": "CONFIG SET", "param": "dir", "value": "/var/spool/cron" }),
+        Some(r),
+    )
+    .await;
+    // The same text on a sensor that is not a database sensor is not SQL.
+    command(
+        &pool,
+        "192.0.2.32",
+        "http",
+        t0(),
+        Uuid::now_v7(),
+        "ALTER USER fixture_acct WITH PASSWORD 'fixture-secret-9'",
+    )
+    .await;
+    index_all(&pool).await;
+
+    let rows = sqlx::query(
+        "SELECT host(source_ip) AS ip, technique_id, rule_id, event_id, matched \
+         FROM attack_tag ORDER BY source_ip, rule_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let got: Vec<(String, String, String, i64, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.get("ip"),
+                r.get("technique_id"),
+                r.get("rule_id"),
+                r.get("event_id"),
+                r.get("matched"),
+            )
+        })
+        .collect();
+    let ip = "192.0.2.31".to_string();
+    assert_eq!(
+        got,
+        [
+            (
+                ip.clone(),
+                "T1053.003".into(),
+                "redis-config-cron".into(),
+                config,
+                "CONFIG SET dir".into()
+            ),
+            (
+                ip.clone(),
+                "T1098".into(),
+                "sql-account-password".into(),
+                alter,
+                "ALTER USER PASSWORD".into()
+            ),
+            (
+                ip,
+                "T1082".into(),
+                "sql-version-discovery".into(),
+                version,
+                "version()".into()
+            ),
+        ]
+    );
+    assert!(got.iter().all(|r| !r.4.contains("fixture-secret")));
+
+    let by_session = attack::session_tags(&pool, &[s.to_string(), r.to_string()])
+        .await
+        .unwrap();
+    let ids = |id: &Uuid| -> Vec<String> {
+        by_session[&id.to_string()]
+            .iter()
+            .map(|t| t.technique.clone())
+            .collect()
+    };
+    assert_eq!(ids(&s), ["T1082", "T1098"]);
+    assert_eq!(ids(&r), ["T1053.003"]);
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_signal_without_a_session_is_tagged_on_its_source(pool: PgPool) {
     migrate(&pool).await;
     let first = append(

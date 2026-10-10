@@ -13,6 +13,17 @@
 
 ### Added
 
+- **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
+  the commands the `redis` sensor records are now tagged, by a SQL reader of its own
+  (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring
+  matching, dialect taken from the sensor) and ten new rules: account password change,
+  privilege change and account creation (T1098, T1136), OS commands through `COPY ... PROGRAM`,
+  `xp_cmdshell` and `sys_exec` (T1059), version and user discovery (T1082, T1033), server-side
+  file reads (T1005), and Redis `CONFIG SET dir|dbfilename` aimed at cron or `.ssh` and `SLAVEOF`
+  (T1053.003, T1098.004, T1105). A tag's token is built from keywords only, so a password in the
+  statement never reaches `attack_tag`. No migration. The `mysql` and `mssql` sensors record no
+  statements, so their dialects are read only if a scanner sends them to the PostgreSQL port. See
+  [ATT&CK tagging](docs/reference/attack-tagging.md).
 - **ATT&CK techniques on the address and campaign pages** - the per-address page gets an "ATT&CK
   techniques" panel (each rule that tagged a technique and the token it matched) and technique
   chips in each session card's header; the campaign list shows chips under each campaign and a

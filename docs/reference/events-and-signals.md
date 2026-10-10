@@ -155,6 +155,7 @@ Captures that are not a protocol's own file transfer say why the bytes were kept
 | `binary_publish_payload` | mqtt | a PUBLISH payload that looks binary |
 | `exec_stdin` | ssh (exec channel), adb (`shell:<command>`) | the standard input a command read: the data sent on its channel or stream |
 | `shell_stdin` | ssh, telnet, adb (interactive shell) | the input a typed line read: what was typed after it (`cat > f` takes the lines up to Ctrl-D) |
+| `probe_payload` | telnet | not a capture: a scanner speaking another protocol to the port, recorded as a `catchall_probe` event with no sample (see [Protocol probes on the telnet port](#protocol-probes-on-the-telnet-port)) |
 
 Standard input is captured text and binary alike, once per distinct body (SHA-256 of the bytes
 kept) per session, when the session ends, including by the listener's `max_duration`
@@ -171,6 +172,39 @@ rows carry three more keys:
 
 A session holds at most 16 distinct bodies (`crates/sensor-framework/src/held_input.rs#MAX_HELD_CAPTURES`);
 a further distinct one is submitted at once with `repeat_count` 1.
+
+#### Protocol probes on the telnet port
+
+The telnet login is two raw lines, so a scanner that opens port 23 and sends another protocol's
+opening bytes (a TLS ClientHello, an RDP or SMB request) has them read as a "username" and
+"password", and the rest lands in the shell capture, where binary-looking bytes used to be
+filed as a `binary_shell_payload` sample. The sensor now classifies the session first, from the
+first bytes of the connection (before telnet option stripping, which would eat an SMB marker byte
+`0xff`), in `crates/sensor-telnet/src/probe.rs#classify`. A session that opens like one of
+nineteen protocols is recorded as a **`catchall_probe`** event instead (the signal for a scanner
+speaking the wrong protocol to a port; weight and category as in the table below), with no
+`sample`, so it is never spooled, fetched, sent to VirusTotal or grouped into a sample campaign.
+The session's `honeypot_connection` and `honeypot_login_attempt` events are unchanged. Its
+metadata:
+
+| key | type | meaning |
+|---|---|---|
+| `capture_reason` | string | `probe_payload` |
+| `probe_protocol` | string | `tls`, `sslv2`, `rdp`, `x224`, `smb`, `http`, `ssh`, `sip`, `rtsp`, `dns`, `jdwp`, `redis`, `x11`, `mqtt`, `socks5`, `socks4`, `vnc`, `adb` or `postgres` |
+| `payload_hex` | string | the connection's first bytes, hex, at most 256 bytes |
+| `observed_len` | integer | every byte the client sent |
+| `protocol_label` | string | `telnet` |
+
+The decision is one-sided, and every doubt leaves the session on the sample path
+(`crates/sensor-telnet/src/probe.rs#verdict`): the opening bytes must match a protocol's own
+structure (length fields and fixed tokens, not a first byte alone); no executable, script or
+archive signature may appear anywhere in the opening bytes or the captured shell input (ELF,
+Mach-O, PE, `#!/`, zip, gzip, xz, 7z, rar, ar, tar), so a dropper cannot hide behind a protocol
+prefix; and the session may have sent at most 4096 bytes. There is no size floor: a short
+`#!/bin/sh` stub is a real dropper. A telnet option negotiation is not a signature, because every
+real client opens with one. Earlier `binary_shell_payload` rows for such probes are not
+reclassified: the stored capture is only the shell-phase tail, which holds none of the opening
+bytes.
 
 #### Echo-loader captures and their keys
 

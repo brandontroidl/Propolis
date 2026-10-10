@@ -6,6 +6,7 @@
 
 pub mod handler;
 pub mod infected_hold;
+pub mod probe;
 pub mod telnet;
 
 use std::net::SocketAddr;

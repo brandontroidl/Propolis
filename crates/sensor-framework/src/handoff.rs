@@ -107,10 +107,18 @@ pub struct CaptureJob {
     pub event_builder: Box<dyn FnOnce(SampleRef) -> SensorEvent + Send>,
 }
 
+/// What the worker is asked to do with one queue entry.
+enum Work {
+    /// Spool a body and emit the event built around its `SampleRef`.
+    Capture(CaptureJob),
+    /// Emit an event that carries no body (see [`CaptureHandoff::submit_event`]).
+    Event(Box<SensorEvent>),
+}
+
 /// A job as it waits in the queue: with the listener the submitting connection arrived on, read
 /// in `submit` because the worker's own task is outside every listener's scope.
 struct Queued {
-    job: CaptureJob,
+    work: Work,
     arrival: Option<Arrival>,
 }
 
@@ -484,7 +492,7 @@ impl CaptureHandoff {
             return Err(CaptureDropped);
         }
         let queued = Queued {
-            job,
+            work: Work::Capture(job),
             arrival: arrival::current(),
         };
         let sent = self.tx.try_send(queued).map_err(|e| {
@@ -519,6 +527,35 @@ impl CaptureHandoff {
             }
         }
         sent
+    }
+
+    /// Enqueue an event that carries no body, for a handler that must record something from a
+    /// place that cannot await (a `Drop`, which is the only code that also runs when the
+    /// listener cancels a session at `max_duration`). The worker appends it on the submitting
+    /// connection's listener, so `local_port` is stamped as for any other event, and `drain`
+    /// finishes it with the captures. Same contract as [`Self::submit`]: never blocks, and a full
+    /// queue or a closing hand-off refuses it (the former counted in `dropped_count`).
+    pub fn submit_event(&self, event: SensorEvent) -> Result<(), CaptureDropped> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(CaptureDropped);
+        }
+        let queued = Queued {
+            work: Work::Event(Box::new(event)),
+            arrival: arrival::current(),
+        };
+        self.tx.try_send(queued).map_err(|e| {
+            if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                return CaptureDropped;
+            }
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped_total = dropped,
+                    "capture hand-off: queue full, event dropped (no body)"
+                );
+            }
+            CaptureDropped
+        })
     }
 
     /// Total jobs `submit` has rejected for a full queue since construction: the operator-visible
@@ -726,15 +763,24 @@ async fn process_job(
     outbox: &OutboxManifest,
     queued: Queued,
 ) {
-    let Queued {
-        job:
-            CaptureJob {
-                body,
-                orig_name,
-                event_builder,
-            },
-        arrival,
-    } = queued;
+    let Queued { work, arrival } = queued;
+    let CaptureJob {
+        body,
+        orig_name,
+        event_builder,
+    } = match work {
+        Work::Capture(job) => job,
+        Work::Event(event) => {
+            let appended = match arrival {
+                Some(arrival) => arrival::scope(arrival, emitter.append(&event)).await,
+                None => emitter.append(&event).await,
+            };
+            if let Err(e) = appended {
+                tracing::error!(error = %e, "capture hand-off: bodyless event emit failed");
+            }
+            return;
+        }
+    };
     let budget_truncated = body.is_exhausted();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let stored = spool.store(body.as_slice());
@@ -1119,6 +1165,36 @@ mod tests {
         let sample = event.sample.unwrap();
         assert!(!sample.sha256.is_empty());
         assert_eq!(sample.size, b"malware payload".len() as u64);
+    }
+
+    /// A bodyless event reaches the log on the submitting connection's port, spools nothing, and
+    /// is refused once the hand-off is closing.
+    #[tokio::test]
+    async fn submit_event_emits_without_a_body_and_on_the_submitting_port() {
+        use crate::arrival::{Arrival, LOCAL_PORT_KEY, scope};
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir.clone(), 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
+        handoff.start_worker();
+
+        scope(Arrival::new(2323), async {
+            handoff.submit_event(test_event(None)).unwrap();
+        })
+        .await;
+        wait_for_lines(&log_path, 1).await;
+
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let event: SensorEvent = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(event.sample.is_none());
+        assert_eq!(event.metadata[LOCAL_PORT_KEY], 2323);
+        assert_eq!(std::fs::read_dir(&spool_dir).unwrap().count(), 0);
+
+        handoff.drain(Duration::from_secs(5)).await;
+        assert!(handoff.submit_event(test_event(None)).is_err());
     }
 
     /// The worker emits on its own task, outside every listener's scope, so the upload event is

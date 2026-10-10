@@ -1571,10 +1571,22 @@ pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) ->
         // `local_port` is the arrival port the sensor framework stamps on every event
         // (`sensor_framework::arrival`); the catch-all binds many ports, so it is what tells
         // its probes apart. No sensor has ever written a `port` key.
+        //
+        // A session-based sensor (telnet) that recognised the protocol a scanner spoke to its
+        // port names it (`probe_protocol`), so the row reads "tls, port 23".
         "catchall_probe" => metadata
             .get("local_port")
             .and_then(|v| v.as_u64())
-            .map(|p| format!("port {p}"))
+            .map(|p| {
+                match metadata
+                    .get("probe_protocol")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(protocol) => format!("{protocol}, port {p}"),
+                    None => format!("port {p}"),
+                }
+            })
             .unwrap_or_else(|| "-".into()),
         _ => metadata
             .as_object()
@@ -1929,6 +1941,14 @@ mod tests {
         // `port` is not a key any sensor writes; reading it would be a second key for one fact.
         let stray = json!({ "payload_hex": "", "observed_len": 0, "port": 8080 });
         assert_eq!(extract_detail("catchall_probe", &stray), "-");
+    }
+
+    #[test]
+    fn extract_detail_catchall_probe_names_the_protocol_a_sensor_recognised() {
+        let metadata = json!({ "probe_protocol": "tls", "local_port": 23 });
+        assert_eq!(extract_detail("catchall_probe", &metadata), "tls, port 23");
+        let blank = json!({ "probe_protocol": "", "local_port": 23 });
+        assert_eq!(extract_detail("catchall_probe", &blank), "port 23");
     }
 
     #[test]

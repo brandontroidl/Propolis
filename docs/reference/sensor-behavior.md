@@ -1024,6 +1024,11 @@ credential, then presents the fake shell.
   the [command-event budget](#command-event-budget-ssh-telnet-adb) become one `command_summary`
   event per source network per minute; its logins, connections, captures and derived URLs keep
   their own events.
+- **Protocol probes.** A session whose first bytes are another protocol's opening (TLS, RDP, SMB,
+  HTTP, SSH, SIP, RTSP, DNS, JDWP, Redis, X11, MQTT, SOCKS, VNC, ADB, PostgreSQL) is recorded as
+  a `catchall_probe` event with `probe_protocol`, not as a malware sample. Anything that carries
+  an executable or archive signature, or sent more than 4096 bytes, stays a sample. Details and
+  the metadata keys: [events and signals](events-and-signals.md#protocol-probes-on-the-telnet-port).
 
 ### sensor-http
 

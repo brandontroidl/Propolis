@@ -724,6 +724,40 @@ mod tests {
         v
     }
 
+    /// Protocol-probe traffic a scanner sends to a telnet port (the sensors record it as probe
+    /// evidence, never as a sample, so VirusTotal does not see it). Should one reach the spool
+    /// anyway, from before the sensor learned to tell them apart, the upload filter refuses it
+    /// on content: none of these is an executable, a script or an archive.
+    #[test]
+    fn protocol_probe_bodies_are_never_uploaded() {
+        let mut tls = vec![
+            0x16, 0x03, 0x01, 0x00, 0x5a, 0x01, 0x00, 0x00, 0x56, 0x03, 0x03,
+        ];
+        tls.resize(100, 0xc3);
+        let mut smb = vec![0, 0, 0, 0x54, 0xff, b'S', b'M', b'B', 0x72];
+        smb.resize(100, 0);
+        let rdp = vec![
+            0x03, 0, 0, 0x13, 0x0e, 0xe0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 3, 0, 0, 0,
+        ];
+        for (label, body) in [
+            ("tls", tls),
+            ("smb", smb),
+            ("rdp", rdp),
+            (
+                "http",
+                b"GET / HTTP/1.1\r\nHost: 192.0.2.1\r\n\r\n".to_vec(),
+            ),
+            ("redis", b"*1\r\n$4\r\nPING\r\n".to_vec()),
+            ("ssh", b"SSH-2.0-scanner\r\n".to_vec()),
+        ] {
+            let verdict = decide(&body);
+            assert!(
+                !verdict.upload,
+                "{label} was cleared for upload: {verdict:?}"
+            );
+        }
+    }
+
     fn pdf() -> Vec<u8> {
         let mut v = b"%PDF-1.7\n".to_vec();
         v.extend_from_slice(b"1 0 obj << /Type /Catalog >> endobj\n");

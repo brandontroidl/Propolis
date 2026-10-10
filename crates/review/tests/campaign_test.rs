@@ -137,6 +137,51 @@ fn of_kind(m: &BTreeMap<(String, String), Vec<String>>, kind: &str) -> Vec<Vec<S
         .collect()
 }
 
+/// A scanner sends the same protocol hello from every host it runs on. Recorded as probe evidence
+/// (the telnet sensor's `probe_payload`), those five events form no campaign and no sample; the
+/// same hosts sending a real upload do. Without the control a test of "no campaign" would pass
+/// on an indexer that ignored everything.
+#[sqlx::test(migrations = false)]
+async fn probe_payload_evidence_is_not_grouped_into_a_sample_campaign(pool: PgPool) {
+    migrate(&pool).await;
+    for i in 1..=5 {
+        append(
+            &pool,
+            &format!("192.0.2.{i}"),
+            "telnet",
+            SignalType::CatchallProbe,
+            t0() + Duration::minutes(i),
+            json!({
+                "capture_reason": "probe_payload",
+                "probe_protocol": "tls",
+                "payload_hex": "160301005a01",
+                "observed_len": 89,
+            }),
+            None,
+        )
+        .await;
+    }
+    index_all(&pool).await;
+    assert!(
+        memberships(&pool).await.is_empty(),
+        "probe evidence made a campaign"
+    );
+
+    let body = sha_hex(b"synthetic body");
+    for i in 1..=5 {
+        upload(
+            &pool,
+            &format!("192.0.2.{i}"),
+            t0() + Duration::hours(1),
+            &body,
+            None,
+        )
+        .await;
+    }
+    index_all(&pool).await;
+    assert_eq!(of_kind(&memberships(&pool).await, "sample").len(), 1);
+}
+
 /// The Raspberry Pi worm copies itself byte for byte: five infected hosts uploading the same body
 /// are one campaign with five members, and a different body is another campaign.
 #[sqlx::test(migrations = false)]

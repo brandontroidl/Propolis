@@ -252,6 +252,19 @@
 
 ### Fixed
 
+- **A scanner's protocol probe on the telnet port is no longer filed as a malware sample** - a
+  scanner that sends a TLS hello, an RDP or SMB request or similar to port 23 had its first bytes
+  read as the login and the rest kept as a 54 to 175 byte `binary_shell_payload` sample, which
+  cluttered the samples list and campaigns. The sensor now classifies a session from the first
+  bytes of the connection and records a recognised probe (19 protocols, each validated by
+  structure, not by a first byte) as a `catchall_probe` event with `probe_protocol`,
+  `payload_hex` and `observed_len`, no sample. A session that carries an executable or archive
+  signature anywhere, or sent more than 4096 bytes, or matches nothing, is a sample exactly as
+  before; there is no size floor, since a short shell stub is a real dropper. The address page
+  names the protocol in the probe row's detail ("tls, port 23"). No migration. Earlier
+  `binary_shell_payload` rows for probes are not reclassified (the stored tail holds none of the
+  opening bytes). See
+  [protocol probes on the telnet port](docs/reference/events-and-signals.md#protocol-probes-on-the-telnet-port).
 - **A bash that runs a script no longer answers like the interactive login shell** - `bash -c f`,
   `bash FILE` and a script piped to `bash` said `f: command not found`, the answer of the
   command-not-found handler that only an interactive bash has (the persona has the

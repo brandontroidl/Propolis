@@ -23,9 +23,7 @@
 <div class="panel">
   <div class="panel-head">Distinct hosts per day <span class="dim">last {{ spark_days }} days</span></div>
   <div class="panel-body">
-    <svg class="spark spark--wide" width="{{ spark_width }}" height="{{ spark_height }}" viewBox="0 0 {{ spark_width }} {{ spark_height }}" role="img" aria-label="distinct hosts per day">
-      {% for b in spark %}<rect x="{{ b.x }}" y="{{ b.y }}" width="4" height="{{ b.h }}"><title>{{ b.day }}: {{ b.hosts }}</title></rect>{% endfor %}
-    </svg>
+    <p>{{ m.day_strip(spark, spark_days) }}</p>
     {% if sensors %}<p class="ctx-dim">{% for s in sensors %}<span class="ctx-chip">{{ s.label }} {{ s.sightings }}</span>{% endfor %}</p>{% endif %}
   </div>
 </div>

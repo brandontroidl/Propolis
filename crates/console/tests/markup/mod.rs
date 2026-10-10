@@ -170,6 +170,7 @@ pub fn vocabulary_violations(html: &str) -> Vec<String> {
                 "score--aggressive",
                 "score--standard",
                 "score--none",
+                "spark",
             ] {
                 if e.has(retired) {
                     out.push(format!("retired style .{retired}: {}", e.describe()));

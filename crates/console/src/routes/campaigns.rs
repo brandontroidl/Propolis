@@ -227,39 +227,38 @@ pub(crate) async fn campaigns_linking_sample(
     Ok(out)
 }
 
-/// One bar of a distinct-addresses-per-day sparkline, laid out in Rust so the template only places
-/// numbers into SVG attributes.
+/// One day of a distinct-hosts strip, drawn with the dashboard's activity-strip cells (`.strip`
+/// in console.css, `macros.html#day_strip`) so the console has one sparkline. `height` is a
+/// pixel height in the strip's 2-26 range, square-root scaled to the busiest day as the
+/// dashboard's hourly cells are, so a one-host day still clears the empty stub. A day with hosts
+/// takes the strip's low rung (`s1`): a host count is volume, not severity.
 #[derive(Debug, Serialize)]
-pub(crate) struct Bar {
-    x: i64,
-    y: i64,
-    h: i64,
+pub(crate) struct DayCell {
+    height: u32,
+    class: &'static str,
     day: String,
     hosts: i64,
 }
 
-pub(crate) const SPARK_HEIGHT: i64 = 20;
-pub(crate) const SPARK_STEP: i64 = 5;
-
-pub(crate) fn sparkline(
+pub(crate) fn host_strip(
     counts: &BTreeMap<NaiveDate, i64>,
     today: NaiveDate,
     days: i64,
-) -> Vec<Bar> {
-    let max = counts.values().copied().max().unwrap_or(0).max(1);
+) -> Vec<DayCell> {
+    let max = counts.values().copied().max().unwrap_or(0).max(1) as f64;
     (0..days)
         .map(|i| {
             let day = today - Duration::days(days - 1 - i);
             let hosts = counts.get(&day).copied().unwrap_or(0);
-            let h = if hosts == 0 {
-                0
+            let (height, class) = if hosts <= 0 {
+                (2, "")
             } else {
-                (hosts * SPARK_HEIGHT / max).max(1)
+                let frac = (hosts as f64).sqrt() / max.sqrt();
+                ((2.0 + 24.0 * frac).round() as u32, "s1")
             };
-            Bar {
-                x: i * SPARK_STEP,
-                y: SPARK_HEIGHT - h,
-                h,
+            DayCell {
+                height,
+                class,
                 day: day.to_string(),
                 hosts,
             }
@@ -462,7 +461,7 @@ struct ListRow {
     members: i32,
     active: String,
     active_title: String,
-    spark: Vec<Bar>,
+    spark: Vec<DayCell>,
     sensors: Vec<SensorCount>,
     sample_count: usize,
     first_sample: Option<SampleLink>,
@@ -610,7 +609,7 @@ async fn list_page(
             members,
             active,
             active_title,
-            spark: sparkline(
+            spark: host_strip(
                 &days.get(&id).cloned().unwrap_or_default(),
                 today,
                 LIST_SPARK_DAYS,
@@ -643,8 +642,6 @@ async fn list_page(
         newest,
         indexer_behind => newest.saturating_sub(indexed),
         spark_days => LIST_SPARK_DAYS,
-        spark_width => LIST_SPARK_DAYS * SPARK_STEP,
-        spark_height => SPARK_HEIGHT,
     })?))
 }
 
@@ -944,9 +941,7 @@ async fn detail_page(
         members,
         member_limit => MEMBER_LIMIT,
         pending_members => pending.len(),
-        spark => sparkline(&days.get(&id).cloned().unwrap_or_default(), today, DETAIL_SPARK_DAYS),
-        spark_width => DETAIL_SPARK_DAYS * SPARK_STEP,
-        spark_height => SPARK_HEIGHT,
+        spark => host_strip(&days.get(&id).cloned().unwrap_or_default(), today, DETAIL_SPARK_DAYS),
         spark_days => DETAIL_SPARK_DAYS,
         sensors,
         samples,
@@ -1102,21 +1097,30 @@ async fn approve_members(
 mod tests {
     use super::*;
 
+    /// The strip's busiest day fills it, a quiet day is the empty stub with no rung, and every
+    /// height names one of the strip's `h-2`..`h-26` classes.
     #[test]
-    fn the_sparkline_scales_to_the_busiest_day_and_keeps_quiet_days_empty() {
+    fn the_host_strip_scales_to_the_busiest_day_and_keeps_quiet_days_empty() {
         let today = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
         let counts: BTreeMap<NaiveDate, i64> = [(today, 4), (today - Duration::days(2), 1)]
             .into_iter()
             .collect();
-        let bars = sparkline(&counts, today, 4);
-        assert_eq!(bars.len(), 4);
-        assert_eq!(bars[3].h, SPARK_HEIGHT);
-        assert_eq!(bars[3].y, 0);
-        assert_eq!(bars[1].h, SPARK_HEIGHT / 4);
-        assert_eq!(bars[0].h, 0);
-        assert_eq!(bars[2].h, 0);
-        assert_eq!(bars[0].day, "2026-10-04");
-        assert_eq!(bars[3].x, 3 * SPARK_STEP);
+        let cells = host_strip(&counts, today, 4);
+        assert_eq!(cells.len(), 4);
+        assert_eq!((cells[3].height, cells[3].class), (26, "s1"));
+        assert_eq!((cells[1].height, cells[1].class), (14, "s1"));
+        assert_eq!((cells[0].height, cells[0].class), (2, ""));
+        assert_eq!((cells[2].height, cells[2].class), (2, ""));
+        assert_eq!(cells[0].day, "2026-10-04");
+        assert_eq!(cells[3].hosts, 4);
+        let wide: BTreeMap<NaiveDate, i64> = (0..30)
+            .map(|d| (today - Duration::days(d), d * d * 97 + 1))
+            .collect();
+        assert!(
+            host_strip(&wide, today, 30)
+                .iter()
+                .all(|c| (2..=26).contains(&c.height))
+        );
     }
 
     #[test]

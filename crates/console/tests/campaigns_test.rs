@@ -299,7 +299,7 @@ async fn the_campaign_list_shows_each_campaign_with_its_hosts_and_activity(pool:
         "{page}"
     );
     assert!(
-        page.contains(&format!("<title>{}: 3</title>", t0().date_naive())),
+        page.contains(&format!(" s1\" title=\"{}: 3\"", t0().date_naive())),
         "{page}"
     );
     assert!(page.contains(&format!("href=\"/samples/{sha}\"")));
@@ -635,7 +635,7 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
         "host count links the sample's own campaign: {row}"
     );
     assert!(
-        row.contains(&format!("<title>{}: 5</title>", t0().date_naive())),
+        row.contains(&format!(" s1\" title=\"{}: 5\"", t0().date_naive())),
         "the hosts-per-day sparkline: {row}"
     );
     assert!(row.contains("UTC"), "the Active cell: {row}");
@@ -652,7 +652,7 @@ async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
     );
     assert!(lone_row.contains("not linked"), "{lone_row}");
     assert!(!lone_row.contains("/campaigns/"), "{lone_row}");
-    assert!(!lone_row.contains("<svg"), "{lone_row}");
+    assert!(!lone_row.contains("class=\"strip\""), "{lone_row}");
     assert!(
         samples
             .find(&format!("href=\"/samples/{sha}\" title="))
@@ -1646,6 +1646,7 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
         r#"<span class="state-pill state-rejected">No</span>"#,
         r#"<a class="state-pill state-snoozed" href="/vt">pending VT analysis</a>"#,
         r#"<td class="score score--aggressive">97.0</td>"#,
+        r#"<svg class="spark" role="img"><rect height="4"></rect></svg>"#,
         r#"<span class="tier-aggressive">aggressive</span>"#,
         r#"<span class="rule rule--commands">commands</span>"#,
         r#"<a class="filter-toggle on" href="/x">shown</a>"#,

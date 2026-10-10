@@ -12,9 +12,8 @@ use crate::AppState;
 use chrono::{Duration, Utc};
 
 use crate::routes::campaigns::{
-    Bar, CampaignRef, LIST_SPARK_DAYS, SPARK_HEIGHT, SPARK_STEP, artifact_iocs,
-    campaigns_by_sample, campaigns_linking_sample, day_counts, delivering_campaigns,
-    sample_activity, sparkline,
+    CampaignRef, DayCell, LIST_SPARK_DAYS, artifact_iocs, campaigns_by_sample,
+    campaigns_linking_sample, day_counts, delivering_campaigns, host_strip, sample_activity,
 };
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
@@ -55,7 +54,7 @@ struct SampleRow {
     /// linked to the sample.
     active: String,
     active_title: String,
-    spark: Vec<Bar>,
+    spark: Vec<DayCell>,
     /// The behaviour (command-sequence campaign) whose sessions uploaded it, as `(id, hosts)`.
     delivered_by: Option<DeliveredBy>,
 }
@@ -312,7 +311,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 .map(|(first, last)| format_active(*first, *last, now))
                 .unwrap_or_default();
             let spark = campaign.as_ref().map_or_else(Vec::new, |c| {
-                sparkline(
+                host_strip(
                     &days.get(&c.id).cloned().unwrap_or_default(),
                     today,
                     LIST_SPARK_DAYS,
@@ -365,8 +364,6 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         status_counts,
         fetch_attempts_total,
         spark_days => LIST_SPARK_DAYS,
-        spark_width => LIST_SPARK_DAYS * SPARK_STEP,
-        spark_height => SPARK_HEIGHT,
     })?))
 }
 

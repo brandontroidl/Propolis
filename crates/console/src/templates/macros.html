@@ -39,6 +39,13 @@
 <span class="meter"><span class="meter-fill{% if pct >= 90 %} meter-fill--crit{% elif pct >= 75 %} meter-fill--high{% elif pct >= 50 %} meter-fill--warn{% endif %} pct-{{ pct }}"></span></span>{{ score }}
 {%- endmacro %}
 
+{#- Distinct hosts per day as the console's one sparkline, the dashboard's activity strip: one cell
+    per day (`routes::campaigns::host_strip`), the empty stub on a quiet day, the exact count in
+    each cell's title. -#}
+{% macro day_strip(cells, days) -%}
+<span class="strip" role="img" aria-label="distinct hosts per day, last {{ days }} days">{% for d in cells %}<i class="h-{{ d.height }}{% if d.class %} {{ d.class }}{% endif %}" title="{{ d.day }}: {{ d.hosts }}"></i>{% endfor %}</span>
+{%- endmacro %}
+
 {#- A VirusTotal verdict, one wording on every page. Detections are a finding, on the same rung as
     a captured fetch; zero detections is a neutral count, because no engine flagging a file is not
     proof it is harmless; the states with no verdict are quiet words. -#}

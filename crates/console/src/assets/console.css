@@ -332,13 +332,14 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 .dot--watch { background: var(--attention); } .dot--low { background: var(--low); }
 
 /* ===================== Activity strip - the signature =======================
-   24 cells, one per hour. Colour = worst signal that hour; height = volume.
-   Reads burst / sustained / one-shot at a glance without parsing timestamps. */
+   One cell per slot: 24 hours on the dashboard, one day per cell for distinct hosts on the
+   campaign and sample pages (the console's only sparkline). Colour = worst signal in the slot;
+   height = volume. Reads burst / sustained / one-shot at a glance without parsing timestamps. */
 .strip { display: inline-flex; align-items: flex-end; gap: 1.5px; height: 26px; }
 /* Empty hour: a dim stub clearly BELOW the low-severity grey, so "nothing happened" reads distinct
    from "a scan happened". Height (inline) encodes volume; the route should scale it sqrt/log so a
    5-event hour still clears the floor and a 500-event hour does not swamp the strip. */
-.strip i { width: 4px; min-height: 2px; background: #2a333c; border-radius: 1px; display: block; }
+.strip i { width: 4px; min-height: 2px; background: var(--border-bright); border-radius: 1px; display: block; }
 .strip i.s1 { background: var(--low); }
 .strip i.s2 { background: var(--attention); }
 .strip i.s3 { background: var(--high); }
@@ -346,8 +347,8 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 /* Severity must beat volume: a HIGH/CRIT hour gets a height FLOOR so it can never render shorter
    than a tall scan bar, and a light top cap gives a NON-COLOUR channel (survives red-green CB and
    ranks the worst hours) - height alone already carries volume, so the cap does the ordering work. */
-.strip i.s3 { min-height: 15px; box-shadow: inset 0 2px 0 rgba(231, 237, 243, 0.30); }
-.strip i.s4 { min-height: 20px; box-shadow: inset 0 3px 0 rgba(231, 237, 243, 0.55); }
+.strip i.s3 { min-height: 15px; box-shadow: inset 0 2px 0 color-mix(in srgb, var(--text) 30%, transparent); }
+.strip i.s4 { min-height: 20px; box-shadow: inset 0 3px 0 color-mix(in srgb, var(--text) 55%, transparent); }
 
 /* -- Range selector (chart time windows) -- */
 .range-selector { display: flex; gap: 0.3rem; flex-wrap: wrap; }
@@ -560,9 +561,6 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .copy-btn:hover { color: var(--text); border-color: var(--border-bright); }
 .copy-btn--live { color: var(--alert-text); }
 .offscreen-copy { position: fixed; left: -9999px; top: 0; opacity: 0; }
-.spark { display: block; overflow: visible; }
-.spark rect { fill: var(--chart-line); }
-.spark--wide { margin: 0.4rem 0; }
 .shape-list { margin: 0.4rem 0 0.4rem 1.4rem; padding: 0; font-size: 0.78rem; }
 .shape-list li { overflow-wrap: anywhere; margin: 0.1rem 0; }
 .approve-list { columns: 3 14rem; margin: 0.6rem 0 1rem 1.2rem; padding: 0; font-size: 0.8rem; }

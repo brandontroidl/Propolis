@@ -49,9 +49,7 @@
       </td>
       <td class="count c-hosts">{{ c.members }}<span class="c-unit"> host{% if c.members != 1 %}s{% endif %}</span></td>
       <td class="c-spark">
-        <svg class="spark" width="{{ spark_width }}" height="{{ spark_height }}" viewBox="0 0 {{ spark_width }} {{ spark_height }}" role="img" aria-label="distinct hosts per day">
-          {% for b in c.spark %}<rect x="{{ b.x }}" y="{{ b.y }}" width="4" height="{{ b.h }}"><title>{{ b.day }}: {{ b.hosts }}</title></rect>{% endfor %}
-        </svg>
+        {{ m.day_strip(c.spark, spark_days) }}
       </td>
       <td class="active-cell c-active" title="{{ c.active_title }}">{{ c.active }}</td>
       <td class="c-sensors"><span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>

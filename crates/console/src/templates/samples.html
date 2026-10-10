@@ -41,11 +41,7 @@
         {% else %}<span class="dim na">-</span>{% endif %}
       </td>
       <td class="s-spark">
-        {% if s.spark %}
-        <svg class="spark" width="{{ spark_width }}" height="{{ spark_height }}" viewBox="0 0 {{ spark_width }} {{ spark_height }}" role="img" aria-label="distinct hosts per day">
-          {% for b in s.spark %}<rect x="{{ b.x }}" y="{{ b.y }}" width="4" height="{{ b.h }}"><title>{{ b.day }}: {{ b.hosts }}</title></rect>{% endfor %}
-        </svg>
-        {% endif %}
+        {% if s.spark %}{{ m.day_strip(s.spark, spark_days) }}{% endif %}
       </td>
       <td class="active-cell s-active"{% if s.active_title %} title="{{ s.active_title }}"{% endif %}>{% if s.active %}{{ s.active }}{% else %}<span class="dim na">-</span>{% endif %}</td>
       <td class="s-by">

@@ -350,8 +350,8 @@ impl IntakeRunner {
         // Lines that are not events, by position, so a failure counts only those it reached.
         let mut rejected_at: Vec<usize> = Vec::new();
         let mut probes: Vec<(usize, String)> = Vec::new();
-        // (digest, text) of each reply in the batch, stored before the append.
-        let mut replies: Vec<(String, String)> = Vec::new();
+        // (index into `pending`, digest, text) of each reply in the batch, stored before the append.
+        let mut replies: Vec<(usize, String, String)> = Vec::new();
         let mut stats_lines: Vec<(usize, SensorStats, DateTime<Utc>)> = Vec::new();
         let mut bytes_read = 0usize;
 
@@ -420,7 +420,9 @@ impl IntakeRunner {
 
             let input = match convert_event(event) {
                 Ok(converted) => {
-                    replies.extend(converted.reply);
+                    if let Some((sha, text)) = converted.reply {
+                        replies.push((pending.len(), sha, text));
+                    }
                     converted.input
                 }
                 Err(e) => {
@@ -444,20 +446,47 @@ impl IntakeRunner {
         }
 
         // The reply text goes in BEFORE the events that name it, so a committed event never points
-        // at a missing row. If this fails nothing is appended and the whole batch is read again;
-        // a row stored for a line that then did not append is harmless (content-addressed, and
-        // stored again as a no-op).
-        if let Err(e) = core_scoring::store_outputs(&self.pool, &replies).await {
-            tracing::error!(
-                sensor = %self.sensor_name,
-                error = %e,
-                "shell replies could not be stored, batch will be read again"
-            );
-            result.errors += 1;
-            self.tailer.rewind_batch();
-            self.batch_size =
-                next_batch_size(self.batch_size, lines_read, bytes_read, result.errors > 0);
-            return result;
+        // at a missing row; a row stored for a line that then did not append is harmless
+        // (content-addressed, and stored again as a no-op).
+        //
+        // A store that fails is isolated to the first reply the database refuses on its own: the
+        // events before that line are still appended, and the refusal is then accounted exactly as
+        // an append refusal of that line is (`note_failure`, the wedge report, quarantine), so a
+        // line whose reply can never be stored does not hold the sensor's whole log behind it. A
+        // failure that does not reproduce reply by reply (a dropped connection) appends nothing
+        // and the batch is read again.
+        let mut store_failure: Option<(usize, core_scoring::RepoError)> = None;
+        if !replies.is_empty() {
+            let all: Vec<(String, String)> = replies
+                .iter()
+                .map(|(_, sha, text)| (sha.clone(), text.clone()))
+                .collect();
+            if let Err(batch_error) = core_scoring::store_outputs(&self.pool, &all).await {
+                for (at, sha, text) in &replies {
+                    if let Err(e) =
+                        core_scoring::store_outputs(&self.pool, &[(sha.clone(), text.clone())])
+                            .await
+                    {
+                        store_failure = Some((*at, core_scoring::RepoError::Db(e)));
+                        break;
+                    }
+                }
+                if store_failure.is_none() {
+                    tracing::error!(
+                        sensor = %self.sensor_name,
+                        error = %batch_error,
+                        "shell replies could not be stored, batch will be read again"
+                    );
+                    result.errors += 1;
+                    self.tailer.rewind_batch();
+                    self.batch_size =
+                        next_batch_size(self.batch_size, lines_read, bytes_read, true);
+                    return result;
+                }
+            }
+        }
+        if let Some((at, _)) = &store_failure {
+            events.truncate(*at);
         }
 
         // One transaction for the whole batch (telemetry and scored events alike, in log order).
@@ -477,7 +506,10 @@ impl IntakeRunner {
 
         // Every line before the failed event was reached; the failed line and all after it were
         // not. With no failure the whole batch was reached.
-        let reached = match &outcome.failure {
+        let failure = outcome
+            .failure
+            .or_else(|| store_failure.map(|(_, error)| error));
+        let reached = match &failure {
             Some(_) => pending.get(outcome.appended).map_or(lines_read, |p| p.line),
             None => lines_read,
         };
@@ -525,7 +557,7 @@ impl IntakeRunner {
             result.stats_updates += 1;
         }
 
-        match outcome.failure {
+        match failure {
             None => {
                 self.wedge = None;
                 self.quarantine_block = None;
@@ -537,7 +569,7 @@ impl IntakeRunner {
                     sensor = %self.sensor_name,
                     error = ?e,
                     appended = outcome.appended,
-                    "append failed, stopping batch"
+                    "append (or the store of a reply it names) failed, stopping batch"
                 );
                 let failed = pending.get(outcome.appended);
                 let wedged_now = self.note_failure(&e, failed);

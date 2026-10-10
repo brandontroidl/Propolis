@@ -249,3 +249,75 @@ async fn two_runners_storing_the_same_replies_in_opposite_orders_do_not_deadlock
         .unwrap();
     assert_eq!(rows, 15 * 400);
 }
+
+/// A reply the database always refuses (a trigger stands in for any permanent per-row refusal)
+/// is accounted like a refused append of its line: the lines before it are ingested at once, the
+/// poll reports the error, the refusal is reported as a wedge after `WEDGE_POLLS` polls, and then
+/// the line is quarantined and the log behind it drains.
+#[sqlx::test(migrations = false)]
+async fn a_reply_the_database_refuses_wedges_then_quarantines_its_line(pool: PgPool) {
+    migrate(&pool).await;
+    sqlx::query(
+        "CREATE FUNCTION refuse_poison() RETURNS trigger AS $$ BEGIN \
+         IF NEW.text = 'poison' THEN RAISE EXCEPTION 'refused' USING ERRCODE = '23514'; END IF; \
+         RETURN NEW; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_poison BEFORE INSERT ON shell_output \
+         FOR EACH ROW EXECUTE FUNCTION refuse_poison()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let texts = ["ok 0", "ok 1", "poison", "ok 3", "ok 4"];
+    let mut file = std::fs::File::create(dir.path().join("events.jsonl")).unwrap();
+    for (n, text) in texts.iter().enumerate() {
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&event(n as i64, Some(reply(text)))).unwrap()
+        )
+        .unwrap();
+    }
+    drop(file);
+    let quarantine = dir.path().join("quarantine");
+    let mut runner = runner(&pool, dir.path())
+        .with_quarantine(intake::quarantine::Quarantine::new(quarantine.clone()));
+
+    let first = runner.run_batch().await;
+    assert_eq!(
+        (first.ingested, first.errors, first.quarantined),
+        (2, 1, 0),
+        "the lines before the refused reply are ingested"
+    );
+    for _ in 2..intake::runner::WEDGE_POLLS {
+        let again = runner.run_batch().await;
+        assert_eq!((again.ingested, again.errors, again.quarantined), (0, 1, 0));
+    }
+    let third = runner.run_batch().await;
+    assert_eq!((third.ingested, third.errors, third.quarantined), (0, 1, 1));
+    assert!(runner.wedged().is_none());
+    assert_eq!(
+        runner.last_quarantine().and_then(|n| n.sqlstate.clone()),
+        Some("23514".to_string()),
+        "the notice carries the refusal's SQLSTATE"
+    );
+    let rest = runner.run_batch().await;
+    assert_eq!((rest.ingested, rest.errors), (2, 0), "the log drains");
+    let quarantined = std::fs::read_to_string(quarantine.join("ssh.jsonl")).unwrap();
+    assert_eq!(quarantined.lines().count(), 1);
+    assert!(quarantined.contains("23514"));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM event")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 4,
+        "every line but the quarantined one is in the ledger"
+    );
+}

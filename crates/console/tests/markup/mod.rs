@@ -118,6 +118,10 @@ pub fn panel_violations(html: &str) -> Vec<String> {
             if chain.last().is_some_and(is_panel) && !allowed_in_panel(e) {
                 out.push(format!("flush in a panel: {}", e.describe()));
             }
+            // One density: a panel's table is the compact one, as on every original page.
+            if chain.last().is_some_and(is_panel) && e.name == "table" && !e.has("table-compact") {
+                out.push(format!("panel table at another density: {}", e.describe()));
+            }
             if e.has("empty-line") && !chain.iter().any(is_panel) {
                 out.push(format!("empty state outside a panel: {}", e.describe()));
             }

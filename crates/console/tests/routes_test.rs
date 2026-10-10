@@ -35,6 +35,8 @@ use sqlx::{PgPool, Row};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod markup;
+
 const TEST_PASSWORD: &str = "s3cret-test-operator-password";
 const TEST_PEER: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 55555);
@@ -4000,6 +4002,9 @@ async fn feed_page_reads_manifest_correctly(pool: PgPool) {
         body.contains(">off<"),
         "an absent exclusions block should render ASN suppression off: {body}"
     );
+    // The status tab with a build is the one page the shared panel test cannot reach (it needs a
+    // published manifest), so it is checked here: one table density, nothing flush in a panel.
+    markup::assert_panels(&body);
 }
 
 #[sqlx::test(migrations = false)]
@@ -4165,6 +4170,8 @@ async fn feed_entries_tab_lists_what_was_published_not_a_fresh_derivation(pool: 
         body.contains("honeypot_malware_upload, ssh_brute_force"),
         "activity labels missing: {body}"
     );
+    markup::assert_panels(&body);
+    assert_eq!(markup::stack_violations(&body), Vec::<String>::new());
 }
 
 #[sqlx::test(migrations = false)]

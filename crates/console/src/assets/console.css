@@ -278,10 +278,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
 /* -- Stat row: secondary metrics. A left rule carries the one bit of state colour. -- */
 .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.7rem; margin-bottom: 1.4rem; }
 .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.7rem 0.9rem; box-shadow: var(--shadow); }
-.stat-card--good { border-left: 3px solid var(--good); }
 .stat-card--attention { border-left: 3px solid var(--attention); }
-.stat-card--alert { border-left: 3px solid var(--alert); }
-.stat-card--info { border-left: 3px solid var(--info); }
 .stat-card .label { margin-bottom: 0.35rem; }
 .stat-card .value { font-family: var(--font-mono); font-size: 1.3rem; font-weight: 700; letter-spacing: -0.01em; }
 .stat-card svg { display: block; margin-top: 0.45rem; }
@@ -822,7 +819,6 @@ summary.log-summary:hover { background: var(--surface-raised); }
 .wrap-24 { max-width: 24rem; overflow-wrap: anywhere; }
 /* Qualified to outrank .band .cell .v and .stat-card .value, as the inline sizes they replace did. */
 .band .cell .v.value-lg, .value-lg { font-size: 1.25rem; }
-.stat-card .value.value-md, .value-md { font-size: 1.1rem; }
 .note-sm { margin-top: 0.35rem; font-size: 0.78rem; }
 .login-foot { text-align: center; font-size: 0.72rem; margin-top: 1rem; }
 .text-good, a.text-good:hover { color: var(--good-text); }

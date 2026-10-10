@@ -1,8 +1,8 @@
 {% extends "base.html" %}
-{% block title %}Feed entries - Propolis{% endblock %}
+{% block title %}Feed {{ tab }} - Propolis{% endblock %}
 {% block content %}
 {% import "macros.html" as m %}
-<h1>Feed status</h1>
+<h1>Feed</h1>
 <div class="tab-bar">
   {% for tab_name in ["status", "entries"] %}
   <a href="/feed?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
@@ -81,24 +81,18 @@
   {% endif %}
 {% else %}
   {% if has_build %}
-  <div class="stat-row">
-    <div class="stat-card stat-card--good">
-      <div class="label">Last build</div>
-      <div class="value seen value-md">{{ build_time }}</div>
-    </div>
-  </div>
   <div class="panel">
-    <div class="panel-head">Blocklist tiers</div>
-    <table>
+    <div class="panel-head">Blocklist tiers <span class="dim">built {{ build_time }}</span></div>
+    <table class="table-compact">
       <thead><tr><th>Tier</th><th>Entries</th><th>Valid until</th></tr></thead>
       <tbody>
         <tr>
-          <td><span class="tier tier-aggressive">Aggressive</span></td>
+          <td>{{ m.tier_pill("aggressive") }}</td>
           <td class="mono">{{ aggressive_count }}</td>
           <td class="seen">{{ aggressive_valid_until }}</td>
         </tr>
         <tr>
-          <td><span class="tier tier-standard">Standard</span></td>
+          <td>{{ m.tier_pill("standard") }}</td>
           <td class="mono">{{ standard_count }}</td>
           <td class="seen">{{ standard_valid_until }}</td>
         </tr>
@@ -108,7 +102,7 @@
   {% if windows %}
   <div class="panel">
     <div class="panel-head">Retention feeds <span class="dim">approved, any tier</span></div>
-    <table>
+    <table class="table-compact">
       <thead><tr><th>Window</th><th>Entries</th><th>Valid until</th><th>File</th></tr></thead>
       <tbody>
         {% for w in windows %}

@@ -1,0 +1,248 @@
+# Shell functions as Ubuntu 22.04's dash (/bin/sh, 0.5.11) runs them, each case a `sh -c` from the
+# login shell. What differs from bash and is recorded here: no `function` keyword, a function body
+# that may be any command, `Bad function name` for a special builtin or a name that is not an
+# identifier (refused before anything on the line runs), `local` that keeps a variable's value,
+# `return` that outside a function ends the shell and refuses a negative or non-numeric status,
+# errors that end the shell (`local` outside a function, `export -f`), the recursion limit and its
+# wording, `type` that tells a special builtin from the others. Each reply was produced by
+# `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`) in the
+# localhost/propolis-survey-ref:jammy container, run with `--network none`, PS1 and PS2 set to
+# markers and these lines fed one at a time on standard input; the `sh` they run is dash 0.5.11.
+# source: ubuntu:22.04 container run of dash 0.5.11 as /bin/sh (synthetic command shapes)
+# date: 2026-10-09
+# protocol: ssh
+# persona: ubuntu
+$ sh -c 'f() { echo hi; }; f; echo "rc=$?"'
+> hi
+> rc=0
+$ sh -c 'f() { echo "n=$# 1=$1 2=$2 at=$@ zero=$0"; }; set -- x y z; f a b; echo "after n=$# 1=$1 at=$@"'
+> n=2 1=a 2=b at=a b zero=sh
+> after n=3 1=x at=x y z
+$ sh -c 'f() { echo "$0 $1"; }; f x' name arg
+> name x
+$ sh -c 'f() { echo "$#"; }; f a "b c" d; f; set -- 1 2; f "$@"; f "$*"; f $*'
+> 3
+> 0
+> 2
+> 1
+> 2
+$ sh -c 'f() { return 3; }; f; echo "rc=$?"; g() { false; return; }; g; echo "rc=$?"; h() { true; return; }; h; echo "rc=$?"'
+> rc=3
+> rc=1
+> rc=0
+$ sh -c 'return 3; echo after'; echo "rc=$?"
+> rc=3
+$ sh -c 'echo a; return; echo b'; echo "rc=$?"
+> a
+> rc=0
+$ sh -c 'false; return; echo b'; echo "rc=$?"
+> rc=1
+$ sh -c 'f() { return -1; }; f; echo cont'; echo "rc=$?"
+> sh: 1: return: Illegal number: -1
+> rc=2
+$ sh -c 'f() { return abc; }; f; echo cont'; echo "rc=$?"
+> sh: 1: return: Illegal number: abc
+> rc=2
+$ sh -c 'f() { return 3 4; }; f; echo "rc=$?"'
+> rc=3
+$ sh -c 'set() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'export() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c ':() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'local() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'return() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'unset() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'eval() { echo mine; }; echo done'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'cd() { echo mine; }; cd /tmp; echo "rc=$?"'
+> mine
+> rc=0
+$ sh -c 'echo() { printf "mine %s\n" "$*"; }; echo hi; command echo hi'
+> mine hi
+> hi
+$ sh -c 'ls() { echo mine; }; ls; \ls'
+> mine
+> mine
+$ sh -c 'function f { echo hi; }; f'
+> sh: 1: Syntax error: "}" unexpected
+$ sh -c 'function f() { echo hi; }; f'
+> sh: 1: Syntax error: "(" unexpected
+$ sh -c 'f-g() { echo hy; }; f-g'
+> sh: 1: Syntax error: Bad function name
+$ sh -c 'a.b() { echo dot; }; a.b'
+> sh: 1: Syntax error: Bad function name
+$ sh -c '1f() { echo digit; }; 1f'
+> sh: 1: Syntax error: Bad function name
+$ sh -c '"f"() { echo q; }; f'
+> sh: 1: Syntax error: Bad function name
+$ sh -c 'x=zz; $x() { echo q; }; echo done'
+> sh: 1: Syntax error: Bad function name
+$ sh -c 'f ( ) { echo sp; }; f'
+> sp
+$ sh -c 'f() echo hi; f'
+> hi
+$ sh -c 'f() ( echo Y ); f'
+> Y
+$ sh -c 'f() if true; then echo Z; fi; f'
+> Z
+$ sh -c 'f() while false; do :; done; f; echo "rc=$?"'
+> rc=0
+$ sh -c 'f() for i in 1 2; do echo $i; done; f'
+> 1
+> 2
+$ sh -c 'f() case a in a) echo C;; esac; f'
+> C
+$ sh -c 'f() { }; f'
+> sh: 1: Syntax error: "}" unexpected
+$ sh -c 'f() { local x=1; echo "in $x"; }; x=0; f; echo "out $x"'
+> in 1
+> out 0
+$ sh -c 'f() { local x; echo "[${x-unset}]"; x=2; echo "[$x]"; }; x=0; f; echo "[$x]"'
+> [0]
+> [2]
+> [0]
+$ sh -c 'local x=1; echo "rc=$?"'
+> sh: 1: local: not in a function
+$ sh -c 'f() { local 1x; echo "rc=$?"; }; f'
+> sh: 1: local: 1x: bad variable name
+$ sh -c 'f() { local -i n=5; echo $n; }; f'
+> sh: 1: local: -i: bad variable name
+$ sh -c 'g() { local x=5; h; echo "g x=$x"; }; h() { x=9; }; g; echo "x=$x"'
+> g x=9
+> x=
+$ sh -c 'f() { local a=1 b=2; echo "$a $b"; local a=7; echo "$a"; }; a=0; f; echo "$a"'
+> 1 2
+> 7
+> 0
+$ sh -c 'f() { echo a; }; type f; command -v f; command -V f; unset -f f; type f; command -v f; echo "rc=$?"; f; echo "rc=$?"'
+> f is a shell function
+> f
+> f is a shell function
+> f: not found
+> rc=127
+> sh: 1: f: not found
+> rc=127
+$ sh -c 'f() { echo hi; }; unset f; f'
+> hi
+$ sh -c 'f() { echo hi; }; unset -v f; f; unset -f f; f; echo "rc=$?"'
+> hi
+> sh: 1: f: not found
+> rc=127
+$ sh -c 'f() { echo hi; }; type -t f'
+> -t: not found
+> f is a shell function
+$ sh -c 'f() { f; }; f; echo "rc=$?"'; echo "outer rc=$?"
+> sh: 1: Maximum function recursion depth (1000) reached
+> outer rc=2
+$ sh -c ':() { :|:& }; :'; echo "rc=$?"
+> sh: 1: Syntax error: Bad function name
+> rc=2
+$ sh -c 'n=0; f() { n=$((n+1)); [ $n -lt 4 ] && f; echo "depth $n"; }; f'
+> depth 4
+> depth 4
+> depth 4
+> depth 4
+$ sh -c 'f() { echo hi; }; sh -c f; echo "rc=$?"'
+> sh: 1: f: not found
+> rc=127
+$ sh -c 'f() { echo hi; }; export -f f; echo "rc=$?"'
+> sh: 1: export: Illegal option -f
+$ sh -c 'f() { nosuch; echo "rc=$?"; cd /nonexistent; echo "rc=$?"; }; f'
+> sh: 1: nosuch: not found
+> rc=127
+> sh: 1: cd: can't cd to /nonexistent
+> rc=2
+$ sh -c 'f() { echo start; nosuch_a
+$ nosuch_b; }
+$ nosuch_c
+$ f'
+> sh: 3: nosuch_c: not found
+> start
+> sh: 1: nosuch_a: not found
+> sh: 2: nosuch_b: not found
+$ sh -c 'f() { echo hi; } >/tmp/shfn_d; f; echo --; cat /tmp/shfn_d; f; cat /tmp/shfn_d'
+> --
+> hi
+> hi
+$ sh -c 'for j in 1 2; do g() { break; }; g; echo "j=$j"; done'
+> j=1
+> j=2
+$ sh -c 'f() { for i in 1 2 3; do echo $i; break; done; echo after; }; f'
+> 1
+> after
+$ sh -c 'f() { exit 7; }; f; echo no'; echo "rc=$?"
+> rc=7
+$ sh -c 'f() { exit 7; }; (f); echo "sub rc=$?"'
+> sub rc=7
+$ sh -c 'f() { echo "$FUNCNAME|"; }; f'
+> |
+$ sh -c 'f() { read a b; echo "[$a][$b]"; }; echo "1 2" | f'
+> [1][2]
+$ sh -c 'f() { echo A; }; f2() { f; }; f() { echo B; }; f2'
+> B
+$ sh -c 'f() { for i in 1 2 3; do if [ $i = 2 ]; then return 9; fi; echo $i; done; echo notreached; }; f; echo "rc=$?"'
+> 1
+> rc=9
+$ sh -c 'f() ( echo sub; return 5 ); f; echo "rc=$?"'
+> sub
+> rc=5
+$ sh -c 'f() { ( return 4; echo no ); echo "rc=$?"; }; f'
+> rc=4
+$ sh -c 'f() { echo x | { read v; return 6; }; echo "rc=$?"; }; f'
+> rc=6
+$ sh -c 'f() { echo $?; }; false; f'
+> 1
+$ sh -c 'f() { echo "$X"; }; X=1 f; echo "after [$X]"'
+> 1
+> after []
+$ sh -c 'f() { echo hi; }; env f; echo "rc=$?"'
+> env: 'f': No such file or directory
+> rc=127
+$ sh -c 'f() { echo hi; }; command f; echo "rc=$?"'
+> sh: 1: f: not found
+> rc=127
+$ sh -c 'f() { g() { echo inner; }; }; f; g'
+> inner
+$ sh -c 'f() { echo one; }; f() { echo two; }; f'
+> two
+$ sh -c 'true && f() { echo cond; } ; f'
+> cond
+$ sh -c 'f() { echo hi; }; f | cat; f > /tmp/shfn_x; cat /tmp/shfn_x; echo a | f'
+> hi
+> hi
+> hi
+$ sh -c 'builtin echo hi'
+> sh: 1: builtin: not found
+$ sh -c 'type return local export set : . cd echo read'
+> return is a special shell builtin
+> local is a special shell builtin
+> export is a special shell builtin
+> set is a special shell builtin
+> : is a special shell builtin
+> . is a special shell builtin
+> cd is a shell builtin
+> echo is a shell builtin
+> read is a shell builtin
+$ sh -c 'command -V export cd'
+> export is a special shell builtin
+$ sh -c 'f() { echo a; }; type export set; command -V f export'
+> export is a special shell builtin
+> set is a special shell builtin
+> f is a shell function
+$ sh -c 'f() { echo "$1"; [ "$1" -lt 3 ] && f $(($1 + 1)); }; f 0'
+> 0
+> 1
+> 2
+> 3

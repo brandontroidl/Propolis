@@ -72,6 +72,7 @@ mod cfmt;
 mod dd;
 mod envtools;
 mod eval;
+mod exec;
 mod expand;
 mod fetch;
 #[cfg(test)]
@@ -879,6 +880,10 @@ impl FakeShell {
     /// The prompt for the active shell level. Exec requests have no prompt. While a construct is
     /// incomplete the continuation prompt (PS2) stands in for it.
     pub fn prompt(&self) -> String {
+        // A shell writes its prompt to standard error; after `exec 2>/dev/null` there is none.
+        if !self.state().fds.stderr_is_terminal() {
+            return String::new();
+        }
         if !self.pending.is_empty() && self.context != ShellContext::ExecC {
             return "> ".to_string();
         }
@@ -2291,10 +2296,13 @@ impl FakeShell {
             return result;
         }
 
-        let output = if matches!(self.active_level(), ShellLevel::Bash { login: true }) {
-            b"logout\n".to_vec()
-        } else {
-            Vec::new()
+        let output = match self.active_level() {
+            ShellLevel::Bash { login: true } => b"logout\n".to_vec(),
+            // A bash that replaced the login shell (`exec bash`) says `exit` as a nested one does.
+            ShellLevel::Bash { login: false } if self.context != ShellContext::ExecC => {
+                b"exit\n".to_vec()
+            }
+            _ => Vec::new(),
         };
         let mut result = CommandResult::shell_exit(status, output, true);
         self.append_exit_trap(&mut result);
@@ -3651,6 +3659,8 @@ mod command_lines_tests;
 mod dd_tests;
 #[cfg(test)]
 mod envtools_tests;
+#[cfg(test)]
+mod exec_tests;
 #[cfg(test)]
 mod fileinfo_tests;
 #[cfg(test)]

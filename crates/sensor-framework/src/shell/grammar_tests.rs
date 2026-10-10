@@ -355,7 +355,10 @@ mod redirection {
             sh.handle_input("echo hi >&2").0.output[0].fd,
             OutputFd::Stderr
         );
-        assert_eq!(run(&mut sh, "echo hi >&-"), "");
+        assert_eq!(
+            run(&mut sh, "echo hi >&-"),
+            "-bash: echo: write error: Bad file descriptor\n"
+        );
         assert_eq!(run(&mut sh, "echo hi >&2 2>/dev/null"), "hi\n");
         assert_eq!(run(&mut sh, "echo hi 3>&1 1>&2 2>&3 >/dev/null"), "");
     }

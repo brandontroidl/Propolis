@@ -451,6 +451,24 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   handler is at most 4096 bytes, one per signal, counted against the content allowance. The
   phone's `trap` is dash's [inferred]. Not modeled: a default-disposition signal to the shell's
   own pid (`kill -9 $$` does not end the session).
+  `exec` (`crates/sensor-framework/src/shell/exec.rs`) with redirections and no command changes the
+  shell's own descriptors for good: `exec 3>file`, `exec 4<file` (read with `read -u 4` or `<&4`,
+  from where the last read stopped), `exec >/dev/null 2>&1`, `exec 3>&-`. They are inherited by
+  later commands, functions, subshells and the shells the session starts, and a copy of a descriptor
+  that is not open is `N: Bad file descriptor`. A write to a closed descriptor is reported in the
+  writer's words (`-bash: echo: write error: Bad file descriptor` in bash, `echo: echo: I/O error` in
+  dash, `NAME: write error: ...` from a program, `cat: standard output: ...`). A prompt goes to
+  standard error, so `exec 2>/dev/null` silences it; `exec <file` at the terminal runs the file's
+  commands and ends the session. bash holds descriptors up to 63; dash only 0 to 9. `exec CMD`
+  replaces the shell: the rest of the script, and the `EXIT` handler, never run; in a subshell, a
+  pipeline stage or a command substitution it ends only that process. A command with no file
+  behind it (a builtin or a function) is `exec: NAME: not found` (127), a directory or non-
+  executable file 126; bash goes on at the terminal after a failure, a script and dash end.
+  `exec bash`/`exec sh` at the terminal replaces the shell by a fresh one that keeps only the
+  exported variables. bash's `-c`, `-l` and `-a NAME` are taken; dash's `exec -z` is the command
+  `-z`. A download run through `exec` is recorded as one run any other way is. Replies are from
+  bash 5.1.16 and dash 0.5.11; the phone's `exec` is dash's [inferred]. Not modeled: `exec` of a
+  program that replaces the shell with a different one (the command just runs), and `/dev/tcp`.
   bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
   the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
   dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it

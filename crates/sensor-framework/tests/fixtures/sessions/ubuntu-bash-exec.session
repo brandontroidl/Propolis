@@ -1,0 +1,86 @@
+# `exec` in an interactive login bash on Ubuntu 22.04. Redirections without a command change the
+# shell's own descriptors for good (open, write, read with `read -u`, close, duplicate), every
+# later command and every shell it starts inherits them, a copy of a descriptor that is not open is
+# `Bad file descriptor`, and `exec CMD` replaces the shell or, inside a subshell, only that subshell
+# (no `EXIT` handler runs; a command that cannot be found is `exec: NAME: not found`, status 127,
+# and a builtin or function is never found; bad options print the usage line, status 2). Each reply
+# was produced by `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`)
+# in the localhost/propolis-survey-ref:jammy container (bash 5.1.16), run with `--network none`,
+# PS1 and PS2 set to markers and these lines fed one at a time on standard input.
+# source: ubuntu:22.04 container run of bash 5.1.16 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ exec 3>/tmp/e1
+$ echo one >&3
+$ echo two >&3
+$ cat /tmp/e1
+> one
+> two
+$ exec 3>&-
+$ echo three >&3
+> -bash: 3: Bad file descriptor
+$ exec 4</tmp/e1
+$ read -u 4 a
+$ echo $a
+> one
+$ read -u 4 b
+$ echo $b
+> two
+$ exec 4<&-
+$ read -u 4 c
+> -bash: read: 4: invalid file descriptor: Bad file descriptor
+$ echo $?
+> 1
+$ exec 5>&99
+> -bash: 99: Bad file descriptor
+$ exec 5>&abc
+> -bash: abc: ambiguous redirect
+$ (echo sub >&3; exec 6>/tmp/e2; echo six >&6)
+> -bash: 3: Bad file descriptor
+$ cat /tmp/e2
+> six
+$ f() { exec 7>/tmp/e3; }
+$ f
+$ echo seven >&7
+$ cat /tmp/e3
+> seven
+$ sh -c 'echo child >&7'
+$ cat /tmp/e3
+> seven
+> child
+$ (exec echo replaced; echo not-reached)
+> replaced
+$ echo $?
+> 0
+$ (exec nosuchcmd_q; echo not-reached)
+> -bash: exec: nosuchcmd_q: not found
+$ echo $?
+> 127
+$ (exec cd /tmp)
+> -bash: exec: cd: not found
+$ echo $?
+> 127
+$ (exec -z)
+> -bash: exec: -z: invalid option
+> exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]
+$ echo $?
+> 2
+$ trap 'echo bye' EXIT
+$ (exec true)
+$ sh -c 'exec echo viaexec'
+> viaexec
+$ sh -c 'trap "echo bye" EXIT; exec echo replaced'
+> replaced
+$ sh -c 'trap "echo bye" EXIT; (exec true); echo after'
+> after
+> bye
+$ sh -c 'exec 2>/dev/null; echo quiet >&2; echo shown'
+> shown
+$ sh -c 'exec >/tmp/e5; echo hidden'
+$ cat /tmp/e5
+> hidden
+$ sh -c 'exec nosuchcmd_q; echo not-reached'
+> sh: 1: exec: nosuchcmd_q: not found
+$ echo $?
+> 127

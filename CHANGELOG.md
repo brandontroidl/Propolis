@@ -168,6 +168,17 @@
   itself (`kill -USR1 $$`) runs its handler. Handlers are text a bot supplies, so they are bounded
   (4096 bytes, one per signal, counted against the content allowance). Two session fixtures replay
   replies from the reference container.
+- **`exec`** - the fake shell answered `exec: command not found`. `exec` with redirections now
+  changes the shell's own descriptors for good (open for writing or reading, duplicate, close,
+  `read -u N`, `<&N`, `>&N`, `exec >/dev/null 2>&1`), a copy of a closed descriptor is `Bad file
+  descriptor`, a write to a closed one is a write error in the writer's words, and an interactive
+  prompt vanishes when standard error is redirected. `exec CMD` runs CMD in place of the shell: a
+  subshell, pipeline stage or command substitution ends alone, a script or the session ends with
+  the command (no `EXIT` handler), a command with no file behind it is `not found`, and an
+  interactive bash survives a failed `exec` where a script and dash do not. A download run through
+  `exec` is reported as one run any other way is. dash's wording for a redirection it cannot make
+  (`cannot create X: Directory nonexistent`, status 2) replaces bash's. Two session fixtures
+  replay replies from the reference container.
 
 ### Changed
 

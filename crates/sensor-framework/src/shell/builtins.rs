@@ -7,6 +7,7 @@
 //! nothing is run, in keeping with the never-exec guarantee that no file is ever handed to an
 //! interpreter here.
 
+use super::eval::Stdin;
 use super::registry::{CommandKind, Registry};
 use super::{CommandResult, FakeShell, Flow, FrameKind, ShellLevel};
 
@@ -687,6 +688,7 @@ impl FakeShell {
     pub(super) fn builtin_read(&mut self, parts: &[&str]) -> CommandResult {
         let mut raw = false;
         let mut names: Vec<&str> = Vec::new();
+        let mut descriptor: Option<&str> = None;
         let mut i = 1;
         while let Some(arg) = parts.get(i) {
             if *arg == "--" {
@@ -700,7 +702,15 @@ impl FakeShell {
                         if c == 'r' {
                             raw = true;
                         } else if takes_value.contains(c) {
-                            if at.saturating_add(c.len_utf8()) == flags.len() {
+                            let after = at.saturating_add(c.len_utf8());
+                            if c == 'u' {
+                                descriptor = if after == flags.len() {
+                                    parts.get(i.saturating_add(1)).copied()
+                                } else {
+                                    flags.get(after..)
+                                };
+                            }
+                            if after == flags.len() {
                                 i = i.saturating_add(1);
                             }
                             break;
@@ -719,6 +729,40 @@ impl FakeShell {
                 );
             }
         }
+        // `-u FD` reads a descriptor `exec` opened, from where the last read of it stopped.
+        let mut swapped: Option<(u16, Stdin)> = None;
+        if let Some(spec) = descriptor {
+            let Ok(fd) = spec.parse::<u16>() else {
+                return CommandResult::stderr(
+                    1,
+                    self.shell_error(format_args!(
+                        "read: {spec}: invalid file descriptor specification"
+                    )),
+                );
+            };
+            if fd != 0 {
+                let Some(open) = self.state().fds.ins.get(&fd) else {
+                    return CommandResult::stderr(
+                        1,
+                        self.shell_error(format_args!(
+                            "read: {fd}: invalid file descriptor: Bad file descriptor"
+                        )),
+                    );
+                };
+                let source = Stdin::data(open.remaining());
+                swapped = Some((fd, std::mem::replace(&mut self.stdin, source)));
+            }
+        }
+        let result = self.read_into(raw, &names);
+        if let Some((fd, previous)) = swapped {
+            self.settle_input(Some(fd));
+            self.stdin = previous;
+        }
+        result
+    }
+
+    /// One line of the input `read` was given into the variables.
+    fn read_into(&mut self, raw: bool, names: &[&str]) -> CommandResult {
         let Some((mut line, mut ended)) = self.stdin.read_line() else {
             return CommandResult::silent(1);
         };

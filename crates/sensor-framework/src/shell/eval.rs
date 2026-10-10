@@ -126,6 +126,15 @@ impl DepthGuard {
     }
 }
 
+/// Open `bytes` for reading on `fd` in `plan`; on descriptor 0 the command reads it as its input.
+fn install_input(plan: &mut RedirPlan, fd: u16, bytes: Vec<u8>) {
+    if fd == 0 {
+        plan.stdin = Some(Stdin::data(bytes.clone()));
+        plan.reads_from = None;
+    }
+    plan.ins.insert(fd, OpenInput::new(bytes));
+}
+
 /// Whether a failing pipeline is something bash's `ERR` handler follows: more than one stage, a
 /// simple command or a subshell.
 fn err_unit(pipeline: &Pipeline) -> bool {
@@ -229,6 +238,8 @@ pub(super) struct ShellState {
     /// Commands being run whose status something tests (an `if` condition, all but the last of a
     /// `&&` list): `ERR` does not fire for a failure inside them.
     pub err_ignore: u32,
+    /// The descriptors `exec` has opened, moved or closed.
+    pub fds: Fds,
 }
 
 /// Where the text a non-interactive shell runs comes from.
@@ -270,6 +281,7 @@ impl ShellState {
             exiting: false,
             in_trap: false,
             err_ignore: 0,
+            fds: Fds::default(),
         };
         state.set_var("IFS", DEFAULT_IFS.to_string(), false);
         match flavor {
@@ -342,6 +354,8 @@ impl ShellState {
             exiting: false,
             in_trap: false,
             err_ignore: 0,
+            // Open descriptors pass to a process started from this one.
+            fds: self.fds.clone(),
         }
     }
 
@@ -567,8 +581,8 @@ impl PidAlloc {
 }
 
 /// Where one of a command's descriptors goes.
-#[derive(Debug, Clone)]
-enum Sink {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Sink {
     /// The terminal, as its standard output or its standard error: a descriptor duplicated from
     /// standard error keeps writing to the error stream.
     Terminal(OutputFd),
@@ -577,39 +591,105 @@ enum Sink {
         path: String,
         append: bool,
     },
+    /// Not open: a write to it fails (`Bad file descriptor`).
+    Closed,
+}
+
+/// Descriptors a shell can hold open: 0 to 63, which is room for every one a script opens.
+pub(super) const FD_MAX: usize = 64;
+
+/// A file open for reading on a descriptor, read from where the last read stopped.
+#[derive(Debug, Clone)]
+pub(super) struct OpenInput {
+    bytes: Arc<Vec<u8>>,
+    pos: usize,
+}
+
+impl OpenInput {
+    pub(super) fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            pos: 0,
+        }
+    }
+
+    /// What has not been read.
+    pub(super) fn remaining(&self) -> Vec<u8> {
+        self.bytes.get(self.pos..).unwrap_or(&[]).to_vec()
+    }
+
+    pub(super) fn advance(&mut self, by: usize) {
+        self.pos = self.pos.saturating_add(by).min(self.bytes.len());
+    }
+}
+
+/// The descriptors a shell holds beyond the terminal's, which `exec` opens, moves and closes and
+/// which every command and every shell it starts inherits.
+#[derive(Debug, Clone)]
+pub(super) struct Fds {
+    /// Where each descriptor writes. Index 0 is unused (standard input has no sink), 1 is standard
+    /// output and 2 standard error; the rest are closed until something opens them.
+    pub out: Vec<Sink>,
+    /// The descriptors open for reading, standard input included once `exec` redirects it.
+    pub ins: BTreeMap<u16, OpenInput>,
+}
+
+impl Default for Fds {
+    fn default() -> Self {
+        Self {
+            out: (0..FD_MAX)
+                .map(|fd| match fd {
+                    0 | 1 => Sink::Terminal(OutputFd::Stdout),
+                    2 => Sink::Terminal(OutputFd::Stderr),
+                    _ => Sink::Closed,
+                })
+                .collect(),
+            ins: BTreeMap::new(),
+        }
+    }
+}
+
+impl Fds {
+    /// Whether anything differs from a fresh shell's descriptors.
+    pub(super) fn is_default(&self) -> bool {
+        self.ins.is_empty() && self.out == Self::default().out
+    }
+
+    /// Whether error output still reaches the terminal, which is where an interactive bash writes
+    /// its prompt.
+    pub(super) fn stderr_is_terminal(&self) -> bool {
+        matches!(self.out.get(2), Some(Sink::Terminal(_)))
+    }
 }
 
 /// The descriptors a command's redirections describe, opened before it runs.
 struct RedirPlan {
-    /// Index 0 is unused (standard input has no output sink); 1 is standard output, 2 standard
-    /// error, 3 to 9 only matter through a `N>&M` duplicate.
+    /// Where each descriptor writes now: the shell's own, changed by the redirections.
     sinks: Vec<Sink>,
+    /// The descriptors open for reading, standard input included.
+    ins: BTreeMap<u16, OpenInput>,
+    /// Standard input as a redirection of this command set it; `None` leaves the shell's.
     stdin: Option<Stdin>,
+    /// The descriptor standard input is read from, so what the command read moves its position.
+    reads_from: Option<u16>,
     active: bool,
 }
 
 impl RedirPlan {
     /// Where descriptor `fd` goes now.
     fn sink(&self, fd: usize) -> Sink {
-        self.sinks
-            .get(fd)
-            .cloned()
-            .unwrap_or(Sink::Terminal(OutputFd::Stdout))
+        self.sinks.get(fd).cloned().unwrap_or(Sink::Closed)
     }
 
-    fn new() -> Self {
+    /// The plan of a command that has no redirection of its own: the shell's descriptors.
+    fn from_fds(fds: &Fds) -> Self {
+        let stdin = fds.ins.get(&0).map(|input| Stdin::data(input.remaining()));
         Self {
-            sinks: (0..10)
-                .map(|fd| {
-                    Sink::Terminal(if fd == 2 {
-                        OutputFd::Stderr
-                    } else {
-                        OutputFd::Stdout
-                    })
-                })
-                .collect(),
-            stdin: None,
-            active: false,
+            sinks: fds.out.clone(),
+            ins: fds.ins.clone(),
+            reads_from: stdin.as_ref().map(|_| 0),
+            stdin,
+            active: !fds.is_default(),
         }
     }
 }
@@ -1215,6 +1295,7 @@ impl FakeShell {
                 CommandResult::silent(0)
             }
         };
+        self.settle_input(plan.reads_from);
         if let Some(previous) = saved {
             self.stdin = previous;
         }
@@ -1433,10 +1514,27 @@ impl FakeShell {
             let resolved = self.resolve_handler(&refs);
             self.trace_set(&argv, ParseNode::Simple, resolved);
         }
+        // `exec` with no command changes the shell's own descriptors.
+        let exec_only = function.is_none()
+            && refs.first() == Some(&"exec")
+            && !self.state().functions.contains_key("exec")
+            && !self.exec_has_command(&refs);
         let mut plan = match self.open_redirs(&simple.redirs) {
             Ok(plan) => plan,
-            Err(refused) => return refused,
+            Err(mut refused) => {
+                // dash ends the shell when a redirection of its special builtin fails.
+                if exec_only && self.is_dash() {
+                    self.end_process(&mut refused);
+                }
+                return refused;
+            }
         };
+        if exec_only {
+            if let Err(usage) = self.exec_args_check(&refs) {
+                return usage;
+            }
+            return self.exec_redirections(plan);
+        }
         let mut assigns: Vec<(String, String)> = Vec::new();
         for assign in &simple.assigns {
             match self.expand_scalar(&assign.value) {
@@ -1494,6 +1592,7 @@ impl FakeShell {
         if !self.charge_work(len_u64(result.bytes().len())) {
             result.stop_line = true;
         }
+        self.settle_input(plan.reads_from);
         if let Some(previous) = stdin {
             self.stdin = previous;
         }
@@ -1507,7 +1606,14 @@ impl FakeShell {
                 }
             }
         }
-        let writer = refs.first().map_or("sh", |arg| command_basename(arg));
+        // A program started by path names itself by it in its own errors.
+        let writer = refs.first().map_or("sh", |arg| {
+            if arg.contains('/') {
+                arg
+            } else {
+                command_basename(arg)
+            }
+        });
         // Routed before the mark goes back, so a file this command's output lands in is known to
         // hold what it read from the session input.
         let routed = self.route(result, &plan, writer, typed);
@@ -1521,6 +1627,35 @@ impl FakeShell {
     fn pass_typed_output(&mut self, typed: bool, plan: &RedirPlan) {
         if typed && matches!(plan.sink(1), Sink::Terminal(OutputFd::Stdout)) {
             self.typed_output = true;
+        }
+    }
+
+    /// `exec` with redirections only: they become the shell's own descriptors.
+    fn exec_redirections(&mut self, mut plan: RedirPlan) -> CommandResult {
+        // `exec <FILE` at the terminal: the shell goes on reading commands, from the file.
+        if plan.stdin.is_some() && plan.reads_from.is_none() && self.exec_reads_commands() {
+            let bytes = plan
+                .ins
+                .remove(&0)
+                .map(|input| input.remaining())
+                .unwrap_or_default();
+            self.commit_descriptors(plan.sinks, plan.ins);
+            return self.exec_input_script(&bytes);
+        }
+        self.commit_descriptors(plan.sinks, plan.ins);
+        CommandResult::silent(0)
+    }
+
+    /// A command that read standard input from descriptor `fd` moves that descriptor's position by
+    /// what it read.
+    pub(super) fn settle_input(&mut self, fd: Option<u16>) {
+        let Some(fd) = fd else { return };
+        let used = match &self.stdin {
+            Stdin::Data { pos, .. } => *pos,
+            _ => return,
+        };
+        if let Some(open) = self.state_mut().fds.ins.get_mut(&fd) {
+            open.advance(used);
         }
     }
 
@@ -1547,8 +1682,8 @@ impl FakeShell {
     /// Open every redirection in order. The first that fails prints the shell's own error and the
     /// command does not run.
     fn open_redirs(&mut self, redirs: &[Redir]) -> Result<RedirPlan, CommandResult> {
-        let mut plan = RedirPlan::new();
-        plan.active = !redirs.is_empty();
+        let mut plan = RedirPlan::from_fds(&self.state().fds);
+        plan.active |= !redirs.is_empty();
         for redir in redirs {
             if !self.charge_work(1) {
                 let mut stopped = CommandResult::silent(1);
@@ -1561,7 +1696,7 @@ impl FakeShell {
             };
             let fd = redir.fd.unwrap_or(default_fd);
             let index = usize::from(fd);
-            if index > 9 {
+            if index >= FD_MAX {
                 continue;
             }
             match (&redir.op, &redir.target) {
@@ -1574,15 +1709,21 @@ impl FakeShell {
                     } else {
                         text.clone()
                     };
-                    plan.stdin = Some(Stdin::data(body.into_bytes()));
+                    install_input(&mut plan, fd, body.into_bytes());
                 }
                 (RedirOp::Out | RedirOp::Append | RedirOp::Clobber, RedirTarget::Word(word)) => {
                     let text = self.redirect_target(word)?;
                     let append = redir.op == RedirOp::Append;
-                    let sink = self.open_output(&text, append, &plan)?;
+                    let natural = if index == 2 {
+                        OutputFd::Stderr
+                    } else {
+                        OutputFd::Stdout
+                    };
+                    let sink = self.open_output(&text, append, &plan, natural)?;
                     if let Some(slot) = plan.sinks.get_mut(index) {
                         *slot = sink;
                     }
+                    plan.ins.remove(&fd);
                 }
                 (RedirOp::DupOut | RedirOp::DupIn, RedirTarget::Word(word)) => {
                     let text = match self.expand_scalar(word) {
@@ -1593,11 +1734,24 @@ impl FakeShell {
                 }
                 (RedirOp::In, RedirTarget::Word(word)) => {
                     let text = self.redirect_target(word)?;
-                    plan.stdin = Some(self.open_input(&text, false)?);
+                    let (bytes, _) = self.open_input(&text, false)?;
+                    install_input(&mut plan, fd, bytes);
+                    if index != 0
+                        && let Some(slot) = plan.sinks.get_mut(index)
+                    {
+                        *slot = Sink::Closed;
+                    }
                 }
                 (RedirOp::ReadWrite, RedirTarget::Word(word)) => {
                     let text = self.redirect_target(word)?;
-                    plan.stdin = Some(self.open_input(&text, true)?);
+                    let (bytes, path) = self.open_input(&text, true)?;
+                    install_input(&mut plan, fd, bytes);
+                    if index != 0
+                        && let Some(slot) = plan.sinks.get_mut(index)
+                    {
+                        // Written at the end: the file is not rewound.
+                        *slot = Sink::File { path, append: true };
+                    }
                 }
                 _ => {}
             }
@@ -1630,12 +1784,15 @@ impl FakeShell {
         text: &str,
         append: bool,
         plan: &RedirPlan,
+        natural: OutputFd,
     ) -> Result<Sink, CommandResult> {
         let resolved = self.resolve_logical(text);
         match resolved.as_str() {
             "/dev/null" => return Ok(Sink::Discard),
             "/dev/stdout" | "/dev/fd/1" => return Ok(plan.sink(1)),
             "/dev/stderr" | "/dev/fd/2" => return Ok(plan.sink(2)),
+            // The session's terminal, when it has one.
+            "/dev/tty" if self.tty_input => return Ok(Sink::Terminal(natural)),
             _ => {}
         }
         let opened = if append && self.fs.file_exists(&resolved) {
@@ -1653,7 +1810,7 @@ impl FakeShell {
     }
 
     /// `< file` and `<> file`: the whole file, read now.
-    fn open_input(&mut self, text: &str, create: bool) -> Result<Stdin, CommandResult> {
+    fn open_input(&mut self, text: &str, create: bool) -> Result<(Vec<u8>, String), CommandResult> {
         // Opened by the shell, before any command it starts has replaced it: `cat < /proc/self/exe`
         // reads the shell's own binary, where `cat /proc/self/exe` reads cat's.
         let reader = self.shell_reader();
@@ -1671,11 +1828,11 @@ impl FakeShell {
                     stopped.stop_line = true;
                     return Err(stopped);
                 }
-                Ok(Stdin::data(bytes))
+                Ok((bytes, resolved))
             }
             Err(FsError::IsADirectory) => {
                 // Opening a directory succeeds; reading it fails, which the reader reports.
-                Ok(Stdin::data(Vec::new()))
+                Ok((Vec::new(), resolved))
             }
             Err(_) => Err(self.input_open_error(text)),
         }
@@ -1697,35 +1854,91 @@ impl FakeShell {
         {
             return Err(self.dash_fatal(2, "Syntax error: Bad fd number"));
         }
+        let fd = u16::try_from(index).unwrap_or(u16::MAX);
         if text == "-" {
+            // `N>&-` and `N<&-` both close the descriptor.
             if let Some(slot) = plan.sinks.get_mut(index) {
-                *slot = Sink::Discard;
+                *slot = Sink::Closed;
+            }
+            plan.ins.remove(&fd);
+            if index == 0 {
+                plan.stdin = Some(Stdin::data(Vec::new()));
+                plan.reads_from = None;
             }
             return Ok(());
         }
         if let Ok(from) = text.parse::<usize>() {
+            let from_fd = u16::try_from(from).unwrap_or(u16::MAX);
             if output {
+                // The descriptor copied must be open.
+                if from >= FD_MAX
+                    || (plan.sink(from) == Sink::Closed && !plan.ins.contains_key(&from_fd))
+                {
+                    return Err(self.bad_descriptor(text));
+                }
                 let dest = plan.sink(from);
                 if let Some(slot) = plan.sinks.get_mut(index) {
                     *slot = dest;
+                }
+                if let Some(input) = plan.ins.get(&from_fd).cloned() {
+                    plan.ins.insert(fd, input);
+                } else {
+                    plan.ins.remove(&fd);
+                }
+            } else if from != 0 {
+                let Some(input) = plan.ins.get(&from_fd).cloned() else {
+                    return Err(self.bad_descriptor(text));
+                };
+                if index == 0 {
+                    plan.stdin = Some(Stdin::data(input.remaining()));
+                    plan.reads_from = Some(from_fd);
+                } else {
+                    plan.ins.insert(fd, input);
                 }
             }
             return Ok(());
         }
         if output && index == 1 {
             // `>&file` is `&>file`.
-            let sink = self.open_output(text, false, plan)?;
+            let sink = self.open_output(text, false, plan, OutputFd::Stdout)?;
             for stream in [1, 2] {
                 if let Some(slot) = plan.sinks.get_mut(stream) {
                     *slot = sink.clone();
                 }
             }
+        } else if self.is_bash() {
+            // Only `>&word` on standard output is a file; anywhere else the word must be a
+            // descriptor.
+            return Err(CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("{text}: ambiguous redirect")),
+            ));
         }
         Ok(())
     }
 
+    /// What the shell says of a descriptor a redirection copies that is not open.
+    fn bad_descriptor(&self, text: &str) -> CommandResult {
+        CommandResult::stderr(
+            if self.is_dash() { 2 } else { 1 },
+            self.shell_error(format_args!("{text}: Bad file descriptor")),
+        )
+    }
+
     /// What the shell itself says when it cannot open a redirection target for writing.
     fn redirect_open_error(&self, text: &str, error: &FsError) -> CommandResult {
+        if self.is_dash() {
+            // dash's own words, and its status for a redirection it could not make.
+            let reason = match error {
+                FsError::ReadOnly => "Read-only file system",
+                FsError::IsADirectory => "Is a directory",
+                other => super::budget_refusal_text(other).unwrap_or("Directory nonexistent"),
+            };
+            return CommandResult::stderr(
+                2,
+                self.shell_error(format_args!("cannot create {text}: {reason}")),
+            );
+        }
         let reason = match error {
             FsError::ReadOnly => "Read-only file system",
             FsError::IsADirectory => "Is a directory",
@@ -1765,6 +1978,8 @@ impl FakeShell {
         }
         let mut kept: Vec<OutputSegment> = Vec::new();
         let mut writes: Vec<(String, bool, Vec<u8>)> = Vec::new();
+        // A command that writes to a descriptor that is not open finds out when it writes.
+        let mut unwritable = false;
         for segment in &result.output {
             let index = match segment.fd {
                 OutputFd::Stdout => 1,
@@ -1772,6 +1987,7 @@ impl FakeShell {
             };
             match plan.sink(index) {
                 Sink::Discard => {}
+                Sink::Closed => unwritable = true,
                 Sink::File { path, append } => {
                     match writes.iter_mut().find(|(p, _, _)| *p == path) {
                         Some((_, _, buf)) => buf.extend_from_slice(&segment.bytes),
@@ -1826,10 +2042,32 @@ impl FakeShell {
                 format!("{writer}: write error: {reason}\n"),
             ));
         }
+        if unwritable && matches!(plan.sink(2), Sink::Terminal(_)) {
+            terminal.append(CommandResult::stderr(1, self.closed_write_error(writer)));
+        }
         terminal.close_session = result.close_session;
         terminal.stop_line = result.stop_line;
         terminal.flow = result.flow;
         terminal
+    }
+
+    /// What a command says when the descriptor it writes to is closed: a builtin in the words of
+    /// its shell, a program in its own (`coreutils`' `write error`).
+    fn closed_write_error(&self, writer: &str) -> String {
+        let builtin = !writer.contains('/')
+            && super::registry::Registry::builtin().kind(writer, self)
+                == Some(super::registry::CommandKind::Builtin);
+        match (builtin, self.is_dash()) {
+            (true, true) => self.shell_error(format_args!("{writer}: {writer}: I/O error")),
+            (true, false) => {
+                self.shell_error(format_args!("{writer}: write error: Bad file descriptor"))
+            }
+            // cat names the stream it could not write; most coreutils say `write error`.
+            (false, _) if writer == "cat" || writer.ends_with("/cat") => {
+                format!("{writer}: standard output: Bad file descriptor\n")
+            }
+            (false, _) => format!("{writer}: write error: Bad file descriptor\n"),
+        }
     }
 
     // ---- shell level bookkeeping ---------------------------------------------------------------

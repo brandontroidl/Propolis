@@ -424,6 +424,7 @@ fn probe_event(protocol: &str) -> sensor_wire::SensorEvent {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     }
 }
 

@@ -4,9 +4,11 @@
 {%- endmacro %}
 
 {#- A command that had line breaks reads as its lines, numbered, like an echo loader's chunk list;
-    anything else (and any event recorded before the lines were kept) shows its one-line detail. -#}
+    anything else (and any event recorded before the lines were kept) shows its one-line detail.
+    What the shell answered folds under it in the same raw toggle the row's JSON uses. -#}
 {% macro detail_text(event) -%}
-{% if event.lines %}<ol class="chunk-lines">{% for l in event.lines %}<li>{{ l }}</li>{% endfor %}</ol>{% if event.lines_truncated %}<span class="c-sub">more lines were sent than are kept</span>{% endif %}{% else %}{{ event.detail }}{% endif %}
+{% if event.lines %}<ol class="chunk-lines">{% for l in event.lines %}<li>{{ l }}</li>{% endfor %}</ol>{% if event.lines_truncated %}<span class="c-sub">more lines were sent than are kept</span>{% endif %}{% else %}{{ event.detail }}{% endif %}{% if event.reply %}
+<details class="raw-toggle"><summary>{{ event.reply.label }}</summary><pre class="raw-json">{{ event.reply.text }}</pre></details>{% endif %}
 {%- endmacro %}
 
 {% macro event_row(event) -%}

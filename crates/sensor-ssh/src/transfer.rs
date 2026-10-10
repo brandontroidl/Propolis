@@ -316,6 +316,7 @@ impl ScpReceiver {
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
+                reply: None,
             }),
         }
     }
@@ -683,6 +684,7 @@ impl SftpHandler {
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
+                reply: None,
             }),
         }
     }

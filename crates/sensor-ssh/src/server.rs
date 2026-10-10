@@ -1319,6 +1319,7 @@ impl Drop for ShellCapture {
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
+                reply: None,
             }),
         });
     }

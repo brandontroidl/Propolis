@@ -386,6 +386,7 @@ fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid)
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -411,6 +412,7 @@ fn login_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 

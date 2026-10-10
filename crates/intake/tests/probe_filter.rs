@@ -82,6 +82,7 @@ fn connection_line(source_ip: &str, sensor: &str) -> SensorEvent {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     }
 }
 

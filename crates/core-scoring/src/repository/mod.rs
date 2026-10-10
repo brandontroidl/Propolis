@@ -13,6 +13,7 @@ mod breadth_sets_tests;
 pub mod coverage;
 pub mod events;
 pub mod replay;
+pub mod shell_output;
 
 pub use batch::{BatchAppend, append_events};
 pub use coverage::{CoverageEventRow, CoverageEvents, MAX_COVERAGE_ROWS, coverage_events};

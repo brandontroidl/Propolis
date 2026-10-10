@@ -31,6 +31,7 @@ fn line(n: usize, signal: &str, metadata: serde_json::Value) -> String {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     };
     serde_json::to_string(&event).unwrap()
 }

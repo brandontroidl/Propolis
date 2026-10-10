@@ -741,6 +741,7 @@ pub fn command_summary_event(
         sample: None,
         session_id: Some(Uuid::now_v7()),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -776,6 +777,7 @@ mod tests {
             sample: None,
             session_id: Some(session),
             occurrence_id: None,
+            reply: None,
         }
     }
 

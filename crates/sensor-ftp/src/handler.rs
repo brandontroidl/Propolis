@@ -229,6 +229,7 @@ impl StorCapture {
                     sample: Some(sample),
                     session_id: Some(session_id),
                     occurrence_id: None,
+                    reply: None,
                 }
             }),
         };
@@ -657,6 +658,7 @@ fn connection_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -687,6 +689,7 @@ fn login_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -717,6 +720,7 @@ fn auth_refused_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 

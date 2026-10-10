@@ -41,7 +41,10 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use sensor_wire::{PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SensorEvent, WIRE_VERSION};
+use sensor_wire::{
+    PROTO_TCP, REPLY_TEXT_CAP, ReplyRef, SIGNAL_HONEYPOT_COMMAND_EXEC, SensorEvent, WIRE_VERSION,
+};
+use sha2::{Digest, Sha256};
 
 use crate::binaries;
 use crate::budget::{ConnectionBudget, Resource};
@@ -49,7 +52,7 @@ use crate::command_codec::CommandCodec;
 use crate::fakefs::{Blob, FakeFs, FsCheckpoint, FsError, READ_CAP};
 use crate::held_input::StdinCaptures;
 use crate::persona;
-use crate::sanitize_value;
+use crate::{sanitize_value, to_hex_bounded};
 
 mod admin;
 mod android;
@@ -151,6 +154,49 @@ fn command_lines(raw: &str) -> Option<(Vec<String>, bool)> {
         lines.push(kept);
     }
     Some((lines, truncated))
+}
+
+/// The shell's answer to one line as the event's `reply`, or `None` when it printed nothing.
+///
+/// What a bot read, sanitized the way a command is (`sanitize_value` per line, so line breaks stay
+/// and bidi/format characters, NULs and escape sequences do not), cut to
+/// [`REPLY_TEXT_CAP`] bytes. `len` is the full length of what was printed; the digest is of the text
+/// as kept, so equal replies share one stored row however long the output behind them was.
+fn reply_ref(bytes: &[u8]) -> Option<ReplyRef> {
+    let window = &bytes[..bytes.len().min(REPLY_TEXT_CAP)];
+    let decoded = String::from_utf8_lossy(window)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut truncated = bytes.len() > REPLY_TEXT_CAP;
+    let mut text = String::new();
+    for (index, line) in decoded.split('\n').enumerate() {
+        if index > 0 {
+            if text.len() == REPLY_TEXT_CAP {
+                truncated = true;
+                break;
+            }
+            text.push('\n');
+        }
+        let room = REPLY_TEXT_CAP - text.len();
+        let whole = sanitize_value(line, usize::MAX);
+        if whole.len() > room {
+            truncated = true;
+            text.push_str(&sanitize_value(line, room));
+            break;
+        }
+        text.push_str(&whole);
+    }
+    text.truncate(text.trim_end_matches('\n').len());
+    if text.is_empty() {
+        return None;
+    }
+    let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    Some(ReplyRef {
+        sha256: to_hex_bounded(&digest, 32),
+        len: len_u64(bytes.len()),
+        truncated,
+        text,
+    })
 }
 
 /// Cap applied to the `wget`/`curl` target URL echoed back in canned output. Smaller than
@@ -964,7 +1010,7 @@ impl FakeShell {
         };
         let output = self.run_input(&decoded);
         self.append_downloads(&mut events);
-        self.end_input(&mut events, true);
+        self.end_input(&mut events, Some(output.bytes()));
         self.flush_loader(&mut events);
         self.gate_events(&mut events);
         (output, events)
@@ -996,7 +1042,7 @@ impl FakeShell {
         if !self.stdin.is_blocked() {
             self.stdin = Stdin::Terminal;
             self.append_downloads(&mut events);
-            self.end_input(&mut events, true);
+            self.end_input(&mut events, Some(output.bytes()));
             self.flush_loader(&mut events);
             self.gate_events(&mut events);
             return (LineStep::Ran(output), events);
@@ -1016,7 +1062,7 @@ impl FakeShell {
             command: sanitize_value(&raw, MAX_COMMAND_LEN),
             attempts: 0,
         });
-        self.end_input(&mut events, false);
+        self.end_input(&mut events, None);
         self.loader_line.urls = derived;
         self.flush_loader(&mut events);
         self.gate_events(&mut events);
@@ -1247,19 +1293,23 @@ impl FakeShell {
     }
 
     /// The common end of [`Self::handle_input`] and [`Self::start_line`], once the line has run.
-    /// `ran` is false for a line left waiting, whose final status is not known yet.
-    fn end_input(&self, events: &mut [SensorEvent], ran: bool) {
+    ///
+    /// `output` is what the line printed: `Some` once it ran, `None` for a line left waiting
+    /// (whose status and reply are not known yet).
+    fn end_input(&self, events: &mut [SensorEvent], output: Option<&[u8]>) {
         tracing::debug!(target: "propolis::shell::trace", trace = ?self.trace, "shell line");
         // Only the normal path pushed CommandExec; the flood markers carry no trace worth
         // classifying. The trace is final here, so the coverage fields are added in place and
         // the event order is untouched.
         if self.trace.events.first() == Some(&TraceEventKind::CommandExec)
-            && let Some(obj) = events.first_mut().and_then(|e| e.metadata.as_object_mut())
+            && let Some(event) = events.first_mut()
+            && let Some(obj) = event.metadata.as_object_mut()
         {
             self.annotate_coverage(obj);
-            if !ran {
+            if output.is_none() {
                 obj.remove("status");
             }
+            event.reply = output.and_then(reply_ref);
         }
     }
 
@@ -1368,6 +1418,7 @@ impl FakeShell {
             sample: None,
             session_id: self.ctx.session_id,
             occurrence_id: None,
+            reply: None,
         }
     }
 
@@ -3480,6 +3531,8 @@ mod procs_tests;
 mod read_tests;
 #[cfg(test)]
 mod readlink_tests;
+#[cfg(test)]
+mod reply_tests;
 #[cfg(test)]
 mod stdin_tests;
 #[cfg(test)]

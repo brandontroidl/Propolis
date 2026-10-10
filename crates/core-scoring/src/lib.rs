@@ -33,6 +33,7 @@ pub use domain::enums::{Category, FeedTier, Protocol, ReviewState, SignalType};
 pub use domain::types::{EventInput, IpScore, ValidationError};
 pub use domain::weights::{SignalWeight, signal_weight};
 pub use net::{embedded_ipv4, is_reserved_ip};
+pub use repository::shell_output::{MAX_OUTPUT_BYTES, output_digest, read_outputs, store_outputs};
 pub use repository::{
     BatchAppend, ChainStatus, CoverageEventRow, CoverageEvents, MAX_COVERAGE_ROWS, RepoError,
     append_event, append_events, append_telemetry_event, begin_exclusive, coverage_events,

@@ -15,6 +15,7 @@ fn sample_wire_event() -> SensorEvent {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     }
 }
 

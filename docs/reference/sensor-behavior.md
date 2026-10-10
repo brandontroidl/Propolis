@@ -285,6 +285,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   is present. The key is not written for the XOR-decoded form, and events recorded before it
   existed show only the collapsed command. A line that is mostly line breaks (over 30% non-printable
   characters, newlines included) is a `binary` flood marker and carries no lines.
+- The command event also carries the shell's `reply`: what the line printed (standard output and
+  standard error together, as the bot read it), sanitized per line like a command, at most
+  `REPLY_TEXT_CAP = 4096` bytes, with the SHA-256 of the kept text, `len` (everything printed) and
+  `truncated` (`crates/sensor-framework/src/shell/mod.rs#reply_ref`). A command that printed nothing
+  carries none, and neither does a line left waiting for input (its output is not recorded when it
+  later runs). The reply is part of the sensor's own log record; intake folds the digest, length and
+  truncation flag into `metadata` (`output_sha256`, `output_len`, `output_truncated`) and stores the
+  text once per digest ([shell output table](database.md#shell-output-table)). Intake refuses a
+  line whose digest is not the text's, whose text is over the cap or holds a NUL.
 - One `ConnectionBudget` per connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget`, limits in `crates/sensor-framework/src/budget.rs#BudgetLimits::standard`)
   bounds what a session can make the sensor hold or send: 192 KiB of created file content and 4096
   created nodes (a removed file's slot is not freed), 64 recorded downloads per connection and 8 per

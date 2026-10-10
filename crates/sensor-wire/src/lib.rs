@@ -58,6 +58,29 @@ pub struct SensorEvent {
     /// None never appears on the wire (no WIRE_VERSION bump), matching `session_id` / `capture_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence_id: Option<uuid::Uuid>,
+    /// What a fake shell answered to a command, on the `honeypot_command_exec` event of that
+    /// command. Optional + skipped like `sample`, so every other event and every older record is
+    /// unchanged on the wire. Intake folds the digest and length into the event's metadata (so the
+    /// hash chain covers them) and keeps the text in `shell_output`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<ReplyRef>,
+}
+
+/// The most bytes of a shell reply a sensor keeps in [`ReplyRef::text`].
+pub const REPLY_TEXT_CAP: usize = 4096;
+
+/// A shell's answer to one command, as the sensor recorded it. `text` is what a bot would have
+/// read, lossily decoded and sanitized line by line (control and format characters removed, line
+/// breaks kept), and cut to [`REPLY_TEXT_CAP`] bytes; `len` is the full length printed. `sha256` is the digest of
+/// `text` as stored (lowercase hex), which intake recomputes and refuses a line that disagrees
+/// with. `text` is attacker-influenced (it can echo the command): render as escaped text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplyRef {
+    pub sha256: String,
+    pub len: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    pub text: String,
 }
 
 /// Reference to a captured file body written to the quarantine spool, named by its SHA-256.
@@ -94,6 +117,7 @@ mod tests {
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         }
     }
 
@@ -169,6 +193,7 @@ mod tests {
             sample: None,
             session_id: Some(sid),
             occurrence_id: None,
+            reply: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: SensorEvent = serde_json::from_str(&json).unwrap();
@@ -213,6 +238,34 @@ mod tests {
         let json = r#"{"v":1,"source_ip":"203.0.113.7","wan_ip":null,"sensor":"ssh","signal_type":"honeypot.command_exec","protocol":"tcp","authenticated":true,"observed_at":"2026-07-20T14:03:11.482913Z","metadata":{},"sample":null,"session_id":null}"#;
         let e: SensorEvent = serde_json::from_str(json).unwrap();
         assert_eq!(e.occurrence_id, None);
+    }
+
+    #[test]
+    fn reply_round_trips_and_is_omitted_when_absent() {
+        let mut e = sample_event();
+        let none = serde_json::to_string(&e).unwrap();
+        assert!(!none.contains("reply"), "no reply, no key on the wire");
+        let back: SensorEvent = serde_json::from_str(&none).unwrap();
+        assert_eq!(back.reply, None, "a record without the key still parses");
+
+        e.reply = Some(ReplyRef {
+            sha256: "ab".repeat(32),
+            len: 12,
+            truncated: false,
+            text: "Linux box".into(),
+        });
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(
+            !s.contains("truncated"),
+            "an untruncated reply omits the flag"
+        );
+        let back: SensorEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.reply, e.reply);
+
+        e.reply.as_mut().unwrap().truncated = true;
+        let s = serde_json::to_string(&e).unwrap();
+        let back: SensorEvent = serde_json::from_str(&s).unwrap();
+        assert!(back.reply.unwrap().truncated);
     }
 
     #[test]

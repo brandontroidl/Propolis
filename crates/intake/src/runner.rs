@@ -1,4 +1,4 @@
-//! The intake runner: wires `LogTailer` (Task 3) to `converter::convert` (Task 1) to
+//! The intake runner: wires `LogTailer` (Task 3) to `converter::convert_event` (Task 1) to
 //! `core_scoring::append_events`, the per-poll unit of work a sensor's intake loop repeats. See
 //! "The runner" in `internal/design/03-event-intake-aggregation.md`.
 
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::converter::convert;
+use crate::converter::convert_event;
 use crate::quarantine::{Quarantine, QuarantinedLine};
 use chrono::{DateTime, Utc};
 use core_scoring::{EventInput, append_events};
@@ -344,6 +344,8 @@ impl IntakeRunner {
         // Lines that are not events, by position, so a failure counts only those it reached.
         let mut rejected_at: Vec<usize> = Vec::new();
         let mut probes: Vec<(usize, String)> = Vec::new();
+        // (digest, text) of each reply in the batch, stored before the append.
+        let mut replies: Vec<(String, String)> = Vec::new();
         let mut bytes_read = 0usize;
 
         for (index, line) in lines.iter().enumerate() {
@@ -377,8 +379,11 @@ impl IntakeRunner {
                 continue;
             }
 
-            let input = match convert(event) {
-                Ok(input) => input,
+            let input = match convert_event(event) {
+                Ok(converted) => {
+                    replies.extend(converted.reply);
+                    converted.input
+                }
                 Err(e) => {
                     tracing::warn!(
                         sensor = %self.sensor_name,
@@ -397,6 +402,23 @@ impl IntakeRunner {
                 line_hash: hash_line(line),
             });
             events.push(input);
+        }
+
+        // The reply text goes in BEFORE the events that name it, so a committed event never points
+        // at a missing row. If this fails nothing is appended and the whole batch is read again;
+        // a row stored for a line that then did not append is harmless (content-addressed, and
+        // stored again as a no-op).
+        if let Err(e) = core_scoring::store_outputs(&self.pool, &replies).await {
+            tracing::error!(
+                sensor = %self.sensor_name,
+                error = %e,
+                "shell replies could not be stored, batch will be read again"
+            );
+            result.errors += 1;
+            self.tailer.rewind_batch();
+            self.batch_size =
+                next_batch_size(self.batch_size, lines_read, bytes_read, result.errors > 0);
+            return result;
         }
 
         // One transaction for the whole batch (telemetry and scored events alike, in log order).

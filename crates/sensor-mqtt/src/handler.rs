@@ -1167,6 +1167,7 @@ fn capture_job(
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
+                reply: None,
             }
         }),
     }
@@ -1205,6 +1206,7 @@ pub async fn handle_connection<S>(
             sample: None,
             session_id: Some(session_id),
             occurrence_id: None,
+            reply: None,
         };
     let record = async |obs: Observation| {
         let mut metadata = obs.metadata;

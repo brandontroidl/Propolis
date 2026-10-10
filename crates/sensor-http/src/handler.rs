@@ -184,6 +184,7 @@ pub async fn handle_connection<S>(
             sample: None,
             session_id: Some(session_id),
             occurrence_id: None,
+            reply: None,
         };
         if emitter.append(&event).await.is_err() {
             tracing::error!(%peer_addr, "http: failed to append request event");
@@ -304,6 +305,7 @@ fn connection_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 

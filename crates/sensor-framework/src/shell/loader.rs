@@ -292,6 +292,7 @@ impl FakeShell {
                 sample: None,
                 session_id: self.ctx.session_id,
                 occurrence_id: None,
+                reply: None,
             });
         }
         let Some(captures) = &self.captures else {

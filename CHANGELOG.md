@@ -4,6 +4,15 @@
 
 ### Added
 
+- **The evidence timeline shows what the shell answered** - the sensor now records a command's
+  reply (what the line printed, sanitized per line, at most 4 KiB, with its length and a
+  truncation flag) on the command event. Intake folds `output_sha256`, `output_len` and
+  `output_truncated` into the event's metadata, so the hash chain covers them, and stores the text
+  once per digest in the new `shell_output` table (migration `0018`, additive; the ledger never
+  holds the text). It refuses a line whose digest is not the text's. The timeline folds the reply
+  under its command in the existing raw expander, escaped. Commands recorded before this, and
+  lines left waiting for input, show none. On a synthetic mix of 1000 bot sessions the table held
+  one row per 3.9 replies (5.1 times fewer bytes than the replies themselves).
 - **A multi-line command is kept as its lines** - SSH exec and the interactive shells recorded a
   script such as `cd /tmp` / `wget ...` / `sh x` as one line, because the sanitizer folds every
   line break into a space. A command that had a break now also carries `metadata.command_lines`

@@ -671,6 +671,7 @@ impl CaptureSet {
                     sample: Some(sample),
                     session_id: Some(source.session_id),
                     occurrence_id: None,
+                    reply: None,
                 }
             }),
         });

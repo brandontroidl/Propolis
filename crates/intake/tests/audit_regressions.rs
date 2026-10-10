@@ -48,6 +48,7 @@ fn event(source_ip: &str) -> SensorEvent {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     }
 }
 

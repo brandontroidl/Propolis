@@ -104,6 +104,7 @@ fn build_events() -> Vec<SensorEvent> {
             sample: None,
             session_id: Some(uuid::Uuid::now_v7()),
             occurrence_id: None,
+            reply: None,
         },
         SensorEvent {
             v: WIRE_VERSION,
@@ -118,6 +119,7 @@ fn build_events() -> Vec<SensorEvent> {
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         },
         SensorEvent {
             v: WIRE_VERSION,
@@ -137,6 +139,7 @@ fn build_events() -> Vec<SensorEvent> {
             }),
             session_id: Some(uuid::Uuid::now_v7()),
             occurrence_id: None,
+            reply: None,
         },
     ]
 }

@@ -352,6 +352,7 @@ fn connection_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -380,6 +381,7 @@ fn login_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -440,6 +442,7 @@ fn data_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 
@@ -469,6 +472,7 @@ fn starttls_refused_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 

@@ -990,6 +990,7 @@ mod tests {
             sample,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         }
     }
 

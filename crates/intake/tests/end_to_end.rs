@@ -68,6 +68,7 @@ async fn ingest_single_event_appears_in_ledger(pool: PgPool) {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     };
     write_event_line(&log_path, &event);
 
@@ -131,6 +132,7 @@ async fn a_telemetry_line_reaches_the_ledger_through_intake_and_scores_nothing(p
         sample: None,
         session_id: Some(uuid::Uuid::now_v7()),
         occurrence_id: None,
+        reply: None,
     };
     write_event_line(&log_path, &telemetry);
 
@@ -198,6 +200,7 @@ async fn unknown_signal_type_rejected_cursor_advances() {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     };
     let good = SensorEvent {
         v: WIRE_VERSION,
@@ -212,6 +215,7 @@ async fn unknown_signal_type_rejected_cursor_advances() {
         sample: None,
         session_id: None,
         occurrence_id: None,
+        reply: None,
     };
     write_event_line(&log_path, &bad);
     write_event_line(&log_path, &good);
@@ -271,6 +275,7 @@ async fn hash_chain_intact_after_ingestion(pool: PgPool) {
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         };
         write_event_line(&log_path, &event);
     }
@@ -311,6 +316,7 @@ async fn rotation_survival_no_events_lost() {
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         };
         write_event_line(&log_path, &event);
     }
@@ -345,6 +351,7 @@ async fn rotation_survival_no_events_lost() {
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         };
         write_event_line(&log_path, &event);
     }
@@ -403,6 +410,7 @@ async fn runner_reports_backlog_last_observed_and_the_sensor_name_its_events_car
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         })
         .collect();
     for event in &events {

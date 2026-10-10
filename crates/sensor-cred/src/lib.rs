@@ -237,6 +237,7 @@ mod tests {
             sample: None,
             session_id: None,
             occurrence_id: None,
+            reply: None,
         };
         let plain = with_tls(event.clone(), false);
         assert_eq!(plain.metadata, event.metadata);

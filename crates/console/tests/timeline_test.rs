@@ -605,3 +605,99 @@ async fn a_multi_line_command_renders_one_line_per_li_and_old_events_stay_collap
         "{single}"
     );
 }
+
+/// A command's reply folds under the command in the raw toggle, escaped; a command that names no
+/// reply, and one whose named reply has no stored row, show nothing; the "Load more" fragment
+/// attaches replies the same way the page does.
+#[sqlx::test(migrations = false)]
+async fn a_stored_reply_folds_under_its_command_escaped_and_old_events_show_none(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.58";
+    scored(&pool, ip).await;
+    let s = Uuid::now_v7();
+    let short = core_scoring::output_digest("uid=0(root) <i>x</i>");
+    let long_text = "line <script>alert(1)</script>";
+    let long = core_scoring::output_digest(long_text);
+    core_scoring::store_outputs(
+        &pool,
+        &[
+            (short.clone(), "uid=0(root) <i>x</i>".to_string()),
+            (long.clone(), long_text.to_string()),
+        ],
+    )
+    .await
+    .unwrap();
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        60,
+        serde_json::json!({ "command": "id", "output_sha256": short, "output_len": 21 }),
+        Some(s),
+    )
+    .await;
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        55,
+        serde_json::json!({
+            "command": "cat big", "output_sha256": long,
+            "output_len": 9000, "output_truncated": true
+        }),
+        Some(s),
+    )
+    .await;
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        50,
+        serde_json::json!({ "command": "old command" }),
+        Some(s),
+    )
+    .await;
+    event(
+        &pool,
+        ip,
+        SignalType::HoneypotCommandExec,
+        45,
+        serde_json::json!({ "command": "lost reply", "output_sha256": "a".repeat(64) }),
+        Some(s),
+    )
+    .await;
+
+    let body = page(pool.clone(), &format!("/ip/{ip}")).await;
+    let t = timeline(&body);
+    // The detail cell, not the raw-JSON expander beside it (whose JSON holds the digest too).
+    let cell = |needle: &str| -> String {
+        let r = row(t, needle);
+        let from = &r[r.find(r#"<td class="mono">"#).unwrap()..];
+        from[..from.find("</td>").unwrap()].to_string()
+    };
+    let id = cell("uid=0");
+    assert!(
+        id.contains(r#"<details class="raw-toggle"><summary>reply, 21 B</summary>"#)
+            && id.contains(r#"<pre class="raw-json">uid=0(root) &lt;i&gt;x&lt;&#x2f;i&gt;</pre>"#),
+        "{id}"
+    );
+    let big = cell("alert(1)");
+    assert!(
+        big.contains("reply, 9000 B, first 30 B shown")
+            && big.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;")
+            && !big.contains("<script>"),
+        "{big}"
+    );
+    assert!(!cell("old command").contains("reply,"));
+    assert!(!cell("lost reply").contains("reply,"));
+
+    let fragment = page(
+        pool,
+        &format!("/ip/{ip}/events?cursor=2099-01-01T00:00:00.000000Z,9223372036854775807"),
+    )
+    .await;
+    assert!(
+        fragment.contains("reply, 21 B"),
+        "the fragment attaches replies too: {fragment}"
+    );
+}

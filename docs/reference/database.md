@@ -338,6 +338,23 @@ Derived by the same indexer, in the same transaction as each batch; the rules ar
 matched token) until the run joins a campaign
 (`crates/core-scoring/migrations/0017_attack_tags.sql#attack_pending`).
 
+<a id="shell-output-table"></a>
+## Shell output table (`0018_shell_output.sql`)
+
+What a fake shell answered to a command, kept once per distinct reply. A `honeypot_command_exec`
+event refers to its reply by `metadata.output_sha256`, which intake writes into the event before
+the hash chain covers it (with `output_len`, and `output_truncated` when the sensor cut the text);
+the ledger never holds the text. Intake stores the text before it appends the events that name it
+(`crates/core-scoring/src/repository/shell_output.rs#store_outputs`).
+
+| table | holds | key | source |
+|---|---|---|---|
+| `shell_output` | `text` (at most 4096 bytes, attacker-influenced, shown escaped) under its `sha256` (lowercase hex of the text), and `first_seen` | `sha256`; a reply stored again is left as it is | `crates/core-scoring/migrations/0018_shell_output.sql#shell_output` |
+
+There is no backfill: commands recorded before the migration, and those whose line was left waiting
+for input, name no reply. Rows are not pruned; the table grows with the number of distinct replies,
+not with sessions.
+
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)
 
 VirusTotal-style verdict per captured sample, keyed by SHA-256; links to a
@@ -457,6 +474,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0015` | the [campaign and indicator tables](#campaign-tables) and the indexer's cursor (starting at 0, no backfill: the indexer reads the ledger in batches after startup) |
 | `0016` | `campaign_cursor.fingerprint_version` and `rebuild_until`, `campaign.min_shapes` and `max_shapes`, `campaign_session.payload` (see [campaign tables](#campaign-tables)); no data is rewritten, the indexer rebuilds the command-sequence campaigns itself on its next batch |
 | `0017` | the [ATT&CK tag tables](#attack-tag-tables) `attack_tag` and `campaign_attack_tag`, and `campaign_session.attack_pending`; no backfill |
+| `0018` | the [shell output table](#shell-output-table) `shell_output`; no backfill |
 
 **review** (`crates/review/migrations/`):
 

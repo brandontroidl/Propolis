@@ -411,6 +411,7 @@ impl UploadCapture {
                 sample: Some(sample),
                 session_id: Some(session_id),
                 occurrence_id: None,
+                reply: None,
             }),
         };
         let _ = self.handoff.submit(job);
@@ -483,6 +484,7 @@ fn connection_event(
         sample: None,
         session_id: Some(session_id),
         occurrence_id: None,
+        reply: None,
     }
 }
 

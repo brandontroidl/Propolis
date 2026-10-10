@@ -125,6 +125,10 @@ struct EventRow {
     lines: Vec<String>,
     /// More lines were sent than the sensor kept (`metadata.command_lines_truncated`).
     lines_truncated: bool,
+    /// What the shell answered to this command, from the `shell_output` row named by
+    /// `metadata.output_sha256`. `None` when the event names none (every other event, and every
+    /// command recorded before replies were kept) or when no row is stored for it.
+    reply: Option<ReplyView>,
     /// What the review fetcher did with the URL a `honeypot_file_download` event named; `None` for
     /// every other event and for a download event that carries no `url` (see
     /// [`attach_fetch_outcomes`]).
@@ -464,6 +468,58 @@ fn fetch_outcome(url: &str, record: Option<&FetchRecord>) -> FetchOutcome {
     }
 }
 
+/// A command's reply as the timeline shows it, folded under the command.
+#[derive(Debug, Serialize)]
+struct ReplyView {
+    /// "reply, 9000 B, first 4096 B shown": the summary of the fold.
+    label: String,
+    /// Attacker-influenced; the template escapes it like every other value.
+    text: String,
+}
+
+/// The digest `metadata.output_sha256` names, when the event names one.
+fn output_sha(event: &EventRow) -> Option<&str> {
+    event.metadata.get("output_sha256")?.as_str()
+}
+
+/// Sets [`EventRow::reply`] on every event whose metadata names a stored reply, from one query.
+async fn attach_replies(db: &PgPool, events: &mut [EventRow]) -> Result<(), sqlx::Error> {
+    let shas: Vec<String> = events
+        .iter()
+        .filter_map(output_sha)
+        .map(str::to_string)
+        .collect();
+    if shas.is_empty() {
+        return Ok(());
+    }
+    let stored = core_scoring::read_outputs(db, &shas).await?;
+    for event in events.iter_mut() {
+        let Some(text) = output_sha(event).and_then(|sha| stored.get(sha)) else {
+            continue;
+        };
+        let len = event
+            .metadata
+            .get("output_len")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(text.len() as u64);
+        let cut = event
+            .metadata
+            .get("output_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let label = if cut {
+            format!("reply, {len} B, first {} B shown", text.len())
+        } else {
+            format!("reply, {len} B")
+        };
+        event.reply = Some(ReplyView {
+            label,
+            text: text.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// The lines of a multi-line command, from `metadata.command_lines`. Only strings are taken, and a
 /// value of any other shape yields no lines (the page then shows the collapsed command).
 fn command_lines(metadata: &serde_json::Value) -> Vec<String> {
@@ -584,6 +640,10 @@ async fn detail(
     degraded.soft(
         "download outcomes",
         attach_fetch_outcomes(&state.db, &mut all_events).await,
+    );
+    degraded.soft(
+        "command replies",
+        attach_replies(&state.db, &mut all_events).await,
     );
     let timeline_counts = TimelineCounts::of(&all_events);
     let has_more_events = all_events.len() as i64 == EVIDENCE_PAGE_SIZE;
@@ -819,6 +879,10 @@ async fn events_fragment(
     Degraded::new().soft(
         "download outcomes",
         attach_fetch_outcomes(&state.db, &mut events).await,
+    );
+    Degraded::new().soft(
+        "command replies",
+        attach_replies(&state.db, &mut events).await,
     );
     let has_more_events = events.len() as i64 == EVIDENCE_PAGE_SIZE;
     let next_cursor = events
@@ -1056,6 +1120,7 @@ async fn fetch_evidence_rows(
                 .get("command_lines_truncated")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            reply: None,
             fetch: None,
             protocol: protocol_label(protocol).to_string(),
             authenticated: row.try_get("authenticated")?,
@@ -1695,6 +1760,7 @@ mod tests {
             xor_badge: None,
             lines: Vec::new(),
             lines_truncated: false,
+            reply: None,
             fetch: None,
             protocol: "TCP".into(),
             authenticated: true,

@@ -130,6 +130,7 @@ impl AuthState {
             sample: None,
             session_id: Some(self.session_id),
             occurrence_id: None,
+            reply: None,
         }
     }
 
@@ -163,6 +164,7 @@ impl AuthState {
             sample: None,
             session_id: Some(self.session_id),
             occurrence_id: None,
+            reply: None,
         }
     }
 
@@ -221,6 +223,7 @@ impl AuthState {
             sample: None,
             session_id: Some(self.session_id),
             occurrence_id: None,
+            reply: None,
         };
 
         // Always accept: see the module doc for why.

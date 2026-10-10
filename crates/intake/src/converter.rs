@@ -18,6 +18,16 @@ pub enum ConvertError {
     UnsupportedVersion(u32),
     #[error("event failed validation: {0:?}")]
     Validation(ValidationError),
+    #[error("shell reply refused: {0}")]
+    BadReply(&'static str),
+}
+
+/// A converted event and the shell reply text its metadata now refers to, to be stored under the
+/// reply's digest. `None` for every event that carried no reply.
+#[derive(Debug)]
+pub struct Converted {
+    pub input: EventInput,
+    pub reply: Option<(String, String)>,
 }
 
 /// Converts one wire-format sensor event into a validated `core-scoring` domain event.
@@ -26,6 +36,47 @@ pub enum ConvertError {
 /// `EventInput::from_signal` (the signal weight table) - a sensor never supplies them, and
 /// this function can never let one drift out of sync with the others.
 pub fn convert(event: SensorEvent) -> Result<EventInput, ConvertError> {
+    convert_event(event).map(|c| c.input)
+}
+
+/// [`convert`], also returning the reply text for the caller to store. The digest, length and
+/// truncation flag are in the returned event's metadata either way, so the hash chain covers them.
+pub fn convert_event(mut event: SensorEvent) -> Result<Converted, ConvertError> {
+    let reply = fold_reply(&mut event)?;
+    let input = convert_folded(event)?;
+    Ok(Converted { input, reply })
+}
+
+/// Takes the event's reply, checks it, and records `output_sha256`, `output_len` and (when set)
+/// `output_truncated` in the metadata. Fails closed: a digest that is not the text's, text over the
+/// cap or with a NUL (which no TEXT column holds), or metadata that is not an object to put the
+/// fields in, refuses the whole line. `len` is the sensor's own count of what was printed and is
+/// carried as given.
+fn fold_reply(event: &mut SensorEvent) -> Result<Option<(String, String)>, ConvertError> {
+    let Some(reply) = event.reply.take() else {
+        return Ok(None);
+    };
+    if reply.text.len() > core_scoring::MAX_OUTPUT_BYTES {
+        return Err(ConvertError::BadReply("text over the cap"));
+    }
+    if reply.text.contains('\0') {
+        return Err(ConvertError::BadReply("text holds a NUL"));
+    }
+    if reply.sha256 != core_scoring::output_digest(&reply.text) {
+        return Err(ConvertError::BadReply("digest is not the text's"));
+    }
+    let Value::Object(map) = &mut event.metadata else {
+        return Err(ConvertError::BadReply("metadata is not an object"));
+    };
+    map.insert("output_sha256".into(), reply.sha256.clone().into());
+    map.insert("output_len".into(), reply.len.into());
+    if reply.truncated {
+        map.insert("output_truncated".into(), true.into());
+    }
+    Ok(Some((reply.sha256, reply.text)))
+}
+
+fn convert_folded(event: SensorEvent) -> Result<EventInput, ConvertError> {
     if event.v != WIRE_VERSION {
         return Err(ConvertError::UnsupportedVersion(event.v));
     }

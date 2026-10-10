@@ -202,8 +202,10 @@ Every sensor emits the same frozen record, `SensorEvent`
 (`crates/sensor-wire/src/lib.rs#SensorEvent`, `WIRE_VERSION = 1`). A sensor emits **raw
 facts only** - `source_ip`, `wan_ip`, `sensor`, `signal_type` (a plain string),
 `protocol`, `authenticated`, `observed_at`, `metadata`, an optional `sample`
-reference, an optional `session_id`, and an optional `occurrence_id` (minted by
-`EventEmitter::append`). Weight, confidence, and category are **not**
+reference, an optional `session_id`, an optional `occurrence_id` (minted by
+`EventEmitter::append`), and on a shell command's event an optional `reply`
+(`crates/sensor-wire/src/lib.rs#ReplyRef`: what the shell printed, capped at 4 KiB, which intake
+moves into the `shell_output` table). Weight, confidence, and category are **not**
 on the wire; they are derived downstream so a sensor never computes a score. Field
 types and the signal vocabulary are owned by
 [`reference/events-and-signals.md`](../reference/events-and-signals.md).

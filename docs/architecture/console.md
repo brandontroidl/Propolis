@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-10
 -->
 
 # Console architecture
@@ -114,19 +114,26 @@ becoming script execution.
   ends in `.html` auto-escapes every `{{ }}` value unless it opts out with `|safe`.
   `|safe` is used deliberately only for `serde_json`-serialized Chart.js data arrays
   injected into inline `<script>` blocks.
-- `base.html` is assembled at **compile time** from five pieces via
-  `concat!(include_str!(..))`: the head, the vendored Chart.js UMD bundle, chart
-  defaults, the vendored htmx bundle, and the tail. Both JS libraries are unmodified
-  upstream, **self-hosted, no CDN at runtime**.
+- `base.html` is assembled at **compile time** from two pieces via
+  `concat!(include_str!(..))` (`crates/console/src/templates.rs#BASE_HTML`): `base_head.html`
+  and `base_tail.html`. The head links the stylesheet and loads the vendored Chart.js UMD
+  bundle, the chart defaults (`assets/charts.js`) and the vendored htmx bundle as static
+  files under `src/assets/`; the tail carries the navigation, the evidence drawer and
+  `console.js`. Both JS libraries are unmodified upstream, **self-hosted, no CDN at
+  runtime**.
+- **Visual system** - one stylesheet (`assets/console.css`) and a set of shared macros
+  (`templates/macros.html`) hold every token and component; the
+  [console design system](../reference/console-design-system.md) lists them and the rules a
+  change follows, and a rendered-page test enforces the structural ones.
 - **Review queue layout** - the pending tab groups by campaign without any script: a native
   `<details>` row per campaign that has two or more listed pending members, whose member rows sit
   in a nested table sharing the page's `<colgroup>` widths (`macros.html#queue_cols`). An address
   in several campaigns is listed under the one with the most pending members, then the most hosts,
   then the lowest id (`routes/queue.rs#group_home`); its other campaigns appear on its IP page.
-  Scores are numbers coloured by feed tier, "Active" is one cell (`routes/format.rs#format_active`:
-  a clock range within one UTC day, a length plus recency across days, exact timestamps in the
-  `title`), and below 640 px each entry stacks as a card (all rules in `console.css`, no inline
-  style). Group counts are rendered with the page and are not updated when a member is decided in
+  Scores carry the same meter as every other page, "Active" is one cell
+  (`routes/format.rs#format_active`: a clock range within one UTC day, a length plus recency
+  across days, exact timestamps in the `title`), and below 640 px each entry stacks as a card,
+  as every table of addresses does (all rules in `console.css`, no inline style). Group counts are rendered with the page and are not updated when a member is decided in
   place; the approve confirmation lists the live pending set.
 - **HTMX fragment model** - several routes return partials rather than full pages:
   the dashboard and IP-detail charts, the IP-detail event timeline (keyset
@@ -154,12 +161,12 @@ does not yet mention it (see
   and **hacker** (a green-phosphor mono theme). The server default is `graphite`,
   whose palette sits on bare `:root` so a no-JS page still renders it.
 - **Persistence** - the selected theme is stored in `localStorage` under
-  `propolis-theme`; a tiny pre-paint inline script applies it before first paint to
+  `propolis-theme`; a tiny pre-paint script (`assets/theme-init.js`, loaded first in the head, never inline) applies it before first paint to
   avoid a flash, guarded in try/catch for private-mode throws. The top-nav
   `<select>` syncs, persists, and re-colors the charts on change.
 - **Top navigation** is server-rendered: wordmark, main nav (Dashboard, Review with
-  a pending badge, Attackers, Feed, Search, an Operations dropdown to
-  Logs/Samples/Integrity), a quick-search form, the theme selector, uptime, version,
+  a pending badge, Attackers, Campaigns, Feed, Search, an Operations dropdown to
+  Fleet/Logs/Samples/Integrity), a quick-search form, the theme selector, uptime, version,
   and Sign out. An `active_nav` context variable drives the active/`aria-current`
   state.
 - **Fonts** are embedded in the binary and served from a public `/assets/fonts/{file}`

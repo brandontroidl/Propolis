@@ -49,6 +49,7 @@ for everything else.
   [ATT&CK tagging](reference/attack-tagging.md),
   [sensor behavior](reference/sensor-behavior.md),
   [console routes](reference/console-routes.md),
+  [console design system](reference/console-design-system.md),
   [scoring and feed](reference/scoring-and-feed.md),
   [integrations](reference/integrations.md),
   [commands](reference/commands.md),

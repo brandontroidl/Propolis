@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-09
+last-verified: 2026-10-10
 -->
 
 # Console tour
@@ -118,7 +118,7 @@ Captured files by SHA-256, with size, which sensor took them, the addresses they
 linked to, how the fetcher's connection was authenticated (a column that reads `n/a,
 uploaded` for a file a sensor took from the address that sent it, since nothing was
 fetched), and the VirusTotal verdict if one exists. Downloads are served as opaque
-attachments. Above the table, a strip shows the dropper fetcher's outcomes by status.
+attachments. Above it, a Fetch attempts panel counts the dropper fetcher's outcomes by status.
 
 ## Search
 

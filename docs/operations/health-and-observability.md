@@ -94,7 +94,10 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 (`crates/console/src/routes/metrics.rs#metrics`). Emitted series (`crates/console/src/routes/metrics.rs#metrics`):
 
 - Gauges: `propolis_ips_scored`, `propolis_ips_eligible`, `propolis_ips_recommended_vendor`,
-  `propolis_ips_recommended_blocklist`, `propolis_review_queue_pending`.
+  `propolis_ips_recommended_blocklist`, `propolis_review_queue_pending`, and the stored shell
+  reply table's `propolis_shell_output_rows` (planner estimate) and `propolis_shell_output_bytes`
+  (table plus indexes), read from the catalog so a scrape never reads the table
+  ([retention](retention.md#stored-shell-replies)).
 - Counter: `propolis_vendor_submissions_total{vendor,status}`.
 - Malware pipeline (the work, not the process): `propolis_fetch_attempts{status}`,
   `propolis_fetch_pending_oldest_age_seconds`, `propolis_sample_analysis{state}`

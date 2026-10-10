@@ -117,6 +117,36 @@ share. They are listed with the other on-disk state under [backup and
 restore](./backup-and-restore.md); do not confuse this directory with the malware fetcher's
 `fetched` spool, which has its own budget and cleanup above.
 
+## Stored shell replies
+
+The text of what the fake shell answered is kept once per distinct reply in `shell_output`
+([database reference](../reference/database.md#shell-output-table)). The ledger rows name a reply
+by digest and are never pruned, so a reply a ledger row names is kept for as long as the row. What
+the daemon removes is the **orphans**: a reply no event names (its batch's append failed, or its
+line was quarantined) that intake has not stored for 24 hours. The pass runs hourly inside the
+`sample-retention` subsystem and logs a count when it deletes any
+(`crates/core-scoring/src/repository/shell_output.rs#prune_orphan_outputs`,
+`crates/propolis/src/main.rs#SHELL_OUTPUT_ORPHAN_GRACE`; the grace period is a compile-time
+constant, not a variable). A reply that arrives again has its age refreshed at most once an hour,
+so a row a batch is about to name is never the one deleted.
+
+**Growth bound.** The table grows with the number of distinct replies, not with sessions or
+events, and each reply is at most 4 KiB (`REPLY_TEXT_CAP`). Per source, the sensor admits at most
+12 command events a minute after a burst of 200 for each /24, with at most 128 distinct command
+shapes tracked per 60-second window
+(`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENTS_PER_MIN`,
+`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENT_BURST`,
+`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`), and a flood of one command
+is one row when its reply is always the same. The worst case is an attacker who varies the reply
+text on purpose: about 128 distinct shapes every 60 seconds from one /24, which at
+the 4 KiB cap is at most about 0.5 MiB a minute, 30 MiB an hour and 0.7 GiB a day from that
+source, before the ledger's own growth for the events that name them. A reply an event names is
+never pruned, so under such a flood the table grows with the ledger, and has the same remedy:
+archive or prune old events yourself and then the orphan pass removes their replies after 24 hours.
+`/metrics` reports `propolis_shell_output_rows` (planner estimate) and `propolis_shell_output_bytes`
+(table plus indexes) so growth is visible before it matters
+([health and observability](health-and-observability.md#metrics)).
+
 ## Log rotation
 
 Sensor NDJSON logs under `/var/log/propolis/` are rotated by logrotate at `size 100M`,

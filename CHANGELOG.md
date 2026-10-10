@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Upgrade note
+
+- **Upgrade intake before the sensors** when they run on different hosts (a split deployment). An
+  intake that predates the shell reply field ignores it, so a reply a newer sensor records in the
+  meantime is dropped: the event is ingested without it and the console shows none for that
+  command. The hash chain is unaffected. See
+  [split deployment](docs/operations/split-deployment.md#upgrading) and
+  [upgrade](docs/operations/upgrade-rollback-and-dr.md#upgrade-the-intake-side-before-the-sensors).
+
 ### Added
 
 - **ATT&CK techniques on the address and campaign pages** - the per-address page gets an "ATT&CK
@@ -17,7 +26,14 @@
   holds the text). It refuses a line whose digest is not the text's. The timeline folds the reply
   under its command in the existing raw expander, escaped. Commands recorded before this, and
   lines left waiting for input, show none. On a synthetic mix of 1000 bot sessions the table held
-  one row per 3.9 replies (5.1 times fewer bytes than the replies themselves).
+  one row per 3.9 replies (5.1 times fewer bytes than the replies themselves). A reply the
+  database refuses is accounted like a refused append of its line (wedge report, then quarantine);
+  replies are stored in digest order so two runners cannot deadlock. The daemon's hourly
+  `sample-retention` pass deletes replies no event names after 24 hours (migration `0019` adds
+  `last_stored` and a partial index on `event`), and `/metrics` reports
+  `propolis_shell_output_rows` and `propolis_shell_output_bytes`. The growth bound is in
+  [retention](docs/operations/retention.md#stored-shell-replies).
+
 - **A multi-line command is kept as its lines** - SSH exec and the interactive shells recorded a
   script such as `cd /tmp` / `wget ...` / `sh x` as one line, because the sanitizer folds every
   line break into a space. A command that had a break now also carries `metadata.command_lines`

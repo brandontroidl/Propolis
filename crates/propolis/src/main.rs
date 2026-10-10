@@ -54,6 +54,11 @@ fn fetch_spool_dir() -> std::path::PathBuf {
 const SAMPLE_RETENTION_DAYS: u64 = 30;
 const SAMPLE_RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How long a stored shell reply that no event names is kept before the same housekeeping pass
+/// deletes it. Must exceed the hour by which a re-stored reply refreshes `last_stored`, so a row an
+/// in-flight batch is about to name is never removed (`core_scoring::prune_orphan_outputs`).
+const SHELL_OUTPUT_ORPHAN_GRACE: Duration = Duration::from_secs(24 * 3600);
+
 /// How often the campaign indexer looks for new ledger rows once it has caught up.
 const CAMPAIGN_TICK_INTERVAL: Duration = Duration::from_secs(15);
 /// The pause between ticks while it works through a backlog, so a large catch-up shares the
@@ -1390,20 +1395,37 @@ async fn main() {
     // its spools were bounded only by the byte budgets, which then refused NEW evidence once old
     // samples had filled them. Retention is not a scanning concern; it runs whether or not any
     // analysis is configured.
+    //
+    // The same pass ages out stored shell replies no event names (`shell_output`): it is the
+    // daemon's one local-housekeeping loop, and a failed prune is logged, never fatal to the
+    // sample pass.
+    let pool_retention = pool.clone();
     handles.push(spawn_supervised_named(
         "sample-retention",
         cancel.clone(),
         supervisor_state.clone(),
-        move |token| async move {
-            let spool_dirs = review::spool::all_body_dirs();
-            loop {
-                if token.is_cancelled() {
-                    return;
-                }
-                review::virustotal::cleanup_old_samples(&spool_dirs, SAMPLE_RETENTION_DAYS).await;
-                tokio::select! {
-                    _ = tokio::time::sleep(SAMPLE_RETENTION_INTERVAL) => {}
-                    _ = token.cancelled() => {}
+        move |token| {
+            let pool = pool_retention.clone();
+            async move {
+                let spool_dirs = review::spool::all_body_dirs();
+                loop {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    review::virustotal::cleanup_old_samples(&spool_dirs, SAMPLE_RETENTION_DAYS)
+                        .await;
+                    match core_scoring::prune_orphan_outputs(&pool, SHELL_OUTPUT_ORPHAN_GRACE).await
+                    {
+                        Ok(0) => {}
+                        Ok(deleted) => {
+                            tracing::info!(deleted, "propolis: pruned orphaned shell replies");
+                        }
+                        Err(e) => tracing::warn!(error = %e, "propolis: shell reply prune failed"),
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(SAMPLE_RETENTION_INTERVAL) => {}
+                        _ = token.cancelled() => {}
+                    }
                 }
             }
         },

@@ -254,6 +254,103 @@ async fn two_runners_storing_the_same_replies_in_opposite_orders_do_not_deadlock
     assert_eq!(rows, 15 * 400);
 }
 
+async fn backdate(pool: &PgPool, text: &str, hours: i32) {
+    sqlx::query(
+        "UPDATE shell_output SET last_stored = now() - make_interval(hours => $2) WHERE sha256 = $1",
+    )
+    .bind(output_digest(text))
+    .bind(hours)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn present(pool: &PgPool, text: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM shell_output WHERE sha256 = $1)")
+        .bind(output_digest(text))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn pair(text: &str) -> (String, String) {
+    (output_digest(text), text.to_string())
+}
+
+/// The pruner removes a reply only when no event names it AND it has not been stored for longer
+/// than the grace period: a named reply stays however old, a young orphan stays, an old orphan goes.
+#[sqlx::test(migrations = false)]
+async fn pruning_removes_only_old_replies_no_event_names(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut file = std::fs::File::create(dir.path().join("events.jsonl")).unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&event(0, Some(reply("named")))).unwrap()
+    )
+    .unwrap();
+    drop(file);
+    assert_eq!(runner(&pool, dir.path()).run_batch().await.ingested, 1);
+    core_scoring::store_outputs(&pool, &[pair("orphan old"), pair("orphan young")])
+        .await
+        .unwrap();
+    backdate(&pool, "named", 72).await;
+    backdate(&pool, "orphan old", 72).await;
+    backdate(&pool, "orphan young", 2).await;
+
+    let deleted = core_scoring::prune_orphan_outputs(&pool, Duration::from_secs(24 * 3600))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(present(&pool, "named").await, "an event names it");
+    assert!(
+        present(&pool, "orphan young").await,
+        "inside the grace period"
+    );
+    assert!(!present(&pool, "orphan old").await);
+}
+
+/// Storing a reply again refreshes its age (at most hourly), so a row the pruner would otherwise
+/// take is saved by the batch that is about to name it; a store inside the hour writes nothing.
+#[sqlx::test(migrations = false)]
+async fn storing_a_reply_again_refreshes_its_age_at_most_hourly(pool: PgPool) {
+    migrate(&pool).await;
+    core_scoring::store_outputs(&pool, &[pair("old"), pair("recent")])
+        .await
+        .unwrap();
+    backdate(&pool, "old", 72).await;
+    backdate(&pool, "recent", 0).await;
+    let stamp = |text: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT last_stored FROM shell_output WHERE sha256 = $1",
+            )
+            .bind(output_digest(text))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let recent_before = stamp("recent").await;
+    let old_before = stamp("old").await;
+
+    core_scoring::store_outputs(&pool, &[pair("old"), pair("recent")])
+        .await
+        .unwrap();
+    assert!(stamp("old").await > old_before, "an old row is touched");
+    assert_eq!(
+        stamp("recent").await,
+        recent_before,
+        "a row stored within the hour is not rewritten"
+    );
+    let deleted = core_scoring::prune_orphan_outputs(&pool, Duration::from_secs(24 * 3600))
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0, "the re-stored row is young again");
+}
+
 /// A reply the database always refuses (a trigger stands in for any permanent per-row refusal)
 /// is accounted like a refused append of its line: the lines before it are ingested at once, the
 /// poll reports the error, the refusal is reported as a wedge after `WEDGE_POLLS` polls, and then

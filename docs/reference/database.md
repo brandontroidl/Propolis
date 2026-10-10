@@ -339,7 +339,7 @@ matched token) until the run joins a campaign
 (`crates/core-scoring/migrations/0017_attack_tags.sql#attack_pending`).
 
 <a id="shell-output-table"></a>
-## Shell output table (`0018_shell_output.sql`)
+## Shell output table (`0018_shell_output.sql`, `0019_shell_output_retention.sql`)
 
 What a fake shell answered to a command, kept once per distinct reply. A `honeypot_command_exec`
 event refers to its reply by `metadata.output_sha256`, which intake writes into the event before
@@ -349,11 +349,16 @@ the ledger never holds the text. Intake stores the text before it appends the ev
 
 | table | holds | key | source |
 |---|---|---|---|
-| `shell_output` | `text` (at most 4096 bytes, attacker-influenced, shown escaped) under its `sha256` (lowercase hex of the text), and `first_seen` | `sha256`; a reply stored again is left as it is | `crates/core-scoring/migrations/0018_shell_output.sql#shell_output` |
+| `shell_output` | `text` (at most 4096 bytes, attacker-influenced, shown escaped) under its `sha256` (lowercase hex of the text), `first_seen`, and `last_stored` (0019) | `sha256`; a reply stored again keeps its text and `first_seen`, and has `last_stored` refreshed at most once an hour | `crates/core-scoring/migrations/0018_shell_output.sql#shell_output`, `crates/core-scoring/migrations/0019_shell_output_retention.sql#last_stored` |
+
+Migration 0019 also adds the partial index `event_output_sha256_idx` on
+`metadata ->> 'output_sha256'`, which is how the orphan pass asks whether any event names a reply
+without scanning the ledger
+(`crates/core-scoring/migrations/0019_shell_output_retention.sql#event_output_sha256_idx`).
 
 There is no backfill: commands recorded before the migration, and those whose line was left waiting
-for input, name no reply. Rows are not pruned; the table grows with the number of distinct replies,
-not with sessions.
+for input, name no reply. The table grows with the number of distinct replies, not with sessions;
+the daemon deletes replies no event names after 24 hours ([retention](../operations/retention.md#stored-shell-replies)).
 
 ## Table: `sample_analysis` (`0009_sample_analysis.sql`)
 
@@ -475,6 +480,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0016` | `campaign_cursor.fingerprint_version` and `rebuild_until`, `campaign.min_shapes` and `max_shapes`, `campaign_session.payload` (see [campaign tables](#campaign-tables)); no data is rewritten, the indexer rebuilds the command-sequence campaigns itself on its next batch |
 | `0017` | the [ATT&CK tag tables](#attack-tag-tables) `attack_tag` and `campaign_attack_tag`, and `campaign_session.attack_pending`; no backfill |
 | `0018` | the [shell output table](#shell-output-table) `shell_output`; no backfill |
+| `0019` | `shell_output.last_stored` and the partial index `event_output_sha256_idx` on `event` (built inside the migration transaction like `0013`, so writes to `event` wait for the build; no event carries a reply yet when it runs) |
 
 **review** (`crates/review/migrations/`):
 

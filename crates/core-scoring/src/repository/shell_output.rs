@@ -43,13 +43,37 @@ pub async fn store_outputs(pool: &PgPool, outputs: &[(String, String)]) -> Resul
         "INSERT INTO shell_output (sha256, text) \
          SELECT sha256, text FROM UNNEST($1::text[], $2::text[]) AS t(sha256, text) \
          ORDER BY sha256 \
-         ON CONFLICT (sha256) DO NOTHING",
+         ON CONFLICT (sha256) DO UPDATE SET last_stored = now() \
+             WHERE shell_output.last_stored < now() - interval '1 hour'",
     )
     .bind(&shas)
     .bind(&texts)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Deletes the rows no event names (`metadata.output_sha256`) that intake has not stored for
+/// `grace`, and returns how many. A row is orphaned when its batch's append failed or its line was
+/// quarantined; the grace period keeps a row an in-flight batch is about to name (a re-store
+/// refreshes `last_stored` at most hourly, so `grace` must exceed an hour). Uses
+/// `event_output_sha256_idx`, so it never scans the ledger.
+pub async fn prune_orphan_outputs(
+    pool: &PgPool,
+    grace: std::time::Duration,
+) -> Result<u64, sqlx::Error> {
+    let deleted = sqlx::query(
+        "DELETE FROM shell_output o \
+         WHERE o.last_stored < now() - make_interval(secs => $1) \
+           AND NOT EXISTS (SELECT 1 FROM event e \
+                           WHERE e.metadata ? 'output_sha256' \
+                             AND e.metadata ->> 'output_sha256' = o.sha256)",
+    )
+    .bind(grace.as_secs_f64())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
 }
 
 /// The stored text for each digest in `shas` that has a row; a digest with none is absent from the

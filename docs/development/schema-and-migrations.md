@@ -17,7 +17,7 @@ migration → change map are owned by [`reference/database`](../reference/databa
 
 Migration SQL lives in **three crates**, applied against **one** physical database:
 
-- `crates/core-scoring/migrations/` - `0001_enums.sql` … `0018_shell_output.sql`.
+- `crates/core-scoring/migrations/` - `0001_enums.sql` … `0019_shell_output_retention.sql`.
   Owns `event`, `ip_score`, `ip_vantage`, `ip_sensor`, `sample_analysis`, and all five enum
   types.
 - `crates/review/migrations/` - `0001_review_queue.sql` …

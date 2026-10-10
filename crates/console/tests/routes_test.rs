@@ -4393,6 +4393,42 @@ async fn metrics_returns_prometheus_text_format(pool: PgPool) {
     assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
 }
 
+/// The shell reply table is the one store with no per-source bound, so its size is on /metrics:
+/// a row estimate and the on-disk size, read from the catalog rather than counted.
+#[sqlx::test(migrations = false)]
+async fn metrics_reports_the_shell_reply_table_size(pool: PgPool) {
+    migrate(&pool).await;
+    let replies: Vec<(String, String)> = (0..25)
+        .map(|i| {
+            let text = format!("reply number {i}");
+            (core_scoring::output_digest(&text), text)
+        })
+        .collect();
+    core_scoring::store_outputs(&pool, &replies).await.unwrap();
+    sqlx::query("ANALYZE shell_output")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = test_app(test_state(pool))
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+    let body = body_text(response).await;
+    assert!(
+        body.contains("# TYPE propolis_shell_output_rows gauge"),
+        "{body}"
+    );
+    assert!(body.contains("propolis_shell_output_rows 25\n"), "{body}");
+    let bytes: i64 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("propolis_shell_output_bytes "))
+        .expect("bytes gauge present")
+        .parse()
+        .unwrap();
+    assert!(bytes > 0, "{body}");
+}
+
 /// The malware pipeline used to be invisible to /metrics: a scanner or fetcher alive but no
 /// longer verdicting or retiring urls looked identical to a healthy one. Queue depth by stage and
 /// the age of the oldest waiting item are what make that visible.

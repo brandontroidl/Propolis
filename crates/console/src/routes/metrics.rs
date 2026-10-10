@@ -115,6 +115,27 @@ async fn metrics(
         review_queue_pending,
     );
 
+    // Planner estimate and on-disk size, not a count over the table: a scrape must not read it.
+    // `reltuples` is -1 on a table never analysed, which reads as 0 rows here.
+    let (shell_output_rows, shell_output_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT GREATEST(reltuples, 0)::bigint, pg_total_relation_size(oid)::bigint \
+         FROM pg_class WHERE oid = 'shell_output'::regclass",
+    )
+    .fetch_one(&state.db)
+    .await?;
+    push_gauge(
+        &mut out,
+        "propolis_shell_output_rows",
+        "Stored shell reply texts (planner estimate).",
+        shell_output_rows,
+    );
+    push_gauge(
+        &mut out,
+        "propolis_shell_output_bytes",
+        "On-disk size of the shell reply table with its indexes.",
+        shell_output_bytes,
+    );
+
     let submission_rows = sqlx::query(
         "SELECT vendor, success, COUNT(*) AS count FROM vendor_submission \
          GROUP BY vendor, success ORDER BY vendor, success",

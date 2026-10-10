@@ -1665,6 +1665,11 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
     assert_eq!(markup::stack_violations(&stacked), Vec::<String>::new());
     assert_eq!(markup::stack_violations(&not_a_row), Vec::<String>::new());
     assert_eq!(markup::stack_violations(&scrolling).len(), 1);
+    let fielded = r#"<form><input type="hidden" name="csrf_token" value="t">
+        <div class="field"><label for="n">Notes</label><textarea id="n"></textarea></div></form>"#;
+    assert_eq!(markup::form_violations(fielded), Vec::<String>::new());
+    let bare = r#"<form><label for="n">Notes</label><textarea id="n"></textarea></form>"#;
+    assert_eq!(markup::form_violations(bare).len(), 1);
 }
 
 /// Every page the console serves, rendered from one database the real indexer filled, keeps the
@@ -1740,6 +1745,7 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
         let mut found = markup::panel_violations(&page);
         found.extend(markup::vocabulary_violations(&page));
         found.extend(markup::stack_violations(&page));
+        found.extend(markup::form_violations(&page));
         assert!(found.is_empty(), "{uri}:\n{}", found.join("\n"));
     }
 }

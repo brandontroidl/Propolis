@@ -43,6 +43,9 @@
   --font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 
   /* -- GRAPHITE (default, dark) -- */
+  /* color-scheme tells the browser which ground it is drawing native parts (date pickers,
+     scrollbars, a textarea's defaults) on; without it they stay light on the dark themes. */
+  color-scheme: dark;
   --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d; --surface-2:#2a241d;
   --border:#332c24; --border-bright:#493f34; --border-strong:#493f34;
   --text:#ece3d3; --text-muted:#a79c8a; --text-dim:#a79c8a; --text-faint:#8a7f6a;
@@ -62,6 +65,7 @@
 
 /* -- CREAM (light) + SYSTEM's light default -- */
 :root[data-theme="cream"], :root[data-theme="system"] {
+  color-scheme: light;
   --bg:#efe9dd; --surface:#f5efe3; --surface-raised:#e7e0cf; --surface-2:#e7e0cf;
   --border:#ddd5c3; --border-bright:#c3b89e; --border-strong:#c3b89e;
   --text:#231f16; --text-muted:#5c5545; --text-dim:#5c5545; --text-faint:#766c58;
@@ -83,6 +87,7 @@
 /* -- SYSTEM under a dark OS -> Graphite -- */
 @media (prefers-color-scheme: dark) {
   :root[data-theme="system"] {
+    color-scheme: dark;
     --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d; --surface-2:#2a241d;
     --border:#332c24; --border-bright:#493f34; --border-strong:#493f34;
     --text:#ece3d3; --text-muted:#a79c8a; --text-dim:#a79c8a; --text-faint:#8a7f6a;
@@ -104,6 +109,7 @@
 
 /* -- 1337 |-|4><0R: green phosphor, all-mono, glow. Effects stay scoped to this theme. -- */
 :root[data-theme="hacker"] {
+  color-scheme: dark;
   --font-sans: "IBM Plex Mono", ui-monospace, "JetBrains Mono", Consolas, monospace;
   --bg:#000000; --surface:#010c01; --surface-raised:#021402; --surface-2:#021402;
   --border:#064006; --border-bright:#0a6a0a; --border-strong:#0a6a0a;
@@ -299,7 +305,7 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
   align-items: center;
   gap: 0.75rem;
 }
-.panel-head .dim { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.panel-head .dim, .field > label .dim { text-transform: none; letter-spacing: 0; font-weight: 500; }
 /* --blue/--orange were categorical chart chrome; --orange in particular reused the HIGH-severity
    hue as decoration. Panel identity comes from the title, so those are neutral now. --alert stays:
    a red-capped panel is a real signal (something in that panel is wrong). */
@@ -612,12 +618,7 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .qnote > summary { color: var(--text-faint); font-size: 0.76rem; padding: 0.2rem 0.3rem; border-radius: var(--radius-sm); }
 .qnote > summary:hover { color: var(--text); }
 .qnote[open] { flex: 1 1 100%; }
-.qnote textarea {
-  display: block; width: 100%; resize: vertical; min-height: 3rem; margin-top: 0.3rem;
-  background: var(--bg); border: 1px solid var(--border); color: var(--text);
-  font-family: var(--font-sans); font-size: 0.8rem; border-radius: var(--radius-sm); padding: 0.35rem 0.5rem;
-}
-.qnote textarea:focus { border-color: var(--border-bright); outline: none; }
+.qnote textarea { margin-top: 0.3rem; }
 button, .btn {
   font-family: var(--font-sans); font-size: 0.78rem; font-weight: 600;
   border: 1px solid var(--border); background: var(--surface-raised); color: var(--text);
@@ -635,18 +636,25 @@ a.btn { display: inline-block; }
 .btn-danger { border-color: var(--alert); color: var(--alert-text); background: transparent; cursor: pointer; }
 .btn-danger:hover { background: var(--alert-dim); }
 
-/* ============================== Filter form ================================ */
+/* ============================ Forms and fields ============================= */
+/* The filter bar's field is the one field shape, wherever a form sits (the search and log
+   filters, the campaign approval): a micro-caps label over a control on the page ground. Every
+   textarea and code span takes the system's ink and font, never the browser's. */
 .filter-form {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 0.9rem 1rem; margin-bottom: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.6rem 0.8rem; align-items: flex-end;
   box-shadow: var(--shadow);
 }
-.filter-form .field { display: flex; flex-direction: column; gap: 0.25rem; }
-.filter-form label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
-.filter-form input[type="text"], .filter-form input[type="date"], .filter-form select {
-  background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm); padding: 0.4rem 0.55rem; font-size: 0.82rem;
+.field { display: flex; flex-direction: column; gap: 0.25rem; margin-bottom: 0.75rem; }
+.filter-form .field { margin-bottom: 0; }
+.field > label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.field input[type="text"], .field input[type="date"], .field select, textarea {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius-sm);
+  padding: 0.4rem 0.55rem; font-family: var(--font-sans); font-size: 0.82rem;
 }
-.filter-form input:focus, .filter-form select:focus { border-color: var(--border-bright); outline: none; }
+.field input:focus, .field select:focus, textarea:focus { border-color: var(--border-bright); outline: none; }
+textarea { display: block; width: 100%; resize: vertical; min-height: 3rem; }
+code { font-family: var(--font-mono); }
 .search-mode-tabs { margin-bottom: 1rem; }
 
 /* =============================== Log viewer ================================ */

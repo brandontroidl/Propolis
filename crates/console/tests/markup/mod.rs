@@ -12,6 +12,7 @@ struct Element {
     name: String,
     classes: Vec<String>,
     id: Option<String>,
+    kind: Option<String>,
 }
 
 impl Element {
@@ -78,6 +79,7 @@ fn walk(
                 .map(|c| c.split_whitespace().map(str::to_string).collect())
                 .unwrap_or_default(),
             id: attr(tag, "id"),
+            kind: attr(tag, "type"),
             name: name.clone(),
         };
         visit(&stack, &element);
@@ -211,6 +213,35 @@ pub fn stack_violations(html: &str) -> Vec<String> {
         |_, _| {},
     );
     out.dedup();
+    out
+}
+
+/// Every visible form control outside the wrappers that style it. With no global rule a bare
+/// control renders with the browser's defaults: the campaign approval's textarea was a light
+/// field on the dark theme.
+pub fn form_violations(html: &str) -> Vec<String> {
+    const STYLED: [&str; 6] = [
+        "field",
+        "qnote",
+        "nav-search",
+        "theme-switch",
+        "dl",
+        "login-card",
+    ];
+    let mut out = Vec::new();
+    walk(
+        html,
+        |chain, e| {
+            let visible_input = e.name == "input"
+                && !matches!(e.kind.as_deref(), Some("hidden" | "submit" | "button"));
+            if (visible_input || e.name == "textarea" || e.name == "select")
+                && !chain.iter().any(|p| STYLED.iter().any(|c| p.has(c)))
+            {
+                out.push(format!("unstyled form control: <{} id={:?}>", e.name, e.id));
+            }
+        },
+        |_, _| {},
+    );
     out
 }
 

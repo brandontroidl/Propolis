@@ -6,26 +6,41 @@
 <h1>Approve campaign members</h1>
 <p class="page-sub campaign-label">{{ label }}</p>
 {% if confirming %}
+<div class="panel">
+  <div class="panel-head">Pending members{% if pending %} <span class="dim">{{ pending | length }}</span>{% endif %}</div>
   {% if pending %}
-  <p>These {{ pending | length }} pending address{% if pending | length != 1 %}es{% endif %} will be approved for vendor reporting, exactly as if each were approved from the review queue. Nothing else is approved, including a member that joins after this page was loaded.{% if pending | length >= max_approve %} At most {{ max_approve }} are approved at once; approve again for the rest.{% endif %}</p>
-  <ul class="approve-list mono">{% for ip in pending %}<li>{{ m.ip_evidence_link(ip) }}</li>{% endfor %}</ul>
-  <form method="post" action="/campaigns/{{ id }}/approve">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="ips" value="{{ ips }}">
-    <label for="approve-notes">Notes <span class="dim">(optional, recorded on each entry)</span></label>
-    <textarea id="approve-notes" name="notes" placeholder="approved with campaign {{ id }}"></textarea>
-    <p><button type="submit" class="btn-approve">Approve these {{ pending | length }}</button> <a href="/campaigns/{{ id }}">Cancel</a></p>
-  </form>
+  <div class="panel-body">
+    <p>These {{ pending | length }} pending address{% if pending | length != 1 %}es{% endif %} will be approved for vendor reporting, exactly as if each were approved from the review queue. Nothing else is approved, including a member that joins after this page was loaded.{% if pending | length >= max_approve %} At most {{ max_approve }} are approved at once; approve again for the rest.{% endif %}</p>
+    <ul class="approve-list mono">{% for ip in pending %}<li>{{ m.ip_evidence_link(ip) }}</li>{% endfor %}</ul>
+    <form method="post" action="/campaigns/{{ id }}/approve">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="ips" value="{{ ips }}">
+      <div class="field">
+        <label for="approve-notes">Notes <span class="dim">(optional, recorded on each entry)</span></label>
+        <textarea id="approve-notes" name="notes" placeholder="approved with campaign {{ id }}"></textarea>
+      </div>
+      <p class="actions"><button type="submit" class="btn-approve">Approve these {{ pending | length }}</button> <a href="/campaigns/{{ id }}">Cancel</a></p>
+    </form>
+  </div>
   {% else %}
-  <p class="dim">No member of this campaign is pending review.</p>
+  <p class="empty-line">no member of this campaign is pending review</p>
   {% endif %}
+</div>
 {% else %}
-  <p>Approved {{ approved | length }} address{% if approved | length != 1 %}es{% endif %}.</p>
-  {% if approved %}<ul class="approve-list mono">{% for ip in approved %}<li>{{ m.ip_evidence_link(ip) }}</li>{% endfor %}</ul>{% endif %}
-  {% if skipped %}
-  <p>Skipped {{ skipped | length }}: no longer pending, or no longer a member.</p>
-  <ul class="approve-list mono">{% for ip in skipped %}<li>{{ ip }}</li>{% endfor %}</ul>
+<div class="panel">
+  <div class="panel-head">Approved {{ approved | length }} address{% if approved | length != 1 %}es{% endif %}</div>
+  {% if approved %}
+  <div class="panel-body"><ul class="approve-list mono">{% for ip in approved %}<li>{{ m.ip_evidence_link(ip) }}</li>{% endfor %}</ul></div>
+  {% else %}
+  <p class="empty-line">none approved</p>
   {% endif %}
-  <p><a href="/queue">Back to the review queue</a></p>
+</div>
+{% if skipped %}
+<div class="panel">
+  <div class="panel-head">Skipped {{ skipped | length }} <span class="dim">no longer pending, or no longer a member</span></div>
+  <div class="panel-body"><ul class="approve-list mono">{% for ip in skipped %}<li>{{ ip }}</li>{% endfor %}</ul></div>
+</div>
+{% endif %}
+<p><a href="/queue">Back to the review queue</a></p>
 {% endif %}
 {% endblock %}

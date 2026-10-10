@@ -273,26 +273,27 @@ impl Lexer<'_, '_> {
         }
     }
 
-    /// [`Self::incomplete`] for a construct dash has its own complaint for when the text ends
-    /// inside it (`Unterminated quoted string`); the other shells just meet the end of the text.
-    fn incomplete_with(&self, dash: &'static str) -> LexError {
-        if self.at_eof && self.dialect == Dialect::Posix {
-            syntax(Near::Message(dash), self.line)
-        } else {
-            self.incomplete()
+    /// [`Self::incomplete`] for a construct the shells have their own complaint for when the text
+    /// ends inside it: dash's `Unterminated quoted string`, and bash's `unexpected EOF while
+    /// looking for matching` the `closer` it wanted.
+    fn incomplete_with(&self, dash: &'static str, closer: char) -> LexError {
+        match (self.at_eof, self.dialect) {
+            (true, Dialect::Posix) => syntax(Near::Message(dash), self.line),
+            (true, Dialect::Bash) => syntax(Near::Unmatched(closer), self.line),
+            _ => self.incomplete(),
         }
     }
 
     /// [`Self::incomplete`] for text that ends inside `$( ... )`, where dash names the `)` it
     /// wanted.
     fn incomplete_paren(&self) -> LexError {
-        if self.at_eof && self.dialect == Dialect::Posix {
-            LexError::Syntax(SyntaxError {
+        match (self.at_eof, self.dialect) {
+            (true, Dialect::Posix) => LexError::Syntax(SyntaxError {
                 expecting: Some("\")\""),
                 ..SyntaxError::new(Near::EndOfFile, self.line)
-            })
-        } else {
-            self.incomplete()
+            }),
+            (true, Dialect::Bash) => syntax(Near::Unmatched(')'), self.line),
+            _ => self.incomplete(),
         }
     }
 
@@ -614,7 +615,7 @@ impl Lexer<'_, '_> {
                     self.bump();
                     let rest = self.src.get(self.i..).unwrap_or("");
                     let Some(end) = rest.find('\'') else {
-                        return Err(self.incomplete_with("Unterminated quoted string"));
+                        return Err(self.incomplete_with("Unterminated quoted string", '\''));
                     };
                     let text = rest.get(..end).unwrap_or("").to_string();
                     self.advance_bytes(end.saturating_add(1));
@@ -625,7 +626,7 @@ impl Lexer<'_, '_> {
                     self.bump();
                     let inner = self.nested(|lexer| lexer.scan_parts(Mode::Double))?;
                     if self.peek() != Some('"') {
-                        return Err(self.incomplete_with("Unterminated quoted string"));
+                        return Err(self.incomplete_with("Unterminated quoted string", '"'));
                     }
                     self.bump();
                     flush(&mut lit, &mut parts);
@@ -727,7 +728,7 @@ impl Lexer<'_, '_> {
         let mut body = String::new();
         loop {
             match self.bump() {
-                None => return Err(self.incomplete_with("EOF in backquote substitution")),
+                None => return Err(self.incomplete_with("EOF in backquote substitution", '`')),
                 Some('`') => return Ok(body),
                 Some('\\') => match self.peek() {
                     Some(next @ ('$' | '`' | '\\')) => {
@@ -771,9 +772,9 @@ impl Lexer<'_, '_> {
                 let Some(end) = scan_paren_end(rest) else {
                     // `$((` is dash's arithmetic opener, and it wants the `))`.
                     return Err(if rest.starts_with('(') {
-                        self.incomplete_with("Missing '))'")
+                        self.incomplete_with("Missing '))'", ')')
                     } else if ends_inside_quote(rest) {
-                        self.incomplete_with("Unterminated quoted string")
+                        self.incomplete_with("Unterminated quoted string", '"')
                     } else {
                         self.incomplete_paren()
                     });
@@ -958,7 +959,7 @@ impl Lexer<'_, '_> {
         let start = self.i;
         let parts = self.nested(|lexer| lexer.scan_parts(Mode::Brace))?;
         if self.peek() != Some('}') {
-            return Err(self.incomplete_with("Missing '}'"));
+            return Err(self.incomplete_with("Missing '}'", '}'));
         }
         let raw = self.src.get(start..self.i).unwrap_or("").to_string();
         self.bump();
@@ -976,7 +977,7 @@ impl Lexer<'_, '_> {
         let mut depth = 1u32;
         loop {
             match self.bump() {
-                None => return Err(self.incomplete_with("Missing '}'")),
+                None => return Err(self.incomplete_with("Missing '}'", '}')),
                 Some('\\') => {
                     self.bump();
                 }

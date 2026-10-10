@@ -305,6 +305,9 @@ pub(super) enum Near {
     /// string`, `Missing '}'`), which name no token. bash and mksh have their own wording for
     /// an unfinished construct and use the end-of-file one.
     Message(&'static str),
+    /// bash's `unexpected EOF while looking for matching` this character, when a script ends
+    /// inside a quote or a substitution.
+    Unmatched(char),
     Newline,
     EndOfFile,
     /// dash's `Bad function name`: not a complaint about a token, so it has its own wording.

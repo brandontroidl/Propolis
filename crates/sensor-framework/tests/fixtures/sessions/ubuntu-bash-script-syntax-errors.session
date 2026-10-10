@@ -1,0 +1,52 @@
+# bash 5.1.16 refusing a script, as a login shell's child (`bash -c`, `bash FILE`, standard input)
+# and as an SSH exec runs it. What this records: the message names where the text came from
+# (`bash: -c: line 2:` for `-c` text, `FILE: line 2:` for a file, `bash: line 2:` for standard
+# input; the operand after a `-c` script replaces `bash`), a bad token is followed by the line it
+# is on in quotes, and a script that runs out is reported on the line after its last one, after
+# `unexpected EOF while looking for matching` when it ran out inside a quote or a substitution.
+# Each reply was produced by `bash --noprofile --norc --noediting -i` started as a login shell
+# (`exec -a -bash`) in the localhost/propolis-survey-ref:jammy container (bash 5.1.16), run with
+# `--network none`, PS1 and PS2 set to markers and these lines fed one at a time on standard input.
+# source: ubuntu:22.04 container run of bash 5.1.16 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ bash -c 'if true; then echo x'
+> bash: -c: line 2: syntax error: unexpected end of file
+$ bash -c 'echo a )'
+> bash: -c: line 1: syntax error near unexpected token `)'
+> bash: -c: line 1: `echo a )'
+$ bash -c 'echo a
+$ echo b )'
+> a
+> bash: -c: line 2: syntax error near unexpected token `)'
+> bash: -c: line 2: `echo b )'
+$ bash -c 'if true; then echo x
+$ fi fi'
+> bash: -c: line 2: syntax error near unexpected token `fi'
+> bash: -c: line 2: `fi fi'
+$ printf 'echo a\n)\n' > /tmp/s.sh
+$ bash /tmp/s.sh
+> a
+> /tmp/s.sh: line 2: syntax error near unexpected token `)'
+> /tmp/s.sh: line 2: `)'
+$ printf 'if true; then\necho a\n' > /tmp/s2.sh
+$ bash /tmp/s2.sh
+> /tmp/s2.sh: line 3: syntax error: unexpected end of file
+$ bash -c 'echo "abc'
+> bash: -c: line 1: unexpected EOF while looking for matching `"'
+> bash: -c: line 2: syntax error: unexpected end of file
+$ bash -c 'echo $(echo'
+> bash: -c: line 1: unexpected EOF while looking for matching `)'
+> bash: -c: line 2: syntax error: unexpected end of file
+$ printf 'echo a )\n' | bash
+> bash: line 1: syntax error near unexpected token `)'
+> bash: line 1: `echo a )'
+$ printf 'if true\n' | bash
+> bash: line 2: syntax error: unexpected end of file
+$ bash -c 'echo a >'
+> bash: -c: line 1: syntax error near unexpected token `newline'
+> bash: -c: line 1: `echo a >'
+$ bash -c 'echo hi; echo >' name
+> name: -c: line 1: syntax error near unexpected token `newline'
+> name: -c: line 1: `echo hi; echo >'

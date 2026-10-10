@@ -1091,7 +1091,7 @@ mod syntax_errors {
         );
         assert_eq!(
             run(&mut exec, ")"),
-            "bash: line 1: syntax error near unexpected token `)'\n"
+            "bash: -c: line 1: syntax error near unexpected token `)'\nbash: -c: line 1: `)'\n"
         );
     }
 
@@ -1100,7 +1100,7 @@ mod syntax_errors {
         let mut sh = shell();
         assert_eq!(
             run(&mut sh, "bash -c 'if true; then echo x'"),
-            "bash: syntax error: unexpected end of file\n"
+            "bash: -c: line 2: syntax error: unexpected end of file\n"
         );
         assert_eq!(
             run(&mut sh, "sh -c 'if true; then echo x'"),
@@ -1158,6 +1158,66 @@ mod syntax_errors {
     }
 }
 
+mod command_not_found {
+    use super::*;
+
+    /// The interactive login bash on this box has Ubuntu's command-not-found handler, whose
+    /// answer for a name it has no suggestion for is the bare `NAME: command not found`. A bash
+    /// that runs a script has no handler: it names `$0` and the line (replies from the reference
+    /// container's bash 5.1.16 and dash 0.5.11, see `ubuntu-bash-command-not-found.session`).
+    #[test]
+    fn only_the_interactive_bash_has_the_handler_and_a_script_names_its_line() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "f"), "f: command not found\n");
+        assert_eq!(run(&mut sh, "(f)"), "f: command not found\n");
+        assert_eq!(
+            run(&mut sh, "foo/bar"),
+            "-bash: foo/bar: No such file or directory\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c f"),
+            "bash: line 1: f: command not found\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c 'f' name arg"),
+            "name: line 1: f: command not found\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c 'cd /nonexistent'"),
+            "bash: line 1: cd: /nonexistent: No such file or directory\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c 'g() { f; }; g'"),
+            "environment: line 1: f: command not found\n"
+        );
+        assert_eq!(run(&mut sh, "sh -c f"), "sh: 1: f: not found\n");
+        assert_eq!(
+            run(&mut sh, "sh -c 'f' name arg"),
+            "name: 1: f: not found\n"
+        );
+    }
+
+    #[test]
+    fn a_script_names_itself_as_typed_and_the_line_of_the_command() {
+        let mut sh = shell();
+        run(&mut sh, "printf 'echo a\\nf\\n' > /tmp/y.sh");
+        assert_eq!(
+            run(&mut sh, "bash /tmp/y.sh"),
+            "a\n/tmp/y.sh: line 2: f: command not found\n"
+        );
+        run(&mut sh, "cd /tmp");
+        assert_eq!(
+            run(&mut sh, "bash y.sh"),
+            "a\ny.sh: line 2: f: command not found\n"
+        );
+        assert_eq!(
+            run(&mut sh, "cat y.sh | bash"),
+            "a\nbash: line 2: f: command not found\n"
+        );
+        assert_eq!(run(&mut sh, "echo $?"), "127\n");
+    }
+}
+
 mod continuation_lines {
     use super::*;
 
@@ -1212,7 +1272,8 @@ mod continuation_lines {
         // No next line will finish an open quote: the exec shell reports it at once.
         assert_eq!(
             run(&mut exec, "echo \"open"),
-            "bash: line 1: syntax error: unexpected end of file\n"
+            "bash: -c: line 1: unexpected EOF while looking for matching `\"'\n\
+             bash: -c: line 2: syntax error: unexpected end of file\n"
         );
         assert_eq!(exec.prompt(), "");
     }

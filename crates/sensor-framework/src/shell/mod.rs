@@ -110,7 +110,7 @@ mod tr;
 mod tr_gnu;
 mod trace;
 
-use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
+use eval::{DepthGuard, LineBudget, PidAlloc, ScriptKind, ShellState, Stdin};
 use registry::{HandlerFn, Registry, resolve_proc_self};
 
 pub use ast::UnsupportedKind;
@@ -935,18 +935,28 @@ impl FakeShell {
         // `-bash` wherever the command is.
         let in_function = !self.state().calls.is_empty();
         match (self.context, self.active_level()) {
-            (ShellContext::ExecC, ShellLevel::Bash { .. }) if in_function => {
+            (_, ShellLevel::Bash { .. }) if self.bash_is_scripted() && in_function => {
                 "environment: line 1".to_string()
             }
-            (ShellContext::ExecC, ShellLevel::Bash { .. }) => "bash: line 1".to_string(),
-            (_, ShellLevel::Bash { login: false }) if in_function && self.in_script() => {
-                "environment: line 1".to_string()
-            }
+            // `bash -c CMD NAME` and `bash FILE` name themselves by `$0`: the operand, or the
+            // file as it was typed; a script on standard input is `bash`.
+            (_, ShellLevel::Bash { .. }) if self.bash_is_scripted() => format!(
+                "{}: line {}",
+                self.state().argv0.as_deref().unwrap_or("bash"),
+                self.state().line
+            ),
             (_, ShellLevel::Bash { login: true }) => "-bash".to_string(),
             (_, ShellLevel::Bash { login: false }) => "bash".to_string(),
             (_, ShellLevel::Dash { line }) => format!("{}: {line}", self.dash_name()),
             (_, ShellLevel::AndroidMksh) => "sh".to_string(),
         }
+    }
+
+    /// Whether the bash answering is not interactive: an SSH exec's `bash -c`, or a script it
+    /// runs (`bash -c`, `bash FILE`, a script on its standard input). Such a bash has no
+    /// command-not-found handler, names the line a command is on, and says `bash`, not `-bash`.
+    fn bash_is_scripted(&self) -> bool {
+        self.context == ShellContext::ExecC || self.in_script()
     }
 
     /// Whether the innermost shell is one running a script (`bash -c`, `sh FILE`) rather than
@@ -995,9 +1005,14 @@ impl FakeShell {
     /// What the active shell says for a command it cannot find.
     fn not_found(&self, what: &str) -> String {
         match (self.context, self.active_level()) {
-            (ShellContext::ExecC, ShellLevel::Bash { .. }) => {
+            (_, ShellLevel::Bash { .. }) if self.bash_is_scripted() => {
                 format!("{}: {what}: command not found\n", self.error_prefix())
             }
+            // An interactive bash on this box has Ubuntu's command-not-found handler (the
+            // persona has `command-not-found` installed, `packages.rs`), whose answer for a name
+            // it has no suggestion for is `NAME: command not found` with no shell name in front,
+            // and whose suggestions replace it for the names below. A host without the package
+            // would print `-bash: NAME: command not found`.
             (_, ShellLevel::Bash { .. }) => login_command_not_found(what)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{what}: command not found\n")),
@@ -2461,6 +2476,7 @@ impl FakeShell {
                 script,
                 operands.first().copied(),
                 operands.get(1..).unwrap_or(&[]),
+                ScriptKind::Command,
             );
         }
         if script.is_none()
@@ -2475,7 +2491,7 @@ impl FakeShell {
         }
         if parts.len() == 1 {
             if let Some(text) = self.take_piped_script() {
-                return self.run_shell_text(shell, &text, None, &[]);
+                return self.run_shell_text(shell, &text, None, &[], ScriptKind::Stdin);
             }
             let level = self.spawned_level(shell, 0);
             self.push_level(level);
@@ -2492,6 +2508,7 @@ impl FakeShell {
         text: &str,
         argv0: Option<&str>,
         args: &[&str],
+        kind: ScriptKind,
     ) -> CommandResult {
         let max_depth = self.budget().limits().max_depth;
         if !self.depth.try_enter(max_depth) {
@@ -2504,6 +2521,7 @@ impl FakeShell {
         let caller_frames = self.frames.len();
         self.push_script_level(level);
         let state = self.state_mut();
+        state.script = kind;
         state.argv0 = argv0.map(str::to_string);
         state.positional = args.iter().map(|a| (*a).to_string()).collect();
         // A script is a shell process of its own: the commands in it start as separate processes,
@@ -2530,7 +2548,7 @@ impl FakeShell {
                     return stopped;
                 }
                 let content = String::from_utf8_lossy(&bytes);
-                self.run_shell_text(shell_name, &content, Some(file), args)
+                self.run_shell_text(shell_name, &content, Some(file), args, ScriptKind::File)
             }
             Err(_) if shell_name == "bash" => {
                 // [unverified] wording and status: no `bash FILE` capture exists yet.

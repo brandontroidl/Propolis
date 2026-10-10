@@ -199,6 +199,19 @@
 
 ### Fixed
 
+- **A bash that runs a script no longer answers like the interactive login shell** - `bash -c f`,
+  `bash FILE` and a script piped to `bash` said `f: command not found`, the answer of the
+  command-not-found handler that only an interactive bash has (the persona has the
+  `command-not-found` package, so the login shell's bare `f: command not found` stays). A bash
+  running a script says `bash: line 1: f: command not found`, naming `$0` (the operand after a
+  `-c` script, the file as typed for `bash FILE`) and the line the command is on, as an SSH exec
+  already did for the line `1` only; its other diagnostics (`cd`, `No such file or directory`)
+  carry the line too. Syntax errors in a script are worded as bash words them:
+  `bash: -c: line 2: syntax error near unexpected token `)'` followed by the offending line
+  quoted, `unexpected EOF while looking for matching `"'` when the text ends inside a quote or
+  `$( )`, and an unfinished construct reported on the line after the last. The SSH exec path had
+  `bash: line 1:` with no `-c:` and no quoted line. Checked against bash 5.1.16 and dash 0.5.11 in
+  the reference container; two session fixtures replay it.
 - **dash's syntax-error wording** - dash named an unexpected plain word as the word itself
   (`Syntax error: "extra" unexpected`); dash says `word unexpected` and quotes only reserved words
   and operators. It also names what the grammar was waiting for (`end of file unexpected

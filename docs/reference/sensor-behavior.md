@@ -336,7 +336,12 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `cat` with no redirection prints its lines after Ctrl-D, not one by one.
 - Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
   `-bash`, uses the interactive command-not-found handler and a prompt that follows
-  the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
+  the working directory. The persona has the `command-not-found` package, whose handler answers a
+  name it has no suggestion for with the bare `f: command not found` (a host without the package
+  would print `-bash: f: command not found`). A bash that runs a script has no handler: SSH exec,
+  `bash -c`, `bash FILE` and a script on standard input say `bash: line N: f: command not found`,
+  naming `$0` and the line, and word syntax errors `bash: -c: line N: syntax error near unexpected
+  token `)'` with the offending line quoted after it. SSH exec has no prompt.
   Bare `su`, `sh`, `bash` and `ash` push nested levels; dash levels have their own
   `sh: N:` line counters. `exit` pops one level, and only exiting the outer level
   sets `close_session`. Android starts and nests as mksh with `sh:` diagnostics.

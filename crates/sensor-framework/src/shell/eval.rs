@@ -187,6 +187,24 @@ pub(super) struct ShellState {
     /// The functions running, outermost first. A subshell started inside one is still inside it
     /// (`return` ends the subshell, `local` still scopes to the function).
     pub calls: Vec<Call>,
+    /// The line of the script text the running command sits on, which a non-interactive bash
+    /// names in its diagnostics (`bash: line 3: f: command not found`).
+    pub line: u32,
+    /// Where a script level's text came from, which a non-interactive bash words its syntax
+    /// errors by.
+    pub script: ScriptKind,
+}
+
+/// Where the text a non-interactive shell runs comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ScriptKind {
+    /// `-c TEXT`, and an SSH exec request.
+    #[default]
+    Command,
+    /// A file named on the command line.
+    File,
+    /// Standard input.
+    Stdin,
 }
 
 const DEFAULT_IFS: &str = " \t\n";
@@ -206,6 +224,8 @@ impl ShellState {
             pid,
             functions: BTreeMap::new(),
             calls: Vec::new(),
+            line: 1,
+            script: ScriptKind::Command,
         };
         state.set_var("IFS", DEFAULT_IFS.to_string(), false);
         match flavor {
@@ -268,6 +288,8 @@ impl ShellState {
             pid,
             functions: BTreeMap::new(),
             calls: Vec::new(),
+            line: 1,
+            script: ScriptKind::Command,
         }
     }
 
@@ -556,12 +578,19 @@ impl FakeShell {
         self.pending.clear();
         self.pending_bytes = 0;
         self.note_unit(&text);
-        self.execute_unit(parsed, base_line)
+        self.execute_unit(parsed, base_line, None)
     }
 
     /// Run the items that parsed, then say what was wrong with the rest. Only items that ended on
     /// a line before the error run, as a shell that reads and runs one command at a time would.
-    pub(super) fn execute_unit(&mut self, parsed: Parsed, base_line: u32) -> CommandResult {
+    /// `text` is the script the items came from, when it is one: a non-interactive bash quotes the
+    /// line a syntax error is on.
+    pub(super) fn execute_unit(
+        &mut self,
+        parsed: Parsed,
+        base_line: u32,
+        text: Option<&str>,
+    ) -> CommandResult {
         let Parsed { mut items, tail } = parsed;
         if let Tail::Error(error) = &tail {
             items.retain(|item| item.end_line < error.line);
@@ -574,7 +603,7 @@ impl FakeShell {
                 if !result.stop_line {
                     let line = base_line.saturating_add(error.line).saturating_sub(1);
                     self.set_dash_line(line);
-                    let message = self.syntax_error_text(&error);
+                    let message = self.syntax_error_text(&error, text);
                     result.append(CommandResult::stderr(2, message));
                     self.state_mut().last_status = 2;
                 }
@@ -599,15 +628,18 @@ impl FakeShell {
     }
 
     /// What the active level says about text it cannot parse.
-    fn syntax_error_text(&self, error: &super::ast::SyntaxError) -> String {
+    fn syntax_error_text(&self, error: &super::ast::SyntaxError, text: Option<&str>) -> String {
         let near = &error.near;
         match self.active_level() {
+            ShellLevel::Bash { .. } if self.bash_is_scripted() && text.is_some() => {
+                self.scripted_bash_syntax_error(error, text.unwrap_or(""))
+            }
             ShellLevel::Bash { .. } => match near {
                 Near::Token(token) | Near::Word(token) => {
                     self.shell_error(format_args!("syntax error near unexpected token `{token}'"))
                 }
                 Near::Newline => self.shell_error("syntax error near unexpected token `newline'"),
-                Near::EndOfFile | Near::Message(_) => {
+                Near::EndOfFile | Near::Message(_) | Near::Unmatched(_) => {
                     self.shell_error("syntax error: unexpected end of file")
                 }
                 // Only dash refuses a name at parse time.
@@ -638,7 +670,7 @@ impl FakeShell {
                     Near::Newline => {
                         self.shell_error(format_args!("Syntax error: newline unexpected{hint}"))
                     }
-                    Near::EndOfFile => {
+                    Near::EndOfFile | Near::Unmatched(_) => {
                         self.shell_error(format_args!("Syntax error: end of file unexpected{hint}"))
                     }
                     Near::Message(message) => {
@@ -653,12 +685,60 @@ impl FakeShell {
                     self.shell_error(format_args!("syntax error: '{token}' unexpected"))
                 }
                 Near::Newline => self.shell_error("syntax error: newline unexpected"),
-                Near::EndOfFile | Near::Message(_) => {
+                Near::EndOfFile | Near::Message(_) | Near::Unmatched(_) => {
                     self.shell_error("syntax error: unexpected EOF")
                 }
                 Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
         }
+    }
+
+    /// bash's syntax error in a script, as Ubuntu 22.04's bash 5.1.16 words it: where the text came
+    /// from (`bash: -c: line 2:` for `-c` text, `FILE: line 2:` for a file, `bash: line 2:` for
+    /// standard input), and for a bad token the line it is on, quoted. An unfinished construct is
+    /// reported on the line after the last one.
+    fn scripted_bash_syntax_error(&self, error: &super::ast::SyntaxError, text: &str) -> String {
+        let state = self.state();
+        let name = state.argv0.as_deref().unwrap_or("bash");
+        let at = |line: usize| match state.script {
+            ScriptKind::Command => format!("{name}: -c: line {line}"),
+            ScriptKind::File => format!("{name}: line {line}"),
+            ScriptKind::Stdin => format!("{name}: line {line}"),
+        };
+        let token = match &error.near {
+            Near::Token(token) | Near::Word(token) => token.as_str(),
+            Near::Newline => "newline",
+            Near::EndOfFile | Near::Message(_) | Near::Unmatched(_) => {
+                let newlines = text.matches('\n').count();
+                let lines = if text.ends_with('\n') {
+                    newlines
+                } else {
+                    newlines.saturating_add(1)
+                };
+                // Running out inside a quote or a substitution is first said where, on the
+                // last line, and then as the end of the file one line further.
+                let matching = match error.near {
+                    Near::Unmatched(closer) => format!(
+                        "{}: unexpected EOF while looking for matching `{closer}'\n",
+                        at(lines)
+                    ),
+                    _ => String::new(),
+                };
+                return format!(
+                    "{matching}{}: syntax error: unexpected end of file\n",
+                    at(lines.saturating_add(1))
+                );
+            }
+            Near::BadFunctionName => {
+                return self.shell_error("syntax error: bad function name");
+            }
+        };
+        let line = usize::try_from(error.line).unwrap_or(usize::MAX);
+        let source = text.split('\n').nth(line.saturating_sub(1)).unwrap_or("");
+        format!(
+            "{at}: syntax error near unexpected token `{token}'\n{at}: `{source}'\n",
+            at = at(line)
+        )
     }
 
     /// Run `text` as a script in the shell level just pushed by the caller: a nested `sh -c`, a
@@ -679,7 +759,7 @@ impl FakeShell {
         let dialect = self.grammar();
         let parsed = super::parse::parse_unit(text, true, max_depth, dialect, &mut self.line, 1);
         self.sync_budget_trace();
-        self.execute_unit(parsed, 1)
+        self.execute_unit(parsed, 1, Some(text))
     }
 
     // ---- lists ---------------------------------------------------------------------------------
@@ -1095,6 +1175,7 @@ impl FakeShell {
         let outer_stderr = std::mem::take(&mut self.deferred_stderr);
         let outer_subst = self.last_subst_status.take();
         self.set_dash_line(simple.line);
+        self.state_mut().line = simple.line;
         let ran = self.simple_inner(simple);
         let produced = std::mem::replace(&mut self.deferred_stderr, outer_stderr);
         self.last_subst_status = outer_subst;

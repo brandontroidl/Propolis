@@ -283,3 +283,78 @@ fn more_descriptors_than_a_shell_holds_are_ignored() {
     assert_eq!(run(&mut sh, "exec 99>/tmp/x10; echo $?"), "0\n");
     assert_eq!(run(&mut sh, "echo ok"), "ok\n");
 }
+
+#[test]
+fn dash_words_a_redirection_it_cannot_make_in_its_own_way_and_exits_2() {
+    let mut sh = shell();
+    run(&mut sh, "sh");
+    assert_eq!(
+        run(&mut sh, "echo hi > /nonexistent/x; echo rc=$?"),
+        "sh: 1: cannot create /nonexistent/x: Directory nonexistent\nrc=2\n"
+    );
+    assert_eq!(
+        run(&mut sh, "echo a > /tmp; echo rc=$?"),
+        "sh: 2: cannot create /tmp: Is a directory\nrc=2\n"
+    );
+}
+
+#[test]
+fn dash_ends_the_shell_when_a_redirection_of_exec_fails() {
+    let mut sh = shell();
+    assert_eq!(
+        run(&mut sh, "sh -c 'exec > /nonexistent/x; echo rc=$?'"),
+        "sh: 1: cannot create /nonexistent/x: Directory nonexistent\n"
+    );
+}
+
+#[test]
+fn exec_clear_environment_runs_the_command_with_no_variables() {
+    let mut sh = shell();
+    run(&mut sh, "export FOO=bar");
+    assert_eq!(
+        run(&mut sh, "(exec -c /usr/bin/env)"),
+        "",
+        "`exec -c env` prints nothing: the variables are gone"
+    );
+}
+
+#[test]
+fn exec_that_cannot_start_in_a_script_runs_the_exit_handler_before_the_shell_ends() {
+    let mut sh = shell();
+    assert_eq!(
+        run(
+            &mut sh,
+            "bash -c 'trap \"echo bye\" EXIT; exec nosuchcmd_q; echo not-reached'"
+        ),
+        "bash: line 1: exec: nosuchcmd_q: not found\nbye\n"
+    );
+}
+
+#[test]
+fn a_shell_that_replaced_the_login_shell_starts_with_no_history() {
+    let mut sh = shell();
+    run(&mut sh, "echo one");
+    run(&mut sh, "exec bash");
+    assert_eq!(run(&mut sh, "history"), "    1  history\n");
+}
+
+#[test]
+fn a_failed_exec_ends_a_subshell_bash_runs_the_handler_for_a_missing_command_only() {
+    let mut sh = shell();
+    assert_eq!(
+        run(&mut sh, "(trap 'echo bye' EXIT; exec nosuchcmd_q); echo $?"),
+        "-bash: exec: nosuchcmd_q: not found\nbye\n0\n",
+        "the handler's last command sets the status"
+    );
+    assert_eq!(
+        run(&mut sh, "(trap 'echo bye' EXIT; exec /tmp); echo $?"),
+        "-bash: /tmp: Is a directory\n-bash: exec: /tmp: cannot execute: Is a directory\n126\n"
+    );
+    assert_eq!(
+        run(
+            &mut sh,
+            "sh -c 'trap \"echo bye\" EXIT; exec nosuchcmd_q'; echo $?"
+        ),
+        "sh: 1: exec: nosuchcmd_q: not found\nbye\n127\n"
+    );
+}

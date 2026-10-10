@@ -203,7 +203,14 @@ fn times_prints_the_shells_time_then_its_childrens_and_both_grow_with_the_work()
         "dd costs system time"
     );
     assert!(cell_ms(&later[2]) > 0, "children spent user time");
-    assert!(cell_ms(&later[0]) >= cell_ms(&first[0]));
+    assert!(
+        cell_ms(&later[0]) > cell_ms(&first[0]),
+        "the shell's user time grows"
+    );
+    assert!(
+        cell_ms(&later[1]) > cell_ms(&first[1]),
+        "the shell's system time grows"
+    );
     assert_eq!(answer(&mut sh, "times").2, 0);
 }
 

@@ -403,3 +403,20 @@ fn trap_is_a_builtin_to_type_and_command() {
         "trap is a special shell builtin\n"
     );
 }
+
+#[test]
+fn a_subshell_keeps_the_handlers_its_parent_ignores() {
+    // bash and dash: `trap '' HUP` is inherited by a subshell, which lists it with its own.
+    let mut sh = shell();
+    run(&mut sh, "trap '' HUP");
+    assert_eq!(
+        run(&mut sh, "(trap 'echo a' INT; trap)"),
+        "trap -- '' SIGHUP\ntrap -- 'echo a' SIGINT\n"
+    );
+    run(&mut sh, "sh");
+    run(&mut sh, "trap '' HUP");
+    assert_eq!(
+        run(&mut sh, "(trap 'echo a' INT; trap)"),
+        "trap -- '' HUP\ntrap -- 'echo a' INT\n"
+    );
+}

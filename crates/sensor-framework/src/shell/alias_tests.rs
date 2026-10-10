@@ -415,3 +415,50 @@ fn shopt_is_not_found_in_dash_and_on_the_phone() {
     let mut sh = android();
     assert_eq!(run(&mut sh, "shopt"), "sh: shopt: not found\n");
 }
+
+#[test]
+fn a_self_naming_alias_expands_once_where_repeating_would_show() {
+    // Both shells: `alias echo='echo hi'` is `hi x`, not `hi hi hi ... x`.
+    let mut sh = shell();
+    run(&mut sh, "alias echo='echo hi'");
+    assert_eq!(run(&mut sh, "echo x"), "hi x\n");
+    let mut dash = dash_level();
+    run(&mut dash, "alias echo='echo hi'");
+    assert_eq!(run(&mut dash, "echo x"), "hi x\n");
+}
+
+#[test]
+fn a_chain_of_aliases_stops_at_the_cap_on_expansions() {
+    // A deliberate bound, not a shell's behaviour: bash and dash follow a chain of any length.
+    let mut sh = shell();
+    for n in 0..69 {
+        run(&mut sh, &format!("alias a{n}='a{} '", n + 1));
+    }
+    run(&mut sh, "alias a69='echo done'");
+    let reply = run(&mut sh, "a0 x");
+    assert!(reply.contains("command not found"), "{reply:?}");
+    assert!(!reply.contains("done"), "{reply:?}");
+    // A chain inside the cap runs through.
+    let mut short = shell();
+    for n in 0..40 {
+        run(&mut short, &format!("alias a{n}='a{} '", n + 1));
+    }
+    run(&mut short, "alias a40='echo done'");
+    assert_eq!(run(&mut short, "a0 x"), "done x\n");
+}
+
+#[test]
+fn the_text_an_expansion_grows_to_is_capped_in_bytes() {
+    let mut sh = shell();
+    let value = "echo ".to_string() + &"x".repeat(3900);
+    run(&mut sh, &format!("alias b='{value}'"));
+    // Padding that is a comment keeps the line short of the lexer's work allowance while the
+    // expansions carry the text past the cap.
+    let line = format!("b;b;b;b # {}", "p".repeat(258_000));
+    let reply = run(&mut sh, &line);
+    assert!(
+        reply.contains("b: command not found"),
+        "{}",
+        &reply[..80.min(reply.len())]
+    );
+}

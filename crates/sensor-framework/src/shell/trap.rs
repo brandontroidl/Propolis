@@ -306,12 +306,12 @@ impl FakeShell {
 
     /// The shell that is running ends with the status in `result`: run its `EXIT` handler, once,
     /// after what it printed. The status stays what it was unless the handler itself exits.
-    pub(super) fn append_exit_trap(&mut self, result: &mut CommandResult) {
-        let Some(action) = self.state_mut().traps.remove(&EXIT) else {
-            return;
-        };
+    ///
+    /// Returns the status the handler's own last command left, when a handler ran.
+    pub(super) fn append_exit_trap(&mut self, result: &mut CommandResult) -> Option<u8> {
+        let action = self.state_mut().traps.remove(&EXIT)?;
         if action.is_empty() {
-            return;
+            return None;
         }
         let status = result.status;
         self.state_mut().last_status = status;
@@ -321,8 +321,10 @@ impl FakeShell {
         let exited = trap.stop_line || trap.flow == Flow::ExitSubshell || trap.close_session;
         trap.flow = Flow::None;
         let kept = if exited { trap.status } else { status };
+        let left = trap.status;
         result.append(trap);
         result.status = kept;
+        Some(left)
     }
 
     /// The `DEBUG` or `ERR` handler of the running shell, when one may run now: not while another

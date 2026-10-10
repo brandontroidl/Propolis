@@ -137,13 +137,21 @@ impl FakeShell {
         result
     }
 
-    /// An `exec` that could not start: `result` is the message; the shell ends unless it survives,
-    /// and then runs its `EXIT` handler as any ending shell does.
+    /// An `exec` that could not start: `result` is the message; the shell ends unless it survives.
+    /// dash runs its `EXIT` handler and keeps status 127 or 126. bash runs it only after a command
+    /// that was not found (127), and then exits with the status the handler's last command left;
+    /// it runs none for a file it cannot execute (126).
     fn exec_refused(&mut self, mut result: CommandResult) -> CommandResult {
         if self.exec_survives() {
             return result;
         }
-        self.append_exit_trap(&mut result);
+        if !self.is_dash() && result.status == 126 {
+            self.state_mut().traps.remove(&super::trap::EXIT);
+        } else if let Some(left) = self.append_exit_trap(&mut result)
+            && !self.is_dash()
+        {
+            result.status = left;
+        }
         self.finish_process(result)
     }
 

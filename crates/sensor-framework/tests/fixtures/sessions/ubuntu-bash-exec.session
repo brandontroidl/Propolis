@@ -2,8 +2,10 @@
 # shell's own descriptors for good (open, write, read with `read -u`, close, duplicate), every
 # later command and every shell it starts inherits them, a copy of a descriptor that is not open is
 # `Bad file descriptor`, and `exec CMD` replaces the shell or, inside a subshell, only that subshell
-# (no `EXIT` handler runs; a command that cannot be found is `exec: NAME: not found`, status 127,
-# and a builtin or function is never found; bad options print the usage line, status 2). Each reply
+# (no `EXIT` handler runs; a command that cannot be found is `exec: NAME: not found`, status 127, and
+# a builtin or function is never found; a script that ends that way runs its `EXIT` handler and exits
+# with the handler's status, but none for a file it cannot execute, status 126; bad options print the
+# usage line, status 2). Each reply
 # was produced by `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`)
 # in the localhost/propolis-survey-ref:jammy container (bash 5.1.16), run with `--network none`,
 # PS1 and PS2 set to markers and these lines fed one at a time on standard input.
@@ -83,4 +85,25 @@ $ cat /tmp/e5
 $ sh -c 'exec nosuchcmd_q; echo not-reached'
 > sh: 1: exec: nosuchcmd_q: not found
 $ echo $?
+> 127
+$ (trap 'echo bye' EXIT; exec nosuchcmd_q); echo $?
+> -bash: exec: nosuchcmd_q: not found
+> bye
+> 0
+$ (trap 'echo bye' EXIT; exec /tmp); echo $?
+> -bash: /tmp: Is a directory
+> -bash: exec: /tmp: cannot execute: Is a directory
+> 126
+$ (trap 'echo bye' EXIT; exec -z); echo $?
+> -bash: exec: -z: invalid option
+> exec: usage: exec [-cl] [-a name] [command [argument ...]] [redirection ...]
+> bye
+> 2
+$ bash -c 'trap "echo bye" EXIT; exec nosuchcmd_q; echo no'; echo $?
+> bash: line 1: exec: nosuchcmd_q: not found
+> bye
+> 0
+$ sh -c 'trap "echo bye" EXIT; exec nosuchcmd_q'; echo $?
+> sh: 1: exec: nosuchcmd_q: not found
+> bye
 > 127

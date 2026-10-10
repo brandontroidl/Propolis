@@ -463,7 +463,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   replaces the shell: the rest of the script, and the `EXIT` handler, never run; in a subshell, a
   pipeline stage or a command substitution it ends only that process. A command with no file
   behind it (a builtin or a function) is `exec: NAME: not found` (127), a directory or non-
-  executable file 126; bash goes on at the terminal after a failure, a script and dash end.
+  executable file 126; bash goes on at the terminal after a failure, a script and dash end. A
+  script that ends that way still runs its `EXIT` handler: dash keeps 127 or 126, bash runs none
+  for 126 and, after a missing command, exits with the status the handler's last command left.
   `exec bash`/`exec sh` at the terminal replaces the shell by a fresh one that keeps only the
   exported variables. bash's `-c`, `-l` and `-a NAME` are taken; dash's `exec -z` is the command
   `-z`. A download run through `exec` is recorded as one run any other way is. Replies are from

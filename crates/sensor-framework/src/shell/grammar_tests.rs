@@ -949,7 +949,7 @@ mod syntax_errors {
     /// container (`tests/fixtures/sessions/ubuntu-dash-syntax-errors.session` replays more).
     #[test]
     fn dash_says_word_for_a_plain_word_and_names_the_token_it_waited_for() {
-        let cases: [(&str, &str); 36] = [
+        let cases: [(&str, &str); 38] = [
             ("(echo a) extra", "word unexpected"),
             ("(echo a) then", "\"then\" unexpected"),
             ("echo a; fi", "\"fi\" unexpected"),
@@ -976,6 +976,8 @@ mod syntax_errors {
             ),
             ("for; do echo; done", "Bad for loop variable"),
             ("for 1 in a; do echo; done", "Bad for loop variable"),
+            ("for", "Bad for loop variable"),
+            ("echo a; for", "Bad for loop variable"),
             ("for i in a b", "end of file unexpected"),
             ("for i", "end of file unexpected (expecting \"do\")"),
             (

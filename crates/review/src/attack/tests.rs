@@ -830,8 +830,8 @@ fn the_dialect_of_the_sensor_decides_what_is_code() {
         [("sql-os-command", "sys_exec".to_string())]
     );
     assert_eq!(sql_tokens("postgresql", hidden), []);
-    // PostgreSQL dollar quotes hide a keyword that MySQL would read as code.
-    let dollar = "SELECT $$ CREATE USER x; $$";
+    // PostgreSQL dollar quotes hide a statement boundary and the statement after it.
+    let dollar = "SELECT $$; CREATE USER x; $$";
     assert_eq!(sql_tokens("postgresql", dollar), []);
 }
 
@@ -867,6 +867,13 @@ fn a_statement_after_the_first_is_read_and_other_sensors_are_not_read_as_sql() {
         [("redis-config-cron", "CONFIG SET dir")]
     );
     assert!(tag_database_command("postgresql", "CONFIG SET", &cfg).is_empty());
+    // Only CONFIG SET carries a param and value that mean a save target; the same fields under
+    // another command name (or a case variant of the right one) are read accordingly.
+    let other = serde_json::json!({ "command": "SET", "param": "dir", "value": "/etc/cron.d" });
+    assert!(tag_redis(&other).is_empty());
+    let lower =
+        serde_json::json!({ "command": "config set", "param": "DIR", "value": "/etc/cron.d" });
+    assert_eq!(tag_redis(&lower).len(), 1);
 }
 
 /// `docs/reference/attack-tagging.md` owns the human-readable rule list: one row per rule id, each

@@ -111,6 +111,7 @@ mod toyopt;
 mod tr;
 mod tr_gnu;
 mod trace;
+mod trap;
 
 use eval::{DepthGuard, LineBudget, PidAlloc, ScriptKind, ShellState, Stdin};
 use registry::{HandlerFn, Registry, resolve_proc_self};
@@ -1425,7 +1426,9 @@ impl FakeShell {
             // An exec request is one complete command string, as `bash -c` gets it: there is no
             // next line to finish an open construct, so it is parsed whole.
             self.note_unit(decoded);
-            return self.run_script_text(decoded);
+            let mut result = self.run_script_text(decoded);
+            self.append_exit_trap(&mut result);
+            return result;
         }
         let mut result = CommandResult::silent(0);
         let mut first = true;
@@ -2253,6 +2256,13 @@ impl FakeShell {
         let parent = self.state();
         let mut state = parent.child(pid);
         if matches!(level, ShellLevel::Bash { .. }) {
+            // A signal the parent ignores stays ignored in a bash it starts, and bash lists it.
+            state.traps = parent
+                .traps
+                .iter()
+                .filter(|(_, action)| action.is_empty())
+                .map(|(key, action)| (*key, action.clone()))
+                .collect();
             state.functions = parent
                 .functions
                 .iter()
@@ -2266,14 +2276,19 @@ impl FakeShell {
     /// Leave the innermost shell level that reads the terminal, or end the session from the login
     /// shell. `status` is what `exit` was given.
     fn exit_shell(&mut self, status: u8) -> CommandResult {
+        // The `EXIT` handler runs after the words bash prints as it leaves, in the shell being
+        // left.
         if self.open_levels() > 1 {
-            let popped = self.frames.pop().map(|frame| frame.kind);
-            let output = if matches!(popped, Some(FrameKind::Level(ShellLevel::Bash { .. }))) {
+            let leaving = self.frames.last().map(|frame| frame.kind);
+            let output = if matches!(leaving, Some(FrameKind::Level(ShellLevel::Bash { .. }))) {
                 b"exit\n".to_vec()
             } else {
                 Vec::new()
             };
-            return CommandResult::shell_exit(status, output, false);
+            let mut result = CommandResult::shell_exit(status, output, false);
+            self.append_exit_trap(&mut result);
+            self.frames.pop();
+            return result;
         }
 
         let output = if matches!(self.active_level(), ShellLevel::Bash { login: true }) {
@@ -2281,7 +2296,9 @@ impl FakeShell {
         } else {
             Vec::new()
         };
-        CommandResult::shell_exit(status, output, true)
+        let mut result = CommandResult::shell_exit(status, output, true);
+        self.append_exit_trap(&mut result);
+        result
     }
 
     fn logout_shell(&mut self) -> CommandResult {
@@ -2529,7 +2546,8 @@ impl FakeShell {
         // A script is a shell process of its own: the commands in it start as separate processes,
         // not as applets of the busybox that started the script.
         let applets = std::mem::take(&mut self.busybox_depth);
-        let result = self.run_script(text);
+        let mut result = self.run_script(text);
+        self.append_exit_trap(&mut result);
         self.busybox_depth = applets;
         self.frames.truncate(caller_frames);
         self.depth.leave();
@@ -3687,3 +3705,5 @@ mod tftp_tests;
 mod timing_tests;
 #[cfg(test)]
 mod tr_gnu_tests;
+#[cfg(test)]
+mod trap_tests;

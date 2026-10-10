@@ -31,6 +31,7 @@ use super::ast::{
 use super::expand::ExpandError;
 use super::parse::{Parsed, Tail};
 use super::trace::BudgetHit;
+use super::trap::Traps;
 use super::{
     CommandResult, ControlOp, FakeShell, Flow, Frame, FrameKind, HandlerId, OutputFd,
     OutputSegment, ParseNode, RunDecision, SegmentTrace, ShellFlavor, ShellLevel, command_basename,
@@ -125,6 +126,16 @@ impl DepthGuard {
     }
 }
 
+/// Whether a failing pipeline is something bash's `ERR` handler follows: more than one stage, a
+/// simple command or a subshell.
+fn err_unit(pipeline: &Pipeline) -> bool {
+    pipeline.stages.len() > 1
+        || matches!(
+            pipeline.stages.first(),
+            Some(Command::Simple(_) | Command::Subshell { .. })
+        )
+}
+
 /// Whether a script's text holds the word `alias`: the only way it can define one.
 fn mentions_alias(text: &str) -> bool {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -206,6 +217,18 @@ pub(super) struct ShellState {
     /// bash's `shopt` options changed from their defaults, and its `set -o` ones.
     pub shopt: BTreeMap<String, bool>,
     pub set_o: BTreeMap<String, bool>,
+    /// The `trap` handlers this shell runs.
+    pub traps: Traps,
+    /// What a subshell lists as its handlers until it changes one: those of the shell it was made
+    /// from. `None` in every other shell.
+    pub trap_view: Option<Traps>,
+    /// The `EXIT` handler is running: an `exit` in it ends it, not the shell a second time.
+    pub exiting: bool,
+    /// A `DEBUG` or `ERR` handler is running, and does not trigger itself.
+    pub in_trap: bool,
+    /// Commands being run whose status something tests (an `if` condition, all but the last of a
+    /// `&&` list): `ERR` does not fire for a failure inside them.
+    pub err_ignore: u32,
 }
 
 /// Where the text a non-interactive shell runs comes from.
@@ -242,6 +265,11 @@ impl ShellState {
             aliases: Vec::new(),
             shopt: BTreeMap::new(),
             set_o: BTreeMap::new(),
+            traps: Traps::new(),
+            trap_view: None,
+            exiting: false,
+            in_trap: false,
+            err_ignore: 0,
         };
         state.set_var("IFS", DEFAULT_IFS.to_string(), false);
         match flavor {
@@ -309,7 +337,26 @@ impl ShellState {
             aliases: Vec::new(),
             shopt: BTreeMap::new(),
             set_o: BTreeMap::new(),
+            traps: Traps::new(),
+            trap_view: None,
+            exiting: false,
+            in_trap: false,
+            err_ignore: 0,
         }
+    }
+
+    /// The state of a subshell made from this one: a copy, except that the handlers it would run
+    /// are reset (the ignored signals stay ignored) while it still lists the parent's, as bash does
+    /// until it sets one itself; dash lists none.
+    pub(super) fn subshell_copy(&self, dash: bool) -> Self {
+        let mut copy = self.clone();
+        copy.trap_view = Some(if dash {
+            Traps::new()
+        } else {
+            self.trap_view.clone().unwrap_or_else(|| self.traps.clone())
+        });
+        copy.traps.retain(|_, action| action.is_empty());
+        copy
     }
 
     /// What the variables and functions hold, against the connection's content allowance.
@@ -326,8 +373,10 @@ impl ShellState {
             .aliases
             .iter()
             .map(|alias| alias.name.len().saturating_add(alias.value.len()));
+        let traps = self.traps.values().map(String::len);
         vars.chain(functions)
             .chain(aliases)
+            .chain(traps)
             .fold(0, usize::saturating_add)
     }
 
@@ -885,8 +934,9 @@ impl FakeShell {
 
     fn eval_and_or(&mut self, chain: &AndOr) -> CommandResult {
         let record = self.trace_stack.is_empty();
-        let mut acc = self.eval_segment(&chain.first, ControlOp::Seq, record);
-        for (op, pipeline) in &chain.rest {
+        let mut acc =
+            self.eval_element(&chain.first, ControlOp::Seq, record, chain.rest.is_empty());
+        for (index, (op, pipeline)) in chain.rest.iter().enumerate() {
             if acc.stop_line || acc.flow != Flow::None {
                 break;
             }
@@ -895,7 +945,8 @@ impl FakeShell {
                 AndOrOp::Or => (ControlOp::Or, acc.status != 0),
             };
             if run {
-                let next = self.eval_segment(pipeline, control, record);
+                let last = index.saturating_add(1) == chain.rest.len();
+                let next = self.eval_element(pipeline, control, record, last);
                 acc.append(next);
             } else if record {
                 self.trace.segments.push(SegmentTrace {
@@ -910,6 +961,35 @@ impl FakeShell {
             }
         }
         acc
+    }
+
+    /// One pipeline of an and-or chain. bash's `ERR` handler runs after the last one of the chain
+    /// fails when it is a simple command, a pipeline or a subshell (a brace group, an `if` or a
+    /// loop leaves it to the commands inside), and not for one that is negated or whose status
+    /// something tests, which is every earlier one of the chain.
+    fn eval_element(
+        &mut self,
+        pipeline: &Pipeline,
+        op: ControlOp,
+        record: bool,
+        last: bool,
+    ) -> CommandResult {
+        if !last {
+            self.state_mut().err_ignore = self.state().err_ignore.saturating_add(1);
+        }
+        let mut result = self.eval_segment(pipeline, op, record);
+        if !last {
+            self.state_mut().err_ignore = self.state().err_ignore.saturating_sub(1);
+        } else if result.status != 0
+            && !result.stop_line
+            && result.flow == Flow::None
+            && !pipeline.bang
+            && err_unit(pipeline)
+            && let Some(handler) = self.err_after(result.status)
+        {
+            result.append(handler);
+        }
+        result
     }
 
     fn eval_segment(&mut self, pipeline: &Pipeline, op: ControlOp, record: bool) -> CommandResult {
@@ -938,16 +1018,17 @@ impl FakeShell {
                 format!("[{}] {pid}\n", self.next_job),
             ));
         }
-        let copy = self.state().clone();
+        let copy = self.subshell_state();
         self.frames.push(Frame {
             kind: FrameKind::Subshell,
             state: copy,
         });
         let saved = std::mem::replace(&mut self.stdin, Stdin::data(Vec::new()));
         self.script_depth = self.script_depth.saturating_add(1);
-        let ran = self.eval_and_or(&item.and_or);
+        let mut ran = self.eval_and_or(&item.and_or);
         self.script_depth = self.script_depth.saturating_sub(1);
         self.stdin = saved;
+        self.append_exit_trap(&mut ran);
         self.frames.pop();
         let stopped = ran.stop_line;
         acc.append(ran);
@@ -1004,7 +1085,14 @@ impl FakeShell {
         let count = pipeline.stages.len();
         for (index, stage) in pipeline.stages.iter().enumerate() {
             let last = index.saturating_add(1) == count;
-            let copy = self.state().clone();
+            // bash runs a simple command's `DEBUG` handler before it forks the stage, so what it
+            // prints goes to the terminal and not into the pipe.
+            if matches!(stage, Command::Simple(_))
+                && let Some(handler) = self.debug_before()
+            {
+                acc.append(handler);
+            }
+            let copy = self.subshell_state();
             self.frames.push(Frame {
                 kind: FrameKind::Subshell,
                 state: copy,
@@ -1024,6 +1112,7 @@ impl FakeShell {
             if let Some(previous) = saved {
                 self.stdin = previous;
             }
+            self.append_exit_trap(&mut ran);
             self.frames.pop();
             ran.flow = Flow::None;
             let stopped = ran.stop_line;
@@ -1136,8 +1225,13 @@ impl FakeShell {
         routed
     }
 
+    /// The state a `( )`, a pipeline stage, a `$( )` and a background job start from.
+    pub(super) fn subshell_state(&self) -> ShellState {
+        self.state().subshell_copy(self.is_dash())
+    }
+
     fn eval_subshell(&mut self, body: &List) -> CommandResult {
-        let copy = self.state().clone();
+        let copy = self.subshell_state();
         self.frames.push(Frame {
             kind: FrameKind::Subshell,
             state: copy,
@@ -1145,9 +1239,18 @@ impl FakeShell {
         self.script_depth = self.script_depth.saturating_add(1);
         let mut result = self.eval_list(body);
         self.script_depth = self.script_depth.saturating_sub(1);
+        self.append_exit_trap(&mut result);
         self.frames.pop();
         // `exit`, `break` and `continue` end at the subshell's edge.
         result.flow = Flow::None;
+        result
+    }
+
+    /// A condition: the status of what it runs is tested, so `ERR` does not follow a failure in it.
+    fn eval_tested(&mut self, list: &List) -> CommandResult {
+        self.state_mut().err_ignore = self.state().err_ignore.saturating_add(1);
+        let result = self.eval_list(list);
+        self.state_mut().err_ignore = self.state().err_ignore.saturating_sub(1);
         result
     }
 
@@ -1158,7 +1261,7 @@ impl FakeShell {
         elifs: &[(List, List)],
         els: Option<&List>,
     ) -> CommandResult {
-        let mut acc = self.eval_list(cond);
+        let mut acc = self.eval_tested(cond);
         if acc.stop_line || acc.flow != Flow::None {
             return acc;
         }
@@ -1168,7 +1271,7 @@ impl FakeShell {
             return acc;
         }
         for (test, body) in elifs {
-            let tested = self.eval_list(test);
+            let tested = self.eval_tested(test);
             acc.append(tested);
             if acc.stop_line || acc.flow != Flow::None {
                 return acc;
@@ -1191,6 +1294,15 @@ impl FakeShell {
 
     /// `case WORD in ... esac`: the first arm with a matching pattern runs; no match is status 0.
     fn eval_case(&mut self, word: &Word, arms: &[CaseArm]) -> CommandResult {
+        let Some(mut handler) = self.debug_before() else {
+            return self.eval_case_arms(word, arms);
+        };
+        let ran = self.eval_case_arms(word, arms);
+        handler.append(ran);
+        handler
+    }
+
+    fn eval_case_arms(&mut self, word: &Word, arms: &[CaseArm]) -> CommandResult {
         let subject = match self.expand_scalar(word) {
             Ok(subject) => subject,
             Err(error) => return self.expand_failure(error),
@@ -1223,6 +1335,9 @@ impl FakeShell {
                 acc.status = 1;
                 break;
             }
+            if let Some(handler) = self.debug_before() {
+                acc.append(handler);
+            }
             self.assign_var(var, item);
             let ran = self.eval_list(body);
             acc.append(ran);
@@ -1244,7 +1359,7 @@ impl FakeShell {
                 body_status = 1;
                 break;
             }
-            let tested = self.eval_list(cond);
+            let tested = self.eval_tested(cond);
             acc.append(tested);
             if !loop_continues(&mut acc) {
                 body_status = acc.status;
@@ -1274,11 +1389,16 @@ impl FakeShell {
         let outer_subst = self.last_subst_status.take();
         self.set_dash_line(simple.line);
         self.state_mut().line = simple.line;
+        // bash's `DEBUG` handler runs first, and what it prints comes first.
+        let debug = self.debug_before();
         let ran = self.simple_inner(simple);
         let produced = std::mem::replace(&mut self.deferred_stderr, outer_stderr);
         self.last_subst_status = outer_subst;
         // What the expansions wrote to standard error came before the command itself.
         let mut result = CommandResult::silent(ran.status);
+        if let Some(handler) = debug {
+            result.append(handler);
+        }
         for segment in produced {
             result.append(CommandResult::one(segment.fd, 0, segment.bytes));
         }

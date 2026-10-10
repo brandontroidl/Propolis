@@ -102,7 +102,7 @@ impl FakeShell {
                 }
             },
         };
-        let mut result = if self.top_frame_is_scoped() {
+        let mut result = if self.top_frame_is_scoped() || self.state().exiting {
             let mut scoped = CommandResult::silent(status);
             scoped.flow = Flow::ExitSubshell;
             scoped

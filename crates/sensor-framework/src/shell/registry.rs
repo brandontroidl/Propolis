@@ -73,6 +73,7 @@ impl Registry {
         register_core(&mut registry);
         super::alias::register(&mut registry);
         super::shopt::register(&mut registry);
+        super::trap::register(&mut registry);
         super::read::register(&mut registry);
         super::dd::register(&mut registry);
         super::readlink::register(&mut registry);

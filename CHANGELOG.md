@@ -158,6 +158,16 @@
   shell, counted against the content allowance, and a text expands at most 64 aliases and grows to
   at most 256 KiB. Replies are from bash 5.1.16 and dash 0.5.11 in the reference container; two
   session fixtures replay them. The phone's mksh output is [inferred].
+- **`trap`** - the fake shell answered `trap: command not found`, which a bot that sets
+  `trap 'rm -f /tmp/x' EXIT` or `trap '' HUP INT` reads at once. Handlers are now kept, listed and
+  reset as bash 5.1.16 and dash 0.5.11 do (bash `trap -- 'CMD' SIGINT`, `-l`, `-p`, `DEBUG`/`ERR`/
+  `RETURN`; dash bare names, `bad trap`, no options), and the `EXIT` handler runs when the shell
+  ends: after `logout`/`exit`, at the end of a script, an SSH exec string, a subshell, a pipeline
+  stage or a command substitution, with `$?` kept unless the handler exits. bash's `DEBUG` handler
+  runs before simple commands and `ERR` after a failing one nothing tests; a signal a shell sends
+  itself (`kill -USR1 $$`) runs its handler. Handlers are text a bot supplies, so they are bounded
+  (4096 bytes, one per signal, counted against the content allowance). Two session fixtures replay
+  replies from the reference container.
 
 ### Changed
 

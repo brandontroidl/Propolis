@@ -430,6 +430,27 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   The phone's alias output is dash's, sorted [inferred]. Not modeled: `$'..'` values (the
   command that holds one is skipped, as everywhere), and alias expansion inside `eval`, which runs
   nothing.
+  `trap` (`crates/sensor-framework/src/shell/trap.rs`) keeps, lists, ignores (`trap '' INT`) and
+  resets handlers as the two shells do: bash lists `trap -- 'CMD' SIGINT` in signal order with
+  `EXIT` first and `DEBUG`, `ERR`, `RETURN` last, reads names in any case with or without `SIG`,
+  `RTMIN+N`, and the numbers 0 to 64 (32 and 33 listed by number), has `-l` and `-p`; dash lists
+  `trap -- 'CMD' INT` with bare names (16, 32 and 33 by number), takes no option (`-p` and `-l`
+  end the shell with status 2), stops at the first signal it cannot read (`trap: NAME: bad trap`),
+  and has no pseudo-signals; a first operand that is a signal (dash) or a number (bash) resets
+  every operand. No signal is delivered except one a shell sends itself (`kill -USR1 $$` runs the
+  handler; an ignored one does nothing). The `EXIT` handler runs when the shell ends: after
+  `logout` or `exit` for a login or nested shell, at the end of a script, an SSH exec string, a
+  subshell, a pipeline stage or a command substitution, with `$?` as the status it ended with,
+  which stays unless the handler calls `exit`; none runs when `exec` replaces the shell, a
+  subshell lists its parent's handlers until it sets one and runs none of them, and a bash started
+  from this one lists only the signals that are ignored. bash's `DEBUG` handler runs before each
+  simple command (and each trip of a `for`, and a `case`) outside functions, and `ERR` after a
+  failing simple command, pipeline or subshell that nothing tests; `RETURN` is kept and listed
+  and never run, as in a bash whose functions do not trace; `$BASH_COMMAND` is not set. A session
+  that ends by the client hanging up runs no handler, since nothing could show its output. A
+  handler is at most 4096 bytes, one per signal, counted against the content allowance. The
+  phone's `trap` is dash's [inferred]. Not modeled: a default-disposition signal to the shell's
+  own pid (`kill -9 $$` does not end the session).
   bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
   the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
   dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it

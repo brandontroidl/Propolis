@@ -424,7 +424,7 @@ impl FakeShell {
             return Err(ExpandError::Refused);
         }
         self.note_depth();
-        let copy = self.state().clone();
+        let copy = self.subshell_state();
         self.frames.push(Frame {
             kind: FrameKind::Subshell,
             state: copy,
@@ -432,6 +432,7 @@ impl FakeShell {
         self.script_depth = self.script_depth.saturating_add(1);
         let mut ran = self.eval_list(list);
         self.script_depth = self.script_depth.saturating_sub(1);
+        self.append_exit_trap(&mut ran);
         self.frames.pop();
         self.depth.leave();
         let stdout = ran.take_stdout();

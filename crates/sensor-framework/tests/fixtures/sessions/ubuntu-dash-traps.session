@@ -1,0 +1,162 @@
+# `trap` as Ubuntu 22.04's dash (/bin/sh, 0.5.11) has it, each case a `sh -c` from the login shell.
+# What differs from bash: the listing is `trap -- 'CMD' NAME` with the bare name (`INT`, `RTMAX`,
+# and the number where dash has no name: 16, 32, 33), names are accepted in any case without
+# `SIG`, `-l` and `-p` are illegal options that end the shell with status 2, a signal it cannot
+# read is `trap: NAME: bad trap` (status 1, the signals before it already set and the ones after
+# it not), a first operand that is a signal resets every operand, and `DEBUG`, `ERR` and `RETURN`
+# do not exist. The `EXIT` handler runs when the shell ends, and not in a subshell or a shell it
+# starts. Each reply was produced by `bash --noprofile --norc --noediting -i` started as a login
+# shell (`exec -a -bash`) in the localhost/propolis-survey-ref:jammy container (bash 5.1.16, dash
+# 0.5.11), run with `--network none`, PS1 and PS2 set to markers and these lines fed one at a time
+# on standard input; the `sh` they run is dash as /bin/sh.
+# source: ubuntu:22.04 container run of dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ sh -c 'trap'
+$ sh -c 'trap "echo bye" EXIT; trap'
+> trap -- 'echo bye' EXIT
+> bye
+$ sh -c 'trap "echo bye" EXIT; echo body'
+> body
+> bye
+$ sh -c 'trap -p; echo after'; echo "rc=$?"
+> sh: 1: trap: Illegal option -p
+> rc=2
+$ sh -c 'trap -l; echo "rc=$?"'
+> sh: 1: trap: Illegal option -l
+$ sh -c 'trap "echo int" INT; trap "echo hup" 1; trap'
+> trap -- 'echo hup' HUP
+> trap -- 'echo int' INT
+$ sh -c 'trap "echo int" INT; trap - INT; trap'
+$ sh -c 'trap "" TERM; trap'
+> trap -- '' TERM
+$ sh -c 'trap "x" USR1 USR2; trap'
+> trap -- 'x' USR1
+> trap -- 'x' USR2
+$ sh -c 'trap "echo e" NOSUCH; echo "rc=$?"'
+> trap: NOSUCH: bad trap
+> rc=1
+$ sh -c 'trap "echo e" 99; echo "rc=$?"'
+> trap: 99: bad trap
+> rc=1
+$ sh -c 'trap "echo e" -1; echo "rc=$?"'
+> trap: -1: bad trap
+> rc=1
+$ sh -c 'trap "echo e" 65; echo "rc=$?"'
+> trap: 65: bad trap
+> rc=1
+$ sh -c 'trap "echo e" 64; echo "rc=$?"; trap'
+> rc=0
+> trap -- 'echo e' RTMAX
+$ sh -c 'trap INT; trap'
+$ sh -c 'trap "echo q" INT; trap INT; trap'
+$ sh -c 'trap "echo q" INT; trap - INT; trap'
+$ sh -c 'trap "echo q" SIGINT; trap'
+> trap: SIGINT: bad trap
+$ sh -c 'trap "echo q" int; trap; echo "rc=$?"'
+> trap -- 'echo q' INT
+> rc=0
+$ sh -c 'trap "echo x" KILL; echo "rc=$?"; trap'
+> rc=0
+> trap -- 'echo x' KILL
+$ sh -c 'trap "echo x" 9; echo "rc=$?"; trap'
+> rc=0
+> trap -- 'echo x' KILL
+$ sh -c 'trap "echo dbg" DEBUG; echo "rc=$?"; trap'
+> trap: DEBUG: bad trap
+> rc=1
+$ sh -c 'trap "echo err" ERR; echo "rc=$?"; trap'
+> trap: ERR: bad trap
+> rc=1
+$ sh -c 'trap - ; echo "rc=$?"; trap'
+> trap: -: bad trap
+> rc=1
+$ sh -c 'trap -- ""; echo "rc=$?"; trap'
+> trap: : bad trap
+> rc=1
+$ sh -c 'trap "" EXIT; trap'
+> trap -- '' EXIT
+$ sh -c 'trap "x" CHLD WINCH; trap'
+> trap -- 'x' CHLD
+> trap -- 'x' WINCH
+$ sh -c 'trap "x" 1 2 3 15; trap'
+> trap -- 'x' HUP
+> trap -- 'x' INT
+> trap -- 'x' QUIT
+> trap -- 'x' TERM
+$ sh -c 'trap "x" 0 1 2; trap; trap - 0 1 2; trap'
+> trap -- 'x' EXIT
+> trap -- 'x' HUP
+> trap -- 'x' INT
+$ sh -c 'trap "x" 16 32 33 34 35 RTMAX-1; trap'
+> trap -- 'x' 16
+> trap -- 'x' 32
+> trap -- 'x' 33
+> trap -- 'x' RTMIN
+> trap -- 'x' RTMIN+1
+> trap -- 'x' RTMAX-1
+$ sh -c 'trap "x" 0 STKFLT 2; trap'
+> trap: STKFLT: bad trap
+> trap -- 'x' EXIT
+> sh: 1: x: not found
+$ sh -c 'trap "" INT QUIT; trap'
+> trap -- '' INT
+> trap -- '' QUIT
+$ sh -c 'trap 1 EXIT; trap'
+$ sh -c 'trap 1 2; echo "rc=$?"; trap'
+> rc=0
+$ sh -c 'trap "echo bye" EXIT; exit 3'; echo "rc=$?"
+> bye
+> rc=3
+$ sh -c 'trap "echo bye; exit 5" EXIT; exit 3'; echo "rc=$?"
+> bye
+> rc=5
+$ sh -c 'trap "echo bye \$?" EXIT; false'; echo "rc=$?"
+> bye 1
+> rc=1
+$ sh -c 'trap "echo bye" EXIT; (echo sub)'
+> sub
+> bye
+$ sh -c 'trap "echo bye" EXIT; (trap)'
+> bye
+$ sh -c 'trap "echo bye" EXIT; sh -c "echo inner"'
+> inner
+> bye
+$ sh -c 'trap "echo bye" EXIT; sh -c "trap"'
+> bye
+$ sh -c 'trap "echo bye" EXIT; f() { trap "echo infn" EXIT; }; f; trap'
+> trap -- 'echo infn' EXIT
+> infn
+$ sh -c 'trap "echo one" EXIT; trap "echo two" EXIT'
+> two
+$ sh -c 'trap "echo got" USR1; kill -USR1 $$; echo after'
+> got
+> after
+$ sh -c 'trap "echo got" TERM; kill $$; echo after'
+> got
+> after
+$ sh -c 'trap "" TERM; kill $$; echo after'
+> after
+$ sh -c 'trap "echo bye" EXIT; trap - EXIT; echo end'
+> end
+$ sh -c 'trap "echo bye" EXIT; trap EXIT; echo end'
+> end
+$ sh -c 'trap "echo bye" EXIT; return 2'; echo "rc=$?"
+> bye
+> rc=2
+$ sh -c 'trap "echo A" EXIT; trap "echo B" EXIT; echo end'
+> end
+> B
+$ sh -c 'echo start; trap "echo exit-trap; echo second-line" EXIT; echo end'
+> start
+> end
+> exit-trap
+> second-line
+$ sh -c 'trap "echo T1" EXIT
+$ echo L2
+$ trap "echo T2" EXIT
+$ echo L4'
+> L2
+> L4
+> T2

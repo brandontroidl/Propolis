@@ -179,6 +179,12 @@
   `exec` is reported as one run any other way is. dash's wording for a redirection it cannot make
   (`cannot create X: Directory nonexistent`, status 2) replaces bash's. Two session fixtures
   replay replies from the reference container.
+- **`times`** - the fake shell answered `times: command not found`. It now prints the two lines of
+  CPU time bash and dash print (the shell's own user and system time, then its children's),
+  derived from the same process model `time` uses so the two agree: starting commands and `dd`
+  grow the children's figures, a subshell or a fresh `sh -c` starts at zero, bash refuses an option
+  with its usage line and dash prints microseconds. A session fixture replays the deterministic
+  cases from the reference container.
 
 ### Changed
 

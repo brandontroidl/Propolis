@@ -1,0 +1,55 @@
+# `times` in an interactive login bash on Ubuntu 22.04 and in the dash behind /bin/sh: the two
+# lines of CPU time (the shell's own, then its children's), `0m0.000s` in bash and `0m0.000000s` in
+# dash, all zero in a subshell, a command substitution or a fresh `sh -c`; bash takes no option
+# (`times: -x: invalid option`, usage line, status 2) and ignores operands, dash ignores both;
+# `times` is a shell builtin in bash and a special one in dash. The figures of a long-running login
+# shell vary from run to run, so only the cases that are always zero are recorded here. Each reply
+# was produced by `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`)
+# in the localhost/propolis-survey-ref:jammy container (bash 5.1.16, dash 0.5.11), run with
+# `--network none`, PS1 and PS2 set to markers and these lines fed one at a time on standard input.
+# source: ubuntu:22.04 container run of bash 5.1.16 and dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ times -x
+> -bash: times: -x: invalid option
+> times: usage: times
+$ echo $?
+> 2
+$ times foo >/dev/null
+$ echo $?
+> 0
+$ (times)
+> 0m0.000s 0m0.000s
+> 0m0.000s 0m0.000s
+$ echo $(times)
+> 0m0.000s 0m0.000s 0m0.000s 0m0.000s
+$ sh -c 'times'
+> 0m0.000000s 0m0.000000s
+> 0m0.000000s 0m0.000000s
+$ sh -c 'times; echo $?'
+> 0m0.000000s 0m0.000000s
+> 0m0.000000s 0m0.000000s
+> 0
+$ sh -c 'times -x; echo $?'
+> 0m0.000000s 0m0.000000s
+> 0m0.000000s 0m0.000000s
+> 0
+$ sh -c 'times foo; echo $?'
+> 0m0.000000s 0m0.000000s
+> 0m0.000000s 0m0.000000s
+> 0
+$ sh -c '/bin/true; /bin/true; times'
+> 0m0.000000s 0m0.000000s
+> 0m0.000000s 0m0.000000s
+$ sh -c 'sleep 1; times'
+> 0m0.000000s 0m0.000000s
+> 0m0.000000s 0m0.000000s
+$ sh -c 'type times'
+> times is a special shell builtin
+$ type times
+> times is a shell builtin
+$ command -v times
+> times
+$ times >/dev/null; echo $?
+> 0

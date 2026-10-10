@@ -173,3 +173,85 @@ fn history_lists_the_interactive_lines_and_nothing_on_exec() {
         ("".into(), "sh: 1: history: not found\n".into(), 127)
     );
 }
+
+/// The cells of `times` output: user and system of the shell, then of its children.
+fn cells(out: &str) -> Vec<String> {
+    out.split_whitespace().map(str::to_string).collect()
+}
+
+/// A figure `0mS.mmms` in milliseconds.
+fn cell_ms(cell: &str) -> u64 {
+    let (minutes, rest) = cell.split_once('m').unwrap();
+    let seconds: f64 = rest.trim_end_matches('s').parse().unwrap();
+    minutes.parse::<u64>().unwrap() * 60_000 + (seconds * 1000.0).round() as u64
+}
+
+#[test]
+fn times_prints_the_shells_time_then_its_childrens_and_both_grow_with_the_work() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    let first = cells(&answer(&mut sh, "times").0);
+    // The recorded first `times` of a login bash: a few milliseconds of its own, none of children.
+    assert_eq!(first, vec!["0m0.002s", "0m0.002s", "0m0.000s", "0m0.000s"]);
+    answer(
+        &mut sh,
+        "dd if=/dev/zero of=/tmp/t bs=1M count=300 2>/dev/null",
+    );
+    answer(&mut sh, "for i in 1 2 3 4 5 6 7 8 9 10; do uname; done");
+    let later = cells(&answer(&mut sh, "times").0);
+    assert!(
+        cell_ms(&later[3]) > cell_ms(&first[3]),
+        "dd costs system time"
+    );
+    assert!(cell_ms(&later[2]) > 0, "children spent user time");
+    assert!(cell_ms(&later[0]) >= cell_ms(&first[0]));
+    assert_eq!(answer(&mut sh, "times").2, 0);
+}
+
+#[test]
+fn times_starts_at_zero_in_a_subshell_a_substitution_and_a_fresh_shell() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    answer(&mut sh, "/bin/true");
+    assert_eq!(
+        answer(&mut sh, "(times)").0,
+        "0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n"
+    );
+    assert_eq!(
+        answer(&mut sh, "sh -c times").0,
+        "0m0.000000s 0m0.000000s\n0m0.000000s 0m0.000000s\n"
+    );
+    assert_eq!(
+        answer(&mut sh, "echo $(times)").0,
+        "0m0.000s 0m0.000s 0m0.000s 0m0.000s\n"
+    );
+}
+
+#[test]
+fn bash_times_takes_no_option_and_ignores_operands_while_dash_ignores_both() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    assert_eq!(
+        answer(&mut sh, "times -x"),
+        (
+            "".into(),
+            "-bash: times: -x: invalid option\ntimes: usage: times\n".into(),
+            2
+        )
+    );
+    assert_eq!(answer(&mut sh, "times foo").2, 0);
+    assert_eq!(answer(&mut sh, "times foo").0.lines().count(), 2);
+    assert_eq!(
+        answer(&mut sh, "sh -c 'times -x; echo $?'").0,
+        "0m0.000000s 0m0.000000s\n0m0.000000s 0m0.000000s\n0\n"
+    );
+}
+
+#[test]
+fn times_follows_its_redirections_and_is_a_shell_builtin() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    assert_eq!(answer(&mut sh, "times >/dev/null").0, "");
+    answer(&mut sh, "times > /tmp/tt");
+    assert_eq!(answer(&mut sh, "cat /tmp/tt").0.lines().count(), 2);
+    assert_eq!(
+        answer(&mut sh, "type times").0,
+        "times is a shell builtin\n"
+    );
+}

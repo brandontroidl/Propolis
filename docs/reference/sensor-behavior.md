@@ -469,6 +469,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `-z`. A download run through `exec` is recorded as one run any other way is. Replies are from
   bash 5.1.16 and dash 0.5.11; the phone's `exec` is dash's [inferred]. Not modeled: `exec` of a
   program that replaces the shell with a different one (the command just runs), and `/dev/tcp`.
+  `times` (`crates/sensor-framework/src/shell/timing.rs`) prints the shell's own user and system CPU
+  time, then its children's, from the same process model `time` uses: a command started from a file
+  adds to the children, `dd` to their system time, and the shell spends a 2 ms base plus a share of
+  that. bash and the phone's shell print `0m0.002s`, dash `0m0.002000s`; a subshell, a command
+  substitution and a `sh -c` are new processes and print zeros. bash takes no option (`times -x` is
+  `times: -x: invalid option` and a usage line, status 2) and ignores operands; dash ignores both.
+  Real figures vary from run to run, so the fixture pins only the cases that are always zero and the
+  option errors, and the growth is pinned by unit tests; the phone's format is bash's [inferred].
   bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
   the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
   dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it

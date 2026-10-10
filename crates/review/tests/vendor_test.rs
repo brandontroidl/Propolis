@@ -9,8 +9,8 @@
 //! bodies these adapters build) to serve one canned response and capture the
 //! one request the adapter under test sends. See `respond_once`.
 //!
-//! Unlike `gatekeeper_test.rs`/`queue_test.rs`, nothing here touches the
-//! shared `propolis_test` database - every test binds its own OS-assigned
+//! Unlike `gatekeeper_test.rs`/`queue_test.rs`, nothing here touches a
+//! database - every test binds its own OS-assigned
 //! loopback port, so this file runs safely under the default parallel test
 //! runner (no `--test-threads=1` needed).
 //!

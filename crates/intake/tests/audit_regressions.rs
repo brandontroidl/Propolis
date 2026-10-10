@@ -1,14 +1,12 @@
 // Regression cover for the 2026-09-17 audit finding "intake can permanently skip events after a
 // temporary database failure".
 //
-// Like `end_to_end.rs`, these require a running PostgreSQL instance and share ONE database across
-// the test binary, so the suite must run with `--test-threads=1` and every test uses its own
-// source IP.
+// Like `end_to_end.rs`, these require a running PostgreSQL instance and give each test its own
+// database (`#[sqlx::test]`).
 //
 // The database failure is injected with a BEFORE INSERT trigger on `event` that raises. The
-// trigger is installed and dropped inside the test; a panic between the two would leave it behind
-// and fail every later insert in the shared database, so the drop runs through a guard rather
-// than an assertion-ordered statement.
+// trigger lives only in the test's own database, so a panic between installing and dropping it
+// cannot fail inserts for any other test.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -23,15 +21,11 @@ use sqlx::PgPool;
 
 const PROBE_GRACE: Duration = Duration::from_secs(600);
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    pool
 }
 
 fn event(source_ip: &str) -> SensorEvent {
@@ -52,53 +46,28 @@ fn event(source_ip: &str) -> SensorEvent {
     }
 }
 
-/// Installs the raising trigger for as long as it is held, and removes it on drop so a failing
-/// assertion cannot poison the shared database for the rest of the binary.
-struct FailingInserts(PgPool);
+async fn install_failing_inserts(pool: &PgPool) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION audit_fail() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'audit transient failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER audit_fail BEFORE INSERT ON event \
+         FOR EACH ROW EXECUTE FUNCTION audit_fail()",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
 
-impl FailingInserts {
-    async fn install(pool: &PgPool) -> Self {
-        sqlx::query(
-            "CREATE OR REPLACE FUNCTION audit_fail() RETURNS trigger LANGUAGE plpgsql AS \
-             $$ BEGIN RAISE EXCEPTION 'audit transient failure'; END $$",
-        )
+async fn remove_failing_inserts(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER audit_fail ON event")
         .execute(pool)
         .await
         .unwrap();
-        sqlx::query(
-            "CREATE TRIGGER audit_fail BEFORE INSERT ON event \
-             FOR EACH ROW EXECUTE FUNCTION audit_fail()",
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        Self(pool.clone())
-    }
-
-    async fn remove(self) {
-        drop_trigger(&self.0).await;
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for FailingInserts {
-    fn drop(&mut self) {
-        let pool = self.0.clone();
-        // Only reached on the panic path; the happy path goes through `remove`.
-        std::thread::spawn(move || {
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async move { drop_trigger(&pool).await });
-        })
-        .join()
-        .ok();
-    }
-}
-
-async fn drop_trigger(pool: &PgPool) {
-    let _ = sqlx::query("DROP TRIGGER IF EXISTS audit_fail ON event")
-        .execute(pool)
-        .await;
 }
 
 /// A transient database error must not cost the event, and recovery must not require a restart.
@@ -107,9 +76,9 @@ async fn drop_trigger(pool: &PgPool) {
 /// batch, so a runner that merely declines to persist on error still starts the NEXT poll past the
 /// failed line. That poll reads nothing, reports `errors == 0`, and persists the advanced cursor -
 /// permanently skipping an event the ledger never received, with no crash and no restart involved.
-#[tokio::test]
-async fn database_error_is_retried_without_a_process_restart() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn database_error_is_retried_without_a_process_restart(pool: PgPool) {
+    migrate(&pool).await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
     let cursor_dir = dir.path().join("cursor");
@@ -135,9 +104,9 @@ async fn database_error_is_retried_without_a_process_restart() {
         .await
         .unwrap();
 
-    let failing = FailingInserts::install(&pool).await;
+    install_failing_inserts(&pool).await;
     let failed = runner.run_batch().await;
-    failing.remove().await;
+    remove_failing_inserts(&pool).await;
     assert_eq!(failed.errors, 1, "the injected failure should surface");
     assert_eq!(failed.ingested, 0);
 

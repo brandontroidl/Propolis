@@ -1,17 +1,12 @@
-//! Real-Postgres tests for `FeedBuilder::build`, sharing the persistent `propolis_test` database
-//! with other crates' tests (see the project's `local-gate-toolchain` note). Every test seeds
-//! distinct source IPs outside every reserved range (see `crates/feed/tests/exclusion_test.rs` for
+//! Real-Postgres tests for `FeedBuilder::build`. Each test owns a fresh database
+//! (`#[sqlx::test]`): `event_count` and the raw score accumulate per source IP across every
+//! `append_event` call, and the build and `ReviewQueue::populate` read whole tables, so a shared
+//! database would let earlier runs and other crates' rows change a result. Resetting a shared one
+//! meant `DELETE FROM event`, which severs the hash chain every other suite verifies. Every test
+//! seeds source IPs outside every reserved range (see `crates/feed/tests/exclusion_test.rs` for
 //! why 45.10.30.0/24 and a made-up IPv6 prefix are used as "ordinary public address" fixtures
 //! rather than the RFC5737 ranges other crates' tests use - this crate's own exclusion engine
-//! would otherwise filter those RFC5737 fixtures straight back out). Run with
-//! `--test-threads=1`, same as `intake`/`review`: `append_event` serializes via a Postgres
-//! advisory lock scoped to a transaction, not a test.
-//!
-//! `reset_ip` wipes leftover `event`/`ip_score` rows for a test's IP before seeding, matching
-//! `review`'s `reset_ip`/`reset_vendor` discipline for rerun-safety against this same persistent,
-//! never-reset database: `event_count` and the raw score accumulate per source IP across every
-//! `append_event` call ever made against it, so re-running this suite a second time without a
-//! reset would double up on these fixed IPs and desync every count/tier assertion below.
+//! would otherwise filter those RFC5737 fixtures straight back out).
 //!
 //! Event timestamps use `Utc::now()` (captured once per test), not a fixed historical string:
 //! `FeedBuilder::build` reads scores via `core_scoring::read_score`, which decays to the ACTUAL
@@ -27,37 +22,12 @@ use feed::{ExclusionEngine, FeedBuilder, FeedConfig};
 use review::queue::ReviewQueue;
 use sqlx::PgPool;
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    review::migrator().run(&pool).await.unwrap();
-    pool
-}
-
-/// Deletes any leftover `ip_score`/`event` rows for `ip` from a previous run of this suite. See
-/// the module doc comment for why this is required for rerun-safety, not merely tidy.
-async fn reset_ip(pool: &PgPool, ip: IpAddr) {
-    let ip_txt = ip.to_string();
-    sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
-        .bind(&ip_txt)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM ip_score WHERE source_ip = $1::inet")
-        .bind(&ip_txt)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM event WHERE source_ip = $1::inet")
-        .bind(&ip_txt)
-        .execute(pool)
-        .await
-        .unwrap();
+    review::migrator().run(pool).await.unwrap();
 }
 
 fn ev(
@@ -96,7 +66,6 @@ async fn seed_qualifying(
     honeypot_signal: SignalType,
     now: DateTime<Utc>,
 ) {
-    reset_ip(pool, ip).await;
     append_event(pool, ev(ip, honeypot_signal, Protocol::Tcp, true, now))
         .await
         .unwrap();
@@ -113,9 +82,9 @@ async fn seed_qualifying(
     queue.approve(pool, ip, None).await.unwrap();
 }
 
-#[tokio::test]
-async fn aggressive_and_standard_entries_are_built_sorted_and_isolated_by_tier() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn aggressive_and_standard_entries_are_built_sorted_and_isolated_by_tier(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
 
     // Two Aggressive-tier IPs, seeded in descending order to prove the output re-sorts ascending.
@@ -182,12 +151,11 @@ async fn aggressive_and_standard_entries_are_built_sorted_and_isolated_by_tier()
     assert!(!snapshot.aggressive.iter().any(|e| e.source_ip == std_ip));
 }
 
-#[tokio::test]
-async fn ineligible_single_event_ip_never_appears() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn ineligible_single_event_ip_never_appears(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.60".parse().unwrap();
-    reset_ip(&pool, ip).await;
 
     // A single event: event_count=1 fails the eligibility floor (needs >=2) regardless of weight.
     append_event(
@@ -217,12 +185,11 @@ async fn ineligible_single_event_ip_never_appears() {
     assert!(!snapshot.standard.iter().any(|e| e.source_ip == ip));
 }
 
-#[tokio::test]
-async fn recommended_but_tier_none_is_excluded_fail_closed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn recommended_but_tier_none_is_excluded_fail_closed(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.70".parse().unwrap();
-    reset_ip(&pool, ip).await;
 
     // raw = 40 (HoneypotConnection) + 15 (CatchallProbe) = 55, in [50, 75): eligible
     // (confirmed-real honeypot + a second category) and recommended_for_blocklist (effective
@@ -259,9 +226,9 @@ async fn recommended_but_tier_none_is_excluded_fail_closed() {
     assert!(!snapshot.standard.iter().any(|e| e.source_ip == ip));
 }
 
-#[tokio::test]
-async fn delisted_qualifying_ip_is_excluded_from_output() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn delisted_qualifying_ip_is_excluded_from_output(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.80".parse().unwrap();
 
@@ -289,7 +256,6 @@ async fn delisted_qualifying_ip_is_excluded_from_output() {
 /// Like `seed_qualifying` but the honeypot event carries a crawler User-Agent, as the HTTP sensor
 /// records it.
 async fn seed_claiming_crawler(pool: &PgPool, ip: IpAddr, now: DateTime<Utc>) {
-    reset_ip(pool, ip).await;
     let claimed = EventInput::from_signal(
         ip,
         None,
@@ -316,9 +282,11 @@ async fn seed_claiming_crawler(pool: &PgPool, ip: IpAddr, now: DateTime<Utc>) {
     queue.approve(pool, ip, None).await.unwrap();
 }
 
-#[tokio::test]
-async fn a_claimed_crawler_is_published_unless_its_address_is_in_an_operator_range_file() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn a_claimed_crawler_is_published_unless_its_address_is_in_an_operator_range_file(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
     let now = Utc::now();
     let spoofer: IpAddr = "45.10.30.201".parse().unwrap();
     let listed: IpAddr = "45.10.30.202".parse().unwrap();
@@ -359,9 +327,9 @@ async fn a_claimed_crawler_is_published_unless_its_address_is_in_an_operator_ran
     );
 }
 
-#[tokio::test]
-async fn all_output_timestamps_are_coarsened_to_hour_boundaries() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn all_output_timestamps_are_coarsened_to_hour_boundaries(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.95".parse().unwrap();
 
@@ -387,9 +355,9 @@ async fn all_output_timestamps_are_coarsened_to_hour_boundaries() {
     assert_eq!(entry.valid_from, snapshot.build_time);
 }
 
-#[tokio::test]
-async fn ipv6_source_ip_is_supported_end_to_end() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn ipv6_source_ip_is_supported_end_to_end(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "2003:aaaa:bbbb::42".parse().unwrap();
 
@@ -410,9 +378,9 @@ async fn ipv6_source_ip_is_supported_end_to_end() {
     assert!(matches!(entry.source_ip, IpAddr::V6(_)));
 }
 
-#[tokio::test]
-async fn db_error_during_build_fails_closed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn db_error_during_build_fails_closed(pool: PgPool) {
+    migrate(&pool).await;
     pool.close().await;
 
     let exclusions = ExclusionEngine::new(Vec::new(), Vec::new());
@@ -424,12 +392,11 @@ async fn db_error_during_build_fails_closed() {
     );
 }
 
-#[tokio::test]
-async fn eligible_ip_without_approval_is_excluded_from_feed() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn eligible_ip_without_approval_is_excluded_from_feed(pool: PgPool) {
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.99".parse().unwrap();
-    reset_ip(&pool, ip).await;
 
     // Seed events that cross the eligibility gate (confirmed-real + multi-category),
     // but do NOT approve through the review queue.
@@ -471,16 +438,15 @@ async fn eligible_ip_without_approval_is_excluded_from_feed() {
     );
 }
 
-#[tokio::test]
-async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered() {
+#[sqlx::test(migrations = false)]
+async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered(pool: PgPool) {
     // `distinct_categories` is a count over five coarse sensor classes and says nothing about what
     // an address did. This is the field a consumer filters on to keep malware uploaders and drop
     // port-scan noise, so it must reflect the events actually recorded, deduplicated and sorted.
-    let pool = setup_pool().await;
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.77".parse().unwrap();
 
-    reset_ip(&pool, ip).await;
     // Two events of the SAME type, so a missing DISTINCT would show up as a duplicate, plus two
     // others - seeded out of alphabetical order so the sort is proven rather than coincidental.
     append_event(
@@ -549,12 +515,12 @@ async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered(
     );
 }
 
-#[tokio::test]
-async fn retention_windows_are_built_with_their_configured_label_and_duration() {
+#[sqlx::test(migrations = false)]
+async fn retention_windows_are_built_with_their_configured_label_and_duration(pool: PgPool) {
     // The window label is the published filename (`all-{label}.txt`) and the retention it carries
     // is what that file's header states, so a window whose label and duration disagree would
     // advertise a coverage it does not have.
-    let pool = setup_pool().await;
+    migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.78".parse().unwrap();
     seed_qualifying(&pool, ip, SignalType::HoneypotMalwareUpload, now).await;

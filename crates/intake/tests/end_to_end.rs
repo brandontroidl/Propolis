@@ -1,8 +1,6 @@
-// These tests require a running PostgreSQL instance (propolis-pg container) and share ONE
-// database across the whole test binary (no per-test isolated database, unlike core-scoring's
-// `#[sqlx::test]`). Every test therefore uses unique source IPs to avoid cross-test interference,
-// and the suite must run with `--test-threads=1` since `append_event` serializes via a Postgres
-// advisory lock that is scoped to a transaction, not a test.
+// These tests require a running PostgreSQL instance. Each test owns a fresh database
+// (`#[sqlx::test]`), so source IPs, event counts and the hash chain are never shared with another
+// test, another run or another crate's suite.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -24,15 +22,11 @@ fn no_probe_sources() -> Arc<HashSet<IpAddr>> {
     Arc::new(HashSet::new())
 }
 
-async fn setup_pool() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://propolis:propolis@localhost:5432/propolis_test".into());
-    let pool = PgPool::connect(&url).await.unwrap();
+async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .unwrap();
-    pool
 }
 
 fn write_event_line(path: &std::path::Path, event: &SensorEvent) {
@@ -96,8 +90,8 @@ async fn ingest_single_event_appears_in_ledger(pool: PgPool) {
     // restating the implementation.
     //
     // This is why the test needs its own database: `event_count` accumulates permanently per
-    // source IP, so on the shared, never-reset database a second run of this same test would push
-    // the count to 2 and flip the assertion. It passed once and failed on re-run.
+    // source IP, so on a database shared across runs a second run of this same test would push
+    // the count to 2 and flip the assertion.
     assert!(!score.eligible);
 }
 
@@ -180,9 +174,9 @@ async fn a_telemetry_line_reaches_the_ledger_through_intake_and_scores_nothing(p
     ));
 }
 
-#[tokio::test]
-async fn unknown_signal_type_rejected_cursor_advances() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn unknown_signal_type_rejected_cursor_advances(pool: PgPool) {
+    migrate(&pool).await;
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
 
@@ -244,14 +238,9 @@ async fn unknown_signal_type_rejected_cursor_advances() {
     assert!(score.is_some());
 }
 
-/// Runs on its OWN database, unlike every other test in this file.
-///
 /// `verify_chain` is a whole-table assertion: it walks every row in `event` and checks the hash
-/// linkage end to end. On the database this suite otherwise shares, other crates' tests legitimately
-/// `DELETE FROM event` to reset their own fixtures, and deleting any row from a hash-chained table
-/// severs the chain - so this test failed for a reason that had nothing to do with intake, and would
-/// fail for every future run of `cargo test --workspace` against one database. A global assertion
-/// needs an isolated database by its nature; the per-IP tests around it do not.
+/// linkage end to end, so it only means something on a database no other test has written to or
+/// deleted from. Deleting any row from a hash-chained table severs the chain.
 #[sqlx::test(migrations = false)]
 async fn hash_chain_intact_after_ingestion(pool: PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
@@ -294,9 +283,9 @@ async fn hash_chain_intact_after_ingestion(pool: PgPool) {
     assert!(matches!(status, ChainStatus::Intact));
 }
 
-#[tokio::test]
-async fn rotation_survival_no_events_lost() {
-    let pool = setup_pool().await;
+#[sqlx::test(migrations = false)]
+async fn rotation_survival_no_events_lost(pool: PgPool) {
+    migrate(&pool).await;
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("events.jsonl");
     let cursor_dir = dir.path().join("cursors");

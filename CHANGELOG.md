@@ -174,6 +174,15 @@
 
 ### Fixed
 
+- **The feed and intake database tests no longer share a database** - the feed builder tests
+  (11), intake's `audit_regressions` and two of the `end_to_end` tests ran on one persistent
+  database and reset it by hand. The feed suite's `DELETE FROM event` severed the shared
+  database's hash chain (two runs left `verify_chain` reporting broken), a row another suite had
+  left for `203.0.113.8` failed `unknown_signal_type_rejected_cursor_advances`, and the audit test's
+  failure-injecting trigger on `event` failed other tests' inserts if a run was killed before it
+  was dropped. Each now runs on its own `#[sqlx::test]` database, so there is no reset to be
+  incomplete and the trigger can only affect its own test. Test-only; the other database tests in
+  the workspace already ran this way.
 - **Two flaky tests are deterministic** - the review fetcher's
   `a_claim_hides_its_rows_until_recorded_or_the_lease_lapses` failed about one run in three
   because `claim_candidates` is global (it syncs every download event and selects across all of

@@ -88,8 +88,8 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
 - **Total: 4025 test functions** (2519 unit + 1506 integration).
-- **DB-backed (`sqlx::test`): 397** - console 213, review 97, core-scoring 44,
-  intake 27, fleet 9, propolis 7. These provision a fresh database per test.
+- **DB-backed (`sqlx::test`): 411** - console 213, review 97, core-scoring 44,
+  intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -158,7 +158,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (43 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (351 uses) - needed wherever a test needs more than
+  applies migrations manually (365 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

@@ -85,8 +85,7 @@ impl MockVendor {
     }
 
     /// Every report submitted whose `source_ip` is exactly `ip` - immune to
-    /// any OTHER approved IP the shared `propolis_test` database also hands
-    /// this vendor.
+    /// any OTHER approved IP the test's database also hands this vendor.
     fn submissions_for(&self, ip: IpAddr) -> Vec<VendorReport> {
         self.submissions
             .lock()

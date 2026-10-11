@@ -839,8 +839,9 @@ impl FakeShell {
     /// What a bare `sh` or `bash` does with a script piped to it: run it as a script in a shell
     /// level of its own. `None` when standard input is a terminal.
     pub(super) fn take_piped_script(&mut self) -> Option<String> {
+        let cap = self.read_cap();
         self.stdin
-            .take_script()
+            .take_script(cap)
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 }

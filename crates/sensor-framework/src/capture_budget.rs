@@ -245,6 +245,20 @@ impl CaptureBody {
         (self.chunks.len() as u64).saturating_mul(CAPTURE_CHUNK_BYTES)
     }
 
+    /// Moves the bytes out to be read in place by something that must own them (the fake shell's
+    /// standard input), leaving the body empty. The chunk reservations stay with the body, so the
+    /// bytes remain charged for as long as the body lives, whichever way the borrower ends -
+    /// including a panic, which drops the body and refunds. Give them back with
+    /// [`Self::restore_bytes`].
+    pub fn lend_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
+    /// Returns bytes taken by [`Self::lend_bytes`].
+    pub fn restore_bytes(&mut self, bytes: Vec<u8>) {
+        self.buf = bytes;
+    }
+
     /// Consumes the body and returns its bytes. The chunk reservations are released on return, so
     /// the returned `Vec` is no longer charged: the caller owns that memory from here.
     pub fn into_bytes(self) -> Vec<u8> {
@@ -310,6 +324,30 @@ mod tests {
         .join();
         assert!(res.is_err());
         assert_eq!(b.current_bytes(), 0);
+    }
+
+    #[test]
+    fn lent_bytes_stay_charged_until_the_body_drops_and_come_back_whole() {
+        let b = Arc::new(CaptureMemoryBudget::new(10 * CAPTURE_CHUNK_BYTES));
+        let mut body = CaptureBody::with_budget(b.clone());
+        body.extend_from_slice(b"payload").unwrap();
+        let charged = b.current_bytes();
+        assert_eq!(charged, CAPTURE_CHUNK_BYTES);
+        let lent = body.lend_bytes();
+        assert_eq!(lent, b"payload");
+        assert!(body.is_empty());
+        assert_eq!(
+            b.current_bytes(),
+            charged,
+            "lending does not release the charge"
+        );
+        body.restore_bytes(lent);
+        assert_eq!(body.as_slice(), b"payload");
+        // A borrower that never returns the bytes (it panicked) still refunds with the body.
+        let lent = body.lend_bytes();
+        drop(body);
+        assert_eq!(b.current_bytes(), 0);
+        drop(lent);
     }
 
     #[test]

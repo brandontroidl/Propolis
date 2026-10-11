@@ -339,7 +339,10 @@ impl FakeShell {
                 out.truncate(clamp(cap));
                 out
             }
-            (unit, true) => without_last(self.stdin.take_rest(), unit, args.count.n),
+            (unit, true) => {
+                let all = self.stdin.take_rest(self.read_cap());
+                without_last(all, unit, args.count.n)
+            }
         }
     }
 
@@ -395,7 +398,7 @@ impl FakeShell {
     }
 
     fn tail_stdin(&mut self, args: &TailArgs<'_>, cap: u64) -> Vec<u8> {
-        let mut all = self.stdin.take_rest();
+        let mut all = self.stdin.take_rest(cap);
         all.truncate(clamp(cap));
         tail_of(all, args)
     }

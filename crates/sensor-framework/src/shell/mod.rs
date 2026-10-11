@@ -487,13 +487,13 @@ pub struct FakeShell {
     /// When the session began on the shell's clock: the start time of the processes the session
     /// owns in the process table.
     session_started: chrono::DateTime<chrono::Utc>,
-    /// The line [`Self::start_line`] found waiting for its input, run by [`Self::finish_line`]
+    /// The line [`Self::start_line`] found waiting for its input, run by [`Self::finish_line_owned`]
     /// once the input has ended.
     held: Option<HeldLine>,
     /// The session input is a terminal (a login shell, or an exec channel with a pty), not a pipe.
     tty_input: bool,
     /// The status a read that waits for more session input ends its line with, while
-    /// [`Self::finish_line`] runs a line whose input was cut off; `None` when it ended normally.
+    /// [`Self::finish_line_owned`] runs a line whose input was cut off; `None` when it ended normally.
     input_interrupt: Option<u8>,
     /// How far into the session input the readers had got when the running command started, so
     /// a write it makes can be told apart as one carrying what it read.
@@ -573,7 +573,7 @@ pub enum LineStep {
     Ran(CommandResult),
     /// A command on the line reads standard input past what has arrived, so the line waits for
     /// it, as a real shell's command blocks in `read`. Nothing it did is kept: the shell is as it
-    /// was before the line, and [`FakeShell::finish_line`] runs it once its input has ended.
+    /// was before the line, and [`FakeShell::finish_line_owned`] runs it once its input has ended.
     AwaitingInput,
 }
 
@@ -1147,11 +1147,24 @@ impl FakeShell {
     /// Run the line [`Self::start_line`] left waiting, now that its input has ended: `input` is
     /// every byte the command can read, and `end` how the input ended. Nothing happens when no
     /// line is waiting.
+    ///
+    /// Tests only: it copies `input`. Production runs [`Self::finish_line_owned`], and keeping
+    /// this out of the non-test build is what makes a copy of a large held input unreachable.
+    #[cfg(test)]
     pub fn finish_line(&mut self, input: &[u8], end: InputEnd) -> CommandResult {
+        self.finish_line_owned(input.to_vec(), end).0
+    }
+
+    /// Run the line [`Self::start_line`] left waiting, as the tests' copying `finish_line` does, on an input
+    /// the shell reads in place: it hands the same buffer back, so a held input of N bytes costs
+    /// the line N bytes once, not once per copy. The buffer is the caller's to keep accounted
+    /// while the line runs.
+    pub fn finish_line_owned(&mut self, input: Vec<u8>, end: InputEnd) -> (CommandResult, Vec<u8>) {
         let Some(held) = self.held.take() else {
-            return CommandResult::silent(0);
+            return (CommandResult::silent(0), input);
         };
-        self.run_held(held, input, Some(end)).0
+        let (output, _, input) = self.run_held(held, input, Some(end));
+        (output, input)
     }
 
     /// Run the waiting line on the input typed so far, with more still able to come, as a real
@@ -1169,7 +1182,8 @@ impl FakeShell {
         held.attempts = held.attempts.saturating_add(1);
         let saved = self.checkpoint();
         let held = self.held.take()?;
-        let (output, wants_more) = self.run_held(held, input, None);
+        // Bounded by RESUME_BYTES above, so this copy is a small constant.
+        let (output, wants_more, _) = self.run_held(held, input.to_vec(), None);
         if wants_more {
             self.rollback(saved);
             return None;
@@ -1177,14 +1191,14 @@ impl FakeShell {
         Some(output)
     }
 
-    /// Run `held` on `input`: ended as `end` says, or still open with `None`. Returns the output
-    /// and whether a reader asked for more than `input` held.
+    /// Run `held` on `input`: ended as `end` says, or still open with `None`. Returns the output,
+    /// whether a reader asked for more than `input` held, and `input` itself back.
     fn run_held(
         &mut self,
         held: HeldLine,
-        input: &[u8],
+        input: Vec<u8>,
         end: Option<InputEnd>,
-    ) -> (CommandResult, bool) {
+    ) -> (CommandResult, bool, Vec<u8>) {
         self.begin_line();
         self.line_command = held.command.clone();
         self.trace = LineTrace {
@@ -1198,12 +1212,13 @@ impl FakeShell {
             Some(InputEnd::Interrupt) => Some(130),
             Some(InputEnd::Hangup) => Some(129),
         };
-        self.stdin = Stdin::session(input.to_vec(), end == Some(InputEnd::Eof), self.tty_input);
+        self.stdin = Stdin::session(input, end == Some(InputEnd::Eof), self.tty_input);
         let mut output = self.run_input(&held.decoded);
         let interrupted = self.stdin.is_blocked();
+        let input = self.stdin.take_session_bytes();
         if end.is_none() && interrupted {
             // Still waiting: the caller undoes this run.
-            return (output, true);
+            return (output, true, input);
         }
         self.input_interrupt = None;
         self.stdin = Stdin::Terminal;
@@ -1217,10 +1232,10 @@ impl FakeShell {
             output.append(CommandResult::stdout(b"\n".to_vec()));
             output.status = 130;
         }
-        (output, false)
+        (output, false, input)
     }
 
-    /// The file that holds what the last line run by [`Self::finish_line`] read from its input:
+    /// The file that holds what the last line run by [`Self::finish_line_owned`] read from its input:
     /// the first file written by a command that read it (`cat > f`, `dd of=f`, `base64 -d > f`).
     /// `None` when that input went nowhere a file holds (a bare `sh` ran it, it was discarded).
     pub fn input_destination(&self) -> Option<&str> {

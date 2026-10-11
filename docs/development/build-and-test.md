@@ -87,7 +87,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4222 test functions** (2705 unit + 1517 integration).
+- **Total: 4232 test functions** (2710 unit + 1522 integration).
 - **DB-backed (`sqlx::test`): 413** - console 213, review 99, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -136,19 +136,19 @@ Per-crate breakdown:
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 70 | arrival, env_strict, integration, tls |
-| sensor-framework | 1420 | 178 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, shell_replay, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1421 | 178 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, shell_replay, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 14 | 53 | arrival, env_strict, integration, tls_config |
 | sensor-http | 19 | 41 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 65 | 57 | arrival, env_strict, integration, shutdown_tracking, tls |
 | sensor-redis | 89 | 39 | arrival, env_strict, integration, tls |
 | sensor-smtp | 12 | 41 | arrival, env_strict, integration, tls |
-| sensor-ssh | 66 | 129 | arrival, auth_test, crypto_test, env_strict, integration, shell_test, shutdown_tracking, transport_test |
+| sensor-ssh | 70 | 134 | arrival, auth_test, crypto_test, env_strict, integration, output_backpressure, shell_test, shutdown_tracking, transport_test |
 | sensor-telnet | 60 | 50 | arrival, echo_loader, env_strict, infected_hold, integration, probe_payload, shutdown_tracking |
 | sensor-tftp | 37 | 42 | arrival, env_strict, integration, shutdown |
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2705** | **1517** | |
+| **Total** | **2710** | **1522** | |
 
 ### Test styles by layer
 

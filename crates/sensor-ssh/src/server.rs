@@ -22,8 +22,8 @@ use sensor_framework::{
     Arrival, BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody,
     CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, CommandEventConfig,
     CommandEventGate, ConnectionBounds, ConnectionBudget, EgressState, EventEmitter, HeldEnd,
-    HeldInput, InputMode, OutboxManifest, QuarantineSpool, StdinCaptures, UploadEnd, WanResolver,
-    default_capture_budget_bytes, limits_from,
+    HeldInput, InputMode, OutboxManifest, QuarantineSpool, Reservation, StdinCaptures, UploadEnd,
+    WanResolver, default_capture_budget_bytes, limits_from,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent, WIRE_VERSION,
@@ -57,6 +57,52 @@ const SSH_MSG_CHANNEL_EXTENDED_DATA: u8 = 95;
 const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const MAX_CHANNELS_PER_CONNECTION: usize = 10;
+
+/// The most one line can add to a channel's output queue. A line's output is bounded by its work
+/// budget (`BudgetLimits::work_per_line`, 4_194_304: measured exactly at the cap for `cat` of a
+/// larger input), and a pty doubles the worst case by turning every LF into CR-LF (`onlcr`).
+pub const LINE_OUTPUT_MAX_BYTES: u64 = 2 * BudgetLimits::standard().work_per_line;
+
+/// What a unit of work that can produce output (one packet's lines, one exec) reserves from the
+/// output budget before it runs: a line's worst case, plus 1 MiB for the echo, prompts and exit
+/// status around it. The work then hands out what it really queued; the rest is refunded.
+pub const OUTPUT_UNIT_BYTES: u64 = LINE_OUTPUT_MAX_BYTES + 1_048_576;
+
+/// A channel holding this much unsent output runs no further line until the peer reads it. One
+/// line's worth: the real shell would be blocked on a full pipe at about this point.
+pub const CHANNEL_QUEUED_MAX_BYTES: u64 = LINE_OUTPUT_MAX_BYTES;
+
+/// The same, for all of a connection's channels together: two lines' worth, equal to the
+/// connection's whole egress allowance (`BudgetLimits::egress_bytes`).
+pub const CONNECTION_QUEUED_MAX_BYTES: u64 = 2 * LINE_OUTPUT_MAX_BYTES;
+
+/// Ceiling on the output queued, and the input deferred behind it, across every connection of
+/// the sensor: 12.5% of the unit's 512M `MemoryMax`. Every queued byte holds a reservation of
+/// this budget until it is sent or its channel goes, so this is the bound, whatever the peers do.
+pub const OUTPUT_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Charged for each deferred packet on top of its payload, for the queue entry and the buffer's
+/// header, so a flood of one-byte packets costs what it really holds.
+const DEFERRED_PACKET_OVERHEAD_BYTES: u64 = 128;
+
+/// The most input one channel may have deferred, counted as charged: twice the window the sensor
+/// gives the peer. A peer that keeps to its window cannot send more than that in payload;
+/// one that sends more, or floods tiny packets, is disconnected.
+const DEFERRED_CHANNEL_MAX_BYTES: u64 = 2 * crate::channel::INITIAL_WINDOW_SIZE as u64;
+
+/// The output a channel could not hold: a unit of work produced more than it reserved, or the
+/// output budget could not cover input deferred behind a backed-up queue. Ends the session, so
+/// the cause is a recorded end rather than output silently dropped.
+#[derive(Debug)]
+struct OutputOverrun(&'static str);
+
+impl std::fmt::Display for OutputOverrun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SSH output budget: {}", self.0)
+    }
+}
+
+impl std::error::Error for OutputOverrun {}
 
 /// The handler active on a given channel.
 enum ChannelHandler {
@@ -98,12 +144,85 @@ impl ChannelHandler {
 struct ChannelState {
     handler: ChannelHandler,
     flow: ChannelFlow,
+    /// Packets for this channel that arrived while its output was backed up, in arrival order,
+    /// each holding a reservation of the output budget for as long as it waits. They are run when
+    /// the queue drains, so no line is run, and no input dropped, while the peer is not reading.
+    deferred: VecDeque<DeferredPacket>,
+    /// What `deferred` is charged in all, kept as a running total.
+    deferred_bytes: u64,
+}
+
+impl ChannelState {
+    fn new(flow: ChannelFlow) -> Self {
+        Self {
+            handler: ChannelHandler::Pending,
+            flow,
+            deferred: VecDeque::new(),
+            deferred_bytes: 0,
+        }
+    }
+
+    /// Hold a packet behind the output queue, at the back (a new arrival) or the front (one that
+    /// was taken for a turn and could not run, or the unrun rest of a packet).
+    fn defer(&mut self, packet: DeferredPacket, front: bool) -> Result<(), OutputOverrun> {
+        let total = self.deferred_bytes.saturating_add(packet.charged());
+        if total > DEFERRED_CHANNEL_MAX_BYTES {
+            return Err(OutputOverrun(
+                "the peer sent past its window while its output was backed up",
+            ));
+        }
+        self.deferred_bytes = total;
+        if front {
+            self.deferred.push_front(packet);
+        } else {
+            self.deferred.push_back(packet);
+        }
+        Ok(())
+    }
+
+    fn take_deferred(&mut self) -> Option<DeferredPacket> {
+        let packet = self.deferred.pop_front()?;
+        self.deferred_bytes = self.deferred_bytes.saturating_sub(packet.charged());
+        Some(packet)
+    }
+}
+
+struct DeferredPacket {
+    payload: Vec<u8>,
+    _charge: Reservation,
+}
+
+impl DeferredPacket {
+    fn charged(&self) -> u64 {
+        self._charge.bytes()
+    }
+
+    /// A packet to hold behind a backed-up queue, charged to the output budget for as long as it
+    /// waits. The budget not covering it ends the session: the input is neither run nor dropped.
+    fn reserve(payload: Vec<u8>, budget: &CaptureMemoryBudget) -> Result<Self, OutputOverrun> {
+        let bytes = (payload.len() as u64).saturating_add(DEFERRED_PACKET_OVERHEAD_BYTES);
+        let charge = budget.try_reserve(bytes).ok_or(OutputOverrun(
+            "input waiting behind unread output outgrew the output budget",
+        ))?;
+        Ok(Self {
+            payload,
+            _charge: charge,
+        })
+    }
 }
 
 struct QueuedChannelData {
     fd: OutputFd,
     bytes: Vec<u8>,
     offset: usize,
+    /// Refunded to the output budget when this entry is sent, or with the channel if it never is.
+    _charge: Reservation,
+}
+
+impl QueuedChannelData {
+    fn unsent(&self) -> u64 {
+        self.bytes.len().saturating_sub(self.offset) as u64
+    }
 }
 
 struct ChannelFrame {
@@ -121,6 +240,10 @@ struct ChannelFlow {
     local_consumed: u32,
     pty: bool,
     outbound: VecDeque<QueuedChannelData>,
+    /// The allowance granted to the unit of work now running on this channel, which `queue` hands
+    /// out to the output it produces. Taken from the output budget before the work runs and
+    /// dropped (refunding what was not used) before the next packet is read.
+    unit: Option<Reservation>,
     finish_status: Option<u8>,
     eof_pending: bool,
     close_pending: bool,
@@ -138,6 +261,7 @@ impl ChannelFlow {
             local_consumed: 0,
             pty: false,
             outbound: VecDeque::new(),
+            unit: None,
             finish_status: None,
             eof_pending: false,
             close_pending: false,
@@ -146,14 +270,36 @@ impl ChannelFlow {
         }
     }
 
-    fn queue(&mut self, fd: OutputFd, bytes: Vec<u8>) {
-        if !bytes.is_empty() {
-            self.outbound.push_back(QueuedChannelData {
-                fd,
-                bytes,
-                offset: 0,
-            });
+    /// Output not yet sent to the peer.
+    fn queued_bytes(&self) -> u64 {
+        self.outbound.iter().map(QueuedChannelData::unsent).sum()
+    }
+
+    /// What the running unit has left to hand out.
+    fn unit_bytes(&self) -> u64 {
+        self.unit.as_ref().map_or(0, Reservation::bytes)
+    }
+
+    /// Queue `bytes` for the peer, charged to the running unit's allowance. Output the unit did
+    /// not reserve for is an error, never a drop or a truncation.
+    fn queue(&mut self, fd: OutputFd, bytes: Vec<u8>) -> Result<(), OutputOverrun> {
+        if bytes.is_empty() {
+            return Ok(());
         }
+        let charge = self
+            .unit
+            .as_mut()
+            .and_then(|unit| unit.split_off(bytes.len() as u64))
+            .ok_or(OutputOverrun(
+                "a unit of work produced more than it reserved",
+            ))?;
+        self.outbound.push_back(QueuedChannelData {
+            fd,
+            bytes,
+            offset: 0,
+            _charge: charge,
+        });
+        Ok(())
     }
 
     /// Advance one pure flow-control transition. No socket or budget is touched here, which makes
@@ -307,6 +453,44 @@ pub async fn serve_with_handoff(
     (SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    serve_with_budgets(
+        addr,
+        log_path,
+        spool_dir,
+        host_key_path,
+        wan_resolver,
+        bounds,
+        banner,
+        collector_id,
+        outbox_dir,
+        capture_budget,
+        Arc::new(CaptureMemoryBudget::new(OUTPUT_BUDGET_BYTES)),
+        command_events,
+    )
+    .await
+}
+
+/// [`serve_with_handoff`] with the output budget given, for a test that needs a small one or
+/// wants to read what the queues held. `output_budget` bounds the output queued for peers and the
+/// input deferred behind it, across every connection (see [`OUTPUT_BUDGET_BYTES`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_budgets(
+    addr: SocketAddr,
+    log_path: PathBuf,
+    spool_dir: PathBuf,
+    host_key_path: PathBuf,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    banner: String,
+    collector_id: String,
+    outbox_dir: PathBuf,
+    capture_budget: Arc<CaptureMemoryBudget>,
+    output_budget: Arc<CaptureMemoryBudget>,
+    command_events: Arc<CommandEventGate>,
+) -> Result<
+    (SocketAddr, JoinHandle<()>, Arc<CaptureHandoff>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     // The software-version this server sends in `SSH-2.0-<banner>`. Shared read-only across all
     // sessions, so one `Arc` rather than a clone per connection.
     let banner = Arc::new(banner);
@@ -369,6 +553,7 @@ pub async fn serve_with_handoff(
             let wan_resolver = wan_resolver.clone();
             let banner = banner.clone();
             let command_events = command_events.clone();
+            let output_budget = output_budget.clone();
             // Wrapped once here rather than at each read: every transport function is generic over
             // AsyncRead/AsyncWrite, so the whole session inherits the per-read bound - including
             // any read added later, which a per-call-site timeout would miss.
@@ -386,6 +571,7 @@ pub async fn serve_with_handoff(
                     max_captured_bytes,
                     budget_limits,
                     command_events,
+                    output_budget,
                 )
                 .await
                 {
@@ -419,6 +605,7 @@ async fn handle_session(
     max_captured_bytes: u64,
     budget_limits: BudgetLimits,
     command_events: Arc<CommandEventGate>,
+    output_budget: Arc<CaptureMemoryBudget>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let started = std::time::Instant::now();
     // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
@@ -562,26 +749,88 @@ async fn handle_session(
     // submitted below. A write error used to return straight out of this function and take a
     // half-received SCP or SFTP file with it.
     let loop_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        // Set when a packet taken from a channel's deferred queue could not run yet, so the next
+        // turn reads the socket (where the WINDOW_ADJUST that drains the queue arrives) instead
+        // of taking the same packet again.
+        let mut skip_replay = false;
         loop {
-            let payload =
-                match transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq).await
-                {
-                    Ok(p) => p,
-                    // These are four different endings, and a capture cannot say whether its bytes
-                    // are whole unless they stay apart. A closed connection means the peer finished
-                    // sending; a timeout or a socket error means it did not.
-                    Err(e) => {
-                        shell_capture.mark_session_end(classify_read_failure(&e));
-                        break;
+            // No unit of output allowance is held across a wait for the peer.
+            for state in channels.values_mut() {
+                state.flow.unit = None;
+            }
+            let replay = if skip_replay {
+                None
+            } else {
+                next_deferred(&mut channels, &output_budget)
+            };
+            skip_replay = false;
+            let (payload, replay_charge) = match replay {
+                Some(packet) => (packet.payload, Some(packet._charge)),
+                None => {
+                    let read =
+                        transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq)
+                            .await;
+                    match read {
+                        Ok(p) => {
+                            c2s_seq = c2s_seq.wrapping_add(1);
+                            (p, None)
+                        }
+                        // These are four different endings, and a capture cannot say whether its
+                        // bytes are whole unless they stay apart. A closed connection means the
+                        // peer finished sending; a timeout or a socket error means it did not.
+                        Err(e) => {
+                            shell_capture.mark_session_end(classify_read_failure(&e));
+                            break;
+                        }
                     }
-                };
-            c2s_seq = c2s_seq.wrapping_add(1);
+                }
+            };
 
             if payload.is_empty() {
                 continue;
             }
 
             let msg_type = payload[0];
+
+            // Input that can make a channel produce output runs only while that channel, and its
+            // connection, are not already holding as much unsent output as a line can make, and
+            // only with an allowance of the output budget in hand for what it makes. Otherwise it
+            // waits, in order, behind the packets already waiting: the peer is not reading, and
+            // the real shell would be blocked on its write. Nothing is run, dropped or cut.
+            if let Some(ch_id) = output_target(&payload)
+                && channels.contains_key(&ch_id)
+            {
+                let was_replayed = replay_charge.is_some();
+                let in_order = was_replayed
+                    || channels
+                        .get(&ch_id)
+                        .is_some_and(|state| state.deferred.is_empty());
+                let unit = if in_order && output_room(&channels, ch_id) {
+                    output_budget.try_reserve(OUTPUT_UNIT_BYTES)
+                } else {
+                    None
+                };
+                let Some(state) = channels.get_mut(&ch_id) else {
+                    continue;
+                };
+                match unit {
+                    Some(unit) => state.flow.unit = Some(unit),
+                    None => {
+                        let packet = match replay_charge {
+                            Some(charge) => DeferredPacket {
+                                payload,
+                                _charge: charge,
+                            },
+                            None => DeferredPacket::reserve(payload, &output_budget)?,
+                        };
+                        state.defer(packet, was_replayed)?;
+                        if was_replayed {
+                            skip_replay = true;
+                        }
+                        continue;
+                    }
+                }
+            }
 
             match msg_type {
                 SSH_MSG_DISCONNECT => {
@@ -633,10 +882,10 @@ async fn handle_session(
                     if accepted {
                         channels.insert(
                             opened.recipient_channel,
-                            ChannelState {
-                                handler: ChannelHandler::Pending,
-                                flow: ChannelFlow::new(opened.peer_window, opened.peer_max_packet),
-                            },
+                            ChannelState::new(ChannelFlow::new(
+                                opened.peer_window,
+                                opened.peer_max_packet,
+                            )),
                         );
                     }
                 }
@@ -708,7 +957,7 @@ async fn handle_session(
                             state.handler =
                                 ChannelHandler::Shell(Box::new(shell), Vec::new(), None);
                             if state.flow.pty {
-                                state.flow.queue(OutputFd::Stdout, prompt.into_bytes());
+                                state.flow.queue(OutputFd::Stdout, prompt.into_bytes())?;
                                 flush_channel_output(
                                     &mut stream,
                                     &mut s2c_cipher,
@@ -757,7 +1006,7 @@ async fn handle_session(
                                     &cmd,
                                 );
                                 state.handler = ChannelHandler::Scp(scp);
-                                state.flow.queue(OutputFd::Stdout, initial);
+                                state.flow.queue(OutputFd::Stdout, initial)?;
                                 flush_channel_output(
                                     &mut stream,
                                     &mut s2c_cipher,
@@ -774,7 +1023,7 @@ async fn handle_session(
                                         // EOF and CLOSE. Large output remains queued until the peer
                                         // replenishes its window instead of being emitted as one
                                         // invalid SSH packet.
-                                        finish_exec(&mut state.flow, output);
+                                        finish_exec(&mut state.flow, output)?;
                                         flush_channel_output(
                                             &mut stream,
                                             &mut s2c_cipher,
@@ -841,7 +1090,11 @@ async fn handle_session(
                     }
                     let data = &payload[9..9 + data_len];
                     let pty = state.flow.pty;
-                    let mut nonpty_segments = Vec::new();
+                    let mut nonpty_segments: Vec<crate::shell::OutputSegment> = Vec::new();
+                    // How much of `data` was run. All of it unless this unit's allowance ran out
+                    // part-way through a packet of lines (below).
+                    let mut consumed = data_len;
+                    let mut unconsumed_tail: Option<Vec<u8>> = None;
 
                     match &mut state.handler {
                         ChannelHandler::Shell(shell, line_buf, held) => {
@@ -864,6 +1117,16 @@ async fn handle_session(
                             let mut close_shell = false;
                             let mut at = 0;
                             while at < data.len() && !close_shell {
+                                // A packet can hold hundreds of lines that each print megabytes.
+                                // Another line runs only while the unit's allowance can still
+                                // cover a whole one; the rest of the packet waits for its own.
+                                let produced = responses.len()
+                                    + nonpty_segments.iter().map(|s| s.bytes.len()).sum::<usize>();
+                                if produced as u64 + LINE_OUTPUT_MAX_BYTES > state.flow.unit_bytes()
+                                {
+                                    unconsumed_tail = Some(data[at..].to_vec());
+                                    break;
+                                }
                                 if let Some(input) = held.as_mut() {
                                     let fed = input.feed(&data[at..]);
                                     at += fed.taken;
@@ -1014,9 +1277,10 @@ async fn handle_session(
                             // session accumulates here but the buffer is discarded, never spooled,
                             // once the loop ends.
                             shell_capture.push(&typed);
-                            state.flow.queue(OutputFd::Stdout, responses);
+                            consumed = at;
+                            state.flow.queue(OutputFd::Stdout, responses)?;
                             for segment in nonpty_segments {
-                                state.flow.queue(segment.fd, segment.bytes);
+                                state.flow.queue(segment.fd, segment.bytes)?;
                             }
                             if close_shell {
                                 state.flow.finish_status = Some(0);
@@ -1034,11 +1298,11 @@ async fn handle_session(
                         ChannelHandler::Exec(shell, held) => {
                             if let Some(input) = held.as_mut() {
                                 let fed = input.feed(data);
-                                state.flow.queue(OutputFd::Stdout, fed.echo);
+                                state.flow.queue(OutputFd::Stdout, fed.echo)?;
                                 if let Some(end) = fed.ended
                                     && let Some(input) = held.take()
                                 {
-                                    finish_exec(&mut state.flow, input.finish(shell, end));
+                                    finish_exec(&mut state.flow, input.finish(shell, end))?;
                                 }
                                 flush_channel_output(
                                     &mut stream,
@@ -1053,7 +1317,7 @@ async fn handle_session(
                         }
                         ChannelHandler::Scp(scp) => {
                             let response = scp.feed(data);
-                            state.flow.queue(OutputFd::Stdout, response);
+                            state.flow.queue(OutputFd::Stdout, response)?;
                             flush_channel_output(
                                 &mut stream,
                                 &mut s2c_cipher,
@@ -1066,7 +1330,7 @@ async fn handle_session(
                         }
                         ChannelHandler::Sftp(sftp) => {
                             let response = sftp.feed(data);
-                            state.flow.queue(OutputFd::Stdout, response);
+                            state.flow.queue(OutputFd::Stdout, response)?;
                             flush_channel_output(
                                 &mut stream,
                                 &mut s2c_cipher,
@@ -1079,8 +1343,19 @@ async fn handle_session(
                         }
                         ChannelHandler::Pending => {}
                     }
+                    // What the unit did not get to goes back to the front of the channel's queue
+                    // as the packet it was, to run, in order, when the output has drained. It is
+                    // not counted as consumed, so the peer's window stays closed behind it.
+                    if let Some(tail) = unconsumed_tail {
+                        let mut rest = Vec::with_capacity(9 + tail.len());
+                        rest.push(SSH_MSG_CHANNEL_DATA);
+                        rest.extend_from_slice(&ch_id.to_be_bytes());
+                        rest.extend_from_slice(&(tail.len() as u32).to_be_bytes());
+                        rest.extend_from_slice(&tail);
+                        state.defer(DeferredPacket::reserve(rest, &output_budget)?, true)?;
+                    }
                     state.flow.local_consumed =
-                        state.flow.local_consumed.saturating_add(data_len as u32);
+                        state.flow.local_consumed.saturating_add(consumed as u32);
                     if state.flow.local_consumed >= crate::channel::INITIAL_WINDOW_SIZE / 2 {
                         let adjust = build_channel_window_adjust(ch_id, state.flow.local_consumed);
                         write_encrypted(&mut stream, &mut s2c_cipher, &mut s2c_seq, &adjust)
@@ -1126,7 +1401,7 @@ async fn handle_session(
                     match &mut state.handler {
                         ChannelHandler::Exec(shell, held) => {
                             if let Some(input) = held.take() {
-                                finish_exec(&mut state.flow, input.finish(shell, HeldEnd::Eof));
+                                finish_exec(&mut state.flow, input.finish(shell, HeldEnd::Eof))?;
                             }
                         }
                         ChannelHandler::Shell(shell, _, held) => {
@@ -1142,9 +1417,9 @@ async fn handle_session(
                                 if !close_shell && pty {
                                     responses.extend_from_slice(shell.prompt().as_bytes());
                                 }
-                                state.flow.queue(OutputFd::Stdout, responses);
+                                state.flow.queue(OutputFd::Stdout, responses)?;
                                 for segment in nonpty_segments {
-                                    state.flow.queue(segment.fd, segment.bytes);
+                                    state.flow.queue(segment.fd, segment.bytes)?;
                                 }
                                 if close_shell {
                                     state.flow.finish_status = Some(0);
@@ -1329,7 +1604,7 @@ impl Drop for ShellCapture {
 
 /// Queue an exec command's output, then its exit status, which the flow follows with EOF and
 /// CLOSE once the output has drained.
-fn finish_exec(flow: &mut ChannelFlow, output: CommandResult) {
+fn finish_exec(flow: &mut ChannelFlow, output: CommandResult) -> Result<(), OutputOverrun> {
     let pty = flow.pty;
     for segment in output.output {
         let bytes = if pty {
@@ -1337,9 +1612,54 @@ fn finish_exec(flow: &mut ChannelFlow, output: CommandResult) {
         } else {
             segment.bytes
         };
-        flow.queue(segment.fd, bytes);
+        flow.queue(segment.fd, bytes)?;
     }
     flow.finish_status = Some(output.status);
+    Ok(())
+}
+
+/// The channel a packet can make produce output: channel data, EOF, and channel requests.
+fn output_target(payload: &[u8]) -> Option<u32> {
+    match *payload.first()? {
+        kind @ (SSH_MSG_CHANNEL_DATA | SSH_MSG_CHANNEL_EOF | SSH_MSG_CHANNEL_REQUEST) => {
+            channel_recipient(payload, kind)
+        }
+        _ => None,
+    }
+}
+
+/// Unsent output across all of a connection's channels.
+fn connection_queued_bytes(channels: &HashMap<u32, ChannelState>) -> u64 {
+    channels.values().map(|c| c.flow.queued_bytes()).sum()
+}
+
+/// Whether channel `ch` and its connection are both holding less unsent output than a line can
+/// add, so another unit of work may run for it.
+fn output_room(channels: &HashMap<u32, ChannelState>, ch: u32) -> bool {
+    channels
+        .get(&ch)
+        .is_some_and(|c| c.flow.queued_bytes() < CHANNEL_QUEUED_MAX_BYTES)
+        && connection_queued_bytes(channels) < CONNECTION_QUEUED_MAX_BYTES
+}
+
+/// The next packet waiting behind a backed-up queue that can run now: the lowest-numbered
+/// channel with one whose queue has drained below its bound, if the output budget has room for
+/// a unit. The packet keeps its place and its charge until the caller decides to run it.
+fn next_deferred(
+    channels: &mut HashMap<u32, ChannelState>,
+    budget: &CaptureMemoryBudget,
+) -> Option<DeferredPacket> {
+    if budget.current_bytes().saturating_add(OUTPUT_UNIT_BYTES) > budget.ceiling_bytes()
+        || connection_queued_bytes(channels) >= CONNECTION_QUEUED_MAX_BYTES
+    {
+        return None;
+    }
+    let ch = channels
+        .iter()
+        .filter(|(_, c)| !c.deferred.is_empty() && c.flow.queued_bytes() < CHANNEL_QUEUED_MAX_BYTES)
+        .map(|(id, _)| *id)
+        .min()?;
+    channels.get_mut(&ch)?.take_deferred()
 }
 
 /// Add what an interactive line printed to the reply: one CR-LF-translated stream on a pty,
@@ -1470,6 +1790,9 @@ async fn flush_channel_output(
     flow: &mut ChannelFlow,
     budget: &ConnectionBudget,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Everything the running unit made is queued by now; what it did not use goes back to the
+    // output budget before this waits on the peer's socket.
+    flow.unit = None;
     while let Some(frame) = flow.next_frame(channel) {
         write_encrypted(stream, cipher, seq, &frame.packet).await?;
         if frame.egress_bytes > 0
@@ -1619,10 +1942,17 @@ mod tests {
         }
     }
 
+    /// A flow whose running unit holds a full allowance of `budget`, as the packet loop grants one.
+    fn flow_with_unit(window: u32, packet: u32, budget: &CaptureMemoryBudget) -> ChannelFlow {
+        let mut flow = ChannelFlow::new(window, packet);
+        flow.unit = Some(budget.try_reserve(OUTPUT_UNIT_BYTES).unwrap());
+        flow
+    }
+
     #[test]
     fn channel_flow_chunks_at_both_limits_and_orders_exec_lifecycle() {
-        let mut flow = ChannelFlow::new(5, 3);
-        flow.queue(OutputFd::Stdout, b"abcdef".to_vec());
+        let mut flow = flow_with_unit(5, 3, &CaptureMemoryBudget::new(u64::MAX));
+        flow.queue(OutputFd::Stdout, b"abcdef".to_vec()).unwrap();
         flow.finish_status = Some(7);
 
         let first = flow.next_frame(9).unwrap();
@@ -1649,8 +1979,8 @@ mod tests {
 
     #[test]
     fn channel_flow_separates_stderr_without_a_pty_and_merges_it_with_one() {
-        let mut plain = ChannelFlow::new(100, 100);
-        plain.queue(OutputFd::Stderr, b"err".to_vec());
+        let mut plain = flow_with_unit(100, 100, &CaptureMemoryBudget::new(u64::MAX));
+        plain.queue(OutputFd::Stderr, b"err".to_vec()).unwrap();
         let frame = plain.next_frame(2).unwrap();
         assert_eq!(frame.packet[0], SSH_MSG_CHANNEL_EXTENDED_DATA);
         assert_eq!(
@@ -1659,9 +1989,9 @@ mod tests {
         );
         assert_eq!(&frame.packet[13..], b"err");
 
-        let mut pty = ChannelFlow::new(100, 100);
+        let mut pty = flow_with_unit(100, 100, &CaptureMemoryBudget::new(u64::MAX));
         pty.pty = true;
-        pty.queue(OutputFd::Stderr, b"err".to_vec());
+        pty.queue(OutputFd::Stderr, b"err".to_vec()).unwrap();
         let frame = pty.next_frame(2).unwrap();
         assert_eq!(frame.packet[0], SSH_MSG_CHANNEL_DATA);
         assert_eq!(&frame.packet[9..], b"err");
@@ -1773,6 +2103,148 @@ mod tests {
             handoff.submit(probe_job()).is_ok(),
             "nothing was queued, so the one slot is still free"
         );
+    }
+
+    #[test]
+    fn output_beyond_the_unit_is_an_error_not_a_drop() {
+        let budget = CaptureMemoryBudget::new(u64::MAX);
+        let mut flow = ChannelFlow::new(100, 100);
+        flow.unit = Some(budget.try_reserve(10).unwrap());
+        flow.queue(OutputFd::Stdout, vec![0; 10]).unwrap();
+        assert!(flow.queue(OutputFd::Stdout, vec![0; 1]).is_err());
+        assert_eq!(flow.queued_bytes(), 10, "the refused byte was not queued");
+        assert!(
+            ChannelFlow::new(1, 1)
+                .queue(OutputFd::Stdout, vec![0; 1])
+                .is_err(),
+            "output with no unit running has nothing to be charged to"
+        );
+    }
+
+    #[test]
+    fn queued_output_is_charged_until_it_is_sent_and_refunded_with_the_channel() {
+        let budget = CaptureMemoryBudget::new(u64::MAX);
+        let mut flow = flow_with_unit(100, 100, &budget);
+        flow.queue(OutputFd::Stdout, b"abcdef".to_vec()).unwrap();
+        assert_eq!(budget.current_bytes(), OUTPUT_UNIT_BYTES);
+        flow.unit = None;
+        assert_eq!(
+            budget.current_bytes(),
+            6,
+            "the unused allowance is refunded"
+        );
+        assert_eq!(flow.queued_bytes(), 6);
+        while flow.next_frame(1).is_some() {}
+        assert_eq!(
+            budget.current_bytes(),
+            0,
+            "sending the entry refunds its charge"
+        );
+
+        let mut abandoned = flow_with_unit(0, 100, &budget);
+        abandoned.queue(OutputFd::Stdout, vec![1; 1000]).unwrap();
+        abandoned.unit = None;
+        assert_eq!(
+            budget.current_bytes(),
+            1000,
+            "a closed window sends nothing"
+        );
+        drop(abandoned);
+        assert_eq!(
+            budget.current_bytes(),
+            0,
+            "the channel going away refunds it"
+        );
+    }
+
+    #[test]
+    fn a_channel_may_defer_only_twice_its_window_and_the_total_follows_the_queue() {
+        let budget = CaptureMemoryBudget::new(u64::MAX);
+        let mut state = ChannelState::new(ChannelFlow::new(0, 100));
+        // One-byte packets are charged their overhead too, so a flood of them ends at the cap.
+        let one = DeferredPacket::reserve(vec![0], &budget).unwrap();
+        assert_eq!(one.charged(), 1 + DEFERRED_PACKET_OVERHEAD_BYTES);
+        let mut held = 0u64;
+        loop {
+            let packet = DeferredPacket::reserve(vec![0], &budget).unwrap();
+            if state.defer(packet, false).is_err() {
+                break;
+            }
+            held += 1;
+        }
+        assert_eq!(
+            held,
+            DEFERRED_CHANNEL_MAX_BYTES / (1 + DEFERRED_PACKET_OVERHEAD_BYTES)
+        );
+        assert_eq!(
+            state.deferred_bytes,
+            held * (1 + DEFERRED_PACKET_OVERHEAD_BYTES)
+        );
+        assert!(state.deferred_bytes <= DEFERRED_CHANNEL_MAX_BYTES);
+        // Taking one off the front makes room for exactly one more.
+        let first = state.take_deferred().unwrap();
+        assert_eq!(first.charged(), 1 + DEFERRED_PACKET_OVERHEAD_BYTES);
+        assert!(state.defer(first, true).is_ok());
+        assert!(
+            state
+                .defer(DeferredPacket::reserve(vec![0], &budget).unwrap(), false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deferred_input_waits_for_room_in_the_channel_the_connection_and_the_budget() {
+        let budget = CaptureMemoryBudget::new(8 * OUTPUT_UNIT_BYTES);
+        let channel = |budget: &CaptureMemoryBudget, queued: usize| {
+            let mut flow = flow_with_unit(0, 100, budget);
+            flow.queue(OutputFd::Stdout, vec![0; queued]).unwrap();
+            flow.unit = None;
+            let mut state = ChannelState::new(flow);
+            state
+                .defer(
+                    DeferredPacket::reserve(vec![SSH_MSG_CHANNEL_DATA], budget).unwrap(),
+                    false,
+                )
+                .unwrap();
+            state
+        };
+
+        let mut full = HashMap::from([(1, channel(&budget, CHANNEL_QUEUED_MAX_BYTES as usize))]);
+        assert!(
+            next_deferred(&mut full, &budget).is_none(),
+            "a channel holding a line's worth of unsent output runs nothing more"
+        );
+        assert!(!output_room(&full, 1));
+
+        let mut roomy = HashMap::from([(1, channel(&budget, 10)), (2, channel(&budget, 10))]);
+        assert!(output_room(&roomy, 2));
+        assert!(
+            next_deferred(&mut roomy, &budget).is_some(),
+            "a drained channel's waiting input runs"
+        );
+        assert_eq!(
+            roomy[&1].deferred.len(),
+            0,
+            "the lowest-numbered channel goes first"
+        );
+        assert_eq!(roomy[&2].deferred.len(), 1);
+
+        // Each channel is under its own bound, but together they hold the connection's whole.
+        let almost = CHANNEL_QUEUED_MAX_BYTES as usize - 1;
+        let mut together =
+            HashMap::from([(1, channel(&budget, almost)), (2, channel(&budget, almost))]);
+        assert!(
+            output_room(&together, 1),
+            "two channels just under the bound are still under the connection's"
+        );
+        together.insert(3, channel(&budget, 2));
+        assert!(!output_room(&together, 3), "the connection is at its bound");
+        assert!(next_deferred(&mut together, &budget).is_none());
+
+        // And the budget must be able to grant a unit.
+        let tight = CaptureMemoryBudget::new(OUTPUT_UNIT_BYTES);
+        let mut starved = HashMap::from([(1, channel(&tight, 10))]);
+        assert!(next_deferred(&mut starved, &tight).is_none());
     }
 
     /// An ordinary interactive session is never spooled, and the capture stays inside the

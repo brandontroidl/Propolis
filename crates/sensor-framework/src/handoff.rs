@@ -764,7 +764,7 @@ async fn write_stats(emitter: &EventEmitter, stats: &SensorStats) {
 /// crash between `store` and the manifest write leaves a body with no custody record at all -
 /// identical to today's behavior, handled by the existing spool orphan sweep; no regression.
 async fn process_job(
-    spool: &QuarantineSpool,
+    spool: &Arc<QuarantineSpool>,
     emitter: &EventEmitter,
     spool_refused: &AtomicU64,
     collector_id: &str,
@@ -790,18 +790,32 @@ async fn process_job(
         }
     };
     let budget_truncated = body.is_exhausted();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let stored = spool.store(body.as_slice());
-        // `store` has copied the bytes to a synced file (or refused them) by the time it returns,
-        // so the in-memory body is dead weight from here: refund its budget now, before the
-        // manifest write and the event append (both can block on slow I/O) rather than at the end
-        // of the job. Unwinding out of `store` drops `body` the same way.
-        drop(body);
-        stored.map(|mut sample_ref| {
-            sample_ref.orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
-            event_builder(sample_ref)
-        })
-    }));
+    // `store` hashes, writes and fsyncs a body of up to 10 MB: seconds on a slow disk, during which
+    // this task would hold an async worker (the SSH sensor runs two). So it runs on the blocking
+    // pool, and the body moves with it: its budget reservation is held until the store returns,
+    // even if this future is dropped meanwhile.
+    let spool = Arc::clone(spool);
+    let stored = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let stored = spool.store(body.as_slice());
+            // `store` has copied the bytes to a synced file (or refused them) by the time it
+            // returns, so the in-memory body is dead weight from here: refund its budget now,
+            // before the manifest write and the event append (both can block on slow I/O) rather
+            // than at the end of the job. Unwinding out of `store` drops `body` the same way.
+            drop(body);
+            stored.map(|mut sample_ref| {
+                sample_ref.orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
+                event_builder(sample_ref)
+            })
+        }))
+    })
+    .await;
+    let outcome = stored.unwrap_or_else(|join| {
+        // The blocking task itself was lost (the runtime is shutting down): report it the way a
+        // panic is, so the worker carries on or ends with the runtime.
+        Err(Box::new(format!("blocking store task failed: {join}"))
+            as Box<dyn std::any::Any + Send>)
+    });
 
     let mut event = match outcome {
         Ok(Ok(mut event)) => {
@@ -1418,6 +1432,59 @@ mod tests {
         let event: SensorEvent = serde_json::from_str(lines[0]).unwrap();
         let sample = event.sample.unwrap();
         assert_eq!(sample.size, b"second-ok".len() as u64);
+    }
+
+    /// The store of a 10 MB body hashes and fsyncs it: that must not sit on an async worker. The
+    /// event builder runs right after the store, in the same closure, so where it runs is where
+    /// the store ran. On this single-threaded runtime the async worker is the test's own thread,
+    /// so a store on the worker would run on it too. The body has been refunded by then and not
+    /// before (it is moved into the closure).
+    #[tokio::test]
+    async fn the_store_runs_off_the_async_worker_and_the_body_is_refunded_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let budget = Arc::new(CaptureMemoryBudget::new(1_000_000));
+        let handoff = CaptureHandoff::new(
+            crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000),
+            crate::emit::EventEmitter::new(log_path.clone()),
+            4,
+            "test".to_string(),
+            crate::outbox::OutboxManifest::new(dir.path().join("outbox")),
+            budget.clone(),
+        );
+        handoff.start_worker();
+
+        let mut body = handoff.new_capture_body();
+        body.extend_from_slice(b"a body to store").unwrap();
+        assert_eq!(
+            budget.current_bytes(),
+            crate::capture_budget::CAPTURE_CHUNK_BYTES
+        );
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let record = seen.clone();
+        let watched = budget.clone();
+        handoff
+            .submit(CaptureJob {
+                body,
+                orig_name: String::new(),
+                event_builder: Box::new(move |sample| {
+                    *record.lock().unwrap() =
+                        Some((std::thread::current().id(), watched.current_bytes()));
+                    test_event(Some(sample))
+                }),
+            })
+            .unwrap();
+        wait_for_lines(&log_path, 1).await;
+        let (stored_on, charged_at_build) = seen.lock().unwrap().unwrap();
+        assert_ne!(
+            stored_on,
+            std::thread::current().id(),
+            "the store ran on the async worker"
+        );
+        assert_eq!(charged_at_build, 0, "the body was refunded once stored");
+        assert_eq!(budget.current_bytes(), 0);
     }
 
     #[tokio::test]

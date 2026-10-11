@@ -252,6 +252,10 @@
 
 ### Fixed
 
+- **Storing a capture no longer holds an async worker** - the hand-off worker hashed, wrote and
+  fsynced a body of up to 10 MB on the async runtime, which the SSH sensor runs with two worker
+  threads. The store now runs on the blocking pool; the body moves with it, so its budget
+  reservation is held until the store returns and refunded the moment it does.
 - **A captured binary of 8 to 10 MB is now scanned for indicators** - the scan refused anything
   over 8 MiB, so a sample at the SSH sensor's new 10 MB limit showed "not scanned" on its page.
   The scan limit is now the spool's per-file cap (one definition,

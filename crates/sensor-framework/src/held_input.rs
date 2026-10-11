@@ -327,7 +327,10 @@ impl HeldInput {
     /// Run the held line on the input it got and record that input as evidence. Returns what the
     /// line printed, for the caller to send.
     pub fn finish(mut self, shell: &mut FakeShell, end: HeldEnd) -> CommandResult {
-        let result = shell.finish_line(self.body.as_slice(), end.input_end());
+        // Lent, not copied: the shell reads the one buffer, which stays charged to this body's
+        // reservations until it comes back.
+        let (result, input) = shell.finish_line_owned(self.body.lend_bytes(), end.input_end());
+        self.body.restore_bytes(input);
         let destination = shell.input_destination().map(str::to_string);
         self.record(end.upload_end(), destination);
         result

@@ -530,24 +530,38 @@ impl Stdin {
         taken
     }
 
-    /// Everything not yet read.
-    pub(super) fn take_rest(&mut self) -> Vec<u8> {
+    /// Everything not yet read, up to `cap` bytes. The cap keeps a reader's copy of a large held
+    /// input from growing with the input: a line cannot use more than its work budget of it.
+    pub(super) fn take_rest(&mut self, cap: u64) -> Vec<u8> {
         let Some((rest, pos)) = self.unread() else {
             return Vec::new();
         };
-        let taken = rest.to_vec();
-        *pos = pos.saturating_add(taken.len());
-        self.want_more();
+        let want = rest.len().min(usize::try_from(cap).unwrap_or(usize::MAX));
+        let all = want == rest.len();
+        let taken = rest.get(..want).unwrap_or(&[]).to_vec();
+        *pos = pos.saturating_add(want);
+        if all {
+            self.want_more();
+        }
         taken
     }
 
-    /// A script piped to a bare `sh`: everything not yet read, or `None` when the input is a
-    /// terminal, which a bare `sh` reads as an interactive shell instead.
-    pub(super) fn take_script(&mut self) -> Option<Vec<u8>> {
+    /// A script piped to a bare `sh`: everything not yet read, up to `cap` bytes, or `None` when
+    /// the input is a terminal, which a bare `sh` reads as an interactive shell instead.
+    pub(super) fn take_script(&mut self, cap: u64) -> Option<Vec<u8>> {
         match self {
             Self::Terminal => None,
             Self::Session(input) if input.tty => None,
-            Self::Data { .. } | Self::Session(_) => Some(self.take_rest()),
+            Self::Data { .. } | Self::Session(_) => Some(self.take_rest(cap)),
+        }
+    }
+
+    /// The session input's buffer, handed back so the caller that lent it keeps the one copy.
+    /// Empty for any other input.
+    pub(super) fn take_session_bytes(&mut self) -> Vec<u8> {
+        match self {
+            Self::Session(input) => std::mem::take(&mut input.bytes),
+            _ => Vec::new(),
         }
     }
 }

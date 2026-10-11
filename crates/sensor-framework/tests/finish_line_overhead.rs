@@ -119,7 +119,8 @@ fn extra_heap_held(line: &str, size: usize) -> usize {
     peak.saturating_sub(base)
 }
 
-/// The line's working allowance, a figure of its work budget and not of the input's size.
+/// The line's working allowance, a figure of its work budget and not of the input's size. The
+/// memory sums that count it (`sensor-ssh/tests/memory_budget_test.rs`) use the same constant.
 const BOUND: usize = LINE_WORKING_SET_BYTES as usize;
 
 /// Assert, at every size, that the overhead is within the bound, and that quadrupling the input

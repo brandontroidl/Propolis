@@ -4,7 +4,7 @@
 {% import "macros.html" as m %}
 <p><a href="/samples">&larr; All samples</a></p>
 <h1 class="mono campaign-label">{{ sha256 }}</h1>
-<p class="page-sub">{% if spooled %}{{ size }} in the {{ bucket }} spool. <a href="/samples/download/{{ sha256 }}">Download</a>{% else %}Not in any spool (aged out, or not shipped yet).{% endif %}</p>
+<p class="page-sub">{% if spooled %}{{ size }} in the {{ bucket }} spool{% if truncated %}, truncated: the sensor kept only the first part of the upload, so this hash is of that part, not of the whole file{% endif %}. <a href="/samples/download/{{ sha256 }}">Download</a>{% else %}Not in any spool (aged out, or not shipped yet).{% endif %}</p>
 
 <div class="panel">
   <div class="panel-head">Campaigns</div>

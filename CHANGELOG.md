@@ -225,6 +225,21 @@
 
 ### Changed
 
+- **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 10 MB** -
+  `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `10000000`, the spool's per-file cap, where it
+  was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000
+  bytes, so its hash matched nothing on VirusTotal (0/57). SCP and SFTP uploads were already kept
+  to 10 MB. A body over the limit is still cut there and recorded with `truncated: true` and the
+  real `wire_size`. The Samples list and a sample's page now say `truncated` for a sample a
+  sensor kept only a prefix of (the secondary line under its digest, and the page's first line),
+  from the same flag the address page already used. Samples captured before this stay as captured:
+  a sample cut at 1,000,000 bytes keeps its hash, size and `truncated` flag, and is not
+  re-captured or changed. The memory this can use is bounded by the capture budget, not by the
+  limit; the worst-case sum of the capture budget, the session pool and the output budget, 82.5%
+  of `MemoryMax`, is in
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory) and held
+  under `MemoryMax` by a test. Telnet and adb keep `1000000`. The sensor runs two worker threads
+  (it was one per core): the unit is limited to under one core.
 - **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
   `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
   The count is exact up to 100,000 events and shown bare; past that it is the planner's row

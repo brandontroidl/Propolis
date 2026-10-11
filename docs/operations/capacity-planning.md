@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-10
 -->
 
 # Capacity planning
@@ -147,6 +147,43 @@ The pool, the capture budget (40%) and, for SSH, the 64 MiB output budget leave 
 Sessions can hold more than the pool for as long as the asked sessions take to end: what the
 sessions within their floors took past it, at most the pool again, and what a session past its
 floor allocated before its line stopped.
+
+## SSH sensor worst-case memory
+
+`sensor-ssh` keeps a payload streamed over the shell or an exec's standard input up to 10 MB
+(`PROPOLIS_SSH_MAX_CAPTURED_BYTES`, default `10_000_000`, the spool's per-file cap
+`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`; it was `1_000_000`). The limit decides how
+many uploads fill the capture budget, not how much the budget holds, so the worst case is the
+sum of the places that hold bytes, each bounded where it is allocated and released:
+
+| Term | Bound | Where it is enforced |
+|---|---|---|
+| Capture bodies (uploads, shell payloads, held stdin) | 214,748,364 (40% of `MemoryMax`) | `crates/sensor-framework/src/capture_budget.rs#try_reserve` admits a 64 KiB chunk only by compare-exchange under the ceiling; `CaptureBody` and `Reservation` refund on drop, panic unwind included; `crates/sensor-ssh/src/server.rs#DEFAULT_CAPTURE_BUDGET_BYTES` |
+| What client sessions hold, shell lines included | 161,061,273 (30% of `MemoryMax`) | the session pool [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb); a line runs inside its connection's accounted scope, so its working set is charged to the session (`crates/sensor-framework/src/session_memory.rs#PEAK_LIMIT_BYTES`) |
+| Output queued for peers, and input waiting behind it | 67,108,864 (64 MiB) | `crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; a unit of work reserves `crates/sensor-ssh/src/server.rs#OUTPUT_UNIT_BYTES` before it runs and `ChannelFlow::queue` hands out only that |
+| Sum | 442,918,501 | |
+| Runtime allowance (estimate) | 67,108,864 | code, stacks, packet buffers, the hand-off queue, allocation headers, socket memory |
+| Total against `MemoryMax=512M` (536,870,912) | 510,027,365, 26,843,547 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
+
+Why each term holds:
+
+- **Capture bodies.** Every body is a `CaptureBody` of the one budget (`ShellCapture`, `HeldInput`,
+  `ScpReceiver`, the SFTP handler), so ten-megabyte uploads from all 256 connections still cannot
+  pass the ceiling. A body that cannot grow keeps its prefix and the event says `truncated`. The
+  budget fits 21 bodies of 10 MB; the rest of a burst is cut short and flagged
+  (`end_reason: "capture_memory_budget"`), as at any limit.
+- **Held input.** A command waiting for its input is run on the capture buffer itself, moved into
+  the shell and back (`crates/sensor-framework/src/held_input.rs#HeldInput`), so the input is
+  never copied while it runs, and the buffer stays charged to the capture budget until the
+  capture is recorded. What the line adds is at most one line's working set at any input size,
+  which `crates/sensor-framework/tests/finish_line_overhead.rs` measures at 1, 10 and 40 MB.
+- **Sessions.** The capture limit does not change this term: capture bodies grow outside the
+  session, and the pool bounds the rest.
+
+Residuals, stated plainly. The 64 MiB runtime allowance and the 40% and 30% shares are
+estimates, not measurements, and the margin above is 5% of `MemoryMax`. Sessions can hold more
+than the pool for as long as the asked sessions take to end (see the session memory section);
+a measured high-water of a loaded sensor is the check that would tighten both.
 
 ## Per-unit resource caps (systemd)
 

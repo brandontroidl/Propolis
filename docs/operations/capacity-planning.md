@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-10
 -->
 
 # Capacity planning
@@ -99,6 +99,57 @@ sample; see [environment variables](../reference/environment-variables.md) for t
 the exact behavior. Raise the variable only together with the unit's `MemoryMax`. The per-unit
 counts (current, high-water, refused reservations, truncated and refused captures) are exposed by
 `CaptureHandoff` getters for diagnostics; no endpoint publishes them yet.
+
+## SSH sensor worst-case memory
+
+`sensor-ssh` keeps a payload streamed over the shell or an exec's standard input up to 10 MB
+(`PROPOLIS_SSH_MAX_CAPTURED_BYTES`, default `10_000_000`, the spool's per-file cap
+`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`; it was `1_000_000`). The limit decides how
+many uploads fill the capture budget, not how much the budget holds, so the worst case is the
+sum of the places that hold bytes, each bounded where it is allocated and released:
+
+| Term | Bound | Where it is enforced |
+|---|---|---|
+| Capture bodies (uploads, shell payloads, held stdin) | 214,748,364 (40% of `MemoryMax`) | `crates/sensor-framework/src/capture_budget.rs#try_reserve` admits a 64 KiB chunk only by compare-exchange under the ceiling; `CaptureBody` and `Reservation` refund on drop, panic unwind included; `crates/sensor-ssh/src/server.rs#DEFAULT_CAPTURE_BUDGET_BYTES` |
+| Output queued for peers, and input waiting behind it | 67,108,864 (64 MiB) | `crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; a unit of work reserves `crates/sensor-ssh/src/server.rs#OUTPUT_UNIT_BYTES` before it runs and `ChannelFlow::queue` hands out only that |
+| Per-connection shell and filesystem state | 256 x 466,944 = 119,537,664 | `crates/sensor-framework/src/budget.rs#max_resident_bytes` at `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT` |
+| A shell line's working copies | 2 workers x 22,020,096 = 44,040,192 | `crates/sensor-framework/src/budget.rs#LINE_WORKING_SET_BYTES` (five times the line work allowance, 4,194,304, plus 1 MiB); `#[tokio::main(worker_threads = 2)]` in `crates/sensor-ssh/src/main.rs` |
+| Sum | 445,435,084 | |
+| Runtime allowance (estimate) | 67,108,864 | code, stacks, packet buffers, the hand-off queue, socket memory |
+| Total against `MemoryMax=512M` (536,870,912) | 512,543,948, 24,326,964 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
+
+Why each term holds:
+
+- **Capture bodies.** Every body is a `CaptureBody` of the one budget (`ShellCapture`, `HeldInput`,
+  `ScpReceiver`, the SFTP handler), so ten-megabyte uploads from all 256 connections still cannot
+  pass the ceiling. A body that cannot grow keeps its prefix and the event says `truncated`. The
+  budget fits 21 bodies of 10 MB; the rest of a burst is cut short and flagged
+  (`end_reason: "capture_memory_budget"`), as at any limit.
+- **Held input.** A command waiting for its input is run on the capture buffer itself, moved into
+  the shell and back (`crates/sensor-framework/src/held_input.rs#HeldInput`), so the input is
+  never copied while it runs, and the buffer stays charged until the capture is recorded. Before
+  this, a 10 MB input cost about 31 MB more than the input per line (3.1 times; 15 MB at the old
+  limit); it is now at most 21 MB at any input size, which `crates/sensor-framework/tests/finish_line_overhead.rs`
+  measures at 10 MB and 40 MB.
+- **Output.** A peer that never reads used to leave every line's output (up to 4 MiB a line, 10
+  channels, 256 connections) queued with no bound. Now a line runs only while its channel holds
+  less than one line of unsent output (`CHANNEL_QUEUED_MAX_BYTES`, 8,388,608: the line cap doubled
+  for a pty's CR-LF) and its connection less than two (`CONNECTION_QUEUED_MAX_BYTES`), and only with
+  an allowance of the output budget in hand. Input that cannot run waits in order, charged
+  (payload plus 128 bytes) to the same budget and capped at twice the window per channel
+  (`DEFERRED_CHANNEL_MAX_BYTES`), and runs when the peer reads. When the budget or the cap cannot
+  hold what is waiting, the session ends; nothing is dropped or cut silently. A connection
+  that does this is closed at `max_duration` like any other.
+- **Worker threads.** A line runs synchronously, so only a worker can be inside one. Two is
+  enough for a unit that `CPUQuota=75%` limits to under one core, and it makes the line term
+  independent of the host's core count. With a worker per core it would be cores x 22 MB.
+
+Residuals, stated plainly. The 64 MiB runtime allowance and the 40% and 12.5% shares are
+estimates, not measurements; the margin above is 4.5% of `MemoryMax`, and a measured
+high-water of a loaded sensor is the check that would tighten it. One peer that holds output
+unread can use up to 16,777,216 bytes of the output budget, so a handful of such connections
+stall the shell replies of the others until they time out or are closed; the capture budget and
+the sample hand-off are separate and keep working.
 
 ## Per-unit resource caps (systemd)
 

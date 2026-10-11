@@ -86,6 +86,14 @@ impl Default for BudgetLimits {
     }
 }
 
+/// The most heap one shell line holds while it runs on a held input, beyond that input (which is
+/// charged to the capture budget) and the connection's own budget: five copies of the line's
+/// work allowance (a reader's copy, the output, the redirect's write) plus 1 MiB of bookkeeping.
+/// It does not grow with the input; `tests/finish_line_overhead.rs` measures it at 10 MB and
+/// 40 MB inputs against this figure. A sensor's worst case counts it once per worker thread,
+/// because a line runs synchronously on one.
+pub const LINE_WORKING_SET_BYTES: u64 = 5 * BudgetLimits::standard().work_per_line + 1_048_576;
+
 /// The limits for one connection of a sensor running with `bounds`. Every limit is a fixed engine
 /// constant today; the bounds are the interface a sensor-specific limit would come through, and
 /// `max_concurrent` is what the per-connection product is checked against

@@ -74,13 +74,18 @@ const DEFAULT_HOST_KEY_PATH: &str = "/var/lib/propolis/ssh/host_key";
 /// keeps the outbox manifest well-formed anyway.
 const DEFAULT_COLLECTOR_ID: &str = "local";
 
-// Deliberately identical to sensor-telnet's defaults. Both are unauthenticated, internet-facing
-// TCP honeypots with the same exposure, so two different sets of numbers would be a difference
-// with no reason behind it - and the reason each bound exists is the same for both.
+// Identical to sensor-telnet's defaults except the capture limit. Both are unauthenticated,
+// internet-facing TCP honeypots with the same exposure, so two different sets of numbers would be a
+// difference with no reason behind it - and the reason each bound exists is the same for both.
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
-const DEFAULT_MAX_CAPTURED_BYTES: u64 = 1_000_000;
+/// The per-upload capture limit is the spool's per-file cap, not a number of its own: a payload
+/// streamed over the shell or an exec's stdin is cut at exactly the point the spool would refuse
+/// it, where SCP and SFTP uploads already are. At 1,000,000 a 6.6 MB Go worm was cut at a hash no
+/// reputation service knew. What the larger default costs in memory is bounded by the capture and
+/// output budgets, not by this number (docs/operations/capacity-planning.md).
+const DEFAULT_MAX_CAPTURED_BYTES: u64 = sensor_ssh::server::SPOOL_MAX_FILE_BYTES;
 const DEFAULT_MAX_CONCURRENT: u32 = 256;
 
 #[derive(Debug, Clone)]
@@ -465,6 +470,21 @@ mod tests {
         let spool_dir = PathBuf::from("/custom/spool");
         let outbox_dir = resolve_outbox_dir(&spool_dir, None);
         assert_eq!(outbox_dir, PathBuf::from("/custom/spool/outbox"));
+    }
+
+    #[test]
+    fn the_capture_limit_defaults_to_the_spool_cap_and_rejects_zero_or_garbage() {
+        let parse = |raw: Option<&str>| {
+            parse_positive_u64(raw, DEFAULT_MAX_CAPTURED_BYTES, ENV_MAX_CAPTURED_BYTES)
+        };
+        assert_eq!(parse(None).unwrap(), 10_000_000);
+        assert_eq!(parse(Some("1000000")).unwrap(), 1_000_000);
+        for bad in ["0", "-1", "ten", ""] {
+            assert!(
+                matches!(parse(Some(bad)), Err(ConfigError::InvalidBound { .. })),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

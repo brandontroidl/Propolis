@@ -87,8 +87,8 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4232 test functions** (2710 unit + 1522 integration).
-- **DB-backed (`sqlx::test`): 413** - console 213, review 99, core-scoring 44,
+- **Total: 4240 test functions** (2711 unit + 1529 integration).
+- **DB-backed (`sqlx::test`): 414** - console 214, review 99, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -121,7 +121,7 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 166 | 236 | auth_test, campaigns_test, ledger_count_test, routes_test, samples_transport_test, server_test, timeline_test |
+| console | 166 | 237 | auth_test, campaigns_test, ledger_count_test, routes_test, samples_transport_test, samples_truncated_test, server_test, timeline_test |
 | core-scoring | 80 | 38 | batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 35 | 66 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
@@ -142,13 +142,13 @@ Per-crate breakdown:
 | sensor-mqtt | 65 | 57 | arrival, env_strict, integration, shutdown_tracking, tls |
 | sensor-redis | 89 | 39 | arrival, env_strict, integration, tls |
 | sensor-smtp | 12 | 41 | arrival, env_strict, integration, tls |
-| sensor-ssh | 70 | 134 | arrival, auth_test, crypto_test, env_strict, integration, output_backpressure, shell_test, shutdown_tracking, transport_test |
+| sensor-ssh | 71 | 140 | arrival, auth_test, capture_limit, crypto_test, env_strict, integration, memory_budget_test, output_backpressure, shell_test, shutdown_tracking, transport_test |
 | sensor-telnet | 60 | 50 | arrival, echo_loader, env_strict, infected_hold, integration, probe_payload, shutdown_tracking |
 | sensor-tftp | 37 | 42 | arrival, env_strict, integration, shutdown |
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2710** | **1522** | |
+| **Total** | **2711** | **1529** | |
 
 ### Test styles by layer
 
@@ -158,7 +158,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (43 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (367 uses) - needed wherever a test needs more than
+  applies migrations manually (368 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

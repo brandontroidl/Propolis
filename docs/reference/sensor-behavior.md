@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-09
+last-verified: 2026-10-10
 -->
 
 # Sensor behavior reference
@@ -71,7 +71,7 @@ behavioral inconsistency across the sensor set, not a bug claim.
 
 Common defaults across the internet-facing TCP sensors are `read_timeout`
 30000&nbsp;ms, `idle_timeout` 60000&nbsp;ms, `max_duration` 600&nbsp;s,
-`max_captured_bytes` 1_000_000, `max_concurrent` 256 (verified
+`max_captured_bytes` 1_000_000 (ssh: 10_000_000, the spool's per-file cap), `max_concurrent` 256 (verified
 `crates/sensor-ssh/src/main.rs#DEFAULT_READ_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_DURATION_SECS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT`). Per-sensor deviations are noted in the
 protocol table below; the canonical values live in
 [`environment-variables.md`](environment-variables.md).
@@ -885,6 +885,11 @@ captures SCP/SFTP transfers.
   output is queued per channel and emitted in chunks of at most `min(peer max packet,
   32 KiB, remaining peer window)`, stopping at a zero peer window and resuming only on
   that channel's `WINDOW_ADJUST`, so a 2 MiB reply is never one oversized packet.
+  Output waiting for a peer that is not reading is bounded: a channel holding one line's
+  worth of unsent output (8 MiB) or its connection two lines' worth runs no further line
+  until the peer reads, input that arrives meanwhile waits in order, and all of it is charged
+  to a 64 MiB output budget (`crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; see
+  [capacity planning](../operations/capacity-planning.md#ssh-sensor-worst-case-memory)).
   Client-to-server data is counted as it is consumed, and the server sends
   `WINDOW_ADJUST` once the consumed bytes reach half the initial window (1 MiB)
   (`crates/sensor-ssh/src/server.rs#next_frame`, `crates/sensor-ssh/src/server.rs#flush_channel_output`, `crates/sensor-ssh/src/server.rs#build_channel_window_adjust`, `crates/sensor-ssh/src/channel.rs#INITIAL_WINDOW_SIZE`, `crates/sensor-ssh/src/channel.rs#CHANNEL_MAX_PACKET_SIZE`).

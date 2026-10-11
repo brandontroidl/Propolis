@@ -58,6 +58,12 @@ const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const MAX_CHANNELS_PER_CONNECTION: usize = 10;
 
+/// The quarantine spool's per-file cap (10 MB, decimal, as every spooling sensor's). SCP and SFTP
+/// retain at most this much of an upload (`transfer.rs`), and it is the default of
+/// `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, which limits a payload streamed over the shell or an exec's
+/// stdin.
+pub const SPOOL_MAX_FILE_BYTES: u64 = 10_000_000;
+
 /// The most one line can add to a channel's output queue. A line's output is bounded by its work
 /// budget (`BudgetLimits::work_per_line`, 4_194_304: measured exactly at the cap for `cat` of a
 /// larger input), and a pty doubles the worst case by turning every LF into CR-LF (`onlcr`).
@@ -512,7 +518,7 @@ pub async fn serve_with_budgets(
     let emitter = Arc::new(EventEmitter::new(log_path.clone()));
     let summary_emitter = emitter.clone();
     let summary_gate = command_events.clone();
-    let spool = QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
+    let spool = QuarantineSpool::new(spool_dir, SPOOL_MAX_FILE_BYTES, 100_000_000);
     // The handoff's emitter writes to the same log file. EventEmitter opens with O_APPEND
     // on each write so concurrent emitters to the same path are safe.
     let outbox = OutboxManifest::new(outbox_dir);

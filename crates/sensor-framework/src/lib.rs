@@ -39,7 +39,9 @@ pub mod wan;
 pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
 pub use arrival::Arrival;
 pub use bounds::ConnectionBounds;
-pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
+pub use budget::{
+    BudgetLimits, ConnectionBudget, EgressState, LINE_WORKING_SET_BYTES, limits_from,
+};
 pub use capture_budget::{
     CAPTURE_CHUNK_BYTES, CaptureBody, CaptureExhausted, CaptureMemoryBudget,
     DEFAULT_CAPTURE_BUDGET_BYTES_256M, Reservation, default_capture_budget_bytes,

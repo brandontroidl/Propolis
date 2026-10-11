@@ -6,6 +6,7 @@
 //!
 //! One test in this binary, because the counting allocator is process-global.
 
+use sensor_framework::LINE_WORKING_SET_BYTES;
 use sensor_framework::fakefs::FakeFs;
 use sensor_framework::shell::{EmitContext, FakeShell, InputEnd, LineStep};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -67,10 +68,9 @@ fn extra_heap(line: &str, size: usize) -> usize {
     peak.saturating_sub(base)
 }
 
-/// The line's own working budget of 4_194_304 bytes (`BudgetLimits::work_per_line`), copied at
-/// most five times (a reader's copy, its output, the redirect's write), plus 1 MiB for the
-/// shell's bookkeeping. Not a function of the input's size.
-const BOUND: usize = 5 * 4_194_304 + 1_048_576;
+/// The line's working allowance, a figure of its work budget and not of the input's size. The
+/// memory sums that count it (`sensor-ssh/tests/memory_budget_test.rs`) use the same constant.
+const BOUND: usize = LINE_WORKING_SET_BYTES as usize;
 
 #[test]
 fn the_heap_a_finishing_line_adds_does_not_grow_with_its_input() {

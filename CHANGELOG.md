@@ -199,6 +199,20 @@
 
 ### Changed
 
+- **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 10 MB** -
+  `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `10000000`, the spool's per-file cap, where it
+  was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000
+  bytes, so its hash matched nothing on VirusTotal (0/57). SCP and SFTP uploads were already kept
+  to 10 MB. A body over the limit is still cut there and recorded with `truncated: true` and the
+  real `wire_size`. The Samples list and a sample's page now say `truncated` for a sample a
+  sensor kept only a prefix of (the secondary line under its digest, and the page's first line),
+  from the same flag the address page already used. Samples captured before this stay as captured:
+  a sample cut at 1,000,000 bytes keeps its hash, size and `truncated` flag, and is not
+  re-captured or changed. The memory this can use is bounded by the capture budget and the new
+  output budget, not by the limit; the worst-case sum, 83% of `MemoryMax`, is in
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
+  Telnet and adb keep `1000000`. The sensor now runs two worker threads (it was one per core): the
+  unit is limited to under one core, and the worst-case memory counts the workers.
 - **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
   `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
   The count is exact up to 100,000 events and shown bare; past that it is the planner's row
@@ -252,6 +266,19 @@
 
 ### Fixed
 
+- **The SSH sensor no longer queues unbounded output for a peer that does not read** - a peer
+  could advertise a zero window, then type lines that each print up to 4 MiB (10 channels a
+  connection, 256 connections), and the sensor held all of it in memory with no budget. Output
+  is now charged to a 64 MiB process-wide output budget through an allowance reserved before each
+  unit of work runs; a channel stops running further lines at one line of unsent output and a
+  connection at two; input behind a backed-up queue waits in order, charged, and runs when the
+  peer reads, never dropped; and if the budget cannot hold what is waiting the session ends. A
+  connection holding output unread is still closed at `max_duration`. No configuration option.
+- **A held input is no longer copied per reader** - a command waiting for its input (`cat > f`,
+  `sh`) copied the capture three times as it ran, about 3.1 times a 10 MB body, uncharged, per
+  worker thread. The shell now reads the capture buffer in place, which stays charged to the
+  capture budget, and a line's own copies are bounded by its work allowance (21 MB measured at 10
+  MB and 40 MB inputs; it was 31 MB at 10 MB).
 - **A scanner's protocol probe on the telnet port is no longer filed as a malware sample** - a
   scanner that sends a TLS hello, an RDP or SMB request or similar to port 23 had its first bytes
   read as the login and the rest kept as a 54 to 175 byte `binary_shell_payload` sample, which

@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-10
 -->
 
 # Environment variables
@@ -526,7 +526,7 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 | `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`) | secs; zero → abort |
-| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`; dns `262_272`) | bytes; zero → abort |
+| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (ssh `10_000_000`; catchall `4_096`; dns `262_272`) | bytes; zero → abort |
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero → abort |
 
 The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
@@ -534,7 +534,11 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
 
 - ssh: `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
   `PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
-  `PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`.
+  `PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`. `PROPOLIS_SSH_MAX_CAPTURED_BYTES` defaults to
+  `10_000_000`, the spool's per-file cap (`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`),
+  and limits a payload streamed over the shell or an exec's standard input; SCP and SFTP uploads
+  are already kept up to that cap. A capture cut at the limit is recorded with `truncated: true`
+  and the real `wire_size`. It was `1_000_000` before; samples captured then stay as captured.
 - telnet: `PROPOLIS_TELNET_READ_TIMEOUT_MS`, `PROPOLIS_TELNET_IDLE_TIMEOUT_MS`,
   `PROPOLIS_TELNET_MAX_DURATION_SECS`, `PROPOLIS_TELNET_MAX_CAPTURED_BYTES`,
   `PROPOLIS_TELNET_MAX_CONCURRENT`, `PROPOLIS_TELNET_LOG_PATH`, `PROPOLIS_TELNET_WAN_MAP`.

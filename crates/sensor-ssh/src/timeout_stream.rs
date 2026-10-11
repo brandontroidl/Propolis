@@ -19,9 +19,11 @@
 //!
 //! `max_captured_bytes` is deliberately NOT enforced here, unlike in telnet. This sensor captures
 //! SCP/SFTP uploads, and the transfer path already bounds itself at 10 MB per file against the
-//! quarantine spool's own per-file and total caps. Enforcing the 1 MB session default at the stream
-//! layer would truncate uploads at 1 MB - cutting off precisely the malware captures the sensor
-//! exists to collect - so the byte ceiling stays where it can distinguish a capture from a flood.
+//! quarantine spool's own per-file and total caps. Enforcing the session limit (also 10 MB by
+//! default, the spool's per-file cap) at the stream layer would end a connection at the limit
+//! instead of keeping the capture and letting the session go on - cutting off precisely the
+//! evidence the sensor exists to collect - so the byte ceiling stays where it can distinguish a
+//! capture from a flood: on the shell payload and the held stdin, in `server.rs`.
 
 use std::future::Future;
 use std::io;

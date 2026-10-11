@@ -74,7 +74,7 @@ pub use rate_limit::{
 };
 pub use reply_source::{REFLECTIVE_SOURCE_PORTS, SourceRefusal, check_reply_source};
 pub use sanitize::{sanitize_value, to_hex_bounded};
-pub use spool::{QuarantineSpool, SpoolError};
+pub use spool::{QuarantineSpool, SPOOL_MAX_FILE_BYTES, SpoolError};
 pub use tls::{
     MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, run_tls_listener,
     run_tls_listener_tracked, server_config_from_pem, upgrade_buffered,

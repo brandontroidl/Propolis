@@ -252,6 +252,13 @@
 
 ### Fixed
 
+- **A captured binary of 8 to 10 MB is now scanned for indicators** - the scan refused anything
+  over 8 MiB, so a sample at the SSH sensor's new 10 MB limit showed "not scanned" on its page.
+  The scan limit is now the spool's per-file cap (one definition,
+  `sensor_framework::SPOOL_MAX_FILE_BYTES`, shared by the sensors and the scan), and the page
+  names it. The module comment that said a larger body was scanned in part now says it is not
+  scanned. A sample already marked `too_big` keeps that state (it is terminal in
+  `ioc_artifact_scan`); deleting its row there queues it for the scan again. No migration.
 - **Queued SSH output is charged by what it holds, not its length** - a reply buffer that had
   grown by doubling kept up to twice its length (heap measured at 2.08 times the charge), so the
   64 MiB output budget bounded less memory than it said. Output and input held behind a backed-up

@@ -2273,6 +2273,40 @@ mod tests {
         );
     }
 
+    /// A buffer that grew by doubling holds more memory than its length, and the budget is a bound
+    /// on memory: what is charged is the allocation, and the allocation is trimmed to the bytes
+    /// before it is queued (heap measured at 2.08 times the charge when it was the length).
+    #[test]
+    fn queued_output_is_charged_by_its_allocation_not_its_length() {
+        let budget = CaptureMemoryBudget::new(u64::MAX);
+        let mut flow = flow_with_unit(100, 100, &budget);
+        let mut grown = Vec::with_capacity(1 << 20);
+        grown.extend_from_slice(b"three bytes of output in a megabyte buffer");
+        flow.queue(OutputFd::Stdout, grown).unwrap();
+        let entry = flow.outbound.back().unwrap();
+        assert_eq!(
+            entry._charge.bytes(),
+            entry.bytes.capacity() as u64,
+            "the charge is what the entry holds"
+        );
+        assert!(
+            entry.bytes.capacity() < 4096,
+            "the megabyte of spare capacity was not kept: {}",
+            entry.bytes.capacity()
+        );
+        assert_eq!(flow.charged_bytes(), entry._charge.bytes());
+
+        // The same for input held behind a backed-up queue.
+        let mut payload = Vec::with_capacity(1 << 20);
+        payload.extend_from_slice(b"a short packet");
+        let packet = DeferredPacket::reserve(payload, &budget).unwrap();
+        assert_eq!(
+            packet.charged(),
+            packet.payload.capacity() as u64 + DEFERRED_PACKET_OVERHEAD_BYTES
+        );
+        assert!(packet.charged() < 4096, "{}", packet.charged());
+    }
+
     #[test]
     fn output_beyond_the_unit_is_an_error_not_a_drop() {
         let budget = CaptureMemoryBudget::new(u64::MAX);

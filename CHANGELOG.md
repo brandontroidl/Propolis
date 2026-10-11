@@ -252,6 +252,10 @@
 
 ### Fixed
 
+- **Queued SSH output is charged by what it holds, not its length** - a reply buffer that had
+  grown by doubling kept up to twice its length (heap measured at 2.08 times the charge), so the
+  64 MiB output budget bounded less memory than it said. Output and input held behind a backed-up
+  queue are now trimmed to their bytes and charged by allocation.
 - **A few SSH peers that do not read can no longer stall every other session** - the output
   budget they fill is now shared fairly. Two or three connections that never read could hold all
   of the 64 MiB output budget, and then every other session's shell, exec, SCP and SFTP waited

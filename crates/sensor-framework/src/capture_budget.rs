@@ -6,8 +6,9 @@
 //! spool, so many concurrent connections cannot together push a sensor past its systemd
 //! `MemoryMax` (an OOM kill loses every in-flight capture, not just the greedy one).
 //!
-//! Pure and synchronous: std atomics only, no I/O, no async. Reservations are RAII, so a refund
-//! happens on normal drop, early return and panic unwinding alike.
+//! Synchronous: std atomics and no I/O; the one async-facing piece is a `Notify` that a refund
+//! fires (see [`CaptureMemoryBudget::refunded`]). Reservations are RAII, so a refund happens on
+//! normal drop, early return and panic unwinding alike.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -42,6 +43,36 @@ struct Inner {
     current: AtomicU64,
     high_water: AtomicU64,
     refused: AtomicU64,
+    /// Woken whenever a reservation is refunded, so a holder of work that was refused for lack
+    /// of budget can retry the moment there is some, not at its next unrelated wakeup.
+    refunds: tokio::sync::Notify,
+}
+
+/// Adds `bytes` to `current` if the sum stays under the ceiling: one compare-exchange, so racing
+/// callers cannot both take room only one fits in.
+fn charge(inner: &Inner, bytes: u64) -> bool {
+    let mut observed = inner.current.load(Ordering::Acquire);
+    loop {
+        let next = match observed.checked_add(bytes) {
+            Some(next) if next <= inner.ceiling => next,
+            _ => {
+                inner.refused.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+        match inner.current.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                inner.high_water.fetch_max(next, Ordering::Relaxed);
+                return true;
+            }
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 /// The shared pool. Cloning is cheap and every clone charges the same counters.
@@ -58,6 +89,7 @@ impl CaptureMemoryBudget {
                 current: AtomicU64::new(0),
                 high_water: AtomicU64::new(0),
                 refused: AtomicU64::new(0),
+                refunds: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -69,32 +101,18 @@ impl CaptureMemoryBudget {
     /// total and re-checks. `current` therefore never exceeds the ceiling, and the sum of live
     /// reservations equals `current`. A request whose sum would overflow `u64` is refused.
     pub fn try_reserve(&self, bytes: u64) -> Option<Reservation> {
-        let inner = &self.inner;
-        let mut observed = inner.current.load(Ordering::Acquire);
-        loop {
-            let next = match observed.checked_add(bytes) {
-                Some(next) if next <= inner.ceiling => next,
-                _ => {
-                    inner.refused.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-            };
-            match inner.current.compare_exchange_weak(
-                observed,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    inner.high_water.fetch_max(next, Ordering::Relaxed);
-                    return Some(Reservation {
-                        inner: Arc::clone(inner),
-                        bytes,
-                    });
-                }
-                Err(actual) => observed = actual,
-            }
-        }
+        charge(&self.inner, bytes).then(|| Reservation {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
+    }
+
+    /// Completes when any reservation of this budget is next refunded. `notify_waiters` wakes
+    /// only futures that already exist, so a caller that checks the budget and then waits must
+    /// create the future first and `enable` it (`Notified::enable`) before the check; a refund
+    /// between the check and the wait then cannot be missed.
+    pub fn refunded(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.refunds.notified()
     }
 
     /// A reservation of nothing, for a holder that has not yet been granted anything.
@@ -145,11 +163,27 @@ impl Reservation {
             bytes,
         })
     }
+
+    /// Takes `extra` more bytes of the budget into this reservation, or leaves it unchanged and
+    /// returns false when the ceiling does not allow it.
+    pub fn try_grow(&mut self, extra: u64) -> bool {
+        let Some(total) = self.bytes.checked_add(extra) else {
+            return false;
+        };
+        if !charge(&self.inner, extra) {
+            return false;
+        }
+        self.bytes = total;
+        true
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.inner.current.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.bytes > 0 {
+            self.inner.refunds.notify_waiters();
+        }
     }
 }
 
@@ -343,6 +377,39 @@ mod tests {
         })
         .join();
         assert!(res.is_err());
+        assert_eq!(b.current_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refund_wakes_a_waiter_that_armed_before_it() {
+        let b = CaptureMemoryBudget::new(10);
+        let held = b.try_reserve(10).unwrap();
+        assert!(b.try_reserve(1).is_none());
+        let waiting = b.refunded();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        // The check has failed and the waiter is armed; the refund lands before it awaits.
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("the refund was not missed");
+        assert!(b.try_reserve(1).is_some());
+    }
+
+    #[test]
+    fn try_grow_takes_more_only_under_the_ceiling() {
+        let b = CaptureMemoryBudget::new(100);
+        let mut r = b.try_reserve(40).unwrap();
+        assert!(r.try_grow(60));
+        assert_eq!((r.bytes(), b.current_bytes()), (100, 100));
+        assert!(!r.try_grow(1));
+        assert_eq!(
+            (r.bytes(), b.current_bytes()),
+            (100, 100),
+            "a refused grow takes nothing"
+        );
+        assert!(!r.try_grow(u64::MAX));
+        drop(r);
         assert_eq!(b.current_bytes(), 0);
     }
 

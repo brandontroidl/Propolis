@@ -124,6 +124,8 @@ endings of `crates/sensor-framework/src/handoff.rs#CaptureEnd`.
 | `malformed_input` | the peer sent something the protocol could not parse |
 | `capture_budget` | a sensor-side read bound: `max_captured_bytes`, or a per-transfer cap derived from it |
 | `peer_aborted` | the peer aborted the transfer with its protocol's error message, or with Ctrl-C at a terminal |
+| `output_stalled` | the SSH sensor closed the connection because output queued for the peer made no progress for 30 s: the peer was not reading |
+| `output_evicted` | the SSH sensor closed the connection to free the output budget for sessions it could not serve, because this one held the most of it |
 | `session_cancelled` | the listener cancelled the handler at `max_duration`; no code observed another ending |
 | `capture_memory_budget` | the process-wide capture memory budget ran out; overrides any other value (`crates/sensor-framework/src/handoff.rs#mark_budget_truncated`) |
 

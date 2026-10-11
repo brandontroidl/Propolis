@@ -136,7 +136,7 @@ Per-crate breakdown:
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 70 | arrival, env_strict, integration, tls |
-| sensor-framework | 1421 | 178 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, shell_replay, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1423 | 178 | arrival_coverage, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, shell_replay, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 14 | 53 | arrival, env_strict, integration, tls_config |
 | sensor-http | 19 | 41 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 65 | 57 | arrival, env_strict, integration, shutdown_tracking, tls |

@@ -10,6 +10,7 @@ use std::time::Duration;
 use sensor_framework::{
     CaptureMemoryBudget, CommandEventConfig, CommandEventGate, ConnectionBounds, WanResolver,
 };
+use sensor_ssh::output::{OUTPUT_STALL_LIMIT, OutputLedger};
 use sensor_ssh::server::{
     CHANNEL_QUEUED_MAX_BYTES, LINE_OUTPUT_MAX_BYTES, OUTPUT_BUDGET_BYTES, OUTPUT_UNIT_BYTES,
 };
@@ -40,14 +41,15 @@ struct Rig {
     addr: std::net::SocketAddr,
     handle: tokio::task::JoinHandle<()>,
     output: Arc<CaptureMemoryBudget>,
+    log: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
 async fn rig(max_duration: Duration) -> Rig {
-    rig_with_budget(max_duration, OUTPUT_BUDGET_BYTES).await
+    rig_with(max_duration, OUTPUT_BUDGET_BYTES, OUTPUT_STALL_LIMIT).await
 }
 
-async fn rig_with_budget(max_duration: Duration, output_bytes: u64) -> Rig {
+async fn rig_with(max_duration: Duration, output_bytes: u64, stall_limit: Duration) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let bounds = ConnectionBounds {
         read_timeout: Duration::from_secs(30),
@@ -56,10 +58,12 @@ async fn rig_with_budget(max_duration: Duration, output_bytes: u64) -> Rig {
         max_captured_bytes: 1_000_000,
         max_concurrent: 64,
     };
-    let output = Arc::new(CaptureMemoryBudget::new(output_bytes));
+    let ledger = OutputLedger::new(output_bytes, stall_limit);
+    let output = ledger.budget().clone();
+    let log = dir.path().join("events.jsonl");
     let (addr, handle, _handoff) = sensor_ssh::serve_with_budgets(
         "127.0.0.1:0".parse().unwrap(),
-        dir.path().join("events.jsonl"),
+        log.clone(),
         dir.path().join("spool"),
         dir.path().join("host_key"),
         Arc::new(WanResolver::new(HashMap::new())),
@@ -68,7 +72,7 @@ async fn rig_with_budget(max_duration: Duration, output_bytes: u64) -> Rig {
         "test".to_string(),
         dir.path().join("outbox"),
         Arc::new(CaptureMemoryBudget::new(214_748_364)),
-        output.clone(),
+        ledger,
         Arc::new(CommandEventGate::new(CommandEventConfig::default())),
     )
     .await
@@ -77,6 +81,7 @@ async fn rig_with_budget(max_duration: Duration, output_bytes: u64) -> Rig {
         addr,
         handle,
         output,
+        log,
         _dir: dir,
     }
 }
@@ -277,6 +282,243 @@ async fn input_that_outgrows_the_output_budget_ends_the_session_instead_of_being
     })
     .await;
     assert!(refunded.is_ok(), "the session's charges were not refunded");
+    rig.handle.abort();
+}
+
+// ---- A budget held by peers that do not read must not stop sessions that do ----
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A connection that never reads: `channels` shells, each told to print a megabyte `lines` times,
+/// and an exec holding a little input so that however the sensor ends the connection is written
+/// into a capture. Returns the handles that keep it open.
+async fn hog(
+    addr: std::net::SocketAddr,
+    channels: usize,
+    lines: usize,
+    marker: &[u8],
+) -> (
+    russh::client::Handle<TestHandler>,
+    Vec<russh::Channel<russh::client::Msg>>,
+) {
+    let session = login(addr, 16_384).await;
+    let mut held = Vec::new();
+    let held_input = session.channel_open_session().await.unwrap();
+    held_input.exec(false, b"cat > /tmp/marker").await.unwrap();
+    held_input.data(marker).await.unwrap();
+    held.push(held_input);
+    for _ in 0..channels {
+        let shell = open_shell(&session).await;
+        for _ in 0..lines {
+            let send = shell.data(&b"cat /dev/zero\r"[..]);
+            if tokio::time::timeout(Duration::from_millis(400), send)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        held.push(shell);
+    }
+    (session, held)
+}
+
+/// Every upload event in the log, with the sample digest and the reason it ended.
+fn uploads_in(log: &std::path::Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<sensor_wire::SensorEvent>(line).ok())
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_MALWARE_UPLOAD)
+        .filter_map(|e| {
+            Some((
+                e.sample?.sha256,
+                e.metadata["end_reason"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+async fn wait_for<F: FnMut() -> bool>(limit: Duration, mut done: F) -> bool {
+    let end = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < end {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    done()
+}
+
+async fn read_until(
+    channel: &mut russh::Channel<russh::client::Msg>,
+    needle: &[u8],
+    limit: Duration,
+) -> bool {
+    let mut seen = Vec::new();
+    tokio::time::timeout(limit, async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Data { data }) => {
+                    seen.extend_from_slice(&data);
+                    if seen.windows(needle.len()).any(|w| w == needle) {
+                        return true;
+                    }
+                }
+                Some(_) => {}
+                None => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn scp_put(session: &russh::client::Handle<TestHandler>, name: &str, body: &[u8]) {
+    async fn ack(channel: &mut russh::Channel<russh::client::Msg>, what: &str) {
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match channel.wait().await {
+                    Some(russh::ChannelMsg::Data { data }) => return data.to_vec(),
+                    Some(_) => {}
+                    None => return Vec::new(),
+                }
+            }
+        })
+        .await
+        .unwrap_or_default();
+        assert_eq!(got, [0], "{what} ack");
+    }
+    let mut channel = session.channel_open_session().await.unwrap();
+    channel.exec(false, b"scp -t /tmp").await.unwrap();
+    ack(&mut channel, "ready").await;
+    channel
+        .data(format!("C0644 {} {name}\n", body.len()).as_bytes())
+        .await
+        .unwrap();
+    ack(&mut channel, "header").await;
+    channel.data(body).await.unwrap();
+    channel.data(&[0u8][..]).await.unwrap();
+    ack(&mut channel, "final").await;
+}
+
+/// Five connections that never read fill a 64 MiB budget between them. A sixth, which does read,
+/// still gets its shell reply and its SCP upload promptly: the sensor asks the connection holding
+/// the most to let go rather than refuse the newcomer, and says so in what it recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peers_that_do_not_read_cannot_starve_one_that_does() {
+    let rig = rig(Duration::from_secs(120)).await;
+    let mut hogs = Vec::new();
+    for i in 0..5u8 {
+        hogs.push(hog(rig.addr, 2, 14, &[b'M', i]).await);
+    }
+    assert!(
+        wait_for(Duration::from_secs(20), || rig.output.current_bytes()
+            >= OUTPUT_BUDGET_BYTES - 3 * OUTPUT_UNIT_BYTES)
+        .await,
+        "the hogs hold the budget ({} of {})",
+        rig.output.current_bytes(),
+        OUTPUT_BUDGET_BYTES
+    );
+
+    let started = tokio::time::Instant::now();
+    let victim = login(rig.addr, 2_097_152).await;
+    let mut shell = open_shell(&victim).await;
+    shell.data(&b"echo VICTIM_OK\r"[..]).await.unwrap();
+    assert!(
+        read_until(&mut shell, b"VICTIM_OK\r\n", Duration::from_secs(8)).await,
+        "the shell reply did not come"
+    );
+    let upload = b"\x7fELF a small upload that must still be kept".to_vec();
+    scp_put(&victim, "kept", &upload).await;
+    let latency = started.elapsed();
+    assert!(
+        latency < Duration::from_secs(8),
+        "the reading session took {latency:?}"
+    );
+    let digest = sha256_hex(&upload);
+    drop(shell);
+    drop(victim);
+    assert!(
+        wait_for(Duration::from_secs(10), || uploads_in(&rig.log)
+            .iter()
+            .any(|(sha, _)| *sha == digest))
+        .await,
+        "the SCP upload was not captured"
+    );
+    // At least one hog was the one asked to let go, and its capture says so.
+    assert!(
+        wait_for(Duration::from_secs(10), || uploads_in(&rig.log)
+            .iter()
+            .any(|(_, reason)| reason == "output_evicted"))
+        .await,
+        "no hog was recorded as evicted: {:?}",
+        uploads_in(&rig.log)
+    );
+    drop(hogs);
+    rig.handle.abort();
+}
+
+/// A connection whose queued output has not moved for the stall limit is closed, and the capture
+/// in flight on it says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_whose_output_makes_no_progress_is_closed_and_says_why() {
+    let rig = rig_with(
+        Duration::from_secs(120),
+        OUTPUT_BUDGET_BYTES,
+        Duration::from_secs(2),
+    )
+    .await;
+    // Nothing here reads, so the only thing that can end this connection before max_duration is
+    // the sensor's own decision about the stall.
+    let _open = hog(rig.addr, 1, 6, b"stalled-marker").await;
+    assert!(
+        wait_for(Duration::from_secs(10), || uploads_in(&rig.log)
+            .iter()
+            .any(|(_, reason)| reason == "output_stalled"))
+        .await,
+        "no capture recorded output_stalled: {:?}",
+        uploads_in(&rig.log)
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || rig.output.current_bytes() == 0).await,
+        "the stalled connection's charge was not refunded"
+    );
+    rig.handle.abort();
+}
+
+/// Work refused for lack of budget runs as soon as budget is refunded, not at the session's next
+/// unrelated wakeup (before, a keepalive 20 s later).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_work_runs_the_moment_budget_is_refunded() {
+    let rig = rig_with(
+        Duration::from_secs(120),
+        10 * 1024 * 1024,
+        OUTPUT_STALL_LIMIT,
+    )
+    .await;
+    // Another holder, not a connection, so there is nobody to ask to let go.
+    let held = rig.output.try_reserve(4 * 1024 * 1024).unwrap();
+    let session = login(rig.addr, 2_097_152).await;
+    let mut shell = open_shell(&session).await;
+    shell.data(&b"echo WAKE_OK\r"[..]).await.unwrap();
+    assert!(
+        !read_until(&mut shell, b"WAKE_OK", Duration::from_millis(800)).await,
+        "the budget is short, so nothing runs yet"
+    );
+    let freed = tokio::time::Instant::now();
+    drop(held);
+    assert!(
+        read_until(&mut shell, b"WAKE_OK", Duration::from_secs(3)).await,
+        "the reply did not follow the refund"
+    );
+    assert!(freed.elapsed() < Duration::from_secs(3));
     rig.handle.abort();
 }
 

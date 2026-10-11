@@ -252,6 +252,29 @@
 
 ### Fixed
 
+- **A few SSH peers that do not read can no longer stall every other session** - the output
+  budget they fill is now shared fairly. Two or three connections that never read could hold all
+  of the 64 MiB output budget, and then every other session's shell, exec, SCP and SFTP waited
+  (a reply took 20 s, until the peer's own keepalive woke the session). Now a session that cannot
+  be served asks the connection holding the most to let go, never itself, and is served when the
+  budget is refunded; a refund wakes waiting sessions at once; a connection whose queued output
+  makes no progress for 30 s is closed (`output_stalled`), and one asked to let go is closed
+  (`output_evicted`), both written into the `end_reason` of any capture in flight on it; a
+  packet that cannot print a line reserves 256 KiB, not 9 MiB; SCP and SFTP frames do not wait
+  for queue room. A connection holds at most 24 MiB of the budget in all.
+- **The SSH sensor no longer queues unbounded output for a peer that does not read** - a peer
+  could advertise a zero window, then type lines that each print up to 4 MiB (10 channels a
+  connection, 256 connections), and the sensor held all of it in memory with no budget. Output
+  is now charged to a 64 MiB process-wide output budget through an allowance reserved before each
+  unit of work runs; a channel stops running further lines at one line of unsent output and a
+  connection at two; input behind a backed-up queue waits in order, charged, and runs when the
+  peer reads, never dropped; and if the budget cannot hold what is waiting the session ends. A
+  connection holding output unread is still closed at `max_duration`. No configuration option.
+- **A held input is no longer copied per reader** - a command waiting for its input (`cat > f`,
+  `sh`) copied the capture three times as it ran, about 3.1 times a 10 MB body, uncharged, per
+  worker thread. The shell now reads the capture buffer in place, which stays charged to the
+  capture budget, and a line's own copies are bounded by its work allowance (21 MB measured at 10
+  MB and 40 MB inputs; it was 31 MB at 10 MB).
 - **A scanner's protocol probe on the telnet port is no longer filed as a malware sample** - a
   scanner that sends a TLS hello, an RDP or SMB request or similar to port 23 had its first bytes
   read as the login and the rest kept as a 54 to 175 byte `binary_shell_payload` sample, which

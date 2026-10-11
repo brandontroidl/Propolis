@@ -152,6 +152,12 @@ pub enum CaptureEnd {
     CaptureBudget,
     /// The peer aborted the transfer with its protocol's own error message (a TFTP ERROR).
     PeerAborted,
+    /// The sensor closed the connection because output queued for the peer made no progress for
+    /// the stall limit: the peer was not reading.
+    OutputStalled,
+    /// The sensor closed the connection to free the output budget for sessions that could not be
+    /// served, because it held the most of it.
+    OutputEvicted,
 }
 
 impl CaptureEnd {
@@ -174,6 +180,8 @@ impl CaptureEnd {
             Self::MalformedInput => "malformed_input",
             Self::CaptureBudget => "capture_budget",
             Self::PeerAborted => "peer_aborted",
+            Self::OutputStalled => "output_stalled",
+            Self::OutputEvicted => "output_evicted",
         }
     }
 }
@@ -963,6 +971,8 @@ mod tests {
             (CaptureEnd::MalformedInput, "malformed_input", false),
             (CaptureEnd::CaptureBudget, "capture_budget", false),
             (CaptureEnd::PeerAborted, "peer_aborted", false),
+            (CaptureEnd::OutputStalled, "output_stalled", false),
+            (CaptureEnd::OutputEvicted, "output_evicted", false),
         ];
         for (end, label, session_complete) in all {
             let m = upload_metadata("ssh", &sample(8), 8, UploadEnd::Session(end));

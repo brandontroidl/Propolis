@@ -5,6 +5,7 @@ pub const VERSION_MARKER: &str = "sensor-ssh";
 pub mod auth;
 pub mod channel;
 pub mod hostkey;
+pub mod output;
 pub mod server;
 pub mod timeout_stream;
 pub mod transfer;

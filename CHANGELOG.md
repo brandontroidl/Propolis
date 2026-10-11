@@ -252,6 +252,12 @@
 
 ### Fixed
 
+- **A panic while a held line ran no longer loses the input it had captured** - while the shell
+  reads a held input in place the capture body is empty, so a panic unwound through it recorded an
+  empty body, which records nothing. The shell now reads a shared handle to the bytes and the
+  input keeps its own, so the bytes are recorded (as cut off by the cancellation) however the line
+  ends. The overhead test now also measures `HeldInput::finish`, the path production takes, and
+  asserts at every input size.
 - **Storing a capture no longer holds an async worker** - the hand-off worker hashed, wrote and
   fsynced a body of up to 10 MB on the async runtime, which the SSH sensor runs with two worker
   threads. The store now runs on the blocking pool; the body moves with it, so its budget

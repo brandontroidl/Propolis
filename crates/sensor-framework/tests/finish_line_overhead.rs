@@ -4,11 +4,20 @@
 //! that does not grow with the input. Before this was pinned the shell copied the whole input
 //! once on entry and again in each reader: about 3x a 10 MB body, uncharged, per worker thread.
 //!
+//! Measured twice: on the shell alone, and through `HeldInput::finish`, the path production
+//! takes (a copy added there is invisible to a test that calls the shell directly). Every size is
+//! asserted, not only the largest.
+//!
 //! One test in this binary, because the counting allocator is process-global.
 
 use sensor_framework::fakefs::FakeFs;
 use sensor_framework::shell::{EmitContext, FakeShell, InputEnd, LineStep};
+use sensor_framework::{
+    CaptureHandoff, CaptureMemoryBudget, CaptureSource, EventEmitter, HeldEnd, HeldInput,
+    InputMode, LINE_WORKING_SET_BYTES, OutboxManifest, QuarantineSpool, StdinCaptures,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Counting;
@@ -53,24 +62,86 @@ fn ctx() -> EmitContext {
     }
 }
 
-/// Heap a line adds while it runs on `size` bytes of input, beyond the input itself.
-fn extra_heap(line: &str, size: usize) -> usize {
+/// Heap a line adds while the shell runs it on `size` bytes of input, beyond the input itself.
+fn extra_heap_shell(line: &str, size: usize) -> usize {
     let mut shell = FakeShell::exec(FakeFs::new(), ctx());
     assert!(matches!(shell.start_line(line).0, LineStep::AwaitingInput));
-    let body = vec![b'A'; size];
+    let body = Arc::new(vec![b'A'; size]);
     let base = CURRENT.load(Ordering::SeqCst);
     PEAK.store(base, Ordering::SeqCst);
-    let (out, body) = shell.finish_line_owned(body, InputEnd::Eof);
+    let out = shell.finish_line_shared(body.clone(), InputEnd::Eof);
     let peak = PEAK.load(Ordering::SeqCst);
-    assert_eq!(body.len(), size, "{line}: the input comes back whole");
+    assert_eq!(body.len(), size, "{line}: the input is still whole");
     drop(out);
     peak.saturating_sub(base)
 }
 
-/// The line's own working budget of 4_194_304 bytes (`BudgetLimits::work_per_line`), copied at
-/// most five times (a reader's copy, its output, the redirect's write), plus 1 MiB for the
-/// shell's bookkeeping. Not a function of the input's size.
-const BOUND: usize = 5 * 4_194_304 + 1_048_576;
+/// The same, through `HeldInput::finish`: the input is fed in as a connection would feed it, then
+/// the line is finished and recorded. Only `finish` is measured.
+fn extra_heap_held(line: &str, size: usize) -> usize {
+    let dir = tempfile::tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    std::fs::create_dir(&spool_dir).unwrap();
+    let handoff = Arc::new(CaptureHandoff::new(
+        QuarantineSpool::new(spool_dir, 100_000_000, 1_000_000_000),
+        EventEmitter::new(dir.path().join("events.jsonl")),
+        4,
+        "test".to_string(),
+        OutboxManifest::new(dir.path().join("outbox")),
+        Arc::new(CaptureMemoryBudget::new(u64::MAX)),
+    ));
+    let captures = StdinCaptures::new(
+        handoff,
+        CaptureSource {
+            sensor: "ssh",
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: None,
+            session_id: uuid::Uuid::now_v7(),
+            authenticated: true,
+        },
+    );
+    let mut shell = FakeShell::exec(FakeFs::new(), ctx());
+    assert!(matches!(shell.start_line(line).0, LineStep::AwaitingInput));
+    let mut input = HeldInput::new(
+        &shell,
+        InputMode::Pipe,
+        &captures,
+        "exec_stdin",
+        size as u64,
+    );
+    input.feed(&vec![b'A'; size]);
+    assert_eq!(input.len(), size, "{line}: the whole input was kept");
+    let base = CURRENT.load(Ordering::SeqCst);
+    PEAK.store(base, Ordering::SeqCst);
+    let out = input.finish(&mut shell, HeldEnd::Eof);
+    let peak = PEAK.load(Ordering::SeqCst);
+    drop(out);
+    peak.saturating_sub(base)
+}
+
+/// The line's working allowance, a figure of its work budget and not of the input's size.
+const BOUND: usize = LINE_WORKING_SET_BYTES as usize;
+
+/// Assert, at every size, that the overhead is within the bound, and that quadrupling the input
+/// from 10 MB moves it by no more than a megabyte.
+fn check(path: &str, line: &str, measure: fn(&str, usize) -> usize) {
+    let small = measure(line, 1_000_000);
+    let large = measure(line, 10_000_000);
+    let huge = measure(line, 40_000_000);
+    println!("FINISH_LINE {path} {line:?} 1MB={small} 10MB={large} 40MB={huge}");
+    for (size, extra) in [("1 MB", small), ("10 MB", large), ("40 MB", huge)] {
+        assert!(
+            extra <= BOUND,
+            "{path} {line}: {extra} extra bytes on {size}"
+        );
+    }
+    // Four times the input must not move the overhead: that is what separates a bound from a
+    // multiple of the input.
+    assert!(
+        huge <= large.saturating_add(1_048_576),
+        "{path} {line}: overhead grew with the input, {large} at 10 MB and {huge} at 40 MB"
+    );
+}
 
 #[test]
 fn the_heap_a_finishing_line_adds_does_not_grow_with_its_input() {
@@ -83,18 +154,7 @@ fn the_heap_a_finishing_line_adds_does_not_grow_with_its_input() {
         "wc -c",
         "dd of=/tmp/y",
     ] {
-        let small = extra_heap(line, 1_000_000);
-        let large = extra_heap(line, 10_000_000);
-        let huge = extra_heap(line, 40_000_000);
-        println!("FINISH_LINE {line:?} 1MB={small} 10MB={large} 40MB={huge}");
-        assert!(large <= BOUND, "{line}: {large} extra bytes on 10 MB");
-        // Four times the input must not move the overhead: that is what separates a bound from a
-        // multiple of the input.
-        assert!(
-            huge <= large.saturating_add(1_048_576),
-            "{line}: overhead grew with the input, {large} at 10 MB and {huge} at 40 MB"
-        );
-        assert!(huge <= BOUND, "{line}: {huge} extra bytes on 40 MB");
-        let _ = small;
+        check("shell", line, extra_heap_shell);
+        check("held", line, extra_heap_held);
     }
 }

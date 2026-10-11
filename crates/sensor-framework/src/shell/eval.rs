@@ -440,7 +440,9 @@ pub(super) enum Stdin {
 /// name, and one that does sets it by reading, through the same calls every reader makes.
 #[derive(Debug, Clone)]
 pub(super) struct SessionInput {
-    bytes: Vec<u8>,
+    /// Shared with whoever lent it, which keeps its own handle: the shell reads the one buffer in
+    /// place, and the lender still has the bytes if the shell never gives them back (a panic).
+    bytes: std::sync::Arc<Vec<u8>>,
     pos: usize,
     /// Nothing more will arrive: a read past the end sees end of input, as it does on a pipe.
     eof: bool,
@@ -456,7 +458,7 @@ impl Stdin {
         Self::Data { bytes, pos: 0 }
     }
 
-    pub(super) fn session(bytes: Vec<u8>, eof: bool, tty: bool) -> Self {
+    pub(super) fn session(bytes: std::sync::Arc<Vec<u8>>, eof: bool, tty: bool) -> Self {
         Self::Session(SessionInput {
             bytes,
             pos: 0,
@@ -553,15 +555,6 @@ impl Stdin {
             Self::Terminal => None,
             Self::Session(input) if input.tty => None,
             Self::Data { .. } | Self::Session(_) => Some(self.take_rest(cap)),
-        }
-    }
-
-    /// The session input's buffer, handed back so the caller that lent it keeps the one copy.
-    /// Empty for any other input.
-    pub(super) fn take_session_bytes(&mut self) -> Vec<u8> {
-        match self {
-            Self::Session(input) => std::mem::take(&mut input.bytes),
-            _ => Vec::new(),
         }
     }
 }

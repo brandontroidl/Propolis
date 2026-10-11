@@ -252,6 +252,11 @@
 
 ### Fixed
 
+- **`$SHLVL` counts nested shells** - it stayed 1 however many `bash` or `su` levels a session
+  opened, where a real bash adds one to the `SHLVL` it inherits and exports it, so `bash; echo
+  $SHLVL` printing 1 was a tell. Each bash level now counts itself in (a value that is not a number
+  counts as 0, one that reaches 1000 starts again at 1); dash and mksh leave it alone. bash's
+  warning at 1000 is not printed.
 - **A panic while a held line ran no longer loses the input it had captured** - while the shell
   reads a held input in place the capture body is empty, so a panic unwound through it recorded an
   empty body, which records nothing. The shell now reads a shared handle to the bytes and the

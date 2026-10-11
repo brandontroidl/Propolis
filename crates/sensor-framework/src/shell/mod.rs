@@ -2292,6 +2292,20 @@ impl FakeShell {
                 .filter(|(_, held)| held.exported)
                 .map(|(name, held)| (name.clone(), held.clone()))
                 .collect();
+            // bash counts itself into the `SHLVL` it inherits and exports the result: a value
+            // that is not a number counts as 0, and one that reaches 1000 starts again at 1.
+            // dash and mksh leave it as they found it.
+            let inherited = state
+                .vars
+                .get("SHLVL")
+                .and_then(|var| var.value.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let level = match inherited.saturating_add(1) {
+                n if n < 0 => 0,
+                n if n >= 1000 => 1,
+                n => n,
+            };
+            state.set_var("SHLVL", level.to_string(), true);
         }
         state
     }

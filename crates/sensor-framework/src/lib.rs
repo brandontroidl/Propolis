@@ -42,7 +42,7 @@ pub use bounds::ConnectionBounds;
 pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
 pub use capture_budget::{
     CAPTURE_CHUNK_BYTES, CaptureBody, CaptureExhausted, CaptureMemoryBudget,
-    DEFAULT_CAPTURE_BUDGET_BYTES_256M, default_capture_budget_bytes,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, Reservation, default_capture_budget_bytes,
 };
 pub use command_codec::CommandCodec;
 pub use command_flood::{

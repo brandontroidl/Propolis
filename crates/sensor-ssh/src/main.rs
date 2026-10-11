@@ -308,7 +308,12 @@ fn parse_positive_u32(
     Ok(value)
 }
 
-#[tokio::main]
+// Two workers, not one per core: the unit runs under `CPUQuota=75%`, so more threads add no
+// throughput, and every worker can be inside a shell line at once, each with a line's working
+// copies (about 21 MB) outside any budget. The worst-case sum in
+// docs/operations/capacity-planning.md and `tests/budget_product_test.rs` counts exactly this
+// many.
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     sensor_framework::init_logging();
 

@@ -97,6 +97,14 @@ impl CaptureMemoryBudget {
         }
     }
 
+    /// A reservation of nothing, for a holder that has not yet been granted anything.
+    pub fn empty_reservation(&self) -> Reservation {
+        Reservation {
+            inner: Arc::clone(&self.inner),
+            bytes: 0,
+        }
+    }
+
     pub fn ceiling_bytes(&self) -> u64 {
         self.inner.ceiling
     }
@@ -124,6 +132,18 @@ pub struct Reservation {
 impl Reservation {
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Moves `bytes` of this reservation into a reservation of its own, or `None` when it holds
+    /// less. The budget's total does not change: the two halves refund exactly what the whole
+    /// would have, each on its own drop. This is how a worst-case allowance reserved before work
+    /// runs is handed out to the pieces of output the work produces.
+    pub fn split_off(&mut self, bytes: u64) -> Option<Reservation> {
+        self.bytes = self.bytes.checked_sub(bytes)?;
+        Some(Reservation {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
     }
 }
 
@@ -323,6 +343,23 @@ mod tests {
         })
         .join();
         assert!(res.is_err());
+        assert_eq!(b.current_bytes(), 0);
+    }
+
+    #[test]
+    fn split_off_hands_out_part_of_a_reservation_without_changing_the_total() {
+        let b = CaptureMemoryBudget::new(100);
+        let mut whole = b.try_reserve(60).unwrap();
+        let part = whole.split_off(25).unwrap();
+        assert_eq!((whole.bytes(), part.bytes()), (35, 25));
+        assert_eq!(b.current_bytes(), 60);
+        assert!(whole.split_off(36).is_none(), "more than it holds");
+        assert_eq!(whole.bytes(), 35, "a refused split takes nothing");
+        drop(part);
+        assert_eq!(b.current_bytes(), 35);
+        drop(whole);
+        assert_eq!(b.current_bytes(), 0);
+        assert_eq!(b.empty_reservation().bytes(), 0);
         assert_eq!(b.current_bytes(), 0);
     }
 

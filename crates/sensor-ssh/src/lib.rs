@@ -17,7 +17,7 @@ pub mod transport;
 pub use sensor_framework::fakefs;
 pub use sensor_framework::shell;
 
-pub use server::{serve, serve_with_handoff};
+pub use server::{serve, serve_with_budgets, serve_with_handoff};
 
 #[cfg(test)]
 mod tests {

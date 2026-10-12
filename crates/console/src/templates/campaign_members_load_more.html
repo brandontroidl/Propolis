@@ -1,0 +1,1 @@
+{% if cursor_lost %}<span class="dim">The list changed since it loaded: the last member shown is no longer in this campaign. Reload to continue.</span>{% elif next_after %}<button hx-get="/campaigns/{{ id }}/members?after={{ next_after }}" hx-target="#members-rows" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}

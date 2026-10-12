@@ -1,0 +1,4 @@
+{% include "campaign_members_rows.html" %}
+{#- The rows land through the request's own `beforeend` swap into `#members-rows`; this replaces
+    the button out of band, as `ips_rows_fragment.html` does. -#}
+<div id="load-more-container" hx-swap-oob="true">{% include "campaign_members_load_more.html" %}</div>

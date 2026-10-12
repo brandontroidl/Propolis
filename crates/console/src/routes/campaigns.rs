@@ -43,6 +43,7 @@ pub fn router() -> Router<AppState> {
         .route("/campaigns", get(list_page))
         .route("/campaigns/rows", get(list_rows))
         .route("/campaigns/{id}", get(detail_page))
+        .route("/campaigns/{id}/members", get(member_rows))
         .route(
             "/campaigns/{id}/approve",
             get(approve_confirm).post(approve_members),
@@ -51,7 +52,7 @@ pub fn router() -> Router<AppState> {
 
 /// Campaigns listed per load: the page shows this many, and each "Load more" this many more.
 const LIST_LIMIT: i64 = 200;
-/// Members listed on a campaign page.
+/// Members listed per load on a campaign page, most recently seen first.
 const MEMBER_LIMIT: i64 = 500;
 /// Pending members one confirmation can approve.
 pub(crate) const MAX_APPROVE: i64 = 1000;
@@ -871,6 +872,97 @@ fn representative(value: &Value) -> Representative {
     }
 }
 
+/// One load of a campaign's members, most recently seen first: up to [`MEMBER_LIMIT`] after the
+/// member `after` names (from the top when `None`), and the address to continue after when more
+/// follow. Both order columns run descending, so one row-value comparison resumes exactly past
+/// the last member shown.
+async fn fetch_members(
+    db: &PgPool,
+    id: i64,
+    after: Option<std::net::IpAddr>,
+) -> Result<(Vec<MemberRow>, Option<String>), AppError> {
+    let rows = sqlx::query(
+        "SELECT host(m.source_ip) AS ip, m.first_seen, m.last_seen, m.sightings, m.uploaded, \
+                q.state::text AS review \
+         FROM campaign_member m LEFT JOIN review_queue q ON q.source_ip = m.source_ip \
+         WHERE m.campaign_id = $1 \
+           AND ($3::inet IS NULL OR (m.last_seen, m.source_ip) < \
+                (SELECT last_seen, source_ip FROM campaign_member \
+                 WHERE campaign_id = $1 AND source_ip = $3::inet)) \
+         ORDER BY m.last_seen DESC, m.source_ip DESC LIMIT $2",
+    )
+    .bind(id)
+    .bind(MEMBER_LIMIT + 1)
+    .bind(after.map(|ip| ip.to_string()))
+    .fetch_all(db)
+    .await?;
+    let more = rows.len() as i64 > MEMBER_LIMIT;
+    let mut members = Vec::with_capacity(rows.len());
+    for r in rows.iter().take(MEMBER_LIMIT as usize) {
+        members.push(MemberRow {
+            ip: r.try_get("ip")?,
+            first_seen: format_timestamp(r.try_get("first_seen")?),
+            last_seen: format_timestamp(r.try_get("last_seen")?),
+            sightings: r.try_get("sightings")?,
+            uploaded: r.try_get("uploaded")?,
+            review: r.try_get("review")?,
+        });
+    }
+    let next_after = members.last().map(|m| m.ip.clone()).filter(|_| more);
+    Ok((members, next_after))
+}
+
+#[derive(Debug, Deserialize)]
+struct MemberQuery {
+    /// The address of the last member already shown.
+    after: Option<String>,
+}
+
+/// `GET /campaigns/{id}/members`: the next load of members after `after=`. A member no longer in
+/// the campaign cannot say where to resume, so nothing is added and the fragment says so.
+async fn member_rows(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<MemberQuery>,
+) -> Result<Html<String>, AppError> {
+    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM campaign WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await?;
+    let after = query
+        .after
+        .as_deref()
+        .and_then(|a| a.parse::<std::net::IpAddr>().ok());
+    let is_member = match after {
+        Some(ip) if kind.is_some() => {
+            sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM campaign_member \
+             WHERE campaign_id = $1 AND source_ip = $2::inet)",
+            )
+            .bind(id)
+            .bind(ip.to_string())
+            .fetch_one(&state.db)
+            .await?
+        }
+        _ => false,
+    };
+    let (members, next_after) = if is_member {
+        fetch_members(&state.db, id, after).await?
+    } else {
+        (Vec::new(), None)
+    };
+    let tmpl = state
+        .templates
+        .get_template("campaign_members_fragment.html")?;
+    Ok(Html(tmpl.render(context! {
+        id,
+        kind_value => kind.unwrap_or_default(),
+        members,
+        next_after,
+        cursor_lost => !is_member,
+    })?))
+}
+
 /// The campaign's pending members, at most [`MAX_APPROVE`], in address order.
 async fn pending_members(pool: &PgPool, id: i64) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
@@ -913,27 +1005,7 @@ async fn detail_page(
     let kind: String = c.try_get("kind")?;
     let key: String = c.try_get("key")?;
 
-    let member_rows = sqlx::query(
-        "SELECT host(m.source_ip) AS ip, m.first_seen, m.last_seen, m.sightings, m.uploaded, \
-                q.state::text AS review \
-         FROM campaign_member m LEFT JOIN review_queue q ON q.source_ip = m.source_ip \
-         WHERE m.campaign_id = $1 ORDER BY m.last_seen DESC, m.source_ip LIMIT $2",
-    )
-    .bind(id)
-    .bind(MEMBER_LIMIT)
-    .fetch_all(&state.db)
-    .await?;
-    let mut members = Vec::with_capacity(member_rows.len());
-    for r in &member_rows {
-        members.push(MemberRow {
-            ip: r.try_get("ip")?,
-            first_seen: format_timestamp(r.try_get("first_seen")?),
-            last_seen: format_timestamp(r.try_get("last_seen")?),
-            sightings: r.try_get("sightings")?,
-            uploaded: r.try_get("uploaded")?,
-            review: r.try_get("review")?,
-        });
-    }
+    let (members, next_after) = fetch_members(&state.db, id, None).await?;
 
     let base = base_context(&state.db, state.startup_time, state.version).await;
     let mut degraded = base.degraded;
@@ -1034,7 +1106,8 @@ async fn detail_page(
         role => member_role(&kind, self_propagating),
         self_propagating,
         members,
-        member_limit => MEMBER_LIMIT,
+        next_after,
+        cursor_lost => false,
         pending_members => pending.len(),
         spark => host_strip(&days.get(&id).cloned().unwrap_or_default(), today, DETAIL_SPARK_DAYS),
         spark_days => DETAIL_SPARK_DAYS,

@@ -1,0 +1,10 @@
+{% import "macros.html" as m %}
+{% for mbr in members %}
+      <tr>
+        <td class="ip stack-lead">{{ m.ip_evidence_link(mbr.ip) }}{% if mbr.uploaded and kind_value == "sample" %} <span class="dim">uploaded</span>{% endif %}</td>
+        <td class="seen" data-label="First seen">{{ mbr.first_seen }}</td>
+        <td class="seen" data-label="Last seen">{{ mbr.last_seen }}</td>
+        <td class="count" data-label="Sightings">{{ mbr.sightings | count }}</td>
+        <td class="stack-end">{% if mbr.review %}<span class="state-pill state-{{ mbr.review }}">{{ mbr.review }}</span>{% else %}<span class="dim">not queued</span>{% endif %}</td>
+      </tr>
+{% endfor %}

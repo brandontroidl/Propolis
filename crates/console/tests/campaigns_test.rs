@@ -1846,3 +1846,72 @@ async fn campaigns_load_every_campaign_once_in_order(pool: PgPool) {
     );
     assert!(listed_campaigns(&lost).is_empty());
 }
+
+/// A campaign page lists every member, most recently seen first, 500 at a time: members seen at
+/// the same moment are each loaded once, and a member gone from the campaign is reported.
+#[sqlx::test(migrations = false)]
+async fn a_campaign_loads_every_member_once_most_recent_first(pool: PgPool) {
+    migrate(&pool).await;
+    let id = insert_campaign(&pool, "command_sequence", "3 commands: big", 1200, 48, 0).await;
+    // 1,200 members over 100 distinct times: twelve share each last_seen.
+    sqlx::query(
+        "INSERT INTO campaign_member (campaign_id, source_ip, first_seen, last_seen, sightings) \
+         SELECT $1, ('10.9.' || (i / 256) || '.' || (i % 256))::inet, now() - interval '2 days', \
+                now() - (i % 100) * interval '1 minute', 1 \
+         FROM generate_series(0, 1199) AS i",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let console = Console::new(pool.clone());
+    let listed = |body: &str| -> Vec<String> {
+        body.split("<td class=\"ip stack-lead\"><a class=\"insp\" href=\"/ip/")
+            .skip(1)
+            .map(|r| r[..r.find('"').unwrap()].to_string())
+            .collect()
+    };
+    let load_more = |body: &str| -> Option<String> {
+        let at = body.find(&format!("<button hx-get=\"/campaigns/{id}/members?"))? + 16;
+        Some(body[at..at + body[at..].find('"')?].to_string())
+    };
+
+    let (status, page) = console.get(&format!("/campaigns/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!page.contains("most recent 500 shown"), "{page}");
+    let mut members = listed(&page);
+    assert_eq!(members.len(), 500);
+    let mut next = load_more(&page).expect("a second load");
+    loop {
+        let (status, more) = console.get(&next).await;
+        assert_eq!(status, StatusCode::OK);
+        members.extend(listed(&more));
+        match load_more(&more) {
+            Some(url) => next = url,
+            None => break,
+        }
+    }
+    let unique: std::collections::BTreeSet<&String> = members.iter().collect();
+    assert_eq!(members.len(), 1200, "every member listed");
+    assert_eq!(unique.len(), 1200, "and each once");
+    let seen: Vec<i64> = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM last_seen))::bigint FROM campaign_member \
+         WHERE campaign_id = $1 AND source_ip = ANY($2::inet[]) \
+         ORDER BY array_position($2::text[], host(source_ip))",
+    )
+    .bind(id)
+    .bind(&members)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(seen.windows(2).all(|w| w[0] >= w[1]), "most recent first");
+
+    let (_, lost) = console
+        .get(&format!("/campaigns/{id}/members?after=192.0.2.250"))
+        .await;
+    assert!(
+        lost.contains("no longer in this campaign. Reload to continue."),
+        "{lost}"
+    );
+    assert!(listed(&lost).is_empty());
+}

@@ -22,6 +22,11 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// `PROPOLIS_SPOOL_ROOT` is one variable for the whole process, and two tests here point it at
+/// spools of their own. Run in parallel, one read the other's spool and lost its sample (about one
+/// run in five). Each holds this for its whole run.
+static SPOOL_ROOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 mod markup;
 
 fn state(db: PgPool) -> AppState {
@@ -577,8 +582,9 @@ async fn approving_a_campaign_confirms_the_list_first_and_approves_only_it(pool:
 #[sqlx::test(migrations = false)]
 async fn queue_ip_and_samples_pages_link_to_the_campaign(pool: PgPool) {
     migrate(&pool).await;
+    let _spool = SPOOL_ROOT.lock().await;
     let root = tempfile::tempdir().unwrap();
-    // SAFETY: set before anything reads it, and nothing else in this binary reads the environment.
+    // SAFETY: the only other writer of the environment in this binary holds the same lock.
     unsafe { std::env::set_var("PROPOLIS_SPOOL_ROOT", root.path()) };
     let body = b"#!/bin/sh\necho worm four\n";
     let sha = seed(&pool, body).await;
@@ -1681,8 +1687,9 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
 #[sqlx::test(migrations = false)]
 async fn every_page_keeps_the_panel_contract(pool: PgPool) {
     migrate(&pool).await;
+    let _spool = SPOOL_ROOT.lock().await;
     let root = tempfile::tempdir().unwrap();
-    // SAFETY: set before anything reads it, and nothing else in this binary reads the environment.
+    // SAFETY: the only other writer of the environment in this binary holds the same lock.
     unsafe { std::env::set_var("PROPOLIS_SPOOL_ROOT", root.path()) };
     let body = b"#!/bin/sh\necho \"127.0.0.1 rival.example.net\" >> /etc/hosts\n";
     let sha = seed(&pool, body).await;

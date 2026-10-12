@@ -182,6 +182,14 @@ fi
 
 STEP="recording digests"
 (cd "$PARTIAL" && sha256sum -- "${files[@]}" > SHA256SUMS)
+# An encrypted set, and only an encrypted one, is readable by the off-host pull account
+# (deploy/backup-serve.sh): ciphertext can leave the box, a plaintext dump never does.
+if [ "$ENCRYPT" -eq 1 ] && getent group propolis-backup-pull >/dev/null 2>&1; then
+    STEP="opening the encrypted set to the pull account"
+    chgrp -R propolis-backup-pull "$PARTIAL"
+    chmod 0750 "$PARTIAL"
+    chmod 0640 "$PARTIAL"/*
+fi
 mv -- "$PARTIAL" "$BACKUP_DIR/$SET"
 PARTIAL=""
 

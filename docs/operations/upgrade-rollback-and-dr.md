@@ -146,15 +146,13 @@ What is irreplaceable if the host is lost and nothing left it:
 What is not lost with a database backup: the feed output regenerates from
 `ip_score`, and log cursors rebuild by re-reading logs.
 
-### Off-host backup is the missing piece
+### Off-host backup
 
-There is currently **no off-host backup mechanism shipped** with Propolis. Real
-disaster recovery for a single-node deployment requires an off-host anchor that a
-full host loss cannot touch: ship the database dump and the spool/config archives
-(see [backup and restore](backup-and-restore.md)) to storage on independent
-hardware, power, and network. Off-host replication of evidence is a recommended
-operator responsibility and a planned platform capability, not a delivered
-feature. `[planned]`
+Real disaster recovery for a single-node deployment needs an off-host anchor that a full host
+loss cannot touch. The node backs itself up nightly and a machine on independent hardware,
+power and network pulls each encrypted set over a restricted SSH key
+([off-host copies](backup-and-restore.md#off-host-copies)); until that pull is set up, every
+backup is on the same disk as what it protects.
 
 ### Recovery is a claim to test
 

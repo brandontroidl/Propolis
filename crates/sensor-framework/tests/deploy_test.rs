@@ -2224,6 +2224,67 @@ fn watch_authorized_keys_example_forces_the_watcher_under_restrict() {
     );
 }
 
+/// The off-host pull account is set up like the watcher's: its key runs only the serve script under
+/// `restrict`, its home and `.ssh` are root-owned so it cannot add a key, it has no password, the
+/// backup directory is traversable by its group (plaintext sets inside stay 0700 root), and both
+/// deploy scripts install the forced command where the key names it.
+#[test]
+fn the_backup_pull_account_can_only_fetch_encrypted_sets_through_its_forced_command() {
+    let example = deploy_file("backup-pull-authorized-keys.example");
+    let lines: Vec<&str> = example
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one example key line");
+    let (options, rest) = lines[0]
+        .split_once(" ssh-ed25519 ")
+        .expect("an ssh-ed25519 key line");
+    assert_eq!(
+        options,
+        "restrict,command=\"/usr/local/sbin/propolis-backup-serve\""
+    );
+    assert!(
+        rest.starts_with("AAAA... "),
+        "the example must not carry a real key"
+    );
+
+    let provision = deploy_file("provision.sh");
+    for needle in [
+        "ensure_dir /var/backups/propolis          0750 root              propolis-backup-pull",
+        "ensure_dir /var/lib/propolis-backup-pull  0750 root              propolis-backup-pull",
+        "ensure_dir /var/lib/propolis-backup-pull/.ssh 0755 root          root",
+        "run usermod -p '*' propolis-backup-pull",
+        "--home-dir /var/lib/propolis-backup-pull --shell /bin/sh --user-group propolis-backup-pull",
+    ] {
+        assert!(provision.contains(needle), "provision.sh lacks {needle:?}");
+    }
+    assert!(
+        supplementary_groups(&provision, "propolis-backup-pull").is_empty(),
+        "the pull account needs no group but its own"
+    );
+
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        assert!(
+            script
+                .lines()
+                .map(str::trim_start)
+                .any(|l| l.contains("install -m 0755")
+                    && l.contains("backup-serve.sh")
+                    && l.ends_with("/usr/local/sbin/propolis-backup-serve")),
+            "{script_name} must install the forced command where the key names it"
+        );
+    }
+    for script in ["backup-serve.sh", "backup-pull.sh"] {
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy")).join(script))
+            .fenced_status()
+            .expect("bash -n runs");
+        assert!(status.success(), "deploy/{script} is not valid bash");
+    }
+}
+
 /// Runs deploy/watch-env.sh against `source` content, writing into a fresh directory, and returns
 /// the directory and the script's output.
 fn run_watch_env(source: Option<&str>, dry_run: bool) -> (tempfile::TempDir, std::process::Output) {

@@ -54,8 +54,10 @@ The policy's `prerotate` hook is `/usr/local/sbin/propolis-logrotate-guard`. See
 
 The nightly backup (`/usr/local/sbin/propolis-backup`, from `deploy/backup.sh`, run by
 `propolis-backup.timer`) writes one set per run under `/var/backups/propolis`
-(0750 root; `deploy/provision.sh#ensure_dir /var/backups/propolis`), each set 0700 and its
-files 0600. Its status files are in `/var/lib/propolis/backup-status`
+(0750 root:propolis-backup-pull; `deploy/provision.sh#ensure_dir /var/backups/propolis`). A
+plaintext set is 0700 root with 0600 files; an encrypted set is 0750 with 0640 files in group
+`propolis-backup-pull`, the account the off-host pull logs into, whose home
+`/var/lib/propolis-backup-pull` (and its `.ssh`) are root-owned like `propolis-watch`'s. Its status files are in `/var/lib/propolis/backup-status`
 (0755 root, files 0644; `deploy/provision.sh#ensure_dir /var/lib/propolis/backup-status`):
 `last-success`, `last-failure`, and the `lock` that keeps two runs apart. Age recipients
 for encrypted sets are read from `/etc/propolis/backup-recipients.txt`. See

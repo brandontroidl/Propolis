@@ -33,6 +33,12 @@
   so a dead host or a wedged monitor still reaches you. A new `backup-stale` condition pages when
   the last good backup is older than 36 h. `config-check.sh` reports backup, alerting and clock
   state. See [health and observability](docs/operations/health-and-observability.md#when-the-daemon-or-the-host-is-down).
+- **Off-host backup copies** - a machine you choose pulls each encrypted nightly set over a
+  dedicated SSH key whose forced command (`propolis-backup-serve`, account
+  `propolis-backup-pull`) can only list and send encrypted sets; a plaintext set never leaves
+  the box. `deploy/backup-pull.sh` fetches the newest set, checks every digest before keeping it,
+  and keeps the newest 14. See
+  [off-host copies](docs/operations/backup-and-restore.md#off-host-copies).
 - **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
   the commands the `redis` sensor records are now tagged, by a SQL reader of its own
   (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring

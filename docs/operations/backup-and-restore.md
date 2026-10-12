@@ -56,8 +56,47 @@ Run one by hand with `sudo systemctl start propolis-backup.service`, or
 `sudo propolis-backup` to see its output directly.
 
 A set on the same disk survives a bad upgrade, a deleted table or a corrupted ledger.
-It does not survive losing the host: copy sets off the box (see
-[upgrade, rollback and DR](upgrade-rollback-and-dr.md#off-host-backup-is-the-missing-piece)).
+It does not survive losing the host: copy sets off the box, as below.
+
+## Off-host copies
+
+The machine that keeps the copies pulls them; the honeypot holds no credential for anywhere
+else. A dedicated SSH key logs into the `propolis-backup-pull` account, whose forced command
+(`/usr/local/sbin/propolis-backup-serve`, from `deploy/backup-serve.sh`) answers only "list the
+encrypted sets" and "send this file of an encrypted set". A plaintext set is never listed or
+sent, so encryption is required for this, and a stolen pull key yields ciphertext at most.
+
+Once, on the machine that keeps the copies (not the honeypot):
+
+```
+age-keygen -o ~/.config/propolis/backup-age.key
+ssh-keygen -t ed25519 -f ~/.ssh/propolis_backup -C backup@workstation
+```
+
+`age-keygen` prints the public key (`age1...`). Keep the key file somewhere safe and separate:
+it is the only thing that decrypts the backups.
+
+Then on the honeypot, as root:
+
+1. `apt install age`, and put that public key in `/etc/propolis/backup-recipients.txt` (root,
+   0644; one key per line). The next nightly set is encrypted and readable by the pull account;
+   start one now with `systemctl start propolis-backup.service`.
+2. Put the PUBLIC half of the SSH key in `/var/lib/propolis-backup-pull/.ssh/authorized_keys`
+   (root:root 0644), in the form `deploy/backup-pull-authorized-keys.example` shows.
+
+Back on the machine that keeps the copies, pull with `deploy/backup-pull.sh` from a checkout of
+this repository, through the host's real administrative sshd port (not the honeypot's port 22):
+
+```
+deploy/backup-pull.sh --host <honeypot> --port <admin ssh port> --key ~/.ssh/propolis_backup --dest ~/propolis-backups
+```
+
+It fetches the newest encrypted set it does not have, checks every file against the set's
+`SHA256SUMS` before keeping it, keeps the newest 14 (`--keep`), and exits non-zero when it could
+not, so run it from a daily `systemd --user` timer or cron that reports failures. To restore from
+a pulled set, decrypt both files with
+`age --decrypt -i ~/.config/propolis/backup-age.key -o <file> <file>.age` and follow
+[restore procedure](#restore-procedure).
 
 > **Recovery is unverified until you test it.** A backup you have never restored
 > is a hypothesis. Rehearse the restore end to end against a scratch environment

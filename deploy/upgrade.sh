@@ -139,6 +139,8 @@ for unit in propolis-backup.service propolis-backup.timer; do
 done
 # Every Propolis unit names this in OnFailure=; installed with them, nothing to enable.
 install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+# The off-host pull's forced command; inert until the operator adds a key for propolis-backup-pull.
+install -m 0755 "$SCRIPT_DIR/backup-serve.sh" /usr/local/sbin/propolis-backup-serve
 install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service
 
 # After every step that can fail (the build, and every install above), and before the restarts, so

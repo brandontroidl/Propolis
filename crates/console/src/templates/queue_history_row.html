@@ -5,7 +5,7 @@
   <td>
     {{ m.tier_pill(row.tier) }}
   </td>
-  <td class="count" data-label="Events">{{ row.event_count }}</td>
+  <td class="count" data-label="Events">{{ row.event_count | count }}</td>
   <td class="seen stack-end" data-label="Decided">{{ row.decided_at }}</td>
   {% if row.state == "approved" %}<td data-label="Submissions">{{ row.submissions }}</td>{% endif %}
   <td class="dim stack-full">{{ row.notes }}</td>

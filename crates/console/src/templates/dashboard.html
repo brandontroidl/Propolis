@@ -8,23 +8,23 @@
 <div class="band">
   <div class="cell{% if pending_reviews > 0 %} cell--call{% endif %}">
     <span class="label">Waiting on you</span>
-    <div class="v {% if pending_reviews > 0 %}v--call{% else %}v--ok{% endif %}"><a href="/queue">{{ pending_reviews }}</a></div>
+    <div class="v {% if pending_reviews > 0 %}v--call{% else %}v--ok{% endif %}"><a href="/queue">{{ pending_reviews | count }}</a></div>
     <div class="foot">{% if pending_reviews > 0 %}in the review queue{% else %}queue clear{% endif %}</div>
   </div>
   <div class="cell">
     <span class="label">Events / 24h</span>
-    <div class="v">{{ events_24h }}</div>
-    <div class="foot">{% if events_last_hour >= 0 %}+{{ events_last_hour }} in the last hour{% else %}last 24 hours{% endif %}</div>
+    <div class="v">{{ events_24h | count }}</div>
+    <div class="foot">{% if events_last_hour >= 0 %}+{{ events_last_hour | count }} in the last hour{% else %}last 24 hours{% endif %}</div>
   </div>
   <div class="cell">
     <span class="label">Scored IPs</span>
-    <div class="v">{{ total_scored_ips }}</div>
+    <div class="v">{{ total_scored_ips | count }}</div>
     <div class="foot">{% if top_attacker_ip != "--" %}top {{ m.ip_evidence_link(top_attacker_ip) }}{% else %}no attackers yet{% endif %}</div>
   </div>
   <div class="cell">
     <span class="label">Published</span>
     <div class="v {% if feed_entries >= 0 %}v--ok{% endif %}">{% if feed_entries >= 0 %}{{ feed_entries }}{% else %}--{% endif %}</div>
-    <div class="foot">aggressive + standard &middot; {{ approved_today }} approved today</div>
+    <div class="foot">aggressive + standard &middot; {{ approved_today | count }} approved today</div>
   </div>
   <div class="cell">
     <span class="label">Last event</span>
@@ -53,7 +53,7 @@
       <tr>
         <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
         <td><span class="strip">{% for c in r.strip %}<i class="h-{{ c.height }}{% if c.class %} {{ c.class }}{% endif %}"></i>{% endfor %}</span></td>
-        <td class="count" data-label="Events">{{ r.event_count }}</td>
+        <td class="count" data-label="Events">{{ r.event_count | count }}</td>
         <td class="stack-full"><span class="sev-tags">{% for t in r.tags %}<span class="sev sev--{{ t.sev }}">{{ t.label }}</span>{% endfor %}</span></td>
         <td class="seen dim" data-label="Last seen">{{ r.last_seen }}</td>
       </tr>
@@ -112,7 +112,7 @@
       <tr>
         <td class="seen mono stack-end"{% if e.count > 1 %} title="{{ e.first_at }} to {{ e.last_at }}"{% endif %}>{{ e.relative_time }}</td>
         <td>{{ e.activity }}</td>
-        <td class="count" data-label="Events">{% if e.count > 1 or e.open_ended %}<span class="run-count">x{{ e.count }}{% if e.open_ended %}+{% endif %}</span>{% else %}<span class="faint">1</span>{% endif %}</td>
+        <td class="count" data-label="Events">{% if e.count > 1 or e.open_ended %}<span class="run-count">x{{ e.count | count }}{% if e.open_ended %}+{% endif %}</span>{% else %}<span class="faint">1</span>{% endif %}</td>
         <td class="ip stack-lead">{{ m.ip_evidence_link(e.source_ip) }}</td>
       </tr>
       {% endfor %}

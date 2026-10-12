@@ -16,7 +16,7 @@ pub mod detail;
 pub mod error;
 pub mod feed;
 pub mod fleet;
-mod format;
+pub(crate) mod format;
 pub mod health;
 pub mod integrity;
 pub mod ips;

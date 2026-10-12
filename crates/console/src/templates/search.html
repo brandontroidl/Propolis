@@ -46,7 +46,7 @@
 
 {% if mode == "ips" %}
   <div class="panel">
-    <div class="panel-head">Matching addresses{% if ip_rows %} <span class="dim">{{ ip_rows | length }}</span>{% endif %}</div>
+    <div class="panel-head">Matching addresses{% if ip_rows %} <span class="dim">{{ ip_rows | length | count }}</span>{% endif %}</div>
   {% if not searched %}
   <p class="empty-line">enter at least one filter to search</p>
   {% elif ip_rows %}
@@ -56,7 +56,7 @@
         {% for r in ip_rows %}
         <tr>
           <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
-          <td class="count" data-label="Matches">{{ r.match_count }}</td>
+          <td class="count" data-label="Matches">{{ r.match_count | count }}</td>
           <td class="score">{{ m.score_meter(r.score, r.score_pct) }}</td>
           <td>{{ m.tier_pill(r.tier) }}</td>
           <td class="seen" data-label="First seen">{{ r.first_seen }}</td>

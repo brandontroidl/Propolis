@@ -1,15 +1,15 @@
 {% extends "base.html" %}
 {% block title %}Captured samples - Propolis{% endblock %}
 {% block content %}
-<h1>Captured samples <span class="dim">({{ total }})</span></h1>
+<h1>Captured samples <span class="dim">({{ total | count }})</span></h1>
 <p class="page-sub">The files the sensors captured, most widely delivered first. Hosts counts every address that uploaded a file, or reported a URL it was fetched from. A file delivered by a command sequence names that <a href="/campaigns">campaign</a>.</p>
 
 <div class="panel">
-  <div class="panel-head">Fetch attempts <span class="dim">{{ fetch_attempts_total }}</span></div>
+  <div class="panel-head">Fetch attempts <span class="dim">{{ fetch_attempts_total | count }}</span></div>
   {% if fetch_attempts_total > 0 %}
   <table class="table-compact">
     <thead><tr>{% for sc in status_counts %}<th class="count">{{ sc.label }}</th>{% endfor %}</tr></thead>
-    <tbody><tr>{% for sc in status_counts %}<td class="count">{{ sc.count }}</td>{% endfor %}</tr></tbody>
+    <tbody><tr>{% for sc in status_counts %}<td class="count">{{ sc.count | count }}</td>{% endfor %}</tr></tbody>
   </table>
   {% else %}
   <p class="empty-line">no fetch attempts recorded</p>
@@ -37,18 +37,18 @@
     <tr>
       <td class="s-hash stack-full">{{ m.hash_link(s.sha256) }}<span class="c-sub">{{ s.sensor }}, {{ s.size }}{% if s.truncated %}, truncated{% endif %}</span></td>
       <td class="count" data-label="Hosts">
-        {% if s.campaign %}<a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members }}</a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
+        {% if s.campaign %}<a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members | count }}</a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
         {% else %}<span class="dim na">-</span>{% endif %}
       </td>
       <td>{% if s.spark %}{{ m.day_strip(s.spark, spark_days) }}{% endif %}</td>
       <td class="active-cell stack-end"{% if s.active_title %} title="{{ s.active_title }}"{% endif %}>{% if s.active %}{{ s.active }}{% else %}<span class="dim na">-</span>{% endif %}</td>
       <td>
-        {% if s.delivered_by %}<a href="/campaigns/{{ s.delivered_by.id }}" title="{{ s.delivered_by.members }} host{% if s.delivered_by.members != 1 %}s{% endif %} ran this command sequence">campaign {{ s.delivered_by.id }}</a>{% else %}<span class="dim na">-</span>{% endif %}
+        {% if s.delivered_by %}<a href="/campaigns/{{ s.delivered_by.id }}" title="{{ s.delivered_by.members | count }} host{% if s.delivered_by.members != 1 %}s{% endif %} ran this command sequence">campaign {{ s.delivered_by.id }}</a>{% else %}<span class="dim na">-</span>{% endif %}
       </td>
       <td class="ip stack-full">
         {% if s.source_ips %}
           {% for ip in s.source_ips %}{{ m.ip_evidence_link(ip) }}{% if not loop.last %} {% endif %}{% endfor %}
-          {% if s.more_source_ips > 0 %}<span class="dim">+{{ s.more_source_ips }} more</span>{% endif %}
+          {% if s.more_source_ips > 0 %}<span class="dim">+{{ s.more_source_ips | count }} more</span>{% endif %}
         {% else %}
           <span class="dim">not linked</span>
         {% endif %}

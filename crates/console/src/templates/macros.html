@@ -27,7 +27,7 @@
   {% for t in techniques %}
   <li><span class="sev" title="ATT&amp;CK {{ t.matrix }}">{{ t.id }}</span> {{ t.name }}
     {% for e in t.evidence %}<span class="c-sub"><span class="dim">{{ e.rule }}</span> <code class="ioc-value">{{ e.matched }}</code>{% if e.event_id %} <span class="dim">event {{ e.event_id }}</span>{% endif %}{% if e.artifact %} sample {{ hash_link(e.artifact) }}{% endif %}</span>{% endfor %}
-    {% if t.more > 0 %}<span class="c-sub dim">+{{ t.more }} more</span>{% endif %}
+    {% if t.more > 0 %}<span class="c-sub dim">+{{ t.more | count }} more</span>{% endif %}
   </li>
   {% endfor %}
 </ul>
@@ -43,14 +43,14 @@
     per day (`routes::campaigns::host_strip`), the empty stub on a quiet day, the exact count in
     each cell's title. -#}
 {% macro day_strip(cells, days) -%}
-<span class="strip" role="img" aria-label="distinct hosts per day, last {{ days }} days">{% for d in cells %}<i class="h-{{ d.height }}{% if d.class %} {{ d.class }}{% endif %}" title="{{ d.day }}: {{ d.hosts }}"></i>{% endfor %}</span>
+<span class="strip" role="img" aria-label="distinct hosts per day, last {{ days }} days">{% for d in cells %}<i class="h-{{ d.height }}{% if d.class %} {{ d.class }}{% endif %}" title="{{ d.day }}: {{ d.hosts | count }}"></i>{% endfor %}</span>
 {%- endmacro %}
 
 {#- A VirusTotal verdict, one wording on every page. Detections are a finding, on the same rung as
     a captured fetch; zero detections is a neutral count, because no engine flagging a file is not
     proof it is harmless; the states with no verdict are quiet words. -#}
 {% macro vt_verdict(detected, total, link, has_sha) -%}
-{% if detected is defined and detected is not none %}{% if detected > 0 %}<a class="sev sev--high" href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ detected }}/{{ total }} detected</a>{% elif detected == -1 %}<a class="dim" href="{{ link }}" target="_blank" rel="noopener noreferrer">pending</a>{% elif detected == -2 %}<span class="dim" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>{% else %}<a class="sev" href="{{ link }}" target="_blank" rel="noopener noreferrer" title="No engine flagged it. That is not proof the file is harmless.">0/{{ total }} detections</a>{% endif %}{% elif has_sha %}<span class="dim">not scanned</span>{% else %}<span class="dim">-</span>{% endif %}
+{% if detected is defined and detected is not none %}{% if detected > 0 %}<a class="sev sev--high" href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ detected }}/{{ total | count }} detected</a>{% elif detected == -1 %}<a class="dim" href="{{ link }}" target="_blank" rel="noopener noreferrer">pending</a>{% elif detected == -2 %}<span class="dim" title="VirusTotal was asked about the hash only; the file was not uploaded because it is not executable or script content.">not uploaded (type)</span>{% else %}<a class="sev" href="{{ link }}" target="_blank" rel="noopener noreferrer" title="No engine flagged it. That is not proof the file is harmless.">0/{{ total | count }} detections</a>{% endif %}{% elif has_sha %}<span class="dim">not scanned</span>{% else %}<span class="dim">-</span>{% endif %}
 {%- endmacro %}
 
 {#- What the review fetcher did with a URL (`kind` from `routes::detail`'s fetch classification):
@@ -61,7 +61,7 @@
 
 {#- A campaign an address or sample belongs to, phrased the same wherever it is listed. -#}
 {% macro campaign_ref(c) -%}
-<a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members }} host{% if c.members != 1 %}s{% endif %}{% if c.role == "infected host" %}, likely infected hosts{% endif %}{% if c.pending and c.pending > 0 %}, {{ c.pending }} pending review{% endif %}</span>
+<a href="/campaigns/{{ c.id }}">{{ c.label }}</a> <span class="dim">{{ c.kind }}, {{ c.members | count }} host{% if c.members != 1 %}s{% endif %}{% if c.role == "infected host" %}, likely infected hosts{% endif %}{% if c.pending and c.pending > 0 %}, {{ c.pending | count }} pending review{% endif %}</span>
 {%- endmacro %}
 
 {#- The feed tier, the one way every page shows it: a Title-case pill on the severity ramp. -#}

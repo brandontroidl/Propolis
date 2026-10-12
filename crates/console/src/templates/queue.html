@@ -2,7 +2,7 @@
 {% block title %}Review queue - Propolis{% endblock %}
 {% block content %}
 {% import "macros.html" as m %}
-<h1>Review queue <span class="dim">({{ pending_count }} pending)</span></h1>
+<h1>Review queue <span class="dim">({{ pending_count | count }} pending)</span></h1>
 <div class="tab-bar">
   {% for tab_name in ["pending", "approved", "rejected", "snoozed"] %}
   <a href="/queue?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
@@ -43,13 +43,13 @@ rest.</p>
         <details class="qgroup">
           <summary>
             <span class="qg-title">
-              <span class="qg-head"><span class="run-count">{{ g.shown }} pending</span><span class="qg-label campaign-label">{{ g.label }}</span></span>
-              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}){% if g.pending != g.shown %} &middot; {{ g.pending }} pending campaign-wide{% endif %} &middot; {{ g.members }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(likely infected hosts)</span>{% endif %}</span>
+              <span class="qg-head"><span class="run-count">{{ g.shown | count }} pending</span><span class="qg-label campaign-label">{{ g.label }}</span></span>
+              <span class="qg-meta"><a href="/campaigns/{{ g.id }}">campaign {{ g.id }}</a> ({{ g.kind }}){% if g.pending != g.shown %} &middot; {{ g.pending | count }} pending campaign-wide{% endif %} &middot; {{ g.members | count }} host{% if g.members != 1 %}s{% endif %}{% if g.infected %} <span class="dim">(likely infected hosts)</span>{% endif %}</span>
             </span>
             {% if g.what %}<span class="ctx-what qg-what"><span class="ctx-verb">{% if g.what.kind == "upload" %}uploaded{% elif g.what.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ g.what.full }}">{{ g.what.text }}</code></span>{% endif %}
             <span class="qg-side">
               <span class="qg-top"><span class="dim">top</span> <span class="score">{{ g.top_score }}</span></span>
-              <a class="btn btn-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending }}&hellip;</a>
+              <a class="btn btn-approve" href="/campaigns/{{ g.id }}/approve">Approve all {{ g.pending | count }}&hellip;</a>
             </span>
           </summary>
           <table class="table-compact stack qmembers">

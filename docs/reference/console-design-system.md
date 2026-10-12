@@ -122,6 +122,12 @@ campaigns.
 
 **IP link.** `macros.html#ip_evidence_link` for every address, so it opens the evidence drawer.
 
+**Numbers.** Every count is grouped in thousands, `29,296`, through the templates' `count`
+filter (`crates/console/src/templates.rs#count_filter`), on every page and in tooltips. A value a
+script or a URL reads (`data-*`, `href`) keeps its plain digits.
+`crates/console/src/templates.rs#every_count_a_template_prints_goes_through_the_count_filter`
+fails on a count printed without it.
+
 **Repeat count.** `.run-count`, mono ink: `x37`, `x3 identical sessions`, `3 pending`. The nav's
 `.badge` is the only count in colour, because waiting work is the one count that asks for the
 operator.

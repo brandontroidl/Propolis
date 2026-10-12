@@ -158,13 +158,17 @@ async fn a_ledger_past_the_counting_cap_is_labelled_an_estimate(pool: PgPool) {
         row.contains("about ") && row.contains("(estimate)"),
         "the Evidence chain panel labels it too: {row}"
     );
-    let shown = cell
+    let printed = cell
         .split("about ")
         .nth(1)
         .unwrap_or_else(|| panic!("an estimate reads 'about N': {cell}"))
         .split('<')
         .next()
-        .unwrap()
+        .unwrap();
+    // Grouped like every other count on the console.
+    assert!(printed.contains(','), "{printed}: {cell}");
+    let shown = printed
+        .replace(',', "")
         .parse::<i64>()
         .unwrap_or_else(|_| panic!("a number follows 'about': {cell}"));
     // Never below what was counted before falling back (a never-analyzed table's reltuples is -1).

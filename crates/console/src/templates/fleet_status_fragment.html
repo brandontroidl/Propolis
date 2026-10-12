@@ -11,7 +11,7 @@
 <div class="band">
   <div class="cell{% if summary.alarm > 0 %} cell--alarm{% endif %}">
     <span class="label">Listeners proven</span>
-    <div class="v {% if summary.proven == summary.total and summary.total > 0 %}v--ok{% elif summary.alarm > 0 %}v--alarm{% endif %}">{{ summary.proven }}<small>/ {{ summary.total }}</small></div>
+    <div class="v {% if summary.proven == summary.total and summary.total > 0 %}v--ok{% elif summary.alarm > 0 %}v--alarm{% endif %}">{{ summary.proven }}<small>/ {{ summary.total | count }}</small></div>
     <div class="foot">{{ summary.headline }}</div>
   </div>
   <div class="cell{% if summary.alarm > 0 %} cell--alarm{% endif %}">
@@ -33,7 +33,7 @@
   </div>
   <div class="cell">
     <span class="label">Ledger</span>
-    <div class="v">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}{% if ledger.events_estimate %}about {% endif %}{{ ledger.events }}{% endif %}</div>
+    <div class="v">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}{% if ledger.events_estimate %}about {% endif %}{{ ledger.events | count }}{% endif %}</div>
     <div class="foot">{% if ledger_unavailable %}the event count could not be read{% elif ledger.events_estimate %}events recorded (estimate){% else %}events recorded{% endif %} &middot; <a href="/integrity">verify the chain</a></div>
   </div>
 </div>
@@ -65,7 +65,7 @@
           {# A backlog makes LAST EVENT read like a quiet sensor while its events are still waiting
              in the intake log, so the badge sits in this cell, and only while the log is behind. #}
           <td class="seen"><span class="{{ r.last_event_dot }}" aria-hidden="true"></span> {{ r.last_event_ago }}{% if r.behind %}<div><span class="sev sev--high">{{ r.behind }}</span></div>{% endif %}</td>
-          <td class="count">{{ r.events_24h }}</td>
+          <td class="count">{{ r.events_24h | count }}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -97,17 +97,17 @@
             {% else %}
             <span class="meter"><span class="{{ c.meter_class }} pct-{{ [c.rate_pct, 100]|min }}"></span></span>
             <span class="mono">{{ c.rate_pct }}%</span>
-            <span class="dim">{{ c.complete }} of {{ c.captures - c.unlabelled }}</span>
+            <span class="dim">{{ c.complete }} of {{ (c.captures - c.unlabelled) | count }}</span>
             {% endif %}
-            {% if c.unlabelled > 0 %}<div class="dim">{{ c.unlabelled }} unlabelled (excluded from the rate)</div>{% endif %}
+            {% if c.unlabelled > 0 %}<div class="dim">{{ c.unlabelled | count }} unlabelled (excluded from the rate)</div>{% endif %}
           </td>
-          <td class="count">{{ c.captures }}</td>
-          <td class="count">{{ c.incomplete }}</td>
-          <td class="count">{{ c.truncated }}</td>
+          <td class="count">{{ c.captures | count }}</td>
+          <td class="count">{{ c.incomplete | count }}</td>
+          <td class="count">{{ c.truncated | count }}</td>
           {# Three outcomes, not two: a reason, a reason that could not be read, and a genuinely
              clean sensor. The middle one used to render as the last, so one failed query made a
              row with incomplete captures say "nothing incomplete" next to its own count. #}
-          <td>{% if c.top_end_reason %}<span class="{{ c.end_reason_sev }}">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count }}</span>{% elif c.end_reason_unavailable %}<span class="faint">reason unavailable</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
+          <td>{% if c.top_end_reason %}<span class="{{ c.end_reason_sev }}">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count | count }}</span>{% elif c.end_reason_unavailable %}<span class="faint">reason unavailable</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
         </tr>
         {% endfor %}
       </tbody>
@@ -126,7 +126,7 @@
     <div class="panel-head">Evidence chain</div>
     <table class="table-compact">
       <tbody>
-        <tr><td>Events</td><td>{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{% if ledger.events_estimate %}about {% endif %}{{ ledger.events }}</span>{% if ledger.events_estimate %} <span class="dim">(estimate)</span>{% endif %}{% endif %}</td></tr>
+        <tr><td>Events</td><td>{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{% if ledger.events_estimate %}about {% endif %}{{ ledger.events | count }}</span>{% if ledger.events_estimate %} <span class="dim">(estimate)</span>{% endif %}{% endif %}</td></tr>
         <tr><td>Newest ingest</td><td><span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></td></tr>
       </tbody>
     </table>

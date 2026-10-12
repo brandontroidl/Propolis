@@ -63,11 +63,22 @@ pub(crate) fn script_json<T: serde::Serialize + ?Sized>(value: &T) -> String {
     out
 }
 
+/// The `count` filter: every count on every page reads the same way, `29,296`, wherever it is
+/// printed. An integer is grouped; anything else (a count a route already worded, such as Attackers'
+/// `about N`) is passed through unchanged, so applying the filter is never wrong.
+fn count_filter(value: minijinja::Value) -> minijinja::Value {
+    match i64::try_from(value.clone()) {
+        Ok(n) if value.is_integer() => crate::routes::format::group_digits(n).into(),
+        _ => value,
+    }
+}
+
 /// Builds the environment once at startup (`AppState::templates`); cheap to construct (five small
 /// templates) but shared via `Arc` so the source is parsed exactly once per process rather than
 /// once per request.
 pub fn environment() -> Environment<'static> {
     let mut env = Environment::new();
+    env.add_filter("count", count_filter);
     // Shared macros (the canonical IP evidence-link drawer trigger). Imported by every page that
     // renders an IP link so the drawer contract lives in exactly one place.
     env.add_template("macros.html", MACROS_HTML)
@@ -185,6 +196,96 @@ mod tests {
             out.len()
         );
         out
+    }
+
+    #[test]
+    fn the_count_filter_groups_integers_and_leaves_everything_else() {
+        let f = |v: minijinja::Value| count_filter(v).to_string();
+        assert_eq!(f(29296.into()), "29,296");
+        assert_eq!(f(999.into()), "999");
+        assert_eq!(f("about 120,000".into()), "about 120,000");
+        assert_eq!(f(1234.5.into()), "1234.5");
+        let env = environment();
+        let out = env
+            .render_str(
+                "{{ (n - 1) | count }} {{ xs | length | count }}",
+                minijinja::context! { n => 10001, xs => vec![0; 1200] },
+            )
+            .unwrap();
+        assert_eq!(out, "10,000 1,200");
+    }
+
+    /// Every count on every page is grouped the same way (`29,296`), so a count a template prints
+    /// goes through `| count`. A count is recognised by its name, the way the templates name them:
+    /// `..._count`, `count`, a `| length`, or one of the plural nouns below. A value a script or a
+    /// URL reads (`data-*`, `href`, `hx-*`, `value`) keeps its plain digits.
+    #[test]
+    fn every_count_a_template_prints_goes_through_the_count_filter() {
+        const NOUNS: [&str; 12] = [
+            "members",
+            "sightings",
+            "hosts",
+            "total",
+            "events",
+            "captures",
+            "incomplete",
+            "truncated",
+            "repeat",
+            "shown",
+            "pending",
+            "sessions",
+        ];
+        // Inside an attribute that is still open on this line, and one that code reads?
+        let read_by_code = |before: &str| {
+            let Some(q) = before.rfind("=\"") else {
+                return false;
+            };
+            if before[q + 2..].contains('"') {
+                return false;
+            }
+            let attr = before[..q].rsplit([' ', '<']).next().unwrap_or("");
+            ["data-", "href", "hx-", "value", "action"]
+                .iter()
+                .any(|a| attr.starts_with(a))
+        };
+        let is_count = |expr: &str| {
+            let head = expr
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('(');
+            if head.contains('(') {
+                return false;
+            }
+            let last = head.rsplit('.').next().unwrap_or("");
+            expr.contains("| length")
+                || last == "count"
+                || last.ends_with("_count")
+                || NOUNS.contains(&last)
+        };
+        let mut missing = Vec::new();
+        for (name, source) in template_sources() {
+            let mut at = 0;
+            while let Some(open) = source[at..].find("{{").map(|i| at + i) {
+                let Some(close) = source[open..].find("}}").map(|i| open + i) else {
+                    break;
+                };
+                let expr = source[open + 2..close].trim();
+                let line_start = source[..open].rfind('\n').map_or(0, |i| i + 1);
+                if is_count(expr)
+                    && !expr.ends_with("| count")
+                    && !read_by_code(&source[line_start..open])
+                {
+                    missing.push(format!("{name}: {{{{ {expr} }}}}"));
+                }
+                at = close + 2;
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "counts printed without `| count`:\n{}",
+            missing.join("\n")
+        );
     }
 
     /// The Content-Security-Policy forbids inline script, inline style and event-handler
@@ -720,7 +821,7 @@ mod tests {
                 ..fleet_base_context()
             })
             .unwrap();
-        assert!(readable.contains("4242") && readable.contains("events recorded"));
+        assert!(readable.contains("4,242") && readable.contains("events recorded"));
     }
 
     /// A listener row whose intake log is behind carries the badge as a word-bearing pill in the

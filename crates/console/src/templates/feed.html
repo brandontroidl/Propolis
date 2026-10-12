@@ -38,7 +38,7 @@
     {% for r in rows %}
     <tr>
       <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
-      <td class="mono" data-label="Events">{{ r.event_count }}</td>
+      <td class="mono" data-label="Events">{{ r.event_count | count }}</td>
       <td class="dim stack-full">{{ r.signals }}</td>
       <td class="seen" data-label="First seen">{{ r.first_seen }}</td>
       <td class="seen" data-label="Last seen">{{ r.last_seen }}</td>
@@ -55,14 +55,14 @@
   {% if has_build %}
     <div class="panel">
       <div class="panel-head">
-        <span>Aggressive tier <span class="dim">({{ aggressive_entries | length }})</span></span>
+        <span>Aggressive tier <span class="dim">({{ aggressive_entries | length | count }})</span></span>
         {{ download_row("aggressive") }}
       </div>
       {{ entry_table(aggressive_entries, "no addresses in the aggressive tier") }}
     </div>
     <div class="panel">
       <div class="panel-head">
-        <span>Standard tier <span class="dim">({{ standard_entries | length }})</span></span>
+        <span>Standard tier <span class="dim">({{ standard_entries | length | count }})</span></span>
         {{ download_row("standard") }}
       </div>
       {{ entry_table(standard_entries, "no addresses in the standard tier") }}
@@ -70,7 +70,7 @@
     {% for label, rows in window_entries %}
     <div class="panel">
       <div class="panel-head">
-        <span>Last {{ label }} <span class="dim">({{ rows | length }})</span></span>
+        <span>Last {{ label }} <span class="dim">({{ rows | length | count }})</span></span>
         {{ download_row("all-" ~ label) }}
       </div>
       {{ entry_table(rows, "no activity in this window") }}
@@ -88,12 +88,12 @@
       <tbody>
         <tr>
           <td>{{ m.tier_pill("aggressive") }}</td>
-          <td class="mono">{{ aggressive_count }}</td>
+          <td class="mono">{{ aggressive_count | count }}</td>
           <td class="seen">{{ aggressive_valid_until }}</td>
         </tr>
         <tr>
           <td>{{ m.tier_pill("standard") }}</td>
-          <td class="mono">{{ standard_count }}</td>
+          <td class="mono">{{ standard_count | count }}</td>
           <td class="seen">{{ standard_valid_until }}</td>
         </tr>
       </tbody>
@@ -108,7 +108,7 @@
         {% for w in windows %}
         <tr>
           <td>Last {{ w.label }}</td>
-          <td class="mono">{{ w.count }}</td>
+          <td class="mono">{{ w.count | count }}</td>
           <td class="seen">{{ w.valid_until }}</td>
           <td class="mono dim">all-{{ w.label }}</td>
         </tr>
@@ -122,14 +122,14 @@
     <table class="table-compact">
       <tbody>
         <tr><td>Reserved / special-purpose ranges</td><td>always on</td></tr>
-        <tr><td>Operator CIDR allowlist</td><td class="mono">{{ exclusions.allowlist_count }} range{% if exclusions.allowlist_count != 1 %}s{% endif %}</td></tr>
-        <tr><td>Delisted addresses</td><td class="mono">{{ exclusions.delist_count }}</td></tr>
+        <tr><td>Operator CIDR allowlist</td><td class="mono">{{ exclusions.allowlist_count | count }} range{% if exclusions.allowlist_count != 1 %}s{% endif %}</td></tr>
+        <tr><td>Delisted addresses</td><td class="mono">{{ exclusions.delist_count | count }}</td></tr>
         <tr>
           <td>Trusted-org ASN suppression</td>
           <td>
             {% if exclusions.asn_allowlist_count == 0 %}<span class="dim">off</span>
-            {% elif exclusions.asn_db_loaded %}{{ exclusions.asn_allowlist_count }} ASN{% if exclusions.asn_allowlist_count != 1 %}s{% endif %} active
-            {% else %}<span class="sev sev--watch">{{ exclusions.asn_allowlist_count }} configured, GeoLite2-ASN not loaded, inert</span>{% endif %}
+            {% elif exclusions.asn_db_loaded %}{{ exclusions.asn_allowlist_count | count }} ASN{% if exclusions.asn_allowlist_count != 1 %}s{% endif %} active
+            {% else %}<span class="sev sev--watch">{{ exclusions.asn_allowlist_count | count }} configured, GeoLite2-ASN not loaded, inert</span>{% endif %}
           </td>
         </tr>
       </tbody>

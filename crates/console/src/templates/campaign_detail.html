@@ -4,7 +4,7 @@
 {% import "macros.html" as m %}
 <p><a href="/campaigns">&larr; All campaigns</a></p>
 <h1 class="campaign-label">{{ label }}</h1>
-<p class="page-sub">{{ kind }} campaign {{ id }}: {{ member_count }} host{% if member_count != 1 %}s{% endif %}, {{ sightings }} sighting{% if sightings != "1" %}s{% endif %}, {{ first_seen }} to {{ last_seen }}. Members are treated as: <strong>{{ role }}</strong>.</p>
+<p class="page-sub">{{ kind }} campaign {{ id }}: {{ member_count | count }} host{% if member_count != 1 %}s{% endif %}, {{ sightings | count }} sighting{% if sightings != "1" %}s{% endif %}, {{ first_seen }} to {{ last_seen }}. Members are treated as: <strong>{{ role }}</strong>.</p>
 {% if self_propagating %}
 <p class="table-note">The sample scans for new hosts and copies itself to them, so the hosts that uploaded it are most likely infected machines rather than its operators. This is shown here only; vendor reports do not use it yet.</p>
 {% endif %}
@@ -13,7 +13,7 @@
   <div class="panel-head">Review</div>
   {% if pending_members > 0 %}
   <div class="panel-body">
-    <p>{{ pending_members }} member{% if pending_members != 1 %}s are{% else %} is{% endif %} pending review. <a class="btn btn-approve" href="/campaigns/{{ id }}/approve">Approve all {{ pending_members }}&hellip;</a> <span class="dim">shows the list first; nothing is approved until you confirm</span></p>
+    <p>{{ pending_members | count }} member{% if pending_members != 1 %}s are{% else %} is{% endif %} pending review. <a class="btn btn-approve" href="/campaigns/{{ id }}/approve">Approve all {{ pending_members | count }}&hellip;</a> <span class="dim">shows the list first; nothing is approved until you confirm</span></p>
   </div>
   {% else %}
   <p class="empty-line">no member is pending review</p>
@@ -24,7 +24,7 @@
   <div class="panel-head">Distinct hosts per day <span class="dim">last {{ spark_days }} days</span></div>
   <div class="panel-body">
     <p>{{ m.day_strip(spark, spark_days) }}</p>
-    {% if sensors %}<p class="ctx-dim">{% for s in sensors %}<span class="ctx-chip">{{ s.label }} {{ s.sightings }}</span>{% endfor %}</p>{% endif %}
+    {% if sensors %}<p class="ctx-dim">{% for s in sensors %}<span class="ctx-chip">{{ s.label }} {{ s.sightings | count }}</span>{% endfor %}</p>{% endif %}
   </div>
 </div>
 
@@ -62,7 +62,7 @@
   <div class="panel-head">Linked samples</div>
   {% if samples %}
   <div class="panel-body">
-    <p>{% for s in samples %}{{ m.hash_link(s.sha256) }}{% if not loop.last %} {% endif %}{% endfor %}{% if more_samples > 0 %} <span class="dim">+{{ more_samples }} more</span>{% endif %}</p>
+    <p>{% for s in samples %}{{ m.hash_link(s.sha256) }}{% if not loop.last %} {% endif %}{% endfor %}{% if more_samples > 0 %} <span class="dim">+{{ more_samples | count }} more</span>{% endif %}</p>
   </div>
   {% else %}
   <p class="empty-line">no linked samples</p>
@@ -82,7 +82,7 @@
       <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td>sample {{ m.hash_link(i.sample) }}</td></tr>
       {% endfor %}
       {% for i in command_iocs %}
-      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts }} host{% if i.hosts != 1 %}s{% endif %}, <span class="run-count">x{{ i.sightings }}</span> <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts | count }} host{% if i.hosts != 1 %}s{% endif %}, <span class="run-count">x{{ i.sightings | count }}</span> <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -92,7 +92,7 @@
 </div>
 
 <div class="panel">
-  <div class="panel-head">Members <span class="dim">{{ member_count }}{% if member_count > member_limit %}, most recent {{ member_limit }} shown{% endif %}</span></div>
+  <div class="panel-head">Members <span class="dim">{{ member_count | count }}{% if member_count > member_limit %}, most recent {{ member_limit | count }} shown{% endif %}</span></div>
   <table class="table-compact stack">
     <thead><tr><th>IP</th><th>First seen</th><th>Last seen</th><th class="count">Sightings</th><th>Review</th></tr></thead>
     <tbody>
@@ -101,7 +101,7 @@
         <td class="ip stack-lead">{{ m.ip_evidence_link(mbr.ip) }}{% if mbr.uploaded and kind_value == "sample" %} <span class="dim">uploaded</span>{% endif %}</td>
         <td class="seen" data-label="First seen">{{ mbr.first_seen }}</td>
         <td class="seen" data-label="Last seen">{{ mbr.last_seen }}</td>
-        <td class="count" data-label="Sightings">{{ mbr.sightings }}</td>
+        <td class="count" data-label="Sightings">{{ mbr.sightings | count }}</td>
         <td class="stack-end">{% if mbr.review %}<span class="state-pill state-{{ mbr.review }}">{{ mbr.review }}</span>{% else %}<span class="dim">not queued</span>{% endif %}</td>
       </tr>
       {% endfor %}

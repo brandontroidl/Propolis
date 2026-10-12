@@ -7,12 +7,12 @@
 {% macro href(kind, sort, single) -%}
 /campaigns?{% if kind %}kind={{ kind }}&amp;{% endif %}sort={{ sort }}{% if single %}&amp;single=1{% endif %}
 {%- endmacro %}
-<h1>Campaigns <span class="dim">({{ total }})</span></h1>
+<h1>Campaigns <span class="dim">({{ total | count }})</span></h1>
 <p class="page-sub">A campaign is a group of addresses doing the same thing: running the same commands, sending the same kind of probe, or reaching the same set of services within an hour. Files that several addresses uploaded are on the <a href="/samples">Samples</a> page. Commands are attacker data, shown as text.</p>
 <div class="tab-bar">
-  <a href="{{ href('', sort, show_single) }}" class="tab {% if not kind %}active{% endif %}">All <span class="tab-count">{{ all_count }}</span></a>
+  <a href="{{ href('', sort, show_single) }}" class="tab {% if not kind %}active{% endif %}">All <span class="tab-count">{{ all_count | count }}</span></a>
   {% for t in tabs %}
-  <a href="{{ href(t.value, sort, show_single) }}" class="tab {% if kind == t.value %}active{% endif %}">{{ t.label }} <span class="tab-count">{{ t.count }}</span></a>
+  <a href="{{ href(t.value, sort, show_single) }}" class="tab {% if kind == t.value %}active{% endif %}">{{ t.label }} <span class="tab-count">{{ t.count | count }}</span></a>
   {% endfor %}
 </div>
 {% if indexer_behind > 0 %}
@@ -27,11 +27,11 @@
   {% if show_single %}
   <a class="range-btn active" href="{{ href(kind, sort, false) }}" role="switch" aria-checked="true">single-host groups shown</a>
   {% elif single_hidden > 0 %}
-  <a class="range-btn" href="{{ href(kind, sort, true) }}" role="switch" aria-checked="false">show single-host groups ({{ single_hidden }})</a>
+  <a class="range-btn" href="{{ href(kind, sort, true) }}" role="switch" aria-checked="false">show single-host groups ({{ single_hidden | count }})</a>
   {% endif %}
 </nav>
 {% if total > shown_limit %}
-<p class="table-note">showing the first {{ shown_limit }} of {{ total }}</p>
+<p class="table-note">showing the first {{ shown_limit | count }} of {{ total | count }}</p>
 {% endif %}
 {% if campaigns %}
 <div class="panel campaigns-panel">
@@ -45,14 +45,14 @@
     <tr>
       <td class="stack-full">
         <a class="c-text mono campaign-label" href="/campaigns/{{ c.id }}" title="{{ c.text }}">{{ c.text }}</a>
-        <span class="c-meta"><span class="sev">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ c.tags | length - 4 }}</span>{% endif %}</span>{% endif %}</span>
+        <span class="c-meta"><span class="sev">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ (c.tags | length - 4) | count }}</span>{% endif %}</span>{% endif %}</span>
       </td>
-      <td class="count" data-label="Hosts">{{ c.members }}</td>
+      <td class="count" data-label="Hosts">{{ c.members | count }}</td>
       <td>{{ m.day_strip(c.spark, spark_days) }}</td>
       <td class="active-cell stack-end" title="{{ c.active_title }}">{{ c.active }}</td>
       <td><span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>
       <td class="stack-end">
-        {% if c.first_sample %}{{ m.hash_link(c.first_sample.sha256) }}{% if c.sample_count > 1 %} <span class="dim">+{{ c.sample_count - 1 }} more</span>{% endif %}{% if c.worm %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
+        {% if c.first_sample %}{{ m.hash_link(c.first_sample.sha256) }}{% if c.sample_count > 1 %} <span class="dim">+{{ (c.sample_count - 1) | count }} more</span>{% endif %}{% if c.worm %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
         {% else %}<span class="dim">-</span>{% endif %}
       </td>
     </tr>

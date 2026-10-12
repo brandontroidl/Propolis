@@ -3514,3 +3514,45 @@ fn a_log_skipped_for_unread_input_still_refreshes_the_state_file_and_fails_the_r
     );
     assert!(state.exists(), "the state file is still written");
 }
+
+/// Every deploy script is run by path (upgrade.sh runs backup.sh and rollback.sh, the operator
+/// runs the rest), so each must carry the executable bit as checked out. The suite runs them
+/// through `bash`, which does not need it, so only this test notices a missing bit. A script
+/// another one sources, named in a `# shellcheck source=` directive, is a library and is exempt.
+#[test]
+fn every_deploy_script_is_executable_except_the_sourced_libraries() {
+    use std::os::unix::fs::PermissionsExt;
+    let deploy = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    let scripts: Vec<std::path::PathBuf> = std::fs::read_dir(deploy)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sh"))
+        .collect();
+    let libraries: std::collections::BTreeSet<String> = scripts
+        .iter()
+        .flat_map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("# shellcheck source=deploy/"))
+                .map(|name| name.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(libraries.contains("listeners-lib.sh"), "{libraries:?}");
+    let mut not_executable = Vec::new();
+    for script in &scripts {
+        let name = script.file_name().unwrap().to_string_lossy().into_owned();
+        if libraries.contains(&name) {
+            continue;
+        }
+        let mode = std::fs::metadata(script).unwrap().permissions().mode();
+        if mode & 0o100 == 0 {
+            not_executable.push(name);
+        }
+    }
+    assert!(
+        not_executable.is_empty(),
+        "deploy scripts without the executable bit (git update-index --chmod=+x): {not_executable:?}"
+    );
+}

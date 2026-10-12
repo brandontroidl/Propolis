@@ -1356,9 +1356,16 @@ check_backup() {
     if [ -n "$completed" ] && epoch="$(date -u -d "$completed" +%s 2>/dev/null)"; then
         age=$((NOW - epoch))
         parts+=("last good backup $(human_age "$age") ago")
-        if [ "$age" -gt "$BACKUP_STALE_SECS" ]; then
+        local limit="$BACKUP_STALE_SECS" configured
+        configured="$(read_env_var_in PROPOLIS_OPS_BACKUP_MAX_AGE_SECS "$ENV_DIR/propolis.env")"
+        # The daemon refuses to start on a value it would not accept, so only an accepted one
+        # (whole seconds, at least an hour) can be the limit it is alerting on.
+        if [[ "$configured" =~ ^[0-9]{1,9}$ ]] && [ "$configured" -ge 3600 ]; then
+            limit="$configured"
+        fi
+        if [ "$age" -gt "$limit" ]; then
             worst=fail
-            finding fail "backup" "backup-stale" "the last good backup is $(human_age "$age") old (the daemon's backup-stale alert fires at 36h)${step:+; the last run failed while $step}" \
+            finding fail "backup" "backup-stale" "the last good backup is $(human_age "$age") old (the daemon's backup-stale alert fires at $(human_age "$limit"))${step:+; the last run failed while $step}" \
                 "sudo systemctl start propolis-backup.service; sudo journalctl -u propolis-backup.service -n 30 --no-pager"
         fi
         case "$success" in
@@ -1370,7 +1377,9 @@ check_backup() {
                 ;;
         esac
     else
-        if [ -n "$failure" ]; then
+        # A "not configured" record is a run from before DATABASE_URL existed, not a failed
+        # backup: reported as never-ran, the same as the daemon's backup-stale reads it.
+        if [ -n "$failure" ] && [[ "$step" != "not configured"* ]]; then
             worst=fail
             parts+=("never succeeded")
             finding fail "backup" "backup-failing" "no backup has ever completed${step:+; the last run failed while $step}" \

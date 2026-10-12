@@ -2488,6 +2488,44 @@ fn fix_scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// The staleness limit is the one the daemon alerts on, PROPOLIS_OPS_BACKUP_MAX_AGE_SECS when it
+/// is set, and a run from before DATABASE_URL existed reads as never-ran, not as a failure.
+#[test]
+fn backup_staleness_follows_the_configured_limit_and_not_configured_is_not_a_failure() {
+    let fx = Fx::new();
+    fx.write(
+        "state/backup-status/last-success",
+        &format!(
+            "{{\"completed_at\":\"{}\",\"reason\":\"scheduled\",\"set\":\"x\",\"encrypted\":true}}\n",
+            iso(NOW - 2 * 86_400)
+        ),
+    );
+    let ids = |fx: &Fx| -> Vec<String> {
+        fx.json()["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(ids(&fx).contains(&"backup-stale".to_string()));
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_BACKUP_MAX_AGE_SECS=",
+        Some("PROPOLIS_OPS_BACKUP_MAX_AGE_SECS=259200"),
+    );
+    assert!(!ids(&fx).contains(&"backup-stale".to_string()));
+
+    std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
+    fx.write(
+        "state/backup-status/last-failure",
+        "{\"failed_at\":\"x\",\"reason\":\"scheduled\",\"step\":\"not configured: no DATABASE_URL in /etc/propolis/propolis.env\",\"exit_code\":0}\n",
+    );
+    let found = ids(&fx);
+    assert!(found.contains(&"backup-never".to_string()), "{found:?}");
+    assert!(!found.contains(&"backup-failing".to_string()), "{found:?}");
+}
+
 /// `epoch` as the backup script writes its timestamps.
 fn iso(epoch: u64) -> String {
     let out = Command::new("date")

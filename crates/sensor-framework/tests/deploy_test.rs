@@ -2634,7 +2634,11 @@ fn upgrade_backs_up_and_keeps_the_running_release_before_installing_anything() {
         "pre-upgrade backup run with the built binary",
     );
     let save = position(
-        &|l| l.contains("rollback.sh\" --save \"${INSTALL_BINS[@]}\""),
+        &|l| {
+            l.contains(
+                "rollback.sh\" --save --backup-set \"$PRE_UPGRADE_SET\" \"${INSTALL_BINS[@]}\"",
+            )
+        },
         "rollback --save of the install list",
     );
     let first_install = position(&|l| l.starts_with("install -m"), "install");

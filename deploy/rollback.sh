@@ -2,11 +2,13 @@
 #
 # Keep the running release before an upgrade replaces it, and put it back on request.
 #
-#   rollback.sh --save BIN...    upgrade.sh runs this before installing anything: copies the named
+#   rollback.sh --save [--backup-set SET] BIN...
+#                                upgrade.sh runs this before installing anything: copies the named
 #                                binaries from /usr/local/bin, the Propolis unit files from
 #                                /etc/systemd/system, the propolis-* helpers from /usr/local/sbin,
 #                                and the deploy stamp into /var/lib/propolis/rollback/<release>/,
-#                                with the pre-upgrade backup set upgrade.sh just wrote. Keeps 3.
+#                                recording SET, the pre-upgrade backup upgrade.sh just wrote (none
+#                                when it took none). Keeps 3.
 #   rollback.sh --list           lists the kept releases, newest first.
 #   rollback.sh [--with-database] [--identity FILE] [--yes] [RELEASE]
 #                                stops the services, puts RELEASE (default: the newest) back,
@@ -38,7 +40,7 @@ SENSORS=(sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor
 
 usage() {
     cat >&2 <<EOF
-usage: $0 --save BIN...
+usage: $0 --save [--backup-set SET] BIN...
        $0 --list
        $0 [--with-database] [--identity FILE] [--yes] [RELEASE]
 EOF
@@ -68,8 +70,17 @@ field() { sed -n "s/^$1=//p" "$2" | head -n 1; }
 
 save() {
     require_root
+    local set=""
+    if [ "${1:-}" = --backup-set ]; then
+        set="${2-}"
+        shift 2 || usage
+        if [ -n "$set" ] && ! [[ "$set" =~ $SET_RE ]]; then
+            echo "error: not a pre-upgrade backup set name: $set" >&2
+            exit 2
+        fi
+    fi
     [ "$#" -gt 0 ] || usage
-    local sha name partial stamp set=""
+    local sha name partial stamp
     sha="$(installed_sha)"
     if [ "$sha" = none ]; then
         echo "    nothing to keep: no installed propolis binary reports its commit"
@@ -95,12 +106,9 @@ save() {
     shopt -u nullglob
     stamp="$ROOT/var/lib/propolis/deploy-stamp.json"
     [ -f "$stamp" ] && cp -p -- "$stamp" "$partial/deploy-stamp.json"
-    # The pre-upgrade backup upgrade.sh took moments ago, if it took one.
-    local status="$ROOT/var/lib/propolis/backup-status/last-success"
-    if [ -f "$status" ]; then
-        set="$(sed -n 's/.*"set":"\([^"]*\)".*/\1/p' "$status")"
-        [[ "$set" =~ $SET_RE ]] || set=""
-    fi
+    # The set is the one upgrade.sh names: the backup it took moments ago, or none when it took
+    # none. Never whatever backup happens to be newest, which could be from before an earlier
+    # upgrade and would roll the database back past it.
     printf 'saved_at=%s\ncommit=%s\nbackup_set=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sha" "$set" \
         > "$partial/manifest"
     mv -- "$partial" "$STORE/$name"
@@ -135,6 +143,34 @@ list() {
 
 unit_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
 
+env_value() {
+    local file="$ROOT/etc/propolis/propolis.env" v
+    [ -r "$file" ] || return 0
+    v="$(sed -n "s/^$1=//p" "$file" | tail -n 1)"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    printf '%s' "$v"
+}
+
+# Set once services are stopped: a failure from then on must say what state the box is in, and
+# tries to bring the services back rather than leave a honeypot dark.
+STOPPED=0
+STEP=""
+ASIDE=""
+on_exit() {
+    local code=$?
+    [ "$code" -ne 0 ] && [ "$STOPPED" -eq 1 ] || return 0
+    echo "error: the rollback failed while $STEP, after the services were stopped." >&2
+    if [ -n "$ASIDE" ]; then
+        echo "The database from before the rollback was renamed to $ASIDE; nothing was dropped." >&2
+    fi
+    echo "Trying to start the services again; check \`systemctl --failed\`." >&2
+    for unit in "${SENSORS[@]}" gateway propolis shipper; do
+        unit_enabled "$unit.service" && systemctl start "$unit.service" 2>/dev/null || true
+    done
+    return 0
+}
+trap on_exit EXIT
+
 restore() {
     require_root
     local with_db=0 yes=0 identity="$ROOT/etc/propolis/backup-identity.txt" release=""
@@ -155,7 +191,7 @@ restore() {
     [[ "$release" =~ $RELEASE_RE ]] || { echo "error: not a kept release name: $release" >&2; exit 2; }
     local dir="$STORE/$release"
     [ -d "$dir" ] || { echo "error: $dir does not exist (see $0 --list)" >&2; exit 1; }
-    local commit set dump=""
+    local commit set dump="" db="" role=""
     commit="$(field commit "$dir/manifest")"
     set="$(field backup_set "$dir/manifest")"
 
@@ -173,6 +209,17 @@ restore() {
             exit 1
         fi
         id -u postgres >/dev/null 2>&1 || { echo "error: no local postgres user; restore the database by hand (docs/operations/backup-and-restore.md)" >&2; exit 1; }
+        # Asked of the database with the binary installed NOW (the release being rolled back
+        # from, which has pg-exec), before anything is stopped, so a missing URL or an odd name
+        # refuses while the box still runs.
+        DATABASE_URL="$(env_value DATABASE_URL)"
+        [ -n "$DATABASE_URL" ] || { echo "error: no DATABASE_URL in $ROOT/etc/propolis/propolis.env" >&2; exit 1; }
+        export DATABASE_URL
+        db="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_database()')"
+        role="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user')"
+        unset DATABASE_URL
+        [[ "$db" =~ ^[a-z_][a-z0-9_]*$ ]] && [[ "$role" =~ ^[a-z_][a-z0-9_]*$ ]] || {
+            echo "error: database '$db' or role '$role' is not a plain name; restore by hand" >&2; exit 1; }
     fi
 
     echo "Rolling back to $release (commit $commit)."
@@ -184,11 +231,17 @@ restore() {
     fi
 
     echo "==> stopping services"
+    STOPPED=1
+    STEP="stopping services"
+    # The backup too: a nightly dump holding a connection would make the rename below fail, and a
+    # rolled-back release may have no backup helper at all.
+    systemctl stop propolis-backup.timer propolis-backup.service 2>/dev/null || true
     for unit in shipper gateway propolis "${SENSORS[@]}"; do
         unit_enabled "$unit.service" && systemctl stop "$unit.service"
     done
 
     echo "==> putting the kept binaries, helpers and units back"
+    STEP="putting the kept files back"
     shopt -s nullglob
     for f in "$dir"/bin/*; do install -m 0755 "$f" "$ROOT/usr/local/bin/$(basename "$f")"; done
     for f in "$dir"/sbin/*; do install -m 0755 "$f" "$ROOT/usr/local/sbin/$(basename "$f")"; done
@@ -197,18 +250,18 @@ restore() {
     [ -f "$dir/deploy-stamp.json" ] && install -m 0644 "$dir/deploy-stamp.json" "$ROOT/var/lib/propolis/deploy-stamp.json"
     systemctl daemon-reload
 
-    local aside=""
     if [ "$with_db" -eq 1 ]; then
         echo "==> restoring the database from $set"
-        local db role
-        db="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_database()')"
-        role="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user')"
-        [[ "$db" =~ ^[a-z_][a-z0-9_]*$ ]] && [[ "$role" =~ ^[a-z_][a-z0-9_]*$ ]] || {
-            echo "error: database '$db' or role '$role' is not a plain name; restore by hand" >&2; exit 1; }
+        STEP="renaming the current database aside"
+        local aside
         aside="${db}_before_rollback_$(date -u +%Y%m%d%H%M%S)"
         runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
-            -c "ALTER DATABASE \"$db\" RENAME TO \"$aside\"" \
+            -c "ALTER DATABASE \"$db\" RENAME TO \"$aside\""
+        ASIDE="$aside"
+        STEP="creating the empty database"
+        runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
             -c "CREATE DATABASE \"$db\" OWNER \"$role\" TEMPLATE template0"
+        STEP="restoring the dump"
         if [[ "$dump" == *.age ]]; then
             age --decrypt -i "$identity" "$dump" | runuser -u postgres -- pg_restore --exit-on-error --dbname="$db"
         else
@@ -216,7 +269,18 @@ restore() {
         fi
     fi
 
+    # A release from before the nightly backup has no helper to run it, and its propolis binary no
+    # pg-exec: the newer script would start that binary as the daemon. Off until upgraded again.
+    STEP="setting the backup timer"
+    if [ -e "$dir/sbin/propolis-backup" ]; then
+        unit_enabled propolis-backup.timer && systemctl start propolis-backup.timer
+    else
+        systemctl disable --now propolis-backup.timer 2>/dev/null || true
+        echo "    the kept release predates the nightly backup: propolis-backup.timer is disabled until the next upgrade"
+    fi
+
     echo "==> starting services"
+    STEP="starting services"
     for unit in "${SENSORS[@]}"; do
         unit_enabled "$unit.service" && systemctl start "$unit.service"
     done
@@ -224,6 +288,7 @@ restore() {
     systemctl start propolis.service
     unit_enabled shipper.service && systemctl start shipper.service
 
+    STEP="waiting for propolis.service"
     local up=0 wait="${PROPOLIS_ROLLBACK_WAIT_SECS:-30}"
     [[ "$wait" =~ ^[0-9]{1,4}$ ]] || wait=30
     for _ in $(seq 1 $(( (wait + 1) / 2 ))); do
@@ -238,8 +303,9 @@ restore() {
         fi
         exit 1
     fi
+    STOPPED=0
     echo "Rolled back to $release (commit $commit)."
-    [ -n "$aside" ] && echo "The database from before the rollback is kept as $aside; drop it once you are satisfied."
+    [ -n "$ASIDE" ] && echo "The database from before the rollback is kept as $ASIDE; drop it once you are satisfied."
     return 0
 }
 

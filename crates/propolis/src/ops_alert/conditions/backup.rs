@@ -53,7 +53,12 @@ fn backup_outcome(dir: &Path, max_age: Duration, now: SystemTime) -> Outcome {
             };
         }
     };
-    let failure = std::fs::read_to_string(dir.join("last-failure")).ok();
+    // "not configured" is the record of a run before DATABASE_URL existed (a node still being set
+    // up), not a failed backup: it does not page at once, and the directory-age rule below still
+    // pages if no backup follows.
+    let failure = std::fs::read_to_string(dir.join("last-failure"))
+        .ok()
+        .filter(|f| !field(f, "step").is_some_and(|s| s.starts_with("not configured")));
     let failed_step = failure
         .as_deref()
         .and_then(|f| field(f, "step"))
@@ -196,6 +201,22 @@ mod tests {
             Outcome::Firing { detail, .. } => assert!(detail.contains("dumping the database")),
             other => panic!("a first run that failed pages at once, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_not_configured_run_does_not_page_until_the_directory_age_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("last-failure"),
+            "{\"failed_at\":\"x\",\"reason\":\"scheduled\",\"step\":\"not configured: no DATABASE_URL in /etc/propolis/propolis.env\",\"exit_code\":0}\n",
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        assert_eq!(backup_outcome(dir.path(), LIMIT, now), Outcome::Ok);
+        assert!(matches!(
+            backup_outcome(dir.path(), LIMIT, now + 2 * DAY),
+            Outcome::Firing { .. }
+        ));
     }
 
     #[test]

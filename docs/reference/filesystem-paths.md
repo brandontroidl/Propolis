@@ -63,6 +63,11 @@ plaintext set is 0700 root with 0600 files; an encrypted set is 0750 with 0640 f
 for encrypted sets are read from `/etc/propolis/backup-recipients.txt`. See
 [backup and restore](../operations/backup-and-restore.md#the-nightly-backup).
 
+Each upgrade keeps the release it replaces in `/var/lib/propolis/rollback/<UTC time>-<commit>`
+(0700 root; `deploy/rollback.sh#save`): its binaries, `propolis-*` helpers, unit files, deploy
+stamp, and a `manifest` naming the commit and the pre-upgrade backup set. The newest 3 are
+kept. See [rollback](../operations/upgrade-rollback-and-dr.md#rollback).
+
 ## Spool / quarantine (uploaded-artifact capture)
 
 > **Mount requirement:** spool dirs must be backed by `noexec,nosuid,nodev`

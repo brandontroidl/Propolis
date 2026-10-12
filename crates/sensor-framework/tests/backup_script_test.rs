@@ -14,7 +14,11 @@ static EXEC_FENCE: Mutex<()> = Mutex::new(());
 
 const SECRET: &str = "s3cret-pw";
 
+/// The text deploy/backup.sh looks for in the binary before it runs pg-exec.
+const PG_EXEC_MARKER: &str = "propolis pg-exec: DATABASE_URL is not set";
+
 const PROPOLIS_STUB: &str = r#"#!/usr/bin/env bash
+# propolis pg-exec: DATABASE_URL is not set
 [ "$1" = pg-exec ] || exit 99
 shift
 printf '%s | url=%s\n' "$*" "${DATABASE_URL:+set}" >> "$STUB_LOG"
@@ -22,6 +26,13 @@ case "$1" in
     psql) echo "${STUB_DB_BYTES:-4096}" ;;
     pg_dump)
         [ -n "${STUB_DUMP_FAIL:-}" ] && exit 3
+        if [ -n "${STUB_DUMP_SLOW:-}" ]; then
+            for a in "$@"; do
+                case "$a" in --file=*) printf 'PGDMP partial\n' > "${a#--file=}" ;; esac
+            done
+            touch "$STUB_DUMP_SLOW"
+            sleep 30
+        fi
         for a in "$@"; do
             case "$a" in --file=*) printf 'PGDMP fake dump\n' > "${a#--file=}" ;; esac
         done
@@ -388,4 +399,118 @@ fn bad_arguments_and_a_bad_keep_are_usage_errors() {
         assert_eq!(output.status.code(), Some(2), "{args:?} {env:?}");
     }
     assert!(fx.sets().is_empty());
+}
+
+/// A propolis binary from before pg-exec would start the daemon when handed `pg-exec`; the script
+/// looks for pg-exec's own message in the binary and refuses one without it, running nothing.
+#[test]
+fn a_binary_without_pg_exec_is_refused_without_running_it() {
+    let fx = Fixture::new();
+    {
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        let old = PROPOLIS_STUB.replace(PG_EXEC_MARKER, "an older release");
+        std::fs::write(fx.bin.join("propolis"), old).unwrap();
+    }
+    let output = fx.run(&[], &[]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("has no pg-exec"));
+    assert!(fx.stub_log().is_empty(), "the binary was never run");
+    assert!(fx.sets().is_empty());
+
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../propolis/src/pg_exec.rs"
+    ))
+    .unwrap();
+    assert!(
+        source.contains(PG_EXEC_MARKER),
+        "deploy/backup.sh looks for text pg_exec.rs no longer prints"
+    );
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/backup.sh"
+    ))
+    .unwrap();
+    assert!(script.contains(PG_EXEC_MARKER));
+}
+
+/// The spools' .staging directories (a sample between its write and its rename) stay out of the
+/// archive, and a half-written set a killed run left behind is cleared under the lock.
+#[test]
+fn staging_files_are_not_archived_and_a_killed_runs_partial_set_is_cleared() {
+    let fx = Fixture::new();
+    std::fs::create_dir_all(fx.root.join("var/spool/propolis/ssh/.staging")).unwrap();
+    std::fs::write(
+        fx.root.join("var/spool/propolis/ssh/.staging/inflight"),
+        b"x",
+    )
+    .unwrap();
+    let stale = fx.backups().join(".partial-20200101T000000Z-scheduled");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("propolis.dump"), b"plaintext").unwrap();
+
+    assert_ok(&fx.run(&[], &[]));
+    assert!(!stale.exists(), "the leftover partial set is gone");
+    let set = fx.backups().join(&fx.sets()[0]);
+    let list = Command::new("tar")
+        .args(["-tzf", "state.tgz"])
+        .current_dir(&set)
+        .output()
+        .unwrap();
+    let members = String::from_utf8_lossy(&list.stdout);
+    assert!(!members.contains(".staging"), "{members}");
+    assert!(members.contains("var/spool/propolis/ssh/abc"), "{members}");
+}
+
+/// Stopped mid-dump the way systemd stops a unit (TERM to the whole group), the run removes its
+/// half-written set and records where it was.
+#[test]
+fn a_run_stopped_mid_dump_leaves_no_partial_set() {
+    use std::os::unix::process::CommandExt;
+    let fx = Fixture::new();
+    let started = fx.root.join("dump-started");
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/backup.sh");
+    let path = format!("{}:{}", fx.bin.display(), std::env::var("PATH").unwrap());
+    let mut command = Command::new("bash");
+    command
+        .arg(script)
+        .env("PATH", path)
+        .env("PROPOLIS_BACKUP_ROOT", &fx.root)
+        .env("STUB_LOG", &fx.log)
+        .env("STUB_DUMP_SLOW", &started)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = {
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        command.spawn().unwrap()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dump never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let group = format!("-{}", child.id());
+    Command::new("kill")
+        .args(["-TERM", "--", &group])
+        .status()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    let leftovers: Vec<String> = std::fs::read_dir(fx.backups())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "nothing is left behind: {leftovers:?}"
+    );
+    let failure = fx
+        .status("last-failure")
+        .expect("the interruption is recorded");
+    assert_eq!(failure["step"], "interrupted while dumping the database");
 }

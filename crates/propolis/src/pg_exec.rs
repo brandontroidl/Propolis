@@ -113,6 +113,36 @@ fn ssl_mode_name(mode: PgSslMode) -> &'static str {
 fn connection_env(url: &str, tool: &str) -> Result<Vec<(String, String)>, String> {
     let options =
         PgConnectOptions::from_str(url).map_err(|e| format!("DATABASE_URL does not parse: {e}"))?;
+    let query = url_query(url)?;
+    // Two places where a default would differ between the daemon and this tool, so the tool could
+    // reach a different account or fail for a different reason than the daemon: refused, with the
+    // fix, rather than guessed. With no user, the daemon connects as `propolis` (the user it runs
+    // as) but this tool, run by the root backup job, would connect as root. And libpq's
+    // verify-ca/verify-full read a root certificate from the caller's home, which the backup unit
+    // hides, while the daemon checks against its own trust store.
+    let (authority, _) = split_url(url)?;
+    let names_user = authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| !userinfo.split(':').next().unwrap_or("").is_empty())
+        || query.iter().any(|(k, v)| k == "user" && !v.is_empty());
+    if !names_user {
+        return Err(
+            "DATABASE_URL names no user; add it (postgres://propolis@...) so every \
+                    tool connects as the daemon does"
+                .to_string(),
+        );
+    }
+    if matches!(
+        options.get_ssl_mode(),
+        PgSslMode::VerifyCa | PgSslMode::VerifyFull
+    ) && !query.iter().any(|(k, _)| k == "sslrootcert")
+    {
+        return Err(
+            "DATABASE_URL verifies the server's certificate but names no sslrootcert; \
+                    add sslrootcert=<CA file> so every tool checks against the same CA"
+                .to_string(),
+        );
+    }
     let mut env = Vec::new();
     let host = match options.get_socket() {
         Some(socket) => socket.display().to_string(),
@@ -132,7 +162,7 @@ fn connection_env(url: &str, tool: &str) -> Result<Vec<(String, String)>, String
     if let Some(password) = url_password(url)? {
         env.push(("PGPASSWORD".to_string(), password));
     }
-    for (key, value) in url_query(url)? {
+    for (key, value) in query {
         if PARSED_KEYS.contains(&key.as_str()) {
             continue;
         }
@@ -241,6 +271,20 @@ mod tests {
         let err =
             connection_env("postgres://u:p@h/d?target_session_attrs=any", "pg_dump").unwrap_err();
         assert!(err.contains("target_session_attrs"), "{err}");
+    }
+
+    #[test]
+    fn a_url_without_a_user_or_with_an_unanchored_verify_mode_is_refused() {
+        let err = connection_env("postgres://localhost/propolis", "pg_dump").unwrap_err();
+        assert!(err.contains("names no user"), "{err}");
+        assert!(connection_env("postgres://:pw@localhost/propolis", "pg_dump").is_err());
+        assert!(
+            connection_env("postgres://localhost/propolis?user=propolis", "pg_dump").is_ok(),
+            "a user given as a setting counts"
+        );
+        let err = connection_env("postgres://u:p@h/d?sslmode=verify-full", "pg_dump").unwrap_err();
+        assert!(err.contains("sslrootcert"), "{err}");
+        assert!(connection_env("postgres://u:p@h/d?sslmode=require", "pg_dump").is_ok());
     }
 
     #[test]

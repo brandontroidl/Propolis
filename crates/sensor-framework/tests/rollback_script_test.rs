@@ -26,6 +26,7 @@ esac
 const RUNUSER_STUB: &str = r#"#!/usr/bin/env bash
 shift 3
 printf 'runuser %s\n' "$*" >> "$STUB_LOG"
+if [ -n "${STUB_RUNUSER_FAIL:-}" ] && [[ "$*" == *"$STUB_RUNUSER_FAIL"* ]]; then exit 1; fi
 if [ "$1" = pg_restore ]; then printf 'restored %s bytes\n' "$(wc -c)" >> "$STUB_LOG"; fi
 "#;
 
@@ -53,6 +54,7 @@ fn propolis_stub(commit: &str) -> String {
 case "$1" in
     --version) echo "propolis 0.4.0 ({commit}, built 2026-10-11T00:00:00Z)" ;;
     pg-exec)
+        [ -n "${{DATABASE_URL:-}}" ] || {{ echo "propolis pg-exec: DATABASE_URL is not set" >&2; exit 1; }}
         case "$*" in
             *current_database*) echo propolis ;;
             *current_user*) echo propolis ;;
@@ -105,6 +107,12 @@ impl Fixture {
         ] {
             std::fs::write(units.join(name), body).unwrap();
         }
+        std::fs::create_dir_all(root.join("etc/propolis")).unwrap();
+        std::fs::write(
+            root.join("etc/propolis/propolis.env"),
+            "DATABASE_URL=\"postgres://propolis:pw@localhost/propolis\"\n",
+        )
+        .unwrap();
         let state = root.join("var/lib/propolis");
         std::fs::create_dir_all(state.join("backup-status")).unwrap();
         std::fs::write(state.join("deploy-stamp.json"), "{\"head\":\"old\"}\n").unwrap();
@@ -234,7 +242,18 @@ fn read(path: &Path) -> String {
 #[test]
 fn save_keeps_the_named_binaries_the_units_the_helpers_the_stamp_and_the_backup_set() {
     let fx = Fixture::new();
-    assert_ok(&fx.run(&["--save", "propolis", "sensor-ssh", "gateway"], &[], None));
+    assert_ok(&fx.run(
+        &[
+            "--save",
+            "--backup-set",
+            SET,
+            "propolis",
+            "sensor-ssh",
+            "gateway",
+        ],
+        &[],
+        None,
+    ));
     let releases = fx.releases();
     assert_eq!(releases.len(), 1, "{releases:?}");
     assert!(releases[0].ends_with("-abc000000001"), "{releases:?}");
@@ -277,7 +296,7 @@ fn save_keeps_the_newest_three_and_never_deletes_a_name_it_did_not_make() {
     ] {
         std::fs::create_dir_all(fx.store().join(name)).unwrap();
     }
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     let releases = fx.releases();
     assert!(
         !releases.contains(&"20200101T000000Z-aaaa00000001".to_string()),
@@ -295,18 +314,105 @@ fn save_keeps_the_newest_three_and_never_deletes_a_name_it_did_not_make() {
     );
 }
 
+/// The kept release records only the set upgrade.sh names. An older pre-upgrade set on record is
+/// never picked up in its place: restoring it would roll the database back past an earlier upgrade.
+#[test]
+fn save_records_only_the_named_set_never_an_older_one_on_record() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    let kept = fx.store().join(&fx.releases()[0]);
+    let manifest = read(&kept.join("manifest"));
+    assert!(manifest.contains("backup_set=\n"), "{manifest}");
+    assert_eq!(
+        fx.run(
+            &["--save", "--backup-set", "../../etc", "propolis"],
+            &[],
+            None
+        )
+        .status
+        .code(),
+        Some(2),
+        "a set name of the wrong shape is refused"
+    );
+}
+
+/// The database names are read, and a missing DATABASE_URL refused, while everything still runs.
+#[test]
+fn a_database_rollback_without_a_url_refuses_before_stopping_anything() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    std::fs::write(
+        fx.root.join("etc/propolis/propolis.env"),
+        "PROPOLIS_FEED_ENABLED=true\n",
+    )
+    .unwrap();
+    let out = fx.run(&["--with-database", "--yes"], &[], None);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no DATABASE_URL"));
+    assert!(!fx.log().contains("systemctl stop"), "{}", fx.log());
+}
+
+/// A step that fails after the services are stopped says where the box is, names the database it
+/// renamed aside, and starts the services again rather than leaving the honeypot dark.
+#[test]
+fn a_failure_after_stopping_reports_the_state_and_starts_the_services_again() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_RUNUSER_FAIL", "CREATE DATABASE")],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("while creating the empty database"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("renamed to propolis_before_rollback_"),
+        "{stderr}"
+    );
+    let log = fx.log();
+    let failed = log.find("CREATE DATABASE").unwrap();
+    assert!(
+        log[failed..].contains("systemctl start propolis.service"),
+        "the services are started again after the failure: {log}"
+    );
+}
+
+/// Rolling back to a release from before the nightly backup turns its timer off: that release's
+/// binary has no pg-exec, and the newer backup script would start it as the daemon.
+#[test]
+fn rolling_back_past_the_backup_helper_disables_the_backup_timer() {
+    let fx = Fixture::new();
+    std::fs::remove_file(fx.root.join("usr/local/sbin/propolis-backup")).unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    assert_ok(&fx.run(&["--yes"], &[], None));
+    assert!(
+        fx.log()
+            .contains("systemctl disable --now propolis-backup.timer"),
+        "{}",
+        fx.log()
+    );
+}
+
 #[test]
 fn save_without_an_installed_binary_keeps_nothing_and_succeeds() {
     let fx = Fixture::new();
     std::fs::remove_file(fx.root.join("usr/local/bin/propolis")).unwrap();
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     assert!(fx.releases().is_empty());
 }
 
 #[test]
 fn a_rollback_puts_exactly_the_kept_files_back_and_restarts_in_order() {
     let fx = Fixture::new();
-    assert_ok(&fx.run(&["--save", "propolis", "sensor-ssh"], &[], None));
+    assert_ok(&fx.run(
+        &["--save", "--backup-set", SET, "propolis", "sensor-ssh"],
+        &[],
+        None,
+    ));
     fx.upgrade();
     let output = fx.run(&["--yes"], &[], None);
     assert_ok(&output);
@@ -338,7 +444,7 @@ fn a_rollback_puts_exactly_the_kept_files_back_and_restarts_in_order() {
 #[test]
 fn a_database_rollback_renames_the_current_database_aside_and_restores_the_dump() {
     let fx = Fixture::new();
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     fx.upgrade();
     let output = fx.run(&["--with-database", "--yes"], &[], None);
     assert_ok(&output);
@@ -383,7 +489,7 @@ fn an_encrypted_dump_is_decrypted_with_the_identity_on_the_way_to_pg_restore() {
         "AGE-SECRET-KEY-1TEST\n",
     )
     .unwrap();
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
 
     let without = fx.run(&["--with-database", "--yes"], &[], None);
     assert_eq!(
@@ -416,7 +522,7 @@ fn every_refusal_happens_before_a_service_is_stopped() {
     let fx = Fixture::new();
     // No kept release yet.
     assert_eq!(fx.run(&["--yes"], &[], None).status.code(), Some(1));
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     let release = fx.releases()[0].clone();
 
     // A wrong confirmation, a malformed name, a database rollback with no local PostgreSQL, and
@@ -452,7 +558,7 @@ fn every_refusal_happens_before_a_service_is_stopped() {
 #[test]
 fn a_daemon_that_does_not_come_back_names_a_migration_problem() {
     let fx = Fixture::new();
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     let output = fx.run(
         &["--yes"],
         &[
@@ -478,7 +584,7 @@ fn list_shows_the_kept_releases_newest_first() {
         "commit=aaaa00000001\nbackup_set=\n",
     )
     .unwrap();
-    assert_ok(&fx.run(&["--save", "propolis"], &[], None));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     let output = fx.run(&["--list"], &[], None);
     assert_ok(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);

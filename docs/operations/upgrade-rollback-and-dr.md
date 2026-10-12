@@ -123,8 +123,19 @@ the age identity that decrypts it: pass `--identity <file>`, or keep a box-local
 `/etc/propolis/backup-identity.txt` (root, 0600) whose public half is also in
 `backup-recipients.txt`.
 
+The kept release records only the pre-upgrade set that upgrade wrote. An upgrade run with
+`PROPOLIS_UPGRADE_SKIP_BACKUP=1`, or before `DATABASE_URL` was set, records none, so
+`--with-database` refuses it rather than restore an older set from before an earlier upgrade.
+
 Every refusal (no kept release, a release with no backup, a missing identity, no local
-PostgreSQL, an unconfirmed prompt) happens before any service is stopped.
+PostgreSQL, no `DATABASE_URL`, a database or role name that is not a plain identifier, an
+unconfirmed prompt) happens before any service is stopped. The script also stops
+`propolis-backup.timer` while it works, so a nightly dump cannot hold the database open
+during the rename. If a step fails after the services are stopped, it says which step, names
+the renamed-aside database if there is one, and starts the services again; check
+`systemctl --failed` afterwards. Rolling back to a release from before the nightly backup
+disables `propolis-backup.timer` until the next upgrade, because that release's binary has no
+`pg-exec`.
 
 ## Disaster recovery
 

@@ -49,8 +49,17 @@ options or archived paths stop matching the commands on this page.
 - **Status.** `/var/lib/propolis/backup-status/last-success` records the newest good set
   (time, reason, set name, encrypted or not, sizes). A failed run writes `last-failure`
   with the step that failed, leaves no partial set, and exits non-zero, so it shows in
-  `systemctl --failed` and `journalctl -u propolis-backup.service`. Until `propolis.env`
-  sets `DATABASE_URL`, each run records "not configured" and succeeds.
+  `systemctl --failed` and `journalctl -u propolis-backup.service`. A run stopped from
+  outside (its unit's timeout, `systemctl stop`, a shutdown) cleans up the same way, and
+  a half-written set left by one killed outright is removed by the next run. Until
+  `propolis.env` sets `DATABASE_URL`, each run records "not configured" and succeeds;
+  neither the daemon nor `config-check.sh` treats that record as a failure.
+- **Live spools.** The archive is taken while sensors run. Each spool's `.staging`
+  directory (a sample between its write and its rename into place) is left out, and a
+  file a sensor adds or removes mid-archive does not fail the run.
+- **The binary it runs.** Before connecting, the script checks that the `propolis`
+  binary has `pg-exec` and refuses one that predates it, which would otherwise start
+  the daemon.
 
 Run one by hand with `sudo systemctl start propolis-backup.service`, or
 `sudo propolis-backup` to see its output directly.
@@ -83,6 +92,9 @@ Then on the honeypot, as root:
    start one now with `systemctl start propolis-backup.service`.
 2. Put the PUBLIC half of the SSH key in `/var/lib/propolis-backup-pull/.ssh/authorized_keys`
    (root:root 0644), in the form `deploy/backup-pull-authorized-keys.example` shows.
+3. If `sshd_config` (or a file in `/etc/ssh/sshd_config.d/`) sets `AllowUsers` or
+   `AllowGroups`, add `propolis-backup-pull` or its group, then
+   `sshd -t && systemctl reload ssh`. With neither set, nothing changes.
 
 Back on the machine that keeps the copies, pull with `deploy/backup-pull.sh` from a checkout of
 this repository, through the host's real administrative sshd port (not the honeypot's port 22):

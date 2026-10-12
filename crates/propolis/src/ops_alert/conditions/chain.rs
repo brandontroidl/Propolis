@@ -132,6 +132,20 @@ impl Condition for ChainVerify {
                 shared.lock().unwrap_or_else(|p| p.into_inner()).verdict = Some(outcome);
             });
         }
+        // A scan that has run for a whole interval is hung (a lock wait, a dead connection): its
+        // last verdict is no longer news, and serving it would hide that no scan completes.
+        // Unknown lets the monitor's probe-stale warning say so.
+        if state.running
+            && let Some(started) = state.started
+            && now.duration_since(started) > ctx.cfg.chain_verify_interval
+        {
+            return Outcome::Unknown {
+                why: format!(
+                    "a hash-chain verification has been running for {} min without finishing",
+                    now.duration_since(started).as_secs() / 60
+                ),
+            };
+        }
         state.verdict.clone().unwrap_or_else(|| Outcome::Unknown {
             why: "the first hash-chain verification since startup is still running".to_string(),
         })
@@ -316,6 +330,39 @@ mod tests {
             Outcome::Firing { severity, .. } => assert_eq!(severity, Severity::Critical),
             other => panic!("the scan's Broken verdict must be served, got {other:?}"),
         }
+    }
+
+    /// A scan that never finishes stops serving its predecessor's verdict once it has run for a
+    /// whole interval, so the monitor's probe-stale warning reports it.
+    #[tokio::test]
+    async fn a_scan_running_longer_than_the_interval_reads_as_unknown() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cond = ChainVerify::with_verifier(Arc::new(GatedVerifier {
+            release: release.clone(),
+            result: Stub::Intact,
+            scans: scans.clone(),
+        }));
+        let ctx = monitor_ctx("1");
+        // A first scan finishes Intact.
+        cond.evaluate(&ctx).await;
+        release.notify_one();
+        settle().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(cond.evaluate(&ctx).await, Outcome::Ok);
+        // The next one starts once due, and never finishes.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            cond.evaluate(&ctx).await,
+            Outcome::Ok,
+            "fresh: the last verdict still stands"
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            cond.evaluate(&ctx).await.is_unknown(),
+            "a scan running past a whole interval is no longer hidden"
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     struct PanickingVerifier(Arc<std::sync::atomic::AtomicUsize>);

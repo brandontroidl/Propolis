@@ -66,13 +66,24 @@ INSTALL_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sen
 # release, which may predate `propolis pg-exec`.
 # BEGIN pre-upgrade
 echo "==> backing up before the upgrade"
+# The kept release records the set THIS run wrote, read back from the status file and accepted
+# only when it is new: a run that wrote none (skipped, or nothing configured yet) records none,
+# never an older set that would roll the database back past an earlier upgrade.
+BACKUP_STATUS=/var/lib/propolis/backup-status/last-success
+set_in_status() { sed -n 's/.*"set":"\([^"]*-pre-upgrade\)".*/\1/p' "$BACKUP_STATUS" 2>/dev/null || true; }
+PRE_UPGRADE_SET=""
 if [ "${PROPOLIS_UPGRADE_SKIP_BACKUP:-0}" = 1 ]; then
     echo "    skipped (PROPOLIS_UPGRADE_SKIP_BACKUP=1): this upgrade keeps no database to roll back to"
 else
+    before="$(set_in_status)"
     PROPOLIS_BIN="$BUILD_DIR/propolis" "$SCRIPT_DIR/backup.sh" --reason pre-upgrade
+    after="$(set_in_status)"
+    if [ -n "$after" ] && [ "$after" != "$before" ]; then
+        PRE_UPGRADE_SET="$after"
+    fi
 fi
 echo "==> keeping the running release for rollback (deploy/rollback.sh)"
-"$SCRIPT_DIR/rollback.sh" --save "${INSTALL_BINS[@]}"
+"$SCRIPT_DIR/rollback.sh" --save --backup-set "$PRE_UPGRADE_SET" "${INSTALL_BINS[@]}"
 # END pre-upgrade
 
 echo "==> installing binaries"

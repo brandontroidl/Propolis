@@ -92,11 +92,24 @@ on_error() {
     exit 1
 }
 trap on_error ERR
+# A run stopped from outside (its unit's timeout, `systemctl stop`, a shutdown) cleans up the same
+# way: a half-written set holds a plaintext dump even when sets are encrypted.
+on_signal() {
+    trap - ERR TERM INT HUP
+    STEP="interrupted while $STEP"
+    false || on_error
+}
+trap on_signal TERM INT HUP
 
 mkdir -p "$STATUS_DIR"
 exec 9> "$STATUS_DIR/lock"
 STEP="waiting for another backup to finish"
 flock -w 3600 9
+# Under the lock no other run is writing, so a .partial set left here was left by a run that was
+# killed outright (SIGKILL, power loss) and never cleaned up after itself.
+if [ -d "$BACKUP_DIR" ]; then
+    find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '.partial-*' -exec rm -rf -- {} +
+fi
 
 STEP="reading DATABASE_URL"
 DATABASE_URL=""
@@ -120,6 +133,13 @@ PROPOLIS_BIN="${PROPOLIS_BIN:-$(command -v propolis || echo /usr/local/bin/propo
 for tool in "$PROPOLIS_BIN" pg_restore tar sha256sum flock df du; do
     command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; false; }
 done
+# A propolis binary from before pg-exec would ignore the argument and start the daemon, as root,
+# with DATABASE_URL in its environment. Look for pg-exec's own message in the binary instead of
+# running it to find out.
+grep -q -a -F 'propolis pg-exec: DATABASE_URL is not set' "$PROPOLIS_BIN" || {
+    echo "error: $PROPOLIS_BIN has no pg-exec (it predates it); upgrade before backing up" >&2
+    false
+}
 ENCRYPT=0
 if [ -s "$RECIPIENTS" ]; then
     ENCRYPT=1
@@ -139,7 +159,9 @@ db_bytes="$("$PROPOLIS_BIN" pg-exec psql -X -A -t -c 'SELECT pg_database_size(cu
 [[ "$db_bytes" =~ ^[0-9]{1,18}$ ]] || { echo "error: could not read the database size: $db_bytes" >&2; false; }
 state_bytes=0
 if [ "${#existing[@]}" -gt 0 ]; then
-    state_bytes="$(cd "$ROOT/" && du -s -B1 -- "${existing[@]}" | awk '{s += $1} END {printf "%d", s}')"
+    # Sensors add and remove spool files while this runs; a file that vanishes mid-walk makes du
+    # exit non-zero but its total is still the estimate this needs.
+    state_bytes="$( (cd "$ROOT/" && du -s -B1 -- "${existing[@]}" 2>/dev/null || true) | awk '{s += $1} END {printf "%d", s}')"
 fi
 [[ "$state_bytes" =~ ^[0-9]{1,18}$ ]] || { echo "error: could not size the state directories: $state_bytes" >&2; false; }
 # A dump is usually far smaller than the database, but a mostly-text ledger does not compress to
@@ -164,11 +186,18 @@ STEP="checking the dump reads back"
 pg_restore --list "$PARTIAL/propolis.dump" > /dev/null
 
 STEP="archiving the state directories"
+# The spools are live. A spool's .staging directory only holds a sample between its write and its
+# rename into place, so it is left out; a file a sensor adds, removes or grows while tar reads is
+# GNU tar's exit 1 ("some files differ"), which still leaves a complete archive of everything else.
+# Exit 2 and above is a real failure.
+tar_rc=0
 if [ "${#existing[@]}" -gt 0 ]; then
-    tar -C "$ROOT/" -czf "$PARTIAL/state.tgz" -- "${existing[@]}"
+    tar -C "$ROOT/" --exclude=.staging --warning=no-file-changed --warning=no-file-removed \
+        --warning=no-file-shrank -czf "$PARTIAL/state.tgz" -- "${existing[@]}" || tar_rc=$?
 else
-    tar -C "$ROOT/" -czf "$PARTIAL/state.tgz" --files-from /dev/null
+    tar -C "$ROOT/" -czf "$PARTIAL/state.tgz" --files-from /dev/null || tar_rc=$?
 fi
+[ "$tar_rc" -le 1 ] || { echo "error: tar exited $tar_rc" >&2; false; }
 
 files=(propolis.dump state.tgz)
 if [ "$ENCRYPT" -eq 1 ]; then

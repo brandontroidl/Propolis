@@ -161,6 +161,12 @@ pub fn environment() -> Environment<'static> {
         .expect("sample_detail.html must be a valid template");
     env.add_template("campaigns.html", CAMPAIGNS_HTML)
         .expect("campaigns.html must be a valid template");
+    env.add_template("campaigns_rows.html", CAMPAIGNS_ROWS_HTML)
+        .expect("campaigns_rows.html must be a valid template");
+    env.add_template("campaigns_load_more.html", CAMPAIGNS_LOAD_MORE_HTML)
+        .expect("campaigns_load_more.html must be a valid template");
+    env.add_template("campaigns_rows_fragment.html", CAMPAIGNS_ROWS_FRAGMENT_HTML)
+        .expect("campaigns_rows_fragment.html must be a valid template");
     env.add_template("campaign_detail.html", CAMPAIGN_DETAIL_HTML)
         .expect("campaign_detail.html must be a valid template");
     env.add_template("campaign_approve.html", CAMPAIGN_APPROVE_HTML)
@@ -170,6 +176,9 @@ pub fn environment() -> Environment<'static> {
 
 const SAMPLE_DETAIL_HTML: &str = include_str!("templates/sample_detail.html");
 const CAMPAIGNS_HTML: &str = include_str!("templates/campaigns.html");
+const CAMPAIGNS_ROWS_HTML: &str = include_str!("templates/campaigns_rows.html");
+const CAMPAIGNS_LOAD_MORE_HTML: &str = include_str!("templates/campaigns_load_more.html");
+const CAMPAIGNS_ROWS_FRAGMENT_HTML: &str = include_str!("templates/campaigns_rows_fragment.html");
 const CAMPAIGN_DETAIL_HTML: &str = include_str!("templates/campaign_detail.html");
 const CAMPAIGN_APPROVE_HTML: &str = include_str!("templates/campaign_approve.html");
 const IPS_HTML: &str = include_str!("templates/ips.html");

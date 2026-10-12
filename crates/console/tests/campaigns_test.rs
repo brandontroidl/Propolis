@@ -1757,3 +1757,92 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
         assert!(found.is_empty(), "{uri}:\n{}", found.join("\n"));
     }
 }
+
+/// The "Load more" a Campaigns page or fragment offers, as the URL its button fetches.
+fn campaigns_load_more(body: &str) -> Option<String> {
+    let at = body.find("<button hx-get=\"/campaigns/rows?")? + "<button hx-get=\"".len();
+    Some(body[at..at + body[at..].find('"')?].replace("&amp;", "&"))
+}
+
+/// Each listed campaign's id and host count, in order.
+fn listed_campaigns(body: &str) -> Vec<(i64, i64)> {
+    body.split("<a class=\"c-text mono campaign-label\" href=\"/campaigns/")
+        .skip(1)
+        .map(|rest| {
+            let id = rest[..rest.find('"').unwrap()].parse().unwrap();
+            let hosts = &rest[rest.find("data-label=\"Hosts\">").unwrap() + 19..];
+            (
+                id,
+                hosts[..hosts.find('<').unwrap()]
+                    .replace(',', "")
+                    .parse()
+                    .unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A list longer than one load is all reachable: each "Load more" continues exactly after the
+/// last campaign shown, in the sort's order, keeping the tab and the sort, and a campaign removed
+/// meanwhile is reported instead of restarting the list.
+#[sqlx::test(migrations = false)]
+async fn campaigns_load_every_campaign_once_in_order(pool: PgPool) {
+    migrate(&pool).await;
+    // Host counts repeat (2 to 8), so the order rests on the tiebreaks as much as on the count.
+    sqlx::query(
+        "INSERT INTO campaign (kind, key, label, representative, rep_event_id, first_seen, \
+                               last_seen, member_count, sightings) \
+         SELECT 'command_sequence', 'key-' || i, '3 commands: run ' || i, \
+                jsonb_build_object('opening', 'run ' || i), 1, now() - interval '2 days', \
+                now() - (i % 11) * interval '1 hour', 2 + i % 7, 2 + i % 7 \
+         FROM generate_series(1, 450) AS i",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let console = Console::new(pool.clone());
+
+    let (status, first) = console.get("/campaigns?kind=behaviour&sort=hosts").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!first.contains("showing the first"), "{first}");
+    let mut listed = listed_campaigns(&first);
+    assert_eq!(listed.len(), 200);
+    let mut next = campaigns_load_more(&first).expect("a second load");
+    assert!(
+        next.starts_with("/campaigns/rows?kind=behaviour&sort=hosts&after="),
+        "{next}"
+    );
+    let mut loads = 1;
+    loop {
+        let (status, more) = console.get(&next).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!more.contains("<html"), "a fragment, not a page: {more}");
+        listed.extend(listed_campaigns(&more));
+        loads += 1;
+        match campaigns_load_more(&more) {
+            Some(url) => next = url,
+            None => break,
+        }
+    }
+    assert_eq!(loads, 3, "200, 200, then the last 50");
+    let ids: std::collections::BTreeSet<i64> = listed.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids.len(), 450, "every campaign exactly once");
+    assert_eq!(listed.len(), 450);
+    let hosts: Vec<i64> = listed.iter().map(|(_, h)| *h).collect();
+    assert!(hosts.windows(2).all(|w| w[0] >= w[1]), "{hosts:?}");
+
+    let (_, by_last) = console.get("/campaigns?sort=last_seen&single=1").await;
+    let next = campaigns_load_more(&by_last).unwrap();
+    assert!(
+        next.starts_with("/campaigns/rows?sort=last_seen&single=1&after="),
+        "{next}"
+    );
+
+    let (status, lost) = console.get("/campaigns/rows?sort=hosts&after=999999").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        lost.contains("no longer exists. Reload to continue."),
+        "{lost}"
+    );
+    assert!(listed_campaigns(&lost).is_empty());
+}

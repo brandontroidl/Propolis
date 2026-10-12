@@ -30,9 +30,6 @@
   <a class="range-btn" href="{{ href(kind, sort, true) }}" role="switch" aria-checked="false">show single-host groups ({{ single_hidden | count }})</a>
   {% endif %}
 </nav>
-{% if total > shown_limit %}
-<p class="table-note">showing the first {{ shown_limit | count }} of {{ total | count }}</p>
-{% endif %}
 {% if campaigns %}
 <div class="panel campaigns-panel">
 <table class="table-compact stack">
@@ -40,25 +37,11 @@
   <thead>
     <tr><th>Campaign</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Top sensors</th><th>Delivers</th></tr>
   </thead>
-  <tbody>
-    {% for c in campaigns %}
-    <tr>
-      <td class="stack-full">
-        <a class="c-text mono campaign-label" href="/campaigns/{{ c.id }}" title="{{ c.text }}">{{ c.text }}</a>
-        <span class="c-meta"><span class="sev">{{ c.badge }}</span>{% if c.range %}<span class="dim">{{ c.range }}</span>{% endif %}{% if c.tags %}<span class="sev-tags">{% for t in c.tags[:4] %}<span class="sev" title="{{ t.title }}">{{ t.id }}</span>{% endfor %}{% if c.tags | length > 4 %}<span class="dim">+{{ (c.tags | length - 4) | count }}</span>{% endif %}</span>{% endif %}</span>
-      </td>
-      <td class="count" data-label="Hosts">{{ c.members | count }}</td>
-      <td>{{ m.day_strip(c.spark, spark_days) }}</td>
-      <td class="active-cell stack-end" title="{{ c.active_title }}">{{ c.active }}</td>
-      <td><span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s.label }}</span>{% endfor %}</span></td>
-      <td class="stack-end">
-        {% if c.first_sample %}{{ m.hash_link(c.first_sample.sha256) }}{% if c.sample_count > 1 %} <span class="dim">+{{ (c.sample_count - 1) | count }} more</span>{% endif %}{% if c.worm %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
-        {% else %}<span class="dim">-</span>{% endif %}
-      </td>
-    </tr>
-    {% endfor %}
+  <tbody id="campaigns-rows">
+{% include "campaigns_rows.html" %}
   </tbody>
 </table>
+<div id="load-more-container">{% include "campaigns_load_more.html" %}</div>
 </div>
 {% else %}
 <div class="panel campaigns-panel"><p class="empty-line">no campaigns{% if kind %} of this kind{% endif %}{% if single_hidden > 0 %} with more than one host{% endif %} yet</p></div>

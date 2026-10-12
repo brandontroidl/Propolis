@@ -34,12 +34,14 @@ use crate::AppState;
 use crate::auth::Session;
 use crate::routes::attack::{self, TagChip};
 use crate::routes::context::base_context;
+use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::format::{format_active, format_sensor_label, format_timestamp, group_digits};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/campaigns", get(list_page))
+        .route("/campaigns/rows", get(list_rows))
         .route("/campaigns/{id}", get(detail_page))
         .route(
             "/campaigns/{id}/approve",
@@ -47,7 +49,7 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// Campaigns listed on one page.
+/// Campaigns listed per load: the page shows this many, and each "Load more" this many more.
 const LIST_LIMIT: i64 = 200;
 /// Members listed on a campaign page.
 const MEMBER_LIMIT: i64 = 500;
@@ -414,6 +416,8 @@ struct ListQuery {
     kind: Option<String>,
     sort: Option<String>,
     single: Option<String>,
+    /// The id of the last campaign already shown (`/campaigns/rows` only).
+    after: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,7 +444,18 @@ impl Sort {
         }
     }
 
-    /// Fixed text, never built from input. Every order ends in the id so paging is stable.
+    /// The columns the list orders by, all descending and ending in the id, so a row value
+    /// comparison against the last campaign shown resumes exactly past it. Fixed text, never
+    /// built from input.
+    fn columns(self) -> &'static str {
+        match self {
+            Sort::Hosts => "member_count, last_seen, id",
+            Sort::LastSeen => "last_seen, member_count, id",
+            Sort::FirstSeen => "first_seen, member_count, id",
+        }
+    }
+
+    /// The same columns, each descending.
     fn order_by(self) -> &'static str {
         match self {
             Sort::Hosts => "member_count DESC, last_seen DESC, id DESC",
@@ -499,6 +514,87 @@ pub(crate) async fn indexer_progress(pool: &PgPool) -> Result<(i64, i64), sqlx::
     .await
 }
 
+/// One load of the list: up to [`LIST_LIMIT`] campaigns after `after` (from the top when `None`)
+/// in the sort's order, and the id to continue after when more follow.
+async fn fetch_list(
+    db: &PgPool,
+    class: Option<Class>,
+    sort: Sort,
+    show_single: bool,
+    after: Option<i64>,
+) -> Result<(Vec<sqlx::postgres::PgRow>, Option<i64>), AppError> {
+    // Only constants are interpolated: the class query and the fixed column lists `Sort` picks.
+    let mut rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT id, label, member_count, first_seen, last_seen, class \
+         FROM ({CLASSED}) x WHERE ($3::text IS NULL OR class = $3) \
+           AND ($4 OR member_count > 1) \
+           AND ($6::bigint IS NULL OR ({cols}) < (SELECT {cols} FROM campaign WHERE id = $6)) \
+         ORDER BY {order} LIMIT $5",
+        cols = sort.columns(),
+        order = sort.order_by(),
+    )))
+    .bind(OPENING_HTTP)
+    .bind(OPENING_ENTRY_ONLY)
+    .bind(class.map(Class::value))
+    .bind(show_single)
+    .bind(LIST_LIMIT + 1)
+    .bind(after)
+    .fetch_all(db)
+    .await?;
+    let more = rows.len() as i64 > LIST_LIMIT;
+    rows.truncate(LIST_LIMIT as usize);
+    let next_after = match rows.last() {
+        Some(last) if more => Some(last.try_get("id")?),
+        _ => None,
+    };
+    Ok((rows, next_after))
+}
+
+/// `GET /campaigns/rows`: the next load after the campaign `after=` names, with the page's tab,
+/// sort and single-host choice. A campaign that no longer exists cannot say where to resume, so
+/// nothing is added and the fragment says so. A soft failure here leaves its placeholder in the
+/// rows; the page's degraded banner is not redrawn by a fragment.
+async fn list_rows(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> Result<Html<String>, AppError> {
+    let class = query.kind.as_deref().and_then(Class::parse);
+    let sort = Sort::parse(query.sort.as_deref());
+    let show_single = query.single.as_deref() == Some("1");
+    let after = query.after.as_deref().and_then(|a| a.parse::<i64>().ok());
+    let exists = match after {
+        Some(id) => {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM campaign WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await?
+        }
+        None => false,
+    };
+    let (campaigns, next_after) = if exists {
+        let (rows, next_after) = fetch_list(&state.db, class, sort, show_single, after).await?;
+        let mut degraded = Degraded::new();
+        (
+            build_rows(&state.db, rows, &mut degraded).await?,
+            next_after,
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    let tmpl = state
+        .templates
+        .get_template("campaigns_rows_fragment.html")?;
+    Ok(Html(tmpl.render(context! {
+        campaigns,
+        next_after,
+        cursor_lost => !exists,
+        kind => class.map(Class::value).unwrap_or(""),
+        sort => sort.value(),
+        show_single,
+        spark_days => LIST_SPARK_DAYS,
+    })?))
+}
+
 async fn list_page(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -506,20 +602,7 @@ async fn list_page(
     let class = query.kind.as_deref().and_then(Class::parse);
     let sort = Sort::parse(query.sort.as_deref());
     let show_single = query.single.as_deref() == Some("1");
-    // Only constants are interpolated: the class query and a fixed ORDER BY chosen by `Sort`.
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT id, label, member_count, first_seen, last_seen, class \
-         FROM ({CLASSED}) x WHERE ($3::text IS NULL OR class = $3) \
-           AND ($4 OR member_count > 1) ORDER BY {} LIMIT $5",
-        sort.order_by()
-    )))
-    .bind(OPENING_HTTP)
-    .bind(OPENING_ENTRY_ONLY)
-    .bind(class.map(Class::value))
-    .bind(show_single)
-    .bind(LIST_LIMIT)
-    .fetch_all(&state.db)
-    .await?;
+    let (rows, next_after) = fetch_list(&state.db, class, sort, show_single, None).await?;
     // Per class, how many campaigns have one host and how many have more.
     let counts: Vec<(String, bool, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT class, member_count > 1, count(*) FROM ({CLASSED}) x GROUP BY 1, 2"
@@ -553,32 +636,65 @@ async fn list_page(
         })
         .collect();
     let all_count = in_class(None, listed);
+
+    let base = base_context(&state.db, state.startup_time, state.version).await;
+    let mut degraded = base.degraded;
+    let (indexed, newest) = degraded.soft("indexer progress", indexer_progress(&state.db).await);
+    let campaigns = build_rows(&state.db, rows, &mut degraded).await?;
+
+    let tmpl = state.templates.get_template("campaigns.html")?;
+    Ok(Html(tmpl.render(context! {
+        active_nav => "campaigns",
+        pending_count => base.pending_count,
+        uptime => base.uptime,
+        version => base.version,
+        degraded => degraded.names(),
+        campaigns,
+        next_after,
+        cursor_lost => false,
+        total,
+        kind => current.unwrap_or(""),
+        sort => sort.value(),
+        show_single,
+        single_hidden,
+        all_count,
+        tabs,
+        indexed,
+        newest,
+        indexer_behind => newest.saturating_sub(indexed),
+        spark_days => LIST_SPARK_DAYS,
+    })?))
+}
+
+/// The list's rows, each with its sparkline, top sensors, first sample and techniques, read in
+/// one query per kind for the whole load.
+async fn build_rows(
+    db: &PgPool,
+    rows: Vec<sqlx::postgres::PgRow>,
+    degraded: &mut Degraded,
+) -> Result<Vec<ListRow>, AppError> {
     let ids: Vec<i64> = rows
         .iter()
         .map(|r| r.try_get("id"))
         .collect::<Result<_, _>>()?;
-
-    let base = base_context(&state.db, state.startup_time, state.version).await;
-    let mut degraded = base.degraded;
     let today = Utc::now().date_naive();
     let days = degraded.soft(
         "activity sparklines",
-        day_counts(&state.db, &ids, today - Duration::days(LIST_SPARK_DAYS - 1)).await,
+        day_counts(db, &ids, today - Duration::days(LIST_SPARK_DAYS - 1)).await,
     );
-    let mut sensors = degraded.soft("campaign sensors", sensor_counts(&state.db, &ids).await);
-    let mut samples = degraded.soft("linked samples", linked_samples(&state.db, &ids, 1).await);
+    let mut sensors = degraded.soft("campaign sensors", sensor_counts(db, &ids).await);
+    let mut samples = degraded.soft("linked samples", linked_samples(db, &ids, 1).await);
     let first_shas: Vec<String> = samples
         .values()
         .filter_map(|(links, _)| links.first().map(|l| l.sha256.clone()))
         .collect();
     let sample_campaigns = degraded.soft(
         "sample campaigns",
-        campaigns_by_sample(&state.db, &first_shas).await,
+        campaigns_by_sample(db, &first_shas).await,
     );
-    let (indexed, newest) = degraded.soft("indexer progress", indexer_progress(&state.db).await);
     let mut tags = degraded.soft(
         "ATT&CK techniques",
-        review::attack::campaign_tags(&state.db, &ids).await,
+        review::attack::campaign_tags(db, &ids).await,
     );
 
     let now = Utc::now();
@@ -621,28 +737,7 @@ async fn list_page(
             tags: attack::chips(&tags.remove(&id).unwrap_or_default()),
         });
     }
-
-    let tmpl = state.templates.get_template("campaigns.html")?;
-    Ok(Html(tmpl.render(context! {
-        active_nav => "campaigns",
-        pending_count => base.pending_count,
-        uptime => base.uptime,
-        version => base.version,
-        degraded => degraded.names(),
-        campaigns,
-        total,
-        shown_limit => LIST_LIMIT,
-        kind => current.unwrap_or(""),
-        sort => sort.value(),
-        show_single,
-        single_hidden,
-        all_count,
-        tabs,
-        indexed,
-        newest,
-        indexer_behind => newest.saturating_sub(indexed),
-        spark_days => LIST_SPARK_DAYS,
-    })?))
+    Ok(campaigns)
 }
 
 #[derive(Debug, Serialize)]

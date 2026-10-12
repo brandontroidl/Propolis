@@ -1,0 +1,17 @@
+# Nightly trigger for propolis-backup.service.
+#
+# Persistent=true runs a missed night at the next boot (the box was off), and RandomizedDelaySec
+# keeps the dump off a fixed minute. The daemon's backup-stale alert fires when the last good
+# backup is older than PROPOLIS_OPS_BACKUP_MAX_AGE_SECS (36 h by default), so one failed night
+# pages before a second one is missed.
+[Unit]
+Description=Nightly backup of the Propolis database and state
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=propolis-backup.service
+
+[Install]
+WantedBy=timers.target

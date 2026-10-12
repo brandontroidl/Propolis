@@ -145,6 +145,12 @@ ensure_dir /var/lib/propolis/feed         0755 propolis          propolis
 # fingerprint itself as freshly minted). Listed in sensor-ssh.service's ReadWritePaths, so it
 # must exist or ProtectSystem=strict's bind-mount setup fails with NAMESPACE.
 ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
+# deploy/backup.sh's status files: root-written, world-readable, so the daemon's backup-stale alert
+# and config-check.sh can read when the last backup finished without being able to forge it.
+ensure_dir /var/lib/propolis/backup-status 0755 root             root
+# The backup sets themselves. root-only: a set holds a full database dump and /etc/propolis's
+# secrets, encrypted only once the operator configures age recipients.
+ensure_dir /var/backups/propolis          0750 root              root
 # propolis-watch's home, outside /var/lib/propolis so it shares nothing with the daemon's state.
 # Root-owned all the way down, so the account cannot change which keys log in to it: owning its
 # home would let it rename a root-owned .ssh aside and create its own, and owning .ssh or

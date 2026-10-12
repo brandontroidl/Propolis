@@ -6,6 +6,7 @@
 
 mod config;
 mod ops_alert;
+mod pg_exec;
 mod supervisor;
 
 use std::collections::{HashMap, HashSet};
@@ -1038,6 +1039,15 @@ async fn main() {
             let json = args[2..].iter().any(|a| a == "--json");
             let path = args[2..].iter().find(|a| a.as_str() != "--json");
             std::process::exit(run_shadow_diff(path.map(String::as_str), json));
+        }
+    }
+
+    // A PostgreSQL client tool run against DATABASE_URL (deploy/backup.sh's pg_dump), ahead of
+    // everything else for the same reason: it needs only DATABASE_URL and replaces this process.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("pg-exec") {
+            std::process::exit(pg_exec::run(&args[1..]));
         }
     }
 

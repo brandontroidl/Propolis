@@ -838,7 +838,9 @@ fn every_unit_readwrite_dir_is_provisioned() {
         let entry = entry.expect("failed to read a deploy/ directory entry");
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy().into_owned();
-        if !file_name.starts_with("sensor-") || !file_name.ends_with(".service") {
+        if !(file_name.starts_with("sensor-") || file_name.starts_with("propolis-"))
+            || !file_name.ends_with(".service")
+        {
             continue;
         }
         checked_any = true;
@@ -868,7 +870,11 @@ fn spool_state_read_write_dirs(unit: &str) -> Vec<String> {
     unit.lines()
         .filter(|l| l.starts_with("ReadWritePaths="))
         .flat_map(|l| l.trim_start_matches("ReadWritePaths=").split_whitespace())
-        .filter(|p| p.starts_with("/var/spool/propolis/") || p.starts_with("/var/lib/propolis/"))
+        .filter(|p| {
+            p.starts_with("/var/spool/propolis/")
+                || p.starts_with("/var/lib/propolis/")
+                || p.starts_with("/var/backups/propolis")
+        })
         .map(str::to_string)
         .collect()
 }
@@ -2443,6 +2449,127 @@ fn install_dry_run_installs_the_guard_and_enables_the_rotation_timer() {
         "propolis-logrotate.timer /etc/systemd/system/propolis-logrotate.timer",
         "/usr/local/sbin/propolis-logrotate-guard",
         "[dry-run] systemctl enable --now propolis-logrotate.timer",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "dry-run output missing {expected:?}"
+        );
+    }
+}
+
+/// Both entry points install the backup script where the unit runs it, install both units, and
+/// enable the timer after the reload; upgrade does it before any restart. The behaviour of the
+/// script itself is backup_script_test.rs's.
+#[test]
+fn install_and_upgrade_install_and_enable_the_backup_timer_after_the_reload() {
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("install -m 0755")
+                && l.contains("backup.sh")
+                && l.ends_with("/usr/local/sbin/propolis-backup")),
+            "{script_name} must install deploy/backup.sh as /usr/local/sbin/propolis-backup"
+        );
+        for unit in ["propolis-backup.service", "propolis-backup.timer"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("for unit in ") && l.contains(unit)),
+                "{script_name} never installs {unit}"
+            );
+        }
+        let reload = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl daemon-reload"))
+            .unwrap_or_else(|| panic!("{script_name} never reloads systemd"));
+        let enable = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl enable --now propolis-backup.timer"))
+            .unwrap_or_else(|| panic!("{script_name} never enables the backup timer"));
+        assert!(
+            reload < enable,
+            "{script_name} enables the backup timer before the reload"
+        );
+        if script_name == "upgrade.sh" {
+            let first_restart = lines
+                .iter()
+                .position(|l| l.starts_with("systemctl restart"))
+                .unwrap();
+            assert!(
+                enable < first_restart,
+                "upgrade.sh must enable it before restarting"
+            );
+        }
+    }
+}
+
+/// The unit runs the installed script for the nightly reason and can write only the backup
+/// directory and its status files; the timer is daily and catches up a missed night.
+#[test]
+fn propolis_backup_units_run_nightly_and_write_only_their_own_paths() {
+    let service = uncommented(&deploy_file("propolis-backup.service"));
+    for directive in [
+        "Type=oneshot",
+        "ExecStart=/usr/local/sbin/propolis-backup --reason scheduled",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/var/backups/propolis /var/lib/propolis/backup-status",
+        "IOSchedulingClass=idle",
+        "NoNewPrivileges=yes",
+    ] {
+        assert!(
+            service.contains(directive),
+            "propolis-backup.service lacks {directive}"
+        );
+    }
+    let timer = uncommented(&deploy_file("propolis-backup.timer"));
+    for directive in [
+        "OnCalendar=*-*-* 03:30:00",
+        "Persistent=true",
+        "RandomizedDelaySec=",
+        "Unit=propolis-backup.service",
+        "WantedBy=timers.target",
+    ] {
+        assert!(
+            timer.contains(directive),
+            "propolis-backup.timer lacks {directive}"
+        );
+    }
+    let script = deploy_file("backup.sh");
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/backup.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/backup.sh is not valid bash");
+    assert!(
+        script.contains("pg-exec pg_dump"),
+        "the dump must go through propolis pg-exec"
+    );
+}
+
+/// The dry run shows the backup script, its units, and the enable.
+#[test]
+fn install_dry_run_installs_and_enables_the_backup_timer() {
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "/usr/local/sbin/propolis-backup",
+        "propolis-backup.service /etc/systemd/system/propolis-backup.service",
+        "propolis-backup.timer /etc/systemd/system/propolis-backup.timer",
+        "[dry-run] systemctl enable --now propolis-backup.timer",
+        "/var/backups/propolis",
+        "/var/lib/propolis/backup-status",
     ] {
         assert!(
             stdout.contains(expected),

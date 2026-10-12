@@ -1,0 +1,43 @@
+# Nightly backup of this node (deploy/backup.sh, installed as /usr/local/sbin/propolis-backup),
+# driven by propolis-backup.timer. upgrade.sh runs the same script with --reason pre-upgrade before
+# it installs anything.
+#
+# Runs as root: the archive reads every sensor's 0750 spool, /etc/propolis's 0600 env files and the
+# SSH host key. The sandbox below lets it write only the backup directory and its status files.
+# Idle I/O and CPU priority, because the dump reads the whole ledger and must not slow intake.
+# The daemon's backup-stale alert reads /var/lib/propolis/backup-status/last-success; a failed run
+# writes last-failure there and exits non-zero (visible in `systemctl --failed`).
+[Unit]
+Description=Back up the Propolis database and state
+Documentation=file:///usr/local/sbin/propolis-backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/propolis-backup --reason scheduled
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+# A dump of a ledger in the tens of millions of rows takes a while; this only stops a hung one.
+TimeoutStartSec=6h
+
+ProtectSystem=strict
+ReadWritePaths=/var/backups/propolis /var/lib/propolis/backup-status
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# AF_UNIX and AF_INET/AF_INET6: PostgreSQL over its socket or over TCP, as DATABASE_URL says.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

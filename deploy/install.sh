@@ -19,8 +19,9 @@
 #
 # This script does NOT:
 #   - start or enable any service (`systemctl enable --now <unit>` is an operator action, taken
-#     only after reviewing the populated env files). The single exception is
-#     propolis-logrotate.timer, which needs no env file and bounds the sensor logs.
+#     only after reviewing the populated env files). The exceptions are propolis-logrotate.timer,
+#     which needs no env file and bounds the sensor logs, and propolis-backup.timer, which reads
+#     the daemon's own DATABASE_URL and records "not configured" until it is set.
 #   - create, seed, or migrate the PostgreSQL database. The propolis binary runs its own migrations
 #     (core-scoring + review) at startup once DATABASE_URL is reachable; provisioning the database
 #     server itself is an independent operator/DBA action.
@@ -169,6 +170,13 @@ run install -m 0755 "$SCRIPT_DIR/logrotate-guard.sh" /usr/local/sbin/propolis-lo
 for unit in propolis-logrotate.service propolis-logrotate.timer; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
+# The nightly backup, enabled in step 9 like rotation: it needs nothing the operator has not already
+# set for the daemon (it reads DATABASE_URL from propolis.env) and records "not configured" until
+# that exists.
+run install -m 0755 "$SCRIPT_DIR/backup.sh" /usr/local/sbin/propolis-backup
+for unit in propolis-backup.service propolis-backup.timer; do
+    run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
 
 # ---- 7. fleet listener inventory ----
 
@@ -196,10 +204,11 @@ run systemctl daemon-reload
 # The one thing this script enables: log rotation takes no operator input (no env file, no secret)
 # and an unrotated sensor log fills the disk, so it is not left to a step someone can forget.
 run systemctl enable --now propolis-logrotate.timer
+run systemctl enable --now propolis-backup.timer
 
 if [ "$DRY_RUN" -eq 1 ]; then
     log "dry-run complete - no changes were made."
 else
-    log "done. Services are installed but NOT started or enabled (except propolis-logrotate.timer), and the database is untouched."
+    log "done. Services are installed but NOT started or enabled (except the log rotation and backup timers), and the database is untouched."
     log "Next: populate /etc/propolis/*.env files, then 'systemctl enable --now <unit>' per service."
 fi

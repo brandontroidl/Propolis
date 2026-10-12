@@ -50,6 +50,17 @@ event logs, run hourly by `propolis-logrotate.timer` with its state in
 The policy's `prerotate` hook is `/usr/local/sbin/propolis-logrotate-guard`. See
 [retention](../operations/retention.md#log-rotation).
 
+## Backups
+
+The nightly backup (`/usr/local/sbin/propolis-backup`, from `deploy/backup.sh`, run by
+`propolis-backup.timer`) writes one set per run under `/var/backups/propolis`
+(0750 root; `deploy/provision.sh#ensure_dir /var/backups/propolis`), each set 0700 and its
+files 0600. Its status files are in `/var/lib/propolis/backup-status`
+(0755 root, files 0644; `deploy/provision.sh#ensure_dir /var/lib/propolis/backup-status`):
+`last-success`, `last-failure`, and the `lock` that keeps two runs apart. Age recipients
+for encrypted sets are read from `/etc/propolis/backup-recipients.txt`. See
+[backup and restore](../operations/backup-and-restore.md#the-nightly-backup).
+
 ## Spool / quarantine (uploaded-artifact capture)
 
 > **Mount requirement:** spool dirs must be backed by `noexec,nosuid,nodev`

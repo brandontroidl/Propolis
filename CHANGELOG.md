@@ -13,6 +13,14 @@
 
 ### Added
 
+- **Nightly backups** - `propolis-backup.timer` now runs the documented backup every night at
+  03:30: a `pg_dump` of the database and an archive of the spool, `/etc/propolis` and the SSH
+  host key, with digests, under `/var/backups/propolis` (newest 7 kept). With age public keys in
+  `/etc/propolis/backup-recipients.txt`, sets are stored encrypted only. A run refuses when the
+  disk cannot hold it, leaves nothing behind when it fails, and records its result in
+  `/var/lib/propolis/backup-status`. The database password reaches `pg_dump` through libpq's
+  environment (`propolis pg-exec`), never a command line. `install.sh` and `upgrade.sh` install
+  and enable it. See [backup and restore](docs/operations/backup-and-restore.md#the-nightly-backup).
 - **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
   the commands the `redis` sensor records are now tagged, by a SQL reader of its own
   (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring

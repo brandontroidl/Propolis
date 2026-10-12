@@ -115,6 +115,11 @@ install -m 0755 "$SCRIPT_DIR/logrotate-guard.sh" /usr/local/sbin/propolis-logrot
 for unit in propolis-logrotate.service propolis-logrotate.timer; do
     install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
+# The nightly backup, installed and enabled the same way (after the reload below).
+install -m 0755 "$SCRIPT_DIR/backup.sh" /usr/local/sbin/propolis-backup
+for unit in propolis-backup.service propolis-backup.timer; do
+    install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
 
 # After every step that can fail (the build, and every install above), and before the restarts, so
 # the console reads it as soon as it comes back up. Recording it any earlier - this used to run
@@ -133,8 +138,9 @@ systemctl daemon-reload
 
 # Idempotent: enabling an enabled timer is a no-op, and --now starts it if something stopped it.
 # Before the restarts so a failure here (set -e) aborts before any service is bounced.
-echo "==> enabling the log rotation timer"
+echo "==> enabling the log rotation and backup timers"
 systemctl enable --now propolis-logrotate.timer
+systemctl enable --now propolis-backup.timer
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred; do

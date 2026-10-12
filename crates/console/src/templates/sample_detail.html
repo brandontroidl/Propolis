@@ -4,7 +4,7 @@
 {% import "macros.html" as m %}
 <p><a href="/samples">&larr; All samples</a></p>
 <h1 class="mono campaign-label">{{ sha256 }}</h1>
-<p class="page-sub">{% if spooled %}{{ size }} in the {{ bucket }} spool. <a class="dl-go" href="/samples/download/{{ sha256 }}">Download</a>{% else %}Not in any spool (aged out, or not shipped yet).{% endif %}</p>
+<p class="page-sub">{% if spooled %}{{ size }} in the {{ bucket }} spool{% if truncated %}, truncated: the sensor kept only the first part of the upload, so this hash is of that part, not of the whole file{% endif %}. <a class="dl-go" href="/samples/download/{{ sha256 }}">Download</a>{% else %}Not in any spool (aged out, or not shipped yet).{% endif %}</p>
 
 <div class="panel">
   <div class="panel-head">Campaigns</div>
@@ -35,7 +35,7 @@
     <p class="empty-line">scanned; no indicators found</p>
     {% endif %}
   {% elif scan_state == "not_text" %}<p class="empty-line">scanned; no printable strings to read</p>
-  {% elif scan_state == "too_big" %}<p class="empty-line">not scanned: larger than the indicator scan reads (8 MiB)</p>
+  {% elif scan_state == "too_big" %}<p class="empty-line">not scanned: larger than the indicator scan reads ({{ scan_limit_mb }} MB)</p>
   {% elif scan_state == "missing" %}<p class="empty-line">not scanned: the body was never found in a spool</p>
   {% elif scan_state == "pending" %}<p class="empty-line">queued for scanning</p>
   {% else %}<p class="empty-line">not queued: no event has named this sample yet</p>

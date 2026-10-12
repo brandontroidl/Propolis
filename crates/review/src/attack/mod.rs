@@ -4,7 +4,8 @@
 //! event (a command line, a download, an upload, a signal type, an indicator the IOC extraction
 //! already took), never a score and never a model. Every tag carries the rule that produced it,
 //! the event it came from and the token that matched. The rules are the table in [`rules`]; the
-//! shell reader they share is [`parse`].
+//! shell reader the command rules share is [`parse`] and the SQL reader of the database sensors'
+//! rules is [`sql`].
 //!
 //! The campaign indexer calls this module where it already reads each event
 //! (`crate::campaign`), stores tags per session and per source in `attack_tag`, and folds a
@@ -17,15 +18,17 @@
 
 pub mod parse;
 pub mod rules;
+pub mod sql;
 
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 
 use crate::ioc::{self, Indicator};
-use rules::Input;
-pub use rules::{MATRIX_VERSION, RULES, Rule, SHELL_SENSORS, Scope};
+use rules::{Input, RedisCommand};
+pub use rules::{MATRIX_VERSION, REDIS_SENSOR, RULES, Rule, SHELL_SENSORS, SQL_SENSORS, Scope};
 
 /// Longest stored matched token, in bytes.
 pub const MAX_MATCHED_BYTES: usize = 256;
@@ -82,6 +85,33 @@ pub fn tag_command(line: &str) -> Vec<Match> {
     let simples = parse::parse(line);
     let inputs: Vec<Input> = simples.iter().map(Input::Command).collect();
     evaluate(Scope::Command, &inputs)
+}
+
+/// Tags for the SQL a database sensor captured. The sensor decides the dialect the text is read in.
+pub fn tag_sql(sensor: &str, sql_text: &str) -> Vec<Match> {
+    let statements = sql::parse(sql_text, sql::Dialect::of_sensor(sensor));
+    let inputs: Vec<Input> = statements.iter().map(|s| Input::Sql(s)).collect();
+    evaluate(Scope::Sql, &inputs)
+}
+
+/// Tags for a command the redis sensor recorded, from its event metadata.
+pub fn tag_redis(metadata: &Value) -> Vec<Match> {
+    match RedisCommand::from_metadata(metadata) {
+        Some(c) => evaluate(Scope::Redis, &[Input::Redis(&c)]),
+        None => Vec::new(),
+    }
+}
+
+/// Tags for a `honeypot_command_exec` event of a database sensor: SQL text for the SQL sensors,
+/// the structured command for redis. Any other sensor earns none here.
+pub fn tag_database_command(sensor: &str, command: &str, metadata: &Value) -> Vec<Match> {
+    if SQL_SENSORS.contains(&sensor) {
+        tag_sql(sensor, command)
+    } else if sensor == REDIS_SENSOR {
+        tag_redis(metadata)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Tags for a `honeypot_file_download` event: the URL it resolved, or the command it could not.

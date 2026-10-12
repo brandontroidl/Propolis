@@ -598,6 +598,24 @@ fn busybox_and_toybox_route_to_the_same_env() {
     assert_eq!(out(&mut sh, "busybox env -i A=2"), "A=2\n");
 }
 
+/// Each bash counts itself into the `SHLVL` it inherits; dash does not touch it.
+#[test]
+fn a_bash_started_from_the_shell_counts_itself_into_shlvl() {
+    let mut sh = shell();
+    assert_eq!(out(&mut sh, "echo $SHLVL"), "1\n");
+    sh.handle_input("bash");
+    assert_eq!(out(&mut sh, "echo $SHLVL"), "2\n");
+    sh.handle_input("su");
+    assert_eq!(out(&mut sh, "printenv SHLVL"), "3\n");
+    sh.handle_input("exit");
+    assert_eq!(out(&mut sh, "echo $SHLVL"), "2\n");
+    assert_eq!(out(&mut sh, "bash -c 'echo $SHLVL'"), "3\n");
+    assert_eq!(out(&mut sh, "sh -c 'echo $SHLVL'"), "2\n", "dash keeps it");
+    // Not a number counts as 0; reaching 1000 starts again at 1.
+    assert_eq!(out(&mut sh, "SHLVL=x bash -c 'echo $SHLVL'"), "1\n");
+    assert_eq!(out(&mut sh, "SHLVL=999 bash -c 'echo $SHLVL'"), "1\n");
+}
+
 #[test]
 fn it_reads_only_the_session_and_never_the_host() {
     // The test process has these set, and neither is visible to the session.

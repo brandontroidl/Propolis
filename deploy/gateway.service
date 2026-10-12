@@ -40,6 +40,7 @@
 # docs/operations/split-deployment.md gives the steps.
 
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis collector gateway (mTLS ingest for disposable collectors)
 After=network.target
 

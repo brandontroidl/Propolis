@@ -279,6 +279,24 @@ impl FakeShell {
         }
     }
 
+    /// The command `exec` is about to run, as an executed fetch when it is one: its words are
+    /// already expanded, so a URL that still holds `$name` is left to the lexical pass.
+    pub(super) fn note_exec_fetch(&mut self, argv: &[&str]) {
+        if !self.fetches.enabled {
+            return;
+        }
+        let fetch = match self.fetch_attempt(argv) {
+            Some(Fetch::Url(url)) if has_unexpanded(&url) => return,
+            Some(fetch) => fetch,
+            None => return,
+        };
+        let cap = usize::try_from(self.budget().limits().download_per_line).unwrap_or(usize::MAX);
+        let executed = &mut self.fetches.executed;
+        if executed.len() <= cap && !executed.contains(&fetch) {
+            executed.push(fetch);
+        }
+    }
+
     /// Append the download events of the line that just ran to `events`, then stop collecting.
     pub(super) fn append_downloads(&mut self, events: &mut Vec<SensorEvent>) {
         let fetches = std::mem::take(&mut self.fetches);

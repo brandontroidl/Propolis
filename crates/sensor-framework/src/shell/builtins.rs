@@ -7,6 +7,7 @@
 //! nothing is run, in keeping with the never-exec guarantee that no file is ever handed to an
 //! interpreter here.
 
+use super::eval::Stdin;
 use super::registry::{CommandKind, Registry};
 use super::{CommandResult, FakeShell, Flow, FrameKind, ShellLevel};
 
@@ -102,7 +103,7 @@ impl FakeShell {
                 }
             },
         };
-        let mut result = if self.top_frame_is_scoped() {
+        let mut result = if self.top_frame_is_scoped() || self.state().exiting {
             let mut scoped = CommandResult::silent(status);
             scoped.flow = Flow::ExitSubshell;
             scoped
@@ -210,6 +211,10 @@ impl FakeShell {
             self.history.remove(0);
         }
         self.history.push(line);
+        let mut held: usize = self.history.iter().map(String::len).sum();
+        while held > super::HISTORY_MAX_BYTES && self.history.len() > 1 {
+            held = held.saturating_sub(self.history.remove(0).len());
+        }
     }
 
     pub(super) fn top_frame_is_scoped(&self) -> bool {
@@ -266,12 +271,12 @@ impl FakeShell {
             }
             if let Some(value) = value {
                 self.assign_var(name, value.to_string());
+            } else if !unexport && !self.state().vars.contains_key(name) {
+                // `export name` creates it empty, against the allowance like any other variable.
+                self.assign_var(name, String::new());
             }
-            let state = self.state_mut();
-            match state.vars.get_mut(name) {
-                Some(var) => var.exported = !unexport,
-                None if !unexport => state.set_var(name, String::new(), true),
-                None => {}
+            if let Some(var) = self.state_mut().vars.get_mut(name) {
+                var.exported = !unexport;
             }
         }
         if errors.is_empty() {
@@ -687,6 +692,7 @@ impl FakeShell {
     pub(super) fn builtin_read(&mut self, parts: &[&str]) -> CommandResult {
         let mut raw = false;
         let mut names: Vec<&str> = Vec::new();
+        let mut descriptor: Option<&str> = None;
         let mut i = 1;
         while let Some(arg) = parts.get(i) {
             if *arg == "--" {
@@ -700,7 +706,15 @@ impl FakeShell {
                         if c == 'r' {
                             raw = true;
                         } else if takes_value.contains(c) {
-                            if at.saturating_add(c.len_utf8()) == flags.len() {
+                            let after = at.saturating_add(c.len_utf8());
+                            if c == 'u' {
+                                descriptor = if after == flags.len() {
+                                    parts.get(i.saturating_add(1)).copied()
+                                } else {
+                                    flags.get(after..)
+                                };
+                            }
+                            if after == flags.len() {
                                 i = i.saturating_add(1);
                             }
                             break;
@@ -719,6 +733,40 @@ impl FakeShell {
                 );
             }
         }
+        // `-u FD` reads a descriptor `exec` opened, from where the last read of it stopped.
+        let mut swapped: Option<(u16, Stdin)> = None;
+        if let Some(spec) = descriptor {
+            let Ok(fd) = spec.parse::<u16>() else {
+                return CommandResult::stderr(
+                    1,
+                    self.shell_error(format_args!(
+                        "read: {spec}: invalid file descriptor specification"
+                    )),
+                );
+            };
+            if fd != 0 {
+                let Some(open) = self.state().fds.ins.get(&fd) else {
+                    return CommandResult::stderr(
+                        1,
+                        self.shell_error(format_args!(
+                            "read: {fd}: invalid file descriptor: Bad file descriptor"
+                        )),
+                    );
+                };
+                let source = Stdin::data(open.remaining());
+                swapped = Some((fd, std::mem::replace(&mut self.stdin, source)));
+            }
+        }
+        let result = self.read_into(raw, &names);
+        if let Some((fd, previous)) = swapped {
+            self.settle_input(Some(fd));
+            self.stdin = previous;
+        }
+        result
+    }
+
+    /// One line of the input `read` was given into the variables.
+    fn read_into(&mut self, raw: bool, names: &[&str]) -> CommandResult {
         let Some((mut line, mut ended)) = self.stdin.read_line() else {
             return CommandResult::silent(1);
         };
@@ -795,8 +843,9 @@ impl FakeShell {
     /// What a bare `sh` or `bash` does with a script piped to it: run it as a script in a shell
     /// level of its own. `None` when standard input is a terminal.
     pub(super) fn take_piped_script(&mut self) -> Option<String> {
+        let cap = self.read_cap();
         self.stdin
-            .take_script()
+            .take_script(cap)
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     }
 }

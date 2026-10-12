@@ -5,13 +5,11 @@
 //!
 //! The per-connection figure is `ConnectionBudget::max_resident_bytes`: overlay content, overlay
 //! nodes at their worst-case path length, and one input line. It EXCLUDES
-//! `ConnectionBounds::max_captured_bytes`. Captured bytes are governed separately, by the bound the
-//! sensor's own read loop applies, and this test does not multiply them by `max_concurrent`.
-//! Whether to also hold capture-bytes x concurrency under `MemoryMax` is an open OWNER decision
-//! (lower `DEFAULT_MAX_CAPTURED_BYTES`, lower `max_concurrent`, or raise `MemoryMax`) that the
-//! budget change deliberately does not make: at the current defaults (1_000_000 captured bytes,
-//! 256 concurrent) the capture term alone is about 244 MiB per sensor, against a 128 MiB half of
-//! the 256M units.
+//! `ConnectionBounds::max_captured_bytes`. Captured bytes are charged to the sensor's
+//! `CaptureMemoryBudget`, which holds the total to its ceiling whatever the per-upload limit and
+//! `max_concurrent` are, so this test does not multiply them. The whole sum for `sensor-ssh`,
+//! which adds the capture budget, the output budget and the shell line working sets to this
+//! product, is `crates/sensor-ssh/tests/memory_budget_test.rs`.
 //!
 //! The concurrency defaults and the `MemoryMax` values are read from the sources that set them
 //! (`crates/sensor-*/src/main.rs` and `deploy/sensor-*.service`), not restated here, so a change

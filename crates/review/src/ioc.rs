@@ -37,8 +37,8 @@
 //!
 //! A captured artifact that is not small UTF-8 text (a compiled bot) is scanned through its
 //! printable strings, the way `strings -a` lists them: runs of at least [`MIN_STRING_LEN`]
-//! printable ASCII bytes from the first [`MAX_BINARY_SCAN_BYTES`] bytes, at most
-//! [`MAX_STRINGS_TEXT_BYTES`] of them, each run on its own line.
+//! printable ASCII bytes, at most [`MAX_STRINGS_TEXT_BYTES`] of them, each run on its own line.
+//! An artifact larger than [`MAX_BINARY_SCAN_BYTES`] is not scanned, not scanned in part.
 
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -59,8 +59,10 @@ pub const MAX_IOC_DETAIL_BYTES: usize = 128;
 /// Largest artifact scanned as text, and the size of each piece of strings text scanned. A dropper
 /// or unit file is a few KB; this also bounds each scan.
 pub const MAX_ARTIFACT_TEXT_BYTES: usize = 64 * 1024;
-/// Largest artifact read for its printable strings: a compiled bot is tens of KB to a few MB.
-pub const MAX_BINARY_SCAN_BYTES: usize = 8 * 1024 * 1024;
+/// Largest artifact read for its printable strings: the largest body a sensor keeps, the spool's
+/// per-file cap, so a sample at the cap is scanned and not refused for its size. A larger body
+/// is not scanned at all.
+pub const MAX_BINARY_SCAN_BYTES: usize = sensor_framework::SPOOL_MAX_FILE_BYTES as usize;
 /// Shortest printable run kept as a string.
 pub const MIN_STRING_LEN: usize = 6;
 /// Most strings text kept from one binary.
@@ -1714,6 +1716,28 @@ Jx4u80n/q0WquQbw1QIDAQAB
         );
         // The output bound holds: a run that would pass it ends the listing.
         assert_eq!(printable_strings(body, 6, 10), "abcdef\n");
+    }
+
+    /// The SSH sensor keeps a payload up to the spool cap, and a compiled bot at 8 to 10 MB was
+    /// refused for its size, so it showed "not scanned".
+    #[test]
+    fn a_binary_between_eight_and_ten_megabytes_is_scanned() {
+        let mut body = vec![0u8; 9_500_000];
+        let at = 9_000_000;
+        let marker = b"\x00/etc/init.d/%s\x00";
+        body[at..at + marker.len()].copy_from_slice(marker);
+        let (read, found) =
+            extract_from_artifact(&body).expect("a body under the spool cap is scanned");
+        assert_eq!(read, ArtifactRead::Strings);
+        assert!(
+            found.iter().any(|i| i.value.contains("/etc/init.d/%s")),
+            "{found:?}"
+        );
+        assert_eq!(
+            MAX_BINARY_SCAN_BYTES as u64,
+            sensor_framework::SPOOL_MAX_FILE_BYTES
+        );
+        assert!(extract_from_artifact(&vec![0u8; MAX_BINARY_SCAN_BYTES]).is_some());
     }
 
     #[test]

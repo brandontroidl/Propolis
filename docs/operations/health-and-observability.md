@@ -331,12 +331,46 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   pending for `FETCH_STALE_SECS` (1 h; `fetch-stale`, only with the fetcher enabled) -
   the fetcher retires a url after three attempts, so an old pending row means it is not
   attempting;
-- periodic hash-chain verification every `CHAIN_VERIFY_INTERVAL_SECS` (6 h);
+- periodic hash-chain verification every `CHAIN_VERIFY_INTERVAL_SECS` (6 h). The whole-ledger
+  scan runs as a task of its own and the monitor serves its last verdict, so a scan that takes
+  minutes never holds up the other conditions or the heartbeat
+  (`crates/propolis/src/ops_alert/conditions/chain.rs#ChainVerify`); before the first scan
+  finishes the condition reads as unknown;
+- no good backup (`backup-stale`, Warning): the newest set the
+  [nightly backup](backup-and-restore.md#the-nightly-backup) wrote is older than
+  `BACKUP_MAX_AGE_SECS` (36 h), so one failed night pages before a second is missed; the page
+  names the last set and the step the last failed run stopped at. With no good backup yet it fires
+  once the status directory is older than the limit, or at once if a run has already failed
+  (`crates/propolis/src/ops_alert/conditions/backup.rs#BackupStale`);
 - re-page suppression `REPAGE_COOLDOWN_SECS` (5400 s); poll `POLL_INTERVAL_SECS` (30 s).
 
 `PROPOLIS_OPS_NTFY_TOKEN` is an optional bearer token for a protected topic. See
 [integrations](../reference/integrations.md) and [troubleshooting: integrations and
 feed](../troubleshooting/integrations-and-feed.md).
+
+### When the daemon or the host is down
+
+The monitor runs inside the daemon, so it cannot report the daemon's own death, nor the host's.
+Two pieces cover that:
+
+- **The failure hook.** Every Propolis unit (the daemon, each sensor, the gateway, the shipper,
+  the backup and log rotation) names `OnFailure=propolis-alert@%n.service`. When a unit enters
+  the failed state, systemd runs `/usr/local/sbin/propolis-alert` (`deploy/alert.sh`), which
+  posts "`<unit>` failed on `<host>`" with the unit's last journal lines to the same ntfy topic,
+  read from `propolis.env`, or writes it to the journal at err priority when there is none or the
+  post fails. A unit with `Restart=` passes through the failed state on every crash, so the hook
+  sends at most one alert per unit per 30 minutes. It does not need `PROPOLIS_OPS_ENABLED`.
+- **The heartbeat.** Set `PROPOLIS_OPS_HEARTBEAT_URL` to a dead-man's switch check: a service
+  that alerts you when it stops hearing from you, such as a healthchecks.io check or one you run
+  elsewhere. The monitor requests the URL after every complete evaluation round, at most every
+  `HEARTBEAT_INTERVAL_SECS` (300 s); set the check's period to that and its grace to a few
+  minutes. When the pings stop, because the daemon is down, the monitor is stuck in a probe, or
+  the host or its network is gone, the service raises the alarm. The URL is a secret: it must be
+  `https://` and is never logged. Like ntfy, this is outbound egress you opt into.
+
+`deploy/config-check.sh` reports, under `alerting`, a monitor that is off, alerts that go only to
+the journal, no heartbeat and a missing failure hook, and under `backup` and `clock` the backup
+state and whether the clock is NTP-synchronized.
 
 ### Quarantined intake lines
 

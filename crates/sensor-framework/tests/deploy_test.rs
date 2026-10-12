@@ -838,7 +838,9 @@ fn every_unit_readwrite_dir_is_provisioned() {
         let entry = entry.expect("failed to read a deploy/ directory entry");
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy().into_owned();
-        if !file_name.starts_with("sensor-") || !file_name.ends_with(".service") {
+        if !(file_name.starts_with("sensor-") || file_name.starts_with("propolis-"))
+            || !file_name.ends_with(".service")
+        {
             continue;
         }
         checked_any = true;
@@ -868,7 +870,11 @@ fn spool_state_read_write_dirs(unit: &str) -> Vec<String> {
     unit.lines()
         .filter(|l| l.starts_with("ReadWritePaths="))
         .flat_map(|l| l.trim_start_matches("ReadWritePaths=").split_whitespace())
-        .filter(|p| p.starts_with("/var/spool/propolis/") || p.starts_with("/var/lib/propolis/"))
+        .filter(|p| {
+            p.starts_with("/var/spool/propolis/")
+                || p.starts_with("/var/lib/propolis/")
+                || p.starts_with("/var/backups/propolis")
+        })
         .map(str::to_string)
         .collect()
 }
@@ -2218,6 +2224,67 @@ fn watch_authorized_keys_example_forces_the_watcher_under_restrict() {
     );
 }
 
+/// The off-host pull account is set up like the watcher's: its key runs only the serve script under
+/// `restrict`, its home and `.ssh` are root-owned so it cannot add a key, it has no password, the
+/// backup directory is traversable by its group (plaintext sets inside stay 0700 root), and both
+/// deploy scripts install the forced command where the key names it.
+#[test]
+fn the_backup_pull_account_can_only_fetch_encrypted_sets_through_its_forced_command() {
+    let example = deploy_file("backup-pull-authorized-keys.example");
+    let lines: Vec<&str> = example
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one example key line");
+    let (options, rest) = lines[0]
+        .split_once(" ssh-ed25519 ")
+        .expect("an ssh-ed25519 key line");
+    assert_eq!(
+        options,
+        "restrict,command=\"/usr/local/sbin/propolis-backup-serve\""
+    );
+    assert!(
+        rest.starts_with("AAAA... "),
+        "the example must not carry a real key"
+    );
+
+    let provision = deploy_file("provision.sh");
+    for needle in [
+        "ensure_dir /var/backups/propolis          0750 root              propolis-backup-pull",
+        "ensure_dir /var/lib/propolis-backup-pull  0750 root              propolis-backup-pull",
+        "ensure_dir /var/lib/propolis-backup-pull/.ssh 0755 root          root",
+        "run usermod -p '*' propolis-backup-pull",
+        "--home-dir /var/lib/propolis-backup-pull --shell /bin/sh --user-group propolis-backup-pull",
+    ] {
+        assert!(provision.contains(needle), "provision.sh lacks {needle:?}");
+    }
+    assert!(
+        supplementary_groups(&provision, "propolis-backup-pull").is_empty(),
+        "the pull account needs no group but its own"
+    );
+
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        assert!(
+            script
+                .lines()
+                .map(str::trim_start)
+                .any(|l| l.contains("install -m 0755")
+                    && l.contains("backup-serve.sh")
+                    && l.ends_with("/usr/local/sbin/propolis-backup-serve")),
+            "{script_name} must install the forced command where the key names it"
+        );
+    }
+    for script in ["backup-serve.sh", "backup-pull.sh"] {
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy")).join(script))
+            .fenced_status()
+            .expect("bash -n runs");
+        assert!(status.success(), "deploy/{script} is not valid bash");
+    }
+}
+
 /// Runs deploy/watch-env.sh against `source` content, writing into a fresh directory, and returns
 /// the directory and the script's output.
 fn run_watch_env(source: Option<&str>, dry_run: bool) -> (tempfile::TempDir, std::process::Output) {
@@ -2443,6 +2510,255 @@ fn install_dry_run_installs_the_guard_and_enables_the_rotation_timer() {
         "propolis-logrotate.timer /etc/systemd/system/propolis-logrotate.timer",
         "/usr/local/sbin/propolis-logrotate-guard",
         "[dry-run] systemctl enable --now propolis-logrotate.timer",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "dry-run output missing {expected:?}"
+        );
+    }
+}
+
+/// Both entry points install the backup script where the unit runs it, install both units, and
+/// enable the timer after the reload; upgrade does it before any restart. The behaviour of the
+/// script itself is backup_script_test.rs's.
+#[test]
+fn install_and_upgrade_install_and_enable_the_backup_timer_after_the_reload() {
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("install -m 0755")
+                && l.contains("backup.sh")
+                && l.ends_with("/usr/local/sbin/propolis-backup")),
+            "{script_name} must install deploy/backup.sh as /usr/local/sbin/propolis-backup"
+        );
+        for unit in ["propolis-backup.service", "propolis-backup.timer"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("for unit in ") && l.contains(unit)),
+                "{script_name} never installs {unit}"
+            );
+        }
+        let reload = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl daemon-reload"))
+            .unwrap_or_else(|| panic!("{script_name} never reloads systemd"));
+        let enable = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl enable --now propolis-backup.timer"))
+            .unwrap_or_else(|| panic!("{script_name} never enables the backup timer"));
+        assert!(
+            reload < enable,
+            "{script_name} enables the backup timer before the reload"
+        );
+        if script_name == "upgrade.sh" {
+            let first_restart = lines
+                .iter()
+                .position(|l| l.starts_with("systemctl restart"))
+                .unwrap();
+            assert!(
+                enable < first_restart,
+                "upgrade.sh must enable it before restarting"
+            );
+        }
+    }
+}
+
+/// The unit runs the installed script for the nightly reason and can write only the backup
+/// directory and its status files; the timer is daily and catches up a missed night.
+#[test]
+fn propolis_backup_units_run_nightly_and_write_only_their_own_paths() {
+    let service = uncommented(&deploy_file("propolis-backup.service"));
+    for directive in [
+        "Type=oneshot",
+        "ExecStart=/usr/local/sbin/propolis-backup --reason scheduled",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/var/backups/propolis /var/lib/propolis/backup-status",
+        "IOSchedulingClass=idle",
+        "NoNewPrivileges=yes",
+    ] {
+        assert!(
+            service.contains(directive),
+            "propolis-backup.service lacks {directive}"
+        );
+    }
+    let timer = uncommented(&deploy_file("propolis-backup.timer"));
+    for directive in [
+        "OnCalendar=*-*-* 03:30:00",
+        "Persistent=true",
+        "RandomizedDelaySec=",
+        "Unit=propolis-backup.service",
+        "WantedBy=timers.target",
+    ] {
+        assert!(
+            timer.contains(directive),
+            "propolis-backup.timer lacks {directive}"
+        );
+    }
+    let script = deploy_file("backup.sh");
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/backup.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/backup.sh is not valid bash");
+    assert!(
+        script.contains("pg-exec pg_dump"),
+        "the dump must go through propolis pg-exec"
+    );
+}
+
+/// The pre-upgrade backup and the kept release come after the build (the backup needs the new
+/// binary's `pg-exec`) and before anything is installed or restarted: a failure there must leave
+/// the box exactly as it was, and the dump must be of the schema the running release knows.
+#[test]
+fn upgrade_backs_up_and_keeps_the_running_release_before_installing_anything() {
+    let script = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+    let position = |pred: &dyn Fn(&str) -> bool, what: &str| {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("upgrade.sh has no {what}"))
+    };
+    let build = position(&|l| l.contains("cargo build --release"), "release build");
+    let backup = position(
+        &|l| {
+            l.starts_with("PROPOLIS_BIN=\"$BUILD_DIR/propolis\"")
+                && l.contains("backup.sh\" --reason pre-upgrade")
+        },
+        "pre-upgrade backup run with the built binary",
+    );
+    let save = position(
+        &|l| {
+            l.contains(
+                "rollback.sh\" --save --backup-set \"$PRE_UPGRADE_SET\" \"${INSTALL_BINS[@]}\"",
+            )
+        },
+        "rollback --save of the install list",
+    );
+    let first_install = position(&|l| l.starts_with("install -m"), "install");
+    let first_restart = position(&|l| l.starts_with("systemctl restart"), "restart");
+    assert!(build < backup, "the backup needs the freshly built binary");
+    assert!(
+        backup < save,
+        "the kept release records the backup just taken"
+    );
+    assert!(
+        save < first_install,
+        "the running release is kept before it is overwritten"
+    );
+    assert!(first_install < first_restart);
+
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/rollback.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/rollback.sh is not valid bash");
+}
+
+/// Every service unit either deploy script installs, plus the two operator-installed split
+/// units, names the failure alert, so a unit that dies pages even when the daemon is the one that
+/// died; the alert unit itself names none, so a failing alert cannot loop. Derived from the
+/// scripts' own install loops, so a unit added to them without the hook fails here.
+#[test]
+fn every_installed_unit_alerts_on_failure_and_the_alert_unit_does_not_loop() {
+    let mut units = HashSet::new();
+    for script in ["install.sh", "upgrade.sh"] {
+        units.extend(unit_install_loop_members(&deploy_file(script)));
+    }
+    units.insert("gateway.service".to_string());
+    units.insert("shipper.service".to_string());
+    for required in [
+        "propolis.service",
+        "sensor-ssh.service",
+        "propolis-backup.service",
+    ] {
+        assert!(
+            units.contains(required),
+            "the install loops lost {required}: {units:?}"
+        );
+    }
+    for unit in &units {
+        let text = uncommented(&deploy_file(unit));
+        assert!(
+            text.lines()
+                .any(|l| l.trim() == "OnFailure=propolis-alert@%n.service"),
+            "deploy/{unit} does not name the failure alert"
+        );
+    }
+
+    let alert = uncommented(&deploy_file("propolis-alert@.service"));
+    assert!(
+        !alert.contains("OnFailure="),
+        "the alert unit must not alert about itself"
+    );
+    for directive in [
+        "Type=oneshot",
+        "ExecStart=/usr/local/sbin/propolis-alert %i",
+        "RuntimeDirectoryPreserve=yes",
+        "ProtectSystem=strict",
+    ] {
+        assert!(
+            alert.contains(directive),
+            "propolis-alert@.service lacks {directive}"
+        );
+    }
+
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("install -m 0755")
+                && l.contains("alert.sh")
+                && l.ends_with("/usr/local/sbin/propolis-alert")),
+            "{script_name} must install deploy/alert.sh where the unit runs it"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("install -m 0644") && l.contains("propolis-alert@.service")),
+            "{script_name} must install the alert unit"
+        );
+    }
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/alert.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/alert.sh is not valid bash");
+}
+
+/// The dry run shows the backup script, its units, and the enable.
+#[test]
+fn install_dry_run_installs_and_enables_the_backup_timer() {
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "/usr/local/sbin/propolis-backup",
+        "propolis-backup.service /etc/systemd/system/propolis-backup.service",
+        "propolis-backup.timer /etc/systemd/system/propolis-backup.timer",
+        "[dry-run] systemctl enable --now propolis-backup.timer",
+        "/var/backups/propolis",
+        "/var/lib/propolis/backup-status",
     ] {
         assert!(
             stdout.contains(expected),

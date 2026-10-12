@@ -1,4 +1,5 @@
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis FTP honeypot sensor
 After=network.target
 

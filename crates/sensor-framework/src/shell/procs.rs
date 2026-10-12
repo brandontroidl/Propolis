@@ -1967,7 +1967,7 @@ const SIGNAL_NAMES: [&str; 31] = [
 
 /// The name `kill -l N` prints for signal `n` (no `SIG` prefix), `None` for a number that is no
 /// signal. 32 and 33 are reserved by the C library, and 34 to 64 are the real-time range.
-fn signal_name(n: u32) -> Option<String> {
+pub(super) fn signal_name(n: u32) -> Option<String> {
     match n {
         1..=31 => SIGNAL_NAMES
             .get(usize::try_from(n.saturating_sub(1)).ok()?)
@@ -3156,7 +3156,7 @@ impl FakeShell {
 
 /// bash's `kill -l` with no argument: the signals in rows of five, each as `N) SIGNAME`, a tab
 /// after each but the fifth, as bash's `display_signal_list` lays them out.
-fn bash_signal_list() -> String {
+pub(super) fn bash_signal_list() -> String {
     let mut out = String::new();
     let mut column = 0u32;
     for n in 1..=64u32 {
@@ -3226,6 +3226,8 @@ impl FakeShell {
         let args = parts.get(1..).unwrap_or(&[]);
         let mut at = 0usize;
         let mut listing: Option<&[&str]> = None;
+        // SIGTERM unless one is named.
+        let mut signal = 15u32;
         while let Some(arg) = args.get(at).copied() {
             if arg == "--" {
                 at = at.saturating_add(1);
@@ -3240,15 +3242,17 @@ impl FakeShell {
             }
             if matches!(flag, "s" | "n") {
                 let spec = args.get(at.saturating_add(1)).copied().unwrap_or("");
-                if parse_signal(spec).is_none() {
+                let Some(named) = parse_signal(spec) else {
                     return self.kill_bad_signal(form, spec);
-                }
+                };
+                signal = named;
                 at = at.saturating_add(2);
                 continue;
             }
-            if parse_signal(flag).is_none() {
+            let Some(named) = parse_signal(flag) else {
                 return self.kill_bad_signal(form, flag);
-            }
+            };
+            signal = named;
             at = at.saturating_add(1);
         }
         if let Some(specs) = listing {
@@ -3262,6 +3266,14 @@ impl FakeShell {
         let mut result = CommandResult::silent(0);
         let mut failed = false;
         for target in targets {
+            // A signal a shell sends itself runs the handler `trap` set for it.
+            if signal != 0
+                && target.parse::<u32>().ok() == Some(self.state().pid)
+                && let Some(delivered) = self.deliver_to_self(signal)
+            {
+                result.append(delivered);
+                continue;
+            }
             match self.kill_one(form, &table, target) {
                 Ok(()) => {}
                 Err(text) => {

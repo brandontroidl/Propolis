@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-09
+last-verified: 2026-10-10
 -->
 
 # Sensor behavior reference
@@ -71,7 +71,7 @@ behavioral inconsistency across the sensor set, not a bug claim.
 
 Common defaults across the internet-facing TCP sensors are `read_timeout`
 30000&nbsp;ms, `idle_timeout` 60000&nbsp;ms, `max_duration` 600&nbsp;s,
-`max_captured_bytes` 1_000_000, `max_concurrent` 256 (verified
+`max_captured_bytes` 1_000_000 (ssh: 10_000_000, the spool's per-file cap), `max_concurrent` 256 (verified
 `crates/sensor-ssh/src/main.rs#DEFAULT_READ_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_DURATION_SECS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT`). Per-sensor deviations are noted in the
 protocol table below; the canonical values live in
 [`environment-variables.md`](environment-variables.md).
@@ -303,6 +303,12 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
   a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
   the reply that spent it.
+- On SSH, telnet and ADB the session's own heap is counted too
+  (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
+  may hold while a line runs stops at its next step, as when its work allowance runs out (the
+  trace notes a memory hit), and a session still holding more than it may keep after a line is
+  ended (`end_reason` `memory_limit`). See
+  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
 - A fetch verb the line executes additionally emits `honeypot_file_download` with
   `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - **Standard input.** The sensors run each line through `start_line`
@@ -336,7 +342,12 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `cat` with no redirection prints its lines after Ctrl-D, not one by one.
 - Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
   `-bash`, uses the interactive command-not-found handler and a prompt that follows
-  the working directory. SSH exec uses `bash: line 1:` diagnostics and no prompt.
+  the working directory. The persona has the `command-not-found` package, whose handler answers a
+  name it has no suggestion for with the bare `f: command not found` (a host without the package
+  would print `-bash: f: command not found`). A bash that runs a script has no handler: SSH exec,
+  `bash -c`, `bash FILE` and a script on standard input say `bash: line N: f: command not found`,
+  naming `$0` and the line, and word syntax errors `bash: -c: line N: syntax error near unexpected
+  token `)'` with the offending line quoted after it. SSH exec has no prompt.
   Bare `su`, `sh`, `bash` and `ash` push nested levels; dash levels have their own
   `sh: N:` line counters. `exit` pops one level, and only exiting the outer level
   sets `close_session`. Android starts and nests as mksh with `sh:` diagnostics.
@@ -359,7 +370,15 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   pattern matches (unquoted `*`, `?` and `[..]` glob, a quoted one is literal, a `/` matches);
   no match is status 0. Constructs outside this subset (`[[ ]]`, `(( ))`, `coproc`, `$'..'`,
   `${x##*/}`, brace expansion, `<<<`, arrays, process substitution) parse and are skipped with
-  status 0 and no output; what bash and dash also reject prints their syntax error and status 2.
+  status 0 and no output (under dash, which has none of `[[ ]]`, `(( ))`, `coproc`, `$'..'`,
+  brace expansion, `<<<`, `|&` or arrays, those read as the plain text or subshells dash reads); what
+  bash and dash also reject prints their syntax error and status 2. dash's wording is its own
+  (`crates/sensor-framework/src/shell/eval.rs#FakeShell::syntax_error_text`): `word unexpected`
+  for a plain word, a quoted name for a reserved word or operator, `(expecting "fi")` where the
+  grammar waited for one token, `end of file unexpected`, and the fixed complaints
+  `Bad for loop variable`, `Unterminated quoted string`, `EOF in backquote substitution`,
+  `Missing '}'` and `Missing '))'`; `Bad fd number`, `Bad substitution` and an arithmetic
+  division by zero end the shell with status 2 when the word runs.
   `read`, `export`, `unset`, `set`, `shift`, `umask`, `break`, `continue`, `return`, `local`,
   `builtin`, `cd`, `exit` act on the shell itself
   (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.
@@ -392,10 +411,80 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   `:(){ :|:& };:` therefore returns at once in bash, and dash refuses the name `:`. A shell holds
   128 functions at most, their text counts against the connection's content allowance with the
   variables, and a refused definition is silent with status 1. Not modeled: `declare -f` and
-  `typeset -f` (the commands do not exist), `readonly -f`, aliases, a dash status above 255 from
+  `typeset -f` (the commands do not exist), `readonly -f`, a dash status above 255 from
   `return`, bash's per-command line numbers in `environment: line N:`, and the exported function
   entries `BASH_FUNC_name%%` in `env`. mksh follows bash's grammar and bash's `local` only inside
   `function name {` bodies; no mksh was available to check it against `[inferred]`.
+  Aliases are text the lexer substitutes at command position while it reads a line
+  (`crates/sensor-framework/src/shell/lex.rs#lex_with_aliases`, `crates/sensor-framework/src/shell/alias.rs`),
+  so a value may hold operators, quotes or a here-document, an alias is in force from the next line
+  and never on the line that defines it, a value ending in a blank lets the next word be an alias,
+  a name is not expanded inside its own value, and a word that is quoted, a `case` pattern or a
+  redirection target is no alias. bash lists sorted as `alias NAME='VALUE'` (`alias -- -x=..` for
+  a name starting with `-`), refuses a name holding a blank, quote, `$`, `/`, backtick or shell
+  metacharacter, and its `alias -p` on an empty table ends before reading its operands; dash lists
+  `NAME='VALUE'` in the order of its 39-bucket hash table, takes any name and treats `-p` and `--`
+  as names to look up; `type` says `x is aliased to `echo hi'` (dash: `x is an alias for echo
+  hi`) and `command -v` prints the definition. A bash that runs a script (`bash -c`, an SSH exec,
+  `bash FILE`) expands none unless `shopt -s expand_aliases` ran, and dash always does; a script
+  that mentions `alias` is read a line at a time so a definition reaches the lines after it. A
+  shell started from another has no aliases, a subshell has a copy. At most 128 aliases of up to
+  4096 bytes each (names 255), counted against the content allowance; one text expands at most 64
+  aliases and grows to at most 256 KiB. `shopt` keeps and lists bash's 53 `shopt` and 27 `set -o`
+  settings with the container's defaults (`~/.bashrc` effects such as `histappend` are not applied
+  [unverified]); only `expand_aliases` changes behavior, and dash and the phone do not have it.
+  The phone's alias output is dash's, sorted [inferred]. Not modeled: `$'..'` values (the
+  command that holds one is skipped, as everywhere), and alias expansion inside `eval`, which runs
+  nothing.
+  `trap` (`crates/sensor-framework/src/shell/trap.rs`) keeps, lists, ignores (`trap '' INT`) and
+  resets handlers as the two shells do: bash lists `trap -- 'CMD' SIGINT` in signal order with
+  `EXIT` first and `DEBUG`, `ERR`, `RETURN` last, reads names in any case with or without `SIG`,
+  `RTMIN+N`, and the numbers 0 to 64 (32 and 33 listed by number), has `-l` and `-p`; dash lists
+  `trap -- 'CMD' INT` with bare names (16, 32 and 33 by number), takes no option (`-p` and `-l`
+  end the shell with status 2), stops at the first signal it cannot read (`trap: NAME: bad trap`),
+  and has no pseudo-signals; a first operand that is a signal (dash) or a number (bash) resets
+  every operand. No signal is delivered except one a shell sends itself (`kill -USR1 $$` runs the
+  handler; an ignored one does nothing). The `EXIT` handler runs when the shell ends: after
+  `logout` or `exit` for a login or nested shell, at the end of a script, an SSH exec string, a
+  subshell, a pipeline stage or a command substitution, with `$?` as the status it ended with,
+  which stays unless the handler calls `exit`; none runs when `exec` replaces the shell, a
+  subshell lists its parent's handlers until it sets one and runs none of them, and a bash started
+  from this one lists only the signals that are ignored. bash's `DEBUG` handler runs before each
+  simple command (and each trip of a `for`, and a `case`) outside functions, and `ERR` after a
+  failing simple command, pipeline or subshell that nothing tests; `RETURN` is kept and listed
+  and never run, as in a bash whose functions do not trace; `$BASH_COMMAND` is not set. A session
+  that ends by the client hanging up runs no handler, since nothing could show its output. A
+  handler is at most 4096 bytes, one per signal, counted against the content allowance. The
+  phone's `trap` is dash's [inferred]. Not modeled: a default-disposition signal to the shell's
+  own pid (`kill -9 $$` does not end the session).
+  `exec` (`crates/sensor-framework/src/shell/exec.rs`) with redirections and no command changes the
+  shell's own descriptors for good: `exec 3>file`, `exec 4<file` (read with `read -u 4` or `<&4`,
+  from where the last read stopped), `exec >/dev/null 2>&1`, `exec 3>&-`. They are inherited by
+  later commands, functions, subshells and the shells the session starts, and a copy of a descriptor
+  that is not open is `N: Bad file descriptor`. A write to a closed descriptor is reported in the
+  writer's words (`-bash: echo: write error: Bad file descriptor` in bash, `echo: echo: I/O error` in
+  dash, `NAME: write error: ...` from a program, `cat: standard output: ...`). A prompt goes to
+  standard error, so `exec 2>/dev/null` silences it; `exec <file` at the terminal runs the file's
+  commands and ends the session. bash holds descriptors up to 63; dash only 0 to 9. `exec CMD`
+  replaces the shell: the rest of the script, and the `EXIT` handler, never run; in a subshell, a
+  pipeline stage or a command substitution it ends only that process. A command with no file
+  behind it (a builtin or a function) is `exec: NAME: not found` (127), a directory or non-
+  executable file 126; bash goes on at the terminal after a failure, a script and dash end. A
+  script that ends that way still runs its `EXIT` handler: dash keeps 127 or 126, bash runs none
+  for 126 and, after a missing command, exits with the status the handler's last command left.
+  `exec bash`/`exec sh` at the terminal replaces the shell by a fresh one that keeps only the
+  exported variables. bash's `-c`, `-l` and `-a NAME` are taken; dash's `exec -z` is the command
+  `-z`. A download run through `exec` is recorded as one run any other way is. Replies are from
+  bash 5.1.16 and dash 0.5.11; the phone's `exec` is dash's [inferred]. Not modeled: `exec` of a
+  program that replaces the shell with a different one (the command just runs), and `/dev/tcp`.
+  `times` (`crates/sensor-framework/src/shell/timing.rs`) prints the shell's own user and system CPU
+  time, then its children's, from the same process model `time` uses: a command started from a file
+  adds to the children, `dd` to their system time, and the shell spends a 2 ms base plus a share of
+  that. bash and the phone's shell print `0m0.002s`, dash `0m0.002000s`; a subshell, a command
+  substitution and a `sh -c` are new processes and print zeros. bash takes no option (`times -x` is
+  `times: -x: invalid option` and a usage line, status 2) and ignores operands; dash ignores both.
+  Real figures vary from run to run, so the fixture pins only the cases that are always zero and the
+  option errors, and the growth is pinned by unit tests; the phone's format is bash's [inferred].
   bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
   the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
   dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it
@@ -403,7 +492,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   file a fixed process cost, so `time dd ...` reports a `real` no shorter than dd's `copied, S s`
   and `time true` reports zeros (`crates/sensor-framework/src/shell/timing.rs#bash_report`).
   `history` lists what the interactive login shell was typed as `    1  echo one`, under Ubuntu's
-  `HISTCONTROL=ignoreboth`; a `bash -c` (SSH exec) shell keeps none and lists nothing
+  `HISTCONTROL=ignoreboth`, keeping the last 1000 lines and at most 64 KiB of them; a `bash -c`
+  (SSH exec) shell keeps none and lists nothing
   (`crates/sensor-framework/src/shell/builtins.rs#FakeShell::builtin_history`).
   `$$` and `$!` come from a per-session process id seeded from the session id
   (`crates/sensor-framework/src/persona.rs#session_pid`), and the shell's own `/proc/PID` reads as
@@ -802,6 +892,11 @@ captures SCP/SFTP transfers.
   output is queued per channel and emitted in chunks of at most `min(peer max packet,
   32 KiB, remaining peer window)`, stopping at a zero peer window and resuming only on
   that channel's `WINDOW_ADJUST`, so a 2 MiB reply is never one oversized packet.
+  Output waiting for a peer that is not reading is bounded: a channel holding one line's
+  worth of unsent output (8 MiB) or its connection two lines' worth runs no further line
+  until the peer reads, input that arrives meanwhile waits in order, and all of it is charged
+  to a 64 MiB output budget (`crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; see
+  [capacity planning](../operations/capacity-planning.md#ssh-sensor-worst-case-memory)).
   Client-to-server data is counted as it is consumed, and the server sends
   `WINDOW_ADJUST` once the consumed bytes reach half the initial window (1 MiB)
   (`crates/sensor-ssh/src/server.rs#next_frame`, `crates/sensor-ssh/src/server.rs#flush_channel_output`, `crates/sensor-ssh/src/server.rs#build_channel_window_adjust`, `crates/sensor-ssh/src/channel.rs#INITIAL_WINDOW_SIZE`, `crates/sensor-ssh/src/channel.rs#CHANNEL_MAX_PACKET_SIZE`).
@@ -941,6 +1036,11 @@ credential, then presents the fake shell.
   the [command-event budget](#command-event-budget-ssh-telnet-adb) become one `command_summary`
   event per source network per minute; its logins, connections, captures and derived URLs keep
   their own events.
+- **Protocol probes.** A session whose first bytes are another protocol's opening (TLS, RDP, SMB,
+  HTTP, SSH, SIP, RTSP, DNS, JDWP, Redis, X11, MQTT, SOCKS, VNC, ADB, PostgreSQL) is recorded as
+  a `catchall_probe` event with `probe_protocol`, not as a malware sample. Anything that carries
+  an executable or archive signature, or sent more than 4096 bytes, stays a sample. Details and
+  the metadata keys: [events and signals](events-and-signals.md#protocol-probes-on-the-telnet-port).
 
 ### sensor-http
 

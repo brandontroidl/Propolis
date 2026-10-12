@@ -107,10 +107,18 @@ pub struct CaptureJob {
     pub event_builder: Box<dyn FnOnce(SampleRef) -> SensorEvent + Send>,
 }
 
+/// What the worker is asked to do with one queue entry.
+enum Work {
+    /// Spool a body and emit the event built around its `SampleRef`.
+    Capture(CaptureJob),
+    /// Emit an event that carries no body (see [`CaptureHandoff::submit_event`]).
+    Event(Box<SensorEvent>),
+}
+
 /// A job as it waits in the queue: with the listener the submitting connection arrived on, read
 /// in `submit` because the worker's own task is outside every listener's scope.
 struct Queued {
-    job: CaptureJob,
+    work: Work,
     arrival: Option<Arrival>,
 }
 
@@ -144,6 +152,15 @@ pub enum CaptureEnd {
     CaptureBudget,
     /// The peer aborted the transfer with its protocol's own error message (a TFTP ERROR).
     PeerAborted,
+    /// The sensor closed the connection because output queued for the peer made no progress for
+    /// the stall limit: the peer was not reading.
+    OutputStalled,
+    /// The sensor closed the connection to free the output budget for sessions that could not be
+    /// served, because it held the most of it.
+    OutputEvicted,
+    /// The sensor ended the session because it held more memory than a session may
+    /// (`session_memory`), or the most when the sensor's pool ran out.
+    MemoryLimit,
 }
 
 impl CaptureEnd {
@@ -166,6 +183,9 @@ impl CaptureEnd {
             Self::MalformedInput => "malformed_input",
             Self::CaptureBudget => "capture_budget",
             Self::PeerAborted => "peer_aborted",
+            Self::OutputStalled => "output_stalled",
+            Self::OutputEvicted => "output_evicted",
+            Self::MemoryLimit => "memory_limit",
         }
     }
 }
@@ -484,7 +504,7 @@ impl CaptureHandoff {
             return Err(CaptureDropped);
         }
         let queued = Queued {
-            job,
+            work: Work::Capture(job),
             arrival: arrival::current(),
         };
         let sent = self.tx.try_send(queued).map_err(|e| {
@@ -519,6 +539,35 @@ impl CaptureHandoff {
             }
         }
         sent
+    }
+
+    /// Enqueue an event that carries no body, for a handler that must record something from a
+    /// place that cannot await (a `Drop`, which is the only code that also runs when the
+    /// listener cancels a session at `max_duration`). The worker appends it on the submitting
+    /// connection's listener, so `local_port` is stamped as for any other event, and `drain`
+    /// finishes it with the captures. Same contract as [`Self::submit`]: never blocks, and a full
+    /// queue or a closing hand-off refuses it (the former counted in `dropped_count`).
+    pub fn submit_event(&self, event: SensorEvent) -> Result<(), CaptureDropped> {
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(CaptureDropped);
+        }
+        let queued = Queued {
+            work: Work::Event(Box::new(event)),
+            arrival: arrival::current(),
+        };
+        self.tx.try_send(queued).map_err(|e| {
+            if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                return CaptureDropped;
+            }
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    dropped_total = dropped,
+                    "capture hand-off: queue full, event dropped (no body)"
+                );
+            }
+            CaptureDropped
+        })
     }
 
     /// Total jobs `submit` has rejected for a full queue since construction: the operator-visible
@@ -719,35 +768,58 @@ async fn write_stats(emitter: &EventEmitter, stats: &SensorStats) {
 /// crash between `store` and the manifest write leaves a body with no custody record at all -
 /// identical to today's behavior, handled by the existing spool orphan sweep; no regression.
 async fn process_job(
-    spool: &QuarantineSpool,
+    spool: &Arc<QuarantineSpool>,
     emitter: &EventEmitter,
     spool_refused: &AtomicU64,
     collector_id: &str,
     outbox: &OutboxManifest,
     queued: Queued,
 ) {
-    let Queued {
-        job:
-            CaptureJob {
-                body,
-                orig_name,
-                event_builder,
-            },
-        arrival,
-    } = queued;
+    let Queued { work, arrival } = queued;
+    let CaptureJob {
+        body,
+        orig_name,
+        event_builder,
+    } = match work {
+        Work::Capture(job) => job,
+        Work::Event(event) => {
+            let appended = match arrival {
+                Some(arrival) => arrival::scope(arrival, emitter.append(&event)).await,
+                None => emitter.append(&event).await,
+            };
+            if let Err(e) = appended {
+                tracing::error!(error = %e, "capture hand-off: bodyless event emit failed");
+            }
+            return;
+        }
+    };
     let budget_truncated = body.is_exhausted();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let stored = spool.store(body.as_slice());
-        // `store` has copied the bytes to a synced file (or refused them) by the time it returns,
-        // so the in-memory body is dead weight from here: refund its budget now, before the
-        // manifest write and the event append (both can block on slow I/O) rather than at the end
-        // of the job. Unwinding out of `store` drops `body` the same way.
-        drop(body);
-        stored.map(|mut sample_ref| {
-            sample_ref.orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
-            event_builder(sample_ref)
-        })
-    }));
+    // `store` hashes, writes and fsyncs a body of up to 10 MB: seconds on a slow disk, during which
+    // this task would hold an async worker (the SSH sensor runs two). So it runs on the blocking
+    // pool, and the body moves with it: its budget reservation is held until the store returns,
+    // even if this future is dropped meanwhile.
+    let spool = Arc::clone(spool);
+    let stored = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let stored = spool.store(body.as_slice());
+            // `store` has copied the bytes to a synced file (or refused them) by the time it
+            // returns, so the in-memory body is dead weight from here: refund its budget now,
+            // before the manifest write and the event append (both can block on slow I/O) rather
+            // than at the end of the job. Unwinding out of `store` drops `body` the same way.
+            drop(body);
+            stored.map(|mut sample_ref| {
+                sample_ref.orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
+                event_builder(sample_ref)
+            })
+        }))
+    })
+    .await;
+    let outcome = stored.unwrap_or_else(|join| {
+        // The blocking task itself was lost (the runtime is shutting down): report it the way a
+        // panic is, so the worker carries on or ends with the runtime.
+        Err(Box::new(format!("blocking store task failed: {join}"))
+            as Box<dyn std::any::Any + Send>)
+    });
 
     let mut event = match outcome {
         Ok(Ok(mut event)) => {
@@ -917,6 +989,9 @@ mod tests {
             (CaptureEnd::MalformedInput, "malformed_input", false),
             (CaptureEnd::CaptureBudget, "capture_budget", false),
             (CaptureEnd::PeerAborted, "peer_aborted", false),
+            (CaptureEnd::OutputStalled, "output_stalled", false),
+            (CaptureEnd::OutputEvicted, "output_evicted", false),
+            (CaptureEnd::MemoryLimit, "memory_limit", false),
         ];
         for (end, label, session_complete) in all {
             let m = upload_metadata("ssh", &sample(8), 8, UploadEnd::Session(end));
@@ -1119,6 +1194,36 @@ mod tests {
         let sample = event.sample.unwrap();
         assert!(!sample.sha256.is_empty());
         assert_eq!(sample.size, b"malware payload".len() as u64);
+    }
+
+    /// A bodyless event reaches the log on the submitting connection's port, spools nothing, and
+    /// is refused once the hand-off is closing.
+    #[tokio::test]
+    async fn submit_event_emits_without_a_body_and_on_the_submitting_port() {
+        use crate::arrival::{Arrival, LOCAL_PORT_KEY, scope};
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let spool = crate::spool::QuarantineSpool::new(spool_dir.clone(), 4096, 1_000_000);
+        let emitter = crate::emit::EventEmitter::new(log_path.clone());
+        let handoff = test_handoff(spool, emitter, 16, dir.path());
+        handoff.start_worker();
+
+        scope(Arrival::new(2323), async {
+            handoff.submit_event(test_event(None)).unwrap();
+        })
+        .await;
+        wait_for_lines(&log_path, 1).await;
+
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let event: SensorEvent = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(event.sample.is_none());
+        assert_eq!(event.metadata[LOCAL_PORT_KEY], 2323);
+        assert_eq!(std::fs::read_dir(&spool_dir).unwrap().count(), 0);
+
+        handoff.drain(Duration::from_secs(5)).await;
+        assert!(handoff.submit_event(test_event(None)).is_err());
     }
 
     /// The worker emits on its own task, outside every listener's scope, so the upload event is
@@ -1332,6 +1437,59 @@ mod tests {
         let event: SensorEvent = serde_json::from_str(lines[0]).unwrap();
         let sample = event.sample.unwrap();
         assert_eq!(sample.size, b"second-ok".len() as u64);
+    }
+
+    /// The store of a 10 MB body hashes and fsyncs it: that must not sit on an async worker. The
+    /// event builder runs right after the store, in the same closure, so where it runs is where
+    /// the store ran. On this single-threaded runtime the async worker is the test's own thread,
+    /// so a store on the worker would run on it too. The body has been refunded by then and not
+    /// before (it is moved into the closure).
+    #[tokio::test]
+    async fn the_store_runs_off_the_async_worker_and_the_body_is_refunded_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let budget = Arc::new(CaptureMemoryBudget::new(1_000_000));
+        let handoff = CaptureHandoff::new(
+            crate::spool::QuarantineSpool::new(spool_dir, 4096, 1_000_000),
+            crate::emit::EventEmitter::new(log_path.clone()),
+            4,
+            "test".to_string(),
+            crate::outbox::OutboxManifest::new(dir.path().join("outbox")),
+            budget.clone(),
+        );
+        handoff.start_worker();
+
+        let mut body = handoff.new_capture_body();
+        body.extend_from_slice(b"a body to store").unwrap();
+        assert_eq!(
+            budget.current_bytes(),
+            crate::capture_budget::CAPTURE_CHUNK_BYTES
+        );
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let record = seen.clone();
+        let watched = budget.clone();
+        handoff
+            .submit(CaptureJob {
+                body,
+                orig_name: String::new(),
+                event_builder: Box::new(move |sample| {
+                    *record.lock().unwrap() =
+                        Some((std::thread::current().id(), watched.current_bytes()));
+                    test_event(Some(sample))
+                }),
+            })
+            .unwrap();
+        wait_for_lines(&log_path, 1).await;
+        let (stored_on, charged_at_build) = seen.lock().unwrap().unwrap();
+        assert_ne!(
+            stored_on,
+            std::thread::current().id(),
+            "the store ran on the async worker"
+        );
+        assert_eq!(charged_at_build, 0, "the body was refunded once stored");
+        assert_eq!(budget.current_bytes(), 0);
     }
 
     #[tokio::test]

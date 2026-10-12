@@ -635,10 +635,14 @@ impl Batch {
                         self.record_iocs(tx, event, &found).await?;
                     }
                     // Protocol commands (an SMTP DATA, a Redis CONFIG) share this event shape and
-                    // are not shell lines.
+                    // are not shell lines; the database sensors' have rules of their own.
                     if attack::is_shell_sensor(&event.sensor) {
                         let mut hits = attack::tag_command(command);
                         hits.extend(attack::tag_indicators(&found));
+                        self.tag(tx, event, hits).await?;
+                    } else {
+                        let hits =
+                            attack::tag_database_command(&event.sensor, command, &event.metadata);
                         self.tag(tx, event, hits).await?;
                     }
                 }

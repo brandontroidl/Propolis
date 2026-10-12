@@ -6,6 +6,7 @@
 
 mod config;
 mod ops_alert;
+mod pg_exec;
 mod supervisor;
 
 use std::collections::{HashMap, HashSet};
@@ -1041,6 +1042,15 @@ async fn main() {
         }
     }
 
+    // A PostgreSQL client tool run against DATABASE_URL (deploy/backup.sh's pg_dump), ahead of
+    // everything else for the same reason: it needs only DATABASE_URL and replaces this process.
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.first().map(String::as_str) == Some("pg-exec") {
+            std::process::exit(pg_exec::run(&args[1..]));
+        }
+    }
+
     // Operator query over the event database. Still ahead of tracing, migrations and every
     // listener: it needs only DATABASE_URL and must never start the daemon.
     {
@@ -1738,6 +1748,7 @@ async fn main() {
                         feed_push_marker_path,
                         feed_build_interval,
                         rotation,
+                        backup_status_dir: ops_alert::conditions::backup::BACKUP_STATUS_DIR.into(),
                         cfg: ops_cfg.clone(),
                     };
                     if local_only {
@@ -1758,6 +1769,7 @@ async fn main() {
                             ctx,
                             dispatcher,
                         )
+                        .with_configured_heartbeat(&ops_cfg)
                         .run(token)
                         .await;
                     } else {
@@ -1776,6 +1788,7 @@ async fn main() {
                             ctx,
                             dispatcher,
                         )
+                        .with_configured_heartbeat(&ops_cfg)
                         .run(token)
                         .await;
                     }

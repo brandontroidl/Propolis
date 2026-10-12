@@ -1,0 +1,72 @@
+# How bash and dash answer a name they cannot find, in every shell a session can be in. A bash
+# that runs a script (`bash -c`, `bash FILE`, a script on standard input) has no command-not-found
+# handler, names itself by `$0` and the line the command is on, and a function defined in `-c` text
+# says `environment`; dash says `NAME: N: f: not found`. Each reply below was produced by
+# `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`) in the
+# localhost/propolis-survey-ref:jammy container (bash 5.1.16, dash 0.5.11), run with
+# `--network none`, PS1 and PS2 set to markers and these lines fed one at a time on standard
+# input. The one exception is the interactive `f` on the last line: that container has no
+# `command-not-found` package and says `-bash: f: command not found`, while the persona has it
+# installed (`crates/sensor-framework/src/packages.rs`), and the handler it defines in
+# /etc/bash.bashrc prints the bare `f: command not found` for a name it has no suggestion for.
+# source: ubuntu:22.04 container run of bash 5.1.16 and dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ bash -c f
+> bash: line 1: f: command not found
+$ bash -c 'f' name arg
+> name: line 1: f: command not found
+$ bash -c 'echo hi; f'
+> hi
+> bash: line 1: f: command not found
+$ bash -c 'cd /nonexistent'
+> bash: line 1: cd: /nonexistent: No such file or directory
+$ bash -c 'g() { f; }; g'
+> environment: line 1: f: command not found
+$ printf 'f\n' > /tmp/x.sh
+$ bash /tmp/x.sh
+> /tmp/x.sh: line 1: f: command not found
+$ bash /tmp/x.sh arg
+> /tmp/x.sh: line 1: f: command not found
+$ cd /tmp; bash x.sh
+> x.sh: line 1: f: command not found
+$ bash ./x.sh
+> ./x.sh: line 1: f: command not found
+$ printf 'echo a\nf\n' > /tmp/y.sh; bash /tmp/y.sh
+> a
+> /tmp/y.sh: line 2: f: command not found
+$ bash -c 'foo/bar'
+> bash: line 1: foo/bar: No such file or directory
+$ bash -c '/nonexistent'
+> bash: line 1: /nonexistent: No such file or directory
+$ bash -c 'f; echo $?'
+> bash: line 1: f: command not found
+> 127
+$ echo f | bash
+> bash: line 1: f: command not found
+$ printf 'echo a\nf\n' | bash
+> a
+> bash: line 2: f: command not found
+$ bash < /tmp/y.sh
+> a
+> bash: line 2: f: command not found
+$ sh /tmp/y.sh
+> a
+> /tmp/y.sh: 2: f: not found
+$ sh -c f
+> sh: 1: f: not found
+$ sh -c 'f' name arg
+> name: 1: f: not found
+$ sh < /tmp/y.sh
+> a
+> sh: 2: f: not found
+$ bash -c '(f)'
+> bash: line 1: f: command not found
+$ bash -c 'for i in 1; do f; done'
+> bash: line 1: f: command not found
+$ bash -c '
+$ f'
+> bash: line 2: f: command not found
+$ f
+> f: command not found

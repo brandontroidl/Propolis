@@ -16,6 +16,7 @@
     clippy::indexing_slicing
 )]
 
+use super::alias::Alias;
 use super::ast::{
     Dialect, Line, List, Near, Param, ParamDefault, ParamName, SyntaxError, UnsupportedKind, Word,
     WordPart,
@@ -111,10 +112,20 @@ pub(super) struct HereDoc {
 pub(super) struct Lexed {
     pub tokens: Vec<Token>,
     pub heredocs: Vec<HereDoc>,
+    /// The text the tokens' positions are in, when aliases changed it.
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LexError {
+    /// A word at `start..end` is an alias whose `value` replaces it; the text is read again.
+    /// Never leaves [`lex_with_aliases`].
+    Splice {
+        start: usize,
+        end: usize,
+        name: String,
+        value: String,
+    },
     /// The text ends inside a quote, substitution or here-document.
     NeedMore,
     Syntax(SyntaxError),
@@ -153,6 +164,43 @@ struct PendingHere {
     strip: bool,
 }
 
+/// Where the lexer is in a `case`, so that a pattern is not taken for a command.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseState {
+    /// After `case`: the subject word comes next.
+    Subject,
+    /// After the subject: `in` comes next.
+    In,
+    /// Reading patterns, up to the `)`.
+    Pattern,
+    /// In an arm's commands, up to `;;` or `esac`.
+    Body,
+}
+
+/// Most `case` constructs the alias tracking follows at once.
+const CASE_NEST_MAX: usize = 32;
+
+/// An alias that was expanded into the text: where its value now sits, so that the same name is
+/// not expanded again inside it, and so that a trailing blank lets the next word be an alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Splice {
+    pub start: usize,
+    pub len: usize,
+    pub name: String,
+    /// The value ends in a blank.
+    pub blank: bool,
+}
+
+impl Splice {
+    fn end(&self) -> usize {
+        self.start.saturating_add(self.len)
+    }
+}
+
+/// The most aliases one text may expand, and the longest it may grow to by doing so.
+const EXPANSIONS_MAX: usize = 64;
+const EXPANDED_TEXT_MAX: usize = 262_144;
+
 struct Lexer<'a, 'b> {
     src: &'a str,
     i: usize,
@@ -172,6 +220,17 @@ struct Lexer<'a, 'b> {
     /// Handed to the parser of a substitution's text.
     dialect: Dialect,
     budget: &'b mut LineBudget,
+    /// The aliases in force while this text is read; empty when none is.
+    aliases: &'b [Alias],
+    /// The aliases already expanded into `src`.
+    splices: &'b [Splice],
+    /// The next word starts a command, so it may be an alias.
+    cmd_pos: bool,
+    /// The next word is the target of a redirection.
+    after_redir: bool,
+    cases: Vec<CaseState>,
+    /// Words left of a `function NAME` header before its body starts.
+    function_words: u8,
 }
 
 /// Tokenize `src`. `at_eof` says no more input will follow, so an incomplete construct is a syntax
@@ -184,6 +243,114 @@ pub(super) fn lex(
     max_depth: u32,
     dialect: Dialect,
     budget: &mut LineBudget,
+) -> Result<Lexed, LexError> {
+    lex_once(
+        src,
+        at_eof,
+        base_line,
+        depth,
+        max_depth,
+        dialect,
+        budget,
+        &[],
+        &[],
+    )
+}
+
+/// [`lex`] with `aliases` expanded at command position, as a shell expands them while it reads.
+/// Each expansion changes the text, so the text is read again from the start with the expansion
+/// recorded, and `Lexed::text` is the text as expanded.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lex_with_aliases(
+    src: &str,
+    at_eof: bool,
+    base_line: Line,
+    depth: u32,
+    max_depth: u32,
+    dialect: Dialect,
+    budget: &mut LineBudget,
+    aliases: &[Alias],
+) -> Result<Lexed, LexError> {
+    if aliases.is_empty() {
+        return lex(src, at_eof, base_line, depth, max_depth, dialect, budget);
+    }
+    let mut text = src.to_string();
+    let mut splices: Vec<Splice> = Vec::new();
+    let mut spent = false;
+    loop {
+        let expanding = !spent && splices.len() < EXPANSIONS_MAX;
+        let result = lex_once(
+            &text,
+            at_eof,
+            base_line,
+            depth,
+            max_depth,
+            dialect,
+            budget,
+            if expanding { aliases } else { &[] },
+            &splices,
+        );
+        match result {
+            Err(LexError::Splice {
+                start,
+                end,
+                name,
+                value,
+            }) => {
+                let grown = text
+                    .len()
+                    .saturating_sub(end.saturating_sub(start))
+                    .saturating_add(value.len());
+                if grown > EXPANDED_TEXT_MAX || !budget.charge(len_u64(value.len())) {
+                    // No more room: the text is read as it stands from here on.
+                    spent = true;
+                    continue;
+                }
+                let blank = value.ends_with([' ', '\t']);
+                let new_len = value.len();
+                text.replace_range(start..end, &value);
+                // The aliases whose value holds the word replaced grow or shrink with it.
+                for splice in &mut splices {
+                    if splice.start <= start && splice.end() >= end {
+                        splice.len = splice
+                            .len
+                            .saturating_add(new_len)
+                            .saturating_sub(end.saturating_sub(start));
+                    }
+                }
+                splices.push(Splice {
+                    start,
+                    len: new_len,
+                    name,
+                    blank,
+                });
+            }
+            Ok(mut lexed) => {
+                if !splices.is_empty() {
+                    lexed.text = Some(text);
+                }
+                return Ok(lexed);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lex_once(
+    src: &str,
+    at_eof: bool,
+    base_line: Line,
+    depth: u32,
+    max_depth: u32,
+    dialect: Dialect,
+    budget: &mut LineBudget,
+    aliases: &[Alias],
+    splices: &[Splice],
 ) -> Result<Lexed, LexError> {
     let mut lexer = Lexer {
         src,
@@ -199,11 +366,18 @@ pub(super) fn lex(
         max_depth,
         dialect,
         budget,
+        aliases,
+        splices,
+        cmd_pos: true,
+        after_redir: false,
+        cases: Vec::new(),
+        function_words: 0,
     };
     lexer.run()?;
     Ok(Lexed {
         tokens: lexer.tokens,
         heredocs: lexer.heredocs,
+        text: None,
     })
 }
 
@@ -231,12 +405,18 @@ pub(super) fn lex_body(
         max_depth,
         dialect,
         budget,
+        aliases: &[],
+        splices: &[],
+        cmd_pos: true,
+        after_redir: false,
+        cases: Vec::new(),
+        function_words: 0,
     };
     lexer.scan_parts(Mode::Body)
 }
 
 fn syntax(near: Near, line: Line) -> LexError {
-    LexError::Syntax(SyntaxError { near, line })
+    LexError::Syntax(SyntaxError::new(near, line))
 }
 
 impl Lexer<'_, '_> {
@@ -270,6 +450,30 @@ impl Lexer<'_, '_> {
             syntax(Near::EndOfFile, self.line)
         } else {
             LexError::NeedMore
+        }
+    }
+
+    /// [`Self::incomplete`] for a construct the shells have their own complaint for when the text
+    /// ends inside it: dash's `Unterminated quoted string`, and bash's `unexpected EOF while
+    /// looking for matching` the `closer` it wanted.
+    fn incomplete_with(&self, dash: &'static str, closer: char) -> LexError {
+        match (self.at_eof, self.dialect) {
+            (true, Dialect::Posix) => syntax(Near::Message(dash), self.line),
+            (true, Dialect::Bash) => syntax(Near::Unmatched(closer), self.line),
+            _ => self.incomplete(),
+        }
+    }
+
+    /// [`Self::incomplete`] for text that ends inside `$( ... )`, where dash names the `)` it
+    /// wanted.
+    fn incomplete_paren(&self) -> LexError {
+        match (self.at_eof, self.dialect) {
+            (true, Dialect::Posix) => LexError::Syntax(SyntaxError {
+                expecting: Some("\")\""),
+                ..SyntaxError::new(Near::EndOfFile, self.line)
+            }),
+            (true, Dialect::Bash) => syntax(Near::Unmatched(')'), self.line),
+            _ => self.incomplete(),
         }
     }
 
@@ -312,6 +516,8 @@ impl Lexer<'_, '_> {
                 '\n' => {
                     self.bump();
                     self.push(Tok::Newline, pos, line);
+                    self.cmd_pos = true;
+                    self.after_redir = false;
                     self.read_heredoc_bodies()?;
                 }
                 '#' => {
@@ -322,9 +528,11 @@ impl Lexer<'_, '_> {
                 ';' | '&' | '|' | '(' | ')' | '<' | '>' => {
                     if let Some(word) = self.process_substitution()? {
                         self.push(Tok::Word(word), pos, line);
+                        self.note_word(None);
                     } else {
                         let op = self.operator();
                         self.push(Tok::Op(op), pos, line);
+                        self.note_op(op);
                     }
                 }
                 _ => {
@@ -335,6 +543,10 @@ impl Lexer<'_, '_> {
                         if self.i == pos {
                             self.bump();
                         }
+                        if let Some(splice) = self.alias_at(&parts, pos) {
+                            return Err(splice);
+                        }
+                        self.note_word(literal_of(&parts));
                         let raw = self.src.get(pos..self.i).unwrap_or("").to_string();
                         self.push(Tok::Word(Word { parts, raw }), pos, line);
                     }
@@ -349,6 +561,163 @@ impl Lexer<'_, '_> {
             self.pending.clear();
         }
         Ok(())
+    }
+
+    // ---- aliases ---------------------------------------------------------------------------
+
+    /// Whether a word that ends here may be an alias: it starts a command, or follows an alias
+    /// whose value ended in a blank, and it is not a pattern, a redirection target or a here-document
+    /// delimiter.
+    fn alias_eligible(&self, pos: usize) -> bool {
+        let in_command = self.cmd_pos
+            && !self.after_redir
+            && self.awaiting.is_none()
+            && matches!(self.cases.last(), None | Some(CaseState::Body));
+        let after_blank = self.splices.iter().any(|splice| {
+            splice.blank
+                && splice.end() <= pos
+                && self
+                    .tokens
+                    .last()
+                    .is_none_or(|token| token.end <= splice.end())
+        });
+        in_command || (after_blank && !self.after_redir)
+    }
+
+    /// The splice that replaces the word `parts` at `pos..self.i` with its alias, if it is one.
+    fn alias_at(&self, parts: &[WordPart], pos: usize) -> Option<LexError> {
+        if self.aliases.is_empty() {
+            return None;
+        }
+        let name = literal_of(parts)?;
+        let alias = self.aliases.iter().find(|alias| alias.name == name)?;
+        if !self.alias_eligible(pos) {
+            return None;
+        }
+        // dash looks for a reserved word before an alias; bash for the alias first.
+        if self.dialect == Dialect::Posix && self.cmd_pos && is_dash_reserved(name) {
+            return None;
+        }
+        // A name is not expanded again inside its own value.
+        if self
+            .splices
+            .iter()
+            .any(|splice| splice.name == name && splice.start <= pos && pos < splice.end())
+        {
+            return None;
+        }
+        Some(LexError::Splice {
+            start: pos,
+            end: self.i,
+            name: name.to_string(),
+            value: alias.value.clone(),
+        })
+    }
+
+    /// Track where a command may start after the word `text` (its text when it is one unquoted
+    /// literal), for the alias check of the next word.
+    fn note_word(&mut self, text: Option<&str>) {
+        if std::mem::take(&mut self.after_redir) {
+            return;
+        }
+        match self.cases.last().copied() {
+            Some(CaseState::Subject) => {
+                if let Some(state) = self.cases.last_mut() {
+                    *state = CaseState::In;
+                }
+                return;
+            }
+            Some(CaseState::In) => {
+                if let Some(state) = self.cases.last_mut() {
+                    *state = if text == Some("in") {
+                        CaseState::Pattern
+                    } else {
+                        CaseState::Body
+                    };
+                }
+                return;
+            }
+            Some(CaseState::Pattern) => {
+                if text == Some("esac") {
+                    self.cases.pop();
+                    self.cmd_pos = false;
+                }
+                return;
+            }
+            Some(CaseState::Body) | None => {}
+        }
+        if self.function_words > 0 {
+            self.function_words = self.function_words.saturating_sub(1);
+            self.cmd_pos = self.function_words == 0 && text == Some("{");
+            return;
+        }
+        if !self.cmd_pos {
+            return;
+        }
+        self.cmd_pos = match text {
+            Some(
+                "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "{" | "!" | "time",
+            ) => true,
+            Some("case") => {
+                if self.cases.len() < CASE_NEST_MAX {
+                    self.cases.push(CaseState::Subject);
+                }
+                false
+            }
+            Some("esac") => {
+                self.cases.pop();
+                false
+            }
+            Some("function") => {
+                self.function_words = 2;
+                false
+            }
+            // An assignment before the command leaves the command still to come.
+            Some(word) if is_assignment_word(word) => true,
+            _ => false,
+        };
+    }
+
+    /// Track where a command may start after the operator `op`.
+    fn note_op(&mut self, op: Op) {
+        match op {
+            Op::RParen if self.cases.last() == Some(&CaseState::Pattern) => {
+                if let Some(state) = self.cases.last_mut() {
+                    *state = CaseState::Body;
+                }
+                self.cmd_pos = true;
+                self.after_redir = false;
+            }
+            Op::LParen if self.cases.last() == Some(&CaseState::Pattern) => {}
+            Op::DSemi if self.cases.last() == Some(&CaseState::Body) => {
+                if let Some(state) = self.cases.last_mut() {
+                    *state = CaseState::Pattern;
+                }
+                self.cmd_pos = false;
+                self.after_redir = false;
+            }
+            Op::Semi
+            | Op::Amp
+            | Op::AndIf
+            | Op::OrIf
+            | Op::Pipe
+            | Op::PipeAmp
+            | Op::LParen
+            | Op::RParen
+            | Op::DSemi => {
+                self.cmd_pos = true;
+                self.after_redir = false;
+            }
+            Op::Less
+            | Op::Great
+            | Op::DLess { .. }
+            | Op::DGreat
+            | Op::LessAnd
+            | Op::GreatAnd
+            | Op::LessGreat
+            | Op::Clobber
+            | Op::TLess => self.after_redir = true,
+        }
     }
 
     fn skip_blanks(&mut self) -> Result<(), LexError> {
@@ -366,7 +735,9 @@ impl Lexer<'_, '_> {
                         if !self.at_eof {
                             return Err(LexError::NeedMore);
                         }
-                        self.bump();
+                        // A lone backslash that ends a script is the word it is (`echo \` prints
+                        // it, in dash and in bash); the word scanner takes it from here.
+                        return Ok(());
                     }
                     Some(_) => return Ok(()),
                 },
@@ -379,7 +750,8 @@ impl Lexer<'_, '_> {
     fn io_number(&mut self) -> Option<u16> {
         let rest = self.src.get(self.i..)?;
         let digits = rest.chars().take_while(char::is_ascii_digit).count();
-        if digits == 0 {
+        // dash takes one digit for a descriptor; `10>f` is the word `10` and a redirection.
+        if digits == 0 || (self.dialect == Dialect::Posix && digits != 1) {
             return None;
         }
         let after = rest.chars().nth(digits)?;
@@ -394,7 +766,10 @@ impl Lexer<'_, '_> {
     /// `<(..)` and `>(..)`: a process substitution, outside the subset.
     fn process_substitution(&mut self) -> Result<Option<Word>, LexError> {
         let c = self.peek();
-        if !matches!(c, Some('<' | '>')) || self.peek_at(1) != Some('(') {
+        if self.dialect == Dialect::Posix
+            || !matches!(c, Some('<' | '>'))
+            || self.peek_at(1) != Some('(')
+        {
             return Ok(None);
         }
         let start = self.i;
@@ -444,14 +819,16 @@ impl Lexer<'_, '_> {
             ('&', Some('&')) => take(self, Op::AndIf),
             ('&', _) => Op::Amp,
             ('|', Some('|')) => take(self, Op::OrIf),
-            ('|', Some('&')) => take(self, Op::PipeAmp),
+            ('|', Some('&')) if self.dialect == Dialect::Bash => take(self, Op::PipeAmp),
             ('|', _) => Op::Pipe,
             ('(', _) => Op::LParen,
             (')', _) => Op::RParen,
             ('<', Some('<')) => {
                 self.bump();
                 match self.peek() {
-                    Some('<') => take(self, Op::TLess),
+                    // dash has no here-string: `<<<` is `<<` and then a `<` where its word
+                    // should be.
+                    Some('<') if self.dialect == Dialect::Bash => take(self, Op::TLess),
                     Some('-') => {
                         self.bump();
                         self.here_op(true)
@@ -527,7 +904,11 @@ impl Lexer<'_, '_> {
             match mode {
                 Mode::Word if is_meta(c) => {
                     // `name=(` opens an array value, which the word keeps consuming.
-                    if c == '(' && parts.is_empty() && is_array_assignment(&lit) {
+                    if c == '('
+                        && parts.is_empty()
+                        && self.dialect == Dialect::Bash
+                        && is_array_assignment(&lit)
+                    {
                         self.bump();
                         self.skip_balanced_parens()?;
                         flush(&mut lit, &mut parts);
@@ -579,7 +960,7 @@ impl Lexer<'_, '_> {
                     self.bump();
                     let rest = self.src.get(self.i..).unwrap_or("");
                     let Some(end) = rest.find('\'') else {
-                        return Err(self.incomplete());
+                        return Err(self.incomplete_with("Unterminated quoted string", '\''));
                     };
                     let text = rest.get(..end).unwrap_or("").to_string();
                     self.advance_bytes(end.saturating_add(1));
@@ -590,7 +971,7 @@ impl Lexer<'_, '_> {
                     self.bump();
                     let inner = self.nested(|lexer| lexer.scan_parts(Mode::Double))?;
                     if self.peek() != Some('"') {
-                        return Err(self.incomplete());
+                        return Err(self.incomplete_with("Unterminated quoted string", '"'));
                     }
                     self.bump();
                     flush(&mut lit, &mut parts);
@@ -599,7 +980,7 @@ impl Lexer<'_, '_> {
                 '`' => {
                     self.bump();
                     let inner = self.backtick_body()?;
-                    let list = self.nested_parse(&inner)?;
+                    let list = self.nested_parse(&inner, "`")?;
                     flush(&mut lit, &mut parts);
                     parts.push(WordPart::CmdSub(list));
                 }
@@ -619,7 +1000,13 @@ impl Lexer<'_, '_> {
                     }
                 }
                 '{' if mode == Mode::Word => {
-                    if let Some(len) = self.brace_expansion_len() {
+                    // dash has no brace expansion: `{a,b}` stays the text it is.
+                    let expansion = if self.dialect == Dialect::Bash {
+                        self.brace_expansion_len()
+                    } else {
+                        None
+                    };
+                    if let Some(len) = expansion {
                         flush(&mut lit, &mut parts);
                         self.advance_bytes(len);
                         parts.push(WordPart::Unsupported(UnsupportedKind::BraceExpansion));
@@ -652,19 +1039,34 @@ impl Lexer<'_, '_> {
         result
     }
 
-    fn nested_parse(&mut self, text: &str) -> Result<List, LexError> {
+    /// Parse the text of a substitution closed by `closer` (`)` or a backtick). dash's parser
+    /// reads the substitution inline, so the closer is the token it meets where the text stops
+    /// short, and the one every other complaint inside says it was waiting for.
+    fn nested_parse(&mut self, text: &str, closer: &'static str) -> Result<List, LexError> {
         if self.depth >= self.max_depth {
             return Err(LexError::TooDeep);
         }
         let line = self.base_line.saturating_add(self.line).saturating_sub(1);
-        super::parse::parse_nested(
+        let parsed = super::parse::parse_nested(
             text,
             line,
             self.depth.saturating_add(1),
             self.max_depth,
             self.dialect,
             self.budget,
-        )
+            self.aliases,
+        );
+        match parsed {
+            Err(LexError::Syntax(mut error)) if self.dialect == Dialect::Posix => {
+                if error.near == Near::EndOfFile {
+                    error.near = Near::Token(closer.to_string());
+                } else if error.expecting.is_none() && !matches!(error.near, Near::Message(_)) {
+                    error.expecting = Some(if closer == ")" { "\")\"" } else { "\"`\"" });
+                }
+                Err(LexError::Syntax(error))
+            }
+            other => other,
+        }
     }
 
     /// The text of a backtick command substitution, with the backslash escapes it allows removed.
@@ -672,7 +1074,7 @@ impl Lexer<'_, '_> {
         let mut body = String::new();
         loop {
             match self.bump() {
-                None => return Err(self.incomplete()),
+                None => return Err(self.incomplete_with("EOF in backquote substitution", '`')),
                 Some('`') => return Ok(body),
                 Some('\\') => match self.peek() {
                     Some(next @ ('$' | '`' | '\\')) => {
@@ -714,10 +1116,17 @@ impl Lexer<'_, '_> {
                 self.bump();
                 let rest = self.src.get(self.i..).unwrap_or("");
                 let Some(end) = scan_paren_end(rest) else {
-                    return Err(self.incomplete());
+                    // `$((` is dash's arithmetic opener, and it wants the `))`.
+                    return Err(if rest.starts_with('(') {
+                        self.incomplete_with("Missing '))'", ')')
+                    } else if ends_inside_quote(rest) {
+                        self.incomplete_with("Unterminated quoted string", '"')
+                    } else {
+                        self.incomplete_paren()
+                    });
                 };
                 let inner = rest.get(..end).unwrap_or("").to_string();
-                let list = self.nested_parse(&inner)?;
+                let list = self.nested_parse(&inner, ")")?;
                 self.advance_bytes(end.saturating_add(1));
                 Ok(vec![WordPart::CmdSub(list)])
             }
@@ -725,7 +1134,7 @@ impl Lexer<'_, '_> {
                 self.bump();
                 self.braced_param()
             }
-            '\'' if matches!(mode, Mode::Word | Mode::Brace) => {
+            '\'' if matches!(mode, Mode::Word | Mode::Brace) && self.dialect == Dialect::Bash => {
                 self.bump();
                 let mut escaped = false;
                 loop {
@@ -835,12 +1244,19 @@ impl Lexer<'_, '_> {
             }
             _ => None,
         };
-        let unsupported = |lexer: &mut Self| -> Result<Vec<WordPart>, LexError> {
+        let unsupported = |lexer: &mut Self, named: bool| -> Result<Vec<WordPart>, LexError> {
+            // dash refuses a `${` its parser cannot read (`${}`, `${a:1}`, `${a/x/y}`, `${a,,}`)
+            // when the word is expanded.
+            let bad = lexer.dialect == Dialect::Posix && !lexer.dash_param_op_follows(named);
             lexer.skip_braced()?;
-            Ok(vec![WordPart::Unsupported(UnsupportedKind::ParamOp)])
+            Ok(vec![WordPart::Unsupported(if bad {
+                UnsupportedKind::BadSubstitution
+            } else {
+                UnsupportedKind::ParamOp
+            })])
         };
         let Some(name) = parsed else {
-            return unsupported(self);
+            return unsupported(self, false);
         };
         match self.peek() {
             Some('}') => {
@@ -859,7 +1275,29 @@ impl Lexer<'_, '_> {
                 self.bump();
                 self.param_default(name, false)
             }
-            _ => unsupported(self),
+            _ => unsupported(self, true),
+        }
+    }
+
+    /// Whether the text just after `${` (or after `${name`, when `named`) is a form dash's parser
+    /// reads, so that only the forms it refuses are `Bad substitution`.
+    fn dash_param_op_follows(&self, named: bool) -> bool {
+        let rest = self.src.get(self.i..).unwrap_or("");
+        let mut chars = rest.chars();
+        if named {
+            return match chars.next() {
+                Some('#' | '%' | '=' | '?' | '+') => true,
+                Some(':') => matches!(chars.next(), Some('-' | '=' | '?' | '+')),
+                _ => false,
+            };
+        }
+        match chars.next() {
+            Some('#') => chars.next().is_some_and(|c| {
+                c.is_ascii_alphanumeric()
+                    || matches!(c, '_' | '?' | '$' | '!' | '@' | '*' | '#' | '-')
+            }),
+            Some('-') => chars.next() == Some('}'),
+            _ => false,
         }
     }
 
@@ -867,7 +1305,7 @@ impl Lexer<'_, '_> {
         let start = self.i;
         let parts = self.nested(|lexer| lexer.scan_parts(Mode::Brace))?;
         if self.peek() != Some('}') {
-            return Err(self.incomplete());
+            return Err(self.incomplete_with("Missing '}'", '}'));
         }
         let raw = self.src.get(start..self.i).unwrap_or("").to_string();
         self.bump();
@@ -885,7 +1323,7 @@ impl Lexer<'_, '_> {
         let mut depth = 1u32;
         loop {
             match self.bump() {
-                None => return Err(self.incomplete()),
+                None => return Err(self.incomplete_with("Missing '}'", '}')),
                 Some('\\') => {
                     self.bump();
                 }
@@ -955,6 +1393,44 @@ impl Lexer<'_, '_> {
         }
         None
     }
+}
+
+/// The text of a word that is one unquoted literal, which is all an alias or a keyword can be.
+fn literal_of(parts: &[WordPart]) -> Option<&str> {
+    match parts {
+        [WordPart::Literal(text)] => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+/// dash's reserved words, which it recognises before it looks for an alias.
+fn is_dash_reserved(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "while"
+            | "until"
+            | "for"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "!"
+            | "{"
+            | "}"
+    )
+}
+
+/// `NAME=value`, which a command may be preceded by.
+fn is_assignment_word(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Whether `text` (a word's leading literal) is `NAME=` or `NAME+=`, the start of an array value.
@@ -1029,6 +1505,23 @@ fn scan_paren_end(rest: &str) -> Option<usize> {
         prev = c;
     }
     None
+}
+
+/// Whether `rest`, the text of an unclosed `$(`, stops inside a quote.
+fn ends_inside_quote(rest: &str) -> bool {
+    let (mut single, mut double) = (false, false);
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !single => {
+                chars.next();
+            }
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ => {}
+        }
+    }
+    single || double
 }
 
 /// The length of the expression in `$(( expr ))` when `rest` (just after `$((`) closes with `))`.

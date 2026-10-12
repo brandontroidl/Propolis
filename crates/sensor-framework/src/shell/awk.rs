@@ -2266,7 +2266,9 @@ impl Awk<'_, '_> {
         input: Option<Vec<u8>>,
     ) -> u8 {
         let saved = input.map(|data| std::mem::replace(&mut self.sh.stdin, Stdin::data(data)));
-        let mut result = self.sh.run_shell_text("sh", command, None, &[]);
+        let mut result =
+            self.sh
+                .run_shell_text("sh", command, None, &[], super::ScriptKind::Command);
         if let Some(previous) = saved {
             self.sh.stdin = previous;
         }

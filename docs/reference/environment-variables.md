@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-10
 -->
 
 # Environment variables
@@ -371,6 +371,9 @@ u32.
 | `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
 | `PROPOLIS_OPS_SCAN_STALE_SECS` | no | `21600` | min 1 | `scan-stale`: a spooled body unscanned, or a VirusTotal upload unverdicted, this long; silent unless VirusTotal is enabled |
 | `PROPOLIS_OPS_FETCH_STALE_SECS` | no | `3600` | min 1 | `fetch-stale`: a fetch url pending this long; silent unless the fetcher is enabled |
+| `PROPOLIS_OPS_HEARTBEAT_URL` | no | none (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | `https://` only, else abort (the value is not echoed) | an external dead-man's switch (a healthchecks.io-style ping URL), requested after each complete evaluation round; the service alerts when the pings stop, which covers a dead daemon or host. The URL is a secret and is never logged |
+| `PROPOLIS_OPS_HEARTBEAT_INTERVAL_SECS` | no | `300` | min 30 | at most one ping per interval; a failed ping is retried on the next round |
+| `PROPOLIS_OPS_BACKUP_MAX_AGE_SECS` | no | `129600` (36 h) | min 3600 | `backup-stale`: the newest good backup (`deploy/backup.sh`) older than this, or none since the backup timer was installed this long ago |
 
 ---
 
@@ -526,7 +529,7 @@ Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_C
 | `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`) | secs; zero → abort |
-| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (catchall `4_096`; dns `262_272`) | bytes; zero → abort |
+| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (ssh `10_000_000`; catchall `4_096`; dns `262_272`) | bytes; zero → abort |
 | `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero → abort |
 
 The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
@@ -534,7 +537,11 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
 
 - ssh: `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
   `PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
-  `PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`.
+  `PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`. `PROPOLIS_SSH_MAX_CAPTURED_BYTES` defaults to
+  `10_000_000`, the spool's per-file cap (`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`),
+  and limits a payload streamed over the shell or an exec's standard input; SCP and SFTP uploads
+  are already kept up to that cap. A capture cut at the limit is recorded with `truncated: true`
+  and the real `wire_size`. It was `1_000_000` before; samples captured then stay as captured.
 - telnet: `PROPOLIS_TELNET_READ_TIMEOUT_MS`, `PROPOLIS_TELNET_IDLE_TIMEOUT_MS`,
   `PROPOLIS_TELNET_MAX_DURATION_SECS`, `PROPOLIS_TELNET_MAX_CAPTURED_BYTES`,
   `PROPOLIS_TELNET_MAX_CONCURRENT`, `PROPOLIS_TELNET_LOG_PATH`, `PROPOLIS_TELNET_WAN_MAP`.

@@ -52,13 +52,41 @@ fi
 echo "==> building release"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release --workspace --locked
 
-echo "==> installing binaries"
 # SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the
 # sensors and the unified daemon. A single-box migration installs and restarts every unit on this
 # one host, so this list covers both topologies at once - a box running only the collector role
 # (or only the control-plane role) simply has no unit file for the other side's binaries and the
 # is-enabled guard below skips restarting what was never enabled.
 INSTALL_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper propolis-watch)
+
+# Before anything is installed, so a failure here (set -e) leaves the box exactly as it was, and
+# before propolis restarts, so the dump is of the schema the running release knows: migrations run
+# only when the new daemon starts. This is the database deploy/rollback.sh --with-database puts
+# back. The backup runs the binary just built (PROPOLIS_BIN): the installed one is the previous
+# release, which may predate `propolis pg-exec`.
+# BEGIN pre-upgrade
+echo "==> backing up before the upgrade"
+# The kept release records the set THIS run wrote, read back from the status file and accepted
+# only when it is new: a run that wrote none (skipped, or nothing configured yet) records none,
+# never an older set that would roll the database back past an earlier upgrade.
+BACKUP_STATUS=/var/lib/propolis/backup-status/last-success
+set_in_status() { sed -n 's/.*"set":"\([^"]*-pre-upgrade\)".*/\1/p' "$BACKUP_STATUS" 2>/dev/null || true; }
+PRE_UPGRADE_SET=""
+if [ "${PROPOLIS_UPGRADE_SKIP_BACKUP:-0}" = 1 ]; then
+    echo "    skipped (PROPOLIS_UPGRADE_SKIP_BACKUP=1): this upgrade keeps no database to roll back to"
+else
+    before="$(set_in_status)"
+    PROPOLIS_BIN="$BUILD_DIR/propolis" "$SCRIPT_DIR/backup.sh" --reason pre-upgrade
+    after="$(set_in_status)"
+    if [ -n "$after" ] && [ "$after" != "$before" ]; then
+        PRE_UPGRADE_SET="$after"
+    fi
+fi
+echo "==> keeping the running release for rollback (deploy/rollback.sh)"
+"$SCRIPT_DIR/rollback.sh" --save --backup-set "$PRE_UPGRADE_SET" "${INSTALL_BINS[@]}"
+# END pre-upgrade
+
+echo "==> installing binaries"
 for bin in "${INSTALL_BINS[@]}"; do
     if [ ! -x "$BUILD_DIR/$bin" ]; then
         echo "error: $BUILD_DIR/$bin was not built; the install list names a binary the workspace does not produce" >&2
@@ -115,6 +143,16 @@ install -m 0755 "$SCRIPT_DIR/logrotate-guard.sh" /usr/local/sbin/propolis-logrot
 for unit in propolis-logrotate.service propolis-logrotate.timer; do
     install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
+# The nightly backup, installed and enabled the same way (after the reload below).
+install -m 0755 "$SCRIPT_DIR/backup.sh" /usr/local/sbin/propolis-backup
+for unit in propolis-backup.service propolis-backup.timer; do
+    install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
+# Every Propolis unit names this in OnFailure=; installed with them, nothing to enable.
+install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+# The off-host pull's forced command; inert until the operator adds a key for propolis-backup-pull.
+install -m 0755 "$SCRIPT_DIR/backup-serve.sh" /usr/local/sbin/propolis-backup-serve
+install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service
 
 # After every step that can fail (the build, and every install above), and before the restarts, so
 # the console reads it as soon as it comes back up. Recording it any earlier - this used to run
@@ -133,8 +171,9 @@ systemctl daemon-reload
 
 # Idempotent: enabling an enabled timer is a no-op, and --now starts it if something stopped it.
 # Before the restarts so a failure here (set -e) aborts before any service is bounced.
-echo "==> enabling the log rotation timer"
+echo "==> enabling the log rotation and backup timers"
 systemctl enable --now propolis-logrotate.timer
+systemctl enable --now propolis-backup.timer
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred; do

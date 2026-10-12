@@ -20,9 +20,18 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
 1. Runs `git pull` and `cargo build --release --workspace --locked` **as the
    repo-owner user**, not as root, so build output keeps the owner's identity and
    dependency resolution cannot drift from the reviewed lockfile.
-2. Installs the built binaries (`propolis`, the 12 sensors, `gateway`, `shipper`)
+2. Takes a [backup](backup-and-restore.md#the-nightly-backup) of the database and state as a
+   `-pre-upgrade` set, then keeps the running release (its binaries, the Propolis unit files,
+   the `propolis-*` helpers in `/usr/local/sbin` and the deploy stamp) under
+   `/var/lib/propolis/rollback/<time>-<commit>/` with the name of that backup, for
+   [rollback](#rollback); the newest 3 are kept (`deploy/upgrade.sh#pre-upgrade`). Both happen
+   before anything is installed, so a failure in either leaves the box as it was. The backup
+   runs the binary just built, because the installed one may predate the `propolis pg-exec`
+   it needs. `PROPOLIS_UPGRADE_SKIP_BACKUP=1` skips the backup (the release is still kept),
+   leaving no database to roll back to.
+3. Installs the built binaries (`propolis`, the 12 sensors, `gateway`, `shipper`)
    to `/usr/local/bin/` with `install -m 0755`.
-3. Runs `deploy/provision.sh` (idempotent users + directories), then
+4. Runs `deploy/provision.sh` (idempotent users + directories), then
    `deploy/provision-tls.sh`, which mints a self-signed TLS pair for each
    TLS-capable sensor that lacks one and leaves any existing pair, including an
    operator-supplied real certificate, untouched (`deploy/upgrade.sh#provision-tls.sh`;
@@ -32,9 +41,9 @@ The script (run as root, `sudo ./deploy/upgrade.sh`):
    installs; `gateway.service`/`shipper.service` only where already enabled), then
    runs `systemctl daemon-reload` so the restarts below pick up the new unit
    definitions.
-4. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
+5. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
    if enabled.
-5. Restarts `propolis.service`, so the daemon runs any new migrations after the
+6. Restarts `propolis.service`, so the daemon runs any new migrations after the
    binaries are in place, then `shipper.service` if enabled (after the gateway it
    dials). `propolis.service` is restarted on every host, so the script must not be
    run on a collector of a [split deployment](split-deployment.md#upgrading).
@@ -85,22 +94,48 @@ sensors together, so the order only matters when the sensors are upgraded separa
 
 ## Rollback
 
-Rollback of the **binaries** is straightforward: reinstall the previous release
-binaries (rebuild from the prior source revision, or keep the prior
-`/usr/local/bin/propolis` and sensor binaries aside before an upgrade) and
-restart the services.
+Every upgrade keeps the release it replaces (step 2 above). `deploy/rollback.sh` puts one back:
 
-Rollback of the **database schema** is not shipped. Because migrations only run
-forward and no down-migration exists, a schema that a newer binary has already
-migrated cannot be automatically reverted to the older shape. If you must return
-to an older binary after its migrations have applied, restore the pre-upgrade
-database backup rather than trying to reverse the schema. This is the operational
-reason to take a database backup immediately before every upgrade - see
-[backup and restore](backup-and-restore.md).
+```
+sudo ./deploy/rollback.sh --list
+sudo ./deploy/rollback.sh
+sudo ./deploy/rollback.sh --with-database
+```
 
-> **Take a database backup before upgrading.** The forward-only migration model
-> means an in-place schema change is not automatically reversible. Your rollback
-> path for the database is the pre-upgrade dump, nothing else.
+`--list` shows the kept releases, newest first, with the commit each was built from and its
+pre-upgrade backup. Without arguments it rolls back to the newest one; name another to pick
+it. It shows what it is about to do and asks you to type the release name (`--yes` skips
+that). Then it stops the enabled services, puts the kept binaries, helpers, unit files and
+deploy stamp back, reloads systemd, starts the services again and waits for
+`propolis.service` to stay up.
+
+**When the upgrade changed the schema**, the binaries alone are not enough. Migrations only run
+forward and no down-migration exists, so the older daemon refuses the newer database at
+startup, and the script says so when it sees a migration error in the journal. Run it with
+`--with-database` to also restore the release's pre-upgrade dump. It never drops anything: the
+current database is renamed to `<name>_before_rollback_<time>`, a new empty one is created
+owned by the same role, and the dump is restored into it by the
+[documented procedure](backup-and-restore.md#restore-procedure). Events recorded since the
+upgrade are in the renamed database, not the restored one; drop it yourself once you no longer
+need them. This needs PostgreSQL on the same host (the script runs `psql` and `pg_restore` as
+the `postgres` user); restore a remote database by hand with that page. An encrypted dump needs
+the age identity that decrypts it: pass `--identity <file>`, or keep a box-local key at
+`/etc/propolis/backup-identity.txt` (root, 0600) whose public half is also in
+`backup-recipients.txt`.
+
+The kept release records only the pre-upgrade set that upgrade wrote. An upgrade run with
+`PROPOLIS_UPGRADE_SKIP_BACKUP=1`, or before `DATABASE_URL` was set, records none, so
+`--with-database` refuses it rather than restore an older set from before an earlier upgrade.
+
+Every refusal (no kept release, a release with no backup, a missing identity, no local
+PostgreSQL, no `DATABASE_URL`, a database or role name that is not a plain identifier, an
+unconfirmed prompt) happens before any service is stopped. The script also stops
+`propolis-backup.timer` while it works, so a nightly dump cannot hold the database open
+during the rename. If a step fails after the services are stopped, it says which step, names
+the renamed-aside database if there is one, and starts the services again; check
+`systemctl --failed` afterwards. Rolling back to a release from before the nightly backup
+disables `propolis-backup.timer` until the next upgrade, because that release's binary has no
+`pg-exec`.
 
 ## Disaster recovery
 
@@ -122,15 +157,13 @@ What is irreplaceable if the host is lost and nothing left it:
 What is not lost with a database backup: the feed output regenerates from
 `ip_score`, and log cursors rebuild by re-reading logs.
 
-### Off-host backup is the missing piece
+### Off-host backup
 
-There is currently **no off-host backup mechanism shipped** with Propolis. Real
-disaster recovery for a single-node deployment requires an off-host anchor that a
-full host loss cannot touch: ship the database dump and the spool/config archives
-(see [backup and restore](backup-and-restore.md)) to storage on independent
-hardware, power, and network. Off-host replication of evidence is a recommended
-operator responsibility and a planned platform capability, not a delivered
-feature. `[planned]`
+Real disaster recovery for a single-node deployment needs an off-host anchor that a full host
+loss cannot touch. The node backs itself up nightly and a machine on independent hardware,
+power and network pulls each encrypted set over a restricted SSH key
+([off-host copies](backup-and-restore.md#off-host-copies)); until that pull is set up, every
+backup is on the same disk as what it protects.
 
 ### Recovery is a claim to test
 

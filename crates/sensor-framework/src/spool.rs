@@ -119,6 +119,11 @@ impl From<std::io::Error> for SpoolError {
     }
 }
 
+/// The per-file cap of every spooling sensor's quarantine spool (10 MB, decimal): the largest
+/// body a sensor keeps. The SSH sensor's capture limit and the indicator scan's size limit are
+/// this same number, so nothing a sensor keeps is then refused for size by a later stage.
+pub const SPOOL_MAX_FILE_BYTES: u64 = 10_000_000;
+
 /// A directory of captured bodies, each named by its SHA-256, guarded by a per-file size cap and
 /// a global byte budget shared across every call. Safe to call concurrently: `store` and `verify`
 /// take `&self` because production capture hand-off shares one instance across every sensor

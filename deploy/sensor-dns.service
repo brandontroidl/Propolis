@@ -1,4 +1,5 @@
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis DNS honeypot sensor
 After=network.target
 

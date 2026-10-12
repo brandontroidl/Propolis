@@ -93,7 +93,9 @@
 #     PROPOLIS_OPS_FEED_STALE_MULTIPLE (default 2), PROPOLIS_OPS_VENDOR_WINDOW_SECS (default 3600),
 #     PROPOLIS_OPS_VENDOR_FAIL_PCT (default 50), PROPOLIS_OPS_VENDOR_MIN_SAMPLES (default 20),
 #     PROPOLIS_OPS_BACKLOG_MAX (default 500), PROPOLIS_OPS_BACKLOG_FOR_SECS (default 900),
-#     PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS (default 21600 - 6h).
+#     PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS (default 21600 - 6h), PROPOLIS_OPS_BACKUP_MAX_AGE_SECS
+#     (default 129600 - 36h), PROPOLIS_OPS_HEARTBEAT_URL (optional https dead-man's switch) and
+#     PROPOLIS_OPS_HEARTBEAT_INTERVAL_SECS (default 300).
 #   - /var/log/propolis/{catchall,ssh}, owned by their respective sensor users (unchanged from
 #     deploy/sensor-catchall.service / deploy/sensor-ssh.service).
 #   - /var/lib/propolis/{cursors,quarantine,feed,spool}, owned by propolis.
@@ -107,6 +109,7 @@
 #   - the built binary at /usr/local/bin/propolis (crates/propolis, bin target "propolis").
 
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis unified daemon (intake + review + feed + console)
 After=network.target postgresql.service
 

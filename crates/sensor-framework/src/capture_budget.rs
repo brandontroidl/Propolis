@@ -6,8 +6,9 @@
 //! spool, so many concurrent connections cannot together push a sensor past its systemd
 //! `MemoryMax` (an OOM kill loses every in-flight capture, not just the greedy one).
 //!
-//! Pure and synchronous: std atomics only, no I/O, no async. Reservations are RAII, so a refund
-//! happens on normal drop, early return and panic unwinding alike.
+//! Synchronous: std atomics and no I/O; the one async-facing piece is a `Notify` that a refund
+//! fires (see [`CaptureMemoryBudget::refunded`]). Reservations are RAII, so a refund happens on
+//! normal drop, early return and panic unwinding alike.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -42,6 +43,36 @@ struct Inner {
     current: AtomicU64,
     high_water: AtomicU64,
     refused: AtomicU64,
+    /// Woken whenever a reservation is refunded, so a holder of work that was refused for lack
+    /// of budget can retry the moment there is some, not at its next unrelated wakeup.
+    refunds: tokio::sync::Notify,
+}
+
+/// Adds `bytes` to `current` if the sum stays under the ceiling: one compare-exchange, so racing
+/// callers cannot both take room only one fits in.
+fn charge(inner: &Inner, bytes: u64) -> bool {
+    let mut observed = inner.current.load(Ordering::Acquire);
+    loop {
+        let next = match observed.checked_add(bytes) {
+            Some(next) if next <= inner.ceiling => next,
+            _ => {
+                inner.refused.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        };
+        match inner.current.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                inner.high_water.fetch_max(next, Ordering::Relaxed);
+                return true;
+            }
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 /// The shared pool. Cloning is cheap and every clone charges the same counters.
@@ -58,6 +89,7 @@ impl CaptureMemoryBudget {
                 current: AtomicU64::new(0),
                 high_water: AtomicU64::new(0),
                 refused: AtomicU64::new(0),
+                refunds: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -69,31 +101,25 @@ impl CaptureMemoryBudget {
     /// total and re-checks. `current` therefore never exceeds the ceiling, and the sum of live
     /// reservations equals `current`. A request whose sum would overflow `u64` is refused.
     pub fn try_reserve(&self, bytes: u64) -> Option<Reservation> {
-        let inner = &self.inner;
-        let mut observed = inner.current.load(Ordering::Acquire);
-        loop {
-            let next = match observed.checked_add(bytes) {
-                Some(next) if next <= inner.ceiling => next,
-                _ => {
-                    inner.refused.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-            };
-            match inner.current.compare_exchange_weak(
-                observed,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    inner.high_water.fetch_max(next, Ordering::Relaxed);
-                    return Some(Reservation {
-                        inner: Arc::clone(inner),
-                        bytes,
-                    });
-                }
-                Err(actual) => observed = actual,
-            }
+        charge(&self.inner, bytes).then(|| Reservation {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
+    }
+
+    /// Completes when any reservation of this budget is next refunded. `notify_waiters` wakes
+    /// only futures that already exist, so a caller that checks the budget and then waits must
+    /// create the future first and `enable` it (`Notified::enable`) before the check; a refund
+    /// between the check and the wait then cannot be missed.
+    pub fn refunded(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.refunds.notified()
+    }
+
+    /// A reservation of nothing, for a holder that has not yet been granted anything.
+    pub fn empty_reservation(&self) -> Reservation {
+        Reservation {
+            inner: Arc::clone(&self.inner),
+            bytes: 0,
         }
     }
 
@@ -125,11 +151,39 @@ impl Reservation {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Moves `bytes` of this reservation into a reservation of its own, or `None` when it holds
+    /// less. The budget's total does not change: the two halves refund exactly what the whole
+    /// would have, each on its own drop. This is how a worst-case allowance reserved before work
+    /// runs is handed out to the pieces of output the work produces.
+    pub fn split_off(&mut self, bytes: u64) -> Option<Reservation> {
+        self.bytes = self.bytes.checked_sub(bytes)?;
+        Some(Reservation {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
+    }
+
+    /// Takes `extra` more bytes of the budget into this reservation, or leaves it unchanged and
+    /// returns false when the ceiling does not allow it.
+    pub fn try_grow(&mut self, extra: u64) -> bool {
+        let Some(total) = self.bytes.checked_add(extra) else {
+            return false;
+        };
+        if !charge(&self.inner, extra) {
+            return false;
+        }
+        self.bytes = total;
+        true
+    }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.inner.current.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.bytes > 0 {
+            self.inner.refunds.notify_waiters();
+        }
     }
 }
 
@@ -206,8 +260,12 @@ impl CaptureBody {
                 Some(r) => {
                     self.chunks.push(r);
                     let target = self.charged_capacity();
-                    self.buf
-                        .reserve_exact(target.saturating_sub(self.buf.len()));
+                    let buf = &mut self.buf;
+                    // This budget charges the body; the session that received it is not charged
+                    // a second time.
+                    crate::session_memory::unaccounted(|| {
+                        buf.reserve_exact(target.saturating_sub(buf.len()));
+                    });
                 }
                 None => {
                     exhausted = true;
@@ -243,6 +301,20 @@ impl CaptureBody {
     /// Bytes currently charged to the budget by this body.
     pub fn charged_bytes(&self) -> u64 {
         (self.chunks.len() as u64).saturating_mul(CAPTURE_CHUNK_BYTES)
+    }
+
+    /// Moves the bytes out to be read in place by something that must own them (the fake shell's
+    /// standard input), leaving the body empty. The chunk reservations stay with the body, so the
+    /// bytes remain charged for as long as the body lives, whichever way the borrower ends -
+    /// including a panic, which drops the body and refunds. Give them back with
+    /// [`Self::restore_bytes`].
+    pub fn lend_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
+    /// Returns bytes taken by [`Self::lend_bytes`].
+    pub fn restore_bytes(&mut self, bytes: Vec<u8>) {
+        self.buf = bytes;
     }
 
     /// Consumes the body and returns its bytes. The chunk reservations are released on return, so
@@ -310,6 +382,80 @@ mod tests {
         .join();
         assert!(res.is_err());
         assert_eq!(b.current_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refund_wakes_a_waiter_that_armed_before_it() {
+        let b = CaptureMemoryBudget::new(10);
+        let held = b.try_reserve(10).unwrap();
+        assert!(b.try_reserve(1).is_none());
+        let waiting = b.refunded();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        // The check has failed and the waiter is armed; the refund lands before it awaits.
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("the refund was not missed");
+        assert!(b.try_reserve(1).is_some());
+    }
+
+    #[test]
+    fn try_grow_takes_more_only_under_the_ceiling() {
+        let b = CaptureMemoryBudget::new(100);
+        let mut r = b.try_reserve(40).unwrap();
+        assert!(r.try_grow(60));
+        assert_eq!((r.bytes(), b.current_bytes()), (100, 100));
+        assert!(!r.try_grow(1));
+        assert_eq!(
+            (r.bytes(), b.current_bytes()),
+            (100, 100),
+            "a refused grow takes nothing"
+        );
+        assert!(!r.try_grow(u64::MAX));
+        drop(r);
+        assert_eq!(b.current_bytes(), 0);
+    }
+
+    #[test]
+    fn split_off_hands_out_part_of_a_reservation_without_changing_the_total() {
+        let b = CaptureMemoryBudget::new(100);
+        let mut whole = b.try_reserve(60).unwrap();
+        let part = whole.split_off(25).unwrap();
+        assert_eq!((whole.bytes(), part.bytes()), (35, 25));
+        assert_eq!(b.current_bytes(), 60);
+        assert!(whole.split_off(36).is_none(), "more than it holds");
+        assert_eq!(whole.bytes(), 35, "a refused split takes nothing");
+        drop(part);
+        assert_eq!(b.current_bytes(), 35);
+        drop(whole);
+        assert_eq!(b.current_bytes(), 0);
+        assert_eq!(b.empty_reservation().bytes(), 0);
+        assert_eq!(b.current_bytes(), 0);
+    }
+
+    #[test]
+    fn lent_bytes_stay_charged_until_the_body_drops_and_come_back_whole() {
+        let b = Arc::new(CaptureMemoryBudget::new(10 * CAPTURE_CHUNK_BYTES));
+        let mut body = CaptureBody::with_budget(b.clone());
+        body.extend_from_slice(b"payload").unwrap();
+        let charged = b.current_bytes();
+        assert_eq!(charged, CAPTURE_CHUNK_BYTES);
+        let lent = body.lend_bytes();
+        assert_eq!(lent, b"payload");
+        assert!(body.is_empty());
+        assert_eq!(
+            b.current_bytes(),
+            charged,
+            "lending does not release the charge"
+        );
+        body.restore_bytes(lent);
+        assert_eq!(body.as_slice(), b"payload");
+        // A borrower that never returns the bytes (it panicked) still refunds with the body.
+        let lent = body.lend_bytes();
+        drop(body);
+        assert_eq!(b.current_bytes(), 0);
+        drop(lent);
     }
 
     #[test]

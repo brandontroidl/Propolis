@@ -355,7 +355,10 @@ mod redirection {
             sh.handle_input("echo hi >&2").0.output[0].fd,
             OutputFd::Stderr
         );
-        assert_eq!(run(&mut sh, "echo hi >&-"), "");
+        assert_eq!(
+            run(&mut sh, "echo hi >&-"),
+            "-bash: echo: write error: Bad file descriptor\n"
+        );
         assert_eq!(run(&mut sh, "echo hi >&2 2>/dev/null"), "hi\n");
         assert_eq!(run(&mut sh, "echo hi 3>&1 1>&2 2>&3 >/dev/null"), "");
     }
@@ -942,6 +945,131 @@ mod syntax_errors {
         );
     }
 
+    /// Each reply is dash 0.5.11's for the same `sh -c` text, run in the jammy reference
+    /// container (`tests/fixtures/sessions/ubuntu-dash-syntax-errors.session` replays more).
+    #[test]
+    fn dash_says_word_for_a_plain_word_and_names_the_token_it_waited_for() {
+        let cases: [(&str, &str); 38] = [
+            ("(echo a) extra", "word unexpected"),
+            ("(echo a) then", "\"then\" unexpected"),
+            ("echo a; fi", "\"fi\" unexpected"),
+            (
+                "if true; then echo a",
+                "end of file unexpected (expecting \"fi\")",
+            ),
+            (
+                "if true; echo a; fi",
+                "\"fi\" unexpected (expecting \"then\")",
+            ),
+            ("if; then echo; fi", "\";\" unexpected"),
+            (
+                "while true; do echo a",
+                "end of file unexpected (expecting \"done\")",
+            ),
+            (
+                "while true; echo a; done",
+                "\"done\" unexpected (expecting \"do\")",
+            ),
+            (
+                "for i in 1 2; echo $i; done",
+                "word unexpected (expecting \"do\")",
+            ),
+            ("for; do echo; done", "Bad for loop variable"),
+            ("for 1 in a; do echo; done", "Bad for loop variable"),
+            ("for", "Bad for loop variable"),
+            ("echo a; for", "Bad for loop variable"),
+            ("for i in a b", "end of file unexpected"),
+            ("for i", "end of file unexpected (expecting \"do\")"),
+            (
+                "case x in a) echo a",
+                "end of file unexpected (expecting \";;\")",
+            ),
+            ("case x a) echo; esac", "word unexpected (expecting \"in\")"),
+            (
+                "case x in a echo; esac",
+                "word unexpected (expecting \")\")",
+            ),
+            ("case", "end of file unexpected (expecting word)"),
+            (
+                "case x in |a) echo;; esac",
+                "word unexpected (expecting \")\")",
+            ),
+            ("{ echo a", "end of file unexpected (expecting \"}\")"),
+            ("{ echo a; )", "\")\" unexpected (expecting \"}\")"),
+            ("( echo a }", "end of file unexpected (expecting \")\")"),
+            ("echo a |", "end of file unexpected"),
+            ("echo >", "end of file unexpected"),
+            ("echo > > f", "redirection unexpected"),
+            ("echo a <<<b", "redirection unexpected"),
+            ("echo $(echo a", "end of file unexpected (expecting \")\")"),
+            (
+                "echo $(if true; then echo a)",
+                "\")\" unexpected (expecting \"fi\")",
+            ),
+            ("echo $(fi)", "\"fi\" unexpected (expecting \")\")"),
+            ("echo `echo a", "EOF in backquote substitution"),
+            ("echo ${a", "Missing '}'"),
+            ("echo $((1+", "Missing '))'"),
+            ("echo (a)", "word unexpected (expecting \")\")"),
+            ("echo a (b)", "\"(\" unexpected"),
+            ("! ! echo x", "\"!\" unexpected"),
+            ("in", "\"in\" unexpected"),
+            ("x=(1 2)", "\"(\" unexpected"),
+        ];
+        for (script, message) in cases {
+            assert_eq!(
+                once(&format!("sh -c '{script}'")),
+                format!("sh: 1: Syntax error: {message}\n"),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn dash_refuses_a_bad_fd_and_a_bad_substitution_when_it_runs_them() {
+        for (script, reply, status) in [
+            (
+                "echo >&a; echo after",
+                "sh: 1: Syntax error: Bad fd number\n",
+                2,
+            ),
+            ("echo ${}; echo after", "sh: 1: Bad substitution\n", 2),
+            ("echo ${a:1}; echo after", "sh: 1: Bad substitution\n", 2),
+            ("echo ${a/x/y}", "sh: 1: Bad substitution\n", 2),
+            (
+                "echo a; echo ${}; echo after",
+                "a\nsh: 1: Bad substitution\n",
+                2,
+            ),
+            (
+                "echo $((1/0)); echo after",
+                "sh: 1: arithmetic expression: division by zero: \"1/0\"\n",
+                2,
+            ),
+        ] {
+            let mut sh = shell();
+            assert_eq!(
+                run(&mut sh, &format!("sh -c '{script}'")),
+                reply,
+                "{script}"
+            );
+            assert_eq!(sh.last_status(), status, "{script}");
+        }
+    }
+
+    #[test]
+    fn dash_reads_the_constructs_it_has_no_syntax_for_as_plain_text() {
+        // dash has no brace expansion, `$'..'`, `[[`, here-strings or `|&`; a descriptor is one digit.
+        assert_eq!(once("sh -c 'echo {a,b}'"), "{a,b}\n");
+        assert_eq!(once("sh -c \"echo \\$'a'\""), "$a\n");
+        assert_eq!(once("sh -c 'echo 12>f; cat f'"), "12\n");
+        assert_eq!(once("sh -c '(( 1+1 ))'"), "sh: 1: 1+1: not found\n");
+        assert_eq!(
+            once("sh -c 'echo a |& b'"),
+            "sh: 1: Syntax error: \"&\" unexpected\n"
+        );
+    }
+
     #[test]
     fn dash_and_the_exec_shell_word_the_same_error_their_own_way() {
         let mut sh = shell();
@@ -968,7 +1096,7 @@ mod syntax_errors {
         );
         assert_eq!(
             run(&mut exec, ")"),
-            "bash: line 1: syntax error near unexpected token `)'\n"
+            "bash: -c: line 1: syntax error near unexpected token `)'\nbash: -c: line 1: `)'\n"
         );
     }
 
@@ -977,16 +1105,16 @@ mod syntax_errors {
         let mut sh = shell();
         assert_eq!(
             run(&mut sh, "bash -c 'if true; then echo x'"),
-            "bash: syntax error: unexpected end of file\n"
+            "bash: -c: line 2: syntax error: unexpected end of file\n"
         );
         assert_eq!(
             run(&mut sh, "sh -c 'if true; then echo x'"),
-            "sh: 1: Syntax error: end of file unexpected\n"
+            "sh: 1: Syntax error: end of file unexpected (expecting \"fi\")\n"
         );
         run(&mut sh, "sh");
         assert_eq!(
             run(&mut sh, "sh -c 'echo \"open'"),
-            "sh: 1: Syntax error: end of file unexpected\n"
+            "sh: 1: Syntax error: Unterminated quoted string\n"
         );
     }
 
@@ -1032,6 +1160,66 @@ mod syntax_errors {
             run(&mut sh, "echo ./nosuch | sh"),
             "sh: 1: ./nosuch: not found\n"
         );
+    }
+}
+
+mod command_not_found {
+    use super::*;
+
+    /// The interactive login bash on this box has Ubuntu's command-not-found handler, whose
+    /// answer for a name it has no suggestion for is the bare `NAME: command not found`. A bash
+    /// that runs a script has no handler: it names `$0` and the line (replies from the reference
+    /// container's bash 5.1.16 and dash 0.5.11, see `ubuntu-bash-command-not-found.session`).
+    #[test]
+    fn only_the_interactive_bash_has_the_handler_and_a_script_names_its_line() {
+        let mut sh = shell();
+        assert_eq!(run(&mut sh, "f"), "f: command not found\n");
+        assert_eq!(run(&mut sh, "(f)"), "f: command not found\n");
+        assert_eq!(
+            run(&mut sh, "foo/bar"),
+            "-bash: foo/bar: No such file or directory\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c f"),
+            "bash: line 1: f: command not found\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c 'f' name arg"),
+            "name: line 1: f: command not found\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c 'cd /nonexistent'"),
+            "bash: line 1: cd: /nonexistent: No such file or directory\n"
+        );
+        assert_eq!(
+            run(&mut sh, "bash -c 'g() { f; }; g'"),
+            "environment: line 1: f: command not found\n"
+        );
+        assert_eq!(run(&mut sh, "sh -c f"), "sh: 1: f: not found\n");
+        assert_eq!(
+            run(&mut sh, "sh -c 'f' name arg"),
+            "name: 1: f: not found\n"
+        );
+    }
+
+    #[test]
+    fn a_script_names_itself_as_typed_and_the_line_of_the_command() {
+        let mut sh = shell();
+        run(&mut sh, "printf 'echo a\\nf\\n' > /tmp/y.sh");
+        assert_eq!(
+            run(&mut sh, "bash /tmp/y.sh"),
+            "a\n/tmp/y.sh: line 2: f: command not found\n"
+        );
+        run(&mut sh, "cd /tmp");
+        assert_eq!(
+            run(&mut sh, "bash y.sh"),
+            "a\ny.sh: line 2: f: command not found\n"
+        );
+        assert_eq!(
+            run(&mut sh, "cat y.sh | bash"),
+            "a\nbash: line 2: f: command not found\n"
+        );
+        assert_eq!(run(&mut sh, "echo $?"), "127\n");
     }
 }
 
@@ -1089,7 +1277,8 @@ mod continuation_lines {
         // No next line will finish an open quote: the exec shell reports it at once.
         assert_eq!(
             run(&mut exec, "echo \"open"),
-            "bash: line 1: syntax error: unexpected end of file\n"
+            "bash: -c: line 1: unexpected EOF while looking for matching `\"'\n\
+             bash: -c: line 2: syntax error: unexpected end of file\n"
         );
         assert_eq!(exec.prompt(), "");
     }

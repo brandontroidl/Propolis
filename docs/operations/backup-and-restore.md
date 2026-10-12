@@ -9,9 +9,106 @@ last-verified: 2026-09-28
 
 # Backup and restore
 
-Propolis ships **no backup or restore tool**. This page describes what state
-exists, where it lives, and a recommended procedure built from standard tools.
-Treat everything here as operator guidance, not a shipped capability.
+Propolis backs itself up every night with the procedure this page documents (see
+[the nightly backup](#the-nightly-backup)). Restoring stays a manual, deliberate
+operation, described [below](#restore-procedure). This page also describes what
+state exists and where it lives.
+
+## The nightly backup
+
+`propolis-backup.timer` runs `/usr/local/sbin/propolis-backup` (`deploy/backup.sh`) at
+03:30 with up to 30 minutes of random delay, and catches up a missed night at the next
+boot. `install.sh` and `upgrade.sh` install and enable it. Each run writes one set,
+`/var/backups/propolis/<UTC time>-scheduled/`:
+
+| File | Contents |
+|---|---|
+| `propolis.dump` | the database, by the `pg_dump` command [below](#database) |
+| `state.tgz` | the spool, configuration and SSH host key, by the `tar` command [below](#spool-and-configuration) |
+| `SHA256SUMS` | the digest of each file as stored |
+
+`crates/propolis/tests/restore_rehearsal.rs` fails the build if the script's dump
+options or archived paths stop matching the commands on this page.
+
+- **Encryption.** Put one or more [age](https://github.com/FiloSottile/age) public
+  keys, one per line, in `/etc/propolis/backup-recipients.txt` and install `age`
+  (`apt install age`). Every later set holds only `propolis.dump.age` and
+  `state.tgz.age`; no plaintext copy is kept. Decrypt with
+  `age --decrypt -i <your key file> -o propolis.dump propolis.dump.age`. Without the
+  file, sets are plaintext and readable only by root. A recipients file with `age`
+  missing fails the run rather than writing plaintext.
+- **Retention.** The newest 7 scheduled sets are kept (`PROPOLIS_BACKUP_KEEP`, 1-365,
+  in the unit's environment); older ones are deleted after a good run.
+  [Upgrades](upgrade-rollback-and-dr.md) write `-pre-upgrade` sets, of which the
+  newest 3 are kept.
+- **Free space.** A run refuses to start, before dumping anything, unless the backup
+  directory has the database size plus the state directories' size, plus a fifth, free.
+- **No password on a command line.** The dump runs through `propolis pg-exec`, which
+  parses `DATABASE_URL` from `/etc/propolis/propolis.env` with the daemon's own parser
+  and hands `pg_dump` the connection in libpq's `PG*` variables (`crates/propolis/src/pg_exec.rs#run`).
+- **Status.** `/var/lib/propolis/backup-status/last-success` records the newest good set
+  (time, reason, set name, encrypted or not, sizes). A failed run writes `last-failure`
+  with the step that failed, leaves no partial set, and exits non-zero, so it shows in
+  `systemctl --failed` and `journalctl -u propolis-backup.service`. A run stopped from
+  outside (its unit's timeout, `systemctl stop`, a shutdown) cleans up the same way, and
+  a half-written set left by one killed outright is removed by the next run. Until
+  `propolis.env` sets `DATABASE_URL`, each run records "not configured" and succeeds;
+  neither the daemon nor `config-check.sh` treats that record as a failure.
+- **Live spools.** The archive is taken while sensors run. Each spool's `.staging`
+  directory (a sample between its write and its rename into place) is left out, and a
+  file a sensor adds or removes mid-archive does not fail the run.
+- **The binary it runs.** Before connecting, the script checks that the `propolis`
+  binary has `pg-exec` and refuses one that predates it, which would otherwise start
+  the daemon.
+
+Run one by hand with `sudo systemctl start propolis-backup.service`, or
+`sudo propolis-backup` to see its output directly.
+
+A set on the same disk survives a bad upgrade, a deleted table or a corrupted ledger.
+It does not survive losing the host: copy sets off the box, as below.
+
+## Off-host copies
+
+The machine that keeps the copies pulls them; the honeypot holds no credential for anywhere
+else. A dedicated SSH key logs into the `propolis-backup-pull` account, whose forced command
+(`/usr/local/sbin/propolis-backup-serve`, from `deploy/backup-serve.sh`) answers only "list the
+encrypted sets" and "send this file of an encrypted set". A plaintext set is never listed or
+sent, so encryption is required for this, and a stolen pull key yields ciphertext at most.
+
+Once, on the machine that keeps the copies (not the honeypot):
+
+```
+age-keygen -o ~/.config/propolis/backup-age.key
+ssh-keygen -t ed25519 -f ~/.ssh/propolis_backup -C backup@workstation
+```
+
+`age-keygen` prints the public key (`age1...`). Keep the key file somewhere safe and separate:
+it is the only thing that decrypts the backups.
+
+Then on the honeypot, as root:
+
+1. `apt install age`, and put that public key in `/etc/propolis/backup-recipients.txt` (root,
+   0644; one key per line). The next nightly set is encrypted and readable by the pull account;
+   start one now with `systemctl start propolis-backup.service`.
+2. Put the PUBLIC half of the SSH key in `/var/lib/propolis-backup-pull/.ssh/authorized_keys`
+   (root:root 0644), in the form `deploy/backup-pull-authorized-keys.example` shows.
+3. If `sshd_config` (or a file in `/etc/ssh/sshd_config.d/`) sets `AllowUsers` or
+   `AllowGroups`, add `propolis-backup-pull` or its group, then
+   `sshd -t && systemctl reload ssh`. With neither set, nothing changes.
+
+Back on the machine that keeps the copies, pull with `deploy/backup-pull.sh` from a checkout of
+this repository, through the host's real administrative sshd port (not the honeypot's port 22):
+
+```
+deploy/backup-pull.sh --host <honeypot> --port <admin ssh port> --key ~/.ssh/propolis_backup --dest ~/propolis-backups
+```
+
+It fetches the newest encrypted set it does not have, checks every file against the set's
+`SHA256SUMS` before keeping it, keeps the newest 14 (`--keep`), and exits non-zero when it could
+not, so run it from a daily `systemd --user` timer or cron that reports failures. To restore from
+a pulled set, decrypt both files with
+`age --decrypt -i ~/.config/propolis/backup-age.key -o <file> <file>.age` and follow
+[restore procedure](#restore-procedure).
 
 > **Recovery is unverified until you test it.** A backup you have never restored
 > is a hypothesis. Rehearse the restore end to end against a scratch environment
@@ -88,7 +185,8 @@ rules are owned by [secret management](secret-management.md).
 
 ## Recommended backup procedure
 
-This is an example built from standard tooling; adapt it to your environment.
+These are the commands the nightly backup runs; run them by hand to back up to
+anywhere else, or on a node without the shipped timer.
 
 ### Database
 

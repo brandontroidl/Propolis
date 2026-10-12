@@ -5,6 +5,7 @@ pub const VERSION_MARKER: &str = "sensor-ssh";
 pub mod auth;
 pub mod channel;
 pub mod hostkey;
+pub mod output;
 pub mod server;
 pub mod timeout_stream;
 pub mod transfer;
@@ -17,7 +18,7 @@ pub mod transport;
 pub use sensor_framework::fakefs;
 pub use sensor_framework::shell;
 
-pub use server::{serve, serve_with_handoff};
+pub use server::{serve, serve_with_budgets, serve_with_handoff};
 
 #[cfg(test)]
 mod tests {

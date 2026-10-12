@@ -14,6 +14,7 @@ use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
 use sensor_framework::sanitize_value;
+use sensor_framework::session_memory;
 use sensor_framework::shell::{EmitContext, FakeShell, LineStep, onlcr};
 use sensor_framework::{
     CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureSource,
@@ -27,6 +28,7 @@ use sensor_wire::{
 };
 
 use crate::infected_hold::InfectedHold;
+use crate::probe;
 use crate::telnet::{IacFilter, negotiation_preamble};
 
 /// This sensor's identity on both the wire `sensor` field and every event's
@@ -77,6 +79,10 @@ pub async fn handle_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if session_memory::unaccounted_session() {
+        return;
+    }
     // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped IPv6 address
     // (::ffff:a.b.c.d from a dual-stack listener) matches the operator's plain-IPv4 WAN map entry
     // - mirrors sensor-ssh's `server::handle_session` handling of the same listener module doc
@@ -119,6 +125,9 @@ pub async fn handle_connection<S>(
     // the sensor's per-source command-event budget to the shell.
     let budget = ConnectionBudget::with_command_gate(limits_from(&bounds), command_events);
     let mut reader = LineReader::new(bounds, handoff.clone());
+    // Armed before the login, not after: a scanner speaking another protocol never gets past it,
+    // and `Drop` must still be able to record what it was.
+    reader.arm_capture_submit(source_ip, wan_ip, session_id);
 
     let login_prompt = format!("{host} login: ");
     if write_telnet_data(&mut stream, write_timeout, login_prompt.as_bytes(), None)
@@ -178,12 +187,11 @@ pub async fn handle_connection<S>(
     // Capture is shell-phase only: it starts here, after the password has already been read and
     // dropped above, and never before - so a captured sample can never contain the login
     // credentials. See the crate-level design note above `handle_connection`.
+    // The reader submits its capture from `Drop` (armed above). The listener enforces
+    // `max_duration` by dropping this whole future, so a submit written after the loop below
+    // never runs for a session that hits the bound - and a dropper streaming a large payload is
+    // exactly the session that does. `Drop` is the only code that runs on every exit path.
     reader.start_capture();
-    // Arm the reader to submit its capture from `Drop`. The listener enforces `max_duration` by
-    // dropping this whole future, so a submit written after the loop below never runs for a
-    // session that hits the bound - and a dropper streaming a large payload is exactly the
-    // session that does. `Drop` is the only code that runs on every exit path.
-    reader.arm_capture_submit(source_ip, wan_ip, session_id);
 
     // What commands read from the terminal (`cat > f` takes the lines after it until Ctrl-D),
     // captured once per distinct body and submitted when this session's future goes, cancelled
@@ -202,9 +210,26 @@ pub async fn handle_connection<S>(
     // A file the shell sees assembled from typed `echo` chunks is captured through the same set.
     let mut shell = shell.with_captures(stdin_captures.clone());
     let mut hold_on_end = HoldOnEnd::new(infected_hold, source_ip);
+    // This session's memory account, while the sensor accounts sessions.
+    let account = session_memory::current_account();
 
     loop {
-        let Some(line) = reader.read_line(&mut stream, true).await else {
+        // Between lines: over the memory a session may keep, or asked to let go.
+        if account.is_some_and(|a| a.check_retained()) {
+            reader.mark_session_end(CaptureEnd::MemoryLimit);
+            break;
+        }
+        // A session asked to let go while it waits for its next line ends now, not at its idle
+        // timeout; the line half read is not needed.
+        let next = tokio::select! {
+            line = reader.read_line(&mut stream, true) => Some(line),
+            () = session_memory::evicted(account) => None,
+        };
+        let Some(next) = next else {
+            reader.mark_session_end(CaptureEnd::MemoryLimit);
+            break;
+        };
+        let Some(line) = next else {
             break;
         };
         let (step, events) = shell.start_line(&line);
@@ -230,7 +255,18 @@ pub async fn handle_connection<S>(
                 );
                 // Each Enter hands the command its line: `read x` finishes on the first.
                 input.per_line();
-                match reader.read_held(&mut stream, &mut input, &mut shell).await {
+                // Asked to let go while the command waits for its input: end now, with what it
+                // had read.
+                let held = tokio::select! {
+                    held = reader.read_held(&mut stream, &mut input, &mut shell) => Some(held),
+                    () = session_memory::evicted(account) => None,
+                };
+                let Some(held) = held else {
+                    reader.mark_session_end(CaptureEnd::MemoryLimit);
+                    let _ = input.finish(&mut shell, HeldEnd::Cut(CaptureEnd::MemoryLimit));
+                    break;
+                };
+                match held {
                     Some(HeldOutcome::Ended(end)) => input.finish(&mut shell, end),
                     Some(HeldOutcome::Resumed(output)) => output,
                     None => {
@@ -441,6 +477,10 @@ struct LineReader {
     /// Shell-phase bytes that arrived after `capture` hit `bounds.max_captured_bytes` and were
     /// dropped, so the emitted event can say the capture is a prefix and how big the whole was.
     capture_overflow: u64,
+    /// The first bytes the peer sent, raw (before IAC stripping, so a 0xff protocol byte is
+    /// still there) and from the first byte of the connection, login included. Kept only to
+    /// recognise a protocol probe in `Drop`; never stored unless the session is one.
+    head: Vec<u8>,
     /// Set by `start_capture`; gates whether `read_line` accumulates into `capture`. Starts false
     /// so the login/password phase is never captured.
     capturing: bool,
@@ -468,6 +508,25 @@ struct CaptureSubmit {
 /// after the session loop runs. `CaptureHandoff::submit` never blocks, so it is safe here.
 impl Drop for LineReader {
     fn drop(&mut self) {
+        // A scanner speaking another protocol to this port is evidence of that, not a sample.
+        // Decided first, on the connection's leading bytes: the capture below starts after the
+        // login, so it holds only the tail of such a probe. `probe::verdict` keeps anything that
+        // might be a real binary on the sample path.
+        if let Some(ctx) = &self.submit
+            && let Some(protocol) =
+                probe::verdict(&self.head, self.total_captured, self.capture.as_slice())
+        {
+            let event = probe::probe_event(
+                ctx.source_ip,
+                ctx.wan_ip,
+                ctx.session_id,
+                protocol,
+                &self.head,
+                self.total_captured,
+            );
+            let _ = self.handoff.submit_event(event);
+            return;
+        }
         // An empty body that was starved by the budget still goes to `submit`, which counts it as
         // a refusal; a merely empty one has nothing to report.
         if self.capture.is_empty() && !self.capture.is_exhausted() {
@@ -537,6 +596,7 @@ impl LineReader {
             capture: handoff.new_capture_body(),
             handoff,
             capture_overflow: 0,
+            head: Vec::new(),
             capturing: false,
             binary_seen: false,
             session_end: CaptureEnd::Cancelled,
@@ -544,8 +604,8 @@ impl LineReader {
         }
     }
 
-    /// Let this reader hand its capture off when it is dropped. Called once, alongside
-    /// `start_capture`.
+    /// Let this reader hand its capture off, or report the session as a protocol probe, when it
+    /// is dropped. Called once, right after the reader is built.
     fn arm_capture_submit(&mut self, source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) {
         self.submit = Some(CaptureSubmit {
             source_ip,
@@ -686,6 +746,12 @@ impl LineReader {
         }
     }
 
+    /// Keep the connection's first `probe::HEAD_CAP` raw bytes.
+    fn note_head(&mut self, raw: &[u8]) {
+        let room = probe::HEAD_CAP.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&raw[..raw.len().min(room)]);
+    }
+
     /// Read once from the socket into `unread`, answering any option negotiation it carried.
     /// False when the session ended instead (EOF, a timeout, an error, the session's
     /// `max_captured_bytes`), with `session_end` saying which.
@@ -722,6 +788,7 @@ impl LineReader {
         };
         self.first_read = false;
         self.total_captured += n as u64;
+        self.note_head(&raw[..n]);
 
         let mut data = Vec::new();
         let mut response = Vec::new();

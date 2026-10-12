@@ -1,0 +1,36 @@
+# Alerts the operator that the unit named by the instance failed. Every Propolis unit names it in
+# OnFailure=propolis-alert@%n.service, so systemd starts one instance per failure with the failed
+# unit's name; deploy/alert.sh (installed as /usr/local/sbin/propolis-alert) posts it to ntfy or
+# the journal and rate-limits repeats per unit. This unit names no OnFailure= of its own, so a
+# failing alert cannot alert about itself in a loop.
+#
+# Runs as root to read the unit's journal and /etc/propolis/propolis.env (0600). The rate-limit
+# stamps live in /run/propolis-alert, kept across instances by RuntimeDirectoryPreserve=.
+[Unit]
+Description=Alert that %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/propolis-alert %i
+RuntimeDirectory=propolis-alert
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=90s
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

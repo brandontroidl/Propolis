@@ -56,6 +56,8 @@ const DASH_KEYWORDS: &[&str] = &[
 
 /// What a name is to the running shell.
 struct Located {
+    /// The value of an alias of this name, which the shell finds before anything else.
+    alias: Option<String>,
     keyword: bool,
     /// A function the session defined, which the shell finds before a builtin or a file.
     function: Option<Arc<FunctionDef>>,
@@ -131,12 +133,14 @@ impl FakeShell {
                 }
             };
             return runs.then(|| Located {
+                alias: None,
                 keyword: false,
                 function: None,
                 builtin: false,
                 files: vec![name.to_string()],
             });
         }
+        let alias = self.alias_value(name).map(str::to_string);
         let keyword = self.keywords().contains(&name);
         let function = self
             .state()
@@ -146,7 +150,7 @@ impl FakeShell {
         let kind = Registry::builtin()
             .kind(name, self)
             .filter(|kind| *kind != CommandKind::Unresolved);
-        if kind.is_none() && !keyword && function.is_none() {
+        if kind.is_none() && !keyword && function.is_none() && alias.is_none() {
             return None;
         }
         let files = match kind {
@@ -161,6 +165,7 @@ impl FakeShell {
             _ => Vec::new(),
         };
         Some(Located {
+            alias,
             keyword,
             function,
             builtin: kind == Some(CommandKind::Builtin),
@@ -316,7 +321,10 @@ impl FakeShell {
             };
             if force_path || only_files {
                 // `-P` looks in `$PATH` only; `-p` prints a path only for what `-t` calls a file.
-                let is_file = !located.keyword && located.function.is_none() && !located.builtin;
+                let is_file = located.alias.is_none()
+                    && !located.keyword
+                    && located.function.is_none()
+                    && !located.builtin;
                 if force_path || is_file {
                     for file in files {
                         result.append(CommandResult::stdout(format!("{file}\n")));
@@ -326,6 +334,9 @@ impl FakeShell {
                 continue;
             }
             let mut forms: Vec<(&str, String)> = Vec::new();
+            if let Some(value) = &located.alias {
+                forms.push(("alias", self.alias_sentence(name, value)));
+            }
             if located.keyword {
                 forms.push(("keyword", format!("{name} is a shell keyword\n")));
             }
@@ -440,9 +451,26 @@ impl FakeShell {
         format!("{name} is a {kind}\n")
     }
 
+    /// How `type` and `command -V` word an alias: bash quotes the value in a backtick and a quote,
+    /// dash and mksh [inferred for mksh] say `is an alias for` and the value as it is.
+    fn alias_sentence(&self, name: &str, value: &str) -> String {
+        if self.is_bash() {
+            format!("{name} is aliased to `{value}'\n")
+        } else {
+            format!("{name} is an alias for {value}\n")
+        }
+    }
+
     /// The line `command -v` or `-V` prints for a name that was found: a keyword, function or
     /// builtin by name, a file by path.
     fn describe(&self, name: &str, located: &Located, detail: Detail) -> String {
+        if let Some(value) = &located.alias {
+            return match detail {
+                // `command -v` writes the definition, in either shell.
+                Detail::Short => format!("alias {name}={}\n", self.alias_quoted(value)),
+                Detail::Sentence => self.alias_sentence(name, value),
+            };
+        }
         let file = located.files.first();
         match (
             detail,

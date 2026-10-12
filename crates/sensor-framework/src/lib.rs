@@ -31,6 +31,7 @@ pub mod rate_limit;
 pub mod replay;
 pub mod reply_source;
 pub mod sanitize;
+pub mod session_memory;
 pub mod shell;
 pub mod spool;
 pub mod tls;
@@ -39,10 +40,12 @@ pub mod wan;
 pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
 pub use arrival::Arrival;
 pub use bounds::ConnectionBounds;
-pub use budget::{BudgetLimits, ConnectionBudget, EgressState, limits_from};
+pub use budget::{
+    BudgetLimits, ConnectionBudget, EgressState, LINE_WORKING_SET_BYTES, limits_from,
+};
 pub use capture_budget::{
     CAPTURE_CHUNK_BYTES, CaptureBody, CaptureExhausted, CaptureMemoryBudget,
-    DEFAULT_CAPTURE_BUDGET_BYTES_256M, default_capture_budget_bytes,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, Reservation, default_capture_budget_bytes,
 };
 pub use command_codec::CommandCodec;
 pub use command_flood::{
@@ -74,7 +77,7 @@ pub use rate_limit::{
 };
 pub use reply_source::{REFLECTIVE_SOURCE_PORTS, SourceRefusal, check_reply_source};
 pub use sanitize::{sanitize_value, to_hex_bounded};
-pub use spool::{QuarantineSpool, SpoolError};
+pub use spool::{QuarantineSpool, SPOOL_MAX_FILE_BYTES, SpoolError};
 pub use tls::{
     MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, run_tls_listener,
     run_tls_listener_tracked, server_config_from_pem, upgrade_buffered,

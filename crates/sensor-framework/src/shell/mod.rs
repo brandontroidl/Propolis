@@ -57,6 +57,7 @@ use crate::persona;
 use crate::{sanitize_value, to_hex_bounded};
 
 mod admin;
+mod alias;
 mod android;
 mod androidsys;
 mod arch;
@@ -71,6 +72,7 @@ mod cfmt;
 mod dd;
 mod envtools;
 mod eval;
+mod exec;
 mod expand;
 mod fetch;
 #[cfg(test)]
@@ -99,6 +101,7 @@ mod read;
 mod readlink;
 mod regex;
 mod registry;
+mod shopt;
 mod sysres;
 mod test_builtin;
 mod textproc;
@@ -109,8 +112,9 @@ mod toyopt;
 mod tr;
 mod tr_gnu;
 mod trace;
+mod trap;
 
-use eval::{DepthGuard, LineBudget, PidAlloc, ShellState, Stdin};
+use eval::{DepthGuard, LineBudget, PidAlloc, ScriptKind, ShellState, Stdin};
 use registry::{HandlerFn, Registry, resolve_proc_self};
 
 pub use ast::UnsupportedKind;
@@ -483,13 +487,13 @@ pub struct FakeShell {
     /// When the session began on the shell's clock: the start time of the processes the session
     /// owns in the process table.
     session_started: chrono::DateTime<chrono::Utc>,
-    /// The line [`Self::start_line`] found waiting for its input, run by [`Self::finish_line`]
+    /// The line [`Self::start_line`] found waiting for its input, run by [`Self::finish_line_shared`]
     /// once the input has ended.
     held: Option<HeldLine>,
     /// The session input is a terminal (a login shell, or an exec channel with a pty), not a pipe.
     tty_input: bool,
     /// The status a read that waits for more session input ends its line with, while
-    /// [`Self::finish_line`] runs a line whose input was cut off; `None` when it ended normally.
+    /// [`Self::finish_line_shared`] runs a line whose input was cut off; `None` when it ended normally.
     input_interrupt: Option<u8>,
     /// How far into the session input the readers had got when the running command started, so
     /// a write it makes can be told apart as one carrying what it read.
@@ -537,6 +541,11 @@ pub struct FakeShell {
 /// The most entries `history` keeps: Ubuntu's stock `.bashrc` sets `HISTSIZE=1000`.
 const HISTORY_MAX: usize = 1_000;
 
+/// The most bytes of lines `history` keeps, dropping the oldest first. A thousand lines of typical
+/// length fit; a thousand at [`MAX_COMMAND_LEN`] would hold a megabyte, an eighth of what a
+/// session may keep.
+const HISTORY_MAX_BYTES: usize = 64 * 1024;
+
 /// A line waiting for its input.
 #[derive(Clone)]
 struct HeldLine {
@@ -569,7 +578,7 @@ pub enum LineStep {
     Ran(CommandResult),
     /// A command on the line reads standard input past what has arrived, so the line waits for
     /// it, as a real shell's command blocks in `read`. Nothing it did is kept: the shell is as it
-    /// was before the line, and [`FakeShell::finish_line`] runs it once its input has ended.
+    /// was before the line, and [`FakeShell::finish_line_shared`] runs it once its input has ended.
     AwaitingInput,
 }
 
@@ -876,6 +885,10 @@ impl FakeShell {
     /// The prompt for the active shell level. Exec requests have no prompt. While a construct is
     /// incomplete the continuation prompt (PS2) stands in for it.
     pub fn prompt(&self) -> String {
+        // A shell writes its prompt to standard error; after `exec 2>/dev/null` there is none.
+        if !self.state().fds.stderr_is_terminal() {
+            return String::new();
+        }
         if !self.pending.is_empty() && self.context != ShellContext::ExecC {
             return "> ".to_string();
         }
@@ -935,18 +948,28 @@ impl FakeShell {
         // `-bash` wherever the command is.
         let in_function = !self.state().calls.is_empty();
         match (self.context, self.active_level()) {
-            (ShellContext::ExecC, ShellLevel::Bash { .. }) if in_function => {
+            (_, ShellLevel::Bash { .. }) if self.bash_is_scripted() && in_function => {
                 "environment: line 1".to_string()
             }
-            (ShellContext::ExecC, ShellLevel::Bash { .. }) => "bash: line 1".to_string(),
-            (_, ShellLevel::Bash { login: false }) if in_function && self.in_script() => {
-                "environment: line 1".to_string()
-            }
+            // `bash -c CMD NAME` and `bash FILE` name themselves by `$0`: the operand, or the
+            // file as it was typed; a script on standard input is `bash`.
+            (_, ShellLevel::Bash { .. }) if self.bash_is_scripted() => format!(
+                "{}: line {}",
+                self.state().argv0.as_deref().unwrap_or("bash"),
+                self.state().line
+            ),
             (_, ShellLevel::Bash { login: true }) => "-bash".to_string(),
             (_, ShellLevel::Bash { login: false }) => "bash".to_string(),
             (_, ShellLevel::Dash { line }) => format!("{}: {line}", self.dash_name()),
             (_, ShellLevel::AndroidMksh) => "sh".to_string(),
         }
+    }
+
+    /// Whether the bash answering is not interactive: an SSH exec's `bash -c`, or a script it
+    /// runs (`bash -c`, `bash FILE`, a script on its standard input). Such a bash has no
+    /// command-not-found handler, names the line a command is on, and says `bash`, not `-bash`.
+    fn bash_is_scripted(&self) -> bool {
+        self.context == ShellContext::ExecC || self.in_script()
     }
 
     /// Whether the innermost shell is one running a script (`bash -c`, `sh FILE`) rather than
@@ -995,9 +1018,14 @@ impl FakeShell {
     /// What the active shell says for a command it cannot find.
     fn not_found(&self, what: &str) -> String {
         match (self.context, self.active_level()) {
-            (ShellContext::ExecC, ShellLevel::Bash { .. }) => {
+            (_, ShellLevel::Bash { .. }) if self.bash_is_scripted() => {
                 format!("{}: {what}: command not found\n", self.error_prefix())
             }
+            // An interactive bash on this box has Ubuntu's command-not-found handler (the
+            // persona has `command-not-found` installed, `packages.rs`), whose answer for a name
+            // it has no suggestion for is `NAME: command not found` with no shell name in front,
+            // and whose suggestions replace it for the names below. A host without the package
+            // would print `-bash: NAME: command not found`.
             (_, ShellLevel::Bash { .. }) => login_command_not_found(what)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("{what}: command not found\n")),
@@ -1062,7 +1090,7 @@ impl FakeShell {
             return (LineStep::Ran(CommandResult::silent(0)), Vec::new());
         };
         let saved = self.checkpoint();
-        self.stdin = Stdin::session(Vec::new(), false, self.tty_input);
+        self.stdin = Stdin::session(std::sync::Arc::new(Vec::new()), false, self.tty_input);
         let output = self.run_input(&decoded);
         if !self.stdin.is_blocked() {
             self.stdin = Stdin::Terminal;
@@ -1124,7 +1152,24 @@ impl FakeShell {
     /// Run the line [`Self::start_line`] left waiting, now that its input has ended: `input` is
     /// every byte the command can read, and `end` how the input ended. Nothing happens when no
     /// line is waiting.
+    ///
+    /// Tests only: it copies `input`. Production runs [`Self::finish_line_shared`], and keeping
+    /// this out of the non-test build is what makes a copy of a large held input unreachable.
+    #[cfg(test)]
     pub fn finish_line(&mut self, input: &[u8], end: InputEnd) -> CommandResult {
+        self.finish_line_shared(std::sync::Arc::new(input.to_vec()), end)
+    }
+
+    /// Run the line [`Self::start_line`] left waiting, as the tests' copying `finish_line` does,
+    /// on an input the shell reads in place: it holds a handle to the caller's buffer instead of
+    /// a copy, so a held input of N bytes costs the line N bytes once, not once per copy. The
+    /// caller keeps its own handle, which is what lets it still record the bytes if the line
+    /// panics, and keeps the buffer accounted while the line runs.
+    pub fn finish_line_shared(
+        &mut self,
+        input: std::sync::Arc<Vec<u8>>,
+        end: InputEnd,
+    ) -> CommandResult {
         let Some(held) = self.held.take() else {
             return CommandResult::silent(0);
         };
@@ -1146,7 +1191,8 @@ impl FakeShell {
         held.attempts = held.attempts.saturating_add(1);
         let saved = self.checkpoint();
         let held = self.held.take()?;
-        let (output, wants_more) = self.run_held(held, input, None);
+        // Bounded by RESUME_BYTES above, so this copy is a small constant.
+        let (output, wants_more) = self.run_held(held, std::sync::Arc::new(input.to_vec()), None);
         if wants_more {
             self.rollback(saved);
             return None;
@@ -1159,7 +1205,7 @@ impl FakeShell {
     fn run_held(
         &mut self,
         held: HeldLine,
-        input: &[u8],
+        input: std::sync::Arc<Vec<u8>>,
         end: Option<InputEnd>,
     ) -> (CommandResult, bool) {
         self.begin_line();
@@ -1175,7 +1221,7 @@ impl FakeShell {
             Some(InputEnd::Interrupt) => Some(130),
             Some(InputEnd::Hangup) => Some(129),
         };
-        self.stdin = Stdin::session(input.to_vec(), end == Some(InputEnd::Eof), self.tty_input);
+        self.stdin = Stdin::session(input, end == Some(InputEnd::Eof), self.tty_input);
         let mut output = self.run_input(&held.decoded);
         let interrupted = self.stdin.is_blocked();
         if end.is_none() && interrupted {
@@ -1197,7 +1243,7 @@ impl FakeShell {
         (output, false)
     }
 
-    /// The file that holds what the last line run by [`Self::finish_line`] read from its input:
+    /// The file that holds what the last line run by [`Self::finish_line_shared`] read from its input:
     /// the first file written by a command that read it (`cat > f`, `dd of=f`, `base64 -d > f`).
     /// `None` when that input went nowhere a file holds (a bare `sh` ran it, it was discarded).
     pub fn input_destination(&self) -> Option<&str> {
@@ -1408,7 +1454,9 @@ impl FakeShell {
             // An exec request is one complete command string, as `bash -c` gets it: there is no
             // next line to finish an open construct, so it is parsed whole.
             self.note_unit(decoded);
-            return self.run_script_text(decoded);
+            let mut result = self.run_script_text(decoded);
+            self.append_exit_trap(&mut result);
+            return result;
         }
         let mut result = CommandResult::silent(0);
         let mut first = true;
@@ -1906,7 +1954,11 @@ impl FakeShell {
     fn sync_budget_trace(&mut self) {
         self.trace.budget.work_charged = self.line.charged();
         if self.line.take_refusal() {
-            self.record_hit(BudgetHit::Work);
+            self.record_hit(if self.line.by_memory() {
+                BudgetHit::Memory
+            } else {
+                BudgetHit::Work
+            });
         }
     }
 
@@ -2236,12 +2288,33 @@ impl FakeShell {
         let parent = self.state();
         let mut state = parent.child(pid);
         if matches!(level, ShellLevel::Bash { .. }) {
+            // A signal the parent ignores stays ignored in a bash it starts, and bash lists it.
+            state.traps = parent
+                .traps
+                .iter()
+                .filter(|(_, action)| action.is_empty())
+                .map(|(key, action)| (*key, action.clone()))
+                .collect();
             state.functions = parent
                 .functions
                 .iter()
                 .filter(|(_, held)| held.exported)
                 .map(|(name, held)| (name.clone(), held.clone()))
                 .collect();
+            // bash counts itself into the `SHLVL` it inherits and exports the result: a value
+            // that is not a number counts as 0, and one that reaches 1000 starts again at 1.
+            // dash and mksh leave it as they found it.
+            let inherited = state
+                .vars
+                .get("SHLVL")
+                .and_then(|var| var.value.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let level = match inherited.saturating_add(1) {
+                n if n < 0 => 0,
+                n if n >= 1000 => 1,
+                n => n,
+            };
+            state.set_var("SHLVL", level.to_string(), true);
         }
         state
     }
@@ -2249,22 +2322,32 @@ impl FakeShell {
     /// Leave the innermost shell level that reads the terminal, or end the session from the login
     /// shell. `status` is what `exit` was given.
     fn exit_shell(&mut self, status: u8) -> CommandResult {
+        // The `EXIT` handler runs after the words bash prints as it leaves, in the shell being
+        // left.
         if self.open_levels() > 1 {
-            let popped = self.frames.pop().map(|frame| frame.kind);
-            let output = if matches!(popped, Some(FrameKind::Level(ShellLevel::Bash { .. }))) {
+            let leaving = self.frames.last().map(|frame| frame.kind);
+            let output = if matches!(leaving, Some(FrameKind::Level(ShellLevel::Bash { .. }))) {
                 b"exit\n".to_vec()
             } else {
                 Vec::new()
             };
-            return CommandResult::shell_exit(status, output, false);
+            let mut result = CommandResult::shell_exit(status, output, false);
+            self.append_exit_trap(&mut result);
+            self.frames.pop();
+            return result;
         }
 
-        let output = if matches!(self.active_level(), ShellLevel::Bash { login: true }) {
-            b"logout\n".to_vec()
-        } else {
-            Vec::new()
+        let output = match self.active_level() {
+            ShellLevel::Bash { login: true } => b"logout\n".to_vec(),
+            // A bash that replaced the login shell (`exec bash`) says `exit` as a nested one does.
+            ShellLevel::Bash { login: false } if self.context != ShellContext::ExecC => {
+                b"exit\n".to_vec()
+            }
+            _ => Vec::new(),
         };
-        CommandResult::shell_exit(status, output, true)
+        let mut result = CommandResult::shell_exit(status, output, true);
+        self.append_exit_trap(&mut result);
+        result
     }
 
     fn logout_shell(&mut self) -> CommandResult {
@@ -2461,6 +2544,7 @@ impl FakeShell {
                 script,
                 operands.first().copied(),
                 operands.get(1..).unwrap_or(&[]),
+                ScriptKind::Command,
             );
         }
         if script.is_none()
@@ -2475,7 +2559,7 @@ impl FakeShell {
         }
         if parts.len() == 1 {
             if let Some(text) = self.take_piped_script() {
-                return self.run_shell_text(shell, &text, None, &[]);
+                return self.run_shell_text(shell, &text, None, &[], ScriptKind::Stdin);
             }
             let level = self.spawned_level(shell, 0);
             self.push_level(level);
@@ -2492,6 +2576,7 @@ impl FakeShell {
         text: &str,
         argv0: Option<&str>,
         args: &[&str],
+        kind: ScriptKind,
     ) -> CommandResult {
         let max_depth = self.budget().limits().max_depth;
         if !self.depth.try_enter(max_depth) {
@@ -2504,12 +2589,14 @@ impl FakeShell {
         let caller_frames = self.frames.len();
         self.push_script_level(level);
         let state = self.state_mut();
+        state.script = kind;
         state.argv0 = argv0.map(str::to_string);
         state.positional = args.iter().map(|a| (*a).to_string()).collect();
         // A script is a shell process of its own: the commands in it start as separate processes,
         // not as applets of the busybox that started the script.
         let applets = std::mem::take(&mut self.busybox_depth);
-        let result = self.run_script(text);
+        let mut result = self.run_script(text);
+        self.append_exit_trap(&mut result);
         self.busybox_depth = applets;
         self.frames.truncate(caller_frames);
         self.depth.leave();
@@ -2530,7 +2617,7 @@ impl FakeShell {
                     return stopped;
                 }
                 let content = String::from_utf8_lossy(&bytes);
-                self.run_shell_text(shell_name, &content, Some(file), args)
+                self.run_shell_text(shell_name, &content, Some(file), args, ScriptKind::File)
             }
             Err(_) if shell_name == "bash" => {
                 // [unverified] wording and status: no `bash FILE` capture exists yet.
@@ -3589,6 +3676,8 @@ fn low_byte(value: u32) -> u8 {
 #[cfg(test)]
 mod admin_tests;
 #[cfg(test)]
+mod alias_tests;
+#[cfg(test)]
 mod android_tests;
 #[cfg(test)]
 mod androidsys_tests;
@@ -3611,6 +3700,8 @@ mod command_lines_tests;
 mod dd_tests;
 #[cfg(test)]
 mod envtools_tests;
+#[cfg(test)]
+mod exec_tests;
 #[cfg(test)]
 mod fileinfo_tests;
 #[cfg(test)]
@@ -3665,3 +3756,5 @@ mod tftp_tests;
 mod timing_tests;
 #[cfg(test)]
 mod tr_gnu_tests;
+#[cfg(test)]
+mod trap_tests;

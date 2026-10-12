@@ -39,6 +39,15 @@ pub struct OpsAlertConfig {
     /// A fetch url pending for longer than this pages (`fetch-stale`); only when the fetcher is
     /// enabled. The fetcher retires a url after three attempts, so this is well past that.
     pub fetch_stale: Duration,
+    /// An external dead-man's switch (a healthchecks.io-style ping URL) the monitor requests after
+    /// every complete evaluation round, at most once per `heartbeat_interval`. The service on the
+    /// other end alarms when the pings stop: the one alert that still arrives when this daemon, or
+    /// the whole host, is down. `None`: no heartbeat. https only, since the URL is a secret.
+    pub heartbeat_url: Option<String>,
+    pub heartbeat_interval: Duration,
+    /// The newest good backup (`deploy/backup.sh`) older than this pages (`backup-stale`). Above a
+    /// day, so one failed night pages before a second is missed.
+    pub backup_max_age: Duration,
 }
 
 fn get_bool(get: &impl Fn(&str) -> Option<String>, name: &str, default: bool) -> bool {
@@ -146,8 +155,22 @@ pub fn parse_ops_alert(
         }
     }
 
+    let heartbeat_url = get("PROPOLIS_OPS_HEARTBEAT_URL");
+    if let Some(url) = &heartbeat_url
+        && !url.starts_with("https://")
+    {
+        return Err(ConfigError::Invalid {
+            field: "PROPOLIS_OPS_HEARTBEAT_URL",
+            value: "(not shown: it is a secret)".to_string(),
+            reason: "must be an https:// URL",
+        });
+    }
+
     Ok(OpsAlertConfig {
         enabled,
+        heartbeat_url,
+        heartbeat_interval: get_secs(get, "PROPOLIS_OPS_HEARTBEAT_INTERVAL_SECS", 300, 30)?,
+        backup_max_age: get_secs(get, "PROPOLIS_OPS_BACKUP_MAX_AGE_SECS", 129_600, 3600)?,
         ntfy_url,
         ntfy_topic,
         ntfy_token: get("PROPOLIS_OPS_NTFY_TOKEN"),
@@ -275,6 +298,43 @@ mod tests {
             parse_ops_alert(&getter(&over)),
             Err(ConfigError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn the_heartbeat_is_off_by_default_https_only_and_never_echoes_its_url() {
+        let cfg = parse_ops_alert(&getter(&[])).unwrap();
+        assert_eq!(cfg.heartbeat_url, None);
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(300));
+        assert_eq!(cfg.backup_max_age, Duration::from_secs(129_600));
+
+        let cfg = parse_ops_alert(&getter(&[(
+            "PROPOLIS_OPS_HEARTBEAT_URL",
+            "https://hc-ping.example/0b8f",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.heartbeat_url.as_deref(),
+            Some("https://hc-ping.example/0b8f")
+        );
+
+        let err = parse_ops_alert(&getter(&[(
+            "PROPOLIS_OPS_HEARTBEAT_URL",
+            "http://hc-ping.example/0b8f",
+        )]))
+        .unwrap_err();
+        assert!(
+            !format!("{err:?}").contains("0b8f"),
+            "the URL is a secret: {err:?}"
+        );
+
+        assert!(
+            parse_ops_alert(&getter(&[("PROPOLIS_OPS_HEARTBEAT_INTERVAL_SECS", "5")])).is_err(),
+            "a sub-30 s interval would hammer the service"
+        );
+        assert!(
+            parse_ops_alert(&getter(&[("PROPOLIS_OPS_BACKUP_MAX_AGE_SECS", "60")])).is_err(),
+            "an under-an-hour limit would page between nightly runs"
+        );
     }
 
     #[test]

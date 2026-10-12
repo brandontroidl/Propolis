@@ -17,6 +17,13 @@
     clippy::indexing_slicing
 )]
 
+use super::registry::Registry;
+use super::{CommandResult, FakeShell, FrameKind, HandlerId};
+
+pub(super) fn register(r: &mut Registry) {
+    r.register_builtin("times", HandlerId::Times, FakeShell::builtin_times);
+}
+
 /// Time the session's commands claim to have taken, in nanoseconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Timing {
@@ -115,6 +122,86 @@ pub(super) fn mksh_report(spent: &Timing) -> String {
         cell(spent.user_ns),
         cell(spent.sys_ns)
     )
+}
+
+/// The shell's own CPU time at the start of a session, in nanoseconds: what the login shell spent
+/// reading its startup files. The recorded first `times` of a login bash was `0m0.002s 0m0.002s`.
+const SELF_BASE_USER_NS: u64 = 2_000_000;
+const SELF_BASE_SYS_NS: u64 = 2_000_000;
+
+/// `0m0.002s`, to the millisecond (bash and the phone's shell).
+fn times_cell_milli(ns: u64) -> String {
+    let millis = ns / 1_000_000;
+    format!(
+        "{}m{}.{:03}s",
+        millis / 60_000,
+        (millis % 60_000) / 1_000,
+        millis % 1_000
+    )
+}
+
+/// `0m0.002000s`, to the microsecond (dash prints a C `double`).
+fn times_cell_micro(ns: u64) -> String {
+    let micros = ns / 1_000;
+    format!(
+        "{}m{}.{:06}s",
+        micros / 60_000_000,
+        (micros % 60_000_000) / 1_000_000,
+        micros % 1_000_000
+    )
+}
+
+impl FakeShell {
+    /// `times`: the CPU time the shell has used (user and system) on the first line and what its
+    /// children have used on the second. The figures follow the process model: a command started
+    /// from a file adds to the children, `dd` and the like to their system time, and the shell
+    /// itself spends a small base plus a share of what it waited for. A subshell, a command
+    /// substitution and a `sh -c` are new processes and start at zero; bash takes no option and
+    /// says so (`times: usage: times`), dash and the phone's shell read none.
+    pub(super) fn builtin_times(&mut self, parts: &[&str]) -> CommandResult {
+        if self.is_bash()
+            && let Some(bad) = parts
+                .get(1)
+                .filter(|arg| arg.starts_with('-') && arg.len() > 1 && **arg != "--")
+        {
+            let flag = bad.chars().nth(1).unwrap_or('-');
+            return CommandResult::stderr(
+                2,
+                format!(
+                    "{}times: usage: times\n",
+                    self.shell_error(format_args!("times: -{flag}: invalid option"))
+                ),
+            );
+        }
+        let fresh = self
+            .frames
+            .last()
+            .is_some_and(|f| matches!(f.kind, FrameKind::Subshell | FrameKind::Script(_)));
+        let (own_user, own_sys, kids_user, kids_sys) = if fresh {
+            (0, 0, 0, 0)
+        } else {
+            let t = self.timing;
+            (
+                SELF_BASE_USER_NS.saturating_add(t.user_ns / 2),
+                SELF_BASE_SYS_NS.saturating_add(t.sys_ns / 3),
+                t.user_ns,
+                t.sys_ns,
+            )
+        };
+        let cell = if self.is_dash() {
+            times_cell_micro
+        } else {
+            times_cell_milli
+        };
+        let text = format!(
+            "{} {}\n{} {}\n",
+            cell(own_user),
+            cell(own_sys),
+            cell(kids_user),
+            cell(kids_sys)
+        );
+        CommandResult::stdout(text)
+    }
 }
 
 /// The seconds `sleep` was asked for, with GNU's `s`, `m`, `h` and `d` suffixes, summed over its

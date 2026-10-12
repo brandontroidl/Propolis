@@ -47,6 +47,9 @@ struct SampleRow {
     /// The body sits in a sensor's spool rather than the fetcher's bucket, so a sensor took it from
     /// the address that sent it and the Transport column has nothing to say about it.
     uploaded: bool,
+    /// A sensor kept only the first part of an upload of this sample (`metadata.truncated`), so
+    /// the hash is of that part and not of the file.
+    truncated: bool,
     /// The sample's own campaign: every address that uploaded it or reported a URL serving it.
     campaign: Option<CampaignRef>,
     /// When the sample's hosts were active, from the same campaign; empty when no address is
@@ -231,6 +234,26 @@ async fn sample_source_ips(
     Ok(group_source_ips(rows))
 }
 
+/// Which of `shas` (lowercase hex) a sensor kept only a prefix of: any upload event that names the
+/// sample and says `truncated`. The same rule as the address page's malware panel.
+async fn truncated_samples(
+    pool: &sqlx::PgPool,
+    shas: &[String],
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    if shas.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT e.metadata->>'sample_sha256' FROM event e \
+         WHERE e.metadata->>'sample_sha256' = ANY($1) \
+           AND e.metadata->'truncated' = 'true'::jsonb",
+    )
+    .bind(shas)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Groups `(sha, ip)` pairs by sha, preserving input order (the query's newest-attempt-first) and
 /// dropping repeats: one attacker can appear on several URLs that resolved to the same body, and it
 /// should be listed once. Split from the query so the grouping is testable without a database.
@@ -280,6 +303,10 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         campaigns_by_sample(&state.db, &shas).await,
     );
     let activity = degraded.soft("sample activity", sample_activity(&state.db, &shas).await);
+    let truncated = degraded.soft(
+        "truncated captures",
+        truncated_samples(&state.db, &shas).await,
+    );
     let delivering = degraded.soft(
         "delivering campaigns",
         delivering_campaigns(&state.db, &shas).await,
@@ -316,6 +343,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                     LIST_SPARK_DAYS,
                 )
             });
+            let is_truncated = truncated.contains(&file.sha256);
             samples.push(SampleRow {
                 size: format_bytes(file.size),
                 delivered_by: delivering
@@ -334,6 +362,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
                 more_source_ips,
                 transport,
                 uploaded: sensor != FETCHED_BUCKET,
+                truncated: is_truncated,
             });
         }
     }
@@ -400,6 +429,12 @@ async fn sample_page(
             .await,
     );
     let iocs = degraded.soft("indicators", artifact_iocs(&state.db, &sha256).await);
+    let truncated = degraded
+        .soft(
+            "truncated captures",
+            truncated_samples(&state.db, std::slice::from_ref(&sha256)).await,
+        )
+        .contains(&sha256);
 
     let tmpl = state.templates.get_template("sample_detail.html")?;
     Ok(Html(tmpl.render(context! {
@@ -412,6 +447,8 @@ async fn sample_page(
         bucket => spooled.map(|(b, _)| b).unwrap_or_default(),
         size => spooled.map(|(_, s)| format_bytes(s)).unwrap_or_default(),
         sha256,
+        scan_limit_mb => review::ioc::MAX_BINARY_SCAN_BYTES / 1_000_000,
+        truncated,
         campaigns,
         scan_state => scan_state.unwrap_or_default(),
         iocs,

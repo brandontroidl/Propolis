@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::alias::Alias;
 use super::ast::{
     AndOr, AndOrOp, CaseArm, Command, Dialect, FunctionDef, List, ListItem, Near, Pipeline, Redir,
     RedirOp, RedirTarget, SimpleCommand, Word,
@@ -30,6 +31,7 @@ use super::ast::{
 use super::expand::ExpandError;
 use super::parse::{Parsed, Tail};
 use super::trace::BudgetHit;
+use super::trap::Traps;
 use super::{
     CommandResult, ControlOp, FakeShell, Flow, Frame, FrameKind, HandlerId, OutputFd,
     OutputSegment, ParseNode, RunDecision, SegmentTrace, ShellFlavor, ShellLevel, command_basename,
@@ -39,13 +41,15 @@ use crate::fakefs::{FsError, READ_CAP};
 
 /// The per-line work allowance: steps taken plus bytes scanned or produced, shared by parsing,
 /// expansion, evaluation and every re-entry of the line. Reset once per input line, never on
-/// re-entry.
+/// re-entry. It also runs out when the session the shell runs in is over its memory limit, so
+/// whatever is growing the session stops at its next step.
 #[derive(Debug, Clone)]
 pub(super) struct LineBudget {
     left: u64,
     exhausted: bool,
     charged: u64,
     unreported: bool,
+    by_memory: bool,
 }
 
 impl LineBudget {
@@ -55,13 +59,21 @@ impl LineBudget {
             exhausted: false,
             charged: 0,
             unreported: false,
+            by_memory: false,
         }
     }
 
-    /// Spend `n`. False once the allowance is spent, and from then on.
+    /// Spend `n`. False once the allowance is spent, or the session is over its memory limit, and
+    /// from then on.
     pub(super) fn charge(&mut self, n: u64) -> bool {
         self.charged = self.charged.saturating_add(n);
         if self.exhausted {
+            return false;
+        }
+        if crate::session_memory::current_over() {
+            self.exhausted = true;
+            self.unreported = true;
+            self.by_memory = true;
             return false;
         }
         if n > self.left {
@@ -72,6 +84,11 @@ impl LineBudget {
         }
         self.left = self.left.saturating_sub(n);
         true
+    }
+
+    /// Whether the allowance ran out because the session is over its memory limit.
+    pub(super) fn by_memory(&self) -> bool {
+        self.by_memory
     }
 
     /// True once, the first time after the allowance ran out, so the trace notes the hit once.
@@ -122,6 +139,31 @@ impl DepthGuard {
     pub(super) fn leave(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
+}
+
+/// Open `bytes` for reading on `fd` in `plan`; on descriptor 0 the command reads it as its input.
+fn install_input(plan: &mut RedirPlan, fd: u16, bytes: Vec<u8>) {
+    if fd == 0 {
+        plan.stdin = Some(Stdin::data(bytes.clone()));
+        plan.reads_from = None;
+    }
+    plan.ins.insert(fd, OpenInput::new(bytes));
+}
+
+/// Whether a failing pipeline is something bash's `ERR` handler follows: more than one stage, a
+/// simple command or a subshell.
+fn err_unit(pipeline: &Pipeline) -> bool {
+    pipeline.stages.len() > 1
+        || matches!(
+            pipeline.stages.first(),
+            Some(Command::Simple(_) | Command::Subshell { .. })
+        )
+}
+
+/// Whether a script's text holds the word `alias`: the only way it can define one.
+fn mentions_alias(text: &str) -> bool {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == "alias")
 }
 
 /// Work charged for one trip round a loop, on top of what the body costs, so a body that costs
@@ -187,6 +229,44 @@ pub(super) struct ShellState {
     /// The functions running, outermost first. A subshell started inside one is still inside it
     /// (`return` ends the subshell, `local` still scopes to the function).
     pub calls: Vec<Call>,
+    /// The line of the script text the running command sits on, which a non-interactive bash
+    /// names in its diagnostics (`bash: line 3: f: command not found`).
+    pub line: u32,
+    /// Where a script level's text came from, which a non-interactive bash words its syntax
+    /// errors by.
+    pub script: ScriptKind,
+    /// The aliases defined here, in the order they were first defined. A shell started from this
+    /// one has none; a subshell has a copy.
+    pub aliases: Vec<Alias>,
+    /// bash's `shopt` options changed from their defaults, and its `set -o` ones.
+    pub shopt: BTreeMap<String, bool>,
+    pub set_o: BTreeMap<String, bool>,
+    /// The `trap` handlers this shell runs.
+    pub traps: Traps,
+    /// What a subshell lists as its handlers until it changes one: those of the shell it was made
+    /// from. `None` in every other shell.
+    pub trap_view: Option<Traps>,
+    /// The `EXIT` handler is running: an `exit` in it ends it, not the shell a second time.
+    pub exiting: bool,
+    /// A `DEBUG` or `ERR` handler is running, and does not trigger itself.
+    pub in_trap: bool,
+    /// Commands being run whose status something tests (an `if` condition, all but the last of a
+    /// `&&` list): `ERR` does not fire for a failure inside them.
+    pub err_ignore: u32,
+    /// The descriptors `exec` has opened, moved or closed.
+    pub fds: Fds,
+}
+
+/// Where the text a non-interactive shell runs comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ScriptKind {
+    /// `-c TEXT`, and an SSH exec request.
+    #[default]
+    Command,
+    /// A file named on the command line.
+    File,
+    /// Standard input.
+    Stdin,
 }
 
 const DEFAULT_IFS: &str = " \t\n";
@@ -206,6 +286,17 @@ impl ShellState {
             pid,
             functions: BTreeMap::new(),
             calls: Vec::new(),
+            line: 1,
+            script: ScriptKind::Command,
+            aliases: Vec::new(),
+            shopt: BTreeMap::new(),
+            set_o: BTreeMap::new(),
+            traps: Traps::new(),
+            trap_view: None,
+            exiting: false,
+            in_trap: false,
+            err_ignore: 0,
+            fds: Fds::default(),
         };
         state.set_var("IFS", DEFAULT_IFS.to_string(), false);
         match flavor {
@@ -268,7 +359,33 @@ impl ShellState {
             pid,
             functions: BTreeMap::new(),
             calls: Vec::new(),
+            line: 1,
+            script: ScriptKind::Command,
+            aliases: Vec::new(),
+            shopt: BTreeMap::new(),
+            set_o: BTreeMap::new(),
+            traps: Traps::new(),
+            trap_view: None,
+            exiting: false,
+            in_trap: false,
+            err_ignore: 0,
+            // Open descriptors pass to a process started from this one.
+            fds: self.fds.clone(),
         }
+    }
+
+    /// The state of a subshell made from this one: a copy, except that the handlers it would run
+    /// are reset (the ignored signals stay ignored) while it still lists the parent's, as bash does
+    /// until it sets one itself; dash lists none.
+    pub(super) fn subshell_copy(&self, dash: bool) -> Self {
+        let mut copy = self.clone();
+        copy.trap_view = Some(if dash {
+            Traps::new()
+        } else {
+            self.trap_view.clone().unwrap_or_else(|| self.traps.clone())
+        });
+        copy.traps.retain(|_, action| action.is_empty());
+        copy
     }
 
     /// What the variables and functions hold, against the connection's content allowance.
@@ -281,7 +398,15 @@ impl ShellState {
             .functions
             .iter()
             .map(|(name, held)| name.len().saturating_add(held.def.source.len()));
-        vars.chain(functions).fold(0, usize::saturating_add)
+        let aliases = self
+            .aliases
+            .iter()
+            .map(|alias| alias.name.len().saturating_add(alias.value.len()));
+        let traps = self.traps.values().map(String::len);
+        vars.chain(functions)
+            .chain(aliases)
+            .chain(traps)
+            .fold(0, usize::saturating_add)
     }
 
     pub(super) fn get(&self, name: &str) -> Option<&str> {
@@ -330,7 +455,9 @@ pub(super) enum Stdin {
 /// name, and one that does sets it by reading, through the same calls every reader makes.
 #[derive(Debug, Clone)]
 pub(super) struct SessionInput {
-    bytes: Vec<u8>,
+    /// Shared with whoever lent it, which keeps its own handle: the shell reads the one buffer in
+    /// place, and the lender still has the bytes if the shell never gives them back (a panic).
+    bytes: std::sync::Arc<Vec<u8>>,
     pos: usize,
     /// Nothing more will arrive: a read past the end sees end of input, as it does on a pipe.
     eof: bool,
@@ -346,7 +473,7 @@ impl Stdin {
         Self::Data { bytes, pos: 0 }
     }
 
-    pub(super) fn session(bytes: Vec<u8>, eof: bool, tty: bool) -> Self {
+    pub(super) fn session(bytes: std::sync::Arc<Vec<u8>>, eof: bool, tty: bool) -> Self {
         Self::Session(SessionInput {
             bytes,
             pos: 0,
@@ -420,24 +547,29 @@ impl Stdin {
         taken
     }
 
-    /// Everything not yet read.
-    pub(super) fn take_rest(&mut self) -> Vec<u8> {
+    /// Everything not yet read, up to `cap` bytes. The cap keeps a reader's copy of a large held
+    /// input from growing with the input: a line cannot use more than its work budget of it.
+    pub(super) fn take_rest(&mut self, cap: u64) -> Vec<u8> {
         let Some((rest, pos)) = self.unread() else {
             return Vec::new();
         };
-        let taken = rest.to_vec();
-        *pos = pos.saturating_add(taken.len());
-        self.want_more();
+        let want = rest.len().min(usize::try_from(cap).unwrap_or(usize::MAX));
+        let all = want == rest.len();
+        let taken = rest.get(..want).unwrap_or(&[]).to_vec();
+        *pos = pos.saturating_add(want);
+        if all {
+            self.want_more();
+        }
         taken
     }
 
-    /// A script piped to a bare `sh`: everything not yet read, or `None` when the input is a
-    /// terminal, which a bare `sh` reads as an interactive shell instead.
-    pub(super) fn take_script(&mut self) -> Option<Vec<u8>> {
+    /// A script piped to a bare `sh`: everything not yet read, up to `cap` bytes, or `None` when
+    /// the input is a terminal, which a bare `sh` reads as an interactive shell instead.
+    pub(super) fn take_script(&mut self, cap: u64) -> Option<Vec<u8>> {
         match self {
             Self::Terminal => None,
             Self::Session(input) if input.tty => None,
-            Self::Data { .. } | Self::Session(_) => Some(self.take_rest()),
+            Self::Data { .. } | Self::Session(_) => Some(self.take_rest(cap)),
         }
     }
 }
@@ -471,8 +603,8 @@ impl PidAlloc {
 }
 
 /// Where one of a command's descriptors goes.
-#[derive(Debug, Clone)]
-enum Sink {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Sink {
     /// The terminal, as its standard output or its standard error: a descriptor duplicated from
     /// standard error keeps writing to the error stream.
     Terminal(OutputFd),
@@ -481,39 +613,105 @@ enum Sink {
         path: String,
         append: bool,
     },
+    /// Not open: a write to it fails (`Bad file descriptor`).
+    Closed,
+}
+
+/// Descriptors a shell can hold open: 0 to 63, which is room for every one a script opens.
+pub(super) const FD_MAX: usize = 64;
+
+/// A file open for reading on a descriptor, read from where the last read stopped.
+#[derive(Debug, Clone)]
+pub(super) struct OpenInput {
+    bytes: Arc<Vec<u8>>,
+    pos: usize,
+}
+
+impl OpenInput {
+    pub(super) fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            pos: 0,
+        }
+    }
+
+    /// What has not been read.
+    pub(super) fn remaining(&self) -> Vec<u8> {
+        self.bytes.get(self.pos..).unwrap_or(&[]).to_vec()
+    }
+
+    pub(super) fn advance(&mut self, by: usize) {
+        self.pos = self.pos.saturating_add(by).min(self.bytes.len());
+    }
+}
+
+/// The descriptors a shell holds beyond the terminal's, which `exec` opens, moves and closes and
+/// which every command and every shell it starts inherits.
+#[derive(Debug, Clone)]
+pub(super) struct Fds {
+    /// Where each descriptor writes. Index 0 is unused (standard input has no sink), 1 is standard
+    /// output and 2 standard error; the rest are closed until something opens them.
+    pub out: Vec<Sink>,
+    /// The descriptors open for reading, standard input included once `exec` redirects it.
+    pub ins: BTreeMap<u16, OpenInput>,
+}
+
+impl Default for Fds {
+    fn default() -> Self {
+        Self {
+            out: (0..FD_MAX)
+                .map(|fd| match fd {
+                    0 | 1 => Sink::Terminal(OutputFd::Stdout),
+                    2 => Sink::Terminal(OutputFd::Stderr),
+                    _ => Sink::Closed,
+                })
+                .collect(),
+            ins: BTreeMap::new(),
+        }
+    }
+}
+
+impl Fds {
+    /// Whether anything differs from a fresh shell's descriptors.
+    pub(super) fn is_default(&self) -> bool {
+        self.ins.is_empty() && self.out == Self::default().out
+    }
+
+    /// Whether error output still reaches the terminal, which is where an interactive bash writes
+    /// its prompt.
+    pub(super) fn stderr_is_terminal(&self) -> bool {
+        matches!(self.out.get(2), Some(Sink::Terminal(_)))
+    }
 }
 
 /// The descriptors a command's redirections describe, opened before it runs.
 struct RedirPlan {
-    /// Index 0 is unused (standard input has no output sink); 1 is standard output, 2 standard
-    /// error, 3 to 9 only matter through a `N>&M` duplicate.
+    /// Where each descriptor writes now: the shell's own, changed by the redirections.
     sinks: Vec<Sink>,
+    /// The descriptors open for reading, standard input included.
+    ins: BTreeMap<u16, OpenInput>,
+    /// Standard input as a redirection of this command set it; `None` leaves the shell's.
     stdin: Option<Stdin>,
+    /// The descriptor standard input is read from, so what the command read moves its position.
+    reads_from: Option<u16>,
     active: bool,
 }
 
 impl RedirPlan {
     /// Where descriptor `fd` goes now.
     fn sink(&self, fd: usize) -> Sink {
-        self.sinks
-            .get(fd)
-            .cloned()
-            .unwrap_or(Sink::Terminal(OutputFd::Stdout))
+        self.sinks.get(fd).cloned().unwrap_or(Sink::Closed)
     }
 
-    fn new() -> Self {
+    /// The plan of a command that has no redirection of its own: the shell's descriptors.
+    fn from_fds(fds: &Fds) -> Self {
+        let stdin = fds.ins.get(&0).map(|input| Stdin::data(input.remaining()));
         Self {
-            sinks: (0..10)
-                .map(|fd| {
-                    Sink::Terminal(if fd == 2 {
-                        OutputFd::Stderr
-                    } else {
-                        OutputFd::Stdout
-                    })
-                })
-                .collect(),
-            stdin: None,
-            active: false,
+            sinks: fds.out.clone(),
+            ins: fds.ins.clone(),
+            reads_from: stdin.as_ref().map(|_| 0),
+            stdin,
+            active: !fds.is_default(),
         }
     }
 }
@@ -540,8 +738,23 @@ impl FakeShell {
         let base_line = u32::try_from(base).unwrap_or(u32::MAX);
         let max_depth = self.budget().limits().max_depth;
         let dialect = self.grammar();
-        let parsed =
-            super::parse::parse_unit(&text, false, max_depth, dialect, &mut self.line, base_line);
+        let none: &[Alias] = &[];
+        let aliases = if self.aliases_expand() {
+            self.frames
+                .last()
+                .map_or(none, |f| f.state.aliases.as_slice())
+        } else {
+            none
+        };
+        let parsed = super::parse::parse_unit(
+            &text,
+            false,
+            max_depth,
+            dialect,
+            &mut self.line,
+            base_line,
+            aliases,
+        );
         self.sync_budget_trace();
         if parsed.tail == Tail::NeedMore {
             if self.pending.len() > max_pending_lines || self.pending_bytes > max_pending_bytes {
@@ -556,12 +769,19 @@ impl FakeShell {
         self.pending.clear();
         self.pending_bytes = 0;
         self.note_unit(&text);
-        self.execute_unit(parsed, base_line)
+        self.execute_unit(parsed, base_line, None)
     }
 
     /// Run the items that parsed, then say what was wrong with the rest. Only items that ended on
     /// a line before the error run, as a shell that reads and runs one command at a time would.
-    pub(super) fn execute_unit(&mut self, parsed: Parsed, base_line: u32) -> CommandResult {
+    /// `text` is the script the items came from, when it is one: a non-interactive bash quotes the
+    /// line a syntax error is on.
+    pub(super) fn execute_unit(
+        &mut self,
+        parsed: Parsed,
+        base_line: u32,
+        text: Option<&str>,
+    ) -> CommandResult {
         let Parsed { mut items, tail } = parsed;
         if let Tail::Error(error) = &tail {
             items.retain(|item| item.end_line < error.line);
@@ -574,7 +794,8 @@ impl FakeShell {
                 if !result.stop_line {
                     let line = base_line.saturating_add(error.line).saturating_sub(1);
                     self.set_dash_line(line);
-                    let message = self.syntax_error_text(&error.near);
+                    let error = super::ast::SyntaxError { line, ..error };
+                    let message = self.syntax_error_text(&error, text);
                     result.append(CommandResult::stderr(2, message));
                     self.state_mut().last_status = 2;
                 }
@@ -599,44 +820,117 @@ impl FakeShell {
     }
 
     /// What the active level says about text it cannot parse.
-    fn syntax_error_text(&self, near: &Near) -> String {
+    fn syntax_error_text(&self, error: &super::ast::SyntaxError, text: Option<&str>) -> String {
+        let near = &error.near;
         match self.active_level() {
+            ShellLevel::Bash { .. } if self.bash_is_scripted() && text.is_some() => {
+                self.scripted_bash_syntax_error(error, text.unwrap_or(""))
+            }
             ShellLevel::Bash { .. } => match near {
-                Near::Token(token) => {
+                Near::Token(token) | Near::Word(token) => {
                     self.shell_error(format_args!("syntax error near unexpected token `{token}'"))
                 }
                 Near::Newline => self.shell_error("syntax error near unexpected token `newline'"),
-                Near::EndOfFile => self.shell_error("syntax error: unexpected end of file"),
+                Near::EndOfFile | Near::Message(_) | Near::Unmatched(_) => {
+                    self.shell_error("syntax error: unexpected end of file")
+                }
                 // Only dash refuses a name at parse time.
                 Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
-            ShellLevel::Dash { .. } => match near {
-                // Dash names every redirection operator alike.
-                Near::Token(token)
-                    if matches!(
-                        token.as_str(),
-                        "<" | ">" | ">>" | "<<" | "<<<" | "<&" | ">&" | "<>" | ">|"
-                    ) =>
-                {
-                    self.shell_error("Syntax error: redirection unexpected")
+            ShellLevel::Dash { .. } => {
+                // dash's `synexpect`: what was unexpected, and, where the grammar was waiting for
+                // one particular token, what that was.
+                let hint = error
+                    .expecting
+                    .map_or_else(String::new, |token| format!(" (expecting {token})"));
+                match near {
+                    // Dash names every redirection operator alike.
+                    Near::Token(token)
+                        if matches!(
+                            token.as_str(),
+                            "<" | ">" | ">>" | "<<" | "<<<" | "<&" | ">&" | "<>" | ">|"
+                        ) =>
+                    {
+                        self.shell_error(format_args!("Syntax error: redirection unexpected{hint}"))
+                    }
+                    Near::Token(token) => {
+                        self.shell_error(format_args!("Syntax error: \"{token}\" unexpected{hint}"))
+                    }
+                    Near::Word(_) => {
+                        self.shell_error(format_args!("Syntax error: word unexpected{hint}"))
+                    }
+                    Near::Newline => {
+                        self.shell_error(format_args!("Syntax error: newline unexpected{hint}"))
+                    }
+                    Near::EndOfFile | Near::Unmatched(_) => {
+                        self.shell_error(format_args!("Syntax error: end of file unexpected{hint}"))
+                    }
+                    Near::Message(message) => {
+                        self.shell_error(format_args!("Syntax error: {message}"))
+                    }
+                    Near::BadFunctionName => self.shell_error("Syntax error: Bad function name"),
                 }
-                Near::Token(token) => {
-                    self.shell_error(format_args!("Syntax error: \"{token}\" unexpected"))
-                }
-                Near::Newline => self.shell_error("Syntax error: newline unexpected"),
-                Near::EndOfFile => self.shell_error("Syntax error: end of file unexpected"),
-                Near::BadFunctionName => self.shell_error("Syntax error: Bad function name"),
-            },
+            }
             // [unverified] mksh's wording; no Android capture exists.
             ShellLevel::AndroidMksh => match near {
-                Near::Token(token) => {
+                Near::Token(token) | Near::Word(token) => {
                     self.shell_error(format_args!("syntax error: '{token}' unexpected"))
                 }
                 Near::Newline => self.shell_error("syntax error: newline unexpected"),
-                Near::EndOfFile => self.shell_error("syntax error: unexpected EOF"),
+                Near::EndOfFile | Near::Message(_) | Near::Unmatched(_) => {
+                    self.shell_error("syntax error: unexpected EOF")
+                }
                 Near::BadFunctionName => self.shell_error("syntax error: bad function name"),
             },
         }
+    }
+
+    /// bash's syntax error in a script, as Ubuntu 22.04's bash 5.1.16 words it: where the text came
+    /// from (`bash: -c: line 2:` for `-c` text, `FILE: line 2:` for a file, `bash: line 2:` for
+    /// standard input), and for a bad token the line it is on, quoted. An unfinished construct is
+    /// reported on the line after the last one.
+    fn scripted_bash_syntax_error(&self, error: &super::ast::SyntaxError, text: &str) -> String {
+        let state = self.state();
+        let name = state.argv0.as_deref().unwrap_or("bash");
+        let at = |line: usize| match state.script {
+            ScriptKind::Command => format!("{name}: -c: line {line}"),
+            ScriptKind::File => format!("{name}: line {line}"),
+            ScriptKind::Stdin => format!("{name}: line {line}"),
+        };
+        let token = match &error.near {
+            Near::Token(token) | Near::Word(token) => token.as_str(),
+            Near::Newline => "newline",
+            Near::EndOfFile | Near::Message(_) | Near::Unmatched(_) => {
+                let newlines = text.matches('\n').count();
+                let lines = if text.ends_with('\n') {
+                    newlines
+                } else {
+                    newlines.saturating_add(1)
+                };
+                // Running out inside a quote or a substitution is first said where, on the
+                // last line, and then as the end of the file one line further.
+                let matching = match error.near {
+                    Near::Unmatched(closer) => format!(
+                        "{}: unexpected EOF while looking for matching `{closer}'\n",
+                        at(lines)
+                    ),
+                    _ => String::new(),
+                };
+                return format!(
+                    "{matching}{}: syntax error: unexpected end of file\n",
+                    at(lines.saturating_add(1))
+                );
+            }
+            Near::BadFunctionName => {
+                return self.shell_error("syntax error: bad function name");
+            }
+        };
+        let line = usize::try_from(error.line).unwrap_or(usize::MAX);
+        let source = text.split('\n').nth(line.saturating_sub(1)).unwrap_or("");
+        format!(
+            "{at}: syntax error near unexpected token `{token}'\n{at}: `{source}'\n",
+            at = at(line)
+        )
     }
 
     /// Run `text` as a script in the shell level just pushed by the caller: a nested `sh -c`, a
@@ -653,11 +947,68 @@ impl FakeShell {
 
     /// Parse and run complete text in the current shell level.
     pub(super) fn run_script_text(&mut self, text: &str) -> CommandResult {
+        // A script that defines an alias is read a command at a time, since the alias is in force
+        // from the next line; any other is parsed whole.
+        if (self.aliases_expand() || (self.is_bash() && text.contains("expand_aliases")))
+            && mentions_alias(text)
+        {
+            return self.run_script_lines(text);
+        }
         let max_depth = self.budget().limits().max_depth;
         let dialect = self.grammar();
-        let parsed = super::parse::parse_unit(text, true, max_depth, dialect, &mut self.line, 1);
+        let parsed =
+            super::parse::parse_unit(text, true, max_depth, dialect, &mut self.line, 1, &[]);
         self.sync_budget_trace();
-        self.execute_unit(parsed, 1)
+        self.execute_unit(parsed, 1, Some(text))
+    }
+
+    /// Run `text` as a shell reads a script that may define aliases: each physical line joins the
+    /// lines of an unfinished construct and runs as soon as the text is complete, with the aliases
+    /// defined so far in force. The end of the text finishes whatever is left.
+    fn run_script_lines(&mut self, text: &str) -> CommandResult {
+        let max_depth = self.budget().limits().max_depth;
+        let dialect = self.grammar();
+        let mut acc = CommandResult::silent(0);
+        let mut pending: Vec<&str> = Vec::new();
+        let mut first_line: u32 = 1;
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let total = body.split('\n').count();
+        for (index, line) in body.split('\n').enumerate() {
+            pending.push(line);
+            let unit = pending.join("\n");
+            let last = index.saturating_add(1) == total;
+            let none: &[Alias] = &[];
+            let aliases = if self.aliases_expand() {
+                self.frames
+                    .last()
+                    .map_or(none, |f| f.state.aliases.as_slice())
+            } else {
+                none
+            };
+            let parsed = super::parse::parse_unit(
+                &unit,
+                last,
+                max_depth,
+                dialect,
+                &mut self.line,
+                first_line,
+                aliases,
+            );
+            self.sync_budget_trace();
+            if parsed.tail == Tail::NeedMore {
+                continue;
+            }
+            // The first text the shell cannot read ends the script.
+            let refused = !matches!(parsed.tail, Tail::Done);
+            let ran = self.execute_unit(parsed, first_line, Some(text));
+            pending.clear();
+            first_line = u32::try_from(index.saturating_add(2)).unwrap_or(u32::MAX);
+            acc.append(ran);
+            if refused || acc.stop_line || acc.flow != Flow::None {
+                break;
+            }
+        }
+        acc
     }
 
     // ---- lists ---------------------------------------------------------------------------------
@@ -685,8 +1036,9 @@ impl FakeShell {
 
     fn eval_and_or(&mut self, chain: &AndOr) -> CommandResult {
         let record = self.trace_stack.is_empty();
-        let mut acc = self.eval_segment(&chain.first, ControlOp::Seq, record);
-        for (op, pipeline) in &chain.rest {
+        let mut acc =
+            self.eval_element(&chain.first, ControlOp::Seq, record, chain.rest.is_empty());
+        for (index, (op, pipeline)) in chain.rest.iter().enumerate() {
             if acc.stop_line || acc.flow != Flow::None {
                 break;
             }
@@ -695,7 +1047,8 @@ impl FakeShell {
                 AndOrOp::Or => (ControlOp::Or, acc.status != 0),
             };
             if run {
-                let next = self.eval_segment(pipeline, control, record);
+                let last = index.saturating_add(1) == chain.rest.len();
+                let next = self.eval_element(pipeline, control, record, last);
                 acc.append(next);
             } else if record {
                 self.trace.segments.push(SegmentTrace {
@@ -710,6 +1063,35 @@ impl FakeShell {
             }
         }
         acc
+    }
+
+    /// One pipeline of an and-or chain. bash's `ERR` handler runs after the last one of the chain
+    /// fails when it is a simple command, a pipeline or a subshell (a brace group, an `if` or a
+    /// loop leaves it to the commands inside), and not for one that is negated or whose status
+    /// something tests, which is every earlier one of the chain.
+    fn eval_element(
+        &mut self,
+        pipeline: &Pipeline,
+        op: ControlOp,
+        record: bool,
+        last: bool,
+    ) -> CommandResult {
+        if !last {
+            self.state_mut().err_ignore = self.state().err_ignore.saturating_add(1);
+        }
+        let mut result = self.eval_segment(pipeline, op, record);
+        if !last {
+            self.state_mut().err_ignore = self.state().err_ignore.saturating_sub(1);
+        } else if result.status != 0
+            && !result.stop_line
+            && result.flow == Flow::None
+            && !pipeline.bang
+            && err_unit(pipeline)
+            && let Some(handler) = self.err_after(result.status)
+        {
+            result.append(handler);
+        }
+        result
     }
 
     fn eval_segment(&mut self, pipeline: &Pipeline, op: ControlOp, record: bool) -> CommandResult {
@@ -738,16 +1120,17 @@ impl FakeShell {
                 format!("[{}] {pid}\n", self.next_job),
             ));
         }
-        let copy = self.state().clone();
+        let copy = self.subshell_state();
         self.frames.push(Frame {
             kind: FrameKind::Subshell,
             state: copy,
         });
         let saved = std::mem::replace(&mut self.stdin, Stdin::data(Vec::new()));
         self.script_depth = self.script_depth.saturating_add(1);
-        let ran = self.eval_and_or(&item.and_or);
+        let mut ran = self.eval_and_or(&item.and_or);
         self.script_depth = self.script_depth.saturating_sub(1);
         self.stdin = saved;
+        self.append_exit_trap(&mut ran);
         self.frames.pop();
         let stopped = ran.stop_line;
         acc.append(ran);
@@ -804,7 +1187,14 @@ impl FakeShell {
         let count = pipeline.stages.len();
         for (index, stage) in pipeline.stages.iter().enumerate() {
             let last = index.saturating_add(1) == count;
-            let copy = self.state().clone();
+            // bash runs a simple command's `DEBUG` handler before it forks the stage, so what it
+            // prints goes to the terminal and not into the pipe.
+            if matches!(stage, Command::Simple(_))
+                && let Some(handler) = self.debug_before()
+            {
+                acc.append(handler);
+            }
+            let copy = self.subshell_state();
             self.frames.push(Frame {
                 kind: FrameKind::Subshell,
                 state: copy,
@@ -824,6 +1214,7 @@ impl FakeShell {
             if let Some(previous) = saved {
                 self.stdin = previous;
             }
+            self.append_exit_trap(&mut ran);
             self.frames.pop();
             ran.flow = Flow::None;
             let stopped = ran.stop_line;
@@ -852,8 +1243,15 @@ impl FakeShell {
             Command::Unsupported(kind) => {
                 self.trace_open(&[], ParseNode::Unsupported, HandlerId::Compound);
                 self.trace_unsupported(*kind);
-                self.trace_close(0);
-                CommandResult::silent(0)
+                // dash's expansion error ends the shell (or the script, subshell or stage).
+                let refused = *kind == super::UnsupportedKind::BadSubstitution && self.is_dash();
+                let result = if refused {
+                    self.dash_bad_substitution()
+                } else {
+                    CommandResult::silent(0)
+                };
+                self.trace_close(result.status);
+                result
             }
             compound => self.eval_compound(compound),
         }
@@ -919,6 +1317,7 @@ impl FakeShell {
                 CommandResult::silent(0)
             }
         };
+        self.settle_input(plan.reads_from);
         if let Some(previous) = saved {
             self.stdin = previous;
         }
@@ -929,8 +1328,13 @@ impl FakeShell {
         routed
     }
 
+    /// The state a `( )`, a pipeline stage, a `$( )` and a background job start from.
+    pub(super) fn subshell_state(&self) -> ShellState {
+        self.state().subshell_copy(self.is_dash())
+    }
+
     fn eval_subshell(&mut self, body: &List) -> CommandResult {
-        let copy = self.state().clone();
+        let copy = self.subshell_state();
         self.frames.push(Frame {
             kind: FrameKind::Subshell,
             state: copy,
@@ -938,9 +1342,18 @@ impl FakeShell {
         self.script_depth = self.script_depth.saturating_add(1);
         let mut result = self.eval_list(body);
         self.script_depth = self.script_depth.saturating_sub(1);
+        self.append_exit_trap(&mut result);
         self.frames.pop();
         // `exit`, `break` and `continue` end at the subshell's edge.
         result.flow = Flow::None;
+        result
+    }
+
+    /// A condition: the status of what it runs is tested, so `ERR` does not follow a failure in it.
+    fn eval_tested(&mut self, list: &List) -> CommandResult {
+        self.state_mut().err_ignore = self.state().err_ignore.saturating_add(1);
+        let result = self.eval_list(list);
+        self.state_mut().err_ignore = self.state().err_ignore.saturating_sub(1);
         result
     }
 
@@ -951,7 +1364,7 @@ impl FakeShell {
         elifs: &[(List, List)],
         els: Option<&List>,
     ) -> CommandResult {
-        let mut acc = self.eval_list(cond);
+        let mut acc = self.eval_tested(cond);
         if acc.stop_line || acc.flow != Flow::None {
             return acc;
         }
@@ -961,7 +1374,7 @@ impl FakeShell {
             return acc;
         }
         for (test, body) in elifs {
-            let tested = self.eval_list(test);
+            let tested = self.eval_tested(test);
             acc.append(tested);
             if acc.stop_line || acc.flow != Flow::None {
                 return acc;
@@ -984,6 +1397,15 @@ impl FakeShell {
 
     /// `case WORD in ... esac`: the first arm with a matching pattern runs; no match is status 0.
     fn eval_case(&mut self, word: &Word, arms: &[CaseArm]) -> CommandResult {
+        let Some(mut handler) = self.debug_before() else {
+            return self.eval_case_arms(word, arms);
+        };
+        let ran = self.eval_case_arms(word, arms);
+        handler.append(ran);
+        handler
+    }
+
+    fn eval_case_arms(&mut self, word: &Word, arms: &[CaseArm]) -> CommandResult {
         let subject = match self.expand_scalar(word) {
             Ok(subject) => subject,
             Err(error) => return self.expand_failure(error),
@@ -1016,6 +1438,9 @@ impl FakeShell {
                 acc.status = 1;
                 break;
             }
+            if let Some(handler) = self.debug_before() {
+                acc.append(handler);
+            }
             self.assign_var(var, item);
             let ran = self.eval_list(body);
             acc.append(ran);
@@ -1037,7 +1462,7 @@ impl FakeShell {
                 body_status = 1;
                 break;
             }
-            let tested = self.eval_list(cond);
+            let tested = self.eval_tested(cond);
             acc.append(tested);
             if !loop_continues(&mut acc) {
                 body_status = acc.status;
@@ -1066,11 +1491,17 @@ impl FakeShell {
         let outer_stderr = std::mem::take(&mut self.deferred_stderr);
         let outer_subst = self.last_subst_status.take();
         self.set_dash_line(simple.line);
+        self.state_mut().line = simple.line;
+        // bash's `DEBUG` handler runs first, and what it prints comes first.
+        let debug = self.debug_before();
         let ran = self.simple_inner(simple);
         let produced = std::mem::replace(&mut self.deferred_stderr, outer_stderr);
         self.last_subst_status = outer_subst;
         // What the expansions wrote to standard error came before the command itself.
         let mut result = CommandResult::silent(ran.status);
+        if let Some(handler) = debug {
+            result.append(handler);
+        }
         for segment in produced {
             result.append(CommandResult::one(segment.fd, 0, segment.bytes));
         }
@@ -1105,10 +1536,27 @@ impl FakeShell {
             let resolved = self.resolve_handler(&refs);
             self.trace_set(&argv, ParseNode::Simple, resolved);
         }
+        // `exec` with no command changes the shell's own descriptors.
+        let exec_only = function.is_none()
+            && refs.first() == Some(&"exec")
+            && !self.state().functions.contains_key("exec")
+            && !self.exec_has_command(&refs);
         let mut plan = match self.open_redirs(&simple.redirs) {
             Ok(plan) => plan,
-            Err(refused) => return refused,
+            Err(mut refused) => {
+                // dash ends the shell when a redirection of its special builtin fails.
+                if exec_only && self.is_dash() {
+                    self.end_process(&mut refused);
+                }
+                return refused;
+            }
         };
+        if exec_only {
+            if let Err(usage) = self.exec_args_check(&refs) {
+                return usage;
+            }
+            return self.exec_redirections(plan);
+        }
         let mut assigns: Vec<(String, String)> = Vec::new();
         for assign in &simple.assigns {
             match self.expand_scalar(&assign.value) {
@@ -1166,6 +1614,7 @@ impl FakeShell {
         if !self.charge_work(len_u64(result.bytes().len())) {
             result.stop_line = true;
         }
+        self.settle_input(plan.reads_from);
         if let Some(previous) = stdin {
             self.stdin = previous;
         }
@@ -1179,7 +1628,14 @@ impl FakeShell {
                 }
             }
         }
-        let writer = refs.first().map_or("sh", |arg| command_basename(arg));
+        // A program started by path names itself by it in its own errors.
+        let writer = refs.first().map_or("sh", |arg| {
+            if arg.contains('/') {
+                arg
+            } else {
+                command_basename(arg)
+            }
+        });
         // Routed before the mark goes back, so a file this command's output lands in is known to
         // hold what it read from the session input.
         let routed = self.route(result, &plan, writer, typed);
@@ -1196,11 +1652,45 @@ impl FakeShell {
         }
     }
 
+    /// `exec` with redirections only: they become the shell's own descriptors.
+    fn exec_redirections(&mut self, mut plan: RedirPlan) -> CommandResult {
+        // `exec <FILE` at the terminal: the shell goes on reading commands, from the file.
+        if plan.stdin.is_some() && plan.reads_from.is_none() && self.exec_reads_commands() {
+            let bytes = plan
+                .ins
+                .remove(&0)
+                .map(|input| input.remaining())
+                .unwrap_or_default();
+            self.commit_descriptors(plan.sinks, plan.ins);
+            return self.exec_input_script(&bytes);
+        }
+        self.commit_descriptors(plan.sinks, plan.ins);
+        CommandResult::silent(0)
+    }
+
+    /// A command that read standard input from descriptor `fd` moves that descriptor's position by
+    /// what it read.
+    pub(super) fn settle_input(&mut self, fd: Option<u16>) {
+        let Some(fd) = fd else { return };
+        let used = match &self.stdin {
+            Stdin::Data { pos, .. } => *pos,
+            _ => return,
+        };
+        if let Some(open) = self.state_mut().fds.ins.get_mut(&fd) {
+            open.advance(used);
+        }
+    }
+
     /// What an expansion that failed leaves: its own message and status 1, or, for a refusal by
     /// the depth cap or the allowance, a bounded silent failure.
     pub(super) fn expand_failure(&mut self, error: ExpandError) -> CommandResult {
         let mut result = match error {
             ExpandError::Message(message) => CommandResult::stderr(1, message),
+            ExpandError::Fatal(message) => {
+                let mut fatal = CommandResult::stderr(2, message);
+                self.end_process(&mut fatal);
+                fatal
+            }
             ExpandError::Refused => CommandResult::silent(1),
         };
         if self.line.exhausted() {
@@ -1214,8 +1704,8 @@ impl FakeShell {
     /// Open every redirection in order. The first that fails prints the shell's own error and the
     /// command does not run.
     fn open_redirs(&mut self, redirs: &[Redir]) -> Result<RedirPlan, CommandResult> {
-        let mut plan = RedirPlan::new();
-        plan.active = !redirs.is_empty();
+        let mut plan = RedirPlan::from_fds(&self.state().fds);
+        plan.active |= !redirs.is_empty();
         for redir in redirs {
             if !self.charge_work(1) {
                 let mut stopped = CommandResult::silent(1);
@@ -1228,7 +1718,7 @@ impl FakeShell {
             };
             let fd = redir.fd.unwrap_or(default_fd);
             let index = usize::from(fd);
-            if index > 9 {
+            if index >= FD_MAX {
                 continue;
             }
             match (&redir.op, &redir.target) {
@@ -1241,15 +1731,21 @@ impl FakeShell {
                     } else {
                         text.clone()
                     };
-                    plan.stdin = Some(Stdin::data(body.into_bytes()));
+                    install_input(&mut plan, fd, body.into_bytes());
                 }
                 (RedirOp::Out | RedirOp::Append | RedirOp::Clobber, RedirTarget::Word(word)) => {
                     let text = self.redirect_target(word)?;
                     let append = redir.op == RedirOp::Append;
-                    let sink = self.open_output(&text, append, &plan)?;
+                    let natural = if index == 2 {
+                        OutputFd::Stderr
+                    } else {
+                        OutputFd::Stdout
+                    };
+                    let sink = self.open_output(&text, append, &plan, natural)?;
                     if let Some(slot) = plan.sinks.get_mut(index) {
                         *slot = sink;
                     }
+                    plan.ins.remove(&fd);
                 }
                 (RedirOp::DupOut | RedirOp::DupIn, RedirTarget::Word(word)) => {
                     let text = match self.expand_scalar(word) {
@@ -1260,11 +1756,24 @@ impl FakeShell {
                 }
                 (RedirOp::In, RedirTarget::Word(word)) => {
                     let text = self.redirect_target(word)?;
-                    plan.stdin = Some(self.open_input(&text, false)?);
+                    let (bytes, _) = self.open_input(&text, false)?;
+                    install_input(&mut plan, fd, bytes);
+                    if index != 0
+                        && let Some(slot) = plan.sinks.get_mut(index)
+                    {
+                        *slot = Sink::Closed;
+                    }
                 }
                 (RedirOp::ReadWrite, RedirTarget::Word(word)) => {
                     let text = self.redirect_target(word)?;
-                    plan.stdin = Some(self.open_input(&text, true)?);
+                    let (bytes, path) = self.open_input(&text, true)?;
+                    install_input(&mut plan, fd, bytes);
+                    if index != 0
+                        && let Some(slot) = plan.sinks.get_mut(index)
+                    {
+                        // Written at the end: the file is not rewound.
+                        *slot = Sink::File { path, append: true };
+                    }
                 }
                 _ => {}
             }
@@ -1297,12 +1806,15 @@ impl FakeShell {
         text: &str,
         append: bool,
         plan: &RedirPlan,
+        natural: OutputFd,
     ) -> Result<Sink, CommandResult> {
         let resolved = self.resolve_logical(text);
         match resolved.as_str() {
             "/dev/null" => return Ok(Sink::Discard),
             "/dev/stdout" | "/dev/fd/1" => return Ok(plan.sink(1)),
             "/dev/stderr" | "/dev/fd/2" => return Ok(plan.sink(2)),
+            // The session's terminal, when it has one.
+            "/dev/tty" if self.tty_input => return Ok(Sink::Terminal(natural)),
             _ => {}
         }
         let opened = if append && self.fs.file_exists(&resolved) {
@@ -1320,7 +1832,7 @@ impl FakeShell {
     }
 
     /// `< file` and `<> file`: the whole file, read now.
-    fn open_input(&mut self, text: &str, create: bool) -> Result<Stdin, CommandResult> {
+    fn open_input(&mut self, text: &str, create: bool) -> Result<(Vec<u8>, String), CommandResult> {
         // Opened by the shell, before any command it starts has replaced it: `cat < /proc/self/exe`
         // reads the shell's own binary, where `cat /proc/self/exe` reads cat's.
         let reader = self.shell_reader();
@@ -1338,11 +1850,11 @@ impl FakeShell {
                     stopped.stop_line = true;
                     return Err(stopped);
                 }
-                Ok(Stdin::data(bytes))
+                Ok((bytes, resolved))
             }
             Err(FsError::IsADirectory) => {
                 // Opening a directory succeeds; reading it fails, which the reader reports.
-                Ok(Stdin::data(Vec::new()))
+                Ok((Vec::new(), resolved))
             }
             Err(_) => Err(self.input_open_error(text)),
         }
@@ -1356,35 +1868,99 @@ impl FakeShell {
         text: &str,
         output: bool,
     ) -> Result<(), CommandResult> {
+        // dash takes a descriptor number of one digit, or `-`, after `>&` and `<&`, and refuses
+        // anything else (bash opens a name as a file).
+        if self.is_dash()
+            && text != "-"
+            && !(text.len() == 1 && text.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(self.dash_fatal(2, "Syntax error: Bad fd number"));
+        }
+        let fd = u16::try_from(index).unwrap_or(u16::MAX);
         if text == "-" {
+            // `N>&-` and `N<&-` both close the descriptor.
             if let Some(slot) = plan.sinks.get_mut(index) {
-                *slot = Sink::Discard;
+                *slot = Sink::Closed;
+            }
+            plan.ins.remove(&fd);
+            if index == 0 {
+                plan.stdin = Some(Stdin::data(Vec::new()));
+                plan.reads_from = None;
             }
             return Ok(());
         }
         if let Ok(from) = text.parse::<usize>() {
+            let from_fd = u16::try_from(from).unwrap_or(u16::MAX);
             if output {
+                // The descriptor copied must be open.
+                if from >= FD_MAX
+                    || (plan.sink(from) == Sink::Closed && !plan.ins.contains_key(&from_fd))
+                {
+                    return Err(self.bad_descriptor(text));
+                }
                 let dest = plan.sink(from);
                 if let Some(slot) = plan.sinks.get_mut(index) {
                     *slot = dest;
+                }
+                if let Some(input) = plan.ins.get(&from_fd).cloned() {
+                    plan.ins.insert(fd, input);
+                } else {
+                    plan.ins.remove(&fd);
+                }
+            } else if from != 0 {
+                let Some(input) = plan.ins.get(&from_fd).cloned() else {
+                    return Err(self.bad_descriptor(text));
+                };
+                if index == 0 {
+                    plan.stdin = Some(Stdin::data(input.remaining()));
+                    plan.reads_from = Some(from_fd);
+                } else {
+                    plan.ins.insert(fd, input);
                 }
             }
             return Ok(());
         }
         if output && index == 1 {
             // `>&file` is `&>file`.
-            let sink = self.open_output(text, false, plan)?;
+            let sink = self.open_output(text, false, plan, OutputFd::Stdout)?;
             for stream in [1, 2] {
                 if let Some(slot) = plan.sinks.get_mut(stream) {
                     *slot = sink.clone();
                 }
             }
+        } else if self.is_bash() {
+            // Only `>&word` on standard output is a file; anywhere else the word must be a
+            // descriptor.
+            return Err(CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("{text}: ambiguous redirect")),
+            ));
         }
         Ok(())
     }
 
+    /// What the shell says of a descriptor a redirection copies that is not open.
+    fn bad_descriptor(&self, text: &str) -> CommandResult {
+        CommandResult::stderr(
+            if self.is_dash() { 2 } else { 1 },
+            self.shell_error(format_args!("{text}: Bad file descriptor")),
+        )
+    }
+
     /// What the shell itself says when it cannot open a redirection target for writing.
     fn redirect_open_error(&self, text: &str, error: &FsError) -> CommandResult {
+        if self.is_dash() {
+            // dash's own words, and its status for a redirection it could not make.
+            let reason = match error {
+                FsError::ReadOnly => "Read-only file system",
+                FsError::IsADirectory => "Is a directory",
+                other => super::budget_refusal_text(other).unwrap_or("Directory nonexistent"),
+            };
+            return CommandResult::stderr(
+                2,
+                self.shell_error(format_args!("cannot create {text}: {reason}")),
+            );
+        }
         let reason = match error {
             FsError::ReadOnly => "Read-only file system",
             FsError::IsADirectory => "Is a directory",
@@ -1424,6 +2000,8 @@ impl FakeShell {
         }
         let mut kept: Vec<OutputSegment> = Vec::new();
         let mut writes: Vec<(String, bool, Vec<u8>)> = Vec::new();
+        // A command that writes to a descriptor that is not open finds out when it writes.
+        let mut unwritable = false;
         for segment in &result.output {
             let index = match segment.fd {
                 OutputFd::Stdout => 1,
@@ -1431,6 +2009,7 @@ impl FakeShell {
             };
             match plan.sink(index) {
                 Sink::Discard => {}
+                Sink::Closed => unwritable = true,
                 Sink::File { path, append } => {
                     match writes.iter_mut().find(|(p, _, _)| *p == path) {
                         Some((_, _, buf)) => buf.extend_from_slice(&segment.bytes),
@@ -1485,10 +2064,32 @@ impl FakeShell {
                 format!("{writer}: write error: {reason}\n"),
             ));
         }
+        if unwritable && matches!(plan.sink(2), Sink::Terminal(_)) {
+            terminal.append(CommandResult::stderr(1, self.closed_write_error(writer)));
+        }
         terminal.close_session = result.close_session;
         terminal.stop_line = result.stop_line;
         terminal.flow = result.flow;
         terminal
+    }
+
+    /// What a command says when the descriptor it writes to is closed: a builtin in the words of
+    /// its shell, a program in its own (`coreutils`' `write error`).
+    fn closed_write_error(&self, writer: &str) -> String {
+        let builtin = !writer.contains('/')
+            && super::registry::Registry::builtin().kind(writer, self)
+                == Some(super::registry::CommandKind::Builtin);
+        match (builtin, self.is_dash()) {
+            (true, true) => self.shell_error(format_args!("{writer}: {writer}: I/O error")),
+            (true, false) => {
+                self.shell_error(format_args!("{writer}: write error: Bad file descriptor"))
+            }
+            // cat names the stream it could not write; most coreutils say `write error`.
+            (false, _) if writer == "cat" || writer.ends_with("/cat") => {
+                format!("{writer}: standard output: Bad file descriptor\n")
+            }
+            (false, _) => format!("{writer}: write error: Bad file descriptor\n"),
+        }
     }
 
     // ---- shell level bookkeeping ---------------------------------------------------------------
@@ -1696,6 +2297,14 @@ impl FakeShell {
                 crashed
             }
         }
+    }
+
+    /// dash's refusal of a `${...}` it cannot read: no `Syntax error:` prefix, status 2, and the
+    /// shell process ends.
+    fn dash_bad_substitution(&mut self) -> CommandResult {
+        let mut result = CommandResult::stderr(2, self.shell_error("Bad substitution"));
+        self.end_process(&mut result);
+        result
     }
 
     /// An error dash makes fatal (its `sh_error`, which every special builtin's complaint is):

@@ -116,6 +116,56 @@ fn the_rehearsal_runs_the_options_the_backup_page_documents() {
     check("tar (extract)", extract, &[TAR_EXTRACT, "-C"]);
 }
 
+/// The shipped backup script (`deploy/backup.sh`) archives exactly the paths the page's `tar`
+/// command names and dumps with the page's `pg_dump` options, so what the rehearsal proves about
+/// the documented procedure holds for the nightly job too. A path added to one and not the other
+/// would leave the job saving something the page's restore does not expect, or missing something
+/// it does. Needs no PostgreSQL, so it is not ignored.
+#[test]
+fn the_backup_script_archives_and_dumps_what_the_backup_page_documents() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let doc = fs::read_to_string(root.join(BACKUP_DOC)).expect("backup page");
+    let script = fs::read_to_string(root.join("deploy/backup.sh")).expect("deploy/backup.sh");
+
+    let documented: BTreeSet<String> = doc_commands::tar_create_inputs(&doc)
+        .into_iter()
+        .flatten()
+        .collect();
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("STATE_PATHS=("))
+        .expect("backup.sh declares STATE_PATHS");
+    let scripted: BTreeSet<String> = line
+        .trim_start_matches("STATE_PATHS=(")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .map(|p| format!("/{p}"))
+        .collect();
+    assert_eq!(
+        scripted, documented,
+        "deploy/backup.sh's STATE_PATHS and {BACKUP_DOC}'s tar inputs must be the same paths"
+    );
+
+    let dump: Vec<&str> = script
+        .lines()
+        .find(|l| l.contains("pg-exec pg_dump"))
+        .expect("backup.sh runs pg_dump")
+        .split_whitespace()
+        .skip_while(|w| *w != "pg_dump")
+        .skip(1)
+        .collect();
+    let scripted: BTreeSet<String> = dump
+        .iter()
+        .filter(|w| w.starts_with('-'))
+        .map(|o| option_key(o))
+        .collect();
+    let expected: BTreeSet<String> = [PG_DUMP_FORMAT, "--file"]
+        .iter()
+        .map(|o| option_key(o))
+        .collect();
+    assert_eq!(scripted, expected, "backup.sh's pg_dump options: {dump:?}");
+}
+
 /// An option as the comparison sees it. A long option is its name, except `--format`, whose value
 /// is the point. A short group is its letters as a set (`-czf` and `-zcf` agree), but only when any
 /// value-taking letter ends the group: `-xfpz` makes `pz` the archive name, so it is kept as written

@@ -16,13 +16,18 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
+use sensor_framework::session_memory::{self, AccountingAlloc};
 use sensor_framework::{
     Arrival, CaptureMemoryBudget, CommandEventConfig, CommandEventConfigError, CommandEventGate,
     ConnectionBounds, EnvError, EventEmitter, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
     strict_env_var,
 };
 use sensor_ssh::hostkey::HostKey;
-use sensor_ssh::server::DEFAULT_CAPTURE_BUDGET_BYTES;
+use sensor_ssh::server::{DEFAULT_CAPTURE_BUDGET_BYTES, SESSION_MEMORY_POOL_BYTES};
+
+/// Every allocation is charged to the session it was made in (`session_memory`).
+#[global_allocator]
+static ALLOCATOR: AccountingAlloc = AccountingAlloc;
 
 const ENV_BIND: &str = "PROPOLIS_SSH_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_SSH_WAN_MAP";
@@ -74,13 +79,18 @@ const DEFAULT_HOST_KEY_PATH: &str = "/var/lib/propolis/ssh/host_key";
 /// keeps the outbox manifest well-formed anyway.
 const DEFAULT_COLLECTOR_ID: &str = "local";
 
-// Deliberately identical to sensor-telnet's defaults. Both are unauthenticated, internet-facing
-// TCP honeypots with the same exposure, so two different sets of numbers would be a difference
-// with no reason behind it - and the reason each bound exists is the same for both.
+// Identical to sensor-telnet's defaults except the capture limit. Both are unauthenticated,
+// internet-facing TCP honeypots with the same exposure, so two different sets of numbers would be a
+// difference with no reason behind it - and the reason each bound exists is the same for both.
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
-const DEFAULT_MAX_CAPTURED_BYTES: u64 = 1_000_000;
+/// The per-upload capture limit is the spool's per-file cap, not a number of its own: a payload
+/// streamed over the shell or an exec's stdin is cut at exactly the point the spool would refuse
+/// it, where SCP and SFTP uploads already are. At 1,000,000 a 6.6 MB Go worm was cut at a hash no
+/// reputation service knew. What the larger default costs in memory is bounded by the capture and
+/// output budgets, not by this number (docs/operations/capacity-planning.md).
+const DEFAULT_MAX_CAPTURED_BYTES: u64 = sensor_ssh::server::SPOOL_MAX_FILE_BYTES;
 const DEFAULT_MAX_CONCURRENT: u32 = 256;
 
 #[derive(Debug, Clone)]
@@ -308,7 +318,12 @@ fn parse_positive_u32(
     Ok(value)
 }
 
-#[tokio::main]
+// Two workers, not one per core: the unit runs under `CPUQuota=75%`, so more threads add no
+// throughput, and every worker can be inside a shell line at once, each with a line's working
+// copies (about 21 MB) outside any budget. The worst-case sum in
+// docs/operations/capacity-planning.md and `tests/budget_product_test.rs` counts exactly this
+// many.
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     sensor_framework::init_logging();
 
@@ -319,6 +334,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Every admitted session must fit in the session memory pool at its floor.
+    if let Err(e) =
+        session_memory::configure(SESSION_MEMORY_POOL_BYTES, config.bounds.max_concurrent)
+    {
+        tracing::error!(error = %e, "sensor-ssh: invalid configuration; refusing to start");
+        std::process::exit(1);
+    }
+    tokio::spawn(session_memory::watchdog());
 
     // Load or generate the host key so the honeypot does not fingerprint itself as freshly
     // minted on every restart (design doc's "Host key").
@@ -460,6 +484,21 @@ mod tests {
         let spool_dir = PathBuf::from("/custom/spool");
         let outbox_dir = resolve_outbox_dir(&spool_dir, None);
         assert_eq!(outbox_dir, PathBuf::from("/custom/spool/outbox"));
+    }
+
+    #[test]
+    fn the_capture_limit_defaults_to_the_spool_cap_and_rejects_zero_or_garbage() {
+        let parse = |raw: Option<&str>| {
+            parse_positive_u64(raw, DEFAULT_MAX_CAPTURED_BYTES, ENV_MAX_CAPTURED_BYTES)
+        };
+        assert_eq!(parse(None).unwrap(), 10_000_000);
+        assert_eq!(parse(Some("1000000")).unwrap(), 1_000_000);
+        for bad in ["0", "-1", "ten", ""] {
+            assert!(
+                matches!(parse(Some(bad)), Err(ConfigError::InvalidBound { .. })),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

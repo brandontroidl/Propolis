@@ -149,6 +149,9 @@ pub struct HeldInput {
     command: String,
     reason: &'static str,
     captures: StdinCaptures,
+    /// The body's bytes while the shell reads them in place. This handle keeps them reachable if
+    /// the line panics, so `Drop` can still record what was captured.
+    lent: Option<std::sync::Arc<Vec<u8>>>,
     /// Recorded already, so `Drop` has nothing left to do.
     recorded: bool,
 }
@@ -174,7 +177,27 @@ impl HeldInput {
             command: shell.awaiting_command().unwrap_or_default().to_string(),
             reason,
             captures: captures.clone(),
+            lent: None,
             recorded: false,
+        }
+    }
+
+    /// Hand the body's bytes to the shell to read in place. They stay charged to the body's
+    /// reservations, and this input keeps a handle to them until [`Self::take_back`].
+    fn lend(&mut self) -> std::sync::Arc<Vec<u8>> {
+        let bytes = std::sync::Arc::new(self.body.lend_bytes());
+        self.lent = Some(bytes.clone());
+        bytes
+    }
+
+    /// Put lent bytes back into the body. Normally the shell has let go of its handle and this is
+    /// a move; if it still holds one (the line panicked and is being unwound) the bytes are copied
+    /// so that what was captured is still recorded.
+    fn take_back(&mut self) {
+        if let Some(bytes) = self.lent.take() {
+            self.body.restore_bytes(
+                std::sync::Arc::try_unwrap(bytes).unwrap_or_else(|shared| shared.as_ref().clone()),
+            );
         }
     }
 
@@ -327,7 +350,11 @@ impl HeldInput {
     /// Run the held line on the input it got and record that input as evidence. Returns what the
     /// line printed, for the caller to send.
     pub fn finish(mut self, shell: &mut FakeShell, end: HeldEnd) -> CommandResult {
-        let result = shell.finish_line(self.body.as_slice(), end.input_end());
+        // Lent, not copied: the shell reads the one buffer, which stays charged to this body's
+        // reservations until it comes back.
+        let lent = self.lend();
+        let result = shell.finish_line_shared(lent, end.input_end());
+        self.take_back();
         let destination = shell.input_destination().map(str::to_string);
         self.record(end.upload_end(), destination);
         result
@@ -343,6 +370,8 @@ impl HeldInput {
         if std::mem::replace(&mut self.recorded, true) {
             return;
         }
+        // Bytes still lent here mean the line never gave them back: record them, not an empty body.
+        self.take_back();
         let body = std::mem::replace(&mut self.body, CaptureBody::unbudgeted());
         self.captures.record(Consumed {
             body,
@@ -927,6 +956,38 @@ mod tests {
             events[0]["metadata"]["destination"],
             serde_json::Value::Null
         );
+    }
+
+    /// While the shell reads the input in place, the body is empty and the bytes are in the shell's
+    /// hands. If the line panics, the input is dropped by the unwind with the shell's handle still
+    /// alive; what it captured must still be recorded, not an empty body (which records nothing).
+    #[tokio::test]
+    async fn a_line_that_panics_still_leaves_what_was_captured_to_be_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = FakeShell::exec(FakeFs::new(), ctx());
+        assert!(matches!(
+            shell.start_line("cat > x").0,
+            LineStep::AwaitingInput
+        ));
+        let mut input = HeldInput::new(&shell, InputMode::Pipe, &captures, "exec_stdin", 1 << 20);
+        input.feed(b"captured before the panic");
+        // What `finish` has done when the line starts: the bytes are lent, and the line's handle
+        // is still alive when the unwind reaches the input.
+        let shells_handle = input.lend();
+        assert!(
+            input.is_empty(),
+            "the body is empty while the bytes are lent"
+        );
+        drop(input);
+        drop(shells_handle);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["size"], 25);
+        assert_eq!(events[0]["metadata"]["end_reason"], "session_cancelled");
     }
 
     /// A downloader as an echo loader sends it: an x86_64 ELF header (class, byte order and

@@ -1,0 +1,274 @@
+# Aliases in an interactive login bash on Ubuntu 22.04. Definition, the listing format (sorted by
+# name, `alias NAME='VALUE'`, `--` before a name that starts with `-`), the refusals (a name with a
+# blank, a quote, `$` or `/` is `invalid alias name`; `-x` is `invalid option` with a usage line),
+# expansion at command position (after `;`, `&&`, `|`, `(`, `then`, `do`, an assignment and a
+# redirection, never in a pattern or after a quote), the trailing blank that lets the next word be
+# an alias, a value that holds an operator, a quote or a here-document, a name that is not expanded
+# inside its own value, and `type` and `command -v`. An alias takes effect from the next line, so
+# the lines that define and use one are separate. Each reply was produced by
+# `bash --noprofile --norc --noediting -i` started as a login shell (`exec -a -bash`) in the
+# localhost/propolis-survey-ref:jammy container (bash 5.1.16), run with `--network none`, PS1 and
+# PS2 set to markers and these lines fed one at a time on standard input.
+# source: ubuntu:22.04 container run of bash 5.1.16 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ alias
+$ alias ll='ls -l'
+$ alias
+> alias ll='ls -l'
+$ alias ll
+> alias ll='ls -l'
+$ alias nope
+> -bash: alias: nope: not found
+$ echo $?
+> 1
+$ alias a=b c=d
+$ alias -p
+> alias a='b'
+> alias c='d'
+> alias ll='ls -l'
+$ alias 'x y=z'
+> -bash: alias: `x y': invalid alias name
+$ echo $?
+> 1
+$ alias =x
+> -bash: alias: =x: not found
+$ alias a b=c
+> alias a='b'
+$ echo $?
+> 0
+$ unalias nope
+> -bash: unalias: nope: not found
+$ echo $?
+> 1
+$ unalias
+> unalias: usage: unalias [-a] name [name ...]
+$ echo $?
+> 2
+$ unalias -a
+$ alias
+$ alias x='echo hi'
+$ x
+> hi
+$ alias e=echo
+$ e hello
+> hello
+$ alias w=world
+$ e w
+> w
+$ alias e='echo '
+$ e w w
+> world w
+$ type x
+> x is aliased to `echo hi'
+$ command -v x
+> alias x='echo hi'
+$ type -t x
+> alias
+$ alias -x
+> -bash: alias: -x: invalid option
+> alias: usage: alias [-p] [name[=value] ... ]
+$ echo $?
+> 2
+$ unalias -x
+> -bash: unalias: -x: invalid option
+> unalias: usage: unalias [-a] name [name ...]
+$ echo $?
+> 2
+$ alias -- -x=y
+$ alias
+> alias -- -x='y'
+> alias e='echo '
+> alias w='world'
+> alias x='echo hi'
+$ unalias -a
+$ alias q='it'"'"'s'
+$ alias q
+> alias q='it'\''s'
+$ alias a=
+$ alias a
+> alias a=''
+$ alias a/b=1
+> -bash: alias: `a/b': invalid alias name
+$ alias 'a$b=1'
+> -bash: alias: `a$b': invalid alias name
+$ alias 'a"b=1'
+> -bash: alias: `a"b': invalid alias name
+$ alias 'a;b=1'
+> -bash: alias: `a;b': invalid alias name
+$ alias 'a!b=1' 'a-b=1' 'a.b=1' 'a#b=1' 'a~b=1' 'a?b=1' 'a%b=1' 'a:b=1' 'a,b=1' 'a+b=1' 'a@b=1' 'a^b=1' 'a*b=1'
+$ alias
+> alias a=''
+> alias a!b='1'
+> alias a#b='1'
+> alias a%b='1'
+> alias a*b='1'
+> alias a+b='1'
+> alias a,b='1'
+> alias a-b='1'
+> alias a.b='1'
+> alias a:b='1'
+> alias a?b='1'
+> alias a@b='1'
+> alias a^b='1'
+> alias a~b='1'
+> alias q='it'\''s'
+$ unalias -a
+$ alias B=1 a=2 Z=3 _u=4 9n=5
+$ alias
+> alias 9n='5'
+> alias B='1'
+> alias Z='3'
+> alias _u='4'
+> alias a='2'
+$ unalias a nosuch B
+> -bash: unalias: nosuch: not found
+$ alias
+> alias 9n='5'
+> alias Z='3'
+> alias _u='4'
+$ unalias -a nosuch
+$ alias
+$ alias -p v1=x
+$ alias v1
+> -bash: alias: v1: not found
+$ alias v1=y v1
+> alias v1='y'
+$ alias -p -p
+> alias v1='y'
+$ alias -p v2
+> alias v1='y'
+> -bash: alias: v2: not found
+$ alias v3='$HOME "q" \\ `x`'
+$ alias v3
+> alias v3='$HOME "q" \\ `x`'
+$ unalias -a
+$ alias t='printf "%s\n"'
+$ t a b
+> a
+> b
+$ true && t one
+> one
+$ (t two)
+> two
+$ { t three; }
+> three
+$ if true; then t four; fi
+> four
+$ for i in 1; do t five; done
+> five
+$ FOO=1 t six
+> six
+$ > /dev/null t seven
+$ x=y t eight
+> eight
+$ alias nn=echo
+$ case a in a) nn inmatch;; esac
+> inmatch
+$ case nn in nn) nn pat;; esac
+> pat
+$ case x in
+$ x) nn nl;;
+$ esac
+> nl
+$ for nn in nn; do nn loop; done
+> loop
+$ nn=1 nn assign
+> assign
+$ 2>&1 nn redir
+> redir
+$ (nn paren; nn paren2)
+> paren
+> paren2
+$ { nn brace; }
+> brace
+$ x() { nn infn; }
+$ alias nn='echo NN'
+$ x
+> infn
+$ nn z
+> NN z
+$ alias zz=nn
+$ zz zz
+> NN zz
+$ a=1 b=2 zz 3
+> NN 3
+$ if nn y; then nn then; fi
+> NN y
+> NN then
+$ echo $(echo a; nn sub)
+> a NN sub
+$ echo `nn back`
+> NN back
+$ { nn a; nn b; } | nn c
+> NN c
+$ alias pp='nn P |'
+$ pp cat
+> NN P
+$ unalias -a
+$ alias t7='echo seven ;'
+$ t7 echo eight
+> seven
+> eight
+$ alias t8='cat <<EOF'
+$ t8
+$ body line
+$ EOF
+> body line
+$ alias t4="echo '"
+$ t4 four'
+>  four
+$ alias t6='(echo six'
+$ t6 )
+> six
+$ alias k='echo K; echo L'
+$ k
+> K
+> L
+$ alias m='echo M |'
+$ m cat
+> M
+$ alias s1='echo one;' s2='echo two'
+$ s1 s2
+> one
+> two
+$ alias f1='f2'
+$ alias f2='f3 x'
+$ alias f3='echo f3'
+$ f1
+> f3 x
+$ alias c1='case'
+$ c1 a in a) echo caseA;; esac
+> caseA
+$ alias l1=ls l2='l1 -d'
+$ l2 /
+> /
+$ alias l1='echo L1 '
+$ alias l3='l1 l2'
+$ l3 l1
+> L1 echo L1 -d l1
+$ unalias -a
+$ alias ee='echo '
+$ alias aa=AAA
+$ ee aa aa
+> AAA aa
+$ alias ls='ls -d'
+$ ls /
+> /
+$ alias ls
+> alias ls='ls -d'
+$ alias hi='echo hello'
+$ f() { hi; }
+$ alias hi='echo hello2'
+$ f
+> hello
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo hello
+> }
+$ alias un='unalias -a'
+$ un
+$ alias

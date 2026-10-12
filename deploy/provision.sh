@@ -96,6 +96,18 @@ run usermod -p '*' propolis-watch
 # the units' journal with --journal is an opt-in step in docs/operations/live-watch.md.
 run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis-watch
 
+# propolis-backup-pull: the account the off-host copy logs into, with a key whose forced command
+# is deploy/backup-serve.sh (list and fetch ENCRYPTED backup sets, nothing else). Set up like
+# propolis-watch above: a home for authorized_keys, a shell for the forced command, no password.
+# It reads sets through its own group, which deploy/backup.sh gives encrypted sets only.
+if id -u propolis-backup-pull >/dev/null 2>&1; then
+    log "user propolis-backup-pull already exists"
+else
+    run useradd --system --no-create-home --home-dir /var/lib/propolis-backup-pull --shell /bin/sh --user-group propolis-backup-pull
+    [ "$DRY_RUN" -eq 1 ] || log "created user propolis-backup-pull"
+fi
+run usermod -p '*' propolis-backup-pull
+
 # ---- 2. directories ----
 
 ensure_dir() {
@@ -145,6 +157,16 @@ ensure_dir /var/lib/propolis/feed         0755 propolis          propolis
 # fingerprint itself as freshly minted). Listed in sensor-ssh.service's ReadWritePaths, so it
 # must exist or ProtectSystem=strict's bind-mount setup fails with NAMESPACE.
 ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
+# deploy/backup.sh's status files: root-written, world-readable, so the daemon's backup-stale alert
+# and config-check.sh can read when the last backup finished without being able to forge it.
+ensure_dir /var/lib/propolis/backup-status 0755 root             root
+# The backup sets themselves. Group propolis-backup-pull may enter and list it; each plaintext set
+# inside is 0700 root, so only the encrypted sets backup.sh opens to the group can be read.
+ensure_dir /var/backups/propolis          0750 root              propolis-backup-pull
+# propolis-backup-pull's home: root-owned all the way down, exactly as propolis-watch's below, so
+# the account cannot change which keys log in to it.
+ensure_dir /var/lib/propolis-backup-pull  0750 root              propolis-backup-pull
+ensure_dir /var/lib/propolis-backup-pull/.ssh 0755 root          root
 # propolis-watch's home, outside /var/lib/propolis so it shares nothing with the daemon's state.
 # Root-owned all the way down, so the account cannot change which keys log in to it: owning its
 # home would let it rename a root-owned .ssh aside and create its own, and owning .ssh or

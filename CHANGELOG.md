@@ -13,6 +13,43 @@
 
 ### Added
 
+- **Nightly backups** - `propolis-backup.timer` now runs the documented backup every night at
+  03:30: a `pg_dump` of the database and an archive of the spool, `/etc/propolis` and the SSH
+  host key, with digests, under `/var/backups/propolis` (newest 7 kept). With age public keys in
+  `/etc/propolis/backup-recipients.txt`, sets are stored encrypted only. A run refuses when the
+  disk cannot hold it, leaves nothing behind when it fails, and records its result in
+  `/var/lib/propolis/backup-status`. The database password reaches `pg_dump` through libpq's
+  environment (`propolis pg-exec`), never a command line. `install.sh` and `upgrade.sh` install
+  and enable it. See [backup and restore](docs/operations/backup-and-restore.md#the-nightly-backup).
+- **Rollback** - `upgrade.sh` now backs the database up and keeps the running release (binaries,
+  unit files, helpers, deploy stamp) before it installs anything, and `deploy/rollback.sh` puts
+  a kept release back. `--with-database` also restores the pre-upgrade dump, for an upgrade
+  whose migrations the older daemon refuses; it renames the current database aside rather than
+  dropping it. See [rollback](docs/operations/upgrade-rollback-and-dr.md#rollback).
+- **Alerts that survive the daemon dying** - every Propolis unit now names
+  `OnFailure=propolis-alert@%n.service`, which posts "`<unit>` failed" with its last journal lines
+  to the ops ntfy topic (or the journal), at most once per unit per 30 minutes. The monitor can
+  ping an external dead-man's switch after every complete round (`PROPOLIS_OPS_HEARTBEAT_URL`),
+  so a dead host or a wedged monitor still reaches you. A new `backup-stale` condition pages when
+  the last good backup is older than 36 h. `config-check.sh` reports backup, alerting and clock
+  state. See [health and observability](docs/operations/health-and-observability.md#when-the-daemon-or-the-host-is-down).
+- **Off-host backup copies** - a machine you choose pulls each encrypted nightly set over a
+  dedicated SSH key whose forced command (`propolis-backup-serve`, account
+  `propolis-backup-pull`) can only list and send encrypted sets; a plaintext set never leaves
+  the box. `deploy/backup-pull.sh` fetches the newest set, checks every digest before keeping it,
+  and keeps the newest 14. See
+  [off-host copies](docs/operations/backup-and-restore.md#off-host-copies).
+- **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
+  the commands the `redis` sensor records are now tagged, by a SQL reader of its own
+  (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring
+  matching, dialect taken from the sensor) and ten new rules: account password change,
+  privilege change and account creation (T1098, T1136), OS commands through `COPY ... PROGRAM`,
+  `xp_cmdshell` and `sys_exec` (T1059), version and user discovery (T1082, T1033), server-side
+  file reads (T1005), and Redis `CONFIG SET dir|dbfilename` aimed at cron or `.ssh` and `SLAVEOF`
+  (T1053.003, T1098.004, T1105). A tag's token is built from keywords only, so a password in the
+  statement never reaches `attack_tag`. No migration. The `mysql` and `mssql` sensors record no
+  statements, so their dialects are read only if a scanner sends them to the PostgreSQL port. See
+  [ATT&CK tagging](docs/reference/attack-tagging.md).
 - **ATT&CK techniques on the address and campaign pages** - the per-address page gets an "ATT&CK
   techniques" panel (each rule that tagged a technique and the token it matched) and technique
   chips in each session card's header; the campaign list shows chips under each campaign and a
@@ -143,9 +180,66 @@
   in a container, and three session fixtures replay them. The grammar note that listed `case` as
   skipped is corrected: only `[[ ]]`, `(( ))`, `coproc`, `$'..'`, `${x##*/}`, brace expansion,
   `<<<`, arrays and process substitution are skipped now.
+- **`alias`, `unalias` and `shopt`** - bots hide commands behind aliases (`alias ls='ls --color'`,
+  `alias wget='wget -q'`), and the fake shell answered `alias: command not found`. An alias is now
+  text the lexer substitutes at command position while it reads, as a shell does: a value may hold
+  operators, quotes or a here-document, an alias is in force from the next line, a trailing blank
+  lets the next word be an alias, a name is not expanded inside its own value, and a quoted word, a
+  `case` pattern or a redirection target is no alias. bash lists sorted (`alias ll='ls -l'`) and
+  refuses names with a blank, quote, `$`, `/` or metacharacter (`invalid alias name`); dash lists
+  `ll='ls -l'` in the order of its 39-bucket hash table (checked on 47 names), takes any name,
+  expands in a script (bash does not, unless `shopt -s expand_aliases`) and recognises a reserved
+  word before an alias. `type`, `command -v` and `command -V` name an alias first. `shopt` keeps
+  and lists bash's 53 options and the 27 `set -o` ones with the reference container's defaults; only
+  `expand_aliases` changes what the shell does. Bounded: 128 aliases of 4096 bytes (names 255) per
+  shell, counted against the content allowance, and a text expands at most 64 aliases and grows to
+  at most 256 KiB. Replies are from bash 5.1.16 and dash 0.5.11 in the reference container; two
+  session fixtures replay them. The phone's mksh output is [inferred].
+- **`trap`** - the fake shell answered `trap: command not found`, which a bot that sets
+  `trap 'rm -f /tmp/x' EXIT` or `trap '' HUP INT` reads at once. Handlers are now kept, listed and
+  reset as bash 5.1.16 and dash 0.5.11 do (bash `trap -- 'CMD' SIGINT`, `-l`, `-p`, `DEBUG`/`ERR`/
+  `RETURN`; dash bare names, `bad trap`, no options), and the `EXIT` handler runs when the shell
+  ends: after `logout`/`exit`, at the end of a script, an SSH exec string, a subshell, a pipeline
+  stage or a command substitution, with `$?` kept unless the handler exits. bash's `DEBUG` handler
+  runs before simple commands and `ERR` after a failing one nothing tests; a signal a shell sends
+  itself (`kill -USR1 $$`) runs its handler. Handlers are text a bot supplies, so they are bounded
+  (4096 bytes, one per signal, counted against the content allowance). Two session fixtures replay
+  replies from the reference container.
+- **`exec`** - the fake shell answered `exec: command not found`. `exec` with redirections now
+  changes the shell's own descriptors for good (open for writing or reading, duplicate, close,
+  `read -u N`, `<&N`, `>&N`, `exec >/dev/null 2>&1`), a copy of a closed descriptor is `Bad file
+  descriptor`, a write to a closed one is a write error in the writer's words, and an interactive
+  prompt vanishes when standard error is redirected. `exec CMD` runs CMD in place of the shell: a
+  subshell, pipeline stage or command substitution ends alone, a script or the session ends with
+  the command (no `EXIT` handler), a command with no file behind it is `not found`, and an
+  interactive bash survives a failed `exec` where a script and dash do not. A download run through
+  `exec` is reported as one run any other way is. dash's wording for a redirection it cannot make
+  (`cannot create X: Directory nonexistent`, status 2) replaces bash's. Two session fixtures
+  replay replies from the reference container.
+- **`times`** - the fake shell answered `times: command not found`. It now prints the two lines of
+  CPU time bash and dash print (the shell's own user and system time, then its children's),
+  derived from the same process model `time` uses so the two agree: starting commands and `dd`
+  grow the children's figures, a subshell or a fresh `sh -c` starts at zero, bash refuses an option
+  with its usage line and dash prints microseconds. A session fixture replays the deterministic
+  cases from the reference container.
 
 ### Changed
 
+- **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 10 MB** -
+  `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `10000000`, the spool's per-file cap, where it
+  was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000
+  bytes, so its hash matched nothing on VirusTotal (0/57). SCP and SFTP uploads were already kept
+  to 10 MB. A body over the limit is still cut there and recorded with `truncated: true` and the
+  real `wire_size`. The Samples list and a sample's page now say `truncated` for a sample a
+  sensor kept only a prefix of (the secondary line under its digest, and the page's first line),
+  from the same flag the address page already used. Samples captured before this stay as captured:
+  a sample cut at 1,000,000 bytes keeps its hash, size and `truncated` flag, and is not
+  re-captured or changed. The memory this can use is bounded by the capture budget, not by the
+  limit; the worst-case sum of the capture budget, the session pool and the output budget, 82.5%
+  of `MemoryMax`, is in
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory) and held
+  under `MemoryMax` by a test. Telnet and adb keep `1000000`. The sensor runs two worker threads
+  (it was one per core): the unit is limited to under one core.
 - **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
   `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
   The count is exact up to 100,000 events and shown bare; past that it is the planner's row
@@ -199,6 +293,115 @@
 
 ### Fixed
 
+- **The hash-chain check no longer stalls the monitor** - the whole-ledger scan ran inside the
+  ops monitor's loop, so on a large ledger every other condition went unevaluated for minutes
+  every six hours. It now runs as its own task and the monitor serves its last verdict.
+- **What a client's shell sessions can make a sensor hold is bounded** - nothing bounded what one SSH,
+  telnet or ADB session could make its fake shell hold: 256 SSH connections of 10 idle shells
+  measured 1.05 GB against a 512 M `MemoryMax`, and a single shell grew without limit by typing
+  (doubling positional parameters, 50 MB; holding `/dev/zero` open on every descriptor, 64 MB;
+  nested `bash`, 7 KB a level; functions that parse to 230 times their text). The three sensors
+  now count what each session really allocates and bound it: 8 MiB a session between lines, about
+  29 MiB while a line runs, and a pool of 30% of `MemoryMax` shared by every session: when it runs
+  out, a session past its floor gets no more (its line stops), one within its floor still gets
+  what it is owed, and while sessions hold more than the pool the ones furthest over their fair
+  shares are ended one at a time. A line that would pass the
+  limit stops at its next step; a session over it is ended (`end_reason` `memory_limit`); SSH
+  refuses a new shell or exec while the pool is nearly full. History now keeps at most 64 KiB of
+  lines, and `export name` of a new name counts against the variable allowance. Every allocation
+  in those three sensors carries a 16-byte header. See
+  [capacity planning](docs/operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
+- **`$SHLVL` counts nested shells** - it stayed 1 however many `bash` or `su` levels a session
+  opened, where a real bash adds one to the `SHLVL` it inherits and exports it, so `bash; echo
+  $SHLVL` printing 1 was a tell. Each bash level now counts itself in (a value that is not a number
+  counts as 0, one that reaches 1000 starts again at 1); dash and mksh leave it alone. bash's
+  warning at 1000 is not printed.
+- **A panic while a held line ran no longer loses the input it had captured** - while the shell
+  reads a held input in place the capture body is empty, so a panic unwound through it recorded an
+  empty body, which records nothing. The shell now reads a shared handle to the bytes and the
+  input keeps its own, so the bytes are recorded (as cut off by the cancellation) however the line
+  ends. The overhead test now also measures `HeldInput::finish`, the path production takes, and
+  asserts at every input size.
+- **Storing a capture no longer holds an async worker** - the hand-off worker hashed, wrote and
+  fsynced a body of up to 10 MB on the async runtime, which the SSH sensor runs with two worker
+  threads. The store now runs on the blocking pool; the body moves with it, so its budget
+  reservation is held until the store returns and refunded the moment it does.
+- **A captured binary of 8 to 10 MB is now scanned for indicators** - the scan refused anything
+  over 8 MiB, so a sample of 8 to 10 MB, which SCP, SFTP and the other sensors' uploads reach,
+  showed "not scanned" on its page.
+  The scan limit is now the spool's per-file cap (one definition,
+  `sensor_framework::SPOOL_MAX_FILE_BYTES`, shared by the sensors and the scan), and the page
+  names it. The module comment that said a larger body was scanned in part now says it is not
+  scanned. A sample already marked `too_big` keeps that state (it is terminal in
+  `ioc_artifact_scan`); deleting its row there queues it for the scan again. No migration.
+- **Queued SSH output is charged by what it holds, not its length** - a reply buffer that had
+  grown by doubling kept up to twice its length (heap measured at 2.08 times the charge), so the
+  64 MiB output budget bounded less memory than it said. Output and input held behind a backed-up
+  queue are now trimmed to their bytes and charged by allocation.
+- **A few SSH peers that do not read can no longer stall every other session** - the output
+  budget they fill is now shared fairly. Two or three connections that never read could hold all
+  of the 64 MiB output budget, and then every other session's shell, exec, SCP and SFTP waited
+  (a reply took 20 s, until the peer's own keepalive woke the session). Now a session that cannot
+  be served asks the connection holding the most to let go, never itself, and is served when the
+  budget is refunded; a refund wakes waiting sessions at once; a connection whose queued output
+  makes no progress for 30 s is closed (`output_stalled`), and one asked to let go is closed
+  (`output_evicted`), both written into the `end_reason` of any capture in flight on it; a
+  packet that cannot print a line reserves 256 KiB, not 9 MiB; SCP and SFTP frames do not wait
+  for queue room. A connection holds at most 24 MiB of the budget in all.
+- **The SSH sensor no longer queues unbounded output for a peer that does not read** - a peer
+  could advertise a zero window, then type lines that each print up to 4 MiB (10 channels a
+  connection, 256 connections), and the sensor held all of it in memory with no budget. Output
+  is now charged to a 64 MiB process-wide output budget through an allowance reserved before each
+  unit of work runs; a channel stops running further lines at one line of unsent output and a
+  connection at two; input behind a backed-up queue waits in order, charged, and runs when the
+  peer reads, never dropped; and if the budget cannot hold what is waiting the session ends. A
+  connection holding output unread is still closed at `max_duration`. No configuration option.
+- **A held input is no longer copied per reader** - a command waiting for its input (`cat > f`,
+  `sh`) copied the capture three times as it ran, about 3.1 times a 10 MB body, uncharged, per
+  worker thread. The shell now reads the capture buffer in place, which stays charged to the
+  capture budget, and a line's own copies are bounded by its work allowance (21 MB measured at 10
+  MB and 40 MB inputs; it was 31 MB at 10 MB).
+- **A scanner's protocol probe on the telnet port is no longer filed as a malware sample** - a
+  scanner that sends a TLS hello, an RDP or SMB request or similar to port 23 had its first bytes
+  read as the login and the rest kept as a 54 to 175 byte `binary_shell_payload` sample, which
+  cluttered the samples list and campaigns. The sensor now classifies a session from the first
+  bytes of the connection and records a recognised probe (19 protocols, each validated by
+  structure, not by a first byte) as a `catchall_probe` event with `probe_protocol`,
+  `payload_hex` and `observed_len`, no sample. A session that carries an executable or archive
+  signature anywhere, or sent more than 4096 bytes, or matches nothing, is a sample exactly as
+  before; there is no size floor, since a short shell stub is a real dropper. The address page
+  names the protocol in the probe row's detail ("tls, port 23"). No migration. Earlier
+  `binary_shell_payload` rows for probes are not reclassified (the stored tail holds none of the
+  opening bytes). See
+  [protocol probes on the telnet port](docs/reference/events-and-signals.md#protocol-probes-on-the-telnet-port).
+- **A bash that runs a script no longer answers like the interactive login shell** - `bash -c f`,
+  `bash FILE` and a script piped to `bash` said `f: command not found`, the answer of the
+  command-not-found handler that only an interactive bash has (the persona has the
+  `command-not-found` package, so the login shell's bare `f: command not found` stays). A bash
+  running a script says `bash: line 1: f: command not found`, naming `$0` (the operand after a
+  `-c` script, the file as typed for `bash FILE`) and the line the command is on, as an SSH exec
+  already did for the line `1` only; its other diagnostics (`cd`, `No such file or directory`)
+  carry the line too. Syntax errors in a script are worded as bash words them:
+  `bash: -c: line 2: syntax error near unexpected token `)'` followed by the offending line
+  quoted, `unexpected EOF while looking for matching `"'` when the text ends inside a quote or
+  `$( )`, and an unfinished construct reported on the line after the last. The SSH exec path had
+  `bash: line 1:` with no `-c:` and no quoted line. Checked against bash 5.1.16 and dash 0.5.11 in
+  the reference container; two session fixtures replay it.
+- **dash's syntax-error wording** - dash named an unexpected plain word as the word itself
+  (`Syntax error: "extra" unexpected`); dash says `word unexpected` and quotes only reserved words
+  and operators. It also names what the grammar was waiting for (`end of file unexpected
+  (expecting "fi")`, `"done" unexpected (expecting "do")`, `word unexpected (expecting "in")`,
+  inside `$( )` `(expecting ")")`), and has fixed complaints that name no token: `Bad for loop
+  variable`, `Unterminated quoted string`, `EOF in backquote substitution`, `Missing '}'`,
+  `Missing '))'`; a redirection with nothing after it at the end of a script is
+  `end of file unexpected`. `>&word` and `<&word` with anything but one digit or `-` are
+  `Syntax error: Bad fd number`, a `${...}` dash cannot read (`${}`, `${a:1}`, `${a/x/y}`) is
+  `Bad substitution`, and an arithmetic division by zero is `arithmetic expression: division by
+  zero: "1/0"`, each ending the shell with status 2. The grammar differences behind the
+  wording are now dash's too: `((` is two subshells, a descriptor is one digit (`10>f` writes
+  `10` into `f`), and brace expansion, `$'..'`, `[[`, `<<<`, `|&` and `name=(...)` are
+  plain text or errors instead of being skipped. Every reply was checked against dash 0.5.11 in
+  the reference container; `ubuntu-dash-syntax-errors.session` replays 77 of them.
 - **dash's `cd` error and `type` wording** - a failed `cd` under dash said bash's
   `cd: DIR: No such file or directory` with status 1; dash says `cd: can't cd to DIR` and exits 2.
   `type` and `command -V` called every builtin `a shell builtin`; dash calls its special builtins

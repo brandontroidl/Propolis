@@ -344,6 +344,7 @@ mod tests {
             feed_push_marker_path: "/nonexistent".into(),
             feed_build_interval: Duration::from_secs(300),
             rotation,
+            backup_status_dir: "/nonexistent".into(),
             cfg: parse_ops_alert(&|_: &str| None).unwrap(),
         }
     }

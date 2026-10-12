@@ -56,7 +56,7 @@
   --link:#a9b8c9; --link-hover:#c3d0de;
   --brand-ink:#1a1613;
   --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13);
-  --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13);
+  --high:#e8883f; --high-text:#eea26b; --high-dim:rgba(232,136,63,0.13);
   --attention:#e0a43f; --attention-text:#e8b96a; --attention-dim:rgba(224,164,63,0.13);
   --good:#9fb168; --good-text:#b3c489; --good-dim:rgba(159,177,104,0.13);
   --info:#86b0ad; --info-text:#a0c4c1; --info-dim:rgba(134,176,173,0.13);
@@ -73,7 +73,7 @@
   --link:#3d5670; --link-hover:#2c4259;
   --brand-ink:#f5efe3;
   --alert:#8c2e21; --alert-text:#8c2e21; --alert-dim:rgba(140,46,33,0.10);
-  --high:#a8630f; --high-text:#8a520c; --high-dim:rgba(168,99,15,0.11);
+  --high:#b4501a; --high-text:#9a4413; --high-dim:rgba(180,80,26,0.11);
   --attention:#a2661a; --attention-text:#7d4f14; --attention-dim:rgba(162,102,26,0.12);
   --good:#5b6d2c; --good-text:#4a5a22; --good-dim:rgba(91,109,44,0.12);
   --info:#436565; --info-text:#436565; --info-dim:rgba(67,101,101,0.10);
@@ -92,7 +92,7 @@
     --link:#a9b8c9; --link-hover:#c3d0de;
     --brand-ink:#1a1613;
     --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13);
-    --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13);
+    --high:#e8883f; --high-text:#eea26b; --high-dim:rgba(232,136,63,0.13);
     --attention:#e0a43f; --attention-text:#e8b96a; --attention-dim:rgba(224,164,63,0.13);
     --good:#9fb168; --good-text:#b3c489; --good-dim:rgba(159,177,104,0.13);
     --info:#86b0ad; --info-text:#a0c4c1; --info-dim:rgba(134,176,173,0.13);

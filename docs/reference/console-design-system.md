@@ -29,6 +29,9 @@ is meaning, never decoration:
 - red (`--alert`) is live intrusion or something broken;
 - green (`--good`) is handled.
 
+The three warm rungs are spaced in hue so they read apart at a glance: amber about 38 degrees,
+orange about 25, red about 8, in Graphite and in Cream.
+
 Links, the active tab and the focus ring (`--link`) are a cool neutral, off that ramp, so a link
 never reads as something that wants a look. The 1337 theme keeps them green with everything else.
 
@@ -151,8 +154,3 @@ console page from one indexed database:
   styles;
 - `crates/console/tests/markup/mod.rs#stack_violations`: an address table that does not stack;
 - `crates/console/tests/markup/mod.rs#form_violations`: a form control outside a styled wrapper.
-
-## Open decisions
-
-- In Graphite and Cream `--high` (orange) is nearly the same colour as `--attention` (amber), so
-  the ramp's middle rungs are hard to tell apart.

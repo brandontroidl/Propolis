@@ -7,7 +7,9 @@
    just noise and is rendered in the same grey as faint text. Warmth is spent only
    on things that want the operator - amber (review), orange (hands on the
    keyboard), red (live intrusion) - and green means handled. Colour is
-   meaning here, never decoration: a grey row is a fine row.
+   meaning here, never decoration: a grey row is a fine row. Links, the
+   active tab and the focus ring are a cool neutral, off the heat axis, so a
+   link never reads as something that wants a look.
 
    Token NAMES are kept stable (the utility classes that replaced the
    templates' inline styles read --good / --alert-text / etc.); this file
@@ -51,8 +53,8 @@
   --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d;
   --border:#332c24; --border-bright:#493f34;
   --text:#ece3d3; --text-muted:#a79c8a; --text-faint:#8a7f6a;
-  --link:#e0a43f; --link-hover:#efbf6a;
-  --brand:#e0a43f; --brand-ink:#1a1613;
+  --link:#a9b8c9; --link-hover:#c3d0de;
+  --brand-ink:#1a1613;
   --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13);
   --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13);
   --attention:#e0a43f; --attention-text:#e8b96a; --attention-dim:rgba(224,164,63,0.13);
@@ -68,8 +70,8 @@
   --bg:#efe9dd; --surface:#f5efe3; --surface-raised:#e7e0cf;
   --border:#ddd5c3; --border-bright:#c3b89e;
   --text:#231f16; --text-muted:#5c5545; --text-faint:#766c58;
-  --link:#a2661a; --link-hover:#8a5414;
-  --brand:#a2661a; --brand-ink:#f5efe3;
+  --link:#3d5670; --link-hover:#2c4259;
+  --brand-ink:#f5efe3;
   --alert:#8c2e21; --alert-text:#8c2e21; --alert-dim:rgba(140,46,33,0.10);
   --high:#a8630f; --high-text:#8a520c; --high-dim:rgba(168,99,15,0.11);
   --attention:#a2661a; --attention-text:#7d4f14; --attention-dim:rgba(162,102,26,0.12);
@@ -87,8 +89,8 @@
     --bg:#1a1613; --surface:#221d18; --surface-raised:#2a241d;
     --border:#332c24; --border-bright:#493f34;
     --text:#ece3d3; --text-muted:#a79c8a; --text-faint:#8a7f6a;
-    --link:#e0a43f; --link-hover:#efbf6a;
-    --brand:#e0a43f; --brand-ink:#1a1613;
+    --link:#a9b8c9; --link-hover:#c3d0de;
+    --brand-ink:#1a1613;
     --alert:#e2705d; --alert-text:#e88b7b; --alert-dim:rgba(226,112,93,0.13);
     --high:#e0a24a; --high-text:#e8b56e; --high-dim:rgba(224,162,74,0.13);
     --attention:#e0a43f; --attention-text:#e8b96a; --attention-dim:rgba(224,164,63,0.13);
@@ -108,7 +110,7 @@
   --border:#064006; --border-bright:#0a6a0a;
   --text:#03a062; --text-muted:#02784a; --text-faint:#015a37;
   --link:#05d67f; --link-hover:#0affa0;
-  --brand:#05d67f; --brand-ink:#000000;
+  --brand-ink:#000000;
   --alert:#05d67f; --alert-text:#05d67f; --alert-dim:rgba(5,214,127,0.14);
   --high:#03a062; --high-text:#04c074; --high-dim:rgba(3,160,98,0.14);
   --attention:#03a062; --attention-text:#05d67f; --attention-dim:rgba(3,160,98,0.14);
@@ -348,13 +350,13 @@ h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 
   background: var(--bg); color: var(--text-muted); border: 1px solid var(--border-bright);
   border-radius: var(--radius-sm); padding: 0.25rem 0.45rem; font-family: var(--font-mono); font-size: 0.68rem;
 }
-.dl select:focus { border-color: var(--brand); outline: none; color: var(--text); }
+.dl select:focus { border-color: var(--link); outline: none; color: var(--text); }
 .dl-go {
   display: inline-block; background: var(--bg); border: 1px solid var(--border-bright); border-radius: var(--radius-sm);
   padding: 0.25rem 0.7rem; font-size: 0.66rem; color: var(--text-muted); text-decoration: none;
   font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; font-family: var(--font-sans); cursor: pointer;
 }
-.dl-go:hover { border-color: var(--brand); color: var(--text); text-decoration: none; }
+.dl-go:hover { border-color: var(--link-hover); color: var(--text); text-decoration: none; }
 
 /* -- Tab bar -- */
 .tab-bar { display: flex; gap: 0.25rem; margin: 0.9rem 0 1.1rem; border-bottom: 1px solid var(--border); }
@@ -378,7 +380,7 @@ td.ip, td.score, td.seen, td.count { font-family: var(--font-mono); font-variant
 /* Quantity columns right-align so digits stack by place value (tabular-nums only pays off then). */
 th.count, td.count { text-align: right; }
 td.ip a { color: var(--text); }
-td.ip a:hover { color: var(--brand); }
+td.ip a:hover { color: var(--link-hover); }
 
 /* -- Meters (score bars) -- */
 .meter { position: relative; width: 54px; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 0.5rem; }
@@ -479,7 +481,7 @@ tr.queue-context .sev-tags { display: inline-flex; }
 .sortbar { display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: baseline; font-size: 0.78rem; margin: 0 0 0.6rem; }
 .sortbar a { color: var(--text-muted); }
 .sortbar a:hover { color: var(--text); }
-.sortbar a.active { color: var(--brand); font-weight: 600; }
+.sortbar a.active { color: var(--link); font-weight: 600; }
 /* Fixed layout with shared column widths so the member tables nested in a group line up under the
    page's headers; the widths come from the <colgroup> in macros.html. */
 .queue-panel--pending table { table-layout: fixed; }
@@ -548,7 +550,7 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .cs-hash { width: 14%; } .cs-hosts { width: 7%; } .cs-spark { width: 11%; } .cs-active { width: 15%; } .cs-by { width: 9%; } .cs-src { width: 15%; } .cs-tr { width: 9%; } .cs-vt { width: 11%; } .cs-dl { width: 9%; }
 .samples-panel td.active-cell { white-space: normal; }
 .c-text { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.8rem; color: var(--text); }
-.c-text:hover { color: var(--brand); }
+.c-text:hover { color: var(--link-hover); }
 .c-meta { display: flex; align-items: baseline; gap: 0.5rem; margin-top: 0.15rem; font-size: 0.72rem; }
 .c-sub { display: block; font-size: 0.72rem; color: var(--text-faint); }
 .s-hash a { color: var(--text); }
@@ -672,7 +674,7 @@ summary.log-summary:hover { background: var(--surface-raised); }
 .log-line.level-warn .log-message { color: var(--attention-text); }
 .log-line.level-debug .log-message, .log-line.level-trace .log-message { color: var(--text-faint); }
 #log-connection-status { margin-left: 0.6rem; text-transform: none; letter-spacing: 0; }
-#log-pause-toggle.active { border-color: var(--brand); color: var(--brand); }
+#log-pause-toggle.active { border-color: var(--link); color: var(--link); }
 
 /* -- Empty state: the one idiom. The panel stays, with its head, and says in a lowercase fragment
    what is not there; a panel that vanishes when empty reads as a page that lost a section. -- */

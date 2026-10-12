@@ -29,6 +29,9 @@ is meaning, never decoration:
 - red (`--alert`) is live intrusion or something broken;
 - green (`--good`) is handled.
 
+Links, the active tab and the focus ring (`--link`) are a cool neutral, off that ramp, so a link
+never reads as something that wants a look. The 1337 theme keeps them green with everything else.
+
 So a count is ink, not colour; a yes/no answer is ink or dim text, never a red "No"; and colour
 appears only on the severity ramp below.
 
@@ -44,8 +47,8 @@ draw on the right ground.
 | `--bg`, `--surface`, `--surface-raised` | page ground, panels and cards, heads and column headers |
 | `--border`, `--border-bright` | hairlines; chips, hover and the empty strip cell |
 | `--text`, `--text-muted`, `--text-faint` | data; labels and secondary text; timestamps and placeholders |
-| `--link`, `--link-hover` | links, the active tab and the focus ring |
-| `--brand`, `--brand-ink` | the active sort, the nav badge's ink |
+| `--link`, `--link-hover` | links and every selected, focused or hovered control: the active tab and sort, the focus ring |
+| `--brand-ink` | ink on a filled colour: the nav badge, the sign-in button |
 | `--attention`, `--high`, `--alert`, `--good`, `--info` | the ramp; each has `-text` (ink on dark) and `-dim` (a tint) |
 | `--low` | the ramp's grey rung (noise) |
 | `--chart-line`, `--chart-fill`, `--chart-point-border` | Chart.js, read by `assets/charts.js` |
@@ -151,8 +154,5 @@ console page from one indexed database:
 
 ## Open decisions
 
-- The link hue equals the attention hue in every theme, so links, the active tab and the focus
-  ring read as "wants a look"; the original redesign kept links off the heat axis. The owner is
-  deciding it.
 - In Graphite and Cream `--high` (orange) is nearly the same colour as `--attention` (amber), so
   the ramp's middle rungs are hard to tell apart.

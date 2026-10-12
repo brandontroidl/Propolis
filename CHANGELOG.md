@@ -21,6 +21,11 @@
   `/var/lib/propolis/backup-status`. The database password reaches `pg_dump` through libpq's
   environment (`propolis pg-exec`), never a command line. `install.sh` and `upgrade.sh` install
   and enable it. See [backup and restore](docs/operations/backup-and-restore.md#the-nightly-backup).
+- **Rollback** - `upgrade.sh` now backs the database up and keeps the running release (binaries,
+  unit files, helpers, deploy stamp) before it installs anything, and `deploy/rollback.sh` puts
+  a kept release back. `--with-database` also restores the pre-upgrade dump, for an upgrade
+  whose migrations the older daemon refuses; it renames the current database aside rather than
+  dropping it. See [rollback](docs/operations/upgrade-rollback-and-dr.md#rollback).
 - **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
   the commands the `redis` sensor records are now tagged, by a SQL reader of its own
   (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring

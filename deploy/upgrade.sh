@@ -52,13 +52,30 @@ fi
 echo "==> building release"
 sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release --workspace --locked
 
-echo "==> installing binaries"
 # SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the
 # sensors and the unified daemon. A single-box migration installs and restarts every unit on this
 # one host, so this list covers both topologies at once - a box running only the collector role
 # (or only the control-plane role) simply has no unit file for the other side's binaries and the
 # is-enabled guard below skips restarting what was never enabled.
 INSTALL_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper propolis-watch)
+
+# Before anything is installed, so a failure here (set -e) leaves the box exactly as it was, and
+# before propolis restarts, so the dump is of the schema the running release knows: migrations run
+# only when the new daemon starts. This is the database deploy/rollback.sh --with-database puts
+# back. The backup runs the binary just built (PROPOLIS_BIN): the installed one is the previous
+# release, which may predate `propolis pg-exec`.
+# BEGIN pre-upgrade
+echo "==> backing up before the upgrade"
+if [ "${PROPOLIS_UPGRADE_SKIP_BACKUP:-0}" = 1 ]; then
+    echo "    skipped (PROPOLIS_UPGRADE_SKIP_BACKUP=1): this upgrade keeps no database to roll back to"
+else
+    PROPOLIS_BIN="$BUILD_DIR/propolis" "$SCRIPT_DIR/backup.sh" --reason pre-upgrade
+fi
+echo "==> keeping the running release for rollback (deploy/rollback.sh)"
+"$SCRIPT_DIR/rollback.sh" --save "${INSTALL_BINS[@]}"
+# END pre-upgrade
+
+echo "==> installing binaries"
 for bin in "${INSTALL_BINS[@]}"; do
     if [ ! -x "$BUILD_DIR/$bin" ]; then
         echo "error: $BUILD_DIR/$bin was not built; the install list names a binary the workspace does not produce" >&2

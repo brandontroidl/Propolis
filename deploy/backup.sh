@@ -27,6 +27,10 @@
 #   PROPOLIS_BACKUP_DIR   where sets are written (default /var/backups/propolis)
 #   PROPOLIS_BACKUP_KEEP  scheduled sets to keep, 1-365 (default 7); pre-upgrade sets keep 3
 #   PROPOLIS_BACKUP_ROOT  read every other path under this directory instead of / (tests only)
+#   PROPOLIS_BIN          the propolis binary to run pg-exec with (default: propolis on PATH).
+#                         upgrade.sh passes the one it just built: the installed one is still the
+#                         previous release then, which may predate pg-exec, and a propolis binary
+#                         without it would ignore the argument and start the daemon.
 
 set -euo pipefail
 set -o errtrace
@@ -112,7 +116,7 @@ fi
 export DATABASE_URL
 
 STEP="finding the tools"
-PROPOLIS_BIN="$(command -v propolis || echo /usr/local/bin/propolis)"
+PROPOLIS_BIN="${PROPOLIS_BIN:-$(command -v propolis || echo /usr/local/bin/propolis)}"
 for tool in "$PROPOLIS_BIN" pg_restore tar sha256sum flock df du; do
     command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; false; }
 done

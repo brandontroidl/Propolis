@@ -2551,6 +2551,55 @@ fn propolis_backup_units_run_nightly_and_write_only_their_own_paths() {
     );
 }
 
+/// The pre-upgrade backup and the kept release come after the build (the backup needs the new
+/// binary's `pg-exec`) and before anything is installed or restarted: a failure there must leave
+/// the box exactly as it was, and the dump must be of the schema the running release knows.
+#[test]
+fn upgrade_backs_up_and_keeps_the_running_release_before_installing_anything() {
+    let script = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+    let position = |pred: &dyn Fn(&str) -> bool, what: &str| {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("upgrade.sh has no {what}"))
+    };
+    let build = position(&|l| l.contains("cargo build --release"), "release build");
+    let backup = position(
+        &|l| {
+            l.starts_with("PROPOLIS_BIN=\"$BUILD_DIR/propolis\"")
+                && l.contains("backup.sh\" --reason pre-upgrade")
+        },
+        "pre-upgrade backup run with the built binary",
+    );
+    let save = position(
+        &|l| l.contains("rollback.sh\" --save \"${INSTALL_BINS[@]}\""),
+        "rollback --save of the install list",
+    );
+    let first_install = position(&|l| l.starts_with("install -m"), "install");
+    let first_restart = position(&|l| l.starts_with("systemctl restart"), "restart");
+    assert!(build < backup, "the backup needs the freshly built binary");
+    assert!(
+        backup < save,
+        "the kept release records the backup just taken"
+    );
+    assert!(
+        save < first_install,
+        "the running release is kept before it is overwritten"
+    );
+    assert!(first_install < first_restart);
+
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/rollback.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/rollback.sh is not valid bash");
+}
+
 /// The dry run shows the backup script, its units, and the enable.
 #[test]
 fn install_dry_run_installs_and_enables_the_backup_timer() {

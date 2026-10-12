@@ -210,6 +210,9 @@ pub struct MonitorCtx {
     /// threshold.
     pub feed_build_interval: Duration,
     pub rotation: RotationCtx,
+    /// Where `deploy/backup.sh` writes its status files (`conditions::backup::BACKUP_STATUS_DIR`
+    /// in production; a field so tests point it at a temp directory).
+    pub backup_status_dir: PathBuf,
     pub cfg: OpsAlertConfig,
 }
 

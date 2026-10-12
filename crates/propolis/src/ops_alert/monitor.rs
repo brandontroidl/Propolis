@@ -34,12 +34,77 @@ async fn deliver<P: Poster>(dispatcher: &Dispatcher<P>, alert: OpsAlert, now: In
     }
 }
 
+/// Requests a dead-man's switch URL. Behind a trait so tests count pings without a server.
+#[async_trait::async_trait]
+pub trait Pinger: Send + Sync {
+    async fn ping(&self, url: &str) -> Result<(), String>;
+}
+
+/// The production pinger: one GET, bounded, over the already-vetted rustls client.
+pub struct ReqwestPinger(reqwest::Client);
+
+impl ReqwestPinger {
+    pub fn new() -> Result<Self, String> {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map(Self)
+            .map_err(|e| format!("http client build failed: {e}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl Pinger for ReqwestPinger {
+    async fn ping(&self, url: &str) -> Result<(), String> {
+        // without_url: the URL is the check's secret and must not reach the journal.
+        let resp = self
+            .0
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("status {}", resp.status().as_u16()))
+        }
+    }
+}
+
+/// The dead-man's switch: pinged after a complete evaluation round, at most once per interval.
+/// Only a round that finished counts, so a monitor wedged in a probe stops pinging and the service
+/// on the other end raises the alarm this daemon cannot raise about itself.
+struct Heartbeat {
+    url: String,
+    interval: Duration,
+    last_sent: Option<Instant>,
+    pinger: Box<dyn Pinger>,
+}
+
+impl Heartbeat {
+    async fn after_round(&mut self, now: Instant) {
+        if self
+            .last_sent
+            .is_some_and(|t| now.duration_since(t) < self.interval)
+        {
+            return;
+        }
+        match self.pinger.ping(&self.url).await {
+            // A failed ping is retried on the next round, not after a full interval.
+            Ok(()) => self.last_sent = Some(now),
+            Err(why) => tracing::warn!(error = %why, "ops-monitor: heartbeat ping failed"),
+        }
+    }
+}
+
 /// The operational monitor. Generic over the dispatcher's `Poster` so tests inject a recorder.
 pub struct Monitor<P: Poster> {
     tracked: Vec<Tracked>,
     ctx: MonitorCtx,
     dispatcher: Dispatcher<P>,
     probe_stale_after: Duration,
+    heartbeat: Option<Heartbeat>,
 }
 
 impl<P: Poster> Monitor<P> {
@@ -66,7 +131,45 @@ impl<P: Poster> Monitor<P> {
             ctx,
             dispatcher,
             probe_stale_after: PROBE_STALE_AFTER,
+            heartbeat: None,
         }
+    }
+
+    /// The heartbeat `cfg` configures (`PROPOLIS_OPS_HEARTBEAT_URL`), if any. A client that cannot
+    /// be built is logged and the monitor runs without one: the alerts still go out.
+    pub fn with_configured_heartbeat(self, cfg: &super::config::OpsAlertConfig) -> Self {
+        let Some(url) = cfg.heartbeat_url.clone() else {
+            return self;
+        };
+        match ReqwestPinger::new() {
+            Ok(pinger) => {
+                tracing::info!(
+                    interval_secs = cfg.heartbeat_interval.as_secs(),
+                    "ops-monitor: heartbeat enabled"
+                );
+                self.with_heartbeat(url, cfg.heartbeat_interval, Box::new(pinger))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ops-monitor: heartbeat disabled, client build failed");
+                self
+            }
+        }
+    }
+
+    /// Ping `url` after every complete round, at most once per `interval`.
+    pub fn with_heartbeat(
+        mut self,
+        url: String,
+        interval: Duration,
+        pinger: Box<dyn Pinger>,
+    ) -> Self {
+        self.heartbeat = Some(Heartbeat {
+            url,
+            interval,
+            last_sent: None,
+            pinger,
+        });
+        self
     }
 
     /// Evaluate every condition once and dispatch the resulting actions. Extracted from `run` so it
@@ -78,6 +181,7 @@ impl<P: Poster> Monitor<P> {
             ctx,
             dispatcher,
             probe_stale_after,
+            heartbeat,
         } = self;
 
         for t in tracked.iter_mut() {
@@ -171,6 +275,11 @@ impl<P: Poster> Monitor<P> {
         }
 
         dispatcher.prune_expired(now);
+
+        // Last, after every condition was evaluated: the ping says "a whole round finished".
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.after_round(now).await;
+        }
     }
 
     /// Run until cancelled. A clean return on cancel (the supervisor treats it as intentional
@@ -195,13 +304,13 @@ impl<P: Poster> Monitor<P> {
     }
 }
 
-/// All sixteen operational conditions, in a stable order. Built fresh on each (re)start so per-
+/// All seventeen operational conditions, in a stable order. Built fresh on each (re)start so per-
 /// condition state (backlog history, the chain-verify cache, intake lag tracks) resets cleanly
 /// after a supervised restart.
 pub fn default_conditions() -> Vec<Box<dyn Condition>> {
     use super::conditions::{
-        backlog, capacity, chain, feed, intake, intake_lag, intake_quarantine, malware, sensor_log,
-        subsystem, vendor,
+        backlog, backup, capacity, chain, feed, intake, intake_lag, intake_quarantine, malware,
+        sensor_log, subsystem, vendor,
     };
     vec![
         Box::new(subsystem::SubsystemGaveUp),
@@ -220,6 +329,7 @@ pub fn default_conditions() -> Vec<Box<dyn Condition>> {
         Box::new(sensor_log::SensorLogOversized::new()),
         Box::new(sensor_log::RotationStale),
         Box::new(intake::IntakeRotationLoss),
+        Box::new(backup::BackupStale),
     ]
 }
 
@@ -306,6 +416,7 @@ mod tests {
             feed_push_marker_path: "/nonexistent".into(),
             feed_build_interval: Duration::from_secs(300),
             rotation: crate::ops_alert::condition::RotationCtx::production(Vec::new()),
+            backup_status_dir: "/nonexistent".into(),
             cfg,
         }
     }
@@ -355,6 +466,106 @@ mod tests {
             "{body}"
         );
         assert!(!body.contains("ssh"), "{body}");
+    }
+
+    /// Counts pings; fails while `fail` is set.
+    struct CountingPinger {
+        pings: Arc<Mutex<Vec<String>>>,
+        fail: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl Pinger for CountingPinger {
+        async fn ping(&self, url: &str) -> Result<(), String> {
+            self.pings.lock().unwrap().push(url.to_string());
+            if *self.fail.lock().unwrap() {
+                Err("status 503".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A round pings once per interval, a failed ping is retried on the very next round, and a
+    /// round that never finishes never pings.
+    #[tokio::test]
+    async fn the_heartbeat_follows_complete_rounds_at_most_once_per_interval() {
+        let rec = Recorder::new();
+        let pings = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(Mutex::new(false));
+        let mut m = Monitor::new(Vec::new(), test_ctx(), dispatcher(&rec)).with_heartbeat(
+            "https://hc.example/abc".into(),
+            Duration::from_secs(300),
+            Box::new(CountingPinger {
+                pings: pings.clone(),
+                fail: fail.clone(),
+            }),
+        );
+        let base = Instant::now();
+        m.process_tick(base).await;
+        assert_eq!(pings.lock().unwrap().len(), 1, "the first round pings");
+        m.process_tick(base + Duration::from_secs(30)).await;
+        assert_eq!(
+            pings.lock().unwrap().len(),
+            1,
+            "not again within the interval"
+        );
+
+        *fail.lock().unwrap() = true;
+        m.process_tick(base + Duration::from_secs(301)).await;
+        assert_eq!(pings.lock().unwrap().len(), 2, "due again, attempted");
+        *fail.lock().unwrap() = false;
+        m.process_tick(base + Duration::from_secs(331)).await;
+        assert_eq!(
+            pings.lock().unwrap().len(),
+            3,
+            "a failed ping is retried on the next round, not an interval later"
+        );
+        assert!(
+            pings
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|u| u == "https://hc.example/abc")
+        );
+    }
+
+    /// A probe that never returns: the round never completes, so no ping is ever sent.
+    struct HangingCond;
+
+    #[async_trait]
+    impl Condition for HangingCond {
+        fn id(&self) -> &'static str {
+            "hang"
+        }
+        fn for_dur(&self, _cfg: &crate::ops_alert::config::OpsAlertConfig) -> Duration {
+            Duration::ZERO
+        }
+        async fn evaluate(&self, _ctx: &MonitorCtx) -> Outcome {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wedged_round_sends_no_heartbeat() {
+        let rec = Recorder::new();
+        let pings = Arc::new(Mutex::new(Vec::new()));
+        let mut m = Monitor::new(vec![Box::new(HangingCond)], test_ctx(), dispatcher(&rec))
+            .with_heartbeat(
+                "https://hc.example/abc".into(),
+                Duration::from_secs(300),
+                Box::new(CountingPinger {
+                    pings: pings.clone(),
+                    fail: Arc::new(Mutex::new(false)),
+                }),
+            );
+        let wedged =
+            tokio::time::timeout(Duration::from_millis(200), m.process_tick(Instant::now())).await;
+        assert!(wedged.is_err(), "the round is stuck in the probe");
+        assert!(
+            pings.lock().unwrap().is_empty(),
+            "so the dead-man's switch hears nothing"
+        );
     }
 
     #[tokio::test]
@@ -452,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_conditions_are_the_sixteen_expected_ids() {
+    async fn default_conditions_are_the_seventeen_expected_ids() {
         let ids: Vec<&str> = default_conditions().iter().map(|c| c.id()).collect();
         assert_eq!(
             ids,
@@ -473,6 +684,7 @@ mod tests {
                 "sensor-log-oversized",
                 "rotation-stale",
                 "intake-rotation-loss",
+                "backup-stale",
             ]
         );
     }

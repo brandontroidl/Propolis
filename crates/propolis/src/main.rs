@@ -1748,6 +1748,7 @@ async fn main() {
                         feed_push_marker_path,
                         feed_build_interval,
                         rotation,
+                        backup_status_dir: ops_alert::conditions::backup::BACKUP_STATUS_DIR.into(),
                         cfg: ops_cfg.clone(),
                     };
                     if local_only {
@@ -1768,6 +1769,7 @@ async fn main() {
                             ctx,
                             dispatcher,
                         )
+                        .with_configured_heartbeat(&ops_cfg)
                         .run(token)
                         .await;
                     } else {
@@ -1786,6 +1788,7 @@ async fn main() {
                             ctx,
                             dispatcher,
                         )
+                        .with_configured_heartbeat(&ops_cfg)
                         .run(token)
                         .await;
                     }

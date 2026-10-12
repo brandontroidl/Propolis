@@ -87,7 +87,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4283 test functions** (2730 unit + 1553 integration).
+- **Total: 4296 test functions** (2738 unit + 1558 integration).
 - **DB-backed (`sqlx::test`): 413** - console 213, review 99, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -129,14 +129,14 @@ Per-crate breakdown:
 | geoip | 4 | 0 | - |
 | intake | 29 | 49 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine, sensor_stats, shell_reply |
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
-| propolis | 145 | 34 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| propolis | 153 | 34 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
 | review | 206 | 104 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 61 | 46 | arrival, env_strict, integration, session_memory_limit, shutdown_tracking |
 | sensor-catchall | 18 | 9 | arrival, env_strict, integration |
 | sensor-cred | 32 | 40 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 70 | arrival, env_strict, integration, tls |
-| sensor-framework | 1431 | 202 | arrival_coverage, backup_script_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1431 | 207 | alert_script_test, arrival_coverage, backup_script_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 14 | 53 | arrival, env_strict, integration, tls_config |
 | sensor-http | 19 | 41 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 65 | 57 | arrival, env_strict, integration, shutdown_tracking, tls |
@@ -148,7 +148,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2730** | **1553** | |
+| **Total** | **2738** | **1558** | |
 
 ### Test styles by layer
 

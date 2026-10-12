@@ -26,6 +26,13 @@
   a kept release back. `--with-database` also restores the pre-upgrade dump, for an upgrade
   whose migrations the older daemon refuses; it renames the current database aside rather than
   dropping it. See [rollback](docs/operations/upgrade-rollback-and-dr.md#rollback).
+- **Alerts that survive the daemon dying** - every Propolis unit now names
+  `OnFailure=propolis-alert@%n.service`, which posts "`<unit>` failed" with its last journal lines
+  to the ops ntfy topic (or the journal), at most once per unit per 30 minutes. The monitor can
+  ping an external dead-man's switch after every complete round (`PROPOLIS_OPS_HEARTBEAT_URL`),
+  so a dead host or a wedged monitor still reaches you. A new `backup-stale` condition pages when
+  the last good backup is older than 36 h. `config-check.sh` reports backup, alerting and clock
+  state. See [health and observability](docs/operations/health-and-observability.md#when-the-daemon-or-the-host-is-down).
 - **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
   the commands the `redis` sensor records are now tagged, by a SQL reader of its own
   (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring
@@ -265,6 +272,9 @@
 
 ### Fixed
 
+- **The hash-chain check no longer stalls the monitor** - the whole-ledger scan ran inside the
+  ops monitor's loop, so on a large ledger every other condition went unevaluated for minutes
+  every six hours. It now runs as its own task and the monitor serves its last verdict.
 - **What a client's shell sessions can make a sensor hold is bounded** - nothing bounded what one SSH,
   telnet or ADB session could make its fake shell hold: 256 SSH connections of 10 idle shells
   measured 1.05 GB against a 512 M `MemoryMax`, and a single shell grew without limit by typing

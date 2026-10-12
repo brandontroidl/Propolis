@@ -26,6 +26,7 @@
 #     restrictive permission bits - see the ReadWritePaths comment below.
 
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis SSH honeypot sensor
 After=network.target
 

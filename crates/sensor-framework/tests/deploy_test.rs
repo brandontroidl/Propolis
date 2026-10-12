@@ -2600,6 +2600,81 @@ fn upgrade_backs_up_and_keeps_the_running_release_before_installing_anything() {
     assert!(status.success(), "deploy/rollback.sh is not valid bash");
 }
 
+/// Every service unit either deploy script installs, plus the two operator-installed split
+/// units, names the failure alert, so a unit that dies pages even when the daemon is the one that
+/// died; the alert unit itself names none, so a failing alert cannot loop. Derived from the
+/// scripts' own install loops, so a unit added to them without the hook fails here.
+#[test]
+fn every_installed_unit_alerts_on_failure_and_the_alert_unit_does_not_loop() {
+    let mut units = HashSet::new();
+    for script in ["install.sh", "upgrade.sh"] {
+        units.extend(unit_install_loop_members(&deploy_file(script)));
+    }
+    units.insert("gateway.service".to_string());
+    units.insert("shipper.service".to_string());
+    for required in [
+        "propolis.service",
+        "sensor-ssh.service",
+        "propolis-backup.service",
+    ] {
+        assert!(
+            units.contains(required),
+            "the install loops lost {required}: {units:?}"
+        );
+    }
+    for unit in &units {
+        let text = uncommented(&deploy_file(unit));
+        assert!(
+            text.lines()
+                .any(|l| l.trim() == "OnFailure=propolis-alert@%n.service"),
+            "deploy/{unit} does not name the failure alert"
+        );
+    }
+
+    let alert = uncommented(&deploy_file("propolis-alert@.service"));
+    assert!(
+        !alert.contains("OnFailure="),
+        "the alert unit must not alert about itself"
+    );
+    for directive in [
+        "Type=oneshot",
+        "ExecStart=/usr/local/sbin/propolis-alert %i",
+        "RuntimeDirectoryPreserve=yes",
+        "ProtectSystem=strict",
+    ] {
+        assert!(
+            alert.contains(directive),
+            "propolis-alert@.service lacks {directive}"
+        );
+    }
+
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim_start).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("install -m 0755")
+                && l.contains("alert.sh")
+                && l.ends_with("/usr/local/sbin/propolis-alert")),
+            "{script_name} must install deploy/alert.sh where the unit runs it"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("install -m 0644") && l.contains("propolis-alert@.service")),
+            "{script_name} must install the alert unit"
+        );
+    }
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/alert.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/alert.sh is not valid bash");
+}
+
 /// The dry run shows the backup script, its units, and the enable.
 #[test]
 fn install_dry_run_installs_and_enables_the_backup_timer() {

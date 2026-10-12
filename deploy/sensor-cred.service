@@ -1,4 +1,5 @@
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis multi-protocol credential capture sensor
 After=network.target
 

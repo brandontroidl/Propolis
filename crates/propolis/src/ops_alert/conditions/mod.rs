@@ -2,6 +2,7 @@
 //! the monitor poll loop.
 
 pub mod backlog;
+pub mod backup;
 pub mod capacity;
 pub mod chain;
 pub mod feed;

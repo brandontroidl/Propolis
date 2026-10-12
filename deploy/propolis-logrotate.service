@@ -19,6 +19,7 @@
 # Runs as root: logrotate must read 0750 sensor-owned directories and chown the rotated copy back to
 # the sensor user. The sandbox below confines it to the two trees it writes.
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Rotate Propolis sensor event logs
 Documentation=file:///etc/logrotate.d/propolis-sensors
 ConditionPathExists=/etc/logrotate.d/propolis-sensors

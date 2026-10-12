@@ -117,6 +117,8 @@ ROTATE_STATE="${PROPOLIS_CC_LOGROTATE_STATE:-/var/lib/propolis/logrotate.state}"
 ROTATE_POLICY="${PROPOLIS_CC_LOGROTATE_POLICY:-/etc/logrotate.d/propolis-sensors}"
 ROTATE_GUARD="${PROPOLIS_CC_LOGROTATE_GUARD:-/usr/local/sbin/propolis-logrotate-guard}"
 WATCH_HOME="${PROPOLIS_CC_WATCH_HOME:-/var/lib/propolis-watch}"
+BACKUP_STATUS="${PROPOLIS_CC_BACKUP_STATUS:-/var/lib/propolis/backup-status}"
+ALERT_HOOK="${PROPOLIS_CC_ALERT_HOOK:-/usr/local/sbin/propolis-alert}"
 STALE_HOURS="${PROPOLIS_CC_LOG_STALE_HOURS:-24}"
 case "$STALE_HOURS" in '' | *[!0-9]*) STALE_HOURS=24 ;; esac
 NOW="${PROPOLIS_CC_NOW:-$(date +%s)}"
@@ -129,6 +131,9 @@ fi
 # State-file staleness the daemon's rotation-stale alert uses
 # (crates/propolis/src/ops_alert/conditions/sensor_log.rs STATE_STALE_AFTER).
 ROTATE_STALE_SECS=$((3 * 3600))
+# The daemon's backup-stale default (PROPOLIS_OPS_BACKUP_MAX_AGE_SECS, crates/propolis/src/
+# ops_alert/config.rs).
+BACKUP_STALE_SECS=$((36 * 3600))
 DEFAULT_ROTATE_SIZE=$((100 * 1024 * 1024))
 
 TMP_DIR="$(mktemp -d)"
@@ -1320,6 +1325,140 @@ check_rotation() {
     global logrotate "$worst" "$text (rotation size: $ROTATE_SIZE_NOTE)"
 }
 
+# The nightly backup (deploy/backup.sh): the timer, the age of the last good set and whether sets
+# are encrypted. Reads the script's own status files, so it agrees with the daemon's backup-stale.
+check_backup() {
+    local e a worst=ok parts=() success failure completed epoch age step
+    if [ "$SYSTEMCTL" -eq 1 ]; then
+        e="$(sysq is-enabled propolis-backup.timer)"
+        a="$(sysq is-active propolis-backup.timer)"
+        if [ "$a" = active ]; then
+            parts+=("timer active")
+        else
+            worst=fail
+            parts+=("timer ${a:-not installed}")
+            finding fail "backup" "backup-timer" "propolis-backup.timer is ${a:-not installed}: nothing backs this node up. If the unit is not installed at all, run the upgrade script instead: $(upgrade_fix)" \
+                "sudo systemctl enable --now propolis-backup.timer"
+        fi
+        if [ "$a" = active ] && [ -n "$e" ] && ! { [ "$e" = enabled ] || [ "$e" = enabled-runtime ]; }; then
+            if [ "$worst" = ok ]; then worst=warn; fi
+            finding warn "backup" "backup-timer-enabled" "propolis-backup.timer is active but $e, so it will not return after a reboot" \
+                "sudo systemctl enable propolis-backup.timer"
+        fi
+    else
+        worst=unknown
+        parts+=("timer state unknown")
+    fi
+    success="$(cat -- "$BACKUP_STATUS/last-success" 2>/dev/null || true)"
+    failure="$(cat -- "$BACKUP_STATUS/last-failure" 2>/dev/null || true)"
+    step="$(printf '%s' "$failure" | sed -n 's/.*"step":"\([^"]*\)".*/\1/p')"
+    completed="$(printf '%s' "$success" | sed -n 's/.*"completed_at":"\([^"]*\)".*/\1/p')"
+    if [ -n "$completed" ] && epoch="$(date -u -d "$completed" +%s 2>/dev/null)"; then
+        age=$((NOW - epoch))
+        parts+=("last good backup $(human_age "$age") ago")
+        if [ "$age" -gt "$BACKUP_STALE_SECS" ]; then
+            worst=fail
+            finding fail "backup" "backup-stale" "the last good backup is $(human_age "$age") old (the daemon's backup-stale alert fires at 36h)${step:+; the last run failed while $step}" \
+                "sudo systemctl start propolis-backup.service; sudo journalctl -u propolis-backup.service -n 30 --no-pager"
+        fi
+        case "$success" in
+            *'"encrypted":false'*)
+                if [ "$worst" = ok ]; then worst=warn; fi
+                parts+=("plaintext")
+                finding warn "backup" "backup-plaintext" "backup sets are not encrypted, so they cannot safely leave this host" \
+                    "install age (sudo apt install age) and put your age public key in $ENV_DIR/backup-recipients.txt; see docs/operations/backup-and-restore.md, \"The nightly backup\"" manual
+                ;;
+        esac
+    else
+        if [ -n "$failure" ]; then
+            worst=fail
+            parts+=("never succeeded")
+            finding fail "backup" "backup-failing" "no backup has ever completed${step:+; the last run failed while $step}" \
+                "sudo journalctl -u propolis-backup.service -n 30 --no-pager"
+        else
+            if [ "$worst" = ok ]; then worst=warn; fi
+            parts+=("never ran")
+            finding warn "backup" "backup-never" "no backup has run on this host yet ($BACKUP_STATUS/last-success does not exist)" \
+                "sudo systemctl start propolis-backup.service"
+        fi
+    fi
+    if [ -s "$ENV_DIR/backup-recipients.txt" ] && ! command -v age >/dev/null 2>&1; then
+        worst=fail
+        finding fail "backup" "backup-age-missing" "$ENV_DIR/backup-recipients.txt names recipients but age is not installed, so every backup fails rather than write plaintext" \
+            "install age with your package manager (sudo apt install age on Debian)" manual
+    fi
+    local text="" p
+    for p in "${parts[@]}"; do text="${text:+$text, }$p"; done
+    global backup "$worst" "$text"
+}
+
+# Whether anything reaches the operator when something breaks: the daemon's monitor (off by
+# default), a push target for it, the dead-man's switch that covers a dead host, and the
+# OnFailure= hook that covers a dead daemon.
+check_alerting() {
+    local file="$ENV_DIR/propolis.env" enabled url heartbeat worst=ok parts=()
+    if [ ! -r "$file" ]; then
+        global alerting unknown "$file is not readable"
+        return
+    fi
+    enabled="$(read_env_var_in PROPOLIS_OPS_ENABLED "$file")"
+    url="$(read_env_var_in PROPOLIS_OPS_NTFY_URL "$file")"
+    heartbeat="$(read_env_var_in PROPOLIS_OPS_HEARTBEAT_URL "$file")"
+    case "$(printf '%s' "$enabled" | tr '[:upper:]' '[:lower:]')" in
+        true | 1 | yes | on) parts+=("monitor on") ;;
+        *)
+            worst=warn
+            parts+=("monitor off")
+            finding warn "alerting" "ops-monitor-off" "PROPOLIS_OPS_ENABLED is not true in $file: nothing pages when a sensor dies, intake stalls or a backup goes stale (docs/operations/health-and-observability.md)" \
+                "set PROPOLIS_OPS_ENABLED=true in $file, then run: sudo systemctl restart propolis" manual
+            ;;
+    esac
+    if [ -n "$url" ]; then
+        parts+=("ntfy")
+    else
+        if [ "$worst" = ok ]; then worst=warn; fi
+        parts+=("journal only")
+        finding warn "alerting" "ops-no-push" "no PROPOLIS_OPS_NTFY_URL in $file: alerts are written to the journal, where nobody sees them unless they look" \
+            "set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC in $file, then run: sudo systemctl restart propolis" manual
+    fi
+    if [ -n "$heartbeat" ]; then
+        parts+=("heartbeat")
+    else
+        if [ "$worst" = ok ]; then worst=warn; fi
+        parts+=("no heartbeat")
+        finding warn "alerting" "ops-no-heartbeat" "no PROPOLIS_OPS_HEARTBEAT_URL in $file: if the whole host goes down, nothing tells you" \
+            "create a dead-man's switch check (healthchecks.io or your own) and set PROPOLIS_OPS_HEARTBEAT_URL to its ping URL in $file, then run: sudo systemctl restart propolis" manual
+    fi
+    if [ ! -x "$ALERT_HOOK" ]; then
+        worst=fail
+        parts+=("failure hook missing")
+        finding fail "alerting" "ops-failure-hook" "$ALERT_HOOK is not installed: a unit that dies (the daemon included) alerts nobody" \
+            "$(upgrade_fix)"
+    fi
+    local text="" p
+    for p in "${parts[@]}"; do text="${text:+$text, }$p"; done
+    global alerting "$worst" "$text"
+}
+
+# Every timestamp Propolis keeps (event times, feed TTLs, backup ages) assumes the clock is right.
+check_clock() {
+    local synced
+    if ! command -v timedatectl >/dev/null 2>&1; then
+        global clock unknown "timedatectl is not available"
+        return
+    fi
+    synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    case "$synced" in
+        yes) global clock ok "synchronized" ;;
+        no)
+            global clock warn "not synchronized"
+            finding warn "clock" "clock-unsynced" "the system clock is not NTP-synchronized: event times, feed expiry and backup ages drift with it" \
+                "sudo timedatectl set-ntp true"
+            ;;
+        *) global clock unknown "timedatectl did not report NTPSynchronized" ;;
+    esac
+}
+
 # The rotation guard (deploy/logrotate-guard.sh) skips a log whose reader has not caught up by
 # reading the reader's saved cursor, and rotates anyway when it cannot find one. Each log in the
 # intake list therefore needs a cursor file the guard can see: one under the cursor directory, and
@@ -1703,6 +1842,9 @@ done
 
 check_env_files
 check_rotation
+check_backup
+check_alerting
+check_clock
 check_binaries
 check_intake_list
 check_cursors

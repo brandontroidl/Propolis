@@ -33,7 +33,7 @@ STORE="$ROOT/var/lib/propolis/rollback"
 KEEP=3
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4,40}$'
 SET_RE='^[0-9]{8}T[0-9]{6}Z-pre-upgrade$'
-SBIN_HELPERS=(propolis-backup propolis-logrotate-guard)
+SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert)
 SENSORS=(sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred)
 
 usage() {

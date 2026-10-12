@@ -137,6 +137,9 @@ install -m 0755 "$SCRIPT_DIR/backup.sh" /usr/local/sbin/propolis-backup
 for unit in propolis-backup.service propolis-backup.timer; do
     install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
+# Every Propolis unit names this in OnFailure=; installed with them, nothing to enable.
+install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service
 
 # After every step that can fail (the build, and every install above), and before the restarts, so
 # the console reads it as soon as it comes back up. Recording it any earlier - this used to run

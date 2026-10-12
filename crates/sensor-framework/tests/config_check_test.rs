@@ -201,8 +201,31 @@ impl Fx {
         );
         fx.write(
             "etc/propolis.env",
-            &format!("DATABASE_URL=postgres://propolis:s3cret%21pw@db.example.invalid:5433/propolis?sslmode=require\n{sensor_logs}\n"),
+            &format!("DATABASE_URL=postgres://propolis:s3cret%21pw@db.example.invalid:5433/propolis?sslmode=require\n{sensor_logs}\nPROPOLIS_OPS_ENABLED=true\nPROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=propolis-ops\nPROPOLIS_OPS_HEARTBEAT_URL=https://hc.example.invalid/check\n"),
         );
+        // A good encrypted backup an hour ago, the timer running, and the failure hook installed.
+        let an_hour_ago = String::from_utf8(
+            Command::new("date")
+                .args([
+                    "-u",
+                    "-d",
+                    &format!("@{}", NOW - 3600),
+                    "+%Y-%m-%dT%H:%M:%SZ",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        fx.write(
+            "state/backup-status/last-success",
+            &format!(
+                "{{\"completed_at\":\"{}\",\"reason\":\"scheduled\",\"set\":\"x-scheduled\",\"encrypted\":true,\"dump_bytes\":1,\"archive_bytes\":1}}\n",
+                an_hour_ago.trim()
+            ),
+        );
+        fx.unit("propolis-backup.timer", "enabled", "active");
+        fx.exec("sbin/propolis-alert", "exit 0\n");
         fx.write("etc/watch.env", &format!("{sensor_logs}\n"));
         for (dir, file) in [
             ("ssh", "events"),
@@ -335,6 +358,7 @@ impl Fx {
             "cut",
             "sha256sum",
             "readlink",
+            "tr",
         ] {
             let real = ["/usr/bin", "/bin"]
                 .iter()
@@ -368,6 +392,11 @@ case "$*" in *-lunp*) cat "$d/ss_udp" ;; *-ltnp*) cat "$d/ss_tcp" ;; *) exit 2 ;
             "stubs/ufw",
             r#"if [ -f "$STUB_STATE/ufw" ]; then cat "$STUB_STATE/ufw"; exit 0; fi
 echo "ERROR: You need to be root to run this script" >&2; exit 1
+"#,
+        );
+        self.exec(
+            "stubs/timedatectl",
+            r#"if [ -f "$STUB_STATE/ntp_unsynced" ]; then echo no; else echo yes; fi
 "#,
         );
         self.exec(
@@ -423,7 +452,9 @@ cat "$d/psql_out"
                 "PROPOLIS_CC_ROTATE_DROPIN_DIR",
                 self.p("etc-logrotate/dropin"),
             )
-            .env("PROPOLIS_CC_WATCH_HOME", self.p("home-watch"));
+            .env("PROPOLIS_CC_WATCH_HOME", self.p("home-watch"))
+            .env("PROPOLIS_CC_BACKUP_STATUS", self.p("state/backup-status"))
+            .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"));
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1976,7 +2007,15 @@ impl Fx {
                 "line=\"{name} sudo=${{UNDER_SUDO:-0}}\"\nfor a in \"$@\"; do line=\"$line [$a]\"; done\nprintf '%s\\n' \"$line\" >> \"$FIXLOG\"\n"
             )
         };
-        for name in ["systemctl", "ss", "ufw", "firewall-cmd", "nft", "psql"] {
+        for name in [
+            "systemctl",
+            "ss",
+            "ufw",
+            "firewall-cmd",
+            "nft",
+            "psql",
+            "timedatectl",
+        ] {
             self.exec(&format!("fixstubs/{name}"), &record(name));
         }
         // A log line that a `| grep -i bind` filter keeps, so the pipeline's exit status is 0.
@@ -2407,7 +2446,55 @@ fn fix_scenarios() -> Vec<Scenario> {
                 std::fs::remove_dir_all(fx.p(d)).unwrap();
             }
         }),
+        (
+            "backups failing, timer not enabled, recipients without age",
+            |fx| {
+                std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
+                fx.write(
+                "state/backup-status/last-failure",
+                "{\"failed_at\":\"x\",\"reason\":\"scheduled\",\"step\":\"dumping the database\",\"exit_code\":1}\n",
+            );
+                fx.unit("propolis-backup.timer", "disabled", "active");
+                fx.write("etc/backup-recipients.txt", "age1example\n");
+            },
+        ),
+        ("a stale plaintext backup", |fx| {
+            fx.write(
+                "state/backup-status/last-success",
+                &format!(
+                    "{{\"completed_at\":\"{}\",\"reason\":\"scheduled\",\"set\":\"x\",\"encrypted\":false}}\n",
+                    iso(NOW - 3 * 86_400)
+                ),
+            );
+        }),
+        ("no backup has run yet", |fx| {
+            std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
+        }),
+        (
+            "no alerting configured, no failure hook, clock unsynced",
+            |fx| {
+                for prefix in [
+                    "PROPOLIS_OPS_ENABLED=",
+                    "PROPOLIS_OPS_NTFY_URL=",
+                    "PROPOLIS_OPS_NTFY_TOPIC=",
+                    "PROPOLIS_OPS_HEARTBEAT_URL=",
+                ] {
+                    fx.set_env_line("etc/propolis.env", prefix, None);
+                }
+                std::fs::remove_file(fx.p("sbin/propolis-alert")).unwrap();
+                fx.write("state/ntp_unsynced", "");
+            },
+        ),
     ]
+}
+
+/// `epoch` as the backup script writes its timestamps.
+fn iso(epoch: u64) -> String {
+    let out = Command::new("date")
+        .args(["-u", "-d", &format!("@{epoch}"), "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 #[test]

@@ -177,6 +177,9 @@ run install -m 0755 "$SCRIPT_DIR/backup.sh" /usr/local/sbin/propolis-backup
 for unit in propolis-backup.service propolis-backup.timer; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
+# Every Propolis unit names this in OnFailure=, so it is installed with them; it needs no enable.
+run install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+run install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service
 
 # ---- 7. fleet listener inventory ----
 

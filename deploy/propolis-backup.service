@@ -8,6 +8,7 @@
 # The daemon's backup-stale alert reads /var/lib/propolis/backup-status/last-success; a failed run
 # writes last-failure there and exits non-zero (visible in `systemctl --failed`).
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Back up the Propolis database and state
 Documentation=file:///usr/local/sbin/propolis-backup
 After=postgresql.service

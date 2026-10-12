@@ -27,6 +27,7 @@
 # for layout symmetry with sensor-ssh.service and is otherwise unused.
 
 [Unit]
+OnFailure=propolis-alert@%n.service
 Description=Propolis catch-all sensor
 After=network.target
 

@@ -1,19 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Attackers - Propolis{% endblock %}
 {% block content %}
-{% import "macros.html" as m %}
-{% macro pager() -%}
-{% if prev_before or next_after %}
-<nav class="pager" aria-label="Attackers pages">
-  {% if prev_before %}<a href="/ips?sort={{ sort }}&dir={{ dir }}">First</a><a href="/ips?sort={{ sort }}&dir={{ dir }}&before={{ prev_before }}">&larr; Previous</a>{% else %}<span class="dim">First</span><span class="dim">&larr; Previous</span>{% endif %}
-  {% if next_after %}<a href="/ips?sort={{ sort }}&dir={{ dir }}&after={{ next_after }}">Next &rarr;</a>{% else %}<span class="dim">Next &rarr;</span>{% endif %}
-</nav>
-{% endif %}
-{%- endmacro %}
 <h1>Attackers</h1>
-{% if cursor_lost %}
-<p class="table-note">That page started at an address that is no longer scored, so this is the first page.</p>
-{% endif %}
 <p class="table-note" id="tier-note"><strong>Tier</strong> is set when an address is scored, from its raw score and its strongest signal's confidence: aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70. <strong>Score</strong> is live, decayed since the last event and weighted for breadth, so a 100.0 can be standard while a 99.9 is aggressive. Rules: <span class="mono">docs/reference/scoring-and-feed.md#tier</span></p>
 {#- The same sort bar as Review and Campaigns: column headers are hidden when the table stacks
     into cards on a narrow screen, and the bar is not. The active key shows its direction and its
@@ -24,10 +12,9 @@
   <a href="/ips?sort={{ key }}&dir={% if sort == key and dir == 'desc' %}asc{% else %}desc{% endif %}" class="{% if sort == key %}active{% endif %}">{{ name }}{% if sort == key %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a>
   {% endfor %}
 </nav>
-{{ pager() }}
 <div class="panel">
-<div class="panel-head">Addresses{% if shown > 0 %} <span class="dim">showing {{ shown_from | count }}-{{ shown_to | count }}{% if not position_exact %} (position estimated){% endif %} of {% if total_exact %}{{ total | count }}{% else %}about {{ total | count }} (estimate){% endif %} scored addresses</span>{% endif %}</div>
-{% if shown > 0 %}
+<div class="panel-head">Addresses{% if ips %} <span class="dim">{% if total_exact %}{{ total | count }}{% else %}about {{ total | count }} (estimate){% endif %} scored</span>{% endif %}</div>
+{% if ips %}
 <table class="table-compact stack">
   <thead>
     <tr>
@@ -42,25 +29,13 @@
       <th>Eligible</th>
     </tr>
   </thead>
-  <tbody>
-    {% for ip in ips %}
-    <tr>
-      <td class="count score">{{ m.score_meter(ip.raw_score, ip.score_pct) }}</td>
-      <td class="ip stack-lead">{{ m.ip_evidence_link(ip.ip) }}</td>
-      <td>{{ m.tier_pill(ip.tier) }}</td>
-      <td class="count" data-label="Events">{{ ip.event_count | count }}</td>
-      <td class="mono" data-label="Categories">{{ ip.distinct_categories | count }}</td>
-      <td class="mono" data-label="WANs">{{ ip.distinct_wan_count | count }}</td>
-      <td class="dim" data-label="First seen">{{ ip.first_seen }}</td>
-      <td data-label="Last seen"><span class="dim" title="{{ ip.last_seen }}">{{ ip.last_seen_relative }}</span></td>
-      <td data-label="Eligible">{{ m.yes_no(ip.eligible) }}</td>
-    </tr>
-    {% endfor %}
+  <tbody id="ips-rows">
+{% include "ips_rows.html" %}
   </tbody>
 </table>
+<div id="load-more-container">{% include "ips_load_more.html" %}</div>
 {% else %}
 <p class="empty-line">no scored IPs yet</p>
 {% endif %}
 </div>
-{{ pager() }}
 {% endblock %}

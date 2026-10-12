@@ -1,0 +1,1 @@
+{% if cursor_lost %}<span class="dim">The list changed since it loaded: the last address shown is no longer scored. Reload to continue.</span>{% elif next_after %}<button hx-get="/ips/rows?sort={{ sort }}&amp;dir={{ dir }}&amp;after={{ next_after }}" hx-target="#ips-rows" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}

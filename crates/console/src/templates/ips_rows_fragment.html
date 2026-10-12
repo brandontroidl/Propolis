@@ -1,0 +1,6 @@
+{% include "ips_rows.html" %}
+{#- Out-of-band swap, the split `search_events_fragment.html` uses: the rows above land through the
+    request's own `beforeend` swap into `#ips-rows`, and this replaces the button with one carrying
+    the next cursor, with nothing after the last row, or with a note when the row the list was
+    continuing from is no longer scored. -#}
+<div id="load-more-container" hx-swap-oob="true">{% include "ips_load_more.html" %}</div>

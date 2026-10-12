@@ -1,25 +1,27 @@
-//! `GET /ips` - the Attackers table: every scored address, 500 to a page.
+//! `GET /ips` - the Attackers table: every scored address, 500 at a time. `GET /ips/rows` is the
+//! console's "Load more" for it (the same control as the IP page's timeline and Search): it
+//! appends the next 500 below the rows already shown.
 //!
-//! Paging is keyset, not `OFFSET`: a page link carries the address of the row it continues from
-//! (`after=` for the next page, `before=` for the previous), and the query resumes strictly past
-//! that row's `(sort key, source_ip)` - looked up by `ip_score`'s primary key - so a page never
-//! repeats or skips a row because addresses were scored while the operator paged, and its cost
-//! does not grow with depth. `ip_score` has no index on any sort column, so each page is one
-//! bounded scan of the projection table with a top-500 sort (the table holds one row per address,
-//! never the event ledger).
+//! Loading more is keyset, not `OFFSET`: the button carries the address of the last row shown
+//! (`after=`), and the query resumes strictly past that row's `(sort key, source_ip)` - looked up
+//! by `ip_score`'s primary key - so the list never repeats or skips a row because addresses were
+//! scored while the operator read it, and its cost does not grow with depth. `ip_score` has no
+//! index on any sort column, so each load is one bounded scan of the projection table with a
+//! top-500 sort (the table holds one row per address, never the event ledger).
 //!
 //! The score sort orders by a TIME-INVARIANT key rather than the live score itself. Every row's
 //! live score decays with the same half-life, so `ln(raw * breadth) + ln 2 * anchor / half_life`
 //! orders rows as their live scores do at any instant (both sides of a comparison decay by the
-//! same factor) and does not change between two page loads. The live score itself is clamped at
-//! 100, and clamped rows tie: broken by address, they leave the tie in a different order as they
-//! decay below the cap, so rows could trade places between the request for page one and the
-//! request for page two, and a keyset cursor over a moving order repeats and drops rows. The
-//! displayed score is still the live one (`LIVE_EFFECTIVE_SCORE_SQL`); the visible difference is
-//! that rows showing 100.0 are ordered among themselves by how far past the cap they are.
+//! same factor) and does not change between two loads. The live score itself is clamped at 100,
+//! and clamped rows tie: broken by address, they leave the tie in a different order as they decay
+//! below the cap, so rows could trade places between the first load and the next, and a keyset
+//! cursor over a moving order repeats and drops rows. The displayed score is still the live one
+//! (`LIVE_EFFECTIVE_SCORE_SQL`); the visible difference is that rows showing 100.0 are ordered
+//! among themselves by how far past the cap they are.
 //!
-//! The heading says which rows are shown out of how many: counts are exact up to
-//! [`COUNT_CAP`] and past it read from the planner's row estimate, labelled as an estimate.
+//! The heading says how many addresses are scored: exact up to
+//! [`crate::routes::rowcount::COUNT_CAP`] and past it read from the planner's row estimate,
+//! labelled as an estimate.
 
 use std::net::IpAddr;
 
@@ -34,14 +36,16 @@ use sqlx::PgPool;
 use crate::AppState;
 use crate::routes::context::base_context;
 use crate::routes::error::AppError;
-use crate::routes::format::{format_relative_time, format_timestamp, group_digits, score_pct};
-use crate::routes::rowcount::{COUNT_CAP, Count, capped_total};
+use crate::routes::format::{format_relative_time, format_timestamp, score_pct};
+use crate::routes::rowcount::{Count, capped_total};
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/ips", get(ip_list))
+    Router::new()
+        .route("/ips", get(ip_list))
+        .route("/ips/rows", get(ip_rows))
 }
 
-/// Rows per page.
+/// Rows per load.
 const PAGE_SIZE: usize = 500;
 
 /// The score sort's order key: equal in order to the live effective score at every instant, but
@@ -80,7 +84,7 @@ impl SortKey {
         }
     }
 
-    /// The SQL the page orders and pages by. One of four literals, never user input.
+    /// The SQL the list orders and resumes by. One of four literals, never user input.
     fn order_key(self) -> &'static str {
         match self {
             SortKey::Score => SCORE_ORDER_KEY,
@@ -95,18 +99,8 @@ impl SortKey {
 struct IpListParams {
     sort: Option<String>,
     dir: Option<String>,
-    /// Continue after this address (the next page).
+    /// The last address already shown (`/ips/rows` only).
     after: Option<String>,
-    /// Continue before this address (the previous page).
-    before: Option<String>,
-}
-
-/// Where a page starts.
-#[derive(Debug, Clone, Copy)]
-enum Cursor {
-    First,
-    After(IpAddr),
-    Before(IpAddr),
 }
 
 #[derive(Debug, Serialize)]
@@ -124,51 +118,118 @@ struct IpRow {
     eligible: bool,
 }
 
+/// One load's rows in display order, and the cursor for the next load if there is more.
+struct Batch {
+    rows: Vec<IpRow>,
+    next_after: Option<String>,
+}
+
 async fn ip_list(
     State(state): State<AppState>,
     Query(params): Query<IpListParams>,
 ) -> Result<Html<String>, AppError> {
     let sort = SortKey::parse(params.sort.as_deref());
     let desc = params.dir.as_deref() != Some("asc");
-
-    // A cursor that does not parse, or names an address no longer scored (deleted since the link
-    // was rendered), cannot say where to resume: start over from the first page and say so,
-    // rather than showing an empty page.
-    let requested = match (params.after.as_deref(), params.before.as_deref()) {
-        (Some(raw), _) => raw.parse().ok().map(Cursor::After),
-        (None, Some(raw)) => raw.parse().ok().map(Cursor::Before),
-        (None, None) => Some(Cursor::First),
-    };
-    let cursor = match requested {
-        Some(Cursor::After(ip) | Cursor::Before(ip)) if !is_scored(&state.db, ip).await? => None,
-        other => other,
-    };
-    let cursor_lost = cursor.is_none();
-    let cursor = cursor.unwrap_or(Cursor::First);
-
-    let page = fetch_page(&state.db, sort, desc, cursor).await?;
-    let position = match (cursor, page.rows.first()) {
-        (Cursor::First, _) | (_, None) => Count {
-            value: 0,
-            exact: true,
-        },
-        (_, Some(first)) => rows_ahead(&state.db, sort, desc, &first.ip).await?,
-    };
+    let batch = fetch_batch(&state.db, sort, desc, None).await?;
     let total = total_count(&state.db).await?;
 
-    let next_after = page
-        .rows
-        .last()
-        .map(|r| r.ip.clone())
-        .filter(|_| page.has_next);
-    let prev_before = page
-        .rows
-        .first()
-        .map(|r| r.ip.clone())
-        .filter(|_| page.has_prev);
-    let shown = page.rows.len() as i64;
-    let rows: Vec<IpRow> = page
-        .rows
+    let base = base_context(&state.db, state.startup_time, state.version).await;
+    let tmpl = state.templates.get_template("ips.html")?;
+    Ok(Html(tmpl.render(context! {
+        active_nav => "ips",
+        pending_count => base.pending_count,
+        uptime => base.uptime,
+        version => base.version,
+        ips => batch.rows,
+        next_after => batch.next_after,
+        cursor_lost => false,
+        total => total.value,
+        total_exact => total.exact,
+        sort => sort.as_str(),
+        dir => if desc { "desc" } else { "asc" },
+    })?))
+}
+
+/// The next batch after `after`. A cursor that does not parse, or names an address no longer
+/// scored (deleted since the button was rendered), cannot say where to resume: the fragment adds
+/// no rows and says so, rather than starting over and repeating rows already on the page.
+async fn ip_rows(
+    State(state): State<AppState>,
+    Query(params): Query<IpListParams>,
+) -> Result<Html<String>, AppError> {
+    let sort = SortKey::parse(params.sort.as_deref());
+    let desc = params.dir.as_deref() != Some("asc");
+    let after = params
+        .after
+        .as_deref()
+        .and_then(|raw| raw.parse::<IpAddr>().ok());
+    let after = match after {
+        Some(ip) if is_scored(&state.db, ip).await? => Some(ip),
+        _ => None,
+    };
+    let batch = match after {
+        Some(ip) => fetch_batch(&state.db, sort, desc, Some(ip)).await?,
+        None => Batch {
+            rows: Vec::new(),
+            next_after: None,
+        },
+    };
+    let tmpl = state.templates.get_template("ips_rows_fragment.html")?;
+    Ok(Html(tmpl.render(context! {
+        ips => batch.rows,
+        next_after => batch.next_after,
+        cursor_lost => after.is_none(),
+        sort => sort.as_str(),
+        dir => if desc { "desc" } else { "asc" },
+    })?))
+}
+
+async fn is_scored(db: &PgPool, ip: IpAddr) -> Result<bool, AppError> {
+    Ok(
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ip_score WHERE source_ip = $1::inet)")
+            .bind(ip.to_string())
+            .fetch_one(db)
+            .await?,
+    )
+}
+
+/// The batch after `after` (the first one when `None`), read one row past [`PAGE_SIZE`] so
+/// whether more follow is known without a count.
+async fn fetch_batch(
+    db: &PgPool,
+    sort: SortKey,
+    desc: bool,
+    after: Option<IpAddr>,
+) -> Result<Batch, AppError> {
+    let key = sort.order_key();
+    let (dir, past) = if desc { ("DESC", "<") } else { ("ASC", ">") };
+    let resume = match after {
+        None => String::new(),
+        Some(_) => format!(
+            "WHERE ({key}, source_ip) {past} \
+             (SELECT {key}, source_ip FROM ip_score WHERE source_ip = $1::inet)"
+        ),
+    };
+    let sql = format!(
+        "SELECT host(source_ip) AS ip, ({live})::float8 AS score, \
+         COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, \
+         first_seen, last_seen, eligible FROM ip_score {resume} \
+         ORDER BY {key} {dir}, source_ip {dir} LIMIT {limit}",
+        live = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
+        limit = PAGE_SIZE + 1,
+    );
+    // Audited: `sql` interpolates only `LIVE_EFFECTIVE_SCORE_SQL`, one of `SortKey::order_key`'s
+    // four literals, fixed direction words and the page-size constant. The cursor address is a
+    // bound parameter.
+    let query = sqlx::query_as::<_, IpRowRaw>(sqlx::AssertSqlSafe(sql));
+    let mut raw = match after {
+        None => query.fetch_all(db).await?,
+        Some(ip) => query.bind(ip.to_string()).fetch_all(db).await?,
+    };
+    let more = raw.len() > PAGE_SIZE;
+    raw.truncate(PAGE_SIZE);
+    let next_after = raw.last().map(|r| r.ip.clone()).filter(|_| more);
+    let rows = raw
         .into_iter()
         .map(|r| IpRow {
             ip: r.ip,
@@ -188,125 +249,10 @@ async fn ip_list(
             eligible: r.eligible,
         })
         .collect();
-
-    let base = base_context(&state.db, state.startup_time, state.version).await;
-    let tmpl = state.templates.get_template("ips.html")?;
-    Ok(Html(tmpl.render(context! {
-        active_nav => "ips",
-        pending_count => base.pending_count,
-        uptime => base.uptime,
-        version => base.version,
-        ips => rows,
-        shown,
-        shown_from => group_digits(position.value + 1),
-        shown_to => group_digits(position.value + shown),
-        position_exact => position.exact,
-        total => group_digits(total.value),
-        total_exact => total.exact,
-        next_after,
-        prev_before,
-        cursor_lost,
-        sort => sort.as_str(),
-        dir => if desc { "desc" } else { "asc" },
-    })?))
+    Ok(Batch { rows, next_after })
 }
 
-/// One page of rows in display order, and whether pages exist on either side of it.
-struct Page {
-    rows: Vec<IpRowRaw>,
-    has_prev: bool,
-    has_next: bool,
-}
-
-async fn is_scored(db: &PgPool, ip: IpAddr) -> Result<bool, AppError> {
-    Ok(
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ip_score WHERE source_ip = $1::inet)")
-            .bind(ip.to_string())
-            .fetch_one(db)
-            .await?,
-    )
-}
-
-/// Fetches the page `cursor` names, one row past [`PAGE_SIZE`] so the far side's existence is
-/// known without a count. A `Before` page is read in reverse order from its cursor and flipped.
-async fn fetch_page(
-    db: &PgPool,
-    sort: SortKey,
-    desc: bool,
-    cursor: Cursor,
-) -> Result<Page, AppError> {
-    let key = sort.order_key();
-    // Reading toward the end of the listing in its own direction, or back toward its start.
-    let forward = !matches!(cursor, Cursor::Before(_));
-    let read_desc = desc == forward;
-    let (dir, past) = if read_desc {
-        ("DESC", "<")
-    } else {
-        ("ASC", ">")
-    };
-    let resume = match cursor {
-        Cursor::First => String::new(),
-        Cursor::After(_) | Cursor::Before(_) => format!(
-            "WHERE ({key}, source_ip) {past} \
-             (SELECT {key}, source_ip FROM ip_score WHERE source_ip = $1::inet)"
-        ),
-    };
-    let sql = format!(
-        "SELECT host(source_ip) AS ip, ({live})::float8 AS score, \
-         COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, \
-         first_seen, last_seen, eligible FROM ip_score {resume} \
-         ORDER BY {key} {dir}, source_ip {dir} LIMIT {limit}",
-        live = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
-        limit = PAGE_SIZE + 1,
-    );
-    // Audited: `sql` interpolates only `LIVE_EFFECTIVE_SCORE_SQL`, one of `SortKey::order_key`'s
-    // four literals, fixed direction words and the page-size constant. The cursor address is a
-    // bound parameter.
-    let query = sqlx::query_as::<_, IpRowRaw>(sqlx::AssertSqlSafe(sql));
-    let mut rows = match cursor {
-        Cursor::First => query.fetch_all(db).await?,
-        Cursor::After(ip) | Cursor::Before(ip) => query.bind(ip.to_string()).fetch_all(db).await?,
-    };
-    let more = rows.len() > PAGE_SIZE;
-    rows.truncate(PAGE_SIZE);
-    if forward {
-        Ok(Page {
-            rows,
-            has_prev: matches!(cursor, Cursor::After(_)),
-            has_next: more,
-        })
-    } else {
-        rows.reverse();
-        Ok(Page {
-            rows,
-            has_prev: more,
-            has_next: true,
-        })
-    }
-}
-
-/// How many rows sort ahead of `ip` in this listing: the zero-based position of the page's first
-/// row. Stops counting at [`COUNT_CAP`] and says so.
-async fn rows_ahead(db: &PgPool, sort: SortKey, desc: bool, ip: &str) -> Result<Count, AppError> {
-    let key = sort.order_key();
-    let ahead = if desc { ">" } else { "<" };
-    let sql = format!(
-        "SELECT count(*) FROM (SELECT 1 FROM ip_score WHERE ({key}, source_ip) {ahead} \
-         (SELECT {key}, source_ip FROM ip_score WHERE source_ip = $1::inet) LIMIT {COUNT_CAP}) s"
-    );
-    // Audited: interpolates one of `SortKey::order_key`'s literals, a fixed operator and a
-    // constant; the address is bound.
-    let value: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-        .bind(ip)
-        .fetch_one(db)
-        .await?;
-    Ok(Count {
-        value,
-        exact: value < COUNT_CAP,
-    })
-}
-
-/// Scored addresses in total: exact up to [`COUNT_CAP`], past it the planner's estimate.
+/// Scored addresses in total: exact up to the counting cap, past it the planner's estimate.
 async fn total_count(db: &PgPool) -> Result<Count, AppError> {
     Ok(capped_total(db, "ip_score").await?)
 }

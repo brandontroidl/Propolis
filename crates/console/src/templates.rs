@@ -146,6 +146,13 @@ pub fn environment() -> Environment<'static> {
         .expect("fleet_status_fragment.html must be a valid template");
     env.add_template("ips.html", IPS_HTML)
         .expect("ips.html must be a valid template");
+    // Attackers' "Load more" (`routes::ips`): the same page/fragment split as Search's pair.
+    env.add_template("ips_rows.html", IPS_ROWS_HTML)
+        .expect("ips_rows.html must be a valid template");
+    env.add_template("ips_load_more.html", IPS_LOAD_MORE_HTML)
+        .expect("ips_load_more.html must be a valid template");
+    env.add_template("ips_rows_fragment.html", IPS_ROWS_FRAGMENT_HTML)
+        .expect("ips_rows_fragment.html must be a valid template");
     env.add_template("integrity.html", INTEGRITY_HTML)
         .expect("integrity.html must be a valid template");
     env.add_template("samples.html", SAMPLES_HTML)
@@ -166,6 +173,9 @@ const CAMPAIGNS_HTML: &str = include_str!("templates/campaigns.html");
 const CAMPAIGN_DETAIL_HTML: &str = include_str!("templates/campaign_detail.html");
 const CAMPAIGN_APPROVE_HTML: &str = include_str!("templates/campaign_approve.html");
 const IPS_HTML: &str = include_str!("templates/ips.html");
+const IPS_ROWS_HTML: &str = include_str!("templates/ips_rows.html");
+const IPS_LOAD_MORE_HTML: &str = include_str!("templates/ips_load_more.html");
+const IPS_ROWS_FRAGMENT_HTML: &str = include_str!("templates/ips_rows_fragment.html");
 const INTEGRITY_HTML: &str = include_str!("templates/integrity.html");
 const SAMPLES_HTML: &str = include_str!("templates/samples.html");
 

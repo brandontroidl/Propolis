@@ -166,7 +166,12 @@ pub fn vocabulary_violations(html: &str) -> Vec<String> {
     }
     walk(
         html,
-        |_, e| {
+        |chain, e| {
+            // Sorting is the `.sortbar` above a table: a column header is hidden when the table
+            // stacks into cards on a phone, so a sort link in one leaves a phone unable to sort.
+            if e.name == "a" && chain.iter().any(|p| p.name == "th") {
+                out.push(format!("a link in a column header: {}", e.describe()));
+            }
             let tier_colour = ["tier-aggressive", "tier-standard", "tier-none"];
             if tier_colour.iter().any(|c| e.has(c)) && !e.has("tier") {
                 out.push(format!("tier colour without the pill: {}", e.describe()));

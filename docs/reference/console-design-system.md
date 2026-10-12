@@ -87,8 +87,11 @@ empty, and no empty line sits outside a panel.
 compact table without a header (the IP page's summary, the fleet pane's panels). A table of
 attacker addresses adds `.stack`: below 640px each row becomes a card, cells flowing in source
 order, a cell's `data-label` naming it, and three roles placing the rest (`.stack-lead` for the
-row's subject, `.stack-end`, `.stack-full`). A sortable header stays as the row of its sort links.
-Other tables scroll inside their panel.
+row's subject, `.stack-end`, `.stack-full`). Other tables scroll inside their panel.
+
+**Sorting.** A sortable list has a `nav.sortbar` above it ("Sort by" and one link per key, the
+active one `.active`, with its direction where the list can reverse). Never a link in a column
+header: headers are hidden when a table stacks, and one column can cover two keys.
 
 **Severity tag.** `span.sev` with `.sev--crit`, `.sev--high`, `.sev--watch` or `.sev--low`; a `.sev`
 with no modifier is a neutral label chip (an ATT&CK id, a campaign class, a sample's origin).
@@ -156,7 +159,7 @@ console page from one indexed database:
   another density, an empty state outside a panel, the retired empty-state styles, and malformed
   tags;
 - `crates/console/tests/markup/mod.rs#vocabulary_violations`: a review-state pill used for anything
-  else, a bare tier colour, a tier-coloured score, and the retired chip, count and sparkline
-  styles;
+  else, a bare tier colour, a tier-coloured score, a link in a column header, and the retired
+  chip, count and sparkline styles;
 - `crates/console/tests/markup/mod.rs#stack_violations`: an address table that does not stack;
 - `crates/console/tests/markup/mod.rs#form_violations`: a form control outside a styled wrapper.

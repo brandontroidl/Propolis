@@ -15,6 +15,15 @@
 <p class="table-note">That page started at an address that is no longer scored, so this is the first page.</p>
 {% endif %}
 <p class="table-note" id="tier-note"><strong>Tier</strong> is set when an address is scored, from its raw score and its strongest signal's confidence: aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70. <strong>Score</strong> is live, decayed since the last event and weighted for breadth, so a 100.0 can be standard while a 99.9 is aggressive. Rules: <span class="mono">docs/reference/scoring-and-feed.md#tier</span></p>
+{#- The same sort bar as Review and Campaigns: column headers are hidden when the table stacks
+    into cards on a narrow screen, and the bar is not. The active key shows its direction and its
+    link reverses it. -#}
+<nav class="sortbar" aria-label="Sort the addresses">
+  <span class="dim">Sort by</span>
+  {% for key, name in [["score", "score"], ["events", "events"], ["first", "first seen"], ["last", "last seen"]] %}
+  <a href="/ips?sort={{ key }}&dir={% if sort == key and dir == 'desc' %}asc{% else %}desc{% endif %}" class="{% if sort == key %}active{% endif %}">{{ name }}{% if sort == key %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a>
+  {% endfor %}
+</nav>
 {{ pager() }}
 <div class="panel">
 <div class="panel-head">Addresses{% if shown > 0 %} <span class="dim">showing {{ shown_from | count }}-{{ shown_to | count }}{% if not position_exact %} (position estimated){% endif %} of {% if total_exact %}{{ total | count }}{% else %}about {{ total | count }} (estimate){% endif %} scored addresses</span>{% endif %}</div>
@@ -22,14 +31,14 @@
 <table class="table-compact stack">
   <thead>
     <tr>
-      <th class="count"><a href="/ips?sort=score&dir={% if sort == 'score' and dir == 'desc' %}asc{% else %}desc{% endif %}">Score{% if sort == 'score' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th class="count">Score</th>
       <th>IP</th>
       <th title="aggressive: raw score &ge; 90 and confidence &ge; 0.95; standard: &ge; 75 and &ge; 0.70; set when scored" aria-describedby="tier-note">Tier</th>
-      <th class="count"><a href="/ips?sort=events&dir={% if sort == 'events' and dir == 'desc' %}asc{% else %}desc{% endif %}">Events{% if sort == 'events' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th class="count">Events</th>
       <th>Categories</th>
       <th>WANs</th>
-      <th><a href="/ips?sort=first&dir={% if sort == 'first' and dir == 'desc' %}asc{% else %}desc{% endif %}">First seen{% if sort == 'first' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
-      <th><a href="/ips?sort=last&dir={% if sort == 'last' and dir == 'desc' %}asc{% else %}desc{% endif %}">Last seen{% if sort == 'last' %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a></th>
+      <th>First seen</th>
+      <th>Last seen</th>
       <th>Eligible</th>
     </tr>
   </thead>

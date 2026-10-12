@@ -371,8 +371,6 @@ table { width: 100%; border-collapse: collapse; }
 .panel .table-wrap { border: none; border-radius: 0; box-shadow: none; }
 th, td { padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
 th { background: var(--surface-raised); white-space: nowrap; }
-th a { color: var(--text-muted); }
-th a:hover { color: var(--text); }
 tbody tr { transition: background-color 90ms ease; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover td { background: color-mix(in srgb, var(--surface-raised) 60%, transparent); }

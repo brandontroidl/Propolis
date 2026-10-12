@@ -32,42 +32,11 @@
      of this sample (its same-sample campaign, and the command sequences that uploaded it). #}
   <colgroup><col class="cs-hash"><col class="cs-hosts"><col class="cs-spark"><col class="cs-active"><col class="cs-by"><col class="cs-src"><col class="cs-tr"><col class="cs-vt"><col class="cs-dl"></colgroup>
   <thead><tr><th>Sample</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Delivered by</th><th title="The address that uploaded the file, or the first to report a URL the fetcher retrieved it from">Source</th><th title="How the fetcher's connection for this body was authenticated">Transport</th><th>VirusTotal</th><th></th></tr></thead>
-  <tbody>
-    {% for s in samples %}
-    <tr>
-      <td class="s-hash stack-full">{{ m.hash_link(s.sha256) }}<span class="c-sub">{{ s.sensor }}, {{ s.size }}{% if s.truncated %}, truncated{% endif %}</span></td>
-      <td class="count" data-label="Hosts">
-        {% if s.campaign %}<a href="/campaigns/{{ s.campaign.id }}">{{ s.campaign.members | count }}</a>{% if s.campaign.role == "infected host" %} <span class="sev sev--watch" title="The sample scans for and copies itself to new hosts: its uploaders are most likely infected hosts">worm</span>{% endif %}
-        {% else %}<span class="dim na">-</span>{% endif %}
-      </td>
-      <td>{% if s.spark %}{{ m.day_strip(s.spark, spark_days) }}{% endif %}</td>
-      <td class="active-cell stack-end"{% if s.active_title %} title="{{ s.active_title }}"{% endif %}>{% if s.active %}{{ s.active }}{% else %}<span class="dim na">-</span>{% endif %}</td>
-      <td>
-        {% if s.delivered_by %}<a href="/campaigns/{{ s.delivered_by.id }}" title="{{ s.delivered_by.members | count }} host{% if s.delivered_by.members != 1 %}s{% endif %} ran this command sequence">campaign {{ s.delivered_by.id }}</a>{% else %}<span class="dim na">-</span>{% endif %}
-      </td>
-      <td class="ip stack-full">
-        {% if s.source_ips %}
-          {% for ip in s.source_ips %}{{ m.ip_evidence_link(ip) }}{% if not loop.last %} {% endif %}{% endfor %}
-          {% if s.more_source_ips > 0 %}<span class="dim">+{{ s.more_source_ips | count }} more</span>{% endif %}
-        {% else %}
-          <span class="dim">not linked</span>
-        {% endif %}
-      </td>
-      <td>
-        {% if s.transport %}
-          <span class="sev-tags">{% for t in s.transport %}{% if t.sev %}<span class="sev sev--{{ t.sev }}"{% if t.detail %} title="{{ t.detail }}"{% endif %}>{{ t.label }}</span>{% else %}<span class="dim">{{ t.label }}</span>{% endif %}{% endfor %}</span>
-        {% elif s.uploaded %}
-          <span class="dim" title="A sensor took this file from the address that sent it. Nothing was fetched, so there is no connection to authenticate.">n/a, uploaded</span>
-        {% else %}
-          <span class="dim" title="The file is in the fetcher's bucket but no successful fetch record names it.">not recorded</span>
-        {% endif %}
-      </td>
-      <td>{{ m.vt_verdict(s.vt_detected, s.vt_total, s.vt_link, s.sha256) }}</td>
-      <td class="stack-end"><a href="/samples/download/{{ s.sha256 }}" class="dl-go">Download</a></td>
-    </tr>
-    {% endfor %}
+  <tbody id="samples-rows">
+{% include "samples_rows.html" %}
   </tbody>
 </table>
+<div class="load-more-row" id="load-more-container">{% include "samples_load_more.html" %}</div>
 </div>
 {% else %}
 <div class="panel samples-panel"><p class="empty-line">no captured samples in the spool</p></div>

@@ -6,7 +6,7 @@ use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use minijinja::context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use chrono::{Duration, Utc};
@@ -16,12 +16,14 @@ use crate::routes::campaigns::{
     campaigns_linking_sample, day_counts, delivering_campaigns, host_strip, sample_activity,
 };
 use crate::routes::context::base_context;
+use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
 use crate::routes::format::{format_active, format_bytes, format_sensor_label};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/samples", get(samples_page))
+        .route("/samples/rows", get(samples_rows))
         .route("/samples/{sha256}", get(sample_page))
         .route("/samples/download/{sha256}", get(download_sample))
 }
@@ -268,14 +270,129 @@ fn group_source_ips(rows: Vec<(String, String)>) -> std::collections::HashMap<St
     map
 }
 
+/// Samples per load: the page shows this many, and each "Load more" this many more.
+const SAMPLES_PER_LOAD: usize = 200;
+
+#[derive(Debug, Deserialize)]
+struct SamplesQuery {
+    /// The last sample already shown, as `{sha256}:{bucket}` (`/samples/rows` only).
+    after: Option<String>,
+}
+
+/// One load of the Samples list.
+struct SamplesLoad {
+    samples: Vec<SampleRow>,
+    total: usize,
+    next_after: Option<String>,
+    cursor_lost: bool,
+}
+
 async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
-    // Each DB read soft-fails through `degraded` so the page names the placeholder: an empty
-    // source-IP map renders "not linked" and an empty verdict map "not yet scanned", both of
-    // which are also what a healthy node with nothing to show renders.
     let mut degraded = base.degraded;
-    let source_ips_by_sha = degraded.soft("sample source IPs", sample_source_ips(&state.db).await);
-    let transport_by_sha = degraded.soft("fetch transport", sample_transport(&state.db).await);
+    let load = load_samples(&state.db, None, &mut degraded).await?;
+    let status_counts = degraded.soft("fetch status counts", fetch_status_counts(&state.db).await);
+    let fetch_attempts_total: i64 = status_counts.iter().map(|c| c.count).sum();
+
+    let tmpl = state.templates.get_template("samples.html")?;
+    Ok(Html(tmpl.render(context! {
+        active_nav => "samples",
+        pending_count => base.pending_count,
+        uptime => base.uptime,
+        version => base.version,
+        degraded => degraded.names(),
+        samples => load.samples,
+        total => load.total,
+        next_after => load.next_after,
+        cursor_lost => false,
+        status_counts,
+        fetch_attempts_total,
+        spark_days => LIST_SPARK_DAYS,
+    })?))
+}
+
+/// `GET /samples/rows`: the next load after the sample `after=` names. A sample no longer
+/// spooled (aged out of a spool's budget since the page loaded) cannot say where to resume, so
+/// nothing is added and the fragment says so. A soft failure leaves its placeholder in the rows;
+/// the page's degraded banner is not redrawn by a fragment.
+async fn samples_rows(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<SamplesQuery>,
+) -> Result<Html<String>, AppError> {
+    let mut degraded = Degraded::new();
+    let load = match query.after.as_deref() {
+        Some(after) => load_samples(&state.db, Some(after), &mut degraded).await?,
+        None => SamplesLoad {
+            samples: Vec::new(),
+            total: 0,
+            next_after: None,
+            cursor_lost: true,
+        },
+    };
+    let tmpl = state.templates.get_template("samples_rows_fragment.html")?;
+    Ok(Html(tmpl.render(context! {
+        samples => load.samples,
+        next_after => load.next_after,
+        cursor_lost => load.cursor_lost,
+        spark_days => LIST_SPARK_DAYS,
+    })?))
+}
+
+/// Every spooled file ranked - the most widely delivered first, then by digest and bucket, so
+/// the order is stable and a digest in two buckets has a place of its own - and the load after
+/// `after` (the first when `None`). Only that load's rows are read from the database beyond the
+/// campaigns the ranking needs. Each read soft-fails through `degraded` so the page names the
+/// placeholder: an empty source-IP map renders "not linked" and an empty verdict map "not yet
+/// scanned", both of which are also what a healthy node with nothing to show renders.
+async fn load_samples(
+    db: &sqlx::PgPool,
+    after: Option<&str>,
+    degraded: &mut Degraded,
+) -> Result<SamplesLoad, AppError> {
+    let mut files = Vec::new();
+    for (sensor, dir) in spool_dirs() {
+        for file in review::spool::list_samples(&dir).await.unwrap_or_default() {
+            files.push((sensor, file));
+        }
+    }
+    let all_shas: Vec<String> = files.iter().map(|(_, f)| f.sha256.clone()).collect();
+    let campaigns = degraded.soft("sample campaigns", campaigns_by_sample(db, &all_shas).await);
+    let hosts = |sha: &str| campaigns.get(sha).map_or(0, |c| c.members);
+    files.sort_by(|(sa, a), (sb, b)| {
+        hosts(&b.sha256)
+            .cmp(&hosts(&a.sha256))
+            .then_with(|| a.sha256.cmp(&b.sha256))
+            .then_with(|| sa.cmp(sb))
+    });
+    let total = files.len();
+    let key = |sensor: &str, sha: &str| format!("{sha}:{sensor}");
+    let start = match after {
+        None => 0,
+        Some(after) => match files.iter().position(|(s, f)| key(s, &f.sha256) == after) {
+            Some(at) => at + 1,
+            None => {
+                return Ok(SamplesLoad {
+                    samples: Vec::new(),
+                    total,
+                    next_after: None,
+                    cursor_lost: true,
+                });
+            }
+        },
+    };
+    let files: Vec<_> = files
+        .into_iter()
+        .skip(start)
+        .take(SAMPLES_PER_LOAD)
+        .collect();
+    let next_after = files
+        .last()
+        .map(|(s, f)| key(s, &f.sha256))
+        .filter(|_| start + files.len() < total);
+    let shas: Vec<String> = files.iter().map(|(_, f)| f.sha256.clone()).collect();
+
+    let source_ips_by_sha = degraded.soft("sample source IPs", sample_source_ips(db).await);
+    let transport_by_sha = degraded.soft("fetch transport", sample_transport(db).await);
 
     let vt_results: std::collections::HashMap<String, (i32, i32, String)> = degraded
         .soft(
@@ -283,7 +400,7 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
             sqlx::query_as::<_, (String, i32, i32, String)>(
                 "SELECT sha256, detected, total, vt_link FROM sample_analysis",
             )
-            .fetch_all(&state.db)
+            .fetch_all(db)
             .await,
         )
         .into_iter()
@@ -291,31 +408,20 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
         .collect();
 
     let max_source_ips = max_source_ips_shown();
-    let mut files = Vec::new();
-    for (sensor, dir) in spool_dirs() {
-        for file in review::spool::list_samples(&dir).await.unwrap_or_default() {
-            files.push((sensor, file));
-        }
-    }
-    let shas: Vec<String> = files.iter().map(|(_, f)| f.sha256.clone()).collect();
-    let campaigns = degraded.soft(
-        "sample campaigns",
-        campaigns_by_sample(&state.db, &shas).await,
-    );
-    let activity = degraded.soft("sample activity", sample_activity(&state.db, &shas).await);
-    let truncated = degraded.soft(
-        "truncated captures",
-        truncated_samples(&state.db, &shas).await,
-    );
+    let activity = degraded.soft("sample activity", sample_activity(db, &shas).await);
+    let truncated = degraded.soft("truncated captures", truncated_samples(db, &shas).await);
     let delivering = degraded.soft(
         "delivering campaigns",
-        delivering_campaigns(&state.db, &shas).await,
+        delivering_campaigns(db, &shas).await,
     );
     let today = Utc::now().date_naive();
-    let ids: Vec<i64> = campaigns.values().map(|c| c.id).collect();
+    let ids: Vec<i64> = shas
+        .iter()
+        .filter_map(|sha| campaigns.get(sha).map(|c| c.id))
+        .collect();
     let days = degraded.soft(
         "activity sparklines",
-        day_counts(&state.db, &ids, today - Duration::days(LIST_SPARK_DAYS - 1)).await,
+        day_counts(db, &ids, today - Duration::days(LIST_SPARK_DAYS - 1)).await,
     );
     let now = Utc::now();
     let mut samples = Vec::new();
@@ -366,32 +472,12 @@ async fn samples_page(State(state): State<AppState>) -> Result<Html<String>, App
             });
         }
     }
-
-    // The most widely delivered files first, then by digest so the order is stable.
-    samples.sort_by(|a, b| {
-        let hosts = |s: &SampleRow| s.campaign.as_ref().map_or(0, |c| c.members);
-        hosts(b)
-            .cmp(&hosts(a))
-            .then_with(|| a.sha256.cmp(&b.sha256))
-    });
-    let total = samples.len();
-
-    let status_counts = degraded.soft("fetch status counts", fetch_status_counts(&state.db).await);
-    let fetch_attempts_total: i64 = status_counts.iter().map(|c| c.count).sum();
-
-    let tmpl = state.templates.get_template("samples.html")?;
-    Ok(Html(tmpl.render(context! {
-        active_nav => "samples",
-        pending_count => base.pending_count,
-        uptime => base.uptime,
-        version => base.version,
-        degraded => degraded.names(),
+    Ok(SamplesLoad {
         samples,
         total,
-        status_counts,
-        fetch_attempts_total,
-        spark_days => LIST_SPARK_DAYS,
-    })?))
+        next_after,
+        cursor_lost: false,
+    })
 }
 
 /// `GET /samples/{sha256}` - one sample: where it is spooled, the campaigns it belongs to, and the

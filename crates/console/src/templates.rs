@@ -166,6 +166,12 @@ pub fn environment() -> Environment<'static> {
         .expect("integrity.html must be a valid template");
     env.add_template("samples.html", SAMPLES_HTML)
         .expect("samples.html must be a valid template");
+    env.add_template("samples_rows.html", SAMPLES_ROWS_HTML)
+        .expect("samples_rows.html must be a valid template");
+    env.add_template("samples_load_more.html", SAMPLES_LOAD_MORE_HTML)
+        .expect("samples_load_more.html must be a valid template");
+    env.add_template("samples_rows_fragment.html", SAMPLES_ROWS_FRAGMENT_HTML)
+        .expect("samples_rows_fragment.html must be a valid template");
     env.add_template("sample_detail.html", SAMPLE_DETAIL_HTML)
         .expect("sample_detail.html must be a valid template");
     env.add_template("campaigns.html", CAMPAIGNS_HTML)
@@ -213,6 +219,9 @@ const IPS_LOAD_MORE_HTML: &str = include_str!("templates/ips_load_more.html");
 const IPS_ROWS_FRAGMENT_HTML: &str = include_str!("templates/ips_rows_fragment.html");
 const INTEGRITY_HTML: &str = include_str!("templates/integrity.html");
 const SAMPLES_HTML: &str = include_str!("templates/samples.html");
+const SAMPLES_ROWS_HTML: &str = include_str!("templates/samples_rows.html");
+const SAMPLES_LOAD_MORE_HTML: &str = include_str!("templates/samples_load_more.html");
+const SAMPLES_ROWS_FRAGMENT_HTML: &str = include_str!("templates/samples_rows_fragment.html");
 
 #[cfg(test)]
 mod tests {

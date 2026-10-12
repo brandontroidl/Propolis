@@ -65,10 +65,11 @@ score can be rebuilt from it.
 
 ## Attackers
 
-Every scored address, sortable by score, events, first seen or last seen, 500 to a page,
-with Previous and Next links and a "showing 501-1,000 of N" line. Pages resume from the
-last address shown, so an address scored while you page does not repeat or skip a row.
-Past 100,000 addresses the total is the database's estimate and says so.
+Every scored address, sorted from the "Sort by" bar by score, events, first seen or last
+seen (choose the active key again to reverse it), 500 at a time with Load more below for
+the next 500, like every long list in the console. Each load resumes from the last address
+shown, so an address scored while you read does not repeat or skip a row. Past 100,000
+addresses the total is the database's estimate and says so.
 
 The **score** column is the live score: decayed since the address's last event and
 weighted for how many of your WAN addresses it hit. The **tier** was set when the address

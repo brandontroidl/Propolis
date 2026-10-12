@@ -225,6 +225,24 @@
 
 ### Changed
 
+- **Every long console list loads the rest the same way** - Attackers paged with First,
+  Previous and Next; Campaigns and a campaign's members stopped at 200 and 500 with "showing
+  the first N"; Samples and the Feed's Entries tables printed everything at once. Each now
+  shows its first load (500 addresses or members, 200 campaigns or samples) with one "Load
+  more" below it that appends the next load, the control the IP timeline and Search already
+  used. Each load continues from the last row shown rather than by offset, so rows added
+  meanwhile neither repeat nor go missing, and a row that disappears in between is reported
+  with a note to reload. Attackers no longer says which rows of how many are shown, only the
+  total.
+- **Every list sorts from the "Sort by" bar** - Attackers sorted from links in its column
+  headers, which are hidden when its table turns into cards on a phone, so it could not be
+  sorted there. It now has the bar Review and Campaigns use; choosing the active key again
+  reverses it.
+- **Every count is grouped in thousands** - the dashboard printed `29296` where Attackers
+  printed `29,296`. All counts, in tables, headings and tooltips, now read `29,296`.
+- **The orange severity rung is distinct from the amber one** - in Graphite and Cream "high"
+  and "attention" were within a few degrees of each other. High is now a clear orange
+  (Graphite `#e8883f`, Cream `#b4501a`) between the amber and the red.
 - **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 10 MB** -
   `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `10000000`, the spool's per-file cap, where it
   was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000

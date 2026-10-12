@@ -111,7 +111,8 @@ Attacker input cannot drive unbounded resource use:
   counter rather than blocking or growing unbounded. See
   [../architecture/concurrency-and-failure.md](../architecture/concurrency-and-failure.md).
 - **Console read pages are bounded:** event/IP listings paginate (search page size 50; the
-  attacker IP list pages 500 rows at a time by keyset, and its counts stop at 100,000 rows;
+  attacker IP list loads 500 rows at a time by keyset, and its counts stop at 100,000 rows;
+  campaigns, a campaign's members, samples and each feed table load 200 or 500 at a time;
   each review-queue context line reads at most 5,000 of its address's events; the dashboard's
   Recent activity reads the newest 1,000 events). See [../reference/console-routes.md](../reference/console-routes.md).
 - **The opt-in reverse-DNS cache is capacity-bounded:** at most 4096 distinct IPs

@@ -71,7 +71,7 @@ above it as a `.table-note`.
 ## Components
 
 **Panel.** `div.panel > div.panel-head` then any of: a `table.table-compact`, a `div.panel-body`,
-one `p.empty-line`, or the `#load-more-container` row. Nothing else sits directly in a panel; text,
+one `p.empty-line`, or a `.load-more-row`. Nothing else sits directly in a panel; text,
 lists, strips and forms go in `.panel-body`, which pads them and sets them at the table's size. A
 head carries a title and at most a short `.dim` subtitle or a control (range buttons, a download).
 `.panel-head--alert` caps a panel with something wrong in it.
@@ -92,6 +92,13 @@ row's subject, `.stack-end`, `.stack-full`). Other tables scroll inside their pa
 **Sorting.** A sortable list has a `nav.sortbar` above it ("Sort by" and one link per key, the
 active one `.active`, with its direction where the list can reverse). Never a link in a column
 header: headers are hidden when a table stacks, and one column can cover two keys.
+
+**Long lists.** A list longer than one load ends in a `div.load-more-row` (the list's own id,
+since a page can hold several) with one "Load more" button that appends the next load below
+(`hx-swap="beforeend"`) and is replaced, out of band, by the next button, by nothing after the
+last row, or by a dim note when the row it was continuing from is gone. It continues from the
+last row shown, never by offset, so rows added meanwhile neither repeat nor go missing. No list
+stops at a cap with "showing the first N", and none pages with First/Previous/Next.
 
 **Severity tag.** `span.sev` with `.sev--crit`, `.sev--high`, `.sev--watch` or `.sev--low`; a `.sev`
 with no modifier is a neutral label chip (an ATT&CK id, a campaign class, a sample's origin).

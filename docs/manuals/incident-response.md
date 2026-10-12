@@ -57,7 +57,7 @@ Routes are owned by [console routes](../reference/console-routes.md).
 - **Event history** - `GET /ip/{ip}/events`: the attacker's captured events for that IP,
   keyset-paginated.
 - **Search** - `GET /search/events` and `/search/ips` to pivot across the corpus;
-  `GET /ips` lists every scored IP, 500 to a page.
+  `GET /ips` lists every scored IP, 500 at a time with Load more.
 - **Samples** - `GET /samples` lists captured samples; `GET /samples/download/{sha256}`
   streams the raw body as `application/octet-stream` with `Content-Disposition: attachment`
   and `Content-Security-Policy: default-src 'none'` (a hardened download - see custody below

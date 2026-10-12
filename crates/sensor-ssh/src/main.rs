@@ -16,13 +16,18 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
+use sensor_framework::session_memory::{self, AccountingAlloc};
 use sensor_framework::{
     Arrival, CaptureMemoryBudget, CommandEventConfig, CommandEventConfigError, CommandEventGate,
     ConnectionBounds, EnvError, EventEmitter, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
     strict_env_var,
 };
 use sensor_ssh::hostkey::HostKey;
-use sensor_ssh::server::DEFAULT_CAPTURE_BUDGET_BYTES;
+use sensor_ssh::server::{DEFAULT_CAPTURE_BUDGET_BYTES, SESSION_MEMORY_POOL_BYTES};
+
+/// Every allocation is charged to the session it was made in (`session_memory`).
+#[global_allocator]
+static ALLOCATOR: AccountingAlloc = AccountingAlloc;
 
 const ENV_BIND: &str = "PROPOLIS_SSH_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_SSH_WAN_MAP";
@@ -324,6 +329,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Every admitted session must fit in the session memory pool at its floor.
+    if let Err(e) =
+        session_memory::configure(SESSION_MEMORY_POOL_BYTES, config.bounds.max_concurrent)
+    {
+        tracing::error!(error = %e, "sensor-ssh: invalid configuration; refusing to start");
+        std::process::exit(1);
+    }
+    tokio::spawn(session_memory::watchdog());
 
     // Load or generate the host key so the honeypot does not fingerprint itself as freshly
     // minted on every restart (design doc's "Host key").

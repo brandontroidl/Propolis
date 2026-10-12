@@ -125,7 +125,8 @@ pub async fn start_test_server_with_handoff(
             let bounds = bounds.clone();
             let command_events = command_events.clone();
             let infected_hold = hold_for_sessions.clone();
-            async move {
+            // What the session allocates is its own (`session_memory`).
+            sensor_framework::session_memory::scope(async move {
                 // Before anything is written or logged: a held source sees a closed door, not a
                 // login prompt, and the refusal is counted by the hold.
                 if infected_hold.refuses(normalize_dual_stack(peer).ip()) {
@@ -145,7 +146,7 @@ pub async fn start_test_server_with_handoff(
                     infected_hold,
                 )
                 .await;
-            }
+            })
         },
     )
     .await?;

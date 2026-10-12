@@ -252,6 +252,21 @@
 
 ### Fixed
 
+- **What a client's shell sessions can make a sensor hold is bounded** - nothing bounded what one SSH,
+  telnet or ADB session could make its fake shell hold: 256 SSH connections of 10 idle shells
+  measured 1.05 GB against a 512 M `MemoryMax`, and a single shell grew without limit by typing
+  (doubling positional parameters, 50 MB; holding `/dev/zero` open on every descriptor, 64 MB;
+  nested `bash`, 7 KB a level; functions that parse to 230 times their text). The three sensors
+  now count what each session really allocates and bound it: 8 MiB a session between lines, about
+  29 MiB while a line runs, and a pool of 30% of `MemoryMax` shared by every session: when it runs
+  out, a session past its floor gets no more (its line stops), one within its floor still gets
+  what it is owed, and while sessions hold more than the pool the ones furthest over their fair
+  shares are ended one at a time. A line that would pass the
+  limit stops at its next step; a session over it is ended (`end_reason` `memory_limit`); SSH
+  refuses a new shell or exec while the pool is nearly full. History now keeps at most 64 KiB of
+  lines, and `export name` of a new name counts against the variable allowance. Every allocation
+  in those three sensors carries a 16-byte header. See
+  [capacity planning](docs/operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
 - **`$SHLVL` counts nested shells** - it stayed 1 however many `bash` or `su` levels a session
   opened, where a real bash adds one to the `SHLVL` it inherits and exports it, so `bash; echo
   $SHLVL` printing 1 was a tell. Each bash level now counts itself in (a value that is not a number

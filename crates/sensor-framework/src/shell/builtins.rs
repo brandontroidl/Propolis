@@ -211,6 +211,10 @@ impl FakeShell {
             self.history.remove(0);
         }
         self.history.push(line);
+        let mut held: usize = self.history.iter().map(String::len).sum();
+        while held > super::HISTORY_MAX_BYTES && self.history.len() > 1 {
+            held = held.saturating_sub(self.history.remove(0).len());
+        }
     }
 
     pub(super) fn top_frame_is_scoped(&self) -> bool {
@@ -267,12 +271,12 @@ impl FakeShell {
             }
             if let Some(value) = value {
                 self.assign_var(name, value.to_string());
+            } else if !unexport && !self.state().vars.contains_key(name) {
+                // `export name` creates it empty, against the allowance like any other variable.
+                self.assign_var(name, String::new());
             }
-            let state = self.state_mut();
-            match state.vars.get_mut(name) {
-                Some(var) => var.exported = !unexport,
-                None if !unexport => state.set_var(name, String::new(), true),
-                None => {}
+            if let Some(var) = self.state_mut().vars.get_mut(name) {
+                var.exported = !unexport;
             }
         }
         if errors.is_empty() {

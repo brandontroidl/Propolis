@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 use sensor_framework::listener::{normalize_dual_stack, run_tcp_listener_tracked};
+use sensor_framework::session_memory::{self, AccountRef};
 use sensor_framework::{
     Arrival, BudgetLimits, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody,
     CaptureEnd, CaptureHandoff, CaptureJob, CaptureMemoryBudget, CaptureSource, CommandEventConfig,
@@ -178,7 +179,9 @@ impl ChannelState {
 
     /// Hold a packet behind the output queue, at the back (a new arrival) or the front (one that
     /// was taken for a turn and could not run, or the unrun rest of a packet).
-    fn defer(&mut self, packet: DeferredPacket, front: bool) -> Result<(), OutputOverrun> {
+    fn defer(&mut self, mut packet: DeferredPacket, front: bool) -> Result<(), OutputOverrun> {
+        // The output budget charges it while it waits; the session's own memory does not twice.
+        session_memory::disown(&mut packet.payload);
         let total = self.deferred_bytes.saturating_add(packet.charged());
         if total > DEFERRED_CHANNEL_MAX_BYTES {
             return Err(OutputOverrun(
@@ -351,6 +354,8 @@ impl ChannelFlow {
         if self.outbound.is_empty() {
             self.last_progress = Instant::now();
         }
+        // The output budget charges it from here; the session's own memory does not twice.
+        session_memory::disown(&mut bytes);
         self.outbound.push_back(QueuedChannelData {
             fd,
             bytes,
@@ -490,6 +495,10 @@ pub const UNIT_MEMORY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// The capture memory ceiling used when none is configured: 40% of [`UNIT_MEMORY_MAX_BYTES`].
 pub const DEFAULT_CAPTURE_BUDGET_BYTES: u64 = default_capture_budget_bytes(UNIT_MEMORY_MAX_BYTES);
 
+/// The pool every session's own heap shares (`sensor_framework::session_memory`): 30% of
+/// [`UNIT_MEMORY_MAX_BYTES`], beside the capture budget's 40% and the output budget.
+pub const SESSION_MEMORY_POOL_BYTES: u64 = session_memory::pool_bytes(UNIT_MEMORY_MAX_BYTES);
+
 /// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, the process-wide
 /// capture memory budget `main` built from its configured ceiling, and the sensor's per-source
 /// command-event budget, which `main` flushes on shutdown. A separate function rather than a wider
@@ -618,7 +627,9 @@ pub async fn serve_with_budgets(
             // AsyncRead/AsyncWrite, so the whole session inherits the per-read bound - including
             // any read added later, which a per-call-site timeout would miss.
             let stream = TimeoutStream::new(stream, read_timeout, idle_timeout);
-            async move {
+            // What the session allocates, from its handshake to its last capture, is its own
+            // (`session_memory`).
+            session_memory::scope(async move {
                 if let Err(e) = handle_session(
                     stream,
                     peer_addr,
@@ -637,7 +648,7 @@ pub async fn serve_with_budgets(
                 {
                     tracing::debug!(error = %e, peer = %peer_addr, "SSH session ended");
                 }
-            }
+            })
         },
     )
     .await?;
@@ -669,6 +680,10 @@ async fn handle_session(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let output_budget = output.budget().clone();
     let registration = output.register();
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if session_memory::unaccounted_session() {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
     // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped
     // IPv6 address (::ffff:a.b.c.d from a dual-stack listener) matches the operator's
@@ -810,6 +825,8 @@ async fn handle_session(
     // propagating with `?`) the evidence held in `handler` and `shell_capture` is still
     // submitted below. A write error used to return straight out of this function and take a
     // half-received SCP or SFTP file with it.
+    // This session's memory account, while the sensor accounts sessions.
+    let account = session_memory::current_account();
     let loop_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
         // Set when a packet taken from a channel's deferred queue could not run yet, so the next
         // turn reads the socket (where the WINDOW_ADJUST that drains the queue arrives) instead
@@ -824,6 +841,11 @@ async fn handle_session(
             if registration.is_evicted() {
                 // Another session could not be served and this one held the most.
                 shell_capture.mark_session_end(CaptureEnd::OutputEvicted);
+                break;
+            }
+            // Between packets: over the memory a session may keep, or asked to let go.
+            if account.is_some_and(|a| a.check_retained()) {
+                shell_capture.mark_session_end(CaptureEnd::MemoryLimit);
                 break;
             }
             let stall_at = stall_deadline(&channels, output.stall_limit());
@@ -858,13 +880,24 @@ async fn handle_session(
                         tokio::select! {
                             _ = &mut refunded => continue,
                             () = registration.evicted() => continue,
+                            () = session_memory::evicted(account) => continue,
                             () = sleep_until_or_never(stall_at) => continue,
                             _ = stream.get_ref().peek(&mut probe) => {}
                         }
                     }
-                    let read =
-                        transport::read_packet_encrypted(&mut stream, &mut c2s_cipher, c2s_seq)
-                            .await;
+                    // A session asked to let go while it waits for its peer ends now, not at its
+                    // idle timeout: the packet half read is not needed, the session is over.
+                    let read = tokio::select! {
+                        read = transport::read_packet_encrypted(
+                            &mut stream,
+                            &mut c2s_cipher,
+                            c2s_seq,
+                        ) => read,
+                        () = session_memory::evicted(account) => {
+                            shell_capture.mark_session_end(CaptureEnd::MemoryLimit);
+                            break;
+                        }
+                    };
                     match read {
                         Ok(p) => {
                             c2s_seq = c2s_seq.wrapping_add(1);
@@ -1011,6 +1044,7 @@ async fn handle_session(
                         ChannelAction::Shell | ChannelAction::Exec(_) => {
                             matches!(state.handler, ChannelHandler::Pending)
                                 && !state.flow.close_sent
+                                && shell_room(account)
                         }
                         ChannelAction::Subsystem(name) => {
                             name == "sftp"
@@ -1796,6 +1830,16 @@ async fn sleep_until_or_never(at: Option<Instant>) {
         Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
         None => std::future::pending().await,
     }
+}
+
+/// The least room the session memory pool must have left for a new shell or exec: about a new
+/// shell's own heap.
+const SHELL_ROOM_BYTES: u64 = 512 * 1024;
+
+/// Whether this session may open another shell or exec: it is not over its memory limit and the
+/// pool has room for one more. Always true when sessions are not accounted.
+fn shell_room(account: Option<AccountRef>) -> bool {
+    account.is_none_or(|a| !a.is_over() && session_memory::pool_free() >= SHELL_ROOM_BYTES)
 }
 
 /// What the packet must reserve to run, and whether it must also wait for room in the channel's

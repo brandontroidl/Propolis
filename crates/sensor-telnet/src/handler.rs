@@ -14,6 +14,7 @@ use sensor_framework::fakefs::FakeFs;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::persona;
 use sensor_framework::sanitize_value;
+use sensor_framework::session_memory;
 use sensor_framework::shell::{EmitContext, FakeShell, LineStep, onlcr};
 use sensor_framework::{
     CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, CaptureSource,
@@ -78,6 +79,10 @@ pub async fn handle_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if session_memory::unaccounted_session() {
+        return;
+    }
     // Normalize dual-stack mapped addresses before resolving WAN, so an IPv4-mapped IPv6 address
     // (::ffff:a.b.c.d from a dual-stack listener) matches the operator's plain-IPv4 WAN map entry
     // - mirrors sensor-ssh's `server::handle_session` handling of the same listener module doc
@@ -205,9 +210,26 @@ pub async fn handle_connection<S>(
     // A file the shell sees assembled from typed `echo` chunks is captured through the same set.
     let mut shell = shell.with_captures(stdin_captures.clone());
     let mut hold_on_end = HoldOnEnd::new(infected_hold, source_ip);
+    // This session's memory account, while the sensor accounts sessions.
+    let account = session_memory::current_account();
 
     loop {
-        let Some(line) = reader.read_line(&mut stream, true).await else {
+        // Between lines: over the memory a session may keep, or asked to let go.
+        if account.is_some_and(|a| a.check_retained()) {
+            reader.mark_session_end(CaptureEnd::MemoryLimit);
+            break;
+        }
+        // A session asked to let go while it waits for its next line ends now, not at its idle
+        // timeout; the line half read is not needed.
+        let next = tokio::select! {
+            line = reader.read_line(&mut stream, true) => Some(line),
+            () = session_memory::evicted(account) => None,
+        };
+        let Some(next) = next else {
+            reader.mark_session_end(CaptureEnd::MemoryLimit);
+            break;
+        };
+        let Some(line) = next else {
             break;
         };
         let (step, events) = shell.start_line(&line);
@@ -233,7 +255,18 @@ pub async fn handle_connection<S>(
                 );
                 // Each Enter hands the command its line: `read x` finishes on the first.
                 input.per_line();
-                match reader.read_held(&mut stream, &mut input, &mut shell).await {
+                // Asked to let go while the command waits for its input: end now, with what it
+                // had read.
+                let held = tokio::select! {
+                    held = reader.read_held(&mut stream, &mut input, &mut shell) => Some(held),
+                    () = session_memory::evicted(account) => None,
+                };
+                let Some(held) = held else {
+                    reader.mark_session_end(CaptureEnd::MemoryLimit);
+                    let _ = input.finish(&mut shell, HeldEnd::Cut(CaptureEnd::MemoryLimit));
+                    break;
+                };
+                match held {
                     Some(HeldOutcome::Ended(end)) => input.finish(&mut shell, end),
                     Some(HeldOutcome::Resumed(output)) => output,
                     None => {

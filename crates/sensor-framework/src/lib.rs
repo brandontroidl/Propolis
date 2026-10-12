@@ -31,6 +31,7 @@ pub mod rate_limit;
 pub mod replay;
 pub mod reply_source;
 pub mod sanitize;
+pub mod session_memory;
 pub mod shell;
 pub mod spool;
 pub mod tls;

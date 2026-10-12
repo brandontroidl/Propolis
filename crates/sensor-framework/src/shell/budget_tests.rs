@@ -470,6 +470,50 @@ fn shells_on_one_budget_share_one_command_ceiling_and_one_marker() {
     assert_eq!(marker_events, 1, "and the whole connection gets one marker");
 }
 
+// ---- what one shell keeps -------------------------------------------------------------------
+
+/// A line of `len` letters that differs for every `seed`.
+fn distinct(seed: usize, len: usize) -> String {
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            char::from(b'a' + u8::try_from((state >> 33) % 26).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn history_keeps_64_kib_of_lines_dropping_the_oldest() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    // 200 lines of 1005 bytes: 65 of them fit in 64 KiB, with the `history` line itself.
+    for i in 0..200 {
+        sh.handle_input(format!("echo {}", distinct(i, 1000)));
+    }
+    let (out, _) = sh.handle_input("history | wc -l");
+    assert_eq!(out, "66\n");
+    let (out, _) = sh.handle_input("history");
+    assert!(
+        !out.to_string().contains(&distinct(0, 1000)),
+        "the oldest line went"
+    );
+    assert!(
+        out.to_string().contains(&distinct(199, 1000)),
+        "the newest stayed"
+    );
+}
+
+#[test]
+fn export_of_a_new_name_counts_against_the_content_allowance() {
+    let base = FakeShell::new(FakeFs::new(), ctx()).state().owned_bytes();
+    // Three 3-byte names fit in 10 bytes; five do not.
+    let (mut sh, _) = limited(|l| l.owned_bytes = u64::try_from(base + 10).unwrap());
+    sh.handle_input("export zz0 zz1 zz2 zz3 zz4");
+    assert_eq!(sh.handle_input("env | grep -c '^zz'").0, "3\n");
+}
+
 // ---- untouched sessions ---------------------------------------------------------------------
 
 #[test]

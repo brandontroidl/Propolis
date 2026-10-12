@@ -126,6 +126,7 @@ endings of `crates/sensor-framework/src/handoff.rs#CaptureEnd`.
 | `peer_aborted` | the peer aborted the transfer with its protocol's error message, or with Ctrl-C at a terminal |
 | `output_stalled` | the SSH sensor closed the connection because output queued for the peer made no progress for 30 s: the peer was not reading |
 | `output_evicted` | the SSH sensor closed the connection to free the output budget for sessions it could not serve, because this one held the most of it |
+| `memory_limit` | a shell sensor (SSH, telnet, ADB) ended the session because it held more memory than a session may, or the most over its fair share when the sensor's session memory pool ran out (`crates/sensor-framework/src/session_memory.rs`) |
 | `session_cancelled` | the listener cancelled the handler at `max_duration`; no code observed another ending |
 | `capture_memory_budget` | the process-wide capture memory budget ran out; overrides any other value (`crates/sensor-framework/src/handoff.rs#mark_budget_truncated`) |
 

@@ -303,6 +303,12 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
   a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
   the reply that spent it.
+- On SSH, telnet and ADB the session's own heap is counted too
+  (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
+  may hold while a line runs stops at its next step, as when its work allowance runs out (the
+  trace notes a memory hit), and a session still holding more than it may keep after a line is
+  ended (`end_reason` `memory_limit`). See
+  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
 - A fetch verb the line executes additionally emits `honeypot_file_download` with
   `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - **Standard input.** The sensors run each line through `start_line`
@@ -486,7 +492,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   file a fixed process cost, so `time dd ...` reports a `real` no shorter than dd's `copied, S s`
   and `time true` reports zeros (`crates/sensor-framework/src/shell/timing.rs#bash_report`).
   `history` lists what the interactive login shell was typed as `    1  echo one`, under Ubuntu's
-  `HISTCONTROL=ignoreboth`; a `bash -c` (SSH exec) shell keeps none and lists nothing
+  `HISTCONTROL=ignoreboth`, keeping the last 1000 lines and at most 64 KiB of them; a `bash -c`
+  (SSH exec) shell keeps none and lists nothing
   (`crates/sensor-framework/src/shell/builtins.rs#FakeShell::builtin_history`).
   `$$` and `$!` come from a per-session process id seeded from the session id
   (`crates/sensor-framework/src/persona.rs#session_pid`), and the shell's own `/proc/PID` reads as

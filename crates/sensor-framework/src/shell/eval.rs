@@ -41,13 +41,15 @@ use crate::fakefs::{FsError, READ_CAP};
 
 /// The per-line work allowance: steps taken plus bytes scanned or produced, shared by parsing,
 /// expansion, evaluation and every re-entry of the line. Reset once per input line, never on
-/// re-entry.
+/// re-entry. It also runs out when the session the shell runs in is over its memory limit, so
+/// whatever is growing the session stops at its next step.
 #[derive(Debug, Clone)]
 pub(super) struct LineBudget {
     left: u64,
     exhausted: bool,
     charged: u64,
     unreported: bool,
+    by_memory: bool,
 }
 
 impl LineBudget {
@@ -57,13 +59,21 @@ impl LineBudget {
             exhausted: false,
             charged: 0,
             unreported: false,
+            by_memory: false,
         }
     }
 
-    /// Spend `n`. False once the allowance is spent, and from then on.
+    /// Spend `n`. False once the allowance is spent, or the session is over its memory limit, and
+    /// from then on.
     pub(super) fn charge(&mut self, n: u64) -> bool {
         self.charged = self.charged.saturating_add(n);
         if self.exhausted {
+            return false;
+        }
+        if crate::session_memory::current_over() {
+            self.exhausted = true;
+            self.unreported = true;
+            self.by_memory = true;
             return false;
         }
         if n > self.left {
@@ -74,6 +84,11 @@ impl LineBudget {
         }
         self.left = self.left.saturating_sub(n);
         true
+    }
+
+    /// Whether the allowance ran out because the session is over its memory limit.
+    pub(super) fn by_memory(&self) -> bool {
+        self.by_memory
     }
 
     /// True once, the first time after the allowance ran out, so the trace notes the hit once.

@@ -113,7 +113,8 @@ pub async fn start_test_server_with_handoff(
             let bounds = bounds.clone();
             let handoff = handoff.clone();
             let command_events = command_events.clone();
-            async move {
+            // What the session allocates is its own (`session_memory`).
+            sensor_framework::session_memory::scope(async move {
                 handler::handle_connection(
                     stream,
                     peer,
@@ -125,7 +126,7 @@ pub async fn start_test_server_with_handoff(
                     command_events,
                 )
                 .await;
-            }
+            })
         },
     )
     .await?;

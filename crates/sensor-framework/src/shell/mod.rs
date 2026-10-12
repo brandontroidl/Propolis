@@ -541,6 +541,11 @@ pub struct FakeShell {
 /// The most entries `history` keeps: Ubuntu's stock `.bashrc` sets `HISTSIZE=1000`.
 const HISTORY_MAX: usize = 1_000;
 
+/// The most bytes of lines `history` keeps, dropping the oldest first. A thousand lines of typical
+/// length fit; a thousand at [`MAX_COMMAND_LEN`] would hold a megabyte, an eighth of what a
+/// session may keep.
+const HISTORY_MAX_BYTES: usize = 64 * 1024;
+
 /// A line waiting for its input.
 #[derive(Clone)]
 struct HeldLine {
@@ -1949,7 +1954,11 @@ impl FakeShell {
     fn sync_budget_trace(&mut self) {
         self.trace.budget.work_charged = self.line.charged();
         if self.line.take_refusal() {
-            self.record_hit(BudgetHit::Work);
+            self.record_hit(if self.line.by_memory() {
+                BudgetHit::Memory
+            } else {
+                BudgetHit::Work
+            });
         }
     }
 

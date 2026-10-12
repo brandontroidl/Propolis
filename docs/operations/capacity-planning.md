@@ -100,6 +100,54 @@ the exact behavior. Raise the variable only together with the unit's `MemoryMax`
 counts (current, high-water, refused reservations, truncated and refused captures) are exposed by
 `CaptureHandoff` getters for diagnostics; no endpoint publishes them yet.
 
+## Session memory (`sensor-ssh`, `sensor-telnet`, `sensor-adb`)
+
+The shell sensors count what each client session really holds on the heap instead of estimating
+it. Their binaries install `AccountingAlloc`
+(`crates/sensor-framework/src/session_memory.rs#AccountingAlloc`), which tags every allocation with
+the session it was made in; each connection's future runs in its own accounted scope
+(`crates/sensor-framework/src/session_memory.rs#scope`). Capture bodies grow outside the session,
+since the capture memory budget above already charges them. Every allocation carries a header of
+16 bytes (more for alignments above 16), counted in the session's figure.
+
+- A session may keep at most 8 MiB between lines
+  (`crates/sensor-framework/src/session_memory.rs#RETAINED_LIMIT_BYTES`), and hold at most that
+  plus one line's working set, about 29 MiB, while a line runs
+  (`crates/sensor-framework/src/session_memory.rs#PEAK_LIMIT_BYTES`). Past the peak the shell stops
+  the running line at its next step (the line's work budget runs out, recorded as a memory hit)
+  and the sensor then ends the session; past the retained limit after a line it ends the session
+  too.
+- One sensor's sessions share a pool of 30% of `MemoryMax`
+  (`crates/sensor-framework/src/session_memory.rs#pool_bytes`): 161,061,273 bytes for SSH,
+  80,530,635 for telnet and ADB. A session reserves it in 64 KiB chunks. Its fair share is the
+  pool, less what ended sessions left allocated, divided among the sessions running (a newcomer
+  included), and never under the pool divided by `max_concurrent` (629,145 bytes for SSH, 314,572
+  for telnet and ADB at the default 256). When the pool has no room:
+  - a session within its floor still takes what it asked for, and the pool counts it past its
+    ceiling; floors add up to the pool, so this is at most the pool again;
+  - a session past its floor gets no more: its running line stops, and after the line (for SSH
+    and ADB, after the packet or message) it is ended unless it is back within what it had
+    reserved or its share;
+  - the session holding the most above its share is asked to let go and ended, and while what
+    the sessions hold stays over the ceiling the next one over its share is asked every 200 ms,
+    whether or not anyone allocates. A session at or under its share is never asked.
+
+  A sensor whose share would be under 64 KiB refuses to start.
+- A session that is ended this way marks any capture in flight `end_reason` `memory_limit`. A
+  watchdog task wakes sessions asked to let go every 200 ms, so one waiting for its peer's next
+  line, message or packet (telnet's held input included) ends then, not at its idle timeout. A
+  session blocked writing to a peer that does not read ends through the output limits instead
+  (the stall limit, the write timeout), and its memory counts against the pool until then. While
+  one asked session is still giving its room back, the pool asks no other. SSH also refuses a new
+  shell or exec (`SSH_MSG_CHANNEL_FAILURE`) while the session is over or the pool has under 512 KiB
+  left, and its queued output is charged to the output budget, not to the session.
+
+The pool, the capture budget (40%) and, for SSH, the 64 MiB output budget leave the rest of
+`MemoryMax` to the runtime, the allocation headers and the worker threads' line working sets.
+Sessions can hold more than the pool for as long as the asked sessions take to end: what the
+sessions within their floors took past it, at most the pool again, and what a session past its
+floor allocated before its line stopped.
+
 ## Per-unit resource caps (systemd)
 
 The deploy units cap memory, tasks, CPU, and file descriptors. These are the hard ceilings a

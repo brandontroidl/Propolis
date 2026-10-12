@@ -707,6 +707,10 @@ pub async fn handle_connection(
     handoff: Arc<CaptureHandoff>,
     command_events: Arc<CommandEventGate>,
 ) {
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if sensor_framework::session_memory::unaccounted_session() {
+        return;
+    }
     // Normalize dual-stack mapped addresses before resolving WAN - mirrors sensor-telnet/
     // sensor-ssh's own handling of the same listener module doc requirement.
     let norm_peer = normalize_dual_stack(peer_addr);
@@ -775,10 +779,28 @@ pub async fn handle_connection(
     let mut streams: HashMap<u32, Stream> = HashMap::new();
     let mut next_stream_id: u32 = 1;
 
+    // This session's memory account, while the sensor accounts sessions.
+    let account = sensor_framework::session_memory::current_account();
+
     // A sync stream still holding a half-received SEND when this function returns, or when the
     // listener cancels it at max_duration, is flushed by `SyncState`'s `Drop`.
     loop {
-        let Some((header, data)) = reader.read_message(&mut stream).await else {
+        // Between messages: over the memory a session may keep, or asked to let go.
+        if account.is_some_and(|a| a.check_retained()) {
+            session_end.set(CaptureEnd::MemoryLimit);
+            return;
+        }
+        // A session asked to let go while it waits for its next message ends now, not at its
+        // idle timeout; the message half read is not needed.
+        let next = tokio::select! {
+            message = reader.read_message(&mut stream) => Some(message),
+            () = sensor_framework::session_memory::evicted(account) => None,
+        };
+        let Some(next) = next else {
+            session_end.set(CaptureEnd::MemoryLimit);
+            return;
+        };
+        let Some((header, data)) = next else {
             return;
         };
 

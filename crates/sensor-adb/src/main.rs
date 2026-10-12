@@ -15,11 +15,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sensor_framework::session_memory::{self, AccountingAlloc, DEFAULT_POOL_BYTES_256M};
 use sensor_framework::{
     Arrival, CaptureMemoryBudget, CommandEventConfig, CommandEventConfigError, CommandEventGate,
     ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError, EventEmitter,
     SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
 };
+
+/// Every allocation is charged to the session it was made in (`session_memory`).
+#[global_allocator]
+static ALLOCATOR: AccountingAlloc = AccountingAlloc;
 
 const ENV_BIND: &str = "PROPOLIS_ADB_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_ADB_WAN_MAP";
@@ -284,6 +289,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Every admitted session must fit in the session memory pool at its floor.
+    if let Err(e) = session_memory::configure(DEFAULT_POOL_BYTES_256M, config.bounds.max_concurrent)
+    {
+        tracing::error!(error = %e, "sensor-adb: invalid configuration; refusing to start");
+        std::process::exit(1);
+    }
+    tokio::spawn(session_memory::watchdog());
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
     let command_events = Arc::new(CommandEventGate::new(config.command_events));

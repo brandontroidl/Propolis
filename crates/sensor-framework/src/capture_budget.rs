@@ -260,8 +260,12 @@ impl CaptureBody {
                 Some(r) => {
                     self.chunks.push(r);
                     let target = self.charged_capacity();
-                    self.buf
-                        .reserve_exact(target.saturating_sub(self.buf.len()));
+                    let buf = &mut self.buf;
+                    // This budget charges the body; the session that received it is not charged
+                    // a second time.
+                    crate::session_memory::unaccounted(|| {
+                        buf.reserve_exact(target.saturating_sub(buf.len()));
+                    });
                 }
                 None => {
                     exhausted = true;

@@ -158,6 +158,9 @@ pub enum CaptureEnd {
     /// The sensor closed the connection to free the output budget for sessions that could not be
     /// served, because it held the most of it.
     OutputEvicted,
+    /// The sensor ended the session because it held more memory than a session may
+    /// (`session_memory`), or the most when the sensor's pool ran out.
+    MemoryLimit,
 }
 
 impl CaptureEnd {
@@ -182,6 +185,7 @@ impl CaptureEnd {
             Self::PeerAborted => "peer_aborted",
             Self::OutputStalled => "output_stalled",
             Self::OutputEvicted => "output_evicted",
+            Self::MemoryLimit => "memory_limit",
         }
     }
 }
@@ -987,6 +991,7 @@ mod tests {
             (CaptureEnd::PeerAborted, "peer_aborted", false),
             (CaptureEnd::OutputStalled, "output_stalled", false),
             (CaptureEnd::OutputEvicted, "output_evicted", false),
+            (CaptureEnd::MemoryLimit, "memory_limit", false),
         ];
         for (end, label, session_complete) in all {
             let m = upload_metadata("ssh", &sample(8), 8, UploadEnd::Session(end));

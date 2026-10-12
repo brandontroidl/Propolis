@@ -335,6 +335,8 @@ pub enum BudgetHit {
     DownloadPerLine,
     OwnedBytes,
     Nodes,
+    /// The session the shell runs in is over its memory limit (`session_memory`).
+    Memory,
 }
 
 /// How well the fake shell handled one input line, for the operator's coverage measure. Derived

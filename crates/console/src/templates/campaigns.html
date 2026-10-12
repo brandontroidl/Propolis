@@ -41,7 +41,7 @@
 {% include "campaigns_rows.html" %}
   </tbody>
 </table>
-<div id="load-more-container">{% include "campaigns_load_more.html" %}</div>
+<div class="load-more-row" id="load-more-container">{% include "campaigns_load_more.html" %}</div>
 </div>
 {% else %}
 <div class="panel campaigns-panel"><p class="empty-line">no campaigns{% if kind %} of this kind{% endif %}{% if single_hidden > 0 %} with more than one host{% endif %} yet</p></div>

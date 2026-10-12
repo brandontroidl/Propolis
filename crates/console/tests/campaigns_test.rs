@@ -1628,7 +1628,7 @@ fn the_panel_check_flags_flush_content_and_passes_the_padded_parts() {
     let ok = r#"<div class="panel"><div class="panel-head">T <span class="dim">s</span></div>
         <table class="table-compact"><tr><td>1</td></tr></table>
         <div class="panel-body"><p>text</p><ul><li>x</li></ul></div>
-        <div id="load-more-container"></div></div>
+        <div class="load-more-row" id="more-a"></div></div>
         <div class="panel"><div class="panel-head">E</div><p class="empty-line">none</p></div>
         <p class="dim">outside any panel</p>"#;
     assert_eq!(markup::panel_violations(ok), Vec::<String>::new());

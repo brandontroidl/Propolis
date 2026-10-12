@@ -565,9 +565,10 @@ td.active-cell { font-family: var(--font-mono); font-size: 0.76rem; color: var(-
 .section-title { font-size: 0.9rem; font-weight: 600; margin: 1.75rem 0 0.75rem; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 
-/* -- Evidence timeline "Load more" -- */
-#load-more-container { padding: 0.7rem 0.9rem; text-align: center; border-top: 1px solid var(--border); }
-#load-more-container:empty { display: none; }
+/* -- "Load more": every long list's one way to show the rest. Each list has its own container
+   (a page can hold several), so this is a class; the id is the list's swap target. -- */
+.load-more-row { padding: 0.7rem 0.9rem; text-align: center; border-top: 1px solid var(--border); }
+.load-more-row:empty { display: none; }
 .load-more { width: 100%; max-width: 220px; }
 
 /* ============================ Actions & buttons ============================ */

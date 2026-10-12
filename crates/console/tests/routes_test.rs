@@ -4174,6 +4174,86 @@ async fn feed_entries_tab_lists_what_was_published_not_a_fresh_derivation(pool: 
     assert_eq!(markup::stack_violations(&body), Vec::<String>::new());
 }
 
+/// A tier longer than one load shows its true size and loads every address once, in the file's
+/// order; the endpoint reads only files the manifest names, and a rebuild that drops the last
+/// address shown is reported rather than restarting the list.
+#[sqlx::test(migrations = false)]
+async fn feed_entries_load_every_published_address_once(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":1201,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":0,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":0,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
+    )
+    .unwrap();
+    let published: Vec<String> = (0..1201)
+        .map(|i| format!("10.7.{}.{}", i / 256, i % 256))
+        .collect();
+    let entries: Vec<String> = published
+        .iter()
+        .map(|ip| {
+            format!(
+                r#"{{"ip":"{ip}","first_seen":"2026-07-20T10:00:00Z","last_seen":"2026-07-29T13:00:00Z","categories":1,"events":3,"signals":["port_scan"]}}"#
+            )
+        })
+        .collect();
+    write_published_feed(tmp.path(), "aggressive", &entries.join(","));
+    write_published_feed(tmp.path(), "standard", "");
+    write_published_feed(tmp.path(), "all-7d", "");
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let listed = |body: &str| -> Vec<String> {
+        body.split(r#"<td class="ip stack-lead"><a class="insp" href="/ip/"#)
+            .skip(1)
+            .map(|r| r[..r.find('"').unwrap()].to_string())
+            .collect()
+    };
+    let load_more = |body: &str| -> Option<String> {
+        let at = body.find("<button hx-get=\"/feed/entries/aggressive?")? + 16;
+        Some(body[at..at + body[at..].find('"')?].to_string())
+    };
+
+    let (status, page) = get_page(state.clone(), "/feed?tab=entries").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains("Aggressive tier <span class=\"dim\">(1,201)</span>"),
+        "{page}"
+    );
+    let mut seen = listed(&page);
+    assert_eq!(seen.len(), 500);
+    let mut next = load_more(&page).expect("a second load");
+    loop {
+        let (status, more) = get_page(state.clone(), &next).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            more.contains("id=\"more-aggressive\" hx-swap-oob=\"true\""),
+            "{more}"
+        );
+        seen.extend(listed(&more));
+        match load_more(&more) {
+            Some(url) => next = url,
+            None => break,
+        }
+    }
+    assert_eq!(seen, published, "every address once, in the file's order");
+    markup::assert_panels(&page);
+
+    for name in ["manifest", "..%2Fmanifest", "all-30d", "aggressive.json"] {
+        let (status, _) = get_page(
+            state.clone(),
+            &format!("/feed/entries/{name}?after=10.7.0.0"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+    }
+    let (status, lost) = get_page(state, "/feed/entries/aggressive?after=192.0.2.1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        lost.contains("no longer in it. Reload to continue."),
+        "{lost}"
+    );
+    assert!(listed(&lost).is_empty());
+}
+
 #[sqlx::test(migrations = false)]
 async fn feed_entries_tab_shows_awaiting_build_state_when_no_manifest(pool: PgPool) {
     migrate(&pool).await;
@@ -7611,7 +7691,9 @@ async fn attackers_loads_every_address_once_in_live_score_order(pool: PgPool) {
     // A fragment: rows, and the button replaced out of band, never a whole page.
     assert!(!second.contains("<html"), "{second}");
     assert!(
-        second.contains("<div id=\"load-more-container\" hx-swap-oob=\"true\">"),
+        second.contains(
+            "<div class=\"load-more-row\" id=\"load-more-container\" hx-swap-oob=\"true\">"
+        ),
         "{second}"
     );
     let page2 = listed_ips(&second);

@@ -81,7 +81,7 @@
         {% include "search_events_rows.html" %}
       </tbody>
     </table>
-    <div id="load-more-container">{% if has_more %}<button hx-get="/search/events" hx-include="#search-filter-form" hx-vals='{"cursor": "{{ next_cursor }}"}' hx-target="#search-results-body" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
+    <div class="load-more-row" id="load-more-container">{% if has_more %}<button hx-get="/search/events" hx-include="#search-filter-form" hx-vals='{"cursor": "{{ next_cursor }}"}' hx-target="#search-results-body" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
   {% else %}
   <p class="empty-line">no events match these filters</p>
   {% endif %}

@@ -31,6 +31,9 @@ const LOGIN_HTML: &str = include_str!("templates/login.html");
 const DETAIL_HTML: &str = include_str!("templates/detail.html");
 const DRAWER_SHELL_HTML: &str = include_str!("templates/drawer_shell.html");
 const FEED_HTML: &str = include_str!("templates/feed.html");
+const FEED_ENTRIES_ROWS_HTML: &str = include_str!("templates/feed_entries_rows.html");
+const FEED_ENTRIES_LOAD_MORE_HTML: &str = include_str!("templates/feed_entries_load_more.html");
+const FEED_ENTRIES_FRAGMENT_HTML: &str = include_str!("templates/feed_entries_fragment.html");
 const SESSION_CARDS_HTML: &str = include_str!("templates/session_cards.html");
 const EVENTS_FRAGMENT_HTML: &str = include_str!("templates/events_fragment.html");
 const DETAIL_CHART_FRAGMENT_HTML: &str = include_str!("templates/detail_chart_fragment.html");
@@ -110,6 +113,12 @@ pub fn environment() -> Environment<'static> {
         .expect("drawer_shell.html must be a valid template");
     env.add_template("feed.html", FEED_HTML)
         .expect("feed.html must be a valid template");
+    env.add_template("feed_entries_rows.html", FEED_ENTRIES_ROWS_HTML)
+        .expect("feed_entries_rows.html must be a valid template");
+    env.add_template("feed_entries_load_more.html", FEED_ENTRIES_LOAD_MORE_HTML)
+        .expect("feed_entries_load_more.html must be a valid template");
+    env.add_template("feed_entries_fragment.html", FEED_ENTRIES_FRAGMENT_HTML)
+        .expect("feed_entries_fragment.html must be a valid template");
     // Fragments (console-forensics task 4): partial templates rendered standalone by an HTMX
     // endpoint's handler (no `base.html` wrapper) and also `{% include %}`-ed from the full page
     // template that shows the same content on first load, so the two never drift into two

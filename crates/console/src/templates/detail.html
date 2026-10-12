@@ -269,7 +269,7 @@
     <p class="empty-line">no events recorded</p>
     {% endif %}
   </div>
-  <div id="load-more-container">{% if has_more_events %}<button hx-get="/ip/{{ ip }}/events?cursor={{ next_cursor }}" hx-target="#evidence-timeline" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
+  <div class="load-more-row" id="load-more-container">{% if has_more_events %}<button hx-get="/ip/{{ ip }}/events?cursor={{ next_cursor }}" hx-target="#evidence-timeline" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}</div>
 </div>
 
 <div class="panel">

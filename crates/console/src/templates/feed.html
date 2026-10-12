@@ -30,22 +30,17 @@
 </span>
 {% endmacro %}
 
-{% macro entry_table(rows, empty_text) %}
-{% if rows %}
+{#- One feed file's addresses, the first load of them with a "Load more" for the rest; each table
+    has its own body and button, keyed by the file it reads. -#}
+{% macro entry_table(t, empty_text) %}
+{% if t.rows %}
 <table class="table-compact stack">
   <thead><tr><th>IP</th><th>Events</th><th>Activity</th><th>First seen</th><th>Last seen</th></tr></thead>
-  <tbody>
-    {% for r in rows %}
-    <tr>
-      <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
-      <td class="mono" data-label="Events">{{ r.event_count | count }}</td>
-      <td class="dim stack-full">{{ r.signals }}</td>
-      <td class="seen" data-label="First seen">{{ r.first_seen }}</td>
-      <td class="seen" data-label="Last seen">{{ r.last_seen }}</td>
-    </tr>
-    {% endfor %}
+  <tbody id="entries-{{ t.key }}">
+{% include "feed_entries_rows.html" %}
   </tbody>
 </table>
+<div class="load-more-row" id="more-{{ t.key }}">{% include "feed_entries_load_more.html" %}</div>
 {% else %}
 <p class="empty-line">{{ empty_text }}</p>
 {% endif %}
@@ -55,25 +50,25 @@
   {% if has_build %}
     <div class="panel">
       <div class="panel-head">
-        <span>Aggressive tier <span class="dim">({{ aggressive_entries | length | count }})</span></span>
+        <span>Aggressive tier <span class="dim">({{ aggressive_entries.total | count }})</span></span>
         {{ download_row("aggressive") }}
       </div>
       {{ entry_table(aggressive_entries, "no addresses in the aggressive tier") }}
     </div>
     <div class="panel">
       <div class="panel-head">
-        <span>Standard tier <span class="dim">({{ standard_entries | length | count }})</span></span>
+        <span>Standard tier <span class="dim">({{ standard_entries.total | count }})</span></span>
         {{ download_row("standard") }}
       </div>
       {{ entry_table(standard_entries, "no addresses in the standard tier") }}
     </div>
-    {% for label, rows in window_entries %}
+    {% for label, t in window_entries %}
     <div class="panel">
       <div class="panel-head">
-        <span>Last {{ label }} <span class="dim">({{ rows | length | count }})</span></span>
+        <span>Last {{ label }} <span class="dim">({{ t.total | count }})</span></span>
         {{ download_row("all-" ~ label) }}
       </div>
-      {{ entry_table(rows, "no activity in this window") }}
+      {{ entry_table(t, "no activity in this window") }}
     </div>
     {% endfor %}
   {% else %}

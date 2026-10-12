@@ -57,7 +57,87 @@ use crate::routes::format::format_timestamp;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/feed", get(feed_page))
+        .route("/feed/entries/{name}", get(feed_entries))
         .route("/feed/download/{tier}/{format}", get(download_feed))
+}
+
+/// Addresses per load on the Entries tab: each table shows this many, and each "Load more" this
+/// many more.
+const ENTRIES_PER_LOAD: usize = 500;
+
+/// One feed file's table on the Entries tab: the load being shown, how many the file holds, and
+/// the address to continue after when more follow.
+#[derive(Debug, Serialize)]
+struct EntryTable {
+    /// The feed file's name (`aggressive`, `standard`, `all-{window}`): the table's id and what
+    /// its "Load more" asks for.
+    key: String,
+    total: usize,
+    rows: Vec<FeedEntryRow>,
+    next_after: Option<String>,
+    cursor_lost: bool,
+}
+
+impl EntryTable {
+    /// The load of `all` that follows `after` (the first one when `None`). `None` when `after`
+    /// is no longer in the file, which a rebuild since the page loaded can do.
+    fn load(key: &str, all: Vec<FeedEntryRow>, after: Option<&str>) -> Option<EntryTable> {
+        let total = all.len();
+        let start = match after {
+            None => 0,
+            Some(ip) => all.iter().position(|r| r.ip == ip)? + 1,
+        };
+        let rows: Vec<FeedEntryRow> = all.into_iter().skip(start).take(ENTRIES_PER_LOAD).collect();
+        let next_after = rows
+            .last()
+            .map(|r| r.ip.clone())
+            .filter(|_| start + rows.len() < total);
+        Some(EntryTable {
+            key: key.to_string(),
+            total,
+            rows,
+            next_after,
+            cursor_lost: false,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EntriesQuery {
+    after: Option<String>,
+}
+
+/// `GET /feed/entries/{name}`: the next load of one feed file's addresses after `after=`. The
+/// name becomes a file path, so it must be one the current manifest lists (a tier, or `all-` and
+/// one of its windows) before anything is read; anything else is a 404.
+async fn feed_entries(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<EntriesQuery>,
+) -> Result<Response, AppError> {
+    let dir = state.feed_output_dir.as_deref();
+    let Some(manifest) = dir.and_then(read_manifest) else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let known = name == "aggressive"
+        || name == "standard"
+        || manifest
+            .windows
+            .iter()
+            .any(|w| name == format!("all-{}", w.label));
+    if !known {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    let all = read_published_feed(dir, &name).unwrap_or_default();
+    let t = EntryTable::load(&name, all, query.after.as_deref()).unwrap_or(EntryTable {
+        key: name.clone(),
+        total: 0,
+        rows: Vec::new(),
+        next_after: None,
+        cursor_lost: true,
+    });
+    let tmpl = state.templates.get_template("feed_entries_fragment.html")?;
+    Ok(Html(tmpl.render(context! { t })?).into_response())
 }
 
 /// Tab accepted via `?tab=` - `Status` (the original manifest summary, unchanged default) or
@@ -160,29 +240,33 @@ async fn feed_page(
     // A feed file that is missing or unparsable while the manifest says a build exists is a
     // placeholder, not an empty tier, and the page names it.
     let dir = state.feed_output_dir.as_deref();
+    let first = |name: &str, rows: Vec<FeedEntryRow>| {
+        EntryTable::load(name, rows, None).expect("a first load always has a start")
+    };
     let (aggressive_entries, standard_entries, window_entries) = match query.tab {
         Tab::Entries => {
             let has_build = manifest.is_some();
-            let mut windows: Vec<(String, Vec<FeedEntryRow>)> = Vec::new();
+            let mut windows: Vec<(String, EntryTable)> = Vec::new();
             for w in manifest
                 .as_ref()
                 .map(|m| m.windows.as_slice())
                 .unwrap_or_default()
             {
-                match read_published_feed(dir, &format!("all-{}", w.label)) {
-                    Some(rows) => windows.push((w.label.clone(), rows)),
+                let name = format!("all-{}", w.label);
+                match read_published_feed(dir, &name) {
+                    Some(rows) => windows.push((w.label.clone(), first(&name, rows))),
                     None if has_build => degraded.note("retention feed entries"),
                     None => {}
                 }
             }
-            let mut read = |name: &str, what: &'static str| -> Vec<FeedEntryRow> {
+            let mut read = |name: &str, what: &'static str| -> EntryTable {
                 match read_published_feed(dir, name) {
-                    Some(rows) => rows,
+                    Some(rows) => first(name, rows),
                     None => {
                         if has_build {
                             degraded.note(what);
                         }
-                        Vec::new()
+                        first(name, Vec::new())
                     }
                 }
             };
@@ -192,7 +276,11 @@ async fn feed_page(
                 windows,
             )
         }
-        Tab::Status => (Vec::new(), Vec::new(), Vec::new()),
+        Tab::Status => (
+            first("aggressive", Vec::new()),
+            first("standard", Vec::new()),
+            Vec::new(),
+        ),
     };
     let degraded = degraded.names();
     let tab = query.tab.as_str();

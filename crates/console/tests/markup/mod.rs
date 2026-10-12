@@ -105,7 +105,7 @@ fn allowed_in_panel(e: &Element) -> bool {
     (e.name == "div" && (e.has("panel-head") || e.has("panel-body") || e.has("log-viewer")))
         || e.name == "table"
         || (e.name == "p" && (e.has("empty-line") || e.has("log-hidden")))
-        || e.id.as_deref() == Some("load-more-container")
+        || (e.name == "div" && e.has("load-more-row"))
 }
 
 /// Every way `html` breaks the panel contract: content placed directly in a `.panel` that is not

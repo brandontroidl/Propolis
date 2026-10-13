@@ -29,9 +29,14 @@
 # not happened yet. Both callers (install.sh, upgrade.sh) place it after their install step for
 # that reason. See `installed_sha`'s own comment.
 #
+# origin_url is where this deploy pulled from, so the next upgrade.sh can refuse a remote that
+# was pointed elsewhere since (its "origin pinning"); install.sh records it the same way, which
+# is why re-running install.sh is one of the two ways to accept a new origin.
+#
 # Written atomically (temp file in the same directory, then mv) and world-readable, because both
 # the propolis daemon and the standalone console read it as their own unprivileged users. It holds
-# nothing secret: commit ids, a branch name and two timestamps.
+# nothing secret: commit ids, a branch name, two timestamps and the origin URL with any userinfo
+# (an embedded token) stripped.
 #
 # Idempotent, and safe to run where git cannot answer: an unavailable field is written as the empty
 # string and the pane treats a stamp it cannot read as no stamp at all.
@@ -54,6 +59,9 @@ BRANCH="$(git_field rev-parse --abbrev-ref HEAD)"
 # The last fetched origin/main, not a live lookup. Falls back to empty when there is no such ref,
 # and the pane then says it cannot tell whether the box is behind rather than claiming it is not.
 ORIGIN_MAIN_SHA="$(git_field rev-parse refs/remotes/origin/main)"
+# Without the userinfo an https URL can carry (a token): the file is 0644. upgrade.sh strips the
+# live URL the same way before comparing it with this.
+ORIGIN_URL="$(git_field remote get-url origin | sed 's#^\([a-z][a-z0-9+.-]*://\)[^/@]*@#\1#')"
 # This script runs immediately after the build, so now IS the build time. The pull happened
 # earlier in the same deploy, so the caller passes it rather than letting the two fields carry the
 # same number and pretend to be two facts.
@@ -130,8 +138,8 @@ mkdir -p "$OUT_DIR"
 TMP_FILE="$(mktemp "$OUT_DIR/.deploy-stamp.json.XXXXXX")"
 trap 'rm -f "$TMP_FILE"' EXIT
 
-printf '{"head_sha": "%s", "origin_main_sha": "%s", "branch": "%s", "pulled_at": "%s", "built_at": "%s", "installed": {"propolis": "%s", "console": "%s"}}\n' \
-    "$HEAD_SHA" "$ORIGIN_MAIN_SHA" "$BRANCH" "$PULLED_AT" "$BUILT_AT" \
+printf '{"head_sha": "%s", "origin_main_sha": "%s", "origin_url": "%s", "branch": "%s", "pulled_at": "%s", "built_at": "%s", "installed": {"propolis": "%s", "console": "%s"}}\n' \
+    "$HEAD_SHA" "$ORIGIN_MAIN_SHA" "$ORIGIN_URL" "$BRANCH" "$PULLED_AT" "$BUILT_AT" \
     "$PROPOLIS_INSTALLED_SHA" "$CONSOLE_INSTALLED_SHA" > "$TMP_FILE"
 
 chmod 0644 "$TMP_FILE"

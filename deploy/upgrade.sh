@@ -9,7 +9,17 @@
 # sensor's spool dir) always exists before the unit that needs it restarts - no longer assumes
 # install.sh already provisioned it.
 #
-# Usage: sudo ./deploy/upgrade.sh
+# Usage: sudo ./deploy/upgrade.sh [--accept-origin]
+#   --accept-origin   deploy from the origin URL the checkout has NOW although it differs from the
+#                     one the last deploy recorded; this run's deploy stamp records the new one.
+#
+# What gets built and installed as root is whatever the pull brings in, so the pull is held to the
+# checks in the pull-and-reexec block below: a clean tree, the origin the last deploy recorded, a
+# fast-forward of origin/main, and, when /etc/propolis/upgrade-signers exists, a commit signed by
+# one of the keys in it. See docs/operations/upgrade-rollback-and-dr.md, "What the pull trusts".
+#
+# PROPOLIS_UPGRADE_ROOT reads the deploy stamp and the signers file under that directory instead
+# of / (tests, like rollback.sh's PROPOLIS_ROLLBACK_ROOT).
 
 set -euo pipefail
 
@@ -32,6 +42,35 @@ cd "$REPO_DIR"
 # mid-upgrade) and carries the pull timestamp across, so the deploy stamp still records when the
 # pull happened rather than when the re-exec did. deploy_test.rs runs this block against stubs.
 # BEGIN pull-and-reexec
+ACCEPT_ORIGIN=0
+for arg in "$@"; do
+    case "$arg" in
+        --accept-origin) ACCEPT_ORIGIN=1 ;;
+        *) echo "usage: $0 [--accept-origin]" >&2; exit 2 ;;
+    esac
+done
+ROOT="${PROPOLIS_UPGRADE_ROOT:-}"
+STAMP_FILE="$ROOT/var/lib/propolis/deploy-stamp.json"
+SIGNERS_FILE="$ROOT/etc/propolis/upgrade-signers"
+REPO_OWNER="$(stat -c '%U' "$REPO_DIR")"
+# Every git command runs as the checkout's owner, like the build: the fetch needs the owner's
+# credentials, and git refuses root a directory someone else owns.
+as_owner() { sudo -u "$REPO_OWNER" "$@"; }
+stamp_field() {
+    [ -r "$STAMP_FILE" ] || return 0
+    sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p" "$STAMP_FILE" | head -n 1 || true
+}
+# The userinfo part of an https URL can be a token; the stamp is world-readable, so it records
+# and compares the URL without it. deploy-stamp.sh strips it the same way.
+strip_userinfo() { sed 's#^\([a-z][a-z0-9+.-]*://\)[^/@]*@#\1#'; }
+refuse() {
+    echo "error: $1" >&2
+    shift
+    [ "$#" -eq 0 ] || printf '%s\n' "$@" >&2
+    echo "the upgrade stops here: nothing was built or installed" >&2
+    exit 1
+}
+
 echo "==> pulling latest"
 if [ -n "${PROPOLIS_UPGRADE_REEXEC:-}" ]; then
     PULLED_AT="${PROPOLIS_UPGRADE_PULLED_AT:?PROPOLIS_UPGRADE_REEXEC is set without PROPOLIS_UPGRADE_PULLED_AT}"
@@ -39,7 +78,58 @@ if [ -n "${PROPOLIS_UPGRADE_REEXEC:-}" ]; then
 else
     PULLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     SCRIPT_SUM_BEFORE="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
-    sudo -u "$(stat -c '%U' "$REPO_DIR")" git pull
+
+    # An operator's uncommitted edit would otherwise be built and installed as root as though it
+    # had been reviewed and merged. Untracked files count: a build can pick those up too.
+    DIRTY="$(as_owner git status --porcelain)"
+    if [ -n "$DIRTY" ]; then
+        refuse "the checkout has local changes, which a root-installed build must not include:" \
+            "$DIRTY" "commit, stash or discard them, then run the upgrade again"
+    fi
+
+    # The remote is box-local git config that anyone with the owner account can point elsewhere;
+    # the deploy stamp remembers where the last deploy pulled from, and a different origin is a
+    # decision for the operator, never something this script discovers by building from it.
+    ORIGIN_URL="$(as_owner git remote get-url origin | strip_userinfo)"
+    RECORDED_ORIGIN="$(stamp_field origin_url)"
+    if [ "$ACCEPT_ORIGIN" -eq 1 ]; then
+        echo "    --accept-origin: pulling from $ORIGIN_URL; this run's deploy stamp records it"
+    elif [ -z "$RECORDED_ORIGIN" ]; then
+        echo "    no deploy has recorded an origin yet; this run's deploy stamp records $ORIGIN_URL"
+    elif [ "$ORIGIN_URL" != "$RECORDED_ORIGIN" ]; then
+        refuse "the checkout's origin is $ORIGIN_URL but the last deploy pulled from $RECORDED_ORIGIN" \
+            "if the move is deliberate, run again with --accept-origin (or re-run install.sh) to record the new origin"
+    fi
+
+    as_owner git fetch origin
+
+    # Opt-in: the file's presence turns verification on, and from then on an unsigned or
+    # wrongly-signed origin/main is refused. The file must be root's and writable by no one else,
+    # or the account that can edit it could sign for itself.
+    if [ -e "$SIGNERS_FILE" ]; then
+        if [ -z "$ROOT" ] && [ "$(stat -c '%u' "$SIGNERS_FILE")" != 0 ]; then
+            refuse "$SIGNERS_FILE is not owned by root"
+        fi
+        if [ -n "$(find "$SIGNERS_FILE" -maxdepth 0 -perm /022)" ]; then
+            refuse "$SIGNERS_FILE is writable by its group or others (expected 0644)"
+        fi
+        echo "    verifying origin/main against the signers in $SIGNERS_FILE"
+        if ! as_owner git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS_FILE" \
+            verify-commit refs/remotes/origin/main; then
+            refuse "origin/main is not signed by a key in $SIGNERS_FILE, so it will not be deployed" \
+                "sign the commit, add the key to the file, or remove the file to deploy unsigned commits"
+        fi
+    fi
+
+    # Only ever move forward onto what main has: a commit on this box that main lacks would be
+    # merged into a root-installed build and would also never match the deploy stamp.
+    if ! as_owner git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+        refuse "this checkout is not an ancestor of origin/main, so the upgrade cannot fast-forward" \
+            "commits here that origin/main does not have:" \
+            "$(as_owner git log --oneline refs/remotes/origin/main..HEAD)" \
+            "reset the checkout to origin/main (or merge the commits into main) and run again"
+    fi
+    as_owner git merge --ff-only refs/remotes/origin/main
     SCRIPT_SUM_AFTER="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
     if [ "$SCRIPT_SUM_BEFORE" != "$SCRIPT_SUM_AFTER" ]; then
         echo "==> deploy/upgrade.sh changed in the pull, re-executing the new version"
@@ -50,7 +140,7 @@ fi
 # END pull-and-reexec
 
 echo "==> building release"
-sudo -u "$(stat -c '%U' "$REPO_DIR")" cargo build --release --workspace --locked
+as_owner cargo build --release --workspace --locked
 
 # SP-A (collector/control-plane split): gateway and shipper are new binaries alongside the
 # sensors and the unified daemon. A single-box migration installs and restarts every unit on this

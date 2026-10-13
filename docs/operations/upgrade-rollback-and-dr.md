@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-12
 -->
 
 # Upgrade, rollback and disaster recovery
@@ -15,11 +15,14 @@ Propolis is deployed from source. An upgrade is: pull the new source, rebuild
 the release binaries, reinstall them, and restart the services. `deploy/upgrade.sh`
 performs an in-place live upgrade on a node where `install.sh` has already run.
 
-The script (run as root, `sudo ./deploy/upgrade.sh`):
+The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin]`):
 
-1. Runs `git pull` and `cargo build --release --workspace --locked` **as the
-   repo-owner user**, not as root, so build output keeps the owner's identity and
-   dependency resolution cannot drift from the reviewed lockfile.
+1. Fetches and fast-forwards the checkout to `origin/main`, then runs
+   `cargo build --release --workspace --locked`, both **as the repo-owner user**, not as
+   root, so build output keeps the owner's identity and dependency resolution cannot drift
+   from the reviewed lockfile. The pull is held to the checks in
+   [what the pull trusts](#what-the-pull-trusts) and stops before the build when one
+   fails.
 2. Takes a [backup](backup-and-restore.md#the-nightly-backup) of the database and state as a
    `-pre-upgrade` set, then keeps the running release (its binaries, the Propolis unit files,
    the `propolis-*` helpers in `/usr/local/sbin` and the deploy stamp) under
@@ -57,6 +60,83 @@ The unified daemon is the production surface; the standalone `intake`/`review`/
 `feed`/`console` units are superseded by it and are not part of the upgrade
 path. See [deployment models](deployment-models.md) and
 [service lifecycle](service-lifecycle.md).
+
+### What the pull trusts
+
+Whatever the pull brings in is built and installed as root, so `upgrade.sh` checks four things
+before it builds (`deploy/upgrade.sh#pull-and-reexec`). Each refusal says what it found and
+ends with "nothing was built or installed"; the checkout is left where it was.
+
+1. **A clean tree.** `git status --porcelain` must print nothing: an uncommitted edit on the
+   box, tracked or untracked, would otherwise be built and installed as though it had been
+   reviewed and merged. The refusal lists the files. Commit, stash or discard them.
+2. **The origin the last deploy pulled from.** The deploy stamp
+   (`/var/lib/propolis/deploy-stamp.json`, `deploy/deploy-stamp.sh#origin_url`) records the
+   `origin` URL of every install and upgrade, without any userinfo an https URL may carry.
+   An upgrade whose `git remote get-url origin` differs from the record is refused before
+   anything is fetched: the remote is box-local git configuration, and a remote that changed
+   under root's feet is a decision for the operator, not something the script discovers by
+   building from it. When the move is deliberate, run `sudo ./deploy/upgrade.sh --accept-origin`
+   once (or re-run `install.sh`); that run's stamp records the new origin and later runs need
+   no flag. The first upgrade after this check exists has no record to compare with: it records
+   the origin and goes on.
+3. **A signature, when you have opted in** (below). With `/etc/propolis/upgrade-signers`
+   present, the fetched `origin/main` must pass `git verify-commit` against the keys in that
+   file.
+4. **A fast-forward.** `HEAD` must be an ancestor of the fetched `origin/main`
+   (`git merge-base --is-ancestor`) and the move is `git merge --ff-only`. A commit on the box
+   that `main` does not have is listed and refused: reset the checkout to `origin/main`, or
+   merge the commits into `main` and pull them back.
+
+The checks run only on the first pass: when the pull changed `upgrade.sh` itself, the
+re-executed copy carries on from the pull it already did.
+
+### Signed upgrades (recommended)
+
+Fast-forward and origin pinning make the pull deploy exactly what `origin/main` is. Signing
+makes it deploy only what a holder of a listed key published: a compromised remote, a
+hijacked repository or a mistaken push to `main` then fails verification on the box instead
+of being built as root. It is off by default and turned on by one file on the box:
+
+```
+sudo install -m 0644 -o root -g root /dev/null /etc/propolis/upgrade-signers
+```
+
+`upgrade-signers` is an SSH allowed-signers file (`ssh-keygen -Y`, OpenSSH 8.2 or later; git
+runs `ssh-keygen` as the repo owner). One line per key that may publish a release:
+
+```
+you@example.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+```
+
+The first word is a label git reports; the key is the public half of the signing key. The
+file must be root's and writable by no one else (`0644`), or the account that can edit it
+could list its own key; the script refuses a file that is not.
+
+On the machine you commit from, sign every commit with SSH:
+
+```
+ssh-keygen -t ed25519 -f ~/.ssh/propolis-signing -C "propolis signing"
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/propolis-signing.pub
+git config --global commit.gpgsign true
+```
+
+(`user.signingkey` can name the public key when `ssh-agent` holds the private one, or the
+private key file itself.) `cat ~/.ssh/propolis-signing.pub` is the rest of the signers line.
+
+What this does and does not cover:
+
+- Only the commit at `origin/main` is verified, every time, including when the checkout is
+  already at it. The signature says who published the tip, not that every ancestor was
+  signed.
+- The tip must be a commit you signed. A merge or squash commit made in the GitHub web
+  interface is signed by GitHub's own GPG key, which the box does not hold, so with signing
+  on, land work on `main` from the command line (`git merge --ff-only`, or a rebase and push).
+- **CI does not verify signatures**, and nothing in the repository enforces them. The check
+  happens on the box, against that box's file, at upgrade time only. A key is rotated by
+  adding the new line, upgrading, then removing the old one.
+- Removing the file turns verification off again; the next upgrade says nothing about it.
 
 > **Rebuild after any dependency or vendoring change.** Run
 > `cargo build --release --locked` and confirm it succeeds before restarting -

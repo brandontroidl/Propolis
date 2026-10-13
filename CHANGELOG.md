@@ -13,6 +13,15 @@
 
 ### Added
 
+- **The upgrade pull is checked before it is built as root** - `upgrade.sh` did a plain
+  `git pull`, so whatever the remote served, or whatever had been edited or committed on the
+  box, was built and installed. It now refuses a dirty checkout (naming the files), a remote
+  that differs from the one the last deploy recorded in the deploy stamp (new `origin_url`
+  field; `--accept-origin` records a deliberate move, and a box with no record yet records
+  it), and a commit `origin/main` does not have, and it only fast-forwards. Opt-in signature
+  verification: with `/etc/propolis/upgrade-signers` (an SSH allowed-signers file, root
+  `0644`) present, `origin/main` must pass `git verify-commit` against it. See
+  [what the pull trusts](docs/operations/upgrade-rollback-and-dr.md#what-the-pull-trusts).
 - **Nightly backups** - `propolis-backup.timer` now runs the documented backup every night at
   03:30: a `pg_dump` of the database and an archive of the spool, `/etc/propolis` and the SSH
   host key, with digests, under `/var/backups/propolis` (newest 7 kept). With age public keys in

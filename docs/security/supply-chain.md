@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-12
 -->
 
 # Supply chain
@@ -111,9 +111,22 @@ practice: read the `Cargo.lock` diff and the `vendor/` changes together, check a
 new version's publish date and yanked status, look for a new or changed build
 script, and re-run the full gate including a release build after re-vendoring.
 
+## Deploying from the repository
+
+A box is upgraded by pulling the repository and building it as root installs the result
+(`deploy/upgrade.sh`), so the pull is the last link of the chain above. The script refuses to
+build from a dirty checkout, from a remote other than the one the last deploy recorded in the
+deploy stamp (`deploy/deploy-stamp.sh#origin_url`; `--accept-origin` records a deliberate
+move), or from a commit `origin/main` does not have, and it only ever fast-forwards. With
+`/etc/propolis/upgrade-signers` on the box, the fetched `origin/main` must also carry an SSH
+signature by a listed key, which holds against a compromised remote or a mistaken push; it is
+off by default, CI does not verify signatures, and the setup is in
+[upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md#signed-upgrades-recommended).
+
 ## Related
 
 - [Dependencies reference](../reference/dependencies.md)
+- [Upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md)
 - [Build and test](../development/build-and-test.md)
 - [Outbound controls](./outbound-controls.md)
 - [Residual risks](./residual-risks.md)

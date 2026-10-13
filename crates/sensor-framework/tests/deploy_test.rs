@@ -1270,6 +1270,43 @@ fn deploy_stamp_warns_when_the_installed_binary_is_not_the_commit_that_was_built
     );
 }
 
+/// The stamp is world-readable and the origin URL is what `upgrade.sh` pins the next pull to, so
+/// it is recorded without the userinfo an https remote can carry (a token), and a checkout with no
+/// origin records the empty string rather than failing the deploy.
+#[test]
+fn deploy_stamp_records_the_origin_without_its_userinfo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fixture_repo(&repo);
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let output = run_deploy_stamp(&repo, &out_file, &tmp.path().join("no-bins"));
+    assert!(output.status.success());
+    assert_eq!(stamp_json(&out_file)["origin_url"], "");
+
+    let add = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://deploy:ghp_secret@example.com/org/propolis.git",
+        ])
+        .current_dir(&repo)
+        .fenced_output()
+        .unwrap();
+    assert!(add.status.success());
+    let output = run_deploy_stamp(&repo, &out_file, &tmp.path().join("no-bins"));
+    assert!(output.status.success());
+    let stamp = std::fs::read_to_string(&out_file).unwrap();
+    assert!(
+        !stamp.contains("ghp_secret") && !stamp.contains("deploy:"),
+        "the stamp must not carry the remote's credentials: {stamp}"
+    );
+    assert_eq!(
+        stamp_json(&out_file)["origin_url"],
+        "https://example.com/org/propolis.git"
+    );
+}
+
 /// Same standard as `install_script_is_valid_bash`: `upgrade.sh` has no `--dry-run`, so a syntax
 /// check is the one real execution it gets without root.
 #[test]
@@ -1972,9 +2009,9 @@ fn upgrade_script_reexecs_after_the_pull_and_before_any_build_or_install() {
             .position(|l| l.trim_start().starts_with(needle))
             .unwrap_or_else(|| panic!("upgrade.sh has no line starting with `{needle}`"))
     };
-    let pull = at("sudo -u \"$(stat -c '%U' \"$REPO_DIR\")\" git pull");
+    let pull = at("as_owner git merge --ff-only refs/remotes/origin/main");
     let reexec = at("exec \"$BASH\" \"$SCRIPT_DIR/upgrade.sh\" \"$@\"");
-    let build = at("sudo -u \"$(stat -c '%U' \"$REPO_DIR\")\" cargo build");
+    let build = at("as_owner cargo build");
     let first_install = at("install -m 0755");
     let provision = at("\"$SCRIPT_DIR/provision.sh\"");
     let first_restart = at("systemctl restart");
@@ -2003,115 +2040,307 @@ fn upgrade_script_reexecs_after_the_pull_and_before_any_build_or_install() {
 
 struct ReexecRun {
     output: std::process::Output,
-    pulls: usize,
+    /// Each git subcommand the script ran through `sudo -u <owner>`, in order.
+    git_calls: Vec<String>,
 }
 
-/// Runs a copy of the real pull-and-reexec block as `deploy/upgrade.sh` of a throwaway tree, with
-/// a stub `sudo` standing in for `sudo -u <owner> git pull`. The stub counts pulls and, when
-/// `pull_rewrites_script`, rewrites the running script the way a pull of a release that changes
-/// upgrade.sh does. The script ends in a `CONTINUED` line so the output shows how many times
-/// execution got past the block.
-fn run_pull_and_reexec(pull_rewrites_script: bool, env: &[(&str, &str)]) -> ReexecRun {
-    let tmp = tempfile::tempdir().unwrap();
-    let deploy = tmp.path().join("deploy");
-    let stubs = tmp.path().join("stubs");
-    std::fs::create_dir_all(&deploy).unwrap();
-    std::fs::create_dir_all(&stubs).unwrap();
-    let pull_log = tmp.path().join("pulls.log");
-    let script = deploy.join("upgrade.sh");
-    write_executable(
-        &script,
-        &format!(
-            "#!/usr/bin/env bash\nset -euo pipefail\n\
-             SCRIPT_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n\
-             REPO_DIR=\"$(cd \"$SCRIPT_DIR/..\" && pwd)\"\n\
-             echo ENTERED\n\
-             {}\
-             echo \"CONTINUED pulled_at=$PULLED_AT args=$* guard=${{PROPOLIS_UPGRADE_REEXEC:-none}}\"\n",
-            pull_and_reexec_block()
-        ),
-    );
-    // `sudo -u <owner> git pull`: record it, and optionally change the script like a real pull.
-    write_executable(
-        &stubs.join("sudo"),
-        "#!/bin/sh\n[ \"$1\" = \"-u\" ] && [ \"$3\" = \"git\" ] && [ \"$4\" = \"pull\" ] || exit 64\n\
-         echo pull >> \"$PULL_LOG\"\n\
-         [ \"$(wc -l < \"$PULL_LOG\")\" -le 3 ] || exit 70\n\
-         [ -z \"$PULL_REWRITES_SCRIPT\" ] || printf '# changed by pull\\n' >> \"$UPGRADE_SCRIPT\"\n",
-    );
-    let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
-    let mut cmd = std::process::Command::new(&script);
-    cmd.args(["--flag", "value"])
-        .env("PATH", path)
-        .env("PULL_LOG", &pull_log)
-        .env("UPGRADE_SCRIPT", &script)
-        .env_remove("PROPOLIS_UPGRADE_REEXEC")
-        .env_remove("PROPOLIS_UPGRADE_PULLED_AT");
-    if pull_rewrites_script {
-        cmd.env("PULL_REWRITES_SCRIPT", "1");
-    } else {
-        cmd.env_remove("PULL_REWRITES_SCRIPT");
+impl ReexecRun {
+    fn fetches(&self) -> usize {
+        self.git_calls.iter().filter(|c| *c == "fetch").count()
     }
-    for (k, v) in env {
-        cmd.env(k, v);
+
+    fn merged(&self) -> bool {
+        self.git_calls.iter().any(|c| c == "merge")
     }
-    let output = cmd
+
+    fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.output.stdout).into_owned()
+    }
+
+    fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.output.stderr).into_owned()
+    }
+}
+
+/// Runs `git` in `dir`, asserting success and returning trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
         .fenced_output()
-        .expect("failed to run the fixture upgrade.sh");
-    let pulls = std::fs::read_to_string(&pull_log)
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
-    ReexecRun { output, pulls }
+        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A throwaway deployment for the real pull-and-reexec block of `upgrade.sh`: a bare `origin`
+/// repository, the box's clone of it (`repo`, whose `deploy/upgrade.sh` is the block wrapped in a
+/// fixture that prints `ENTERED` on start and `CONTINUED` once past the block, then writes the
+/// deploy stamp the way the real script does), a second clone (`author`) that pushes what the box
+/// will pull, a scratch root for the stamp and the signers file, and a stub `sudo` on PATH that
+/// checks it was asked for the checkout's owner, logs the git subcommand and runs it for real.
+struct UpgradeFixture {
+    tmp: tempfile::TempDir,
+    repo: PathBuf,
+    author: PathBuf,
+    root: PathBuf,
+    stubs: PathBuf,
+    git_log: PathBuf,
+}
+
+impl UpgradeFixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let repo = tmp.path().join("repo");
+        let author = tmp.path().join("author");
+        let root = tmp.path().join("root");
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&author).unwrap();
+        std::fs::create_dir_all(&stubs).unwrap();
+        std::fs::create_dir_all(root.join("var/lib/propolis")).unwrap();
+        std::fs::create_dir_all(root.join("etc/propolis")).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+
+        git(&author, &["init", "-q", "-b", "main"]);
+        git(&author, &["config", "user.email", "test@example.com"]);
+        git(&author, &["config", "user.name", "test"]);
+        std::fs::create_dir_all(author.join("deploy")).unwrap();
+        std::fs::write(author.join("README"), "fixture\n").unwrap();
+        write_executable(
+            &author.join("deploy/upgrade.sh"),
+            &format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\n\
+                 SCRIPT_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\n\
+                 REPO_DIR=\"$(cd \"$SCRIPT_DIR/..\" && pwd)\"\n\
+                 cd \"$REPO_DIR\"\n\
+                 echo ENTERED\n\
+                 {}\
+                 echo \"CONTINUED pulled_at=$PULLED_AT args=$* guard=${{PROPOLIS_UPGRADE_REEXEC:-none}}\"\n\
+                 \"$DEPLOY_STAMP\" \"$REPO_DIR\" \"$STAMP_FILE\" \"$REPO_DIR/no-bins\"\n",
+                pull_and_reexec_block()
+            ),
+        );
+        git(&author, &["add", "README", "deploy/upgrade.sh"]);
+        git(&author, &["commit", "-q", "-m", "fixture"]);
+        git(
+            &author,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&author, &["push", "-q", "origin", "main"]);
+
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "test"]);
+
+        // `sudo -u <owner> git <sub> ...`: the owner must be the checkout's, the subcommand is
+        // logged, and git itself runs against the fixture repositories.
+        write_executable(
+            &stubs.join("sudo"),
+            "#!/bin/sh\n[ \"$1\" = \"-u\" ] && [ \"$2\" = \"$(id -un)\" ] || exit 64\nshift 2\n\
+             [ \"$1\" = git ] || [ \"$1\" = cargo ] || exit 64\n\
+             sub=\"$2\"\n[ \"$sub\" != -c ] || sub=\"$6\"\n\
+             echo \"$sub\" >> \"$GIT_LOG\"\nexec \"$@\"\n",
+        );
+        Self {
+            git_log: tmp.path().join("git.log"),
+            tmp,
+            repo,
+            author,
+            root,
+            stubs,
+        }
+    }
+
+    fn origin_url(&self) -> String {
+        git(&self.repo, &["remote", "get-url", "origin"])
+    }
+
+    fn stamp_path(&self) -> PathBuf {
+        self.root.join("var/lib/propolis/deploy-stamp.json")
+    }
+
+    fn signers_path(&self) -> PathBuf {
+        self.root.join("etc/propolis/upgrade-signers")
+    }
+
+    fn head(&self) -> String {
+        git(&self.repo, &["rev-parse", "HEAD"])
+    }
+
+    /// The author pushes a commit touching `README`, or, with `changes_script`, one that appends
+    /// a comment to `deploy/upgrade.sh` the way a release that changes the script does.
+    fn push_change(&self, changes_script: bool) {
+        if changes_script {
+            let script = self.author.join("deploy/upgrade.sh");
+            let mut text = std::fs::read_to_string(&script).unwrap();
+            text.push_str("# changed by pull\n");
+            write_executable(&script, &text);
+        } else {
+            std::fs::write(self.author.join("README"), "fixture, revised\n").unwrap();
+        }
+        git(&self.author, &["add", "-A"]);
+        git(&self.author, &["commit", "-q", "-m", "upstream change"]);
+        git(&self.author, &["push", "-q", "origin", "main"]);
+    }
+
+    /// The author pushes an empty commit signed with the SSH private key at `key`.
+    fn push_signed(&self, key: &Path, message: &str) {
+        git(
+            &self.author,
+            &[
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                &format!("user.signingkey={}", key.display()),
+                "commit",
+                "-q",
+                "-S",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+        git(&self.author, &["push", "-q", "origin", "main"]);
+    }
+
+    /// A fresh ed25519 key pair under the fixture, returning the private key's path and the
+    /// public key line (`ssh-ed25519 AAAA...`).
+    fn ssh_key(&self, name: &str) -> (PathBuf, String) {
+        let key = self.tmp.path().join(name);
+        let out = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", name, "-f"])
+            .arg(&key)
+            .fenced_output()
+            .expect("ssh-keygen is installed");
+        assert!(
+            out.status.success(),
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        let mut parts = public.split_whitespace();
+        let line = format!("{} {}", parts.next().unwrap(), parts.next().unwrap());
+        (key, line)
+    }
+
+    /// Writes the allowed-signers file naming `public_key_lines`, with the mode the script
+    /// expects (`0644`).
+    fn write_signers(&self, public_key_lines: &[&str]) {
+        use std::os::unix::fs::PermissionsExt;
+        let text: String = public_key_lines
+            .iter()
+            .map(|k| format!("owner namespaces=\"git\" {k}\n"))
+            .collect();
+        std::fs::write(self.signers_path(), text).unwrap();
+        std::fs::set_permissions(self.signers_path(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+
+    fn run(&self, args: &[&str], env: &[(&str, &str)]) -> ReexecRun {
+        let _ = std::fs::remove_file(&self.git_log);
+        let path = format!(
+            "{}:{}",
+            self.stubs.display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut cmd = std::process::Command::new(self.repo.join("deploy/upgrade.sh"));
+        cmd.args(args)
+            .env("PATH", path)
+            .env("GIT_LOG", &self.git_log)
+            .env("DEPLOY_STAMP", DEPLOY_STAMP)
+            .env("PROPOLIS_UPGRADE_ROOT", &self.root)
+            .env_remove("PROPOLIS_UPGRADE_REEXEC")
+            .env_remove("PROPOLIS_UPGRADE_PULLED_AT");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let output = cmd
+            .fenced_output()
+            .expect("failed to run the fixture upgrade.sh");
+        let git_calls = std::fs::read_to_string(&self.git_log)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        ReexecRun { output, git_calls }
+    }
 }
 
 /// How many times the script started: a re-exec starts it a second time, where merely setting the
 /// guard variable and carrying on does not.
 fn script_starts(run: &ReexecRun) -> usize {
-    String::from_utf8_lossy(&run.output.stdout)
-        .lines()
-        .filter(|l| *l == "ENTERED")
-        .count()
+    run.stdout().lines().filter(|l| *l == "ENTERED").count()
 }
 
 fn continued_lines(run: &ReexecRun) -> Vec<String> {
-    String::from_utf8_lossy(&run.output.stdout)
+    run.stdout()
         .lines()
         .filter(|l| l.starts_with("CONTINUED"))
         .map(str::to_string)
         .collect()
 }
 
+/// A refusal happens before anything is built: the script exits non-zero, never reaches the line
+/// after the block, and leaves the checkout where it was.
+fn assert_refused_before_build(fx: &UpgradeFixture, run: &ReexecRun, head_before: &str) {
+    assert!(
+        !run.output.status.success(),
+        "the upgrade must refuse: {}",
+        run.stdout()
+    );
+    assert!(
+        continued_lines(run).is_empty(),
+        "a refused upgrade must not get past the pull block: {}",
+        run.stdout()
+    );
+    assert!(
+        run.stderr().contains("nothing was built or installed"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(fx.head(), head_before, "a refused upgrade moves nothing");
+}
+
 /// The defect: a pull that replaces upgrade.sh must not leave the rest of the upgrade running from
-/// the old copy. The stub rewrites the script on EVERY pull, so a re-executed run that pulled again
-/// would loop; the guard has to hold it to exactly one pull, one pass through the rest of the
-/// script, the original arguments, and the first run's pull timestamp.
+/// the old copy. The author's push changes the script, so the fast-forward rewrites it under the
+/// running bash; the guard has to hold the result to exactly one fetch, one pass through the rest
+/// of the script, the original arguments, and the first run's pull timestamp.
 #[test]
 fn upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again() {
-    let run = run_pull_and_reexec(true, &[]);
-    assert!(
-        run.output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&run.output.stderr)
-    );
-    assert_eq!(run.pulls, 1, "the re-executed run must not pull again");
+    let fx = UpgradeFixture::new();
+    fx.push_change(true);
+    let run = fx.run(&["--accept-origin"], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert_eq!(run.fetches(), 1, "the re-executed run must not fetch again");
     assert_eq!(
         script_starts(&run),
         2,
         "the changed script must be exec'd anew"
     );
     let continued = continued_lines(&run);
-    assert_eq!(
-        continued.len(),
-        1,
-        "stdout: {}",
-        String::from_utf8_lossy(&run.output.stdout)
-    );
+    assert_eq!(continued.len(), 1, "stdout: {}", run.stdout());
     assert!(
-        continued[0].ends_with("args=--flag value guard=1"),
+        continued[0].ends_with("args=--accept-origin guard=1"),
         "the surviving run must be the re-executed one, with the original arguments: {continued:?}"
     );
-    let stdout = String::from_utf8_lossy(&run.output.stdout);
-    assert!(stdout.contains("re-executing the new version"), "{stdout}");
+    assert!(
+        run.stdout().contains("re-executing the new version"),
+        "{}",
+        run.stdout()
+    );
     let pulled_at = continued[0]
         .strip_prefix("CONTINUED pulled_at=")
         .and_then(|r| r.split_once(' '))
@@ -2121,48 +2350,261 @@ fn upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again
         pulled_at.len() == 20 && pulled_at.ends_with('Z') && pulled_at.as_bytes()[10] == b'T',
         "the stamp's PULLED_AT must be the pull's UTC timestamp, got {pulled_at:?}"
     );
+    assert_eq!(
+        fx.head(),
+        git(&fx.author, &["rev-parse", "HEAD"]),
+        "the checkout is fast-forwarded to origin/main"
+    );
 }
 
 #[test]
 fn upgrade_does_not_reexec_when_the_pull_leaves_the_script_unchanged() {
-    let run = run_pull_and_reexec(false, &[]);
-    assert!(run.output.status.success());
-    assert_eq!(run.pulls, 1);
+    let fx = UpgradeFixture::new();
+    fx.push_change(false);
+    let run = fx.run(&[], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert_eq!(run.fetches(), 1);
     let continued = continued_lines(&run);
     assert_eq!(continued.len(), 1);
     assert!(continued[0].ends_with("guard=none"), "{continued:?}");
     assert_eq!(script_starts(&run), 1);
     assert!(
-        !String::from_utf8_lossy(&run.output.stdout).contains("re-executing"),
+        !run.stdout().contains("re-executing"),
         "an unchanged script must not be re-executed"
     );
+    assert_eq!(fx.head(), git(&fx.author, &["rev-parse", "HEAD"]));
 }
 
 /// The guard alone skips the pull, takes PULLED_AT from the environment, and fails closed when the
 /// timestamp is missing rather than stamping an empty or invented one.
 #[test]
 fn upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp() {
-    let run = run_pull_and_reexec(
-        true,
+    let fx = UpgradeFixture::new();
+    fx.push_change(true);
+    let run = fx.run(
+        &["--accept-origin"],
         &[
             ("PROPOLIS_UPGRADE_REEXEC", "1"),
             ("PROPOLIS_UPGRADE_PULLED_AT", "2026-01-02T03:04:05Z"),
         ],
     );
-    assert!(run.output.status.success());
-    assert_eq!(run.pulls, 0, "the guard must skip the pull");
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert!(
+        run.git_calls.is_empty(),
+        "the guard must skip the pull and its checks: {:?}",
+        run.git_calls
+    );
     assert_eq!(
         continued_lines(&run),
-        ["CONTINUED pulled_at=2026-01-02T03:04:05Z args=--flag value guard=1"]
+        ["CONTINUED pulled_at=2026-01-02T03:04:05Z args=--accept-origin guard=1"]
     );
 
-    let run = run_pull_and_reexec(true, &[("PROPOLIS_UPGRADE_REEXEC", "1")]);
+    let run = fx.run(&[], &[("PROPOLIS_UPGRADE_REEXEC", "1")]);
     assert!(
         !run.output.status.success(),
         "a guarded run with no carried timestamp must abort"
     );
-    assert_eq!(run.pulls, 0);
+    assert!(run.git_calls.is_empty());
     assert!(continued_lines(&run).is_empty());
+}
+
+/// A commit on the box that origin/main does not have would be merged into a root-installed
+/// build. The upgrade refuses before anything is merged, names the commit, and leaves the
+/// checkout alone.
+#[test]
+fn upgrade_refuses_a_checkout_that_is_not_an_ancestor_of_origin_main() {
+    let fx = UpgradeFixture::new();
+    git(
+        &fx.repo,
+        &["commit", "-q", "--allow-empty", "-m", "local only change"],
+    );
+    fx.push_change(false);
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("not an ancestor of origin/main") && stderr.contains("local only change"),
+        "the refusal must say what diverged: {stderr}"
+    );
+    assert_eq!(run.fetches(), 1, "the check needs the fetched origin/main");
+    assert!(!run.merged(), "nothing may be merged: {:?}", run.git_calls);
+}
+
+/// Local edits, tracked or not, are refused by name before the remote is even contacted.
+#[test]
+fn upgrade_refuses_a_dirty_checkout_and_names_the_files() {
+    let fx = UpgradeFixture::new();
+    let head = fx.head();
+    std::fs::write(fx.repo.join("README"), "edited on the box\n").unwrap();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("local changes") && stderr.contains("README"),
+        "the refusal must name the changed file: {stderr}"
+    );
+    assert_eq!(run.fetches(), 0, "nothing is fetched for a dirty tree");
+
+    git(&fx.repo, &["checkout", "-q", "--", "README"]);
+    std::fs::write(fx.repo.join("notes.txt"), "untracked\n").unwrap();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(run.stderr().contains("notes.txt"), "{}", run.stderr());
+
+    std::fs::remove_file(fx.repo.join("notes.txt")).unwrap();
+    let run = fx.run(&[], &[]);
+    assert!(
+        run.output.status.success(),
+        "a clean tree upgrades: {}",
+        run.stderr()
+    );
+}
+
+/// The origin the last deploy recorded is the one the next upgrade pulls from. A remote pointed
+/// elsewhere since is refused before any fetch; `--accept-origin` deploys from it and records it,
+/// so the run after that needs no flag.
+#[test]
+fn upgrade_refuses_a_changed_origin_and_accept_origin_records_the_new_one() {
+    let fx = UpgradeFixture::new();
+    std::fs::write(
+        fx.stamp_path(),
+        "{\"head_sha\": \"\", \"origin_main_sha\": \"\", \"origin_url\": \"https://example.com/elsewhere.git\", \"branch\": \"main\", \"pulled_at\": \"\", \"built_at\": \"\", \"installed\": {\"propolis\": \"\", \"console\": \"\"}}\n",
+    )
+    .unwrap();
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("https://example.com/elsewhere.git")
+            && stderr.contains(&fx.origin_url())
+            && stderr.contains("--accept-origin"),
+        "the refusal must name both origins and the override: {stderr}"
+    );
+    assert_eq!(run.fetches(), 0, "an unexpected remote is never contacted");
+
+    let run = fx.run(&["--accept-origin"], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert_eq!(run.fetches(), 1);
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        fx.origin_url().as_str(),
+        "the accepted origin is recorded"
+    );
+
+    let run = fx.run(&[], &[]);
+    assert!(
+        run.output.status.success(),
+        "once recorded, the new origin needs no flag: {}",
+        run.stderr()
+    );
+}
+
+/// The first upgrade after this check exists (no stamp, or a stamp from before the field) has no
+/// record to compare with: it records the origin rather than refusing every box at once.
+#[test]
+fn upgrade_records_the_origin_when_no_deploy_has_recorded_one() {
+    let fx = UpgradeFixture::new();
+    let run = fx.run(&[], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert!(
+        run.stdout()
+            .contains("no deploy has recorded an origin yet"),
+        "{}",
+        run.stdout()
+    );
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        fx.origin_url().as_str()
+    );
+
+    std::fs::write(
+        fx.stamp_path(),
+        "{\"head_sha\": \"\", \"origin_main_sha\": \"\", \"branch\": \"main\", \"pulled_at\": \"\", \"built_at\": \"\", \"installed\": {\"propolis\": \"\", \"console\": \"\"}}\n",
+    )
+    .unwrap();
+    let run = fx.run(&[], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        fx.origin_url().as_str(),
+        "a stamp from before the field is treated as no record"
+    );
+}
+
+/// With an allowed-signers file present, an unsigned origin/main is refused before it is merged,
+/// and one signed by a listed key is deployed.
+#[test]
+fn upgrade_with_signers_refuses_an_unsigned_head_and_accepts_a_signed_one() {
+    let fx = UpgradeFixture::new();
+    let (key, public) = fx.ssh_key("signer");
+    fx.write_signers(&[&public]);
+    fx.push_change(false);
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("not signed by a key in"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(
+        run.fetches(),
+        1,
+        "verification is of the fetched origin/main"
+    );
+    assert!(!run.merged(), "{:?}", run.git_calls);
+
+    fx.push_signed(&key, "signed release");
+    let run = fx.run(&[], &[]);
+    assert!(
+        run.output.status.success(),
+        "a head signed by a listed key deploys: {}",
+        run.stderr()
+    );
+    assert!(
+        run.stdout().contains("verifying origin/main"),
+        "{}",
+        run.stdout()
+    );
+    assert_eq!(fx.head(), git(&fx.author, &["rev-parse", "HEAD"]));
+    assert!(continued_lines(&run).len() == 1);
+}
+
+/// A signature by a key the file does not list is no better than none, and a signers file anyone
+/// but root can write would let that account list its own key; both are refused.
+#[test]
+fn upgrade_with_signers_refuses_an_unlisted_key_and_a_writable_signers_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = UpgradeFixture::new();
+    let (_listed, public) = fx.ssh_key("listed");
+    let (other, _) = fx.ssh_key("other");
+    fx.write_signers(&[&public]);
+    fx.push_signed(&other, "signed by someone else");
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("not signed by a key in"),
+        "{}",
+        run.stderr()
+    );
+    assert!(!run.merged());
+
+    std::fs::set_permissions(fx.signers_path(), std::fs::Permissions::from_mode(0o664)).unwrap();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("writable by its group or others"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        !run.git_calls.iter().any(|c| c == "verify-commit"),
+        "a file that cannot be trusted is not consulted: {:?}",
+        run.git_calls
+    );
 }
 
 /// Both loops run under `set -e` with an explicit check, so a listed binary the build did not

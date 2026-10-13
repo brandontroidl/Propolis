@@ -19,6 +19,11 @@ All secrets are set in the per-service files under `/etc/propolis/`:
 
 - Files are mode `0600`, owned by the service user (`install.sh` creates the
   users; the `.env` files themselves are authored by hand - `crates/propolis/src/config.rs` reads them, `deploy/install.sh#OPERATOR-owned`).
+- The mode is not the only wall. Each sensor unit also lists every other unit's env file,
+  `watch.env` and the split deployment's `/etc/propolis/certs` under `InaccessiblePaths=`
+  (`deploy/sensor-ssh.service#InaccessiblePaths=`), so a sensor process cannot open the
+  daemon's env file even after a `chmod` slip; systemd reads a unit's own env file before that
+  namespace exists, so the sensor still gets its variables.
 - `deploy/install.sh` **does not create or edit any operator-owned `.env` file** -
   the script "has no business fabricating" secret-bearing files; its only
   generated env file, `/etc/propolis/fleet-listeners.env`, carries no secret

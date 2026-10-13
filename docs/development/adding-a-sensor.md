@@ -149,6 +149,11 @@ existing units. Observable required directives (`deploy/sensor-ssh.service`):
   sensor's log/spool/state dirs, `AmbientCapabilities`/`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`,
   and `NoExecPaths=/` with `ExecPaths=/usr/local/bin/sensor-<name> /usr/lib /usr/lib64` (the
   binary and its libraries are the only executable content; a sensor execs nothing).
+- `InaccessiblePaths=` naming, `-`-prefixed, every other unit's env file, `watch.env` and
+  `/etc/propolis/certs` (copy the list from `deploy/sensor-ssh.service` and drop your own
+  `<name>.env`), and add `-/etc/propolis/<name>.env` to every other sensor unit's list: the
+  test derives the set from every unit's `EnvironmentFile=` and holds each sensor unit to it
+  exactly, so both halves fail until done.
 - Resource caps: `MemoryMax=512M`, `TasksMax=`, `LimitNOFILE=`, `CPUQuota=`.
 
 > **`SystemCallFilter` is a placeholder, not a shipped hardened filter.** The units
@@ -160,10 +165,13 @@ existing units. Observable required directives (`deploy/sensor-ssh.service`):
 `crates/sensor-framework/tests/deploy_test.rs` asserts these directives are present - but the assertions target the **catchall and ssh units specifically**
 (`catchall_unit_has_hardening_directives`, `ssh_unit_has_hardening_directives`). A new
 sensor's unit is not automatically covered by those; extend `deploy_test.rs` to assert your
-new unit too. The `NoExecPaths=/` and `ExecPaths=` pair is the exception: that test walks
-every `deploy/*.service` and checks the named program against the unit's own `ExecStart=`
-(`crates/sensor-framework/tests/deploy_test.rs#every_unit_makes_the_filesystem_non_executable_except_its_own_program`),
-so a new unit without the pair fails as soon as the file exists.
+new unit too. The `NoExecPaths=/` and `ExecPaths=` pair and the `InaccessiblePaths=` list are
+the exceptions: those tests walk every `deploy/*.service`, check the named program against the
+unit's own `ExecStart=`
+(`crates/sensor-framework/tests/deploy_test.rs#every_unit_makes_the_filesystem_non_executable_except_its_own_program`)
+and derive the deny list from every unit's `EnvironmentFile=`
+(`crates/sensor-framework/tests/deploy_test.rs#every_sensor_unit_denies_the_secrets_it_does_not_load`),
+so a new unit without them fails as soon as the file exists.
 
 Then register the binary and unit in `deploy/install.sh` (the binary list at
 `deploy/install.sh#installing binaries to /usr/local/bin` and the unit list at `deploy/install.sh#installing systemd units`). `install.sh` installs

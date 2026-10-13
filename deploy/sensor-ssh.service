@@ -70,6 +70,23 @@ ReadWritePaths=/var/log/propolis/ssh /var/spool/propolis/ssh /var/lib/propolis/s
 # even on a mount that silently lost its noexec option. Requires systemd 244 and a merged /usr.
 NoExecPaths=/
 ExecPaths=/usr/local/bin/sensor-ssh /usr/lib /usr/lib64
+# Secrets this sensor must never read. /etc/propolis is 0755 and each env file 0600 under its own
+# service user, so file permissions already deny the daemon's env file (database URL, console
+# password, vendor keys, ntfy token), every other unit's, the watcher's copy and the split
+# deployment's mTLS keys; a chmod slip would not, and config-check.sh only reports one after the
+# fact. These mounts hold regardless of mode. The sensor's own env file is deliberately not
+# listed: systemd reads EnvironmentFile= as root before any mount of this namespace is set up
+# (systemd.exec(5), EnvironmentFile=), so denying it would cost nothing at runtime either way,
+# and keeping it readable keeps the directive's meaning "files this unit does not load". The
+# host key lives under /var/lib/propolis/ssh and the TLS pairs under /etc/propolis/tls, neither
+# touched here. The "-" skips a file absent on this host (a sensor-only collector box has no
+# propolis.env); without it a missing path fails the unit. deploy_test.rs derives the list from
+# every unit's own EnvironmentFile= and holds each sensor unit to it exactly, so a unit added
+# later without being denied to the others fails there.
+InaccessiblePaths=-/etc/propolis/propolis.env -/etc/propolis/fleet-listeners.env -/etc/propolis/watch.env
+InaccessiblePaths=-/etc/propolis/console.env -/etc/propolis/feed.env -/etc/propolis/intake.env -/etc/propolis/review.env
+InaccessiblePaths=-/etc/propolis/gateway.env -/etc/propolis/shipper.env -/etc/propolis/certs
+InaccessiblePaths=-/etc/propolis/adb.env -/etc/propolis/catchall.env -/etc/propolis/cred.env -/etc/propolis/dns.env -/etc/propolis/ftp.env -/etc/propolis/http.env -/etc/propolis/mqtt.env -/etc/propolis/redis.env -/etc/propolis/smtp.env -/etc/propolis/telnet.env -/etc/propolis/tftp.env
 
 # --- Privileged port binding ---
 # SSH is conventionally port 22 (privileged), so the honeypot needs CAP_NET_BIND_SERVICE

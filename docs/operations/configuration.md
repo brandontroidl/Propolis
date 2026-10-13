@@ -32,7 +32,9 @@ Each systemd unit reads one `EnvironmentFile`:
 
 These `.env` files are **operator-authored**. `deploy/install.sh` does not
 create them - it only prints "Next: populate /etc/propolis/*.env files"
-(`deploy/install.sh#populate /etc/propolis`). They are mode `0600` and owned by the service user.
+(`deploy/install.sh#populate /etc/propolis`). They are mode `0600` and owned by the service user,
+and each sensor unit additionally mounts every env file it does not load as inaccessible
+(`InaccessiblePaths=`), so a sensor cannot read `propolis.env` even if its mode slips.
 The defaults documented in the reference table are the **code** defaults applied
 when a variable is unset or blank; they are authoritative for runtime behavior
 even though the `.env` files themselves are not in the repo.

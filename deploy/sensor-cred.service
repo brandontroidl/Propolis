@@ -31,6 +31,15 @@ ReadOnlyPaths=-/etc/propolis/tls
 # lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
 NoExecPaths=/
 ExecPaths=/usr/local/bin/sensor-cred /usr/lib /usr/lib64
+# Secrets this sensor must never read, even where a file's mode slips (config-check.sh reports
+# that): the daemon's and every other unit's env file and the split deployment's mTLS keys. Its
+# own env file is read by systemd before this namespace exists, so nothing it needs is here; its
+# TLS pair under /etc/propolis/tls stays readable. The "-" skips a file absent on this host. See
+# deploy/sensor-ssh.service for the full reasoning.
+InaccessiblePaths=-/etc/propolis/propolis.env -/etc/propolis/fleet-listeners.env -/etc/propolis/watch.env
+InaccessiblePaths=-/etc/propolis/console.env -/etc/propolis/feed.env -/etc/propolis/intake.env -/etc/propolis/review.env
+InaccessiblePaths=-/etc/propolis/gateway.env -/etc/propolis/shipper.env -/etc/propolis/certs
+InaccessiblePaths=-/etc/propolis/adb.env -/etc/propolis/catchall.env -/etc/propolis/dns.env -/etc/propolis/ftp.env -/etc/propolis/http.env -/etc/propolis/mqtt.env -/etc/propolis/redis.env -/etc/propolis/smtp.env -/etc/propolis/ssh.env -/etc/propolis/telnet.env -/etc/propolis/tftp.env
 CapabilityBoundingSet=
 
 MemoryMax=256M

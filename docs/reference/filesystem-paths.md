@@ -173,6 +173,9 @@ itself) and `/var/log/propolis`.
   `console.env`, `ssh.env`, `catchall.env`, `propolis.env` at
   `deploy/propolis.service#EnvironmentFile=/etc/propolis/propolis.env`). `install.sh` does **not** create these env files
   (`deploy/install.sh#OPERATOR-owned /etc/propolis/*.env file`) - the operator populates them.
+  Each sensor unit makes every env file it does not load, plus `watch.env` and `certs/`,
+  inaccessible by mount (`InaccessiblePaths=`, `-`-prefixed so an absent file does not fail
+  the unit); the unit's own file is read by systemd before the namespace exists.
 - **Derived, secret-free env files** written by deploy scripts, never by hand:
   `/etc/propolis/fleet-listeners.env` (`deploy/fleet-listeners.sh`) and
   `/etc/propolis/watch.env`, root:propolis-watch 0640, holding only the `PROPOLIS_SENSOR_LOGS` line

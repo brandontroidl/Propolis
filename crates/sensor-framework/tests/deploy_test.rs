@@ -1692,6 +1692,114 @@ fn service_units() -> Vec<String> {
     units
 }
 
+// ---- InaccessiblePaths=: a sensor cannot read the secrets other units load ----
+
+/// Every path under `/etc/propolis` that something other than a sensor's own process needs:
+/// each unit's `EnvironmentFile=` (the daemon's holds the database URL, console password, vendor
+/// keys and ntfy token), the key directory the split units name in `ReadOnlyPaths=`, and the
+/// watcher's env file, whose path only `crates/watch` knows. Derived from those files, so a unit
+/// or env file added later widens the set the sensors must deny.
+fn secret_paths_under_etc_propolis() -> HashSet<String> {
+    let mut paths = HashSet::new();
+    for name in service_units() {
+        let text = uncommented(&deploy_file(&name));
+        paths.extend(unit_environment_files(&text));
+        for token in text
+            .lines()
+            .filter_map(|l| l.strip_prefix("ReadOnlyPaths="))
+            .flat_map(str::split_whitespace)
+        {
+            let path = token.trim_start_matches(['-', '+']);
+            if path.starts_with("/etc/propolis/") && path != "/etc/propolis/tls" {
+                paths.insert(path.to_string());
+            }
+        }
+    }
+    let watch_config = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../watch/src/config.rs"
+    ))
+    .expect("crates/watch/src/config.rs");
+    let watch_env = watch_config
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const WATCH_ENV_PATH: &str = \""))
+        .and_then(|rest| rest.strip_suffix("\";"))
+        .expect("crates/watch/src/config.rs has no `pub const WATCH_ENV_PATH: &str = \"...\";`");
+    paths.insert(watch_env.to_string());
+    assert!(
+        paths.len() >= 20,
+        "only {} secret paths derived from deploy/ and crates/watch: the derivation is broken: \
+         {paths:?}",
+        paths.len()
+    );
+    paths
+}
+
+/// The files a unit's `EnvironmentFile=` lines load, without the optional `-` prefix.
+fn unit_environment_files(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("EnvironmentFile="))
+        .map(|p| p.trim_start_matches('-').to_string())
+        .collect()
+}
+
+/// Every sensor unit denies itself, by mount, exactly the secret paths it does not load: every
+/// other unit's env file, the watcher's copy and the split deployment's mTLS keys. File modes
+/// already deny these; the mount holds when a mode slips. The list is held equal to the derived
+/// set, not a superset, so a unit cannot quietly deny `/etc/propolis` or `/etc/propolis/tls`
+/// (which would hide its own TLS pair) either. Every entry is `-`-prefixed: the files absent on
+/// a sensor-only collector box must not fail the unit (226/NAMESPACE). A unit's own env file is
+/// not in its list: systemd reads it before the namespace exists, so denying it is pointless.
+#[test]
+fn every_sensor_unit_denies_the_secrets_it_does_not_load() {
+    let secrets = secret_paths_under_etc_propolis();
+    let mut sensors = 0usize;
+    for name in service_units() {
+        if !name.starts_with("sensor-") {
+            continue;
+        }
+        sensors += 1;
+        let text = uncommented(&deploy_file(&name));
+        let own = unit_environment_files(&text);
+        assert!(!own.is_empty(), "deploy/{name} loads no EnvironmentFile=");
+        let expected: HashSet<String> = secrets.difference(&own).cloned().collect();
+        let mut denied = HashSet::new();
+        for token in text
+            .lines()
+            .filter_map(|l| l.strip_prefix("InaccessiblePaths="))
+            .flat_map(str::split_whitespace)
+        {
+            let path = token.strip_prefix('-').unwrap_or_else(|| {
+                panic!(
+                    "deploy/{name}: InaccessiblePaths= entry {token} must carry the - prefix so a \
+                     file absent on this host does not fail the unit"
+                )
+            });
+            assert!(
+                denied.insert(path.to_string()),
+                "deploy/{name} denies {path} twice"
+            );
+        }
+        let mut missing: Vec<&String> = expected.difference(&denied).collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "deploy/{name} can still read secrets it does not load: {missing:?}"
+        );
+        let mut extra: Vec<&String> = denied.difference(&expected).collect();
+        extra.sort();
+        assert!(
+            extra.is_empty(),
+            "deploy/{name} denies paths outside the derived set (its own env file, the TLS \
+             directory, or a path nothing loads): {extra:?}"
+        );
+    }
+    assert!(
+        sensors >= 12,
+        "only {sensors} sensor units walked: the walk is broken"
+    );
+}
+
 // ---- NoExecPaths=/ and ExecPaths=: nothing is executable but the unit's own program ----
 
 /// The library roots every dynamically linked binary in `deploy/` executes through

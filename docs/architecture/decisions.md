@@ -59,7 +59,8 @@ under a **dedicated unprivileged user** (never root), with `ProtectSystem=strict
 `MemoryDenyWriteExecute=yes`, `NoExecPaths=/` with `ExecPaths=` naming only its own binary
 and libraries, per-service `ReadWritePaths` scoped to that sensor's own dirs, and resource
 caps. A sensor can write only to its own log and spool, can execute nothing but itself; it
-has no database credentials and no path to another sensor.
+has no database credentials and no path to another sensor, and every other unit's env file
+is mounted inaccessible to it (`InaccessiblePaths=`) so a mode slip cannot hand it one.
 
 **Code evidence:** one crate per sensor; per-unit systemd files asserted by
 `crates/sensor-framework/tests/deploy_test.rs` (which fails if a hardening directive is

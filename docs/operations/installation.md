@@ -116,7 +116,8 @@ You must author the
 All units apply a least-authority sandbox (`NoNewPrivileges`,
 `ProtectSystem=strict`, `PrivateTmp`, `PrivateDevices`, `MemoryDenyWriteExecute`,
 `NoExecPaths=/` with an `ExecPaths=` naming only the unit's own program and its
-libraries, and a supplementary hardening block). Two important caveats:
+libraries, and a supplementary hardening block); each sensor unit also mounts every
+env file it does not load as inaccessible (`InaccessiblePaths=`). Two important caveats:
 
 > **The `SystemCallFilter` in every shipped unit is a PLACEHOLDER, not a
 > hardened filter.** It is `@system-service` minus `@privileged @resources` - a

@@ -243,6 +243,17 @@
 
 ### Changed
 
+- **A sensor cannot read the other units' secrets, whatever their mode** - each
+  `deploy/sensor-*.service` now lists every other unit's env file, `/etc/propolis/watch.env`
+  and `/etc/propolis/certs` under `InaccessiblePaths=`, so a compromised sensor process cannot
+  open `propolis.env` (database URL, console password, vendor keys, ntfy token), another
+  sensor's env file or the split deployment's mTLS keys even after a `chmod` slip on one of
+  them. The sensor still receives its own variables: systemd reads `EnvironmentFile=` before
+  it sets the namespace up. Every entry is `-`-prefixed, so a file absent on a sensor-only
+  collector box does not stop the unit. A test derives the list from every unit's
+  `EnvironmentFile=` and holds each sensor unit to it exactly, so a unit added later must be
+  denied to the others before it merges. See
+  [secret management](docs/operations/secret-management.md#where-secrets-live).
 - **Nothing in a unit's filesystem is executable but its own program** - every
   `deploy/*.service` now sets `NoExecPaths=/` and nests back in, with `ExecPaths=`, only the
   program its `ExecStart=` runs and the library roots it loads (`/usr/lib`, `/usr/lib64`);

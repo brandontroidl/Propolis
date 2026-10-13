@@ -87,7 +87,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4376 test functions** (2745 unit + 1631 integration).
+- **Total: 4380 test functions** (2745 unit + 1635 integration).
 - **DB-backed (`sqlx::test`): 419** - console 219, review 99, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -136,7 +136,7 @@ Per-crate breakdown:
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 41 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1441 | 238 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1441 | 242 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 54 | arrival, env_strict, integration, tls_config |
 | sensor-http | 31 | 58 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 64 | 58 | arrival, env_strict, integration, shutdown_tracking, tls |
@@ -148,7 +148,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2745** | **1631** | |
+| **Total** | **2745** | **1635** | |
 
 ### Test styles by layer
 

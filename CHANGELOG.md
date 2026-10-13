@@ -31,7 +31,6 @@
   the checkout's owner, which builds what root installs; the residuals are in
   [residual risks](docs/security/residual-risks.md#deploying-from-the-repository). See
   [what the pull trusts](docs/operations/upgrade-rollback-and-dr.md#what-the-pull-trusts).
-- **`config-check.sh` reports an env file other accounts can read** - a new `env-mode`
 - **`config-check.sh` reports an env file other accounts can read or write** - a new `env-mode`
   failure for any `/etc/propolis/*.env` whose mode is looser than `0600` (`0640` for
   `watch.env`, whose group reads it by design; `0644` for the generated `fleet-listeners.env`),

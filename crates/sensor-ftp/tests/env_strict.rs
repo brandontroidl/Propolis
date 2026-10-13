@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Every variable `load_config_from_env` reads, legacy spellings included.
+/// Every variable `load_config` reads, legacy spellings included.
 const VARS: &[&str] = &[
     "PROPOLIS_FTP_BIND",
     "PROPOLIS_FTP_TLS_BIND",

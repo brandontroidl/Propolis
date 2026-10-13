@@ -202,13 +202,8 @@ impl Env {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Self::from_lookup(move |var| {
-            Ok(table
-                .get(var)
-                .map(|v| {
-                    v.trim_matches(|c: char| c.is_ascii_whitespace())
-                        .to_string()
-                })
-                .filter(|v| !v.is_empty()))
+            let raw = table.get(var).cloned().ok_or(env::VarError::NotPresent);
+            strict_env_value(var, raw)
         })
     }
 
@@ -260,11 +255,10 @@ impl Env {
     /// unset. The type carries the guarantee: a caller that needs a plain `u32` takes `.get()`.
     pub fn positive_u32(&self, var: &str, default: u32) -> Result<NonZeroU32, EnvError> {
         let value = self.positive_u64_at_most(var, u64::from(default), u64::from(u32::MAX))?;
-        // `positive_u64` refused zero and `at_most` refused anything past `u32::MAX`.
         Ok(u32::try_from(value)
             .ok()
             .and_then(NonZeroU32::new)
-            .unwrap_or(NonZeroU32::MIN))
+            .expect("positive_u64_at_most refused 0 and > u32::MAX"))
     }
 
     /// A positive number of milliseconds as a [`Duration`], `default_ms` when unset.

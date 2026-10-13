@@ -79,10 +79,10 @@ matches a dual-stack listener (`crates/sensor-framework/src/listener.rs#normaliz
 
 `ConnectionBounds` (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`) defines *shape only* - `read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`,
 `max_concurrent`. Concrete values are set per sensor and read from environment
-variables validated at startup; a present-but-zero or unparseable bound makes the
-process refuse to start on most sensors ("zero never means unlimited"). Exact
-defaults, and the two sensors that fall back to defaults instead of refusing
-(SMTP and cred), are owned by
+variables through the framework's typed readers (`crates/sensor-framework/src/env.rs#Env`),
+validated before anything binds; a present-but-zero or unparseable bound makes every
+sensor refuse to start ("zero never means unlimited"), and only a missing or blank
+variable takes its default. Exact defaults are owned by
 [`reference/environment-variables.md`](../reference/environment-variables.md).
 
 ### Server-side TLS

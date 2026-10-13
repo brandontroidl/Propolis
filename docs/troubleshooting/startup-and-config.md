@@ -51,7 +51,7 @@ Values and the full required/optional matrix:
 
 ## Invalid numeric bounds
 
-Two parse idioms exist and they are **not uniform**:
+One parse idiom, strict everywhere:
 
 - **Strict**, everywhere (unified daemon, `intake`, `review`, `feed`, `console`, and all twelve
   sensors): a present-but-invalid or present-but-zero numeric bound **aborts startup**. Zero is

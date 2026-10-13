@@ -6,7 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Every variable `load_config_from_env` reads.
+/// Every variable `load_config` reads.
 const VARS: &[&str] = &[
     "PROPOLIS_HTTP_BIND",
     "PROPOLIS_HTTP_TLS_BIND",

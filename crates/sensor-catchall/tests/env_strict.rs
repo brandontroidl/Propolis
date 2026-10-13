@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Every variable `load_config_from_env` reads, plus one legacy bare spelling per kind of read.
+/// Every variable `load_config` reads, plus one legacy bare spelling per kind of read.
 const VARS: &[&str] = &[
     "PROPOLIS_CATCHALL_BIND_ADDRS",
     "PROPOLIS_CATCHALL_WAN_MAP",

@@ -62,17 +62,13 @@ rDNS) all default **off**; see [../security/outbound-controls.md](../security/ou
 
 ## Fail-fast validation
 
-Configuration is validated at startup. Most binaries (`propolis`, `intake`,
-`review`, `feed`, `console`, and sensors `ssh/telnet/http/ftp/tftp/mqtt/dns/redis/adb/catchall`)
-**abort startup** on a missing required variable or a present-but-invalid /
-present-but-zero numeric bound - "zero never means unlimited"
-(`crates/propolis/src/config.rs#require_env`, `crates/propolis/src/config.rs#parse_positive_u64`). A misconfiguration cannot silently
-disable a guard.
-
-Two exceptions: the `cred` and `smtp` sensors are **lenient** - an invalid or
-zero bound silently falls back to the default rather than aborting
-(`crates/sensor-cred/src/main.rs#parse_positive_u64`,
-`crates/sensor-smtp/src/main.rs#parse_positive_u64`). Their bind variables still fail-close.
+Configuration is validated at startup. Every binary (`propolis`, `intake`, `review`, `feed`,
+`console`, and all twelve sensors) **aborts startup** on a missing required variable or a
+present-but-invalid / present-but-zero numeric bound - "zero never means unlimited"
+(`crates/propolis/src/config.rs#require_env`, `crates/propolis/src/config.rs#parse_positive_u64`;
+the sensors through `crates/sensor-framework/src/env.rs#Env`). A misconfiguration cannot silently
+disable a guard. The `cred` and `smtp` sensors used to fall back to the default on such a value;
+they now refuse to start like the rest.
 
 Fail-closed pairings worth noting (all owned by the reference table):
 

@@ -5,22 +5,21 @@
 //!
 //! Configuration is environment variables (see the `ENV_*` constants below): this crate's brief
 //! deliberately carries no TOML/CLI-arg-parsing dependency, and a handful of env vars is enough
-//! surface for a single-purpose catch-all binary. Every value is validated at startup and the
-//! process refuses to start on a malformed one rather than silently substituting a default that
-//! could disable the bound it names - `internal/design/02-sensor-framework.md`'s "Catch-all
-//! listener": "a validated, bounded config", and "Config values are validated and bounded":
-//! "zero does not mean unlimited".
+//! surface for a single-purpose catch-all binary. Every value is read through
+//! `sensor_framework::Env`, validated at startup, and the process refuses to start on a malformed
+//! one rather than silently substituting a default that could disable the bound it names -
+//! `internal/design/02-sensor-framework.md`'s "Catch-all listener": "a validated, bounded
+//! config", and "Config values are validated and bounded": "zero does not mean unlimited".
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use sensor_catchall::handler;
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    ConnectionBounds, EnvError, EventEmitter, WanResolver, run_tcp_listener, run_udp_listener,
+    ConnectionBounds, Env, EnvError, EventEmitter, WanResolver, run_tcp_listener, run_udp_listener,
     shutdown_signal,
 };
 use tokio::task::JoinHandle;
@@ -79,14 +78,8 @@ enum ConfigError {
     /// entries.
     NoBindAddrs,
     InvalidBindAddr(String),
-    InvalidWanMapEntry(String),
-    /// A bound value failed to parse, or parsed to 0. Zero is always rejected rather than
-    /// silently treated as "unlimited" - see this file's module doc.
-    InvalidBound {
-        field: &'static str,
-        value: String,
-    },
-    /// An env var held bytes that are not valid UTF-8; never read as unset.
+    /// A variable was not valid UTF-8, or was set to a value the sensor refuses. Zero is always
+    /// rejected rather than silently treated as "unlimited" - see this file's module doc.
     Env(EnvError),
 }
 
@@ -105,16 +98,6 @@ impl std::fmt::Display for ConfigError {
                 "{ENV_BIND_ADDRS} must name at least one bind address (comma-separated ip:port)"
             ),
             ConfigError::InvalidBindAddr(s) => write!(f, "invalid bind address {s:?}"),
-            ConfigError::InvalidWanMapEntry(s) => {
-                write!(
-                    f,
-                    "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"
-                )
-            }
-            ConfigError::InvalidBound { field, value } => write!(
-                f,
-                "{field} must be a positive integer, got {value:?} (zero never means unlimited)"
-            ),
         }
     }
 }
@@ -139,122 +122,24 @@ fn parse_bind_addrs(raw: &str) -> Result<Vec<SocketAddr>, ConfigError> {
     Ok(addrs)
 }
 
-/// Parse a comma-separated `local_ip=wan_ip` list. An empty (or absent) input is a valid, empty
-/// map - the wire contract's documented "no WAN binding" case, not an error.
-fn parse_wan_map(raw: &str) -> Result<HashMap<IpAddr, IpAddr>, ConfigError> {
-    let mut map = HashMap::new();
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (local, wan) = entry
-            .split_once('=')
-            .ok_or_else(|| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let local: IpAddr = local
-            .trim()
-            .parse()
-            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let wan: IpAddr = wan
-            .trim()
-            .parse()
-            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        map.insert(local, wan);
-    }
-    Ok(map)
-}
-
-/// Parse an optional positive `u64` bound: `None` (the env var was unset) falls back to `default`;
-/// present-but-zero or present-but-unparseable are both rejected. Pure (takes the already-read
-/// value rather than touching `std::env` itself) so it is unit-testable without mutating real
-/// process environment - env var mutation is global, mutable, cross-thread state that would race
-/// against Rust's default parallel test execution.
-fn parse_positive_u64(
-    raw: Option<&str>,
-    default: u64,
-    field: &'static str,
-) -> Result<u64, ConfigError> {
-    let Some(raw) = raw else {
-        return Ok(default);
-    };
-    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound {
-        field,
-        value: raw.to_string(),
-    })?;
-    if value == 0 {
-        return Err(ConfigError::InvalidBound {
-            field,
-            value: raw.to_string(),
-        });
-    }
-    Ok(value)
-}
-
-/// `u32` counterpart of [`parse_positive_u64`] (for `max_concurrent`), same rules.
-fn parse_positive_u32(
-    raw: Option<&str>,
-    default: u32,
-    field: &'static str,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = raw else {
-        return Ok(default);
-    };
-    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound {
-        field,
-        value: raw.to_string(),
-    })?;
-    if value == 0 {
-        return Err(ConfigError::InvalidBound {
-            field,
-            value: raw.to_string(),
-        });
-    }
-    Ok(value)
-}
-
-/// Load and validate configuration from environment variables. Fails closed: any missing bind
-/// address, malformed entry, or zero-valued bound is rejected here rather than silently
-/// substituted with a default that could disable the bound it names.
-fn load_config_from_env() -> Result<Config, ConfigError> {
-    let bind_addrs = parse_bind_addrs(&env_var(ENV_BIND_ADDRS)?.unwrap_or_default())?;
-    let wan_map = parse_wan_map(&env_var(ENV_WAN_MAP)?.unwrap_or_default())?;
-    let log_path = env_var(ENV_LOG_PATH)?
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
-
-    let read_timeout_ms = parse_positive_u64(
-        env_var(ENV_READ_TIMEOUT_MS)?.as_deref(),
-        DEFAULT_READ_TIMEOUT_MS,
-        ENV_READ_TIMEOUT_MS,
-    )?;
-    let idle_timeout_ms = parse_positive_u64(
-        env_var(ENV_IDLE_TIMEOUT_MS)?.as_deref(),
-        DEFAULT_IDLE_TIMEOUT_MS,
-        ENV_IDLE_TIMEOUT_MS,
-    )?;
-    let max_duration_secs = parse_positive_u64(
-        env_var(ENV_MAX_DURATION_SECS)?.as_deref(),
-        DEFAULT_MAX_DURATION_SECS,
-        ENV_MAX_DURATION_SECS,
-    )?;
-    let max_captured_bytes = parse_positive_u64(
-        env_var(ENV_MAX_CAPTURED_BYTES)?.as_deref(),
-        DEFAULT_MAX_CAPTURED_BYTES,
-        ENV_MAX_CAPTURED_BYTES,
-    )?;
-    let max_concurrent = parse_positive_u32(
-        env_var(ENV_MAX_CONCURRENT)?.as_deref(),
-        DEFAULT_MAX_CONCURRENT,
-        ENV_MAX_CONCURRENT,
-    )?;
-
+/// Load and validate configuration. Fails closed: any missing bind address, malformed entry, or
+/// zero-valued bound is rejected here rather than silently substituted with a default that could
+/// disable the bound it names.
+fn load_config(env: &Env) -> Result<Config, ConfigError> {
     Ok(Config {
-        bind_addrs,
-        wan_map,
+        bind_addrs: parse_bind_addrs(&env.string(ENV_BIND_ADDRS)?.unwrap_or_default())?,
+        wan_map: env.wan_map(ENV_WAN_MAP)?,
+        log_path: env.path(ENV_LOG_PATH, DEFAULT_LOG_PATH)?,
         bounds: ConnectionBounds {
-            read_timeout: Duration::from_millis(read_timeout_ms),
-            idle_timeout: Duration::from_millis(idle_timeout_ms),
-            max_duration: Duration::from_secs(max_duration_secs),
-            max_captured_bytes,
-            max_concurrent,
+            read_timeout: env.duration_ms(ENV_READ_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS)?,
+            idle_timeout: env.duration_ms(ENV_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS)?,
+            max_duration: env.duration_secs(ENV_MAX_DURATION_SECS, DEFAULT_MAX_DURATION_SECS)?,
+            max_captured_bytes: env
+                .positive_u64(ENV_MAX_CAPTURED_BYTES, DEFAULT_MAX_CAPTURED_BYTES)?,
+            max_concurrent: env
+                .positive_u32(ENV_MAX_CONCURRENT, DEFAULT_MAX_CONCURRENT)?
+                .get(),
         },
-        log_path,
     })
 }
 
@@ -262,7 +147,7 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
 async fn main() {
     sensor_framework::init_logging();
 
-    let config = match load_config_from_env() {
+    let config = match load_config(&Env::from_lookup(env_var)) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "catchall: invalid configuration; refusing to start");
@@ -356,6 +241,9 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    const BINDS: (&str, &str) = (ENV_BIND_ADDRS, "0.0.0.0:2222, 0.0.0.0:8080");
 
     #[test]
     fn parse_bind_addrs_accepts_comma_separated_list() {
@@ -373,6 +261,10 @@ mod tests {
     fn parse_bind_addrs_rejects_empty() {
         assert_eq!(parse_bind_addrs(""), Err(ConfigError::NoBindAddrs));
         assert_eq!(parse_bind_addrs("   "), Err(ConfigError::NoBindAddrs));
+        assert_eq!(
+            load_config(&Env::from_table(&[])).unwrap_err(),
+            ConfigError::NoBindAddrs
+        );
     }
 
     #[test]
@@ -384,70 +276,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_wan_map_accepts_entries() {
-        let map = parse_wan_map("10.0.0.1=198.51.100.4,10.0.0.2=198.51.100.5").unwrap();
-        assert_eq!(map.len(), 2);
-        assert_eq!(
-            map.get(&"10.0.0.1".parse::<IpAddr>().unwrap()),
-            Some(&"198.51.100.4".parse::<IpAddr>().unwrap())
-        );
+    fn a_valid_bind_list_loads_with_the_documented_defaults() {
+        let c = load_config(&Env::from_table(&[BINDS])).unwrap();
+        assert_eq!(c.bind_addrs.len(), 2);
+        assert!(c.wan_map.is_empty());
+        assert_eq!(c.log_path, PathBuf::from(DEFAULT_LOG_PATH));
+        assert_eq!(c.bounds.read_timeout, Duration::from_millis(5_000));
+        assert_eq!(c.bounds.idle_timeout, Duration::from_millis(5_000));
+        assert_eq!(c.bounds.max_duration, Duration::from_secs(30));
+        assert_eq!(c.bounds.max_captured_bytes, 4_096);
+        assert_eq!(c.bounds.max_concurrent, 256);
     }
 
     #[test]
-    fn parse_wan_map_empty_string_is_empty_map_not_an_error() {
-        assert!(parse_wan_map("").unwrap().is_empty());
-    }
-
-    #[test]
-    fn parse_wan_map_rejects_malformed_entry() {
-        assert!(matches!(
-            parse_wan_map("not-valid"),
-            Err(ConfigError::InvalidWanMapEntry(_))
-        ));
-        assert!(matches!(
-            parse_wan_map("also=not=valid=at=all"),
-            Err(ConfigError::InvalidWanMapEntry(_))
-        ));
-    }
-
-    #[test]
-    fn parse_positive_u64_uses_default_when_absent() {
-        assert_eq!(parse_positive_u64(None, 42, "x").unwrap(), 42);
-    }
-
-    #[test]
-    fn parse_positive_u64_rejects_zero() {
-        // Zero must never silently mean "unlimited".
-        assert!(matches!(
-            parse_positive_u64(Some("0"), 42, "x"),
-            Err(ConfigError::InvalidBound { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_positive_u64_rejects_non_numeric() {
-        assert!(matches!(
-            parse_positive_u64(Some("not-a-number"), 42, "x"),
-            Err(ConfigError::InvalidBound { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_positive_u64_accepts_explicit_value() {
-        assert_eq!(parse_positive_u64(Some("100"), 42, "x").unwrap(), 100);
-    }
-
-    #[test]
-    fn parse_positive_u32_rejects_zero() {
-        assert!(matches!(
-            parse_positive_u32(Some("0"), 1, "x"),
-            Err(ConfigError::InvalidBound { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_positive_u32_accepts_explicit_value() {
-        assert_eq!(parse_positive_u32(Some("7"), 1, "x").unwrap(), 7);
+    fn a_zero_or_garbage_bound_is_an_error_not_a_disabled_guard() {
+        for var in [
+            ENV_READ_TIMEOUT_MS,
+            ENV_IDLE_TIMEOUT_MS,
+            ENV_MAX_DURATION_SECS,
+            ENV_MAX_CAPTURED_BYTES,
+            ENV_MAX_CONCURRENT,
+        ] {
+            for bad in ["0", "-1", "ten"] {
+                match load_config(&Env::from_table(&[BINDS, (var, bad)])) {
+                    Err(ConfigError::Env(EnvError::Invalid { var: v, value, .. })) => {
+                        assert_eq!((v.as_str(), value.as_str()), (var, bad));
+                    }
+                    other => panic!("{var}={bad}: {other:?}"),
+                }
+            }
+        }
+        for bad in ["not-valid", "also=not=valid=at=all"] {
+            assert!(
+                matches!(
+                    load_config(&Env::from_table(&[BINDS, (ENV_WAN_MAP, bad)])),
+                    Err(ConfigError::Env(EnvError::Invalid { .. }))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     // The legacy spelling is derived by stripping the PROPOLIS_ prefix, so a config written against

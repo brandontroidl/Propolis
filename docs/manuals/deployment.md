@@ -64,8 +64,7 @@ required). The installer is idempotent and creates users, directories, binaries,
 Propolis is configured entirely through environment variables in
 operator-authored per-service files under `/etc/propolis/` (`0600`, owned by the
 service user). Startup is fail-fast on any missing-required or present-but-zero
-numeric bound - a misconfiguration cannot silently disable a guard (the `cred`
-and `smtp` sensors are the two lenient exceptions on non-bind bounds).
+numeric bound - a misconfiguration cannot silently disable a guard.
 
 - Model and which file configures what:
   [`../operations/configuration.md`](../operations/configuration.md)

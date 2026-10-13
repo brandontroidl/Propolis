@@ -350,6 +350,16 @@
   a sender that disguises its own request can still get a secret through; the privacy doc
   lists those classes. See
   [sample and credential privacy](docs/security/sample-and-credential-privacy.md#credential-handling).
+- **A sensor bound that is set and wrong now refuses to start on every sensor** - `sensor-smtp`
+  and `sensor-cred` read their timeouts, capture limit and concurrency limit through a parser
+  that fell back to the default on a value it could not parse, so a typo in their env file
+  (`PROPOLIS_SMTP_MAX_CONCURRENT=ten`, `PROPOLIS_CRED_MAX_DURATION_SECS=0`) ran the sensor with a
+  limit other than the one written and said nothing; the same two skipped a malformed WAN map
+  entry instead of refusing it. All twelve sensors now read every variable through one set of
+  typed readers in the framework, so a zero, negative, non-numeric or over-maximum bound, a
+  malformed bind address or a bad WAN map entry exits 1 before anything binds, naming the
+  variable and quoting the value. A missing or blank variable still takes its documented default.
+  See [environment variables](docs/reference/environment-variables.md#sensor-binaries).
 - **The hash-chain check no longer stalls the monitor** - the whole-ledger scan ran inside the
   ops monitor's loop, so on a large ledger every other condition went unevaluated for minutes
   every six hours. It now runs as its own task and the monitor serves its last verdict.

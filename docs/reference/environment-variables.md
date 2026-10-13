@@ -43,15 +43,12 @@ Which run mode a given deployment uses is an operator choice; both sets of
 
 ## Parse and fail semantics
 
-Two fail-closed idioms recur; they are **not** uniform:
-
-- **Strict parse** - `propolis`, `intake`, `review`, `feed`, `console`, and
-  sensors `ssh`/`telnet`/`http`/`ftp`/`redis`/`adb`/`catchall`/`tftp`/`mqtt`/`dns`: a
-  present-but-invalid or present-but-zero numeric bound **aborts startup**.
-- **Lenient parse** - sensors `cred` and `smtp` **only**: an invalid or zero
-  bound silently falls back to the default (`parse_positive_u64` filters `>0`
-  then `unwrap_or(default)`, `crates/sensor-cred/src/main.rs#parse_positive_u64`,
-  `crates/sensor-smtp/src/main.rs#parse_positive_u64`).
+One fail-closed idiom, everywhere: `propolis`, `intake`, `review`, `feed`, `console` and all
+twelve sensors **abort startup** on a present-but-invalid or present-but-zero numeric bound. A
+missing or blank variable takes its documented default; a value that is set and wrong is never
+replaced by it. The sensors read every variable through one set of typed readers
+(`crates/sensor-framework/src/env.rs#Env`; see "Sensor binaries" below). The `cred` and `smtp`
+sensors used to fall back to the default on an invalid or zero bound; they no longer do.
 
 Unified daemon (`config.rs`) parse helpers:
 
@@ -494,43 +491,56 @@ is unset. The value is trimmed of leading and trailing ASCII whitespace, and a v
 after the trim counts as unset, the same way `deploy/fleet-listeners.sh` skips a blank bind; for a
 required bind that means a blank value is the same startup error as a missing one. A value that is
 not valid UTF-8 is invalid, never unset and never replaced by a default: the sensor logs
-`environment variable <NAME> is not valid UTF-8` and exits 1 before binding anything. This holds
-for the lenient sensors too (cred, smtp): "lenient" below covers only an unparseable or zero
-bound, never a non-UTF-8 value. The per-variable rules below apply to the value after this step.
+`environment variable <NAME> is not valid UTF-8` and exits 1 before binding anything.
 
-### Standard sensors (strict parse) - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt, dns
+**What a malformed value does, for every sensor.** The value is then parsed by the typed reader
+for its kind (`crates/sensor-framework/src/env.rs#Env`): an `ip:port` address
+(`crates/sensor-framework/src/env.rs#socket_addr`), a positive whole number of milliseconds,
+seconds, bytes or connections (`crates/sensor-framework/src/env.rs#positive_u64`,
+`crates/sensor-framework/src/env.rs#positive_u32`, digits only), a `local_ip=wan_ip` table
+(`crates/sensor-framework/src/env.rs#wan_map`) or a path. A value that is set but not that shape
+(a bare port, `0`, `-1`, `ten`, `1.5`, a number past `u32` or past a documented maximum, a WAN
+entry that is not two addresses around `=`) is a startup error: the sensor logs
+`<NAME> must be <shape>, got "<value>"` (or `<NAME> must be a positive integer at most <max>,
+got "<value>"`) and exits 1 before binding anything. No sensor ever substitutes the default for a
+value it could not parse, so a typo in an env file cannot silently turn a limit off or change it.
+A number is never clamped: above a maximum it is refused naming the maximum. Only the zero and
+maximum rules differ per variable, and the tables below state them.
 
-Shared `ConnectionBounds` pattern via each crate's local
-`parse_positive_u64`/`parse_positive_u32`: unset → default; **present-but-zero or
-unparseable → abort startup** (no upper clamp - a very large timeout/bytes value
-is accepted). `parse_wan_map` (e.g. `sensor-ssh/src/main.rs#parse_wan_map`): comma-sep
-`local_ip=wan_ip`; empty/absent → empty map (valid: no WAN attribution, stamps a
-null `wan_ip`); invalid entry → abort.
+### All twelve sensors - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt, dns, smtp, cred
+
+Shared `ConnectionBounds` pattern through the typed readers above: unset → default;
+**present-but-zero, negative or unparseable → abort startup** (no upper clamp - a very large
+timeout/bytes value is accepted, except where a maximum is documented). `<P>WAN_MAP`: comma-sep
+`local_ip=wan_ip`; empty/absent → empty map (valid: no WAN attribution, stamps a null `wan_ip`);
+invalid entry → abort.
 
 | Sensor | Prefix `<P>` | Bind variable (required) | Log path default |
 |---|---|---|---|
-| ssh | `PROPOLIS_SSH_` | `PROPOLIS_SSH_BIND` (unset → abort, `sensor-ssh/src/main.rs#load_config_from_env`) | `/var/log/propolis/ssh/events.jsonl` |
+| ssh | `PROPOLIS_SSH_` | `PROPOLIS_SSH_BIND` (unset → abort, `sensor-ssh/src/main.rs#load_config`) | `/var/log/propolis/ssh/events.jsonl` |
 | telnet | `PROPOLIS_TELNET_` | `PROPOLIS_TELNET_BIND` | `/var/log/propolis/telnet/events.jsonl` |
 | http | `PROPOLIS_HTTP_` | `PROPOLIS_HTTP_BIND` | `/var/log/propolis/http/events.jsonl` |
 | ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
-| tftp | `PROPOLIS_TFTP_` | `PROPOLIS_TFTP_BIND` (UDP; unset aborts startup, `sensor-tftp/src/main.rs#load_config_from`) | `/var/log/propolis/tftp/events.jsonl` |
-| mqtt | `PROPOLIS_MQTT_` | `PROPOLIS_MQTT_BIND` (unset aborts startup, `sensor-mqtt/src/main.rs#load_config_from_env`) | `/var/log/propolis/mqtt/events.jsonl` |
-| dns | `PROPOLIS_DNS_` | `PROPOLIS_DNS_BIND` (UDP and TCP; unset aborts startup, `sensor-dns/src/main.rs#load_config_from`) | `/var/log/propolis/dns/events.jsonl` |
+| tftp | `PROPOLIS_TFTP_` | `PROPOLIS_TFTP_BIND` (UDP; unset aborts startup, `sensor-tftp/src/main.rs#load_config`) | `/var/log/propolis/tftp/events.jsonl` |
+| mqtt | `PROPOLIS_MQTT_` | `PROPOLIS_MQTT_BIND` (unset aborts startup, `sensor-mqtt/src/main.rs#load_config`) | `/var/log/propolis/mqtt/events.jsonl` |
+| dns | `PROPOLIS_DNS_` | `PROPOLIS_DNS_BIND` (UDP and TCP; unset aborts startup, `sensor-dns/src/main.rs#load_config`) | `/var/log/propolis/dns/events.jsonl` |
 | redis | `PROPOLIS_REDIS_` | `PROPOLIS_REDIS_BIND` | `/var/log/propolis/redis/events.jsonl` |
 | adb | `PROPOLIS_ADB_` | `PROPOLIS_ADB_BIND` | `/var/log/propolis/adb/events.jsonl` |
 | catchall | `PROPOLIS_CATCHALL_` (bare `CATCHALL_` still read, deprecated) | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
+| smtp | `PROPOLIS_SMTP_` | `PROPOLIS_SMTP_BIND` (unset aborts startup, `sensor-smtp/src/main.rs#load_config`) | `/var/log/propolis/smtp/events.jsonl` |
+| cred | `PROPOLIS_CRED_` | one or more of `PROPOLIS_CRED_VNC_BIND`, `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_PG_BIND`, `PROPOLIS_CRED_MONGO_BIND` (none set aborts startup, `sensor-cred/src/main.rs#load_config`) | a directory, `PROPOLIS_CRED_LOG_DIR` default `/var/log/propolis/cred`, one `<protocol>.jsonl` per bound protocol |
 
 Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_CATCHALL_`, with the bare `CATCHALL_` spelling still read but deprecated):
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
 | `<P>WAN_MAP` (catchall `PROPOLIS_CATCHALL_WAN_MAP`) | no | empty map | invalid entry → abort |
-| `<P>LOG_PATH` (catchall `PROPOLIS_CATCHALL_LOG_PATH`) | no | see table above | |
+| `<P>LOG_PATH` (catchall `PROPOLIS_CATCHALL_LOG_PATH`; cred `PROPOLIS_CRED_LOG_DIR`, a directory) | no | see table above | |
 | `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
 | `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
-| `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`) | secs; zero → abort |
-| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (ssh `10_000_000`; catchall `4_096`; dns `262_272`) | bytes; zero → abort |
-| `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero → abort |
+| `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`; cred `60`) | secs; zero → abort |
+| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (ssh `10_000_000`; catchall `4_096`; dns `262_272`; cred `100_000`) | bytes; zero → abort; tftp also has a maximum (below) |
+| `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero or above `4294967295` → abort |
 
 The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
 `main.rs`):
@@ -549,7 +559,7 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `PROPOLIS_ADB_MAX_DURATION_SECS`, `PROPOLIS_ADB_MAX_CAPTURED_BYTES`, `PROPOLIS_ADB_MAX_CONCURRENT`,
   `PROPOLIS_ADB_LOG_PATH`, `PROPOLIS_ADB_WAN_MAP`.
 - ssh, telnet and adb also read a per-source command-event budget
-  (`crates/sensor-framework/src/command_flood.rs#CommandEventConfig::from_lookup`): how many
+  (`crates/sensor-framework/src/command_flood.rs#CommandEventConfig::from_env`): how many
   `honeypot_command_exec` events one source network (the IPv4 /24 or IPv6 /56) may write before
   its further repeated commands are folded into one summary per 60 s. Each is a positive `u32`;
   zero, a negative number or a non-number aborts startup, and no value turns the budget off. The
@@ -650,7 +660,26 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
 - catchall: `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`, `PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`,
   `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
   `PROPOLIS_CATCHALL_MAX_CONCURRENT`.
-- smtp and cred: listed under "Lenient sensors" below, since their invalid-value behavior differs.
+- smtp: `PROPOLIS_SMTP_READ_TIMEOUT_MS`, `PROPOLIS_SMTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_SMTP_MAX_DURATION_SECS`, `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_SMTP_MAX_CONCURRENT`, `PROPOLIS_SMTP_LOG_PATH`, `PROPOLIS_SMTP_WAN_MAP`
+  (`sensor-smtp/src/main.rs#load_config`). The extra-listener and TLS variables
+  `PROPOLIS_SMTP_SUBMISSION_BIND`, `PROPOLIS_SMTP_TLS_BIND`, `PROPOLIS_SMTP_TLS_CERT` and
+  `PROPOLIS_SMTP_TLS_KEY` are documented with the sensor TLS variables below; the two optional
+  binds take the same `ip:port` rule as every bind (unset or blank is "no listener", a malformed
+  value aborts startup, never a silently dropped listener the fleet inventory still claims).
+- cred: multi-protocol (VNC/MySQL/MSSQL/PostgreSQL/MongoDB), one bind variable per protocol
+  (`PROPOLIS_CRED_VNC_BIND`, `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`,
+  `PROPOLIS_CRED_PG_BIND`, `PROPOLIS_CRED_MONGO_BIND`; `sensor-cred/src/main.rs#load_config`):
+  at least one must be set, each set one must parse, and a protocol whose OS bind then fails is
+  logged and skipped while the others keep running; none starting aborts startup. Bounds
+  `PROPOLIS_CRED_READ_TIMEOUT_MS`, `PROPOLIS_CRED_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_CRED_MAX_DURATION_SECS` (**`60`**, shorter than the others' 600: a credential probe
+  is over in seconds), `PROPOLIS_CRED_MAX_CAPTURED_BYTES` (**`100_000`**, smaller than the
+  others' 1_000_000: a login exchange carries no file body), `PROPOLIS_CRED_MAX_CONCURRENT`,
+  plus `PROPOLIS_CRED_WAN_MAP` and `PROPOLIS_CRED_LOG_DIR` (default `/var/log/propolis/cred`,
+  per-protocol file `<protocol>.jsonl`). The TLS variables `PROPOLIS_CRED_TLS_CERT` and
+  `PROPOLIS_CRED_TLS_KEY` are documented with the sensor TLS variables below.
 
 The gate `every_env_var_the_code_reads_is_documented_in_the_env_var_reference`
 (`crates/propolis/tests/docs_agreement.rs`) checks each of these names literally against this file,
@@ -692,7 +721,7 @@ Sensor-specific extras:
   (default `/var/lib/propolis/ssh/host_key`, `sensor-ssh/src/main.rs#DEFAULT_HOST_KEY_PATH`), `PROPOLIS_SSH_SPOOL_DIR`
   (default `/var/spool/propolis/ssh`, `sensor-ssh/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_SSH_BANNER` (default =
   persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `sensor-ssh/src/main.rs#DEFAULT_BANNER` +
-  `sensor-framework/src/persona.rs#OPENSSH_VERSION`; unset or blank → default, `sensor-ssh/src/main.rs#load_config_from_env`), `PROPOLIS_SSH_OUTBOX_DIR` (default
+  `sensor-framework/src/persona.rs#OPENSSH_VERSION`; unset or blank → default, `sensor-ssh/src/main.rs#load_config`), `PROPOLIS_SSH_OUTBOX_DIR` (default
   `/var/spool/propolis/ssh/outbox`; see "Outbox manifest" below).
 - **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
   `/var/spool/propolis/ftp`, `sensor-ftp/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_FTP_OUTBOX_DIR` (default
@@ -798,8 +827,8 @@ Sensor-specific extras:
   `crates/sensor-smtp/src/main.rs#main`): the sensor exits 1 with `refusing to start`, before
   binding any listener (the plain one included), when exactly one of CERT and KEY is set (a blank
   value counts as unset), when `PROPOLIS_SMTP_TLS_BIND` is set without both paths, when
-  `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` does not parse (unlike the lenient
-  bound variables, a bad bind never falls back to a default), when a file is unreadable, not PEM
+  `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` does not parse (a bad bind never
+  falls back to a default), when a file is unreadable, not PEM
   or a mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of
   the four is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`,
   `crates/sensor-smtp/src/lib.rs#tls_from_env`). If the OS refuses any one bind, the listeners
@@ -900,36 +929,6 @@ ordinary connection event is unaffected); the hand-off counts it as refused. The
 unmeasured choice that leaves the rest of `MemoryMax` for the runtime, parsers, fake-filesystem
 state and allocator overhead, none of which this budget charges. Raise the variable only together
 with the unit's `MemoryMax`.
-
-### Lenient sensors - cred, smtp
-
-Invalid or zero bound → **silent default**, not abort.
-
-- **sensor-smtp** (`crates/sensor-smtp/src/main.rs`): `PROPOLIS_SMTP_BIND` (req;
-  unset → `exit(1)`, invalid → `exit(1)`, `sensor-smtp/src/main.rs#main`), `PROPOLIS_SMTP_WAN_MAP`
-  (invalid entries silently skipped, `sensor-smtp/src/main.rs#parse_wan_map`), `PROPOLIS_SMTP_LOG_PATH` (default
-  `/var/log/propolis/smtp/events.jsonl`), `PROPOLIS_SMTP_READ_TIMEOUT_MS`
-  (`30_000`), `PROPOLIS_SMTP_IDLE_TIMEOUT_MS` (`60_000`),
-  `PROPOLIS_SMTP_MAX_DURATION_SECS` (`600`), `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`
-  (`1_000_000`), `PROPOLIS_SMTP_MAX_CONCURRENT` (`256`). The extra-listener and TLS variables
-  `PROPOLIS_SMTP_SUBMISSION_BIND`, `PROPOLIS_SMTP_TLS_BIND`, `PROPOLIS_SMTP_TLS_CERT` and
-  `PROPOLIS_SMTP_TLS_KEY` are strict, not lenient: see the smtp entry under the sensor TLS
-  variables above.
-- **sensor-cred** (`crates/sensor-cred/src/main.rs`): multi-protocol
-  (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Bind variables `PROPOLIS_CRED_VNC_BIND`,
-  `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_PG_BIND`,
-  `PROPOLIS_CRED_MONGO_BIND` (`sensor-cred/src/main.rs#main`). At
-  least one required - none set → `exit(1)` (`sensor-cred/src/main.rs#main`); a set-but-invalid bind →
-  `exit(1)` (`sensor-cred/src/main.rs#main`); all-configured-fail-to-bind → `exit(1)` (`sensor-cred/src/main.rs#main`).
-  `PROPOLIS_CRED_WAN_MAP` (invalid skipped), `PROPOLIS_CRED_LOG_DIR` (default
-  `/var/log/propolis/cred`, per-protocol file `<protocol>.jsonl`). Bounds:
-  `PROPOLIS_CRED_READ_TIMEOUT_MS` (`30_000`), `PROPOLIS_CRED_IDLE_TIMEOUT_MS` (`60_000`),
-  `PROPOLIS_CRED_MAX_DURATION_SECS` (**`60`**, differs from others' 600),
-  `PROPOLIS_CRED_MAX_CAPTURED_BYTES` (**`100_000`**, differs from others' 1_000_000),
-  `PROPOLIS_CRED_MAX_CONCURRENT` (`256`). A bind failure on one protocol is logged and that
-  protocol is skipped; the others keep running. The TLS variables `PROPOLIS_CRED_TLS_CERT` and
-  `PROPOLIS_CRED_TLS_KEY` are strict, not lenient: see the cred entry under the sensor TLS
-  variables above.
 
 ---
 

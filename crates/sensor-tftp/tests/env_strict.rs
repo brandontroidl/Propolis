@@ -81,6 +81,42 @@ fn a_non_utf8_value_exits_1_before_any_listener_binds() {
     }
 }
 
+/// A bound that is set and wrong refuses to start, naming the variable and quoting the value.
+#[test]
+fn a_zero_or_garbage_bound_exits_1_before_any_listener_binds() {
+    for var in [
+        "PROPOLIS_TFTP_READ_TIMEOUT_MS",
+        "PROPOLIS_TFTP_IDLE_TIMEOUT_MS",
+        "PROPOLIS_TFTP_MAX_DURATION_SECS",
+        "PROPOLIS_TFTP_MAX_CAPTURED_BYTES",
+        "PROPOLIS_TFTP_MAX_CONCURRENT",
+        "PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES",
+    ] {
+        for bad in ["0", "-1", "ten"] {
+            let (code, text) = run_with(Some((var, OsStr::new(bad))), Duration::from_secs(10));
+            assert_eq!(code, Some(1), "{var}={bad}: {text}");
+            assert!(
+                text.contains(var) && text.contains(&format!("{bad:?}")),
+                "{var}={bad}: {text}"
+            );
+            assert!(
+                !text.contains("listening"),
+                "{var}={bad}: bound first: {text}"
+            );
+        }
+    }
+    // The one bound with a documented maximum: over it is an error naming the maximum.
+    let (code, text) = run_with(
+        Some(("PROPOLIS_TFTP_MAX_CAPTURED_BYTES", OsStr::new("10000001"))),
+        Duration::from_secs(10),
+    );
+    assert_eq!(code, Some(1), "{text}");
+    assert!(
+        text.contains("PROPOLIS_TFTP_MAX_CAPTURED_BYTES") && text.contains("10000000"),
+        "{text}"
+    );
+}
+
 /// A reply rate can never be configured off: zero or a non-number refuses to start.
 #[test]
 fn a_zero_or_garbage_reply_rate_exits_1_before_any_listener_binds() {

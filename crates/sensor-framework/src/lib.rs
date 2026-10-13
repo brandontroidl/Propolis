@@ -49,8 +49,7 @@ pub use capture_budget::{
 };
 pub use command_codec::CommandCodec;
 pub use command_flood::{
-    CommandEventConfig, CommandEventConfigError, CommandEventGate, CommandSummary,
-    command_summary_event,
+    CommandEventConfig, CommandEventGate, CommandSummary, command_summary_event,
 };
 pub use config::SensorConfig;
 pub use connection_tracker::{CONNECTION_GRACE, ConnectionTracker, QuiesceOutcome};

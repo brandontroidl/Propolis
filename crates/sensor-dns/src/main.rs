@@ -3,19 +3,18 @@
 //! for the surfaces and the reply invariant.
 //!
 //! Configuration is environment variables only (the `ENV_*` constants below), every one read
-//! through `sensor_framework::strict_env_var`. The sensor is off by default: with no bind it binds
-//! nothing and exits. Every value is validated at startup and a malformed one refuses to start
-//! rather than falling back to a default that could disable the bound it names.
+//! through `sensor_framework::Env`. The sensor is off by default: with no bind it binds nothing
+//! and exits. Every value is validated at startup and a malformed one refuses to start rather
+//! than falling back to a default that could disable the bound it names.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    ConnectionBounds, EnvError, Rate, RateLimitConfig, WanResolver, shutdown_signal,
+    ConnectionBounds, Env, EnvError, Rate, RateLimitConfig, WanResolver, shutdown_signal,
 };
 
 const ENV_BIND: &str = "PROPOLIS_DNS_BIND";
@@ -76,18 +75,12 @@ struct TlsConfig {
 #[derive(Debug, PartialEq)]
 enum ConfigError {
     NoBind,
-    InvalidBind(String),
-    InvalidWanMapEntry(String),
-    /// A bound failed to parse, or parsed to 0. Zero never means unlimited.
-    InvalidBound {
-        field: &'static str,
-        value: String,
-    },
-    InvalidTlsBind(String),
     /// The named cert or key variable was unset or blank while the rest of the TLS configuration
     /// was present.
     TlsPathMissing(&'static str),
-    /// A variable held bytes that are not valid UTF-8; never read as unset.
+    /// A variable was not valid UTF-8, or was set to a value the sensor refuses (a malformed
+    /// address, a zero or unparseable bound or rate, a bad WAN map entry); never read as unset.
+    /// Zero never means unlimited, and a rate can never be configured off.
     Env(EnvError),
 }
 
@@ -103,16 +96,6 @@ impl std::fmt::Display for ConfigError {
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set (the sensor is off by default)")
             }
-            ConfigError::InvalidBind(s) => write!(f, "invalid {ENV_BIND} address {s:?}"),
-            ConfigError::InvalidWanMapEntry(s) => write!(
-                f,
-                "invalid {ENV_WAN_MAP} entry {s:?}, expected local_ip=wan_ip"
-            ),
-            ConfigError::InvalidBound { field, value } => write!(
-                f,
-                "{field} must be a positive integer, got {value:?} (zero never means unlimited)"
-            ),
-            ConfigError::InvalidTlsBind(s) => write!(f, "invalid {ENV_TLS_BIND} address {s:?}"),
             ConfigError::TlsPathMissing(var) => write!(
                 f,
                 "{var} must be set to a PEM file path (TLS needs both {ENV_TLS_CERT} and {ENV_TLS_KEY})"
@@ -124,79 +107,16 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Parse a comma-separated `local_ip=wan_ip` list. An empty input is a valid, empty map.
-fn parse_wan_map(raw: &str) -> Result<HashMap<IpAddr, IpAddr>, ConfigError> {
-    let mut map = HashMap::new();
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let bad = || ConfigError::InvalidWanMapEntry(entry.to_string());
-        let (local, wan) = entry.split_once('=').ok_or_else(bad)?;
-        let local: IpAddr = local.trim().parse().map_err(|_| bad())?;
-        let wan: IpAddr = wan.trim().parse().map_err(|_| bad())?;
-        map.insert(local, wan);
-    }
-    Ok(map)
-}
-
-/// An optional positive `u64` bound: unset takes `default`; zero or unparseable is an error.
-fn parse_positive_u64(
-    raw: Option<&str>,
-    default: u64,
-    field: &'static str,
-) -> Result<u64, ConfigError> {
-    let Some(raw) = raw else {
-        return Ok(default);
-    };
-    match raw.parse::<u64>() {
-        Ok(value) if value > 0 => Ok(value),
-        _ => Err(ConfigError::InvalidBound {
-            field,
-            value: raw.to_string(),
-        }),
-    }
-}
-
-/// `u32` counterpart of [`parse_positive_u64`] (for `max_concurrent`), same rules.
-fn parse_positive_u32(
-    raw: Option<&str>,
-    default: u32,
-    field: &'static str,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = raw else {
-        return Ok(default);
-    };
-    match raw.parse::<u32>() {
-        Ok(value) if value > 0 => Ok(value),
-        _ => Err(ConfigError::InvalidBound {
-            field,
-            value: raw.to_string(),
-        }),
-    }
-}
-
-/// A reply rate or burst: unset takes `default`; zero or unparseable is an error, so a rate can
-/// never be configured off.
-fn parse_rate_value(
-    raw: Option<&str>,
-    default: u32,
-    field: &'static str,
-) -> Result<NonZeroU32, ConfigError> {
-    let value = parse_positive_u32(raw, default, field)?;
-    NonZeroU32::new(value).ok_or(ConfigError::InvalidBound {
-        field,
-        value: value.to_string(),
-    })
-}
-
 /// `None` only when nothing TLS-related is configured. A bind without the pair, or exactly one of
 /// the pair, is an error so the sensor refuses to start rather than run without the TLS that was
 /// asked for. A pair without a bind parses (the caller still validates the files) but yields no
 /// listener: the fleet inventory derives from the `*_BIND` variables.
 fn parse_tls(
-    bind: Option<&str>,
+    bind_addr: Option<SocketAddr>,
     cert: Option<&str>,
     key: Option<&str>,
 ) -> Result<Option<TlsConfig>, ConfigError> {
-    if bind.is_none() && cert.is_none() && key.is_none() {
+    if bind_addr.is_none() && cert.is_none() && key.is_none() {
         return Ok(None);
     }
     let cert_path = cert
@@ -205,12 +125,6 @@ fn parse_tls(
     let key_path = key
         .map(PathBuf::from)
         .ok_or(ConfigError::TlsPathMissing(ENV_TLS_KEY))?;
-    let bind_addr = bind
-        .map(|raw| {
-            raw.parse::<SocketAddr>()
-                .map_err(|_| ConfigError::InvalidTlsBind(raw.to_string()))
-        })
-        .transpose()?;
     Ok(Some(TlsConfig {
         bind_addr,
         cert_path,
@@ -218,77 +132,37 @@ fn parse_tls(
     }))
 }
 
-/// Load the configuration through `get` (in production `sensor_framework::strict_env_var`), so the
-/// rules are testable without touching the process environment.
-fn load_config_from(
-    get: impl Fn(&str) -> Result<Option<String>, EnvError>,
-) -> Result<Config, ConfigError> {
-    let bind_raw = get(ENV_BIND)?.ok_or(ConfigError::NoBind)?;
-    let bind_addr: SocketAddr = bind_raw
-        .parse()
-        .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
-
-    let wan_map = parse_wan_map(&get(ENV_WAN_MAP)?.unwrap_or_default())?;
-    let log_path = get(ENV_LOG_PATH)?
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
-
-    let read_timeout_ms = parse_positive_u64(
-        get(ENV_READ_TIMEOUT_MS)?.as_deref(),
-        DEFAULT_READ_TIMEOUT_MS,
-        ENV_READ_TIMEOUT_MS,
-    )?;
-    let idle_timeout_ms = parse_positive_u64(
-        get(ENV_IDLE_TIMEOUT_MS)?.as_deref(),
-        DEFAULT_IDLE_TIMEOUT_MS,
-        ENV_IDLE_TIMEOUT_MS,
-    )?;
-    let max_duration_secs = parse_positive_u64(
-        get(ENV_MAX_DURATION_SECS)?.as_deref(),
-        DEFAULT_MAX_DURATION_SECS,
-        ENV_MAX_DURATION_SECS,
-    )?;
-    let max_captured_bytes = parse_positive_u64(
-        get(ENV_MAX_CAPTURED_BYTES)?.as_deref(),
-        DEFAULT_MAX_CAPTURED_BYTES,
-        ENV_MAX_CAPTURED_BYTES,
-    )?;
-    let max_concurrent = parse_positive_u32(
-        get(ENV_MAX_CONCURRENT)?.as_deref(),
-        DEFAULT_MAX_CONCURRENT,
-        ENV_MAX_CONCURRENT,
-    )?;
-
-    let rate = |var: &'static str, default: u32| -> Result<NonZeroU32, ConfigError> {
-        parse_rate_value(get(var)?.as_deref(), default, var)
-    };
+/// Load the configuration through `env` (in production the process environment), so the rules
+/// are testable without touching the process environment.
+fn load_config(env: &Env) -> Result<Config, ConfigError> {
     let per_source = Rate::new(
-        rate(ENV_REPLY_RATE_PER_SOURCE, DEFAULT_REPLY_RATE_PER_SOURCE)?,
-        rate(ENV_REPLY_BURST_PER_SOURCE, DEFAULT_REPLY_BURST_PER_SOURCE)?,
+        env.positive_u32(ENV_REPLY_RATE_PER_SOURCE, DEFAULT_REPLY_RATE_PER_SOURCE)?,
+        env.positive_u32(ENV_REPLY_BURST_PER_SOURCE, DEFAULT_REPLY_BURST_PER_SOURCE)?,
     );
     let global = Rate::new(
-        rate(ENV_REPLY_RATE_GLOBAL, DEFAULT_REPLY_RATE_GLOBAL)?,
-        rate(ENV_REPLY_BURST_GLOBAL, DEFAULT_REPLY_BURST_GLOBAL)?,
+        env.positive_u32(ENV_REPLY_RATE_GLOBAL, DEFAULT_REPLY_RATE_GLOBAL)?,
+        env.positive_u32(ENV_REPLY_BURST_GLOBAL, DEFAULT_REPLY_BURST_GLOBAL)?,
     );
 
-    let tls = parse_tls(
-        get(ENV_TLS_BIND)?.as_deref(),
-        get(ENV_TLS_CERT)?.as_deref(),
-        get(ENV_TLS_KEY)?.as_deref(),
-    )?;
-
     Ok(Config {
-        bind_addr,
-        wan_map,
-        log_path,
+        bind_addr: env.socket_addr(ENV_BIND)?.ok_or(ConfigError::NoBind)?,
+        wan_map: env.wan_map(ENV_WAN_MAP)?,
+        log_path: env.path(ENV_LOG_PATH, DEFAULT_LOG_PATH)?,
         rate: RateLimitConfig::new(per_source, global),
-        tls,
+        tls: parse_tls(
+            env.socket_addr(ENV_TLS_BIND)?,
+            env.string(ENV_TLS_CERT)?.as_deref(),
+            env.string(ENV_TLS_KEY)?.as_deref(),
+        )?,
         bounds: ConnectionBounds {
-            read_timeout: Duration::from_millis(read_timeout_ms),
-            idle_timeout: Duration::from_millis(idle_timeout_ms),
-            max_duration: Duration::from_secs(max_duration_secs),
-            max_captured_bytes,
-            max_concurrent,
+            read_timeout: env.duration_ms(ENV_READ_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS)?,
+            idle_timeout: env.duration_ms(ENV_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS)?,
+            max_duration: env.duration_secs(ENV_MAX_DURATION_SECS, DEFAULT_MAX_DURATION_SECS)?,
+            max_captured_bytes: env
+                .positive_u64(ENV_MAX_CAPTURED_BYTES, DEFAULT_MAX_CAPTURED_BYTES)?,
+            max_concurrent: env
+                .positive_u32(ENV_MAX_CONCURRENT, DEFAULT_MAX_CONCURRENT)?
+                .get(),
         },
     })
 }
@@ -297,7 +171,7 @@ fn load_config_from(
 async fn main() {
     sensor_framework::init_logging();
 
-    let config = match load_config_from(sensor_framework::strict_env_var) {
+    let config = match load_config(&Env::process()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "sensor-dns: invalid configuration; refusing to start");
@@ -398,27 +272,17 @@ async fn main() {
 mod tests {
     use super::*;
 
-    /// A getter over a fixed table that applies `strict_env_var`'s contract (ASCII-whitespace trim,
-    /// blank is unset), so the loader sees exactly what the real reader would hand it.
-    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, EnvError> {
-        let table: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |var| {
-            Ok(table
-                .get(var)
-                .map(|v| {
-                    v.trim_matches(|c: char| c.is_ascii_whitespace())
-                        .to_string()
-                })
-                .filter(|v| !v.is_empty()))
-        }
+    fn env(pairs: &[(&str, &str)]) -> Env {
+        Env::from_table(pairs)
     }
 
     const BIND: (&str, &str) = (ENV_BIND, "203.0.113.7:53");
     const CERT: &str = "/etc/propolis/tls/dns.crt";
     const KEY: &str = "/etc/propolis/tls/dns.key";
+    const TLS_BIND: Option<SocketAddr> = Some(SocketAddr::new(
+        IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+        853,
+    ));
     const BOUNDS: [&str; 5] = [
         ENV_READ_TIMEOUT_MS,
         ENV_IDLE_TIMEOUT_MS,
@@ -429,14 +293,14 @@ mod tests {
 
     #[test]
     fn no_bind_is_an_error() {
-        assert_eq!(load_config_from(env(&[])).unwrap_err(), ConfigError::NoBind);
+        assert_eq!(load_config(&env(&[])).unwrap_err(), ConfigError::NoBind);
     }
 
     #[test]
     fn blank_bind_is_no_bind() {
         for blank in [" ", "\t\n"] {
             assert_eq!(
-                load_config_from(env(&[(ENV_BIND, blank)])).unwrap_err(),
+                load_config(&env(&[(ENV_BIND, blank)])).unwrap_err(),
                 ConfigError::NoBind
             );
         }
@@ -445,17 +309,18 @@ mod tests {
     #[test]
     fn malformed_bind_is_an_error() {
         for bad in ["53", "0.0.0.0", "x:53", "203.0.113.7:99999"] {
-            assert_eq!(
-                load_config_from(env(&[(ENV_BIND, bad)])).unwrap_err(),
-                ConfigError::InvalidBind(bad.to_string()),
-                "{bad}"
-            );
+            match load_config(&env(&[(ENV_BIND, bad)])) {
+                Err(ConfigError::Env(EnvError::Invalid { var, value, .. })) => {
+                    assert_eq!((var.as_str(), value.as_str()), (ENV_BIND, bad));
+                }
+                other => panic!("{bad}: {other:?}"),
+            }
         }
     }
 
     #[test]
     fn a_valid_bind_loads_with_the_documented_defaults() {
-        let c = load_config_from(env(&[BIND])).unwrap();
+        let c = load_config(&env(&[BIND])).unwrap();
         assert_eq!(c.bind_addr, "203.0.113.7:53".parse().unwrap());
         assert!(c.wan_map.is_empty());
         assert_eq!(
@@ -489,21 +354,22 @@ mod tests {
     fn a_zero_or_non_numeric_reply_rate_is_an_error_not_a_disabled_limit() {
         for field in RATES {
             for bad in ["0", "-5", "fast", "4294967296"] {
-                assert_eq!(
-                    load_config_from(env(&[BIND, (field, bad)])).unwrap_err(),
-                    ConfigError::InvalidBound {
-                        field,
-                        value: bad.to_string()
-                    },
-                    "{field}={bad}"
-                );
+                match load_config(&env(&[BIND, (field, bad)])) {
+                    Err(ConfigError::Env(
+                        EnvError::Invalid { var, value, .. }
+                        | EnvError::TooLarge { var, value, .. },
+                    )) => {
+                        assert_eq!((var.as_str(), value.as_str()), (field, bad));
+                    }
+                    other => panic!("{field}={bad}: {other:?}"),
+                }
             }
         }
     }
 
     #[test]
     fn reply_rates_load_each_from_its_own_variable_and_blank_takes_the_default() {
-        let c = load_config_from(env(&[
+        let c = load_config(&env(&[
             BIND,
             (ENV_REPLY_RATE_PER_SOURCE, "7"),
             (ENV_REPLY_BURST_PER_SOURCE, "11"),
@@ -521,8 +387,8 @@ mod tests {
         );
         let mut pairs = vec![BIND];
         pairs.extend(RATES.iter().map(|f| (*f, " ")));
-        let blank = load_config_from(env(&pairs)).unwrap();
-        let defaults = load_config_from(env(&[BIND])).unwrap();
+        let blank = load_config(&env(&pairs)).unwrap();
+        let defaults = load_config(&env(&[BIND])).unwrap();
         assert_eq!(blank.rate, defaults.rate);
     }
 
@@ -530,24 +396,22 @@ mod tests {
     fn a_zero_or_non_numeric_bound_is_an_error_not_a_disabled_guard() {
         for field in BOUNDS {
             for bad in ["0", "-1", "ten"] {
-                assert_eq!(
-                    load_config_from(env(&[BIND, (field, bad)])).unwrap_err(),
-                    ConfigError::InvalidBound {
-                        field,
-                        value: bad.to_string()
-                    },
-                    "{field}={bad}"
-                );
+                match load_config(&env(&[BIND, (field, bad)])) {
+                    Err(ConfigError::Env(EnvError::Invalid { var, value, .. })) => {
+                        assert_eq!((var.as_str(), value.as_str()), (field, bad));
+                    }
+                    other => panic!("{field}={bad}: {other:?}"),
+                }
             }
         }
     }
 
     #[test]
     fn a_blank_bound_takes_its_default() {
-        let defaults = load_config_from(env(&[BIND])).unwrap().bounds;
+        let defaults = load_config(&env(&[BIND])).unwrap().bounds;
         let mut pairs = vec![BIND];
         pairs.extend(BOUNDS.iter().map(|f| (*f, "  ")));
-        let blank = load_config_from(env(&pairs)).unwrap().bounds;
+        let blank = load_config(&env(&pairs)).unwrap().bounds;
         assert_eq!(blank.read_timeout, defaults.read_timeout);
         assert_eq!(blank.idle_timeout, defaults.idle_timeout);
         assert_eq!(blank.max_duration, defaults.max_duration);
@@ -557,7 +421,7 @@ mod tests {
 
     #[test]
     fn wan_map_parses_and_rejects_garbage() {
-        let c = load_config_from(env(&[
+        let c = load_config(&env(&[
             BIND,
             (ENV_WAN_MAP, "10.0.0.1=198.51.100.4, 10.0.0.2=198.51.100.5"),
         ]))
@@ -570,8 +434,8 @@ mod tests {
         for bad in ["not-valid", "10.0.0.1=", "x=198.51.100.4"] {
             assert!(
                 matches!(
-                    load_config_from(env(&[BIND, (ENV_WAN_MAP, bad)])),
-                    Err(ConfigError::InvalidWanMapEntry(_))
+                    load_config(&env(&[BIND, (ENV_WAN_MAP, bad)])),
+                    Err(ConfigError::Env(EnvError::Invalid { .. }))
                 ),
                 "{bad}"
             );
@@ -586,9 +450,9 @@ mod tests {
     #[test]
     fn parse_tls_full_is_some() {
         assert_eq!(
-            parse_tls(Some("0.0.0.0:853"), Some(CERT), Some(KEY)),
+            parse_tls(TLS_BIND, Some(CERT), Some(KEY)),
             Ok(Some(TlsConfig {
-                bind_addr: Some("0.0.0.0:853".parse().unwrap()),
+                bind_addr: TLS_BIND,
                 cert_path: CERT.into(),
                 key_path: KEY.into(),
             }))
@@ -598,11 +462,11 @@ mod tests {
     #[test]
     fn parse_tls_bind_without_cert_is_refused() {
         assert_eq!(
-            parse_tls(Some("0.0.0.0:853"), None, Some(KEY)),
+            parse_tls(TLS_BIND, None, Some(KEY)),
             Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
         );
         assert_eq!(
-            parse_tls(Some("0.0.0.0:853"), None, None),
+            parse_tls(TLS_BIND, None, None),
             Err(ConfigError::TlsPathMissing(ENV_TLS_CERT))
         );
     }
@@ -610,7 +474,7 @@ mod tests {
     #[test]
     fn parse_tls_bind_without_key_is_refused() {
         assert_eq!(
-            parse_tls(Some("0.0.0.0:853"), Some(CERT), None),
+            parse_tls(TLS_BIND, Some(CERT), None),
             Err(ConfigError::TlsPathMissing(ENV_TLS_KEY))
         );
     }
@@ -640,26 +504,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_tls_rejects_a_bad_bind() {
-        assert_eq!(
-            parse_tls(Some("nonsense"), Some(CERT), Some(KEY)),
-            Err(ConfigError::InvalidTlsBind("nonsense".to_string()))
-        );
+    fn a_bad_tls_bind_is_an_error() {
+        assert!(matches!(
+            load_config(&env(&[
+                BIND,
+                (ENV_TLS_BIND, "nonsense"),
+                (ENV_TLS_CERT, CERT),
+                (ENV_TLS_KEY, KEY)
+            ])),
+            Err(ConfigError::Env(EnvError::Invalid { .. }))
+        ));
     }
 
     #[test]
     fn a_non_utf8_value_is_an_env_error() {
-        let base = env(&[BIND]);
-        let get = |var: &str| {
+        let get = Env::from_lookup(|var: &str| {
             if var == ENV_TLS_KEY {
                 Err(EnvError::NotUnicode {
                     var: var.to_string(),
                 })
+            } else if var == ENV_BIND {
+                Ok(Some(BIND.1.to_string()))
             } else {
-                base(var)
+                Ok(None)
             }
-        };
-        let err = load_config_from(get).unwrap_err();
+        });
+        let err = load_config(&get).unwrap_err();
         assert_eq!(
             err,
             ConfigError::Env(EnvError::NotUnicode {

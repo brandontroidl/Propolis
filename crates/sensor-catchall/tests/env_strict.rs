@@ -21,9 +21,9 @@ const VARS: &[&str] = &[
     "CATCHALL_MAX_CONCURRENT",
 ];
 
-/// Runs the sensor with a valid minimal config plus `bad` set to non-UTF-8 bytes (if given), and
+/// Runs the sensor with a valid minimal config plus `bad` set to the given bytes (if given), and
 /// returns its exit code (`None` if still running after `wait`) and combined output.
-fn run(bad: Option<&str>, wait: Duration) -> (Option<i32>, String) {
+fn run(bad: Option<(&str, &[u8])>, wait: Duration) -> (Option<i32>, String) {
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sensor-catchall"));
     cmd.env_clear()
@@ -36,8 +36,8 @@ fn run(bad: Option<&str>, wait: Duration) -> (Option<i32>, String) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(var) = bad {
-        cmd.env(var, OsStr::from_bytes(b"\xff\xfe"));
+    if let Some((var, value)) = bad {
+        cmd.env(var, OsStr::from_bytes(value));
     }
     let mut child = cmd.spawn().unwrap();
     let deadline = Instant::now() + wait;
@@ -57,7 +57,7 @@ fn run(bad: Option<&str>, wait: Duration) -> (Option<i32>, String) {
 #[test]
 fn a_non_utf8_value_exits_1_before_any_listener_binds() {
     for var in VARS {
-        let (code, text) = run(Some(var), Duration::from_secs(10));
+        let (code, text) = run(Some((var, &b"\xff\xfe"[..])), Duration::from_secs(10));
         assert_eq!(code, Some(1), "{var}: {text}");
         assert!(
             text.contains(var) && text.contains("UTF-8"),
@@ -67,6 +67,32 @@ fn a_non_utf8_value_exits_1_before_any_listener_binds() {
             !text.contains("listener bound"),
             "{var}: bound first: {text}"
         );
+    }
+}
+
+/// A bound that is set and wrong refuses to start, naming the variable and quoting the value.
+#[test]
+fn a_zero_or_garbage_bound_exits_1_before_any_listener_binds() {
+    for var in [
+        "PROPOLIS_CATCHALL_READ_TIMEOUT_MS",
+        "PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS",
+        "PROPOLIS_CATCHALL_MAX_DURATION_SECS",
+        "PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES",
+        "PROPOLIS_CATCHALL_MAX_CONCURRENT",
+        "CATCHALL_MAX_CONCURRENT",
+    ] {
+        for bad in ["0", "-1", "ten"] {
+            let (code, text) = run(Some((var, bad.as_bytes())), Duration::from_secs(10));
+            assert_eq!(code, Some(1), "{var}={bad}: {text}");
+            assert!(
+                text.contains(var) && text.contains(&format!("{bad:?}")),
+                "{var}={bad}: {text}"
+            );
+            assert!(
+                !text.contains("listener bound"),
+                "{var}={bad}: bound first: {text}"
+            );
+        }
     }
 }
 

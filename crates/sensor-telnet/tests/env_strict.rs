@@ -70,6 +70,32 @@ fn a_non_utf8_value_exits_1_before_any_listener_binds() {
     }
 }
 
+/// A bound that is set and wrong refuses to start, naming the variable and quoting the value.
+#[test]
+fn a_zero_or_garbage_bound_exits_1_before_any_listener_binds() {
+    for var in [
+        "PROPOLIS_TELNET_READ_TIMEOUT_MS",
+        "PROPOLIS_TELNET_IDLE_TIMEOUT_MS",
+        "PROPOLIS_TELNET_MAX_DURATION_SECS",
+        "PROPOLIS_TELNET_MAX_CAPTURED_BYTES",
+        "PROPOLIS_TELNET_MAX_CONCURRENT",
+        "PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES",
+    ] {
+        for bad in ["0", "-1", "ten"] {
+            let (code, text) = run(Some((var, bad.as_bytes())), Duration::from_secs(10));
+            assert_eq!(code, Some(1), "{var}={bad}: {text}");
+            assert!(
+                text.contains(var) && text.contains(&format!("{bad:?}")),
+                "{var}={bad}: {text}"
+            );
+            assert!(
+                !text.contains("listening"),
+                "{var}={bad}: bound first: {text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_zero_or_garbage_command_event_budget_exits_1_before_any_listener_binds() {
     for var in [

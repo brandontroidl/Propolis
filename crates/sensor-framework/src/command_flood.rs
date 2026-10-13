@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
-use std::fmt;
 use std::hash::BuildHasher;
 use std::net::IpAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -50,7 +49,7 @@ use uuid::Uuid;
 
 use crate::arrival::{self, Arrival};
 use crate::emit::EventEmitter;
-use crate::env::EnvError;
+use crate::env::{Env, EnvError};
 use crate::rate_limit::{
     DEFAULT_RATE_TABLE_CAPACITY, DEFAULT_SUMMARY_CAPACITY, MAX_SUMMARY_SAMPLES, Rate, RateDecision,
     RateLimitConfig, ReplyRateLimiter, SourceKey,
@@ -103,35 +102,6 @@ impl Default for CommandEventConfig {
     }
 }
 
-/// A command-event setting the sensor refuses to start with.
-#[derive(Debug, PartialEq, Eq)]
-pub enum CommandEventConfigError {
-    /// The variable held bytes that are not UTF-8.
-    Env(EnvError),
-    /// The value was zero or not a whole number that fits in a `u32`.
-    Invalid { var: String, value: String },
-}
-
-impl fmt::Display for CommandEventConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Env(e) => write!(f, "{e}"),
-            Self::Invalid { var, value } => write!(
-                f,
-                "{var} must be a positive integer, got {value:?} (zero never means unlimited)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CommandEventConfigError {}
-
-impl From<EnvError> for CommandEventConfigError {
-    fn from(e: EnvError) -> Self {
-        Self::Env(e)
-    }
-}
-
 /// The two variables `PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE_PER_MIN` and `..._BURST`.
 pub fn command_event_vars(sensor: &str) -> (String, String) {
     let prefix = format!("PROPOLIS_{}_COMMAND_EVENT", sensor.to_ascii_uppercase());
@@ -139,34 +109,15 @@ pub fn command_event_vars(sensor: &str) -> (String, String) {
 }
 
 impl CommandEventConfig {
-    /// Read the rate and burst for `sensor` (`telnet`, `ssh`, `adb`) from the process environment.
-    pub fn from_env(sensor: &str) -> Result<Self, CommandEventConfigError> {
-        Self::from_lookup(sensor, crate::env::strict_env_var)
-    }
-
-    /// [`Self::from_env`] over any variable lookup. Unset takes the default; zero, a negative
-    /// number, garbage or a value past `u32` is an error, never a default and never "unlimited".
-    pub fn from_lookup(
-        sensor: &str,
-        get: impl Fn(&str) -> Result<Option<String>, EnvError>,
-    ) -> Result<Self, CommandEventConfigError> {
+    /// Read the rate and burst for `sensor` (`telnet`, `ssh`, `adb`). Unset takes the default;
+    /// zero, a negative number, garbage or a value past `u32` is an error, never a default and
+    /// never "unlimited".
+    pub fn from_env(sensor: &str, env: &Env) -> Result<Self, EnvError> {
         let (rate_var, burst_var) = command_event_vars(sensor);
-        let read = |var: &str, default: u32| -> Result<NonZeroU32, CommandEventConfigError> {
-            let Some(raw) = get(var)? else {
-                return Ok(NonZeroU32::new(default).unwrap_or(NonZeroU32::MIN));
-            };
-            raw.parse::<u32>()
-                .ok()
-                .and_then(NonZeroU32::new)
-                .ok_or_else(|| CommandEventConfigError::Invalid {
-                    var: var.to_string(),
-                    value: raw.clone(),
-                })
-        };
         Ok(Self {
             rate: Rate::per_minute(
-                read(&rate_var, DEFAULT_COMMAND_EVENTS_PER_MIN)?,
-                read(&burst_var, DEFAULT_COMMAND_EVENT_BURST)?,
+                env.positive_u32(&rate_var, DEFAULT_COMMAND_EVENTS_PER_MIN)?,
+                env.positive_u32(&burst_var, DEFAULT_COMMAND_EVENT_BURST)?,
             ),
             ..Self::default()
         })
@@ -1354,13 +1305,13 @@ mod tests {
 
     #[test]
     fn config_reads_rate_and_burst_strictly() {
-        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
-            move |var: &str| -> Result<Option<String>, EnvError> {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            Env::from_lookup(move |var: &str| {
                 Ok(pairs
                     .iter()
                     .find(|(k, _)| *k == var)
                     .map(|(_, v)| v.to_string()))
-            }
+            })
         };
         assert_eq!(
             command_event_vars("telnet"),
@@ -1369,14 +1320,14 @@ mod tests {
                 "PROPOLIS_TELNET_COMMAND_EVENT_BURST".to_string()
             )
         );
-        let default = CommandEventConfig::from_lookup("ssh", lookup(&[])).unwrap();
+        let default = CommandEventConfig::from_env("ssh", &env(&[])).unwrap();
         assert_eq!(default, CommandEventConfig::default());
         assert_eq!(default.rate.count(), 12);
         assert_eq!(default.rate.period(), Duration::from_secs(60));
         assert_eq!(default.rate.burst(), 200);
-        let set = CommandEventConfig::from_lookup(
+        let set = CommandEventConfig::from_env(
             "adb",
-            lookup(&[
+            &env(&[
                 ("PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN", "5"),
                 ("PROPOLIS_ADB_COMMAND_EVENT_BURST", "50"),
                 // The per-second spelling never shipped and is not read.
@@ -1395,25 +1346,29 @@ mod tests {
             ] {
                 let pairs: &'static [(&'static str, &'static str)] =
                     Box::leak(vec![(var, bad)].into_boxed_slice());
-                let err = CommandEventConfig::from_lookup("telnet", lookup(pairs)).unwrap_err();
-                assert_eq!(
-                    err,
-                    CommandEventConfigError::Invalid {
-                        var: var.to_string(),
-                        value: bad.to_string()
+                let err = CommandEventConfig::from_env("telnet", &env(pairs)).unwrap_err();
+                match &err {
+                    EnvError::Invalid { var: v, value, .. }
+                    | EnvError::TooLarge { var: v, value, .. } => {
+                        assert_eq!((v.as_str(), value.as_str()), (var, bad));
                     }
+                    other => panic!("{var}={bad}: {other:?}"),
+                }
+                let text = err.to_string();
+                assert!(
+                    text.contains(var) && text.contains("positive integer"),
+                    "{text}"
                 );
-                assert!(err.to_string().contains(var));
             }
         }
-        let not_unicode = |var: &str| -> Result<Option<String>, EnvError> {
+        let not_unicode = Env::from_lookup(|var: &str| {
             Err(EnvError::NotUnicode {
                 var: var.to_string(),
             })
-        };
+        });
         assert!(matches!(
-            CommandEventConfig::from_lookup("telnet", not_unicode),
-            Err(CommandEventConfigError::Env(_))
+            CommandEventConfig::from_env("telnet", &not_unicode),
+            Err(EnvError::NotUnicode { .. })
         ));
     }
 

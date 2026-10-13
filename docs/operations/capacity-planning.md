@@ -75,10 +75,9 @@ Defaults (all operator-overridable via each sensor's `_MAX_CONCURRENT` env var, 
   `crates/sensor-catchall/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`/
   `crates/sensor-catchall/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`).
 
-A zero or unparseable bound is rejected at startup ("zero never means unlimited") for every
-sensor except SMTP and cred, which fall back to the default on invalid input
-(`crates/sensor-smtp/src/main.rs#parse_positive_u64`/`crates/sensor-smtp/src/main.rs#parse_positive_u32`,
-`crates/sensor-cred/src/main.rs#parse_positive_u64`/`crates/sensor-cred/src/main.rs#parse_positive_u32`). Raising
+A zero or unparseable bound is rejected at startup ("zero never means unlimited") by every
+sensor, all twelve reading their bounds through one set of typed readers
+(`crates/sensor-framework/src/env.rs#Env`). Raising
 `max_concurrent` raises peak memory and file-descriptor use; keep it under each unit's
 `LimitNOFILE`.
 

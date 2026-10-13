@@ -53,19 +53,16 @@ Values and the full required/optional matrix:
 
 Two parse idioms exist and they are **not uniform**:
 
-- **Strict** (unified daemon, `intake`, `review`, `feed`, `console`, and sensors
-  `ssh`/`telnet`/`http`/`ftp`/`tftp`/`mqtt`/`dns`/`redis`/`adb`/`catchall`): a present-but-invalid or
-  present-but-zero numeric bound **aborts startup**. Zero is rejected on most
-  bounds because "zero never means unlimited"
-  (`parse_positive_u64`, `crates/propolis/src/config.rs#parse_positive_u64`). A few bounds allow 0 with a defined
-  meaning (e.g. `PROPOLIS_FETCH_MAX_HOPS=0` = no redirects,
-  `PROPOLIS_FETCH_MAX_DEPTH=0` = no recursion,
-  `PROPOLIS_OPS_CAPACITY_FREE_PCT` rejects 0).
-- **Lenient** (sensors `cred` and `smtp` only): an invalid or zero bound
-  **silently falls back to the default** instead of aborting
-  (`crates/sensor-cred/src/main.rs#parse_positive_u64`,
-  `crates/sensor-smtp/src/main.rs#parse_positive_u64`). If you set a `cred`/`smtp` bound and it
-  seems ignored, this is why - the value was rejected and the default used.
+- **Strict**, everywhere (unified daemon, `intake`, `review`, `feed`, `console`, and all twelve
+  sensors): a present-but-invalid or present-but-zero numeric bound **aborts startup**. Zero is
+  rejected on most bounds because "zero never means unlimited"
+  (`parse_positive_u64`, `crates/propolis/src/config.rs#parse_positive_u64`; the sensors read every
+  bound through `crates/sensor-framework/src/env.rs#Env`, whose message names the variable and
+  quotes the value). A few daemon bounds allow 0 with a defined meaning (e.g.
+  `PROPOLIS_FETCH_MAX_HOPS=0` = no redirects, `PROPOLIS_FETCH_MAX_DEPTH=0` = no recursion,
+  `PROPOLIS_OPS_CAPACITY_FREE_PCT` rejects 0). The `cred` and `smtp` sensors used to fall back to
+  the default on a bound they could not parse; if one of them now refuses to start after an
+  upgrade, the journal line names the variable that was always being ignored.
 
 Fetcher bounds also enforce an upper clamp; a value above the max aborts (e.g.
 `PROPOLIS_FETCH_MAX_BYTES` max 500 MB, and `=0` aborts because it would disable

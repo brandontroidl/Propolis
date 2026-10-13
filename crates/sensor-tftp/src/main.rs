@@ -1,13 +1,12 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{
-    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, EnvError, Rate,
-    RateLimitConfig, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal, strict_env_var,
+    CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, Env, EnvError, Rate,
+    RateLimitConfig, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
 };
 use sensor_tftp::handler::MAX_BODY_HARD_CAP;
 
@@ -62,20 +61,12 @@ const DEFAULT_REPLY_BURST_GLOBAL: u32 = 2000;
 /// How long shutdown waits to write the rate-limited summaries still accumulating.
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum ConfigError {
     NoBind,
-    InvalidBind(String),
-    InvalidWanMapEntry(String),
-    InvalidBound {
-        field: &'static str,
-        value: String,
-    },
-    BoundTooLarge {
-        field: &'static str,
-        max: u64,
-    },
-    /// An env var held bytes that are not valid UTF-8; never read as unset.
+    /// A variable was not valid UTF-8, or was set to a value the sensor refuses (a malformed
+    /// address, a zero, oversized or unparseable bound or rate, a bad WAN map entry); never read
+    /// as unset.
     Env(EnvError),
 }
 
@@ -91,14 +82,6 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Env(e) => write!(f, "{e}"),
             ConfigError::NoBind => {
                 write!(f, "{ENV_BIND} must be set (the sensor is off by default)")
-            }
-            ConfigError::InvalidBind(s) => write!(f, "invalid {ENV_BIND}: {s:?}"),
-            ConfigError::InvalidWanMapEntry(s) => write!(f, "invalid {ENV_WAN_MAP} entry: {s:?}"),
-            ConfigError::InvalidBound { field, value } => {
-                write!(f, "{field} must be positive, got {value:?}")
-            }
-            ConfigError::BoundTooLarge { field, max } => {
-                write!(f, "{field} must be at most {max}")
             }
         }
     }
@@ -129,158 +112,47 @@ fn resolve_outbox_dir(spool_dir: &Path, env_override: Option<String>) -> PathBuf
         .unwrap_or_else(|| spool_dir.join("outbox"))
 }
 
-/// Build the configuration from a variable lookup (the process environment in `main`, a map in the
-/// tests). A missing bind, a malformed value, or a zero or oversized bound is an error: the caller
-/// exits without binding anything, and no default ever stands in for a bad value.
-fn load_config_from(
-    get: impl Fn(&str) -> Result<Option<String>, EnvError>,
-) -> Result<Config, ConfigError> {
-    let bind_raw = get(ENV_BIND)?.ok_or(ConfigError::NoBind)?;
-    let bind_addr: SocketAddr = bind_raw
-        .trim()
-        .parse()
-        .map_err(|_| ConfigError::InvalidBind(bind_raw.clone()))?;
-    let wan_map = parse_wan_map(&get(ENV_WAN_MAP)?.unwrap_or_default())?;
-    let log_path = get(ENV_LOG_PATH)?
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH));
-    let spool_dir = get(ENV_SPOOL_DIR)?
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_DIR));
-    let outbox_dir = resolve_outbox_dir(&spool_dir, get(ENV_OUTBOX_DIR)?);
-    let collector_id = get(ENV_COLLECTOR_ID)?.unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string());
-
-    let max_captured_bytes = parse_positive_u64(
-        get(ENV_MAX_CAPTURED_BYTES)?.as_deref(),
-        DEFAULT_MAX_CAPTURED_BYTES,
-        ENV_MAX_CAPTURED_BYTES,
-    )?;
-    if max_captured_bytes > MAX_BODY_HARD_CAP {
-        return Err(ConfigError::BoundTooLarge {
-            field: ENV_MAX_CAPTURED_BYTES,
-            max: MAX_BODY_HARD_CAP,
-        });
-    }
-
-    let rate = |var: &'static str, default: u32| -> Result<NonZeroU32, ConfigError> {
-        parse_rate_value(get(var)?.as_deref(), default, var)
-    };
+/// Build the configuration from `env` (the process environment in `main`, a table in the tests).
+/// A missing bind, a malformed value, or a zero or oversized bound is an error: the caller exits
+/// without binding anything, and no default ever stands in for a bad value.
+fn load_config(env: &Env) -> Result<Config, ConfigError> {
+    let spool_dir = env.path(ENV_SPOOL_DIR, DEFAULT_SPOOL_DIR)?;
+    let outbox_dir = resolve_outbox_dir(&spool_dir, env.string(ENV_OUTBOX_DIR)?);
     let per_source = Rate::new(
-        rate(ENV_REPLY_RATE_PER_SOURCE, DEFAULT_REPLY_RATE_PER_SOURCE)?,
-        rate(ENV_REPLY_BURST_PER_SOURCE, DEFAULT_REPLY_BURST_PER_SOURCE)?,
+        env.positive_u32(ENV_REPLY_RATE_PER_SOURCE, DEFAULT_REPLY_RATE_PER_SOURCE)?,
+        env.positive_u32(ENV_REPLY_BURST_PER_SOURCE, DEFAULT_REPLY_BURST_PER_SOURCE)?,
     );
     let global = Rate::new(
-        rate(ENV_REPLY_RATE_GLOBAL, DEFAULT_REPLY_RATE_GLOBAL)?,
-        rate(ENV_REPLY_BURST_GLOBAL, DEFAULT_REPLY_BURST_GLOBAL)?,
+        env.positive_u32(ENV_REPLY_RATE_GLOBAL, DEFAULT_REPLY_RATE_GLOBAL)?,
+        env.positive_u32(ENV_REPLY_BURST_GLOBAL, DEFAULT_REPLY_BURST_GLOBAL)?,
     );
 
     Ok(Config {
         rate: RateLimitConfig::new(per_source, global),
-        bind_addr,
-        wan_map,
-        log_path,
+        bind_addr: env.socket_addr(ENV_BIND)?.ok_or(ConfigError::NoBind)?,
+        wan_map: env.wan_map(ENV_WAN_MAP)?,
+        log_path: env.path(ENV_LOG_PATH, DEFAULT_LOG_PATH)?,
         spool_dir,
-        collector_id,
+        collector_id: env
+            .string(ENV_COLLECTOR_ID)?
+            .unwrap_or_else(|| DEFAULT_COLLECTOR_ID.to_string()),
         outbox_dir,
-        capture_memory_bytes: parse_positive_u64(
-            get(ENV_CAPTURE_MEMORY_BYTES)?.as_deref(),
-            DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-            ENV_CAPTURE_MEMORY_BYTES,
-        )?,
+        capture_memory_bytes: env
+            .positive_u64(ENV_CAPTURE_MEMORY_BYTES, DEFAULT_CAPTURE_BUDGET_BYTES_256M)?,
         bounds: ConnectionBounds {
-            read_timeout: Duration::from_millis(parse_positive_u64(
-                get(ENV_READ_TIMEOUT_MS)?.as_deref(),
-                DEFAULT_READ_TIMEOUT_MS,
-                ENV_READ_TIMEOUT_MS,
-            )?),
-            idle_timeout: Duration::from_millis(parse_positive_u64(
-                get(ENV_IDLE_TIMEOUT_MS)?.as_deref(),
-                DEFAULT_IDLE_TIMEOUT_MS,
-                ENV_IDLE_TIMEOUT_MS,
-            )?),
-            max_duration: Duration::from_secs(parse_positive_u64(
-                get(ENV_MAX_DURATION_SECS)?.as_deref(),
-                DEFAULT_MAX_DURATION_SECS,
-                ENV_MAX_DURATION_SECS,
-            )?),
-            max_captured_bytes,
-            max_concurrent: parse_positive_u32(
-                get(ENV_MAX_CONCURRENT)?.as_deref(),
-                DEFAULT_MAX_CONCURRENT,
-                ENV_MAX_CONCURRENT,
+            read_timeout: env.duration_ms(ENV_READ_TIMEOUT_MS, DEFAULT_READ_TIMEOUT_MS)?,
+            idle_timeout: env.duration_ms(ENV_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS)?,
+            max_duration: env.duration_secs(ENV_MAX_DURATION_SECS, DEFAULT_MAX_DURATION_SECS)?,
+            // Bounded by the spool's per-file limit: a body the spool would refuse is never read.
+            max_captured_bytes: env.positive_u64_at_most(
+                ENV_MAX_CAPTURED_BYTES,
+                DEFAULT_MAX_CAPTURED_BYTES,
+                MAX_BODY_HARD_CAP,
             )?,
+            max_concurrent: env
+                .positive_u32(ENV_MAX_CONCURRENT, DEFAULT_MAX_CONCURRENT)?
+                .get(),
         },
-    })
-}
-
-fn parse_wan_map(raw: &str) -> Result<HashMap<IpAddr, IpAddr>, ConfigError> {
-    let mut map = HashMap::new();
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (local, wan) = entry
-            .split_once('=')
-            .ok_or_else(|| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let local: IpAddr = local
-            .trim()
-            .parse()
-            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        let wan: IpAddr = wan
-            .trim()
-            .parse()
-            .map_err(|_| ConfigError::InvalidWanMapEntry(entry.to_string()))?;
-        map.insert(local, wan);
-    }
-    Ok(map)
-}
-
-fn parse_positive_u64(
-    raw: Option<&str>,
-    default: u64,
-    field: &'static str,
-) -> Result<u64, ConfigError> {
-    let Some(raw) = raw else { return Ok(default) };
-    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound {
-        field,
-        value: raw.to_string(),
-    })?;
-    if value == 0 {
-        return Err(ConfigError::InvalidBound {
-            field,
-            value: raw.to_string(),
-        });
-    }
-    Ok(value)
-}
-
-fn parse_positive_u32(
-    raw: Option<&str>,
-    default: u32,
-    field: &'static str,
-) -> Result<u32, ConfigError> {
-    let Some(raw) = raw else { return Ok(default) };
-    let value: u32 = raw.parse().map_err(|_| ConfigError::InvalidBound {
-        field,
-        value: raw.to_string(),
-    })?;
-    if value == 0 {
-        return Err(ConfigError::InvalidBound {
-            field,
-            value: raw.to_string(),
-        });
-    }
-    Ok(value)
-}
-
-/// A reply rate or burst: unset takes `default`; zero or unparseable is an error, so a rate can
-/// never be configured off.
-fn parse_rate_value(
-    raw: Option<&str>,
-    default: u32,
-    field: &'static str,
-) -> Result<NonZeroU32, ConfigError> {
-    let value = parse_positive_u32(raw, default, field)?;
-    NonZeroU32::new(value).ok_or(ConfigError::InvalidBound {
-        field,
-        value: value.to_string(),
     })
 }
 
@@ -288,7 +160,7 @@ fn parse_rate_value(
 async fn main() {
     sensor_framework::init_logging();
 
-    let config = match load_config_from(strict_env_var) {
+    let config = match load_config(&Env::process()) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "sensor-tftp: invalid configuration; refusing to start");
@@ -340,21 +212,13 @@ async fn main() {
 mod tests {
     use super::*;
 
-    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>, EnvError> {
-        let map: HashMap<String, String> = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        move |name| Ok(map.get(name).cloned())
-    }
-
     fn load(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
-        load_config_from(vars(pairs))
+        load_config(&Env::from_table(pairs))
     }
 
     #[test]
     fn a_non_utf8_variable_is_a_config_error_never_a_default() {
-        let get = |name: &str| {
+        let get = Env::from_lookup(|name: &str| {
             if name == ENV_MAX_CONCURRENT {
                 Err(EnvError::NotUnicode {
                     var: name.to_string(),
@@ -364,9 +228,12 @@ mod tests {
             } else {
                 Ok(None)
             }
-        };
-        let err = load_config_from(get).expect_err("must not fall back to the default");
-        assert!(matches!(err, ConfigError::Env(_)), "{err}");
+        });
+        let err = load_config(&get).expect_err("must not fall back to the default");
+        assert!(
+            matches!(err, ConfigError::Env(EnvError::NotUnicode { .. })),
+            "{err}"
+        );
         assert!(err.to_string().contains(ENV_MAX_CONCURRENT));
     }
 
@@ -379,13 +246,21 @@ mod tests {
             load(&[(ENV_LOG_PATH, "/tmp/x"), (ENV_MAX_CONCURRENT, "4")]),
             Err(ConfigError::NoBind)
         ));
+        // A blank bind is unset for every sensor variable.
+        assert!(matches!(
+            load(&[(ENV_BIND, "  ")]),
+            Err(ConfigError::NoBind)
+        ));
     }
 
     #[test]
     fn malformed_bind_is_an_error() {
-        for bad in ["", "69", "0.0.0.0", "not-an-addr:69", "203.0.113.7:99999"] {
+        for bad in ["69", "0.0.0.0", "not-an-addr:69", "203.0.113.7:99999"] {
             assert!(
-                matches!(load(&[(ENV_BIND, bad)]), Err(ConfigError::InvalidBind(_))),
+                matches!(
+                    load(&[(ENV_BIND, bad)]),
+                    Err(ConfigError::Env(EnvError::Invalid { .. }))
+                ),
                 "{bad:?} must be rejected"
             );
         }
@@ -401,6 +276,7 @@ mod tests {
             cfg.outbox_dir,
             PathBuf::from("/var/spool/propolis/tftp/outbox")
         );
+        assert_eq!(cfg.collector_id, "local");
         assert_eq!(cfg.bounds.max_captured_bytes, 1_000_000);
         assert_eq!(cfg.bounds.max_concurrent, 128);
         assert_eq!(cfg.bounds.read_timeout, Duration::from_millis(30_000));
@@ -429,10 +305,13 @@ mod tests {
     #[test]
     fn a_zero_or_non_numeric_reply_rate_is_an_error_not_a_disabled_limit() {
         for field in RATES {
-            for bad in ["0", "-5", "fast", "4294967296", ""] {
+            for bad in ["0", "-5", "fast", "4294967296"] {
                 match load(&[(ENV_BIND, "203.0.113.7:69"), (field, bad)]) {
-                    Err(ConfigError::InvalidBound { field: f, value }) => {
-                        assert_eq!((f, value.as_str()), (field, bad));
+                    Err(ConfigError::Env(
+                        EnvError::Invalid { var, value, .. }
+                        | EnvError::TooLarge { var, value, .. },
+                    )) => {
+                        assert_eq!((var.as_str(), value.as_str()), (field, bad));
                     }
                     other => panic!("{field}={bad:?}: {other:?}"),
                 }
@@ -491,12 +370,13 @@ mod tests {
             ENV_MAX_CONCURRENT,
             ENV_CAPTURE_MEMORY_BYTES,
         ] {
-            for bad in ["0", "-1", "ten", ""] {
-                let result = load(&[(ENV_BIND, "203.0.113.7:69"), (field, bad)]);
-                assert!(
-                    matches!(result, Err(ConfigError::InvalidBound { .. })),
-                    "{field}={bad:?} must be rejected"
-                );
+            for bad in ["0", "-1", "ten"] {
+                match load(&[(ENV_BIND, "203.0.113.7:69"), (field, bad)]) {
+                    Err(ConfigError::Env(EnvError::Invalid { var, value, .. })) => {
+                        assert_eq!((var.as_str(), value.as_str()), (field, bad));
+                    }
+                    other => panic!("{field}={bad:?}: {other:?}"),
+                }
             }
         }
     }
@@ -518,13 +398,18 @@ mod tests {
         let at = MAX_BODY_HARD_CAP.to_string();
         assert!(load(&[(ENV_BIND, "203.0.113.7:69"), (ENV_MAX_CAPTURED_BYTES, &at)]).is_ok());
         let over = (MAX_BODY_HARD_CAP + 1).to_string();
-        assert!(matches!(
-            load(&[
-                (ENV_BIND, "203.0.113.7:69"),
-                (ENV_MAX_CAPTURED_BYTES, &over)
-            ]),
-            Err(ConfigError::BoundTooLarge { .. })
-        ));
+        match load(&[
+            (ENV_BIND, "203.0.113.7:69"),
+            (ENV_MAX_CAPTURED_BYTES, &over),
+        ]) {
+            Err(ConfigError::Env(EnvError::TooLarge { var, max, .. })) => {
+                assert_eq!(
+                    (var.as_str(), max),
+                    (ENV_MAX_CAPTURED_BYTES, MAX_BODY_HARD_CAP)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -540,7 +425,7 @@ mod tests {
         );
         assert!(matches!(
             load(&[(ENV_BIND, "10.0.0.5:69"), (ENV_WAN_MAP, "10.0.0.5")]),
-            Err(ConfigError::InvalidWanMapEntry(_))
+            Err(ConfigError::Env(EnvError::Invalid { .. }))
         ));
     }
 

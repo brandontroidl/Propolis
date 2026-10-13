@@ -27,7 +27,7 @@ page explains exposure and operator responsibilities.
 Sensors are the internet-exposed honeypot listeners. Each requires its bind
 address explicitly and fails closed if it is absent or unparseable - there is no
 compiled-in default port anywhere
-(`crates/sensor-ssh/src/main.rs#load_config_from_env` and
+(`crates/sensor-ssh/src/main.rs#load_config` and
 the equivalent in each sensor). The IP portion is whatever the operator writes
 (`0.0.0.0`, a specific address, etc.). `sensor-ftp` additionally opens
 passive-mode data connections on dynamic ephemeral ports negotiated per session

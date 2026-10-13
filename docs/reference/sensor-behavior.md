@@ -61,13 +61,11 @@ in each `main.rs` and are overridable by env var (owned by
 `max_captured_bytes` are enforced by each handler's read loop.
 
 A connection accepted past `max_concurrent` is refused immediately (socket closed,
-not queued) (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). Every bound is validated at startup: for most
-sensors a present-but-zero or unparseable value is rejected and the process refuses
-to start ("zero never means unlimited"). **Exceptions:** `sensor-smtp`
-(`crates/sensor-smtp/src/main.rs#parse_positive_u64`, `crates/sensor-smtp/src/main.rs#parse_positive_u32`) and `sensor-cred`
-(`crates/sensor-cred/src/main.rs#parse_positive_u64`, `crates/sensor-cred/src/main.rs#parse_positive_u32`) fall back to the default on an
-invalid or zero value instead of refusing to start. This is an evidenced
-behavioral inconsistency across the sensor set, not a bug claim.
+not queued) (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). Every bound is validated at startup through
+the one set of typed readers every sensor uses (`crates/sensor-framework/src/env.rs#Env`): a
+present-but-zero, negative or unparseable value is rejected and the process refuses to start,
+naming the variable and quoting the value ("zero never means unlimited"). `sensor-smtp` and
+`sensor-cred` used to fall back to the default on such a value; they no longer do.
 
 Common defaults across the internet-facing TCP sensors are `read_timeout`
 30000&nbsp;ms, `idle_timeout` 60000&nbsp;ms, `max_duration` 600&nbsp;s,
@@ -1177,7 +1175,7 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
 A TFTP (RFC 1350) honeypot on UDP, conventional port 69. It is one of two sensors that
 answer over UDP, so its reply surface is bounded in code and **it is off until an
 operator sets `PROPOLIS_TFTP_BIND`**: with no bind it logs the error, exits 1 and binds
-nothing (`crates/sensor-tftp/src/main.rs#load_config_from`).
+nothing (`crates/sensor-tftp/src/main.rs#load_config`).
 
 - **Sockets.** A request socket on the configured bind only receives. Each valid RRQ or
   WRQ moves to a fresh ephemeral socket bound on the same local IP, as the RFC specifies
@@ -1263,7 +1261,7 @@ An MQTT honeypot on TCP, conventional port 1883. It records metadata for every P
 additionally spools a PUBLISH payload that passes the shared `looks_binary` gate
 (`crates/sensor-mqtt/src/handler.rs#on_publish`). It is **off until an
 operator sets `PROPOLIS_MQTT_BIND`**: with no bind it logs the error, exits 1 and binds
-nothing (`crates/sensor-mqtt/src/main.rs#load_config_from_env`). It speaks MQTT 3.1
+nothing (`crates/sensor-mqtt/src/main.rs#load_config`). It speaks MQTT 3.1
 (`MQIsdp` level 3), 3.1.1 (`MQTT` level 4) and 5.0 (`MQTT` level 5), accepts any credential
 on every connection (the deliberate low-interaction choice: it is what lets the
 post-CONNECT SUBSCRIBE and PUBLISH recon through, and every CONNECT is logged, so a
@@ -1379,7 +1377,7 @@ under the process-wide capture-memory budget, and never run.
 A DNS honeypot with three surfaces: UDP and TCP on the one `PROPOLIS_DNS_BIND` address
 (conventional port 53) and, optionally, DNS over TLS (RFC 7858, conventional port 853). It is
 **off until an operator sets `PROPOLIS_DNS_BIND`**: with no bind it logs the error, exits 1 and
-binds nothing (`crates/sensor-dns/src/main.rs#load_config_from`). UDP and TCP are bound together
+binds nothing (`crates/sensor-dns/src/main.rs#load_config`). UDP and TCP are bound together
 or not at all: UDP is bound first but not served until TCP binds on the same port, and if either
 bind fails the sensor exits 1 with nothing left listening
 (`crates/sensor-dns/src/lib.rs#start_test_server`). It serves no records: every query that parses
@@ -1585,10 +1583,10 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   acknowledged nor recorded), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
   unknown→502. Caps: line 8192, username 255; a message body is kept up to 65536 bytes and
   the event records the full `body_size` received plus `truncated` when it was cut.
-- **Bounds:** common defaults, `max_concurrent` 256. **Bound parsing falls back to
-  the default on invalid/zero input rather than refusing to start**
-  (`crates/sensor-smtp/src/main.rs#parse_positive_u64`, `crates/sensor-smtp/src/main.rs#parse_positive_u32`) - differs from the reject-on-zero sensors. No spool (message
-  body captured as size and subject only, never stored as a file).
+- **Bounds:** common defaults, `max_concurrent` 256, read the same strict way as every other
+  sensor (`crates/sensor-smtp/src/main.rs#load_config`): a zero, negative or unparseable value
+  refuses to start. No spool (message body captured as size and subject only, never stored as a
+  file).
 - **SMTP over TLS (optional):** `PROPOLIS_SMTP_TLS_CERT` and `PROPOLIS_SMTP_TLS_KEY` together
   enable STARTTLS on the plain listeners (25 and the optional 587,
   `PROPOLIS_SMTP_SUBMISSION_BIND`); `PROPOLIS_SMTP_TLS_BIND` adds an implicit-TLS (SMTPS, 465)
@@ -1735,10 +1733,10 @@ One binary running one listener per configured DB/remote protocol. Every configu
 protocol logs to its own `<log_dir>/<protocol>.jsonl` (`crates/sensor-cred/src/main.rs#main`). At least one
 per-protocol bind var is required.
 
-- **Distinct bound defaults** (`crates/sensor-cred/src/main.rs#main`): `read_timeout` 30000&nbsp;ms,
+- **Distinct bound defaults** (`crates/sensor-cred/src/main.rs#load_config`): `read_timeout` 30000&nbsp;ms,
   `idle_timeout` 60000&nbsp;ms, `max_duration` **60&nbsp;s**, `max_captured_bytes`
-  **100_000**, `max_concurrent` 256. Bound parsing falls back to the default on
-  invalid input (`crates/sensor-cred/src/main.rs#parse_positive_u64`, `crates/sensor-cred/src/main.rs#parse_positive_u32`).
+  **100_000**, `max_concurrent` 256. A zero, negative or unparseable value refuses to start, the
+  same as every other sensor.
 
 | Protocol | Impersonates (conventional port) | Capture behavior |
 |---|---|---|

@@ -28,6 +28,12 @@ ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 ReadWritePaths=/var/log/propolis/tftp /var/spool/propolis/tftp
+# Nothing on the filesystem is executable except this sensor's own binary and the shared
+# libraries it loads (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64). The
+# sensor execs nothing, so a captured upload or spool entry cannot run here even on a mount that
+# lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/sensor-tftp /usr/lib /usr/lib64
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

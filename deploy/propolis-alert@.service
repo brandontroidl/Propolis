@@ -34,3 +34,11 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# Executable: the script, the distro tools it runs (bash, sed, logger, journalctl, curl and the
+# rest, all under /usr/bin on a merged-/usr system) and their libraries. Nothing else, so a path
+# the alert body quotes from a hostile journal line can never be run. This unit runs as root,
+# which could undo a mount, so the mount syscalls are filtered out as systemd.exec(5) advises
+# for these directives; nothing the script runs mounts anything.
+NoExecPaths=/
+ExecPaths=/usr/local/sbin/propolis-alert /usr/bin /usr/lib /usr/lib64
+SystemCallFilter=~@mount

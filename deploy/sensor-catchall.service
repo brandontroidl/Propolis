@@ -60,6 +60,12 @@ RestrictAddressFamilies=AF_INET AF_INET6
 # the path; it cannot enforce the mount option, which is a deployment-time (fstab/provisioning)
 # concern verified against the running system, not the unit file.
 ReadWritePaths=/var/log/propolis/catchall /var/spool/propolis/catchall
+# Nothing on the filesystem is executable except this sensor's own binary and the shared
+# libraries it loads (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64). The
+# sensor execs nothing, so a captured upload or spool entry cannot run here even on a mount that
+# lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/sensor-catchall /usr/lib /usr/lib64
 
 # --- Privileged port binding ---
 # The catch-all's operator-configured port set is wide and spans below 1024 (design doc: "a wide

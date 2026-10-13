@@ -73,6 +73,11 @@ ProtectControlGroups=yes
 # AF_INET and AF_INET6, no AF_UNIX (see this file's header: unlike intake, a local-socket
 # PostgreSQL connection is out of scope for this unit as specified).
 RestrictAddressFamilies=AF_INET AF_INET6
+# Nothing on the filesystem is executable except this binary and the shared libraries it loads
+# (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64); review execs nothing. See
+# deploy/sensor-ssh.service for the full reasoning behind this pair.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/review /usr/lib /usr/lib64
 
 # --- No privileged port binding ---
 # review binds no port at all - it is a PostgreSQL client and an outbound HTTPS client to vendor

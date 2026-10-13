@@ -32,6 +32,7 @@ and every sensor unit:
 | `ProtectHome=yes` | - | home trees invisible |
 | `MemoryDenyWriteExecute=yes` | correct spelling (the `-ion` form silently installs no rule) | no W^X pages: captured code cannot become executable memory |
 | `RestrictAddressFamilies=` | sensors `AF_INET AF_INET6`; daemon adds `AF_UNIX` (local PostgreSQL socket) | no raw/packet/netlink sockets |
+| `NoExecPaths=/` with `ExecPaths=` | the program `ExecStart=` runs, named first, then `/usr/lib /usr/lib64` (its libraries and loader); the three root-run script units add `/usr/bin` and the one extra program each runs | nothing on the filesystem can be executed or mapped executable except the unit's own program: a captured upload, a spool entry or a fetched sample cannot run even where the operator's `noexec` mount is missing. Asserted per unit against its own `ExecStart=` (`crates/sensor-framework/tests/deploy_test.rs#every_unit_makes_the_filesystem_non_executable_except_its_own_program`); needs systemd 244 and a merged `/usr` |
 | `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `RemoveIPC`, `ProtectProc=invisible`, `ProcSubset=pid` | - | broad supplementary containment |
 | `UMask=` | sensors `0027` (logs group-readable so the daemon's group membership can read them); console `0077` | default file mode |
 | Resource caps | `MemoryMax`, `TasksMax`, `CPUQuota`, `LimitNOFILE` per unit | bound resource-exhaustion blast radius |
@@ -42,9 +43,11 @@ persistent host key. Sensors binding a privileged port (22/23/80/21/25) carry
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` with a matching bounding set; the
 daemon and non-privileged-port sensors carry an empty `CapabilityBoundingSet=`.
 
-The unified daemon additionally sets `ReadOnlyPaths=/var/log/propolis`,
-`NoExecPaths=/var/spool/propolis/fetched` (systemd ≥244, defense-in-depth over
-the fstab `noexec` mount for live malware binaries), and `PrivateUsers=yes`.
+The unified daemon additionally sets `ReadOnlyPaths=/var/log/propolis` and
+`PrivateUsers=yes`. The three units that run as root (`propolis-alert@`,
+`propolis-backup`, `propolis-logrotate`) keep `CAP_SYS_ADMIN`, which could undo the
+`NoExecPaths=` mounts, so they also carry `SystemCallFilter=~@mount` as
+`systemd.exec(5)` advises; the other units have no such capability.
 
 > **Caveat - `SystemCallFilter` is a placeholder, not a delivered control.**
 > Every unit ships `SystemCallFilter=@system-service` minus `@privileged

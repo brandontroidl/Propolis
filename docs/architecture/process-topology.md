@@ -28,7 +28,9 @@ Each sensor binary runs as its own systemd service (twelve units:
 sensors as separate processes keeps a sensor crash or compromise off the data plane.
 
 Each unit runs `ExecStart=/usr/local/bin/sensor-<x>` with
-`EnvironmentFile=/etc/propolis/<x>.env`, `Restart=always`, and `MemoryMax=512M`.
+`EnvironmentFile=/etc/propolis/<x>.env`, `Restart=always`, and `MemoryMax=512M`, and
+leaves nothing on the filesystem executable but that binary and its libraries
+(`NoExecPaths=/` with `ExecPaths=`).
 Configuration is environment variables only, validated at startup: the process refuses
 to start (`exit`) on a malformed value. Each sensor binds its TCP/UDP addresses and
 writes NDJSON event logs that intake later tails.

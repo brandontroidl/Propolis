@@ -76,6 +76,12 @@ ReadOnlyPaths=/var/log/propolis
 # failure) so an existing install of this unit still starts after an upgrade; without the directory
 # a refused line cannot be set aside and intake stays on it, reporting why in its log.
 ReadWritePaths=/var/lib/propolis/cursors -/var/lib/propolis/quarantine
+# Nothing on the filesystem is executable except this binary and the shared libraries it loads
+# (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64); intake execs nothing, and
+# a sensor log line it tails is data however it is crafted. See deploy/sensor-ssh.service for the
+# full reasoning behind this pair.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/intake /usr/lib /usr/lib64
 
 # --- No privileged port binding ---
 # Intake binds no port at all - it is a consumer of sensor logs and a PostgreSQL client, not a

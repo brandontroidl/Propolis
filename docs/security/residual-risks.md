@@ -41,7 +41,7 @@ proxy. Do not assume transport encryption exists unless you configured it.
 Captured samples are written `0640` under spool directories that the deployment
 *expects* to be mounted `noexec,nosuid,nodev`. `install.sh` only prints the fstab
 guidance; it cannot enforce the mount. If those options are missing on the host,
-the `0640` mode and the daemon's `NoExecPaths` are the remaining defenses, but the
+the `0640` mode and every unit's `NoExecPaths=/` are the remaining defenses, but the
 intended filesystem-level no-execute guarantee is not in force. Sample bodies are
 never executed by Propolis itself regardless (see
 [never-execute](./never-execute.md) and [malware custody](./malware-custody.md)).

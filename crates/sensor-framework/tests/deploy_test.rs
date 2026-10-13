@@ -1669,6 +1669,134 @@ fn deploy_file(name: &str) -> String {
     .unwrap_or_else(|e| panic!("failed to read deploy/{name}: {e}"))
 }
 
+/// Every `deploy/*.service` by name. The walk is the population, so a unit added later is held
+/// to the same bar without anyone listing it.
+fn service_units() -> Vec<String> {
+    let deploy_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    let mut units: Vec<String> = std::fs::read_dir(&deploy_dir)
+        .expect("failed to read deploy/")
+        .map(|e| {
+            e.expect("failed to read a deploy/ entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|n| n.ends_with(".service"))
+        .collect();
+    units.sort();
+    assert!(
+        units.len() >= 20,
+        "only {} deploy/*.service units found: the walk is broken",
+        units.len()
+    );
+    units
+}
+
+// ---- NoExecPaths=/ and ExecPaths=: nothing is executable but the unit's own program ----
+
+/// The library roots every dynamically linked binary in `deploy/` executes through
+/// `mmap(PROT_EXEC)`: `ldd` on each lists libc, libm, libgcc_s and the ld-linux loader, which
+/// live under one of these two on every merged-/usr distribution (`/lib` and `/lib64` resolve
+/// into them). `systemd.exec(5)`'s own allow-list example pairs `NoExecPaths=/` with exactly
+/// these two and the daemon.
+const LIBRARY_ROOTS: [&str; 2] = ["/usr/lib", "/usr/lib64"];
+
+/// What a unit's `ExecPaths=` must name, given the program its `ExecStart=` runs. A Propolis
+/// binary execs nothing (the never-exec static checks), so it gets itself and the library roots
+/// and nothing else. The three root-run script units run distro tools, so they also name
+/// `/usr/bin` (merged-/usr: `/bin` and `/sbin` resolve into it) plus the one extra program each
+/// runs by path.
+fn expected_exec_paths(unit: &str, program: &str) -> Vec<String> {
+    let mut paths = vec![program.to_string()];
+    match unit {
+        "propolis-alert@.service" => paths.push("/usr/bin".to_string()),
+        "propolis-backup.service" => {
+            // backup.sh runs `propolis pg-exec`, which execs pg_dump and psql from /usr/bin.
+            paths.push("/usr/local/bin/propolis".to_string());
+            paths.push("/usr/bin".to_string());
+        }
+        "propolis-logrotate.service" => {
+            // The policy's prerotate hook, then the tools it and logrotate run.
+            paths.push("/usr/local/sbin/propolis-logrotate-guard".to_string());
+            paths.push("/usr/bin".to_string());
+        }
+        _ => {}
+    }
+    paths.extend(LIBRARY_ROOTS.iter().map(|p| p.to_string()));
+    paths
+}
+
+/// The program `ExecStart=` runs: its first word, minus the `-`, `@`, `:`, `+` and `!` prefixes
+/// systemd accepts there, which change how it is run but not what it is.
+fn exec_start_program(unit: &str, text: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .unwrap_or_else(|| panic!("deploy/{unit} has no ExecStart="))
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("deploy/{unit} has an empty ExecStart="))
+        .trim_start_matches(['-', '@', ':', '+', '!'])
+        .to_string()
+}
+
+/// Every service unit makes the whole filesystem non-executable and nests back in only the
+/// program it runs, that program's libraries and, for the script units, the tool directories, so
+/// a captured upload, a spool entry or anything written through a writable path cannot be run
+/// even where the operator's noexec mount is missing. The program named must be the one
+/// `ExecStart=` runs and must come first, so a unit whose binary moves fails here rather than
+/// starting with its own program unexecutable. A process holding `CAP_SYS_ADMIN` could undo the
+/// mounts, so a unit that keeps it (the root-run script units) must filter the mount syscalls, as
+/// `systemd.exec(5)` advises for these directives.
+#[test]
+fn every_unit_makes_the_filesystem_non_executable_except_its_own_program() {
+    for name in service_units() {
+        let text = uncommented(&deploy_file(&name));
+        let noexec: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("NoExecPaths="))
+            .collect();
+        assert_eq!(
+            noexec,
+            ["NoExecPaths=/"],
+            "deploy/{name} must make the whole filesystem non-executable with exactly NoExecPaths=/"
+        );
+        let exec: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("ExecPaths="))
+            .collect();
+        assert_eq!(
+            exec.len(),
+            1,
+            "deploy/{name} must carry exactly one ExecPaths= line: {exec:?}"
+        );
+        let actual: Vec<String> = exec[0]["ExecPaths=".len()..]
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let program = exec_start_program(&name, &text);
+        assert_eq!(
+            actual,
+            expected_exec_paths(&name, &program),
+            "deploy/{name}: ExecPaths= must name the program ExecStart= runs ({program}) first, \
+             then only what it legitimately executes"
+        );
+        assert!(
+            actual.iter().all(|p| p.starts_with('/')),
+            "deploy/{name}: an ExecPaths= entry must not be optional (a missing library root has \
+             to fail the unit, not start it with its loader unexecutable): {actual:?}"
+        );
+        let mounts_locked = text.lines().any(|l| l == "SystemCallFilter=~@mount")
+            || text
+                .lines()
+                .any(|l| l.starts_with("CapabilityBoundingSet=") && !l.contains("CAP_SYS_ADMIN"));
+        assert!(
+            mounts_locked,
+            "deploy/{name} keeps CAP_SYS_ADMIN and does not filter @mount, so its processes could \
+             undo NoExecPaths="
+        );
+    }
+}
+
 /// The key directory is root-owned and traverse-only: sensor uids need x to open their own key by
 /// name, nobody needs to list it. 0750 would lock every sensor out.
 #[test]

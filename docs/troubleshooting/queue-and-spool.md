@@ -158,7 +158,7 @@ paths: [Filesystem paths](../reference/filesystem-paths.md).
 
 > **Warning - live malware.** Files under `/var/spool/propolis/fetched` and the
 > sensor spools are unanalyzed, potentially live malware samples. Do not open,
-> execute, or copy them onto a general-purpose host. The daemon mounts
-> `NoExecPaths=/var/spool/propolis/fetched` as defense in depth; preserve that
-> posture when handling them. See
+> execute, or copy them onto a general-purpose host. Every unit mounts the whole
+> filesystem non-executable (`NoExecPaths=/`, with `ExecPaths=` naming only its own
+> program and libraries) as defense in depth; preserve that posture when handling them. See
 > [Malware custody](../security/malware-custody.md).

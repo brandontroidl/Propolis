@@ -72,6 +72,12 @@ RestrictAddressFamilies=AF_INET AF_INET6
 ReadOnlyPaths=/etc/propolis/certs
 # This unit's own writable roots: the per-collector spool tree and its state directory.
 ReadWritePaths=/var/spool/propolis/gateway /var/lib/propolis/gateway
+# Nothing on the filesystem is executable except this binary and the shared libraries it loads
+# (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64); the gateway execs
+# nothing, and a batch a collector ships into the spool above is data. See
+# deploy/sensor-ssh.service for the full reasoning behind this pair.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/gateway /usr/lib /usr/lib64
 
 # --- No privileged port binding ---
 # PROPOLIS_GATEWAY_BIND must be port 1024 or above, or fronted by a proxy. Unlike

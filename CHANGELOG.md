@@ -243,6 +243,18 @@
 
 ### Changed
 
+- **Nothing in a unit's filesystem is executable but its own program** - every
+  `deploy/*.service` now sets `NoExecPaths=/` and nests back in, with `ExecPaths=`, only the
+  program its `ExecStart=` runs and the library roots it loads (`/usr/lib`, `/usr/lib64`);
+  the three root-run script units (`propolis-alert@`, `propolis-backup`,
+  `propolis-logrotate`) add `/usr/bin` and the one extra program each runs, and filter the
+  mount syscalls so root cannot undo the mounts. Before, only the daemon's fetched-sample
+  spool was marked, so a captured upload or spool entry on a mount that had lost its `noexec`
+  option could be run by a compromised process. A test walks every unit and checks the named
+  program against its `ExecStart=`. Needs a merged `/usr` (every supported Debian, Ubuntu and
+  Fedora release); `age` and any other tool the backup runs must come from the distro package,
+  not `/usr/local/bin`. See
+  [filesystem protections](docs/security/filesystem-and-db-protections.md).
 - **Every long console list loads the rest the same way** - Attackers paged with First,
   Previous and Next; Campaigns and a campaign's members stopped at 200 and 500 with "showing
   the first N"; Samples and the Feed's Entries tables printed everything at once. Each now

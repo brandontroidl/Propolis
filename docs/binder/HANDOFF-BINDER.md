@@ -733,7 +733,7 @@ code and deployment model, stated plainly, not defects to be discovered later.
   operator-provided reverse proxy.
 - **Quarantine mount options are operator-applied.** `install.sh` prints the
   `noexec,nosuid,nodev` fstab guidance but cannot enforce it; if the mounts are
-  missing, the `0640` mode and `NoExecPaths` are the remaining defenses.
+  missing, the `0640` mode and every unit's `NoExecPaths=/` are the remaining defenses.
 - **Manual feed publish** (global correction). The blocklist-sync/publish cron is
   an operator setup step, not a shipped timer; without it the feed builds locally
   but is pushed nowhere.

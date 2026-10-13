@@ -52,7 +52,8 @@ is ticked.
       directories; it does not mount anything.
 - [ ] The sandboxing in the unit files is in effect on your systemd version:
       `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateUsers`,
-      `MemoryDenyWriteExecute`, and the per-sensor capability sets. See
+      `MemoryDenyWriteExecute`, `NoExecPaths=/` (needs a merged `/usr`), and the
+      per-sensor capability sets. See
       [service lifecycle](../operations/service-lifecycle.md).
 - [ ] PostgreSQL does not trust all hosts. The evaluation's `trust` auth is for a
       loopback container only.

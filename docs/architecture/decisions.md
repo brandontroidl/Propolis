@@ -56,9 +56,10 @@ the application being uncompromised.
 
 Each sensor is its own crate and its own binary, deployed as its own systemd service
 under a **dedicated unprivileged user** (never root), with `ProtectSystem=strict`,
-`MemoryDenyWriteExecute=yes`, per-service `ReadWritePaths` scoped to that sensor's own
-dirs, and resource caps. A sensor can write only to its own log and spool; it has no
-database credentials and no path to another sensor.
+`MemoryDenyWriteExecute=yes`, `NoExecPaths=/` with `ExecPaths=` naming only its own binary
+and libraries, per-service `ReadWritePaths` scoped to that sensor's own dirs, and resource
+caps. A sensor can write only to its own log and spool, can execute nothing but itself; it
+has no database credentials and no path to another sensor.
 
 **Code evidence:** one crate per sensor; per-unit systemd files asserted by
 `crates/sensor-framework/tests/deploy_test.rs` (which fails if a hardening directive is
@@ -82,8 +83,9 @@ are never run at any point - custody is store → hash → verify → human-appr
 
 **Code evidence:** the ten `never_exec_static_check` tests (one gap: `sensor-catchall`
 lacks its own regression test but is clean under the workspace grep);
-`MemoryDenyWriteExecute=yes` on every unit; the spool permissions and mount requirement.
-See [security/never-execute.md](../security/never-execute.md) and
+`MemoryDenyWriteExecute=yes` and `NoExecPaths=/` (the whole filesystem non-executable except
+the unit's own program and its libraries) on every unit; the spool permissions and mount
+requirement. See [security/never-execute.md](../security/never-execute.md) and
 [malware custody](../security/malware-custody.md).
 
 ## 5. Sensors are egress-free by construction; outbound is confined and gated

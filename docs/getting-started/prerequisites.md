@@ -13,8 +13,10 @@ last-verified: 2026-09-05
 
 Linux with systemd. Development and the production box run Fedora and Debian; any
 systemd distribution should work. The shipped units use sandboxing directives that need
-a reasonably current systemd; one of them (`NoExecPaths`) arrived in systemd 244.
-Nothing else is supported.
+a reasonably current systemd; one of them (`NoExecPaths`) arrived in systemd 244. The units
+leave only `/usr/lib` and `/usr/lib64` executable besides their own program, so the host
+needs a merged `/usr` (`/lib` and `/lib64` as links into it), as every supported Debian,
+Ubuntu and Fedora release has. Nothing else is supported.
 
 ## Rust toolchain
 

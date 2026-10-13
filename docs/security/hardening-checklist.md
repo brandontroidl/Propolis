@@ -47,7 +47,10 @@ findmnt -no OPTIONS /var/spool/propolis/ssh   # expect noexec,nosuid,nodev
 ```
 
 Captured sample files are written `0640`; the mount options are what keep a
-captured binary from being executed. See [malware custody](./malware-custody.md).
+captured binary from being executed by anything on the host. Inside each unit, the
+whole filesystem is already non-executable except the unit's own program and its
+libraries (`NoExecPaths=/` with `ExecPaths=`), so the mount is the second layer, not
+the only one. See [malware custody](./malware-custody.md).
 
 ## 3. Lock down network exposure
 

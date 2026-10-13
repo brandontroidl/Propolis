@@ -42,3 +42,14 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# Executable: the script, `propolis pg-exec` (which execs pg_dump and psql from /usr/bin), the
+# distro tools the script runs (bash, tar, age, sha256sum, flock, df, du and the rest, under
+# /usr/bin on a merged-/usr system; Debian's pg_dump wrapper runs the real one from
+# /usr/lib/postgresql) and their libraries. Nothing else: the spools and /etc/propolis it
+# archives hold captured samples, and age or any other tool must come from the distro package,
+# not /usr/local/bin. This unit runs as root, which could undo a mount, so the mount syscalls
+# are filtered out as systemd.exec(5) advises for these directives; nothing the script runs
+# mounts anything.
+NoExecPaths=/
+ExecPaths=/usr/local/sbin/propolis-backup /usr/local/bin/propolis /usr/bin /usr/lib /usr/lib64
+SystemCallFilter=~@mount

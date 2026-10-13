@@ -51,3 +51,11 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# Executable: logrotate, the free-space guard it runs per log, the distro tools the guard and
+# the policy run (sh, gzip, df, stat, logger and the rest, under /usr/bin on a merged-/usr
+# system) and their libraries. Nothing else, so nothing under the sensor logs it rotates can be
+# run. This unit runs as root, which could undo a mount, so the mount syscalls are filtered out
+# as systemd.exec(5) advises for these directives; logrotate mounts nothing.
+NoExecPaths=/
+ExecPaths=/usr/sbin/logrotate /usr/local/sbin/propolis-logrotate-guard /usr/bin /usr/lib /usr/lib64
+SystemCallFilter=~@mount

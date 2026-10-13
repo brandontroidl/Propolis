@@ -81,6 +81,12 @@ The invariant is defence-in-depth, not source discipline alone:
   `crates/sensor-framework/tests/deploy_test.rs#assert_unit_hardened` - because the `-ion`
   misspelling silently installs no rule. Owned by
   [filesystem-and-db-protections.md](filesystem-and-db-protections.md).
+- **Nothing executable but the program itself.** Every unit sets `NoExecPaths=/` and
+  nests back in, with `ExecPaths=`, only the program its `ExecStart=` runs and the library
+  roots it loads (`deploy/sensor-ssh.service#NoExecPaths=/`), so even a file that reached
+  a writable path with its execute bit set cannot be executed or mapped executable. A test
+  walks every unit and checks the named program against its `ExecStart=`
+  (`crates/sensor-framework/tests/deploy_test.rs#every_unit_makes_the_filesystem_non_executable_except_its_own_program`).
 - **No-execute spool.** Captured sample bodies are written mode `0640`
   (`crates/sensor-framework/src/spool.rs#write_and_seal`) and the spool directory is
   required to be a `noexec,nosuid,nodev` mount. A captured file is therefore not

@@ -90,6 +90,11 @@ RestrictAddressFamilies=AF_INET AF_INET6
 # Harmless when PROPOLIS_FEED_OUTPUT_DIR is unset or the directory does not exist yet: this grants
 # access to the PATH, it does not require the path to be populated.
 ReadOnlyPaths=/var/lib/propolis/feed
+# Nothing on the filesystem is executable except this binary and the shared libraries it loads
+# (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64); the console execs nothing.
+# See deploy/sensor-ssh.service for the full reasoning behind this pair.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/console /usr/lib /usr/lib64
 
 # --- No privileged port binding ---
 # 8080 is unprivileged (> 1024): binding it needs no capability at all, unlike sensor-ssh's port

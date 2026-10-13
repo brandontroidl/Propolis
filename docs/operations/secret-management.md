@@ -19,6 +19,10 @@ All secrets are set in the per-service files under `/etc/propolis/`:
 
 - Files are mode `0600`, owned by the service user (`install.sh` creates the
   users; the `.env` files themselves are authored by hand - `crates/propolis/src/config.rs` reads them, `deploy/install.sh#OPERATOR-owned`).
+- `deploy/config-check.sh` fails on an env file that accounts other than its owner can read
+  (`env-mode`: anything looser than `0600`, or than `0640` for `watch.env` and `0644` for the
+  generated `fleet-listeners.env`) and prints the `chmod` that closes it; a stricter mode is
+  not reported.
 - The mode is not the only wall. Each sensor unit also lists every other unit's env file,
   `watch.env` and the split deployment's `/etc/propolis/certs` under `InaccessiblePaths=`
   (`deploy/sensor-ssh.service#InaccessiblePaths=`), so a sensor process cannot open the

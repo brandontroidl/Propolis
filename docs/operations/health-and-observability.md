@@ -369,8 +369,9 @@ Two pieces cover that:
   `https://` and is never logged. Like ntfy, this is outbound egress you opt into.
 
 `deploy/config-check.sh` reports, under `alerting`, a monitor that is off, alerts that go only to
-the journal, no heartbeat and a missing failure hook, and under `backup` and `clock` the backup
-state and whether the clock is NTP-synchronized.
+the journal, no heartbeat and a missing failure hook, under `backup` and `clock` the backup
+state and whether the clock is NTP-synchronized, and under `env-files` an env file whose mode
+lets another account read it.
 
 ### Quarantined intake lines
 

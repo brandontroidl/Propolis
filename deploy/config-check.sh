@@ -21,7 +21,8 @@
 # daemon's own rules (crates/log-tailer/src/sensor_logs.rs); and, when a database URL is readable,
 # the newest event the ledger holds for the sensor. Host-wide: the log rotation timer and its state
 # file, the binaries upgrade.sh installs against the deploy stamp, the watcher's env file, enabled
-# sensor units with no bind configured, and unreadable env files.
+# sensor units with no bind configured, unreadable env files, and an env file whose mode lets
+# another account read it.
 #
 # NEVER MUTATES. It writes nothing outside a private temp directory it removes, restarts nothing,
 # and changes no firewall rule. Every external tool is optional: a missing one makes its check
@@ -1824,11 +1825,42 @@ check_unconfigured_units() {
     fi
 }
 
+# The widest mode an env file may have. fleet-listeners.env is generated, secret-free and written
+# 0644 (deploy/fleet-listeners.sh); watch.env is written root:propolis-watch 0640 so the watcher's
+# account can read its one line (deploy/watch-env.sh); every other env file carries a secret and
+# is created by the operator 0600 under its service user (docs/operations/secret-management.md).
+env_mode_limit() {
+    case "${1##*/}" in
+        fleet-listeners.env) printf '644' ;;
+        watch.env) printf '640' ;;
+        *) printf '600' ;;
+    esac
+}
+
+# A group or other bit beyond the limit lets another account on the host read a secret. The
+# sensor units deny themselves the files by mount, but nothing covers a shell account or an
+# unrelated service, and a file's mode can be read without root even where its content cannot.
+# A mode stricter than the limit (0400, or 0000 for a file being rotated) is not a finding.
 check_env_files() {
+    local f mode limit extra loose=()
+    for f in "${ENV_FILES[@]}"; do
+        mode="$(stat -c %a -- "$f" 2>/dev/null)" || continue
+        case "$mode" in '' | *[!0-7]*) continue ;; esac
+        limit="$(env_mode_limit "$f")"
+        extra=$(( 8#$mode & 8#077 & ~8#$limit ))
+        if [ "$extra" -ne 0 ]; then
+            loose+=("${f##*/}")
+            finding fail "env-files" "env-mode:$f" \
+                "$f is mode 0$mode, so accounts other than its owner can read it; it must be 0$limit (every env file but the generated fleet-listeners.env carries a secret: the database URL, the console password, vendor keys, a bind list another sensor need not see)" \
+                "sudo chmod 0$limit $(q "$f")"
+        fi
+    done
     if [ "${#ENV_FILES[@]}" -eq 0 ]; then
         global env-files warn "no *.env files in $ENV_DIR"
         finding warn "env-files" "env-none" "no *.env files in $ENV_DIR: nothing is configured on this host" \
             "copy deploy/sensor.env.example and deploy/propolis.env.example to $ENV_DIR and fill them in (docs/operations/installation.md)" manual
+    elif [ "${#loose[@]}" -gt 0 ]; then
+        global env-files fail "${#ENV_FILES[@]} env files, readable by other accounts: ${loose[*]}"
     elif [ "${#UNREADABLE_ENV[@]}" -gt 0 ]; then
         global env-files unknown "${#UNREADABLE_ENV[@]} of ${#ENV_FILES[@]} env files unreadable as this user"
     elif [ "$ROW_COUNT" -eq 0 ]; then

@@ -31,6 +31,12 @@
   the checkout's owner, which builds what root installs; the residuals are in
   [residual risks](docs/security/residual-risks.md#deploying-from-the-repository). See
   [what the pull trusts](docs/operations/upgrade-rollback-and-dr.md#what-the-pull-trusts).
+- **`config-check.sh` reports an env file other accounts can read** - a new `env-mode`
+  failure for any `/etc/propolis/*.env` whose mode is looser than `0600` (`0640` for
+  `watch.env`, whose group reads it by design; `0644` for the generated `fleet-listeners.env`),
+  with the `chmod` that closes it as the fix line. A stricter mode is not reported. The
+  sensor units now deny themselves these files by mount, but nothing covers a shell account
+  or an unrelated service on the host; the mode is that wall, and this is the check on it.
 - **Nightly backups** - `propolis-backup.timer` now runs the documented backup every night at
   03:30: a `pg_dump` of the database and an archive of the spool, `/etc/propolis` and the SSH
   host key, with digests, under `/var/backups/propolis` (newest 7 kept). With age public keys in
@@ -243,6 +249,10 @@
 
 ### Changed
 
+- **CI's token is read-only** - the workflow now declares `permissions: contents: read`, the
+  least a checkout needs. No job writes to the repository, comments or publishes, so a
+  compromised action or build script can no longer push, tag or alter a pull request with
+  the workflow's token. See [supply chain](docs/security/supply-chain.md#pinned-build-inputs-ci).
 - **A sensor cannot read the other units' secrets, whatever their mode** - each
   `deploy/sensor-*.service` now lists every other unit's env file, `/etc/propolis/watch.env`
   and `/etc/propolis/certs` under `InaccessiblePaths=`, so a compromised sensor process cannot

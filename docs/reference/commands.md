@@ -145,7 +145,7 @@ sudo ./deploy/config-check.sh [--json] [--report-only] [--no-events] [--env-dir 
 
 Read-only comparison of the configured listeners with what is running: unit, port and its
 holder, firewall, log, `PROPOLIS_SENSOR_LOGS` entry, newest ledger event, plus the rotation
-timer, installed binaries, deploy stamp and watcher env. Exit `0` ok, `1` warnings or checks
+timer, installed binaries, deploy stamp, env file modes and watcher env. Exit `0` ok, `1` warnings or checks
 it could not answer, `2` failures, `64` bad usage; `--report-only` always exits `0`
 (`upgrade.sh` uses it). What each column means and what runs without root:
 [`../operations/service-lifecycle.md`](../operations/service-lifecycle.md#configuration-check).

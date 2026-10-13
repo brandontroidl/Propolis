@@ -25,6 +25,13 @@ on:
   push:
   pull_request:
 
+# The token every job receives can only read the repository. No job writes to it, opens or
+# comments on anything, or publishes: checkout needs read, the cache and the step summary use the
+# runner's own token, and cargo-deny clones a public advisory database. A compromised action or
+# build script therefore cannot push, tag, or alter a pull request with the workflow's token.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

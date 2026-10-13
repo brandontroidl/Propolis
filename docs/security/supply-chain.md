@@ -58,6 +58,11 @@ is pinned to an immutable identifier, not a moving tag:
 | `EmbarkStudios/cargo-deny-action` | commit SHA `3c6349835b2b7b196a839186cb8b78e02f7b5f25` (v2.1.1, cargo-deny 0.20.2) |
 | PostgreSQL test container | `postgres:18` by digest `sha256:32ca0af8...ad5500` |
 
+The workflow's token is read-only (`permissions: contents: read` at the top of the
+workflow, `.github/workflows/ci.yml#permissions:`): no job writes to the repository or
+comments on anything, so a compromised action or build script cannot push, tag or alter a
+pull request with it.
+
 The Rust toolchain itself is pinned to exact version `1.96.1` (not `stable`) in
 `rust-toolchain.toml`, for reproducible builds.
 

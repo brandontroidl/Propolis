@@ -105,10 +105,15 @@ impl Fx {
         self.root.path().join(rel)
     }
 
+    /// An env file is written 0600, the mode the operator gives every one in production, so the
+    /// control stays green and a test that wants a looser mode sets it on purpose.
     fn write(&self, rel: &str, body: &str) {
         let path = self.p(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
+        std::fs::write(&path, body).unwrap();
+        if rel.starts_with("etc/") && rel.ends_with(".env") {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
     }
 
     fn read(&self, rel: &str) -> String {
@@ -1964,7 +1969,7 @@ fn an_unreadable_firewall_is_unknown_but_a_readable_active_one_wins() {
 // that record who ran them. A parse check alone would pass `sudo`-less commands.
 
 /// The privileged commands a run fix may only invoke through sudo.
-const ROOT_COMMANDS: [&str; 7] = [
+const ROOT_COMMANDS: [&str; 8] = [
     "systemctl",
     "journalctl",
     "ss",
@@ -1972,6 +1977,7 @@ const ROOT_COMMANDS: [&str; 7] = [
     "firewall-cmd",
     "nft",
     "install",
+    "chmod",
 ];
 
 /// Every finding id in the script: the part of each `finding LEVEL "scope" "KEY"` key before its
@@ -2015,6 +2021,7 @@ impl Fx {
             "nft",
             "psql",
             "timedatectl",
+            "chmod",
         ] {
             self.exec(&format!("fixstubs/{name}"), &record(name));
         }
@@ -2437,6 +2444,18 @@ fn fix_scenarios() -> Vec<Scenario> {
                 "PROPOLIS_CURSOR_DIR=",
                 Some("PROPOLIS_CURSOR_DIR=/srv/propolis-cursors"),
             );
+        }),
+        ("env files readable by other accounts", |fx| {
+            std::fs::set_permissions(
+                fx.p("etc/propolis.env"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                fx.p("etc/watch.env"),
+                std::fs::Permissions::from_mode(0o660),
+            )
+            .unwrap();
         }),
         ("no env files", |fx| {
             std::fs::remove_dir_all(fx.p("etc")).unwrap();
@@ -2968,4 +2987,82 @@ fn each_intake_log_with_content_needs_a_cursor_file_and_a_visible_cursor_directo
             .to_string()
             .contains("does not read that file")
     );
+}
+
+/// An env file another account can read is a failure naming the chmod that closes it: 0600 for
+/// a secret-bearing file, 0640 for the watcher's copy (its group reads it by design), 0644 for
+/// the generated listener inventory. A mode stricter than the limit is not reported, so a file
+/// with no access at all (which the unreadable-files test uses) raises nothing here.
+#[test]
+fn an_env_file_readable_by_other_accounts_is_a_failure_with_the_chmod_that_closes_it() {
+    let fx = Fx::new();
+    let mode_findings = |fx: &Fx| -> Vec<(String, String, String)> {
+        fx.json()["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "env-mode")
+            .map(|f| {
+                (
+                    f["level"].as_str().unwrap().to_string(),
+                    f["fix"].as_str().unwrap().to_string(),
+                    f["fix_kind"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let chmod = |fx: &Fx, rel: &str, mode: u32| {
+        std::fs::set_permissions(fx.p(rel), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    // The control writes every env file 0600, and the modes each file is allowed raise nothing.
+    chmod(&fx, "etc/watch.env", 0o640);
+    fx.write(
+        "etc/fleet-listeners.env",
+        "PROPOLIS_FLEET_LISTENERS=local/ssh/tcp/22\n",
+    );
+    chmod(&fx, "etc/fleet-listeners.env", 0o644);
+    chmod(&fx, "etc/tftp.env", 0o400);
+    assert!(mode_findings(&fx).is_empty(), "{}", fx.json()["findings"]);
+    assert_eq!(global_state(&fx.json(), "env-files"), "ok");
+
+    // A secret-bearing file readable by its group or by everyone fails, with the 0600 fix.
+    chmod(&fx, "etc/propolis.env", 0o640);
+    let propolis_env = fx.p("etc/propolis.env").display().to_string();
+    assert_eq!(
+        mode_findings(&fx),
+        [(
+            "fail".to_string(),
+            format!("sudo chmod 0600 {propolis_env}"),
+            "run".to_string()
+        )]
+    );
+    let r = fx.run(&[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    assert!(
+        r.has(&format!(
+            "{propolis_env} is mode 0640, so accounts other than its owner can read it"
+        )),
+        "{}",
+        r.out
+    );
+    assert_eq!(global_state(&fx.json(), "env-files"), "fail");
+
+    // The watcher's copy may be group-readable, not world-readable, and each loose file is its
+    // own finding.
+    chmod(&fx, "etc/watch.env", 0o644);
+    let watch_env = fx.p("etc/watch.env").display().to_string();
+    let found = mode_findings(&fx);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found.contains(&(
+        "fail".to_string(),
+        format!("sudo chmod 0640 {watch_env}"),
+        "run".to_string()
+    )));
+
+    // Closing the modes clears every finding; stricter than required stays clear.
+    chmod(&fx, "etc/propolis.env", 0o600);
+    chmod(&fx, "etc/watch.env", 0o600);
+    assert!(mode_findings(&fx).is_empty());
+    assert_eq!(fx.run(&[]).code, 0);
 }

@@ -239,9 +239,11 @@ installed policy and guard; the `INSTALL_BINS` set from `deploy/upgrade.sh` pres
 `/usr/local/bin` and equal to the build in `target/release`, and the deploy stamp's recorded
 `propolis` revision against its own commit and the checkout (an upgrade whose first run
 installed no new binary shows here); `PROPOLIS_SENSOR_LOGS` as a whole; sensor units that are
-enabled with no bind variable set (the look of a misspelled `*_BIND` name); and, where
-`propolis-watch` is installed, `watch.env` against `propolis.env` and the watcher's
-authorized key.
+enabled with no bind variable set (the look of a misspelled `*_BIND` name); every env file's
+mode, failing one that accounts other than its owner can read (`0600` for a secret-bearing
+file, `0640` for `watch.env`, `0644` for the generated `fleet-listeners.env`; stricter is fine)
+with the `chmod` that closes it; and, where `propolis-watch` is installed, `watch.env` against
+`propolis.env` and the watcher's authorized key.
 
 Every finding carries the next step, in one of two labelled forms, and the explanation lives in
 the finding text above it, never in the step itself:

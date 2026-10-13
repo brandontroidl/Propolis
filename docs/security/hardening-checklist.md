@@ -93,7 +93,8 @@ credential/topic. Enable only what you need, and confirm each is intended:
 ## 6. Provision secrets correctly
 
 - Create `/etc/propolis/*.env` by hand, mode `0600`, owned by the service user.
-  `install.sh` never creates them.
+  `install.sh` never creates them. `deploy/config-check.sh` fails on one that other
+  accounts can read and prints the `chmod` to run.
 - Set a strong `PROPOLIS_CONSOLE_PASSWORD` (the console refuses to start without
   one; hashed with Argon2id at startup).
 - Set `PROPOLIS_CONSOLE_SESSION_SECRET` (64 hex chars) if you want sessions to

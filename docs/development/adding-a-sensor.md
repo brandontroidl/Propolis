@@ -147,8 +147,9 @@ existing units. Observable required directives (`deploy/sensor-ssh.service`):
 - Hardening: `NoNewPrivileges=yes`, `ProtectSystem=strict`, `PrivateTmp=yes`,
   `RestrictAddressFamilies=AF_INET AF_INET6`, `ReadWritePaths=` scoped to only this
   sensor's log/spool/state dirs, `AmbientCapabilities`/`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`,
-  and `NoExecPaths=/` with `ExecPaths=/usr/local/bin/sensor-<name> /usr/lib /usr/lib64` (the
-  binary and its libraries are the only executable content; a sensor execs nothing).
+  and `NoExecPaths=/` with `ExecPaths=/usr/local/bin/sensor-<name> /usr/lib -/usr/lib64` (the
+  binary and its libraries are the only executable content; a sensor execs nothing; `/usr/lib64`
+  is optional because arm64 hosts have none).
 - `InaccessiblePaths=` naming, `-`-prefixed, every other unit's env file, `watch.env` and
   `/etc/propolis/certs` (copy the list from `deploy/sensor-ssh.service` and drop your own
   `<name>.env`), and add `-/etc/propolis/<name>.env` to every other sensor unit's list: the

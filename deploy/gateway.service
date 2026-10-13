@@ -77,7 +77,7 @@ ReadWritePaths=/var/spool/propolis/gateway /var/lib/propolis/gateway
 # nothing, and a batch a collector ships into the spool above is data. See
 # deploy/sensor-ssh.service for the full reasoning behind this pair.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/gateway /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/gateway /usr/lib -/usr/lib64
 
 # --- No privileged port binding ---
 # PROPOLIS_GATEWAY_BIND must be port 1024 or above, or fronted by a proxy. Unlike

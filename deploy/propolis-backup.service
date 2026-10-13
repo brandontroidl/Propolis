@@ -42,14 +42,20 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-# Executable: the script, `propolis pg-exec` (which execs pg_dump and psql from /usr/bin), the
-# distro tools the script runs (bash, tar, age, sha256sum, flock, df, du and the rest, under
-# /usr/bin on a merged-/usr system; Debian's pg_dump wrapper runs the real one from
-# /usr/lib/postgresql) and their libraries. Nothing else: the spools and /etc/propolis it
-# archives hold captured samples, and age or any other tool must come from the distro package,
-# not /usr/local/bin. This unit runs as root, which could undo a mount, so the mount syscalls
-# are filtered out as systemd.exec(5) advises for these directives; nothing the script runs
-# mounts anything.
+# Executable: the script, `propolis pg-exec` (which execs pg_dump and psql by PATH; the script
+# runs pg_restore itself), the distro tools the script runs (bash, tar, age, sha256sum, flock,
+# df, du and the rest, under /usr/bin on a merged-/usr system) and their libraries. On Debian
+# and Ubuntu, postgresql-client-common ships /usr/bin/pg_dump, psql and pg_restore as symlinks
+# to /usr/share/postgresql-common/pg_wrapper, a Perl script that then execs the real binary
+# from /usr/lib/postgresql/<N>/bin; the kernel's noexec check runs on the mount holding the
+# resolved target, not the symlink, so the wrapper is named here as well (with "-": Fedora's
+# postgresql package has no wrapper, and an absent unprefixed path fails the unit). The list
+# assumes the distro's own PostgreSQL client packages: PGDG packages on RHEL and Fedora install
+# under /usr/pgsql-<N>/bin with alternatives symlinks in /usr/bin, outside it. Nothing else: the
+# spools and /etc/propolis it archives hold captured samples, and age or any other tool must
+# come from the distro package, not /usr/local/bin. This unit runs as root, which could undo a
+# mount, so the mount syscalls are filtered out as systemd.exec(5) advises for these
+# directives; nothing the script runs mounts anything.
 NoExecPaths=/
-ExecPaths=/usr/local/sbin/propolis-backup /usr/local/bin/propolis /usr/bin /usr/lib /usr/lib64
+ExecPaths=/usr/local/sbin/propolis-backup /usr/local/bin/propolis /usr/bin -/usr/share/postgresql-common/pg_wrapper /usr/lib -/usr/lib64
 SystemCallFilter=~@mount

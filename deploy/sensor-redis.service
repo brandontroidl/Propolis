@@ -30,7 +30,7 @@ ReadOnlyPaths=-/etc/propolis/tls
 # sensor execs nothing, so a captured upload or spool entry cannot run here even on a mount that
 # lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/sensor-redis /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/sensor-redis /usr/lib -/usr/lib64
 # Secrets this sensor must never read, even where a file's mode slips (config-check.sh reports
 # that): the daemon's and every other unit's env file and the split deployment's mTLS keys. Its
 # own env file is read by systemd before this namespace exists, so nothing it needs is here; its

@@ -77,7 +77,7 @@ RestrictAddressFamilies=AF_INET AF_INET6
 # (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64); review execs nothing. See
 # deploy/sensor-ssh.service for the full reasoning behind this pair.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/review /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/review /usr/lib -/usr/lib64
 
 # --- No privileged port binding ---
 # review binds no port at all - it is a PostgreSQL client and an outbound HTTPS client to vendor

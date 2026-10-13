@@ -75,7 +75,11 @@ installer does not do yet, are in [split deployment](split-deployment.md).
   (`NoExecPaths=`, `deploy/propolis.service#NoExecPaths=`); every currently-supported
   distro ships well past that. They also assume a merged `/usr` (`/lib` and `/lib64` resolve
   into `/usr/lib` and `/usr/lib64`), which every supported Debian, Ubuntu and Fedora release
-  has: those two directories are the only library roots the units leave executable.
+  has: those two directories are the only library roots the units leave executable, and
+  `/usr/lib64` is marked optional so a host without it (arm64 Debian and Ubuntu, whose loader
+  lives under `/usr/lib`) starts the units as well. `propolis-backup.service` further assumes
+  the distro's own PostgreSQL client packages: Debian's `pg_wrapper` symlink target is in its
+  allow-list, PGDG's `/usr/pgsql-<N>/bin` on RHEL and Fedora is not.
 - **PostgreSQL:** version 15+ is the `INSTALL.md` claim
   (`docs/archive/2026-08-26/root/INSTALL.md#Prerequisites`; the live `INSTALL.md` is now a redirect stub). The
   binary connects via `DATABASE_URL` and runs its own migrations at startup; no

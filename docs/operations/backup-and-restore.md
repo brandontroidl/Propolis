@@ -46,6 +46,9 @@ options or archived paths stop matching the commands on this page.
 - **No password on a command line.** The dump runs through `propolis pg-exec`, which
   parses `DATABASE_URL` from `/etc/propolis/propolis.env` with the daemon's own parser
   and hands `pg_dump` the connection in libpq's `PG*` variables (`crates/propolis/src/pg_exec.rs#run`).
+  The unit lets it execute the distro's own client packages only: on Debian and Ubuntu the
+  `/usr/bin` names are symlinks to `/usr/share/postgresql-common/pg_wrapper`, which the unit
+  allows; PGDG packages on RHEL and Fedora (`/usr/pgsql-<N>/bin`) are outside its allow-list.
 - **Status.** `/var/lib/propolis/backup-status/last-success` records the newest good set
   (time, reason, set name, encrypted or not, sizes). A failed run writes `last-failure`
   with the step that failed, leaves no partial set, and exits non-zero, so it shows in

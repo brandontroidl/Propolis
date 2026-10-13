@@ -80,7 +80,7 @@ ReadWritePaths=/var/lib/propolis/shipper
 # (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64); the shipper execs nothing.
 # See deploy/sensor-ssh.service for the full reasoning behind this pair.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/shipper /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/shipper /usr/lib -/usr/lib64
 
 # --- No bind capability ---
 # The shipper is outbound-only (it dials the gateway, it never listens); no

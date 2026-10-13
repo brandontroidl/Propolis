@@ -40,5 +40,5 @@ SystemCallArchitectures=native
 # which could undo a mount, so the mount syscalls are filtered out as systemd.exec(5) advises
 # for these directives; nothing the script runs mounts anything.
 NoExecPaths=/
-ExecPaths=/usr/local/sbin/propolis-alert /usr/bin /usr/lib /usr/lib64
+ExecPaths=/usr/local/sbin/propolis-alert /usr/bin /usr/lib -/usr/lib64
 SystemCallFilter=~@mount

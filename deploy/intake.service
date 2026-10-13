@@ -81,7 +81,7 @@ ReadWritePaths=/var/lib/propolis/cursors -/var/lib/propolis/quarantine
 # a sensor log line it tails is data however it is crafted. See deploy/sensor-ssh.service for the
 # full reasoning behind this pair.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/intake /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/intake /usr/lib -/usr/lib64
 
 # --- No privileged port binding ---
 # Intake binds no port at all - it is a consumer of sensor logs and a PostgreSQL client, not a

@@ -64,12 +64,15 @@ ReadWritePaths=/var/log/propolis/ssh /var/spool/propolis/ssh /var/lib/propolis/s
 # mmap(PROT_EXEC) of any file, and ExecPaths= nests the exceptions back in (systemd.exec(5),
 # whose own allow-list example is exactly this pair). The binary is dynamically linked (ldd:
 # libc, libm, libgcc_s and ld-linux), so the two library roots are part of what it legitimately
-# executes; on a merged-/usr system /lib and /lib64 resolve into them. The sensor itself execs
-# nothing (the never-exec static checks), so this closes the one path a noexec spool mount left
-# open: an upload, a spool entry or a file written through any writable path cannot run here
-# even on a mount that silently lost its noexec option. Requires systemd 244 and a merged /usr.
+# executes; on a merged-/usr system /lib and /lib64 resolve into them. /usr/lib64 carries "-"
+# because it exists on x86_64 but not on arm64 Debian or Ubuntu (their loader is
+# /lib/ld-linux-aarch64.so.1, under /usr/lib), and an unprefixed absent path fails the unit;
+# /usr/lib exists everywhere and stays mandatory. The sensor itself execs nothing (the
+# never-exec static checks), so this closes the one path a noexec spool mount left open: an
+# upload, a spool entry or a file written through any writable path cannot run here even on a
+# mount that silently lost its noexec option. Requires systemd 244 and a merged /usr.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/sensor-ssh /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/sensor-ssh /usr/lib -/usr/lib64
 # Secrets this sensor must never read. /etc/propolis is 0755 and each env file 0600 under its own
 # service user, so file permissions already deny the daemon's env file (database URL, console
 # password, vendor keys, ntfy token), every other unit's, the watcher's copy and the split

@@ -1806,22 +1806,33 @@ fn every_sensor_unit_denies_the_secrets_it_does_not_load() {
 /// `mmap(PROT_EXEC)`: `ldd` on each lists libc, libm, libgcc_s and the ld-linux loader, which
 /// live under one of these two on every merged-/usr distribution (`/lib` and `/lib64` resolve
 /// into them). `systemd.exec(5)`'s own allow-list example pairs `NoExecPaths=/` with exactly
-/// these two and the daemon.
-const LIBRARY_ROOTS: [&str; 2] = ["/usr/lib", "/usr/lib64"];
+/// these two and the daemon. `/usr/lib64` is optional: it exists on x86_64 (Fedora keeps libc
+/// there; Debian's libc6 ships `/lib64/ld-linux-x86-64.so.2`) but not on arm64 Debian or
+/// Ubuntu, whose loader is `/lib/ld-linux-aarch64.so.1` under `/usr/lib`, and an unprefixed
+/// absent path fails the unit (226/NAMESPACE). Where it is missing the loader is not in it
+/// either, so skipping it loses nothing. `/usr/lib` exists everywhere and stays mandatory.
+const LIBRARY_ROOTS: [&str; 2] = ["/usr/lib", "-/usr/lib64"];
 
 /// What a unit's `ExecPaths=` must name, given the program its `ExecStart=` runs. A Propolis
 /// binary execs nothing (the never-exec static checks), so it gets itself and the library roots
 /// and nothing else. The three root-run script units run distro tools, so they also name
-/// `/usr/bin` (merged-/usr: `/bin` and `/sbin` resolve into it) plus the one extra program each
+/// `/usr/bin` (merged-/usr: `/bin` and `/sbin` resolve into it) plus the extra programs each
 /// runs by path.
 fn expected_exec_paths(unit: &str, program: &str) -> Vec<String> {
     let mut paths = vec![program.to_string()];
     match unit {
         "propolis-alert@.service" => paths.push("/usr/bin".to_string()),
         "propolis-backup.service" => {
-            // backup.sh runs `propolis pg-exec`, which execs pg_dump and psql from /usr/bin.
+            // backup.sh runs `propolis pg-exec`, which execs pg_dump and psql by PATH, and
+            // pg_restore directly. On Debian and Ubuntu, postgresql-client-common ships all
+            // three /usr/bin names as symlinks to /usr/share/postgresql-common/pg_wrapper, and
+            // the kernel's noexec check runs on the mount holding the resolved target, not the
+            // symlink, so /usr/bin alone leaves them unexecutable. The wrapper is `-` prefixed:
+            // Fedora's postgresql package has none, and an absent unprefixed path fails the
+            // unit.
             paths.push("/usr/local/bin/propolis".to_string());
             paths.push("/usr/bin".to_string());
+            paths.push("-/usr/share/postgresql-common/pg_wrapper".to_string());
         }
         "propolis-logrotate.service" => {
             // The policy's prerotate hook, then the tools it and logrotate run.
@@ -1852,9 +1863,14 @@ fn exec_start_program(unit: &str, text: &str) -> String {
 /// a captured upload, a spool entry or anything written through a writable path cannot be run
 /// even where the operator's noexec mount is missing. The program named must be the one
 /// `ExecStart=` runs and must come first, so a unit whose binary moves fails here rather than
-/// starting with its own program unexecutable. A process holding `CAP_SYS_ADMIN` could undo the
-/// mounts, so a unit that keeps it (the root-run script units) must filter the mount syscalls, as
-/// `systemd.exec(5)` advises for these directives.
+/// starting with its own program unexecutable. The program and `/usr/lib` are never `-`
+/// prefixed: a unit whose program or loader root is missing has to fail, not start with it
+/// unexecutable. The entries that may be absent on a supported host (`/usr/lib64`, Debian's
+/// PostgreSQL wrapper) carry the prefix in the expected list itself. A process holding
+/// `CAP_SYS_ADMIN` could undo the mounts, so a unit must either filter the mount syscalls, as
+/// `systemd.exec(5)` advises for these directives, or drop the capability with an allow-list
+/// `CapabilityBoundingSet=` (a `~` deny-list keeps every capability it does not name, so it
+/// does not count).
 #[test]
 fn every_unit_makes_the_filesystem_non_executable_except_its_own_program() {
     for name in service_units() {
@@ -1889,20 +1905,54 @@ fn every_unit_makes_the_filesystem_non_executable_except_its_own_program() {
              then only what it legitimately executes"
         );
         assert!(
-            actual.iter().all(|p| p.starts_with('/')),
-            "deploy/{name}: an ExecPaths= entry must not be optional (a missing library root has \
-             to fail the unit, not start it with its loader unexecutable): {actual:?}"
+            actual[0].starts_with('/') && actual.contains(&"/usr/lib".to_string()),
+            "deploy/{name}: the program and /usr/lib must not be optional ExecPaths= entries (a \
+             missing program or loader root has to fail the unit, not start it with them \
+             unexecutable): {actual:?}"
         );
-        let mounts_locked = text.lines().any(|l| l == "SystemCallFilter=~@mount")
-            || text
-                .lines()
-                .any(|l| l.starts_with("CapabilityBoundingSet=") && !l.contains("CAP_SYS_ADMIN"));
         assert!(
-            mounts_locked,
-            "deploy/{name} keeps CAP_SYS_ADMIN and does not filter @mount, so its processes could \
-             undo NoExecPaths="
+            mounts_locked(&text),
+            "deploy/{name} keeps CAP_SYS_ADMIN (no allow-list CapabilityBoundingSet= without it; \
+             a ~ deny-list keeps it) and does not filter @mount, so its processes could undo \
+             NoExecPaths="
         );
     }
+}
+
+/// Whether a unit's processes cannot undo its `NoExecPaths=` mounts: either the mount syscalls
+/// are filtered, or every `CapabilityBoundingSet=` line is an allow-list without `CAP_SYS_ADMIN`
+/// (an empty one drops everything). A `~` deny-list is not enough: it keeps every capability it
+/// does not name, so `CapabilityBoundingSet=~CAP_NET_RAW` keeps `CAP_SYS_ADMIN` while containing
+/// no mention of it.
+fn mounts_locked(text: &str) -> bool {
+    let bounding: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("CapabilityBoundingSet="))
+        .collect();
+    let drops_sys_admin = !bounding.is_empty()
+        && bounding
+            .iter()
+            .all(|set| !set.starts_with('~') && !set.contains("CAP_SYS_ADMIN"));
+    text.lines().any(|l| l == "SystemCallFilter=~@mount") || drops_sys_admin
+}
+
+/// The shipped units all pass the check above, so this pins what it rejects for the next unit:
+/// a deny-list capability set, an allow-list that keeps `CAP_SYS_ADMIN`, and no set at all,
+/// unless the mount syscalls are filtered.
+#[test]
+fn a_deny_list_capability_set_does_not_count_as_dropping_cap_sys_admin() {
+    assert!(!mounts_locked("CapabilityBoundingSet=~CAP_NET_RAW\n"));
+    assert!(!mounts_locked(
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_ADMIN\n"
+    ));
+    assert!(!mounts_locked("User=propolis\n"));
+    assert!(mounts_locked("CapabilityBoundingSet=\n"));
+    assert!(mounts_locked(
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n"
+    ));
+    assert!(mounts_locked(
+        "CapabilityBoundingSet=~CAP_NET_RAW\nSystemCallFilter=~@mount\n"
+    ));
 }
 
 /// The key directory is root-owned and traverse-only: sensor uids need x to open their own key by

@@ -1851,7 +1851,7 @@ check_env_files() {
         if [ "$extra" -ne 0 ]; then
             loose+=("${f##*/}")
             finding fail "env-files" "env-mode:$f" \
-                "$f is mode 0$mode, so accounts other than its owner can read it; it must be 0$limit (every env file but the generated fleet-listeners.env carries a secret: the database URL, the console password, vendor keys, a bind list another sensor need not see)" \
+                "$f is mode 0$mode, so accounts other than its owner can read or write it; it must be 0$limit (every env file but the generated fleet-listeners.env carries a secret: the database URL, the console password, vendor keys, a bind list another sensor need not see)" \
                 "sudo chmod 0$limit $(q "$f")"
         fi
     done
@@ -1860,7 +1860,7 @@ check_env_files() {
         finding warn "env-files" "env-none" "no *.env files in $ENV_DIR: nothing is configured on this host" \
             "copy deploy/sensor.env.example and deploy/propolis.env.example to $ENV_DIR and fill them in (docs/operations/installation.md)" manual
     elif [ "${#loose[@]}" -gt 0 ]; then
-        global env-files fail "${#ENV_FILES[@]} env files, readable by other accounts: ${loose[*]}"
+        global env-files fail "${#ENV_FILES[@]} env files, readable or writable by other accounts: ${loose[*]}"
     elif [ "${#UNREADABLE_ENV[@]}" -gt 0 ]; then
         global env-files unknown "${#UNREADABLE_ENV[@]} of ${#ENV_FILES[@]} env files unreadable as this user"
     elif [ "$ROW_COUNT" -eq 0 ]; then

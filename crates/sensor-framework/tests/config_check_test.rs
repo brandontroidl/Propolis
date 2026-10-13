@@ -2445,7 +2445,7 @@ fn fix_scenarios() -> Vec<Scenario> {
                 Some("PROPOLIS_CURSOR_DIR=/srv/propolis-cursors"),
             );
         }),
-        ("env files readable by other accounts", |fx| {
+        ("env files readable or writable by other accounts", |fx| {
             std::fs::set_permissions(
                 fx.p("etc/propolis.env"),
                 std::fs::Permissions::from_mode(0o644),
@@ -3041,7 +3041,7 @@ fn an_env_file_readable_by_other_accounts_is_a_failure_with_the_chmod_that_close
     assert_eq!(r.code, 2, "{}", r.out);
     assert!(
         r.has(&format!(
-            "{propolis_env} is mode 0640, so accounts other than its owner can read it"
+            "{propolis_env} is mode 0640, so accounts other than its owner can read or write it"
         )),
         "{}",
         r.out

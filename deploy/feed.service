@@ -98,7 +98,7 @@ ReadWritePaths=/var/lib/propolis/feed
 # the files it publishes under the grant above are data. See deploy/sensor-ssh.service for the
 # full reasoning behind this pair.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/feed /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/feed /usr/lib -/usr/lib64
 
 # --- No privileged port binding ---
 # feed binds no port at all - it is a PostgreSQL client and a local file publisher, never a

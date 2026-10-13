@@ -32,6 +32,7 @@
   [residual risks](docs/security/residual-risks.md#deploying-from-the-repository). See
   [what the pull trusts](docs/operations/upgrade-rollback-and-dr.md#what-the-pull-trusts).
 - **`config-check.sh` reports an env file other accounts can read** - a new `env-mode`
+- **`config-check.sh` reports an env file other accounts can read or write** - a new `env-mode`
   failure for any `/etc/propolis/*.env` whose mode is looser than `0600` (`0640` for
   `watch.env`, whose group reads it by design; `0644` for the generated `fleet-listeners.env`),
   with the `chmod` that closes it as the fix line. A stricter mode is not reported. The
@@ -266,15 +267,20 @@
   [secret management](docs/operations/secret-management.md#where-secrets-live).
 - **Nothing in a unit's filesystem is executable but its own program** - every
   `deploy/*.service` now sets `NoExecPaths=/` and nests back in, with `ExecPaths=`, only the
-  program its `ExecStart=` runs and the library roots it loads (`/usr/lib`, `/usr/lib64`);
-  the three root-run script units (`propolis-alert@`, `propolis-backup`,
-  `propolis-logrotate`) add `/usr/bin` and the one extra program each runs, and filter the
-  mount syscalls so root cannot undo the mounts. Before, only the daemon's fetched-sample
-  spool was marked, so a captured upload or spool entry on a mount that had lost its `noexec`
-  option could be run by a compromised process. A test walks every unit and checks the named
-  program against its `ExecStart=`. Needs a merged `/usr` (every supported Debian, Ubuntu and
-  Fedora release); `age` and any other tool the backup runs must come from the distro package,
-  not `/usr/local/bin`. See
+  program its `ExecStart=` runs and the library roots it loads (`/usr/lib`, and `/usr/lib64`
+  where it exists: arm64 Debian and Ubuntu have none, so it is marked optional); the three
+  root-run script units (`propolis-alert@`, `propolis-backup`, `propolis-logrotate`) add
+  `/usr/bin` and the extra program each runs, and filter the mount syscalls so root cannot
+  undo the mounts. The backup unit also allows Debian's and Ubuntu's PostgreSQL wrapper
+  (`/usr/share/postgresql-common/pg_wrapper`, which their `/usr/bin/pg_dump`, `psql` and
+  `pg_restore` are symlinks to; noexec is checked on the resolved file, so `/usr/bin` alone
+  would have failed every nightly run there). Before, only the daemon's fetched-sample spool
+  was marked, so a captured upload or spool entry on a mount that had lost its `noexec` option
+  could be run by a compromised process. A test walks every unit and checks the named program
+  against its `ExecStart=`. Needs a merged `/usr` (every supported Debian, Ubuntu and Fedora
+  release) and the distro's own PostgreSQL client packages (not PGDG's `/usr/pgsql-<N>/bin`);
+  `age` and any other tool the backup runs must come from the distro package, not
+  `/usr/local/bin`. See
   [filesystem protections](docs/security/filesystem-and-db-protections.md).
 - **Every long console list loads the rest the same way** - Attackers paged with First,
   Previous and Next; Campaigns and a campaign's members stopped at 200 and 500 with "showing

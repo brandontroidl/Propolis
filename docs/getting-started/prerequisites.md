@@ -16,7 +16,10 @@ systemd distribution should work. The shipped units use sandboxing directives th
 a reasonably current systemd; one of them (`NoExecPaths`) arrived in systemd 244. The units
 leave only `/usr/lib` and `/usr/lib64` executable besides their own program, so the host
 needs a merged `/usr` (`/lib` and `/lib64` as links into it), as every supported Debian,
-Ubuntu and Fedora release has. Nothing else is supported.
+Ubuntu and Fedora release has; `/usr/lib64` is optional in the units, so an arm64 host,
+which has no `/lib64` at all, starts them too. The nightly backup unit also assumes the
+distro's own PostgreSQL client packages (Debian's `pg_wrapper` is allowed for; PGDG's
+`/usr/pgsql-<N>/bin` is not). Nothing else is supported.
 
 ## Rust toolchain
 

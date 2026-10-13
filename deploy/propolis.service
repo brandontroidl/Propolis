@@ -172,7 +172,7 @@ ReadWritePaths=/var/spool/propolis/fetched
 # (ExecPaths=/NoExecPaths= were added in that release) and a merged /usr; see
 # deploy/sensor-ssh.service for the full reasoning behind this pair.
 NoExecPaths=/
-ExecPaths=/usr/local/bin/propolis /usr/lib /usr/lib64
+ExecPaths=/usr/local/bin/propolis /usr/lib -/usr/lib64
 
 # --- No privileged port binding ---
 # The console listener binds an unprivileged port (8080 by default, > 1024, matching

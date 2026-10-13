@@ -57,5 +57,5 @@ SystemCallArchitectures=native
 # run. This unit runs as root, which could undo a mount, so the mount syscalls are filtered out
 # as systemd.exec(5) advises for these directives; logrotate mounts nothing.
 NoExecPaths=/
-ExecPaths=/usr/sbin/logrotate /usr/local/sbin/propolis-logrotate-guard /usr/bin /usr/lib /usr/lib64
+ExecPaths=/usr/sbin/logrotate /usr/local/sbin/propolis-logrotate-guard /usr/bin /usr/lib -/usr/lib64
 SystemCallFilter=~@mount

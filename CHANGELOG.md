@@ -329,18 +329,26 @@
 
 ### Fixed
 
-- **The HTTP sensor no longer records submitted passwords** - the platform rule is that a
-  submitted password is never placed in any event field, and the SSH and credential sensors keep
-  it, but sensor-http stored the query string and a body preview verbatim, so a password typed
-  into a fake login form landed in the ledger. The value of every password-like parameter
-  (`password`, `passwd`, `pass`, `secret`, `token`, `api_key`, `pin`, `otp` and the rest) in the
-  query string and in url-encoded, JSON and multipart bodies is now `<redacted>`; the parameter
-  names and usernames stay. `Authorization` and `Proxy-Authorization` are recorded as their
-  scheme plus, for `Basic`, the username (`auth_scheme`, `auth_username`, `proxy_auth_scheme`,
-  `proxy_auth_username`), and a `Cookie` header as its names with every value replaced
-  (`cookie`); none of the three was recorded before. An event where something was replaced
-  carries `credentials_redacted: true`; a request without credentials serializes exactly as
-  before. See
+- **The HTTP sensor cuts credentials out of the request fields it records** - the platform
+  rule is that a submitted password is never placed in any event field, and the SSH and
+  credential sensors keep it, but sensor-http stored the request target, the query string and
+  a body preview verbatim, so a password typed into a fake login form landed in the ledger. The
+  value of every password-like name (`password`, `pass`, `pw`, `secret`, `token`, `api-key`,
+  `pin`, `otp`, `senha` and the rest, matched as a whole, as a segment, or by the substring
+  `pass`) is now `<redacted>` in the query string, in the request target, and in url-encoded,
+  JSON (a container value whole), XML (elements, attributes and struct members) and multipart
+  bodies; a login-shaped XML-RPC call (`wp.*`, `metaWeblog.*`, `blogger.*`, `mt.*`,
+  `system.multicall`, the `xmlrpc.php` brute-force shape) keeps its first parameter and loses
+  the rest. The parameter names and usernames stay; the password of an absolute-form
+  `user:password@host` target does not. `Authorization` and `Proxy-Authorization` are recorded
+  as their scheme plus, for `Basic` and `Digest`, the username (`auth_scheme`,
+  `auth_username`, `proxy_auth_scheme`, `proxy_auth_username`); a value with no scheme word is
+  the credential and is recorded as `<redacted>`. A `Cookie` header is recorded as its names
+  with every value replaced (`cookie`); none of the three was recorded before. An event where a
+  value was replaced carries `credentials_redacted: true`; a request without credentials
+  serializes exactly as before. The scanners match the names and shapes real clients send, so
+  a sender that disguises its own request can still get a secret through; the privacy doc
+  lists those classes. See
   [sample and credential privacy](docs/security/sample-and-credential-privacy.md#credential-handling).
 - **The hash-chain check no longer stalls the monitor** - the whole-ledger scan ran inside the
   ops monitor's loop, so on a large ledger every other condition went unevaluated for minutes

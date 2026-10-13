@@ -53,28 +53,59 @@ Enforcement:
 
 **HTTP keeps the evidence with the credential cut out.** The HTTP sensor cannot
 drop a password the way SSH does, because it arrives inside the bytes that are the
-evidence: the query string, a form, JSON or multipart body, an `Authorization`
-header, a cookie. So `crates/sensor-http/src/redact.rs` removes the credential at
-the point the event fields are built, before the sanitizer and the size caps
-(`crates/sensor-http/src/handler.rs#handle_connection`):
+evidence: the request target, the query string, a form, JSON, XML or multipart
+body, an `Authorization` header, a cookie. So `crates/sensor-http/src/redact.rs`
+removes the credential at the point the event fields are built, before the
+sanitizer and the size caps (`crates/sensor-http/src/handler.rs#handle_connection`).
+What it promises is scoped by how it works: the scanners are textual and match the
+names and shapes real clients send, under password-like names, in
+`Authorization` / `Proxy-Authorization` and in `Cookie`.
 
 - **Kept:** parameter and cookie names, the values of username-like fields, the
   `Authorization` / `Proxy-Authorization` scheme (`auth_scheme`,
-  `proxy_auth_scheme`) and for `Basic` the username from the decoded pair
-  (`auth_username`, `proxy_auth_username`). Which fields a scanner targets, and with
-  what account, is the intelligence.
+  `proxy_auth_scheme`) and for `Basic` the username from the decoded pair, for
+  `Digest` the `username` field (`auth_username`, `proxy_auth_username`). Which
+  fields a scanner targets, and with what account, is the intelligence. A name
+  ending in `type`, `method` or `kind` (`auth_type=basic`, `token_type=bearer`)
+  names a credential's kind, not a credential, and its value stays.
 - **Dropped:** every value under a password-like name (`password`, `passwd`,
-  `pwd`, `pass`, `passphrase`, `secret`, `token`, `api_key`, `apikey`,
-  `access_key`, `auth`, `credential`, `pin`, `otp`, any segment of a name equal to
-  one of these, and any name containing `passw`:
-  `crates/sensor-http/src/redact.rs#is_secret_name`), in the query string and in
-  url-encoded, JSON (at any depth, a truncated body included) and multipart bodies;
-  a `Basic` password, a bearer token, a digest response; and every cookie value.
-  Each is replaced by the marker `<redacted>`
+  `pwd`, `pw`, `psw`, `pswd`, `pass`, `passcode`, `passphrase`, `senha`, `secret`,
+  `token`, `apikey`, `accesskey`, `auth`, `credential`, `credentials`, `pin`,
+  `otp`; a name matches as a whole with its punctuation removed (`api-key`), by
+  any segment (`user[pin]`, `client_secret`), or by containing `pass`
+  (`userpass`, `pass1`, `mot_de_passe`): `crates/sensor-http/src/redact.rs#is_secret_name`),
+  in the query string (pairs split on `&` and `;`), in the request target (a
+  `%3F`-encoded query, a `;` matrix parameter, the password of an absolute-form
+  `user:password@host`: `crates/sensor-http/src/redact.rs#redact_target`), and in
+  url-encoded, JSON (at any depth, a container value replaced whole, a truncated
+  body included), XML (an element, an attribute, an XML-RPC struct member under a
+  secret name, and every parameter after the first of a login-shaped XML-RPC call,
+  `wp.*` / `metaWeblog.*` / `blogger.*` / `mt.*` / `system.multicall`, whose
+  parameters are positional and anonymous:
+  `crates/sensor-http/src/redact.rs#redact_xml`) and multipart bodies (CRLF or
+  bare LF line endings, a quoted or token `name`, in any parameter order); a
+  `Basic` password, a bearer token, a digest response, an `Authorization` value
+  with no scheme word (a raw token or Basic blob is the credential, so
+  `auth_scheme` is `<redacted>`); and every cookie value, a bare token without a
+  name included. Each is replaced by the marker `<redacted>`
   (`crates/sensor-http/src/redact.rs#REDACTED`, the same token the review crate's
-  `redact_secrets` writes) and the event carries `credentials_redacted: true`. The
-  key is absent on an event where nothing was replaced, so a credential-free
-  request serializes exactly as it did before.
+  `redact_secrets` writes) and the event carries `credentials_redacted: true`,
+  meaning a value was replaced, not that a credential was proven: every cookie
+  value counts, a scheme word alone (`Authorization: Basic`) does not. The key is
+  absent on an event where nothing was replaced, so a credential-free request
+  serializes exactly as it did before.
+- **Out of scope (bypass classes).** A textual scanner is an accident-prevention
+  layer for what real clients send; a sender that disguises its own request can
+  get a secret past it, and the ledger's access controls remain the containment.
+  Known classes: a JSON key spelled with an escape (`"password"`), a
+  non-ASCII space (U+00A0) between a key and its colon, a non-UTF-8 byte inside a
+  name, JSON or XML carried inside a url-encoded value (`data=%7B...`), a GraphQL
+  login mutation inside a `query` string, a multipart body whose declared boundary
+  does not match, a credential under a name outside the list, an unknown
+  `Authorization` scheme word followed by its credential (the word is kept as the
+  scheme, capped at 32 bytes), and a secret in a field the scanners do not read (a
+  header other than the three above). The JSON scanner does not run on the query
+  string.
 - **Serialized-JSON tests.** `form_login_password_never_in_event`,
   `json_login_password_never_in_event_at_any_depth`,
   `basic_auth_keeps_the_username_and_never_the_password`,
@@ -85,7 +116,17 @@ the point the event fields are built, before the sanitizer and the size caps
   and siblings) assert each secret is absent from the line the sensor wrote, with
   the usernames and names present;
   `request_without_credentials_serializes_exactly_as_before` pins the common case,
-  and `redacted_body_preview_still_respects_the_cap` the preview cap.
+  and `redacted_body_preview_still_respects_the_cap` the preview cap. The bypasses
+  a review found in the first cut each have a test with the request that leaked:
+  `authorization_without_a_scheme_word_never_in_event`,
+  `xmlrpc_and_xml_login_password_never_in_event`,
+  `password_like_names_outside_the_first_list_never_in_event`,
+  `json_secret_inside_a_container_never_in_event`,
+  `multipart_as_real_senders_write_it_never_in_event`,
+  `cookie_token_without_a_name_never_in_event` and
+  `semicolon_query_and_target_secrets_never_in_event`
+  (`crates/sensor-http/tests/integration.rs#authorization_without_a_scheme_word_never_in_event`
+  and siblings).
 
 ## Sample privacy
 

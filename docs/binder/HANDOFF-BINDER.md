@@ -622,10 +622,10 @@ fails clippy rather than silently vanishing; `--test-threads=1` runs serially;
 green; `--locked` freezes `Cargo.lock`. `CONTRIBUTING.md` gives a looser one-liner
 - use the CI commands.
 
-**Test corpus.** 2654 test functions (1814 unit + 840 integration; 208 DB-backed
-via `sqlx::test`; 3 `#[ignore]`d tests). These are static
-attribute counts, not a verified passing run in this pass; the old "~946 tests"
-and the tag's "770+" are stale. Sensor crates test with real TCP against ephemeral
+**Test corpus.** The live figures are in
+[build-and-test.md](../development/build-and-test.md#test-inventory), where the
+`docs_agreement` test holds them to the source; the counts an earlier pass wrote
+here went stale and are not repeated. Sensor crates test with real TCP against ephemeral
 listeners plus static-check tests that enforce the sensor contract (never-execute,
 no-HTTP-client). A `docs_agreement` test fails CI if any `PROPOLIS_*`/`CATCHALL_*`
 env var in source is missing from `INSTALL.md`.

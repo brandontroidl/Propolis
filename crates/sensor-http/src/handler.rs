@@ -124,8 +124,15 @@ pub async fn handle_connection<S>(
     };
 
     {
+        // Credentials are cut out before the sanitizer and the caps: every value under a
+        // password-like name, the Authorization/Proxy-Authorization credentials, every cookie
+        // value, a userinfo password in the target (docs/security/sample-and-credential-privacy.md
+        // states what the textual scanners do and do not promise). The flag is absent, not false,
+        // when nothing was replaced, so credential-free events stay byte-identical.
+        let mut credentials_redacted = false;
         let method = sanitize_value(&request.method, 16);
-        let path = sanitize_value(&request.path, 2048);
+        let kept = redact::redact_target(&request.path).inspect(|_| credentials_redacted = true);
+        let path = sanitize_value(kept.as_deref().unwrap_or(&request.path), 2048);
         let user_agent = request
             .header("user-agent")
             .map(|v| sanitize_value(v, 512))
@@ -151,11 +158,6 @@ pub async fn handle_connection<S>(
         if !host.is_empty() {
             metadata["host"] = serde_json::Value::String(host);
         }
-        // Credentials are cut out before the sanitizer and the caps, so a password never reaches
-        // a field in any form (docs/security/sample-and-credential-privacy.md). The flag is
-        // absent, not false, when nothing was replaced, so credential-free events stay
-        // byte-identical.
-        let mut credentials_redacted = false;
         if let Some(query) = &request.query {
             let kept = redact::redact_form(query).inspect(|_| credentials_redacted = true);
             metadata["query"] =
@@ -172,11 +174,10 @@ pub async fn handle_connection<S>(
             let Some(value) = request.header(header) else {
                 continue;
             };
-            let auth = redact::redact_authorization(value);
-            if auth.scheme.is_empty() {
+            let Some(auth) = redact::redact_authorization(value) else {
                 continue;
-            }
-            credentials_redacted = true;
+            };
+            credentials_redacted |= auth.credential_dropped;
             metadata[scheme_key] = serde_json::Value::String(sanitize_value(&auth.scheme, 32));
             if let Some(username) = auth.username {
                 metadata[username_key] = serde_json::Value::String(sanitize_value(&username, 255));

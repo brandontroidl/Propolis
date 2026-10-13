@@ -1052,13 +1052,15 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   Last-Modified/ETag/Accept-Ranges and a regenerated `Date` header. Captures
   method, path, query, user-agent, host, and a body preview into one
   `honeypot_command_exec` (authenticated=false, `crates/sensor-http/src/handler.rs#handle_connection`).
-  Credentials are cut out of `query` and `body_preview` before they are stored: the
-  value of every password-like parameter (url-encoded, JSON at any depth, multipart)
-  becomes `<redacted>` while the parameter names and usernames stay
-  (`crates/sensor-http/src/redact.rs#redact_body`). An `Authorization` or
+  Credentials are cut out of `path`, `query` and `body_preview` before they are
+  stored: the value of every password-like parameter (url-encoded, JSON at any
+  depth, XML and XML-RPC, multipart) becomes `<redacted>` while the parameter names
+  and usernames stay (`crates/sensor-http/src/redact.rs#redact_body`,
+  `crates/sensor-http/src/redact.rs#redact_target`). An `Authorization` or
   `Proxy-Authorization` header is recorded as its scheme (`auth_scheme`,
-  `proxy_auth_scheme`) plus, for `Basic`, the decoded username (`auth_username`,
-  `proxy_auth_username`), never the password or token
+  `proxy_auth_scheme`, or `<redacted>` for a value with no scheme word) plus, for
+  `Basic` and `Digest`, the username (`auth_username`, `proxy_auth_username`),
+  never the password or token
   (`crates/sensor-http/src/redact.rs#redact_authorization`); a `Cookie` header is
   recorded as `cookie` with every value replaced
   (`crates/sensor-http/src/redact.rs#redact_cookie`). Any event where a value was

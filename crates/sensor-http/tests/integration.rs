@@ -486,7 +486,7 @@ async fn form_login_password_never_in_event() {
 
 #[tokio::test]
 async fn json_login_password_never_in_event_at_any_depth() {
-    let body = r#"{"user":"admin","password":"hunter2","session":{"auth":{"token":"tok_9f8e"}}}"#;
+    let body = r#"{"user":"admin","password":"hunter2","session":{"creds":{"token":"tok_9f8e"}}}"#;
     let (event, line) = request_event(&post("/api/login", "application/json", body)).await;
     assert!(
         !line.contains("hunter2"),
@@ -498,7 +498,7 @@ async fn json_login_password_never_in_event_at_any_depth() {
     );
     assert_eq!(
         event.metadata["body_preview"],
-        r#"{"user":"admin","password":"<redacted>","session":{"auth":{"token":"<redacted>"}}}"#
+        r#"{"user":"admin","password":"<redacted>","session":{"creds":{"token":"<redacted>"}}}"#
     );
     assert_eq!(event.metadata["credentials_redacted"], true);
 }
@@ -643,6 +643,147 @@ async fn redacted_body_preview_still_respects_the_cap() {
         "{preview}"
     );
     assert_eq!(event.metadata["truncated"], false);
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+// Bypasses a review found in the first cut, each with the request that leaked. The secret is
+// `ZZSECRETZZ` (or `WlpTRUNSRVRaWjp4`, its Basic encoding with `:x`) so one substring check
+// covers the line.
+
+#[tokio::test]
+async fn authorization_without_a_scheme_word_never_in_event() {
+    let (event, line) =
+        request_event("GET / HTTP/1.1\r\nHost: t\r\nAuthorization: WlpTRUNSRVRaWjp4\r\n\r\n").await;
+    assert!(!line.contains("WlpTRUNSRVRaWjp4"), "{line}");
+    assert_eq!(event.metadata["auth_scheme"], "<redacted>");
+    assert_eq!(event.metadata["credentials_redacted"], true);
+
+    let (event, line) =
+        request_event("GET / HTTP/1.1\r\nHost: t\r\nAuthorization: ZZSECRETZZ\r\n\r\n").await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(event.metadata["auth_scheme"], "<redacted>");
+
+    // A scheme word alone dropped nothing, so the flag stays absent.
+    let (event, _) =
+        request_event("GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Basic\r\n\r\n").await;
+    assert_eq!(event.metadata["auth_scheme"], "Basic");
+    assert!(event.metadata.get("credentials_redacted").is_none());
+}
+
+#[tokio::test]
+async fn xmlrpc_and_xml_login_password_never_in_event() {
+    let call = "<?xml version=\"1.0\"?><methodCall><methodName>wp.getUsersBlogs</methodName><params><param><value><string>admin</string></value></param><param><value><string>ZZSECRETZZ</string></value></param></params></methodCall>";
+    let (event, line) = request_event(&post("/xmlrpc.php", "text/xml", call)).await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    let preview = event.metadata["body_preview"].as_str().unwrap();
+    assert!(preview.contains("wp.getUsersBlogs"), "{preview}");
+    assert!(preview.contains("<string>admin</string>"), "{preview}");
+    assert!(preview.contains("<string><redacted></string>"), "{preview}");
+    assert_eq!(event.metadata["credentials_redacted"], true);
+
+    let soap = "<login><username>admin</username><password>ZZSECRETZZ</password></login>";
+    let (event, line) = request_event(&post("/api", "application/xml", soap)).await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(
+        event.metadata["body_preview"],
+        "<login><username>admin</username><password><redacted></password></login>"
+    );
+}
+
+#[tokio::test]
+async fn password_like_names_outside_the_first_list_never_in_event() {
+    let (event, line) = request_event(
+        "GET /?userpass=ZZ1&passcode=ZZ2&credentials=admin:ZZ3&api-key=ZZ4&pw=ZZ5&psw=ZZ6&pswd=ZZ7&senha=ZZ8&mot_de_passe=ZZ9&loginpass=ZZa&pass1=ZZb&access-key=ZZc HTTP/1.1\r\nHost: t\r\n\r\n",
+    )
+    .await;
+    for secret in [
+        "ZZ1", "ZZ2", "ZZ3", "ZZ4", "ZZ5", "ZZ6", "ZZ7", "ZZ8", "ZZ9", "ZZa", "ZZb", "ZZc",
+    ] {
+        assert!(!line.contains(secret), "{secret} leaked: {line}");
+    }
+    assert_eq!(
+        event.metadata["query"],
+        "userpass=<redacted>&passcode=<redacted>&credentials=<redacted>&api-key=<redacted>&pw=<redacted>&psw=<redacted>&pswd=<redacted>&senha=<redacted>&mot_de_passe=<redacted>&loginpass=<redacted>&pass1=<redacted>&access-key=<redacted>"
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn json_secret_inside_a_container_never_in_event() {
+    let (event, line) = request_event(&post(
+        "/api",
+        "application/json",
+        r#"{"password":["ZZSECRETZZ"]}"#,
+    ))
+    .await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(
+        event.metadata["body_preview"],
+        r#"{"password":"<redacted>"}"#
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+
+    let (event, line) = request_event(&post(
+        "/api",
+        "application/json",
+        r#"{"password":{"value":"ZZSECRETZZ"}}"#,
+    ))
+    .await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(
+        event.metadata["body_preview"],
+        r#"{"password":"<redacted>"}"#
+    );
+}
+
+#[tokio::test]
+async fn multipart_as_real_senders_write_it_never_in_event() {
+    for body in [
+        "--bb\nContent-Disposition: form-data; name=\"password\"\n\nZZSECRETZZ\n--bb--\n",
+        "--bb\r\nContent-Disposition: form-data; filename=\"x\"; name=\"password\"\r\n\r\nZZSECRETZZ\r\n--bb--\r\n",
+        "--bb\r\nContent-Disposition: form-data; name=password\r\n\r\nZZSECRETZZ\r\n--bb--\r\n",
+    ] {
+        let (event, line) =
+            request_event(&post("/login", "multipart/form-data; boundary=bb", body)).await;
+        assert!(!line.contains("ZZSECRETZZ"), "{body:?}: {line}");
+        let preview = event.metadata["body_preview"].as_str().unwrap();
+        assert!(preview.contains("<redacted>"), "{preview}");
+        assert_eq!(event.metadata["credentials_redacted"], true, "{body:?}");
+    }
+}
+
+#[tokio::test]
+async fn cookie_token_without_a_name_never_in_event() {
+    let (event, line) =
+        request_event("GET / HTTP/1.1\r\nHost: t\r\nCookie: ZZSECRETZZ\r\n\r\n").await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(event.metadata["cookie"], "<redacted>");
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn semicolon_query_and_target_secrets_never_in_event() {
+    let (event, line) =
+        request_event("GET /?user=a;password=ZZSECRETZZ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(event.metadata["query"], "user=a;password=<redacted>");
+    assert_eq!(event.metadata["credentials_redacted"], true);
+
+    let (event, line) = request_event(
+        "GET http://admin:ZZSECRETZZ@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    )
+    .await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(
+        event.metadata["path"],
+        "http://admin:<redacted>@example.com/"
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+
+    let (event, line) =
+        request_event("GET /login%3Fpassword=ZZSECRETZZ HTTP/1.1\r\nHost: t\r\n\r\n").await;
+    assert!(!line.contains("ZZSECRETZZ"), "{line}");
+    assert_eq!(event.metadata["path"], "/login%3Fpassword=<redacted>");
     assert_eq!(event.metadata["credentials_redacted"], true);
 }
 

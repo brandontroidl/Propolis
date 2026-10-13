@@ -1,5 +1,6 @@
 pub mod crawler;
 pub mod handler;
+pub mod redact;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -4,7 +4,7 @@ audience: security
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-12
 -->
 
 # Sample and credential privacy
@@ -36,8 +36,8 @@ Enforcement:
   the serialized event JSON, not merely from the typed struct - so a future field
   addition cannot reintroduce it silently.
 - **No password is logged.** A grep for `tracing::*` lines containing `password`
-  (or `metadata.*password`) across `sensor-cred/src` and `sensor-ssh/src` returns
-  zero.
+  (or `metadata.*password`) across `sensor-cred/src`, `sensor-ssh/src` and
+  `sensor-http/src` returns zero.
 - **No password field on the wire type.** `SensorEvent`
   (`crates/sensor-wire/src/lib.rs`, ~line 30) has fields `source_ip`, `wan_ip`,
   `sensor`, `signal_type`, `protocol`, `authenticated`, `observed_at`,
@@ -50,6 +50,42 @@ Enforcement:
   `sanitize_value` calls in `auth.rs`). The shared
   sanitizer chokepoint is covered by
   [input-handling.md](input-handling.md).
+
+**HTTP keeps the evidence with the credential cut out.** The HTTP sensor cannot
+drop a password the way SSH does, because it arrives inside the bytes that are the
+evidence: the query string, a form, JSON or multipart body, an `Authorization`
+header, a cookie. So `crates/sensor-http/src/redact.rs` removes the credential at
+the point the event fields are built, before the sanitizer and the size caps
+(`crates/sensor-http/src/handler.rs#handle_connection`):
+
+- **Kept:** parameter and cookie names, the values of username-like fields, the
+  `Authorization` / `Proxy-Authorization` scheme (`auth_scheme`,
+  `proxy_auth_scheme`) and for `Basic` the username from the decoded pair
+  (`auth_username`, `proxy_auth_username`). Which fields a scanner targets, and with
+  what account, is the intelligence.
+- **Dropped:** every value under a password-like name (`password`, `passwd`,
+  `pwd`, `pass`, `passphrase`, `secret`, `token`, `api_key`, `apikey`,
+  `access_key`, `auth`, `credential`, `pin`, `otp`, any segment of a name equal to
+  one of these, and any name containing `passw`:
+  `crates/sensor-http/src/redact.rs#is_secret_name`), in the query string and in
+  url-encoded, JSON (at any depth, a truncated body included) and multipart bodies;
+  a `Basic` password, a bearer token, a digest response; and every cookie value.
+  Each is replaced by the marker `<redacted>`
+  (`crates/sensor-http/src/redact.rs#REDACTED`, the same token the review crate's
+  `redact_secrets` writes) and the event carries `credentials_redacted: true`. The
+  key is absent on an event where nothing was replaced, so a credential-free
+  request serializes exactly as it did before.
+- **Serialized-JSON tests.** `form_login_password_never_in_event`,
+  `json_login_password_never_in_event_at_any_depth`,
+  `basic_auth_keeps_the_username_and_never_the_password`,
+  `bearer_token_never_in_event`, `cookie_values_never_in_event`,
+  `multipart_login_password_never_in_event` and
+  `query_string_password_never_in_event`
+  (`crates/sensor-http/tests/integration.rs#form_login_password_never_in_event`
+  and siblings) assert each secret is absent from the line the sensor wrote, with
+  the usernames and names present;
+  `request_without_credentials_serializes_exactly_as_before` pins the common case,
+  and `redacted_body_preview_still_respects_the_cap` the preview cap.
 
 ## Sample privacy
 

@@ -440,6 +440,212 @@ async fn query_string_captured() {
     srv.handle.abort();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Credential privacy (docs/security/sample-and-credential-privacy.md). Modelled on sensor-ssh's
+// `password_never_in_event`: each secret is asserted absent from the SERIALIZED request event as
+// written to the log, not from the typed struct, so a future field cannot reintroduce it silently.
+// ---------------------------------------------------------------------------------------------
+
+/// Sends `request`, returns the request event and the exact JSON line the sensor wrote for it.
+async fn request_event(request: &str) -> (sensor_wire::SensorEvent, String) {
+    let srv = TestServer::start().await;
+    let _ = send_request(srv.addr, request).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let content = tokio::fs::read_to_string(&srv.log_path).await.unwrap();
+    let line = content
+        .lines()
+        .find(|l| l.contains(sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC))
+        .expect("a request event line")
+        .to_string();
+    srv.handle.abort();
+    (serde_json::from_str(&line).unwrap(), line)
+}
+
+fn post(path: &str, content_type: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test]
+async fn form_login_password_never_in_event() {
+    let body = "username=admin&password=s3cret_p%40ssw0rd!&remember=1";
+    let (event, line) =
+        request_event(&post("/login", "application/x-www-form-urlencoded", body)).await;
+    assert!(
+        !line.contains("s3cret_p"),
+        "password must NEVER appear in event: {line}"
+    );
+    assert_eq!(
+        event.metadata["body_preview"],
+        "username=admin&password=<redacted>&remember=1"
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn json_login_password_never_in_event_at_any_depth() {
+    let body = r#"{"user":"admin","password":"hunter2","session":{"auth":{"token":"tok_9f8e"}}}"#;
+    let (event, line) = request_event(&post("/api/login", "application/json", body)).await;
+    assert!(
+        !line.contains("hunter2"),
+        "password must NEVER appear in event: {line}"
+    );
+    assert!(
+        !line.contains("tok_9f8e"),
+        "token must NEVER appear in event: {line}"
+    );
+    assert_eq!(
+        event.metadata["body_preview"],
+        r#"{"user":"admin","password":"<redacted>","session":{"auth":{"token":"<redacted>"}}}"#
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn basic_auth_keeps_the_username_and_never_the_password() {
+    // admin:hunter2
+    let (event, line) = request_event(
+        "GET /admin HTTP/1.1\r\nHost: test\r\nAuthorization: Basic YWRtaW46aHVudGVyMg==\r\n\r\n",
+    )
+    .await;
+    assert!(
+        !line.contains("hunter2"),
+        "password must NEVER appear in event: {line}"
+    );
+    assert!(
+        !line.contains("YWRtaW46aHVudGVyMg"),
+        "nor its encoding: {line}"
+    );
+    assert_eq!(event.metadata["auth_scheme"], "Basic");
+    assert_eq!(event.metadata["auth_username"], "admin");
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn bearer_token_never_in_event() {
+    let (event, line) = request_event(
+        "GET /api HTTP/1.1\r\nHost: test\r\nProxy-Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\r\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\r\n\r\n",
+    )
+    .await;
+    assert!(
+        !line.contains("eyJhbGci"),
+        "token must NEVER appear in event: {line}"
+    );
+    assert_eq!(event.metadata["auth_scheme"], "Bearer");
+    assert_eq!(event.metadata["proxy_auth_scheme"], "Bearer");
+    assert!(event.metadata.get("auth_username").is_none());
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn cookie_values_never_in_event() {
+    let (event, line) = request_event(
+        "GET / HTTP/1.1\r\nHost: test\r\nCookie: PHPSESSID=9a1b2c3d4e; remember_token=rt_55aa; lang=en\r\n\r\n",
+    )
+    .await;
+    for secret in ["9a1b2c3d4e", "rt_55aa", "=en"] {
+        assert!(
+            !line.contains(secret),
+            "cookie value must NEVER appear in event: {line}"
+        );
+    }
+    assert_eq!(
+        event.metadata["cookie"],
+        "PHPSESSID=<redacted>; remember_token=<redacted>; lang=<redacted>"
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn multipart_login_password_never_in_event() {
+    let body = "--b0undary\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nadmin\r\n--b0undary\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--b0undary--\r\n";
+    let (event, line) = request_event(&post(
+        "/login",
+        "multipart/form-data; boundary=b0undary",
+        body,
+    ))
+    .await;
+    assert!(
+        !line.contains("hunter2"),
+        "password must NEVER appear in event: {line}"
+    );
+    let preview = event.metadata["body_preview"].as_str().unwrap();
+    assert!(preview.contains("name=\"username\""), "{preview}");
+    assert!(preview.contains("admin"), "{preview}");
+    assert!(preview.contains("name=\"password\""), "{preview}");
+    assert!(preview.contains("<redacted>"), "{preview}");
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+#[tokio::test]
+async fn query_string_password_never_in_event() {
+    let (event, line) = request_event(
+        "GET /login?user=root&passwd=toor123&next=%2F HTTP/1.1\r\nHost: test\r\n\r\n",
+    )
+    .await;
+    assert!(
+        !line.contains("toor123"),
+        "password must NEVER appear in event: {line}"
+    );
+    assert_eq!(
+        event.metadata["query"],
+        "user=root&passwd=<redacted>&next=%2F"
+    );
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
+/// The common case is behaviour-preserving: a request that carries no credential produces
+/// exactly the fields it produced before redaction existed, with no flag and nothing rewritten.
+#[tokio::test]
+async fn request_without_credentials_serializes_exactly_as_before() {
+    let body = "q=nginx&lang=en";
+    let (mut event, _) = request_event(&format!(
+        "POST /search?page=2&sort=asc HTTP/1.1\r\nHost: test\r\nUser-Agent: curl/8.5.0\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ))
+    .await;
+    // The emitter stamps the ephemeral listener port on every event; it is not the handler's.
+    event.metadata.as_object_mut().unwrap().remove("local_port");
+    assert_eq!(
+        event.metadata,
+        serde_json::json!({
+            "protocol_label": "http",
+            "method": "POST",
+            "path": "/search",
+            "query": "page=2&sort=asc",
+            "user_agent": "curl/8.5.0",
+            "host": "test",
+            "body_size": 15,
+            "body_declared": 15,
+            "body_complete": true,
+            "truncated": false,
+            "body_preview": "q=nginx&lang=en",
+        })
+    );
+}
+
+/// Redaction runs on the captured body before the preview cap, so a secret anywhere in the
+/// captured bytes is gone and the preview is still no longer than the cap.
+#[tokio::test]
+async fn redacted_body_preview_still_respects_the_cap() {
+    let filler = "a".repeat(4_500);
+    let body = format!("password=first_secret&note={filler}&pin=last_secret");
+    let (event, line) =
+        request_event(&post("/login", "application/x-www-form-urlencoded", &body)).await;
+    assert!(!line.contains("first_secret"), "{line}");
+    assert!(!line.contains("last_secret"), "{line}");
+    let preview = event.metadata["body_preview"].as_str().unwrap();
+    assert!(preview.len() <= 4096, "preview is {} bytes", preview.len());
+    assert!(
+        preview.starts_with("password=<redacted>&note=aaaa"),
+        "{preview}"
+    );
+    assert_eq!(event.metadata["truncated"], false);
+    assert_eq!(event.metadata["credentials_redacted"], true);
+}
+
 fn walk_rs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {

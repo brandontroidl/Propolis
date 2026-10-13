@@ -13,6 +13,8 @@ sensor-wire = { path = "../sensor-wire" }
 sensor-framework = { path = "../sensor-framework" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
 serde_json = "1.0.151"
+# Decodes a Basic credential so its username can be kept and its password dropped (redact.rs).
+base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 tracing = "0.1.44"
 

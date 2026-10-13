@@ -1051,7 +1051,19 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   give an nginx 405 and unknown paths an nginx 404 (`crates/sensor-http/src/handler.rs#build_response`). Static 200s carry
   Last-Modified/ETag/Accept-Ranges and a regenerated `Date` header. Captures
   method, path, query, user-agent, host, and a body preview into one
-  `honeypot_command_exec` (authenticated=false, `crates/sensor-http/src/handler.rs#handle_connection`). Caps: request line
+  `honeypot_command_exec` (authenticated=false, `crates/sensor-http/src/handler.rs#handle_connection`).
+  Credentials are cut out of `query` and `body_preview` before they are stored: the
+  value of every password-like parameter (url-encoded, JSON at any depth, multipart)
+  becomes `<redacted>` while the parameter names and usernames stay
+  (`crates/sensor-http/src/redact.rs#redact_body`). An `Authorization` or
+  `Proxy-Authorization` header is recorded as its scheme (`auth_scheme`,
+  `proxy_auth_scheme`) plus, for `Basic`, the decoded username (`auth_username`,
+  `proxy_auth_username`), never the password or token
+  (`crates/sensor-http/src/redact.rs#redact_authorization`); a `Cookie` header is
+  recorded as `cookie` with every value replaced
+  (`crates/sensor-http/src/redact.rs#redact_cookie`). Any event where a value was
+  replaced carries `credentials_redacted: true`; the key is absent otherwise. The
+  policy is [../security/sample-and-credential-privacy.md](../security/sample-and-credential-privacy.md#credential-handling). Caps: request line
   8192, header block 16384, body capture 65536 (`crates/sensor-http/src/handler.rs#MAX_REQUEST_LINE_LEN`, `crates/sensor-http/src/handler.rs#MAX_HEADER_BLOCK`, `crates/sensor-http/src/handler.rs#MAX_BODY_CAPTURE`). A declared body is read to
   its end before the reply (the first 65536 bytes kept, the rest drained); the event
   records `body_size` (bytes received), `body_declared`, `body_complete` and
@@ -1075,7 +1087,7 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   [environment-variables.md](environment-variables.md); the operator view is
   [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
 - **Capture:** no login, no spool. **The POST body is captured only as a truncated
-  preview in metadata**, never stored as a file.
+  preview in metadata**, with its credentials redacted, never stored as a file.
 - **Emits:** `honeypot_connection`, `honeypot_command_exec`.
 
 ### sensor-ftp

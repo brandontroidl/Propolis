@@ -329,6 +329,19 @@
 
 ### Fixed
 
+- **The HTTP sensor no longer records submitted passwords** - the platform rule is that a
+  submitted password is never placed in any event field, and the SSH and credential sensors keep
+  it, but sensor-http stored the query string and a body preview verbatim, so a password typed
+  into a fake login form landed in the ledger. The value of every password-like parameter
+  (`password`, `passwd`, `pass`, `secret`, `token`, `api_key`, `pin`, `otp` and the rest) in the
+  query string and in url-encoded, JSON and multipart bodies is now `<redacted>`; the parameter
+  names and usernames stay. `Authorization` and `Proxy-Authorization` are recorded as their
+  scheme plus, for `Basic`, the username (`auth_scheme`, `auth_username`, `proxy_auth_scheme`,
+  `proxy_auth_username`), and a `Cookie` header as its names with every value replaced
+  (`cookie`); none of the three was recorded before. An event where something was replaced
+  carries `credentials_redacted: true`; a request without credentials serializes exactly as
+  before. See
+  [sample and credential privacy](docs/security/sample-and-credential-privacy.md#credential-handling).
 - **The hash-chain check no longer stalls the monitor** - the whole-ledger scan ran inside the
   ops monitor's loop, so on a large ledger every other condition went unevaluated for minutes
   every six hours. It now runs as its own task and the monitor serves its last verdict.

@@ -10,6 +10,8 @@ use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SensorEvent, WIRE_VERSION,
 };
 
+use crate::redact;
+
 const PROTOCOL_LABEL: &str = "http";
 
 const MAX_REQUEST_LINE_LEN: usize = 8192;
@@ -149,8 +151,41 @@ pub async fn handle_connection<S>(
         if !host.is_empty() {
             metadata["host"] = serde_json::Value::String(host);
         }
+        // Credentials are cut out before the sanitizer and the caps, so a password never reaches
+        // a field in any form (docs/security/sample-and-credential-privacy.md). The flag is
+        // absent, not false, when nothing was replaced, so credential-free events stay
+        // byte-identical.
+        let mut credentials_redacted = false;
         if let Some(query) = &request.query {
-            metadata["query"] = serde_json::Value::String(sanitize_value(query, 2048));
+            let kept = redact::redact_form(query).inspect(|_| credentials_redacted = true);
+            metadata["query"] =
+                serde_json::Value::String(sanitize_value(kept.as_deref().unwrap_or(query), 2048));
+        }
+        for (header, scheme_key, username_key) in [
+            ("authorization", "auth_scheme", "auth_username"),
+            (
+                "proxy-authorization",
+                "proxy_auth_scheme",
+                "proxy_auth_username",
+            ),
+        ] {
+            let Some(value) = request.header(header) else {
+                continue;
+            };
+            let auth = redact::redact_authorization(value);
+            if auth.scheme.is_empty() {
+                continue;
+            }
+            credentials_redacted = true;
+            metadata[scheme_key] = serde_json::Value::String(sanitize_value(&auth.scheme, 32));
+            if let Some(username) = auth.username {
+                metadata[username_key] = serde_json::Value::String(sanitize_value(&username, 255));
+            }
+        }
+        if let Some(cookie) = request.header("cookie") {
+            let kept = redact::redact_cookie(cookie).inspect(|_| credentials_redacted = true);
+            metadata["cookie"] =
+                serde_json::Value::String(sanitize_value(kept.as_deref().unwrap_or(cookie), 2048));
         }
         if request.body_declared > 0 {
             metadata["body_size"] = serde_json::Value::Number(request.body_received.into());
@@ -161,11 +196,15 @@ pub async fn handle_connection<S>(
                 serde_json::Value::Bool(request.body_received > request.body.len());
         }
         if !request.body.is_empty() {
-            let body_preview = sanitize_value(
-                &String::from_utf8_lossy(&request.body),
-                MAX_BODY_CAPTURE.min(4096),
-            );
+            let body = String::from_utf8_lossy(&request.body);
+            let kept = redact::redact_body(&body, request.header("content-type"))
+                .inspect(|_| credentials_redacted = true);
+            let body_preview =
+                sanitize_value(kept.as_deref().unwrap_or(&body), MAX_BODY_CAPTURE.min(4096));
             metadata["body_preview"] = serde_json::Value::String(body_preview);
+        }
+        if credentials_redacted {
+            metadata["credentials_redacted"] = serde_json::Value::Bool(true);
         }
         if tls {
             metadata["tls"] = serde_json::Value::Bool(true);

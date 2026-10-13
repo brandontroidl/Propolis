@@ -171,9 +171,15 @@ pub fn load_config_from_env() -> Result<Config, ConfigError> {
         .map_err(|e| ConfigError::Invalid {
             field: ENV_COLLECTOR_ID,
             value: String::new(),
+            // env_with_legacy reads the value as text and never parses it, so only the UTF-8
+            // refusal can reach here; the other readers' errors cannot, but the type carries them.
             reason: match e {
                 sensor_framework::EnvError::NotUnicode { .. } => {
                     "this or its legacy spelling is not valid UTF-8"
+                }
+                sensor_framework::EnvError::Invalid { .. }
+                | sensor_framework::EnvError::TooLarge { .. } => {
+                    "this or its legacy spelling could not be read"
                 }
             },
         })?

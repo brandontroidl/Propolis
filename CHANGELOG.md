@@ -19,8 +19,17 @@
   that differs from the one the last deploy recorded in the deploy stamp (new `origin_url`
   field; `--accept-origin` records a deliberate move, and a box with no record yet records
   it), and a commit `origin/main` does not have, and it only fast-forwards. Opt-in signature
-  verification: with `/etc/propolis/upgrade-signers` (an SSH allowed-signers file, root
-  `0644`) present, `origin/main` must pass `git verify-commit` against it. See
+  verification: with `/etc/propolis/upgrade-signers` (an SSH allowed-signers file, a regular
+  file, root `0644`) present, `origin/main` must carry an SSH signature by a listed key; the
+  PGP and X.509 backends are disabled for that check, so a PGP-signed commit (a GitHub
+  web-interface merge) is refused whatever keys the owner's keyring holds. `origin/main` is
+  resolved once after the fetch and the checks and the merge all name that commit. The origin
+  the stamp records is handed over from the pull rather than read again as root (git refuses
+  root a checkout it does not own unless `SUDO_UID` names the owner), and a stamp that
+  recorded an empty origin is refused until `--accept-origin` records one, instead of leaving
+  the check unarmed. The checks hold against the remote and operator mistakes, not against
+  the checkout's owner, which builds what root installs; the residuals are in
+  [residual risks](docs/security/residual-risks.md#deploying-from-the-repository). See
   [what the pull trusts](docs/operations/upgrade-rollback-and-dr.md#what-the-pull-trusts).
 - **Nightly backups** - `propolis-backup.timer` now runs the documented backup every night at
   03:30: a `pg_dump` of the database and an archive of the spool, `/etc/propolis` and the SSH

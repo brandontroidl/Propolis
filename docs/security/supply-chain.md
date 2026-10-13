@@ -113,15 +113,25 @@ script, and re-run the full gate including a release build after re-vendoring.
 
 ## Deploying from the repository
 
-A box is upgraded by pulling the repository and building it as root installs the result
-(`deploy/upgrade.sh`), so the pull is the last link of the chain above. The script refuses to
-build from a dirty checkout, from a remote other than the one the last deploy recorded in the
-deploy stamp (`deploy/deploy-stamp.sh#origin_url`; `--accept-origin` records a deliberate
-move), or from a commit `origin/main` does not have, and it only ever fast-forwards. With
-`/etc/propolis/upgrade-signers` on the box, the fetched `origin/main` must also carry an SSH
-signature by a listed key, which holds against a compromised remote or a mistaken push; it is
-off by default, CI does not verify signatures, and the setup is in
+A box is upgraded by pulling the repository, building it as the checkout's owner, and
+installing the result as root (`deploy/upgrade.sh`), so the pull is the last link of the chain
+above. The script refuses to build from a dirty checkout, from a remote other than the one the
+last deploy recorded in the deploy stamp (`deploy/deploy-stamp.sh#origin_url`;
+`--accept-origin` records a deliberate move), or from a commit `origin/main` does not have,
+and it only ever fast-forwards. With `/etc/propolis/upgrade-signers` on the box, the fetched
+`origin/main` must also carry an SSH signature by a listed key; only SSH signatures are
+accepted (a PGP-signed commit, such as a GitHub web-interface merge, is refused whatever keys
+the box holds). That holds against a compromised remote or a mistaken push; it is off by
+default, CI does not verify signatures, and the setup is in
 [upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md#signed-upgrades-recommended).
+
+Those checks hold against the remote and against operator mistakes, not against the account
+that owns the checkout, which builds what root installs and is trusted by construction. What
+remains with and without signing is stated in
+[residual risks](./residual-risks.md#deploying-from-the-repository). The hand-run collector
+upgrade in [split deployment](../operations/split-deployment.md#upgrading) runs the same
+fetch, signature check and fast-forward by hand; it does not run the dirty check or the origin
+pin.
 
 ## Related
 

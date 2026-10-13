@@ -1307,6 +1307,68 @@ fn deploy_stamp_records_the_origin_without_its_userinfo() {
     );
 }
 
+/// `upgrade.sh` hands the origin it read as the owner over in `PROPOLIS_DEPLOY_ORIGIN_URL`,
+/// because this script runs as root and git may refuse it the checkout; the handed value wins
+/// over what the script could read itself, an empty hand-over is recorded as empty (so the next
+/// upgrade sees that the deploy could not read it) rather than silently re-read, and a URL that
+/// would break the JSON is left unrecorded with a warning rather than written.
+#[test]
+fn deploy_stamp_prefers_the_origin_the_deploy_hands_over_and_keeps_the_json_well_formed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fixture_repo(&repo);
+    let add = std::process::Command::new("git")
+        .args(["remote", "add", "origin", "https://example.com/read.git"])
+        .current_dir(&repo)
+        .fenced_output()
+        .unwrap();
+    assert!(add.status.success());
+    let out_file = tmp.path().join("deploy-stamp.json");
+    let run = |origin: &str| -> std::process::Output {
+        std::process::Command::new(DEPLOY_STAMP)
+            .arg(&repo)
+            .arg(&out_file)
+            .arg(tmp.path().join("no-bins"))
+            .env("PROPOLIS_DEPLOY_ORIGIN_URL", origin)
+            .fenced_output()
+            .unwrap()
+    };
+
+    assert!(run("https://example.com/handed.git").status.success());
+    assert_eq!(
+        stamp_json(&out_file)["origin_url"],
+        "https://example.com/handed.git"
+    );
+
+    assert!(run("").status.success());
+    assert_eq!(
+        stamp_json(&out_file)["origin_url"],
+        "",
+        "an empty hand-over is recorded as empty, not re-read"
+    );
+
+    let output = run("https://example.com/br\"oken.git");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("quote or backslash"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stamp_json(&out_file)["origin_url"],
+        "",
+        "a URL the JSON cannot carry is left unrecorded, and the stamp still parses"
+    );
+
+    let output = run_deploy_stamp(&repo, &out_file, &tmp.path().join("no-bins"));
+    assert!(output.status.success());
+    assert_eq!(
+        stamp_json(&out_file)["origin_url"],
+        "https://example.com/read.git",
+        "without a hand-over the origin is read from the checkout"
+    );
+}
+
 /// Same standard as `install_script_is_valid_bash`: `upgrade.sh` has no `--dry-run`, so a syntax
 /// check is the one real execution it gets without root.
 #[test]
@@ -2009,7 +2071,7 @@ fn upgrade_script_reexecs_after_the_pull_and_before_any_build_or_install() {
             .position(|l| l.trim_start().starts_with(needle))
             .unwrap_or_else(|| panic!("upgrade.sh has no line starting with `{needle}`"))
     };
-    let pull = at("as_owner git merge --ff-only refs/remotes/origin/main");
+    let pull = at("as_owner git merge --ff-only \"$TARGET\"");
     let reexec = at("exec \"$BASH\" \"$SCRIPT_DIR/upgrade.sh\" \"$@\"");
     let build = at("as_owner cargo build");
     let first_install = at("install -m 0755");
@@ -2084,8 +2146,16 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// deploy stamp the way the real script does), a second clone (`author`) that pushes what the box
 /// will pull, a scratch root for the stamp and the signers file, and a stub `sudo` on PATH that
 /// checks it was asked for the checkout's owner, logs the git subcommand and runs it for real.
+/// Next to it, a `git-remote-probe` helper serves the bare origin for any `probe://` URL, so a
+/// test can give the box's remote a URL with userinfo (a path cannot carry one) that still fetches.
+///
+/// The fixture runs as one unprivileged user throughout, so two branches of the script never run
+/// here: the signers file's root-ownership check (skipped under `PROPOLIS_UPGRADE_ROOT`, since
+/// the fixture cannot create a root-owned file), and `deploy-stamp.sh` reading the origin as the
+/// checkout's owner, which only root takes. Both are guarded by reading, not by these tests.
 struct UpgradeFixture {
     tmp: tempfile::TempDir,
+    origin: PathBuf,
     repo: PathBuf,
     author: PathBuf,
     root: PathBuf,
@@ -2123,6 +2193,7 @@ impl UpgradeFixture {
                  echo ENTERED\n\
                  {}\
                  echo \"CONTINUED pulled_at=$PULLED_AT args=$* guard=${{PROPOLIS_UPGRADE_REEXEC:-none}}\"\n\
+                 PROPOLIS_DEPLOY_PULLED_AT=\"$PULLED_AT\" PROPOLIS_DEPLOY_ORIGIN_URL=\"$ORIGIN_URL\" \
                  \"$DEPLOY_STAMP\" \"$REPO_DIR\" \"$STAMP_FILE\" \"$REPO_DIR/no-bins\"\n",
                 pull_and_reexec_block()
             ),
@@ -2147,18 +2218,32 @@ impl UpgradeFixture {
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "test"]);
 
-        // `sudo -u <owner> git <sub> ...`: the owner must be the checkout's, the subcommand is
-        // logged, and git itself runs against the fixture repositories.
+        // `sudo -u <owner> git [-c k=v]... <sub> ...`: the owner must be the checkout's, the
+        // subcommand (the first argument after any `-c` pairs) is logged, and git itself runs
+        // against the fixture repositories.
         write_executable(
             &stubs.join("sudo"),
             "#!/bin/sh\n[ \"$1\" = \"-u\" ] && [ \"$2\" = \"$(id -un)\" ] || exit 64\nshift 2\n\
              [ \"$1\" = git ] || [ \"$1\" = cargo ] || exit 64\n\
-             sub=\"$2\"\n[ \"$sub\" != -c ] || sub=\"$6\"\n\
-             echo \"$sub\" >> \"$GIT_LOG\"\nexec \"$@\"\n",
+             prog=\"$1\"\nshift\nsub=\"\"\nskip=0\nfor a in \"$@\"; do\n\
+             \tif [ \"$skip\" = 1 ]; then skip=0; continue; fi\n\
+             \tif [ \"$a\" = -c ]; then skip=1; continue; fi\n\
+             \tsub=\"$a\"; break\ndone\n\
+             echo \"$sub\" >> \"$GIT_LOG\"\nexec \"$prog\" \"$@\"\n",
+        );
+        // A remote helper for `probe://` URLs that connects to the bare origin, whatever the host
+        // or userinfo in the URL says.
+        write_executable(
+            &stubs.join("git-remote-probe"),
+            "#!/bin/sh\nwhile IFS= read -r cmd; do\n\tcase \"$cmd\" in\n\
+             \t\tcapabilities) printf 'connect\\n\\n' ;;\n\
+             \t\t\"connect git-upload-pack\") printf '\\n'; exec git upload-pack \"$FIXTURE_ORIGIN\" ;;\n\
+             \t\t\"\") exit 0 ;;\n\t\t*) exit 1 ;;\n\tesac\ndone\n",
         );
         Self {
             git_log: tmp.path().join("git.log"),
             tmp,
+            origin,
             repo,
             author,
             root,
@@ -2218,6 +2303,73 @@ impl UpgradeFixture {
         git(&self.author, &["push", "-q", "origin", "main"]);
     }
 
+    /// The author pushes an empty commit carrying a PGP signature from a throwaway `GNUPGHOME`
+    /// under the fixture, returning that home so a run can be given the same keyring (the shape
+    /// of a box whose owner imported the signer's key, such as GitHub's web-flow key).
+    fn push_pgp_signed(&self, message: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let home = self.tmp.path().join("gnupg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gpg = |args: &[&str]| -> std::process::Output {
+            let out = std::process::Command::new("gpg")
+                .args(args)
+                .env("GNUPGHOME", &home)
+                .fenced_output()
+                .expect("gpg is installed");
+            assert!(
+                out.status.success(),
+                "gpg {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        gpg(&[
+            "--batch",
+            "--quiet",
+            "--passphrase",
+            "",
+            "--quick-gen-key",
+            "fixture <fixture@example.com>",
+            "ed25519",
+            "sign",
+            "0",
+        ]);
+        let listing = gpg(&["--batch", "--with-colons", "--list-secret-keys"]);
+        let fingerprint = String::from_utf8(listing.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("fpr:"))
+            .map(|rest| rest.trim_matches(':').to_string())
+            .expect("the throwaway key has a fingerprint");
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "gpg.format=openpgp",
+                "-c",
+                "gpg.program=gpg",
+                "-c",
+                &format!("user.signingkey={fingerprint}"),
+                "commit",
+                "-q",
+                "-S",
+                "--allow-empty",
+                "-m",
+                message,
+            ])
+            .current_dir(&self.author)
+            .env("GNUPGHOME", &home)
+            .fenced_output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the PGP-signed commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(&self.author, &["push", "-q", "origin", "main"]);
+        home
+    }
+
     /// A fresh ed25519 key pair under the fixture, returning the private key's path and the
     /// public key line (`ssh-ed25519 AAAA...`).
     fn ssh_key(&self, name: &str) -> (PathBuf, String) {
@@ -2263,9 +2415,11 @@ impl UpgradeFixture {
             .env("PATH", path)
             .env("GIT_LOG", &self.git_log)
             .env("DEPLOY_STAMP", DEPLOY_STAMP)
+            .env("FIXTURE_ORIGIN", &self.origin)
             .env("PROPOLIS_UPGRADE_ROOT", &self.root)
             .env_remove("PROPOLIS_UPGRADE_REEXEC")
-            .env_remove("PROPOLIS_UPGRADE_PULLED_AT");
+            .env_remove("PROPOLIS_UPGRADE_PULLED_AT")
+            .env_remove("PROPOLIS_UPGRADE_ORIGIN_URL");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -2375,8 +2529,10 @@ fn upgrade_does_not_reexec_when_the_pull_leaves_the_script_unchanged() {
     assert_eq!(fx.head(), git(&fx.author, &["rev-parse", "HEAD"]));
 }
 
-/// The guard alone skips the pull, takes PULLED_AT from the environment, and fails closed when the
-/// timestamp is missing rather than stamping an empty or invented one.
+/// The guard alone skips the pull, takes PULLED_AT and the origin from the environment, and fails
+/// closed when the timestamp is missing rather than stamping an empty or invented one. A run
+/// re-executed by a script from before the origin check carries no origin; that run reads it
+/// (the pull is already done) so the stamp it writes is still complete.
 #[test]
 fn upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp() {
     let fx = UpgradeFixture::new();
@@ -2386,6 +2542,10 @@ fn upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp() {
         &[
             ("PROPOLIS_UPGRADE_REEXEC", "1"),
             ("PROPOLIS_UPGRADE_PULLED_AT", "2026-01-02T03:04:05Z"),
+            (
+                "PROPOLIS_UPGRADE_ORIGIN_URL",
+                "https://example.com/carried.git",
+            ),
         ],
     );
     assert!(run.output.status.success(), "stderr: {}", run.stderr());
@@ -2397,6 +2557,29 @@ fn upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp() {
     assert_eq!(
         continued_lines(&run),
         ["CONTINUED pulled_at=2026-01-02T03:04:05Z args=--accept-origin guard=1"]
+    );
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        "https://example.com/carried.git",
+        "the carried origin is what the stamp records"
+    );
+
+    let run = fx.run(
+        &[],
+        &[
+            ("PROPOLIS_UPGRADE_REEXEC", "1"),
+            ("PROPOLIS_UPGRADE_PULLED_AT", "2026-01-02T03:04:05Z"),
+        ],
+    );
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert_eq!(
+        run.git_calls,
+        ["remote"],
+        "with no carried origin the re-executed run reads it and nothing else"
+    );
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        fx.origin_url().as_str()
     );
 
     let run = fx.run(&[], &[("PROPOLIS_UPGRADE_REEXEC", "1")]);
@@ -2545,7 +2728,7 @@ fn upgrade_with_signers_refuses_an_unsigned_head_and_accepts_a_signed_one() {
     let run = fx.run(&[], &[]);
     assert_refused_before_build(&fx, &run, &head);
     assert!(
-        run.stderr().contains("not signed by a key in"),
+        run.stderr().contains("not SSH-signed by a key in"),
         "{}",
         run.stderr()
     );
@@ -2586,7 +2769,7 @@ fn upgrade_with_signers_refuses_an_unlisted_key_and_a_writable_signers_file() {
     let run = fx.run(&[], &[]);
     assert_refused_before_build(&fx, &run, &head);
     assert!(
-        run.stderr().contains("not signed by a key in"),
+        run.stderr().contains("not SSH-signed by a key in"),
         "{}",
         run.stderr()
     );
@@ -2605,6 +2788,212 @@ fn upgrade_with_signers_refuses_an_unlisted_key_and_a_writable_signers_file() {
         "a file that cannot be trusted is not consulted: {:?}",
         run.git_calls
     );
+    assert_eq!(
+        run.fetches(),
+        0,
+        "a broken policy file is refused before the remote is contacted"
+    );
+}
+
+/// `gpg.format` selects the signing format only; `verify-commit` picks its backend from the
+/// signature itself, so a PGP-signed commit was handed to gpg with the owner's keyring, which the
+/// signers file does not govern: on a box whose owner had imported the signer's key (GitHub's
+/// web-flow key is the common case) a web-interface merge passed the gate. The run is given the
+/// keyring that holds the throwaway key, the shape of that box, and must still refuse.
+#[test]
+fn upgrade_with_signers_refuses_a_pgp_signed_head_even_when_the_box_holds_the_key() {
+    let fx = UpgradeFixture::new();
+    let (_key, public) = fx.ssh_key("listed");
+    fx.write_signers(&[&public]);
+    let gnupg_home = fx.push_pgp_signed("merged in the web interface");
+    let head = fx.head();
+    let run = fx.run(&[], &[("GNUPGHOME", gnupg_home.to_str().unwrap())]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("not SSH-signed by a key in"),
+        "{}",
+        run.stderr()
+    );
+    assert!(!run.merged(), "{:?}", run.git_calls);
+}
+
+/// The signers file is a policy root reads; a symbolic link would let whoever owns the link's
+/// target write the policy, and it is refused by name rather than by the mode check that happened
+/// to catch it. Like the other file checks, before any fetch.
+#[test]
+fn upgrade_refuses_a_symlinked_signers_file_before_the_fetch() {
+    let fx = UpgradeFixture::new();
+    let (_key, public) = fx.ssh_key("listed");
+    let target = fx.tmp.path().join("elsewhere-signers");
+    std::fs::write(&target, format!("owner namespaces=\"git\" {public}\n")).unwrap();
+    std::os::unix::fs::symlink(&target, fx.signers_path()).unwrap();
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("is a symbolic link"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(run.fetches(), 0, "{:?}", run.git_calls);
+}
+
+/// A stamp whose `origin_url` key is present but empty is not a stamp from before the field: the
+/// last deploy ran where git could not read the checkout (root, SUDO_UID naming another account)
+/// and recorded nothing. Treating it as "no record" would leave the check unarmed on every later
+/// upgrade without a word; it is refused with the override, and `--accept-origin` records the
+/// origin read as the owner.
+#[test]
+fn upgrade_refuses_a_stamp_that_recorded_an_empty_origin_until_one_is_accepted() {
+    let fx = UpgradeFixture::new();
+    std::fs::write(
+        fx.stamp_path(),
+        "{\"head_sha\": \"\", \"origin_main_sha\": \"\", \"origin_url\": \"\", \"branch\": \"main\", \"pulled_at\": \"\", \"built_at\": \"\", \"installed\": {\"propolis\": \"\", \"console\": \"\"}}\n",
+    )
+    .unwrap();
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("recorded an empty origin") && stderr.contains("--accept-origin"),
+        "the refusal must say what is wrong and how to arm the check: {stderr}"
+    );
+    assert_eq!(run.fetches(), 0);
+
+    let run = fx.run(&["--accept-origin"], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        fx.origin_url().as_str(),
+        "the origin the script read is recorded, so the next run is checked"
+    );
+    let run = fx.run(&[], &[]);
+    assert!(run.output.status.success(), "stderr: {}", run.stderr());
+}
+
+/// The box's remote carries userinfo (a token); the comparison is of the stripped form on both
+/// sides, and neither a refusal nor the stamp ever prints the token. The `probe://` remote fetches
+/// through the fixture's helper, so the matching case runs the whole pull.
+#[test]
+fn upgrade_compares_the_origin_without_its_userinfo_and_never_prints_it() {
+    let fx = UpgradeFixture::new();
+    git(
+        &fx.repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "probe://deploy:tok@example.invalid/origin.git",
+        ],
+    );
+    std::fs::write(
+        fx.stamp_path(),
+        "{\"head_sha\": \"\", \"origin_main_sha\": \"\", \"origin_url\": \"probe://example.com/elsewhere.git\", \"branch\": \"main\", \"pulled_at\": \"\", \"built_at\": \"\", \"installed\": {\"propolis\": \"\", \"console\": \"\"}}\n",
+    )
+    .unwrap();
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("the checkout's origin is probe://example.invalid/origin.git"),
+        "the refusal names the stripped URL: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tok") && !stderr.contains("deploy:"),
+        "a refusal must never print the remote's credentials: {stderr}"
+    );
+    assert_eq!(run.fetches(), 0);
+
+    std::fs::write(
+        fx.stamp_path(),
+        "{\"head_sha\": \"\", \"origin_main_sha\": \"\", \"origin_url\": \"probe://example.invalid/origin.git\", \"branch\": \"main\", \"pulled_at\": \"\", \"built_at\": \"\", \"installed\": {\"propolis\": \"\", \"console\": \"\"}}\n",
+    )
+    .unwrap();
+    fx.push_change(false);
+    let run = fx.run(&[], &[]);
+    assert!(
+        run.output.status.success(),
+        "a record equal to the stripped remote passes: {}",
+        run.stderr()
+    );
+    assert_eq!(run.fetches(), 1);
+    assert_eq!(fx.head(), git(&fx.author, &["rev-parse", "HEAD"]));
+    let stamp = std::fs::read_to_string(fx.stamp_path()).unwrap();
+    assert!(
+        !stamp.contains("tok") && !stamp.contains("deploy:"),
+        "{stamp}"
+    );
+    assert_eq!(
+        stamp_json(&fx.stamp_path())["origin_url"],
+        "probe://example.invalid/origin.git"
+    );
+}
+
+/// A clone whose fetch refspec does not bring `main` (or a remote without one) has no
+/// `origin/main` after the fetch. That is reported as such, not as a missing signature or a
+/// commit that is not an ancestor, and nothing is merged.
+#[test]
+fn upgrade_refuses_a_fetch_that_brings_no_origin_main_by_name() {
+    let fx = UpgradeFixture::new();
+    git(&fx.author, &["branch", "-q", "other"]);
+    git(&fx.author, &["push", "-q", "origin", "other"]);
+    git(
+        &fx.repo,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/other:refs/remotes/origin/other",
+        ],
+    );
+    git(&fx.repo, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("brought no origin/main"),
+        "the refusal names the missing ref: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not SSH-signed") && !stderr.contains("not an ancestor"),
+        "{stderr}"
+    );
+    assert_eq!(run.fetches(), 1);
+    assert!(!run.merged(), "{:?}", run.git_calls);
+}
+
+/// The commit the checks looked at is the commit that is merged: the block resolves
+/// `origin/main` once and every later git command names that commit, not the ref.
+#[test]
+fn upgrade_resolves_origin_main_once_and_merges_that_commit() {
+    let block = pull_and_reexec_block();
+    let resolve =
+        "TARGET=\"$(as_owner git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}')\"";
+    assert!(
+        block.contains(resolve),
+        "the block must resolve the target once"
+    );
+    let after_resolve = &block[block.find(resolve).unwrap() + resolve.len()..];
+    for line in after_resolve.lines() {
+        let code = line.trim_start();
+        if code.starts_with('#') || code.starts_with("echo ") {
+            continue;
+        }
+        assert!(
+            !code.contains("refs/remotes/origin/main") && !code.contains("origin/main.."),
+            "a git command after the resolve must use \"$TARGET\", not the ref: {line}"
+        );
+    }
+    for needle in [
+        "verify-commit \"$TARGET\"",
+        "merge-base --is-ancestor HEAD \"$TARGET\"",
+        "\"$TARGET..HEAD\"",
+        "merge --ff-only \"$TARGET\"",
+    ] {
+        assert!(block.contains(needle), "missing `{needle}` in the block");
+    }
 }
 
 /// Both loops run under `set -e` with an explicit check, so a listed binary the build did not

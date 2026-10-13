@@ -360,9 +360,27 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
 - **Collector.** Do not run `deploy/upgrade.sh`. It restarts `propolis.service` on every host
   (`deploy/upgrade.sh#systemctl restart propolis.service`), which on a collector either fails,
   stopping the script before it restarts the shipper, or starts the daemon if a `propolis.env`
-  exists. Instead, as the owner of the checkout, `git pull` and
-  `cargo build --release --workspace --locked`; then, as root from the top of the same checkout
-  (`sudo -i` would start you in `/root`, where these relative paths do not exist):
+  exists. Instead, as the owner of the checkout, fetch and fast-forward by hand with the same
+  checks `upgrade.sh` makes, then build:
+
+  ```sh
+  git status --porcelain --untracked-files=normal   # must print nothing
+  git remote get-url origin                         # must be the remote you expect
+  git fetch origin
+  # only with /etc/propolis/upgrade-signers on this box (see "Signed upgrades")
+  git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/propolis/upgrade-signers \
+      -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
+      verify-commit refs/remotes/origin/main
+  git merge --ff-only refs/remotes/origin/main
+  cargo build --release --workspace --locked
+  ```
+
+  The first two lines are the dirty check and the origin pin done by eye: this path writes no
+  deploy stamp, so the origin a collector's stamp records is the one `install.sh` saw and is
+  never refreshed (see [what the pull trusts](upgrade-rollback-and-dr.md#what-the-pull-trusts)).
+  Then, as root
+  from the top of the same checkout (`sudo -i` would start you in `/root`, where these relative
+  paths do not exist):
 
   ```sh
   for bin in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred shipper; do

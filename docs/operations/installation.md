@@ -176,7 +176,7 @@ forms are collected in [../reference/commands.md](../reference/commands.md).
 In-place upgrades use `sudo ./deploy/upgrade.sh` (requires root): it fast-forwards the checkout
 to `origin/main` (refusing a dirty tree, a remote that differs from the one the last deploy
 recorded unless `--accept-origin` is given, a commit `main` does not have, and, where
-`/etc/propolis/upgrade-signers` exists, an unsigned head; see
+`/etc/propolis/upgrade-signers` exists, a head without an SSH signature by a listed key; see
 [what the pull trusts](upgrade-rollback-and-dr.md#what-the-pull-trusts)), runs
 `cargo build --release --workspace --locked` as the repo-owner user, reinstalls the binaries, runs
 `provision.sh`, runs `provision-tls.sh` (idempotent; keeps any existing TLS pair), reinstalls the unit files, logrotate config and free-space guard, runs

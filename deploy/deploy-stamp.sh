@@ -22,7 +22,9 @@
 #   OUT_FILE   file to write                 (default /var/lib/propolis/deploy-stamp.json)
 #   BIN_DIR    where the binaries were installed (default /usr/local/bin)
 # Environment:
-#   PROPOLIS_DEPLOY_PULLED_AT   when the deploy pulled, RFC 3339 UTC (default: now)
+#   PROPOLIS_DEPLOY_PULLED_AT    when the deploy pulled, RFC 3339 UTC (default: now)
+#   PROPOLIS_DEPLOY_ORIGIN_URL   the origin URL the deploy pulled from, userinfo already stripped
+#                                (default: read from the checkout, as its owner when run as root)
 #
 # Run this AFTER the binaries are installed, never before: the `installed` field below is read back
 # from the files that landed on disk, so a stamp written earlier would describe an install that had
@@ -60,8 +62,35 @@ BRANCH="$(git_field rev-parse --abbrev-ref HEAD)"
 # and the pane then says it cannot tell whether the box is behind rather than claiming it is not.
 ORIGIN_MAIN_SHA="$(git_field rev-parse refs/remotes/origin/main)"
 # Without the userinfo an https URL can carry (a token): the file is 0644. upgrade.sh strips the
-# live URL the same way before comparing it with this.
-ORIGIN_URL="$(git_field remote get-url origin | sed 's#^\([a-z][a-z0-9+.-]*://\)[^/@]*@#\1#')"
+# live URL the same way before comparing it with this, and hands its copy over, because this
+# script runs as root and git refuses root a checkout someone else owns unless sudo's SUDO_UID
+# names that owner: an admin account upgrading a deploy user's checkout would otherwise record an
+# empty origin here, which upgrade.sh then refuses to pin against. Without the hand-over (install.sh)
+# the read runs as the owner for the same reason; that branch runs only as root, so the fixtures
+# that run this script as a user do not reach it.
+strip_userinfo() { sed 's#^\([a-z][a-z0-9+.-]*://\)[^/@]*@#\1#'; }
+origin_url_as_owner() {
+    local owner
+    owner="$(stat -c '%u' "$REPO_DIR" 2>/dev/null || echo 0)"
+    if [ "$(id -u)" -eq 0 ] && [ "$owner" != 0 ]; then
+        sudo -u "#$owner" git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true
+    else
+        git_field remote get-url origin
+    fi
+}
+if [ -n "${PROPOLIS_DEPLOY_ORIGIN_URL+x}" ]; then
+    ORIGIN_URL="$PROPOLIS_DEPLOY_ORIGIN_URL"
+else
+    ORIGIN_URL="$(origin_url_as_owner | strip_userinfo)"
+fi
+# The stamp is printf'd into JSON with no escaping (every other field is a hash, a branch or a
+# timestamp); a URL with a quote or backslash would break the whole file, which the console reads
+# as no stamp and upgrade.sh as an empty origin. It is left unrecorded instead, and said so.
+case "$ORIGIN_URL" in
+    *'"'* | *\\*)
+        echo "warning: the origin URL contains a quote or backslash and is not recorded in the deploy stamp" >&2
+        ORIGIN_URL="" ;;
+esac
 # This script runs immediately after the build, so now IS the build time. The pull happened
 # earlier in the same deploy, so the caller passes it rather than letting the two fields carry the
 # same number and pretend to be two facts.

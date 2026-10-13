@@ -16,7 +16,10 @@
 # What gets built and installed as root is whatever the pull brings in, so the pull is held to the
 # checks in the pull-and-reexec block below: a clean tree, the origin the last deploy recorded, a
 # fast-forward of origin/main, and, when /etc/propolis/upgrade-signers exists, a commit signed by
-# one of the keys in it. See docs/operations/upgrade-rollback-and-dr.md, "What the pull trusts".
+# one of the SSH keys in it. The checks hold against the remote and against operator mistakes,
+# not against the checkout's owner account: that account builds the binaries root installs
+# unchanged, so it is trusted by construction. See docs/operations/upgrade-rollback-and-dr.md,
+# "What the pull trusts".
 #
 # PROPOLIS_UPGRADE_ROOT reads the deploy stamp and the signers file under that directory instead
 # of / (tests, like rollback.sh's PROPOLIS_ROLLBACK_ROOT).
@@ -60,6 +63,9 @@ stamp_field() {
     [ -r "$STAMP_FILE" ] || return 0
     sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p" "$STAMP_FILE" | head -n 1 || true
 }
+# A key that is present but empty means the last deploy could not read the value, which is not
+# the same as a stamp written before the field existed; the origin check treats the two apart.
+stamp_has_field() { [ -r "$STAMP_FILE" ] && grep -q "\"$1\":" "$STAMP_FILE"; }
 # The userinfo part of an https URL can be a token; the stamp is world-readable, so it records
 # and compares the URL without it. deploy-stamp.sh strips it the same way.
 strip_userinfo() { sed 's#^\([a-z][a-z0-9+.-]*://\)[^/@]*@#\1#'; }
@@ -74,66 +80,115 @@ refuse() {
 echo "==> pulling latest"
 if [ -n "${PROPOLIS_UPGRADE_REEXEC:-}" ]; then
     PULLED_AT="${PROPOLIS_UPGRADE_PULLED_AT:?PROPOLIS_UPGRADE_REEXEC is set without PROPOLIS_UPGRADE_PULLED_AT}"
+    # The run that re-executed this one may predate the origin check (a box upgrading from a
+    # release without it) and then carries no origin; reading it here is not a check, the pull
+    # already happened, it only keeps the stamp this run writes complete.
+    ORIGIN_URL="${PROPOLIS_UPGRADE_ORIGIN_URL:-}"
+    if [ -z "$ORIGIN_URL" ]; then
+        ORIGIN_URL="$(as_owner git remote get-url origin 2>/dev/null | strip_userinfo || true)"
+    fi
     echo "    already pulled by the run that re-executed this script"
 else
     PULLED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     SCRIPT_SUM_BEFORE="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
 
     # An operator's uncommitted edit would otherwise be built and installed as root as though it
-    # had been reviewed and merged. Untracked files count: a build can pick those up too.
-    DIRTY="$(as_owner git status --porcelain)"
+    # had been reviewed and merged. Untracked files count: a build can pick those up too. The
+    # untracked mode is pinned so the owner's status.showUntrackedFiles cannot narrow the check;
+    # ignored paths (target/, .env) are outside it either way.
+    DIRTY="$(as_owner git status --porcelain --untracked-files=normal)"
     if [ -n "$DIRTY" ]; then
         refuse "the checkout has local changes, which a root-installed build must not include:" \
             "$DIRTY" "commit, stash or discard them, then run the upgrade again"
     fi
 
-    # The remote is box-local git config that anyone with the owner account can point elsewhere;
-    # the deploy stamp remembers where the last deploy pulled from, and a different origin is a
-    # decision for the operator, never something this script discovers by building from it.
-    ORIGIN_URL="$(as_owner git remote get-url origin | strip_userinfo)"
+    # The remote is box-local git config, so a remote that moved since the last deploy is a
+    # decision for the operator (a mistyped set-url, a mispointed clone), never something this
+    # script discovers by building from it: the deploy stamp remembers where that deploy pulled
+    # from. This holds against operator mistakes, not against the owner account, which can edit
+    # the stamp's source of truth (the build) directly.
+    if ! ORIGIN_URL="$(as_owner git remote get-url origin 2>/dev/null)"; then
+        refuse "the checkout has no origin remote, so there is nothing to pull from" \
+            "add one (git remote add origin <url>) and run again with --accept-origin"
+    fi
+    case "$ORIGIN_URL" in
+        *'"'* | *\\*)
+            refuse "the origin URL contains a quote or backslash, which the deploy stamp cannot record" ;;
+    esac
+    ORIGIN_URL="$(printf '%s' "$ORIGIN_URL" | strip_userinfo)"
     RECORDED_ORIGIN="$(stamp_field origin_url)"
     if [ "$ACCEPT_ORIGIN" -eq 1 ]; then
         echo "    --accept-origin: pulling from $ORIGIN_URL; this run's deploy stamp records it"
-    elif [ -z "$RECORDED_ORIGIN" ]; then
+    elif ! stamp_has_field origin_url; then
         echo "    no deploy has recorded an origin yet; this run's deploy stamp records $ORIGIN_URL"
+    elif [ -z "$RECORDED_ORIGIN" ]; then
+        # The field is there and empty: the last deploy ran deploy-stamp.sh where git could not
+        # read the checkout (root, with sudo's SUDO_UID naming an account other than the owner).
+        # Proceeding would keep the check unarmed on every later upgrade without a word.
+        refuse "the last deploy recorded an empty origin, so this upgrade cannot check the checkout's ($ORIGIN_URL) against it" \
+            "run again with --accept-origin to record it; this script now records the origin it reads as the owner"
     elif [ "$ORIGIN_URL" != "$RECORDED_ORIGIN" ]; then
         refuse "the checkout's origin is $ORIGIN_URL but the last deploy pulled from $RECORDED_ORIGIN" \
             "if the move is deliberate, run again with --accept-origin (or re-run install.sh) to record the new origin"
     fi
 
-    as_owner git fetch origin
-
-    # Opt-in: the file's presence turns verification on, and from then on an unsigned or
-    # wrongly-signed origin/main is refused. The file must be root's and writable by no one else,
-    # or the account that can edit it could sign for itself.
-    if [ -e "$SIGNERS_FILE" ]; then
+    # Opt-in: the file's presence turns verification on, and from then on an origin/main without
+    # an SSH signature by a listed key is refused. The file must be a regular file, root's and
+    # writable by no one else, so that no other non-root account can list its own key (the owner
+    # account needs no such route: it builds what root installs). Checked before the remote is
+    # contacted, like the origin, so a broken policy file refuses without any network activity.
+    if [ -e "$SIGNERS_FILE" ] || [ -L "$SIGNERS_FILE" ]; then
+        if [ -L "$SIGNERS_FILE" ]; then
+            refuse "$SIGNERS_FILE is a symbolic link; the signers file must be a regular file root owns"
+        fi
         if [ -z "$ROOT" ] && [ "$(stat -c '%u' "$SIGNERS_FILE")" != 0 ]; then
             refuse "$SIGNERS_FILE is not owned by root"
         fi
         if [ -n "$(find "$SIGNERS_FILE" -maxdepth 0 -perm /022)" ]; then
             refuse "$SIGNERS_FILE is writable by its group or others (expected 0644)"
         fi
-        echo "    verifying origin/main against the signers in $SIGNERS_FILE"
+    fi
+
+    as_owner git fetch origin
+
+    # Resolved once, so the commit every check below looks at is the commit that gets merged: a
+    # fetch from elsewhere (the owner's editor, a cron job, a second operator) between the checks
+    # could otherwise move origin/main under them. A remote with no main branch is the usual
+    # reason for a missing ref, and it must not be reported as a signature or ancestry failure.
+    if ! TARGET="$(as_owner git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}')"; then
+        refuse "the fetch from $ORIGIN_URL brought no origin/main, so there is nothing to upgrade to" \
+            "the remote has no main branch, or the clone's fetch refspec does not include it"
+    fi
+
+    if [ -e "$SIGNERS_FILE" ]; then
+        echo "    verifying origin/main ($TARGET) against the signers in $SIGNERS_FILE"
+        # gpg.format picks the SIGNING format only; verification picks its backend from the
+        # signature itself, so a PGP-signed commit would be handed to gpg with the owner's keyring,
+        # which the signers file does not govern (any imported key, such as GitHub's web-flow key,
+        # would then pass). Both other backends are pointed at /bin/false so only an SSH signature
+        # can verify, and the SSH backend is pinned so the owner's gitconfig cannot replace it.
         if ! as_owner git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS_FILE" \
-            verify-commit refs/remotes/origin/main; then
-            refuse "origin/main is not signed by a key in $SIGNERS_FILE, so it will not be deployed" \
-                "sign the commit, add the key to the file, or remove the file to deploy unsigned commits"
+            -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
+            verify-commit "$TARGET"; then
+            refuse "origin/main ($TARGET) is not SSH-signed by a key in $SIGNERS_FILE, so it will not be deployed" \
+                "sign the commit with a listed SSH key, add the key to the file, or remove the file to deploy unsigned commits"
         fi
     fi
 
     # Only ever move forward onto what main has: a commit on this box that main lacks would be
     # merged into a root-installed build and would also never match the deploy stamp.
-    if ! as_owner git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
-        refuse "this checkout is not an ancestor of origin/main, so the upgrade cannot fast-forward" \
+    if ! as_owner git merge-base --is-ancestor HEAD "$TARGET"; then
+        refuse "this checkout is not an ancestor of origin/main ($TARGET), so the upgrade cannot fast-forward" \
             "commits here that origin/main does not have:" \
-            "$(as_owner git log --oneline refs/remotes/origin/main..HEAD)" \
+            "$(as_owner git log --oneline "$TARGET..HEAD")" \
             "reset the checkout to origin/main (or merge the commits into main) and run again"
     fi
-    as_owner git merge --ff-only refs/remotes/origin/main
+    as_owner git merge --ff-only "$TARGET"
     SCRIPT_SUM_AFTER="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
     if [ "$SCRIPT_SUM_BEFORE" != "$SCRIPT_SUM_AFTER" ]; then
         echo "==> deploy/upgrade.sh changed in the pull, re-executing the new version"
-        export PROPOLIS_UPGRADE_REEXEC=1 PROPOLIS_UPGRADE_PULLED_AT="$PULLED_AT"
+        export PROPOLIS_UPGRADE_REEXEC=1 PROPOLIS_UPGRADE_PULLED_AT="$PULLED_AT" \
+            PROPOLIS_UPGRADE_ORIGIN_URL="$ORIGIN_URL"
         exec "$BASH" "$SCRIPT_DIR/upgrade.sh" "$@"
     fi
 fi
@@ -251,9 +306,12 @@ install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propol
 # reports success for a deploy that did not finish. `deploy-stamp.sh` also reads each installed
 # binary's own `--version` output here, which is the only source that describes the actual bytes
 # now on disk rather than what this checkout merely intended to build - see that script's own
-# `installed_sha` comment.
+# `installed_sha` comment. The origin is handed over rather than read again there: deploy-stamp.sh
+# runs as root, which git refuses the owner's checkout unless sudo's SUDO_UID happens to name the
+# owner, and an origin it could not read would be recorded as empty and refused next time.
 echo "==> recording the deploy stamp"
-PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" "$SCRIPT_DIR/deploy-stamp.sh" "$REPO_DIR"
+PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" PROPOLIS_DEPLOY_ORIGIN_URL="$ORIGIN_URL" \
+    "$SCRIPT_DIR/deploy-stamp.sh" "$REPO_DIR" "$STAMP_FILE"
 
 # Before any restart, or the restarts would start the OLD unit definitions.
 echo "==> reloading systemd unit files"

@@ -102,6 +102,33 @@ because the console defaults to loopback-only. Binding the console to a routable
 address without a fronting proxy exposes operational metrics to the network. See
 [authn/authz](./authn-authz.md) and [attack surfaces](./attack-surfaces.md).
 
+## Deploying from the repository
+
+`deploy/upgrade.sh` fetches the repository, builds it as the checkout's owner and installs the
+result as root. Its checks (a clean tree, the origin the last deploy recorded, fast-forward
+only, and an SSH signature when `/etc/propolis/upgrade-signers` exists) hold against the
+remote and against operator mistakes; the checkout's owner account builds what root installs
+and is trusted by construction. What remains:
+
+- **Without a signers file, the remote is trusted.** A hostile or hijacked remote (a
+  compromised hosting account or push credential, a `core.sshCommand` in the owner's config,
+  an https interception the owner's CA store accepts) that serves any commit descending from
+  `HEAD` is fetched, built and installed as root. Origin pinning and fast-forward-only stop a
+  mispointed remote and a rollback, not the remote itself. Signing is the control, and it is
+  off by default.
+- **With signing on, the signature proves the author, not the intent to release.** The remote
+  may present any commit a listed key signed that descends from `HEAD`, including a signed
+  branch never meant for `main`, and the box deploys it.
+- **A freeze is not detected.** The remote may withhold new commits indefinitely; nothing on
+  the box knows that `main` has moved elsewhere. The fleet pane's "behind" reading is from
+  the last fetch, not a live query.
+- **The hand-run collector upgrade** in
+  [split deployment](../operations/split-deployment.md#upgrading) runs the fetch, signature
+  check and fast-forward by hand and skips the dirty check and the origin pin.
+
+The setup and the full list of what signing does and does not cover are in
+[upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md#signed-upgrades-recommended).
+
 ## Related
 
 - [Hardening checklist](./hardening-checklist.md)

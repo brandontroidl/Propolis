@@ -67,9 +67,11 @@ Whatever the pull brings in is built and installed as root, so `upgrade.sh` chec
 before it builds (`deploy/upgrade.sh#pull-and-reexec`). Each refusal says what it found and
 ends with "nothing was built or installed"; the checkout is left where it was.
 
-1. **A clean tree.** `git status --porcelain` must print nothing: an uncommitted edit on the
-   box, tracked or untracked, would otherwise be built and installed as though it had been
-   reviewed and merged. The refusal lists the files. Commit, stash or discard them.
+1. **A clean tree.** `git status --porcelain --untracked-files=normal` must print nothing: an
+   uncommitted edit on the box, tracked or untracked, would otherwise be built and installed
+   as though it had been reviewed and merged. The refusal lists the files. Commit, stash or
+   discard them. Ignored paths (`target/`, `.env`) are outside what `git status` reports, so
+   the check does not see them; nothing in the build reads them today.
 2. **The origin the last deploy pulled from.** The deploy stamp
    (`/var/lib/propolis/deploy-stamp.json`, `deploy/deploy-stamp.sh#origin_url`) records the
    `origin` URL of every install and upgrade, without any userinfo an https URL may carry.
@@ -79,24 +81,54 @@ ends with "nothing was built or installed"; the checkout is left where it was.
    building from it. When the move is deliberate, run `sudo ./deploy/upgrade.sh --accept-origin`
    once (or re-run `install.sh`); that run's stamp records the new origin and later runs need
    no flag. The first upgrade after this check exists has no record to compare with: it records
-   the origin and goes on.
+   the origin and goes on. A stamp whose record is present but empty is different: the last
+   deploy could not read the checkout's remote (see the note below) and the upgrade refuses
+   until `--accept-origin` records one, rather than leaving the check unarmed silently.
 3. **A signature, when you have opted in** (below). With `/etc/propolis/upgrade-signers`
-   present, the fetched `origin/main` must pass `git verify-commit` against the keys in that
-   file.
+   present, the fetched `origin/main` must carry an SSH signature by a key in that file. Only
+   SSH signatures are accepted: a PGP or X.509 signature fails whatever keys the box holds.
 4. **A fast-forward.** `HEAD` must be an ancestor of the fetched `origin/main`
    (`git merge-base --is-ancestor`) and the move is `git merge --ff-only`. A commit on the box
    that `main` does not have is listed and refused: reset the checkout to `origin/main`, or
    merge the commits into `main` and pull them back.
 
+`origin/main` is resolved to one commit right after the fetch, and the signature check, the
+ancestry check and the merge all name that commit, so a fetch that lands in between (an
+editor, a cron job, a second operator) cannot make the commit verified differ from the commit
+merged. A fetch that brings no `origin/main` at all (a remote without a `main` branch, a
+narrowed fetch refspec) is refused as that, not as a signature or ancestry failure.
+
 The checks run only on the first pass: when the pull changed `upgrade.sh` itself, the
 re-executed copy carries on from the pull it already did.
 
+**Whom the checks hold against.** They hold against the remote and against operator mistakes
+(a mistyped `set-url`, an edit left on the box, a push to `main` that should not have
+happened). They do not hold against the account that owns the checkout: that account builds
+`target/release/*`, which root installs unchanged, and owns `.git/hooks` and its own
+`~/.gitconfig`, so it can already put anything it likes into a release. It is trusted by
+construction, the same way the operator running `sudo` is. The signers file's `root 0644`
+rule is about every other non-root account on the box, none of which may be able to list a
+key of its own.
+
+Every git command in the pull runs as the checkout's owner, because git refuses root a
+directory someone else owns. The stamp is written by root after the install, so the origin
+is handed over from the pull (`PROPOLIS_DEPLOY_ORIGIN_URL`) rather than read again as root:
+git exempts root only for the uid in `SUDO_UID`, and an admin account upgrading a checkout a
+deploy user owns would otherwise record an empty origin on every deploy and never arm the
+check. `install.sh`'s stamp reads it as the owner for the same reason
+(`deploy/deploy-stamp.sh#origin_url_as_owner`).
+
 ### Signed upgrades (recommended)
 
-Fast-forward and origin pinning make the pull deploy exactly what `origin/main` is. Signing
-makes it deploy only what a holder of a listed key published: a compromised remote, a
-hijacked repository or a mistaken push to `main` then fails verification on the box instead
-of being built as root. It is off by default and turned on by one file on the box:
+Fast-forward and origin pinning make the pull deploy exactly what `origin/main` is. Without
+signing, that is the whole guarantee: a remote that is hostile or hijacked (a compromised
+hosting account or push credential, a `core.sshCommand` or an https interception the owner's
+CA store accepts) can serve any commit that descends from `HEAD`, and the box fetches it,
+builds it and installs it as root; origin pinning and fast-forward-only stop a mispointed
+remote and a rollback, not the remote itself. Signing makes the pull deploy only what a
+holder of a listed key published: a compromised remote, a hijacked repository or a mistaken
+push to `main` then fails verification on the box instead of being built as root. It is off
+by default and turned on by one file on the box:
 
 ```
 sudo install -m 0644 -o root -g root /dev/null /etc/propolis/upgrade-signers
@@ -110,8 +142,9 @@ you@example.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
 ```
 
 The first word is a label git reports; the key is the public half of the signing key. The
-file must be root's and writable by no one else (`0644`), or the account that can edit it
-could list its own key; the script refuses a file that is not.
+file must be a regular file (not a symbolic link), root's and writable by no one else
+(`0644`), or another non-root account that can edit it could list its own key; the script
+refuses a file that is not, before it contacts the remote.
 
 On the machine you commit from, sign every commit with SSH:
 
@@ -130,13 +163,25 @@ What this does and does not cover:
 - Only the commit at `origin/main` is verified, every time, including when the checkout is
   already at it. The signature says who published the tip, not that every ancestor was
   signed.
-- The tip must be a commit you signed. A merge or squash commit made in the GitHub web
-  interface is signed by GitHub's own GPG key, which the box does not hold, so with signing
-  on, land work on `main` from the command line (`git merge --ff-only`, or a rebase and push).
+- Only an SSH signature by a listed key passes. `git verify-commit` picks its backend from the
+  signature, not from `gpg.format`, so the script points the PGP and X.509 backends at
+  `/bin/false`: a PGP-signed commit is refused even when the owner's keyring holds the
+  signer's key. A merge or squash commit made in the GitHub web interface is PGP-signed by
+  GitHub's web-flow key and is therefore refused, so with signing on, land work on `main`
+  from the command line (`git merge --ff-only`, or a rebase and push).
+- The signature proves who published the commit, not that it was meant for `main`. The remote
+  can present any commit a listed key signed that descends from `HEAD`, including a signed
+  branch never meant to be released, and the box deploys it.
+- The remote can withhold new commits indefinitely (a freeze); nothing on the box detects
+  that `main` has moved elsewhere. The fleet pane's `origin_main_sha` is what the last fetch
+  saw, not a live query.
 - **CI does not verify signatures**, and nothing in the repository enforces them. The check
   happens on the box, against that box's file, at upgrade time only. A key is rotated by
   adding the new line, upgrading, then removing the old one.
 - Removing the file turns verification off again; the next upgrade says nothing about it.
+
+These are the residual risks of deploying from the repository; they are listed with the
+others in [residual risks](../security/residual-risks.md#deploying-from-the-repository).
 
 > **Rebuild after any dependency or vendoring change.** Run
 > `cargo build --release --locked` and confirm it succeeds before restarting -

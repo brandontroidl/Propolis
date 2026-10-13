@@ -55,7 +55,7 @@ pub use command_flood::{
 pub use config::SensorConfig;
 pub use connection_tracker::{CONNECTION_GRACE, ConnectionTracker, QuiesceOutcome};
 pub use emit::EventEmitter;
-pub use env::{EnvError, env_with_legacy, strict_env_var};
+pub use env::{Env, EnvError, env_with_legacy, strict_env_var};
 pub use handoff::{
     CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome, DrainReport,
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, session_end_metadata,

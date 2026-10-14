@@ -560,25 +560,6 @@ fn a_file_read_for_a_byte_of_output_is_charged_whole() {
     }
 }
 
-/// Two reads that each fit the allowance but not together: the second stops the line.
-#[test]
-fn repeated_reads_that_print_nothing_run_the_line_out() {
-    let size = busybox_len();
-    for read in [
-        "tail -c 1 /bin/busybox >/dev/null",
-        "grep -F -f /bin/busybox /dev/null",
-        "dd if=/bin/busybox of=/tmp/x 2>/dev/null",
-    ] {
-        let (mut sh, _) = limited(|l| l.work_per_line = size + size / 2);
-        let (out, _) = sh.handle_input(format!("{read}; {read}; echo after"));
-        assert!(
-            !out.contains("after"),
-            "{read}: the second read stops the line: {out:?}"
-        );
-        assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Work), "{read}");
-    }
-}
-
 /// A reader that prints what it read costs the line once, not twice.
 #[test]
 fn a_reader_that_prints_its_read_is_not_charged_twice() {

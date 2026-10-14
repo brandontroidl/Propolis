@@ -699,9 +699,15 @@
   standard input), so a reader cannot skip it: the callers that charged for their own reads
   no longer do, the evaluator charges a command's output only beyond what its reads already
   paid (`cat` of a file costs the line once), and a test lists every direct filesystem read so a
-  new one has to be accounted for. `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs`
-  run each reproducer through the real listener and hold every line to 20 s and to
-  `LINE_WORKING_SET_BYTES` of heap.
+  new one has to be accounted for. `grep` compiled every pattern of an `-e` or `-f` list before it
+  charged any of them, so a 4 KB file of 13-byte patterns that each compile to about 200 KB held
+  some 800 MB at once; each pattern is now charged (its bytes, then the heap it compiled to) as
+  it is built, the list stops at 4,096 patterns or 4 MiB of compiled programs with GNU's
+  `grep: memory exhausted`, and a single pattern past 32 KiB reads as `Regular expression too
+  big`, as one past the instruction limit already did. `crates/sensor-telnet/tests/shell_cost.rs`
+  runs the reproducers through the real listener (the `tail`, `grep -f` and `dd` loops among
+  them) and holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap;
+  `crates/sensor-adb/tests/shell_cost.rs` does the same for the ADB sensor's commands.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

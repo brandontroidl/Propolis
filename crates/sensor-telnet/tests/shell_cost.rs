@@ -349,3 +349,68 @@ fn a_dense_append_line_over_a_large_assembly_completes() {
     let out = session.run("wc -c g");
     assert!(out.contains("\r\n151920 g\r\n"), "{out:?}");
 }
+
+/// A file read for a byte of output (or none) is charged whole, so a loop of it runs the line out
+/// instead of holding the sensor: each of these printed almost nothing, charged almost nothing,
+/// and looped for minutes per line before the charge moved into `read_operand`.
+#[test]
+fn loops_of_reads_that_print_nothing_run_the_line_out() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /tmp");
+    session.run("while :; do tail -c 1 /bin/busybox >/dev/null; done");
+    session.run("while :; do grep -F -f /bin/busybox /dev/null; done");
+    session.run("cp /bin/busybox f");
+    session.run("while :; do dd if=f of=f conv=notrunc 2>/dev/null; done");
+    let out = session.run("echo ok");
+    assert!(out.contains("\r\nok\r\n"), "{out:?}");
+}
+
+/// Once a line's allowance is spent a reader with thousands of operands reads none of the rest
+/// (`read_operand` returns nothing): each read of the 2 MiB image costs real time even when its
+/// bytes are then thrown away.
+#[test]
+fn operands_after_the_allowance_is_spent_are_not_read() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("l=/bin/busybox; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do l=\"$l $l\"; done");
+    // `tail` walks every operand and prints one byte of the last, so only the read itself can
+    // stop it: without the guard the 16,384 reads of the image take longer than the line's time.
+    session.run("tail -c 1 $l >/dev/null");
+    let out = session.run("echo ok");
+    assert!(out.contains("\r\nok\r\n"), "{out:?}");
+}
+
+/// `grep -f` compiled every pattern in its file before it charged any: 3,000 lines of a 13-byte
+/// pattern that compiles to some 8,000 instructions held hundreds of megabytes at once. The
+/// patterns are charged as they are built, so the line runs out first.
+#[test]
+fn grep_patterns_are_charged_as_they_are_compiled() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /tmp");
+    session.run("w=x; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do w=\"$w $w\"; done");
+    session.run("p='(a{255}){31}'; for i in $w; do echo $p; done > pats");
+    let out = session.run("wc -l pats");
+    assert!(out.contains("\r\n4096 pats\r\n"), "{out:?}");
+    session.run("echo aaa | grep -E -f pats");
+    // Past the count cap grep answers as GNU does when it cannot hold the list.
+    session.run("w=\"$w $w\"; for i in $w; do echo a; done > many");
+    let out = session.run("echo a | grep -F -f many; echo status $?");
+    assert!(
+        out.contains("grep: memory exhausted\r\nstatus 2\r\n"),
+        "{out:?}"
+    );
+    // A pattern past 32 KiB is refused before its parse tree (about 50 bytes a byte) is built.
+    session.run("printf '%065536d' 0 > big");
+    let out = session.run("echo a | grep -f big; echo status $?");
+    assert!(
+        out.contains("grep: Regular expression too big\r\nstatus 2\r\n"),
+        "{out:?}"
+    );
+    let out = session.run("printf 'foo\\nb.r\\n' > few; printf 'xbar\\nzzz\\n' | grep -f few");
+    assert!(out.contains("\r\nxbar\r\n"), "{out:?}");
+}

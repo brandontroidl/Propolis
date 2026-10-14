@@ -40,6 +40,18 @@ const USAGE: &str =
 /// The most files `-r` visits.
 const RECURSE_MAX: usize = 2_048;
 const RECURSE_DEPTH: u32 = 16;
+/// The most patterns one grep holds, over `-e`, `-f` and newline-separated words together. A
+/// word list in the thousands is real; one in the millions is an attack on the heap, and GNU
+/// itself answers `memory exhausted` at some size.
+const PATTERNS_MAX: usize = 4_096;
+/// The most heap the compiled patterns hold in all. A pattern as short as 13 bytes compiles to
+/// about 200 KB, so the count cap alone would still allow most of a gigabyte.
+const COMPILED_MAX_BYTES: u64 = 4 * 1_048_576;
+/// What a fixed pattern holds beyond its needle bytes: the boxed `Finder` (its searcher state is
+/// inline, 288 bytes under memchr 2.8.3 as measured with a counting allocator, one block plus the
+/// needle's) and two allocator headers rounded up to 16 bytes each.
+const FIXED_OVERHEAD: u64 = size_of::<Finder<'static>>() as u64 + 32;
+const MEMORY_EXHAUSTED: &str = "grep: memory exhausted\n";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -575,8 +587,13 @@ impl FakeShell {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
                     let body = text.strip_suffix('\n').unwrap_or(&text);
-                    if !body.is_empty() || !text.is_empty() {
-                        plan.patterns.extend(body.split('\n').map(str::to_string));
+                    if !text.is_empty() {
+                        for word in body.split('\n') {
+                            if plan.patterns.len() >= PATTERNS_MAX {
+                                return usage_error(MEMORY_EXHAUSTED.to_string());
+                            }
+                            plan.patterns.push(word.to_string());
+                        }
                     }
                 }
                 Err(error) => {
@@ -596,9 +613,17 @@ impl FakeShell {
         } else {
             Kind::Re(Syntax::Basic)
         };
+        // Each pattern is charged to the line as it is built, before the next is: the pattern's
+        // bytes first, then the heap it compiled to, so a list that would hold more than the line
+        // can pay for stops at the pattern that overruns, not after all of them are in memory.
         let mut matchers = Vec::new();
+        let mut held = 0u64;
         for pattern in plan.patterns.iter().flat_map(|p| p.split('\n')) {
-            match kind {
+            let keep = len_u64(pattern.len());
+            if matchers.len() >= PATTERNS_MAX || !self.charge_work(keep) {
+                return self.pattern_refusal();
+            }
+            let cost = match kind {
                 Kind::Fixed => {
                     let needle = if plan.fold {
                         pattern.as_bytes().to_ascii_lowercase()
@@ -606,13 +631,22 @@ impl FakeShell {
                         pattern.as_bytes().to_vec()
                     };
                     matchers.push(Matcher::Fixed(Box::new(Finder::new(&needle).into_owned())));
+                    keep.saturating_add(FIXED_OVERHEAD)
                 }
                 Kind::Re(syntax) => match Regex::new(pattern.as_bytes(), syntax, plan.fold) {
-                    Ok(re) => matchers.push(Matcher::Re(re)),
+                    Ok(re) => {
+                        let heap = re.heap_bytes();
+                        matchers.push(Matcher::Re(re));
+                        heap
+                    }
                     Err(error) => {
                         return CommandResult::stderr(2, format!("grep: {}\n", error.message()));
                     }
                 },
+            };
+            held = held.saturating_add(cost);
+            if held > COMPILED_MAX_BYTES || !self.charge_work(cost) {
+                return self.pattern_refusal();
             }
         }
         let search = Search {
@@ -740,6 +774,16 @@ impl FakeShell {
             u8::from(!any)
         };
         acc
+    }
+
+    /// The reply when the patterns outgrow what the line may hold: the line stops if its allowance
+    /// is what ran out, and otherwise grep reports `memory exhausted` as GNU does.
+    fn pattern_refusal(&self) -> CommandResult {
+        if self.line.exhausted() {
+            stopped()
+        } else {
+            usage_error(MEMORY_EXHAUSTED.to_string())
+        }
     }
 
     /// The files a recursive grep reads under each operand, in listing order, bounded.

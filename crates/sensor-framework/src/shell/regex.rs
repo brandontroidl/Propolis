@@ -19,6 +19,10 @@
 /// The most instructions one compiled pattern may hold; a bigger pattern is refused as GNU grep
 /// refuses one past its own limits.
 const MAX_INSTS: usize = 8_192;
+/// The longest pattern source compiled. The parse tree costs about 50 bytes per source byte
+/// before the instruction limit can refuse it, so a megabyte pattern would build tens of megabytes
+/// of tree for nothing; one past this reads as too big, as one past the instruction limit does.
+const MAX_PATTERN_BYTES: usize = 32_768;
 /// The largest bound an interval may name, as `RE_DUP_MAX` is on glibc.
 const MAX_REPEAT: u32 = 255;
 
@@ -645,6 +649,9 @@ impl Regex {
         fold: bool,
         awk_escapes: bool,
     ) -> Result<Self, RegexError> {
+        if pattern.len() > MAX_PATTERN_BYTES {
+            return Err(RegexError::TooBig);
+        }
         let mut parser = Parser {
             src: pattern,
             pos: 0,
@@ -671,6 +678,19 @@ impl Regex {
             insts: compiler.insts,
             sets: compiler.sets,
         })
+    }
+
+    /// The heap this program holds, which is what a caller that keeps many of them must charge.
+    pub(super) fn heap_bytes(&self) -> u64 {
+        let insts = self
+            .insts
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Inst>());
+        let sets = self
+            .sets
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ByteSet>());
+        u64::try_from(insts.saturating_add(sets)).unwrap_or(u64::MAX)
     }
 
     /// The work one scan of `len` bytes costs: every byte steps every live thread.

@@ -1,7 +1,8 @@
 //! The capture limit of a payload streamed over an exec's stdin or the shell is the spool's
-//! per-file cap, 10 MB. An upload under it is kept whole; one over it is cut at the limit and the
+//! per-file cap, 16 MiB. An upload under it is kept whole; one over it is cut at the limit and the
 //! event says so (`truncated`, the real `wire_size`), so a hash of the prefix is never read as the
-//! hash of the file. The 6.6 MB worm that used to be cut at 1,000,000 bytes is the case.
+//! hash of the file. The cases are a 6.6 MB worm that used to be cut at 1,000,000 bytes and a
+//! 10,027,008-byte miner that used to be cut at 10,000,000.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -125,8 +126,24 @@ async fn uploads(log_path: &std::path::Path) -> sensor_wire::SensorEvent {
 }
 
 #[test]
-fn the_limit_is_the_spool_per_file_cap_in_decimal_megabytes() {
-    assert_eq!(SPOOL_MAX_FILE_BYTES, 10_000_000);
+fn the_limit_is_the_spool_per_file_cap_of_16_mib() {
+    assert_eq!(SPOOL_MAX_FILE_BYTES, 16 * 1024 * 1024);
+}
+
+/// The size of a miner sent over an exec's stdin that the 10,000,000-byte limit cut on every
+/// attempt.
+const MINER_BYTES: usize = 10_027_008;
+
+#[tokio::test]
+async fn a_10_027_008_byte_stdin_transfer_is_captured_whole() {
+    let body = body_of(MINER_BYTES);
+    let event = upload(&body).await;
+    let sample = event.sample.as_ref().expect("the upload has a sample");
+    assert_eq!(sample.size, MINER_BYTES as u64);
+    assert_eq!(sample.sha256, sha256_hex(&body));
+    assert_eq!(event.metadata["wire_size"], MINER_BYTES as u64);
+    assert_eq!(event.metadata["truncated"], false);
+    assert_eq!(event.metadata["complete"], true);
 }
 
 #[tokio::test]
@@ -151,7 +168,7 @@ async fn an_upload_just_over_the_limit_is_cut_at_it_and_flagged_truncated() {
     assert_eq!(
         sample.sha256,
         sha256_hex(kept),
-        "the sample is the first 10 MB of the upload, byte for byte"
+        "the sample is the first 16 MiB of the upload, byte for byte"
     );
     assert_eq!(event.metadata["truncated"], true);
     assert!(

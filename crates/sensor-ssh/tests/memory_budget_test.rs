@@ -140,8 +140,11 @@ fn the_capture_limit_is_the_spool_cap_and_the_budgets_hold_many_of_them() {
         ),
         "the default capture limit must be the spool's per-file cap, not a number of its own"
     );
-    assert_eq!(SPOOL_MAX_FILE_BYTES, 10_000_000);
-    // Every spooling sensor's per-file cap is the same literal, so the ssh limit agrees with them.
+    assert_eq!(SPOOL_MAX_FILE_BYTES, 16 * 1024 * 1024);
+    // The framework's largest kept body, which is the indicator scan's size limit, so the scan
+    // reads every body this sensor keeps.
+    assert_eq!(SPOOL_MAX_FILE_BYTES, sensor_framework::SPOOL_MAX_FILE_BYTES);
+    // The other spooling sensors keep 10 MB, under it, so the scan reads theirs too.
     for sensor in ["adb", "ftp"] {
         let lib = workspace_file(&format!("crates/sensor-{sensor}/src/lib.rs"));
         assert!(
@@ -149,8 +152,11 @@ fn the_capture_limit_is_the_spool_cap_and_the_budgets_hold_many_of_them() {
             "sensor-{sensor}'s per-file cap is not 10_000_000"
         );
     }
-    // Room for at least ten maximum-size uploads at once, so one large upload never decides
-    // whether another is kept whole.
+    const {
+        assert!(10_000_000 < SPOOL_MAX_FILE_BYTES);
+    }
+    // Room for at least ten maximum-size uploads at once (twelve fit), so one large upload never
+    // decides whether another is kept whole.
     const {
         assert!(DEFAULT_CAPTURE_BUDGET_BYTES >= 10 * SPOOL_MAX_FILE_BYTES);
     }

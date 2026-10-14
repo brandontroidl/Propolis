@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-09
+last-verified: 2026-10-14
 -->
 
 # Campaigns and indicators
@@ -216,7 +216,7 @@ Extracted from every command line, every download URL, and every captured artifa
 A captured artifact that is small UTF-8 text is scanned whole. Anything else, a compiled bot
 included, is scanned through its printable strings the way `strings -a` lists them: runs of at
 least 6 printable bytes, at most 256 KiB of them (`crates/review/src/ioc.rs#printable_strings`).
-An artifact over 10 MB, the spool's per-file cap (`crates/review/src/ioc.rs#MAX_BINARY_SCAN_BYTES`),
+An artifact over 16 MiB, the largest body a sensor keeps (`crates/review/src/ioc.rs#MAX_BINARY_SCAN_BYTES`),
 is not scanned. A binary's persistence templates, such as an
 rc.local `sed` line or an `/etc/init.d/%s` script with `%s` where it fills in its own name, are
 kept as written.

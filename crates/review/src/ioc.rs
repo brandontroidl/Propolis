@@ -1718,6 +1718,25 @@ Jx4u80n/q0WquQbw1QIDAQAB
         assert_eq!(printable_strings(body, 6, 10), "abcdef\n");
     }
 
+    /// The SSH sensor keeps a payload streamed over stdin up to 16 MiB, so a 10,027,008-byte miner
+    /// it now keeps whole must be scanned, not shown "not scanned" for its size.
+    #[test]
+    fn a_binary_past_ten_megabytes_up_to_the_ssh_cap_is_scanned() {
+        for len in [10_027_008, 16 * 1024 * 1024] {
+            let mut body = vec![0u8; len];
+            let marker = b"\x00/etc/init.d/%s\x00";
+            let at = len - 1_000;
+            body[at..at + marker.len()].copy_from_slice(marker);
+            let (read, found) = extract_from_artifact(&body)
+                .unwrap_or_else(|| panic!("a {len}-byte body is refused for its size"));
+            assert_eq!(read, ArtifactRead::Strings);
+            assert!(
+                found.iter().any(|i| i.value.contains("/etc/init.d/%s")),
+                "{len}: {found:?}"
+            );
+        }
+    }
+
     /// The SSH sensor keeps a payload up to the spool cap, and a compiled bot at 8 to 10 MB was
     /// refused for its size, so it showed "not scanned".
     #[test]

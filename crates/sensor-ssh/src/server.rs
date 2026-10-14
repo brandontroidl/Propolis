@@ -61,11 +61,11 @@ const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const MAX_CHANNELS_PER_CONNECTION: usize = 10;
 
-/// The quarantine spool's per-file cap (10 MB, decimal, as every spooling sensor's). SCP and SFTP
-/// retain at most this much of an upload (`transfer.rs`), and it is the default of
+/// The quarantine spool's per-file cap (16 MiB), the framework's largest kept body, so the
+/// indicator scan reads every body this sensor keeps. It is the default of
 /// `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, which limits a payload streamed over the shell or an exec's
-/// stdin.
-pub const SPOOL_MAX_FILE_BYTES: u64 = 10_000_000;
+/// stdin. SCP and SFTP retain at most 10 MB of an upload (`transfer.rs`), under it.
+pub const SPOOL_MAX_FILE_BYTES: u64 = sensor_framework::SPOOL_MAX_FILE_BYTES;
 
 /// The most one line can add to a channel's output queue. A line's output is bounded by its work
 /// budget (`BudgetLimits::work_per_line`, 4_194_304: measured exactly at the cap for `cat` of a
@@ -604,10 +604,10 @@ pub async fn serve_with_budgets(
 
     let read_timeout = bounds.read_timeout;
     let idle_timeout = bounds.idle_timeout;
-    // Extracted before `bounds` is moved into `run_tcp_listener` below. This bounds only the
-    // shell-channel evidence capture buffer (see `handle_session`'s Shell branch) - a separate,
-    // much narrower ceiling than SCP/SFTP's own 10 MB per-file cap (see `transfer.rs` and
-    // `timeout_stream.rs`'s module doc for why the two are not the same budget).
+    // Extracted before `bounds` is moved into `run_tcp_listener` below. This bounds the shell
+    // channel's evidence capture and a command's held standard input, not SCP/SFTP, which keep
+    // their own per-file cap (see `transfer.rs`, and `timeout_stream.rs`'s module doc for why
+    // neither is enforced on the stream).
     let max_captured_bytes = bounds.max_captured_bytes;
     // Each connection builds its own budget from these limits: one ceiling for every shell and exec
     // channel it opens.
@@ -2123,7 +2123,7 @@ mod tests {
         let spool_dir = dir.path().join("spool");
         std::fs::create_dir(&spool_dir).unwrap();
         let outbox_dir = dir.path().join("outbox");
-        let spool = QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000);
+        let spool = QuarantineSpool::new(spool_dir, SPOOL_MAX_FILE_BYTES, 100_000_000);
         let emitter = EventEmitter::new(dir.path().join("events.jsonl"));
         std::mem::forget(dir);
         Arc::new(CaptureHandoff::new(
@@ -2297,7 +2297,7 @@ mod tests {
             sensor_framework::CAPTURE_CHUNK_BYTES,
         ));
         let handoff = Arc::new(CaptureHandoff::new(
-            QuarantineSpool::new(spool_dir, 10_000_000, 100_000_000),
+            QuarantineSpool::new(spool_dir, SPOOL_MAX_FILE_BYTES, 100_000_000),
             EventEmitter::new(dir.path().join("events.jsonl")),
             1,
             "test".to_string(),

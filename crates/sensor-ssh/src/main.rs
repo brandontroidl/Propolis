@@ -84,11 +84,11 @@ const DEFAULT_COLLECTOR_ID: &str = "local";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 600;
-/// The per-upload capture limit is the spool's per-file cap, not a number of its own: a payload
-/// streamed over the shell or an exec's stdin is cut at exactly the point the spool would refuse
-/// it, where SCP and SFTP uploads already are. At 1,000,000 a 6.6 MB Go worm was cut at a hash no
-/// reputation service knew. What the larger default costs in memory is bounded by the capture and
-/// output budgets, not by this number (docs/operations/capacity-planning.md).
+/// The per-upload capture limit is the spool's per-file cap, 16 MiB, not a number of its own: a
+/// payload streamed over the shell or an exec's stdin is cut at exactly the point the spool would
+/// refuse it. At 1,000,000 a 6.6 MB Go worm was cut at a hash no reputation service knew, and at
+/// 10,000,000 a 10,027,008-byte miner was. What the larger default costs in memory is bounded by
+/// the capture and output budgets, not by this number (docs/operations/capacity-planning.md).
 const DEFAULT_MAX_CAPTURED_BYTES: u64 = sensor_ssh::server::SPOOL_MAX_FILE_BYTES;
 const DEFAULT_MAX_CONCURRENT: u32 = 256;
 
@@ -343,8 +343,8 @@ mod tests {
         assert_eq!(c.bounds.read_timeout, Duration::from_millis(30_000));
         assert_eq!(c.bounds.idle_timeout, Duration::from_millis(60_000));
         assert_eq!(c.bounds.max_duration, Duration::from_secs(600));
-        // The spool's per-file cap, not 1_000_000 like the other sensors.
-        assert_eq!(c.bounds.max_captured_bytes, 10_000_000);
+        // The spool's per-file cap, 16 MiB, not 1_000_000 like the other sensors.
+        assert_eq!(c.bounds.max_captured_bytes, 16_777_216);
         assert_eq!(c.bounds.max_concurrent, 256);
         assert_eq!(c.banner, DEFAULT_BANNER);
         // 40% of the unit's 512M MemoryMax.

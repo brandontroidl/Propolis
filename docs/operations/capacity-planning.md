@@ -45,14 +45,16 @@ refuses (fail-closed) once the budget is reached (`crates/sensor-framework/src/s
 
 | Spool | Per-file cap | Global budget | Cite |
 |---|---|---|---|
-| `sensor-ssh`, `sensor-ftp`, `sensor-adb`, `sensor-telnet`, `sensor-tftp` capture | 10 MB | 100 MB | SSH `crates/sensor-ssh/src/server.rs#serve`, TFTP `crates/sensor-tftp/src/lib.rs#start_test_server`, FTP `crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, ADB `crates/sensor-adb/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-adb/src/lib.rs#SPOOL_GLOBAL_BUDGET`, telnet `crates/sensor-telnet/src/lib.rs#start_test_server` |
+| `sensor-ssh` capture | 16 MiB (`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`) | 100 MB | `crates/sensor-ssh/src/server.rs#serve` |
+| `sensor-ftp`, `sensor-adb`, `sensor-telnet`, `sensor-tftp` capture | 10 MB | 100 MB | TFTP `crates/sensor-tftp/src/lib.rs#start_test_server`, FTP `crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, ADB `crates/sensor-adb/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-adb/src/lib.rs#SPOOL_GLOBAL_BUDGET`, telnet `crates/sensor-telnet/src/lib.rs#start_test_server` |
 | `sensor-mqtt` capture (binary PUBLISH payloads) | 256 KiB (one PUBLISH packet, `crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) | 100 MB | `crates/sensor-mqtt/src/lib.rs#SPOOL_MAX_FILE_SIZE`/`crates/sensor-mqtt/src/lib.rs#SPOOL_GLOBAL_BUDGET` |
 | Fetcher (`/var/spool/propolis/fetched`) | `PROPOLIS_FETCH_MAX_BYTES` (default 10 MB) | **1 GB** (`FETCH_SPOOL_GLOBAL_BUDGET`) | `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`, `crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_BYTES` |
 
 Redis, HTTP, SMTP, cred, DNS, and catchall sensors never write a body to a spool (they capture
 metadata only), so they consume no spool budget. Telnet only spools when the shell phase sees a
 binary payload (a Mirai/Gafgyt dropper), never the login/password phase - but when it does, it
-draws from the same 10 MB/100 MB budget as ssh/ftp/adb/tftp. MQTT spools only a PUBLISH payload
+draws from the same 10 MB/100 MB budget as ftp/adb/tftp. The SSH spool's 100 MB holds five
+distinct bodies at its 16 MiB cap (a body already stored costs nothing again). MQTT spools only a PUBLISH payload
 that passes the binary gate, from its own 100 MB budget. The fetcher spool is a growing malware
 corpus with a much larger budget than the incidental per-connection upload spools; its per-file
 cap is the same `PROPOLIS_FETCH_MAX_BYTES` the HTTP fetch enforces, so the two cannot drift.
@@ -226,11 +228,14 @@ is 314,572 and the largest body fits.
 
 ## SSH sensor worst-case memory
 
-`sensor-ssh` keeps a payload streamed over the shell or an exec's standard input up to 10 MB
-(`PROPOLIS_SSH_MAX_CAPTURED_BYTES`, default `10_000_000`, the spool's per-file cap
-`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`; it was `1_000_000`). The limit decides how
-many uploads fill the capture budget, not how much the budget holds, so the worst case is the
-sum of the places that hold bytes, each bounded where it is allocated and released:
+`sensor-ssh` keeps a payload streamed over the shell or an exec's standard input up to 16 MiB
+(`PROPOLIS_SSH_MAX_CAPTURED_BYTES`, default `16_777_216`, the spool's per-file cap
+`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`; it was `1_000_000`, then `10_000_000`,
+which cut a 10,027,008-byte miner on every attempt). The limit decides how many uploads fill the
+capture budget, not how much the budget holds, so the worst case is the sum of the places that
+hold bytes, each bounded where it is allocated and released. Re-derived for 16 MiB from those
+places, the sum is unchanged; the one term that did grow with the limit, what a growing body
+frees, is now kept out (below):
 
 | Term | Bound | Where it is enforced |
 |---|---|---|
@@ -244,10 +249,12 @@ sum of the places that hold bytes, each bounded where it is allocated and releas
 Why each term holds:
 
 - **Capture bodies.** Every body is a `CaptureBody` of the one budget (`ShellCapture`, `HeldInput`,
-  `ScpReceiver`, the SFTP handler), so ten-megabyte uploads from all 256 connections still cannot
+  `ScpReceiver`, the SFTP handler), so 16 MiB uploads from all 256 connections still cannot
   pass the ceiling. A body that cannot grow keeps its prefix and the event says `truncated`. The
-  budget fits 21 bodies of 10 MB; the rest of a burst is cut short and flagged
-  (`end_reason: "capture_memory_budget"`), as at any limit.
+  budget fits 12 bodies of 16 MiB (it fitted 21 of 10 MB); the rest of a burst is cut short and
+  flagged (`end_reason: "capture_memory_budget"`), as at any limit. A body is hashed and written
+  to the spool from the buffer it was captured in (`crates/sensor-framework/src/handoff.rs#process_job`),
+  charged until the write returns, so storing one makes no second copy.
 - **Held input.** A command waiting for its input is run on the capture buffer itself, moved into
   the shell and back (`crates/sensor-framework/src/held_input.rs#HeldInput`), so the input is
   never copied while it runs, and the buffer stays charged to the capture budget until the
@@ -260,10 +267,11 @@ Why each term holds:
   large capture is stored the next bodies grow on the heap, where a reallocation that cannot
   extend in place copies and leaves the freed block resident. No budget charges it, and it
   scales with the capture limit and with how many bodies grow at once: eight bodies growing to
-  10 MB together left 71,016,448 bytes resident past what they held. The sensor pins the
-  threshold at 128 KiB at startup (`crates/sensor-framework/src/session_memory.rs#pin_mmap_threshold`),
-  so a body past it is its own mapping, grown by `mremap` and returned to the kernel when freed;
-  the same eight bodies then leave 499,712 bytes
+  10 MB together left 71,016,448 bytes resident past what they held, more than the margin below,
+  and a probe of eight growing to 16 MiB about 118 MB. The sensor pins the threshold at 128 KiB
+  at startup (`crates/sensor-framework/src/session_memory.rs#pin_mmap_threshold`), so a body
+  past it is its own mapping, grown by `mremap` and returned to the kernel when freed; eight
+  bodies growing to 16 MiB then leave 499,712 bytes
   (`crates/sensor-ssh/tests/capture_heap_test.rs`). If the allocator refuses the setting (a
   non-glibc build), the sensor logs a warning at startup and this term is not bounded.
 

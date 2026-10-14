@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-08-26
+last-verified: 2026-10-14
 -->
 
 # Event and sample lifecycle
@@ -100,7 +100,7 @@ flowchart TD
    from leaking whether a capture happened.
 2. **Sequential worker + spool.** A single worker drains the queue and stores each
    body under its **SHA-256 filename** (never the attacker name), `0640`, with a
-   per-file size cap (10 MB) and a global byte budget (100 MB) reserved atomically;
+   per-file size cap (10 MB; 16 MiB for SSH) and a global byte budget (100 MB) reserved atomically;
    the capture hand-off never calls the store concurrently, and a body gets its digest
    name only once it is complete (`crates/sensor-framework/src/handoff.rs#start_worker`, `crates/sensor-framework/src/handoff.rs#process_job`, `crates/sensor-framework/src/spool.rs#store`, `crates/sensor-framework/src/spool.rs#publish`). The emitted event carries a
    `SampleRef { sha256, size, orig_name }` where `orig_name` is a sanitized indicator

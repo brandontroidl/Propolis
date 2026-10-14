@@ -4,7 +4,7 @@ audience: all
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-10
+last-verified: 2026-10-14
 -->
 
 # Sensor behavior reference
@@ -69,7 +69,7 @@ naming the variable and quoting the value ("zero never means unlimited"). `senso
 
 Common defaults across the internet-facing TCP sensors are `read_timeout`
 30000&nbsp;ms, `idle_timeout` 60000&nbsp;ms, `max_duration` 600&nbsp;s,
-`max_captured_bytes` 1_000_000 (ssh: 10_000_000, the spool's per-file cap), `max_concurrent` 256 (verified
+`max_captured_bytes` 1_000_000 (ssh: 16_777_216, the spool's per-file cap), `max_concurrent` 256 (verified
 `crates/sensor-ssh/src/main.rs#DEFAULT_READ_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_DURATION_SECS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT`). Per-sensor deviations are noted in the
 protocol table below; the canonical values live in
 [`environment-variables.md`](environment-variables.md).

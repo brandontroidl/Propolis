@@ -4,7 +4,7 @@ audience: developer
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-07
+last-verified: 2026-10-14
 -->
 
 # Sensor architecture
@@ -182,8 +182,9 @@ path**, for covertness - response latency must not leak whether a capture happen
 and re-hash-on-read fail-closed (`sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#read_verified`). It enforces a per-file
 size cap and a global byte budget via an atomic `compare_exchange` reservation, dedups
 on existing hash, and recovers its used-byte count by scanning the directory on
-startup so a restart does not reset the ceiling. SSH/FTP/ADB use a 10 MB per-file cap
-and a 100 MB global budget. See
+startup so a restart does not reset the ceiling. FTP/ADB use a 10 MB per-file cap and SSH
+a 16 MiB one (`crates/sensor-framework/src/spool.rs#SPOOL_MAX_FILE_BYTES`, the largest kept
+body, which the indicator scan reads), each with a 100 MB global budget. See
 [`security/malware-custody.md`](../security/malware-custody.md) and
 [`reference/filesystem-paths.md`](../reference/filesystem-paths.md).
 

@@ -801,7 +801,7 @@ async fn process_job(
         }
     };
     let budget_truncated = body.is_exhausted();
-    // `store` hashes, writes and fsyncs a body of up to 10 MB: seconds on a slow disk, during which
+    // `store` hashes, writes and fsyncs a body of up to 16 MiB: seconds on a slow disk, during which
     // this task would hold an async worker (the SSH sensor runs two). So it runs on the blocking
     // pool, and the body moves with it: its budget reservation is held until the store returns,
     // even if this future is dropped meanwhile.

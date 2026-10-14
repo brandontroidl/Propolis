@@ -35,7 +35,7 @@
     <p class="empty-line">scanned; no indicators found</p>
     {% endif %}
   {% elif scan_state == "not_text" %}<p class="empty-line">scanned; no printable strings to read</p>
-  {% elif scan_state == "too_big" %}<p class="empty-line">not scanned: larger than the indicator scan reads ({{ scan_limit_mb }} MB)</p>
+  {% elif scan_state == "too_big" %}<p class="empty-line">not scanned: larger than the indicator scan reads ({{ scan_limit }})</p>
   {% elif scan_state == "missing" %}<p class="empty-line">not scanned: the body was never found in a spool</p>
   {% elif scan_state == "pending" %}<p class="empty-line">queued for scanning</p>
   {% else %}<p class="empty-line">not queued: no event has named this sample yet</p>

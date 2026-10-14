@@ -533,7 +533,8 @@ async fn sample_page(
         bucket => spooled.map(|(b, _)| b).unwrap_or_default(),
         size => spooled.map(|(_, s)| format_bytes(s)).unwrap_or_default(),
         sha256,
-        scan_limit_mb => review::ioc::MAX_BINARY_SCAN_BYTES / 1_000_000,
+        // In the units of the size above, so the two compare at a glance.
+        scan_limit => format_bytes(review::ioc::MAX_BINARY_SCAN_BYTES as u64),
         truncated,
         campaigns,
         scan_state => scan_state.unwrap_or_default(),

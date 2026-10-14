@@ -299,12 +299,16 @@
 - **The orange severity rung is distinct from the amber one** - in Graphite and Cream "high"
   and "attention" were within a few degrees of each other. High is now a clear orange
   (Graphite `#e8883f`, Cream `#b4501a`) between the amber and the red.
-- **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 10 MB** -
-  `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `10000000`, the spool's per-file cap, where it
-  was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000
-  bytes, so its hash matched nothing on VirusTotal (0/57). SCP and SFTP uploads were already kept
-  to 10 MB. A body over the limit is still cut there and recorded with `truncated: true` and the
-  real `wire_size`. The Samples list and a sample's page now say `truncated` for a sample a
+- **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 16 MiB** -
+  `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `16777216`, the SSH spool's per-file cap, where
+  it was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000
+  bytes, so its hash matched nothing on VirusTotal (0/57); a first raise to 10,000,000 then cut a
+  10,027,008-byte miner on every attempt, so the cap is 16 MiB. The indicator scan reads up to the
+  same 16 MiB, so a body kept whole is not then shown "not scanned", and a sample's page names
+  that limit in the units of its size. SCP and SFTP uploads are kept to 10 MB, and the other
+  spooling sensors keep their 10 MB caps. A body over the limit is still cut there and recorded
+  with `truncated: true` and the real `wire_size`. An env file that sets the variable explicitly
+  keeps its value. The Samples list and a sample's page now say `truncated` for a sample a
   sensor kept only a prefix of (the secondary line under its digest, and the page's first line),
   from the same flag the address page already used. Samples captured before this stay as captured:
   a sample cut at 1,000,000 bytes keeps its hash, size and `truncated` flag, and is not
@@ -592,12 +596,12 @@
   fsynced a body of up to 10 MB on the async runtime, which the SSH sensor runs with two worker
   threads. The store now runs on the blocking pool; the body moves with it, so its budget
   reservation is held until the store returns and refunded the moment it does.
-- **A captured binary of 8 to 10 MB is now scanned for indicators** - the scan refused anything
+- **A captured binary of 8 to 16 MiB is now scanned for indicators** - the scan refused anything
   over 8 MiB, so a sample of 8 to 10 MB, which SCP, SFTP and the other sensors' uploads reach,
   showed "not scanned" on its page.
-  The scan limit is now the spool's per-file cap (one definition,
-  `sensor_framework::SPOOL_MAX_FILE_BYTES`, shared by the sensors and the scan), and the page
-  names it. The module comment that said a larger body was scanned in part now says it is not
+  The scan limit is now the largest body a sensor keeps, the SSH spool's 16 MiB cap (one
+  definition, `sensor_framework::SPOOL_MAX_FILE_BYTES`, shared by the SSH sensor and the scan),
+  and the page names it. The module comment that said a larger body was scanned in part now says it is not
   scanned. A sample already marked `too_big` keeps that state (it is terminal in
   `ioc_artifact_scan`); deleting its row there queues it for the scan again. No migration.
 - **Queued SSH output is charged by what it holds, not its length** - a reply buffer that had

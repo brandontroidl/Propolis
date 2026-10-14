@@ -1594,7 +1594,10 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   is never allocated at its declared size (`crates/sensor-smtp/src/handler.rs#read_raw_chunk`),
   so a stalled chunk holds at most the body cap), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
   unknown→502. Caps: line 8192, username 255; a message body is kept up to 65536 bytes and
-  the event records the full `body_size` received plus `truncated` when it was cut.
+  the event records the full `body_size` received plus `truncated` when it was cut. A DATA
+  body line longer than 8192 bytes keeps its first 8192 bytes, the rest is read and counted
+  in `body_size` but not kept, the message is flagged `truncated` and still gets `250`
+  (`crates/sensor-smtp/src/handler.rs#read_body_line`).
 - **Bounds:** common defaults, `max_concurrent` 256, read the same strict way as every other
   sensor (`crates/sensor-smtp/src/main.rs#load_config`): a zero, negative or unparseable value
   refuses to start. No spool (message body captured as size and subject only, never stored as a

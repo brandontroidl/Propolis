@@ -87,7 +87,7 @@ anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4390 test functions** (2747 unit + 1643 integration).
+- **Total: 4391 test functions** (2747 unit + 1644 integration).
 - **DB-backed (`sqlx::test`): 419** - console 219, review 99, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -141,14 +141,14 @@ Per-crate breakdown:
 | sensor-http | 31 | 58 | arrival, env_strict, integration, tls |
 | sensor-mqtt | 64 | 58 | arrival, env_strict, integration, shutdown_tracking, tls |
 | sensor-redis | 82 | 40 | arrival, env_strict, integration, tls |
-| sensor-smtp | 18 | 50 | arrival, env_strict, integration, memory_bounds, tls |
+| sensor-smtp | 18 | 51 | arrival, env_strict, integration, memory_bounds, tls |
 | sensor-ssh | 72 | 146 | arrival, auth_test, capture_limit, crypto_test, env_strict, integration, memory_budget_test, output_backpressure, session_memory_limit, shell_test, shutdown_tracking, transport_test |
 | sensor-telnet | 53 | 52 | arrival, echo_loader, env_strict, infected_hold, integration, probe_payload, session_memory_limit, shutdown_tracking |
 | sensor-tftp | 37 | 43 | arrival, env_strict, integration, shutdown |
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2747** | **1643** | |
+| **Total** | **2747** | **1644** | |
 
 ### Test styles by layer
 

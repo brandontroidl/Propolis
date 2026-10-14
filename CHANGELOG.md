@@ -391,6 +391,12 @@
   `452 4.5.3 Error: too many recipients` (`smtpd_recipient_limit`), the message event keeps
   the first 100 addresses with a new `rcpt_count` of all accepted ones, and the envelope is
   cleared after each message as Postfix clears it.
+- **A long DATA line no longer drops the message in the SMTP sensor** - a body line of 8193
+  bytes or more, counting its line break, hit the 8192-byte read cap and was treated as an
+  unfinished transfer: after `354` the session closed with no reply, no event, and any
+  pipelined command unanswered, where Postfix accepts the message. The line's first 8192
+  bytes are now kept, the rest is drained to the line break and counted in `body_size`, and
+  the message is recorded with `truncated: true` and answered `250`.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

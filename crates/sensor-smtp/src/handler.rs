@@ -721,36 +721,87 @@ async fn read_line_bounded<S: AsyncRead + Unpin>(
     }
 }
 
-/// `read_line_bounded` for the message body: the raw line bytes with the terminator stripped,
-/// and whether a terminator was actually seen. Decoding per line would count a replacement
-/// character's three bytes where the wire carried one, and the body's own decoding happens once
-/// over the whole message.
-async fn read_body_line<S: AsyncRead + Unpin>(
+/// Reads into `buf` (cleared first) up to and including the next `\n`, but never more than
+/// `MAX_LINE_LEN` bytes or the rest of the capture budget. `None` on EOF, error, the idle
+/// timeout, or an exhausted budget; a piece that does not end in `\n` was cut by one of the
+/// two caps, or by EOF, which the next call reports.
+async fn read_line_piece<S: AsyncRead + Unpin>(
     reader: &mut BufReader<S>,
     bounds: &ConnectionBounds,
     total: &mut u64,
-) -> Option<Vec<u8>> {
+    buf: &mut Vec<u8>,
+) -> Option<()> {
+    buf.clear();
     if *total >= bounds.max_captured_bytes {
         return None;
     }
     let remaining = bounds.max_captured_bytes.saturating_sub(*total);
     let cap = (MAX_LINE_LEN as u64).min(remaining).max(1);
-    let mut buf = Vec::new();
     let mut limited = (&mut *reader).take(cap);
-    match tokio::time::timeout(bounds.idle_timeout, limited.read_until(b'\n', &mut buf)).await {
+    match tokio::time::timeout(bounds.idle_timeout, limited.read_until(b'\n', buf)).await {
         Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
         Ok(Ok(n)) => {
             *total += n as u64;
-            if buf.last() != Some(&b'\n') {
-                // Cut by the cap or the budget, not a line the client finished.
-                return None;
-            }
-            buf.pop();
-            if buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            Some(buf)
+            Some(())
         }
+    }
+}
+
+/// One line of a message body: at most its first `MAX_LINE_LEN` bytes, line break stripped,
+/// and the count of bytes the client sent past those before the break, which were read and
+/// discarded.
+struct BodyLine {
+    kept: Vec<u8>,
+    dropped: usize,
+}
+
+/// `read_line_bounded` for the message body, as raw bytes: decoding per line would count a
+/// replacement character's three bytes where the wire carried one, and the body's own decoding
+/// happens once over the whole message.
+///
+/// A line longer than `MAX_LINE_LEN` is still a line, not an unfinished transfer: its head is
+/// kept and the rest is drained up to the break, piece by piece, so it costs no more memory
+/// than a short one. Treating the cap as the end of the transfer dropped the whole message
+/// and closed the session silently after `354`, where Postfix accepts it. `None` only when
+/// the client hung up, went quiet, or ran out of budget before ending the line.
+async fn read_body_line<S: AsyncRead + Unpin>(
+    reader: &mut BufReader<S>,
+    bounds: &ConnectionBounds,
+    total: &mut u64,
+) -> Option<BodyLine> {
+    let mut kept = Vec::new();
+    read_line_piece(reader, bounds, total, &mut kept).await?;
+    if kept.last() == Some(&b'\n') {
+        kept.pop();
+        if kept.last() == Some(&b'\r') {
+            kept.pop();
+        }
+        return Some(BodyLine { kept, dropped: 0 });
+    }
+    let mut piece = Vec::new();
+    let mut dropped = 0usize;
+    let mut previous_last = kept.last().copied();
+    loop {
+        read_line_piece(reader, bounds, total, &mut piece).await?;
+        dropped += piece.len();
+        if piece.last() == Some(&b'\n') {
+            dropped -= 1;
+            let cr = match piece.len() {
+                1 => previous_last == Some(b'\r'),
+                n => piece[n - 2] == b'\r',
+            };
+            // The CR of a CRLF split across the cap is in the kept head when nothing was
+            // dropped before the LF, otherwise it is among the dropped bytes.
+            if cr {
+                if dropped == 0 {
+                    kept.pop();
+                } else {
+                    dropped -= 1;
+                }
+            }
+            return Some(BodyLine { kept, dropped });
+        }
+        previous_last = piece.last().copied();
     }
 }
 
@@ -811,9 +862,10 @@ fn append_bounded(body: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// The message body up to `MAX_DATA_BODY` bytes, and the number of body bytes the client sent,
-/// which keeps counting after the body stops growing so the event can say the body was cut.
-/// `None` when the client never sent the terminating `.` line (it hung up, went quiet, or ran
-/// out of budget): that is an unfinished transfer, not a message, and it gets no "queued".
+/// which keeps counting after the body stops growing, and past the kept head of an over-long
+/// line, so the event can say the body was cut. `None` when the client never sent the
+/// terminating `.` line (it hung up, went quiet, or ran out of budget): that is an unfinished
+/// transfer, not a message, and it gets no "queued".
 async fn read_data_body<S: AsyncRead + Unpin>(
     reader: &mut BufReader<S>,
     bounds: &ConnectionBounds,
@@ -822,13 +874,13 @@ async fn read_data_body<S: AsyncRead + Unpin>(
     let mut body = Vec::new();
     let mut received = 0usize;
     loop {
-        let line = read_body_line(reader, bounds, total).await?;
-        if line == b"." {
+        let BodyLine { kept, dropped } = read_body_line(reader, bounds, total).await?;
+        if kept == b"." && dropped == 0 {
             return Some((body, received));
         }
         // Dot-stuffing: a line starting with "." has the leading dot removed
-        let actual = line.strip_prefix(b".").unwrap_or(&line);
-        received += actual.len() + 1;
+        let actual = kept.strip_prefix(b".").unwrap_or(&kept);
+        received += actual.len() + dropped + 1;
         append_bounded(&mut body, actual);
         append_bounded(&mut body, b"\n");
     }

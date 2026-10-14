@@ -766,6 +766,42 @@ async fn data_without_terminating_dot_is_neither_acknowledged_nor_recorded() {
     srv.handle.abort();
 }
 
+/// A body line longer than the 8192-byte read cap used to end the session silently after 354:
+/// no reply, no event, and the pipelined QUIT unanswered. Postfix accepts the message. The
+/// sensor now keeps the first 8192 bytes of the line, counts the rest in `body_size`, flags
+/// the message `truncated`, and answers 250. A line that ends exactly at the cap is whole.
+#[tokio::test]
+async fn data_line_past_the_read_cap_keeps_the_message_and_flags_it_truncated() {
+    // (line length without its CRLF, expect truncated)
+    for (len, expect_truncated) in [(8191usize, false), (9000, true), (30_000, true)] {
+        let srv = TestServer::start().await;
+        let mut client = SmtpClient::connect(srv.addr).await;
+        let r = client.send("DATA").await;
+        assert!(r.starts_with("354"), "{r}");
+        let mut body = b"Subject: long\r\n\r\n".to_vec();
+        body.extend(std::iter::repeat_n(b'X', len));
+        body.extend_from_slice(b"\r\nafter\r\n.\r\nQUIT\r\n");
+        client.reader.get_mut().write_all(&body).await.unwrap();
+        let r = client.read_reply().await;
+        assert!(r.starts_with("250 2.0.0 Ok: queued as"), "len {len}: {r}");
+        let r = client.read_reply().await;
+        assert!(r.starts_with("221"), "len {len}: the QUIT is answered: {r}");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = srv.events().await;
+        let msg = events
+            .iter()
+            .find(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+            .unwrap_or_else(|| panic!("len {len}: a message event: {events:?}"));
+        assert_eq!(msg.metadata["subject"], "long", "len {len}");
+        // Each line counts its bytes plus one for the line break.
+        let expected_size = "Subject: long".len() + 1 + 1 + len + 1 + "after".len() + 1;
+        assert_eq!(msg.metadata["body_size"], expected_size, "len {len}");
+        assert_eq!(msg.metadata["truncated"], expect_truncated, "len {len}");
+        srv.handle.abort();
+    }
+}
+
 #[tokio::test]
 async fn data_capture_with_sender_and_recipient() {
     let srv = TestServer::start().await;

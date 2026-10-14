@@ -25,6 +25,13 @@ const MAX_INSTS: usize = 8_192;
 const MAX_PATTERN_BYTES: usize = 32_768;
 /// The largest bound an interval may name, as `RE_DUP_MAX` is on glibc.
 const MAX_REPEAT: u32 = 255;
+/// The most compiled patterns one command holds at once (`grep`'s pattern list, `awk`'s regex
+/// literals). A word list in the thousands is real; one in the millions is an attack on the heap.
+pub(super) const HELD_PATTERNS_MAX: usize = 4_096;
+/// The most heap a command's compiled patterns hold in all. A pattern as short as 12 bytes
+/// (`(a{255}){31}`) compiles to about 200 KB, so the count cap alone would still allow most of a
+/// gigabyte.
+pub(super) const HELD_HEAP_MAX: u64 = 4 * 1_048_576;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Syntax {

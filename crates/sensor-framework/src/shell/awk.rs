@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use super::cfmt;
 use super::eval::Stdin;
 use super::read::errno_text;
-use super::regex::Regex;
+use super::regex::{HELD_HEAP_MAX, HELD_PATTERNS_MAX, Regex};
 use super::registry::Registry;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 
@@ -96,6 +96,10 @@ enum SyntaxErr {
     Runaway(u32, String),
     MissingBrace(u32),
     Regex(u32, String, String),
+    /// The program's regex literals compiled to more than one command may hold.
+    OutOfMemory,
+    /// The line's work allowance ran out while the regex literals compiled.
+    Spent,
 }
 
 fn regex_allowed(prev: Option<&Tok>) -> bool {
@@ -427,6 +431,14 @@ struct Parser {
     toks: Vec<(Tok, u32)>,
     pos: usize,
     regexes: Vec<Regex>,
+    /// What the regex literals compiled so far hold, against `HELD_HEAP_MAX`.
+    held: u64,
+    /// The work the literals have cost so far (source bytes, then compiled heap), charged to the
+    /// line by the caller once parsing ends.
+    spent: u64,
+    /// The work the line has left when parsing starts: a literal that would overrun it is not
+    /// compiled.
+    allowance: u64,
     /// Inside an unparenthesized `print` list, where `>` is a redirection.
     no_gt: bool,
     /// Inside `for (... in` detection or a getline target, where `in` must not be consumed.
@@ -1103,9 +1115,28 @@ impl Parser {
             Tok::Re(r) => {
                 let line = self.line();
                 self.bump();
+                // Each literal pays for its source before it compiles and for the heap it
+                // compiled to after, under the caps `grep`'s pattern list is held to, so a
+                // program of many large literals stops instead of growing the heap unseen.
+                if self.regexes.len() >= HELD_PATTERNS_MAX {
+                    return Err(SyntaxErr::OutOfMemory);
+                }
+                self.spent = self.spent.saturating_add(len_u64(r.len()));
+                if self.spent > self.allowance {
+                    return Err(SyntaxErr::Spent);
+                }
                 let re = Regex::awk(r.as_bytes()).map_err(|e| {
                     SyntaxErr::Regex(line, mawk_regex_reason(&e).to_string(), r.clone())
                 })?;
+                let heap = re.heap_bytes();
+                self.held = self.held.saturating_add(heap);
+                self.spent = self.spent.saturating_add(heap);
+                if self.held > HELD_HEAP_MAX {
+                    return Err(SyntaxErr::OutOfMemory);
+                }
+                if self.spent > self.allowance {
+                    return Err(SyntaxErr::Spent);
+                }
                 self.regexes.push(re);
                 Ok(Expr::Re(self.regexes.len().saturating_sub(1)))
             }
@@ -2880,6 +2911,7 @@ fn syntax_message(error: &SyntaxErr) -> String {
         SyntaxErr::Regex(line, reason, text) => {
             format!("awk: line {line}: regular expression compile failed ({reason})\n{text}\n")
         }
+        SyntaxErr::OutOfMemory | SyntaxErr::Spent => "awk: out of memory\n".to_string(),
     }
 }
 
@@ -2997,13 +3029,26 @@ impl FakeShell {
             toks: lexed.toks,
             pos: 0,
             regexes: Vec::new(),
+            held: 0,
+            spent: 0,
+            allowance: self.line.remaining(),
             no_gt: false,
             no_in: false,
             depth: 0,
         };
-        let program = match parser.program() {
-            Ok(program) => program,
+        let parsed = parser.program();
+        // The literals' cost is charged however parsing ended. A program that ran the line out
+        // fails as out of memory and ends the line, as the allowance running out anywhere does.
+        let paid = self.charge_work(parser.spent);
+        let program = match parsed {
+            Err(error @ (SyntaxErr::OutOfMemory | SyntaxErr::Spent)) => {
+                let mut failed = CommandResult::stderr(2, syntax_message(&error));
+                failed.stop_line = !paid;
+                return failed;
+            }
+            _ if !paid => return super::texttools::stopped(),
             Err(error) => return CommandResult::stderr(2, syntax_message(&error)),
+            Ok(program) => program,
         };
         let mut globals: HashMap<String, Val> = HashMap::new();
         for (name, value) in [

@@ -669,6 +669,7 @@
   See [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron).
 
 - **One shell line can no longer freeze or exhaust the SSH, telnet or ADB sensor** - a line runs
+- **Shell commands that walked or allocated past their charge now pay for it (SSH, telnet, ADB)** - a line runs
   synchronously on a runtime worker, so a fake command that walks or allocates past what it
   charges to the line's work allowance stalls every session of that sensor, or takes it past its
   `MemoryMax` and gets it killed. GNU `tr` walked a `[c*N]` repeat one byte at a time, up to
@@ -700,14 +701,27 @@
   no longer do, the evaluator charges a command's output only beyond what its reads already
   paid (`cat` of a file costs the line once), and a test lists every direct filesystem read so a
   new one has to be accounted for. `grep` compiled every pattern of an `-e` or `-f` list before it
-  charged any of them, so a 4 KB file of 13-byte patterns that each compile to about 200 KB held
-  some 800 MB at once; each pattern is now charged (its bytes, then the heap it compiled to) as
-  it is built, the list stops at 4,096 patterns or 4 MiB of compiled programs with GNU's
-  `grep: memory exhausted`, and a single pattern past 32 KiB reads as `Regular expression too
-  big`, as one past the instruction limit already did. `crates/sensor-telnet/tests/shell_cost.rs`
-  runs the reproducers through the real listener (the `tail`, `grep -f` and `dd` loops among
-  them) and holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap;
+  charged any of them, so a pattern file of 4,096 lines (53,248 bytes) of the 12-byte
+  `(a{255}){31}`, each of which compiles to about 200 KB, held some 800 MB at once; each pattern
+  is now charged (its bytes, then the heap it compiled to) as it is built, the list stops at
+  4,096 patterns or 4 MiB of compiled programs with GNU's `grep: memory exhausted`, and a single
+  pattern past 32 KiB reads as `Regular expression too big`, as one past the instruction limit
+  already did. awk compiled every `/re/` literal of its program and charged none of them
+  (512 literals of `/(a{255}){31}/`, a 7,680-byte program, grew the heap by 101 MB); each
+  literal's source and compiled heap are now charged as it is parsed, under the same 4,096
+  literal and 4 MiB caps, and a program past them fails with `awk: out of memory` (mawk's
+  wording, [unverified]) and ends the line. `grep` reads its operands through the same door, so
+  it pays for a file once: the read charge covers the first scan pass and only the matchers' work
+  beyond it is charged on top (`grep x /bin/busybox`, 2,193,272 bytes, stays inside the line's
+  4,194,304-unit allowance). `crates/sensor-telnet/tests/shell_cost.rs`
+  runs the reproducers through the real listener (the `tail`, `grep -f`, `dd` and awk-literal
+  cases among them) and holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap;
   `crates/sensor-adb/tests/shell_cost.rs` does the same for the ADB sensor's commands.
+  **Still open:** a line is not yet bounded in time everywhere. awk compiles a dynamic regex (a
+  string used as a pattern, as in `x ~ p`) again on every evaluation and charges only the scan, and the compiler dedupes character sets in quadratic time,
+  so one 260-byte awk line looping a pattern of some 1,900 distinct brackets held a worker for
+  45 s in a release build. That is a separate follow-up; until it lands this change does not
+  promise that no single line can hold a worker.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

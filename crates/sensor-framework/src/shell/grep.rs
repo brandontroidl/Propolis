@@ -21,7 +21,7 @@ use std::cell::Cell;
 use memchr::memmem::Finder;
 
 use super::read::errno_text;
-use super::regex::{Regex, Syntax};
+use super::regex::{HELD_HEAP_MAX, HELD_PATTERNS_MAX, Regex, Syntax};
 use super::registry::Registry;
 use super::texttools::stopped;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
@@ -40,13 +40,10 @@ const USAGE: &str =
 /// The most files `-r` visits.
 const RECURSE_MAX: usize = 2_048;
 const RECURSE_DEPTH: u32 = 16;
-/// The most patterns one grep holds, over `-e`, `-f` and newline-separated words together. A
-/// word list in the thousands is real; one in the millions is an attack on the heap, and GNU
+/// The most patterns one grep holds, over `-e`, `-f` and newline-separated words together; GNU
 /// itself answers `memory exhausted` at some size.
-const PATTERNS_MAX: usize = 4_096;
-/// The most heap the compiled patterns hold in all. A pattern as short as 13 bytes compiles to
-/// about 200 KB, so the count cap alone would still allow most of a gigabyte.
-const COMPILED_MAX_BYTES: u64 = 4 * 1_048_576;
+const PATTERNS_MAX: usize = HELD_PATTERNS_MAX;
+const COMPILED_MAX_BYTES: u64 = HELD_HEAP_MAX;
 /// What a fixed pattern holds beyond its needle bytes: the boxed `Finder` (its searcher state is
 /// inline, 288 bytes under memchr 2.8.3 as measured with a counting allocator, one block plus the
 /// needle's) and two allocator headers rounded up to 16 bytes each.

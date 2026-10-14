@@ -573,6 +573,40 @@ fn a_reader_that_prints_its_read_is_not_charged_twice() {
     assert_eq!(sh.last_trace().budget.hit, None);
 }
 
+/// `grep` pays for the bytes it reads once at the read, and for the scan only beyond that one
+/// pass. Charging both in full made `grep x /bin/busybox` cost twice the image, more than the
+/// line's whole allowance.
+#[test]
+fn grep_of_the_busybox_image_fits_the_line_and_pays_for_its_read_once() {
+    let size = busybox_len();
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    assert!(
+        2 * size > sh.budget().limits().work_per_line,
+        "the image is big enough that charging it twice would not fit"
+    );
+    let work = work_of(&mut sh, "grep x /bin/busybox > /dev/null");
+    assert_eq!(sh.last_trace().budget.hit, None, "the line was not stopped");
+    assert!(
+        work >= size && work < size + size / 8,
+        "one charge per byte read: {work} for {size} bytes"
+    );
+}
+
+/// The scan is still charged where it costs more than the read: each extra pattern is another
+/// pass over the same bytes.
+#[test]
+fn grep_charges_the_scan_beyond_the_pass_the_read_paid() {
+    let size = busybox_len();
+    let (mut sh, _) = limited(|l| l.work_per_line = 8 * size);
+    let one = work_of(&mut sh, "grep -F -e x /bin/busybox > /dev/null");
+    let (mut sh, _) = limited(|l| l.work_per_line = 8 * size);
+    let three = work_of(&mut sh, "grep -F -e x -e y -e z /bin/busybox > /dev/null");
+    assert!(
+        three >= 3 * size && three - one >= 2 * size,
+        "three patterns scan three times: {three} against {one} for one ({size} bytes read)"
+    );
+}
+
 /// Every place the shell takes bytes out of the filesystem. `read_operand` is the door for a
 /// file a command was told to read and charges the line itself; `read_charged` is the other
 /// charging helper. Anything else listed here reads a fixed system file of a few KiB that no

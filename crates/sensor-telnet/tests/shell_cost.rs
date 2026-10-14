@@ -383,9 +383,10 @@ fn operands_after_the_allowance_is_spent_are_not_read() {
     assert!(out.contains("\r\nok\r\n"), "{out:?}");
 }
 
-/// `grep -f` compiled every pattern in its file before it charged any: 3,000 lines of a 13-byte
-/// pattern that compiles to some 8,000 instructions held hundreds of megabytes at once. The
-/// patterns are charged as they are built, so the line runs out first.
+/// `grep -f` compiled every pattern in its file before it charged any: a file of 4,096 lines of
+/// the 12-byte pattern `(a{255}){31}` (53,248 bytes with their line breaks), each of which
+/// compiles to some 200 KB, held some 800 MB at once. The patterns are charged as they are built,
+/// so the line runs out first.
 #[test]
 fn grep_patterns_are_charged_as_they_are_compiled() {
     let _turn = one_at_a_time();
@@ -413,4 +414,31 @@ fn grep_patterns_are_charged_as_they_are_compiled() {
     );
     let out = session.run("printf 'foo\\nb.r\\n' > few; printf 'xbar\\nzzz\\n' | grep -f few");
     assert!(out.contains("\r\nxbar\r\n"), "{out:?}");
+}
+
+/// `awk` compiled every `/re/` literal of its program and charged none of them: 512 literals of
+/// `/(a{255}){31}/` (a 7,680-byte program) grew the heap by some 100 MB, about 197 KB a literal.
+/// The literals are charged as they compile, under the caps `grep` holds its patterns to, so the
+/// program fails with `out of memory` before the heap grows. Both ways of giving awk a program
+/// are driven, and a program of ordinary literals still runs.
+#[test]
+fn awk_regex_literals_are_charged_as_they_are_compiled() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /tmp");
+    session.run("w=x; for i in 1 2 3 4 5 6 7 8 9; do w=\"$w $w\"; done");
+    session.run("p='/(a{255}){31}/ { n++ }'; for i in $w; do echo \"$p\"; done > prog");
+    let out = session.run("wc -l prog");
+    assert!(out.contains("\r\n512 prog\r\n"), "{out:?}");
+    // The line ends with the failed command, as with any command that spends the allowance.
+    let out = session.run("awk -f prog /dev/null");
+    assert!(out.contains("awk: out of memory\r\n"), "{out:?}");
+    let out = session.run("awk \"$(cat prog)\" /dev/null");
+    assert!(out.contains("awk: out of memory\r\n"), "{out:?}");
+    let out = session.run("echo foo | awk '/fo+/ { print \"hit\" } /(ab){2}/ { print \"no\" }'");
+    assert!(
+        out.contains("\r\nhit\r\n") && !out.contains("no\r\n"),
+        "{out:?}"
+    );
 }

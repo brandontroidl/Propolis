@@ -61,7 +61,8 @@ fn growing_capture_bodies_leave_no_freed_copies_resident() {
     let mut worst = 0u64;
     while bodies.iter().all(|b| b.len() < cap) {
         for body in &mut bodies {
-            body.extend_from_slice(&packet).expect("an unbounded budget");
+            body.extend_from_slice(&packet)
+                .expect("an unbounded budget");
             kept.push(vec![1u8; 4096]);
         }
         let live = budget.current_bytes() + (kept.len() * 4096) as u64;

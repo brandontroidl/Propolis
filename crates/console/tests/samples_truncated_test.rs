@@ -127,6 +127,11 @@ async fn a_cut_short_sample_says_so_on_the_list_and_on_its_page_and_a_whole_one_
     let whole = spool(root.path(), "ssh", b"a small upload that arrived whole");
     upload_event(&pool, &cut, true).await;
     upload_event(&pool, &whole, false).await;
+    sqlx::query("INSERT INTO ioc_artifact_scan (sha256, state) VALUES ($1, 'too_big')")
+        .bind(&cut)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let state = state(pool);
     let (_, cookie) = state.sessions.create();
@@ -144,6 +149,11 @@ async fn a_cut_short_sample_says_so_on_the_list_and_on_its_page_and_a_whole_one_
     let cut_page = get(app.clone(), &cookie, &format!("/samples/{cut}")).await;
     assert!(
         cut_page.contains("truncated: the sensor kept only the first part"),
+        "{cut_page}"
+    );
+    // The scan's limit is named in the units of the size line above it (16 MiB reads `16.0 MB`).
+    assert!(
+        cut_page.contains("not scanned: larger than the indicator scan reads (16.0 MB)"),
         "{cut_page}"
     );
     let whole_page = get(app, &cookie, &format!("/samples/{whole}")).await;

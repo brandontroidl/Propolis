@@ -106,9 +106,11 @@ fn a_shell_lines_working_set_is_inside_the_session_limit() {
 
 /// The capture budget charges a body's capacity, not the copies the allocator leaves behind as
 /// the body grows; the sensor keeps those out by pinning glibc's mmap threshold before it serves
-/// (measured in `capture_heap_test.rs`).
+/// (measured in `capture_heap_test.rs`). This reads `main.rs` and proves only that the call is
+/// there and ahead of the serve call in source order; that the setting takes effect is
+/// `capture_heap_test.rs`.
 #[test]
-fn the_sensor_pins_the_mmap_threshold_before_serving() {
+fn main_calls_pin_mmap_threshold_ahead_of_serving_in_source_order() {
     let main = main_source();
     let pinned = main
         .find("session_memory::pin_mmap_threshold()")

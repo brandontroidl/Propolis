@@ -278,7 +278,9 @@ Why each term holds:
   past it is its own mapping, grown by `mremap` and returned to the kernel when freed; eight
   bodies growing to 16 MiB then leave 499,712 bytes
   (`crates/sensor-ssh/tests/capture_heap_test.rs`). If the allocator refuses the setting (a
-  non-glibc build), the sensor logs a warning at startup and this term is not bounded.
+  non-glibc build), the sensor logs a warning at startup and this term is not bounded. Only `sensor-ssh`
+  pins it: `sensor-ftp`, `sensor-adb`, `sensor-tftp` and `sensor-telnet` also grow
+  capture bodies and do not, so this term is not bounded there (open follow-up).
 
 Residuals, stated plainly. The 64 MiB runtime allowance and the 40% and 30% shares are
 estimates, not measurements, and the margin above is 5% of `MemoryMax`. Sessions can hold more

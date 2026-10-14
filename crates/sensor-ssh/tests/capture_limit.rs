@@ -92,8 +92,10 @@ async fn upload(body: &[u8]) -> sensor_wire::SensorEvent {
     for piece in body.chunks(1 << 20) {
         // The server stops reading once it has the limit, so a late write may find the channel
         // closed; the capture is what is under test, not the transfer.
-        if channel.data(piece).await.is_err() {
-            break;
+        // A client blocked on a window the server no longer opens is the same case.
+        match tokio::time::timeout(Duration::from_secs(10), channel.data(piece)).await {
+            Ok(Ok(())) => {}
+            _ => break,
         }
     }
     let _ = channel.eof().await;
@@ -178,4 +180,21 @@ async fn an_upload_just_over_the_limit_is_cut_at_it_and_flagged_truncated() {
         event.metadata["wire_size"].as_u64().unwrap() > SPOOL_MAX_FILE_BYTES,
         "wire_size is past what was kept (a lower bound on the upload, not its size)"
     );
+}
+
+/// `wire_size` of a cut shell or stdin capture is what had arrived when the input ended, the limit
+/// rounded up to the SSH data packet that crossed it, not the transfer's size. A reader must not
+/// take it for the size of what was sent (the docs say it is a lower bound).
+#[tokio::test]
+async fn a_cut_uploads_wire_size_is_a_lower_bound_not_the_transfer_size() {
+    let body = body_of(SPOOL_MAX_FILE_BYTES as usize + 8 * 1024 * 1024);
+    let event = upload(&body).await;
+    let wire = event.metadata["wire_size"].as_u64().unwrap();
+    assert_eq!(event.metadata["truncated"], true);
+    assert!(wire >= SPOOL_MAX_FILE_BYTES, "{wire}");
+    assert!(
+        wire < SPOOL_MAX_FILE_BYTES + 1024 * 1024,
+        "wire_size {wire} counted past the packet that crossed the limit"
+    );
+    assert!(wire < body.len() as u64, "the transfer was {}", body.len());
 }

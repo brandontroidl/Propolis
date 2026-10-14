@@ -192,7 +192,7 @@ pub fn configure(ceiling: u64, max_concurrent: u32) -> Result<(), String> {
     let sessions = u64::from(max_concurrent.max(1));
     if sessions >= SLOT_COUNT as u64 {
         return Err(format!(
-            "max_concurrent {max_concurrent} exceeds the {} session memory slots",
+            "{max_concurrent} sessions in all exceed the {} session memory slots",
             SLOT_COUNT - 1
         ));
     }

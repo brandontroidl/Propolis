@@ -1365,7 +1365,10 @@ under the process-wide capture-memory budget, and never run.
 - **Session memory.** The binary installs the session accounting allocator and runs each
   connection, plain or TLS, in its own accounted scope, as the shell sensors do: a body still
   arriving is the session's heap, charged to a pool of 30% of `MemoryMax` shared by every
-  session of both listeners. A session the pool cannot hold is ended, whether it is reading a
+  session of both listeners. With both listeners the per-session floor is 157,286 bytes, so while
+  the pool is full a PUBLISH body past 128 KiB (131,072 bytes; the buffer then doubles to
+  262,144) is not captured: its session is ended with `end_reason` `memory_limit`. A session
+  the pool cannot hold is ended, whether it is reading a
   body or waiting for the next packet, and a connection that cannot get a slot is closed before
   anything is answered. A PUBLISH declaring 256 KiB and sent most of the way used to hold that
   much heap until the idle timeout; hundreds of them on the TLS listener were half of what

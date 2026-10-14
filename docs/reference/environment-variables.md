@@ -617,6 +617,12 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   connection; a single packet is separately capped at 262144 bytes of declared remaining length
   (`sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) and a connection at 1024 packets
   (`sensor-mqtt/src/handler.rs#MAX_PACKETS`), neither configurable.
+  `PROPOLIS_MQTT_MAX_CONCURRENT` (default 256) is per listener, and the session memory pool has
+  1023 slots shared by both: the sensor refuses to start when it times the listener count
+  (2 with `PROPOLIS_MQTT_TLS_BIND`, else 1) reaches 1024, so the largest value is 1023 plaintext
+  only and 511 with the TLS listener, and its log names the configured value and the listener
+  count. It also refuses when the pool divided by that product leaves under 64 KiB a session,
+  which the 80,530,635-byte pool does not reach before the slot limit.
 - dns: `PROPOLIS_DNS_READ_TIMEOUT_MS`, `PROPOLIS_DNS_IDLE_TIMEOUT_MS`,
   `PROPOLIS_DNS_MAX_DURATION_SECS`, `PROPOLIS_DNS_MAX_CAPTURED_BYTES`,
   `PROPOLIS_DNS_MAX_CONCURRENT`, `PROPOLIS_DNS_LOG_PATH`, `PROPOLIS_DNS_WAN_MAP`, and the DoT

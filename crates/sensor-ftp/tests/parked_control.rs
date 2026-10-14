@@ -27,8 +27,8 @@ const FLOOD_CAP: usize = 4 * 1024 * 1024;
 
 /// What one parked connection may push: the sensor's receive queue plus the client's own small send
 /// buffer. Clamped, the sensor's queue is 32 KiB and the flood measured 36,864 bytes; unclamped,
-/// the default 128 KiB receive buffer let it push 155,136 (both on loopback, `tcp_rmem` default
-/// 131072). The limit sits between with room on both sides.
+/// the default 128 KiB receive buffer let it push 155,136 to 896,388 depending on the listener and
+/// the run (loopback, `tcp_rmem` default 131072). The limit sits between with room on both sides.
 const PARKED_LIMIT: usize = 96 * 1024;
 
 struct Server {

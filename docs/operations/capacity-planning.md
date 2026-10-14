@@ -203,18 +203,26 @@ the limit and was OOM-killed, losing all ten uploads.
 
 | Term | Bound |
 |---|---|
-| Capture bodies | 107,374,182 (40% of `MemoryMax`) |
+| Capture bodies | 17,039,360 (65 x 262,144: the hand-off queue holds 64 jobs, `CAPTURE_QUEUE_SIZE` in `sensor-mqtt/src/lib.rs`, and one is being written, each at most one packet, `MAX_PACKET_BYTES`; the 107,374,182-byte budget is never reached) |
 | What sessions hold, PUBLISH bodies still arriving included | 80,530,635 (the session pool [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt)) |
+| The pool's residual | 80,530,635 (sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms) |
 | Socket memory | 512 x 65,536 = 33,554,432, plus a segment each |
-| Sum | 221,459,249, 46,976,207 left for the runtime, TLS state from the handshake (allocated before a session's scope) and allocation headers |
+| Sum | 211,655,062, 56,780,394 left for the runtime, TLS state from the handshake (allocated before a session's scope) and allocation headers |
 
-The pool term carries the pool's own residual: sessions can hold more than it for as long as the
-asked sessions take to end (see the session memory section). Measured on loopback with the client
+The residual row is the session memory section's "at most the pool again". Measured on loopback with the client
 MSS set to 1460 (debug build, no swap): 256 plaintext connections stalled on SUBACKs behind 600 KB
 of PUBLISH each, then 256 TLS connections each holding a 262,000-byte partial PUBLISH, peaked at
-129,417,216 bytes (heap 117 MB at most, socket memory 2.1 MB at most, since each stalled reply was
-cut after 5 s); 11 sessions were ended by the pool. Before these bounds the same load
-OOM-killed the unit.
+129,417,216 bytes in one run (a reviewer's run of the same shape reached 139.9 MB; heap 117 MB at
+most, socket memory 2.1 MB at most, since each stalled reply was cut after 5 s); 11 sessions were
+ended by the pool. A third load, 256 plaintext connections each holding a 262,143-byte partial
+PUBLISH and then 256 TLS connections each holding 150,000 bytes, peaked at 122.0 MB and ended 267
+sessions. Before these bounds the same load OOM-killed the unit.
+
+With both listeners the per-session floor is 157,286 bytes, under the largest body (262,144).
+The body buffer doubles as it fills, so a session holds 262,144 bytes once a body passes 131,072;
+while the pool is full, such a session is refused and ended with `end_reason` `memory_limit`, so
+a PUBLISH body over 128 KiB sent during that pressure is not captured. Plaintext only, the floor
+is 314,572 and the largest body fits.
 
 ## SSH sensor worst-case memory
 

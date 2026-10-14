@@ -981,10 +981,6 @@ mod tests {
         assert_eq!(m["end_reason"], "idle_timeout");
     }
 
-    /// Every end, as every kind of capture, writes both keys, and `complete` is exactly what the
-    /// end says. The same `PeerClosed` is whole for a shell capture and a fragment for a file
-    /// transfer that never reached its end-of-file marker; the labels stay the strings the shell
-    /// sensors have always written.
     #[test]
     fn stamp_end_reason_adds_the_label_and_keeps_the_other_keys() {
         let mut m = serde_json::json!({"packets": 3});
@@ -993,6 +989,10 @@ mod tests {
         assert_eq!(m["packets"], 3);
     }
 
+    /// Every end, as every kind of capture, writes both keys, and `complete` is exactly what the
+    /// end says. The same `PeerClosed` is whole for a shell capture and a fragment for a file
+    /// transfer that never reached its end-of-file marker; the labels stay the strings the shell
+    /// sensors have always written.
     #[test]
     fn upload_metadata_derives_complete_and_end_reason_from_one_end() {
         let all = [

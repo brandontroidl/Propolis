@@ -494,7 +494,7 @@
   256 M unit and lost all ten uploads. Each control socket's kernel buffers are now fixed at
   32 KiB a direction before the banner (`clamp_socket_buffers`, a socket that cannot be clamped
   is closed), and every reply write is bounded by the idle timeout and ends the session when
-  it runs out. The same load now peaks at 157 MB with every upload recorded. See
+  it runs out. The same load now peaks at about 157 MB with every upload recorded. See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-ftp) and
   [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
 - **MQTT clients that never read their replies, or leave a PUBLISH half sent, are bounded** -
@@ -509,7 +509,7 @@
   sensors use (30% of `MemoryMax`, shared by both listeners): a body still arriving is charged
   to it, a session the pool cannot hold is ended with `end_reason` `memory_limit` on its
   session-end event, and a connection that cannot get a slot is closed unanswered. The same
-  load now peaks at 129 MB. See
+  load now peaks at 129 to 140 MB across runs. See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-mqtt) and
   [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform

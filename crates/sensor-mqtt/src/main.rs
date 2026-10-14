@@ -206,7 +206,13 @@ async fn main() {
     };
     let sessions = config.bounds.max_concurrent.saturating_mul(listeners);
     if let Err(e) = session_memory::configure(DEFAULT_POOL_BYTES_256M, sessions) {
-        tracing::error!(error = %e, "sensor-mqtt: invalid configuration; refusing to start");
+        tracing::error!(
+            error = %e,
+            max_concurrent = config.bounds.max_concurrent,
+            listeners,
+            "sensor-mqtt: {ENV_MAX_CONCURRENT} times the listener count does not fit the session \
+             memory pool; refusing to start"
+        );
         std::process::exit(1);
     }
     tokio::spawn(session_memory::watchdog());

@@ -183,7 +183,7 @@ installed, so a push that has never succeeded is reported rather than read as
 - "Permission denied" running the script as `propolis-blocklist`: the script, its
   sibling `blocklist-README.md` and every directory above them must be readable
   and traversable by that account. Use the root-owned copy under
-  `/usr/local/lib/propolis/` that the routine-procedures page installs.
+  `/usr/local/lib/propolis/` that `deploy/install.sh` and `deploy/upgrade.sh` install.
 
 ## Ops alerts never fire, or the daemon won't start with ops enabled
 

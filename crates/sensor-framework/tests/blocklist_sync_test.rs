@@ -5,7 +5,7 @@
 //! planting something in that directory and checks that nothing it plants is published, opened
 //! or written through. Real git, stat and dd run as shipped; only the swap and root tests put a stand-in first on PATH.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -429,6 +429,11 @@ struct SwapShim {
 
 impl SwapShim {
     fn new(fx: &Fixture, mode: &str) -> Self {
+        Self::with_link_target(fx, mode, &fx.secret())
+    }
+
+    /// As `new`, where the symlink modes point the planted link at `target`.
+    fn with_link_target(fx: &Fixture, mode: &str, target: &Path) -> Self {
         let dir = fx.root().join("shim");
         std::fs::create_dir_all(&dir).unwrap();
         let real = ["/usr/bin/stat", "/bin/stat"]
@@ -444,7 +449,7 @@ if [ "$last" = aggressive.txt ]; then
   n=$(cat "{count}" 2>/dev/null || echo 0)
   n=$((n + 1))
   echo "$n" >"{count}"
-  if [ "$n" = 2 ] && {{ [ "{mode}" = symlink_restore ] || [ "{mode}" = hardlink_restore ]; }}; then
+  if [ "$n" = 2 ] && {{ [ "{mode}" = symlink_restore ] || [ "{mode}" = hardlink_restore ] || [ "{mode}" = fifolink_restore ]; }}; then
     rm -f aggressive.txt
     mv "{orig}" aggressive.txt
   fi
@@ -454,7 +459,7 @@ rc=$?
 if [ "$n" = 1 ]; then
   mv aggressive.txt "{orig}"
   case "{mode}" in
-    symlink|symlink_restore) ln -s "{secret}" aggressive.txt ;;
+    symlink|symlink_restore|fifolink_restore) ln -s "{target}" aggressive.txt ;;
     hardlink|hardlink_restore) ln "{secret}" aggressive.txt ;;
     fifo) mkfifo aggressive.txt ;;
   esac
@@ -463,6 +468,7 @@ exit $rc
 "#,
             count = dir.join("count").display(),
             orig = fx.root().join("orig-aggressive.txt").display(),
+            target = target.display(),
             secret = fx.secret().display(),
             mode = mode,
             real = real,
@@ -506,7 +512,8 @@ fn a_symlink_swapped_in_after_the_check_is_not_followed() {
 }
 
 /// The link is there only while the script opens the file and gone again when it looks afterwards,
-/// so the second look sees a clean file: only refusing to follow a link at the open stops it.
+/// so the second look sees a clean file: the open must refuse the link itself (O_NOFOLLOW) or the
+/// descriptor's inode must differ; `a_symlink_is_never_opened_through` pins the first.
 #[test]
 fn a_symlink_present_only_during_the_open_is_not_followed() {
     let fx = Fixture::new();
@@ -514,6 +521,51 @@ fn a_symlink_present_only_during_the_open_is_not_followed() {
     let shim = SwapShim::new(&fx, "symlink_restore");
     let out = fx.run_with(&[("PATH", &shim.path_env())]);
     fx.assert_refused_and_nothing_published(&out, "symlink present only during the open");
+}
+
+/// Detects a followed open, which refusing afterwards on the inode cannot: the link points at a
+/// FIFO and an observer holds that FIFO's write side open-pending, so its open returns only if
+/// something opens the FIFO for reading. A script that follows the link opens the target (waking
+/// the observer, and as root that is how a device with open-time side effects gets touched)
+/// before it refuses; one that opens with O_NOFOLLOW never does.
+#[test]
+fn a_symlink_is_never_opened_through() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fx = Fixture::new();
+    let target = fx.root().join("secret/observed.fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let opened = Arc::new(AtomicBool::new(false));
+    let observer = {
+        let (target, opened) = (target.clone(), opened.clone());
+        std::thread::spawn(move || {
+            // Blocks until a reader opens the FIFO.
+            let _writer = std::fs::OpenOptions::new().write(true).open(&target);
+            opened.store(true, Ordering::SeqCst);
+        })
+    };
+    let shim = SwapShim::with_link_target(&fx, "fifolink_restore", &target);
+    let out = fx.run_with(&[("PATH", &shim.path_env())]);
+    let followed = opened.load(Ordering::SeqCst);
+    // Release the observer if nothing did, so the join cannot hang the test.
+    let _reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&target)
+        .unwrap();
+    observer.join().unwrap();
+    fx.assert_refused_and_nothing_published(&out, "symlink to a FIFO present during the open");
+    assert!(
+        !followed,
+        "the script opened the symlink's target; it must refuse the link at the open"
+    );
 }
 
 /// A name swapped after its check for a hard link to a same-size secret is the same inode as the
@@ -559,8 +611,8 @@ fn a_fifo_swapped_in_after_the_check_does_not_block() {
     let out = fx.run_with(&[("PATH", &shim.path_env())]);
     fx.assert_refused_and_nothing_published(&out, "fifo swapped after the check");
     assert!(
-        started.elapsed() < Duration::from_secs(30),
-        "refused promptly, not after a timeout"
+        started.elapsed() < Duration::from_secs(5),
+        "refused promptly, not after the open's 10 s timeout"
     );
 }
 
@@ -743,32 +795,34 @@ fn the_format_list_matches_the_publisher() {
     assert_eq!(listed, ours, "blocklist-sync.sh's FORMATS drifted");
 }
 
-/// The cron runs a root-owned copy under /usr/local/lib/propolis, not the checkout, so an upgrade
-/// that does not reinstall it leaves the box running the previous script. The upgrade script
-/// cannot be executed from a test (it writes system paths), so this is the static half.
+/// The cron runs a root-owned copy under /usr/local/lib/propolis, not the checkout, so an install
+/// or upgrade that does not put it there leaves the box with no copy, or the previous script. Both
+/// scripts write system paths and cannot be executed from a test, so this is the static half.
+/// `install.sh` runs its commands through `run` (which honours --dry-run); `upgrade.sh` does not.
 #[test]
-fn the_upgrade_reinstalls_the_root_owned_copy_of_the_script_and_its_readme() {
-    let upgrade = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../deploy/upgrade.sh"
-    ))
-    .unwrap();
-    for (src, dest, mode) in [
-        (
-            "blocklist-sync.sh",
-            "/usr/local/lib/propolis/blocklist-sync.sh",
-            "0755",
-        ),
-        (
-            "blocklist-README.md",
-            "/usr/local/lib/propolis/blocklist-README.md",
-            "0644",
-        ),
-    ] {
-        let wanted = format!("install -o root -g root -m {mode} \"$SCRIPT_DIR/{src}\" {dest}");
-        assert!(
-            upgrade.lines().any(|l| l.trim() == wanted),
-            "deploy/upgrade.sh does not run: {wanted}"
-        );
+fn install_and_upgrade_put_the_root_owned_copy_of_the_script_and_its_readme_in_place() {
+    for (script, prefix) in [("install.sh", "run "), ("upgrade.sh", "")] {
+        let text = std::fs::read_to_string(format!(
+            "{}/../../deploy/{script}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let mut wanted = vec![format!(
+            "{prefix}install -d -o root -g root -m 0755 /usr/local/lib/propolis"
+        )];
+        for (src, mode) in [
+            ("blocklist-sync.sh", "0755"),
+            ("blocklist-README.md", "0644"),
+        ] {
+            wanted.push(format!(
+                "{prefix}install -o root -g root -m {mode} \"$SCRIPT_DIR/{src}\" /usr/local/lib/propolis/{src}"
+            ));
+        }
+        for line in wanted {
+            assert!(
+                text.lines().any(|l| l.trim() == line),
+                "deploy/{script} does not run: {line}"
+            );
+        }
     }
 }

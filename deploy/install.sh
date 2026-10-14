@@ -179,6 +179,11 @@ for unit in propolis-backup.service propolis-backup.timer; do
 done
 # Every Propolis unit names this in OnFailure=, so it is installed with them; it needs no enable.
 run install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+# The public-feed push runs from the operator's cron as propolis-blocklist out of a root-owned copy
+# the account cannot edit (upgrade.sh refreshes it); inert until the operator adds the cron entry.
+run install -d -o root -g root -m 0755 /usr/local/lib/propolis
+run install -o root -g root -m 0755 "$SCRIPT_DIR/blocklist-sync.sh" /usr/local/lib/propolis/blocklist-sync.sh
+run install -o root -g root -m 0644 "$SCRIPT_DIR/blocklist-README.md" /usr/local/lib/propolis/blocklist-README.md
 # The off-host pull's forced command; inert until the operator adds a key for propolis-backup-pull.
 run install -m 0755 "$SCRIPT_DIR/backup-serve.sh" /usr/local/sbin/propolis-backup-serve
 run install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service

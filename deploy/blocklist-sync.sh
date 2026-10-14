@@ -163,12 +163,14 @@ done
 # --- Copy each file safely --------------------------------------------------------------------
 # Copies one feed file to `dest`. The type and link count are checked on the name before opening
 # it, so a FIFO or device is not opened in the ordinary case. The read is then bound to the file
-# that was checked: a child shell opens the name once, takes the device and inode of the OPEN
-# DESCRIPTOR (stat -L on /dev/fd/3, not on the name), refuses unless they equal the pre-open
-# stat, and only then reads from that same descriptor. A hard link or symlink swapped in around
-# the open is a different inode and is refused even if the name is restored before the next look.
-# The child runs under timeout because opening a FIFO swapped in at that instant would block for
-# good. After the read the name must still match its check, and the copy must be the size checked.
+# that was checked: perl (perl-base, Essential on Debian) opens the name ONCE with O_NOFOLLOW (a
+# symlink swapped in is never opened, so nothing at its target sees an open) and O_NONBLOCK (a FIFO
+# swapped in cannot hold the open), takes the device and inode of that same handle with fstat,
+# refuses unless they equal the pre-open stat (perl's st_dev is the raw dev_t, the number GNU stat
+# prints as %d) and the handle is a regular file, and only then copies at most `max` bytes from it.
+# A hard link swapped in around the open is a different inode and is refused even if the name is
+# restored before the next look. The timeout covers only a filesystem that stalls an open. After
+# the read the name must still match its check, and the copy must be the size checked.
 copy_feed_file() {
   local name="$1" dest="$2" max="$3" checked after type links size id
   checked="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
@@ -185,11 +187,28 @@ copy_feed_file() {
     echo "blocklist-sync: $name is $size bytes, over the $max-byte limit" >&2
     return 1
   fi
-  timeout 10 bash -c '
-    exec 3<"$1" || exit 1
-    [ "$(stat -L -c %d:%i /dev/fd/3)" = "$2" ] || exit 3
-    exec dd of="$3" iflag=count_bytes count="$4" bs=1M status=none <&3
-  ' _ "$name" "$id" "$dest" "$max" \
+  # shellcheck disable=SC2016 # perl, not the shell, expands $ARGV and the other $ names here
+  timeout 10 perl -e '
+    use Fcntl;
+    my ($name, $id, $dest, $max) = @ARGV;
+    sysopen(my $in, $name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or exit 1;
+    my @st = stat($in);
+    exit 3 unless @st && "$st[0]:$st[1]" eq $id && -f $in;
+    sysopen(my $out, $dest, O_WRONLY | O_CREAT | O_EXCL, 0644) or exit 1;
+    my ($left, $buf) = ($max, "");
+    while ($left > 0) {
+      my $n = sysread($in, $buf, $left < 1048576 ? $left : 1048576);
+      exit 1 unless defined $n;
+      last if $n == 0;
+      for (my $off = 0; $off < $n; ) {
+        my $w = syswrite($out, $buf, $n - $off, $off);
+        exit 1 unless defined $w;
+        $off += $w;
+      }
+      $left -= $n;
+    }
+    close($out) or exit 1;
+  ' "$name" "$id" "$dest" "$max" \
     || { echo "blocklist-sync: $name could not be opened as the file that was checked" >&2; return 1; }
   after="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
   if [ "$after" != "$checked" ]; then

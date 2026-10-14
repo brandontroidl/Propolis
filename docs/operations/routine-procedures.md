@@ -123,9 +123,10 @@ sudo crontab -u propolis-blocklist -e
 The account must be able to read the script and its sibling `blocklist-README.md`, and
 it must not be able to change them: a checkout under `/root` or a `0700` home fails
 with "Permission denied", and a script the account could edit would run as the account
-on the next tick. Install a root-owned copy where every account can read it. `deploy/upgrade.sh`
-refreshes both files on every upgrade, so this is a one-time step on a box that has not
-been upgraded since the copy was introduced:
+on the next tick. Install a root-owned copy where every account can read it. `deploy/install.sh` installs
+both files and `deploy/upgrade.sh` refreshes them on every upgrade, so the commands below
+are needed only on a box that was installed before the copy was introduced and has not been
+upgraded since:
 
 ```
 sudo install -d -o root -g root -m 0755 /usr/local/lib/propolis

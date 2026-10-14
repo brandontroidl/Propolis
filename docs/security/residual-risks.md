@@ -97,8 +97,9 @@ responsibilities and out of the code's control.
 
 The script reads a directory the daemon writes, so a compromised daemon chooses
 what it finds there. It copies only single-link regular files with the publisher's
-names, opens each name once and compares the device and inode of the open descriptor
-with the stat it took before opening (reading only from that descriptor), and writes
+names, opens each name once, without following a link or blocking (`O_NOFOLLOW|O_NONBLOCK`), compares
+the device and inode of the open descriptor with the stat it took before opening
+(reading only from that descriptor), and writes
 nothing in that directory, so a planted link, FIFO or stray file is refused, including
 one present only for the instant of the open. Planting a hard link to a file the
 daemon cannot itself read is also refused by the kernel when `fs.protected_hardlinks=1`

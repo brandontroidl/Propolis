@@ -14,8 +14,9 @@
   creates the account and `/var/lib/propolis/blocklist-status`; a root crontab keeps working,
   with a warning, until you move it (steps in
   [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
-  Install the script where `propolis-blocklist` can read it (a root-owned copy under
-  `/usr/local/lib/propolis/`); a checkout under `/root` is not readable by it. A root run records
+  `install.sh` and `upgrade.sh` install the script and its README as a root-owned copy under
+  `/usr/local/lib/propolis/`, where `propolis-blocklist` can read it (a checkout under `/root` is
+  not readable by it); point the crontab at that copy. A root run records
   the push marker by dropping to the status directory's owner, which needs `setpriv` (util-linux).
   The push marker moved there from `/var/lib/propolis/feed/.current.last_pushed`, so until the
   first push after the upgrade `feed-push-stale` sees no push; with `PROPOLIS_OPS_FEED_PUSH_EXPECTED`
@@ -655,10 +656,11 @@
   truncate, chmod or create any file. The script now enters the feed directory once (refusing a
   symlinked one), accepts only the publisher's names and formats with every format present,
   copies only single-link regular files of at most 32 MiB (256 MiB a build), binds each read
-  to the file it checked (it opens the name once, compares the device and inode of that open
+  to the file it checked (it opens the name once with `O_NOFOLLOW|O_NONBLOCK`, so a link is never
+  followed and a FIFO cannot hold the open, compares the device and inode of that open
   descriptor with the pre-open stat, and reads only from that descriptor, so a link swapped in
   around the open is refused even if the name is restored), and stages the copies so a
-  refusal leaves the checkout untouched. `deploy/upgrade.sh` now reinstalls the root-owned
+  refusal leaves the checkout untouched. `deploy/install.sh` and `deploy/upgrade.sh` now install the root-owned
   copy under `/usr/local/lib/propolis` that the cron runs. The marker moved to `/var/lib/propolis/blocklist-status/last-pushed`, a
   directory the daemon cannot write, written by temporary file and rename. `provision.sh`
   creates a `propolis-blocklist` account to run it as, which cannot read root's files at all.

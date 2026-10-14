@@ -1580,9 +1580,13 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   (Python smtplib's default) takes the initial response as the username and prompts only
   `334 UGFzc3dvcmQ6`; `=` is an empty initial response. A PLAIN blob without both NUL
   separators is malformed and records an empty username. `*` answering a `334` gets
-  `501 5.7.0 Authentication aborted` and no event. MAIL FROM / RCPT TO, DATA (captures
+  `501 5.7.0 Authentication aborted` and no event. MAIL FROM / RCPT TO (Postfix's
+  `smtpd_recipient_limit` default: the 1001st recipient of a transaction gets `452 4.5.3
+  Error: too many recipients`; `crates/sensor-smtp/src/handler.rs#Envelope`), DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
-  Postfix queue id; without the terminating `.` line nothing is acknowledged or recorded),
+  Postfix queue id; without the terminating `.` line nothing is acknowledged or recorded;
+  `rcpt_to` holds the first 100 recipients and `rcpt_count` how many were accepted; the
+  envelope is cleared after each message, as Postfix clears it),
   BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate as bytes until LAST, then the same
   message event with `chunking: true`; `BDAT 0 LAST` is a valid empty final chunk; a chunk
   the client does not finish sending, or that exceeds the session byte budget, is neither

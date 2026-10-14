@@ -71,8 +71,7 @@ pub async fn handle_connection(
         return;
     }
 
-    let mut mail_from = String::new();
-    let mut rcpt_to = Vec::new();
+    let mut envelope = Envelope::default();
     let mut total_read: u64 = 0;
     // Message body accumulated across BDAT chunks until the LAST one arrives, and the bytes the
     // client sent for it (the body stops growing at MAX_DATA_BODY; the count does not).
@@ -141,8 +140,7 @@ pub async fn handle_connection(
                 // RFC 3207 section 4.2: the server discards what it learned before the upgrade and
                 // the client must EHLO again. `total_read` is deliberately kept: the capture cap is
                 // per connection.
-                mail_from.clear();
-                rcpt_to.clear();
+                envelope.reset();
                 bdat_body.clear();
                 bdat_received = 0;
             } else {
@@ -175,12 +173,16 @@ pub async fn handle_connection(
                 Auth::Closed => return,
             }
         } else if upper.starts_with("MAIL FROM:") {
-            mail_from = extract_angle_bracket(&line[10..]);
-            rcpt_to.clear();
+            envelope.reset();
+            envelope.mail_from = extract_angle_bracket(&line[10..]);
             let _ = write_reply(&mut reader, b"250 2.1.0 Ok\r\n").await;
         } else if upper.starts_with("RCPT TO:") {
-            rcpt_to.push(extract_angle_bracket(&line[8..]));
-            let _ = write_reply(&mut reader, b"250 2.1.5 Ok\r\n").await;
+            let reply: &[u8] = if envelope.add_recipient(&extract_angle_bracket(&line[8..])) {
+                b"250 2.1.5 Ok\r\n"
+            } else {
+                b"452 4.5.3 Error: too many recipients\r\n"
+            };
+            let _ = write_reply(&mut reader, reply).await;
         } else if upper == "DATA" {
             let _ = write_reply(&mut reader, b"354 End data with <CR><LF>.<CR><LF>\r\n").await;
             // No terminating `.` line means no message: the session ends without a "queued".
@@ -192,8 +194,7 @@ pub async fn handle_connection(
             let text = String::from_utf8_lossy(&body);
             let subject = extract_header(&text, "Subject");
             let msg = ReceivedMessage {
-                mail_from: &mail_from,
-                rcpt_to: &rcpt_to,
+                envelope: &envelope,
                 subject: &subject,
                 body_size: received,
                 truncated: received > body.len(),
@@ -203,6 +204,7 @@ pub async fn handle_connection(
             let _ = emitter
                 .append(&data_event(source_ip, wan_ip, &msg, session_id))
                 .await;
+            envelope.reset();
             // Postfix acknowledges an accepted message with a queue id, not a bare "250 OK".
             let reply = format!("250 2.0.0 Ok: queued as {}\r\n", queue_id());
             let _ = write_reply(&mut reader, reply.as_bytes()).await;
@@ -236,8 +238,7 @@ pub async fn handle_connection(
                         let text = String::from_utf8_lossy(&bdat_body);
                         let subject = extract_header(&text, "Subject");
                         let msg = ReceivedMessage {
-                            mail_from: &mail_from,
-                            rcpt_to: &rcpt_to,
+                            envelope: &envelope,
                             subject: &subject,
                             body_size: bdat_received,
                             truncated: bdat_received > bdat_body.len(),
@@ -247,6 +248,7 @@ pub async fn handle_connection(
                         let _ = emitter
                             .append(&data_event(source_ip, wan_ip, &msg, session_id))
                             .await;
+                        envelope.reset();
                         bdat_body.clear();
                         bdat_received = 0;
                         let reply = format!("250 2.0.0 Ok: queued as {}\r\n", queue_id());
@@ -258,8 +260,7 @@ pub async fn handle_connection(
                 }
             }
         } else if upper.starts_with("RSET") {
-            mail_from.clear();
-            rcpt_to.clear();
+            envelope.reset();
             bdat_body.clear();
             bdat_received = 0;
             let _ = write_reply(&mut reader, b"250 2.0.0 Ok\r\n").await;
@@ -367,10 +368,50 @@ fn login_event(
     }
 }
 
+/// Postfix's `smtpd_recipient_limit` default: recipients accepted per transaction. The next one
+/// gets `452 4.5.3 Error: too many recipients`.
+const MAX_RECIPIENTS: usize = 1000;
+/// Recipients kept for the message event; the rest of the accepted ones are only counted.
+const KEPT_RECIPIENTS: usize = 100;
+/// Characters kept of an address, the same cap the event has always applied.
+const MAX_ADDRESS_LEN: usize = 255;
+
+/// The current mail transaction. What it holds is bounded whatever the client repeats: at most
+/// `KEPT_RECIPIENTS` addresses of at most `MAX_ADDRESS_LEN` characters. The list used to grow
+/// one String per `RCPT TO:` line with no count limit, about 4 MB of heap per 1 MB of input,
+/// enough for one source address to OOM-kill the unit.
+#[derive(Debug, Default)]
+struct Envelope {
+    mail_from: String,
+    /// The first `KEPT_RECIPIENTS` accepted recipients, already sanitized.
+    rcpt_to: Vec<String>,
+    /// Every recipient accepted in this transaction, at most `MAX_RECIPIENTS`.
+    rcpt_count: usize,
+}
+
+impl Envelope {
+    /// Postfix clears the envelope after each message, on MAIL FROM, RSET and STARTTLS.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Accepts one recipient, or returns false when the transaction already has
+    /// `MAX_RECIPIENTS`.
+    fn add_recipient(&mut self, address: &str) -> bool {
+        if self.rcpt_count >= MAX_RECIPIENTS {
+            return false;
+        }
+        self.rcpt_count += 1;
+        if self.rcpt_to.len() < KEPT_RECIPIENTS {
+            self.rcpt_to.push(sanitize_value(address, MAX_ADDRESS_LEN));
+        }
+        true
+    }
+}
+
 /// One received message, however it was transferred, as the event records it.
 struct ReceivedMessage<'a> {
-    mail_from: &'a str,
-    rcpt_to: &'a [String],
+    envelope: &'a Envelope,
     subject: &'a str,
     /// Bytes the client sent as the body, whether or not all of it was kept.
     body_size: usize,
@@ -389,8 +430,7 @@ fn data_event(
     session_id: Uuid,
 ) -> SensorEvent {
     let ReceivedMessage {
-        mail_from,
-        rcpt_to,
+        envelope,
         subject,
         body_size,
         truncated,
@@ -403,8 +443,10 @@ fn data_event(
     let mut metadata = serde_json::json!({
         "protocol_label": PROTOCOL_LABEL,
         "command": "DATA",
-        "mail_from": sanitize_value(mail_from, 255),
-        "rcpt_to": rcpt_to.iter().map(|r| sanitize_value(r, 255)).collect::<Vec<_>>(),
+        "mail_from": sanitize_value(&envelope.mail_from, MAX_ADDRESS_LEN),
+        // `rcpt_to` is the kept prefix; `rcpt_count` says how many were accepted in all.
+        "rcpt_to": envelope.rcpt_to,
+        "rcpt_count": envelope.rcpt_count,
         "subject": sanitize_value(subject, 512),
         "body_size": body_size,
         "truncated": truncated,
@@ -823,10 +865,15 @@ mod tests {
         assert!(event.metadata.get("tls").is_none());
     }
 
+    static EMPTY_ENVELOPE: Envelope = Envelope {
+        mail_from: String::new(),
+        rcpt_to: Vec::new(),
+        rcpt_count: 0,
+    };
+
     fn message(tls: bool) -> ReceivedMessage<'static> {
         ReceivedMessage {
-            mail_from: "a@b.test",
-            rcpt_to: &[],
+            envelope: &EMPTY_ENVELOPE,
             subject: "s",
             body_size: 1,
             truncated: false,
@@ -898,6 +945,27 @@ mod tests {
         // base64 of "admin\0secret": one NUL, so the second field is the password
         assert_eq!(decode_auth_plain("YWRtaW4Ac2VjcmV0"), None);
         assert_eq!(decode_auth_plain(""), None);
+    }
+
+    #[test]
+    fn envelope_keeps_a_bounded_prefix_and_counts_to_the_limit() {
+        let mut envelope = Envelope::default();
+        let long = "x".repeat(8000);
+        for _ in 0..MAX_RECIPIENTS {
+            assert!(envelope.add_recipient(&long));
+        }
+        assert!(!envelope.add_recipient("late@example.com"));
+        assert_eq!(envelope.rcpt_count, MAX_RECIPIENTS);
+        assert_eq!(envelope.rcpt_to.len(), KEPT_RECIPIENTS);
+        assert!(
+            envelope
+                .rcpt_to
+                .iter()
+                .all(|r| r.chars().count() <= MAX_ADDRESS_LEN)
+        );
+        envelope.reset();
+        assert!(envelope.add_recipient("again@example.com"));
+        assert_eq!(envelope.rcpt_count, 1);
     }
 
     #[test]

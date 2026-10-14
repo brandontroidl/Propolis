@@ -90,6 +90,72 @@ async fn greeted(addr: std::net::SocketAddr) -> BufReader<TcpStream> {
     conn
 }
 
+/// The audit's other scenario: one source repeating `RCPT TO:` within the byte budget. Every
+/// line pushed a String with no count limit, about 4 MB of heap per 1 MB of input, and 64
+/// sessions from one address OOM-killed the unit. Past the recipient limit the lines are
+/// refused, and only a bounded prefix of the accepted ones is kept for the event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flood_of_rcpt_lines_holds_a_bounded_amount() {
+    const CONNECTIONS: usize = 16;
+    const LINES: usize = 20_000;
+    const PER_CONNECTION_LIMIT: usize = 64 * 1024;
+
+    let _serial = SERIAL.lock().await;
+    let (addr, handle, _dir) = start().await;
+    let mut flood = b"MAIL FROM:<a@evil.test>\r\n".to_vec();
+    for _ in 0..LINES {
+        flood.extend_from_slice(b"RCPT TO:<victim@example.com>\r\n");
+    }
+    let flood: Arc<[u8]> = flood.into();
+
+    let mut conns = Vec::new();
+    for _ in 0..CONNECTIONS {
+        conns.push(greeted(addr).await.into_inner());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let base = CURRENT.load(Ordering::SeqCst);
+
+    let sessions: Vec<_> = conns
+        .into_iter()
+        .map(|conn| {
+            let flood = flood.clone();
+            tokio::spawn(async move {
+                let (read, mut write) = conn.into_split();
+                let writer = tokio::spawn(async move {
+                    write.write_all(&flood).await.unwrap();
+                    write
+                });
+                // Every line is answered; read them all so neither side blocks on a full
+                // socket buffer, and so the server has processed the whole flood.
+                let mut read = BufReader::new(read);
+                let mut line = String::new();
+                for _ in 0..=LINES {
+                    line.clear();
+                    tokio::time::timeout(Duration::from_secs(10), read.read_line(&mut line))
+                        .await
+                        .expect("a reply per line")
+                        .unwrap();
+                }
+                (read, writer.await.unwrap())
+            })
+        })
+        .collect();
+    let mut held = Vec::new();
+    for s in sessions {
+        held.push(s.await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let grown = CURRENT.load(Ordering::SeqCst).saturating_sub(base);
+
+    assert!(
+        grown <= CONNECTIONS * PER_CONNECTION_LIMIT,
+        "{CONNECTIONS} sessions of {LINES} RCPT lines grew the heap by {grown} bytes, over \
+         {PER_CONNECTION_LIMIT} per connection"
+    );
+    drop(held);
+    handle.abort();
+}
+
 /// The audit's scenario: `BDAT 999000 LAST`, then one byte short of the chunk, then silence.
 /// The sensor allocated the declared size up front and held it for the idle timeout, about
 /// 1 MB per connection; 256 such connections pushed the unit past `MemoryMax`. A stalled chunk

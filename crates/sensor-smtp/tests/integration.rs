@@ -809,6 +809,65 @@ async fn data_capture_with_sender_and_recipient() {
     srv.handle.abort();
 }
 
+/// Postfix's `smtpd_recipient_limit` (default 1000): the 1001st RCPT of a transaction gets
+/// `452 4.5.3 Error: too many recipients`. The event keeps the first 100 addresses and the
+/// accepted count, and the envelope resets after the message as Postfix's does, so the next
+/// transaction neither inherits nor re-emits the old recipients.
+#[tokio::test]
+async fn rcpt_list_is_capped_like_postfix_and_reset_after_each_message() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let _ = client.send("MAIL FROM:<a@evil.test>").await;
+    let mut batch = String::new();
+    for i in 0..1000 {
+        batch.push_str(&format!("RCPT TO:<r{i}@example.com>\r\n"));
+    }
+    client
+        .reader
+        .get_mut()
+        .write_all(batch.as_bytes())
+        .await
+        .unwrap();
+    for i in 0..1000 {
+        let r = client.read_reply().await;
+        assert_eq!(r, "250 2.1.5 Ok\r\n", "recipient {i}");
+    }
+    let r = client.send("RCPT TO:<one-too-many@example.com>").await;
+    assert_eq!(r, "452 4.5.3 Error: too many recipients\r\n");
+    let r = client.send("DATA").await;
+    assert!(r.starts_with("354"), "{r}");
+    let r = client.send("Subject: many\r\n\r\nx\r\n.").await;
+    assert!(r.contains("queued as"), "{r}");
+
+    // A second transaction on the same connection starts from an empty envelope.
+    let _ = client.send("MAIL FROM:<b@evil.test>").await;
+    let r = client.send("RCPT TO:<second@example.com>").await;
+    assert!(r.starts_with("250"), "the cap is per transaction: {r}");
+    let _ = client.send("DATA").await;
+    let r = client.send("Subject: one\r\n\r\ny\r\n.").await;
+    assert!(r.contains("queued as"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let messages: Vec<_> = events
+        .iter()
+        .filter(|e| e.metadata.get("command").and_then(|v| v.as_str()) == Some("DATA"))
+        .collect();
+    assert_eq!(messages.len(), 2, "{events:?}");
+    let first = &messages[0].metadata;
+    assert_eq!(first["rcpt_count"], 1000);
+    let kept = first["rcpt_to"].as_array().unwrap();
+    assert_eq!(kept.len(), 100);
+    assert_eq!(kept[0], "r0@example.com");
+    assert_eq!(kept[99], "r99@example.com");
+    let second = &messages[1].metadata;
+    assert_eq!(second["mail_from"], "b@evil.test");
+    assert_eq!(second["rcpt_to"], serde_json::json!(["second@example.com"]));
+    assert_eq!(second["rcpt_count"], 1);
+    srv.handle.abort();
+}
+
 #[tokio::test]
 async fn never_relays_no_outbound_smtp() {
     let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

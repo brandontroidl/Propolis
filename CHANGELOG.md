@@ -384,6 +384,13 @@
   a 4 KiB read into the 64 KiB retained body, every octet still counted against the session
   budget; measured on 32 stalled 999,000-byte chunks, the heap grows about 64 KiB per
   connection instead of about 1 MB.
+- **The SMTP sensor caps recipients like Postfix** - every `RCPT TO:` line pushed another
+  address with no count limit, about 4 MB of heap per 1 MB of input, so 64 sessions from one
+  source address OOM-killed the unit; the list also survived each message, so every further
+  `DATA` re-emitted it whole. The 1001st recipient of a transaction now gets Postfix's
+  `452 4.5.3 Error: too many recipients` (`smtpd_recipient_limit`), the message event keeps
+  the first 100 addresses with a new `rcpt_count` of all accepted ones, and the envelope is
+  cleared after each message as Postfix clears it.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

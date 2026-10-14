@@ -1586,7 +1586,9 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate as bytes until LAST, then the same
   message event with `chunking: true`; `BDAT 0 LAST` is a valid empty final chunk; a chunk
   the client does not finish sending, or that exceeds the session byte budget, is neither
-  acknowledged nor recorded), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
+  acknowledged nor recorded; a chunk streams through a 4 KiB read into the retained body and
+  is never allocated at its declared size (`crates/sensor-smtp/src/handler.rs#read_raw_chunk`),
+  so a stalled chunk holds at most the body cap), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
   unknown→502. Caps: line 8192, username 255; a message body is kept up to 65536 bytes and
   the event records the full `body_size` received plus `truncated` when it was cut.
 - **Bounds:** common defaults, `max_concurrent` 256, read the same strict way as every other

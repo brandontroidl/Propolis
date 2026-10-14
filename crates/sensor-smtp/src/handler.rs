@@ -225,13 +225,13 @@ pub async fn handle_connection(
                 Some(size) => {
                     // A chunk that never fully arrived is neither acknowledged nor recorded:
                     // the client hung up mid-transfer, and the session ends as a real one would.
-                    let Some(chunk) =
-                        read_raw_chunk(&mut reader, size, &bounds, &mut total_read).await
-                    else {
+                    if !read_raw_chunk(&mut reader, size, &bounds, &mut total_read, &mut bdat_body)
+                        .await
+                    {
                         return;
-                    };
-                    bdat_received += chunk.len();
-                    append_bounded(&mut bdat_body, &chunk);
+                    }
+                    // `size` fits in the session budget, which read_raw_chunk checked.
+                    bdat_received += size as usize;
                     if last {
                         let text = String::from_utf8_lossy(&bdat_body);
                         let subject = extract_header(&text, "Subject");
@@ -712,34 +712,52 @@ async fn read_body_line<S: AsyncRead + Unpin>(
     }
 }
 
-/// Read exactly the `size` raw octets of a BDAT chunk. `Some` only when the whole declared chunk
-/// arrived: a client that declared more than the session's remaining capture budget, hung up,
-/// or went quiet past the idle timeout has not delivered the chunk, and `None` ends the session
-/// without an acknowledgement. Reading what fit in the budget and calling that the chunk was
-/// how a 512-byte declaration became a "queued" 156-byte message. A declared size of zero is a
-/// valid, complete, empty chunk (RFC 3030 allows `BDAT 0 LAST`), not exhausted capacity.
+/// Largest single read of a BDAT chunk. The chunk streams through a buffer this size into the
+/// retained body, so what a session holds never depends on the size the client declared.
+const BDAT_READ_PIECE: usize = 4096;
+
+/// Read exactly the `size` raw octets of a BDAT chunk, appending what fits under
+/// `MAX_DATA_BODY` to `body` and counting every octet against the session's capture budget.
+/// `true` only when the whole declared chunk arrived: a client that declared more than the
+/// session's remaining capture budget, hung up, or went quiet past the idle timeout has not
+/// delivered the chunk, and `false` ends the session without an acknowledgement. Reading what
+/// fit in the budget and calling that the chunk was how a 512-byte declaration became a
+/// "queued" 156-byte message. A declared size of zero is a valid, complete, empty chunk
+/// (RFC 3030 allows `BDAT 0 LAST`), not exhausted capacity.
+///
+/// The chunk is never allocated at its declared size: that held up to `max_captured_bytes`
+/// (1 MB) per stalled connection for the whole idle timeout, and a few hundred such
+/// connections pushed the unit past `MemoryMax`. The idle timeout applies to each read, so a
+/// chunk that is still arriving is not cut, and `max_duration` bounds the session as a whole.
 async fn read_raw_chunk<S: AsyncRead + Unpin>(
     reader: &mut BufReader<S>,
     size: u64,
     bounds: &ConnectionBounds,
     total: &mut u64,
-) -> Option<Vec<u8>> {
+    body: &mut Vec<u8>,
+) -> bool {
     let remaining = bounds.max_captured_bytes.saturating_sub(*total);
     if size > remaining {
         *total = bounds.max_captured_bytes;
-        return None;
+        return false;
     }
-    let mut buf = vec![0u8; size as usize];
-    match tokio::time::timeout(bounds.idle_timeout, reader.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => {
-            *total += size;
-            Some(buf)
-        }
-        _ => {
-            *total = bounds.max_captured_bytes;
-            None
+    let mut piece = [0u8; BDAT_READ_PIECE];
+    let mut left = size;
+    while left > 0 {
+        let want = left.min(BDAT_READ_PIECE as u64) as usize;
+        match tokio::time::timeout(bounds.idle_timeout, reader.read(&mut piece[..want])).await {
+            Ok(Ok(n)) if n > 0 => {
+                *total += n as u64;
+                left -= n as u64;
+                append_bounded(body, &piece[..n]);
+            }
+            _ => {
+                *total = bounds.max_captured_bytes;
+                return false;
+            }
         }
     }
+    true
 }
 
 /// Append `bytes` to `body` up to `MAX_DATA_BODY` bytes. The body is kept as bytes and decoded

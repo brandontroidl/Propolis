@@ -377,6 +377,13 @@
   and read from the next line, as Postfix does, instead of `502`, and a `*` answering a
   challenge gets `501 5.7.0 Authentication aborted`. See
   [sensor-smtp](docs/reference/sensor-behavior.md#sensor-smtp).
+- **A stalled BDAT chunk no longer pins its declared size in the SMTP sensor** - `BDAT <size>`
+  allocated the whole declared chunk (up to the 1 MB session budget) before reading it and
+  held it for the idle timeout, so a few hundred connections that sent all but the last byte
+  pushed the unit past `MemoryMax=256M` and got it OOM-killed. The chunk now streams through
+  a 4 KiB read into the 64 KiB retained body, every octet still counted against the session
+  budget; measured on 32 stalled 999,000-byte chunks, the heap grows about 64 KiB per
+  connection instead of about 1 MB.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

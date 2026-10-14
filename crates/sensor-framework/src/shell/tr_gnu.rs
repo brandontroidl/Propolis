@@ -30,6 +30,8 @@
 //! not read it.
 //!
 //! Output is never longer than the input, so reading through the shared bounded reader bounds it.
+//! Building the sets costs at most 256 steps per construct: a `[c*n]` count (up to 2^64-2) is
+//! never walked a byte at a time as `tr.c` walks it, since the line runs on the sensor's runtime.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -404,6 +406,56 @@ impl<'a> Cursor<'a> {
             }
         }
     }
+
+    /// How many more bytes the construct under the cursor yields when it is a counted `[c*n]`,
+    /// each the same byte.
+    fn repeat_left(&self) -> Option<u64> {
+        let tail = if self.state == State::Begin {
+            0
+        } else {
+            self.tail
+        };
+        match *self.elems.get(tail)? {
+            Elem::Repeat(_, count) if count > 0 => {
+                let done = match self.state {
+                    State::At(v) => v,
+                    _ => 0,
+                };
+                Some(count.saturating_sub(done))
+            }
+            _ => None,
+        }
+    }
+
+    /// Step over `n` bytes of the `[c*n]` under the cursor at once; `n` is less than what
+    /// [`Self::repeat_left`] reported, so the construct is not finished.
+    fn skip_in_repeat(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if self.state == State::Begin {
+            self.tail = 0;
+        }
+        let done = match self.state {
+            State::At(v) => v,
+            _ => 0,
+        };
+        self.state = State::At(done.saturating_add(n));
+    }
+}
+
+/// Advance two cursors walked in step past all but the last of the pairs they make while both
+/// sit in a `[c*n]`. Every such pair is the same two bytes, so only the last one can change
+/// anything; walking a count one byte at a time is what let `[b*18446744073709551614]` hold the
+/// sensor for longer than it will run. Returns whether anything was skipped.
+fn skip_paired_repeats(a: &mut Cursor<'_>, b: &mut Cursor<'_>) -> bool {
+    let (Some(left_a), Some(left_b)) = (a.repeat_left(), b.repeat_left()) else {
+        return false;
+    };
+    let n = left_a.min(left_b).saturating_sub(1);
+    a.skip_in_repeat(n);
+    b.skip_in_repeat(n);
+    n > 0
 }
 
 /// A SET after its escapes are read: the bytes, and which of them came from a backslash.
@@ -738,13 +790,26 @@ fn card_of_complement(spec: &Spec) -> u64 {
     len_u64(members.iter().filter(|m| !**m).count())
 }
 
-/// `set_initialize`: which bytes the SET names, or does not name when `complement`.
+/// `set_initialize`: which bytes the SET names, or does not name when `complement`. `tr.c` walks
+/// the SET a byte at a time; this marks each construct's bytes once, which names the same bytes
+/// without walking a repeat count.
 fn membership(spec: &Spec, complement: bool) -> Vec<bool> {
     let mut set = vec![false; 256];
-    let mut cursor = Cursor::new(&spec.elems);
-    while let Some((c, _)) = cursor.next_char() {
-        if let Some(slot) = set.get_mut(usize::from(c)) {
+    let mut mark = |b: u8| {
+        if let Some(slot) = set.get_mut(usize::from(b)) {
             *slot = true;
+        }
+    };
+    for elem in &spec.elems {
+        match *elem {
+            Elem::Char(c) | Elem::Equiv(c) => mark(c),
+            Elem::Range(first, last) => (first..=last).for_each(&mut mark),
+            Elem::Class(class) => (0..=255u8).filter(|b| class.has(*b)).for_each(&mut mark),
+            Elem::Repeat(c, count) => {
+                if count > 0 {
+                    mark(c);
+                }
+            }
         }
     }
     if complement {
@@ -767,6 +832,10 @@ fn validate_case_classes(s1: &Spec, s2: &Spec, diag: &mut Diag<'_>) -> Result<()
     let (mut s1_new, mut s2_new) = (true, true);
     let (mut more1, mut more2) = (true, true);
     while more1 && more2 {
+        if skip_paired_repeats(&mut c1, &mut c2) {
+            s1_new = false;
+            s2_new = false;
+        }
         let a = c1.next_char();
         let b = c2.next_char();
         more1 = a.is_some();
@@ -789,16 +858,11 @@ fn validate_case_classes(s1: &Spec, s2: &Spec, diag: &mut Diag<'_>) -> Result<()
 
 /// `homogeneous_spec_list`: a non-empty SET naming one byte only.
 fn homogeneous(spec: &Spec) -> bool {
-    let mut cursor = Cursor::new(&spec.elems);
-    let Some((first, _)) = cursor.next_char() else {
-        return false;
-    };
-    while let Some((c, _)) = cursor.next_char() {
-        if c != first {
-            return false;
-        }
-    }
-    true
+    membership(spec, false)
+        .iter()
+        .filter(|named| **named)
+        .count()
+        == 1
 }
 
 /// `string2_extend`: pad SET2 with its last character to the length of SET1.
@@ -915,6 +979,7 @@ fn translation(s1: &Spec, s2: &Spec, flags: &Flags) -> Vec<u8> {
     }
     let mut first = Cursor::new(&s1.elems);
     loop {
+        skip_paired_repeats(&mut first, &mut second);
         let a = first.next_char();
         let b = second.next_char();
         let class1 = a.map_or(Ul::Neither, |x| x.1);

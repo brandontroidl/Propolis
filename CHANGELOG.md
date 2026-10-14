@@ -668,6 +668,15 @@
   creates a `propolis-blocklist` account to run it as, which cannot read root's files at all.
   See [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron).
 
+- **One shell line can no longer freeze or exhaust the SSH, telnet or ADB sensor** - a line runs
+  synchronously on a runtime worker, so a fake command that walks or allocates past what it
+  charges to the line's work allowance stalls every session of that sensor, or takes it past its
+  `MemoryMax` and gets it killed. GNU `tr` walked a `[c*N]` repeat one byte at a time, up to
+  2^64-2 steps: `tr -s a '[b*18446744073709551614]'` (37 bytes) held the telnet and SSH sensors
+  until restarted, with no event written. It now marks a repeat's byte once and pairs two
+  repeats without walking them, which gives the same sets and translation.
+  `crates/sensor-telnet/tests/shell_cost.rs` runs each reproducer through the real listener and
+  holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

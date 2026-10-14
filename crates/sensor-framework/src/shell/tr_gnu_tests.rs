@@ -53,6 +53,23 @@ fn the_ubuntu_shell_has_a_tr_file_and_resolves_it() {
     );
 }
 
+/// Repeats are paired without walking their counts, and the pairs come out as walking them gives:
+/// the last pair a byte takes part in decides its translation. Expected replies follow `tr.c`'s
+/// `get_next` pairing [derived, not captured].
+#[test]
+fn repeats_pair_as_a_byte_by_byte_walk_would() {
+    let mut sh = ubuntu();
+    for (line, expect) in [
+        ("printf 'abcabc' | tr '[a*3]bc' '[x*2]yz'", "yzzyzz"),
+        ("printf 'ab' | tr '[a*2][b*3]' '[x*3][y*2]'", "xy"),
+        ("printf 'ab' | tr '[a*2][b*3]' '[x*4]y'", "xy"),
+        ("printf 'ab' | tr '[a*2][b*3]' '[x*5]y'", "xx"),
+        ("printf 'aab' | tr -s '[a*7]' '[b*7]'", "b"),
+    ] {
+        assert_eq!(answer(&mut sh, line).0, expect.as_bytes(), "{line}");
+    }
+}
+
 #[test]
 fn busybox_tr_is_not_gnu_trs_wording() {
     // The BusyBox applet's refusals are not captured, so under `busybox` the name succeeds silently

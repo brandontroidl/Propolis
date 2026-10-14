@@ -312,7 +312,10 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   and each line once), and `grep` charges every search past the first pass over its input, which
   `-o` and `-w` make when they look again from a later offset
   (`crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`). A match the line cannot pay
-  for stops the line there, as when the allowance runs out anywhere else.
+  for stops the line there, as when the allowance runs out anywhere else. `pgrep` and `pkill`
+  take each pattern alternative's steps (items times text length, plus class range tests) from
+  the line's remaining allowance before it runs over the process table
+  (`crates/sensor-framework/src/shell/procs.rs#FakeShell::select_charged`).
 - On SSH, telnet and ADB the session's own heap is counted too
   (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
   may hold while a line runs stops at its next step, as when its work allowance runs out (the

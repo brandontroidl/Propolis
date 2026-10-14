@@ -444,6 +444,13 @@
   one pass is charged, and a scan past the line's allowance stops the line. Output is unchanged:
   a differential test runs the old window scan against 2,000 generated `-F` cases under `-i -w
   -x -o -c -v`.
+- **`pgrep` and `pkill` pay for their pattern matching** - a pattern of up to 64 alternatives of
+  256 items was run over every process row without being charged to the line's work allowance,
+  and allocated a fresh position set per item, so a heavy pattern cost about a second in an
+  unoptimized build and a loop of them held the runtime worker every other session needed. Each
+  alternative's steps (items times text length, plus the class range tests) are now taken from
+  the line's remaining allowance before it runs, and a selection that cannot pay stops the line.
+  The position sets are reused across items. An ordinary pattern selects the same rows as before.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

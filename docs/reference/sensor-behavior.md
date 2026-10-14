@@ -1152,6 +1152,18 @@ Impersonates **vsFTPd 3.0.5** (conventional port 21).
   sanitized cap 255.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`, `crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, `crates/sensor-ftp/src/lib.rs#CAPTURE_QUEUE_SIZE`, `crates/sensor-ftp/src/lib.rs#start_test_server`).
 - **Bounds:** common defaults, `max_concurrent` 256.
+- **Parked control channel:** the handler does not read the control socket while a LIST or STOR
+  waits for its data connection or a STOR receives, nor while it writes a reply, so what the
+  client sends meanwhile waits in the kernel, charged to the unit's cgroup and outside the capture
+  budget. Each accepted control socket, plain or implicit TLS, has its receive and send buffers
+  fixed at 16 KiB, which Linux stores as 32 KiB a direction, before the banner
+  (`crates/sensor-ftp/src/handler.rs#CONTROL_SOCKET_BUFFER_BYTES`,
+  `crates/sensor-framework/src/listener.rs#clamp_socket_buffers`); a socket that cannot be
+  clamped is closed. Every reply write, the listing sent on a data connection and the final
+  shutdown are bounded by the idle timeout, and a reply that is not written in time ends the
+  session (`crates/sensor-ftp/src/handler.rs#write_line`): a client that never reads its replies
+  used to hold its connection slot until `max_duration`. Data connections are not clamped; the
+  sensor reads a STOR as fast as it arrives.
 - **FTPS and AUTH TLS (optional):** `PROPOLIS_FTP_TLS_CERT` and `PROPOLIS_FTP_TLS_KEY` together
   enable AUTH TLS on the plain listener (21); `PROPOLIS_FTP_TLS_BIND` adds an implicit-TLS (FTPS,
   990) listener that needs the pair, where the handshake comes before the banner. Both run in one

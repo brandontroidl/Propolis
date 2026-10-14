@@ -484,6 +484,19 @@
   and one cut in its body is still recorded, with `body_complete: false`. At the defaults a
   request holds its buffers for at most 150 s. See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-http).
+- **A parked FTP control channel no longer takes the unit down with the uploads in flight** -
+  `sensor-ftp` does not read the control socket while a LIST or STOR waits for its data
+  connection or a STOR receives, or while it writes a reply, so what a client sends meanwhile
+  waits in the kernel, charged to the unit's cgroup and seen by no budget. Receive autotuning
+  let one parked connection hold about 150 KiB on loopback and 260 KiB at Internet MSS, and a
+  reply the client never read held the handler until `max_duration`. Ten uploads filling the
+  capture budget plus 480 parked control connections (plain and implicit TLS) OOM-killed the
+  256 M unit and lost all ten uploads. Each control socket's kernel buffers are now fixed at
+  32 KiB a direction before the banner (`clamp_socket_buffers`, a socket that cannot be clamped
+  is closed), and every reply write is bounded by the idle timeout and ends the session when
+  it runs out. The same load now peaks at 157 MB with every upload recorded. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-ftp) and
+  [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

@@ -149,6 +149,47 @@ Sessions can hold more than the pool for as long as the asked sessions take to e
 sessions within their floors took past it, at most the pool again, and what a session past its
 floor allocated before its line stopped.
 
+## Kernel socket memory
+
+What a peer sends while a handler is not reading waits in the kernel receive queue, and what a
+handler writes waits in the send queue until the peer reads it. Both are charged to the unit's
+cgroup (`memory.stat` `sock`) and to none of the budgets above. Linux grows a receive buffer
+while a connection is read quickly (up to `net.ipv4.tcp_rmem`'s maximum), so a connection read
+fast and then left unread can hold a few hundred KiB, and a full listener of them is tens of MiB
+the 60% headroom was never sized for.
+
+A sensor whose handler stops reading by design fixes the buffers of each accepted socket before
+its first read (`crates/sensor-framework/src/listener.rs#clamp_socket_buffers`): 16 KiB asked
+for, which Linux stores as 32 KiB, per direction, so a connection holds at most 64 KiB of socket
+memory plus the one segment the kernel admits past the receive limit (1.5 KiB at Internet MSS).
+What arrives beyond it is dropped and retransmitted by the peer. A socket that cannot be clamped
+is closed. Writes to a peer that may not read are bounded too, so a stalled connection ends.
+
+- `sensor-ftp` clamps its control sockets, plain and implicit TLS
+  (`crates/sensor-ftp/src/handler.rs#CONTROL_SOCKET_BUFFER_BYTES`): a LIST or STOR does not read
+  the control channel while it waits for or runs its data connection. Each reply write ends the
+  session if it does not finish within the idle timeout
+  (`crates/sensor-ftp/src/handler.rs#write_line`). Data connections are not clamped; a STOR is
+  read as it arrives.
+
+`sensor-ftp` at its defaults, with both listeners (512 control connections), against
+`MemoryMax=256M` (268,435,456):
+
+| Term | Bound |
+|---|---|
+| Capture bodies | 107,374,182 (40% of `MemoryMax`) |
+| Control socket memory | 512 x 65,536 = 33,554,432, plus a segment each |
+| Connection heap, TLS state and runtime (estimate) | 512 x 96 KiB = 50,331,648 |
+| Sum | 191,260,262, 77,175,194 to spare |
+
+The heap allowance is an estimate from one measurement, not a bound the code enforces: on
+loopback with the client MSS set to 1460, ten 10 MB uploads held open (the capture budget full)
+plus 480 control connections parked in LIST behind a flood (240 plain, 240 implicit TLS) peaked
+at 156,815,360 bytes. About 100 MB of that was the uploads, and socket memory read 11.0 MB with
+319 of the connections parked (about 35 KiB each), which leaves roughly 80 KiB a connection for
+everything else (debug build). Every upload was recorded. Before the clamp the same load reached the limit and was
+OOM-killed, losing all ten uploads.
+
 ## SSH sensor worst-case memory
 
 `sensor-ssh` keeps a payload streamed over the shell or an exec's standard input up to 10 MB

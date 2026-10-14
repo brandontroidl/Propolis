@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::listener::{clamp_socket_buffers, normalize_dual_stack};
 use sensor_framework::sanitize_value;
 use sensor_framework::{
     CaptureBody, CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter,
@@ -24,6 +24,15 @@ const MAX_STOR_BODY: usize = 10_000_000;
 /// upload size for the event's `wire_size`/`truncated`. Bounded so an attacker trickling bytes
 /// cannot hold the data connection open indefinitely once nothing more is being kept.
 const MAX_STOR_DRAIN: usize = 10_000_000;
+/// Kernel buffer size asked for on each control socket, per direction; Linux stores twice this.
+/// A LIST or STOR does not read the control channel while it waits for (and runs) its data
+/// connection, so whatever the peer sends meanwhile sits in the kernel, charged to the unit's
+/// cgroup and outside the capture budget. Unclamped, that queue reached about 150 KiB per
+/// connection on loopback and about 260 KiB at Internet MSS, and 512 parked control connections
+/// next to a full capture budget OOM-killed the unit, losing every upload in flight. At 32 KiB a
+/// direction the 512 cost at most 32 MiB plus a segment each. A control line is at most
+/// `MAX_LINE_LEN` and the largest reply (FEAT) is under 200 bytes, so a real client never fills it.
+const CONTROL_SOCKET_BUFFER_BYTES: u32 = 16 * 1024;
 
 // Impersonate vsFTPd 3.0.5 end to end: the banner, the FEAT block, and every response string below
 // are that daemon's real output. A banner that matches no daemon - or a banner and FEAT that do not
@@ -276,9 +285,37 @@ pub async fn handle_connection(
         ))
         .await;
 
-    let mut reader = BufReader::new(stream);
-    if write_line(&mut reader, BANNER).await.is_err() {
+    let control_tcp = match &stream {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Tls(tls) => tls.get_ref().0,
+    };
+    if let Err(error) = clamp_socket_buffers(control_tcp, CONTROL_SOCKET_BUFFER_BYTES) {
+        // Serving it unclamped would reopen the unbudgeted kernel queue; refuse instead.
+        tracing::warn!(%peer_addr, %error, "cannot cap the control socket's buffers; closing");
         return;
+    }
+
+    // A reply the peer does not read within this ends the session (see `write_line`).
+    let write_timeout = bounds.idle_timeout;
+    let mut reader = BufReader::new(stream);
+    if write_line(&mut reader, BANNER, write_timeout)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Every reply below goes through here: a write that fails or does not finish within
+    // `write_timeout` ends the session, since the handler cannot read the control channel while
+    // it is blocked writing to it.
+    macro_rules! reply {
+        ($bytes:expr) => {
+            if write_line(&mut reader, $bytes, write_timeout)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        };
     }
 
     let mut username = String::new();
@@ -306,7 +343,7 @@ pub async fn handle_connection(
         match verb.as_str() {
             "USER" => {
                 username = sanitize_value(arg, MAX_USERNAME_LEN);
-                let _ = write_line(&mut reader, b"331 Please specify the password.\r\n").await;
+                reply!(b"331 Please specify the password.\r\n");
             }
             "PASS" => {
                 // Password read to advance protocol; immediately dropped.
@@ -320,22 +357,22 @@ pub async fn handle_connection(
                         reader.get_ref().is_tls(),
                     ))
                     .await;
-                let _ = write_line(&mut reader, b"230 Login successful.\r\n").await;
+                reply!(b"230 Login successful.\r\n");
             }
             "SYST" => {
-                let _ = write_line(&mut reader, b"215 UNIX Type: L8\r\n").await;
+                reply!(b"215 UNIX Type: L8\r\n");
             }
             "AUTH" => match tls.as_ref() {
                 // No TLS configured: AUTH is an unknown verb, as before TLS support existed.
                 None => {
-                    let _ = write_line(&mut reader, b"500 Unknown command.\r\n").await;
+                    reply!(b"500 Unknown command.\r\n");
                 }
                 Some(tls_server) => {
                     let mechanism = arg.to_ascii_uppercase();
                     if reader.get_ref().is_tls() {
-                        let _ = write_line(&mut reader, b"503 Bad sequence of commands.\r\n").await;
+                        reply!(b"503 Bad sequence of commands.\r\n");
                     } else if !matches!(mechanism.as_str(), "TLS" | "TLS-C" | "SSL" | "TLS-P") {
-                        let _ = write_line(&mut reader, b"504 Unknown AUTH type.\r\n").await;
+                        reply!(b"504 Unknown AUTH type.\r\n");
                     } else {
                         // Bytes already buffered behind the AUTH line were sent in plaintext
                         // before the handshake: a man-in-the-middle prepending commands to the
@@ -349,20 +386,13 @@ pub async fn handle_connection(
                                     source_ip, wan_ip, logged_in, session_id, pipelined,
                                 ))
                                 .await;
-                            let _ = write_line(
-                                &mut reader,
-                                b"504 Pipelined commands after AUTH TLS refused.\r\n",
-                            )
-                            .await;
-                            let _ = reader.get_mut().shutdown().await;
+                            reply!(b"504 Pipelined commands after AUTH TLS refused.\r\n");
+                            let _ =
+                                tokio::time::timeout(write_timeout, reader.get_mut().shutdown())
+                                    .await;
                             return;
                         }
-                        if write_line(&mut reader, b"234 Proceed with negotiation.\r\n")
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                        reply!(b"234 Proceed with negotiation.\r\n");
                         match upgrade_buffered(reader, tls_server, bounds.read_timeout).await {
                             Ok(upgraded) => reader = upgraded,
                             Err(error) => {
@@ -388,7 +418,7 @@ pub async fn handle_connection(
                 } else {
                     b"503 Bad sequence of commands.\r\n"
                 };
-                let _ = write_line(&mut reader, reply).await;
+                reply!(reply);
             }
             "PROT" if tls.is_some() => {
                 let reply: &[u8] = if !reader.get_ref().is_tls() || !pbsz_done {
@@ -407,17 +437,17 @@ pub async fn handle_connection(
                         _ => b"504 Bad PROT command.\r\n",
                     }
                 };
-                let _ = write_line(&mut reader, reply).await;
+                reply!(reply);
             }
             "FEAT" => {
                 let feat = if tls.is_some() { FEAT_TLS } else { FEAT_PLAIN };
-                let _ = write_line(&mut reader, feat).await;
+                reply!(feat);
             }
             "PWD" | "XPWD" => {
-                let _ = write_line(&mut reader, b"257 \"/\" is the current directory\r\n").await;
+                reply!(b"257 \"/\" is the current directory\r\n");
             }
             "CWD" | "XCWD" => {
-                let _ = write_line(&mut reader, b"250 Directory successfully changed.\r\n").await;
+                reply!(b"250 Directory successfully changed.\r\n");
             }
             "TYPE" => {
                 // vsftpd validates the type argument rather than blindly accepting it.
@@ -426,7 +456,7 @@ pub async fn handle_connection(
                     "A" | "A N" => b"200 Switching to ASCII mode.\r\n",
                     _ => b"500 Unrecognised TYPE command.\r\n",
                 };
-                let _ = write_line(&mut reader, reply).await;
+                reply!(reply);
             }
             "SIZE" => {
                 let reply = if sanitize_value(arg, 255) == CANNED_FILE {
@@ -434,7 +464,7 @@ pub async fn handle_connection(
                 } else {
                     "550 Could not get file size.\r\n".to_string()
                 };
-                let _ = write_line(&mut reader, reply.as_bytes()).await;
+                reply!(reply.as_bytes());
             }
             "MDTM" => {
                 let reply = if sanitize_value(arg, 255) == CANNED_FILE {
@@ -442,10 +472,10 @@ pub async fn handle_connection(
                 } else {
                     "550 Could not get file modification time.\r\n".to_string()
                 };
-                let _ = write_line(&mut reader, reply.as_bytes()).await;
+                reply!(reply.as_bytes());
             }
             "REST" => {
-                let _ = write_line(&mut reader, b"350 Restart position accepted (0).\r\n").await;
+                reply!(b"350 Restart position accepted (0).\r\n");
             }
             "PASV" | "EPSV" => {
                 // Bind the data listener on the interface the control connection arrived on (not
@@ -493,18 +523,16 @@ pub async fn handle_connection(
                         if resp.starts_with("227") || resp.starts_with("229") {
                             pasv_listener = Some(listener);
                         }
-                        let _ = write_line(&mut reader, resp.as_bytes()).await;
+                        reply!(resp.as_bytes());
                     }
                     Err(_) => {
-                        let _ =
-                            write_line(&mut reader, b"425 Cannot open data connection\r\n").await;
+                        reply!(b"425 Cannot open data connection\r\n");
                     }
                 }
             }
             "LIST" | "NLST" => {
                 if let Some(ref listener) = pasv_listener {
-                    let _ =
-                        write_line(&mut reader, b"150 Here comes the directory listing.\r\n").await;
+                    reply!(b"150 Here comes the directory listing.\r\n");
                     let reply: &[u8] =
                         match tokio::time::timeout(bounds.idle_timeout, listener.accept()).await {
                             Ok(Ok((data, data_peer))) => {
@@ -524,10 +552,12 @@ pub async fn handle_connection(
                                             } else {
                                                 CANNED_LIST
                                             };
-                                            if send_and_close(&mut data, payload.as_bytes())
-                                                .await
-                                                .is_ok()
-                                            {
+                                            let sent = tokio::time::timeout(
+                                                write_timeout,
+                                                send_and_close(&mut data, payload.as_bytes()),
+                                            )
+                                            .await;
+                                            if matches!(sent, Ok(Ok(()))) {
                                                 b"226 Directory send OK.\r\n"
                                             } else {
                                                 b"426 Failure writing network stream.\r\n"
@@ -544,26 +574,22 @@ pub async fn handle_connection(
                             // report a transfer that never happened.
                             _ => b"425 Failed to establish connection.\r\n",
                         };
-                    let _ = write_line(&mut reader, reply).await;
+                    reply!(reply);
                 } else {
-                    let _ = write_line(&mut reader, b"425 Use PORT or PASV first.\r\n").await;
+                    reply!(b"425 Use PORT or PASV first.\r\n");
                 }
             }
             "STOR" => {
                 let filename = sanitize_value(arg, 255);
                 if let Some(ref listener) = pasv_listener {
-                    let _ = write_line(&mut reader, b"150 Ok to send data.\r\n").await;
+                    reply!(b"150 Ok to send data.\r\n");
                     let (data, data_peer) =
                         match tokio::time::timeout(bounds.idle_timeout, listener.accept()).await {
                             Ok(Ok(accepted)) => accepted,
                             // No data connection: no transfer happened, and "Transfer complete"
                             // used to be the answer anyway.
                             _ => {
-                                let _ = write_line(
-                                    &mut reader,
-                                    b"425 Failed to establish connection.\r\n",
-                                )
-                                .await;
+                                reply!(b"425 Failed to establish connection.\r\n");
                                 continue;
                             }
                         };
@@ -572,15 +598,13 @@ pub async fn handle_connection(
                     // would attribute the sample to the control connection's source_ip.
                     if !data_peer_matches(source_ip, data_peer) {
                         drop(data);
-                        let _ =
-                            write_line(&mut reader, b"425 Security: bad IP connecting.\r\n").await;
+                        reply!(b"425 Security: bad IP connecting.\r\n");
                         continue;
                     }
                     let Some(data) =
                         protect_data(data, prot_private, tls.as_ref(), bounds.read_timeout).await
                     else {
-                        let _ = write_line(&mut reader, b"425 Failed to establish connection.\r\n")
-                            .await;
+                        reply!(b"425 Failed to establish connection.\r\n");
                         continue;
                     };
                     let mut capture = StorCapture {
@@ -606,30 +630,30 @@ pub async fn handle_connection(
                             b"451 Failure writing to local file.\r\n"
                         }
                     };
-                    let _ = write_line(&mut reader, reply).await;
+                    reply!(reply);
                 } else {
-                    let _ = write_line(&mut reader, b"425 Use PORT or PASV first.\r\n").await;
+                    reply!(b"425 Use PORT or PASV first.\r\n");
                 }
             }
             "RETR" => {
-                let _ = write_line(&mut reader, b"550 Failed to open file.\r\n").await;
+                reply!(b"550 Failed to open file.\r\n");
             }
             "PORT" | "EPRT" => {
                 // Known commands, but active mode is unimplemented -> 502 (not 500, which is for an
                 // unrecognized verb). This also keeps the sensor from ever dialing out.
-                let _ = write_line(&mut reader, b"502 Command not implemented.\r\n").await;
+                reply!(b"502 Command not implemented.\r\n");
             }
             "QUIT" => {
-                let _ = write_line(&mut reader, b"221 Goodbye.\r\n").await;
+                reply!(b"221 Goodbye.\r\n");
                 // close_notify on a TLS control channel, FIN on plain.
-                let _ = reader.get_mut().shutdown().await;
+                let _ = tokio::time::timeout(write_timeout, reader.get_mut().shutdown()).await;
                 return;
             }
             "NOOP" => {
-                let _ = write_line(&mut reader, b"200 NOOP ok.\r\n").await;
+                reply!(b"200 NOOP ok.\r\n");
             }
             _ => {
-                let _ = write_line(&mut reader, b"500 Unknown command.\r\n").await;
+                reply!(b"500 Unknown command.\r\n");
             }
         }
     }
@@ -735,14 +759,25 @@ fn split_ftp_command(line: &str) -> (&str, &str) {
     }
 }
 
+/// `Err` when the write fails or does not finish within `within`. Without the bound a peer that
+/// never reads held the handler here until `max_duration`, its slot taken and its control socket
+/// unread the whole time.
 async fn write_line<S: AsyncRead + AsyncWrite + Unpin>(
     reader: &mut BufReader<S>,
     data: &[u8],
+    within: std::time::Duration,
 ) -> Result<(), ()> {
     let inner = reader.get_mut();
-    inner.write_all(data).await.map_err(|_| ())?;
-    // A TLS stream can hold written records until flushed.
-    inner.flush().await.map_err(|_| ())
+    let written = tokio::time::timeout(within, async {
+        inner.write_all(data).await?;
+        // A TLS stream can hold written records until flushed.
+        inner.flush().await
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
 }
 
 async fn read_line_bounded<S: AsyncRead + Unpin>(

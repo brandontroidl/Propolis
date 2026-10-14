@@ -52,6 +52,46 @@ pub fn listener_start_error(addr: SocketAddr, error: std::io::Error) -> std::io:
     )
 }
 
+/// Cap a connected socket's kernel receive and send buffers, for a handler that stops reading its
+/// peer while it waits on something else (an FTP control channel during a transfer, a reply to a
+/// peer that does not read).
+///
+/// What a peer sends while the handler is not reading waits in the kernel receive queue. That
+/// memory is charged to the unit's cgroup (`memory.stat` `sock`), and no budget in the process
+/// sees it: left alone, Linux autotunes the buffer upward as the handler reads quickly, so one
+/// parked connection can hold a few hundred KiB and a full listener of them can push the unit past
+/// `MemoryMax`. Setting `SO_RCVBUF` fixes the buffer and turns that autotuning off. The kernel
+/// stores twice the value asked for (`socket(7)`), so each direction then holds about `2 * bytes`,
+/// plus the one segment it admits past the limit before it starts dropping; the peer retransmits
+/// what was dropped, so nothing is lost but the peer's time.
+///
+/// Call it right after accept, before the first read, so the buffer is never larger than this.
+pub fn clamp_socket_buffers<S: std::os::fd::AsRawFd>(
+    socket: &S,
+    bytes: u32,
+) -> std::io::Result<()> {
+    let value = libc::c_int::try_from(bytes)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = socket.as_raw_fd();
+    for option in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        // SAFETY: `fd` is the open socket `socket` borrows for this call, and the option value is
+        // a live `c_int` whose exact size is passed as its length.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw const value).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Bind one TCP address and run its accept loop as a spawned task, returning immediately with the
 /// actual bound address (useful for an ephemeral `:0` port, as every test in
 /// `tests/listener_integration.rs` relies on) and a `JoinHandle` the caller can `.abort()` to stop
@@ -423,5 +463,43 @@ mod tests {
             error.to_string(),
             format!("cannot start listener on {addr}: {os_text}")
         );
+    }
+
+    fn socket_option(stream: &TcpStream, option: libc::c_int) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: the stream's fd is open for this call; `value` and `len` are live and sized.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut value).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        value
+    }
+
+    #[tokio::test]
+    async fn clamp_socket_buffers_fixes_both_directions_and_refuses_an_unrepresentable_size() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        clamp_socket_buffers(&accepted, 16 * 1024).unwrap();
+        // Linux stores twice the value asked for.
+        assert_eq!(socket_option(&accepted, libc::SO_RCVBUF), 32 * 1024);
+        assert_eq!(socket_option(&accepted, libc::SO_SNDBUF), 32 * 1024);
+        assert_eq!(
+            clamp_socket_buffers(&accepted, u32::MAX)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        drop(client);
     }
 }

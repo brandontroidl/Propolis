@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, TlsServer, WanResolver, server_config_from_pem};
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, TlsServer, WanResolver, server_config_from_pem,
+};
 use sensor_wire::SensorEvent;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -54,8 +56,10 @@ async fn plain_and_tls_events_carry_their_own_listeners_port() {
     let log = dir.path().join("events.jsonl");
     let wan = Arc::new(WanResolver::new(HashMap::new()));
     let any = "127.0.0.1:0".parse().unwrap();
+    // One pool for both listeners, as main.rs builds it.
+    let pool = Arc::new(CaptureMemoryBudget::new(sensor_redis::memory::POOL_BYTES));
     let (plain, plain_handle) =
-        sensor_redis::start_test_server(any, log.clone(), wan.clone(), bounds())
+        sensor_redis::start_test_server(any, log.clone(), wan.clone(), bounds(), pool.clone())
             .await
             .unwrap();
     let rcgen::CertifiedKey { cert, signing_key } =
@@ -68,7 +72,7 @@ async fn plain_and_tls_events_carry_their_own_listeners_port() {
         .unwrap(),
     );
     let (tls, tls_handle) =
-        sensor_redis::start_test_server_tls(any, log.clone(), wan, bounds(), tls_server)
+        sensor_redis::start_test_server_tls(any, log.clone(), wan, bounds(), tls_server, pool)
             .await
             .unwrap();
     let mut roots = RootCertStore::empty();

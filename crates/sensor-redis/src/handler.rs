@@ -15,7 +15,8 @@
 //! `SET` stores the value in a small per-session map and `GET` reads it back, so the ordinary
 //! write-then-read check an attacker's tooling makes (`SET foo bar` / `GET foo`) sees a
 //! consistent server; it used to answer nil to every GET, which contradicted the `+OK` two
-//! commands earlier. The map is session-scoped and capped (`MAX_KEYS`); nothing persists between
+//! commands earlier. The map is session-scoped and capped (`MAX_KEYS`, `MAX_STORE_BYTES`, and
+//! past a small floor the pool every session shares, see `memory.rs`); nothing persists between
 //! connections and nothing behind it is real.
 
 use std::collections::HashMap;
@@ -28,12 +29,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver, persona};
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, EventEmitter, Uuid, WanResolver, persona,
+};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
     SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
 };
 
+use crate::memory::{self, Charge};
 use crate::resp;
 
 /// This sensor's identity on both the wire `sensor` field and every event's
@@ -273,26 +277,36 @@ pub struct Session {
     session_id: Uuid,
     authenticated: bool,
     /// Values SET this session, read back by GET, stored whole. Bounded by `MAX_KEYS` entries
-    /// and `MAX_STORE_BYTES` in total, so a connection cannot grow the process without limit.
+    /// and `MAX_STORE_BYTES` in total, and past `memory::STORE_FLOOR` by the pool every session
+    /// shares, so the sessions together cannot grow the process past its memory limit.
     keys: HashMap<Vec<u8>, Vec<u8>>,
     /// Bytes of keys and values currently held, against `MAX_STORE_BYTES`.
     store_bytes: usize,
+    /// The store's charge to the shared pool.
+    store_memory: Charge,
     /// Connection arrived over TLS; stamped on every event as `"tls": true`.
     tls: bool,
 }
 
 /// Distinct keys, and total key+value bytes, one session may hold. A SET that would exceed
-/// either is refused with the error a real instance gives when it is out of memory under its
-/// `noeviction` policy; acknowledging the write and then dropping or cutting it was the same
-/// contradiction as the old always-nil GET, just moved to the limit.
+/// either, or that the shared pool cannot hold, is refused with the error a real instance gives
+/// when it is out of memory under its `noeviction` policy; acknowledging the write and then
+/// dropping or cutting it was the same contradiction as the old always-nil GET, just moved to
+/// the limit.
 const MAX_KEYS: usize = 256;
 const MAX_STORE_BYTES: usize = 1024 * 1024;
 const OOM_REPLY: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
 impl Session {
     /// `source_ip`/`wan_ip` are this connection's real attributes; every event this type ever
-    /// emits carries them verbatim, matching sensor-ssh's `AuthState::new` convention.
-    pub fn new(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> Self {
+    /// emits carries them verbatim, matching sensor-ssh's `AuthState::new` convention. The store
+    /// draws on `pool` past its floor.
+    pub fn new(
+        source_ip: IpAddr,
+        wan_ip: Option<IpAddr>,
+        session_id: Uuid,
+        pool: &CaptureMemoryBudget,
+    ) -> Self {
         Self {
             source_ip,
             wan_ip,
@@ -300,6 +314,7 @@ impl Session {
             authenticated: false,
             keys: HashMap::new(),
             store_bytes: 0,
+            store_memory: Charge::new(pool, memory::STORE_FLOOR),
             tls: false,
         }
     }
@@ -483,7 +498,13 @@ impl Session {
         let incoming = args[1].len() + args[2].len();
         let new_key = !self.keys.contains_key(args[1]);
         let after = self.store_bytes - previous + incoming;
-        if (new_key && self.keys.len() >= MAX_KEYS) || after > MAX_STORE_BYTES {
+        let keys_after = self.keys.len() + usize::from(new_key);
+        if keys_after > MAX_KEYS
+            || after > MAX_STORE_BYTES
+            || !self
+                .store_memory
+                .set(after + keys_after * memory::ENTRY_OVERHEAD)
+        {
             return (resp::error_reply(OOM_REPLY), vec![event]);
         }
         self.keys.insert(args[1].to_vec(), args[2].to_vec());
@@ -557,8 +578,10 @@ impl Session {
 /// dispatch RESP commands in a loop until the peer disconnects, times out, exceeds its capture
 /// budget, or sends a structurally invalid command. Never panics and never propagates an I/O
 /// error to the caller - matches `sensor_framework::run_tcp_listener`'s per-connection isolation
-/// contract (see sensor-telnet's `handle_connection` doc for the same guarantee).
-// Eight parameters: the stream plus the per-connection context every sensor handler takes;
+/// contract (see sensor-telnet's `handle_connection` doc for the same guarantee). The session's
+/// read buffer and store draw on `pool` past their floors (see `memory.rs`), and give it back
+/// when this future ends or is dropped.
+// Nine parameters: the stream plus the per-connection context every sensor handler takes;
 // bundling them would diverge from the uniform handler shape the sibling sensors share.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_connection<S>(
@@ -570,6 +593,7 @@ pub async fn handle_connection<S>(
     emitter: Arc<EventEmitter>,
     wan_resolver: Arc<WanResolver>,
     bounds: ConnectionBounds,
+    pool: Arc<CaptureMemoryBudget>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -584,8 +608,8 @@ pub async fn handle_connection<S>(
         tracing::error!(%peer_addr, "redis: failed to append connection event");
     }
 
-    let mut session = Session::new(source_ip, wan_ip, session_id).with_tls(tls);
-    let mut reader = RespReader::new(bounds);
+    let mut session = Session::new(source_ip, wan_ip, session_id, &pool).with_tls(tls);
+    let mut reader = RespReader::new(bounds, &pool);
 
     loop {
         match reader.read_command(&mut stream).await {
@@ -623,8 +647,9 @@ enum ReadOutcome {
     /// The buffered bytes could never be valid RESP - `handle_connection` writes a protocol-error
     /// reply and ends the session.
     ProtocolError,
-    /// EOF, a read error, a timeout, or the session's `max_captured_bytes` budget was exhausted -
-    /// any of which end the session with no further reply.
+    /// EOF, a read error, a timeout, the session's `max_captured_bytes` budget was exhausted, or
+    /// the shared pool could not buffer the command being read - any of which end the session
+    /// with no further reply.
     Closed,
 }
 
@@ -632,7 +657,9 @@ enum ReadOutcome {
 /// socket read the same way `sensor_telnet::handler::LineReader` does: `read_timeout` bounds the
 /// wait for the very first byte of the whole session, `idle_timeout` bounds every read after
 /// that, and a running total checked against `max_captured_bytes` bounds the whole session's
-/// captured input regardless of how many commands it spans.
+/// captured input regardless of how many commands it spans. The buffer's capacity past
+/// `memory::BUFFER_FLOOR` is charged to the shared pool, and a command the pool cannot buffer
+/// ends the session.
 struct RespReader {
     /// Bytes read off the socket but not yet consumed by a complete, dispatched command.
     buf: Vec<u8>,
@@ -640,17 +667,23 @@ struct RespReader {
     /// next command is read, so its arguments can be dispatched in place until then.
     dispatched: usize,
     parser: resp::Parser,
+    /// `buf`'s capacity, charged to the pool past the floor.
+    memory: Charge,
     bounds: ConnectionBounds,
     first_read: bool,
     total_captured: u64,
 }
 
+/// The step a read buffer grows by when the pool cannot cover doubling it.
+const BUFFER_STEP: usize = 64 * 1024;
+
 impl RespReader {
-    fn new(bounds: ConnectionBounds) -> Self {
+    fn new(bounds: ConnectionBounds, pool: &CaptureMemoryBudget) -> Self {
         Self {
             buf: Vec::new(),
             dispatched: 0,
             parser: resp::Parser::default(),
+            memory: Charge::new(pool, memory::BUFFER_FLOOR),
             bounds,
             first_read: true,
             total_captured: 0,
@@ -662,8 +695,42 @@ impl RespReader {
         ranges.iter().map(|r| &self.buf[r.clone()]).collect()
     }
 
-    async fn read_command<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> ReadOutcome {
+    /// Drop the command last dispatched, and give back the room past the floor that a large one
+    /// took, so a session holds pool room only while a large command is being read.
+    fn release_dispatched(&mut self) {
         self.buf.drain(..std::mem::take(&mut self.dispatched));
+        if self.buf.capacity() > memory::BUFFER_FLOOR {
+            self.buf.shrink_to(memory::BUFFER_FLOOR);
+            // A smaller capacity: refunds, never refused.
+            self.memory.set(self.buf.capacity());
+        }
+    }
+
+    /// Make room for `extra` more bytes, charging the new capacity past the floor; false when
+    /// the pool cannot cover even one step past what is needed.
+    fn reserve(&mut self, extra: usize) -> bool {
+        let need = self.buf.len() + extra;
+        let capacity = self.buf.capacity();
+        if need <= capacity {
+            return true;
+        }
+        // Doubling keeps the copying a growing command costs linear in its size; when the pool
+        // cannot cover that, growing a step at a time still does.
+        let doubled = need.max(capacity * 2).max(READ_CHUNK_SIZE);
+        let stepped = need.next_multiple_of(BUFFER_STEP);
+        let Some(target) = [doubled, stepped]
+            .into_iter()
+            .find(|&target| self.memory.set(target))
+        else {
+            return false;
+        };
+        // Exact, so the capacity is the charged size, not whatever `Vec` would round up to.
+        self.buf.reserve_exact(target - self.buf.len());
+        true
+    }
+
+    async fn read_command<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> ReadOutcome {
+        self.release_dispatched();
         loop {
             match self.parser.parse(&self.buf) {
                 Ok(resp::ParseOutcome::Complete { args, consumed }) => {
@@ -696,6 +763,11 @@ impl RespReader {
             };
             self.first_read = false;
             self.total_captured += n as u64;
+            if !self.reserve(n) {
+                // The pool cannot hold this command: end the session, as a real Redis closes a
+                // client whose query buffer passes its limit.
+                return ReadOutcome::Closed;
+            }
             self.buf.extend_from_slice(&chunk[..n]);
         }
     }
@@ -711,6 +783,16 @@ mod tests {
 
     fn args(strs: &[&str]) -> Vec<Vec<u8>> {
         strs.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    /// A session whose store draws on a pool that never runs out.
+    fn new_session() -> Session {
+        Session::new(
+            ip("203.0.113.7"),
+            None,
+            Uuid::now_v7(),
+            &CaptureMemoryBudget::new(u64::MAX),
+        )
     }
 
     fn metadata_object(event: &SensorEvent) -> &serde_json::Map<String, serde_json::Value> {
@@ -748,7 +830,7 @@ mod tests {
 
     #[test]
     fn ping_replies_pong_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["PING"]));
         assert_eq!(response, resp::simple_string("PONG"));
         assert!(events.is_empty());
@@ -756,7 +838,7 @@ mod tests {
 
     #[test]
     fn command_dispatch_is_case_insensitive() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, _events) = session.dispatch(&args(&["ping"]));
         assert_eq!(response, resp::simple_string("PONG"));
     }
@@ -767,7 +849,7 @@ mod tests {
 
     #[test]
     fn auth_replies_ok_and_sets_authenticated() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         assert!(!session.is_authenticated());
         let (response, events) = session.dispatch(&args(&["AUTH", "hunter2"]));
         assert_eq!(response, resp::simple_string("OK"));
@@ -780,7 +862,7 @@ mod tests {
 
     #[test]
     fn auth_password_never_appears_in_event_metadata() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (_response, events) = session.dispatch(&args(&["AUTH", "SuperSecretPassword123"]));
         let event_json = serde_json::to_string(&events[0]).unwrap();
         assert!(!event_json.contains("SuperSecretPassword123"));
@@ -793,7 +875,7 @@ mod tests {
 
     #[test]
     fn auth_missing_password_argument_is_error_and_no_event() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["AUTH"]));
         assert!(response.starts_with(b"-"), "expected an error reply");
         assert!(events.is_empty());
@@ -804,7 +886,7 @@ mod tests {
     fn auth_accepts_acl_style_username_and_password() {
         // Redis 6+'s `AUTH <username> <password>` form - both dropped identically to the
         // single-password form.
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["AUTH", "default", "hunter2"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -819,7 +901,7 @@ mod tests {
 
     #[test]
     fn info_returns_canned_bulk_string_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["INFO"]));
         assert!(response.starts_with(b"$"), "INFO must reply a bulk string");
         let text = String::from_utf8_lossy(&response);
@@ -830,7 +912,7 @@ mod tests {
 
     #[test]
     fn config_get_returns_array_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["CONFIG", "GET", "*"]));
         assert!(response.starts_with(b"*"), "CONFIG GET must reply an array");
         assert!(events.is_empty());
@@ -842,7 +924,7 @@ mod tests {
 
     #[test]
     fn set_replies_ok_and_emits_command_exec_with_key_and_value() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -864,7 +946,7 @@ mod tests {
 
     #[test]
     fn set_command_exec_authenticated_field_reflects_session_state() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (_r, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
         assert!(
             !events[0].authenticated,
@@ -881,7 +963,7 @@ mod tests {
 
     #[test]
     fn set_wrong_arity_is_error_and_no_event() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["SET", "onlykey"]));
         assert!(response.starts_with(b"-"));
         assert!(events.is_empty());
@@ -889,7 +971,7 @@ mod tests {
 
     #[test]
     fn set_value_containing_crlf_is_sanitized_in_metadata() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (_response, events) = session.dispatch(&args(&[
             "SET",
             "key",
@@ -906,7 +988,7 @@ mod tests {
 
     #[test]
     fn get_of_a_key_never_set_is_nil_and_emits_nothing() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["GET", "foo"]));
         assert_eq!(response, resp::nil_bulk_string());
         assert!(
@@ -919,7 +1001,7 @@ mod tests {
     /// then nil two commands later contradicted the server within one session.
     #[test]
     fn get_after_set_returns_the_value_within_the_session() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         session.dispatch(&args(&["SET", "foo", "bar"]));
         let (response, _events) = session.dispatch(&args(&["GET", "foo"]));
         assert_eq!(response, resp::bulk_string("bar"));
@@ -930,7 +1012,7 @@ mod tests {
             resp::bulk_string("baz")
         );
         // Nothing persists across connections: a new session starts empty.
-        let mut fresh = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut fresh = new_session();
         assert_eq!(
             fresh.dispatch(&args(&["GET", "foo"])).0,
             resp::nil_bulk_string()
@@ -941,7 +1023,7 @@ mod tests {
     /// acknowledged and then dropped or cut: the reply and a later GET must agree.
     #[test]
     fn a_set_past_the_key_cap_is_refused_not_silently_dropped() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         for i in 0..MAX_KEYS {
             let key = format!("k{i}");
             assert_eq!(
@@ -969,7 +1051,7 @@ mod tests {
 
     #[test]
     fn a_value_is_stored_whole_and_a_write_past_the_byte_budget_is_refused() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let big = "x".repeat(1025);
         assert_eq!(
             session.dispatch(&args(&["SET", "big", &big])).0,
@@ -996,12 +1078,131 @@ mod tests {
         );
     }
 
+    /// Past its floor the store draws on the pool every session shares. A write the pool cannot
+    /// hold is refused like any other the store cannot hold, a write within the floor still
+    /// succeeds when the pool is full, and a session that ends gives back what it drew.
+    #[test]
+    fn a_set_the_shared_pool_cannot_hold_is_refused_and_an_ended_session_gives_it_back() {
+        let pool = CaptureMemoryBudget::new(100_000);
+        let session = |pool: &CaptureMemoryBudget| {
+            Session::new(ip("203.0.113.7"), None, Uuid::now_v7(), pool)
+        };
+        let big = "x".repeat(80_000);
+        let mut first = session(&pool);
+        assert_eq!(
+            first.dispatch(&args(&["SET", "a", &big])).0,
+            resp::simple_string("OK")
+        );
+        let drawn = 1 + 80_000 + memory::ENTRY_OVERHEAD - memory::STORE_FLOOR;
+        assert_eq!(pool.current_bytes(), drawn as u64);
+
+        let mut second = session(&pool);
+        let (reply, events) = second.dispatch(&args(&["SET", "a", &big]));
+        assert_eq!(reply, resp::error_reply(OOM_REPLY));
+        assert_eq!(events.len(), 1, "the attempt is still recorded");
+        assert_eq!(
+            second.dispatch(&args(&["GET", "a"])).0,
+            resp::nil_bulk_string()
+        );
+        assert_eq!(
+            second.dispatch(&args(&["SET", "small", "v"])).0,
+            resp::simple_string("OK"),
+            "a write within the floor needs nothing from the pool"
+        );
+        assert_eq!(pool.current_bytes(), drawn as u64);
+
+        // Overwriting with a smaller value gives the difference back.
+        first.dispatch(&args(&["SET", "a", "y"]));
+        assert_eq!(pool.current_bytes(), 0);
+        first.dispatch(&args(&["SET", "a", &big]));
+        drop(first);
+        assert_eq!(pool.current_bytes(), 0);
+        assert_eq!(
+            second.dispatch(&args(&["SET", "a", &big])).0,
+            resp::simple_string("OK")
+        );
+        drop(second);
+        assert_eq!(pool.current_bytes(), 0);
+    }
+
+    fn set_command(value_len: usize) -> Vec<u8> {
+        let mut out = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${value_len}\r\n").into_bytes();
+        out.resize(out.len() + value_len, b'v');
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn reader_bounds() -> ConnectionBounds {
+        ConnectionBounds {
+            read_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(5),
+            max_duration: std::time::Duration::from_secs(30),
+            max_captured_bytes: 1_000_000,
+            max_concurrent: 4,
+        }
+    }
+
+    /// The read buffer's real capacity past the floor is what the pool is charged while a large
+    /// command is read, and reading the next command gives that room back.
+    #[tokio::test]
+    async fn the_read_buffer_is_charged_its_capacity_and_gives_it_back_after_the_command() {
+        let pool = CaptureMemoryBudget::new(u64::MAX);
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut reader = RespReader::new(reader_bounds(), &pool);
+        let command = set_command(200_000);
+        let writer = tokio::spawn(async move {
+            client.write_all(&command).await.unwrap();
+            client.write_all(b"PING\r\n").await.unwrap();
+            client
+        });
+        let ReadOutcome::Command(ranges) = reader.read_command(&mut server).await else {
+            panic!("expected the SET");
+        };
+        assert_eq!(reader.args(&ranges)[2].len(), 200_000);
+        let capacity = reader.buf.capacity();
+        assert!(capacity >= 200_000);
+        assert_eq!(
+            pool.current_bytes(),
+            (capacity - memory::BUFFER_FLOOR) as u64,
+            "the charge is the capacity past the floor"
+        );
+        assert!(matches!(
+            reader.read_command(&mut server).await,
+            ReadOutcome::Command(_)
+        ));
+        assert!(reader.buf.capacity() <= memory::BUFFER_FLOOR);
+        assert_eq!(pool.current_bytes(), 0);
+        let _client = writer.await.unwrap();
+    }
+
+    /// A command the pool cannot buffer ends the session; what the buffer drew is given back.
+    #[tokio::test]
+    async fn a_command_the_pool_cannot_buffer_ends_the_session() {
+        let pool = CaptureMemoryBudget::new(100_000);
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut reader = RespReader::new(reader_bounds(), &pool);
+        let command = set_command(300_000);
+        let writer = tokio::spawn(async move {
+            // The reader stops reading part way, so the rest of the write may fail.
+            let _ = client.write_all(&command).await;
+        });
+        assert!(matches!(
+            reader.read_command(&mut server).await,
+            ReadOutcome::Closed
+        ));
+        assert!(pool.current_bytes() <= 100_000);
+        drop(reader);
+        assert_eq!(pool.current_bytes(), 0);
+        drop(server);
+        writer.await.unwrap();
+    }
+
     /// Redis strings are binary-safe. A value that is not UTF-8 reads back byte for byte, and
     /// two keys that differ only in a non-UTF-8 byte are two keys; decoding arguments as text
     /// used to return U+FFFD for the value and make the keys collide.
     #[test]
     fn non_utf8_values_and_keys_are_kept_as_bytes() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let set = |k: &[u8], v: &[u8]| vec![b"SET".to_vec(), k.to_vec(), v.to_vec()];
         let get = |k: &[u8]| vec![b"GET".to_vec(), k.to_vec()];
         let (reply, events) = session.dispatch(&set(b"bin", &[0xFF]));
@@ -1020,7 +1221,7 @@ mod tests {
 
     #[test]
     fn get_wrong_arity_is_error() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, _events) = session.dispatch(&args(&["GET"]));
         assert!(response.starts_with(b"-"));
     }
@@ -1031,7 +1232,7 @@ mod tests {
 
     #[test]
     fn config_set_dir_is_logged_as_indicator() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["CONFIG", "SET", "dir", "/etc/cron.d"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -1053,7 +1254,7 @@ mod tests {
 
     #[test]
     fn config_set_dbfilename_is_logged_as_indicator() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (_response, events) =
             session.dispatch(&args(&["CONFIG", "SET", "dbfilename", "shell.php"]));
         assert_eq!(events.len(), 1);
@@ -1065,7 +1266,7 @@ mod tests {
 
     #[test]
     fn config_set_dir_param_match_is_case_insensitive() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (_response, events) = session.dispatch(&args(&["CONFIG", "SET", "DIR", "/tmp/x"]));
         assert_eq!(
             events.len(),
@@ -1079,7 +1280,7 @@ mod tests {
         // Only dir/dbfilename are named as filesystem-write indicators by the design spec; a
         // benign CONFIG SET must still succeed (this sensor never really persists config either
         // way) but must not manufacture an indicator event for it.
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["CONFIG", "SET", "maxmemory", "100mb"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert!(events.is_empty());
@@ -1087,7 +1288,7 @@ mod tests {
 
     #[test]
     fn config_unknown_subcommand_is_error() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["CONFIG", "RESETSTAT"]));
         assert!(response.starts_with(b"-"));
         assert!(events.is_empty());
@@ -1099,7 +1300,7 @@ mod tests {
 
     #[test]
     fn slaveof_is_logged_as_indicator() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["SLAVEOF", "198.51.100.50", "6379"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(events.len(), 1);
@@ -1120,7 +1321,7 @@ mod tests {
 
     #[test]
     fn replicaof_no_one_is_logged_with_command_name_preserved() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["REPLICAOF", "NO", "ONE"]));
         assert_eq!(response, resp::simple_string("OK"));
         assert_eq!(
@@ -1135,7 +1336,7 @@ mod tests {
 
     #[test]
     fn eval_replies_error_and_emits_command_exec() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&[
             "EVAL",
             "return redis.call('set', KEYS[1], ARGV[1])",
@@ -1153,7 +1354,7 @@ mod tests {
 
     #[test]
     fn script_replies_error_and_emits_command_exec() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["SCRIPT", "LOAD", "return 1"]));
         assert!(response.starts_with(b"-"));
         assert_eq!(events.len(), 1);
@@ -1169,7 +1370,7 @@ mod tests {
 
     #[test]
     fn unknown_command_replies_error_with_no_events() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let (response, events) = session.dispatch(&args(&["FOOBARBAZ"]));
         assert!(response.starts_with(b"-ERR"));
         let text = String::from_utf8_lossy(&response);
@@ -1183,7 +1384,7 @@ mod tests {
 
     #[test]
     fn every_emitted_event_carries_redis_protocol_label_and_sensor() {
-        let mut session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut session = new_session();
         let mut all_events = vec![connection_event(
             ip("203.0.113.7"),
             None,
@@ -1246,7 +1447,7 @@ mod tests {
 
     #[test]
     fn tls_session_tags_every_event_it_emits() {
-        let session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7()).with_tls(true);
+        let session = new_session().with_tls(true);
         let events = every_kind_of_event(session);
         assert_eq!(events.len(), 5, "AUTH, SET, CONFIG SET, SLAVEOF, EVAL");
         for event in &events {
@@ -1261,7 +1462,7 @@ mod tests {
 
     #[test]
     fn plain_session_events_have_no_tls_key() {
-        let session = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let session = new_session();
         let events = every_kind_of_event(session);
         assert_eq!(events.len(), 5);
         for event in &events {
@@ -1271,7 +1472,7 @@ mod tests {
 
     #[test]
     fn ping_echoes_its_argument() {
-        let mut s = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut s = new_session();
         assert_eq!(
             s.dispatch(&args(&["PING"])).0,
             crate::resp::simple_string("PONG")
@@ -1295,7 +1496,7 @@ mod tests {
 
     #[test]
     fn info_is_live_not_a_frozen_stub() {
-        let mut s = Session::new(ip("203.0.113.7"), None, Uuid::now_v7());
+        let mut s = new_session();
         let (reply, _) = s.dispatch(&args(&["INFO"]));
         let text = String::from_utf8_lossy(&reply);
         // A per-process run_id/master_replid and the real pid replace the old frozen stub, which

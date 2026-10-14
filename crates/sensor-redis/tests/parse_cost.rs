@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_framework::{CaptureMemoryBudget, ConnectionBounds, WanResolver};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -123,6 +123,7 @@ async fn one_large_multibulk_costs_about_what_the_same_bytes_as_separate_command
         dir.path().join("events.jsonl"),
         Arc::new(WanResolver::new(HashMap::new())),
         bounds(),
+        Arc::new(CaptureMemoryBudget::new(sensor_redis::memory::POOL_BYTES)),
     )
     .await
     .unwrap();

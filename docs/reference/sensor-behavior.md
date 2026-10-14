@@ -1610,11 +1610,19 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
   (always OK; only `dir`/`dbfilename` - the RDB-RCE staging primitive - emit a
   `honeypot_command_exec` indicator, `crates/sensor-redis/src/handler.rs#Session::handle_config_set`), SET (OK; key and value captured,
   and kept whole in a per-session store of at most 256 keys and 1 MB; a write past either
-  limit is refused with Redis's OOM error rather than acknowledged and dropped), GET (the
+  limit, or one the shared memory pool cannot hold, is refused with Redis's OOM error rather
+  than acknowledged and dropped; the SET event is still recorded), GET (the
   value SET earlier this session, else nil; no event), SLAVEOF/REPLICAOF (OK +
   captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
   Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024.
-- **Bounds:** common defaults, `max_concurrent` 256. No spool.
+- **Bounds:** common defaults, `max_concurrent` 256 on each listener. No spool. Each session's
+  read buffer and SET store are its own up to 16 KiB each; past that they draw on one 16 MiB
+  pool shared by every session of both listeners
+  (`crates/sensor-redis/src/memory.rs#POOL_BYTES`). A command the pool cannot buffer ends the
+  session with no reply, as a real Redis closes a client past its query buffer limit; a SET it
+  cannot hold gets the OOM error. A session gives its room back when its command is done and
+  when it ends, however it ends. The worst case against `MemoryMax` is in
+  [capacity planning](../operations/capacity-planning.md#redis-sensor-worst-case-memory).
 - **Redis over TLS (optional):** when `PROPOLIS_REDIS_TLS_BIND` is set, a second implicit-TLS
   (`rediss://`) listener in the same process serves the same persona and writes the same
   `events.jsonl` (`crates/sensor-redis/src/lib.rs#start_test_server_tls`). No STARTTLS exists and

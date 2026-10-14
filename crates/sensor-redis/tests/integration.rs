@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_framework::{CaptureMemoryBudget, ConnectionBounds, WanResolver};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -38,6 +38,7 @@ async fn start_server() -> (
         log_path.clone(),
         wan_resolver,
         test_bounds(),
+        Arc::new(CaptureMemoryBudget::new(sensor_redis::memory::POOL_BYTES)),
     )
     .await
     .unwrap();

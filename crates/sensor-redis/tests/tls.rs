@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sensor_framework::{ConnectionBounds, TlsServer, WanResolver};
+use sensor_framework::{CaptureMemoryBudget, ConnectionBounds, TlsServer, WanResolver};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -85,6 +85,7 @@ async fn start_tls(bounds: ConnectionBounds) -> (Started, Arc<ClientConfig>) {
         wan(),
         bounds,
         server,
+        Arc::new(CaptureMemoryBudget::new(sensor_redis::memory::POOL_BYTES)),
     )
     .await
     .unwrap();
@@ -107,6 +108,7 @@ async fn start_plain() -> Started {
         log.clone(),
         wan(),
         test_bounds(),
+        Arc::new(CaptureMemoryBudget::new(sensor_redis::memory::POOL_BYTES)),
     )
     .await
     .unwrap();

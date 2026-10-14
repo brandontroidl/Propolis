@@ -599,6 +599,19 @@
   walks the whole existing ledger once, in bounded chunks (133 ms for the first chunk on a
   400,000-event test ledger, since downloads are sparse there); the old query took 311 ms per
   cycle and the steady-state sync query now takes under a millisecond.
+- **What sensor-redis sessions hold is bounded for the whole process** - each session's SET store
+  (up to 1 MiB) and read buffer (a command is buffered whole, up to about 1 MB, and the buffer
+  never shrank) were bounded per session only, and 256 sessions on each of the two listeners
+  held far more than the unit's 256 M `MemoryMax`: a probe from four addresses had the kernel
+  kill the sensor at about 230 filled sessions, dropping every session in flight, and could
+  repeat it after each restart. Past a floor of 16 KiB each, the buffer and the store are now
+  charged to one 16 MiB pool that every session of both listeners shares. A command the pool
+  cannot buffer ends its session with no reply, as a real Redis closes a client past its query
+  buffer limit, and a SET it cannot hold gets the OOM error (the SET event is still recorded);
+  a session gives its room back when its command is done and when it ends. 256 sessions on each
+  listener sending two 490,000-byte SETs each peaked at 817,840 KiB resident before and now
+  peak at 45 to 49 MiB on one CPU and 54 to 61 MiB with four runtime workers. See
+  [capacity planning](docs/operations/capacity-planning.md#redis-sensor-worst-case-memory).
 - **sensor-redis reads a large command in time linear in its size** - the reader parsed the whole
   buffered command again after every 1 KiB socket read and copied every element it had finished
   on each pass, so one 900-element, 908 KB multi-bulk cost about twelve times the CPU of the same

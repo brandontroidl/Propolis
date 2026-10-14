@@ -347,6 +347,46 @@ How long a connection holds these is bounded too: the header block must arrive w
 timeout of its first byte and the body within the idle timeout of the header's end, so a request
 holds its buffers for at most the read timeout plus twice the idle timeout (150 s at the
 defaults), not the 600 s `max_duration` a byte a minute used to keep them for.
+## Redis sensor worst-case memory
+
+`sensor-redis` admits 256 sessions on each listener, and the TLS listener, when it is bound, has
+its own 256, so one process can hold 512. Two things in a session grow with what the client
+sends: the read buffer, which holds a command whole until it is dispatched (up to the
+1,000,000-byte capture limit), and the SET store (up to 1 MiB). Each is the session's own up to
+a floor of 16 KiB; past it, the buffer's real capacity and the store's key and value bytes (plus
+160 bytes a key for the map and allocator overhead) are charged to one pool of 16 MiB that every
+session of both listeners shares (`crates/sensor-redis/src/memory.rs#POOL_BYTES`). A command the
+pool cannot buffer ends its session; a SET it cannot hold is refused with the OOM error. The
+charge is refunded when a command is done (the buffer shrinks back to its floor) and when the
+session ends, by drop, so a closed socket, an error, the duration limit and a panic all give the
+room back.
+
+| Term | Bound (512 sessions) | Where it is enforced |
+|---|---|---|
+| Read buffers and SET stores past their floors | 16,777,216 (16 MiB) | `crates/sensor-redis/src/memory.rs#Charge::set` takes room only through `crates/sensor-framework/src/capture_budget.rs#try_grow`, one compare-exchange under the ceiling; the buffer grows with `reserve_exact` to the size it charged (`crates/sensor-redis/src/handler.rs#RespReader::reserve`) |
+| Floors, 16 KiB buffer and 16 KiB store a session | 16,777,216 | `crates/sensor-redis/src/memory.rs#BUFFER_FLOOR`, `crates/sensor-redis/src/memory.rs#STORE_FLOOR` |
+| A reply being written (a GET of a stored value, a PING echo of an argument) | 33,554,432, the two rows above again | a session writes one reply at a time, and none is larger than a value its store holds or an argument its buffer holds |
+| The element list of an unfinished multi-bulk | 8,388,608 | 1024 elements at most (`crates/sensor-redis/src/resp.rs#MAX_ARRAY_LEN`), 16 bytes each; arguments are ranges of the buffer, never copies |
+| Each session's fixed state, sockets and TLS included | about 18 MiB, measured | 512 idle sessions, 256 on each listener, held 28,748 KiB resident against 10,280 KiB for the idle process |
+| Sum | about 90 MiB | |
+| Dispatch-time copies | a few copies of one argument (at most 512 KiB) per runtime worker thread | a SET value is sanitized from the whole argument for its ledger copy; dispatch does not yield, so only one command a worker is in it at a time |
+
+Against `MemoryMax=256M` that leaves the runtime, the allocator's free lists and the worker
+threads' dispatch copies about 166 MiB. Measured with the debug binary: 256 sessions on each
+listener from four loopback sources, each sending two SETs of 490,000 bytes, peaked at 45 to 49
+MiB resident pinned to one CPU, 54 to 61 MiB with four runtime workers, and 88 to 100 MiB with
+28, where each worker adds its dispatch copies and its allocator arena.
+`crates/sensor-redis/tests/memory_bound.rs#the_binary_with_both_listeners_full_stays_well_under_memory_max`
+runs that load with four workers and requires a peak under half of `MemoryMax`. Before the pool
+the same run acknowledged every write, 501,761,024 bytes held, and peaked at 817,840 KiB, three
+times `MemoryMax`; under the unit's limit the kernel killed the sensor at about 230 sessions.
+
+Residuals, stated plainly. Kernel socket buffers are charged to the unit's cgroup but are not in
+this sum or in the resident figures; a peer that sends faster than the sensor reads, or never
+reads its replies, is bounded by the kernel's TCP buffer limits, not by the sensor. Memory the
+allocator keeps after a session frees it counts against `MemoryMax` and is not charged to the
+pool; the 28-CPU figure shows it. The number of runtime worker threads follows the CPUs the
+process may use.
 
 ## Per-unit resource caps (systemd)
 

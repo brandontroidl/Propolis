@@ -15,7 +15,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sensor_framework::{ConnectionBounds, Env, EnvError, WanResolver, shutdown_signal};
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, Env, EnvError, WanResolver, shutdown_signal,
+};
 
 const ENV_BIND: &str = "PROPOLIS_REDIS_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_REDIS_WAN_MAP";
@@ -181,12 +183,15 @@ async fn main() {
     };
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
+    // One pool for both listeners: their sessions share the one process's MemoryMax.
+    let pool = Arc::new(CaptureMemoryBudget::new(sensor_redis::memory::POOL_BYTES));
 
     let (bound, handle) = match sensor_redis::start_test_server(
         config.bind_addr,
         config.log_path.clone(),
         wan_resolver.clone(),
         config.bounds.clone(),
+        pool.clone(),
     )
     .await
     {
@@ -208,6 +213,7 @@ async fn main() {
                 wan_resolver,
                 config.bounds,
                 server,
+                pool,
             )
             .await
             {

@@ -654,9 +654,12 @@
   written with `>` and `chmod` at a path in the same directory, so a link there made root
   truncate, chmod or create any file. The script now enters the feed directory once (refusing a
   symlinked one), accepts only the publisher's names and formats with every format present,
-  copies only single-link regular files of at most 32 MiB (256 MiB a build), checks each again
-  on the open descriptor before reading it, and stages the copies so a refusal leaves the
-  checkout untouched. The marker moved to `/var/lib/propolis/blocklist-status/last-pushed`, a
+  copies only single-link regular files of at most 32 MiB (256 MiB a build), binds each read
+  to the file it checked (it opens the name once, compares the device and inode of that open
+  descriptor with the pre-open stat, and reads only from that descriptor, so a link swapped in
+  around the open is refused even if the name is restored), and stages the copies so a
+  refusal leaves the checkout untouched. `deploy/upgrade.sh` now reinstalls the root-owned
+  copy under `/usr/local/lib/propolis` that the cron runs. The marker moved to `/var/lib/propolis/blocklist-status/last-pushed`, a
   directory the daemon cannot write, written by temporary file and rename. `provision.sh`
   creates a `propolis-blocklist` account to run it as, which cannot read root's files at all.
   See [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron).

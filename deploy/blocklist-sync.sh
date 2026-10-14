@@ -162,16 +162,17 @@ done
 
 # --- Copy each file safely --------------------------------------------------------------------
 # Copies one feed file to `dest`. The type and link count are checked on the name before opening
-# it, so a FIFO or device is not opened in the ordinary case. The open itself is dd's with
-# O_NOFOLLOW (a name swapped for a link after the check is refused by the kernel, never followed)
-# and O_NONBLOCK (a FIFO swapped in at that instant reads as empty instead of blocking, and then
-# fails the size check). The name must still be the same inode with the same link count after the
-# read: a swap to a hard link of another file is caught there. A single-link regular file in the
-# daemon's own directory holds only what the daemon wrote.
+# it, so a FIFO or device is not opened in the ordinary case. The read is then bound to the file
+# that was checked: a child shell opens the name once, takes the device and inode of the OPEN
+# DESCRIPTOR (stat -L on /dev/fd/3, not on the name), refuses unless they equal the pre-open
+# stat, and only then reads from that same descriptor. A hard link or symlink swapped in around
+# the open is a different inode and is refused even if the name is restored before the next look.
+# The child runs under timeout because opening a FIFO swapped in at that instant would block for
+# good. After the read the name must still match its check, and the copy must be the size checked.
 copy_feed_file() {
-  local name="$1" dest="$2" max="$3" checked after type links size
+  local name="$1" dest="$2" max="$3" checked after type links size id
   checked="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
-  IFS='|' read -r type links size _ <<<"$checked"
+  IFS='|' read -r type links size id <<<"$checked"
   case "$type" in
     "regular file"|"regular empty file") ;;
     *) echo "blocklist-sync: $name is a $type, not a regular file" >&2; return 1 ;;
@@ -184,8 +185,12 @@ copy_feed_file() {
     echo "blocklist-sync: $name is $size bytes, over the $max-byte limit" >&2
     return 1
   fi
-  dd if="$name" of="$dest" iflag=nofollow,nonblock,count_bytes count="$max" bs=1M status=none \
-    || { echo "blocklist-sync: $name could not be opened and read as a plain file" >&2; return 1; }
+  timeout 10 bash -c '
+    exec 3<"$1" || exit 1
+    [ "$(stat -L -c %d:%i /dev/fd/3)" = "$2" ] || exit 3
+    exec dd of="$3" iflag=count_bytes count="$4" bs=1M status=none <&3
+  ' _ "$name" "$id" "$dest" "$max" \
+    || { echo "blocklist-sync: $name could not be opened as the file that was checked" >&2; return 1; }
   after="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
   if [ "$after" != "$checked" ]; then
     echo "blocklist-sync: $name changed between its check and its copy" >&2

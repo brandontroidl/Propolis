@@ -97,8 +97,14 @@ responsibilities and out of the code's control.
 
 The script reads a directory the daemon writes, so a compromised daemon chooses
 what it finds there. It copies only single-link regular files with the publisher's
-names, checks each again on the open descriptor, and writes nothing in that
-directory, so a planted link, FIFO or stray file is refused. What it cannot stop is
+names, opens each name once and compares the device and inode of the open descriptor
+with the stat it took before opening (reading only from that descriptor), and writes
+nothing in that directory, so a planted link, FIFO or stray file is refused, including
+one present only for the instant of the open. Planting a hard link to a file the
+daemon cannot itself read is also refused by the kernel when `fs.protected_hardlinks=1`
+(the Debian default); the script's checks do not depend on it, but a host that sets it
+to 0 loses that first layer and should be treated as relying on the checks alone. What
+it cannot stop is
 the daemon publishing false content under the right names: the feed is the
 daemon's output, and a compromised daemon can list any address it likes. The
 account it runs as is the operator's choice; the documented one,

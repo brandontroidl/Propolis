@@ -444,7 +444,7 @@ if [ "$last" = aggressive.txt ]; then
   n=$(cat "{count}" 2>/dev/null || echo 0)
   n=$((n + 1))
   echo "$n" >"{count}"
-  if [ "$n" = 2 ] && [ "{mode}" = symlink_restore ]; then
+  if [ "$n" = 2 ] && {{ [ "{mode}" = symlink_restore ] || [ "{mode}" = hardlink_restore ]; }}; then
     rm -f aggressive.txt
     mv "{orig}" aggressive.txt
   fi
@@ -455,7 +455,7 @@ if [ "$n" = 1 ]; then
   mv aggressive.txt "{orig}"
   case "{mode}" in
     symlink|symlink_restore) ln -s "{secret}" aggressive.txt ;;
-    hardlink) ln "{secret}" aggressive.txt ;;
+    hardlink|hardlink_restore) ln "{secret}" aggressive.txt ;;
     fifo) mkfifo aggressive.txt ;;
   esac
 fi
@@ -517,7 +517,8 @@ fn a_symlink_present_only_during_the_open_is_not_followed() {
 }
 
 /// A name swapped after its check for a hard link to a same-size secret is the same inode as the
-/// secret, so reading it copies the secret; the comparison after the read refuses it.
+/// secret, so reading it copies the secret; the opened descriptor's inode differs from the checked
+/// one and the read never starts.
 #[test]
 fn a_hard_link_swapped_in_after_the_check_is_refused() {
     let fx = Fixture::new();
@@ -526,7 +527,24 @@ fn a_hard_link_swapped_in_after_the_check_is_refused() {
     let out = fx.run_with(&[("PATH", &shim.path_env())]);
     fx.assert_refused_and_nothing_published(&out, "hard link swapped after the check");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("changed between its check and its copy"),
+        String::from_utf8_lossy(&out.stderr).contains("opened as the file that was checked"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The hard link is in place only across the open and the original is back before the script's
+/// next look at the name, so a comparison of the name after the read sees nothing wrong: only
+/// binding the read to the inode of the opened descriptor refuses it.
+#[test]
+fn a_hard_link_present_only_during_the_open_is_refused() {
+    let fx = Fixture::new();
+    resize_secret_to(&fx, aggressive_len(&fx));
+    let shim = SwapShim::new(&fx, "hardlink_restore");
+    let out = fx.run_with(&[("PATH", &shim.path_env())]);
+    fx.assert_refused_and_nothing_published(&out, "hard link present only during the open");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("opened as the file that was checked"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -723,4 +741,34 @@ fn the_format_list_matches_the_publisher() {
         .collect();
     listed.sort();
     assert_eq!(listed, ours, "blocklist-sync.sh's FORMATS drifted");
+}
+
+/// The cron runs a root-owned copy under /usr/local/lib/propolis, not the checkout, so an upgrade
+/// that does not reinstall it leaves the box running the previous script. The upgrade script
+/// cannot be executed from a test (it writes system paths), so this is the static half.
+#[test]
+fn the_upgrade_reinstalls_the_root_owned_copy_of_the_script_and_its_readme() {
+    let upgrade = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/upgrade.sh"
+    ))
+    .unwrap();
+    for (src, dest, mode) in [
+        (
+            "blocklist-sync.sh",
+            "/usr/local/lib/propolis/blocklist-sync.sh",
+            "0755",
+        ),
+        (
+            "blocklist-README.md",
+            "/usr/local/lib/propolis/blocklist-README.md",
+            "0644",
+        ),
+    ] {
+        let wanted = format!("install -o root -g root -m {mode} \"$SCRIPT_DIR/{src}\" {dest}");
+        assert!(
+            upgrade.lines().any(|l| l.trim() == wanted),
+            "deploy/upgrade.sh does not run: {wanted}"
+        );
+    }
 }

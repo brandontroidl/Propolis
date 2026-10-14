@@ -57,7 +57,8 @@ use chrono::{DateTime, Datelike, TimeDelta, Utc};
 
 use super::hostinfo::{expand, load_average, uptime_secs, uptime_short};
 use super::registry::{Registry, resolve_proc_self};
-use super::{CommandResult, FakeShell, HandlerId, ShellContext, ShellFlavor};
+use super::texttools::stopped;
+use super::{CommandResult, FakeShell, HandlerId, ShellContext, ShellFlavor, len_u64};
 use crate::fakefs::{Blob, Device, ELF_HEADER_LEN, ElfImage, Node};
 
 pub(super) fn register(r: &mut Registry) {
@@ -1882,10 +1883,51 @@ impl Pattern {
     }
 
     /// Whether the pattern matches anywhere in `text` (`text` is lowercased by the caller when
-    /// the pattern folds case). Runs in time proportional to pattern length times text length.
-    fn is_match(&self, text: &str) -> bool {
+    /// the pattern folds case), each alternative's steps taken from `work` before it runs.
+    /// `None` once an alternative would take more than `work` has left.
+    fn is_match(&self, text: &str, work: &mut Work) -> Option<bool> {
         let chars: Vec<char> = text.chars().take(TEXT_MAX).collect();
-        self.alternatives.iter().any(|alt| alt_matches(alt, &chars))
+        let mut current = Vec::new();
+        let mut stepped = Vec::new();
+        for alt in &self.alternatives {
+            if !work.take(alt.cost(chars.len())) {
+                return None;
+            }
+            if alt_matches(alt, &chars, &mut current, &mut stepped) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+}
+
+impl Alternative {
+    /// The steps matching this alternative against `len` characters takes: each item passes
+    /// over the text at most twice, and a class tests its ranges at each character.
+    fn cost(&self, len: usize) -> u64 {
+        let per_character: u64 = self
+            .items
+            .iter()
+            .map(|(atom, _)| match atom {
+                Atom::Class { ranges, .. } => len_u64(ranges.len()).saturating_add(2),
+                Atom::Any | Atom::Lit(_) => 2,
+            })
+            .fold(1, u64::saturating_add);
+        per_character.saturating_mul(len_u64(len).saturating_add(1))
+    }
+}
+
+/// The steps a selection may take and has taken. A pattern is up to 64 alternatives of up to
+/// 256 items run over every row, about a million steps a call, so the line pays for each.
+struct Work {
+    left: u64,
+    spent: u64,
+}
+
+impl Work {
+    fn take(&mut self, steps: u64) -> bool {
+        self.spent = self.spent.saturating_add(steps);
+        self.spent <= self.left
     }
 }
 
@@ -1900,15 +1942,15 @@ fn marked(set: &[bool], at: usize) -> bool {
     set.get(at).copied().unwrap_or(false)
 }
 
-/// Positions of `chars` an item can step over, one atom wide.
-fn step(set: &[bool], atom: &Atom, chars: &[char]) -> Vec<bool> {
-    let mut next = vec![false; set.len()];
+/// Positions of `chars` an item can step over from `set`, one atom wide, into `next`.
+fn step(set: &[bool], atom: &Atom, chars: &[char], next: &mut Vec<bool>) {
+    next.clear();
+    next.resize(set.len(), false);
     for (at, c) in chars.iter().enumerate() {
         if marked(set, at) && atom.matches(*c) {
-            mark(&mut next, at.saturating_add(1));
+            mark(next, at.saturating_add(1));
         }
     }
-    next
 }
 
 /// Extend `set` over runs of `atom`.
@@ -1920,37 +1962,42 @@ fn close_over(set: &mut [bool], atom: &Atom, chars: &[char]) {
     }
 }
 
-fn alt_matches(alt: &Alternative, chars: &[char]) -> bool {
+/// Whether `alt` matches in `chars`, using `current` and `stepped` as the two position sets so
+/// a call allocates nothing once they have grown to the text.
+fn alt_matches(
+    alt: &Alternative,
+    chars: &[char],
+    current: &mut Vec<bool>,
+    stepped: &mut Vec<bool>,
+) -> bool {
     let width = chars.len().saturating_add(1);
-    let mut current = if alt.start {
-        let mut set = vec![false; width];
-        mark(&mut set, 0);
-        set
-    } else {
-        vec![true; width]
-    };
+    current.clear();
+    current.resize(width, !alt.start);
+    if alt.start {
+        mark(current, 0);
+    }
     for (atom, quant) in &alt.items {
-        let stepped = step(&current, atom, chars);
-        current = match quant {
-            Quant::One => stepped,
-            Quant::Opt => current
-                .iter()
-                .zip(&stepped)
-                .map(|(a, b)| *a || *b)
-                .collect(),
-            Quant::Star => {
-                close_over(&mut current, atom, chars);
-                current
+        match quant {
+            Quant::Star => close_over(current, atom, chars),
+            Quant::One => {
+                step(current, atom, chars, stepped);
+                std::mem::swap(current, stepped);
+            }
+            Quant::Opt => {
+                step(current, atom, chars, stepped);
+                for (on, next) in current.iter_mut().zip(stepped.iter()) {
+                    *on = *on || *next;
+                }
             }
             Quant::Plus => {
-                let mut run = stepped;
-                close_over(&mut run, atom, chars);
-                run
+                step(current, atom, chars, stepped);
+                std::mem::swap(current, stepped);
+                close_over(current, atom, chars);
             }
-        };
+        }
     }
     if alt.end {
-        marked(&current, chars.len())
+        marked(current, chars.len())
     } else {
         current.iter().any(|on| *on)
     }
@@ -2685,30 +2732,33 @@ struct Selector {
 }
 
 impl Selector {
-    /// The rows that match, in pid order (or the one newest or oldest of them).
-    fn select<'a>(&self, table: &'a Table) -> Vec<&'a Proc> {
+    /// The rows that match, in pid order (or the one newest or oldest of them). `None` once the
+    /// pattern would take more steps than `work` has left.
+    fn select<'a>(&self, table: &'a Table, work: &mut Work) -> Option<Vec<&'a Proc>> {
         if self.nobody {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let pattern = self
             .pattern
             .as_deref()
             .map(|text| Pattern::new(text, self.exact, self.fold));
-        let mut hits: Vec<&Proc> = table
-            .procs
-            .iter()
-            .filter(|p| {
-                let text = if self.full { p.args() } else { p.comm.clone() };
-                let text = if self.fold { text.to_lowercase() } else { text };
-                let named = pattern.as_ref().is_none_or(|pat| pat.is_match(&text));
-                let parent = self
-                    .parents
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(&p.ppid));
-                let tty = self.tty.as_ref().is_none_or(|t| *t == p.tty);
-                (named && parent && tty) != self.invert
-            })
-            .collect();
+        let mut hits: Vec<&Proc> = Vec::new();
+        for p in &table.procs {
+            let text = if self.full { p.args() } else { p.comm.clone() };
+            let text = if self.fold { text.to_lowercase() } else { text };
+            let named = match &pattern {
+                Some(pat) => pat.is_match(&text, work)?,
+                None => true,
+            };
+            let parent = self
+                .parents
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&p.ppid));
+            let tty = self.tty.as_ref().is_none_or(|t| *t == p.tty);
+            if (named && parent && tty) != self.invert {
+                hits.push(p);
+            }
+        }
         hits.sort_by_key(|p| p.pid);
         if self.newest || self.oldest {
             let key = |p: &&Proc| (table.start_ticks(p), p.pid);
@@ -2717,9 +2767,9 @@ impl Selector {
             } else {
                 hits.iter().copied().min_by_key(key)
             };
-            return picked.into_iter().collect();
+            return Some(picked.into_iter().collect());
         }
-        hits
+        Some(hits)
     }
 }
 
@@ -2892,6 +2942,26 @@ fn bad_signal(cmd: &str, spec: &str) -> CommandResult {
 }
 
 impl FakeShell {
+    /// The rows `sel` picks, with the pattern's steps charged to the line. `None` once the line
+    /// cannot pay, and the caller stops the line: no alternative runs past what the line has left.
+    fn select_charged<'a>(&mut self, sel: &Selector, table: &'a Table) -> Option<Vec<&'a Proc>> {
+        let mut work = Work {
+            left: self.line.remaining(),
+            spent: 0,
+        };
+        let hits = sel.select(table, &mut work);
+        // A refused selection charges one step past what was left, never work it did not do.
+        let charge = if hits.is_some() {
+            work.spent
+        } else {
+            work.left.saturating_add(1)
+        };
+        if !self.charge_work(charge) {
+            return None;
+        }
+        hits
+    }
+
     /// `pgrep [-flanovxic] [-d DELIM] [-P PPID] [-t TTY] [-u USER] [PATTERN]`: the matching pids,
     /// one per line, status 1 when none match.
     pub(super) fn cmd_pgrep(&mut self, parts: &[&str]) -> CommandResult {
@@ -2903,7 +2973,9 @@ impl FakeShell {
             return CommandResult::stdout("pgrep from procps-ng 3.3.17\n");
         }
         let table = self.process_table();
-        let hits = sel.select(&table);
+        let Some(hits) = self.select_charged(&sel, &table) else {
+            return stopped();
+        };
         if sel.count {
             let mut result = CommandResult::stdout(format!("{}\n", hits.len()));
             result.status = u8::from(hits.is_empty());
@@ -2943,7 +3015,9 @@ impl FakeShell {
             return CommandResult::stdout("pkill from procps-ng 3.3.17\n");
         }
         let table = self.process_table();
-        let hits = sel.select(&table);
+        let Some(hits) = self.select_charged(&sel, &table) else {
+            return stopped();
+        };
         let mut out = String::new();
         if sel.count {
             out.push_str(&format!("{}\n", hits.len()));

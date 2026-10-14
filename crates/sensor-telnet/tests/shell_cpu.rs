@@ -229,6 +229,28 @@ fn grep_fixed_strings_scan_in_linear_time() {
 }
 
 #[test]
+fn pgrep_patterns_are_charged_to_the_line() {
+    let sensor = sensor();
+    let mut client = Client::login(sensor.addr);
+    let heavy = format!("{}{}Z", "(.|.|.|.)".repeat(4), ".*".repeat(100));
+    client.run(&format!("p='{heavy}'"));
+
+    // 64 alternatives of 105 items over every process's arguments: about a second per call in
+    // an unoptimized build, and nothing charged it, so a loop ran thousands of them.
+    let (elapsed, _) = client.timed(
+        "i=0; while [ $i -lt 40 ]; do pgrep -fc \"$p\" >/dev/null; pkill -f \"$p\"; i=$((i+1)); done",
+    );
+    assert!(elapsed < BOUND, "took {elapsed:?}");
+
+    let (_, out) = client.timed("pgrep -c .");
+    assert!(
+        out.lines()
+            .any(|l| l.trim().parse::<u32>().is_ok_and(|n| n > 0)),
+        "an ordinary pgrep still counts: {out:.200}"
+    );
+}
+
+#[test]
 fn find_and_package_globs_with_a_long_bracket_expression_are_linear() {
     let sensor = sensor();
     let mut client = Client::login(sensor.addr);

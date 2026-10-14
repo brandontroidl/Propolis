@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
-use super::{CommandResult, EmitContext, FakeShell, OutputFd};
+use super::{BudgetHit, CommandResult, EmitContext, FakeShell, OutputFd};
 use crate::fakefs::{FakeFs, GENERATED_MAX, Node};
 
 fn ctx_for(label: &str) -> EmitContext {
@@ -792,6 +792,30 @@ fn the_pattern_engine_reads_the_regular_expressions_scripts_write() {
         format!("{}\n", table - 1),
         "every row but cron"
     );
+}
+
+#[test]
+fn pgrep_and_pkill_charge_their_pattern_to_the_line() {
+    // 64 alternatives of 105 items tried against every row's arguments: about a second a call
+    // in an unoptimized build, and nothing charged it, so one loop line ran thousands of them.
+    let heavy = format!("{}{}Z", "(.|.|.|.)".repeat(4), ".*".repeat(100));
+    for command in ["pgrep -fc", "pkill -f"] {
+        let mut sh = shell();
+        let (stdout, _, _) = answer(&mut sh, &format!("{command} '{heavy}'; echo tail"));
+        assert!(
+            !stdout.contains("tail"),
+            "{command}: the line stops at the match"
+        );
+        assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Work));
+        assert_eq!(out(&mut sh, "echo next"), "next\n");
+    }
+
+    // An ordinary pattern answers as before and pays at least a step for every row it tests.
+    let mut sh = shell();
+    let table = u64::try_from(rows(&out(&mut sh, "ps -e")).len()).unwrap();
+    assert_eq!(out(&mut sh, "pgrep -c sshd"), "2\n");
+    let charged = sh.last_trace().budget.work_charged;
+    assert!(charged >= table, "{charged} for {table} rows");
 }
 
 // ------------------------------------------------------------------------------------- kill

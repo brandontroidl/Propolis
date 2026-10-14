@@ -301,6 +301,14 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
   a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
   the reply that spent it.
+- The work allowance pays for pattern matching by the steps it takes, not the bytes it is given:
+  a line runs synchronously on a runtime worker, so a match whose cost grows faster than its
+  operands would hold that worker, and every session sharing it, for as long as it ran. Glob
+  patterns (`case`, pathname expansion, `find -name`/`-path`, `dpkg -l`, `apt list`) compile once
+  to the pieces between their stars, with each bracket expression reduced to sorted ranges; a
+  piece of plain text is found with a linear substring search, and every comparison is a step
+  (`crates/sensor-framework/src/shell/glob.rs#FakeShell::glob_matches`). A match the line cannot
+  pay for stops the line there, as when the allowance runs out anywhere else.
 - On SSH, telnet and ADB the session's own heap is counted too
   (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
   may hold while a line runs stops at its next step, as when its work allowance runs out (the

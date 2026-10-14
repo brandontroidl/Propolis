@@ -31,6 +31,7 @@ use std::cmp::Ordering;
 
 use chrono::DateTime;
 
+use super::glob::Glob;
 use super::registry::Registry;
 use super::sysres::{DU_DEPTH_MAX, DU_VISIT_MAX, Syntax, Tok, ceil_div, disks, scan};
 use super::texttools::stopped;
@@ -1017,8 +1018,8 @@ enum PermKind {
 }
 
 enum Test {
-    Name { pat: String, fold: bool },
-    Path { pat: String, fold: bool },
+    Name(Glob),
+    Path(Glob),
     Type(Vec<char>),
     Perm(PermKind, u32),
     Size { cmp: Ordering, units: u64, per: u64 },
@@ -1246,14 +1247,12 @@ impl<'a> Parser<'a, '_> {
             return Err(Failure::Unmodeled);
         }
         let test = match token {
-            "-name" | "-iname" => Test::Name {
-                pat: self.operand(token)?.to_string(),
-                fold: token == "-iname",
-            },
-            "-path" | "-wholename" | "-ipath" | "-iwholename" => Test::Path {
-                pat: self.operand(token)?.to_string(),
-                fold: token.starts_with("-i"),
-            },
+            "-name" | "-iname" => {
+                Test::Name(Glob::fnmatch(self.operand(token)?, token == "-iname"))
+            }
+            "-path" | "-wholename" | "-ipath" | "-iwholename" => {
+                Test::Path(Glob::fnmatch(self.operand(token)?, token.starts_with("-i")))
+            }
             "-type" => {
                 let value = self.operand(token)?;
                 let mut kinds = Vec::new();
@@ -1323,98 +1322,6 @@ impl<'a> Parser<'a, '_> {
     }
 }
 
-/// `pat` against `text` as `fnmatch` with no flags matches it: `*`, `?`, bracket classes with
-/// ranges and `!`/`^` negation, and a backslash quoting the next character.
-pub(super) fn glob_match(pat: &str, text: &str, fold: bool) -> bool {
-    let pat: Vec<char> = pat.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-    let same = |a: char, b: char| {
-        if fold {
-            a.eq_ignore_ascii_case(&b)
-        } else {
-            a == b
-        }
-    };
-    // Where a bracket expression at `at` ends and whether `ch` is in it; `None` for a `[` with no
-    // closing `]`, which is a literal.
-    let class = |at: usize, ch: char| -> Option<(bool, usize)> {
-        let mut i = at.saturating_add(1);
-        let negate = matches!(pat.get(i), Some('!' | '^'));
-        if negate {
-            i = i.saturating_add(1);
-        }
-        let mut hit = false;
-        let mut first = true;
-        loop {
-            let lo = *pat.get(i)?;
-            if lo == ']' && !first {
-                return Some((hit != negate, i.saturating_add(1)));
-            }
-            first = false;
-            let dash = pat.get(i.saturating_add(1)) == Some(&'-');
-            match pat.get(i.saturating_add(2)) {
-                Some(&hi) if dash && hi != ']' => {
-                    let (lo_c, hi_c, c) = if fold {
-                        (
-                            lo.to_ascii_lowercase(),
-                            hi.to_ascii_lowercase(),
-                            ch.to_ascii_lowercase(),
-                        )
-                    } else {
-                        (lo, hi, ch)
-                    };
-                    hit |= (lo_c..=hi_c).contains(&c);
-                    i = i.saturating_add(3);
-                }
-                _ => {
-                    hit |= same(lo, ch);
-                    i = i.saturating_add(1);
-                }
-            }
-        }
-    };
-    // The pattern position after matching one character at `p`, or `None` when it does not.
-    let step = |p: usize, ch: char| -> Option<usize> {
-        match *pat.get(p)? {
-            '?' => Some(p.saturating_add(1)),
-            '[' => match class(p, ch) {
-                Some((true, next)) => Some(next),
-                Some((false, _)) => None,
-                None => same('[', ch).then_some(p.saturating_add(1)),
-            },
-            '\\' => match pat.get(p.saturating_add(1)) {
-                Some(&quoted) => same(quoted, ch).then_some(p.saturating_add(2)),
-                None => same('\\', ch).then_some(p.saturating_add(1)),
-            },
-            literal => same(literal, ch).then_some(p.saturating_add(1)),
-        }
-    };
-    let (mut p, mut t) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while let Some(&ch) = text.get(t) {
-        if pat.get(p) == Some(&'*') {
-            star = Some((p, t));
-            p = p.saturating_add(1);
-            continue;
-        }
-        if let Some(next) = step(p, ch) {
-            p = next;
-            t = t.saturating_add(1);
-            continue;
-        }
-        let Some((star_p, star_t)) = star else {
-            return false;
-        };
-        p = star_p.saturating_add(1);
-        t = star_t.saturating_add(1);
-        star = Some((star_p, t));
-    }
-    while pat.get(p) == Some(&'*') {
-        p = p.saturating_add(1);
-    }
-    p >= pat.len()
-}
-
 /// The last component of a path as `find -name` sees it: `/` for the root, none of a trailing
 /// slash.
 fn base_name(path: &str) -> &str {
@@ -1462,6 +1369,14 @@ fn emit(walk: &mut Walk, shown: &str, end: char) {
 }
 
 impl FakeShell {
+    /// A `-name` or `-path` test, charged to the line; a line that cannot pay ends the walk.
+    fn find_glob(&mut self, glob: &Glob, text: &str, walk: &mut Walk) -> bool {
+        self.glob_matches(glob, text).unwrap_or_else(|| {
+            walk.refused = true;
+            false
+        })
+    }
+
     fn eval(&mut self, expr: &Expr, here: &mut Here<'_>, walk: &mut Walk) -> bool {
         match expr {
             Expr::Not(inner) => !self.eval(inner, here, walk),
@@ -1473,8 +1388,8 @@ impl FakeShell {
 
     fn eval_test(&mut self, test: &Test, here: &mut Here<'_>, walk: &mut Walk) -> bool {
         match test {
-            Test::Name { pat, fold } => glob_match(pat, base_name(here.shown), *fold),
-            Test::Path { pat, fold } => glob_match(pat, here.shown, *fold),
+            Test::Name(glob) => self.find_glob(glob, base_name(here.shown), walk),
+            Test::Path(glob) => self.find_glob(glob, here.shown, walk),
             Test::Type(kinds) => {
                 let letter = match here.stat.kind {
                     FileKind::Regular => 'f',

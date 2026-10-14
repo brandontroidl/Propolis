@@ -416,6 +416,21 @@
   literally is still found. Loaders resolve as before, and a forward chain is no longer limited
   to 255 links. See
   [rate limits and budgets](docs/reference/rate-limits-and-budgets.md#dropper-script-url-extraction).
+- **A glob pattern can no longer hold a shell sensor's worker for minutes** - `case WORD in
+  PATTERN)`, pathname expansion, `find -name`/`-path`, `dpkg -l` and `apt list` matched with a
+  backtracking loop that restarted the rest of the pattern at every character after a star (and
+  `find`'s and `dpkg`'s re-read a bracket expression at every character), while the line's work
+  allowance charged only the bytes of the pattern and subject. A `case` whose subject and pattern
+  came from a doubled variable (`case $a in *${a}b)`, 48,000 characters each) took about forty
+  seconds in an unoptimized build and minutes at the sizes the allowance admitted, on the runtime
+  worker every other session needed, so the SSH sensor stopped accepting connections until it
+  finished. Patterns now compile once into the pieces between their stars, with bracket
+  expressions merged into sorted ranges; a piece of plain text is found with the standard
+  library's linear substring search, so `*${a}b` answers in linear time, and every comparison
+  is charged to the line, which stops at a match it cannot pay for (a `?`-heavy piece searched
+  across a long subject). Ordinary patterns answer exactly as before: a differential test runs
+  the old matchers against the new on 400,000 generated patterns. See
+  [sensor behavior](docs/reference/sensor-behavior.md).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

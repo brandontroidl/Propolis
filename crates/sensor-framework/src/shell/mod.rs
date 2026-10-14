@@ -80,6 +80,7 @@ mod fetch_tests;
 mod fileinfo;
 mod fnprint;
 mod fsops;
+mod glob;
 mod grep;
 mod hashing;
 mod hostinfo;
@@ -3708,6 +3709,8 @@ mod fileinfo_tests;
 mod fsops_tests;
 #[cfg(test)]
 mod functions_tests;
+#[cfg(test)]
+mod glob_tests;
 #[cfg(test)]
 mod grammar_tests;
 #[cfg(test)]

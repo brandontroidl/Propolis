@@ -19,6 +19,7 @@
 use super::arith::{self, ArithError};
 use super::ast::{List, Param, ParamName, Word, WordPart};
 use super::eval::ShellState;
+use super::glob::Glob;
 use super::lex::lex_body;
 use super::trace::BudgetHit;
 use super::{FakeShell, Frame, FrameKind, ShellLevel, len_u64};
@@ -146,7 +147,8 @@ impl FakeShell {
 
     /// Whether a `case` pattern matches `subject`. The pattern is expanded without splitting or
     /// pathname expansion; its unquoted `*`, `?` and `[..]` are special and, unlike a pathname,
-    /// match a `/` too.
+    /// match a `/` too. The match is charged to the line ([`FakeShell::glob_matches`]): both
+    /// operands can be as long as the line's allowance.
     pub(super) fn case_pattern_matches(
         &mut self,
         pattern: &Word,
@@ -163,8 +165,9 @@ impl FakeShell {
                 Seg::Break => chars.push((' ', true)),
             }
         }
-        let name: Vec<char> = subject.chars().collect();
-        Ok(glob_match(&compile_glob(&chars), &name))
+        let glob = Glob::shell(&chars);
+        self.glob_matches(&glob, subject)
+            .ok_or(ExpandError::Refused)
     }
 
     /// Text expanded the way the inside of double quotes is: a here-document body.
@@ -471,7 +474,7 @@ impl FakeShell {
         }];
         for (index, segment) in segments.iter().enumerate() {
             let last = index.saturating_add(1) == count;
-            let pattern = compile_glob(segment);
+            let pattern = Glob::shell(segment);
             let literal: String = segment.iter().map(|(c, _)| *c).collect();
             let has_glob = segment
                 .iter()
@@ -492,8 +495,11 @@ impl FakeShell {
                         if name.starts_with('.') && !dot {
                             continue;
                         }
-                        if glob_match(&pattern, &name.chars().collect::<Vec<_>>()) {
-                            next.push(format!("{candidate}{name}{}", if last { "" } else { "/" }));
+                        match self.glob_matches(&pattern, &name) {
+                            Some(true) => next
+                                .push(format!("{candidate}{name}{}", if last { "" } else { "/" })),
+                            Some(false) => {}
+                            None => return Err(ExpandError::Refused),
                         }
                     }
                 } else {
@@ -622,120 +628,6 @@ fn build_fields(segs: &[Seg], ifs: &str) -> Vec<Field> {
     fields
 }
 
-// ---- glob patterns -----------------------------------------------------------------------------
-
-enum GlobToken {
-    Literal(char),
-    Any,
-    Star,
-    Class {
-        negated: bool,
-        ranges: Vec<(char, char)>,
-    },
-}
-
-/// Compile a pattern segment, where only unquoted characters are special.
-fn compile_glob(segment: &[(char, bool)]) -> Vec<GlobToken> {
-    let mut tokens = Vec::new();
-    let mut i = 0;
-    while let Some(&(c, quoted)) = segment.get(i) {
-        i = i.saturating_add(1);
-        if quoted {
-            tokens.push(GlobToken::Literal(c));
-            continue;
-        }
-        match c {
-            '*' => tokens.push(GlobToken::Star),
-            '?' => tokens.push(GlobToken::Any),
-            '[' => match parse_class(segment, i) {
-                Some((token, next)) => {
-                    tokens.push(token);
-                    i = next;
-                }
-                None => tokens.push(GlobToken::Literal('[')),
-            },
-            other => tokens.push(GlobToken::Literal(other)),
-        }
-    }
-    tokens
-}
-
-/// A bracket expression whose `[` is just before `start`, and the index after its `]`.
-fn parse_class(segment: &[(char, bool)], start: usize) -> Option<(GlobToken, usize)> {
-    let mut i = start;
-    let negated = matches!(segment.get(i), Some(('!' | '^', false)));
-    if negated {
-        i = i.saturating_add(1);
-    }
-    let mut chars: Vec<char> = Vec::new();
-    let mut first = true;
-    loop {
-        let &(c, quoted) = segment.get(i)?;
-        i = i.saturating_add(1);
-        if c == ']' && !quoted && !first {
-            break;
-        }
-        chars.push(c);
-        first = false;
-    }
-    let mut ranges = Vec::new();
-    let mut k = 0;
-    while let Some(&low) = chars.get(k) {
-        if chars.get(k.saturating_add(1)) == Some(&'-')
-            && let Some(&high) = chars.get(k.saturating_add(2))
-        {
-            ranges.push((low, high));
-            k = k.saturating_add(3);
-        } else {
-            ranges.push((low, low));
-            k = k.saturating_add(1);
-        }
-    }
-    Some((GlobToken::Class { negated, ranges }, i))
-}
-
-/// Whether `name` matches the compiled pattern. Linear in the product of the two lengths at
-/// worst, with no recursion.
-fn glob_match(pattern: &[GlobToken], name: &[char]) -> bool {
-    let (mut p, mut n) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    loop {
-        match pattern.get(p) {
-            Some(GlobToken::Star) => {
-                star = Some((p, n));
-                p = p.saturating_add(1);
-                continue;
-            }
-            Some(token) if n < name.len() => {
-                let c = name.get(n).copied().unwrap_or('\0');
-                let hit = match token {
-                    GlobToken::Literal(l) => *l == c,
-                    GlobToken::Any => true,
-                    GlobToken::Class { negated, ranges } => {
-                        ranges.iter().any(|(low, high)| *low <= c && c <= *high) != *negated
-                    }
-                    GlobToken::Star => false,
-                };
-                if hit {
-                    p = p.saturating_add(1);
-                    n = n.saturating_add(1);
-                    continue;
-                }
-            }
-            None if n == name.len() => return true,
-            _ => {}
-        }
-        match star {
-            Some((star_p, star_n)) if star_n < name.len() => {
-                star = Some((star_p, star_n.saturating_add(1)));
-                p = star_p.saturating_add(1);
-                n = star_n.saturating_add(1);
-            }
-            _ => return false,
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -744,48 +636,6 @@ fn glob_match(pattern: &[GlobToken], name: &[char]) -> bool {
 )]
 mod tests {
     use super::*;
-
-    fn quoted_or_not(text: &str) -> Vec<(char, bool)> {
-        text.chars().map(|c| (c, false)).collect()
-    }
-
-    fn matches(pattern: &str, name: &str) -> bool {
-        glob_match(
-            &compile_glob(&quoted_or_not(pattern)),
-            &name.chars().collect::<Vec<_>>(),
-        )
-    }
-
-    #[test]
-    fn glob_patterns_match_like_the_shell() {
-        assert!(matches("*", "anything"));
-        assert!(matches("a*c", "abbbc"));
-        assert!(!matches("a*c", "abbbd"));
-        assert!(matches("?x", "ax"));
-        assert!(!matches("?x", "x"));
-        assert!(matches("[abc]x", "bx"));
-        assert!(!matches("[!abc]x", "bx"));
-        assert!(matches("[a-c]*", "cat"));
-        assert!(matches("*.txt", "a.txt"));
-        assert!(!matches("*.txt", "a.txt.bak"));
-        assert!(matches("[", "["), "an unclosed bracket is a literal");
-        assert!(matches("a[]]b", "a]b"), "a leading ] is a member");
-        assert!(matches("**a**", "bab"));
-        assert!(!matches("a", ""));
-    }
-
-    #[test]
-    fn a_quoted_star_is_a_plain_character() {
-        let pattern = vec![('*', true)];
-        assert!(glob_match(&compile_glob(&pattern), &['*']));
-        assert!(!glob_match(&compile_glob(&pattern), &['a']));
-    }
-
-    #[test]
-    fn pathological_patterns_finish() {
-        let pattern = "a*".repeat(40) + "b";
-        assert!(!matches(&pattern, &"a".repeat(200)));
-    }
 
     fn text(s: &str, quoted: bool, split: bool) -> Seg {
         Seg::Text {

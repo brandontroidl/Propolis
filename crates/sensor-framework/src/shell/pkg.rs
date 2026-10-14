@@ -20,8 +20,9 @@
     clippy::indexing_slicing
 )]
 
-use super::fileinfo::glob_match;
+use super::glob::Glob;
 use super::registry::Registry;
+use super::texttools::stopped;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor};
 use crate::packages::{self, OPENSSH_SERVER_DETAIL, Package};
 
@@ -163,6 +164,17 @@ impl FakeShell {
         }
     }
 
+    /// Whether `name` matches any of `globs`, each test charged to the line; `None` once the line
+    /// cannot pay.
+    fn any_glob_matches(&mut self, globs: &[Glob], name: &str) -> Option<bool> {
+        for glob in globs {
+            if self.glob_matches(glob, name)? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     fn dpkg_list(&mut self, patterns: &[&str]) -> CommandResult {
         let all: Vec<Package> = packages::installed().collect();
         if patterns.is_empty() {
@@ -171,11 +183,15 @@ impl FakeShell {
         let mut rows: Vec<Package> = Vec::new();
         let mut missing = String::new();
         for pattern in patterns {
-            let found: Vec<Package> = all
-                .iter()
-                .filter(|p| glob_match(pattern, p.name, false))
-                .copied()
-                .collect();
+            let glob = Glob::fnmatch(pattern, false);
+            let mut found: Vec<Package> = Vec::new();
+            for package in &all {
+                match self.glob_matches(&glob, package.name) {
+                    Some(true) => found.push(*package),
+                    Some(false) => {}
+                    None => return stopped(),
+                }
+            }
             if found.is_empty() {
                 missing.push_str(&format!(
                     "dpkg-query: no packages found matching {}\n",
@@ -418,12 +434,20 @@ impl FakeShell {
             "list" => {
                 let mut text = format!("Listing...{done}\n");
                 let upgradable_only = args.contains(&"--upgradable");
+                let globs: Vec<Glob> = operands
+                    .iter()
+                    .map(|pattern| Glob::fnmatch(pattern, false))
+                    .collect();
                 for package in packages::installed() {
                     let wanted = if upgradable_only {
                         package.upgrade.is_some()
+                    } else if globs.is_empty() {
+                        true
                     } else {
-                        operands.is_empty()
-                            || operands.iter().any(|p| glob_match(p, package.name, false))
+                        match self.any_glob_matches(&globs, package.name) {
+                            Some(hit) => hit,
+                            None => return stopped(),
+                        }
                     };
                     if !wanted {
                         continue;

@@ -27,6 +27,10 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> TestServer {
+        TestServer::start_with(test_bounds()).await
+    }
+
+    async fn start_with(bounds: ConnectionBounds) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
@@ -34,7 +38,7 @@ impl TestServer {
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             wan_resolver,
-            test_bounds(),
+            bounds,
         )
         .await
         .unwrap();
@@ -231,6 +235,85 @@ async fn a_header_block_past_16_kib_gets_nginx_400() {
     assert!(response.contains("Server: nginx/1.18.0 (Ubuntu)\r\n"));
     assert!(response.contains("<title>400 Request Header Or Cookie Too Large</title>"));
     assert!(response.contains("<center>Request Header Or Cookie Too Large</center>"));
+    srv.handle.abort();
+}
+
+/// Bounds where a whole request part must arrive within one second, while each read alone may
+/// wait as long, and the connection may last half a minute.
+fn one_second_parts() -> ConnectionBounds {
+    ConnectionBounds {
+        idle_timeout: Duration::from_secs(1),
+        ..test_bounds()
+    }
+}
+
+/// Send `first`, then one byte of `drip` every 300 ms, under the per-read timeout each time, and
+/// return how long after the first send the server closed the connection, if it did within 5 s.
+async fn closed_while_dripping(
+    addr: std::net::SocketAddr,
+    first: &[u8],
+    drip: &[u8],
+) -> Option<Duration> {
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    let start = std::time::Instant::now();
+    conn.write_all(first).await.unwrap();
+    let mut drip = drip.iter().cycle();
+    let mut chunk = [0u8; 1024];
+    while start.elapsed() < Duration::from_secs(5) {
+        match tokio::time::timeout(Duration::from_millis(300), conn.read(&mut chunk)).await {
+            Ok(Ok(0) | Err(_)) => return Some(start.elapsed()),
+            Ok(Ok(_)) => panic!("no reply is owed to an unfinished request"),
+            Err(_) => {
+                if conn.write_all(&[*drip.next().unwrap()]).await.is_err() {
+                    return Some(start.elapsed());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A header block sent a byte at a time, each within the per-read timeout, is cut once it has
+/// taken `idle_timeout` from its first byte, as nginx's `client_header_timeout` cuts a whole
+/// header; the old reader kept it, and its buffer, until `max_duration`.
+#[tokio::test]
+async fn a_header_block_dripped_past_its_deadline_is_dropped() {
+    let srv = TestServer::start_with(one_second_parts()).await;
+    let closed = closed_while_dripping(srv.addr, b"GET / HTTP/1.1\r\n", b"X-Drip: y\r\n").await;
+    assert!(
+        closed.is_some_and(|after| after < Duration::from_millis(2500)),
+        "closed after {closed:?}"
+    );
+    srv.handle.abort();
+}
+
+/// A body sent a byte at a time is cut once it has taken `idle_timeout` from the header's end;
+/// the event records what had arrived and that the body is incomplete, and nothing is answered.
+#[tokio::test]
+async fn a_body_dripped_past_its_deadline_is_dropped_and_recorded_incomplete() {
+    let srv = TestServer::start_with(one_second_parts()).await;
+    let closed = closed_while_dripping(
+        srv.addr,
+        b"POST /upload HTTP/1.1\r\nHost: test\r\nContent-Length: 100\r\n\r\n",
+        b"A",
+    )
+    .await;
+    assert!(
+        closed.is_some_and(|after| after < Duration::from_millis(2500)),
+        "closed after {closed:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let cmd = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .expect("the attempt is still evidence");
+    assert_eq!(
+        cmd.metadata.get("body_complete").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let received = cmd.metadata.get("body_size").and_then(|v| v.as_u64());
+    assert!(received.is_some_and(|n| n < 100), "{received:?}");
     srv.handle.abort();
 }
 

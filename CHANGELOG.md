@@ -473,6 +473,15 @@
   its next read, or at once while it waits for its peer. The session slot table grows from
   1,023 to 2,047 so the HTTP sensor's sessions fit. The arithmetic is in
   [capacity planning](docs/operations/capacity-planning.md#http-sensor-worst-case-memory).
+- **A slowly sent HTTP request no longer holds its buffers for ten minutes** - each read had its
+  own timeout (60 s) and nothing else, so a client sending a byte a minute kept a request's
+  header block and body capture until `max_duration` (600 s). The whole header block must now
+  arrive within the idle timeout of its first byte, as nginx's `client_header_timeout` times a
+  whole header, and the whole body within the idle timeout of the header's end (nginx times a
+  body per read; this limit is the sensor's own). A request cut this way is closed unanswered,
+  and one cut in its body is still recorded, with `body_complete: false`. At the defaults a
+  request holds its buffers for at most 150 s. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-http).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

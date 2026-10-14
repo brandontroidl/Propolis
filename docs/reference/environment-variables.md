@@ -742,7 +742,13 @@ Sensor-specific extras:
   `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) are read by the same reader described under
   "How every sensor variable is read" above. The per-sensor rules below apply to the values after
   that step.
-- **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
+- **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`),
+  per listener; both listeners' sessions share one session memory pool sized for all of them, so
+  the sensor refuses to start when `MAX_CONCURRENT` times the listeners bound leaves a session
+  under 64 KiB of it or exceeds the 2,047 session slots
+  ([capacity planning](../operations/capacity-planning.md#http-sensor-worst-case-memory)).
+  `IDLE_TIMEOUT_MS` also bounds a whole request part: the header block from its first byte, and
+  the body from the header's end.
   HTTP TLS (all three default off; none has a compiled default):
 
   | Variable | Default | Meaning |

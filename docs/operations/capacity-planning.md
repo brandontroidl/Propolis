@@ -228,6 +228,11 @@ the one larger moment: a 64 KiB body of invalid UTF-8 expands when it is decoded
 and measured 350,000 bytes, charged to the session, for the length of one poll; at most one runs
 per worker thread at a time.
 
+How long a connection holds these is bounded too: the header block must arrive within the idle
+timeout of its first byte and the body within the idle timeout of the header's end, so a request
+holds its buffers for at most the read timeout plus twice the idle timeout (150 s at the
+defaults), not the 600 s `max_duration` a byte a minute used to keep them for.
+
 ## Per-unit resource caps (systemd)
 
 The deploy units cap memory, tasks, CPU, and file descriptors. These are the hard ceilings a

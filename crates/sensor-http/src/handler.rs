@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time::Instant;
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
@@ -529,6 +530,12 @@ struct BoundedReader {
     total_captured: u64,
     /// This session's memory account, while the sensor accounts sessions.
     account: Option<AccountRef>,
+    /// When the part being read must have arrived in full: the header block within
+    /// `idle_timeout` of its first byte, as nginx times a whole header (`client_header_timeout`
+    /// is armed once, not per read), and the body within `idle_timeout` of the header's end.
+    /// Per-read timeouts alone let a byte every minute keep a request's buffers for the whole
+    /// `max_duration`.
+    deadline: Option<Instant>,
 }
 
 impl BoundedReader {
@@ -539,12 +546,18 @@ impl BoundedReader {
             first_read: true,
             total_captured: 0,
             account: session_memory::current_account(),
+            deadline: None,
         }
     }
 
+    /// Start the part that must arrive within `idle_timeout` from now.
+    fn arm_deadline(&mut self) {
+        self.deadline = Some(Instant::now() + self.bounds.idle_timeout);
+    }
+
     /// One read of at most `into.len()` bytes into `into`. `None` once the session's byte budget
-    /// is spent, the session memory pool asks it to let go, or the read fails, times out or finds
-    /// the stream closed.
+    /// is spent, the session memory pool asks it to let go, or the read fails, times out, runs
+    /// into the deadline or finds the stream closed.
     async fn read_some<S: AsyncRead + Unpin>(
         &mut self,
         stream: &mut S,
@@ -563,11 +576,15 @@ impl BoundedReader {
             self.bounds.idle_timeout
         };
         self.first_read = false;
+        let mut until = Instant::now() + timeout;
+        if let Some(deadline) = self.deadline {
+            until = until.min(deadline);
+        }
 
         // A session asked to let go while it waits for its peer's next bytes ends now, not at
         // its read timeout.
         let read = tokio::select! {
-            read = tokio::time::timeout(timeout, stream.read(into)) => read,
+            read = tokio::time::timeout_at(until, stream.read(into)) => read,
             () = session_memory::evicted(self.account) => return None,
         };
         match read {
@@ -613,6 +630,9 @@ impl BoundedReader {
             let Some(n) = self.read_some(stream, &mut chunk[..want]).await else {
                 return Err(ReadOutcome::Closed);
             };
+            if self.deadline.is_none() {
+                self.arm_deadline();
+            }
             reserve_within(&mut self.buf, n, MAX_HEADER_BLOCK);
             self.buf.extend_from_slice(&chunk[..n]);
         }
@@ -621,8 +641,9 @@ impl BoundedReader {
     /// Read the whole declared body, keeping the first MAX_BODY_CAPTURE bytes and draining the
     /// rest, so the reply follows the body the way a server's does; the old reader stopped at
     /// the capture cap and answered with the remainder still in flight. A body over what nginx
-    /// accepts is not read at all: the 413 goes out first. The session's byte budget still
-    /// bounds the drain; a body it cuts off counts as incomplete. `body_start` is where the body
+    /// accepts is not read at all: the 413 goes out first. The session's byte budget and the
+    /// body's deadline bound the drain; a body either cuts off counts as incomplete. `body_start`
+    /// is where the body
     /// begins in the header buffer, which may already hold its first bytes.
     async fn read_body<S: AsyncRead + Unpin>(
         &mut self,
@@ -649,6 +670,7 @@ impl BoundedReader {
         // The header buffer is done with; the rest of the body is read a chunk at a time.
         self.buf = Vec::new();
 
+        self.arm_deadline();
         let mut chunk = [0u8; READ_CHUNK_SIZE];
         while received < content_length {
             let want = (content_length - received).min(READ_CHUNK_SIZE);

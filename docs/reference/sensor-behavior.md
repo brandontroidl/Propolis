@@ -1092,7 +1092,15 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   any of it is read; a client that hangs up before its declared body has arrived gets
   no reply, as nginx gives none, and the event says `body_complete: false`.
 - **Bounds:** common defaults except **`max_concurrent` 512** (higher than the
-  others, `crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`). Each connection's heap is
+  others, `crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`). Besides each read's own
+  timeout, the whole header block must arrive within the idle timeout (60 s) of its first byte,
+  as nginx's `client_header_timeout` times a whole header, and the whole body within the idle
+  timeout of the header's end (`crates/sensor-http/src/handler.rs#BoundedReader`); a request cut
+  this way is closed unanswered, and one cut in its body is recorded with `body_complete: false`.
+  nginx times a body per read (`client_body_timeout`) instead; the whole-body limit is this
+  sensor's, so a byte a minute cannot hold a request's buffers for the whole 600 s
+  `max_duration`. A request therefore holds its buffers for at most the read timeout plus twice
+  the idle timeout, 150 s at the defaults. Each connection's heap is
   charged to the session memory pool, 70% of the unit's `MemoryMax` shared by both listeners
   (`crates/sensor-http/src/lib.rs#SESSION_MEMORY_POOL_BYTES`); a session the pool asks to let go
   is ended at its next read, or at once while it waits for its peer (one ended in its body is

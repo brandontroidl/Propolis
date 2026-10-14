@@ -144,22 +144,33 @@ impl FakeShell {
     /// Up to `cap` bytes of the file at the resolved `path`, charged to the line before they are
     /// read. A command that reads a file for its own use (a unit file, a crontab, a package, the
     /// file `>>` appends to) pays for it as a reader that prints it does, so a loop over such a
-    /// command stops where a loop over `cat` would. A device is charged `cap`, all it may hand
-    /// back. `None` when the line cannot pay: the caller stops the line.
+    /// command stops where a loop over `cat` would. A device, which has no size, is charged what the
+    /// read returned (nothing for `/dev/null`). `None` when the line cannot pay: the caller stops the line.
     pub(super) fn read_charged(
         &mut self,
         path: &str,
         cap: u64,
     ) -> Option<Result<Vec<u8>, FsError>> {
-        let cost = match self.fs.stat(path, true) {
-            Some(stat) if stat.kind == FileKind::Regular => stat.size.min(cap),
-            Some(stat) if stat.kind == FileKind::CharDevice => cap,
-            _ => 0,
+        let regular = match self.fs.stat(path, true) {
+            Some(stat) if stat.kind == FileKind::Regular => Some(stat.size.min(cap)),
+            _ => None,
         };
-        if !self.charge_work(cost) {
+        if let Some(cost) = regular
+            && !self.charge_work(cost)
+        {
             return None;
         }
-        Some(self.fs.read_all(path, cap))
+        let read = self.fs.read_all(path, cap);
+        if regular.is_none() {
+            // A device has no size to charge first; what it handed back is charged.
+            let got = read
+                .as_ref()
+                .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            if !self.charge_work(got) {
+                return None;
+            }
+        }
+        Some(read)
     }
 
     /// `cat`: every operand in order, standard input for `-` or no operand.

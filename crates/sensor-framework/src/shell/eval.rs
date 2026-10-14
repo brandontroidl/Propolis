@@ -2036,8 +2036,9 @@ impl FakeShell {
             let prior = content.len();
             content.extend_from_slice(&bytes);
             if append {
-                // The read and rewrite of the whole file are the append's cost however few bytes
-                // it adds; a loop of one-byte appends to a large file pays for every trip.
+                // The read, rewrite and digest of the whole file are the append's cost however
+                // few bytes it adds; a loop of one-byte appends to a large file pays for every
+                // trip. Charged once here, so the loader tracker does not charge it again.
                 self.charge_work(len_u64(content.len()));
             }
             match self.traced_write_file(&path, &content) {
@@ -2048,7 +2049,7 @@ impl FakeShell {
                 }
                 Ok(()) if typed => {
                     let (before, _) = content.split_at(prior.min(content.len()));
-                    self.note_typed_write(&path, before, &content);
+                    self.note_typed_write(&path, before, &content, append);
                 }
                 Ok(()) => {}
                 Err(error) => {

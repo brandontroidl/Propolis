@@ -2206,6 +2206,10 @@ impl Awk<'_, '_> {
                     };
                     match self.sh.read_source(self.parts, source, cap) {
                         Ok(data) => {
+                            // A reopened file is read again, so a loop of getline and close
+                            // pays for every read.
+                            self.sh
+                                .charge_work(u64::try_from(data.len()).unwrap_or(u64::MAX));
                             self.readers.insert(name.clone(), Reader { data, pos: 0 });
                         }
                         Err(_) => return Ok(Val::Num(-1.0)),
@@ -2354,10 +2358,10 @@ impl Awk<'_, '_> {
     fn write_file(&mut self, name: &str, bytes: &[u8], append: bool) {
         let path = self.sh.resolve_logical(name);
         let mut content = if append {
-            self.sh
-                .fs
-                .read_all(&path, crate::fakefs::READ_CAP)
-                .unwrap_or_default()
+            match self.sh.read_charged(&path, crate::fakefs::READ_CAP) {
+                Some(read) => read.unwrap_or_default(),
+                None => return,
+            }
         } else {
             Vec::new()
         };

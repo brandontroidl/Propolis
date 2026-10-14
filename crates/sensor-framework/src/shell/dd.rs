@@ -245,9 +245,10 @@ impl FakeShell {
             return Err(format!("dd: error writing '{arg}': File too large\n"));
         }
         let existing = if args.notrunc || at > 0 {
-            self.fs
-                .read_all(&path, crate::fakefs::READ_CAP)
-                .unwrap_or_default()
+            match self.read_charged(&path, crate::fakefs::READ_CAP) {
+                Some(read) => read.unwrap_or_default(),
+                None => return Ok(()),
+            }
         } else {
             Vec::new()
         };

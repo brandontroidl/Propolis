@@ -681,7 +681,7 @@
   before it is made. `cut --output-delimiter` put an attacker-sized delimiter before every field
   and charged the output only after building all of it (20 KB of commas and a 3,000-byte
   delimiter made 218 MB); its output now stops the line once it would pass what the line can
-  still pay for, and a long `-b`/`-f` list is merged and binary-searched as GNU's is, where
+  still pay for, and a long `-b`/`-f` list is merged and binary-searched, where
   65,536 spans were scanned for every input byte. `crontab FILE`, `systemctl`'s unit lookups and
   `pm install` read up to 1 MiB per call and charged none of it, so `while :; do crontab
   /bin/busybox; done` held the telnet sensor for about ten minutes per line and `systemctl status`
@@ -689,10 +689,13 @@
   charged to the line before it is made, and `crontab -e` no longer reads the file it only needs
   to find. The echo-loader tracker digested a typed assembly twice per `>>` append and again on
   every `chmod`, uncharged (about 23 ms per one-byte append to a 180 KB assembly in a debug
-  build); it now digests the appended bytes once from a retained prior digest, and the append's
-  rewrite, the digest and the read for a `chmod` or run are charged to the line.
-  `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs` run each reproducer through the real listener and
-  holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap.
+  build); it now hashes the file once per append and charges the read, rewrite and digest to
+  the line once, as it charges the read for a `chmod` or run. awk's `getline < FILE` and its
+  `>>` output, and `dd conv=notrunc` or `seek=`, read a file of up to 1 MiB per trip and charged
+  none of it, so a loop around `close()` or `dd` held the sensor past 40 s; each read is now
+  charged. `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs`
+  run each reproducer through the real listener and hold every line to 20 s and to
+  `LINE_WORKING_SET_BYTES` of heap.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

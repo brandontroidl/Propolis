@@ -153,10 +153,17 @@ impl FakeShell {
     /// else has changed since) is not one: what the file holds is not all the attacker's.
     ///
     /// `content` starts with `prior`, so one pass over it digests both. The pass is charged to the
-    /// line: a loop of one-byte appends to a large assembly hashes all of it every trip. It is
+    /// line (`paid` when the caller already charged the whole file, as an append does): a loop of
+    /// one-byte appends to a large assembly hashes all of it every trip. It is
     /// made even when the line cannot pay (the line stops after this write), so the assembly's
     /// record stays true to the file and the session's end still captures it.
-    pub(super) fn note_typed_write(&mut self, path: &str, prior: &[u8], content: &[u8]) {
+    pub(super) fn note_typed_write(
+        &mut self,
+        path: &str,
+        prior: &[u8],
+        content: &[u8],
+        paid: bool,
+    ) {
         let continues = self
             .assembled
             .get(path)
@@ -165,7 +172,9 @@ impl FakeShell {
             self.assembled.remove(path);
             return;
         }
-        self.charge_work(len_u64(content.len()));
+        if !paid {
+            self.charge_work(len_u64(content.len()));
+        }
         let mut hasher = Sha256::new();
         hasher.update(prior);
         let prior_sha256: [u8; 32] = hasher.clone().finalize().into();

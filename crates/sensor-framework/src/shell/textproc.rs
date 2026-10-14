@@ -249,8 +249,9 @@ fn parse_cut(args: &[&str]) -> Result<CutPlan, CommandResult> {
     Ok(plan)
 }
 
-/// The spans of a list in ascending order with every overlapping or adjacent pair joined, as
-/// GNU's `set_fields` leaves them, so a position is found by binary search: a list of thousands
+/// The spans of a list in ascending order with every overlapping or adjacent pair joined (a
+/// position is selected or not, so output is the same; GNU keeps adjacent ranges apart only for
+/// the output delimiter, which this model does not place between them), so a position is found by binary search: a list of thousands
 /// of spans is searched for each byte of the input.
 fn merged(mut spans: Vec<Span>) -> Vec<Span> {
     spans.sort_by_key(|span| span.from);

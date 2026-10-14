@@ -316,3 +316,36 @@ fn tracking_a_typed_assembly_is_charged_to_the_line() {
     let out = session.run("echo ok");
     assert!(out.contains("\r\nok\r\n"), "{out:?}");
 }
+
+/// awk's `getline < FILE` and `>>` output, and `dd conv=notrunc`, each read a file of up to a
+/// megabyte per trip and charged none of it, so a loop around `close()` or `dd` held the sensor
+/// for a minute or more per line.
+#[test]
+fn awk_and_dd_reads_are_charged_to_the_line() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("awk 'BEGIN{while(1){getline x < \"/bin/busybox\"; close(\"/bin/busybox\")}}'");
+    session.run("awk 'BEGIN{while(1){printf \"\" >> \"/bin/busybox\"; close(\"/bin/busybox\")}}'");
+    session.run("while :; do dd if=/dev/null of=/bin/busybox conv=notrunc 2>/dev/null; done");
+    let out = session.run("echo ok");
+    assert!(out.contains("\r\nok\r\n"), "{out:?}");
+}
+
+/// A dense legitimate loader line over a large assembly is charged once per append, not twice,
+/// so it reaches its marker.
+#[test]
+fn a_dense_append_line_over_a_large_assembly_completes() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /tmp");
+    for _ in 0..3 {
+        session.run("printf '%50000s' a >> g");
+    }
+    let chunk = format!("echo -ne '{}' >> g; ", "\\x41".repeat(128));
+    let out = session.run(&format!("{}echo done", chunk.repeat(15)));
+    assert!(out.contains("\r\ndone\r\n"), "{out:?}");
+    let out = session.run("wc -c g");
+    assert!(out.contains("\r\n151920 g\r\n"), "{out:?}");
+}

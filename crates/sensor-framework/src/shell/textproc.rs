@@ -394,12 +394,10 @@ impl FakeShell {
         }
         let mut acc = CommandResult::stdout(data.clone());
         let mut failed = false;
+        // `-` is a file like any other: coreutils' tee does not treat it specially, as POSIX
+        // requires: `echo hi | tee - - | wc -c` is 3 and leaves a file named `-` under coreutils
+        // 9.10 [unverified for 8.32, not captured from the reference container].
         for file in files {
-            if file == "-" {
-                // coreutils 8.32 treats `-` as a file name for tee [unverified]; it is rare.
-                acc.append(CommandResult::stdout(data.clone()));
-                continue;
-            }
             let path = self.resolve_logical(file);
             if self.fs.is_dir(&path) {
                 failed = true;
@@ -409,11 +407,19 @@ impl FakeShell {
                 ));
                 continue;
             }
+            // Each file costs the line what is copied into it, before the copy is made, so a
+            // thousand operands cost a thousand copies of the input and the line stops.
             let mut content = if append {
-                self.fs.read_all(&path, READ_CAP).unwrap_or_default()
+                match self.read_charged(&path, READ_CAP) {
+                    Some(read) => read.unwrap_or_default(),
+                    None => return stopped(),
+                }
             } else {
                 Vec::new()
             };
+            if !self.charge_work(len_u64(data.len())) {
+                return stopped();
+            }
             content.extend_from_slice(&data);
             if let Err(error) = self.traced_write_file(&path, &content) {
                 failed = true;

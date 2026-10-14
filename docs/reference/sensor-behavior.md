@@ -316,6 +316,12 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   take each pattern alternative's steps (items times text length, plus class range tests) from
   the line's remaining allowance before it runs over the process table
   (`crates/sensor-framework/src/shell/procs.rs#FakeShell::select_charged`).
+- The work allowance pays for what a command does, not only for what it prints: a file a command
+  reads for its own use is charged before it is read
+  (`crates/sensor-framework/src/shell/read.rs#FakeShell::read_charged`), every copy `tee` makes is
+  charged before it is made, and a count a command is given (`tr`'s `[c*n]`, up to 2^64-2) is
+  costed by its constructs, never walked. A line runs synchronously on the sensor's runtime, so
+  what its allowance buys is the longest one line can hold a worker.
 - On SSH, telnet and ADB the session's own heap is counted too
   (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
   may hold while a line runs stops at its next step, as when its work allowance runs out (the
@@ -540,7 +546,7 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   toybox `tr` in the escapes (`\x41`, `\e`), the classes' order, repeats, `-t` and the wording;
   `crates/sensor-framework/src/shell/tr_gnu.rs#FakeShell::cmd_tr_gnu`; under `busybox` it stays a
   silent success because that applet's refusals are not captured),
-  `tee` (`-a`; its files are written like a redirection, so a body it saves from the session input is captured,
+  `tee` (`-a`; `-` is a file name, as in GNU; its files are written like a redirection, so a body it saves from the session input is captured,
   `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_tee`), `awk`/`mawk` (an interpreter for mawk 1.3.4's
   language: patterns, `BEGIN`/`END`, fields, arrays, user functions, the string and math built-ins, `printf` through
   glibc-compatible conversions, `getline` and output redirection; `system()`, `cmd | getline` and `print | cmd` run their text

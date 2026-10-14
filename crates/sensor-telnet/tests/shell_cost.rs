@@ -227,3 +227,20 @@ fn tr_repeat_counts_are_not_walked() {
         assert!(out.contains(expect), "{line}: {out:?}");
     }
 }
+
+/// `tee -` writes a file named `-`, as GNU's does; standard output gets the input once. Every
+/// `-` used to add another copy of the input to the output, so a hundred of them over a
+/// megabyte asked for 200 MB and the kernel killed the sensor.
+#[test]
+fn tee_copies_its_input_once_per_file_and_pays_for_each() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /tmp");
+    let dashes = vec!["-"; 100].join(" ");
+    session.run(&format!("head -c 1000000 /dev/zero | tee {dashes} | wc -c"));
+    let out = session.run("echo hi | tee - - | wc -c");
+    assert!(out.contains("\r\n3\r\n"), "{out:?}");
+    let out = session.run("cat ./-");
+    assert!(out.contains("\r\nhi\r\n"), "{out:?}");
+}

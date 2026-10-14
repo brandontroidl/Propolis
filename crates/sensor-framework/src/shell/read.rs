@@ -15,7 +15,7 @@
 
 use super::registry::Registry;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
-use crate::fakefs::FsError;
+use crate::fakefs::{FileKind, FsError};
 
 /// How much of a file `head -n` asks the filesystem for at a time, so it stops reading at the
 /// Nth newline instead of materializing the whole image.
@@ -139,6 +139,27 @@ impl FakeShell {
     /// more once what it has already produced spent what the line had left.
     pub(super) fn read_cap(&self) -> u64 {
         self.budget().limits().work_per_line
+    }
+
+    /// Up to `cap` bytes of the file at the resolved `path`, charged to the line before they are
+    /// read. A command that reads a file for its own use (a unit file, a crontab, a package, the
+    /// file `>>` appends to) pays for it as a reader that prints it does, so a loop over such a
+    /// command stops where a loop over `cat` would. A device is charged `cap`, all it may hand
+    /// back. `None` when the line cannot pay: the caller stops the line.
+    pub(super) fn read_charged(
+        &mut self,
+        path: &str,
+        cap: u64,
+    ) -> Option<Result<Vec<u8>, FsError>> {
+        let cost = match self.fs.stat(path, true) {
+            Some(stat) if stat.kind == FileKind::Regular => stat.size.min(cap),
+            Some(stat) if stat.kind == FileKind::CharDevice => cap,
+            _ => 0,
+        };
+        if !self.charge_work(cost) {
+            return None;
+        }
+        Some(self.fs.read_all(path, cap))
     }
 
     /// `cat`: every operand in order, standard input for `-` or no operand.

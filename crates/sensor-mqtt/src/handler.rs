@@ -36,10 +36,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::session_memory;
 use sensor_framework::shell::looks_binary;
 use sensor_framework::{
     CaptureEnd, CaptureHandoff, CaptureJob, ConnectionBounds, EventEmitter, UploadEnd, Uuid,
-    WanResolver, sanitize_value, to_hex_bounded, upload_metadata,
+    WanResolver, sanitize_value, stamp_end_reason, to_hex_bounded, upload_metadata,
 };
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
@@ -54,6 +55,21 @@ pub const PROTOCOL_LABEL: &str = "mqtt";
 pub const MAX_PACKET_BYTES: usize = 262_144;
 /// Packets processed per connection before the session is ended.
 pub const MAX_PACKETS: usize = 1024;
+/// Kernel buffer size asked for on each accepted socket, per direction; Linux stores twice this.
+/// The handler does not read while it writes a reply, and a SUBACK carries one byte per filter, so
+/// a peer that sends SUBSCRIBEs and never reads blocks the write and parks what it sends next in
+/// the kernel, charged to the unit's cgroup and outside every budget. Unclamped, receive
+/// autotuning grew that queue to about 0.74 MB a connection at Internet MSS, and 256 such
+/// connections plus pending PUBLISH bodies on the TLS listener OOM-killed the unit. At 32 KiB a
+/// direction 512 connections cost at most 32 MiB plus a segment each; a 256 KiB PUBLISH still
+/// arrives at the window this leaves.
+pub const SOCKET_BUFFER_BYTES: u32 = 16 * 1024;
+/// How long one reply may take to write before the session ends (never longer than the idle
+/// timeout). A client reads its CONNACK, SUBACK or PUBACK at once; one that does not is the stall
+/// above, and the handler cannot read it while it waits.
+pub const REPLY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A packet body is read this much at a time, so the session's memory is checked as it grows.
+const BODY_READ_CHUNK: usize = 8 * 1024;
 /// Properties read from one 5.0 properties block; the next one marks `parse_error` and stops.
 pub const MAX_PROPERTIES: usize = 64;
 /// User properties kept (and logged) from one block; `user_property_count` still counts them all.
@@ -150,6 +166,9 @@ pub enum ReadError {
     Malformed,
     TooLarge,
     Budget,
+    /// The session holds more than the session memory pool lets it (`session_memory`): asked to
+    /// let go, or refused room past its floor while a body was arriving.
+    Memory,
 }
 
 impl ReadError {
@@ -160,6 +179,7 @@ impl ReadError {
             ReadError::Malformed => "bad_remaining_length",
             ReadError::TooLarge => "oversize_declaration",
             ReadError::Budget => "capture_budget",
+            ReadError::Memory => "memory_limit",
         }
     }
 }
@@ -185,9 +205,9 @@ pub async fn read_packet<R: AsyncRead + Unpin>(
     read_packet_within(reader, bounds, total, bounds.idle_timeout, &mut Vec::new()).await
 }
 
-/// Read one control packet. The body is read through a `take` limited to the declared length
-/// (already capped at `MAX_PACKET_BYTES` and the remaining capture budget), so memory grows only
-/// with bytes the peer actually sends, never with what it merely declares.
+/// Read one control packet. The body is read up to the declared length (already capped at
+/// `MAX_PACKET_BYTES` and the remaining capture budget) and grown only as bytes arrive, so memory
+/// follows what the peer actually sends, never what it merely declares (see [`read_body`]).
 ///
 /// `idle` is the per-read wait after the first packet (the keepalive-derived bound once a client
 /// has connected). `head` receives the header byte and remaining-length bytes as they arrive, so a
@@ -233,14 +253,9 @@ async fn read_packet_within<R: AsyncRead + Unpin>(
     }
 
     let mut body = Vec::new();
-    let read = tokio::time::timeout(
-        idle,
-        (&mut *reader).take(remaining as u64).read_to_end(&mut body),
-    )
-    .await;
-    match read {
-        Ok(Ok(got)) if got == remaining => {}
-        Ok(_) => return Err(ReadError::Closed),
+    match tokio::time::timeout(idle, read_body(reader, remaining, &mut body)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
         Err(_) => return Err(ReadError::Timeout),
     }
     *total += remaining as u64;
@@ -249,6 +264,40 @@ async fn read_packet_within<R: AsyncRead + Unpin>(
         flags: header[0] & 0x0F,
         body,
     })
+}
+
+/// Read exactly `remaining` body bytes into `body`. The buffer at most doubles as bytes arrive and
+/// never grows past `remaining`, so a body costs at most twice what was sent (8 KiB at least) and
+/// never more than the declaration. A body still arriving is the session's own heap, charged to
+/// the session memory pool where the sensor accounts sessions: once the session is over what the
+/// pool lets it hold, the read stops with [`ReadError::Memory`] rather than hold the rest until
+/// the idle timeout.
+async fn read_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    remaining: usize,
+    body: &mut Vec<u8>,
+) -> Result<(), ReadError> {
+    let mut chunk = [0u8; BODY_READ_CHUNK];
+    while body.len() < remaining {
+        let want = (remaining - body.len()).min(BODY_READ_CHUNK);
+        let n = match reader.read(&mut chunk[..want]).await {
+            Ok(0) | Err(_) => return Err(ReadError::Closed),
+            Ok(n) => n,
+        };
+        if body.capacity() - body.len() < n {
+            let target = body
+                .capacity()
+                .saturating_mul(2)
+                .max(BODY_READ_CHUNK)
+                .min(remaining);
+            body.reserve_exact(target - body.len());
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if session_memory::current_over() {
+            return Err(ReadError::Memory);
+        }
+    }
+    Ok(())
 }
 
 /// The per-read idle bound once a client has connected: a real broker drops a client that is
@@ -1187,6 +1236,10 @@ pub async fn handle_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if session_memory::unaccounted_session() {
+        return;
+    }
     let source_ip: IpAddr = normalize_dual_stack(peer_addr).ip();
     let wan_ip = local_addr
         .map(normalize_dual_stack)
@@ -1226,19 +1279,25 @@ pub async fn handle_connection<S>(
     let started = Instant::now();
     let mut session = Session::default();
     let mut total_read: u64 = 0;
+    let write_timeout = REPLY_WRITE_TIMEOUT.min(bounds.idle_timeout);
+    // This session's memory account, while the sensor accounts sessions.
+    let account = session_memory::current_account();
+    let mut memory_limited = false;
     for _ in 0..MAX_PACKETS {
         let idle = keepalive_idle(bounds.idle_timeout, session.keepalive);
         let mut head = Vec::new();
-        let packet = match read_packet_within(
-            &mut stream,
-            &bounds,
-            &mut total_read,
-            idle,
-            &mut head,
-        )
-        .await
-        {
+        // A session asked to let go while it waits for (the rest of) a packet ends now, not at
+        // its idle timeout.
+        let read = tokio::select! {
+            read = read_packet_within(&mut stream, &bounds, &mut total_read, idle, &mut head) => read,
+            () = session_memory::evicted(account) => Err(ReadError::Memory),
+        };
+        let packet = match read {
             Ok(packet) => packet,
+            Err(ReadError::Memory) => {
+                memory_limited = true;
+                break;
+            }
             Err(err) => {
                 if !session.connected() && total_read > 0 {
                     record(malformed_observation(err.reason(), total_read, &head)).await;
@@ -1267,9 +1326,12 @@ pub async fn handle_connection<S>(
             ))
             .await;
         }
+        // Nothing needs the body past here; it is not held through a reply the peer may never
+        // read.
+        drop(packet);
         if !outcome.reply.is_empty() {
             // Flushed inside the same bound: a TLS stream may hold the reply in its record buffer.
-            let write = tokio::time::timeout(bounds.idle_timeout, async {
+            let write = tokio::time::timeout(write_timeout, async {
                 stream.write_all(&outcome.reply).await?;
                 stream.flush().await
             })
@@ -1282,9 +1344,13 @@ pub async fn handle_connection<S>(
             break;
         }
     }
-    record(session.end_observation(total_read, started.elapsed())).await;
+    let mut end = session.end_observation(total_read, started.elapsed());
+    if memory_limited {
+        stamp_end_reason(&mut end.metadata, CaptureEnd::MemoryLimit);
+    }
+    record(end).await;
     // Sends close_notify on a TLS stream so a real client sees a clean close, not a truncation.
-    let _ = tokio::time::timeout(bounds.idle_timeout, stream.shutdown()).await;
+    let _ = tokio::time::timeout(write_timeout, stream.shutdown()).await;
 }
 
 #[cfg(test)]

@@ -321,7 +321,7 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   may hold while a line runs stops at its next step, as when its work allowance runs out (the
   trace notes a memory hit), and a session still holding more than it may keep after a line is
   ended (`end_reason` `memory_limit`). See
-  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
+  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt).
 - A fetch verb the line executes additionally emits `honeypot_file_download` with
   `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
 - **Standard input.** The sensors run each line through `start_line`
@@ -1356,11 +1356,29 @@ under the process-wide capture-memory budget, and never run.
 - **Parser bounds.** The remaining-length varint is at most four bytes (a fifth continuation
   byte closes the connection). A packet declaring more than `MAX_PACKET_BYTES` = 262144 bytes
   is refused on the declaration alone, before any body is read
-  (`crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`). The body is read through a limit of
-  the declared length, so memory grows with bytes actually received, never with what is
-  merely declared. A connection ends after `MAX_PACKETS` = 1024 packets
-  (`crates/sensor-mqtt/src/handler.rs#MAX_PACKETS`), at `max_captured_bytes` total bytes read,
-  on the first-byte `read_timeout` and per-read `idle_timeout`, or at `max_duration`.
+  (`crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`). The body is read up to the declared
+  length in 8 KiB steps into a buffer that at most doubles and never grows past the declaration,
+  so memory grows with bytes actually received, never with what is merely declared
+  (`crates/sensor-mqtt/src/handler.rs#read_body`). A connection ends after `MAX_PACKETS` = 1024
+  packets (`crates/sensor-mqtt/src/handler.rs#MAX_PACKETS`), at `max_captured_bytes` total bytes
+  read, on the first-byte `read_timeout` and per-read `idle_timeout`, or at `max_duration`.
+- **Session memory.** The binary installs the session accounting allocator and runs each
+  connection, plain or TLS, in its own accounted scope, as the shell sensors do: a body still
+  arriving is the session's heap, charged to a pool of 30% of `MemoryMax` shared by every
+  session of both listeners. A session the pool cannot hold is ended, whether it is reading a
+  body or waiting for the next packet, and a connection that cannot get a slot is closed before
+  anything is answered. A PUBLISH declaring 256 KiB and sent most of the way used to hold that
+  much heap until the idle timeout; hundreds of them on the TLS listener were half of what
+  OOM-killed the unit. See
+  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt).
+- **Replies to a peer that does not read.** The handler does not read while it writes a reply,
+  and a SUBACK carries one byte per filter, so SUBSCRIBEs a peer never reads block the write
+  while what the peer sends next waits in the kernel. Each accepted socket has its receive and
+  send buffers fixed at 16 KiB, stored by Linux as 32 KiB a direction, before the first read
+  (`crates/sensor-mqtt/src/handler.rs#SOCKET_BUFFER_BYTES`); a socket that cannot be clamped is
+  closed. A reply, and the closing shutdown, get `REPLY_WRITE_TIMEOUT` = 5 s (never more than
+  the idle timeout) before the session ends (`crates/sensor-mqtt/src/handler.rs#REPLY_WRITE_TIMEOUT`),
+  and the packet's body is dropped before the write.
 - **Emits:** `honeypot_connection` at accept; `honeypot_login_attempt`
   (`authenticated=true`; `client_id`, `username` (empty when anonymous), `protocol_level`,
   `keepalive`, `clean_session`, and `will_topic` and `will_payload_len` when a will is set;
@@ -1390,8 +1408,8 @@ under the process-wide capture-memory budget, and never run.
   nothing, and a malformed packet after a successful CONNECT, add no such event.
 - **Session end.** Every connection ends with one `honeypot_session_end` event
   (`authenticated=false`; `packets`, `publishes`, `subscribes`, `bytes_in`, `duration_ms`
-  and the `client_id` when a CONNECT was seen)
-  (`crates/sensor-mqtt/src/handler.rs#Session::end_observation`). It is not emitted when
+  and the `client_id` when a CONNECT was seen, plus `end_reason` `memory_limit` when the session
+  memory pool ended it) (`crates/sensor-mqtt/src/handler.rs#Session::end_observation`). It is not emitted when
   `max_duration` cancels the handler, because the listener drops the handler future.
 - **Bounds:** common defaults, `max_concurrent` 256, per-source admission cap. Strict
   parsing: a zero or unparseable bound aborts startup. Only a binary PUBLISH payload is spooled

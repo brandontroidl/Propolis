@@ -99,10 +99,10 @@ the exact behavior. Raise the variable only together with the unit's `MemoryMax`
 counts (current, high-water, refused reservations, truncated and refused captures) are exposed by
 `CaptureHandoff` getters for diagnostics; no endpoint publishes them yet.
 
-## Session memory (`sensor-ssh`, `sensor-telnet`, `sensor-adb`)
+## Session memory (`sensor-ssh`, `sensor-telnet`, `sensor-adb`, `sensor-mqtt`)
 
-The shell sensors count what each client session really holds on the heap instead of estimating
-it. Their binaries install `AccountingAlloc`
+The shell sensors, and `sensor-mqtt` for the packet bodies it buffers, count what each client
+session really holds on the heap instead of estimating it. Their binaries install `AccountingAlloc`
 (`crates/sensor-framework/src/session_memory.rs#AccountingAlloc`), which tags every allocation with
 the session it was made in; each connection's future runs in its own accounted scope
 (`crates/sensor-framework/src/session_memory.rs#scope`). Capture bodies grow outside the session,
@@ -120,10 +120,14 @@ its connections to a pool of its own the same way; its sizing is in
   too.
 - One sensor's sessions share a pool of 30% of `MemoryMax`
   (`crates/sensor-framework/src/session_memory.rs#pool_bytes`): 161,061,273 bytes for SSH,
-  80,530,635 for telnet and ADB. A session reserves it in 64 KiB chunks. Its fair share is the
-  pool, less what ended sessions left allocated, divided among the sessions running (a newcomer
-  included), and never under the pool divided by `max_concurrent` (629,145 bytes for SSH, 314,572
-  for telnet and ADB at the default 256). When the pool has no room:
+  80,530,635 for telnet, ADB and MQTT. A session reserves it in 64 KiB chunks. Its fair share is
+  the pool, less what ended sessions left allocated, divided among the sessions running (a
+  newcomer included), and never under the pool divided by `max_concurrent` (629,145 bytes for
+  SSH, 314,572 for telnet and ADB at the default 256). MQTT divides it by `max_concurrent` times
+  its listeners, since the plain and TLS listeners each admit `max_concurrent` (157,286 bytes
+  with both at the default 256), and ends a session refused room while a PUBLISH body is still
+  arriving at once, not after the packet (`crates/sensor-mqtt/src/handler.rs#read_body`). When
+  the pool has no room:
   - a session within its floor still takes what it asked for, and the pool counts it past its
     ceiling; floors add up to the pool, so this is at most the pool again;
   - a session past its floor gets no more: its running line stops, and after the line (for SSH
@@ -171,6 +175,11 @@ is closed. Writes to a peer that may not read are bounded too, so a stalled conn
   session if it does not finish within the idle timeout
   (`crates/sensor-ftp/src/handler.rs#write_line`). Data connections are not clamped; a STOR is
   read as it arrives.
+- `sensor-mqtt` clamps every accepted socket, plain and TLS
+  (`crates/sensor-mqtt/src/handler.rs#SOCKET_BUFFER_BYTES`): it does not read while it writes a
+  reply, and a SUBACK carries one byte per filter. A reply gets 5 s
+  (`crates/sensor-mqtt/src/handler.rs#REPLY_WRITE_TIMEOUT`, never more than the idle timeout)
+  before the session ends.
 
 `sensor-ftp` at its defaults, with both listeners (512 control connections), against
 `MemoryMax=256M` (268,435,456):
@@ -187,8 +196,25 @@ loopback with the client MSS set to 1460, ten 10 MB uploads held open (the captu
 plus 480 control connections parked in LIST behind a flood (240 plain, 240 implicit TLS) peaked
 at 156,815,360 bytes. About 100 MB of that was the uploads, and socket memory read 11.0 MB with
 319 of the connections parked (about 35 KiB each), which leaves roughly 80 KiB a connection for
-everything else (debug build). Every upload was recorded. Before the clamp the same load reached the limit and was
-OOM-killed, losing all ten uploads.
+everything else (debug build). Every upload was recorded. Before the clamp the same load reached
+the limit and was OOM-killed, losing all ten uploads.
+
+`sensor-mqtt` at its defaults, with both listeners (512 sessions), against `MemoryMax=256M`:
+
+| Term | Bound |
+|---|---|
+| Capture bodies | 107,374,182 (40% of `MemoryMax`) |
+| What sessions hold, PUBLISH bodies still arriving included | 80,530,635 (the session pool [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt)) |
+| Socket memory | 512 x 65,536 = 33,554,432, plus a segment each |
+| Sum | 221,459,249, 46,976,207 left for the runtime, TLS state from the handshake (allocated before a session's scope) and allocation headers |
+
+The pool term carries the pool's own residual: sessions can hold more than it for as long as the
+asked sessions take to end (see the session memory section). Measured on loopback with the client
+MSS set to 1460 (debug build, no swap): 256 plaintext connections stalled on SUBACKs behind 600 KB
+of PUBLISH each, then 256 TLS connections each holding a 262,000-byte partial PUBLISH, peaked at
+129,417,216 bytes (heap 117 MB at most, socket memory 2.1 MB at most, since each stalled reply was
+cut after 5 s); 11 sessions were ended by the pool. Before these bounds the same load
+OOM-killed the unit.
 
 ## SSH sensor worst-case memory
 
@@ -201,7 +227,7 @@ sum of the places that hold bytes, each bounded where it is allocated and releas
 | Term | Bound | Where it is enforced |
 |---|---|---|
 | Capture bodies (uploads, shell payloads, held stdin) | 214,748,364 (40% of `MemoryMax`) | `crates/sensor-framework/src/capture_budget.rs#try_reserve` admits a 64 KiB chunk only by compare-exchange under the ceiling; `CaptureBody` and `Reservation` refund on drop, panic unwind included; `crates/sensor-ssh/src/server.rs#DEFAULT_CAPTURE_BUDGET_BYTES` |
-| What client sessions hold, shell lines included | 161,061,273 (30% of `MemoryMax`) | the session pool [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb); a line runs inside its connection's accounted scope, so its working set is charged to the session (`crates/sensor-framework/src/session_memory.rs#PEAK_LIMIT_BYTES`) |
+| What client sessions hold, shell lines included | 161,061,273 (30% of `MemoryMax`) | the session pool [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt); a line runs inside its connection's accounted scope, so its working set is charged to the session (`crates/sensor-framework/src/session_memory.rs#PEAK_LIMIT_BYTES`) |
 | Output queued for peers, and input waiting behind it | 67,108,864 (64 MiB) | `crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; a unit of work reserves `crates/sensor-ssh/src/server.rs#OUTPUT_UNIT_BYTES` before it runs and `ChannelFlow::queue` hands out only that |
 | Sum | 442,918,501 | |
 | Runtime allowance (estimate) | 67,108,864 | code, stacks, packet buffers, the hand-off queue, allocation headers, socket memory |

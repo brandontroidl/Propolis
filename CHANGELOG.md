@@ -497,6 +497,21 @@
   it runs out. The same load now peaks at 157 MB with every upload recorded. See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-ftp) and
   [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
+- **MQTT clients that never read their replies, or leave a PUBLISH half sent, are bounded** -
+  `sensor-mqtt` does not read while it writes a reply, and a SUBACK carries one byte per
+  filter, so SUBSCRIBEs of empty filters a client never reads blocked the write for the whole
+  idle timeout while what it sent next waited in the kernel, about 0.74 MB a connection at
+  Internet MSS. A PUBLISH declaring 256 KiB and sent most of the way held that much heap
+  until the idle timeout too. Both together OOM-killed the 256 M unit. Each accepted socket's
+  kernel buffers are now fixed at 32 KiB a direction (a socket that cannot be clamped is
+  closed), a reply gets 5 s before the session ends, and the packet body is dropped before the
+  reply is written. The binary now runs every session in the session memory pool the shell
+  sensors use (30% of `MemoryMax`, shared by both listeners): a body still arriving is charged
+  to it, a session the pool cannot hold is ended with `end_reason` `memory_limit` on its
+  session-end event, and a connection that cannot get a slot is closed unanswered. The same
+  load now peaks at 129 MB. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-mqtt) and
+  [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and
@@ -545,7 +560,7 @@
   refuses a new shell or exec while the pool is nearly full. History now keeps at most 64 KiB of
   lines, and `export name` of a new name counts against the variable allowance. Every allocation
   in those three sensors carries a 16-byte header. See
-  [capacity planning](docs/operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
+  [capacity planning](docs/operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt).
 - **`$SHLVL` counts nested shells** - it stayed 1 however many `bash` or `su` levels a session
   opened, where a real bash adds one to the `SHLVL` it inherits and exports it, so `bash; echo
   $SHLVL` printing 1 was a tell. Each bash level now counts itself in (a value that is not a number

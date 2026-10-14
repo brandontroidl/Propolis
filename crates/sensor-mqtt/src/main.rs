@@ -3,10 +3,16 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sensor_framework::session_memory::{self, AccountingAlloc, DEFAULT_POOL_BYTES_256M};
 use sensor_framework::{
     CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M, Env, EnvError,
     SHUTDOWN_DRAIN_TIMEOUT, TlsServer, WanResolver, shutdown_signal,
 };
+
+/// Every allocation is charged to the session it was made in (`session_memory`), so a PUBLISH
+/// body waiting for the rest of its packet counts against the session pool.
+#[global_allocator]
+static ALLOCATOR: AccountingAlloc = AccountingAlloc;
 
 const ENV_BIND: &str = "PROPOLIS_MQTT_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_MQTT_WAN_MAP";
@@ -190,6 +196,20 @@ async fn main() {
         },
         None => None,
     };
+
+    // Every session either listener admits must fit in the session memory pool at its floor; each
+    // listener has its own `max_concurrent` permits.
+    let listeners = if matches!(tls_server, Some((Some(_), _))) {
+        2
+    } else {
+        1
+    };
+    let sessions = config.bounds.max_concurrent.saturating_mul(listeners);
+    if let Err(e) = session_memory::configure(DEFAULT_POOL_BYTES_256M, sessions) {
+        tracing::error!(error = %e, "sensor-mqtt: invalid configuration; refusing to start");
+        std::process::exit(1);
+    }
+    tokio::spawn(session_memory::watchdog());
 
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
     let handoff = match sensor_mqtt::new_capture_handoff(

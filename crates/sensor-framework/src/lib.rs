@@ -58,7 +58,7 @@ pub use env::{Env, EnvError, env_with_legacy, strict_env_var};
 pub use handoff::{
     CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome, DrainReport,
     END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, session_end_metadata,
-    upload_metadata,
+    stamp_end_reason, upload_metadata,
 };
 pub use held_input::{
     CAPTURE_REASON_ECHO_LOADER, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN,

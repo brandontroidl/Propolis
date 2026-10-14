@@ -25,9 +25,10 @@ use tokio::sync::Notify;
 
 use crate::budget::LINE_WORKING_SET_BYTES;
 
-/// Sessions with a slot at once. Above what every accounted sensor admits (256 for each shell
-/// sensor; 1,024 for HTTP, 512 on each of its two listeners), and a slot is free again the moment
-/// its session ends; [`configure`] refuses a sensor that admits more.
+/// Sessions with a slot at once. Above what every accounted sensor admits at its defaults (256
+/// for each shell sensor; 512 for MQTT's two listeners; 1,024 for HTTP, 512 on each of its two),
+/// and a slot is free again the moment its session ends; [`configure`] refuses a sensor that
+/// admits more.
 pub const SLOT_COUNT: usize = 2048;
 
 /// Granularity at which a session reserves pool room.
@@ -68,7 +69,7 @@ pub const fn pool_bytes(unit_memory_max_bytes: u64) -> u64 {
     unit_memory_max_bytes / 10 * 3
 }
 
-/// [`pool_bytes`] for the 256 MiB units (telnet, ADB).
+/// [`pool_bytes`] for the 256 MiB units (telnet, ADB, MQTT).
 pub const DEFAULT_POOL_BYTES_256M: u64 = pool_bytes(256 * 1024 * 1024);
 
 /// How often [`watchdog`] wakes sessions that were asked to let go.

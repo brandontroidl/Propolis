@@ -4,11 +4,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sensor_framework::listener::clamp_socket_buffers;
+use sensor_framework::session_memory;
 use sensor_framework::{
     CaptureHandoff, CaptureMemoryBudget, ConnectionBounds, DEFAULT_CAPTURE_BUDGET_BYTES_256M,
     EventEmitter, OutboxManifest, QuarantineSpool, TlsServer, WanResolver,
     run_tcp_listener_tracked, run_tls_listener_tracked,
 };
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 /// A PUBLISH payload is at most `handler::MAX_PACKET_BYTES`, so no spooled body can exceed it.
@@ -87,7 +90,11 @@ pub async fn start_plain_listener(
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
             let handoff = handoff.clone();
-            async move {
+            // What the session allocates is its own (`session_memory`).
+            session_memory::scope(async move {
+                if !clamped(&stream, peer) {
+                    return;
+                }
                 handler::handle_connection(
                     stream,
                     peer,
@@ -100,10 +107,23 @@ pub async fn start_plain_listener(
                     handoff,
                 )
                 .await;
-            }
+            })
         },
     )
     .await
+}
+
+/// Fix the accepted socket's kernel buffers before the first read (see
+/// `handler::SOCKET_BUFFER_BYTES`). False when that failed: the connection is dropped, since
+/// serving it unclamped would reopen the queue no budget sees.
+fn clamped(stream: &TcpStream, peer: SocketAddr) -> bool {
+    match clamp_socket_buffers(stream, handler::SOCKET_BUFFER_BYTES) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%peer, %error, "sensor-mqtt: cannot cap the socket's buffers; closing");
+            false
+        }
+    }
 }
 
 /// Implicit-TLS MQTT listener (MQTTS) over an existing hand-off. A failed or stalled handshake is
@@ -133,7 +153,10 @@ pub async fn start_tls_listener(
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
             let handoff = handoff.clone();
-            async move {
+            session_memory::scope(async move {
+                if !clamped(stream.get_ref().0, peer) {
+                    return;
+                }
                 handler::handle_connection(
                     stream,
                     peer,
@@ -146,7 +169,7 @@ pub async fn start_tls_listener(
                     handoff,
                 )
                 .await;
-            }
+            })
         },
     )
     .await

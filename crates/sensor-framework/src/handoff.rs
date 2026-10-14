@@ -272,6 +272,13 @@ pub fn session_end_metadata(
     })
 }
 
+/// Add `end_reason` to a `honeypot_session_end` metadata object a protocol built itself, for a
+/// session something cut short (the sensor's own limit rather than the peer). Kept next to
+/// [`session_end_metadata`] so the key still has one home.
+pub fn stamp_end_reason(metadata: &mut serde_json::Value, end: CaptureEnd) {
+    metadata["end_reason"] = end.label().into();
+}
+
 /// `submit` could not enqueue the job because the queue was already at capacity, or because the
 /// hand-off is shutting down (`drain` was called). `submit` never waits for room (see the module
 /// doc), so this is the immediate, synchronous outcome, not a timeout or a retry-later signal.
@@ -978,6 +985,14 @@ mod tests {
     /// end says. The same `PeerClosed` is whole for a shell capture and a fragment for a file
     /// transfer that never reached its end-of-file marker; the labels stay the strings the shell
     /// sensors have always written.
+    #[test]
+    fn stamp_end_reason_adds_the_label_and_keeps_the_other_keys() {
+        let mut m = serde_json::json!({"packets": 3});
+        stamp_end_reason(&mut m, CaptureEnd::MemoryLimit);
+        assert_eq!(m["end_reason"], "memory_limit");
+        assert_eq!(m["packets"], 3);
+    }
+
     #[test]
     fn upload_metadata_derives_complete_and_end_reason_from_one_end() {
         let all = [

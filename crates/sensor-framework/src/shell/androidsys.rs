@@ -376,7 +376,10 @@ impl FakeShell {
             ));
         }
         let path = self.resolve_logical(package);
-        let body = self.fs.read_all(&path, READ_CAP).ok();
+        let body = match self.read_charged(&path, READ_CAP) {
+            Some(read) => read.ok(),
+            None => return super::texttools::stopped(),
+        };
         self.loader_trigger(&path);
         match apk_failure(body.as_deref()) {
             None => result.append(CommandResult::stdout(PM_OK)),

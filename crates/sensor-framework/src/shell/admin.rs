@@ -29,6 +29,7 @@ use chrono::{DateTime, Utc};
 
 use super::procs::ServiceProc;
 use super::registry::Registry;
+use super::texttools::stopped;
 use super::{CommandResult, FakeShell, HandlerId, ShellContext, ShellFlavor};
 use crate::etc;
 use crate::fakefs::READ_CAP;
@@ -712,7 +713,10 @@ impl FakeShell {
             .find(|s| s.name == name && !(s.ssh_only && telnet))
     }
 
-    fn unit(&self, name: &str, user: bool) -> Option<Unit> {
+    /// The unit `name`, a file the session wrote read and charged to the line on every lookup.
+    /// `None` too once the line cannot pay for the read; [`FakeShell::cmd_systemctl`] then stops
+    /// the line.
+    fn unit(&mut self, name: &str, user: bool) -> Option<Unit> {
         let dirs: &[&str] = if user {
             &[USER_DIR, "/etc/systemd/user"]
         } else {
@@ -720,14 +724,14 @@ impl FakeShell {
         };
         for dir in dirs {
             let path = format!("{dir}/{name}");
-            if let Ok(bytes) = self.fs.read_all(&path, READ_CAP) {
-                let is_link = self
-                    .fs
-                    .stat(&path, false)
-                    .is_some_and(|stat| stat.mode & 0o170_000 == 0o120_000);
-                if is_link {
-                    continue;
-                }
+            let is_link = self
+                .fs
+                .stat(&path, false)
+                .is_some_and(|stat| stat.mode & 0o170_000 == 0o120_000);
+            if is_link {
+                continue;
+            }
+            if let Ok(bytes) = self.read_charged(&path, READ_CAP)? {
                 let text = String::from_utf8_lossy(&bytes).into_owned();
                 return Some(Unit::Written {
                     name: name.to_string(),
@@ -930,7 +934,7 @@ impl FakeShell {
         CommandResult::stdout(out)
     }
 
-    fn list_unit_files(&self, user: bool) -> CommandResult {
+    fn list_unit_files(&mut self, user: bool) -> CommandResult {
         let mut rows: Vec<(String, String, &'static str)> = Vec::new();
         if !user {
             for stock in SERVICES {
@@ -971,7 +975,7 @@ impl FakeShell {
         CommandResult::stdout(out)
     }
 
-    fn unit_status(&self, name: &str, user: bool, color: bool) -> (String, u8) {
+    fn unit_status(&mut self, name: &str, user: bool, color: bool) -> (String, u8) {
         let Some(unit) = self.unit(name, user) else {
             return (String::new(), 4);
         };
@@ -1128,8 +1132,18 @@ impl FakeShell {
         }
     }
 
-    /// `systemctl [--user] VERB [UNIT...]`.
+    /// `systemctl [--user] VERB [UNIT...]`. Every unit file a verb looks up is charged to the
+    /// line as it is read, so a verb given thousands of operands, or a directory of large unit
+    /// files, stops the line where a `cat` of them would.
     pub(super) fn cmd_systemctl(&mut self, parts: &[&str]) -> CommandResult {
+        let result = self.systemctl_verb(parts);
+        if self.line.exhausted() {
+            return stopped();
+        }
+        result
+    }
+
+    fn systemctl_verb(&mut self, parts: &[&str]) -> CommandResult {
         let args = parts.get(1..).unwrap_or(&[]);
         let user = args.contains(&"--user");
         let now_flag = args.contains(&"--now");
@@ -1159,8 +1173,17 @@ impl FakeShell {
                 }
                 let mut result = CommandResult::silent(0);
                 let mut worst = 0u8;
+                // A stock unit's status is read from nothing and charged nothing until the
+                // command returns, so the operands it is repeated for are bounded by what the
+                // output may still cost.
+                let mut produced = 0usize;
+                let room = usize::try_from(self.line.remaining()).unwrap_or(usize::MAX);
                 for (index, name) in units.iter().enumerate() {
+                    if self.line.exhausted() || produced > room {
+                        return stopped();
+                    }
                     let (text, status) = self.unit_status(name, user, color);
+                    produced = produced.saturating_add(text.len());
                     if status == 4 {
                         result.append(CommandResult::stderr(
                             4,
@@ -1371,7 +1394,9 @@ impl FakeShell {
             },
             (Some('e'), _) => {
                 let mut text = String::new();
-                if self.fs.read_all(&path, READ_CAP).is_err() {
+                // Whether it can be opened is all `-e` asks before the editor fails; nothing is
+                // read, so `-u` naming any file costs nothing.
+                if self.fs.read_all(&path, 0).is_err() {
                     text.push_str(&format!("no crontab for {user} - using an empty one\n"));
                 }
                 text.push_str("crontab: \"/usr/bin/sensible-editor\" exited with status 1\n");
@@ -1394,14 +1419,15 @@ impl FakeShell {
             self.stdin.take(cap)
         } else {
             let resolved = self.resolve_logical(source);
-            match self.fs.read_all(&resolved, READ_CAP) {
-                Ok(bytes) => bytes,
-                Err(_) => {
+            match self.read_charged(&resolved, READ_CAP) {
+                Some(Ok(bytes)) => bytes,
+                Some(Err(_)) => {
                     return CommandResult::stderr(
                         1,
                         format!("{shown}: No such file or directory\n"),
                     );
                 }
+                None => return stopped(),
             }
         };
         let text = String::from_utf8_lossy(&body).into_owned();

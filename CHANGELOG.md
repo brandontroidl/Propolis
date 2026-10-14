@@ -682,7 +682,12 @@
   and charged the output only after building all of it (20 KB of commas and a 3,000-byte
   delimiter made 218 MB); its output now stops the line once it would pass what the line can
   still pay for, and a long `-b`/`-f` list is merged and binary-searched as GNU's is, where
-  65,536 spans were scanned for every input byte. `crates/sensor-telnet/tests/shell_cost.rs` runs each reproducer through the real listener and
+  65,536 spans were scanned for every input byte. `crontab FILE`, `systemctl`'s unit lookups and
+  `pm install` read up to 1 MiB per call and charged none of it, so `while :; do crontab
+  /bin/busybox; done` held the telnet sensor for about ten minutes per line and `systemctl status`
+  re-read and echoed a 180 KB unit once per operand (200 operands, 118 MB); each read is now
+  charged to the line before it is made, and `crontab -e` no longer reads the file it only needs
+  to find. `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs` run each reproducer through the real listener and
   holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and

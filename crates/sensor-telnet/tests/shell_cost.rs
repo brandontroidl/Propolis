@@ -264,3 +264,35 @@ fn cut_output_is_bounded_by_what_the_line_can_pay() {
     let out = session.run("echo abcdef | cut -b 5-,1,2-3 --output-delimiter=:");
     assert!(out.contains("\r\nabc:ef\r\n"), "{out:?}");
 }
+
+/// `systemctl` and `crontab` read the files they are pointed at for their own use, up to 1 MiB a
+/// time, and charged none of it: `systemctl status` re-read and echoed a 180 KB unit once per
+/// operand (200 operands, 72 MB), and a loop of `crontab /bin/busybox` synthesized a megabyte of
+/// ELF per trip for some ten minutes of sensor time per line.
+#[test]
+fn files_a_command_reads_for_itself_are_charged_to_the_line() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /etc/systemd/system");
+    session.run("printf '[Unit]\\nDescription=' > v.service");
+    for _ in 0..3 {
+        session.run("printf '%060000d' 0 >> v.service");
+    }
+    let out = session.run("wc -c v.service");
+    assert!(out.contains("\r\n180019 v.service\r\n"), "{out:?}");
+    let out = session.run("systemctl status v | wc -c");
+    assert!(out.contains("\r\n180106\r\n"), "{out:?}");
+    let operands = vec!["v"; 200].join(" ");
+    session.run(&format!("systemctl status {operands} | wc -c"));
+
+    session.run("while :; do crontab /bin/busybox 2>/dev/null; done");
+
+    session.run("for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do cp /bin/busybox x$i.service; done");
+    session.run("while :; do systemctl list-unit-files >/dev/null; done");
+
+    let out = session.run("systemctl is-active cron");
+    assert!(out.contains("\r\nactive\r\n"), "{out:?}");
+    let out = session.run("printf '* * * * * id\\n' > /tmp/c; crontab /tmp/c; crontab -l");
+    assert!(out.contains("\r\n* * * * * id\r\n"), "{out:?}");
+}

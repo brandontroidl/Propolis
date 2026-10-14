@@ -18,6 +18,8 @@
   `/usr/local/lib/propolis/`, where `propolis-blocklist` can read it (a checkout under `/root` is
   not readable by it); point the crontab at that copy. A root run records
   the push marker by dropping to the status directory's owner, which needs `setpriv` (util-linux).
+  The script now also needs `perl` (Essential on Debian; install it on Fedora) to open each feed
+  file without following links or blocking; a host without it refuses with "perl is not installed".
   The push marker moved there from `/var/lib/propolis/feed/.current.last_pushed`, so until the
   first push after the upgrade `feed-push-stale` sees no push; with `PROPOLIS_OPS_FEED_PUSH_EXPECTED`
   set it can page once if that push is more than the stale threshold away. Run the sync by hand

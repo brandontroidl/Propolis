@@ -208,8 +208,15 @@ copy_feed_file() {
       $left -= $n;
     }
     close($out) or exit 1;
-  ' "$name" "$id" "$dest" "$max" \
-    || { echo "blocklist-sync: $name could not be opened as the file that was checked" >&2; return 1; }
+  ' "$name" "$id" "$dest" "$max"
+  local rc=$?
+  case "$rc" in
+    0) ;;
+    3) echo "blocklist-sync: $name could not be opened as the file that was checked" >&2; return 1 ;;
+    124) echo "blocklist-sync: opening $name did not finish within 10 s; refused" >&2; return 1 ;;
+    127) echo "blocklist-sync: perl is not installed; it is required to copy feed files safely" >&2; return 1 ;;
+    *) echo "blocklist-sync: $name could not be opened or copied (a link, a FIFO or an I/O error)" >&2; return 1 ;;
+  esac
   after="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
   if [ "$after" != "$checked" ]; then
     echo "blocklist-sync: $name changed between its check and its copy" >&2

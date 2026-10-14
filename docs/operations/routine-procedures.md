@@ -148,7 +148,10 @@ account (mode `0600`), copy root's `known_hosts` entry for the remote into
 as root, with a warning in its log, so an old crontab keeps publishing until then. A root run
 still records the push: it drops to the owner of the status directory
 (`propolis-blocklist`) for that one write, using `setpriv` (util-linux), so the marker
-stays owned by the account and `feed-push-stale` keeps working.
+stays owned by the account and `feed-push-stale` keeps working. The script also needs `perl`
+(`perl-base` is part of every Debian install; on Fedora install `perl`, which `git-core` does not
+pull in): it opens each feed file without following links or blocking and copies from that one
+handle. Without it every run refuses with "perl is not installed" and nothing is pushed.
 
 The script is fail-closed: it aborts if the source has no `manifest.json` or the
 target is not a git checkout, and refuses the whole build, touching nothing in the

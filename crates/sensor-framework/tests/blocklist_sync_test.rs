@@ -3,7 +3,8 @@
 //! daemon, which parses every attacker byte, while the script runs from the operator's cron (root
 //! on a box set up before the dedicated account existed), so each test plays a compromised daemon
 //! planting something in that directory and checks that nothing it plants is published, opened
-//! or written through. Real git, stat and dd run as shipped; only the swap and root tests put a stand-in first on PATH.
+//! or written through. Real git, stat and perl run as shipped; only the swap, root and
+//! missing-perl tests put a stand-in first on PATH.
 
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -825,4 +826,30 @@ fn install_and_upgrade_put_the_root_owned_copy_of_the_script_and_its_readme_in_p
             );
         }
     }
+}
+
+// The copy runs through perl. On a host without it (Fedora's git-core does not pull it in) every
+// file fails, and the log must say perl is missing, not report an inode swap that sends the
+// operator looking for an attack.
+#[test]
+fn a_host_without_perl_is_told_so_and_publishes_nothing() {
+    let fx = Fixture::new();
+    let shim = fx.root().join("noperl");
+    std::fs::create_dir_all(&shim).unwrap();
+    let perl = shim.join("perl");
+    std::fs::write(&perl, "#!/bin/sh\nexit 127\n").unwrap();
+    std::fs::set_permissions(&perl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = fx.run_with(&[("PATH", &path)]);
+    fx.assert_refused_and_nothing_published(&out, "perl missing");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("perl is not installed"), "{stderr}");
+    assert!(
+        !stderr.contains("could not be opened as the file that was checked"),
+        "a missing perl must not read as an inode swap: {stderr}"
+    );
 }

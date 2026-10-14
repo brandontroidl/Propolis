@@ -468,8 +468,9 @@
   sensors use and runs every connection, on both listeners, as an accounted session of one pool
   of 70% of `MemoryMax` (187,904,815 bytes; HTTP has no capture budget, so it gets that share
   too), a floor of 183,500 bytes for each of the 1,024. The most a connection was measured to
-  hold is 132,035 bytes (HTTPS, a full header block and a full body capture), so all 1,024 at
-  their worst fit inside the pool; a session over its share while the pool is short is ended at
+  hold is 132,035 bytes (HTTPS, a full header block and a full body capture), so 1,024 at that
+  size fit inside the pool; the TLS handshake (about 110 KB a connection, 56 MB for 512) runs
+  before the session and is outside it, and the worst mix measured 136 MB of a 256 MiB unit; a session over its share while the pool is short is ended at
   its next read, or at once while it waits for its peer. The session slot table grows from
   1,023 to 2,047 so the HTTP sensor's sessions fit. The arithmetic is in
   [capacity planning](docs/operations/capacity-planning.md#http-sensor-worst-case-memory).

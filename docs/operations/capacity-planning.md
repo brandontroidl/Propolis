@@ -210,8 +210,8 @@ What one connection holds, from where each buffer is allocated and released
 | Body drain, HTTPS | the same, plus rustls's record buffers, which grow inside the session | | 132,035 |
 | Event written, reply sent | the event; the request is dropped first | | 11,687 |
 
-The largest, 132,035 bytes, is under the 183,500-byte floor, so 1,024 sessions at their worst
-hold 135,203,840 bytes, inside the pool; no session at or under its floor is ever asked to let
+The largest measured, 132,035 bytes, is under the 183,500-byte floor, so 1,024 sessions all at that
+size would hold 135,203,840 bytes, inside the pool (only the 512 HTTPS ones can reach it); no session at or under its floor is ever asked to let
 go. A session past its share while the pool is short is ended at its next read, or at once while
 it waits for its peer (`crates/sensor-http/tests/session_memory_limit.rs`, which also holds the
 flood and largest requests, plain and over TLS, within that floor). A header block of empty `:`
@@ -219,11 +219,22 @@ lines costs its bytes: before, each line was a 48-byte table entry, and 5,400 of
 390 KiB through the body drain.
 
 Outside the pool: each connection's task (the handler future measures 6,568 bytes, plus the
-listener's two task cells), the TLS handshake state rustls allocates before the session starts
-and never reallocates inside it (about 1.6 KB a connection, the measured difference with the
-handshake run inside the session), the runtime, and socket memory, which the kernel bounds per
-socket and the handler keeps drained while it reads. That is about 10 MiB for 1,024 connections
-plus the runtime, against the 80,530,641 bytes the pool leaves. Building the request event is
+listener's two task cells), the runtime, and socket memory, which the kernel bounds per socket
+and the handler keeps drained while it reads. And the TLS handshake, which runs in the
+framework (`crates/sensor-framework/src/tls.rs`) before the handler, so before the session
+starts: rustls joins a fragmented handshake message in a buffer of up to 65,535 bytes, held for
+up to the read timeout (30 s). Measured on a release build, 512 connections each holding a
+60 KiB partial ClientHello cost about 110 KB each, 56 MB together. A connection is either in its
+handshake or in its session, and a session costs more, so the worst mix is 512 handshaking
+HTTPS connections (about 56 MB, outside the pool) beside 512 plaintext sessions in the pool; it
+measured 117.6 MB of anonymous memory, 136 MB at its peak, against the 256 MiB unit. Once the
+handshake ends the buffer is released and the connection joins the pool. Past the handshake a
+client can still fragment a handshake message and grow rustls's buffer toward 64 KiB inside the
+session [unverified, from the vendored source]; the pool then ends that session if it is over
+its share while the pool is short. A body capture is sized at the declared Content-Length (up to
+64 KiB) as soon as the header block ends, so an idle connection that declared a large body holds
+about 82.7 KB at once, not as bytes arrive. The sum outside the pool is therefore bounded by
+the 80,530,641 bytes the pool leaves. Building the request event is
 the one larger moment: a 64 KiB body of invalid UTF-8 expands when it is decoded and redacted,
 and measured 350,000 bytes, charged to the session, for the length of one poll; at most one runs
 per worker thread at a time.

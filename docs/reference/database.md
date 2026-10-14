@@ -20,7 +20,7 @@ Three crates own schema through three independent migration sets:
   `ip_vantage`, `ip_sensor`, `sample_analysis`, the campaign and indicator tables, and all five
   enum types.
 - **review** (`crates/review/migrations/*.sql`) owns `review_queue`,
-  `vendor_submission`, `fetch_attempt`, `fetch_daily_usage`.
+  `vendor_submission`, `fetch_attempt`, `fetch_daily_usage`, `fetch_event_cursor`.
 - **fleet** (`crates/fleet/migrations/*.sql`) owns `listener_probe` and `sensor_stats`.
 
 The change maps at the end of this page list every migration in each set.
@@ -450,6 +450,16 @@ One row per UTC day: `day DATE` PRIMARY KEY, `used INTEGER NOT NULL DEFAULT 0 CH
 every node on the database. See
 [rate limits and budgets](rate-limits-and-budgets.md#per-cycle-and-per-host).
 
+### `fetch_event_cursor` (`0008_fetch_event_cursor.sql`)
+
+A single row (`singleton BOOLEAN PRIMARY KEY CHECK (singleton)`) holding `last_event_id
+BIGINT NOT NULL DEFAULT 0 CHECK (last_event_id >= 0)`: the highest `event.id` the fetcher's
+event sync has decided. The sync reads `honeypot_file_download` events with `id` above it, in
+chunks of 5,000 under a row lock on this row (so nodes sharing the database do not repeat each
+other's work), inserts a pending `fetch_attempt` row for each fetchable URL, and moves the
+watermark past the chunk. An event whose URL the fetcher cannot dispatch gets no row and is
+not read again.
+
 `status` is a free TEXT column, **not** an enum or CHECK. The documented value set -
 `pending`, `success`, `dead`, `rejected`, `too_big`, `timeout`, `empty` - lives only
 in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|success|dead|rejected|too_big|timeout|empty`); the actual values written are set by review-crate code.
@@ -493,6 +503,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0005` | `fetch_attempt (first_seen DESC)` index for newest-first selection |
 | `0006` | `fetch_attempt.claim_expires` + partial index; `fetch_daily_usage` table |
 | `0007` | `fetch_attempt.transport_auth` (existing rows `'unknown'`) + `tls_verify_error`, with their CHECK constraints |
+| `0008` | `fetch_event_cursor` (one row, starts at 0: the first sync walks the existing ledger once) |
 
 **fleet** (`crates/fleet/migrations/`, tracked in `_sqlx_migrations_fleet`):
 

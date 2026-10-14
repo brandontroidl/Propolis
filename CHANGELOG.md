@@ -553,6 +553,17 @@
   journald's 48K `LineMax` split) carrying a forged priority. No new
   dependency; terminal output is unchanged. See
   [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
+- **The fetcher stops re-reading the same download events every cycle** - the sync that turns
+  `honeypot_file_download` events into fetch rows anti-joined every such event against
+  `fetch_attempt` on `TRIM(url)` each cycle. An event whose URL the fetcher never stores (an
+  `ftp://` dropper, text that is not a URL) never gets a row, so it never left that query: one
+  live node read the same 5,951 events for 1.5 s every 12 s, indefinitely. The sync now walks
+  event ids past a persisted watermark (new review migration `0008`, table
+  `fetch_event_cursor`, one row shared by every node), in bounded chunks, so each event is
+  decided once whether or not it yields a row. Skipped URLs are counted in one INFO line and
+  still get no `fetch_attempt` row, as before. The first sync after the upgrade walks the
+  existing ledger once; on a 400,000-event test ledger the old query took 311 ms per cycle
+  and the steady-state sync query now takes 0.4 ms.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

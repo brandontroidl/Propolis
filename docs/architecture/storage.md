@@ -29,8 +29,8 @@ Schema is split across three migration sets, each listed migration by migration 
 
 - **`core-scoring`** owns `event`, `ip_score`, `ip_vantage`, `ip_sensor`,
   `sample_analysis`, and all five enum types.
-- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt`, and
-  `fetch_daily_usage`. It depends on the `review_state_enum` created by
+- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt`,
+  `fetch_daily_usage`, and `fetch_event_cursor`. It depends on the `review_state_enum` created by
   core-scoring's first migration - a deliberate cross-crate schema dependency so the
   schema is complete.
 - **`fleet`** owns `listener_probe`, and records its migrations in its own
@@ -224,6 +224,10 @@ to duplicate tier logic in SQL, keeping Rust the single source of truth.
   lease (`claim_expires`), so no two fetch the same URL at once.
 - `fetch_daily_usage` (PK the UTC day) - the fetcher's daily fetch budget, spent
   under a row lock so every node draws on one shared cap.
+- `fetch_event_cursor` (one row) - the highest `event.id` the fetcher's event sync has
+  decided. Each cycle reads only the download events past it, so an event whose URL the
+  fetcher cannot dispatch (an `ftp://` dropper) is read once and never again, instead of on
+  every cycle for lack of a `fetch_attempt` row.
 
 ## Captured file bodies (outside Postgres)
 

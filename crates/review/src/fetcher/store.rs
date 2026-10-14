@@ -2,9 +2,9 @@
 //!
 //! `claim_candidates` is the single entry point that turns both a `honeypot_file_download`
 //! event and a prior cycle's backoff/recursion state into "what to try this cycle" - it first
-//! syncs any not-yet-seen event URL into a fresh `pending` row (an idempotent insert: `ON
-//! CONFLICT (url_hash) DO NOTHING`, so a URL reported by many events, or re-synced across
-//! cycles, only ever gets one row), then claims rows that are either never-attempted or
+//! syncs the events past a persisted watermark (`fetch_event_cursor`) into fresh `pending` rows
+//! (an idempotent insert: `ON CONFLICT (url_hash) DO NOTHING`, so a URL reported by many events
+//! only ever gets one row), then claims rows that are either never-attempted or
 //! backed off past their `next_attempt`, within the per-host and daily budgets. A `dead`
 //! (terminal, 3-attempt-capped) or `success` row is never selected again - `status` alone gates
 //! eligibility, so there is exactly one source of truth for "should this be tried now." The
@@ -118,59 +118,138 @@ pub fn parse_url_parts(url: &str) -> Option<(String, String, Option<i32>)> {
     Some((scheme, host, port))
 }
 
-/// Claim every not-yet-seen `honeypot_file_download` event URL into a pending depth-0 row via
-/// `insert_pending_if_absent`. Safe to call every cycle: a URL whose row already exists (from an
-/// earlier sync, or because a recursion child happened to enqueue the same URL first) is left
-/// completely untouched, never reset.
-///
-/// The `NOT EXISTS` pre-filter compares `TRIM()` of both sides rather than the raw strings, to
-/// match the exact equivalence class `url_hash` (`sha256(trim(url))`) partitions the table by -
-/// without this, two whitespace-variant spellings of the same URL would both pass the filter
-/// (each looking "new" against the other's untrimmed text) while colliding on the same
-/// `url_hash`, so only `insert_pending_if_absent`'s own `ON CONFLICT DO NOTHING` prevents a
-/// row-reset once the pre-filter under-dedups. Matching the filter to the real key makes that
-/// pre-filter accurate rather than merely lucky.
-async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let rows = sqlx::query(
-        // host() not ::text: Postgres renders inet as "1.2.3.4/32" even for a plain address, and
-        // IpAddr::from_str rejects the prefix, so ::text + .parse().ok() silently yielded None and
-        // wrote NULL for every row - the attacker attribution was lost on every fetch.
-        "SELECT host(e.source_ip) AS source_ip, e.metadata->>'url' AS url \
-         FROM event e \
-         WHERE e.signal_type = 'honeypot_file_download' \
-           AND e.metadata->>'url' IS NOT NULL \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM fetch_attempt fa \
-               WHERE TRIM(fa.url) = TRIM(e.metadata->>'url') \
-           )",
-    )
-    .fetch_all(pool)
-    .await?;
+/// Events one sync chunk reads. Bounds the transaction (and the row lock on the watermark) while
+/// the first sync after the watermark was introduced walks the whole existing ledger.
+const SYNC_CHUNK: i64 = 5_000;
 
-    for row in rows {
-        let url: String = row.get("url");
-        let source_ip: Option<IpAddr> = row
-            .get::<Option<String>, _>("source_ip")
-            .and_then(|s| s.parse().ok());
-        let Some((scheme, host, port)) = parse_url_parts(&url) else {
-            continue;
-        };
-        insert_pending_if_absent(
-            pool,
-            &NewPendingRow {
-                url_hash: url_hash(&url),
-                url,
-                host,
-                scheme,
-                port,
-                source_ip,
-                parent_hash: None,
-                depth: 0,
-            },
+/// Turn every `honeypot_file_download` event past the persisted watermark (`fetch_event_cursor`)
+/// into a pending depth-0 row, then advance the watermark. Safe to call every cycle and from
+/// several nodes at once: the watermark row is locked for the chunk, and a URL that already has a
+/// row (from an earlier sync, or a recursion child that enqueued it first) is left completely
+/// untouched by `ON CONFLICT (url_hash) DO NOTHING`, never reset.
+///
+/// This used to anti-join every download event against `fetch_attempt` on `TRIM(url)` each cycle.
+/// An event whose URL [`parse_url_parts`] refuses (an `ftp://` dropper, text that is not a URL)
+/// never gets a row, so it never left that anti-join: a live node re-read the same ~6,000 events
+/// for 1.5 s every 12 s, forever. Walking event ids once makes "decided" a property of the
+/// watermark rather than of a row existing: an event is read once, either becomes a pending row
+/// or is skipped (and counted in the log), and is never looked at again. A skipped event
+/// deliberately gets no `fetch_attempt` row - it can only ever be refused, and a row would
+/// spend backoff cycles and budget on a fetch that cannot happen.
+///
+/// The upper bound is `max(id)` read inside the chunk's transaction, and ids are issued under the
+/// ledger's global append lock (`enforce_chain_linkage` demands every insert extend the current
+/// head), so an id at or below the bound cannot still be in flight.
+async fn sync_new_events(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sync_new_events_chunked(pool, SYNC_CHUNK).await
+}
+
+/// [`sync_new_events`] with the chunk size as a parameter, so a test can cross a chunk boundary
+/// without appending thousands of events.
+pub(super) async fn sync_new_events_chunked(pool: &PgPool, chunk: i64) -> Result<(), sqlx::Error> {
+    loop {
+        let mut tx = pool.begin().await?;
+        let cursor: i64 =
+            sqlx::query_scalar("SELECT last_event_id FROM fetch_event_cursor FOR UPDATE")
+                .fetch_one(&mut *tx)
+                .await?;
+        let upper: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM event")
+            .fetch_one(&mut *tx)
+            .await?;
+        if upper <= cursor {
+            tx.commit().await?;
+            return Ok(());
+        }
+
+        let rows = sqlx::query(
+            // host() not ::text: Postgres renders inet as "1.2.3.4/32" even for a plain address,
+            // and IpAddr::from_str rejects the prefix, so ::text + .parse().ok() silently yielded
+            // None and wrote NULL for every row - the attacker attribution was lost on every fetch.
+            "SELECT id, host(source_ip) AS source_ip, metadata->>'url' AS url \
+             FROM event \
+             WHERE id > $1 AND id <= $2 \
+               AND signal_type = 'honeypot_file_download' \
+               AND metadata->>'url' IS NOT NULL \
+             ORDER BY id \
+             LIMIT $3",
         )
+        .bind(cursor)
+        .bind(upper)
+        .bind(chunk)
+        .fetch_all(&mut *tx)
         .await?;
+        let chunk_full = rows.len() as i64 == chunk;
+        let new_cursor = if chunk_full {
+            rows.last().map_or(upper, |r| r.get::<i64, _>("id"))
+        } else {
+            upper
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        let mut hashes: Vec<Vec<u8>> = Vec::new();
+        let mut urls: Vec<String> = Vec::new();
+        let mut hosts: Vec<String> = Vec::new();
+        let mut schemes: Vec<String> = Vec::new();
+        let mut ports: Vec<Option<i32>> = Vec::new();
+        let mut source_ips: Vec<Option<String>> = Vec::new();
+        let mut skipped = 0usize;
+        for row in rows {
+            let url: String = row.get("url");
+            let Some((scheme, host, port)) = parse_url_parts(&url) else {
+                skipped += 1;
+                continue;
+            };
+            let hash = url_hash(&url);
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+            hashes.push(hash);
+            urls.push(url);
+            hosts.push(host);
+            schemes.push(scheme);
+            ports.push(port);
+            // A value that is not an address becomes NULL, as it always did.
+            source_ips.push(
+                row.get::<Option<String>, _>("source_ip")
+                    .filter(|s| s.parse::<IpAddr>().is_ok()),
+            );
+        }
+
+        if !hashes.is_empty() {
+            sqlx::query(
+                "INSERT INTO fetch_attempt \
+                 (url_hash, url, host, scheme, port, source_ip, depth, status, attempts, last_attempt) \
+                 SELECT h, u, ho, s, p, ip::inet, 0, 'pending', 0, now() \
+                 FROM UNNEST($1::bytea[], $2::text[], $3::text[], $4::text[], $5::int4[], $6::text[]) \
+                      AS t(h, u, ho, s, p, ip) \
+                 ON CONFLICT (url_hash) DO NOTHING",
+            )
+            .bind(&hashes)
+            .bind(&urls)
+            .bind(&hosts)
+            .bind(&schemes)
+            .bind(&ports)
+            .bind(&source_ips)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("UPDATE fetch_event_cursor SET last_event_id = $1")
+            .bind(new_cursor)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        if skipped > 0 {
+            tracing::info!(
+                skipped,
+                "fetcher: event sync skipped download urls it cannot fetch (a scheme other than \
+                 http, https or tftp, or text that is not a url); they get no fetch_attempt row"
+            );
+        }
+        if !chunk_full {
+            return Ok(());
+        }
     }
-    Ok(())
 }
 
 /// The limits one claim is made under.

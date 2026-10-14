@@ -21,8 +21,8 @@ Migration SQL lives in **three crates**, applied against **one** physical databa
   Owns `event`, `ip_score`, `ip_vantage`, `ip_sensor`, `sample_analysis`, and all five enum
   types.
 - `crates/review/migrations/` - `0001_review_queue.sql` …
-  `0007_fetch_attempt_transport_auth.sql`. Owns `review_queue`, `vendor_submission`,
-  `fetch_attempt` and `fetch_daily_usage`.
+  `0008_fetch_event_cursor.sql`. Owns `review_queue`, `vendor_submission`,
+  `fetch_attempt`, `fetch_daily_usage` and `fetch_event_cursor`.
 - `crates/fleet/migrations/` - `0001_listener_probe.sql`, tracked in its own
   `_sqlx_migrations_fleet` table.
 

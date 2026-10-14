@@ -170,7 +170,11 @@ layers.
 | Cycle interval | default 10 s, max 86400 s | `PROPOLIS_FETCH_INTERVAL_SECS` (`crates/propolis/src/config.rs#DEFAULT_FETCH_INTERVAL_SECS`/`crates/propolis/src/config.rs#MAX_FETCH_INTERVAL_SECS`) |
 
 The per-host and daily budgets live in PostgreSQL, not in process memory, so
-they survive a restart and hold across every node sharing the database. Each
+they survive a restart and hold across every node sharing the database. Before
+claiming, a cycle syncs new download events into pending rows: it reads only the
+events past the `fetch_event_cursor` watermark, so each event is read once. A URL
+the fetcher cannot dispatch (a scheme other than http, https or tftp, or text that
+is not a URL) is counted in one INFO log line and gets no row. Each
 cycle claims its rows in one transaction (`store::claim_candidates`): it locks
 today's `fetch_daily_usage` row (serializing claims across nodes), selects
 eligible rows that no other cycle has claimed (`FOR UPDATE SKIP LOCKED`),

@@ -938,6 +938,135 @@ mod orchestration_tests {
         );
     }
 
+    /// Download events past the sync watermark: what the next sync still has to read.
+    async fn unsynced_events(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event \
+             WHERE signal_type = 'honeypot_file_download' \
+               AND id > (SELECT last_event_id FROM fetch_event_cursor)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // Live defect: an event whose url the fetcher never stores (ftp, text that is not a url) got
+    // no fetch_attempt row, so the sync's `NOT EXISTS` anti-join returned it again on every cycle
+    // forever (5,951 rows, 1.5 s, every 12 s). An event is now decided once, by the watermark,
+    // whether or not it yields a row. Fails on main: there the url's row is re-created by the
+    // second sync (and the watermark table does not exist).
+    #[sqlx::test(migrations = false)]
+    async fn an_event_is_decided_once_whether_or_not_it_yields_a_row(pool: PgPool) {
+        migrate(&pool).await;
+        let ip = "203.0.113.15";
+        let http_url = "http://fetch8p.example/mal.bin".to_string();
+        for (n, url) in [
+            "ftp://fetch8q.example/mal.bin",
+            "not a url at all",
+            "data:text/plain,hello",
+            http_url.as_str(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            append_event(
+                &pool,
+                download_event(ip, "sensor-p", url, &format!("2026-08-22T00:00:0{n}Z")),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(unsynced_events(&pool).await, 4);
+
+        let candidates = claim_unleased(&pool, 100).await;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![http_url.as_str()],
+            "only the fetchable url becomes a candidate"
+        );
+        assert_eq!(
+            unsynced_events(&pool).await,
+            0,
+            "every event, the three the fetcher cannot dispatch included, is decided after one sync"
+        );
+
+        // A decided event is not read again: losing its row (an operator pruning the table) must
+        // not bring it back from the ledger.
+        sqlx::query("DELETE FROM fetch_attempt")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(claim_unleased(&pool, 100).await.is_empty());
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_attempt")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "the second sync re-read events past the watermark");
+    }
+
+    // The watermark is incremental: an event appended after a sync is picked up by the next one,
+    // and a walk that crosses chunk boundaries (chunk of 2 over 5 events, a repeated url straddling
+    // a boundary, an undispatchable url in the middle) loses and duplicates nothing.
+    #[sqlx::test(migrations = false)]
+    async fn sync_walks_chunks_and_picks_up_only_new_events(pool: PgPool) {
+        migrate(&pool).await;
+        let ip = "203.0.113.16";
+        let urls = [
+            "http://fetch8r.example/a",
+            "ftp://fetch8r.example/skipped",
+            "http://fetch8r.example/b",
+            "http://fetch8r.example/a",
+            "http://fetch8r.example/c",
+        ];
+        for (n, url) in urls.iter().enumerate() {
+            append_event(
+                &pool,
+                download_event(ip, "sensor-r", url, &format!("2026-08-22T00:00:0{n}Z")),
+            )
+            .await
+            .unwrap();
+        }
+        store::sync_new_events_chunked(&pool, 2).await.unwrap();
+        let mut stored: Vec<String> =
+            sqlx::query_scalar("SELECT url FROM fetch_attempt ORDER BY url")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        stored.sort();
+        assert_eq!(
+            stored,
+            vec![
+                "http://fetch8r.example/a",
+                "http://fetch8r.example/b",
+                "http://fetch8r.example/c"
+            ]
+        );
+        assert_eq!(unsynced_events(&pool).await, 0);
+
+        append_event(
+            &pool,
+            download_event(
+                ip,
+                "sensor-r",
+                "http://fetch8r.example/d",
+                "2026-08-22T00:01:00Z",
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unsynced_events(&pool).await, 1);
+        store::sync_new_events_chunked(&pool, 2).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fetch_attempt")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(unsynced_events(&pool).await, 0);
+    }
+
     // (b) a forbidden URL -> status='rejected', reject_reason set, no spool write.
     #[sqlx::test(migrations = false)]
     async fn rejected_url_is_recorded_with_no_spool_write(pool: PgPool) {

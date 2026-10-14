@@ -255,7 +255,11 @@ Why each term holds:
   budget fits 12 bodies of 16 MiB (it fitted 21 of 10 MB); the rest of a burst is cut short and
   flagged (`end_reason: "capture_memory_budget"`), as at any limit. A body is hashed and written
   to the spool from the buffer it was captured in (`crates/sensor-framework/src/handoff.rs#process_job`),
-  charged until the write returns, so storing one makes no second copy.
+  charged until the write returns, so storing one makes no second copy. Storing a body the spool
+  already holds (the same miner on every attempt) re-hashes the file on disk in 64 KiB chunks
+  (`crates/sensor-framework/src/spool.rs#verify_streamed`), not by reading it whole, so a repeat
+  store adds no body-sized buffer outside the budget
+  (`crates/sensor-framework/tests/spool_dedup_alloc.rs`).
 - **Held input.** A command waiting for its input is run on the capture buffer itself, moved into
   the shell and back (`crates/sensor-framework/src/held_input.rs#HeldInput`), so the input is
   never copied while it runs, and the buffer stays charged to the capture budget until the

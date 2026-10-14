@@ -260,9 +260,9 @@ impl QuarantineSpool {
     /// does the name validation.
     fn verify_on_disk(&self, hash: &str) -> Result<(), SpoolError> {
         // No size cap here: a file stored under a larger cap by an earlier run is still a valid
-        // dedup target, and the cap this call would apply is about memory, which `store` already
-        // bounded when it accepted `body`.
-        read_verified(&self.dir, hash, u64::MAX).map(drop)
+        // dedup target. Streamed, not read whole: `store` still holds the charged body it was
+        // given, and a second full copy of the file would sit outside every memory budget.
+        verify_streamed(&self.dir, hash)
     }
 
     /// Atomically check-and-reserve `size` bytes against the global budget. `SeqCst` throughout:
@@ -305,20 +305,13 @@ impl QuarantineSpool {
     }
 }
 
-/// Read the body filed as `sha256` in `dir`, returning it only if it is a regular file of at most
-/// `max_len` bytes whose content hashes to exactly that name.
-///
-/// This is the one way anything outside the writing sensor may read a spooled body. The spool
-/// directory is written by internet-facing sensor processes, so its contents are untrusted from
-/// the reader's side: a file NAME is a claim about the content, not proof of it. So the entry is
-/// opened without following a symlink (`O_NOFOLLOW`) and without blocking on a FIFO
-/// (`O_NONBLOCK`), must be a regular file by `fstat` of the opened descriptor, and is read from
-/// that descriptor - never re-opened by path - so what is hashed is exactly what is returned.
-/// `sha256` must be the canonical lowercase form the writer produces; an uppercase spelling
-/// names no file the writer could have created.
-pub fn read_verified(dir: &Path, sha256: &str, max_len: u64) -> Result<Vec<u8>, SpoolError> {
-    use std::io::Read;
-
+/// Open the entry filed as `sha256` in `dir` for reading: a canonical name, no symlink followed
+/// (`O_NOFOLLOW`), no block on a FIFO (`O_NONBLOCK`), and a regular file by `fstat` of the opened
+/// descriptor. Returns the descriptor with that metadata.
+fn open_spooled(
+    dir: &Path,
+    sha256: &str,
+) -> Result<(std::fs::File, std::fs::Metadata), SpoolError> {
     if !is_canonical_sha256_hex(sha256) {
         let given: String = sha256.chars().take(128).collect();
         return Err(SpoolError::InvalidHash { given });
@@ -344,6 +337,56 @@ pub fn read_verified(dir: &Path, sha256: &str, max_len: u64) -> Result<Vec<u8>, 
     if !metadata.is_file() {
         return Err(SpoolError::NotRegularFile);
     }
+    Ok((file, metadata))
+}
+
+/// Hash the body filed as `sha256` in `dir` in fixed-size chunks and fail closed if it does not
+/// match its name. Same checks as `read_verified` without holding the body: a body already in
+/// memory (the one being stored) must not be joined by a second full-size copy of the file.
+fn verify_streamed(dir: &Path, sha256: &str) -> Result<(), SpoolError> {
+    use std::io::Read;
+
+    let (file, metadata) = open_spooled(dir, sha256)?;
+    // Bounded by one byte past the fstat length, as `read_verified` is: a file still growing
+    // under a writer must not turn this into an unbounded read (the extra byte changes the hash).
+    let mut reader = file.take(metadata.len().saturating_add(1));
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; VERIFY_CHUNK_BYTES];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(chunk.get(..n).unwrap_or_default());
+    }
+    let actual = hex_digest(&hasher.finalize());
+    if actual != sha256 {
+        return Err(SpoolError::HashMismatch {
+            expected: sha256.to_string(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// The read size `verify_streamed` hashes in.
+const VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Read the body filed as `sha256` in `dir`, returning it only if it is a regular file of at most
+/// `max_len` bytes whose content hashes to exactly that name.
+///
+/// This is the one way anything outside the writing sensor may read a spooled body. The spool
+/// directory is written by internet-facing sensor processes, so its contents are untrusted from
+/// the reader's side: a file NAME is a claim about the content, not proof of it. So the entry is
+/// opened without following a symlink (`O_NOFOLLOW`) and without blocking on a FIFO
+/// (`O_NONBLOCK`), must be a regular file by `fstat` of the opened descriptor, and is read from
+/// that descriptor - never re-opened by path - so what is hashed is exactly what is returned.
+/// `sha256` must be the canonical lowercase form the writer produces; an uppercase spelling
+/// names no file the writer could have created.
+pub fn read_verified(dir: &Path, sha256: &str, max_len: u64) -> Result<Vec<u8>, SpoolError> {
+    use std::io::Read;
+
+    let (file, metadata) = open_spooled(dir, sha256)?;
     if metadata.len() > max_len {
         return Err(SpoolError::FileSizeExceeded {
             size: metadata.len(),

@@ -322,7 +322,9 @@
   of `MemoryMax`, is in
   [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory) and held
   under `MemoryMax` by a test. Telnet and adb keep `1000000`. The sensor runs two worker threads
-  (it was one per core): the unit is limited to under one core.
+  (it was one per core): the unit is limited to under one core. Storing a body the spool already
+  holds (the same sample re-sent) now re-hashes the file on disk in 64 KiB chunks; it read the
+  whole file into a second buffer, up to 16 MiB outside every memory budget on each repeat.
 - **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
   `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
   The count is exact up to 100,000 events and shown bare; past that it is the planner's row

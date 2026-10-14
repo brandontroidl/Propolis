@@ -7,20 +7,45 @@
 #
 # Runs on the honeypot node from cron, after the feed publisher's atomic swap. The split lives HERE,
 # at the push - the publisher's flat output, the manifest contract, and the console are unchanged by
-# design. Replaces the earlier ad-hoc one-liner, which copied only the two tiers (never the retention
-# feeds) as flat files at the repo root.
+# design.
 #
-# Idempotent: a run with no new build makes no commit. Fail-closed: a missing or empty feed output
-# aborts before the repo is touched, so a half-built or absent feed is never pushed.
+# Idempotent: a run with no new build makes no commit. Fail-closed: a missing, malformed or tampered
+# feed output aborts before the repo is touched, so nothing but a complete build is ever pushed.
 #
-# Paths (override via environment; both are auto-detected when unset):
-#   PROPOLIS_FEED_OUTPUT_DIR   the publisher's flat output holding manifest.json
-#   PROPOLIS_BLOCKLIST_REPO    the git checkout that is pushed        (default below)
-#   PROPOLIS_BLOCKLIST_SSH_KEY passphraseless deploy key used for the push (see below)
+# Privilege boundary. The feed directory is written by the daemon, the process that parses every
+# attacker byte, and this script reads it from a cron job. So everything in that directory is
+# treated as chosen by an attacker who controls the daemon: a symlink or hard link under a feed
+# name would have this script copy a file the daemon cannot read (a host key, the deploy key) into
+# a public repo, a FIFO would hang it, and a link planted where it writes would have it overwrite
+# any file. Run it as the dedicated propolis-blocklist account deploy/provision.sh creates, which
+# can read the feed and nothing of root's (docs/operations/routine-procedures.md); and whichever
+# account runs it, it copies only single-link regular files with the publisher's own names, checks
+# each one again on the open descriptor before reading, and writes nothing in the daemon's tree.
+#
+# Paths (override via environment; both feed and repo are auto-detected when unset):
+#   PROPOLIS_FEED_OUTPUT_DIR      the publisher's flat output holding manifest.json
+#   PROPOLIS_BLOCKLIST_REPO       the git checkout that is pushed        (default below)
+#   PROPOLIS_BLOCKLIST_SSH_KEY    passphraseless deploy key used for the push (see below)
+#   PROPOLIS_BLOCKLIST_STATUS_DIR where the last-pushed marker is written (default below)
 set -euo pipefail
+# stat's %F type names are translated under other locales.
+export LC_ALL=C
 
 # Where this script lives, so it can publish its sibling README alongside the feed.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# The publisher's formats, one file per feed each (crates/feed/src/publisher.rs, write_tier); a
+# test holds this list to the publisher's.
+FORMATS=(txt json csv cidr ipset nft pf alias hosts rpz)
+# The largest live file is about 1 MB (a 90-day JSON) and the whole build about 8 MB. 32 MiB a file
+# stays under GitHub's 50 MB warning and 100 MB refusal; 256 MiB a build bounds what one run copies.
+MAX_FILE_BYTES=$((32 * 1024 * 1024))
+MAX_BUILD_BYTES=$((256 * 1024 * 1024))
+# Retention windows are operator-configured (PROPOLIS_FEED_WINDOWS, five by default); this bounds
+# how many file sets a tampered directory can make one run copy.
+MAX_WINDOWS=16
+# Bounds the one open that can block: a file swapped for a FIFO between its check and its open.
+COPY_TIMEOUT_SECS=30
 
 # --- Push authentication ------------------------------------------------------------------------
 # Cron has no ssh-agent, so a passphrase-protected key cannot be used non-interactively: the push
@@ -52,7 +77,19 @@ fi
 # this a failure could not be attributed to either: which identity pushed, and whether a terminal
 # was attached (cron never has one), is exactly what a stale-feed investigation needs first.
 if [ -t 0 ]; then tty_state="tty"; else tty_state="no-tty"; fi
-echo "blocklist-sync: run $(date -Is) ${tty_state} identity=${KEY:-agent-or-default}"
+echo "blocklist-sync: run $(date -Is) ${tty_state} identity=${KEY:-agent-or-default} uid=$(id -u)"
+
+# Root can still run it (a crontab from before the dedicated account), and the checks below hold
+# for root too; but as root, any gap in them reaches every file on the host.
+if [ "$(id -u)" -eq 0 ]; then
+  echo "blocklist-sync: WARNING running as root; run it as propolis-blocklist so the feed it" \
+       "copies can never reach a file only root can read (docs/operations/routine-procedures.md)" >&2
+fi
+
+refuse() {
+  echo "blocklist-sync: $* - refusing to push" >&2
+  exit 1
+}
 
 # --- Resolve the feed source ------------------------------------------------------------------
 # Prefer an explicit override; otherwise take whichever standard location actually holds a build.
@@ -65,6 +102,7 @@ if [ -z "$SRC" ]; then
   done
 fi
 REPO="${PROPOLIS_BLOCKLIST_REPO:-/var/lib/propolis/blocklist-repo}"
+STATUS_DIR="${PROPOLIS_BLOCKLIST_STATUS_DIR:-/var/lib/propolis/blocklist-status}"
 
 # --- Validate (fail closed) -------------------------------------------------------------------
 if [ -z "$SRC" ] || [ ! -f "$SRC/manifest.json" ]; then
@@ -75,42 +113,132 @@ if [ ! -d "$REPO/.git" ]; then
   echo "blocklist-sync: $REPO is not a git checkout" >&2
   exit 1
 fi
+# Absolute, since the work below runs from inside the feed directory.
+absolute() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
+SRC="$(absolute "$SRC")"
+REPO="$(absolute "$REPO")"
+STATUS_DIR="$(absolute "$STATUS_DIR")"
 
-# --- Gather the freshly published files -------------------------------------------------------
-# nullglob so an empty match is a no-op rather than the literal glob string.
-shopt -s nullglob
-tier_files=( "$SRC"/aggressive.* "$SRC"/standard.* )
-retention_files=( "$SRC"/all-*.* )
-shopt -u nullglob
+# Enter the feed directory once and work only on names relative to it, so the daemon swapping the
+# path for a link afterwards changes nothing. The directory entered must be the one the path names
+# itself: a path that is a symlink, or was swapped while being entered, compares unequal.
+cd -- "$SRC" || refuse "cannot enter $SRC"
+[ "$(stat -c %d:%i .)" = "$(stat -c %d:%i -- "$SRC")" ] \
+  || refuse "$SRC is a symbolic link or was replaced while being entered"
 
-# The publisher writes every format even for an empty tier, so an empty tier set means the output is
-# malformed, not a normal state - refuse rather than push a stripped repo.
-if [ "${#tier_files[@]}" -eq 0 ]; then
-  echo "blocklist-sync: no tier files under $SRC - malformed feed output, refusing to push" >&2
-  exit 1
+# --- Check every name against the publisher's output ------------------------------------------
+# The directory is exactly one publisher build (it is swapped in whole), so any other name means
+# something else wrote here: the build is refused rather than published without it.
+shopt -s nullglob dotglob
+entries=( * )
+shopt -u nullglob dotglob
+
+format_pattern="$(IFS='|'; printf '%s' "${FORMATS[*]}")"
+name_pattern="^(aggressive|standard|all-[1-9][0-9]{0,4}[hd])\\.(${format_pattern})\$"
+declare -A present=() feeds=([aggressive]=1 [standard]=1)
+for name in "${entries[@]}"; do
+  if [ "$name" = manifest.json ]; then
+    present[$name]=1
+  elif [[ "$name" =~ $name_pattern ]]; then
+    present[$name]=1
+    feeds[${BASH_REMATCH[1]}]=1
+  else
+    refuse "unexpected entry $(printf '%q' "$name") in $SRC"
+  fi
+done
+
+# Two tiers plus the retention windows.
+if [ $(( ${#feeds[@]} - 2 )) -gt "$MAX_WINDOWS" ]; then
+  refuse "$(( ${#feeds[@]} - 2 )) retention windows in $SRC, more than the $MAX_WINDOWS allowed"
 fi
+# Every feed present carries every format, as the publisher writes them; manifest.json is required.
+for feed in "${!feeds[@]}"; do
+  for f in "${FORMATS[@]}"; do
+    [ -n "${present[$feed.$f]:-}" ] || refuse "$feed.$f missing from $SRC - malformed feed output"
+  done
+done
+[ -n "${present[manifest.json]:-}" ] || refuse "manifest.json missing from $SRC"
+
+# --- Copy each file safely --------------------------------------------------------------------
+# Copies one feed file to `dest`. The type and link count are checked on the name before opening
+# it, so a FIFO or device is never opened; then the open descriptor itself must be that same inode,
+# so a name swapped for a link between the check and the open is refused, not followed. A
+# single-link regular file in the daemon's own directory holds only what the daemon wrote. Run in
+# a child under `timeout`: the one open that can still block is a FIFO swapped in at that instant.
+copy_feed_file() {
+  local name="$1" dest="$2" max="$3" checked opened type links size
+  checked="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
+  IFS='|' read -r type links size _ <<<"$checked"
+  case "$type" in
+    "regular file"|"regular empty file") ;;
+    *) echo "blocklist-sync: $name is a $type, not a regular file" >&2; return 1 ;;
+  esac
+  if [ "$links" != 1 ]; then
+    echo "blocklist-sync: $name has $links hard links; a feed file has exactly one" >&2
+    return 1
+  fi
+  if [ "$size" -gt "$max" ]; then
+    echo "blocklist-sync: $name is $size bytes, over the $max-byte limit" >&2
+    return 1
+  fi
+  exec 3<"$name" || return 1
+  opened="$(stat -L -c '%F|%h|%s|%d:%i' /dev/fd/3)" || return 1
+  if [ "$opened" != "$checked" ]; then
+    echo "blocklist-sync: $name changed between its check and its open" >&2
+    return 1
+  fi
+  head -c "$max" <&3 >"$dest" || return 1
+  if [ "$(stat -c %s -- "$dest")" != "$size" ]; then
+    echo "blocklist-sync: $name changed size while being copied" >&2
+    return 1
+  fi
+}
+export -f copy_feed_file
+
+# Copies land in a private directory inside the checkout's .git (same filesystem, never committed)
+# and move into the work tree only once all of them passed, so a refusal leaves the repo untouched.
+stage="$(mktemp -d "$REPO/.git/blocklist-sync.XXXXXX")"
+trap 'rm -rf -- "$stage"' EXIT
+mkdir "$stage/tiers" "$stage/retention"
+total=0
+for name in "${!present[@]}"; do
+  case "$name" in
+    manifest.json) dest="$stage/manifest.json" ;;
+    all-*) dest="$stage/retention/$name" ;;
+    *) dest="$stage/tiers/$name" ;;
+  esac
+  # shellcheck disable=SC2016 # expanded by the child bash, which receives the values as "$@"
+  timeout "$COPY_TIMEOUT_SECS" bash -c 'copy_feed_file "$@"' copy_feed_file \
+      "$name" "$dest" "$MAX_FILE_BYTES" \
+    || refuse "$name in $SRC failed its checks"
+  total=$(( total + $(stat -c %s -- "$dest") ))
+  [ "$total" -le "$MAX_BUILD_BYTES" ] || refuse "the build in $SRC is over $MAX_BUILD_BYTES bytes"
+done
 
 # --- Arrange the repo layout ------------------------------------------------------------------
-mkdir -p "$REPO/tiers" "$REPO/retention"
-cp -f "${tier_files[@]}" "$REPO/tiers/"
+cd -- "$REPO"
+mkdir -p tiers retention
+mv -f -- "$stage"/tiers/* tiers/
+shopt -s nullglob
+retention_files=( "$stage"/retention/* )
+shopt -u nullglob
 if [ "${#retention_files[@]}" -gt 0 ]; then
-  cp -f "${retention_files[@]}" "$REPO/retention/"
+  mv -f -- "${retention_files[@]}" retention/
 fi
-cp -f "$SRC/manifest.json" "$REPO/manifest.json"
+mv -f -- "$stage/manifest.json" manifest.json
 
 # Keep the repo's public README in sync with the packaged one, so the layout docs and raw-URL
 # examples never drift from what this script actually publishes.
 if [ -f "$SCRIPT_DIR/blocklist-README.md" ]; then
-    cp -f "$SCRIPT_DIR/blocklist-README.md" "$REPO/README.md"
+    cp -f "$SCRIPT_DIR/blocklist-README.md" README.md
 fi
 
 # Drop any stale FLAT feed files the pre-folder layout left at the repo root, so the repo converges
 # on tiers/ + retention/ instead of carrying both copies. Matches only feed filenames; manifest.json,
 # README, and LICENSE are untouched.
-find "$REPO" -maxdepth 1 -type f \( -name 'aggressive.*' -o -name 'standard.*' -o -name 'all-*.*' \) -delete
+find . -maxdepth 1 -type f \( -name 'aggressive.*' -o -name 'standard.*' -o -name 'all-*.*' \) -delete
 
 # --- Commit & push ----------------------------------------------------------------------------
-cd "$REPO"
 git add -A
 if git diff --cached --quiet; then
   echo "blocklist-sync: no new build to commit"
@@ -119,22 +247,39 @@ else
   git commit -q -m "feed: ${build_time:-update}"
 fi
 
+# Records the push time for the daemon's `feed-push-stale` condition, which pages when the local
+# feed has moved on from the last successful push - the one failure the daemon's own feed health
+# cannot see, since this script runs outside it. The path is the one the condition reads
+# (crates/propolis/src/ops_alert/conditions/feed.rs, PUSH_MARKER_PATH), in a directory only this
+# account writes: never the daemon's tree, where a link it planted would redirect the write. A
+# directory others can write is refused for the same reason. Written to a fresh temporary name and
+# renamed over the marker, which replaces whatever entry is there rather than following it.
+write_push_marker() {
+  local owner mode tmp
+  [ -d "$STATUS_DIR" ] && [ ! -L "$STATUS_DIR" ] || return 1
+  read -r owner mode < <(stat -c '%u %a' -- "$STATUS_DIR") || return 1
+  if [ "$owner" != "$(id -u)" ] && [ "$owner" != 0 ]; then return 1; fi
+  if (( 8#$mode & 8#022 )); then return 1; fi
+  tmp="$(mktemp "$STATUS_DIR/.last-pushed.XXXXXX")" || return 1
+  if printf 'blocklist-sync last-pushed marker\n' >"$tmp" && chmod 0644 -- "$tmp" \
+     && mv -f -T -- "$tmp" "$STATUS_DIR/last-pushed"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
+}
+
 # Always attempt the push, even when nothing new was committed: an earlier run may have committed
 # locally but FAILED to push (the classic cause is cron having no SSH agent for the git remote), and
 # a "no new changes -> skip push" flow would strand that commit forever. `git push` is a clean no-op
 # when the branch is already up to date, and ships any stranded commit otherwise.
 if git push -q origin HEAD; then
   echo "blocklist-sync: pushed (HEAD $(git rev-parse --short HEAD))"
-  # Record the push time for the daemon's `feed-push-stale` condition, which pages when the local
-  # feed has moved on from the last successful push - the one failure the daemon's own feed
-  # health cannot see, since this script runs outside it. A sibling dotfile of the feed directory
-  # (never inside it, so it is not published), derived exactly as
-  # crates/propolis/src/ops_alert/conditions/feed.rs's `push_marker_path` derives it; world-
-  # readable so the propolis user can stat it. A marker failure must not fail a successful push.
-  push_marker="$(dirname "$SRC")/.$(basename "$SRC").last_pushed"
-  if ! { printf 'blocklist-sync last-pushed marker\n' > "$push_marker" && chmod 0644 "$push_marker"; }; then
-    echo "blocklist-sync: WARNING could not update push marker $push_marker; the daemon's" \
-         "feed-push-stale condition will read this push as not having happened" >&2
+  # A marker failure must not fail a successful push.
+  if ! write_push_marker; then
+    echo "blocklist-sync: WARNING could not update push marker $STATUS_DIR/last-pushed (the" \
+         "directory must exist, be this account's or root's, and be writable by no one else);" \
+         "the daemon's feed-push-stale condition will read this push as not having happened" >&2
   fi
 else
   echo "blocklist-sync: git push FAILED - the local commit is not on the remote. Under cron this is" \

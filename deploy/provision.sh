@@ -108,6 +108,18 @@ else
 fi
 run usermod -p '*' propolis-backup-pull
 
+# propolis-blocklist: the account the operator's cron runs deploy/blocklist-sync.sh as. That script
+# reads the feed directory the daemon writes, so it must not run as an account that can read what
+# the daemon cannot (root's files, other services' keys): this one reads the world-readable feed,
+# owns its checkout, its deploy key and its status directory below, and nothing else. A home for
+# ssh's known_hosts and the deploy key; no login shell, since cron runs the job with /bin/sh.
+if id -u propolis-blocklist >/dev/null 2>&1; then
+    log "user propolis-blocklist already exists"
+else
+    run useradd --system --no-create-home --home-dir /var/lib/propolis-blocklist --shell /usr/sbin/nologin --user-group propolis-blocklist
+    [ "$DRY_RUN" -eq 1 ] || log "created user propolis-blocklist"
+fi
+
 # ---- 2. directories ----
 
 ensure_dir() {
@@ -160,6 +172,12 @@ ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
 # deploy/backup.sh's status files: root-written, world-readable, so the daemon's backup-stale alert
 # and config-check.sh can read when the last backup finished without being able to forge it.
 ensure_dir /var/lib/propolis/backup-status 0755 root             root
+# deploy/blocklist-sync.sh's last-pushed marker, read by the daemon's feed-push-stale condition. It
+# used to sit beside the feed, in the daemon's own directory, where a link the daemon planted made
+# the cron write through it; here only the sync account writes, and the daemon can still stat it.
+ensure_dir /var/lib/propolis/blocklist-status 0755 propolis-blocklist propolis-blocklist
+# propolis-blocklist's home (known_hosts, the deploy key), outside /var/lib/propolis.
+ensure_dir /var/lib/propolis-blocklist    0750 propolis-blocklist propolis-blocklist
 # The backup sets themselves. Group propolis-backup-pull may enter and list it; each plaintext set
 # inside is 0700 root, so only the encrypted sets backup.sh opens to the group can be read.
 ensure_dir /var/backups/propolis          0750 root              propolis-backup-pull

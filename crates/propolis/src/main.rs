@@ -1716,7 +1716,7 @@ async fn main() {
         let (vt_enabled, fetch_enabled) = (config.vt_enabled, config.fetch_enabled);
         let feed_marker = ops_alert::conditions::feed::marker_path(&config.feed_output_dir);
         let feed_push_marker =
-            ops_alert::conditions::feed::push_marker_path(&config.feed_output_dir);
+            std::path::PathBuf::from(ops_alert::conditions::feed::PUSH_MARKER_PATH);
         let feed_build_interval = config.feed_build_interval;
         let intake_poll_interval = config.poll_interval;
         let ops_rotation = ops_alert::condition::RotationCtx::production(rotation_logs);

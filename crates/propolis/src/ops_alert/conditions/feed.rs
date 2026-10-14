@@ -39,21 +39,12 @@ pub fn touch_marker(output_dir: &Path) -> std::io::Result<()> {
     std::fs::write(&path, b"propolis feed last-published marker\n")
 }
 
-/// The push-time marker path for `output_dir`: `<output_dir>.last_pushed`, the sibling dotfile
-/// `deploy/blocklist-sync.sh` touches after a successful `git push`. Only the reader lives here;
-/// the writer is the operator's cron script, which derives the same path from the feed directory
-/// it publishes (`$(dirname "$SRC")/.$(basename "$SRC").last_pushed`).
-pub fn push_marker_path(output_dir: &Path) -> PathBuf {
-    let name = output_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "feed".to_string());
-    let parent = match output_dir.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    parent.join(format!(".{name}.last_pushed"))
-}
+/// The marker `deploy/blocklist-sync.sh` rewrites after each successful `git push` (its
+/// `STATUS_DIR` default plus `last-pushed`). Only the reader lives here; the writer is the
+/// operator's cron script. It is a fixed path in a directory owned by the sync account
+/// (`deploy/provision.sh`), not one derived from the feed directory: that directory belongs to this
+/// daemon, and a marker there let a compromised daemon plant a link the cron then wrote through.
+pub const PUSH_MARKER_PATH: &str = "/var/lib/propolis/blocklist-status/last-pushed";
 
 /// Push-staleness test, split from I/O: has the local feed moved on from the last successful
 /// push by more than `threshold`? Measured as publish-time minus push-time rather than push age,
@@ -319,12 +310,30 @@ mod tests {
     }
 
     #[test]
-    fn push_marker_path_is_a_sibling_dotfile_matching_the_sync_script() {
-        // deploy/blocklist-sync.sh derives `$(dirname "$SRC")/.$(basename "$SRC").last_pushed`;
-        // the two derivations must agree or the condition reads a marker nobody writes.
-        let p = push_marker_path(Path::new("/var/lib/propolis/feed/current"));
-        assert_eq!(p, Path::new("/var/lib/propolis/feed/.current.last_pushed"));
-        assert!(!p.starts_with("/var/lib/propolis/feed/current"));
+    fn push_marker_path_is_where_the_sync_script_writes_it_outside_the_feed_tree() {
+        // The condition reads a marker nobody writes unless the two paths agree, and provision.sh
+        // must create the directory, owned by the sync account rather than this daemon.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+        let script = std::fs::read_to_string(root.join("blocklist-sync.sh")).unwrap();
+        let marker = Path::new(PUSH_MARKER_PATH);
+        let dir = marker.parent().unwrap().to_str().unwrap();
+        assert!(
+            script.contains(&format!(
+                "STATUS_DIR=\"${{PROPOLIS_BLOCKLIST_STATUS_DIR:-{dir}}}\""
+            )),
+            "blocklist-sync.sh's default status directory is not {dir}"
+        );
+        assert!(script.contains("\"$STATUS_DIR/last-pushed\""));
+        assert_eq!(marker.file_name().unwrap(), "last-pushed");
+        let provision = std::fs::read_to_string(root.join("provision.sh")).unwrap();
+        assert!(
+            provision.lines().any(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() == 5 && f[0] == "ensure_dir" && f[1] == dir && f[3] == "propolis-blocklist"
+            }),
+            "provision.sh does not create {dir} owned by propolis-blocklist"
+        );
+        assert!(!marker.starts_with("/var/lib/propolis/feed"));
     }
 
     #[test]

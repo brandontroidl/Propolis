@@ -1599,7 +1599,10 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
 
 - **Behavior** (`handler.rs`): parses RESP (inline and multi-bulk); arguments are kept
   as raw bytes, so a binary key or value round-trips byte for byte and only the ledger copy
-  is decoded as text. **Never authenticates or persists across connections.** Commands
+  is decoded as text. A command that arrives over many reads is parsed on from where the last
+  read left it, never again from its start, and its arguments are read in place in the read
+  buffer (`crates/sensor-redis/src/resp.rs#Parser`), so reading a command costs time linear in
+  its size. **Never authenticates or persists across connections.** Commands
   (`crates/sensor-redis/src/handler.rs#Session::dispatch`): PING (echoes arg), AUTH
   (always OK → `honeypot_login_attempt`, password never in metadata), INFO
   (live-ish 7.2.4 dump with per-process random `run_id`/`master_replid`, real pid,

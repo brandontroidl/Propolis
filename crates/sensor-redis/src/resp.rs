@@ -2,7 +2,7 @@
 //! no `TcpStream` of its own, mirroring sensor-telnet's `telnet` module and sensor-ssh's
 //! `auth`/`channel` modules' own "no I/O of its own" convention so this logic is deterministic and
 //! testable without a live socket. `handler.rs` is the only place that touches an actual
-//! `TcpStream`; it feeds accumulated socket bytes through [`parse_command`] and writes the bytes
+//! `TcpStream`; it feeds accumulated socket bytes through a [`Parser`] and writes the bytes
 //! this module's encoders produce.
 //!
 //! Redis clients speak two wire forms of the same command stream (see
@@ -10,9 +10,10 @@
 //! (`PING\r\n`, whitespace-separated arguments on one line - what `redis-cli`'s piped mode and
 //! ad-hoc `nc`/telnet-style probing use) and the multi-bulk array form
 //! (`*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n` - what the real `redis-cli` and every client library send).
-//! [`parse_command`] recognizes both from the leading byte (`*` selects multi-bulk, anything else
-//! is inline) and returns identical `Vec<Vec<u8>>` args either way, so `handler.rs`'s dispatch
-//! logic never needs to know which form a given command arrived in. Arguments stay raw bytes: a
+//! [`Parser::parse`] recognizes both from the leading byte (`*` selects multi-bulk, anything else
+//! is inline) and returns the arguments the same way for both, as byte ranges of the buffer, so
+//! `handler.rs`'s dispatch logic never needs to know which form a given command arrived in.
+//! Arguments stay raw bytes: a
 //! bulk string is binary-safe in Redis, and decoding it as text here made a value of `FF` read
 //! back as `EF BF BD` and the keys `FF` and `FE` collide.
 //!
@@ -26,6 +27,8 @@
 //! `proptest` fuzz-lite guards at the bottom of this module's test suite, mirroring
 //! `sensor-telnet::telnet::IacFilter` and `sensor-ssh::auth::parse_userauth_request`'s own
 //! never-panics convention.
+
+use std::ops::Range;
 
 /// Ceiling on a multi-bulk array's declared element count. No real Redis command needs more than
 /// a few dozen arguments; generous enough for any legitimate command, small enough that a header
@@ -41,7 +44,7 @@ const MAX_BULK_LEN: i64 = 512 * 1024;
 /// Ceiling on an inline request line's length before a terminator (`\n`, optionally preceded by
 /// `\r`) has been seen. Matches real Redis's own `PROTO_INLINE_MAX_SIZE` (64 KiB): generous for
 /// any real command line, bounded so a client that never sends a newline cannot grow the buffer
-/// unboundedly while every `parse_command` call keeps reporting `Incomplete`.
+/// unboundedly while every parse call keeps reporting `Incomplete`.
 const MAX_INLINE_LEN: usize = 64 * 1024;
 
 /// Ceiling on a multi-bulk header line (`*N\r\n` or `$M\r\n`) before its terminating `\r\n` has
@@ -50,17 +53,22 @@ const MAX_INLINE_LEN: usize = 64 * 1024;
 /// before `MAX_INLINE_LEN` would.
 const MAX_HEADER_LINE: usize = 32;
 
-/// A parsing outcome for [`parse_command`]: either not enough bytes are buffered yet to complete
+/// A parsing outcome for [`Parser::parse`]: either not enough bytes are buffered yet to complete
 /// one command (the caller should read more from the socket and retry), or exactly one command was
 /// parsed from the front of the buffer, along with how many bytes to drain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseOutcome {
     /// The buffered bytes are a valid prefix of a command but do not yet contain a complete one.
     Incomplete,
-    /// One full command was parsed. `args` is empty for a blank inline line or a zero/negative
-    /// multi-bulk count (both valid RESP, neither naming a command) - `handler.rs`'s read loop
-    /// skips these and reads the next command rather than dispatching an empty one.
-    Complete { args: Vec<Vec<u8>>, consumed: usize },
+    /// One full command was parsed. Each argument is a range of the buffer passed in, so nothing
+    /// is copied: the caller reads the arguments in place and then drains `consumed` bytes.
+    /// `args` is empty for a blank inline line or a zero/negative multi-bulk count (both valid
+    /// RESP, neither naming a command) - `handler.rs`'s read loop skips these and reads the next
+    /// command rather than dispatching an empty one.
+    Complete {
+        args: Vec<Range<usize>>,
+        consumed: usize,
+    },
 }
 
 /// A structural RESP violation that reading more bytes could never fix (as opposed to
@@ -71,30 +79,87 @@ pub enum RespError {
     Protocol(String),
 }
 
-/// Attempt to parse exactly one command from the front of `buf`. Never consumes partial data: on
-/// [`ParseOutcome::Complete`], `consumed` bytes belong to this command and the rest of `buf` (if
-/// any - a pipelining client can send several commands in one write) is left for the next call.
-/// See the module doc for the inline-vs-multi-bulk dispatch rule and the early-rejection bound
-/// guarantee.
-pub fn parse_command(buf: &[u8]) -> Result<ParseOutcome, RespError> {
-    if buf.is_empty() {
-        return Ok(ParseOutcome::Incomplete);
+/// Parses one command at a time from a buffer that only grows between calls, resuming where the
+/// last call stopped. A command arrives over many socket reads; parsing the whole buffer again
+/// after each read, copying every element finished so far, made one large multi-bulk cost time
+/// quadratic in its size. Here each buffered byte is examined a bounded number of times however
+/// many reads the command takes, and nothing is copied.
+///
+/// Contract: between two calls that return [`ParseOutcome::Incomplete`] the caller may only
+/// append to the buffer. After [`ParseOutcome::Complete`] or an error the parser starts afresh,
+/// so the caller drains `consumed` bytes (or ends the session) before the next call.
+#[derive(Debug, Default)]
+pub struct Parser {
+    state: State,
+}
+
+#[derive(Debug, Default)]
+enum State {
+    /// No byte of the next command examined yet.
+    #[default]
+    Start,
+    /// An inline command; `buf[..scanned]` holds no newline.
+    Inline { scanned: usize },
+    /// A multi-bulk command of `count` elements, `args` of them complete; the next element's
+    /// `$` marker is at `cursor`.
+    Multibulk {
+        count: usize,
+        args: Vec<Range<usize>>,
+        cursor: usize,
+    },
+}
+
+impl Parser {
+    /// Attempt to parse exactly one command from the front of `buf`. Never consumes partial data:
+    /// on [`ParseOutcome::Complete`], `consumed` bytes belong to this command and the rest of
+    /// `buf` (if any - a pipelining client can send several commands in one write) is left for the
+    /// next call. See the module doc for the inline-vs-multi-bulk dispatch rule and the
+    /// early-rejection bound guarantee.
+    pub fn parse(&mut self, buf: &[u8]) -> Result<ParseOutcome, RespError> {
+        let outcome = self.advance(buf);
+        if !matches!(outcome, Ok(ParseOutcome::Incomplete)) {
+            self.state = State::Start;
+        }
+        outcome
     }
-    if buf[0] == b'*' {
-        parse_multibulk(buf)
-    } else {
-        parse_inline(buf)
+
+    fn advance(&mut self, buf: &[u8]) -> Result<ParseOutcome, RespError> {
+        if let State::Start = self.state {
+            match buf.first() {
+                None => return Ok(ParseOutcome::Incomplete),
+                Some(b'*') => match start_multibulk(buf)? {
+                    Some(state) => self.state = state,
+                    None => return Ok(ParseOutcome::Incomplete),
+                },
+                Some(_) => self.state = State::Inline { scanned: 0 },
+            }
+        }
+        match &mut self.state {
+            State::Start => Ok(ParseOutcome::Incomplete),
+            State::Inline { scanned } => parse_inline(buf, scanned),
+            State::Multibulk {
+                count,
+                args,
+                cursor,
+            } => parse_elements(buf, *count, args, cursor),
+        }
     }
 }
 
 /// Parse the inline form: a single line, terminated by `\n` (optionally preceded by `\r`), split
 /// on ASCII whitespace into arguments. See the module doc: this is what a plain `nc`/telnet-style
-/// probe or `redis-cli --pipe` sends.
-fn parse_inline(buf: &[u8]) -> Result<ParseOutcome, RespError> {
-    let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
+/// probe or `redis-cli --pipe` sends. `scanned` is how far an earlier call already looked.
+fn parse_inline(buf: &[u8], scanned: &mut usize) -> Result<ParseOutcome, RespError> {
+    let from = (*scanned).min(buf.len());
+    let Some(nl) = buf[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| from + i)
+    else {
         if buf.len() > MAX_INLINE_LEN {
             return Err(RespError::Protocol("inline request too long".to_string()));
         }
+        *scanned = buf.len();
         return Ok(ParseOutcome::Incomplete);
     };
     let line_end = if nl > 0 && buf[nl - 1] == b'\r' {
@@ -102,45 +167,66 @@ fn parse_inline(buf: &[u8]) -> Result<ParseOutcome, RespError> {
     } else {
         nl
     };
-    let consumed = nl + 1;
-    let args: Vec<Vec<u8>> = buf[..line_end]
-        .split(|b| b.is_ascii_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect();
-    Ok(ParseOutcome::Complete { args, consumed })
+    let mut args = Vec::new();
+    let mut start = None;
+    for (i, b) in buf[..line_end].iter().enumerate() {
+        match (b.is_ascii_whitespace(), start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                args.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        args.push(s..line_end);
+    }
+    Ok(ParseOutcome::Complete {
+        args,
+        consumed: nl + 1,
+    })
 }
 
-/// Parse the multi-bulk array form: `*<count>\r\n` followed by `<count>` bulk strings
-/// (`$<len>\r\n<data>\r\n` each). See the module doc for the early-rejection guarantee on both
-/// `count` and each element's `len`.
-fn parse_multibulk(buf: &[u8]) -> Result<ParseOutcome, RespError> {
-    let Some((line_end, mut cursor)) = find_header_crlf(buf, 1)? else {
-        return Ok(ParseOutcome::Incomplete);
+/// Read a multi-bulk array's `*<count>\r\n` header: `None` until it has fully arrived, else the
+/// state that parses its elements, or a completed empty command for a zero or negative count. See
+/// the module doc for the early-rejection guarantee on `count`.
+fn start_multibulk(buf: &[u8]) -> Result<Option<State>, RespError> {
+    let Some((line_end, cursor)) = find_header_crlf(buf, 1)? else {
+        return Ok(None);
     };
     let count: i64 = std::str::from_utf8(&buf[1..line_end])
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .ok_or_else(|| RespError::Protocol("invalid multibulk count".to_string()))?;
-
     if count > MAX_ARRAY_LEN {
         return Err(RespError::Protocol(format!(
             "multibulk count {count} exceeds maximum {MAX_ARRAY_LEN}"
         )));
     }
-    if count <= 0 {
-        // A zero or negative count names no command (RESP's null-array encoding uses -1) - valid
-        // wire content, not a protocol error, but not a dispatchable command either. See
-        // ParseOutcome::Complete's doc.
-        return Ok(ParseOutcome::Complete {
-            args: Vec::new(),
-            consumed: cursor,
-        });
-    }
+    // A zero or negative count names no command (RESP's null-array encoding uses -1) - valid wire
+    // content, not a protocol error, but not a dispatchable command either: it completes with no
+    // elements. See ParseOutcome::Complete's doc.
+    let count = count.max(0) as usize;
+    Ok(Some(State::Multibulk {
+        count,
+        args: Vec::with_capacity(count),
+        cursor,
+    }))
+}
 
-    let mut args = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        let Some(&marker) = buf.get(cursor) else {
+/// Parse the multi-bulk elements still missing (`$<len>\r\n<data>\r\n` each), from `cursor` on.
+/// An element is recorded only once its data and terminator have all arrived, so a call that
+/// returns [`ParseOutcome::Incomplete`] re-reads at most one element's header next time. See the
+/// module doc for the early-rejection guarantee on each element's `len`.
+fn parse_elements(
+    buf: &[u8],
+    count: usize,
+    args: &mut Vec<Range<usize>>,
+    cursor: &mut usize,
+) -> Result<ParseOutcome, RespError> {
+    while args.len() < count {
+        let Some(&marker) = buf.get(*cursor) else {
             return Ok(ParseOutcome::Incomplete);
         };
         if marker != b'$' {
@@ -150,10 +236,10 @@ fn parse_multibulk(buf: &[u8]) -> Result<ParseOutcome, RespError> {
             )));
         }
 
-        let Some((len_end, data_start)) = find_header_crlf(buf, cursor + 1)? else {
+        let Some((len_end, data_start)) = find_header_crlf(buf, *cursor + 1)? else {
             return Ok(ParseOutcome::Incomplete);
         };
-        let len: i64 = std::str::from_utf8(&buf[cursor + 1..len_end])
+        let len: i64 = std::str::from_utf8(&buf[*cursor + 1..len_end])
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .ok_or_else(|| RespError::Protocol("invalid bulk length".to_string()))?;
@@ -178,13 +264,13 @@ fn parse_multibulk(buf: &[u8]) -> Result<ParseOutcome, RespError> {
             ));
         }
 
-        args.push(buf[data_start..data_end].to_vec());
-        cursor = term_end;
+        args.push(data_start..data_end);
+        *cursor = term_end;
     }
 
     Ok(ParseOutcome::Complete {
-        args,
-        consumed: cursor,
+        args: std::mem::take(args),
+        consumed: *cursor,
     })
 }
 
@@ -254,6 +340,110 @@ pub fn array_of_bulk_strings(items: &[&str]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A parse outcome with its arguments copied out of the buffer, for comparing in tests.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Parsed {
+        Incomplete,
+        Complete { args: Vec<Vec<u8>>, consumed: usize },
+    }
+
+    fn owned(buf: &[u8], outcome: ParseOutcome) -> Parsed {
+        match outcome {
+            ParseOutcome::Incomplete => Parsed::Incomplete,
+            ParseOutcome::Complete { args, consumed } => Parsed::Complete {
+                args: args.into_iter().map(|r| buf[r].to_vec()).collect(),
+                consumed,
+            },
+        }
+    }
+
+    /// One parse of `buf` by a fresh parser.
+    fn parse_command(buf: &[u8]) -> Result<Parsed, RespError> {
+        Parser::default().parse(buf).map(|o| owned(buf, o))
+    }
+
+    /// Feed `buf` to one parser a growing prefix at a time, `step` bytes more per call, as the
+    /// reader does across socket reads; the first outcome that is not `Incomplete`, else
+    /// `Incomplete`.
+    fn parse_in_steps(buf: &[u8], step: usize) -> Result<Parsed, RespError> {
+        let mut parser = Parser::default();
+        let mut end = 0;
+        loop {
+            end = (end + step).min(buf.len());
+            let prefix = &buf[..end];
+            match parser.parse(prefix) {
+                Ok(ParseOutcome::Incomplete) if end < buf.len() => {}
+                outcome => return outcome.map(|o| owned(prefix, o)),
+            }
+        }
+    }
+
+    fn multibulk(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+        for p in parts {
+            out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            out.extend_from_slice(p);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Parser - resuming across reads
+    // ---------------------------------------------------------------------------------------
+
+    /// A command fed in pieces parses to exactly what it parses to whole, at every piece size,
+    /// including pieces that end inside a header, inside the data and between `\r` and `\n`.
+    #[test]
+    fn a_command_fed_in_pieces_parses_as_it_does_whole() {
+        let mut buf = multibulk(&[b"SET", b"key", &[0xFF; 300], b""]);
+        buf.extend_from_slice(b"PING\r\n");
+        let whole = parse_command(&buf).unwrap();
+        let Parsed::Complete { consumed, .. } = &whole else {
+            panic!("expected Complete, got {whole:?}");
+        };
+        assert_eq!(*consumed, buf.len() - 6, "the pipelined PING is left");
+        for step in 1..=buf.len() {
+            assert_eq!(parse_in_steps(&buf, step).unwrap(), whole, "step {step}");
+        }
+        let inline = b"SET  foo\tbar  \r\nGET foo\r\n";
+        let whole = parse_command(inline).unwrap();
+        assert_eq!(
+            whole,
+            Parsed::Complete {
+                args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
+                consumed: 16,
+            }
+        );
+        for step in 1..=inline.len() {
+            assert_eq!(parse_in_steps(inline, step).unwrap(), whole, "step {step}");
+        }
+    }
+
+    #[test]
+    fn the_parser_starts_afresh_after_a_command_and_after_an_error() {
+        let mut parser = Parser::default();
+        let buf = b"*1\r\n$4\r\nPING\r\n";
+        assert!(matches!(
+            parser.parse(&buf[..9]),
+            Ok(ParseOutcome::Incomplete)
+        ));
+        let Ok(ParseOutcome::Complete { consumed, .. }) = parser.parse(buf) else {
+            panic!("expected Complete");
+        };
+        assert_eq!(consumed, buf.len());
+        // A new buffer (the reader drained the command) parses from its first byte.
+        assert!(matches!(
+            parser.parse(b"PING\r\n"),
+            Ok(ParseOutcome::Complete { consumed: 6, .. })
+        ));
+        assert!(parser.parse(b"*1\r\nX").is_err());
+        assert!(matches!(
+            parser.parse(b"PING\r\n"),
+            Ok(ParseOutcome::Complete { consumed: 6, .. })
+        ));
+    }
+
     // ---------------------------------------------------------------------------------------
     // encoders
     // ---------------------------------------------------------------------------------------
@@ -317,14 +507,14 @@ mod tests {
 
     #[test]
     fn parse_empty_buffer_is_incomplete() {
-        assert_eq!(parse_command(b"").unwrap(), ParseOutcome::Incomplete);
+        assert_eq!(parse_command(b"").unwrap(), Parsed::Incomplete);
     }
 
     #[test]
     fn parse_inline_simple_command() {
         assert_eq!(
             parse_command(b"PING\r\n").unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"PING".to_vec()],
                 consumed: 6,
             }
@@ -336,7 +526,7 @@ mod tests {
         // Some non-conformant clients send a bare \n with no \r - real Redis accepts this too.
         assert_eq!(
             parse_command(b"PING\n").unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"PING".to_vec()],
                 consumed: 5,
             }
@@ -349,7 +539,7 @@ mod tests {
         let outcome = parse_command(buf).unwrap();
         assert_eq!(
             outcome,
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
                 consumed: buf.len(),
             }
@@ -358,14 +548,14 @@ mod tests {
 
     #[test]
     fn parse_inline_incomplete_no_terminator_yet() {
-        assert_eq!(parse_command(b"PIN").unwrap(), ParseOutcome::Incomplete);
+        assert_eq!(parse_command(b"PIN").unwrap(), Parsed::Incomplete);
     }
 
     #[test]
     fn parse_inline_blank_line_is_complete_with_empty_args() {
         assert_eq!(
             parse_command(b"\r\n").unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![],
                 consumed: 2,
             }
@@ -381,14 +571,14 @@ mod tests {
     #[test]
     fn parse_inline_leaves_pipelined_remainder_for_next_call() {
         let buf = b"PING\r\nPING\r\n";
-        let ParseOutcome::Complete { args, consumed } = parse_command(buf).unwrap() else {
+        let Parsed::Complete { args, consumed } = parse_command(buf).unwrap() else {
             panic!("expected Complete");
         };
         assert_eq!(args, vec![b"PING".to_vec()]);
         assert_eq!(consumed, 6);
         assert_eq!(
             parse_command(&buf[consumed..]).unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"PING".to_vec()],
                 consumed: 6,
             }
@@ -403,7 +593,7 @@ mod tests {
     fn parse_multibulk_single_element() {
         assert_eq!(
             parse_command(b"*1\r\n$4\r\nPING\r\n").unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"PING".to_vec()],
                 consumed: 14,
             }
@@ -415,7 +605,7 @@ mod tests {
         let buf: &[u8] = b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
         assert_eq!(
             parse_command(buf).unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"GET".to_vec(), b"key".to_vec()],
                 consumed: buf.len(),
             }
@@ -424,14 +614,14 @@ mod tests {
 
     #[test]
     fn parse_multibulk_incomplete_mid_count_header() {
-        assert_eq!(parse_command(b"*2\r").unwrap(), ParseOutcome::Incomplete);
+        assert_eq!(parse_command(b"*2\r").unwrap(), Parsed::Incomplete);
     }
 
     #[test]
     fn parse_multibulk_incomplete_waiting_on_second_element() {
         assert_eq!(
             parse_command(b"*2\r\n$3\r\nGET\r\n").unwrap(),
-            ParseOutcome::Incomplete
+            Parsed::Incomplete
         );
     }
 
@@ -440,7 +630,7 @@ mod tests {
         // Second bulk declares 3 bytes but only 2 have arrived, no trailing CRLF yet.
         assert_eq!(
             parse_command(b"*2\r\n$3\r\nGET\r\n$3\r\nke").unwrap(),
-            ParseOutcome::Incomplete
+            Parsed::Incomplete
         );
     }
 
@@ -448,7 +638,7 @@ mod tests {
     fn parse_multibulk_zero_count_is_complete_with_empty_args() {
         assert_eq!(
             parse_command(b"*0\r\n").unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![],
                 consumed: 4,
             }
@@ -461,7 +651,7 @@ mod tests {
         // resolve to nothing, like a zero count.
         assert_eq!(
             parse_command(b"*-1\r\n").unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![],
                 consumed: 5,
             }
@@ -541,7 +731,7 @@ mod tests {
         let buf: &[u8] = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         assert_eq!(
             parse_command(buf).unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
                 consumed: buf.len(),
             }
@@ -557,7 +747,7 @@ mod tests {
         buf.extend_from_slice(b"\r\n");
         assert_eq!(
             parse_command(&buf).unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![vec![0xFF, 0xFE]],
                 consumed: buf.len(),
             }
@@ -567,13 +757,13 @@ mod tests {
     #[test]
     fn parse_multibulk_leaves_pipelined_remainder_for_next_call() {
         let buf = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
-        let ParseOutcome::Complete { consumed, .. } = parse_command(buf).unwrap() else {
+        let Parsed::Complete { consumed, .. } = parse_command(buf).unwrap() else {
             panic!("expected Complete");
         };
         assert_eq!(consumed, 14);
         assert_eq!(
             parse_command(&buf[consumed..]).unwrap(),
-            ParseOutcome::Complete {
+            Parsed::Complete {
                 args: vec![b"PING".to_vec()],
                 consumed: 14,
             }
@@ -595,15 +785,39 @@ mod tests {
             let _ = parse_command(&bytes);
         }
 
-        /// Feeding the same input incrementally, one growing prefix at a time (simulating a slow
-        /// client whose bytes trickle in across many small socket reads), must never panic either.
+        /// Feeding the same input to one parser a growing prefix at a time (a slow client whose
+        /// bytes trickle in across many small socket reads) never panics, and at every prefix it
+        /// says what a fresh parser says of that prefix: resuming changes the cost, never the
+        /// answer.
         #[test]
-        fn parse_command_never_panics_on_incremental_prefixes(
+        fn a_resumed_parse_agrees_with_a_fresh_one_at_every_prefix(
             bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=256)
         ) {
+            let mut parser = Parser::default();
             for i in 0..=bytes.len() {
-                let _ = parse_command(&bytes[..i]);
+                let prefix = &bytes[..i];
+                let resumed = parser.parse(prefix).map(|o| owned(prefix, o));
+                proptest::prop_assert_eq!(&resumed, &parse_command(prefix));
+                if !matches!(resumed, Ok(Parsed::Incomplete)) {
+                    break;
+                }
             }
+        }
+
+        /// A well-formed multi-bulk command, binary elements included, parses to its elements
+        /// whatever size the reads that deliver it are.
+        #[test]
+        fn a_multibulk_command_parses_to_its_elements_at_any_read_size(
+            parts in proptest::collection::vec(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=40), 1..=12),
+            step in 1usize..=64,
+        ) {
+            let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let buf = multibulk(&refs);
+            proptest::prop_assert_eq!(
+                parse_in_steps(&buf, step),
+                Ok(Parsed::Complete { args: parts.clone(), consumed: buf.len() })
+            );
         }
     }
 }

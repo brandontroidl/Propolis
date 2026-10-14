@@ -599,6 +599,13 @@
   walks the whole existing ledger once, in bounded chunks (133 ms for the first chunk on a
   400,000-event test ledger, since downloads are sparse there); the old query took 311 ms per
   cycle and the steady-state sync query now takes under a millisecond.
+- **sensor-redis reads a large command in time linear in its size** - the reader parsed the whole
+  buffered command again after every 1 KiB socket read and copied every element it had finished
+  on each pass, so one 900-element, 908 KB multi-bulk cost about twelve times the CPU of the same
+  bytes as 900 commands (thirty times in the red team's measurements), and 64 such connections
+  from one address kept 25 cores busy. The parser now resumes where the last read left it and
+  returns the arguments as ranges of the buffer, which the commands read in place: the same
+  multi-bulk now costs less than the 900 commands.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
@@ -89,10 +90,10 @@ fn connection_event(
 /// argument quoted, e.g. `unknown command 'FoO', with args beginning with: 'a', 'b', `. The old
 /// reply uppercased the name and dropped the args clause entirely, which is a one-probe tell. Args
 /// are sanitized and length-bounded so an attacker-controlled arg cannot break RESP error framing.
-fn unknown_command_error(args: &[Vec<u8>]) -> String {
+fn unknown_command_error(args: &[&[u8]]) -> String {
     let mut msg = format!(
         "ERR unknown command '{}', with args beginning with: ",
-        sanitize_value(&text(&args[0]), 128)
+        sanitize_value(&text(args[0]), 128)
     );
     for a in args.iter().skip(1).take(20) {
         msg.push('\'');
@@ -349,15 +350,18 @@ impl Session {
     /// reply bytes to write back to the socket and any events to emit. The command name is
     /// matched case-insensitively (real Redis clients send both `PING` and `ping`). Panics if
     /// `args` is empty - the only caller, `RespReader::read_command`'s loop, already filters
-    /// empty parses out before returning `ReadOutcome::Command`.
-    pub fn dispatch(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
-        let cmd = text(&args[0]).to_ascii_uppercase();
+    /// empty parses out before returning `ReadOutcome::Command`. The arguments are borrowed: the
+    /// read loop passes slices of its own buffer, so a command is never copied to be dispatched.
+    pub fn dispatch<A: AsRef<[u8]>>(&mut self, args: &[A]) -> (Vec<u8>, Vec<SensorEvent>) {
+        let args: Vec<&[u8]> = args.iter().map(AsRef::as_ref).collect();
+        let args = args.as_slice();
+        let cmd = text(args[0]).to_ascii_uppercase();
         match cmd.as_str() {
             // Real Redis PING echoes its optional message (as a bulk string) and errors on excess
             // arity; a bare PING is +PONG.
             "PING" => match args.len() {
                 1 => (resp::simple_string("PONG"), vec![]),
-                2 => (resp::bulk_bytes(&args[1]), vec![]),
+                2 => (resp::bulk_bytes(args[1]), vec![]),
                 _ => (
                     resp::error_reply("ERR wrong number of arguments for 'ping' command"),
                     vec![],
@@ -379,7 +383,7 @@ impl Session {
     /// in `metadata` or anywhere else: they live only in this call's local `args` slice, owned by
     /// the read loop's per-command buffer, and are dropped when this function returns. Mirrors
     /// sensor-telnet's `_password` / sensor-ssh's `_password` local-binding convention.
-    fn handle_auth(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_auth(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() != 2 && args.len() != 3 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'auth' command"),
@@ -398,7 +402,7 @@ impl Session {
     /// `CONFIG GET ...` / `CONFIG SET ...`. Only these two subcommands are emulated, matching the
     /// design spec's enumerated command set; anything else is refused like a real unrecognized
     /// subcommand would be.
-    fn handle_config(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_config(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         let Some(sub) = args.get(1) else {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'config' command"),
@@ -421,18 +425,18 @@ impl Session {
     /// `SET` a payload and `SAVE`) - see the design spec's "log as indicator (filesystem write
     /// attempt)". Any other param is accepted silently, matching real Redis's own breadth of
     /// harmless `CONFIG SET` targets.
-    fn handle_config_set(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_config_set(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() < 4 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'config|set' command"),
                 vec![],
             );
         }
-        let param_lower = text(&args[2]).to_ascii_lowercase();
+        let param_lower = text(args[2]).to_ascii_lowercase();
         let mut events = Vec::new();
         if param_lower == "dir" || param_lower == "dbfilename" {
-            let param = sanitize_value(&text(&args[2]), MAX_METADATA_STRING_LEN);
-            let value = sanitize_value(&text(&args[3]), MAX_VALUE_LEN);
+            let param = sanitize_value(&text(args[2]), MAX_METADATA_STRING_LEN);
+            let value = sanitize_value(&text(args[3]), MAX_VALUE_LEN);
             events.push(self.build_event(
                 SIGNAL_HONEYPOT_COMMAND_EXEC,
                 self.authenticated,
@@ -450,15 +454,15 @@ impl Session {
     /// `SET <key> <value>`: stored for this session (see the module doc); the key and value are
     /// captured as indicators, sanitized through `sanitize_value` before they can reach the
     /// event record.
-    fn handle_set(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_set(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() < 3 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'set' command"),
                 vec![],
             );
         }
-        let key = sanitize_value(&text(&args[1]), MAX_METADATA_STRING_LEN);
-        let value = sanitize_value(&text(&args[2]), MAX_VALUE_LEN);
+        let key = sanitize_value(&text(args[1]), MAX_METADATA_STRING_LEN);
+        let value = sanitize_value(&text(args[2]), MAX_VALUE_LEN);
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
             self.authenticated,
@@ -474,29 +478,29 @@ impl Session {
         // silently dropped behind an +OK. The attempt is still evidence, so the event stands.
         let previous = self
             .keys
-            .get(&args[1])
+            .get(args[1])
             .map_or(0, |v| args[1].len() + v.len());
         let incoming = args[1].len() + args[2].len();
-        let new_key = !self.keys.contains_key(&args[1]);
+        let new_key = !self.keys.contains_key(args[1]);
         let after = self.store_bytes - previous + incoming;
         if (new_key && self.keys.len() >= MAX_KEYS) || after > MAX_STORE_BYTES {
             return (resp::error_reply(OOM_REPLY), vec![event]);
         }
-        self.keys.insert(args[1].clone(), args[2].clone());
+        self.keys.insert(args[1].to_vec(), args[2].to_vec());
         self.store_bytes = after;
         (resp::simple_string("OK"), vec![event])
     }
 
     /// `GET <key>`: the value SET earlier this session, else nil. No event: the design spec lists
     /// an event only for the write side (`SET`), not this read side.
-    fn handle_get(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_get(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         if args.len() != 2 {
             return (
                 resp::error_reply("ERR wrong number of arguments for 'get' command"),
                 vec![],
             );
         }
-        let reply = match self.keys.get(&args[1]) {
+        let reply = match self.keys.get(args[1]) {
             Some(value) => resp::bulk_bytes(value),
             None => resp::nil_bulk_string(),
         };
@@ -507,7 +511,7 @@ impl Session {
     /// Always replies `+OK`; every trailing argument is captured as a sanitized indicator - an
     /// attacker pointing this instance at a host they control is the signal, regardless of the
     /// specific host/port offered.
-    fn handle_replicaof(&mut self, cmd: &str, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_replicaof(&mut self, cmd: &str, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         let captured_args: Vec<String> = args[1..]
             .iter()
             .map(|a| sanitize_value(&text(a), MAX_METADATA_STRING_LEN))
@@ -528,7 +532,7 @@ impl Session {
     /// runs any Lua (this sensor executes nothing - see the crate-wide `never_exec_static_check`
     /// in `tests/integration.rs`); replies a plausible compile-style error while capturing every
     /// trailing argument (the script body included) as a sanitized indicator.
-    fn handle_eval(&mut self, cmd: &str, args: &[Vec<u8>]) -> (Vec<u8>, Vec<SensorEvent>) {
+    fn handle_eval(&mut self, cmd: &str, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         let captured_args: Vec<String> = args[1..]
             .iter()
             .map(|a| sanitize_value(&text(a), MAX_VALUE_LEN))
@@ -585,8 +589,8 @@ pub async fn handle_connection<S>(
 
     loop {
         match reader.read_command(&mut stream).await {
-            ReadOutcome::Command(args) => {
-                let (response, events) = session.dispatch(&args);
+            ReadOutcome::Command(ranges) => {
+                let (response, events) = session.dispatch(&reader.args(&ranges));
                 for event in &events {
                     if emitter.append(event).await.is_err() {
                         tracing::error!(%peer_addr, "redis: failed to append command event");
@@ -613,8 +617,9 @@ pub async fn handle_connection<S>(
 
 /// Outcome of one [`RespReader::read_command`] call.
 enum ReadOutcome {
-    /// One non-empty command, ready to dispatch.
-    Command(Vec<Vec<u8>>),
+    /// One non-empty command, ready to dispatch: its arguments as ranges of the reader's buffer,
+    /// read through [`RespReader::args`] until the next [`RespReader::read_command`].
+    Command(Vec<Range<usize>>),
     /// The buffered bytes could never be valid RESP - `handle_connection` writes a protocol-error
     /// reply and ends the session.
     ProtocolError,
@@ -631,6 +636,10 @@ enum ReadOutcome {
 struct RespReader {
     /// Bytes read off the socket but not yet consumed by a complete, dispatched command.
     buf: Vec<u8>,
+    /// Bytes at the front of `buf` that belong to the command last returned; dropped when the
+    /// next command is read, so its arguments can be dispatched in place until then.
+    dispatched: usize,
+    parser: resp::Parser,
     bounds: ConnectionBounds,
     first_read: bool,
     total_captured: u64,
@@ -640,20 +649,30 @@ impl RespReader {
     fn new(bounds: ConnectionBounds) -> Self {
         Self {
             buf: Vec::new(),
+            dispatched: 0,
+            parser: resp::Parser::default(),
             bounds,
             first_read: true,
             total_captured: 0,
         }
     }
 
+    /// The arguments of the command [`Self::read_command`] last returned.
+    fn args(&self, ranges: &[Range<usize>]) -> Vec<&[u8]> {
+        ranges.iter().map(|r| &self.buf[r.clone()]).collect()
+    }
+
     async fn read_command<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> ReadOutcome {
+        self.buf.drain(..std::mem::take(&mut self.dispatched));
         loop {
-            match resp::parse_command(&self.buf) {
+            match self.parser.parse(&self.buf) {
                 Ok(resp::ParseOutcome::Complete { args, consumed }) => {
-                    self.buf.drain(..consumed);
                     if args.is_empty() {
-                        continue; // blank inline line / zero-count array: not a command.
+                        // A blank inline line or a zero-count array: not a command.
+                        self.buf.drain(..consumed);
+                        continue;
                     }
+                    self.dispatched = consumed;
                     return ReadOutcome::Command(args);
                 }
                 Ok(resp::ParseOutcome::Incomplete) => {}
@@ -1266,7 +1285,7 @@ mod tests {
     #[test]
     fn unknown_command_error_keeps_case_and_lists_args() {
         // The old reply uppercased the command and dropped the args clause - both one-probe tells.
-        let msg = unknown_command_error(&args(&["FooBar", "alpha", "beta"]));
+        let msg = unknown_command_error(&[b"FooBar", b"alpha", b"beta"]);
         assert!(msg.contains("unknown command 'FooBar'"), "{msg}");
         assert!(
             msg.contains("with args beginning with: 'alpha', 'beta', "),

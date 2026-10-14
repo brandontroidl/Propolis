@@ -122,7 +122,8 @@ impl From<std::io::Error> for SpoolError {
 /// The largest body a sensor keeps (16 MiB): the SSH sensor's spool per-file cap and its capture
 /// limit, and the indicator scan's size limit, so nothing a sensor keeps is then refused for size
 /// by a later stage. The other spooling sensors keep at most 10 MB, under it. 16 MiB, not 10 MB:
-/// a 10,027,008-byte miner sent over an exec's stdin was cut at 10,000,000 on every attempt.
+/// a miner sent over an exec's stdin was cut at 10,000,000 on every attempt (its true size is
+/// unknown, only that it exceeds 10,000,000).
 pub const SPOOL_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A directory of captured bodies, each named by its SHA-256, guarded by a per-file size cap and

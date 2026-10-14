@@ -551,7 +551,8 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `16_777_216` (16 MiB), the spool's per-file cap
   (`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`), and limits a payload streamed over
   the shell or an exec's standard input; SCP and SFTP uploads are kept up to 10 MB. A capture
-  cut at the limit is recorded with `truncated: true` and the real `wire_size`. It was
+  cut at the limit is recorded with `truncated: true`; its `wire_size` is a lower bound (the limit
+  rounded up to the 32 KiB packet that crossed it), not the transfer's size. It was
   `1_000_000`, then `10_000_000`; samples captured then stay as captured. An env file that sets
   it explicitly keeps that value, and one above the spool's cap loses a body past the cap
   outright (the spool refuses it) instead of keeping its prefix.

@@ -1718,8 +1718,9 @@ Jx4u80n/q0WquQbw1QIDAQAB
         assert_eq!(printable_strings(body, 6, 10), "abcdef\n");
     }
 
-    /// The SSH sensor keeps a payload streamed over stdin up to 16 MiB, so a 10,027,008-byte miner
-    /// it now keeps whole must be scanned, not shown "not scanned" for its size.
+    /// The SSH sensor keeps a payload streamed over stdin up to 16 MiB, so a body just past
+    /// 10,000,000 bytes (a miner was cut there) that it now keeps whole must be scanned, not shown
+    /// "not scanned" for its size.
     #[test]
     fn a_binary_past_ten_megabytes_up_to_the_ssh_cap_is_scanned() {
         for len in [10_027_008, 16 * 1024 * 1024] {

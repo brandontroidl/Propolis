@@ -1,8 +1,10 @@
 //! The capture limit of a payload streamed over an exec's stdin or the shell is the spool's
 //! per-file cap, 16 MiB. An upload under it is kept whole; one over it is cut at the limit and the
-//! event says so (`truncated`, the real `wire_size`), so a hash of the prefix is never read as the
-//! hash of the file. The cases are a 6.6 MB worm that used to be cut at 1,000,000 bytes and a
-//! 10,027,008-byte miner that used to be cut at 10,000,000.
+//! event says so (`truncated`), so a hash of the prefix is never read as the hash of the file. A
+//! cut upload's `wire_size` is a lower bound: the bytes that had arrived when the input ended, the
+//! limit rounded up to the SSH data packet that crossed it. The cases are a 6.6 MB worm that used
+//! to be cut at 1,000,000 bytes and a body just past 10,000,000 (a live miner was cut there; its
+//! true size is unknown).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -130,8 +132,9 @@ fn the_limit_is_the_spool_per_file_cap_of_16_mib() {
     assert_eq!(SPOOL_MAX_FILE_BYTES, 16 * 1024 * 1024);
 }
 
-/// The size of a miner sent over an exec's stdin that the 10,000,000-byte limit cut on every
-/// attempt.
+/// A size just past the old 10,000,000-byte limit. A live miner was cut there on every attempt;
+/// 10,027,008 is the limit rounded up to a 32 KiB packet (306 x 32,768) as that capture recorded
+/// it, so it is a test size, not the miner's.
 const MINER_BYTES: usize = 10_027_008;
 
 #[tokio::test]
@@ -173,6 +176,6 @@ async fn an_upload_just_over_the_limit_is_cut_at_it_and_flagged_truncated() {
     assert_eq!(event.metadata["truncated"], true);
     assert!(
         event.metadata["wire_size"].as_u64().unwrap() > SPOOL_MAX_FILE_BYTES,
-        "wire_size says the upload was bigger than what was kept"
+        "wire_size is past what was kept (a lower bound on the upload, not its size)"
     );
 }

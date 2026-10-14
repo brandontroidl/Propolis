@@ -87,7 +87,8 @@ const DEFAULT_MAX_DURATION_SECS: u64 = 600;
 /// The per-upload capture limit is the spool's per-file cap, 16 MiB, not a number of its own: a
 /// payload streamed over the shell or an exec's stdin is cut at exactly the point the spool would
 /// refuse it. At 1,000,000 a 6.6 MB Go worm was cut at a hash no reputation service knew, and at
-/// 10,000,000 a 10,027,008-byte miner was. What the larger default costs in memory is bounded by
+/// 10,000,000 a miner larger than that was (its recorded wire_size, 10,027,008, is the limit
+/// rounded up to a packet, not its size). What the larger default costs in memory is bounded by
 /// the capture and output budgets, not by this number (docs/operations/capacity-planning.md).
 const DEFAULT_MAX_CAPTURED_BYTES: u64 = sensor_ssh::server::SPOOL_MAX_FILE_BYTES;
 const DEFAULT_MAX_CONCURRENT: u32 = 256;

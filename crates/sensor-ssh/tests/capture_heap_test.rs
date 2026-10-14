@@ -6,7 +6,7 @@
 //! below that size grow on the heap: a realloc that cannot extend in place copies, and the block it
 //! frees stays resident between the other bodies. None of that is charged to the capture budget,
 //! and with several bodies growing at once it reached several times the capture limit (a probe of
-//! eight interleaved 16 MiB bodies: 118 MB resident past what the bodies held). The sensor pins the
+//! eight interleaved 16 MiB bodies: this test with the pin removed leaves 170,573,824 bytes resident). The sensor pins the
 //! threshold at startup, so a body past it is its own mapping, grown by `mremap` and returned to
 //! the kernel when freed.
 //!

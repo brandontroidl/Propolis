@@ -231,7 +231,8 @@ is 314,572 and the largest body fits.
 `sensor-ssh` keeps a payload streamed over the shell or an exec's standard input up to 16 MiB
 (`PROPOLIS_SSH_MAX_CAPTURED_BYTES`, default `16_777_216`, the spool's per-file cap
 `crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`; it was `1_000_000`, then `10_000_000`,
-which cut a 10,027,008-byte miner on every attempt). The limit decides how many uploads fill the
+which cut a miner larger than that on every attempt; its true size is not recorded, see
+[`wire_size`](../reference/sensor-behavior.md)). The limit decides how many uploads fill the
 capture budget, not how much the budget holds, so the worst case is the sum of the places that
 hold bytes, each bounded where it is allocated and released. Re-derived for 16 MiB from those
 places, the sum is unchanged; the one term that did grow with the limit, what a growing body
@@ -268,7 +269,7 @@ Why each term holds:
   extend in place copies and leaves the freed block resident. No budget charges it, and it
   scales with the capture limit and with how many bodies grow at once: eight bodies growing to
   10 MB together left 71,016,448 bytes resident past what they held, more than the margin below,
-  and a probe of eight growing to 16 MiB about 118 MB. The sensor pins the threshold at 128 KiB
+  and the same test at 16 MiB with the pin removed left 170,573,824 bytes resident. The sensor pins the threshold at 128 KiB
   at startup (`crates/sensor-framework/src/session_memory.rs#pin_mmap_threshold`), so a body
   past it is its own mapping, grown by `mremap` and returned to the kernel when freed; eight
   bodies growing to 16 MiB then leave 499,712 bytes

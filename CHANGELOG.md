@@ -14,6 +14,9 @@
   creates the account and `/var/lib/propolis/blocklist-status`; a root crontab keeps working,
   with a warning, until you move it (steps in
   [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
+  Install the script where `propolis-blocklist` can read it (a root-owned copy under
+  `/usr/local/lib/propolis/`); a checkout under `/root` is not readable by it. A root run records
+  the push marker by dropping to the status directory's owner, which needs `setpriv` (util-linux).
   The push marker moved there from `/var/lib/propolis/feed/.current.last_pushed`, so until the
   first push after the upgrade `feed-push-stale` sees no push; with `PROPOLIS_OPS_FEED_PUSH_EXPECTED`
   set it can page once if that push is more than the stale threshold away. Run the sync by hand

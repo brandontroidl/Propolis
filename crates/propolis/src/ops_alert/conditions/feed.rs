@@ -323,7 +323,8 @@ mod tests {
             )),
             "blocklist-sync.sh's default status directory is not {dir}"
         );
-        assert!(script.contains("\"$STATUS_DIR/last-pushed\""));
+        // write_marker_files takes the status directory as its argument and names the marker in it.
+        assert!(script.contains("\"$dir/last-pushed\""));
         assert_eq!(marker.file_name().unwrap(), "last-pushed");
         let provision = std::fs::read_to_string(root.join("provision.sh")).unwrap();
         assert!(

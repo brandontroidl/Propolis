@@ -120,18 +120,33 @@ sudo -u propolis-blocklist env GIT_SSH_COMMAND='ssh -i /var/lib/propolis-blockli
 sudo crontab -u propolis-blocklist -e
 ```
 
+The account must be able to read the script and its sibling `blocklist-README.md`, and
+it must not be able to change them: a checkout under `/root` or a `0700` home fails
+with "Permission denied", and a script the account could edit would run as the account
+on the next tick. Install a root-owned copy where every account can read it, and repeat
+this after any upgrade that changes `deploy/blocklist-sync.sh`:
+
+```
+sudo install -d -o root -g root -m 0755 /usr/local/lib/propolis
+sudo install -o root -g root -m 0755 deploy/blocklist-sync.sh /usr/local/lib/propolis/blocklist-sync.sh
+sudo install -o root -g root -m 0644 deploy/blocklist-README.md /usr/local/lib/propolis/blocklist-README.md
+```
+
 with a crontab entry such as:
 
 ```
 PROPOLIS_BLOCKLIST_SSH_KEY=/var/lib/propolis-blocklist/deploy_key
-5 * * * * /path/to/deploy/blocklist-sync.sh >> /var/lib/propolis-blocklist/sync.log 2>&1
+5 * * * * /usr/local/lib/propolis/blocklist-sync.sh >> /var/lib/propolis-blocklist/sync.log 2>&1
 ```
 
 Moving an existing root crontab: `chown -R propolis-blocklist:propolis-blocklist`
 the checkout, move the deploy key into `/var/lib/propolis-blocklist` owned by the
 account (mode `0600`), copy root's `known_hosts` entry for the remote into
 `/var/lib/propolis-blocklist/.ssh/known_hosts`, and move the crontab entry. The script still runs
-as root, with a warning in its log, so an old crontab keeps publishing until then.
+as root, with a warning in its log, so an old crontab keeps publishing until then. A root run
+still records the push: it drops to the owner of the status directory
+(`propolis-blocklist`) for that one write, using `setpriv` (util-linux), so the marker
+stays owned by the account and `feed-push-stale` keeps working.
 
 The script is fail-closed: it aborts if the source has no `manifest.json` or the
 target is not a git checkout, and refuses the whole build, touching nothing in the
@@ -144,14 +159,14 @@ writes:
   formats, or there are more than 16 retention windows;
 - a file is not a regular file with exactly one link (a symlink, a hard link, a
   FIFO, a device), is over 32 MiB, or the build is over 256 MiB in all;
-- a file is replaced between its check and its open: each one is checked again
-  on the open descriptor before it is read.
+- a file is replaced between its check and its copy: each one is opened without
+  following a link and without blocking, and checked again after it is read.
 
 It always attempts a push (to ship any commit stranded by a prior failed run) and
 exits non-zero with a diagnostic if the push fails. After a successful push it
 rewrites the marker `/var/lib/propolis/blocklist-status/last-pushed`, in a
-directory only `propolis-blocklist` (or root) writes, never the daemon's feed
-directory; it skips the marker, with a warning, if that directory is writable by
+directory only `propolis-blocklist` writes (a root run writes it as that account),
+never the daemon's feed directory; it skips the marker, with a warning, if that directory is writable by
 anyone else. The ops monitor's `feed-push-stale` condition pages when the local
 feed has moved on from that marker by more than `FEED_STALE_MULTIPLE` build cycles
 (see [health and observability](health-and-observability.md)). Schedule it to run

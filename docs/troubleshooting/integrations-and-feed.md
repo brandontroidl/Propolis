@@ -172,8 +172,18 @@ installed, so a push that has never succeeded is reported rather than read as
   before clearing it.
 - `feed-push-stale` firing while pushes succeed: the log says "could not update
   push marker". `/var/lib/propolis/blocklist-status` must exist (re-run
-  `deploy/provision.sh`), be owned by the cron's account or root, and be writable
-  by no one else.
+  `deploy/provision.sh`), be owned by `propolis-blocklist` (a root cron drops to
+  that owner for the write, which needs `setpriv`), and be writable by no one
+  else. Do not chown it to root: `deploy/provision.sh` resets it on every upgrade.
+- `PROPOLIS_FEED_WINDOWS` labels the script refuses: it accepts `all-<n>h|d` with
+  `n` of one to five digits and no leading zero, and at most 16 windows. The
+  daemon accepts more (`024h`, `+24h`, a count of 100000 or more, any number of
+  windows) and builds them, but the sync then refuses the whole build, so
+  `feed-push-stale` is the only signal. Keep the setting within those limits.
+- "Permission denied" running the script as `propolis-blocklist`: the script, its
+  sibling `blocklist-README.md` and every directory above them must be readable
+  and traversable by that account. Use the root-owned copy under
+  `/usr/local/lib/propolis/` that the routine-procedures page installs.
 
 ## Ops alerts never fire, or the daemon won't start with ops enabled
 

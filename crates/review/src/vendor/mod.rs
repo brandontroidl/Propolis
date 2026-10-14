@@ -114,16 +114,29 @@ impl FullVendorConfig {
 /// is enabled. The gatekeeper holds every submission to a disabled vendor at debug level only, so
 /// without this the first sign of a missing key or an unset flag is a `held=N` that never moves.
 /// `enabled` is already false when the flag was set but the key was empty (the loaders fail
-/// closed), so an empty key is the one distinction left to draw.
+/// closed), so an empty key is the one distinction left to draw. DShield is the exception that
+/// returns a notice while enabled: its credential is `user:key`, built only when both variables
+/// are set, so an enabled DShield with no user gets a bare key and every submission fails.
 pub fn disabled_vendor_notice(vc: &FullVendorConfig) -> Option<String> {
+    let dshield = vc.name == "dshield";
     if vc.enabled {
-        return None;
+        return (dshield && !vc.api_key.contains(':')).then(|| {
+            "vendor dshield is enabled but PROPOLIS_VENDOR_DSHIELD_USER is not set, so every \
+             submission to it will fail. Set PROPOLIS_VENDOR_DSHIELD_USER to the DShield user \
+             the key belongs to"
+                .to_string()
+        });
     }
     let var = vc.name.to_uppercase();
+    let key_vars = if dshield {
+        "PROPOLIS_VENDOR_DSHIELD_USER, PROPOLIS_VENDOR_DSHIELD_KEY".to_string()
+    } else {
+        format!("PROPOLIS_VENDOR_{var}_KEY")
+    };
     Some(if vc.api_key.is_empty() {
         format!(
             "vendor {name} is off: no API key is set, so it is treated as disabled and every \
-             approved address is held for it. Set PROPOLIS_VENDOR_{var}_KEY and \
+             approved address is held for it. Set {key_vars} and \
              PROPOLIS_VENDOR_{var}_ENABLED=true to report to it",
             name = vc.name,
         )

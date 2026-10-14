@@ -304,6 +304,35 @@ fn a_disabled_vendor_gets_a_plain_startup_notice_and_an_enabled_one_none() {
     assert!(!flag_off.contains("secret-key"));
 }
 
+// DShield's credential is `user:key`, assembled only when both variables are set
+// (crates/review/src/main.rs, crates/propolis/src/config.rs): the notice for a missing key must
+// name the user variable too, and an enabled DShield given only a key must be called out at
+// startup instead of failing every submission later.
+#[test]
+fn dshield_notices_name_the_user_variable_it_needs() {
+    let no_key = disabled_vendor_notice(&vendor_with("dshield", false, "")).unwrap();
+    assert!(
+        no_key.contains("PROPOLIS_VENDOR_DSHIELD_USER, PROPOLIS_VENDOR_DSHIELD_KEY"),
+        "{no_key}"
+    );
+    let key_only = disabled_vendor_notice(&vendor_with("dshield", true, "secret-key")).unwrap();
+    assert!(
+        key_only.contains("PROPOLIS_VENDOR_DSHIELD_USER is not set"),
+        "{key_only}"
+    );
+    assert!(!key_only.contains("secret-key"));
+    assert_eq!(
+        disabled_vendor_notice(&vendor_with("dshield", true, "user:secret-key")),
+        None,
+        "a complete user:key credential is enabled and needs no notice"
+    );
+    assert_eq!(
+        disabled_vendor_notice(&vendor_with("abuseipdb", true, "no-colon-key")),
+        None,
+        "only DShield's credential has the user:key shape"
+    );
+}
+
 #[test]
 fn adapter_names_match_vendor_submission_table_convention() {
     let client = reqwest::Client::new();

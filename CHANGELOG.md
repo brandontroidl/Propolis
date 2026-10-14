@@ -612,6 +612,17 @@
   listener sending two 490,000-byte SETs each peaked at 817,840 KiB resident before and now
   peak at 45 to 49 MiB on one CPU and 54 to 61 MiB with four runtime workers. See
   [capacity planning](docs/operations/capacity-planning.md#redis-sensor-worst-case-memory).
+- **sensor-redis ends a reply write the peer never reads, and decodes only a prefix of an
+  argument for the ledger** - a peer that pipelined commands and never read the replies held
+  the sensor blocked in the write for the rest of the session while the kernel kept the unsent
+  replies against the unit's memory; the write now gives up after the idle timeout. The ledger
+  field of a SET, CONFIG SET, EVAL or REPLICAOF argument was built by sanitizing the whole
+  argument, several full-length copies of up to 512 KiB (three times that for invalid UTF-8)
+  before cutting to 1 KiB; it now decodes at most four bytes per kept character. INFO and
+  CONFIG GET report a `maxmemory` of 256 MiB, not 0, so the OOM reply a full pool gives no
+  longer contradicts them. A peer that opens many sessions and never reads can still hold the
+  kernel's send buffers (up to 4 MiB a socket) past the unit's limit inside the idle timeout;
+  see [capacity planning](docs/operations/capacity-planning.md#redis-sensor-worst-case-memory).
 - **sensor-redis reads a large command in time linear in its size** - the reader parsed the whole
   buffered command again after every 1 KiB socket read and copied every element it had finished
   on each pass, so one 900-element, 908 KB multi-bulk cost about twelve times the CPU of the same

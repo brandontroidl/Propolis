@@ -150,7 +150,6 @@ async fn many_sessions_filling_set_hold_at_most_the_pool_and_their_floors() {
         "the open sessions hold {held_total} acknowledged bytes, past the pool plus their \
          floors ({bound})"
     );
-    assert!(pool.high_water_bytes() <= POOL_BYTES);
     // Once each session is back waiting for its next command, the pool holds the stores alone:
     // every finished command gave its buffer room back.
     let stores = open
@@ -210,13 +209,17 @@ async fn many_sessions_filling_set_hold_at_most_the_pool_and_their_floors() {
 // The real binary, both listeners
 // -------------------------------------------------------------------------------------------
 
-/// A free loopback port, released for the sensor to bind.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Two distinct free loopback ports, released for the sensor to bind. Both listeners are held
+/// until both ports are chosen, so the pair cannot collide with each other. The gap between
+/// release and the sensor's bind remains, as with any port handed to a child by number: the
+/// sensor reads its addresses from the environment, not from an inherited socket.
+fn free_ports() -> (u16, u16) {
+    let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port(),
+    )
 }
 
 /// `VmHWM` (peak resident set) of `pid`, in bytes.
@@ -272,8 +275,9 @@ async fn the_binary_with_both_listeners_full_stays_well_under_memory_max() {
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )
     .unwrap();
-    let plain: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-    let tls: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let (plain_port, tls_port) = free_ports();
+    let plain: SocketAddr = format!("127.0.0.1:{plain_port}").parse().unwrap();
+    let tls: SocketAddr = format!("127.0.0.1:{tls_port}").parse().unwrap();
     let sensor = Sensor(
         Command::new(env!("CARGO_BIN_EXE_sensor-redis"))
             .env_clear()

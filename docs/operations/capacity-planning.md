@@ -369,7 +369,7 @@ room back.
 | The element list of an unfinished multi-bulk | 8,388,608 | 1024 elements at most (`crates/sensor-redis/src/resp.rs#MAX_ARRAY_LEN`), 16 bytes each; arguments are ranges of the buffer, never copies |
 | Each session's fixed state, sockets and TLS included | about 18 MiB, measured | 512 idle sessions, 256 on each listener, held 28,748 KiB resident against 10,280 KiB for the idle process |
 | Sum | about 90 MiB | |
-| Dispatch-time copies | a few copies of one argument (at most 512 KiB) per runtime worker thread | a SET value is sanitized from the whole argument for its ledger copy; dispatch does not yield, so only one command a worker is in it at a time |
+| Dispatch-time copies | a few copies of a prefix of one argument (at most 4 KiB, 12 KiB decoded) per runtime worker thread, plus a CONFIG subcommand name echoed in full (up to 512 KiB, three times that decoded, two copies) | `crates/sensor-redis/src/handler.rs#ledger` decodes at most four bytes per kept character; the command name is cut to 64 bytes; dispatch does not yield, so only one command a worker is in it at a time |
 
 Against `MemoryMax=256M` that leaves the runtime, the allocator's free lists and the worker
 threads' dispatch copies about 166 MiB. Measured with the debug binary: 256 sessions on each
@@ -382,9 +382,22 @@ the same run acknowledged every write, 501,761,024 bytes held, and peaked at 817
 times `MemoryMax`; under the unit's limit the kernel killed the sensor at about 230 sessions.
 
 Residuals, stated plainly. Kernel socket buffers are charged to the unit's cgroup but are not in
-this sum or in the resident figures; a peer that sends faster than the sensor reads, or never
-reads its replies, is bounded by the kernel's TCP buffer limits, not by the sensor. Memory the
-allocator keeps after a session frees it counts against `MemoryMax` and is not charged to the
+this sum or in the resident figures, and the sensor does not bound them. A peer that sends a
+SET inside the floors (so the pool never sees it), pipelines 4096-command batches of GET for it
+and never reads leaves the sensor blocked in the reply write while the kernel holds the unsent
+replies. Measured on loopback with `MemoryMax=256M` and swap off: 64 such sessions from one
+source held 220,413,952 bytes of socket memory (`memory.stat` `sock`) while the sensor's
+resident set stayed at 18 MB, and 256 sessions on each listener had the kernel kill the sensor
+in about two seconds. The same shape against the code before the pool held 197,763,072 bytes, so
+the pool did not introduce it. The kernel's autotuned send buffer allows up to 4 MiB a socket
+here (`net.ipv4.tcp_wmem`), about eight times `MemoryMax` across 512 sessions, so that limit
+does not protect the unit. The reply write now gives up after the idle timeout
+(`crates/sensor-redis/src/handler.rs#write_reply`), which ends such a session and releases its
+buffers, but it does not stop the buffers filling inside that window. Closing the window means
+capping `SO_SNDBUF` on every accepted socket, a change to the accept path in `sensor-framework`
+that every sensor shares and is not made here. Loopback has a 64 KiB segment size, so its
+buffers grow faster than they would over an internet path; how far a remote peer gets is not
+measured. Memory the allocator keeps after a session frees it counts against `MemoryMax` and is not charged to the
 pool; the 28-CPU figure shows it. The number of runtime worker threads follows the CPUs the
 process may use.
 

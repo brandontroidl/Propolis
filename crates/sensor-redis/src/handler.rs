@@ -97,11 +97,11 @@ fn connection_event(
 fn unknown_command_error(args: &[&[u8]]) -> String {
     let mut msg = format!(
         "ERR unknown command '{}', with args beginning with: ",
-        sanitize_value(&text(args[0]), 128)
+        ledger(args[0], 128)
     );
     for a in args.iter().skip(1).take(20) {
         msg.push('\'');
-        msg.push_str(&sanitize_value(&text(a), 128));
+        msg.push_str(&ledger(a, 128));
         msg.push_str("', ");
     }
     msg
@@ -112,6 +112,17 @@ fn unknown_command_error(args: &[&[u8]]) -> String {
 /// then `sanitize_value`.
 fn text(arg: &[u8]) -> String {
     String::from_utf8_lossy(arg).into_owned()
+}
+
+/// An argument as a sanitized ledger field of at most `max_len`. Only a prefix of the argument
+/// is decoded: invalid UTF-8 grows about threefold in `text` and `sanitize_value` keeps several
+/// full-length copies before it truncates, so running it over a 512 KiB argument cost memory and
+/// CPU out of proportion to the 1 KiB it keeps. Four bytes a kept character is the widest
+/// UTF-8 encoding, so the prefix covers everything a field can keep unless the argument is
+/// mostly characters sanitization removes.
+fn ledger(arg: &[u8], max_len: usize) -> String {
+    let prefix = &arg[..arg.len().min(max_len.saturating_mul(4))];
+    sanitize_value(&text(prefix), max_len)
 }
 
 /// A fresh 40-hex id, as Redis mints for `run_id` / `master_replid` on every boot.
@@ -195,8 +206,8 @@ fn canned_info() -> String {
          used_memory_lua:0\r\n\
          used_memory_scripts:0\r\n\
          number_of_cached_scripts:0\r\n\
-         maxmemory:0\r\n\
-         maxmemory_human:0B\r\n\
+         maxmemory:268435456\r\n\
+         maxmemory_human:256.00M\r\n\
          maxmemory_policy:noeviction\r\n\
          mem_fragmentation_ratio:12.00\r\n\
          mem_allocator:jemalloc-5.3.0\r\n\
@@ -258,7 +269,7 @@ fn canned_info() -> String {
 fn canned_config_get() -> Vec<u8> {
     resp::array_of_bulk_strings(&[
         "maxmemory",
-        "0",
+        "268435456",
         "maxmemory-policy",
         "noeviction",
         "save",
@@ -370,7 +381,9 @@ impl Session {
     pub fn dispatch<A: AsRef<[u8]>>(&mut self, args: &[A]) -> (Vec<u8>, Vec<SensorEvent>) {
         let args: Vec<&[u8]> = args.iter().map(AsRef::as_ref).collect();
         let args = args.as_slice();
-        let cmd = text(args[0]).to_ascii_uppercase();
+        // No command name is anywhere near this long, so a longer one only needs to stay unequal
+        // to every name; cutting it avoids decoding and uppercasing an attacker-sized argument.
+        let cmd = text(&args[0][..args[0].len().min(64)]).to_ascii_uppercase();
         match cmd.as_str() {
             // Real Redis PING echoes its optional message (as a bulk string) and errors on excess
             // arity; a bare PING is +PONG.
@@ -450,8 +463,8 @@ impl Session {
         let param_lower = text(args[2]).to_ascii_lowercase();
         let mut events = Vec::new();
         if param_lower == "dir" || param_lower == "dbfilename" {
-            let param = sanitize_value(&text(args[2]), MAX_METADATA_STRING_LEN);
-            let value = sanitize_value(&text(args[3]), MAX_VALUE_LEN);
+            let param = ledger(args[2], MAX_METADATA_STRING_LEN);
+            let value = ledger(args[3], MAX_VALUE_LEN);
             events.push(self.build_event(
                 SIGNAL_HONEYPOT_COMMAND_EXEC,
                 self.authenticated,
@@ -476,8 +489,8 @@ impl Session {
                 vec![],
             );
         }
-        let key = sanitize_value(&text(args[1]), MAX_METADATA_STRING_LEN);
-        let value = sanitize_value(&text(args[2]), MAX_VALUE_LEN);
+        let key = ledger(args[1], MAX_METADATA_STRING_LEN);
+        let value = ledger(args[2], MAX_VALUE_LEN);
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
             self.authenticated,
@@ -535,7 +548,7 @@ impl Session {
     fn handle_replicaof(&mut self, cmd: &str, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
         let captured_args: Vec<String> = args[1..]
             .iter()
-            .map(|a| sanitize_value(&text(a), MAX_METADATA_STRING_LEN))
+            .map(|a| ledger(a, MAX_METADATA_STRING_LEN))
             .collect();
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
@@ -554,10 +567,8 @@ impl Session {
     /// in `tests/integration.rs`); replies a plausible compile-style error while capturing every
     /// trailing argument (the script body included) as a sanitized indicator.
     fn handle_eval(&mut self, cmd: &str, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
-        let captured_args: Vec<String> = args[1..]
-            .iter()
-            .map(|a| sanitize_value(&text(a), MAX_VALUE_LEN))
-            .collect();
+        let captured_args: Vec<String> =
+            args[1..].iter().map(|a| ledger(a, MAX_VALUE_LEN)).collect();
         let event = self.build_event(
             SIGNAL_HONEYPOT_COMMAND_EXEC,
             self.authenticated,
@@ -609,6 +620,7 @@ pub async fn handle_connection<S>(
     }
 
     let mut session = Session::new(source_ip, wan_ip, session_id, &pool).with_tls(tls);
+    let write_limit = bounds.idle_timeout;
     let mut reader = RespReader::new(bounds, &pool);
 
     loop {
@@ -620,8 +632,7 @@ pub async fn handle_connection<S>(
                         tracing::error!(%peer_addr, "redis: failed to append command event");
                     }
                 }
-                // flush: a TLS stream buffers records until flushed.
-                if stream.write_all(&response).await.is_err() || stream.flush().await.is_err() {
+                if !write_reply(&mut stream, &response, write_limit).await {
                     return;
                 }
             }
@@ -637,6 +648,22 @@ pub async fn handle_connection<S>(
             ReadOutcome::Closed => return,
         }
     }
+}
+
+/// Write one reply and flush (a TLS stream buffers records until flushed), giving up after
+/// `limit`. A peer that pipelines commands and never reads leaves the sensor blocked in the write
+/// while the kernel holds the unsent replies against the unit's memory; without a limit that
+/// session lasts until `max_duration`. Returns false when the session should end.
+async fn write_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    reply: &[u8],
+    limit: std::time::Duration,
+) -> bool {
+    let write = async {
+        stream.write_all(reply).await?;
+        stream.flush().await
+    };
+    matches!(tokio::time::timeout(limit, write).await, Ok(Ok(())))
 }
 
 /// Outcome of one [`RespReader::read_command`] call.
@@ -1049,6 +1076,34 @@ mod tests {
         );
     }
 
+    /// The ledger field of a long argument matches the whole-argument result for ordinary input,
+    /// and a huge invalid-UTF-8 argument decodes only a bounded prefix.
+    #[test]
+    fn a_ledger_field_decodes_only_a_prefix_of_a_long_argument() {
+        let ascii = vec![b'a'; 512 * 1024];
+        assert_eq!(
+            ledger(&ascii, MAX_VALUE_LEN),
+            sanitize_value(&text(&ascii), MAX_VALUE_LEN)
+        );
+        let mixed = "h\u{e9}llo w\u{f6}rld ".repeat(40_000).into_bytes();
+        assert_eq!(
+            ledger(&mixed, MAX_VALUE_LEN),
+            sanitize_value(&text(&mixed), MAX_VALUE_LEN)
+        );
+        let binary = vec![0xFFu8; 512 * 1024];
+        let kept = ledger(&binary, MAX_VALUE_LEN);
+        assert!(kept.len() <= MAX_VALUE_LEN);
+        assert!(!kept.is_empty());
+    }
+
+    #[test]
+    fn info_and_config_get_report_the_same_nonzero_maxmemory() {
+        assert!(canned_info().contains("maxmemory:268435456\r\n"));
+        let mut session = new_session();
+        let reply = session.dispatch(&args(&["CONFIG", "GET", "maxmemory"])).0;
+        assert!(String::from_utf8_lossy(&reply).contains("268435456"));
+    }
+
     #[test]
     fn a_value_is_stored_whole_and_a_write_past_the_byte_budget_is_refused() {
         let mut session = new_session();
@@ -1173,6 +1228,28 @@ mod tests {
         assert!(reader.buf.capacity() <= memory::BUFFER_FLOOR);
         assert_eq!(pool.current_bytes(), 0);
         let _client = writer.await.unwrap();
+    }
+
+    /// A peer that never reads its replies cannot hold the session in the write past the limit.
+    #[tokio::test]
+    async fn a_reply_the_peer_never_reads_ends_the_write() {
+        let (_client, mut server) = tokio::io::duplex(1024);
+        let started = std::time::Instant::now();
+        let ok = write_reply(
+            &mut server,
+            &vec![b'x'; 64 * 1024],
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(!ok);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        assert!(write_reply(&mut server, b"+OK\r\n", std::time::Duration::from_secs(5)).await);
+        let mut got = [0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"+OK\r\n");
     }
 
     /// A command the pool cannot buffer ends the session; what the buffer drew is given back.

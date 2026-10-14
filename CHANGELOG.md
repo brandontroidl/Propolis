@@ -431,6 +431,19 @@
   across a long subject). Ordinary patterns answer exactly as before: a differential test runs
   the old matchers against the new on 400,000 generated patterns. See
   [sensor behavior](docs/reference/sensor-behavior.md).
+- **`grep -F` searches in linear time, and `grep` pays for every search of a line** - a fixed
+  string was found by comparing it at every offset of the line, so a 192,001-byte needle that
+  failed at its last byte against a 384,000-byte line from `echo $a$a` cost about 3.7e10 byte
+  comparisons (three seconds in an unoptimized build, eight minutes with `-i`) while the
+  allowance charged the input's length. It is now found with a two-way searcher built once per
+  pattern (`memchr`, already in the build through `serde_json`; no new package), and `-i`
+  lowercases the needle once and each line once instead of folding every comparison. `-o` and
+  `-w` search a line again from later offsets, which the one charge per input never saw: `-w`
+  rejecting a match at every offset of a long run was still quadratic, through the fixed and
+  the regular-expression paths alike. Every search now counts what it read and the excess over
+  one pass is charged, and a scan past the line's allowance stops the line. Output is unchanged:
+  a differential test runs the old window scan against 2,000 generated `-F` cases under `-i -w
+  -x -o -c -v`.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

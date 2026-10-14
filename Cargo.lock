@@ -3429,6 +3429,7 @@ dependencies = [
  "chrono",
  "libc",
  "md-5",
+ "memchr",
  "rcgen",
  "rustls-pki-types",
  "sensor-wire",

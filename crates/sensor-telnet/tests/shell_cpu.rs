@@ -203,6 +203,32 @@ fn a_case_pattern_of_wildcards_is_charged_to_the_line() {
 }
 
 #[test]
+fn grep_fixed_strings_scan_in_linear_time() {
+    let sensor = sensor();
+    let mut client = Client::login(sensor.addr);
+    let seed = "a".repeat(375);
+    client.run(&format!("a='{seed}'"));
+    client.run("a=$a$a; a=$a$a; a=$a$a; a=$a$a; a=$a$a; a=$a$a; a=$a$a; a=$a$a; a=$a$a");
+
+    // A 192,001-byte needle that fails at its last byte, at each of 192,000 offsets: about
+    // three seconds per grep before, and eight minutes with -i, in an unoptimized build.
+    for (line, count) in [
+        ("echo $a$a | grep -F -c \"${a}b\"", "\n0"),
+        ("echo $a$a | grep -iF -c \"${a}B\"", "\n0"),
+        ("echo $a$a | grep -F -c \"$a\"", "\n1"),
+    ] {
+        let (elapsed, out) = client.timed(line);
+        assert!(elapsed < BOUND, "{line} took {elapsed:?}");
+        assert!(out.contains(count), "{line} printed {out:.300}");
+    }
+
+    // -w rejects the match at every offset and looks again one byte on: 192,000 matches of
+    // 192,000 bytes each. That work is charged, so the line runs out of allowance instead.
+    let (elapsed, _) = client.timed("echo $a$a | grep -F -w -c \"$a\"");
+    assert!(elapsed < BOUND, "took {elapsed:?}");
+}
+
+#[test]
 fn find_and_package_globs_with_a_long_bracket_expression_are_linear() {
     let sensor = sensor();
     let mut client = Client::login(sensor.addr);

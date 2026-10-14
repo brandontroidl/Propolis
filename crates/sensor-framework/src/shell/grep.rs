@@ -16,6 +16,10 @@
     clippy::indexing_slicing
 )]
 
+use std::cell::Cell;
+
+use memchr::memmem::Finder;
+
 use super::read::errno_text;
 use super::regex::{Regex, Syntax};
 use super::registry::Registry;
@@ -291,10 +295,19 @@ fn context(value: &str) -> Result<usize, CommandResult> {
         .map_err(|_| usage_error(format!("grep: {value}: invalid context length argument\n")))
 }
 
-/// One compiled pattern.
+/// One compiled pattern. A fixed string is searched with a two-way searcher built once, linear
+/// in the bytes it reads; under `-i` its needle is ASCII-lowercased, and so is the line it reads.
 enum Matcher {
-    Fixed(Vec<u8>),
+    Fixed(Box<Finder<'static>>),
     Re(Regex),
+}
+
+/// The work a scan has done and may do. `-o` and `-w` search one line again from later offsets, so a scan's work is not the input's length: each search adds what it read, and once
+/// past the allowance every search finds nothing and the caller stops the line.
+#[derive(Clone, Copy, Default)]
+struct Meter {
+    allowance: u64,
+    spent: u64,
 }
 
 struct Search {
@@ -302,6 +315,20 @@ struct Search {
     fold: bool,
     word: bool,
     whole_line: bool,
+    meter: Cell<Meter>,
+}
+
+/// One input line, and under `-i` with a fixed string the same bytes ASCII-lowercased, made
+/// once per line however many times the line is searched.
+struct Line<'a> {
+    bytes: &'a [u8],
+    folded: Option<Vec<u8>>,
+}
+
+impl Line<'_> {
+    fn fixed_hay(&self) -> &[u8] {
+        self.folded.as_deref().unwrap_or(self.bytes)
+    }
 }
 
 fn is_word(byte: u8) -> bool {
@@ -319,44 +346,84 @@ impl Search {
             .fold(0u64, u64::saturating_add)
     }
 
-    /// The first match of one matcher at or after `from`.
-    fn raw_find(&self, matcher: &Matcher, line: &[u8], from: usize) -> Option<(usize, usize)> {
+    /// Start a scan that may do `allowance` work.
+    fn allow(&self, allowance: u64) {
+        self.meter.set(Meter {
+            allowance,
+            spent: 0,
+        });
+    }
+
+    fn spent(&self) -> u64 {
+        self.meter.get().spent
+    }
+
+    fn over(&self) -> bool {
+        let meter = self.meter.get();
+        meter.spent > meter.allowance
+    }
+
+    fn spend(&self, work: u64) {
+        let mut meter = self.meter.get();
+        meter.spent = meter.spent.saturating_add(work);
+        self.meter.set(meter);
+    }
+
+    fn line<'a>(&self, bytes: &'a [u8]) -> Line<'a> {
+        let folded = (self.fold && self.matchers.iter().any(|m| matches!(m, Matcher::Fixed(_))))
+            .then(|| bytes.to_ascii_lowercase());
+        Line { bytes, folded }
+    }
+
+    /// The first match of one matcher at or after `from`, its work spent; none once the scan is
+    /// past its allowance.
+    fn raw_find(&self, matcher: &Matcher, line: &Line<'_>, from: usize) -> Option<(usize, usize)> {
+        if self.over() {
+            return None;
+        }
         match matcher {
-            Matcher::Fixed(needle) => {
-                let hay = line.get(from..)?;
-                if needle.is_empty() {
+            Matcher::Fixed(finder) => {
+                let hay = line.fixed_hay().get(from..)?;
+                let needle = finder.needle().len();
+                if needle == 0 {
+                    self.spend(1);
                     return Some((from, from));
                 }
-                hay.windows(needle.len())
-                    .position(|w| {
-                        if self.fold {
-                            w.eq_ignore_ascii_case(needle)
-                        } else {
-                            w == needle.as_slice()
-                        }
-                    })
-                    .map(|at| {
-                        let start = from.saturating_add(at);
-                        (start, start.saturating_add(needle.len()))
-                    })
+                let found = finder.find(hay);
+                let read = found.map_or(hay.len(), |at| at.saturating_add(needle));
+                self.spend(len_u64(read));
+                found.map(|at| {
+                    let start = from.saturating_add(at);
+                    (start, start.saturating_add(needle))
+                })
             }
-            Matcher::Re(re) => re.find_at(line, from),
+            Matcher::Re(re) => {
+                let (found, stopped) = re.find_scanned(line.bytes, from);
+                self.spend(re.cost(stopped.saturating_sub(from)));
+                found
+            }
         }
     }
 
     /// The first acceptable match of one matcher at or after `from`: whole-line under `-x`,
     /// bounded by non-word characters under `-w`.
-    fn find_one(&self, matcher: &Matcher, line: &[u8], mut from: usize) -> Option<(usize, usize)> {
+    fn find_one(
+        &self,
+        matcher: &Matcher,
+        line: &Line<'_>,
+        mut from: usize,
+    ) -> Option<(usize, usize)> {
+        let bytes = line.bytes;
         loop {
             let (start, end) = self.raw_find(matcher, line, from)?;
             let accepted = if self.whole_line {
-                start == 0 && end == line.len()
+                start == 0 && end == bytes.len()
             } else if self.word {
                 let before_ok = start
                     .checked_sub(1)
-                    .and_then(|i| line.get(i))
+                    .and_then(|i| bytes.get(i))
                     .is_none_or(|&b| !is_word(b));
-                let after_ok = line.get(end).is_none_or(|&b| !is_word(b));
+                let after_ok = bytes.get(end).is_none_or(|&b| !is_word(b));
                 before_ok && after_ok
             } else {
                 true
@@ -364,7 +431,7 @@ impl Search {
             if accepted {
                 return Some((start, end));
             }
-            if self.whole_line || start >= line.len() {
+            if self.whole_line || start >= bytes.len() {
                 return None;
             }
             from = start.saturating_add(1);
@@ -372,14 +439,14 @@ impl Search {
     }
 
     /// The leftmost match of any pattern at or after `from`, the longest among those at it.
-    fn find(&self, line: &[u8], from: usize) -> Option<(usize, usize)> {
+    fn find(&self, line: &Line<'_>, from: usize) -> Option<(usize, usize)> {
         self.matchers
             .iter()
             .filter_map(|m| self.find_one(m, line, from))
             .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
     }
 
-    fn matches(&self, line: &[u8]) -> bool {
+    fn matches(&self, line: &Line<'_>) -> bool {
         self.find(line, 0).is_some()
     }
 }
@@ -407,10 +474,11 @@ fn scan(data: &[u8], search: &Search, plan: &Plan, prefix: &str) -> Outcome {
     let mut after_left = 0usize;
     let quiet_output = plan.count || plan.quiet || plan.list_matching || plan.list_missing;
     for (index, line) in lines.iter().enumerate() {
-        if plan.max.is_some_and(|max| outcome.selected >= max) {
+        if plan.max.is_some_and(|max| outcome.selected >= max) || search.over() {
             break;
         }
-        let selected = search.matches(line) != plan.invert;
+        let searched = search.line(line);
+        let selected = search.matches(&searched) != plan.invert;
         if !selected {
             if after_left > 0 && !quiet_output && !binary {
                 after_left = after_left.saturating_sub(1);
@@ -449,7 +517,7 @@ fn scan(data: &[u8], search: &Search, plan: &Plan, prefix: &str) -> Outcome {
         }
         if plan.only && !plan.invert {
             let mut at = 0usize;
-            while let Some((start, end)) = search.find(line, at) {
+            while let Some((start, end)) = search.find(&searched, at) {
                 if end > start {
                     emit_line(
                         &mut outcome.text,
@@ -531,7 +599,14 @@ impl FakeShell {
         let mut matchers = Vec::new();
         for pattern in plan.patterns.iter().flat_map(|p| p.split('\n')) {
             match kind {
-                Kind::Fixed => matchers.push(Matcher::Fixed(pattern.as_bytes().to_vec())),
+                Kind::Fixed => {
+                    let needle = if plan.fold {
+                        pattern.as_bytes().to_ascii_lowercase()
+                    } else {
+                        pattern.as_bytes().to_vec()
+                    };
+                    matchers.push(Matcher::Fixed(Box::new(Finder::new(&needle).into_owned())));
+                }
                 Kind::Re(syntax) => match Regex::new(pattern.as_bytes(), syntax, plan.fold) {
                     Ok(re) => matchers.push(Matcher::Re(re)),
                     Err(error) => {
@@ -545,6 +620,7 @@ impl FakeShell {
             fold: plan.fold,
             word: plan.word,
             whole_line: plan.whole_line,
+            meter: Cell::default(),
         };
         let busybox = self.busybox_depth > 0;
         let mut names: Vec<Option<String>> = if plan.files.is_empty() {
@@ -582,15 +658,28 @@ impl FakeShell {
                     continue;
                 }
             };
-            if !self.charge_work(search.cost(bytes.len())) {
+            // One pass over the input is charged before it runs, so an input the line cannot
+            // scan once is refused unread. The scan may then spend that and whatever the line
+            // has left, and what it spent past the one pass is charged after it.
+            let one_pass = search.cost(bytes.len());
+            if !self.charge_work(one_pass) {
                 return stopped();
             }
+            search.allow(one_pass.saturating_add(self.line.remaining()));
             let prefix = if labelled {
                 label.clone()
             } else {
                 String::new()
             };
             let found = scan(&bytes, &search, &plan, &prefix);
+            let beyond = if search.over() {
+                self.line.remaining().saturating_add(1)
+            } else {
+                search.spent().saturating_sub(one_pass)
+            };
+            if !self.charge_work(beyond) {
+                return stopped();
+            }
             any |= found.selected > 0;
             if plan.quiet {
                 if any {

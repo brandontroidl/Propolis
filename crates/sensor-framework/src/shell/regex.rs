@@ -687,6 +687,13 @@ impl Regex {
 
     /// The leftmost-longest match starting at or after `from`, as `(start, end)`.
     pub(super) fn find_at(&self, text: &[u8], from: usize) -> Option<(usize, usize)> {
+        self.find_scanned(text, from).0
+    }
+
+    /// [`Self::find_at`], and the position the scan stopped at: the work it did is
+    /// [`Self::cost`] of the bytes from `from` to there, which a caller that scans one text many
+    /// times charges per scan.
+    pub(super) fn find_scanned(&self, text: &[u8], from: usize) -> (Option<(usize, usize)>, usize) {
         let count = self.insts.len();
         let mut current: Vec<(usize, usize)> = Vec::new();
         let mut next: Vec<(usize, usize)> = Vec::new();
@@ -734,7 +741,7 @@ impl Regex {
             }
             pos = step;
         }
-        best
+        (best, pos)
     }
 
     /// Add the thread at `pc`, following jumps, splits and assertions at `pos`; a thread that

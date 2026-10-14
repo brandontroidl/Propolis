@@ -135,6 +135,201 @@ fn grep_reports_what_gnu_grep_reports() {
     );
 }
 
+/// The options a generated `grep -F` case turns on.
+#[derive(Clone, Copy, Debug)]
+struct FixedFlags {
+    fold: bool,
+    word: bool,
+    whole: bool,
+    only: bool,
+    count: bool,
+    invert: bool,
+}
+
+/// What `grep -F` printed when it compared a window at every offset (`grep.rs` at 5560201b),
+/// with `-w`, `-x`, `-o`, `-c` and `-v` applied the way they still are: the reference the
+/// linear search must agree with.
+fn window_grep(needles: &[&str], lines: &[&str], flags: FixedFlags) -> String {
+    let raw_find = |needle: &[u8], line: &[u8], from: usize| -> Option<(usize, usize)> {
+        let hay = line.get(from..)?;
+        if needle.is_empty() {
+            return Some((from, from));
+        }
+        hay.windows(needle.len())
+            .position(|w| {
+                if flags.fold {
+                    w.eq_ignore_ascii_case(needle)
+                } else {
+                    w == needle
+                }
+            })
+            .map(|at| (from + at, from + at + needle.len()))
+    };
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let find_one = |needle: &[u8], line: &[u8], mut from: usize| loop {
+        let (start, end) = raw_find(needle, line, from)?;
+        let accepted = if flags.whole {
+            start == 0 && end == line.len()
+        } else if flags.word {
+            let before = start
+                .checked_sub(1)
+                .and_then(|i| line.get(i))
+                .is_none_or(|&b| !word(b));
+            before && line.get(end).is_none_or(|&b| !word(b))
+        } else {
+            true
+        };
+        if accepted {
+            return Some((start, end));
+        }
+        if flags.whole || start >= line.len() {
+            return None;
+        }
+        from = start + 1;
+    };
+    let find = |line: &[u8], from: usize| {
+        needles
+            .iter()
+            .filter_map(|n| find_one(n.as_bytes(), line, from))
+            .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+    };
+    let mut out = String::new();
+    let mut selected = 0;
+    for line in lines {
+        let bytes = line.as_bytes();
+        if find(bytes, 0).is_some() == flags.invert {
+            continue;
+        }
+        selected += 1;
+        if flags.count {
+            continue;
+        }
+        if flags.only && !flags.invert {
+            let mut at = 0;
+            while let Some((start, end)) = find(bytes, at) {
+                if end > start {
+                    out.push_str(&line[start..end]);
+                    out.push('\n');
+                    at = end;
+                } else {
+                    at = start + 1;
+                }
+                if at > bytes.len() {
+                    break;
+                }
+            }
+        } else if !flags.only {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if flags.count {
+        out = format!("{selected}\n");
+    }
+    out
+}
+
+#[test]
+fn grep_fixed_strings_answer_as_the_window_scan_did() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(n).unwrap()).unwrap()
+        }
+
+        fn word(&mut self, max: usize) -> String {
+            let alphabet = ['a', 'A', 'b', '_', ' ', '-'];
+            let len = self.next(max + 1);
+            (0..len)
+                .map(|_| alphabet[self.next(alphabet.len())])
+                .collect()
+        }
+    }
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut sh = shell();
+    for case in 0..2_000 {
+        let needles: Vec<String> = (0..1 + rng.next(2)).map(|_| rng.word(3)).collect();
+        let lines: Vec<String> = (0..1 + rng.next(4)).map(|_| rng.word(8)).collect();
+        let flags = FixedFlags {
+            fold: rng.next(2) == 0,
+            word: rng.next(3) == 0,
+            whole: rng.next(4) == 0,
+            only: rng.next(3) == 0,
+            count: rng.next(4) == 0,
+            invert: rng.next(4) == 0,
+        };
+        let mut file = lines.join("\n");
+        file.push('\n');
+        sh.fs.write_file("/tmp/fx", file.as_bytes()).unwrap();
+        let mut command = String::from("grep -F");
+        for (on, flag) in [
+            (flags.fold, " -i"),
+            (flags.word, " -w"),
+            (flags.whole, " -x"),
+            (flags.only, " -o"),
+            (flags.count, " -c"),
+            (flags.invert, " -v"),
+        ] {
+            if on {
+                command.push_str(flag);
+            }
+        }
+        for needle in &needles {
+            command.push_str(&format!(" -e '{needle}'"));
+        }
+        command.push_str(" /tmp/fx");
+        let needles: Vec<&str> = needles.iter().map(String::as_str).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(
+            out(&mut sh, &command),
+            window_grep(&needles, &lines, flags),
+            "case {case}: {command} over {lines:?}"
+        );
+    }
+}
+
+/// `NAME` set to `aaaaaaaa` doubled `times` times, one line per doubling.
+fn doubled(sh: &mut FakeShell, name: &str, times: u32) {
+    sh.handle_input(format!("{name}=aaaaaaaa"));
+    for _ in 0..times {
+        sh.handle_input(format!("{name}=${name}${name}"));
+    }
+}
+
+#[test]
+fn grep_charges_every_search_of_a_line_it_searches_again() {
+    // `-w` rejects the match at each offset of `$a$a` and searches again one byte on: 20,480
+    // searches of 20,480 bytes each, far past the line's allowance. The first pass was charged
+    // and the rest was not, so this ran to the end however long it took.
+    let mut sh = shell();
+    doubled(&mut sh, "a", 11);
+    let (stdout, _, _) = answer(&mut sh, "echo $a$a | grep -F -w -c \"$a\"; echo tail");
+    assert_eq!(stdout, "", "the line stops in the search");
+    assert_eq!(sh.last_trace().budget.hit, Some(super::BudgetHit::Work));
+
+    // The same through the regular-expression path: `a*` matches at every offset of a run of
+    // `a` followed by `b`, and `-w` rejects each one.
+    let mut sh = shell();
+    doubled(&mut sh, "a", 9);
+    let (stdout, _, _) = answer(&mut sh, "echo ${a}b | grep -w -c 'a*'; echo tail");
+    assert_eq!(stdout, "");
+    assert_eq!(sh.last_trace().budget.hit, Some(super::BudgetHit::Work));
+
+    // A search that fits is answered as before, and charged for what it read.
+    let mut sh = shell();
+    doubled(&mut sh, "a", 11);
+    assert_eq!(out(&mut sh, "echo $a$a | grep -F -c \"${a}b\""), "0\n");
+    assert_eq!(out(&mut sh, "echo $a$a | grep -iF -c \"${a}A\""), "1\n");
+    assert_eq!(out(&mut sh, "echo x${a}y | grep -F -w -c \"$a\""), "0\n");
+    assert_eq!(
+        out(&mut sh, "echo -${a}- | grep -F -w -o \"$a\""),
+        format!("{}\n", "a".repeat(16_384))
+    );
+}
+
 #[test]
 fn cut_selects_fields_bytes_and_reports_misuse() {
     let mut sh = shell();

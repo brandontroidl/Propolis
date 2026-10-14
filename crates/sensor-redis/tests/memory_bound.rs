@@ -205,6 +205,55 @@ async fn many_sessions_filling_set_hold_at_most_the_pool_and_their_floors() {
     handle.abort();
 }
 
+/// A peer that pipelines commands with large replies and never reads leaves the sensor blocked in
+/// a write while the kernel holds the unsent replies. The write is bounded by the idle timeout:
+/// the session ends, and the room its store drew from the pool comes back, with the peer's
+/// socket still open and unread. Without the limit the session would sit in the write until
+/// `max_duration` (60 s here).
+#[tokio::test]
+async fn a_peer_that_never_reads_its_replies_loses_its_session_and_its_pool_room() {
+    let pool = Arc::new(CaptureMemoryBudget::new(POOL_BYTES));
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = sensor_redis::start_test_server(
+        "127.0.0.1:0".parse().unwrap(),
+        dir.path().join("events.jsonl"),
+        Arc::new(WanResolver::new(HashMap::new())),
+        ConnectionBounds {
+            read_timeout: Duration::from_secs(120),
+            idle_timeout: Duration::from_millis(500),
+            max_duration: Duration::from_secs(60),
+            max_captured_bytes: 1_000_000,
+            max_concurrent: 16,
+        },
+        pool.clone(),
+    )
+    .await
+    .unwrap();
+
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    // A store past its floor, so the session holds pool room that its end gives back.
+    conn.write_all(&set_command("k", &vec![b'v'; 100_000]))
+        .await
+        .unwrap();
+    assert_eq!(reply_line(&mut conn).await.unwrap(), b"+OK\r\n");
+    assert!(pool.current_bytes() > 0, "the store drew on the pool");
+
+    // 600 replies of 100 KB: far more than the two socket buffers on loopback hold.
+    conn.write_all(&b"GET k\r\n".repeat(600)).await.unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while pool.current_bytes() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the session still holds {} pool bytes 15 s after its peer stopped reading",
+            pool.current_bytes()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(conn);
+    handle.abort();
+}
+
 // -------------------------------------------------------------------------------------------
 // The real binary, both listeners
 // -------------------------------------------------------------------------------------------

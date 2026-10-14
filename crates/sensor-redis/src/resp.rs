@@ -47,6 +47,17 @@ const MAX_BULK_LEN: i64 = 512 * 1024;
 /// unboundedly while every parse call keeps reporting `Incomplete`.
 const MAX_INLINE_LEN: usize = 64 * 1024;
 
+/// Ceiling on the arguments of one inline line, the same as a multi-bulk array's. A 64 KiB line
+/// of single-byte words splits into about 32,000 arguments, and the ranges, the dispatch slice
+/// and the argument list built from them held about 1.4 MB for it, charged to nothing.
+const MAX_INLINE_ARGS: usize = MAX_ARRAY_LEN as usize;
+
+fn too_many_inline_args() -> RespError {
+    RespError::Protocol(format!(
+        "inline request has more than {MAX_INLINE_ARGS} arguments"
+    ))
+}
+
 /// Ceiling on a multi-bulk header line (`*N\r\n` or `$M\r\n`) before its terminating `\r\n` has
 /// been seen. Real headers are a handful of bytes (`*1024\r\n` is 7); this is generous enough for
 /// any legitimate header and small enough to reject a client streaming digits with no CRLF long
@@ -173,6 +184,9 @@ fn parse_inline(buf: &[u8], scanned: &mut usize) -> Result<ParseOutcome, RespErr
         match (b.is_ascii_whitespace(), start) {
             (false, None) => start = Some(i),
             (true, Some(s)) => {
+                if args.len() == MAX_INLINE_ARGS {
+                    return Err(too_many_inline_args());
+                }
                 args.push(s..i);
                 start = None;
             }
@@ -180,6 +194,9 @@ fn parse_inline(buf: &[u8], scanned: &mut usize) -> Result<ParseOutcome, RespErr
         }
     }
     if let Some(s) = start {
+        if args.len() == MAX_INLINE_ARGS {
+            return Err(too_many_inline_args());
+        }
         args.push(s..line_end);
     }
     Ok(ParseOutcome::Complete {
@@ -442,6 +459,28 @@ mod tests {
             parser.parse(b"PING\r\n"),
             Ok(ParseOutcome::Complete { consumed: 6, .. })
         ));
+    }
+
+    #[test]
+    fn an_inline_line_is_held_to_the_multibulk_argument_cap() {
+        let at_cap = format!("{}\r\n", vec!["a"; MAX_INLINE_ARGS].join(" "));
+        let Ok(Parsed::Complete { args, .. }) = parse_command(at_cap.as_bytes()) else {
+            panic!("a line at the cap parses");
+        };
+        assert_eq!(args.len(), MAX_INLINE_ARGS);
+        // Past it by a word ending at the newline, and by a word followed by a space.
+        for over in [
+            format!("{} a\r\n", vec!["a"; MAX_INLINE_ARGS].join(" ")),
+            format!("{} a \r\n", vec!["a"; MAX_INLINE_ARGS].join(" ")),
+        ] {
+            assert!(matches!(
+                parse_command(over.as_bytes()),
+                Err(RespError::Protocol(_))
+            ));
+        }
+        // A line that fills the whole 64 KiB with one-byte words.
+        let flood = format!("{}\r\n", vec!["a"; MAX_INLINE_LEN / 2].join(" "));
+        assert!(parse_command(flood.as_bytes()).is_err());
     }
 
     // ---------------------------------------------------------------------------------------

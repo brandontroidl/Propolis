@@ -1614,7 +1614,10 @@ Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
   than acknowledged and dropped; the SET event is still recorded), GET (the
   value SET earlier this session, else nil; no event), SLAVEOF/REPLICAOF (OK +
   captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
-  Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024.
+  Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024, counted after
+  sanitizing (a payload behind padding that sanitization removes is still recorded,
+  `crates/sensor-redis/src/handler.rs#ledger`); an inline line of more than 1024 arguments is a
+  protocol error, as a multi-bulk array of more is.
 - **Bounds:** common defaults, `max_concurrent` 256 on each listener. No spool. Each session's
   read buffer and SET store are its own up to 16 KiB each; past that they draw on one 16 MiB
   pool shared by every session of both listeners

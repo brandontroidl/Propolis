@@ -612,13 +612,18 @@
   listener sending two 490,000-byte SETs each peaked at 817,840 KiB resident before and now
   peak at 45 to 49 MiB on one CPU and 54 to 61 MiB with four runtime workers. See
   [capacity planning](docs/operations/capacity-planning.md#redis-sensor-worst-case-memory).
-- **sensor-redis ends a reply write the peer never reads, and decodes only a prefix of an
-  argument for the ledger** - a peer that pipelined commands and never read the replies held
+- **sensor-redis ends a reply write the peer never reads, and sanitizes an argument for the
+  ledger a chunk at a time** - a peer that pipelined commands and never read the replies held
   the sensor blocked in the write for the rest of the session while the kernel kept the unsent
   replies against the unit's memory; the write now gives up after the idle timeout. The ledger
   field of a SET, CONFIG SET, EVAL or REPLICAOF argument was built by sanitizing the whole
   argument, several full-length copies of up to 512 KiB (three times that for invalid UTF-8)
-  before cutting to 1 KiB; it now decodes at most four bytes per kept character. INFO and
+  before cutting to 1 KiB; it now sanitizes 4 KiB at a time and stops once the field has its
+  1 KiB, so padding that sanitization removes (line breaks, NULs, zero-width characters,
+  terminal escapes) ahead of a payload cannot push the payload out of the record. A CONFIG
+  subcommand or parameter name is cut to 64 bytes before it is matched. One inline line is
+  held to 1024 arguments, as a multi-bulk array is; a longer one is a protocol error, where a
+  64 KiB line of one-byte words held about 1.4 MB of argument lists uncharged. INFO and
   CONFIG GET report a `maxmemory` of 256 MiB, not 0, so the OOM reply a full pool gives no
   longer contradicts them. A peer that opens many sessions and never reads can still hold the
   kernel's send buffers (up to 4 MiB a socket) past the unit's limit inside the idle timeout;

@@ -82,12 +82,37 @@ intent, but it omits `--all`, `--workspace`, `--all-targets`, `--locked`,
 `--test-threads=1`, and its chained `&&` bails on first failure - the exact
 anti-pattern the split CI jobs exist to avoid. Use the CI commands.
 
+## Fixture addresses
+
+No real internet address may appear in the repository: fixtures use RFC 5737 (192.0.2.0/24,
+198.51.100.0/24, 203.0.113.0/24), RFC 1918 or `2001:db8::/32`. The review gatekeeper and queue
+hold every reserved address first, so a test of the holds behind that check needs an address that
+is not reserved. The `review` crate's `test-public-ranges` feature
+(`crates/review/src/reserved.rs`) treats 203.0.113.0/24, and only that block, as public there.
+
+- It is **test-only and never enabled in a release build.** Its sole enabler is the self
+  dev-dependency in `crates/review/Cargo.toml`, which cargo applies to `cargo test` and
+  `--all-targets` builds (the `review` binary the CLI tests spawn is built with it) and never to
+  `cargo build [--release]`.
+- `core_scoring::is_reserved_ip`, the blocklist feed and the fetcher's SSRF guard do not see the
+  feature: 203.0.113.0/24 stays reserved for them in every build.
+- Use another documentation block (198.51.100.0/24, 192.0.2.0/24) for an address that must stay
+  reserved in `review` tests.
+- `crates/propolis/tests/production_features.rs` fails if the feature appears anywhere in the
+  workspace's shipped dependency graph (`cargo tree --workspace -e features,no-dev`): cargo
+  unifies features across a `--workspace` build, so one crate enabling it would switch it on in
+  the `review` library every binary links.
+- `crates/review/src/reserved.rs` refuses to compile with the feature under the release profile,
+  so a `cargo test --release` or `cargo build --release --all-targets` cannot put a feature-enabled
+  binary in `target/release`, where `install.sh` copies from. `cargo test --release -p review`
+  therefore does not compile; run the review tests in the dev profile.
+
 ## Test taxonomy
 
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4533 test functions** (2800 unit + 1733 integration).
+- **Total: 4538 test functions** (2803 unit + 1735 integration).
 - **DB-backed (`sqlx::test`): 426** - console 219, review 106, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -130,9 +155,9 @@ Per-crate breakdown:
 | intake | 29 | 49 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine, sensor_stats, shell_reply |
 | log-format | 0 | 13 | format, no_stock_fmt, process |
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
-| propolis | 156 | 36 | capture_to_console, coverage, docs_agreement, logging, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| propolis | 156 | 38 | capture_to_console, coverage, docs_agreement, logging, production_features, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 221 | 109 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
+| review | 224 | 109 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 41 | arrival, env_strict, integration, tls_integration |
@@ -149,7 +174,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 26 | acceptance, audit_regressions, batcher, config, end_to_end, logging |
 | watch | 14 | 21 | config, read_only, status, stream |
-| **Total** | **2800** | **1733** | |
+| **Total** | **2803** | **1735** | |
 
 ### Test styles by layer
 

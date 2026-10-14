@@ -518,6 +518,16 @@
   See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-mqtt) and
   [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
+- **Freed SSH capture buffers no longer stay resident outside the capture budget** - a capture
+  body grows 64 KiB at a time, and once one large capture had been stored glibc raised its mmap
+  threshold to that size, so later bodies grew on the heap: a reallocation that could not extend
+  in place copied, and the block it freed stayed resident between the other bodies, charged to
+  no budget. Eight bodies growing to 10 MB at once left 71 MB resident past what they held, more
+  than the margin the worst-case memory sum keeps under `MemoryMax`. `sensor-ssh` now pins the
+  threshold at 128 KiB at startup, so a large body is its own mapping, grown in place by the
+  kernel and returned when freed; the same eight bodies leave under 0.5 MB. A build whose
+  allocator refuses the setting logs a warning at startup. See
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

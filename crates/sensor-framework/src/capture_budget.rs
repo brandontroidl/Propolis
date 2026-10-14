@@ -203,7 +203,10 @@ impl std::error::Error for CaptureExhausted {}
 /// chunks. The charge is the buffer's capacity (chunks held times the chunk size), which is
 /// never below `len`. Capacity is grown with `reserve_exact` to exactly the charged size, so
 /// `Vec`'s own over-allocation cannot make the real allocation outrun the charge. A grow
-/// reallocates, so the old and new buffers briefly coexist; that transient is not charged.
+/// reallocates, so on the heap the old and new buffers can coexist and the freed block stays
+/// resident; neither is charged. A sensor keeps large bodies off the heap by pinning glibc's mmap
+/// threshold at startup ([`crate::session_memory::pin_mmap_threshold`]), so a body past it grows
+/// by `mremap` and nothing it frees stays resident.
 #[derive(Debug)]
 pub struct CaptureBody {
     budget: Arc<CaptureMemoryBudget>,

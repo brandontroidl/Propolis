@@ -191,6 +191,13 @@ fn load_config(env: &Env) -> Result<Config, ConfigError> {
 #[tokio::main(worker_threads = 2)]
 async fn main() {
     sensor_framework::init_logging();
+    // Before the first capture: otherwise freed capture bodies stay resident outside every budget.
+    if !session_memory::pin_mmap_threshold() {
+        tracing::warn!(
+            "sensor-ssh: the allocator did not take the mmap threshold; freed capture buffers may \
+             stay resident outside the capture budget"
+        );
+    }
 
     let config = match load_config(&Env::process()) {
         Ok(c) => c,

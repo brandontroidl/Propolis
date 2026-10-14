@@ -424,6 +424,31 @@ fn refund(tag: u64, bytes: u64) {
 /// tag of the session it was made in, just before the pointer it returns.
 pub struct AccountingAlloc;
 
+/// glibc's mmap threshold as [`pin_mmap_threshold`] sets it: glibc's own starting value.
+pub const MMAP_THRESHOLD_BYTES: usize = 128 * 1024;
+
+/// Keep glibc's mmap threshold at [`MMAP_THRESHOLD_BYTES`] for the life of the process. Call once
+/// at startup, before any connection is served; returns whether the allocator took it.
+///
+/// glibc otherwise raises the threshold to the largest mapped block freed so far, up to 32 MiB.
+/// After one large capture body is stored and dropped, the next ones grow on the heap 64 KiB at a
+/// time: a realloc that cannot extend in place copies, and the freed block stays resident between
+/// live ones. That memory is charged to no budget and grows with the capture limit and the number
+/// of bodies growing at once (`crates/sensor-ssh/tests/capture_heap_test.rs`). A pinned threshold
+/// keeps every block past it its own mapping, grown by `mremap` and returned to the kernel on
+/// free. Setting it also turns glibc's adjustment off (mallopt(3)).
+pub fn pin_mmap_threshold() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: mallopt only sets an allocator parameter; it touches no caller memory.
+        unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES as libc::c_int) == 1 }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+
 /// The layout handed to `System` and where the caller's bytes start in it: the header takes
 /// `max(16, align)` bytes, so the returned pointer keeps the caller's alignment and the tag sits
 /// in the 8 bytes just before it.

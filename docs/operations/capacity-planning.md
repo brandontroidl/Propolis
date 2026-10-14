@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-10
+last-verified: 2026-10-14
 -->
 
 # Capacity planning
@@ -255,6 +255,17 @@ Why each term holds:
   which `crates/sensor-framework/tests/finish_line_overhead.rs` measures at 1, 10 and 40 MB.
 - **Sessions.** The capture limit does not change this term: capture bodies grow outside the
   session, and the pool bounds the rest.
+- **What a growing body frees.** A body grows 64 KiB at a time, and each grow is a reallocation.
+  glibc raises its mmap threshold to the largest mapped block freed so far, so after the first
+  large capture is stored the next bodies grow on the heap, where a reallocation that cannot
+  extend in place copies and leaves the freed block resident. No budget charges it, and it
+  scales with the capture limit and with how many bodies grow at once: eight bodies growing to
+  10 MB together left 71,016,448 bytes resident past what they held. The sensor pins the
+  threshold at 128 KiB at startup (`crates/sensor-framework/src/session_memory.rs#pin_mmap_threshold`),
+  so a body past it is its own mapping, grown by `mremap` and returned to the kernel when freed;
+  the same eight bodies then leave 499,712 bytes
+  (`crates/sensor-ssh/tests/capture_heap_test.rs`). If the allocator refuses the setting (a
+  non-glibc build), the sensor logs a warning at startup and this term is not bounded.
 
 Residuals, stated plainly. The 64 MiB runtime allowance and the 40% and 30% shares are
 estimates, not measurements, and the margin above is 5% of `MemoryMax`. Sessions can hold more

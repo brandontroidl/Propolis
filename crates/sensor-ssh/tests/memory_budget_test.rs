@@ -17,7 +17,9 @@
 //!    `CaptureMemoryBudget`, with an allowance reserved before any line runs.
 //!
 //! What is left of `MemoryMax` is the runtime's own: code, task stacks, packet buffers, the
-//! hand-off queue, allocation headers and socket memory. The 64 MiB set aside for it is an
+//! hand-off queue, allocation headers and socket memory. Not the blocks a growing capture body
+//! frees: the sensor pins glibc's mmap threshold so those go back to the kernel, and
+//! `capture_heap_test.rs` measures that they do. The 64 MiB set aside for it is an
 //! estimate, not a measurement (docs/operations/capacity-planning.md says so too), as is the
 //! transient overshoot the pool allows while asked sessions end.
 //!
@@ -99,6 +101,24 @@ fn a_shell_lines_working_set_is_inside_the_session_limit() {
     assert!(
         !server.contains("spawn_blocking"),
         "a line moved off the connection's future would allocate outside its session"
+    );
+}
+
+/// The capture budget charges a body's capacity, not the copies the allocator leaves behind as
+/// the body grows; the sensor keeps those out by pinning glibc's mmap threshold before it serves
+/// (measured in `capture_heap_test.rs`).
+#[test]
+fn the_sensor_pins_the_mmap_threshold_before_serving() {
+    let main = main_source();
+    let pinned = main
+        .find("session_memory::pin_mmap_threshold()")
+        .expect("main pins the mmap threshold");
+    let served = main
+        .find("sensor_ssh::serve_with_handoff(")
+        .expect("main serves");
+    assert!(
+        pinned < served,
+        "the threshold is pinned before the first connection"
     );
 }
 

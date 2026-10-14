@@ -88,7 +88,7 @@ Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = u
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
 - **Total: 4493 test functions** (2794 unit + 1699 integration).
-- **DB-backed (`sqlx::test`): 419** - console 219, review 99, core-scoring 44,
+- **DB-backed (`sqlx::test`): 426** - console 219, review 106, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -125,13 +125,14 @@ Per-crate breakdown:
 | core-scoring | 80 | 38 | batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 35 | 66 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
-| gateway | 11 | 13 | handshake, spool, verify |
+| gateway | 11 | 15 | handshake, logging, spool, verify |
 | geoip | 4 | 0 | - |
 | intake | 29 | 49 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine, sensor_stats, shell_reply |
+| log-format | 0 | 13 | format, no_stock_fmt, process |
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
-| propolis | 156 | 34 | capture_to_console, coverage, docs_agreement, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| propolis | 156 | 36 | capture_to_console, coverage, docs_agreement, logging, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 216 | 104 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
+| review | 221 | 109 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 54 | 47 | arrival, env_strict, integration, session_memory_limit, shutdown_tracking |
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 41 | arrival, env_strict, integration, tls_integration |
@@ -140,13 +141,13 @@ Per-crate breakdown:
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 62 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
-| sensor-redis | 82 | 40 | arrival, env_strict, integration, tls |
+| sensor-redis | 97 | 46 | arrival, env_strict, integration, memory_bound, parse_cost, tls |
 | sensor-smtp | 18 | 52 | arrival, env_strict, integration, memory_bounds, tls |
 | sensor-ssh | 72 | 150 | arrival, auth_test, capture_heap_test, capture_limit, crypto_test, env_strict, integration, memory_budget_test, output_backpressure, session_memory_limit, shell_test, shutdown_tracking, transport_test |
 | sensor-telnet | 53 | 57 | arrival, echo_loader, env_strict, infected_hold, integration, probe_payload, session_memory_limit, shell_cpu, shutdown_tracking |
-| sensor-tftp | 37 | 43 | arrival, env_strict, integration, shutdown |
+| sensor-tftp | 37 | 45 | arrival, env_strict, integration, logging, shutdown |
 | sensor-wire | 18 | 0 | - |
-| shipper | 4 | 24 | acceptance, audit_regressions, batcher, config, end_to_end |
+| shipper | 4 | 26 | acceptance, audit_regressions, batcher, config, end_to_end, logging |
 | watch | 14 | 21 | config, read_only, status, stream |
 | **Total** | **2794** | **1699** | |
 
@@ -158,7 +159,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (43 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (373 uses) - needed wherever a test needs more than
+  applies migrations manually (380 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

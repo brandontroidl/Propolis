@@ -689,8 +689,9 @@ impl FakeShell {
                     continue;
                 }
             };
-            // The read already charged one pass over the bytes (stdin was charged by whatever
-            // produced it), so only the matchers' work beyond that pass is charged before the
+            // The read already charged one pass over the bytes (a file through read_operand, stdin
+            // through read_source when grep read it), so only the matchers' work beyond that pass
+            // is charged before the
             // scan. The scan may then spend one pass and whatever the line has left, and what it
             // spent past the one pass is charged after it: each byte read pays once.
             let one_pass = search.cost(bytes.len());

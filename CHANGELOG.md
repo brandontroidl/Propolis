@@ -710,7 +710,8 @@
   (512 literals of `/(a{255}){31}/`, a 7,680-byte program, grew the heap by 101 MB); each
   literal's source and compiled heap are now charged as it is parsed, under the same 4,096
   literal and 4 MiB caps, and a program past them fails with `awk: out of memory` (mawk's
-  wording, [unverified]) and ends the line. `grep` reads its operands through the same door, so
+  wording, [unverified]) and status 2; the line itself ends only when its work allowance is what
+  ran out. `grep` reads its operands through the same door, so
   it pays for a file once: the read charge covers the first scan pass and only the matchers' work
   beyond it is charged on top (`grep x /bin/busybox`, 2,193,272 bytes, stays inside the line's
   4,194,304-unit allowance). `crates/sensor-telnet/tests/shell_cost.rs`
@@ -719,7 +720,7 @@
   `crates/sensor-adb/tests/shell_cost.rs` does the same for the ADB sensor's commands.
   **Still open:** a line is not yet bounded in time everywhere. awk compiles a dynamic regex (a
   string used as a pattern, as in `x ~ p`) again on every evaluation and charges only the scan, and the compiler dedupes character sets in quadratic time,
-  so one 260-byte awk line looping a pattern of some 1,900 distinct brackets held a worker for
+  so one 225-byte awk line looping a pattern of some 1,900 distinct brackets held a worker for
   45 s in a release build. That is a separate follow-up; until it lands this change does not
   promise that no single line can hold a worker.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform

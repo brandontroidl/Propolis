@@ -451,6 +451,17 @@
   alternative's steps (items times text length, plus the class range tests) are now taken from
   the line's remaining allowance before it runs, and a selection that cannot pay stops the line.
   The position sets are reused across items. An ordinary pattern selects the same rows as before.
+- **A flood of empty header lines no longer multiplies an HTTP connection's memory** - sensor-http
+  copied every header line holding a `:` into a table entry of 48 bytes, so a 16 KiB header
+  block of lone `:` lines (5,400 of them, 3 bytes each) cost about 260 KB, and 512 plaintext
+  plus 248 TLS connections holding such a block behind a slowly sent body got the 256 MiB unit
+  OOM-killed in a loopback reproduction. Header values are now read out of the block when the
+  event is built, so a request holds its header block once and nothing per line, and the block
+  is never buffered past 16384 bytes (the old reader read one 4 KiB chunk past the cap). A
+  block that has not ended by then gets nginx's `400 Bad Request` "Request Header Or Cookie Too
+  Large" page instead of a silent hang-up; a block within the cap is served whatever its lines,
+  as nginx serves one, since it skips a line like `:` as invalid. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-http).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

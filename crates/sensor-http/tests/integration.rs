@@ -207,6 +207,61 @@ async fn post_body_over_one_megabyte_is_refused_with_413_before_it_is_sent() {
     srv.handle.abort();
 }
 
+/// A header block that has not ended within 16 KiB is answered as nginx answers a header past its
+/// buffers, `400` with its "Request Header Or Cookie Too Large" page: the old reader kept reading
+/// one chunk past the cap and then hung up without a word. Empty `:` lines count like any other
+/// bytes.
+#[tokio::test]
+async fn a_header_block_past_16_kib_gets_nginx_400() {
+    let srv = TestServer::start().await;
+    let mut conn = TcpStream::connect(srv.addr).await.unwrap();
+    let mut request = b"GET / HTTP/1.1\r\nHost: test\r\n".to_vec();
+    request.extend(b":\r\n".repeat(6000));
+    // Exactly 16 KiB with no blank line yet, so the server has read everything that was sent
+    // when it answers and closes (bytes it left unread would turn its close into a reset).
+    request.truncate(16 * 1024);
+    conn.write_all(&request).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut response)).await;
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("Server: nginx/1.18.0 (Ubuntu)\r\n"));
+    assert!(response.contains("<title>400 Request Header Or Cookie Too Large</title>"));
+    assert!(response.contains("<center>Request Header Or Cookie Too Large</center>"));
+    srv.handle.abort();
+}
+
+/// Thousands of empty `:` lines inside 16 KiB are still a request nginx serves (it skips each as
+/// an invalid header line): the reply and the event come as for any other GET, and no header
+/// value is taken from them.
+#[tokio::test]
+async fn thousands_of_empty_header_lines_within_16_kib_are_served() {
+    let srv = TestServer::start().await;
+    let mut request = "GET / HTTP/1.1\r\nHost: test\r\n".to_string();
+    request.push_str(&":\r\n".repeat(5400));
+    request.push_str("User-Agent: after-the-flood\r\n\r\n");
+    let response = send_request(srv.addr, &request).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let cmd = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC)
+        .unwrap();
+    assert_eq!(
+        cmd.metadata.get("user_agent").and_then(|v| v.as_str()),
+        Some("after-the-flood")
+    );
+    assert_eq!(
+        cmd.metadata.get("host").and_then(|v| v.as_str()),
+        Some("test")
+    );
+    srv.handle.abort();
+}
+
 /// A body larger than the capture cap but within what nginx accepts is read to the end before
 /// the reply, so the client sees a clean response after its upload instead of a reset part way;
 /// the event records the real size and that the kept copy is a prefix.

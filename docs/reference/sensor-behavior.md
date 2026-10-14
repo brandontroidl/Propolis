@@ -1079,7 +1079,13 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   (`crates/sensor-http/src/redact.rs#redact_cookie`). Any event where a value was
   replaced carries `credentials_redacted: true`; the key is absent otherwise. The
   policy is [../security/sample-and-credential-privacy.md](../security/sample-and-credential-privacy.md#credential-handling). Caps: request line
-  8192, header block 16384, body capture 65536 (`crates/sensor-http/src/handler.rs#MAX_REQUEST_LINE_LEN`, `crates/sensor-http/src/handler.rs#MAX_HEADER_BLOCK`, `crates/sensor-http/src/handler.rs#MAX_BODY_CAPTURE`). A declared body is read to
+  8192, header block 16384, body capture 65536 (`crates/sensor-http/src/handler.rs#MAX_REQUEST_LINE_LEN`, `crates/sensor-http/src/handler.rs#MAX_HEADER_BLOCK`, `crates/sensor-http/src/handler.rs#MAX_BODY_CAPTURE`). The header block
+  counts every byte up to and including its blank line, empty or malformed lines included, and
+  is never buffered past 16384 bytes; a block that has not ended by then gets nginx's
+  `400 Bad Request` "Request Header Or Cookie Too Large" page
+  (`crates/sensor-http/src/handler.rs#NGINX_494_HTML`). Header values are read out of the block
+  when the event is built, so a request holds its block once and nothing per line (a line nginx
+  would skip as invalid, such as a lone `:`, costs its bytes only). A declared body is read to
   its end before the reply (the first 65536 bytes kept, the rest drained); the event
   records `body_size` (bytes received), `body_declared`, `body_complete` and
   `truncated`. A body over nginx's 1 MB `client_max_body_size` gets nginx's 413 before

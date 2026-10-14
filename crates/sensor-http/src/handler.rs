@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Range;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,6 +17,8 @@ use crate::redact;
 const PROTOCOL_LABEL: &str = "http";
 
 const MAX_REQUEST_LINE_LEN: usize = 8192;
+/// The request line and header lines together, their ending blank line included. A block that has
+/// not ended by then is answered as nginx answers a header past its buffers.
 const MAX_HEADER_BLOCK: usize = 16384;
 const MAX_BODY_CAPTURE: usize = 65536;
 const READ_CHUNK_SIZE: usize = 4096;
@@ -91,6 +95,18 @@ const NGINX_413_HTML: &str = "<html>
 </html>
 ";
 
+/// nginx's page for a header block larger than its header buffers (its internal status 494,
+/// sent as `400 Bad Request`).
+const NGINX_494_HTML: &str = "<html>
+<head><title>400 Request Header Or Cookie Too Large</title></head>
+<body>
+<center><h1>400 Bad Request</h1></center>
+<center>Request Header Or Cookie Too Large</center>
+<hr><center>nginx/1.18.0 (Ubuntu)</center>
+</body>
+</html>
+";
+
 // Eight parameters: the stream plus the per-connection context every sensor handler takes;
 // bundling them would diverge from the uniform handler shape the sibling sensors share.
 #[allow(clippy::too_many_arguments)]
@@ -118,10 +134,19 @@ pub async fn handle_connection<S>(
     }
 
     let mut reader = BoundedReader::new(bounds);
-
-    let Some(request) = reader.read_request(&mut stream).await else {
-        return;
+    let request = match reader.read_request(&mut stream).await {
+        ReadOutcome::Request(request) => request,
+        ReadOutcome::HeaderTooLarge => {
+            let response =
+                error_response("400 Bad Request", NGINX_494_HTML, &http_date_now(), false);
+            let _ = stream.write_all(&response).await;
+            let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
+            return;
+        }
+        ReadOutcome::Closed => return,
     };
+    drop(reader);
 
     {
         // Credentials are cut out before the sanitizer and the caps: every value under a
@@ -130,16 +155,17 @@ pub async fn handle_connection<S>(
         // states what the textual scanners do and do not promise). The flag is absent, not false,
         // when nothing was replaced, so credential-free events stay byte-identical.
         let mut credentials_redacted = false;
-        let method = sanitize_value(&request.method, 16);
-        let kept = redact::redact_target(&request.path).inspect(|_| credentials_redacted = true);
-        let path = sanitize_value(kept.as_deref().unwrap_or(&request.path), 2048);
+        let method = sanitize_value(&request.method(), 16);
+        let raw_path = request.path();
+        let kept = redact::redact_target(&raw_path).inspect(|_| credentials_redacted = true);
+        let path = sanitize_value(kept.as_deref().unwrap_or(&raw_path), 2048);
         let user_agent = request
             .header("user-agent")
-            .map(|v| sanitize_value(v, 512))
+            .map(|v| sanitize_value(&v, 512))
             .unwrap_or_default();
         let host = request
             .header("host")
-            .map(|v| sanitize_value(v, 255))
+            .map(|v| sanitize_value(&v, 255))
             .unwrap_or_default();
 
         let mut metadata = serde_json::json!({
@@ -158,10 +184,10 @@ pub async fn handle_connection<S>(
         if !host.is_empty() {
             metadata["host"] = serde_json::Value::String(host);
         }
-        if let Some(query) = &request.query {
-            let kept = redact::redact_form(query).inspect(|_| credentials_redacted = true);
+        if let Some(query) = request.query() {
+            let kept = redact::redact_form(&query).inspect(|_| credentials_redacted = true);
             metadata["query"] =
-                serde_json::Value::String(sanitize_value(kept.as_deref().unwrap_or(query), 2048));
+                serde_json::Value::String(sanitize_value(kept.as_deref().unwrap_or(&query), 2048));
         }
         for (header, scheme_key, username_key) in [
             ("authorization", "auth_scheme", "auth_username"),
@@ -174,7 +200,7 @@ pub async fn handle_connection<S>(
             let Some(value) = request.header(header) else {
                 continue;
             };
-            let Some(auth) = redact::redact_authorization(value) else {
+            let Some(auth) = redact::redact_authorization(&value) else {
                 continue;
             };
             credentials_redacted |= auth.credential_dropped;
@@ -184,9 +210,9 @@ pub async fn handle_connection<S>(
             }
         }
         if let Some(cookie) = request.header("cookie") {
-            let kept = redact::redact_cookie(cookie).inspect(|_| credentials_redacted = true);
+            let kept = redact::redact_cookie(&cookie).inspect(|_| credentials_redacted = true);
             metadata["cookie"] =
-                serde_json::Value::String(sanitize_value(kept.as_deref().unwrap_or(cookie), 2048));
+                serde_json::Value::String(sanitize_value(kept.as_deref().unwrap_or(&cookie), 2048));
         }
         if request.body_declared > 0 {
             metadata["body_size"] = serde_json::Value::Number(request.body_received.into());
@@ -198,7 +224,7 @@ pub async fn handle_connection<S>(
         }
         if !request.body.is_empty() {
             let body = String::from_utf8_lossy(&request.body);
-            let kept = redact::redact_body(&body, request.header("content-type"))
+            let kept = redact::redact_body(&body, request.header("content-type").as_deref())
                 .inspect(|_| credentials_redacted = true);
             let body_preview =
                 sanitize_value(kept.as_deref().unwrap_or(&body), MAX_BODY_CAPTURE.min(4096));
@@ -226,24 +252,31 @@ pub async fn handle_connection<S>(
             occurrence_id: None,
             reply: None,
         };
-        if emitter.append(&event).await.is_err() {
-            tracing::error!(%peer_addr, "http: failed to append request event");
-        }
 
         // A body the client never finished sending is not a request nginx answers: it logs the
         // premature close and drops the connection. Answering it (and the old handler did, with
         // whatever had arrived counted as the whole body) treated a partial read as a request.
         let response = if request.body_declared > NGINX_MAX_BODY {
-            error_response(
+            Some(error_response(
                 "413 Request Entity Too Large",
                 NGINX_413_HTML,
                 &http_date_now(),
                 false,
-            )
+            ))
         } else if request.body_received < request.body_declared {
-            return;
+            None
         } else {
-            build_response(&request.method, &request.path)
+            Some(build_response(&request.method(), &request.path()))
+        };
+        // The header block and the body are in the event now; they are not held while it is
+        // written or the reply is sent.
+        drop(request);
+
+        if emitter.append(&event).await.is_err() {
+            tracing::error!(%peer_addr, "http: failed to append request event");
+        }
+        let Some(response) = response else {
+            return;
         };
         let _ = stream.write_all(&response).await;
         let _ = stream.flush().await;
@@ -302,7 +335,7 @@ fn build_response(method: &str, path: &str) -> Vec<u8> {
     out
 }
 
-/// An nginx error response (404/405): the generated HTML page with Server/Date and no static-file
+/// An nginx error response (400/404/405/413): the generated HTML page with Server/Date and no static-file
 /// headers. `is_head` omits the body while keeping the Content-Length, as nginx does.
 fn error_response(status: &str, body: &str, date: &str, is_head: bool) -> Vec<u8> {
     let head = format!(
@@ -349,11 +382,26 @@ fn connection_event(
     }
 }
 
+/// What [`BoundedReader::read_request`] ends with.
+enum ReadOutcome {
+    Request(HttpRequest),
+    /// The header block had not ended within `MAX_HEADER_BLOCK` bytes.
+    HeaderTooLarge,
+    /// Nothing to answer: the client left, went quiet, sent no usable request line, or its
+    /// session was ended.
+    Closed,
+}
+
 struct HttpRequest {
-    method: String,
-    path: String,
-    query: Option<String>,
-    headers: Vec<(String, String)>,
+    /// The request line and the header lines as received, without the blank line that ends
+    /// them. Every field is read out of it when it is asked for, so a request holds its header
+    /// block once and nothing per line: a block of thousands of empty `:` lines costs its bytes,
+    /// not a table entry each.
+    head: Vec<u8>,
+    /// `head[..method_end]` is the method.
+    method_end: usize,
+    /// The request target (path and query) within `head`.
+    target: Range<usize>,
     /// The body up to `MAX_BODY_CAPTURE` bytes.
     body: Vec<u8>,
     /// The Content-Length the client declared (zero when absent).
@@ -365,11 +413,107 @@ struct HttpRequest {
 }
 
 impl HttpRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
+    /// Read the request line out of `head`: a method, a space, a target, then optionally a space
+    /// and the version. `None` for a line over `MAX_REQUEST_LINE_LEN` or without a target.
+    fn parse(head: Vec<u8>) -> Option<HttpRequest> {
+        let line_end = find_crlf(&head).unwrap_or(head.len());
+        if line_end > MAX_REQUEST_LINE_LEN {
+            return None;
+        }
+        let line = &head[..line_end];
+        let method_end = line.iter().position(|&b| b == b' ')?;
+        let target_start = method_end + 1;
+        let target_end = line[target_start..]
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .position(|&b| b == b' ')
+            .map_or(line_end, |at| target_start + at);
+        Some(HttpRequest {
+            method_end,
+            target: target_start..target_end,
+            head,
+            body: Vec::new(),
+            body_declared: 0,
+            body_received: 0,
+        })
+    }
+
+    fn method(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.head[..self.method_end])
+    }
+
+    fn target(&self) -> &[u8] {
+        &self.head[self.target.clone()]
+    }
+
+    /// The target up to its first `?`.
+    fn path(&self) -> Cow<'_, str> {
+        let target = self.target();
+        let end = target
+            .iter()
+            .position(|&b| b == b'?')
+            .unwrap_or(target.len());
+        String::from_utf8_lossy(&target[..end])
+    }
+
+    /// The target after its first `?`, when it has one.
+    fn query(&self) -> Option<Cow<'_, str>> {
+        let target = self.target();
+        let at = target.iter().position(|&b| b == b'?')?;
+        Some(String::from_utf8_lossy(&target[at + 1..]))
+    }
+
+    /// The first header named `name` (ASCII case-insensitive), its value trimmed. A line without
+    /// a `:` is skipped, as before.
+    fn header(&self, name: &str) -> Option<Cow<'_, str>> {
+        let line_end = find_crlf(&self.head)?;
+        crlf_lines(&self.head[line_end + 2..])
+            .take_while(|line| !line.is_empty())
+            .find_map(|line| {
+                let colon = line.iter().position(|&b| b == b':')?;
+                String::from_utf8_lossy(&line[..colon])
+                    .trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| match String::from_utf8_lossy(&line[colon + 1..]) {
+                        Cow::Borrowed(value) => Cow::Borrowed(value.trim()),
+                        Cow::Owned(value) => Cow::Owned(value.trim().to_string()),
+                    })
+            })
+    }
+}
+
+fn find_crlf(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(2).position(|w| w == b"\r\n")
+}
+
+/// `bytes` split at each CRLF, the last piece included.
+fn crlf_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = Some(bytes);
+    std::iter::from_fn(move || {
+        let current = rest?;
+        match find_crlf(current) {
+            Some(at) => {
+                rest = Some(&current[at + 2..]);
+                Some(&current[..at])
+            }
+            None => {
+                rest = None;
+                Some(current)
+            }
+        }
+    })
+}
+
+/// Make room for `additional` more bytes without letting the capacity pass `cap`: doubling as
+/// `Vec` does, so many small reads do not each copy the buffer, but never past the cap, so the
+/// header buffer holds at most `MAX_HEADER_BLOCK` bytes however its reads arrive.
+fn reserve_within(buf: &mut Vec<u8>, additional: usize, cap: usize) {
+    let needed = buf.len() + additional;
+    if needed > buf.capacity() {
+        let target = buf
+            .capacity()
+            .saturating_mul(2)
+            .clamp(needed, cap.max(needed));
+        buf.reserve_exact(target - buf.len());
     }
 }
 
@@ -390,7 +534,13 @@ impl BoundedReader {
         }
     }
 
-    async fn fill<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> Option<usize> {
+    /// One read of at most `into.len()` bytes into `into`. `None` once the session's byte budget
+    /// is spent or the read fails, times out or finds the stream closed.
+    async fn read_some<S: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut S,
+        into: &mut [u8],
+    ) -> Option<usize> {
         if self.total_captured >= self.bounds.max_captured_bytes {
             return None;
         }
@@ -401,111 +551,107 @@ impl BoundedReader {
         };
         self.first_read = false;
 
-        let mut tmp = [0u8; READ_CHUNK_SIZE];
-        match tokio::time::timeout(timeout, stream.read(&mut tmp)).await {
+        match tokio::time::timeout(timeout, stream.read(into)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
             Ok(Ok(n)) => {
                 self.total_captured += n as u64;
-                self.buf.extend_from_slice(&tmp[..n]);
                 Some(n)
             }
         }
     }
 
-    async fn read_request<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> Option<HttpRequest> {
-        // Accumulate until we see the header terminator \r\n\r\n
+    async fn read_request<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> ReadOutcome {
+        let header_end = match self.read_header_block(stream).await {
+            Ok(end) => end,
+            Err(outcome) => return outcome,
+        };
+        let Some(request) = HttpRequest::parse(self.buf[..header_end].to_vec()) else {
+            return ReadOutcome::Closed;
+        };
+        ReadOutcome::Request(self.read_body(request, header_end + 4, stream).await)
+    }
+
+    /// Read until the blank line that ends the header block, never holding more than
+    /// `MAX_HEADER_BLOCK` bytes: the offset of that blank line's CRLF CRLF, or how the read
+    /// ended without one.
+    async fn read_header_block<S: AsyncRead + Unpin>(
+        &mut self,
+        stream: &mut S,
+    ) -> Result<usize, ReadOutcome> {
+        let mut chunk = [0u8; READ_CHUNK_SIZE];
+        let mut scanned = 0;
         loop {
-            if let Some(end) = find_header_end(&self.buf) {
-                return self.parse_request(end, stream).await;
+            if let Some(end) = find_header_end(&self.buf, scanned) {
+                return Ok(end);
             }
-            if self.buf.len() > MAX_HEADER_BLOCK {
-                return None;
+            // The terminator may straddle the next read; everything before this was searched.
+            scanned = self.buf.len().saturating_sub(3);
+            let room = MAX_HEADER_BLOCK - self.buf.len();
+            if room == 0 {
+                return Err(ReadOutcome::HeaderTooLarge);
             }
-            self.fill(stream).await?;
+            let want = room.min(READ_CHUNK_SIZE);
+            let Some(n) = self.read_some(stream, &mut chunk[..want]).await else {
+                return Err(ReadOutcome::Closed);
+            };
+            reserve_within(&mut self.buf, n, MAX_HEADER_BLOCK);
+            self.buf.extend_from_slice(&chunk[..n]);
         }
     }
 
-    async fn parse_request<S: AsyncRead + Unpin>(
+    /// Read the whole declared body, keeping the first MAX_BODY_CAPTURE bytes and draining the
+    /// rest, so the reply follows the body the way a server's does; the old reader stopped at
+    /// the capture cap and answered with the remainder still in flight. A body over what nginx
+    /// accepts is not read at all: the 413 goes out first. The session's byte budget still
+    /// bounds the drain; a body it cuts off counts as incomplete. `body_start` is where the body
+    /// begins in the header buffer, which may already hold its first bytes.
+    async fn read_body<S: AsyncRead + Unpin>(
         &mut self,
-        header_end: usize,
+        mut request: HttpRequest,
+        body_start: usize,
         stream: &mut S,
-    ) -> Option<HttpRequest> {
-        let header_bytes = self.buf[..header_end].to_vec();
-        // Drain the headers plus the \r\n\r\n separator
-        self.buf.drain(..header_end + 4);
-
-        let header_str = String::from_utf8_lossy(&header_bytes);
-        let mut lines = header_str.split("\r\n");
-
-        let request_line = lines.next()?;
-        if request_line.len() > MAX_REQUEST_LINE_LEN {
-            return None;
-        }
-
-        let mut parts = request_line.splitn(3, ' ');
-        let method = parts.next()?.to_string();
-        let raw_path = parts.next()?.to_string();
-        // HTTP version is optional for robustness
-
-        let (path, query) = if let Some(idx) = raw_path.find('?') {
-            (
-                raw_path[..idx].to_string(),
-                Some(raw_path[idx + 1..].to_string()),
-            )
-        } else {
-            (raw_path, None)
-        };
-
-        let mut headers = Vec::new();
-        for line in lines {
-            if line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_string(), value.trim().to_string()));
-            }
-        }
-
-        let content_length: usize = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, v)| v.parse().ok())
+    ) -> HttpRequest {
+        let content_length: usize = request
+            .header("content-length")
+            .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-
-        // Read the whole declared body, keeping the first MAX_BODY_CAPTURE bytes and draining the
-        // rest, so the reply follows the body the way a server's does; the old reader stopped at
-        // the capture cap and answered with the remainder still in flight. A body over what nginx
-        // accepts is not read at all: the 413 goes out first. The session's byte budget still
-        // bounds the drain; a body it cuts off counts as incomplete.
-        let mut body = Vec::new();
-        let mut received = 0usize;
-        if content_length <= NGINX_MAX_BODY {
-            while received < content_length {
-                if self.buf.is_empty() && self.fill(stream).await.is_none() {
-                    break;
-                }
-                let take = (content_length - received).min(self.buf.len());
-                let keep = MAX_BODY_CAPTURE.saturating_sub(body.len()).min(take);
-                body.extend_from_slice(&self.buf[..keep]);
-                self.buf.drain(..take);
-                received += take;
-            }
+        request.body_declared = content_length;
+        if content_length > NGINX_MAX_BODY {
+            self.buf = Vec::new();
+            return request;
         }
 
-        Some(HttpRequest {
-            method,
-            path,
-            query,
-            headers,
-            body,
-            body_declared: content_length,
-            body_received: received,
-        })
+        // Sized once for what is kept, so the capture never grows past it.
+        let keep_cap = content_length.min(MAX_BODY_CAPTURE);
+        let mut body = Vec::with_capacity(keep_cap);
+        let arrived = &self.buf[body_start..];
+        let mut received = content_length.min(arrived.len());
+        body.extend_from_slice(&arrived[..received.min(keep_cap)]);
+        // The header buffer is done with; the rest of the body is read a chunk at a time.
+        self.buf = Vec::new();
+
+        let mut chunk = [0u8; READ_CHUNK_SIZE];
+        while received < content_length {
+            let want = (content_length - received).min(READ_CHUNK_SIZE);
+            let Some(n) = self.read_some(stream, &mut chunk[..want]).await else {
+                break;
+            };
+            let keep = (keep_cap - body.len()).min(n);
+            body.extend_from_slice(&chunk[..keep]);
+            received += n;
+        }
+        request.body = body;
+        request.body_received = received;
+        request
     }
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+/// The offset of the first CRLF CRLF in `buf` at or after `from`.
+fn find_header_end(buf: &[u8], from: usize) -> Option<usize> {
+    buf.get(from..)?
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| from + at)
 }
 
 #[cfg(test)]
@@ -545,8 +691,54 @@ mod tests {
 
     #[test]
     fn find_header_end_finds_double_crlf() {
-        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n"), Some(14));
-        assert_eq!(find_header_end(b"no terminator"), None);
-        assert_eq!(find_header_end(b"\r\n\r\n"), Some(0));
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\n\r\n", 0), Some(14));
+        assert_eq!(find_header_end(b"no terminator", 0), None);
+        assert_eq!(find_header_end(b"\r\n\r\n", 0), Some(0));
+        assert_eq!(
+            find_header_end(b"GET / HTTP/1.1\r\n\r\n", 11),
+            Some(14),
+            "a terminator that straddles the previous read is still found"
+        );
+        assert_eq!(find_header_end(b"\r\n\r\n", 5), None);
+    }
+
+    #[test]
+    fn the_header_buffer_doubles_but_never_past_its_cap() {
+        let mut buf = Vec::new();
+        for _ in 0..MAX_HEADER_BLOCK {
+            reserve_within(&mut buf, 1, MAX_HEADER_BLOCK);
+            buf.push(b':');
+            assert!(buf.capacity() <= MAX_HEADER_BLOCK, "{}", buf.capacity());
+        }
+        assert_eq!(buf.capacity(), MAX_HEADER_BLOCK);
+    }
+
+    fn parsed(head: &str) -> HttpRequest {
+        HttpRequest::parse(head.as_bytes().to_vec()).expect("a request line")
+    }
+
+    #[test]
+    fn request_line_fields_read_as_before() {
+        let r = parsed("GET /a/b?x=1?y HTTP/1.1\r\nHost: h");
+        assert_eq!(r.method(), "GET");
+        assert_eq!(r.path(), "/a/b");
+        assert_eq!(r.query().as_deref(), Some("x=1?y"));
+        let r = parsed("GET /");
+        assert_eq!((r.path(), r.query()), ("/".into(), None));
+        assert!(HttpRequest::parse(b"GET".to_vec()).is_none(), "no target");
+        let long = format!("GET /{} HTTP/1.1", "a".repeat(MAX_REQUEST_LINE_LEN));
+        assert!(HttpRequest::parse(long.into_bytes()).is_none());
+    }
+
+    #[test]
+    fn headers_are_found_by_name_first_match_trimmed_and_lines_without_a_colon_skipped() {
+        let r = parsed(
+            "GET / HTTP/1.1\r\n:\r\nnot a header\r\n  User-Agent :  curl/8 \r\nuser-agent: second",
+        );
+        assert_eq!(r.header("user-agent").as_deref(), Some("curl/8"));
+        assert_eq!(r.header("host"), None);
+        assert_eq!(parsed("GET / HTTP/1.1").header("host"), None);
+        let invalid = HttpRequest::parse(b"GET / HTTP/1.1\r\nX: a\xffb ".to_vec()).unwrap();
+        assert_eq!(invalid.header("x").as_deref(), Some("a\u{fffd}b"));
     }
 }

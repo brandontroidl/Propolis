@@ -233,6 +233,10 @@ newline above all, are written as `\n`, `\u{1b}` and so on. The stock formatter 
 message text alone, and journald reads a priority prefix at the start of every line, so a captured
 attacker string containing a newline and `<0>` would otherwise forge an emergency entry
 (`crates/log-format/tests/format.rs#journal_mode_cannot_be_made_to_forge_a_priority_line`).
+A line is also cut at 16 KiB with a `...[truncated N bytes]` marker, because journald splits a
+line that reaches `LineMax` (48K by default, journald.conf(5)) and reads a priority prefix again
+at the start of the tail
+(`crates/log-format/tests/process.rs#a_field_past_journald_line_max_stays_one_capped_line`).
 
 The timestamp the format prints stays, although journald stamps each entry itself, so the text is
 identical whether it was read from the journal or from a captured stdout. Entries journaled before

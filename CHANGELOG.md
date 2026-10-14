@@ -548,8 +548,9 @@
   colour only to a terminal, and when `$JOURNAL_STREAM` names the process's own stdout (the
   check systemd.exec(5) prescribes) prefixes each line with the sd-daemon(3) `<N>` level that
   journald turns into the entry's priority: 3 error, 4 warning, 6 info, 7 debug. Off a terminal an
-  event is one line, with newlines and other control characters written as escapes, so a
-  captured attacker string cannot start a second line carrying a forged priority. No new
+  event is one line of at most 16 KiB, with newlines and other control characters written as
+  escapes, so a captured attacker string cannot start a second line (by newline, or by passing
+  journald's 48K `LineMax` split) carrying a forged priority. No new
   dependency; terminal output is unchanged. See
   [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform

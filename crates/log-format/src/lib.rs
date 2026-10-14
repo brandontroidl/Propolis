@@ -87,18 +87,19 @@ pub fn is_journal_stream(var: Option<&str>, stdout: Option<(u64, u64)>) -> bool 
     }
 }
 
-/// Device and inode of this process's stdout. `/proc/self/fd/1` is a magic link, so `stat`
-/// follows it to the open file itself (a socket, for the journal stream). `None` off Linux or
-/// when stdout is closed, which reads as "not the journal".
+/// Device and inode of this process's stdout (a socket, for the journal stream). `None` off Unix
+/// or when stdout is closed, which reads as "not the journal".
 fn stdout_identity() -> Option<(u64, u64)> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
+        use std::os::fd::AsFd as _;
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self/fd/1")
-            .ok()
-            .map(|m| (m.dev(), m.ino()))
+        // fstat on a duplicate of fd 1: no dependency on /proc being mounted.
+        let owned = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+        let m = std::fs::File::from(owned).metadata().ok()?;
+        Some((m.dev(), m.ino()))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         None
     }
@@ -113,6 +114,24 @@ pub fn priority(level: Level) -> u8 {
         Level::INFO => 6,
         Level::DEBUG | Level::TRACE => 7,
     }
+}
+
+/// Longest flattened line written off a terminal. journald forces a record boundary after
+/// `LineMax` bytes (48K by default, journald.conf(5)) and reads a priority prefix at the start of
+/// the continuation, so an event with that much attacker-controlled text could otherwise choose
+/// the priority of its tail. Staying far below the limit keeps every event a single record.
+pub const MAX_LINE_BYTES: usize = 16 * 1024;
+
+/// `line` cut to at most [`MAX_LINE_BYTES`], on a char boundary.
+fn cap_line(line: &str) -> &str {
+    if line.len() <= MAX_LINE_BYTES {
+        return line;
+    }
+    let mut end = MAX_LINE_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// The stock `Full` event format. Off a terminal each event is also flattened to one line, and
@@ -154,12 +173,21 @@ where
         if self.prefix {
             write!(writer, "<{}>", priority(*event.metadata().level()))?;
         }
+        let mut flat = String::with_capacity(line.len());
         for c in line.trim_end_matches('\n').chars() {
             if c.is_control() && c != '\t' {
-                write!(writer, "{}", c.escape_default())?;
+                flat.extend(c.escape_default());
             } else {
-                writer.write_char(c)?;
+                flat.push(c);
             }
+        }
+        writer.write_str(cap_line(&flat))?;
+        if flat.len() > MAX_LINE_BYTES {
+            write!(
+                writer,
+                "...[truncated {} bytes]",
+                flat.len() - cap_line(&flat).len()
+            )?;
         }
         writer.write_char('\n')
     }

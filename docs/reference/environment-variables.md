@@ -81,14 +81,14 @@ console rDNS parse booleans more broadly (called out below).
   `.filter(|s| !s.is_empty())`).
 
 ### `RUST_LOG`
-- Read by: every binary except `provision-certs`, as `tracing_subscriber`'s standard `EnvFilter`
+- Read by: every binary that logs (all except `provision-certs` and `propolis-watch`), as `tracing_subscriber`'s standard `EnvFilter`
   variable.
 - Required: no. When it is unset or does not parse, `propolis` and `console` log at `info`
   (`propolis/src/main.rs#main`, `console/src/main.rs#main`).
 - Sensors: all twelve sensor binaries log at `info` when it is unset; a set `RUST_LOG` overrides
   that default, and an invalid directive in it is skipped rather than failing startup. Each
   calls `sensor_framework::init_logging` (`crates/sensor-framework/src/logging.rs#init_logging`),
-  which installs an `EnvFilter` with an `info` default directive, and `sensor-framework` enables
+  which installs an `EnvFilter` with an `info` default directive, and `log-format` enables
   the `env-filter` feature itself, so the default is the same however the binary is built.
 - Every other binary - `gateway`, `shipper`, and the standalone `intake`, `review` and `feed` -
   logs **errors only**. Each calls `log_format::init(LevelFilter::ERROR)` (for example

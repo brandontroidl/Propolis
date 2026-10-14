@@ -16,6 +16,15 @@ fn emit_binary() -> PathBuf {
         dir.pop();
     }
     let path = dir.join("examples").join("emit");
+    // `cargo test --test process` does not build examples; build it so a targeted run on a clean
+    // target directory works and a stale binary is never used.
+    let mut build = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    build.args(["build", "--example", "emit", "-p", "log-format"]);
+    if dir.ends_with("release") {
+        build.arg("--release");
+    }
+    let status = build.status().unwrap();
+    assert!(status.success());
     assert!(path.exists(), "example not built: {}", path.display());
     path
 }
@@ -72,4 +81,27 @@ fn rust_log_still_filters() {
     let out = run(&[("RUST_LOG", "warn".to_string())], true);
     let prefixes: Vec<&str> = out.lines().map(|l| &l[..3]).collect();
     assert_eq!(prefixes, ["<3>", "<4>"], "{out:?}");
+}
+
+#[test]
+fn a_field_past_journald_line_max_stays_one_capped_line() {
+    for journal in [true, false] {
+        let out = run(&[("EMIT_LONG", "1".to_string())], journal);
+        let long: Vec<&str> = out.lines().filter(|l| l.contains("AAAA")).collect();
+        assert_eq!(
+            long.len(),
+            1,
+            "journal={journal}: {} lines",
+            out.lines().count()
+        );
+        let line = long[0];
+        assert!(line.len() < 20 * 1024, "line not capped: {}", line.len());
+        assert!(
+            line.contains("...[truncated "),
+            "{:?}",
+            &line[line.len() - 40..]
+        );
+        assert!(!line.contains("<0>"), "boundary text survived the cap");
+        assert!(!out.contains("\n<0>"), "forged priority line");
+    }
 }

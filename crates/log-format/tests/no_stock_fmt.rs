@@ -21,6 +21,13 @@ fn walk(dir: &Path, hits: &mut Vec<String>) {
                     || code.contains("tracing_subscriber::fmt::layer")
                     || code.contains("tracing_subscriber::fmt()")
                     || code.contains("tracing_subscriber::fmt::try_init")
+                    || code.contains("FmtSubscriber")
+                    || code.contains("fmt::Subscriber")
+                    || code.contains("fmt::Layer")
+                    || code.contains("use tracing_subscriber::fmt")
+                    || code.contains("use tracing_subscriber::{fmt")
+                    || code.contains("fmt::init(")
+                    || code.contains("fmt::layer(")
                 {
                     hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
                 }

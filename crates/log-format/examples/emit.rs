@@ -15,4 +15,9 @@ fn main() {
     tracing::info!(value = %hostile, "hostile-field");
     // The stock formatter leaves a newline in the message text itself untouched.
     tracing::info!("hostile-message {hostile}");
+    // A field past journald's LineMax with a priority prefix straddling the old 48K boundary.
+    if std::env::var_os("EMIT_LONG").is_some() {
+        let long = format!("{}<0>tail", "A".repeat(49_149));
+        tracing::info!(value = %long, "long-field");
+    }
 }

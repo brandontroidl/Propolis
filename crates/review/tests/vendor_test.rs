@@ -29,7 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use review::vendor::{
     AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter, VendorError, VendorReport,
-    build_categories, build_dshield_categories, build_otx_categories,
+    build_categories, build_dshield_categories, build_otx_categories, disabled_vendor_notice,
 };
 
 // ---------------------------------------------------------------------
@@ -262,6 +262,46 @@ fn full_vendor_config_gate_config_drops_secrets_keeps_gate_fields() {
     // future field addition to that struct cannot silently smuggle the
     // secret back in without this test catching it.
     assert!(!format!("{gate:?}").contains("super-secret-key"));
+}
+
+fn vendor_with(name: &str, enabled: bool, api_key: &str) -> FullVendorConfig {
+    FullVendorConfig {
+        name: name.to_string(),
+        enabled,
+        api_key: api_key.to_string(),
+        api_url: "https://vendor.invalid".to_string(),
+        cooldown_hours: 24,
+        rate_limit: 15,
+        rate_window_hours: 1,
+        score_floor: None,
+        category_filter: None,
+    }
+}
+
+// Live: every pair was held as Disabled, logged at debug only, and nothing at startup said the
+// vendors were off. The notice names the vendor, the reason and the variable that fixes it, and
+// never the key.
+#[test]
+fn a_disabled_vendor_gets_a_plain_startup_notice_and_an_enabled_one_none() {
+    assert_eq!(
+        disabled_vendor_notice(&vendor_with("abuseipdb", true, "k")),
+        None
+    );
+    assert_eq!(
+        disabled_vendor_notice(&vendor_with("abuseipdb", false, "")).as_deref(),
+        Some(
+            "vendor abuseipdb is off: no API key is set, so it is treated as disabled and every \
+             approved address is held for it. Set PROPOLIS_VENDOR_ABUSEIPDB_KEY and \
+             PROPOLIS_VENDOR_ABUSEIPDB_ENABLED=true to report to it"
+        )
+    );
+    let flag_off = disabled_vendor_notice(&vendor_with("dshield", false, "secret-key")).unwrap();
+    assert_eq!(
+        flag_off,
+        "vendor dshield is off: PROPOLIS_VENDOR_DSHIELD_ENABLED is not true, so every approved \
+         address is held for it. Set it to true to report to it"
+    );
+    assert!(!flag_off.contains("secret-key"));
 }
 
 #[test]

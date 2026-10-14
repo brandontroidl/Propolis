@@ -553,6 +553,14 @@
   journald's 48K `LineMax` split) carrying a forged priority. No new
   dependency; terminal output is unchanged. See
   [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
+- **The submission pass says why it held what it held** - a node logged `submitted=0
+  held=17202 failed=0` every pass, with the reason for each held address and vendor only at
+  debug level, so nothing showed why nothing was ever reported. The one INFO line per pass now
+  carries `held_by`, the held count split by reason (`disabled`, `cooldown`, `stale`,
+  `rate_limit`, `score_floor`, `category_filter`, `reserved`, `db_error`, `allowlisted`,
+  `no_vendor_config`), and at startup each vendor that is off logs one warning in plain words
+  (no API key set, or its `_ENABLED` variable not true) naming the variable to set, with a
+  second warning when no vendor is enabled at all.
 - **The submission pass no longer sorts an address's whole event history per address** - the
   newest-`protocol_label`-per-category lookup (`SELECT DISTINCT ON (category) ...`) read and
   sorted every event the address ever produced: 1.55 s for one heavy address on the live node,

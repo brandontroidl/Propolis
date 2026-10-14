@@ -160,6 +160,98 @@ pub struct SubmitResult {
     /// HTTP call was made: a repeat could report the same IP twice while the
     /// table shows one row. See "Idempotency" in the module doc comment.
     pub unresolved: usize,
+    /// `held`, split by why. Always sums to `held`.
+    pub held_by: HeldBreakdown,
+}
+
+/// How many (ip, vendor) pairs a pass held, by reason. `held=17202` alone cannot say whether
+/// every vendor is switched off or every address is in cooldown; the per-pair reason is logged at
+/// debug only, so this carries it into the one line per pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeldBreakdown {
+    /// The address is on the operator allowlist.
+    pub allowlisted: usize,
+    /// The vendor adapter has no gatekeeper configuration.
+    pub no_vendor_config: usize,
+    pub reserved: usize,
+    pub disabled: usize,
+    pub stale: usize,
+    pub cooldown: usize,
+    pub rate_limit: usize,
+    pub score_floor: usize,
+    pub category_filter: usize,
+    pub db_error: usize,
+}
+
+impl HeldBreakdown {
+    fn record(&mut self, reason: &GateReason) {
+        let slot = match reason {
+            GateReason::Reserved => &mut self.reserved,
+            GateReason::Disabled => &mut self.disabled,
+            GateReason::Stale => &mut self.stale,
+            GateReason::Cooldown => &mut self.cooldown,
+            GateReason::RateLimit => &mut self.rate_limit,
+            GateReason::ScoreFloor => &mut self.score_floor,
+            GateReason::CategoryFilter => &mut self.category_filter,
+            GateReason::DbError(_) => &mut self.db_error,
+        };
+        *slot += 1;
+    }
+
+    pub fn total(&self) -> usize {
+        let Self {
+            allowlisted,
+            no_vendor_config,
+            reserved,
+            disabled,
+            stale,
+            cooldown,
+            rate_limit,
+            score_floor,
+            category_filter,
+            db_error,
+        } = *self;
+        allowlisted
+            + no_vendor_config
+            + reserved
+            + disabled
+            + stale
+            + cooldown
+            + rate_limit
+            + score_floor
+            + category_filter
+            + db_error
+    }
+}
+
+impl std::fmt::Display for HeldBreakdown {
+    /// `name=count` for each nonzero reason, space separated; `none` when nothing was held.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts = [
+            ("allowlisted", self.allowlisted),
+            ("no_vendor_config", self.no_vendor_config),
+            ("reserved", self.reserved),
+            ("disabled", self.disabled),
+            ("stale", self.stale),
+            ("cooldown", self.cooldown),
+            ("rate_limit", self.rate_limit),
+            ("score_floor", self.score_floor),
+            ("category_filter", self.category_filter),
+            ("db_error", self.db_error),
+        ];
+        let mut any = false;
+        for (name, count) in parts.into_iter().filter(|(_, c)| *c > 0) {
+            if any {
+                f.write_str(" ")?;
+            }
+            write!(f, "{name}={count}")?;
+            any = true;
+        }
+        if !any {
+            f.write_str("none")?;
+        }
+        Ok(())
+    }
 }
 
 /// Polls `review_queue`'s Approved entries and submits each to every
@@ -212,6 +304,7 @@ impl SubmissionRunner {
                     "approved entry is on the operator allowlist; not submitting to any vendor"
                 );
                 result.held += self.vendors.len();
+                result.held_by.allowlisted += self.vendors.len();
                 continue;
             }
 
@@ -253,6 +346,7 @@ impl SubmissionRunner {
                         "no gatekeeper config for this vendor adapter; holding"
                     );
                     result.held += 1;
+                    result.held_by.no_vendor_config += 1;
                     continue;
                 };
 
@@ -279,6 +373,7 @@ impl SubmissionRunner {
                             }
                         }
                         result.held += 1;
+                        result.held_by.record(&reason);
                         continue;
                     }
                     GateResult::Pass => {}
@@ -563,6 +658,36 @@ mod tests {
             idempotency_key(ip, "abuseipdb", date),
             "203.0.113.9:abuseipdb:2026-07-29"
         );
+    }
+
+    // The text an operator reads in the pass summary: only nonzero reasons, in a fixed order, so
+    // two passes are comparable by eye; `none` rather than an empty field when nothing was held.
+    #[test]
+    fn the_held_breakdown_prints_nonzero_reasons_in_a_fixed_order() {
+        assert_eq!(HeldBreakdown::default().to_string(), "none");
+
+        let mut held = HeldBreakdown::default();
+        for reason in [
+            GateReason::Disabled,
+            GateReason::Cooldown,
+            GateReason::Disabled,
+            GateReason::Reserved,
+            GateReason::Stale,
+            GateReason::RateLimit,
+            GateReason::ScoreFloor,
+            GateReason::CategoryFilter,
+            GateReason::DbError("connection reset".into()),
+        ] {
+            held.record(&reason);
+        }
+        held.allowlisted += 4;
+        held.no_vendor_config += 1;
+        assert_eq!(
+            held.to_string(),
+            "allowlisted=4 no_vendor_config=1 reserved=1 disabled=2 stale=1 cooldown=1 \
+             rate_limit=1 score_floor=1 category_filter=1 db_error=1"
+        );
+        assert_eq!(held.total(), 14);
     }
 
     #[test]

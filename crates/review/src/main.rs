@@ -418,6 +418,7 @@ async fn run_submission_loop(runner: SubmissionRunner, interval: Duration) {
                         held = result.held,
                         failed = result.failed,
                         unresolved = result.unresolved,
+                        held_by = %result.held_by,
                         "review: submission pass complete"
                     );
                 }
@@ -439,6 +440,8 @@ async fn run_daemon(pool: PgPool, config: Config) {
             "review: vendor configured"
         );
     }
+
+    review::vendor::log_vendor_startup(&config.vendors);
 
     let client = reqwest::Client::new();
     let (adapters, gate_configs) = build_adapters(&config.vendors, client);

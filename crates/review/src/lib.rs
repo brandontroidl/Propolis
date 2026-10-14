@@ -21,7 +21,7 @@ pub mod virustotal;
 pub use cli::{Cli, CliError, Command};
 pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
-pub use submit::{SubmissionRunner, SubmitError, SubmitResult};
+pub use submit::{HeldBreakdown, SubmissionRunner, SubmitError, SubmitResult};
 pub use vendor::{
     AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter, VendorError, VendorReport,
     VendorResponse, build_categories, build_dshield_categories, build_otx_categories,

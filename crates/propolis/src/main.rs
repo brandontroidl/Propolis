@@ -335,6 +335,7 @@ async fn run_submission_loop(
                         held = result.held,
                         failed = result.failed,
                         unresolved = result.unresolved,
+                        held_by = %result.held_by,
                         "review: submission pass complete"
                     );
                 }
@@ -1263,6 +1264,9 @@ async fn main() {
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
         let review_allowlist = operator_allowlist.clone();
+
+        // Once per process, not per supervised restart of the review group.
+        review::vendor::log_vendor_startup(&vendors);
 
         handles.push(spawn_supervised_named(
             "review",

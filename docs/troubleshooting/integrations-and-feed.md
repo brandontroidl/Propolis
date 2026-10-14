@@ -56,7 +56,16 @@ disabled vendor is held by the gatekeeper, not skipped at construction. A vendor
 `_ENABLED=true` with an empty `_KEY` is force-disabled fail-closed with a warning
 (`load_vendor_config`, `crates/propolis/src/config.rs#load_vendor_config`). If nothing is being reported, walk the
 gatekeeper's ordered checks - it short-circuits on the first hold
-(`check`, `crates/review/src/gatekeeper.rs#check`):
+(`check`, `crates/review/src/gatekeeper.rs#check`).
+
+You do not have to guess which check holds: each submission pass logs one INFO line,
+`review: submission pass complete`, whose `held` count is split in `held_by` by reason
+(`reserved`, `disabled`, `stale`, `cooldown`, `rate_limit`, `score_floor`,
+`category_filter`, `db_error`, plus `allowlisted` for an address on the operator
+allowlist and `no_vendor_config` for an adapter with no gate configuration). At
+startup a vendor that is off logs one warning naming the variable to set, and a second
+warning if no vendor is enabled at all. The per-address, per-vendor reason stays at
+debug level.
 
 | Order | Hold reason | Meaning |
 |---|---|---|

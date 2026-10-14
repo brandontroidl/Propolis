@@ -610,6 +610,49 @@ async fn run_once_gates_each_configured_vendor_independently(pool: PgPool) {
     assert_eq!(disabled.call_count(), 0);
 }
 
+// Live: "submitted=0 held=17202" every pass with the reason per (ip, vendor) at debug only, so
+// nothing said WHY nothing was submitted. The pass result now carries the held count by reason.
+#[sqlx::test(migrations = false)]
+async fn run_once_reports_held_pairs_by_reason(pool: PgPool) {
+    migrate(&pool).await;
+    seed_and_approve(&pool, "45.10.32.248").await;
+
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![
+        Box::new(MockVendor::new("mockvendor-held-off")),
+        Box::new(MockVendor::new("mockvendor-held-floor")),
+        Box::new(MockVendor::new("mockvendor-held-noconfig")),
+    ];
+    let configs = vec![
+        VendorConfig {
+            enabled: false,
+            ..permissive_config("mockvendor-held-off")
+        },
+        VendorConfig {
+            score_floor: Some(rust_decimal::Decimal::from(100_000)),
+            ..permissive_config("mockvendor-held-floor")
+        },
+    ];
+    let result = SubmissionRunner::new(pool.clone(), vendors, configs)
+        .run_once()
+        .await
+        .unwrap();
+
+    assert_eq!(result.submitted, 0);
+    assert_eq!(result.held, 3);
+    assert_eq!(result.held_by.disabled, 1);
+    assert_eq!(result.held_by.score_floor, 1);
+    assert_eq!(result.held_by.no_vendor_config, 1);
+    assert_eq!(
+        result.held_by.total(),
+        result.held,
+        "every hold has a reason"
+    );
+    assert_eq!(
+        result.held_by.to_string(),
+        "no_vendor_config=1 disabled=1 score_floor=1"
+    );
+}
+
 #[sqlx::test(migrations = false)]
 async fn run_once_holds_vendor_with_no_matching_gatekeeper_config(pool: PgPool) {
     migrate(&pool).await;

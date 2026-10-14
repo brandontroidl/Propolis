@@ -110,6 +110,48 @@ impl FullVendorConfig {
     }
 }
 
+/// Why a vendor will receive nothing, in the words an operator needs, or `None` for a vendor that
+/// is enabled. The gatekeeper holds every submission to a disabled vendor at debug level only, so
+/// without this the first sign of a missing key or an unset flag is a `held=N` that never moves.
+/// `enabled` is already false when the flag was set but the key was empty (the loaders fail
+/// closed), so an empty key is the one distinction left to draw.
+pub fn disabled_vendor_notice(vc: &FullVendorConfig) -> Option<String> {
+    if vc.enabled {
+        return None;
+    }
+    let var = vc.name.to_uppercase();
+    Some(if vc.api_key.is_empty() {
+        format!(
+            "vendor {name} is off: no API key is set, so it is treated as disabled and every \
+             approved address is held for it. Set PROPOLIS_VENDOR_{var}_KEY and \
+             PROPOLIS_VENDOR_{var}_ENABLED=true to report to it",
+            name = vc.name,
+        )
+    } else {
+        format!(
+            "vendor {name} is off: PROPOLIS_VENDOR_{var}_ENABLED is not true, so every approved \
+             address is held for it. Set it to true to report to it",
+            name = vc.name,
+        )
+    })
+}
+
+/// Say once, at startup, which vendors will receive nothing and why, and whether that is all of
+/// them (in which case no approved address can ever be submitted).
+pub fn log_vendor_startup(vendors: &[FullVendorConfig]) {
+    for vc in vendors {
+        if let Some(notice) = disabled_vendor_notice(vc) {
+            tracing::warn!("review: {notice}");
+        }
+    }
+    if !vendors.iter().any(|vc| vc.enabled) {
+        tracing::warn!(
+            "review: no vendor is enabled, so every approved address will be held and nothing \
+             will be reported; the per-pass summary shows the held count by reason"
+        );
+    }
+}
+
 /// One row's vendor-specific codes in the static category mapping table.
 struct CodeSet {
     abuseipdb: &'static str,

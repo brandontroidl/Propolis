@@ -404,6 +404,51 @@ async fn auth_cancelled_with_star_is_aborted_and_not_recorded() {
     srv.handle.abort();
 }
 
+/// EHLO advertises ETRN, which used to get `502 command not recognized`, contradicting the
+/// advertisement. The replies are Postfix's `etrn_cmd` (smtpd.c); a stock install has no
+/// fast-flush domains, so a well-formed request is refused with 459.
+#[tokio::test]
+async fn etrn_is_answered_like_postfix() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    for (cmd, want) in [
+        ("ETRN", "500 Syntax: ETRN domain\r\n"),
+        ("ETRN a.test b.test", "500 Syntax: ETRN domain\r\n"),
+        (
+            "ETRN example.com",
+            "459 <example.com>: service unavailable\r\n",
+        ),
+        (
+            "etrn #example.com",
+            "459 <example.com>: service unavailable\r\n",
+        ),
+        (
+            "ETRN @mail.example.com",
+            "459 <mail.example.com>: service unavailable\r\n",
+        ),
+        (
+            "ETRN [192.0.2.7]",
+            "459 <[192.0.2.7]>: service unavailable\r\n",
+        ),
+        ("ETRN bad..name", "501 Error: invalid parameter syntax\r\n"),
+        ("ETRN -x.test", "501 Error: invalid parameter syntax\r\n"),
+    ] {
+        assert_eq!(client.send(cmd).await, want, "{cmd}");
+    }
+    let _ = client.send("MAIL FROM:<>").await;
+    assert_eq!(
+        client.send("ETRN example.com").await,
+        "503 Error: MAIL transaction in progress\r\n"
+    );
+    let _ = client.send("RSET").await;
+    assert_eq!(
+        client.send("ETRN example.com").await,
+        "459 <example.com>: service unavailable\r\n"
+    );
+    srv.handle.abort();
+}
+
 /// EHLO advertises CHUNKING, so a client may deliver by BDAT instead of DATA. It used to get
 /// "502 command not recognized", contradicting the advertisement and losing the message.
 #[tokio::test]

@@ -172,8 +172,16 @@ pub async fn handle_connection(
                 }
                 Auth::Closed => return,
             }
+        } else if line
+            .split_whitespace()
+            .next()
+            .is_some_and(|verb| verb.eq_ignore_ascii_case("ETRN"))
+        {
+            let reply = etrn_reply(&line, envelope.in_transaction);
+            let _ = write_reply(&mut reader, reply.as_bytes()).await;
         } else if upper.starts_with("MAIL FROM:") {
             envelope.reset();
+            envelope.in_transaction = true;
             envelope.mail_from = extract_angle_bracket(&line[10..]);
             let _ = write_reply(&mut reader, b"250 2.1.0 Ok\r\n").await;
         } else if upper.starts_with("RCPT TO:") {
@@ -306,6 +314,60 @@ fn ehlo_reply(host: &str, offer_starttls: bool) -> String {
     )
 }
 
+/// The reply to an `ETRN` line, in the order Postfix's `etrn_cmd` (smtpd.c) checks: an open
+/// mail transaction, then exactly one argument, then a leading `@` or `#` stripped and the rest
+/// validated as a hostname or an address literal. A stock install has no fast-flush domains
+/// (`fast_flush_domains = $relay_domains`, empty by default), so every well-formed request is
+/// refused with 459. Postfix's ETRN replies carry no enhanced status code.
+fn etrn_reply(line: &str, in_transaction: bool) -> String {
+    if in_transaction {
+        return "503 Error: MAIL transaction in progress\r\n".to_string();
+    }
+    let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+    let [domain] = args.as_slice() else {
+        return "500 Syntax: ETRN domain\r\n".to_string();
+    };
+    let domain = domain
+        .strip_prefix('@')
+        .or_else(|| domain.strip_prefix('#'))
+        .unwrap_or(domain);
+    if !(valid_hostname(domain) || valid_address_literal(domain)) {
+        return "501 Error: invalid parameter syntax\r\n".to_string();
+    }
+    format!(
+        "459 <{}>: service unavailable\r\n",
+        sanitize_value(domain, MAX_ADDRESS_LEN)
+    )
+}
+
+/// A DNS hostname: at most 255 characters of dot-separated labels, each 1 to 63 letters,
+/// digits, hyphens or underscores, not starting or ending with a hyphen.
+fn valid_hostname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// `[192.0.2.1]` or `[IPv6:2001:db8::1]`, the RFC 5321 address literal forms.
+fn valid_address_literal(literal: &str) -> bool {
+    let Some(inner) = literal.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    match inner.get(..5) {
+        Some(tag) if tag.eq_ignore_ascii_case("IPv6:") => {
+            inner[5..].parse::<std::net::Ipv6Addr>().is_ok()
+        }
+        _ => inner.parse::<std::net::Ipv4Addr>().is_ok(),
+    }
+}
+
 /// Adds `"tls": true` to event metadata. The key is absent on plaintext events, so a consumer
 /// reads "has the key" as "was TLS" and existing plaintext events are unchanged.
 fn tag_tls(metadata: &mut serde_json::Value, tls: bool) {
@@ -382,6 +444,9 @@ const MAX_ADDRESS_LEN: usize = 255;
 /// enough for one source address to OOM-kill the unit.
 #[derive(Debug, Default)]
 struct Envelope {
+    /// MAIL FROM was accepted and no message or RSET has ended the transaction since; true for
+    /// the null sender `<>` too, whose `mail_from` is empty.
+    in_transaction: bool,
     mail_from: String,
     /// The first `KEPT_RECIPIENTS` accepted recipients, already sanitized.
     rcpt_to: Vec<String>,
@@ -918,6 +983,7 @@ mod tests {
     }
 
     static EMPTY_ENVELOPE: Envelope = Envelope {
+        in_transaction: false,
         mail_from: String::new(),
         rcpt_to: Vec::new(),
         rcpt_count: 0,

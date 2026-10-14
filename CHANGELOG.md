@@ -397,6 +397,11 @@
   pipelined command unanswered, where Postfix accepts the message. The line's first 8192
   bytes are now kept, the rest is drained to the line break and counted in `body_size`, and
   the message is recorded with `truncated: true` and answered `250`.
+- **The SMTP sensor answers the ETRN it advertises** - EHLO listed `ETRN` but the command got
+  `502 command not recognized`, a contradiction a scanner can see. It now gets Postfix's
+  `etrn_cmd` replies: `459 <domain>: service unavailable` for a well-formed request (a stock
+  install flushes no domains), `500 Syntax: ETRN domain`, `501 Error: invalid parameter
+  syntax`, or `503 Error: MAIL transaction in progress`.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

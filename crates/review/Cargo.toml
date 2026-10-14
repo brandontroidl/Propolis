@@ -31,7 +31,14 @@ tracing = "0.1.44"
 log-format = { path = "../log-format" }
 url = "2"
 
+[features]
+# Test-only: treats the RFC 5737 block 203.0.113.0/24 as public in the gatekeeper and the queue
+# (src/reserved.rs). Off by default and never to be enabled in a release build; its only enabler is
+# the self dev-dependency below, which cargo applies to test builds and not to `cargo build`.
+test-public-ranges = []
+
 [dev-dependencies]
+review = { path = ".", features = ["test-public-ranges"] }
 tracing-subscriber = "0.3.23"
 axum = "0.8.9"
 rcgen = "0.14.9"

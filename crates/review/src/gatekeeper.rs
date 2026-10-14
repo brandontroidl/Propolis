@@ -15,7 +15,9 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use core_scoring::{IpScore, is_reserved_ip};
+use core_scoring::IpScore;
+
+use crate::reserved::is_reserved_ip;
 
 /// Do not report an IP whose most recent activity is older than this. Abuse feeds want RECENT
 /// attacker activity, so re-reporting a days-old attack is both wrong and (for DShield) rejected.

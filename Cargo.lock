@@ -2931,6 +2931,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "reqwest",
+ "review",
  "rust_decimal",
  "rustls",
  "sensor-framework",

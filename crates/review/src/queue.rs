@@ -17,7 +17,9 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
-use core_scoring::{OperatorAllowlist, ReviewState, is_reserved_ip};
+use core_scoring::{OperatorAllowlist, ReviewState};
+
+use crate::reserved::is_reserved_ip;
 
 /// Errors from the review queue. Every variant is fail-closed: the caller
 /// gets an error and no partial state change is left behind (each operation
@@ -63,8 +65,10 @@ pub struct QueueEntry {
 pub struct ReviewQueue {
     allowlist: Arc<OperatorAllowlist>,
     /// Which addresses are never offered and are resolved when found queued.
-    /// [`core_scoring::is_reserved_ip`] in every default queue, so a production queue never
-    /// offers or keeps a reserved address; only the test builders below replace it.
+    /// [`crate::reserved::is_reserved_ip`] in every default queue (exactly
+    /// [`core_scoring::is_reserved_ip`] in any build without the test-only `test-public-ranges`
+    /// feature), so a production queue never offers or keeps a reserved address; only the test
+    /// builders below replace it.
     is_reserved: fn(IpAddr) -> bool,
 }
 
@@ -93,11 +97,12 @@ impl ReviewQueue {
         self
     }
 
-    /// Stop excluding reserved addresses ([`core_scoring::is_reserved_ip`]) from [`Self::populate`]
-    /// and stop resolving them in [`Self::resolve_reserved`].
+    /// Stop excluding reserved addresses ([`crate::reserved::is_reserved_ip`]) from
+    /// [`Self::populate`] and stop resolving them in [`Self::resolve_reserved`].
     ///
     /// For tests only. The repository's fixtures are written in the documentation ranges
-    /// (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24), which are reserved, so a test of queue or
+    /// (192.0.2.0/24, 198.51.100.0/24, and 203.0.113.0/24 outside the `test-public-ranges` test
+    /// feature), which are reserved, so a test of queue or
     /// console behaviour on such an address needs the queue to accept it. No daemon calls this:
     /// a reserved address is never reported to a vendor (the gatekeeper holds it first), so
     /// offering one to the operator only invites an approval that can never take effect.
@@ -126,7 +131,7 @@ impl ReviewQueue {
     /// reporting. The allowlist is checked here in Rust rather than in SQL
     /// because ASN membership needs the GeoLite2 database.
     ///
-    /// A reserved address ([`core_scoring::is_reserved_ip`]: RFC 1918, loopback, documentation
+    /// A reserved address ([`crate::reserved::is_reserved_ip`]: RFC 1918, loopback, documentation
     /// ranges, ...) is never surfaced either. The gatekeeper holds it as `Reserved` at submission
     /// whatever the score, so offering it only lets an operator approve something that can never
     /// be reported. Addresses already queued before this check are handled by

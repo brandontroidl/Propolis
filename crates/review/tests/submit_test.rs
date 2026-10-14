@@ -7,11 +7,12 @@
 //! shared with other tests or crates, rows those leave Approved would reach
 //! `adapter.submit` alongside the test's own IP.
 //!
-//! The fixture addresses are ordinary public addresses, not the RFC5737
-//! documentation ranges used elsewhere, and must stay that way: the
-//! gatekeeper's first check refuses every reserved range outright, so a
-//! documentation-range fixture is held as `Reserved` before the runner
-//! behaviour under test is ever reached. Assertions stay scoped to
+//! The fixture addresses are in 203.0.113.0/24, the one documentation block the
+//! `test-public-ranges` feature (`review::reserved`, enabled for this crate's
+//! own test builds) treats as public, and must stay in it: the gatekeeper's
+//! first check refuses every reserved range outright, so a fixture in any other
+//! documentation block is held as `Reserved` before the runner behaviour under
+//! test is ever reached. Assertions stay scoped to
 //! `(this test's ip, this test's vendor name)` rather than the aggregate
 //! `SubmitResult`, which keeps them independent of fixture count.
 //!
@@ -307,7 +308,7 @@ async fn seed_and_approve(pool: &PgPool, ip: &str) {
 #[sqlx::test(migrations = false)]
 async fn run_once_submits_with_real_protocol_label_mapping(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.240";
+    let ip = "203.0.113.240";
     let ip_addr: IpAddr = ip.parse().unwrap();
     seed_and_approve(&pool, ip).await;
 
@@ -346,7 +347,7 @@ async fn run_once_submits_with_real_protocol_label_mapping(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn run_once_holds_disabled_vendor_without_writing_a_row(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.241";
+    let ip = "203.0.113.241";
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("mockvendor-disabled");
@@ -357,18 +358,29 @@ async fn run_once_holds_disabled_vendor_without_writing_a_row(pool: PgPool) {
     };
     let runner = SubmissionRunner::new(pool.clone(), vendors, vec![config]);
 
-    runner.run_once().await.unwrap();
+    let result = runner.run_once().await.unwrap();
 
     // Disabled holds EVERY ip unconditionally (including any contaminating
     // one), so the raw, unfiltered call count is safe to assert here.
     assert_eq!(mock.call_count(), 0, "a held vendor must never be called");
     assert_eq!(count_submissions(&pool, ip, "mockvendor-disabled").await, 0);
+    // The hold must be the disabled vendor, not the reserved-address check that runs first: a
+    // reserved fixture address would pass the two asserts above for the wrong reason.
+    assert!(
+        result.held_by.disabled >= 1,
+        "held as disabled: {:?}",
+        result.held_by
+    );
+    assert_eq!(
+        result.held_by.reserved, 0,
+        "the fixture address must not be reserved"
+    );
 }
 
 #[sqlx::test(migrations = false)]
 async fn run_once_records_failed_submission(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.242";
+    let ip = "203.0.113.242";
     let ip_addr: IpAddr = ip.parse().unwrap();
     seed_and_approve(&pool, ip).await;
 
@@ -398,7 +410,7 @@ async fn run_once_records_failed_submission(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn run_once_is_idempotent_across_a_failed_then_successful_retry(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.243";
+    let ip = "203.0.113.243";
     let ip_addr: IpAddr = ip.parse().unwrap();
     seed_and_approve(&pool, ip).await;
 
@@ -457,7 +469,7 @@ async fn run_once_is_idempotent_across_a_failed_then_successful_retry(pool: PgPo
 #[sqlx::test(migrations = false)]
 async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_outcome(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.248";
+    let ip = "203.0.113.248";
     let ip_addr: IpAddr = ip.parse().unwrap();
     let vendor = "mockvendor-crashwindow";
     seed_and_approve(&pool, ip).await;
@@ -508,7 +520,7 @@ async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_out
 #[sqlx::test(migrations = false)]
 async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.244";
+    let ip = "203.0.113.244";
     let ip_addr: IpAddr = ip.parse().unwrap();
     seed_and_approve(&pool, ip).await;
 
@@ -547,7 +559,7 @@ async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted(
 #[sqlx::test(migrations = false)]
 async fn run_once_ignores_entries_that_are_not_approved(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.245";
+    let ip = "203.0.113.245";
     let ip_addr: IpAddr = ip.parse().unwrap();
     seed_recommended_ssh(&pool, ip).await;
     // Populate only - left Pending, never approved.
@@ -579,7 +591,7 @@ async fn run_once_ignores_entries_that_are_not_approved(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn run_once_gates_each_configured_vendor_independently(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.246";
+    let ip = "203.0.113.246";
     let ip_addr: IpAddr = ip.parse().unwrap();
     seed_and_approve(&pool, ip).await;
 
@@ -615,7 +627,7 @@ async fn run_once_gates_each_configured_vendor_independently(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn run_once_reports_held_pairs_by_reason(pool: PgPool) {
     migrate(&pool).await;
-    seed_and_approve(&pool, "45.10.32.240").await;
+    seed_and_approve(&pool, "203.0.113.240").await;
 
     let vendors: Vec<Box<dyn VendorAdapter>> = vec![
         Box::new(MockVendor::new("mockvendor-held-off")),
@@ -656,7 +668,7 @@ async fn run_once_reports_held_pairs_by_reason(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn run_once_holds_vendor_with_no_matching_gatekeeper_config(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "45.10.32.247";
+    let ip = "203.0.113.247";
     seed_and_approve(&pool, ip).await;
 
     let mock = MockVendor::new("mockvendor-unconfigured");

@@ -12,6 +12,7 @@ pub mod fetcher;
 pub mod gatekeeper;
 pub mod ioc;
 pub mod queue;
+pub mod reserved;
 pub mod spool;
 pub mod submit;
 pub mod upload_filter;

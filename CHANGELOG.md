@@ -263,6 +263,18 @@
 
 ### Changed
 
+- **No real address in the review tests** - the gatekeeper and the review queue hold every
+  reserved address first, so the Disabled, ScoreFloor, Cooldown and RateLimit holds and the
+  daemon's queue populate pass could only be exercised with a real, allocated address, which the
+  public repository must not carry. The `review` crate now has a test-only `test-public-ranges`
+  feature (off by default, enabled only by the crate's own `[dev-dependencies]`) that treats
+  203.0.113.0/24 as public inside `review::reserved`; those tests use that block. The feature
+  never reaches `cargo build`, `core_scoring::is_reserved_ip`, the blocklist feed or the
+  fetcher's SSRF guard, which keep treating the block as reserved; a test in
+  `crates/propolis/tests/production_features.rs` fails if the whole workspace's shipped
+  dependency graph enables it (cargo unifies features across a `--workspace` build), and
+  `review::reserved` refuses to compile the feature under the release profile, so `cargo test
+  --release` cannot leave such a binary in `target/release` for `install.sh` to copy.
 - **CI's token is read-only** - the workflow now declares `permissions: contents: read`, the
   least a checkout needs. No job writes to the repository, comments or publishes, so a
   compromised action or build script can no longer push, tag or alter a pull request with

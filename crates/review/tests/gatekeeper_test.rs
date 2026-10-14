@@ -286,7 +286,8 @@ async fn reserved_ranges_are_refused_ahead_of_every_configurable_check(pool: PgP
         "172.16.0.1",
         "127.0.0.1",
         "169.254.1.1",
-        "203.0.113.9",
+        // Not 203.0.113.0/24: the `test-public-ranges` feature (on for this crate's tests) treats
+        // that block as public so the other holds are reachable; see `review::reserved`.
         "198.51.100.9",
         "192.0.2.9",
         "::1",

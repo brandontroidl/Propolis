@@ -335,16 +335,17 @@ async fn history_reports_no_history_for_unsubmitted_ip(pool: PgPool) {
 /// against a loaded test machine: `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS=1` means
 /// the first populate pass should land well within that window.
 ///
-/// The seeded address is an ordinary public one on purpose: the daemon's queue never offers a
-/// reserved address, and this test drives the real binary, which has no test-only opt-out. The same
-/// run seeds a recommended documentation-range address (must not be queued) and an Approved
+/// The seeded address is in 203.0.113.0/24, which the `test-public-ranges` feature (enabled for
+/// this crate's own test builds, including the `review` binary this test spawns) treats as public:
+/// the daemon's queue never offers a reserved address. The same run seeds a recommended address
+/// from another documentation block (must not be queued) and an Approved
 /// RFC 1918 entry left over from before that rule (must be resolved to Rejected with a recorded
 /// reason, operator note kept).
 #[sqlx::test(migrations = false)]
 async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
     migrate(&pool).await;
-    let test_ip = "45.10.32.240";
-    let reserved_recommended = "203.0.113.255";
+    let test_ip = "203.0.113.240";
+    let reserved_recommended = "198.51.100.255";
     let reserved_approved = "10.20.30.1";
     seed_recommended(&pool, test_ip).await;
     seed_recommended(&pool, reserved_recommended).await;

@@ -297,7 +297,7 @@ fn leading_ident_len(s: &str) -> Option<usize> {
 }
 
 /// Extract the raw value text after `VAR=` (quote-stripped, or the first unquoted word),
-/// unsubstituted - `resolve_fixed_point` handles `$VAR` references afterward, once the whole map
+/// unsubstituted - [`resolve_assignments`] handles `$VAR` references afterward, once the whole map
 /// is known.
 fn raw_assignment_value(rest: &str) -> &str {
     if let Some(stripped) = rest.strip_prefix('"') {

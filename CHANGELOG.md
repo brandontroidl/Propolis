@@ -402,6 +402,19 @@
   `etrn_cmd` replies: `459 <domain>: service unavailable` for a well-formed request (a stock
   install flushes no domains), `500 Syntax: ETRN domain`, `501 Error: invalid parameter
   syntax`, or `503 Error: MAIL transaction in progress`.
+- **A six-byte shell line no longer OOM-kills the daemon** - the dropper url extractor, which
+  the campaign indexer runs on every captured command and artifact inside the propolis daemon,
+  resolved `VAR=value` assignments by re-substituting every value until nothing changed. A value
+  that names itself twice squares its size on each pass, so typing `A=$A$A` into a honeypot
+  shell (or uploading a few hundred bytes of chained assignments) resolved to gigabytes, the
+  daemon was killed at its 1 GiB memory limit, and because the indexer's cursor only advances
+  after a batch commits, it was killed again on every restart. Each variable is now resolved
+  once, after the variables it references; a cycle, an unassigned name or a value past 64 KiB
+  stays as literal `$NAME`, so a url built on it is dropped as before; and all substitution in
+  one scan draws on a 256 KiB allowance, after which a url written out literally is still
+  found. Legitimate loaders resolve as before, and a forward chain is no longer limited to 255
+  links. See
+  [rate limits and budgets](docs/reference/rate-limits-and-budgets.md#dropper-script-url-extraction).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

@@ -690,10 +690,16 @@
   to find. The echo-loader tracker digested a typed assembly twice per `>>` append and again on
   every `chmod`, uncharged (about 23 ms per one-byte append to a 180 KB assembly in a debug
   build); it now hashes the file once per append and charges the read, rewrite and digest to
-  the line once, as it charges the read for a `chmod` or run. awk's `getline < FILE` and its
-  `>>` output, and `dd conv=notrunc` or `seek=`, read a file of up to 1 MiB per trip and charged
-  none of it, so a loop around `close()` or `dd` held the sensor past 40 s; each read is now
-  charged. `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs`
+  the line once, as it charges the read for a `chmod` or run. awk's `getline < FILE` (up to 4 MiB
+  per trip) and its `>>` output, `dd` (`if=FILE`, and the file `conv=notrunc` or `seek=` keeps),
+  `tail FILE` and `grep -f FILE` read a file and charged none of it, or only the few bytes they
+  printed, so a loop around `close()`, `dd`, `tail -c 1` or `grep -F -f /bin/busybox /dev/null`
+  held the sensor past 40 s and left a fresh login with no prompt. The charge now sits in the
+  one function every file read of a command goes through, `read_operand` (and `read_source` for
+  standard input), so a reader cannot skip it: the callers that charged for their own reads
+  no longer do, the evaluator charges a command's output only beyond what its reads already
+  paid (`cat` of a file costs the line once), and a test lists every direct filesystem read so a
+  new one has to be accounted for. `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs`
   run each reproducer through the real listener and hold every line to 20 s and to
   `LINE_WORKING_SET_BYTES` of heap.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform

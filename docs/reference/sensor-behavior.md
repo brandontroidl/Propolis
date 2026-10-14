@@ -317,8 +317,9 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   the line's remaining allowance before it runs over the process table
   (`crates/sensor-framework/src/shell/procs.rs#FakeShell::select_charged`).
 - The work allowance pays for what a command does, not only for what it prints: a file a command
-  reads for its own use is charged before it is read
-  (`crates/sensor-framework/src/shell/read.rs#FakeShell::read_charged`), every copy `tee` makes is
+  reads is charged before it is read, at the one function every file read goes through
+  (`crates/sensor-framework/src/shell/read.rs#FakeShell::read_operand`, and `read_charged` for
+  the few that read a whole path), and output is charged only beyond what the reads paid, every copy `tee` makes is
   charged before it is made, output that can outgrow its input (`cut --output-delimiter`) stops
   the line once it passes what the line can still pay for, and a count a command is given (`tr`'s `[c*n]`, up to 2^64-2) is
   costed by its constructs, never walked. A line runs synchronously on the sensor's runtime, so

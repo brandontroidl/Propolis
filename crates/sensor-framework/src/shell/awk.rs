@@ -2158,7 +2158,8 @@ impl Awk<'_, '_> {
             };
             match self.sh.read_source(self.parts, name, cap) {
                 Ok(data) => {
-                    if !self.charge(len_u64(data.len())) {
+                    // The read charged the line for the bytes.
+                    if self.sh.line.exhausted() {
                         return false;
                     }
                     self.set_global(
@@ -2206,10 +2207,8 @@ impl Awk<'_, '_> {
                     };
                     match self.sh.read_source(self.parts, source, cap) {
                         Ok(data) => {
-                            // A reopened file is read again, so a loop of getline and close
-                            // pays for every read.
-                            self.sh
-                                .charge_work(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                            // A reopened file is read again, and every read is charged, so a
+                            // loop of getline and close pays for each one.
                             self.readers.insert(name.clone(), Reader { data, pos: 0 });
                         }
                         Err(_) => return Ok(Val::Num(-1.0)),
@@ -2966,6 +2965,9 @@ impl FakeShell {
                 }
                 None => return CommandResult::stdout(USAGE),
             }
+            if !self.charge_work(len_u64(source.len())) {
+                return super::texttools::stopped();
+            }
         } else {
             let cap = self.read_cap();
             for file in &program_files {
@@ -2982,9 +2984,10 @@ impl FakeShell {
                     }
                 }
             }
-        }
-        if !self.charge_work(len_u64(source.len())) {
-            return super::texttools::stopped();
+            // The reads charged the program text.
+            if self.line.exhausted() {
+                return super::texttools::stopped();
+            }
         }
         let lexed = match lex(&source) {
             Ok(lexed) => lexed,

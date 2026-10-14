@@ -511,6 +511,10 @@ pub struct FakeShell {
     origins: std::collections::BTreeMap<String, arch::Origin>,
     /// The origin of the one file `cat` just read, for the redirection that writes its output.
     cat_origin: Option<arch::Origin>,
+    /// Bytes the running command's reads have already charged to the line, so the evaluator
+    /// charges only the output beyond them: a command costs the larger of what it read and what
+    /// it produced, and `cat` of a 2 MiB image is not billed twice.
+    read_paid: u64,
     /// A file the session fetched or assembled was run and started (status 0): the loader's
     /// infection finished, as far as this host can tell. Sticky for the session.
     infection_completed: bool,
@@ -731,6 +735,7 @@ impl FakeShell {
             assembled: std::collections::BTreeMap::new(),
             origins: std::collections::BTreeMap::new(),
             cat_origin: None,
+            read_paid: 0,
             infection_completed: false,
             typed_output: false,
             piped_typed: false,
@@ -798,6 +803,7 @@ impl FakeShell {
                 assembled: self.assembled.clone(),
                 origins: self.origins.clone(),
                 cat_origin: self.cat_origin.clone(),
+                read_paid: 0,
                 infection_completed: self.infection_completed,
                 typed_output: self.typed_output,
                 piped_typed: self.piped_typed,

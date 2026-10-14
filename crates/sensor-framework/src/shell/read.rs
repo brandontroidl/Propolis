@@ -110,6 +110,15 @@ impl FakeShell {
     /// newline, as the kernel returns it). A missing `cmdline` is a classic honeypot tell that
     /// loaders check before delivering a payload. The shell's own `/proc/<pid>/cmdline` is the
     /// shell's argv.
+    ///
+    /// This is the one door every file read of a command goes through, and it charges the line
+    /// for the bytes it hands back, so no reader (present or future) can read for free. A regular
+    /// file is charged before it is read. A read that starts inside the allowance completes (the
+    /// charge may spend what is left, and the line stops at the command's end); once the
+    /// allowance is spent nothing is read, so a command with many operands stops costing CPU. A
+    /// device has no size to charge first; what it handed back is charged. The evaluator charges
+    /// a command's output only beyond what its reads already paid, so a reader that prints what
+    /// it read costs the line once.
     pub(super) fn read_operand(
         &mut self,
         argv: &[&str],
@@ -119,18 +128,48 @@ impl FakeShell {
     ) -> Result<Vec<u8>, FsError> {
         let own_cmdline = format!("/proc/{}/cmdline", self.state().pid);
         let typed = self.normalize_logical(path);
-        if typed == "/proc/self/cmdline" {
+        let synthetic = if typed == "/proc/self/cmdline" {
             let mut out = argv.join("\0");
             out.push('\0');
-            return Ok(window(out.into_bytes(), off, limit));
-        }
-        if typed == own_cmdline {
-            let out = format!("{}\0", self.argv_zero());
-            return Ok(window(out.into_bytes(), off, limit));
+            Some(out)
+        } else if typed == own_cmdline {
+            Some(format!("{}\0", self.argv_zero()))
+        } else {
+            None
+        };
+        if let Some(out) = synthetic {
+            let bytes = window(out.into_bytes(), off, limit);
+            self.pay_for_read(len_u64(bytes.len()));
+            return Ok(bytes);
         }
         let reader = self.reader_of(argv.first().copied().unwrap_or("cat"));
         let resolved = self.resolve_reading(path, Some(reader));
-        self.fs.read_range(&resolved, off, limit)
+        let sized = match self.fs.stat(&resolved, true) {
+            Some(stat) if stat.kind == FileKind::Regular => {
+                Some(stat.size.saturating_sub(off).min(limit))
+            }
+            _ => None,
+        };
+        if self.line.exhausted() {
+            return Ok(Vec::new());
+        }
+        if let Some(cost) = sized {
+            self.pay_for_read(cost);
+        }
+        let read = self.fs.read_range(&resolved, off, limit);
+        // A file whose stat size understates its content, or a device, pays for what came back
+        // beyond what was charged up front.
+        let got = read.as_ref().map_or(0, |bytes| len_u64(bytes.len()));
+        self.pay_for_read(got.saturating_sub(sized.unwrap_or(0)));
+        read
+    }
+
+    /// Charge `n` bytes of reading to the line and remember it, for the output charge to net out.
+    /// False once the line cannot pay; the allowance then stays spent, so the command's own end
+    /// stops the line.
+    pub(super) fn pay_for_read(&mut self, n: u64) -> bool {
+        self.read_paid = self.read_paid.saturating_add(n);
+        self.charge_work(n)
     }
 
     /// The most one read hands back: the line's whole allowance, as it always bounded a modeled

@@ -376,7 +376,7 @@ impl FakeShell {
                     continue;
                 }
             };
-            if !self.charge_work(len_u64(bytes.len())) {
+            if self.line.exhausted() {
                 return stopped();
             }
             // What the line can still pay for, less what earlier operands produced: the output

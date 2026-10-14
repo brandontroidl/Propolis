@@ -658,11 +658,13 @@ impl FakeShell {
                     continue;
                 }
             };
-            // One pass over the input is charged before it runs, so an input the line cannot
-            // scan once is refused unread. The scan may then spend that and whatever the line
-            // has left, and what it spent past the one pass is charged after it.
+            // The read already charged one pass over the bytes (stdin was charged by whatever
+            // produced it), so only the matchers' work beyond that pass is charged before the
+            // scan. The scan may then spend one pass and whatever the line has left, and what it
+            // spent past the one pass is charged after it: each byte read pays once.
             let one_pass = search.cost(bytes.len());
-            if !self.charge_work(one_pass) {
+            let extra = one_pass.saturating_sub(len_u64(bytes.len()));
+            if !self.charge_work(extra) || self.line.exhausted() {
                 return stopped();
             }
             search.allow(one_pass.saturating_add(self.line.remaining()));

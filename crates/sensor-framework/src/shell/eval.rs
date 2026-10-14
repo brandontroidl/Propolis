@@ -1591,6 +1591,7 @@ impl FakeShell {
         let was_blocked = self.stdin.is_blocked();
         let outer_typed = std::mem::take(&mut self.typed_output);
         // A function's own commands are noted as they run; the call is not a fetch.
+        let outer_paid = std::mem::take(&mut self.read_paid);
         let mut result = match &function {
             Some(def) => self.call_function(def, &refs),
             None => {
@@ -1598,6 +1599,7 @@ impl FakeShell {
                 self.dispatch(&refs)
             }
         };
+        let paid_by_reads = std::mem::replace(&mut self.read_paid, outer_paid);
         let typed = std::mem::replace(&mut self.typed_output, outer_typed);
         // A command whose input was cut off (Ctrl-C, a closed channel) dies at the read it was
         // waiting in, and the signal ends the rest of the line with it.
@@ -1611,7 +1613,7 @@ impl FakeShell {
         // Charged here, once per command and before output is routed, so bytes a redirection
         // sends to a file cost the line as much as bytes sent to the terminal, and a re-entrant
         // command's output is not counted twice.
-        if !self.charge_work(len_u64(result.bytes().len())) {
+        if !self.charge_work(len_u64(result.bytes().len()).saturating_sub(paid_by_reads)) {
             result.stop_line = true;
         }
         self.settle_input(plan.reads_from);

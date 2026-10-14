@@ -514,6 +514,143 @@ fn export_of_a_new_name_counts_against_the_content_allowance() {
     assert_eq!(sh.handle_input("env | grep -c '^zz'").0, "3\n");
 }
 
+// ---- files a command reads are charged at the read ------------------------------------------
+
+/// The work a line charged.
+fn work_of(sh: &mut FakeShell, line: &str) -> u64 {
+    sh.handle_input(line);
+    sh.last_trace().budget.work_charged
+}
+
+/// The modeled size of `/bin/busybox` (past the 1 MiB `READ_CAP`, which is why `wc` of it
+/// through a redirect reports less).
+fn busybox_len() -> u64 {
+    let sh = FakeShell::new(FakeFs::new(), ctx());
+    sh.fs
+        .stat("/bin/busybox", true)
+        .expect("the image is modeled")
+        .size
+}
+
+/// Each command reads the image to print or use a byte of it (or nothing), and must be billed
+/// for the read: with only the output charged, a loop of any of them never ran out and froze the
+/// sensor.
+#[test]
+fn a_file_read_for_a_byte_of_output_is_charged_whole() {
+    let size = busybox_len();
+    assert!(size >= 1 << 20, "the image is big enough to matter: {size}");
+    for (line, wanted) in [
+        ("tail -c 1 /bin/busybox > /dev/null", size),
+        ("tail -n 1 /bin/busybox > /dev/null", size),
+        ("grep -F -f /bin/busybox /dev/null", size),
+        ("wc -c /bin/busybox > /dev/null", size),
+        ("md5sum /bin/busybox > /dev/null", size),
+        ("dd if=/bin/busybox of=/tmp/x 2>/dev/null", size),
+        // These ask the filesystem for only the bytes they use.
+        ("head -c 1 /bin/busybox > /dev/null", 1),
+        ("od -N 1 /bin/busybox > /dev/null", 1),
+        ("xxd -l 1 /bin/busybox > /dev/null", 1),
+    ] {
+        let mut sh = FakeShell::new(FakeFs::new(), ctx());
+        let work = work_of(&mut sh, line);
+        assert!(
+            work >= wanted,
+            "{line}: charged {work}, the read is {wanted}"
+        );
+    }
+}
+
+/// Two reads that each fit the allowance but not together: the second stops the line.
+#[test]
+fn repeated_reads_that_print_nothing_run_the_line_out() {
+    let size = busybox_len();
+    for read in [
+        "tail -c 1 /bin/busybox >/dev/null",
+        "grep -F -f /bin/busybox /dev/null",
+        "dd if=/bin/busybox of=/tmp/x 2>/dev/null",
+    ] {
+        let (mut sh, _) = limited(|l| l.work_per_line = size + size / 2);
+        let (out, _) = sh.handle_input(format!("{read}; {read}; echo after"));
+        assert!(
+            !out.contains("after"),
+            "{read}: the second read stops the line: {out:?}"
+        );
+        assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Work), "{read}");
+    }
+}
+
+/// A reader that prints what it read costs the line once, not twice.
+#[test]
+fn a_reader_that_prints_its_read_is_not_charged_twice() {
+    let size = busybox_len();
+    let (mut sh, _) = limited(|l| l.work_per_line = size + size / 2);
+    let work = work_of(&mut sh, "cat /bin/busybox > /dev/null");
+    assert!(
+        work >= size && work < size + size / 2,
+        "once, not twice: {work}"
+    );
+    assert_eq!(sh.last_trace().budget.hit, None);
+}
+
+/// Every place the shell takes bytes out of the filesystem. `read_operand` is the door for a
+/// file a command was told to read and charges the line itself; `read_charged` is the other
+/// charging helper. Anything else listed here reads a fixed system file of a few KiB that no
+/// operand names, or charges at the call (noted per file). A new direct read fails this test
+/// until it is routed through those helpers or listed here with its reason.
+#[test]
+fn every_direct_filesystem_read_is_accounted_for() {
+    let allowed: &[(&str, usize)] = &[
+        // `read_operand` (`read_range`) and `read_charged` (`read_all`): the charging helpers.
+        ("read.rs", 2),
+        // `crontab -l` prints what it reads, and the output is charged; `-e` reads zero bytes.
+        ("admin.rs", 2),
+        // The ELF header: `HEADER_LEN` bytes.
+        ("arch.rs", 1),
+        // Fixed system files, each capped at a few KiB.
+        ("hostinfo.rs", 1),
+        ("fileinfo.rs", 2),
+        ("sysres.rs", 1),
+        ("nameinfo.rs", 1),
+        ("procs.rs", 2),
+        // `>>` append and the typed-assembly tracker (eval), `sh FILE` (mod), the loader hash:
+        // each charges the bytes at the call.
+        ("eval.rs", 2),
+        ("mod.rs", 1),
+        ("loader.rs", 1),
+    ];
+    let expected: std::collections::BTreeMap<String, usize> = allowed
+        .iter()
+        .map(|(name, count)| ((*name).to_string(), *count))
+        .collect();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell");
+    let mut found: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).expect("the shell source directory") {
+        let path = entry.expect("a directory entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("a source file");
+        let count: usize = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(|line| line.matches(".read_all(").count() + line.matches(".read_range(").count())
+            .sum();
+        if count > 0 {
+            found.insert(name, count);
+        }
+    }
+    assert_eq!(
+        found, expected,
+        "a direct filesystem read was added or removed: route it through read_operand or \
+         read_charged, or account for it in this list"
+    );
+}
+
 // ---- untouched sessions ---------------------------------------------------------------------
 
 #[test]

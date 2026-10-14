@@ -390,8 +390,8 @@ impl FakeShell {
             }
         };
         let result = if plan.reverse {
-            // Parsing is work the line pays for, output or not.
-            if !self.charge_work(len_u64(bytes.len())) {
+            // Parsing is work the line pays for, output or not: the read charged it.
+            if self.line.exhausted() {
                 return stopped();
             }
             let room = usize::try_from(self.line.remaining()).unwrap_or(usize::MAX);
@@ -590,7 +590,7 @@ impl FakeShell {
                     continue;
                 }
             };
-            if !self.charge_work(len_u64(bytes.len())) {
+            if self.line.exhausted() {
                 return stopped();
             }
             let room = usize::try_from(self.line.remaining()).unwrap_or(usize::MAX);

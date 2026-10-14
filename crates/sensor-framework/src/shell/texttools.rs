@@ -44,7 +44,10 @@ pub(super) fn stopped() -> CommandResult {
 const WIDE: usize = 7;
 
 impl FakeShell {
-    /// Up to `limit` bytes of one operand: standard input for no operand or `-`.
+    /// Up to `limit` bytes of one operand: standard input for no operand or `-`. The bytes are
+    /// charged to the line (a file in [`FakeShell::read_operand`], standard input here), so a
+    /// caller does not charge for them again and checks `self.line.exhausted()` where it must
+    /// stop when the line could not pay.
     pub(super) fn read_source(
         &mut self,
         argv: &[&str],
@@ -52,7 +55,11 @@ impl FakeShell {
         limit: u64,
     ) -> Result<Vec<u8>, FsError> {
         match path {
-            None | Some("-") => Ok(self.stdin.take(limit)),
+            None | Some("-") => {
+                let bytes = self.stdin.take(limit);
+                self.pay_for_read(len_u64(bytes.len()));
+                Ok(bytes)
+            }
             Some(path) => self.read_operand(argv, path, 0, limit),
         }
     }
@@ -263,8 +270,8 @@ impl FakeShell {
             };
             match self.read_source(parts, name, cap) {
                 Ok(bytes) => {
-                    // Scanning is work the line pays for, output or not.
-                    if !self.charge_work(len_u64(bytes.len())) {
+                    // Scanning is work the line pays for, output or not: the read charged it.
+                    if self.line.exhausted() {
                         return stopped();
                     }
                     slot.counts = Some(Counts::of(&bytes));

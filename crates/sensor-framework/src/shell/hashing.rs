@@ -211,8 +211,8 @@ impl FakeShell {
                     continue;
                 }
             };
-            // Digesting is work the line pays for, output or not.
-            if !self.charge_work(len_u64(bytes.len())) {
+            // Digesting is work the line pays for, output or not: the read charged it.
+            if self.line.exhausted() {
                 return stopped();
             }
             let head = line_of(&bytes);

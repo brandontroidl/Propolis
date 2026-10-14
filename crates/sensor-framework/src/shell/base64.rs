@@ -17,7 +17,7 @@
 use super::read::errno_text;
 use super::registry::Registry;
 use super::texttools::stopped;
-use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
+use super::{CommandResult, FakeShell, HandlerId, ShellFlavor};
 
 pub(super) fn register(r: &mut Registry) {
     // Not an applet of the captured BusyBox, so `busybox base64` answers "applet not found" on
@@ -426,7 +426,7 @@ impl FakeShell {
                     continue;
                 }
             };
-            if !self.charge_work(len_u64(data.len())) {
+            if self.line.exhausted() {
                 return stopped();
             }
             if plan.decode {
@@ -475,7 +475,7 @@ impl FakeShell {
                 );
             }
         };
-        if !self.charge_work(len_u64(data.len())) {
+        if self.line.exhausted() {
             return stopped();
         }
         if !plan.decode {

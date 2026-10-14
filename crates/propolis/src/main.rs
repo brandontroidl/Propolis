@@ -305,6 +305,9 @@ async fn run_queue_scan_loop(
         if let Err(e) = queue.withdraw(&pool).await {
             tracing::error!(error = %e, "review: queue withdraw failed");
         }
+        if let Err(e) = queue.resolve_reserved(&pool).await {
+            tracing::error!(error = %e, "review: queue reserved-address resolution failed");
+        }
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = cancel.cancelled() => { return; }

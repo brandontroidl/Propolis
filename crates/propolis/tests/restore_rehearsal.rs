@@ -685,7 +685,8 @@ async fn populate(pool: &PgPool, spool_root: &Path) {
     }
 
     // Review queue through its own state machine.
-    let queue = review::ReviewQueue::new();
+    // The rehearsal's sources are documentation addresses, which a production queue refuses.
+    let queue = review::ReviewQueue::new().offering_reserved_addresses();
     queue.populate(pool).await.expect("populate review queue");
     let pending = queue.list_pending(pool).await.unwrap();
     assert!(

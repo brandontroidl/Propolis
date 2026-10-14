@@ -553,6 +553,15 @@
   journald's 48K `LineMax` split) carrying a forged priority. No new
   dependency; terminal output is unchanged. See
   [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
+- **The review queue no longer offers a reserved address** - it listed, and the operator
+  approved, an RFC 1918 address that the gatekeeper then held as `Reserved` on every pass for as
+  long as the entry stayed approved. `populate` now skips every address `is_reserved_ip`
+  covers (RFC 1918, loopback, link-local, the documentation ranges and the rest), and each
+  queue scan resolves any reserved entry already queued, in any state but Rejected, to Rejected
+  with `decided_at` stamped and a note recording the automatic rejection, the state it was in
+  and any operator note. Nothing is deleted. A node that is fed documentation-range addresses
+  for testing will now show an empty queue; the repository's own tests opt out through
+  `ReviewQueue::offering_reserved_addresses`, which no daemon calls.
 - **The submission pass says why it held what it held** - a node logged `submitted=0
   held=17202 failed=0` every pass, with the reason for each held address and vendor only at
   debug level, so nothing showed why nothing was ever reported. The one INFO line per pass now

@@ -81,7 +81,9 @@ pub fn spawn(
         let (pool, stats, cancel) = (pool.clone(), stats.clone(), cancel.clone());
         let interval = cfg.queue_interval;
         tasks.push(Box::pin(async move {
-            let queue = ReviewQueue::new();
+            // Every source this harness sends from is a reserved documentation address, and the
+            // approved set is what makes the pass run its per-address queries.
+            let queue = ReviewQueue::new().offering_reserved_addresses();
             while !cancel.is_cancelled() {
                 match queue.populate(&pool).await {
                     Ok(n) => {

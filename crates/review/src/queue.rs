@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row, postgres::PgRow};
 
-use core_scoring::{OperatorAllowlist, ReviewState};
+use core_scoring::{OperatorAllowlist, ReviewState, is_reserved_ip};
 
 /// Errors from the review queue. Every variant is fail-closed: the caller
 /// gets an error and no partial state change is left behind (each operation
@@ -62,11 +62,27 @@ pub struct QueueEntry {
 #[derive(Debug, Default, Clone)]
 pub struct ReviewQueue {
     allowlist: Arc<OperatorAllowlist>,
+    /// Test fixtures only: see [`Self::offering_reserved_addresses`]. False in every default
+    /// queue, so a production queue never offers or keeps a reserved address.
+    offer_reserved: bool,
 }
 
 impl ReviewQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stop excluding reserved addresses ([`core_scoring::is_reserved_ip`]) from [`Self::populate`]
+    /// and stop resolving them in [`Self::resolve_reserved`].
+    ///
+    /// For tests only. The repository's fixtures are written in the documentation ranges
+    /// (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24), which are reserved, so a test of queue or
+    /// console behaviour on such an address needs the queue to accept it. No daemon calls this:
+    /// a reserved address is never reported to a vendor (the gatekeeper holds it first), so
+    /// offering one to the operator only invites an approval that can never take effect.
+    pub fn offering_reserved_addresses(mut self) -> Self {
+        self.offer_reserved = true;
+        self
     }
 
     /// Honour the operator allowlist: an allowlisted address is never surfaced
@@ -89,57 +105,56 @@ impl ReviewQueue {
     /// reporting. The allowlist is checked here in Rust rather than in SQL
     /// because ASN membership needs the GeoLite2 database.
     ///
+    /// A reserved address ([`core_scoring::is_reserved_ip`]: RFC 1918, loopback, documentation
+    /// ranges, ...) is never surfaced either. The gatekeeper holds it as `Reserved` at submission
+    /// whatever the score, so offering it only lets an operator approve something that can never
+    /// be reported. Addresses already queued before this check are handled by
+    /// [`Self::resolve_reserved`].
+    ///
     /// A Snoozed entry therefore only comes back because an operator brings it back
     /// ([`Self::unsnooze`], or deciding it directly from the Snoozed listing). That is
     /// deliberate - an entry that re-surfaced on its own would ignore the operator's decision to
     /// defer it - but it means the Snoozed listing is the ONLY route back, so any interface that
     /// can snooze must also be able to act on what it snoozed.
     pub async fn populate(&self, pool: &PgPool) -> Result<usize, ReviewError> {
-        let result = if self.allowlist.is_empty() {
-            sqlx::query(
-                "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
-                 SELECT source_ip, raw_score, category_breakdown \
-                 FROM ip_score \
-                 WHERE recommended_for_vendor = TRUE \
-                   AND eligible = TRUE \
-                   AND NOT delisted \
-                   AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
-                 ON CONFLICT (source_ip) DO NOTHING",
-            )
-            .execute(pool)
-            .await?
-        } else {
-            let candidates: Vec<String> = sqlx::query_scalar(
-                "SELECT host(source_ip) FROM ip_score \
-                 WHERE recommended_for_vendor = TRUE \
-                   AND eligible = TRUE \
-                   AND NOT delisted \
-                   AND source_ip NOT IN (SELECT source_ip FROM review_queue)",
-            )
-            .fetch_all(pool)
-            .await?;
-            let (allowed, allowlisted) = self.partition_allowlisted(candidates)?;
-            if !allowlisted.is_empty() {
-                tracing::debug!(
-                    skipped = allowlisted.len(),
-                    "review queue: skipped allowlisted addresses (operator allowlist)"
-                );
-            }
-            sqlx::query(
-                "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
-                 SELECT source_ip, raw_score, category_breakdown \
-                 FROM ip_score \
-                 WHERE recommended_for_vendor = TRUE \
-                   AND eligible = TRUE \
-                   AND NOT delisted \
-                   AND source_ip = ANY($1::text[]::inet[]) \
-                   AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
-                 ON CONFLICT (source_ip) DO NOTHING",
-            )
-            .bind(allowed)
-            .execute(pool)
-            .await?
-        };
+        let candidates: Vec<String> = sqlx::query_scalar(
+            "SELECT host(source_ip) FROM ip_score \
+             WHERE recommended_for_vendor = TRUE \
+               AND eligible = TRUE \
+               AND NOT delisted \
+               AND source_ip NOT IN (SELECT source_ip FROM review_queue)",
+        )
+        .fetch_all(pool)
+        .await?;
+        let (candidates, reserved) = self.partition_reserved(candidates)?;
+        let (allowed, allowlisted) = self.partition_allowlisted(candidates)?;
+        // Steady state for as long as the address stays recommended, so debug, not info.
+        if !reserved.is_empty() {
+            tracing::debug!(
+                skipped = reserved.len(),
+                "review queue: skipped reserved addresses (never reportable to a vendor)"
+            );
+        }
+        if !allowlisted.is_empty() {
+            tracing::debug!(
+                skipped = allowlisted.len(),
+                "review queue: skipped allowlisted addresses (operator allowlist)"
+            );
+        }
+        let result = sqlx::query(
+            "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
+             SELECT source_ip, raw_score, category_breakdown \
+             FROM ip_score \
+             WHERE recommended_for_vendor = TRUE \
+               AND eligible = TRUE \
+               AND NOT delisted \
+               AND source_ip = ANY($1::text[]::inet[]) \
+               AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
+             ON CONFLICT (source_ip) DO NOTHING",
+        )
+        .bind(allowed)
+        .execute(pool)
+        .await?;
         let inserted = result.rows_affected() as usize;
         if inserted > 0 {
             tracing::info!(inserted, "review queue: populated new pending entries");
@@ -210,6 +225,93 @@ impl ReviewQueue {
             tracing::info!(%ip, reason = "allowlisted", "review queue: withdrew pending entry");
         }
         Ok(result.len())
+    }
+
+    /// Resolve every queue entry whose address is reserved, in any state but Rejected: a
+    /// reserved address is never reportable, so an entry for one is a decision the operator can
+    /// never see take effect. Each becomes Rejected with `decided_at = now()` and a note that
+    /// records the automatic resolution, the state it was in, and any operator note it carried,
+    /// so nothing is deleted and the history survives. Rejected rows are left as they are, and a
+    /// row whose state changed since it was read (an operator deciding it meanwhile) is skipped
+    /// and picked up next scan. Returns the number resolved.
+    ///
+    /// An Approved entry is resolved too, not only Pending ones: the submission runner holds an
+    /// approved reserved address on every pass for as long as it stays approved, which is
+    /// exactly how a live node came to count 10.x addresses among thousands of held pairs.
+    pub async fn resolve_reserved(&self, pool: &PgPool) -> Result<usize, ReviewError> {
+        if self.offer_reserved {
+            return Ok(0);
+        }
+        let rows = sqlx::query(
+            "SELECT host(source_ip) AS source_ip, state, notes FROM review_queue WHERE state <> $1",
+        )
+        .bind(ReviewState::Rejected)
+        .fetch_all(pool)
+        .await?;
+
+        let mut resolved = 0;
+        for row in rows {
+            let text: String = row.try_get("source_ip")?;
+            let ip: IpAddr = text
+                .parse()
+                .map_err(|e| ReviewError::Corrupt(format!("stored source_ip {text}: {e}")))?;
+            if !is_reserved_ip(ip) {
+                continue;
+            }
+            let was: ReviewState = row.try_get("state")?;
+            let prior_note: Option<String> = row.try_get("notes")?;
+            let note = format!(
+                "auto-rejected: reserved address, never reported to a vendor (was {}{})",
+                format!("{was:?}").to_lowercase(),
+                prior_note
+                    .map(|n| format!(", operator note: {n}"))
+                    .unwrap_or_default(),
+            );
+            // Re-check `state`: an operator may have decided the entry since the SELECT, and a
+            // background scan does not overwrite a decision made in between.
+            let updated = sqlx::query(
+                "UPDATE review_queue SET state = $1, decided_at = now(), notes = $2 \
+                 WHERE source_ip = $3::inet AND state = $4",
+            )
+            .bind(ReviewState::Rejected)
+            .bind(&note)
+            .bind(&text)
+            .bind(was)
+            .execute(pool)
+            .await?;
+            if updated.rows_affected() > 0 {
+                tracing::info!(
+                    %ip, was = ?was, reason = "reserved",
+                    "review queue: resolved entry for a reserved address as rejected"
+                );
+                resolved += 1;
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Split candidate addresses into (not reserved, reserved). Passes everything through when
+    /// the queue was built with [`Self::offering_reserved_addresses`].
+    fn partition_reserved(
+        &self,
+        ips: Vec<String>,
+    ) -> Result<(Vec<String>, Vec<String>), ReviewError> {
+        if self.offer_reserved {
+            return Ok((ips, Vec::new()));
+        }
+        let mut kept = Vec::new();
+        let mut reserved = Vec::new();
+        for text in ips {
+            let ip: IpAddr = text
+                .parse()
+                .map_err(|e| ReviewError::Corrupt(format!("stored source_ip {text}: {e}")))?;
+            if is_reserved_ip(ip) {
+                reserved.push(text);
+            } else {
+                kept.push(text);
+            }
+        }
+        Ok((kept, reserved))
     }
 
     /// Split stored/candidate addresses into (not allowlisted, allowlisted). An unparseable value

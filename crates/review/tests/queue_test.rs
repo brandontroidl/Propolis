@@ -133,7 +133,11 @@ async fn populate_never_queues_a_delisted_address(pool: PgPool) {
         .await
         .unwrap();
 
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
     assert_eq!(row_count(&pool, test_ip).await, 0);
 }
 
@@ -143,7 +147,7 @@ async fn populate_surfaces_recommended_ip(pool: PgPool) {
     let test_ip = "192.0.2.210";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     let count = queue.populate(&pool).await.unwrap();
     assert!(count >= 1);
 
@@ -167,7 +171,7 @@ async fn withdraw_removes_ineligible_pending_entry(pool: PgPool) {
     let test_ip = "192.0.2.211";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     let want: IpAddr = test_ip.parse().unwrap();
     assert!(
@@ -208,7 +212,7 @@ async fn approve_sets_state_and_decided_at(pool: PgPool) {
     let test_ip = "192.0.2.212";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .approve(&pool, test_ip.parse().unwrap(), Some("looks malicious"))
@@ -227,7 +231,7 @@ async fn reject_prevents_resurfacing(pool: PgPool) {
     let test_ip = "192.0.2.213";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .reject(&pool, test_ip.parse().unwrap(), Some("known scanner"))
@@ -266,7 +270,7 @@ async fn duplicate_populate_is_idempotent(pool: PgPool) {
     let test_ip = "192.0.2.214";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue.populate(&pool).await.unwrap();
 
@@ -279,7 +283,7 @@ async fn snooze_sets_state_and_decided_at(pool: PgPool) {
     let test_ip = "198.51.100.215";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .snooze(&pool, test_ip.parse().unwrap(), None)
@@ -298,7 +302,7 @@ async fn deciding_an_unknown_ip_fails_closed(pool: PgPool) {
     // Never seeded and never populated: no review_queue row exists for it.
     let test_ip: IpAddr = "203.0.113.216".parse().unwrap();
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     let result = queue.approve(&pool, test_ip, None).await;
     assert!(
         matches!(result, Err(ReviewError::NotFound(ip)) if ip == test_ip),
@@ -312,7 +316,7 @@ async fn withdraw_never_removes_a_decided_entry(pool: PgPool) {
     let test_ip = "198.51.100.217";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .approve(&pool, test_ip.parse().unwrap(), None)
@@ -342,7 +346,7 @@ async fn a_snoozed_entry_can_be_found_again_and_decided(pool: PgPool) {
     let test_ip = "192.0.2.218";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .snooze(&pool, test_ip.parse().unwrap(), Some("check the ASN first"))
@@ -399,7 +403,7 @@ async fn unsnooze_returns_an_entry_to_pending_and_clears_its_decision_timestamp(
     let test_ip = "192.0.2.219";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .snooze(&pool, test_ip.parse().unwrap(), Some("deferred once"))
@@ -440,7 +444,10 @@ async fn unsnoozing_an_entry_that_does_not_exist_fails_closed(pool: PgPool) {
     migrate(&pool).await;
     let test_ip: IpAddr = "192.0.2.220".parse().unwrap();
 
-    let result = ReviewQueue::new().unsnooze(&pool, test_ip).await;
+    let result = ReviewQueue::new()
+        .offering_reserved_addresses()
+        .unsnooze(&pool, test_ip)
+        .await;
     assert!(
         matches!(result, Err(ReviewError::NotFound(ip)) if ip == test_ip),
         "unsnoozing an IP with no queue entry must fail closed, not silently no-op"
@@ -457,7 +464,7 @@ async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(po
     let test_ip = "192.0.2.221";
     seed_recommended(&pool, test_ip).await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().offering_reserved_addresses();
     queue.populate(&pool).await.unwrap();
     queue
         .snooze(&pool, test_ip.parse().unwrap(), None)
@@ -479,5 +486,108 @@ async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(po
         row_count(&pool, test_ip).await,
         0,
         "an unsnoozed entry must be an ordinary pending entry, withdrawable like any other"
+    );
+}
+
+// Live: the queue offered, and the operator approved, an RFC 1918 address that the gatekeeper then
+// held as Reserved on every pass. The control address is public, so a populate that excluded
+// everything would fail here too.
+#[sqlx::test(migrations = false)]
+async fn populate_never_offers_a_reserved_address(pool: PgPool) {
+    migrate(&pool).await;
+    let public = "45.10.32.230";
+    let reserved = ["10.20.30.1", "192.168.7.7", "192.0.2.51", "127.0.0.9"];
+    seed_recommended(&pool, public).await;
+    for ip in reserved {
+        seed_recommended(&pool, ip).await;
+    }
+
+    let inserted = ReviewQueue::new().populate(&pool).await.unwrap();
+
+    assert_eq!(inserted, 1, "only the public address is offered");
+    assert_eq!(row_count(&pool, public).await, 1);
+    for ip in reserved {
+        assert_eq!(row_count(&pool, ip).await, 0, "{ip} is reserved");
+    }
+}
+
+// What happens to a reserved address that is already in the queue (queued before the rule, or by
+// an older build): every state but Rejected becomes Rejected with decided_at set and a note that
+// records the automatic resolution, the earlier state and any operator note. Nothing is deleted.
+#[sqlx::test(migrations = false)]
+async fn resolve_reserved_rejects_unfinished_entries_and_records_why(pool: PgPool) {
+    migrate(&pool).await;
+    let insert = |ip: &'static str, state: ReviewState, notes: Option<&'static str>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO review_queue \
+                 (source_ip, state, score_at_surface, categories_at_surface, decided_at, notes) \
+                 VALUES ($1::inet, $2, 85, '{}'::jsonb, $3, $4)",
+            )
+            .bind(ip)
+            .bind(state)
+            .bind((state != ReviewState::Pending).then(|| {
+                "2026-10-01T00:00:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap()
+            }))
+            .bind(notes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    insert("10.20.30.2", ReviewState::Pending, None).await;
+    insert("10.20.30.3", ReviewState::Approved, Some("looks real")).await;
+    insert("192.168.1.5", ReviewState::Snoozed, None).await;
+    insert("10.20.30.4", ReviewState::Rejected, Some("earlier")).await;
+    insert("45.10.32.231", ReviewState::Approved, Some("keep")).await;
+    let rejected_before = fetch_row(&pool, "10.20.30.4").await;
+    let public_before = fetch_row(&pool, "45.10.32.231").await;
+
+    let queue = ReviewQueue::new();
+    assert_eq!(queue.resolve_reserved(&pool).await.unwrap(), 3);
+
+    for (ip, was, operator_note) in [
+        ("10.20.30.2", "pending", ""),
+        ("10.20.30.3", "approved", ", operator note: looks real"),
+        ("192.168.1.5", "snoozed", ""),
+    ] {
+        let (state, decided_at, notes) = fetch_row(&pool, ip).await.unwrap();
+        assert_eq!(state, ReviewState::Rejected, "{ip}");
+        let seeded_decision: chrono::DateTime<chrono::Utc> =
+            "2026-10-02T00:00:00Z".parse().unwrap();
+        assert!(
+            decided_at.is_some_and(|t| t > seeded_decision),
+            "{ip}: decided_at is stamped now, not left at the seeded value"
+        );
+        assert_eq!(
+            notes.as_deref(),
+            Some(
+                format!(
+                    "auto-rejected: reserved address, never reported to a vendor \
+                     (was {was}{operator_note})"
+                )
+                .as_str()
+            ),
+            "{ip}"
+        );
+    }
+    assert_eq!(fetch_row(&pool, "10.20.30.4").await, rejected_before);
+    assert_eq!(fetch_row(&pool, "45.10.32.231").await, public_before);
+    assert!(
+        queue
+            .list_approved(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .all(|e| e.source_ip.to_string() == "45.10.32.231"),
+        "no reserved address is left for the submission runner to hold on every pass"
+    );
+    assert_eq!(
+        queue.resolve_reserved(&pool).await.unwrap(),
+        0,
+        "a second scan finds nothing left to resolve"
     );
 }

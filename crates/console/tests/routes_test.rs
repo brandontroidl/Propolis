@@ -292,7 +292,11 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
     )
     .await
     .unwrap();
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -904,7 +908,11 @@ async fn dashboard_vendor_submissions_table_shows_at_most_three_rows(pool: PgPoo
 async fn queue_lists_pending_entries(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.20", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -1026,7 +1034,11 @@ async fn detail_renders_services_probed_and_egress_free_lookup_links(pool: PgPoo
 async fn approve_changes_state_verified_via_db(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.30", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1066,7 +1078,11 @@ async fn approve_changes_state_verified_via_db(pool: PgPool) {
 async fn delete_purges_scoring_state_but_keeps_the_event_ledger(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.40", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1121,7 +1137,11 @@ async fn delete_purges_scoring_state_but_keeps_the_event_ledger(pool: PgPool) {
 async fn delete_rolls_back_all_derived_state_when_the_final_delete_fails(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.41", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO vendor_submission \
          (source_ip, vendor, idempotency_key, categories, comment) \
@@ -1186,7 +1206,11 @@ async fn delete_rolls_back_all_derived_state_when_the_final_delete_fails(pool: P
 async fn reject_changes_state(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.31", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1216,7 +1240,11 @@ async fn reject_changes_state(pool: PgPool) {
 async fn snooze_changes_state(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.32", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1250,7 +1278,11 @@ async fn snooze_changes_state(pool: PgPool) {
 async fn a_snoozed_entry_can_be_decided_from_the_snoozed_tab(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.206", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1309,7 +1341,11 @@ async fn a_snoozed_entry_can_be_decided_from_the_snoozed_tab(pool: PgPool) {
 async fn unsnooze_returns_the_entry_to_the_pending_tab(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.207", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1363,7 +1399,11 @@ async fn unsnooze_returns_the_entry_to_the_pending_tab(pool: PgPool) {
 async fn unsnooze_without_csrf_token_returns_403(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.208", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -1526,7 +1566,11 @@ async fn delist_relist_and_delete_wait_for_an_append_in_flight(pool: PgPool) {
 async fn delist_rolls_back_queue_removal_when_projection_update_fails(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.210", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "CREATE FUNCTION reject_delist_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN RAISE EXCEPTION 'injected delist failure'; END $$",
@@ -1628,7 +1672,11 @@ async fn relist_rolls_back_latch_clear_when_gate_update_fails(pool: PgPool) {
 async fn post_without_csrf_token_returns_403(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.33", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (_, cookie) = state.sessions.create();
@@ -1662,7 +1710,11 @@ async fn queue_sort_by_first_seen_orders_oldest_first(pool: PgPool) {
     // different comparison rather than always returning surface order.
     seed_recommended(&pool, "203.0.113.40", 60).await; // later (first_seen ~60s ago)
     seed_recommended(&pool, "203.0.113.41", 3600).await; // earlier (first_seen ~1h ago)
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -1719,7 +1771,11 @@ async fn queue_page_empty_state_is_contextual(pool: PgPool) {
 async fn queue_page_table_uses_compact_class(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.42", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -1772,7 +1828,11 @@ async fn queue_tab_bar_marks_the_requested_tab_active(pool: PgPool) {
 async fn queue_approved_tab_lists_decided_entries_with_submission_summary(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.60", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool.clone());
     let (session_id, cookie) = state.sessions.create();
@@ -1860,7 +1920,11 @@ async fn queue_approved_tab_lists_decided_entries_with_submission_summary(pool: 
 async fn queue_approved_tab_shows_dash_when_no_submissions_yet(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.61", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (session_id, cookie) = state.sessions.create();
@@ -1901,7 +1965,11 @@ async fn queue_rejected_and_snoozed_tabs_list_only_their_own_state(pool: PgPool)
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.62", 60).await;
     seed_recommended(&pool, "203.0.113.63", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (session_id, cookie) = state.sessions.create();
@@ -2191,7 +2259,11 @@ async fn logout_without_session_redirects_to_login(pool: PgPool) {
 async fn nav_shows_pending_badge_when_reviews_pending(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.80", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -3234,7 +3306,11 @@ async fn attackers_ip_links_use_the_drawer_contract(pool: PgPool) {
 async fn queue_pending_ip_links_use_the_drawer_contract(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.20", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let (_, cookie) = state.sessions.create();
@@ -4101,7 +4177,11 @@ async fn feed_entries_tab_lists_what_was_published_not_a_fresh_derivation(pool: 
     // with the files it claimed to describe - the 8-vs-7 mismatch. The page must report the
     // published feed, so the database's opinion must not appear here.
     seed_recommended(&pool, "203.0.113.99", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
     ReviewQueue::new()
         .approve(&pool, "203.0.113.99".parse().unwrap(), None)
         .await
@@ -4454,7 +4534,11 @@ async fn feed_download_404s_on_unknown_tier_or_format(pool: PgPool) {
 async fn metrics_returns_prometheus_text_format(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.60", 60).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let state = test_state(pool);
     let app = test_app(state);
@@ -7910,7 +7994,11 @@ async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool
         ],
     )
     .await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let (status, body) = get_page(test_state(pool), "/queue").await;
     assert_eq!(status, StatusCode::OK);
@@ -7954,7 +8042,11 @@ async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool
 async fn a_flooding_queue_entry_is_described_from_a_bounded_sample(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.162", 900).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
     // 5,001 more events written straight to the ledger (each linked to the chain head, as the
     // trigger requires), and the projection told it holds 5,004 in all.
     sqlx::query(

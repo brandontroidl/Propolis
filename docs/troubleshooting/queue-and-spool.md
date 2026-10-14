@@ -127,6 +127,17 @@ interval of lag.
   (eligibility needs a confirmed-real honeypot event and `event_count >= 2`),
   it never enters the queue. Eligibility and tier rules are owned by
   [Scoring and feed](../reference/scoring-and-feed.md).
+- **A reserved address never surfaces, and one already queued is rejected** - an
+  address in a reserved range (RFC 1918, loopback, link-local, documentation,
+  and the rest of `core_scoring::is_reserved_ip`) is skipped by `populate`,
+  because the gatekeeper holds it as `Reserved` whatever its score. Each scan
+  also moves any such entry that is still Pending, Approved or Snoozed to
+  Rejected, with a note of the form `auto-rejected: reserved address, never
+  reported to a vendor (was approved, operator note: ...)`, so it stops being
+  held on every submission pass and the history is kept
+  (`crates/review/src/queue.rs#resolve_reserved`). Test deployments that
+  feed documentation-range addresses through a real node will therefore see an
+  empty queue.
 - **A rejected/snoozed entry keeps its state** - Rejected and Snoozed rows
   persist so `populate` does not re-surface them (`reject`/`snooze`, `crates/review/src/queue.rs#reject`, `crates/review/src/queue.rs#snooze`). This is
   intentional; use approve/reject/snooze from the console, not a manual delete.

@@ -153,7 +153,11 @@ async fn list_shows_seeded_pending_entry(pool: PgPool) {
     migrate(&pool).await;
     let test_ip = "203.0.113.248";
     seed_recommended(&pool, test_ip).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let output = Command::new(review_bin())
         .arg("list")
@@ -173,7 +177,11 @@ async fn approve_transitions_state_and_records_notes(pool: PgPool) {
     migrate(&pool).await;
     let test_ip = "203.0.113.249";
     seed_recommended(&pool, test_ip).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let output = Command::new(review_bin())
         .args(["approve", test_ip, "--notes", "confirmed malicious scan"])
@@ -201,7 +209,11 @@ async fn reject_transitions_state(pool: PgPool) {
     migrate(&pool).await;
     let test_ip = "203.0.113.250";
     seed_recommended(&pool, test_ip).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let output = Command::new(review_bin())
         .args(["reject", test_ip])
@@ -220,7 +232,11 @@ async fn snooze_transitions_state(pool: PgPool) {
     migrate(&pool).await;
     let test_ip = "203.0.113.251";
     seed_recommended(&pool, test_ip).await;
-    ReviewQueue::new().populate(&pool).await.unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
 
     let output = Command::new(review_bin())
         .args(["snooze", test_ip])
@@ -318,11 +334,29 @@ async fn history_reports_no_history_for_unsubmitted_ip(pool: PgPool) {
 /// Polls for up to 5s rather than a single fixed sleep, to stay robust
 /// against a loaded test machine: `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS=1` means
 /// the first populate pass should land well within that window.
+///
+/// The seeded address is an ordinary public one on purpose: the daemon's queue never offers a
+/// reserved address, and this test drives the real binary, which has no test-only opt-out. The same
+/// run seeds a recommended documentation-range address (must not be queued) and an Approved
+/// RFC 1918 entry left over from before that rule (must be resolved to Rejected with a recorded
+/// reason, operator note kept).
 #[sqlx::test(migrations = false)]
 async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
     migrate(&pool).await;
-    let test_ip = "203.0.113.255";
+    let test_ip = "45.10.32.255";
+    let reserved_recommended = "203.0.113.255";
+    let reserved_approved = "10.20.30.1";
     seed_recommended(&pool, test_ip).await;
+    seed_recommended(&pool, reserved_recommended).await;
+    sqlx::query(
+        "INSERT INTO review_queue \
+         (source_ip, state, score_at_surface, categories_at_surface, decided_at, notes) \
+         VALUES ($1::inet, 'approved', 85, '{}'::jsonb, now(), 'looks real')",
+    )
+    .bind(reserved_approved)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert!(queue_state(&pool, test_ip).await.is_none());
 
     let mut child = Command::new(review_bin())
@@ -336,7 +370,11 @@ async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut seen = false;
     while Instant::now() < deadline {
-        if queue_state(&pool, test_ip).await.as_deref() == Some("pending") {
+        // Both outcomes come from the one scan, populate then resolve, so waiting on both also
+        // means the reserved candidate has been considered and passed over by then.
+        if queue_state(&pool, test_ip).await.as_deref() == Some("pending")
+            && queue_state(&pool, reserved_approved).await.as_deref() == Some("rejected")
+        {
             seen = true;
             break;
         }
@@ -348,6 +386,21 @@ async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
 
     assert!(
         seen,
-        "daemon must populate the seeded IP into review_queue within 5s"
+        "daemon must populate the seeded IP and resolve the reserved entry within 5s"
+    );
+    assert!(
+        queue_state(&pool, reserved_recommended).await.is_none(),
+        "a recommended reserved address must not be offered"
+    );
+    let note: String =
+        sqlx::query_scalar("SELECT notes FROM review_queue WHERE source_ip = $1::inet")
+            .bind(reserved_approved)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        note,
+        "auto-rejected: reserved address, never reported to a vendor (was approved, \
+         operator note: looks real)"
     );
 }

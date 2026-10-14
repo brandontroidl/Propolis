@@ -396,6 +396,9 @@ async fn run_queue_scan_loop(queue: ReviewQueue, pool: PgPool, interval: Duratio
         if let Err(e) = queue.withdraw(&pool).await {
             tracing::error!(error = %e, "review: queue withdraw failed");
         }
+        if let Err(e) = queue.resolve_reserved(&pool).await {
+            tracing::error!(error = %e, "review: queue reserved-address resolution failed");
+        }
         tokio::time::sleep(interval).await;
     }
 }

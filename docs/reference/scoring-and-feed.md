@@ -265,6 +265,13 @@ before the list covered it
 address is still scored and shown in the console. The list is read once at
 startup, so an edit needs a restart.
 
+The review stage also never offers a reserved address (`is_reserved_ip`): `populate`
+skips it, and each scan rejects, with a recorded note, any such entry already
+queued in a state other than Rejected
+(`crates/review/src/queue.rs#resolve_reserved`). The submission gatekeeper holds
+a reserved address as `Reserved` regardless, so this only keeps the operator
+from approving something that can never be reported.
+
 ## Reserved-range guard (`crates/core-scoring/src/net.rs`)
 
 `is_reserved_ip(ip)` is one definition shared by BOTH outbound paths (feed

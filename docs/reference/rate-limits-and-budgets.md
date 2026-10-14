@@ -224,14 +224,18 @@ unchanged. No other encoding (base64, UTF-16) is decoded.
 | Longest resolved variable or url candidate | 64 KiB *(hard-coded)* | `MAX_RESOLVED_LEN` (`crates/review/src/fetcher/extract.rs#MAX_RESOLVED_LEN`) |
 | Substitution output per scanned body | 256 KiB *(hard-coded)* | `MAX_EXPANSION_BYTES` (`crates/review/src/fetcher/extract.rs#MAX_EXPANSION_BYTES`) |
 
-Each `VAR=value` is resolved once, after the variables it references. A reference that closes a
-cycle (`A=$A$A`, or `A=$B` with `B=$A`), names an unassigned variable, or names a value that would
-pass the 64 KiB limit stays as literal `$NAME`, and a url that still holds a `$` is dropped. Every
-byte a substitution produces (resolved values, url candidates accepted or rejected, a `for` word
-list taken from a variable, `tftp` parts) is drawn from the 256 KiB allowance; once it is spent
-nothing more is substituted, and a url written out literally is still taken. Text copied unchanged
-from the body is not charged, so one scan holds at most the allowance plus a few copies of the
-body (`crates/review/src/fetcher/extract.rs#resolve_assignments`). The campaign indexer runs this
+Each `VAR=value` is resolved at most once, after the variables it references, and only when a url
+token, a `for` list taken from a variable or a `tftp` pair uses it: an assignment nothing refers to
+costs nothing, wherever it sits in the body. A reference that closes a cycle (`A=$A$A`, or `A=$B`
+with `B=$A`), names an unassigned variable, or names a value that would pass the 64 KiB limit stays
+as literal `$NAME`, and a url that still holds a `$` is dropped. Every byte a substitution produces
+(resolved values, url candidates accepted or rejected, a `for` word list taken from a variable,
+`tftp` parts) is drawn from the 256 KiB allowance. A substitution the remaining allowance cannot
+cover is refused, and a url written out literally is still taken. Text copied unchanged from the
+body is not charged, so one scan holds at most the allowance plus a few copies of the body
+(`crates/review/src/fetcher/extract.rs#Vars`). A body can still spend the allowance through
+references its own url tokens make, at the cost of urls built after that point; that is the same
+reach as filling the 256-url cap with literal urls first. The campaign indexer runs this
 on every captured command and artifact inside the daemon, so these limits are what keeps a
 crafted command line from exhausting the daemon's memory.
 

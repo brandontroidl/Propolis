@@ -409,11 +409,12 @@
   shell (or uploading a few hundred bytes of chained assignments) resolved to gigabytes, the
   daemon was killed at its 1 GiB memory limit, and because the indexer's cursor only advances
   after a batch commits, it was killed again on every restart. Each variable is now resolved
-  once, after the variables it references; a cycle, an unassigned name or a value past 64 KiB
-  stays as literal `$NAME`, so a url built on it is dropped as before; and all substitution in
-  one scan draws on a 256 KiB allowance, after which a url written out literally is still
-  found. Legitimate loaders resolve as before, and a forward chain is no longer limited to 255
-  links. See
+  once, after the variables it references, and only when a url, a `for` list or a `tftp` pair
+  uses it, so unrelated assignments cost nothing; a cycle, an unassigned name or a value past
+  64 KiB stays as literal `$NAME`, so a url built on it is dropped as before; and all
+  substitution in one scan draws on a 256 KiB allowance, after which a url written out
+  literally is still found. Loaders resolve as before, and a forward chain is no longer limited
+  to 255 links. See
   [rate limits and budgets](docs/reference/rate-limits-and-budgets.md#dropper-script-url-extraction).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and

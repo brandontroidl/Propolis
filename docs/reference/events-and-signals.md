@@ -87,7 +87,9 @@ Body-capturing sensors cap what they retain (10 MB for SCP, SFTP, ADB and FTP
 STOR; `PROPOLIS_TELNET_MAX_CAPTURED_BYTES` for a telnet binary-payload capture; the
 sensor's `max_captured_bytes` for a command's standard input)
 and drain the rest to keep the protocol aligned. Their `honeypot_malware_upload`
-metadata therefore also carries `wire_size` (bytes the client actually sent) and
+metadata therefore also carries `wire_size` (bytes the client sent; for an `exec_stdin` or
+`shell_stdin` capture cut at its limit, only the bytes that had arrived when the input ended, so
+a lower bound, see below) and
 `truncated` (`wire_size > size`), built by `sensor_framework::upload_metadata`.
 When `truncated` is true the `sha256` and `size` describe a prefix, not the file;
 the IP detail page shows such rows with status `truncated` instead of `captured`.
@@ -163,7 +165,11 @@ Captures that are not a protocol's own file transfer say why the bytes were kept
 Standard input is captured text and binary alike, once per distinct body (SHA-256 of the bytes
 kept) per session, when the session ends, including by the listener's `max_duration`
 cancellation (`crates/sensor-framework/src/held_input.rs#StdinCaptures`). Each body is held to
-`max_captured_bytes`, the rest counted in `wire_size`. Bytes a command consumed are captured
+`max_captured_bytes`, and the input ends at the read that crosses it
+(`crates/sensor-framework/src/held_input.rs#HeldInput`), so the rest is neither kept nor counted:
+`wire_size` is the bytes that had arrived by then, the limit plus at most that one read (on SSH
+one data packet, at most 32 KiB, `crates/sensor-ssh/src/channel.rs#CHANNEL_MAX_PACKET_SIZE`), a
+lower bound of the transfer. Bytes a command consumed are captured
 only as its input, never also as a `binary_shell_payload`. The `exec_stdin` and `shell_stdin`
 rows carry three more keys:
 

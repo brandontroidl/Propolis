@@ -310,8 +310,9 @@
   same 16 MiB, so a body kept whole is not then shown "not scanned", and a sample's page names
   that limit in the units of its size. SCP and SFTP uploads are kept to 10 MB, and the other
   spooling sensors keep their 10 MB caps. A body over the limit is still cut there and recorded
-  with `truncated: true`; for a shell or stdin payload its `wire_size` is a lower bound (the bytes
-  that had arrived when the input ended, the limit rounded up to the packet that crossed it), not
+  with `truncated: true`; for an `exec_stdin` or `shell_stdin` capture its `wire_size` is a lower
+  bound (the bytes that had arrived when the input ended, the limit plus at most the one data
+  packet, at most 32 KiB, that crossed it; a `binary_shell_payload` records the full size), not
   the transfer's size. An env file that sets the variable explicitly
   keeps its value. The Samples list and a sample's page now say `truncated` for a sample a
   sensor kept only a prefix of (the secondary line under its digest, and the page's first line),

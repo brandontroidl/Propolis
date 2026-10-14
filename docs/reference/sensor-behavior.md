@@ -959,8 +959,8 @@ captures SCP/SFTP transfers.
   `SFTP_MAX_FILE_BODY` 10_000_000, `SFTP_MAX_OPEN_HANDLES` 64,
   `SFTP_MAX_SESSION_BYTES` 20_000_000, `SFTP_MAX_PACKET_SIZE` 262_144
   (`crates/sensor-ssh/src/transfer.rs#MAX_CAPTURE_BODY`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_FILE_BODY`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_OPEN_HANDLES`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_SESSION_BYTES`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_PACKET_SIZE`). A body past its cap is kept as a prefix and emitted with
-  `truncated: true` plus the real `wire_size` (a shell or exec-stdin payload cut at the SSH capture limit
-  differs: its `wire_size` is a lower bound, the limit rounded up to the packet that crossed it). A transfer still open when the session
+  `truncated: true` plus the real `wire_size` (an `exec_stdin` or `shell_stdin` capture cut at the SSH capture limit
+  differs: its `wire_size` is a lower bound, the limit plus at most the one data packet, at most 32 KiB, that crossed it; a `binary_shell_payload` records the full size). A transfer still open when the session
   ends (SCP before its trailer, SFTP handles never CLOSEd) is kept as a capture with
   `complete: false` rather than dropped.
 - **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`crates/sensor-ssh/src/server.rs#serve`).

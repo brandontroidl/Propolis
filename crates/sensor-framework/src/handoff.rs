@@ -234,7 +234,9 @@ impl UploadEnd {
 /// actually sent; `sample.size` is how many were retained. Sensors cap the body they keep (SCP,
 /// SFTP and ADB retain a 10 MB prefix and drain the rest to keep the protocol aligned), and an
 /// analysis of the prefix must never be read as an analysis of the file: `truncated` says the
-/// hash and size describe a prefix, and `wire_size` says how big the real upload was.
+/// hash and size describe a prefix, and `wire_size` says how much arrived. For a protocol
+/// transfer that drains its overflow it is the upload's size; for standard input
+/// (`HeldInput`) the input ends at the read that crosses the cap, so it is a lower bound.
 /// `complete` and `end_reason` both come from `end` (see [`UploadEnd`]): false means the session
 /// ended, stalled or was cut off with the transfer still open, so the body is a fragment of
 /// whatever was being sent, kept because a fragment of a dropper is still evidence, and

@@ -137,7 +137,8 @@ pub struct HeldInput {
     mode: InputMode,
     /// The bytes the command can read: everything for a pipe, the finished lines of a terminal.
     body: CaptureBody,
-    /// Input bytes the session sent toward the command, kept or not, for `wire_size`.
+    /// Input bytes that arrived for the command before the input ended, kept or not, for
+    /// `wire_size`; the input ends at the read that crosses `max_bytes`, so nothing after it counts.
     wire: u64,
     max_bytes: u64,
     /// A terminal's line still being typed.

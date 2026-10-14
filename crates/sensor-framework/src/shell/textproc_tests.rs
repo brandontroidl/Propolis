@@ -309,6 +309,13 @@ fn grep_charges_every_search_of_a_line_it_searches_again() {
     let (stdout, _, _) = answer(&mut sh, "echo $a$a | grep -F -w -c \"$a\"; echo tail");
     assert_eq!(stdout, "", "the line stops in the search");
     assert_eq!(sh.last_trace().budget.hit, Some(super::BudgetHit::Work));
+    // The scan is cut at the allowance, not charged in full afterwards: uncut, the excess
+    // charged would be about 4e8.
+    let charged = sh.last_trace().budget.work_charged;
+    assert!(
+        charged <= 4_194_304 + 65_536,
+        "the scan ran past the allowance: {charged}"
+    );
 
     // The same through the regular-expression path: `a*` matches at every offset of a run of
     // `a` followed by `b`, and `-w` rejects each one.

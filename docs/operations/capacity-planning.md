@@ -107,7 +107,9 @@ it. Their binaries install `AccountingAlloc`
 the session it was made in; each connection's future runs in its own accounted scope
 (`crates/sensor-framework/src/session_memory.rs#scope`). Capture bodies grow outside the session,
 since the capture memory budget above already charges them. Every allocation carries a header of
-16 bytes (more for alignments above 16), counted in the session's figure.
+16 bytes (more for alignments above 16), counted in the session's figure. `sensor-http` charges
+its connections to a pool of its own the same way; its sizing is in
+[HTTP sensor worst-case memory](#http-sensor-worst-case-memory).
 
 - A session may keep at most 8 MiB between lines
   (`crates/sensor-framework/src/session_memory.rs#RETAINED_LIMIT_BYTES`), and hold at most that
@@ -183,6 +185,48 @@ Residuals, stated plainly. The 64 MiB runtime allowance and the 40% and 30% shar
 estimates, not measurements, and the margin above is 5% of `MemoryMax`. Sessions can hold more
 than the pool for as long as the asked sessions take to end (see the session memory section);
 a measured high-water of a loaded sensor is the check that would tighten both.
+
+## HTTP sensor worst-case memory
+
+`sensor-http` admits 512 connections on each listener (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`),
+so 1,024 at once with HTTPS bound, against `MemoryMax=256M` (268,435,456 bytes). Its binary
+installs `AccountingAlloc` and runs each connection, on either listener, in its own accounted
+scope (`crates/sensor-http/src/lib.rs#start_test_server`), so what a connection holds is charged
+to its session as on the shell sensors [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb).
+HTTP spools nothing and has no capture budget, so its session pool takes that 40% as well: 70%
+of `MemoryMax`, 187,904,815 bytes (`crates/sensor-http/src/lib.rs#SESSION_MEMORY_POOL_BYTES`),
+shared by both listeners and configured for all 1,024 sessions, which gives each a floor of
+183,500 bytes. The slot table holds 2,047 sessions
+(`crates/sensor-framework/src/session_memory.rs#SLOT_COUNT`).
+
+What one connection holds, from where each buffer is allocated and released
+(`crates/sensor-http/src/handler.rs#BoundedReader`), and measured as the session's live bytes
+(allocation headers included) at each read under the accounting allocator:
+
+| Phase | Held | Bound | Measured |
+|---|---|---|---|
+| Header block | the header buffer | 16,384 bytes: each read asks for at most the room left, and the buffer doubles but never past the cap | 17,172 at 12 KiB read |
+| Body drain, plain | the header block, kept once as bytes; the body capture, sized once to what is kept; the header buffer is freed first | 16,380 + 65,536 | 82,720 |
+| Body drain, HTTPS | the same, plus rustls's record buffers, which grow inside the session | | 132,035 |
+| Event written, reply sent | the event; the request is dropped first | | 11,687 |
+
+The largest, 132,035 bytes, is under the 183,500-byte floor, so 1,024 sessions at their worst
+hold 135,203,840 bytes, inside the pool; no session at or under its floor is ever asked to let
+go. A session past its share while the pool is short is ended at its next read, or at once while
+it waits for its peer (`crates/sensor-http/tests/session_memory_limit.rs`, which also holds the
+flood and largest requests, plain and over TLS, within that floor). A header block of empty `:`
+lines costs its bytes: before, each line was a 48-byte table entry, and 5,400 of them held about
+390 KiB through the body drain.
+
+Outside the pool: each connection's task (the handler future measures 6,568 bytes, plus the
+listener's two task cells), the TLS handshake state rustls allocates before the session starts
+and never reallocates inside it (about 1.6 KB a connection, the measured difference with the
+handshake run inside the session), the runtime, and socket memory, which the kernel bounds per
+socket and the handler keeps drained while it reads. That is about 10 MiB for 1,024 connections
+plus the runtime, against the 80,530,641 bytes the pool leaves. Building the request event is
+the one larger moment: a 64 KiB body of invalid UTF-8 expands when it is decoded and redacted,
+and measured 350,000 bytes, charged to the session, for the length of one poll; at most one runs
+per worker thread at a time.
 
 ## Per-unit resource caps (systemd)
 

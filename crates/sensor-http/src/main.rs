@@ -3,9 +3,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sensor_framework::session_memory::{self, AccountingAlloc};
 use sensor_framework::{
     ConnectionBounds, Env, EnvError, TlsServer, WanResolver, listener_start_error, shutdown_signal,
 };
+
+/// Every allocation is charged to the session it was made in (`session_memory`).
+#[global_allocator]
+static ALLOCATOR: AccountingAlloc = AccountingAlloc;
 
 const ENV_BIND: &str = "PROPOLIS_HTTP_BIND";
 const ENV_WAN_MAP: &str = "PROPOLIS_HTTP_WAN_MAP";
@@ -161,6 +166,18 @@ async fn main() {
         None => None,
     };
 
+    // Both listeners' sessions share one pool, so it is sized for both at once; every admitted
+    // session must fit in it at its floor.
+    let listeners = if tls_server.is_some() { 2 } else { 1 };
+    if let Err(e) = session_memory::configure(
+        sensor_http::SESSION_MEMORY_POOL_BYTES,
+        config.bounds.max_concurrent.saturating_mul(listeners),
+    ) {
+        tracing::error!(error = %e, "sensor-http: invalid configuration; refusing to start");
+        std::process::exit(1);
+    }
+    tokio::spawn(session_memory::watchdog());
+
     let wan_resolver = Arc::new(WanResolver::new(config.wan_map));
 
     let (bound, handle) = match sensor_http::start_test_server(
@@ -275,6 +292,16 @@ mod tests {
                 "{var}={bad}"
             );
         }
+    }
+
+    #[test]
+    fn the_default_bounds_on_both_listeners_fit_the_session_memory_pool() {
+        // Both listeners at the default, as the binary configures it with TLS bound.
+        session_memory::configure(
+            sensor_http::SESSION_MEMORY_POOL_BYTES,
+            DEFAULT_MAX_CONCURRENT * 2,
+        )
+        .expect("1,024 sessions have slots and a usable share");
     }
 
     fn tls_cfg(bind: Option<&str>) -> TlsConfig {

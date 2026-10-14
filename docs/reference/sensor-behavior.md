@@ -1092,7 +1092,12 @@ Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
   any of it is read; a client that hangs up before its declared body has arrived gets
   no reply, as nginx gives none, and the event says `body_complete: false`.
 - **Bounds:** common defaults except **`max_concurrent` 512** (higher than the
-  others, `crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`).
+  others, `crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`). Each connection's heap is
+  charged to the session memory pool, 70% of the unit's `MemoryMax` shared by both listeners
+  (`crates/sensor-http/src/lib.rs#SESSION_MEMORY_POOL_BYTES`); a session the pool asks to let go
+  is ended at its next read, or at once while it waits for its peer (one ended in its body is
+  recorded with `body_complete: false`, unanswered). The arithmetic is in
+  [capacity planning](../operations/capacity-planning.md#http-sensor-worst-case-memory).
 - **HTTPS (optional):** when `PROPOLIS_HTTP_TLS_BIND` is set, a second implicit-TLS listener in the
   same process serves the same nginx persona and writes the same `events.jsonl`
   (`crates/sensor-http/src/lib.rs#start_test_server_tls`). No client certificate is requested.

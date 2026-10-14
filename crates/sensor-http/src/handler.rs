@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::sanitize_value;
+use sensor_framework::session_memory::{self, AccountRef};
 use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver};
 use sensor_wire::{
     PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION, SensorEvent, WIRE_VERSION,
@@ -122,6 +123,10 @@ pub async fn handle_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if session_memory::unaccounted_session() {
+        return;
+    }
     let norm_peer = normalize_dual_stack(peer_addr);
     let source_ip: IpAddr = norm_peer.ip();
     let wan_ip = local_addr
@@ -522,6 +527,8 @@ struct BoundedReader {
     bounds: ConnectionBounds,
     first_read: bool,
     total_captured: u64,
+    /// This session's memory account, while the sensor accounts sessions.
+    account: Option<AccountRef>,
 }
 
 impl BoundedReader {
@@ -531,17 +538,23 @@ impl BoundedReader {
             bounds,
             first_read: true,
             total_captured: 0,
+            account: session_memory::current_account(),
         }
     }
 
     /// One read of at most `into.len()` bytes into `into`. `None` once the session's byte budget
-    /// is spent or the read fails, times out or finds the stream closed.
+    /// is spent, the session memory pool asks it to let go, or the read fails, times out or finds
+    /// the stream closed.
     async fn read_some<S: AsyncRead + Unpin>(
         &mut self,
         stream: &mut S,
         into: &mut [u8],
     ) -> Option<usize> {
         if self.total_captured >= self.bounds.max_captured_bytes {
+            return None;
+        }
+        // Between reads: over what a session may keep, or asked to let go.
+        if self.account.is_some_and(|a| a.check_retained()) {
             return None;
         }
         let timeout = if self.first_read {
@@ -551,7 +564,13 @@ impl BoundedReader {
         };
         self.first_read = false;
 
-        match tokio::time::timeout(timeout, stream.read(into)).await {
+        // A session asked to let go while it waits for its peer's next bytes ends now, not at
+        // its read timeout.
+        let read = tokio::select! {
+            read = tokio::time::timeout(timeout, stream.read(into)) => read,
+            () = session_memory::evicted(self.account) => return None,
+        };
+        match read {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
             Ok(Ok(n)) => {
                 self.total_captured += n as u64;

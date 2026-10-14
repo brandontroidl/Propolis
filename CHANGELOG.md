@@ -462,6 +462,17 @@
   Large" page instead of a silent hang-up; a block within the cap is served whatever its lines,
   as nginx serves one, since it skips a line like `:` as invalid. See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-http).
+- **HTTP connections are charged to a session memory pool** - nothing bounded what the HTTP
+  sensor's connections held together: 512 a listener, 1,024 with HTTPS bound, each with its own
+  buffers, against a 256 MiB unit. Its binary now installs the accounting allocator the shell
+  sensors use and runs every connection, on both listeners, as an accounted session of one pool
+  of 70% of `MemoryMax` (187,904,815 bytes; HTTP has no capture budget, so it gets that share
+  too), a floor of 183,500 bytes for each of the 1,024. The most a connection was measured to
+  hold is 132,035 bytes (HTTPS, a full header block and a full body capture), so all 1,024 at
+  their worst fit inside the pool; a session over its share while the pool is short is ended at
+  its next read, or at once while it waits for its peer. The session slot table grows from
+  1,023 to 2,047 so the HTTP sensor's sessions fit. The arithmetic is in
+  [capacity planning](docs/operations/capacity-planning.md#http-sensor-worst-case-memory).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

@@ -25,9 +25,10 @@ use tokio::sync::Notify;
 
 use crate::budget::LINE_WORKING_SET_BYTES;
 
-/// Sessions with a slot at once. Above every shell sensor's `max_concurrent` (256), and a slot is
-/// free again the moment its session ends; [`configure`] refuses a sensor that admits more.
-pub const SLOT_COUNT: usize = 1024;
+/// Sessions with a slot at once. Above what every accounted sensor admits (256 for each shell
+/// sensor; 1,024 for HTTP, 512 on each of its two listeners), and a slot is free again the moment
+/// its session ends; [`configure`] refuses a sensor that admits more.
+pub const SLOT_COUNT: usize = 2048;
 
 /// Granularity at which a session reserves pool room.
 pub const CHUNK_BYTES: u64 = 64 * 1024;

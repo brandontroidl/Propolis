@@ -11,6 +11,12 @@ use sensor_framework::{
 };
 use tokio::task::JoinHandle;
 
+/// The pool every HTTP session's heap is charged to (`sensor_framework::session_memory`). The
+/// shell sensors give 30% of their unit's `MemoryMax` to sessions and 40% to a capture budget;
+/// HTTP spools nothing and has no capture budget, so that share is the sessions' too, and the
+/// runtime keeps the same 30% (`deploy/sensor-http.service` sets `MemoryMax=256M`).
+pub const SESSION_MEMORY_POOL_BYTES: u64 = 256 * 1024 * 1024 / 10 * 7;
+
 pub async fn start_test_server(
     addr: SocketAddr,
     log_path: PathBuf,
@@ -31,7 +37,8 @@ pub async fn start_test_server(
             let emitter = emitter.clone();
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
-            async move {
+            // What the session allocates is its own (`session_memory`).
+            sensor_framework::session_memory::scope(async move {
                 handler::handle_connection(
                     stream,
                     peer,
@@ -43,7 +50,7 @@ pub async fn start_test_server(
                     bounds,
                 )
                 .await;
-            }
+            })
         },
     )
     .await
@@ -73,7 +80,7 @@ pub async fn start_test_server_tls(
             let emitter = emitter.clone();
             let wan_resolver = wan_resolver.clone();
             let bounds = bounds.clone();
-            async move {
+            sensor_framework::session_memory::scope(async move {
                 handler::handle_connection(
                     stream,
                     peer,
@@ -85,7 +92,7 @@ pub async fn start_test_server_tls(
                     bounds,
                 )
                 .await;
-            }
+            })
         },
     )
     .await

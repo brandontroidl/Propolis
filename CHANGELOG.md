@@ -509,11 +509,12 @@
   sensors use (30% of `MemoryMax`, shared by both listeners): a body still arriving is charged
   to it, a session the pool cannot hold is ended with `end_reason` `memory_limit` on its
   session-end event, and a connection that cannot get a slot is closed unanswered. The same
-  load now peaks at 129 to 140 MB across runs. **Upgrade check:** the pool has 1023 slots
-  shared by both listeners, so `sensor-mqtt` now refuses to start (exit 1, naming the value and
-  the listener count) when `PROPOLIS_MQTT_MAX_CONCURRENT` times the listener count reaches 1024:
-  the largest value is 511 with `PROPOLIS_MQTT_TLS_BIND` set and 1023 without. The default (256)
-  is unaffected; a deployment that raised it past those limits must lower it before upgrading.
+  load now peaks at 129 to 140 MB across runs. **Upgrade check:** both listeners share the
+  session memory pool, so `sensor-mqtt` now refuses to start (exit 1, naming the value and the
+  listener count) when `PROPOLIS_MQTT_MAX_CONCURRENT` times the listener count leaves the pool
+  under 64 KiB a session: the largest value is 614 with `PROPOLIS_MQTT_TLS_BIND` set and 1,228
+  without. The default (256) is unaffected; a deployment that raised it past those limits must
+  lower it before upgrading.
   See
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-mqtt) and
   [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).

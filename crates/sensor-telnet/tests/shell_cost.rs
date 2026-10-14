@@ -296,3 +296,23 @@ fn files_a_command_reads_for_itself_are_charged_to_the_line() {
     let out = session.run("printf '* * * * * id\\n' > /tmp/c; crontab /tmp/c; crontab -l");
     assert!(out.contains("\r\n* * * * * id\r\n"), "{out:?}");
 }
+
+/// The echo-loader tracker digested a typed assembly twice per `>>` append and again on every
+/// `chmod`, and the line was charged for none of it: 15,000 one-byte appends to a 180 KB assembly
+/// took six minutes of sensor time in a debug build.
+#[test]
+fn tracking_a_typed_assembly_is_charged_to_the_line() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    session.run("cd /tmp");
+    for _ in 0..3 {
+        session.run("printf '%60000s' a >> f");
+    }
+    let out = session.run("wc -c f");
+    assert!(out.contains("\r\n180000 f\r\n"), "{out:?}");
+    session.run("while :; do echo -n b >> f; done");
+    session.run("while :; do chmod +x f; done");
+    let out = session.run("echo ok");
+    assert!(out.contains("\r\nok\r\n"), "{out:?}");
+}

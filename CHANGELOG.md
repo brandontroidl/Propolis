@@ -687,7 +687,11 @@
   /bin/busybox; done` held the telnet sensor for about ten minutes per line and `systemctl status`
   re-read and echoed a 180 KB unit once per operand (200 operands, 118 MB); each read is now
   charged to the line before it is made, and `crontab -e` no longer reads the file it only needs
-  to find. `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs` run each reproducer through the real listener and
+  to find. The echo-loader tracker digested a typed assembly twice per `>>` append and again on
+  every `chmod`, uncharged (about 23 ms per one-byte append to a 180 KB assembly in a debug
+  build); it now digests the appended bytes once from a retained prior digest, and the append's
+  rewrite, the digest and the read for a `chmod` or run are charged to the line.
+  `crates/sensor-telnet/tests/shell_cost.rs` and `crates/sensor-adb/tests/shell_cost.rs` run each reproducer through the real listener and
   holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and

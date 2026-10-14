@@ -64,7 +64,9 @@ pub(super) struct Decoded {
 /// has run, so a line run only to learn whether it waits for input leaves nothing behind.
 #[derive(Clone, Debug, Default)]
 pub(super) struct LineLoader {
-    files: Vec<AssembledFile>,
+    /// The files to capture, each with the digest it was found to have, so a later trigger on
+    /// the same line compares digests instead of hashing every queued file again.
+    files: Vec<([u8; 32], AssembledFile)>,
     /// Stage-2 URLs derived on the line, each with the digest of the downloader it came from.
     pub(super) urls: Vec<(String, [u8; 32])>,
     /// The assembled file this line wrote a chunk of, and that chunk's number.
@@ -149,19 +151,34 @@ impl FakeShell {
     /// that made `content` was); one appended to an assembly as its last chunk
     /// left it adds a chunk. Appending to anything else (a system file, an assembly something
     /// else has changed since) is not one: what the file holds is not all the attacker's.
+    ///
+    /// `content` starts with `prior`, so one pass over it digests both. The pass is charged to the
+    /// line: a loop of one-byte appends to a large assembly hashes all of it every trip. It is
+    /// made even when the line cannot pay (the line stops after this write), so the assembly's
+    /// record stays true to the file and the session's end still captures it.
     pub(super) fn note_typed_write(&mut self, path: &str, prior: &[u8], content: &[u8]) {
+        let continues = self
+            .assembled
+            .get(path)
+            .is_some_and(|known| known.len == len_u64(prior.len()));
+        if !prior.is_empty() && !continues {
+            self.assembled.remove(path);
+            return;
+        }
+        self.charge_work(len_u64(content.len()));
+        let mut hasher = Sha256::new();
+        hasher.update(prior);
+        let prior_sha256: [u8; 32] = hasher.clone().finalize().into();
+        hasher.update(content.get(prior.len()..).unwrap_or_default());
+        let sha256: [u8; 32] = hasher.finalize().into();
         let chunks = if prior.is_empty() {
             self.decoded
                 .as_ref()
-                .filter(|decoded| decoded.sha256 == digest(content))
+                .filter(|decoded| decoded.sha256 == sha256)
                 .map_or(1, |decoded| decoded.chunks)
         } else {
             match self.assembled.get(path) {
-                Some(known)
-                    if known.len == len_u64(prior.len()) && known.sha256 == digest(prior) =>
-                {
-                    known.chunks.saturating_add(1)
-                }
+                Some(known) if known.sha256 == prior_sha256 => known.chunks.saturating_add(1),
                 _ => {
                     self.assembled.remove(path);
                     return;
@@ -174,7 +191,7 @@ impl FakeShell {
         self.assembled.insert(
             path.to_string(),
             Assembled {
-                sha256: digest(content),
+                sha256,
                 len: len_u64(content.len()),
                 chunks,
                 command: self.line_command.clone(),
@@ -185,14 +202,22 @@ impl FakeShell {
 
     /// The bytes of the file at `path` and the assembly they are, when it holds exactly what an
     /// assembly of this session left in some file: its own, or the one a copy came from.
-    fn assembled_content(&self, path: &str) -> Option<(Vec<u8>, Assembled)> {
+    ///
+    /// The read and its digest are charged to the line first, as each `chmod +x` or run of the
+    /// file pays for them again; a line that cannot pay finds no assembly here, and one still
+    /// tracked is captured when the session ends.
+    fn assembled_content(&mut self, path: &str) -> Option<(Vec<u8>, Assembled)> {
         let size = self.fs.stat(path, true)?.size;
         // Only a file of an assembly's size is read and hashed, so running `/bin/ls` costs
         // nothing here.
         if size == 0 || !self.assembled.values().any(|known| known.len == size) {
             return None;
         }
-        let bytes = self.fs.read_all(path, size.min(READ_CAP)).ok()?;
+        let size = size.min(READ_CAP);
+        if !self.charge_work(size) {
+            return None;
+        }
+        let bytes = self.fs.read_all(path, size).ok()?;
         let sha256 = digest(&bytes);
         let known = self
             .assembled
@@ -206,7 +231,7 @@ impl FakeShell {
     /// Whether the file at `path` holds a program this session assembled from typed bytes: an ELF,
     /// or something built by more than one write. A short script typed in one `echo` (a probe of
     /// whether a directory is writable and executable) is an assembly of one chunk and no program.
-    pub(super) fn assembled_program(&self, path: &str) -> bool {
+    pub(super) fn assembled_program(&mut self, path: &str) -> bool {
         self.assembled_content(path)
             .is_some_and(|(bytes, known)| bytes.starts_with(b"\x7fELF") || known.chunks > 1)
     }
@@ -219,14 +244,17 @@ impl FakeShell {
             .loader_line
             .files
             .iter()
-            .any(|file| digest(&file.bytes) == known.sha256);
+            .any(|(sha256, _)| *sha256 == known.sha256);
         if !queued {
-            self.loader_line.files.push(AssembledFile {
-                path: path.to_string(),
-                bytes: bytes.clone(),
-                chunk_count: known.chunks,
-                command: known.command,
-            });
+            self.loader_line.files.push((
+                known.sha256,
+                AssembledFile {
+                    path: path.to_string(),
+                    bytes: bytes.clone(),
+                    chunk_count: known.chunks,
+                    command: known.command,
+                },
+            ));
         }
         Some(bytes)
     }
@@ -298,7 +326,7 @@ impl FakeShell {
         let Some(captures) = &self.captures else {
             return;
         };
-        for file in line.files {
+        for (_, file) in line.files {
             captures.record_assembled(file);
         }
         if !self.assembled.is_empty() {

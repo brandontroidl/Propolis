@@ -2035,6 +2035,11 @@ impl FakeShell {
             };
             let prior = content.len();
             content.extend_from_slice(&bytes);
+            if append {
+                // The read and rewrite of the whole file are the append's cost however few bytes
+                // it adds; a loop of one-byte appends to a large file pays for every trip.
+                self.charge_work(len_u64(content.len()));
+            }
             match self.traced_write_file(&path, &content) {
                 Ok(()) if !append && carried.is_some() => {
                     if let Some(origin) = carried.clone() {

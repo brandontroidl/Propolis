@@ -225,9 +225,12 @@ framework (`crates/sensor-framework/src/tls.rs`) before the handler, so before t
 starts: rustls joins a fragmented handshake message in a buffer of up to 65,535 bytes, held for
 up to the read timeout (30 s). Measured on a release build, 512 connections each holding a
 60 KiB partial ClientHello cost about 110 KB each, 56 MB together. A connection is either in its
-handshake or in its session, and a session costs more, so the worst mix is 512 handshaking
-HTTPS connections (about 56 MB, outside the pool) beside 512 plaintext sessions in the pool; it
-measured 117.6 MB of anonymous memory, 136 MB at its peak, against the 256 MiB unit. Once the
+handshake or in its session. The handshake is the largest cost outside the pool: 512 handshaking
+HTTPS connections (about 56 MB) beside 512 plaintext sessions in the pool measured 117.6 to
+117.9 MB of anonymous memory, 131 to 136 MB at its peak. A session costs more than a handshake,
+so the largest whole-process figure measured is every connection in its largest session, 512
+plaintext and 512 HTTPS: 128.8 MB anonymous, 139 to 151 MB at its peak across two runs, against
+the 256 MiB unit. Once the
 handshake ends the buffer is released and the connection joins the pool. Past the handshake a
 client can still fragment a handshake message and grow rustls's buffer toward 64 KiB inside the
 session [unverified, from the vendored source]; the pool then ends that session if it is over

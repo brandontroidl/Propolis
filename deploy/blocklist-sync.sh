@@ -19,8 +19,9 @@
 # a public repo, a FIFO would hang it, and a link planted where it writes would have it overwrite
 # any file. Run it as the dedicated propolis-blocklist account deploy/provision.sh creates, which
 # can read the feed and nothing of root's (docs/operations/routine-procedures.md); and whichever
-# account runs it, it copies only single-link regular files with the publisher's own names, checks
-# each one again on the open descriptor before reading, and writes nothing in the daemon's tree.
+# account runs it, it copies only single-link regular files with the publisher's own names, opens
+# each without following a link or blocking, checks it again after reading, and writes nothing in
+# the daemon's tree.
 #
 # Paths (override via environment; both feed and repo are auto-detected when unset):
 #   PROPOLIS_FEED_OUTPUT_DIR      the publisher's flat output holding manifest.json
@@ -44,8 +45,6 @@ MAX_BUILD_BYTES=$((256 * 1024 * 1024))
 # Retention windows are operator-configured (PROPOLIS_FEED_WINDOWS, five by default); this bounds
 # how many file sets a tampered directory can make one run copy.
 MAX_WINDOWS=16
-# Bounds the one open that can block: a file swapped for a FIFO between its check and its open.
-COPY_TIMEOUT_SECS=30
 
 # --- Push authentication ------------------------------------------------------------------------
 # Cron has no ssh-agent, so a passphrase-protected key cannot be used non-interactively: the push
@@ -118,6 +117,8 @@ absolute() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" 
 SRC="$(absolute "$SRC")"
 REPO="$(absolute "$REPO")"
 STATUS_DIR="$(absolute "$STATUS_DIR")"
+# stat resolves a trailing slash through a final symlink, which would blind the identity check below.
+while [ "${#SRC}" -gt 1 ] && [ "${SRC%/}" != "$SRC" ]; do SRC="${SRC%/}"; done
 
 # Enter the feed directory once and work only on names relative to it, so the daemon swapping the
 # path for a link afterwards changes nothing. The directory entered must be the one the path names
@@ -161,12 +162,14 @@ done
 
 # --- Copy each file safely --------------------------------------------------------------------
 # Copies one feed file to `dest`. The type and link count are checked on the name before opening
-# it, so a FIFO or device is never opened; then the open descriptor itself must be that same inode,
-# so a name swapped for a link between the check and the open is refused, not followed. A
-# single-link regular file in the daemon's own directory holds only what the daemon wrote. Run in
-# a child under `timeout`: the one open that can still block is a FIFO swapped in at that instant.
+# it, so a FIFO or device is not opened in the ordinary case. The open itself is dd's with
+# O_NOFOLLOW (a name swapped for a link after the check is refused by the kernel, never followed)
+# and O_NONBLOCK (a FIFO swapped in at that instant reads as empty instead of blocking, and then
+# fails the size check). The name must still be the same inode with the same link count after the
+# read: a swap to a hard link of another file is caught there. A single-link regular file in the
+# daemon's own directory holds only what the daemon wrote.
 copy_feed_file() {
-  local name="$1" dest="$2" max="$3" checked opened type links size
+  local name="$1" dest="$2" max="$3" checked after type links size
   checked="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
   IFS='|' read -r type links size _ <<<"$checked"
   case "$type" in
@@ -181,19 +184,18 @@ copy_feed_file() {
     echo "blocklist-sync: $name is $size bytes, over the $max-byte limit" >&2
     return 1
   fi
-  exec 3<"$name" || return 1
-  opened="$(stat -L -c '%F|%h|%s|%d:%i' /dev/fd/3)" || return 1
-  if [ "$opened" != "$checked" ]; then
-    echo "blocklist-sync: $name changed between its check and its open" >&2
+  dd if="$name" of="$dest" iflag=nofollow,nonblock,count_bytes count="$max" bs=1M status=none \
+    || { echo "blocklist-sync: $name could not be opened and read as a plain file" >&2; return 1; }
+  after="$(stat -c '%F|%h|%s|%d:%i' -- "$name")" || return 1
+  if [ "$after" != "$checked" ]; then
+    echo "blocklist-sync: $name changed between its check and its copy" >&2
     return 1
   fi
-  head -c "$max" <&3 >"$dest" || return 1
   if [ "$(stat -c %s -- "$dest")" != "$size" ]; then
     echo "blocklist-sync: $name changed size while being copied" >&2
     return 1
   fi
 }
-export -f copy_feed_file
 
 # Copies land in a private directory inside the checkout's .git (same filesystem, never committed)
 # and move into the work tree only once all of them passed, so a refusal leaves the repo untouched.
@@ -207,10 +209,7 @@ for name in "${!present[@]}"; do
     all-*) dest="$stage/retention/$name" ;;
     *) dest="$stage/tiers/$name" ;;
   esac
-  # shellcheck disable=SC2016 # expanded by the child bash, which receives the values as "$@"
-  timeout "$COPY_TIMEOUT_SECS" bash -c 'copy_feed_file "$@"' copy_feed_file \
-      "$name" "$dest" "$MAX_FILE_BYTES" \
-    || refuse "$name in $SRC failed its checks"
+  copy_feed_file "$name" "$dest" "$MAX_FILE_BYTES" || refuse "$name in $SRC failed its checks"
   total=$(( total + $(stat -c %s -- "$dest") ))
   [ "$total" -le "$MAX_BUILD_BYTES" ] || refuse "the build in $SRC is over $MAX_BUILD_BYTES bytes"
 done
@@ -254,19 +253,38 @@ fi
 # account writes: never the daemon's tree, where a link it planted would redirect the write. A
 # directory others can write is refused for the same reason. Written to a fresh temporary name and
 # renamed over the marker, which replaces whatever entry is there rather than following it.
-write_push_marker() {
-  local owner mode tmp
-  [ -d "$STATUS_DIR" ] && [ ! -L "$STATUS_DIR" ] || return 1
-  read -r owner mode < <(stat -c '%u %a' -- "$STATUS_DIR") || return 1
-  if [ "$owner" != "$(id -u)" ] && [ "$owner" != 0 ]; then return 1; fi
-  if (( 8#$mode & 8#022 )); then return 1; fi
-  tmp="$(mktemp "$STATUS_DIR/.last-pushed.XXXXXX")" || return 1
+write_marker_files() {
+  local dir="$1" tmp
+  tmp="$(mktemp "$dir/.last-pushed.XXXXXX")" || return 1
   if printf 'blocklist-sync last-pushed marker\n' >"$tmp" && chmod 0644 -- "$tmp" \
-     && mv -f -T -- "$tmp" "$STATUS_DIR/last-pushed"; then
+     && mv -f -T -- "$tmp" "$dir/last-pushed"; then
     return 0
   fi
   rm -f -- "$tmp"
   return 1
+}
+export -f write_marker_files
+
+# A root run (a crontab from before the dedicated account) cannot write the marker as itself: the
+# directory belongs to propolis-blocklist and must stay that way, and root writing in a directory
+# another account controls is the redirect this layout exists to prevent. So root drops to the
+# directory's owner for the write, which then reaches nothing the owner could not already write.
+write_push_marker() {
+  local owner group mode me
+  me="$(id -u)"
+  [ -d "$STATUS_DIR" ] && [ ! -L "$STATUS_DIR" ] || return 1
+  read -r owner group mode < <(stat -c '%u %g %a' -- "$STATUS_DIR") || return 1
+  if (( 8#$mode & 8#022 )); then return 1; fi
+  if [ "$owner" = "$me" ]; then
+    write_marker_files "$STATUS_DIR"
+  elif [ "$me" = 0 ]; then
+    command -v setpriv >/dev/null 2>&1 || return 1
+    # shellcheck disable=SC2016 # expanded by the child bash, which receives the directory as "$1"
+    setpriv --reuid="$owner" --regid="$group" --clear-groups --no-new-privs -- \
+      bash -c 'write_marker_files "$1"' write_marker_files "$STATUS_DIR"
+  else
+    return 1
+  fi
 }
 
 # Always attempt the push, even when nothing new was committed: an earlier run may have committed
@@ -278,7 +296,8 @@ if git push -q origin HEAD; then
   # A marker failure must not fail a successful push.
   if ! write_push_marker; then
     echo "blocklist-sync: WARNING could not update push marker $STATUS_DIR/last-pushed (the" \
-         "directory must exist, be this account's or root's, and be writable by no one else);" \
+         "directory must exist, be owned by this account (or by the account root can drop to, with" \
+         "setpriv installed) and be writable by no one else);" \
          "the daemon's feed-push-stale condition will read this push as not having happened" >&2
   fi
 else

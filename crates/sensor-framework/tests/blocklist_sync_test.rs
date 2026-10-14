@@ -3,9 +3,10 @@
 //! daemon, which parses every attacker byte, while the script runs from the operator's cron (root
 //! on a box set up before the dedicated account existed), so each test plays a compromised daemon
 //! planting something in that directory and checks that nothing it plants is published, opened
-//! or written through. Real git, stat, head and timeout run as shipped; nothing is stubbed.
+//! or written through. Real git, stat and dd run as shipped; only the swap and root tests put a stand-in first on PATH.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -102,12 +103,21 @@ impl Fixture {
     /// Runs the script with a hard deadline: a script that opens a FIFO the daemon planted blocks
     /// forever, and a test that hung with it would hide the failure instead of reporting it.
     fn run(&self) -> Output {
+        self.run_with(&[])
+    }
+
+    /// As `run`, with extra environment applied last (so it can override the fixture's paths).
+    /// The script gets its own process group so the deadline kills whatever it spawned too:
+    /// killing only bash leaves a blocked grandchild holding the output pipes open, and
+    /// collecting the output would then wait on it forever instead of reporting the failure.
+    fn run_with(&self, extra_env: &[(&str, &str)]) -> Output {
         let script = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../deploy/blocklist-sync.sh"
         );
         let mut command = Command::new("bash");
         command
+            .process_group(0)
             .arg(script)
             .env("HOME", self.root())
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -121,14 +131,19 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
         let mut child = command.spawn().expect("bash runs");
+        let group = child.id() as libc::pid_t;
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if child.try_wait().unwrap().is_some() {
                 return child.wait_with_output().unwrap();
             }
             if Instant::now() > deadline {
-                child.kill().ok();
+                // SAFETY: signals the process group this call created; no memory is touched.
+                unsafe { libc::kill(-group, libc::SIGKILL) };
                 let out = child.wait_with_output().unwrap();
                 panic!(
                     "blocklist-sync.sh did not finish within 90 s (blocked on something it \
@@ -341,11 +356,249 @@ fn a_feed_directory_that_is_a_symlink_is_refused() {
     std::fs::rename(fx.feed(), &real).unwrap();
     std::os::unix::fs::symlink(&real, fx.feed()).unwrap();
     let out = fx.run();
+    fx.assert_refused_and_nothing_published(&out, "symlinked feed directory");
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !out.status.success(),
-        "a symlinked feed directory is refused"
+        stderr.contains("is a symbolic link or was replaced"),
+        "{stderr}"
     );
-    assert!(fx.pushed_paths().is_empty());
+
+    // A trailing slash makes stat resolve the link, which must not hide it.
+    let slashed = format!("{}/", fx.feed().display());
+    let out = fx.run_with(&[("PROPOLIS_FEED_OUTPUT_DIR", &slashed)]);
+    fx.assert_refused_and_nothing_published(&out, "symlinked feed directory with a trailing slash");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is a symbolic link or was replaced"),
+        "{stderr}"
+    );
+}
+
+/// Writes `feed/current/<n>h` retention files so the build carries `count` windows beyond the
+/// fixture's own `all-7d`.
+fn add_windows(fx: &Fixture, count: usize) {
+    for n in 1..=count {
+        for ext in FORMATS {
+            std::fs::write(fx.feed().join(format!("all-{n}h.{ext}")), "192.0.2.1\n").unwrap();
+        }
+    }
+}
+
+/// The script holds the number of retention windows a run will copy to a fixed bound.
+#[test]
+fn more_retention_windows_than_the_bound_are_refused() {
+    let fx = Fixture::new();
+    add_windows(&fx, 15); // 15 + all-7d = 16, the bound
+    assert_ok(&fx.run());
+
+    let fx = Fixture::new();
+    add_windows(&fx, 16); // 17
+    let out = fx.run();
+    fx.assert_refused_and_nothing_published(&out, "17 windows");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("retention windows"), "{stderr}");
+}
+
+/// The whole build is bounded too: nine files at the per-file cap are 288 MiB, past the 256 MiB
+/// a run may copy, and the run stops with the repo untouched.
+#[test]
+fn a_build_over_the_total_bound_is_refused() {
+    let fx = Fixture::new();
+    for ext in FORMATS.iter().take(9) {
+        let big = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(fx.feed().join(format!("all-7d.{ext}")))
+            .unwrap();
+        big.set_len(MAX_FILE_BYTES).unwrap();
+    }
+    let out = fx.run();
+    fx.assert_refused_and_nothing_published(&out, "over the build bound");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("over 268435456 bytes"), "{stderr}");
+}
+
+/// A `stat` placed first on PATH that runs the real one and then, right after the script's first
+/// look at `aggressive.txt` (its pre-open check), swaps that name for something else. That is the
+/// check-to-open window, hit deterministically instead of by racing. `restore` puts the original
+/// back on the script's second look, so only the open itself can refuse a link swapped in for
+/// just that instant.
+struct SwapShim {
+    dir: PathBuf,
+}
+
+impl SwapShim {
+    fn new(fx: &Fixture, mode: &str) -> Self {
+        let dir = fx.root().join("shim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = ["/usr/bin/stat", "/bin/stat"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .expect("a stat binary");
+        let shim = format!(
+            r#"#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+n=0
+if [ "$last" = aggressive.txt ]; then
+  n=$(cat "{count}" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" >"{count}"
+  if [ "$n" = 2 ] && [ "{mode}" = symlink_restore ]; then
+    rm -f aggressive.txt
+    mv "{orig}" aggressive.txt
+  fi
+fi
+{real} "$@"
+rc=$?
+if [ "$n" = 1 ]; then
+  mv aggressive.txt "{orig}"
+  case "{mode}" in
+    symlink|symlink_restore) ln -s "{secret}" aggressive.txt ;;
+    hardlink) ln "{secret}" aggressive.txt ;;
+    fifo) mkfifo aggressive.txt ;;
+  esac
+fi
+exit $rc
+"#,
+            count = dir.join("count").display(),
+            orig = fx.root().join("orig-aggressive.txt").display(),
+            secret = fx.secret().display(),
+            mode = mode,
+            real = real,
+        );
+        let path = dir.join("stat");
+        std::fs::write(&path, shim).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        SwapShim { dir }
+    }
+
+    fn path_env(&self) -> String {
+        format!(
+            "{}:{}",
+            self.dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+}
+
+/// The stand-in secret resized to the target's length, so a size check alone cannot tell them apart.
+fn resize_secret_to(fx: &Fixture, len: usize) {
+    let mut bytes = SECRET.as_bytes().to_vec();
+    bytes.resize(len, b'S');
+    std::fs::write(fx.secret(), bytes).unwrap();
+}
+
+fn aggressive_len(fx: &Fixture) -> usize {
+    std::fs::metadata(fx.feed().join("aggressive.txt"))
+        .unwrap()
+        .len() as usize
+}
+
+/// A name that passed its check and is a symlink to a same-size secret by the time it is opened.
+#[test]
+fn a_symlink_swapped_in_after_the_check_is_not_followed() {
+    let fx = Fixture::new();
+    resize_secret_to(&fx, aggressive_len(&fx));
+    let shim = SwapShim::new(&fx, "symlink");
+    let out = fx.run_with(&[("PATH", &shim.path_env())]);
+    fx.assert_refused_and_nothing_published(&out, "symlink swapped after the check");
+}
+
+/// The link is there only while the script opens the file and gone again when it looks afterwards,
+/// so the second look sees a clean file: only refusing to follow a link at the open stops it.
+#[test]
+fn a_symlink_present_only_during_the_open_is_not_followed() {
+    let fx = Fixture::new();
+    resize_secret_to(&fx, aggressive_len(&fx));
+    let shim = SwapShim::new(&fx, "symlink_restore");
+    let out = fx.run_with(&[("PATH", &shim.path_env())]);
+    fx.assert_refused_and_nothing_published(&out, "symlink present only during the open");
+}
+
+/// A name swapped after its check for a hard link to a same-size secret is the same inode as the
+/// secret, so reading it copies the secret; the comparison after the read refuses it.
+#[test]
+fn a_hard_link_swapped_in_after_the_check_is_refused() {
+    let fx = Fixture::new();
+    resize_secret_to(&fx, aggressive_len(&fx));
+    let shim = SwapShim::new(&fx, "hardlink");
+    let out = fx.run_with(&[("PATH", &shim.path_env())]);
+    fx.assert_refused_and_nothing_published(&out, "hard link swapped after the check");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("changed between its check and its copy"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A FIFO swapped in after the check must not block the run.
+#[test]
+fn a_fifo_swapped_in_after_the_check_does_not_block() {
+    let fx = Fixture::new();
+    let shim = SwapShim::new(&fx, "fifo");
+    let started = Instant::now();
+    let out = fx.run_with(&[("PATH", &shim.path_env())]);
+    fx.assert_refused_and_nothing_published(&out, "fifo swapped after the check");
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "refused promptly, not after a timeout"
+    );
+}
+
+/// Run by root (a crontab from before the dedicated account) the script cannot write the marker as
+/// itself in a directory another account owns, so it drops to that account for the write. The
+/// test is not root, so `id` reports 0 and `setpriv` records its arguments and runs the command
+/// as the test user; the real privilege drop was run separately under a user namespace.
+#[test]
+fn a_root_run_writes_the_marker_as_the_status_directorys_owner() {
+    let fx = Fixture::new();
+    let shim = fx.root().join("rootshim");
+    std::fs::create_dir_all(&shim).unwrap();
+    let id = shim.join("id");
+    std::fs::write(
+        &id,
+        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; else exec /usr/bin/id \"$@\"; fi\n",
+    )
+    .unwrap();
+    let setpriv = shim.join("setpriv");
+    let log = fx.root().join("setpriv.log");
+    std::fs::write(
+        &setpriv,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"{}\"\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    for p in [&id, &setpriv] {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = fx.run_with(&[("PATH", &path)]);
+    assert_ok(&out);
+    assert!(
+        fx.status().join("last-pushed").is_file(),
+        "the marker is written"
+    );
+    let recorded = std::fs::read_to_string(&log).expect("the write went through setpriv");
+    let owner = std::fs::metadata(fx.status()).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert!(
+        recorded.contains(&format!("--reuid={}", owner.uid()))
+            && recorded.contains(&format!("--regid={}", owner.gid()))
+            && recorded.contains("--clear-groups"),
+        "dropped to the directory's owner: {recorded}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("could not update push marker"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// A file past the per-file cap is refused before it is read (sparse, so the test writes nothing).

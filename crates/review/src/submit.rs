@@ -357,6 +357,20 @@ fn idempotency_key(ip: IpAddr, vendor: &str, date: NaiveDate) -> String {
     format!("{ip}:{vendor}:{date}")
 }
 
+/// One index probe per category (`event_source_category_observed_idx`, core-scoring migration
+/// 0020) instead of `SELECT DISTINCT ON (category) ... ORDER BY category, observed_at DESC`, which
+/// reads and sorts every event the address ever produced: 1.55 s for one heavy address on the live
+/// node. The categories come from the enum itself, so a new `Category` variant needs no change
+/// here; a category with no event for this address yields no row, as before.
+const PROTOCOL_LABELS_SQL: &str = "\
+    SELECT c.category, l.protocol_label \
+    FROM unnest(enum_range(NULL::category_enum)) AS c(category) \
+    CROSS JOIN LATERAL ( \
+        SELECT metadata->>'protocol_label' AS protocol_label FROM event \
+        WHERE source_ip = $1::inet AND category = c.category \
+        ORDER BY observed_at DESC LIMIT 1 \
+    ) l";
+
 /// For each `Category` this source IP's ledger has ever recorded an event
 /// under, the `protocol_label` (if any) of the MOST RECENTLY observed such
 /// event. See the module doc comment's "Where `protocol_label` comes from".
@@ -364,14 +378,10 @@ async fn category_protocol_labels(
     pool: &PgPool,
     ip: IpAddr,
 ) -> Result<HashMap<Category, Option<String>>, SubmitError> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT ON (category) category, metadata->>'protocol_label' AS protocol_label \
-         FROM event WHERE source_ip = $1::inet \
-         ORDER BY category, observed_at DESC",
-    )
-    .bind(ip.to_string())
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(PROTOCOL_LABELS_SQL)
+        .bind(ip.to_string())
+        .fetch_all(pool)
+        .await?;
 
     let mut map = HashMap::with_capacity(rows.len());
     for row in rows {
@@ -573,6 +583,142 @@ mod tests {
         assert_eq!(
             categories_for_vendor("future-vendor", Some("ssh"), Category::Auth),
             vec!["22".to_string()]
+        );
+    }
+
+    use core_scoring::{EventInput, Protocol, SignalType, append_event};
+
+    async fn migrate(pool: &PgPool) {
+        sqlx::migrate!("../core-scoring/migrations")
+            .run(pool)
+            .await
+            .unwrap();
+        crate::migrator().run(pool).await.unwrap();
+    }
+
+    async fn event(
+        pool: &PgPool,
+        ip: &str,
+        signal: SignalType,
+        ts: &str,
+        metadata: serde_json::Value,
+    ) {
+        append_event(
+            pool,
+            EventInput::from_signal(
+                ip.parse().unwrap(),
+                None,
+                "sensor-labels".into(),
+                signal,
+                Protocol::Tcp,
+                true,
+                ts.parse().unwrap(),
+                metadata,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn the_newest_label_per_category_is_returned_for_this_address_only(pool: PgPool) {
+        migrate(&pool).await;
+        let ip = "198.51.100.40";
+        // Honeypot: the newer event (telnet) wins over the older one (ssh).
+        event(
+            &pool,
+            ip,
+            SignalType::HoneypotLoginAttempt,
+            "2026-10-01T00:00:00Z",
+            serde_json::json!({"protocol_label": "ssh"}),
+        )
+        .await;
+        event(
+            &pool,
+            ip,
+            SignalType::HoneypotConnection,
+            "2026-10-01T00:05:00Z",
+            serde_json::json!({"protocol_label": "telnet"}),
+        )
+        .await;
+        // Network: newest event carries no label, so the category maps to None, not to an older
+        // label from some other category.
+        event(
+            &pool,
+            ip,
+            SignalType::CatchallProbe,
+            "2026-10-01T00:06:00Z",
+            serde_json::json!({}),
+        )
+        .await;
+        // Another address, newer, with a different label: must not leak in.
+        event(
+            &pool,
+            "198.51.100.41",
+            SignalType::HoneypotConnection,
+            "2026-10-01T01:00:00Z",
+            serde_json::json!({"protocol_label": "ftp"}),
+        )
+        .await;
+
+        let labels = category_protocol_labels(&pool, ip.parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            labels.len(),
+            2,
+            "only categories this address has events in"
+        );
+        assert_eq!(labels[&Category::Honeypot].as_deref(), Some("telnet"));
+        assert_eq!(labels[&Category::Network], None);
+    }
+
+    // The live defect: DISTINCT ON read and sorted every event the address ever produced (1.55 s
+    // for one address). Planner cost choices vary with table size, so this turns off the plans
+    // that could hide the problem on a near-empty table and asserts the query's plan has no Sort
+    // and probes the per-category index one row per category. Fails on the DISTINCT ON form (a
+    // Sort, or with the index an ordered walk of every event, no Limit) and without the index.
+    #[sqlx::test(migrations = false)]
+    async fn the_label_lookup_probes_an_index_per_category_instead_of_sorting_the_address(
+        pool: PgPool,
+    ) {
+        migrate(&pool).await;
+        event(
+            &pool,
+            "198.51.100.42",
+            SignalType::HoneypotConnection,
+            "2026-10-01T00:00:00Z",
+            serde_json::json!({"protocol_label": "ssh"}),
+        )
+        .await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("SET enable_seqscan = off; SET enable_bitmapscan = off")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN {PROTOCOL_LABELS_SQL}"
+        )))
+        .bind("198.51.100.42")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        let plan = plan.join("\n");
+        assert!(
+            !plan.contains("Sort"),
+            "the lookup must not sort the address's events:\n{plan}"
+        );
+        assert!(
+            plan.contains("event_source_category_observed_idx"),
+            "the lookup must probe the per-category index:\n{plan}"
+        );
+        // An index-ordered DISTINCT ON has no Sort either, but still walks every event the
+        // address has; only a per-category top-1 stops after one row each.
+        assert!(
+            plan.contains("Limit"),
+            "the lookup must take one row per category:\n{plan}"
         );
     }
 }

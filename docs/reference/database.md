@@ -90,7 +90,7 @@ Base `0002_event.sql`; hardened by `0004`; `session_id` added by `0007`.
 | `session_id` | UUID | nullable; correlates one sensor session | `crates/core-scoring/migrations/0007_session_id.sql#session_id` |
 
 Indexes: `event_source_ip_idx (source_ip)` (`crates/core-scoring/migrations/0002_event.sql#event_source_ip_idx`), `event_observed_at_idx
-(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`), `event_dedup_idx (source_ip, signal_type, observed_at)` (`crates/core-scoring/migrations/0013_event_dedup_index.sql#event_dedup_idx`).
+(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`), `event_dedup_idx (source_ip, signal_type, observed_at)` (`crates/core-scoring/migrations/0013_event_dedup_index.sql#event_dedup_idx`), `event_source_category_observed_idx (source_ip, category, observed_at DESC)` (`crates/core-scoring/migrations/0020_event_source_category_index.sql#event_source_category_observed_idx`).
 
 `event_dedup_idx` serves the dedup read every scored append makes inside the append lock
 (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`). That statement hides the
@@ -491,6 +491,7 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 | `0017` | the [ATT&CK tag tables](#attack-tag-tables) `attack_tag` and `campaign_attack_tag`, and `campaign_session.attack_pending`; no backfill |
 | `0018` | the [shell output table](#shell-output-table) `shell_output`; no backfill |
 | `0019` | `shell_output.last_stored` and the partial index `event_output_sha256_idx` on `event` (built inside the migration transaction like `0013`, so writes to `event` wait for the build; no event carries a reply yet when it runs) |
+| `0020` | index `event_source_category_observed_idx (source_ip, category, observed_at DESC)`, which serves the submission runner's newest-event-per-category lookup; built inside the migration transaction like `0013`, so writes to `event` wait for the build |
 
 **review** (`crates/review/migrations/`):
 

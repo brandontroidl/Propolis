@@ -553,6 +553,15 @@
   journald's 48K `LineMax` split) carrying a forged priority. No new
   dependency; terminal output is unchanged. See
   [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
+- **The submission pass no longer sorts an address's whole event history per address** - the
+  newest-`protocol_label`-per-category lookup (`SELECT DISTINCT ON (category) ...`) read and
+  sorted every event the address ever produced: 1.55 s for one heavy address on the live node,
+  once per approved address on every pass. New core-scoring migration `0020` adds
+  `event_source_category_observed_idx (source_ip, category, observed_at DESC)` and the lookup
+  takes the newest event of each category with one index probe each. For a test address with
+  200,000 events the query went from 480 ms to 0.35 ms. The index is built inside the migration
+  transaction, so writes to `event` wait for the build at the first start on the new version (see
+  `0013` for the cost on a large ledger).
 - **The fetcher stops re-reading the same download events every cycle** - the sync that turns
   `honeypot_file_download` events into fetch rows anti-joined every such event against
   `fetch_attempt` on `TRIM(url)` each cycle. An event whose URL the fetcher never stores (an

@@ -1,0 +1,17 @@
+-- Serves the submission runner's protocol-label lookup: the newest event per category for one
+-- source address (review::submit::category_protocol_labels), run for every approved address on
+-- every submission pass. event_source_ip_idx finds the address's events but not in category and
+-- time order, so the lookup read every event the address ever produced and sorted them. For one
+-- heavy address that was 1.55 s on the live node (one row returned); on a test ledger with 200,000
+-- events for one address it was 480 ms, 200,000 rows sorted on disk. With this index each
+-- category's newest event is one index probe (0.35 ms for the same address). The query is
+-- written per category to use it; the index alone does not help the old DISTINCT ON form, which
+-- still sorts the whole set.
+--
+-- A plain CREATE INDEX, not CONCURRENTLY, for the reasons given in 0013: sqlx runs this file in
+-- its own transaction at daemon startup, before any intake task exists, so the SHARE lock it takes
+-- on event (writes wait, reads do not) blocks nothing that is running, and a failed build rolls
+-- back with the migration and leaves no INVALID index behind. The lock lasts as long as the build,
+-- which grows with the ledger (the 0013 index took 12-20 s on 7.5M rows; this one is the same
+-- width plus the category).
+CREATE INDEX event_source_category_observed_idx ON event (source_ip, category, observed_at DESC);

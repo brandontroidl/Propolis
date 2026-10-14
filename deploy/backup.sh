@@ -164,10 +164,33 @@ if [ "${#existing[@]}" -gt 0 ]; then
     state_bytes="$( (cd "$ROOT/" && du -s -B1 -- "${existing[@]}" 2>/dev/null || true) | awk '{s += $1} END {printf "%d", s}')"
 fi
 [[ "$state_bytes" =~ ^[0-9]{1,18}$ ]] || { echo "error: could not size the state directories: $state_bytes" >&2; false; }
-# A dump is usually far smaller than the database, but a mostly-text ledger does not compress to
-# nothing; ask for the sum plus a fifth, so the run that would fill the disk is the one refused.
+# What a set will take is best known from the last one: scale its real size by how much the
+# database and state have grown since (the source size each good run records), plus a fifth. The
+# raw database size is the fallback, also plus a fifth, for a first run or a status from before the
+# source size was recorded; it is several times what a compressed dump takes (a 5.9 GB source made
+# a 1.07 GB set), so on its own it refused upgrades the disk had room for.
 total=$(( db_bytes + state_bytes ))
 need=$(( total + total / 5 ))
+prev_success="$(cat -- "$STATUS_DIR/last-success" 2>/dev/null || true)"
+prev_dump="$(printf '%s' "$prev_success" | sed -n 's/.*"dump_bytes":\([0-9]\{1,15\}\).*/\1/p')"
+prev_archive="$(printf '%s' "$prev_success" | sed -n 's/.*"archive_bytes":\([0-9]\{1,15\}\).*/\1/p')"
+prev_source="$(printf '%s' "$prev_success" | sed -n 's/.*"source_bytes":\([0-9]\{1,15\}\).*/\1/p')"
+if [ -n "$prev_dump" ] && [ -n "$prev_archive" ]; then
+    prev_set=$(( prev_dump + prev_archive ))
+    if [ -n "$prev_source" ] && [ "$prev_source" -gt 0 ]; then
+        # The product of two byte counts can pass bash's 64-bit range, so awk does the arithmetic.
+        scaled="$(awk -v s="$prev_set" -v t="$total" -v p="$prev_source" 'BEGIN { printf "%.0f", (s * t / p) * 1.2 + 1 }')"
+    else
+        # A status written before source_bytes was recorded: the growth since is unknown, so allow
+        # half again the last set, never more than the raw-size rule above.
+        scaled=$(( prev_set + prev_set / 2 ))
+        [ "$scaled" -le "$need" ] || scaled="$need"
+    fi
+    [[ "$scaled" =~ ^[0-9]{1,18}$ ]] || { echo "error: could not scale the last set's size: $scaled" >&2; false; }
+    # Never ask for less than the last set really took.
+    [ "$scaled" -ge "$prev_set" ] || scaled="$prev_set"
+    need="$scaled"
+fi
 avail="$(df --output=avail -B1 "$BACKUP_DIR" | tail -n 1 | tr -d ' ')"
 if [ "$avail" -lt "$need" ]; then
     echo "error: $BACKUP_DIR has $avail bytes free; this backup may need $need" >&2
@@ -232,7 +255,7 @@ done
 
 dump_size="$(stat -c %s "$BACKUP_DIR/$SET/${files[0]}")"
 archive_size="$(stat -c %s "$BACKUP_DIR/$SET/${files[1]}")"
-write_status last-success "$(printf '{"completed_at":"%s","reason":"%s","set":"%s","encrypted":%s,"dump_bytes":%d,"archive_bytes":%d}' \
-    "$(now_iso)" "$REASON" "$SET" "$([ "$ENCRYPT" -eq 1 ] && echo true || echo false)" "$dump_size" "$archive_size")"
+write_status last-success "$(printf '{"completed_at":"%s","reason":"%s","set":"%s","encrypted":%s,"dump_bytes":%d,"archive_bytes":%d,"source_bytes":%d}' \
+    "$(now_iso)" "$REASON" "$SET" "$([ "$ENCRYPT" -eq 1 ] && echo true || echo false)" "$dump_size" "$archive_size" "$total")"
 rm -f -- "$STATUS_DIR/last-failure"
 echo "propolis-backup: wrote $BACKUP_DIR/$SET ($dump_size + $archive_size bytes$([ "$ENCRYPT" -eq 1 ] && echo ', encrypted'))"

@@ -341,6 +341,74 @@ fn too_little_space_refuses_before_dumping() {
     );
 }
 
+/// Write a `last-success` status as an earlier run would have left it.
+fn seed_last_success(fx: &Fixture, body: &str) {
+    let dir = fx.root.join("var/lib/propolis/backup-status");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("last-success"), format!("{body}\n")).unwrap();
+}
+
+// The database size alone (here far past any disk) would refuse the run; the last set's real size,
+// scaled by how much the source grew since it was taken, is what the check must use. Live, a 5.9 GB
+// source made a 1.07 GB set and the raw-size rule refused an upgrade on a disk with 6 GB free.
+#[test]
+fn the_space_check_scales_the_last_sets_real_size_not_the_raw_database() {
+    let fx = Fixture::new();
+    seed_last_success(
+        &fx,
+        r#"{"completed_at":"2026-10-14T09:04:27Z","reason":"pre-upgrade","set":"20261014T090129Z-pre-upgrade","encrypted":false,"dump_bytes":1000,"archive_bytes":1000,"source_bytes":900000000000000000}"#,
+    );
+    let output = fx.run(&[], &[("STUB_DB_BYTES", "900000000000000000")]);
+    assert_ok(&output);
+    assert_eq!(fx.sets().len(), 1, "the set was written");
+}
+
+// A status from before source_bytes was recorded (the live box's, the first night after this
+// change) has no growth figure: half again the last set is allowed, never more than the raw rule.
+#[test]
+fn a_status_without_source_bytes_allows_half_again_the_last_set() {
+    let fx = Fixture::new();
+    seed_last_success(
+        &fx,
+        r#"{"completed_at":"2026-10-14T09:04:27Z","reason":"pre-upgrade","set":"20261014T090129Z-pre-upgrade","encrypted":false,"dump_bytes":1000,"archive_bytes":1000}"#,
+    );
+    let output = fx.run(&[], &[("STUB_DB_BYTES", "900000000000000000")]);
+    assert_ok(&output);
+}
+
+// The scaling must still refuse a run that will not fit: a last set as large as this disk could
+// ever hold is a real "no room", whatever the raw rule would say.
+#[test]
+fn a_last_set_too_large_for_the_disk_still_refuses() {
+    let fx = Fixture::new();
+    seed_last_success(
+        &fx,
+        r#"{"completed_at":"2026-10-14T09:04:27Z","reason":"scheduled","set":"20261014T033000Z-scheduled","encrypted":false,"dump_bytes":900000000000000,"archive_bytes":900000000000000,"source_bytes":4096}"#,
+    );
+    let output = fx.run(&[], &[]);
+    assert!(!output.status.success(), "a set this size cannot fit");
+    assert_eq!(
+        fx.status("last-failure").unwrap()["step"],
+        "checking free space"
+    );
+    assert!(!fx.stub_log().contains("pg_dump"), "refused before dumping");
+}
+
+#[test]
+fn a_good_run_records_the_source_size_for_the_next_estimate() {
+    let fx = Fixture::new();
+    let output = fx.run(&[], &[("STUB_DB_BYTES", "4096")]);
+    assert_ok(&output);
+    let status = fx.status("last-success").unwrap();
+    let source = status["source_bytes"]
+        .as_u64()
+        .expect("source_bytes recorded");
+    assert!(
+        source >= 4096,
+        "source_bytes counts the database ({source})"
+    );
+}
+
 #[test]
 fn old_sets_beyond_keep_are_pruned_and_the_other_reason_is_left_alone() {
     let fx = Fixture::new();

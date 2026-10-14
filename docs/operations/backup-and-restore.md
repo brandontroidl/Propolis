@@ -42,7 +42,12 @@ options or archived paths stop matching the commands on this page.
   [Upgrades](upgrade-rollback-and-dr.md) write `-pre-upgrade` sets, of which the
   newest 3 are kept.
 - **Free space.** A run refuses to start, before dumping anything, unless the backup
-  directory has the database size plus the state directories' size, plus a fifth, free.
+  directory has room for the set it is about to write, plus a fifth. The size comes from the
+  last good set: its real dump and archive size, scaled by how much the database and state
+  directories have grown since (each good run records that source size as `source_bytes` in
+  `last-success`). With no earlier set the estimate is the raw database size plus the state
+  directories' size, which is several times what the compressed set takes; with an earlier set
+  that predates `source_bytes`, half again that set's size, never more than the raw estimate.
 - **No password on a command line.** The dump runs through `propolis pg-exec`, which
   parses `DATABASE_URL` from `/etc/propolis/propolis.env` with the daemon's own parser
   and hands `pg_dump` the connection in libpq's `PG*` variables (`crates/propolis/src/pg_exec.rs#run`).

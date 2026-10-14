@@ -405,6 +405,13 @@
 
 ### Fixed
 
+- **A backup no longer refuses a disk with room for it** - the free-space check asked for the
+  raw database size plus the state directories, plus a fifth, but the set it writes is a
+  compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every
+  upgrade (and would have refused the nightly backup) on a volume with 6 GB free. It now sizes the
+  run from the last good set, scaled by the source's growth since (recorded as `source_bytes` in
+  `last-success`), plus a fifth; the raw size stays the estimate when there is no earlier set. See
+  [backup and restore](docs/operations/backup-and-restore.md).
 - **The SMTP sensor no longer records a password as the username** - `AUTH LOGIN <base64
   user>` (the RFC 4954 initial response, Python smtplib's default) had its argument ignored, so
   the sensor prompted `Username:`, the client answered with its password, and that password

@@ -561,7 +561,8 @@
   with `decided_at` stamped and a note recording the automatic rejection, the state it was in
   and any operator note. Nothing is deleted. A node that is fed documentation-range addresses
   for testing will now show an empty queue; the repository's own tests opt out through
-  `ReviewQueue::offering_reserved_addresses`, which no daemon calls.
+  `ReviewQueue::offering_reserved_addresses` (or narrow the test with `with_reserved_classifier`),
+  both hidden from the docs and called by no daemon.
 - **The submission pass says why it held what it held** - a node logged `submitted=0
   held=17202 failed=0` every pass, with the reason for each held address and vendor only at
   debug level, so nothing showed why nothing was ever reported. The one INFO line per pass now
@@ -578,7 +579,11 @@
   takes the newest event of each category with one index probe each. For a test address with
   200,000 events the query went from 480 ms to 0.35 ms. The index is built inside the migration
   transaction, so writes to `event` wait for the build at the first start on the new version (see
-  `0013` for the cost on a large ledger).
+  `0013` for the cost on a large ledger). The probe is written as a row comparison on
+  `(source_ip, category)` ordered by the index's own columns: the plainer `source_ip = $1 AND
+  category = ... ORDER BY observed_at DESC LIMIT 1` let the planner, given a heavy address's
+  statistics, walk `event_observed_at_idx` backward instead, which measured 454-532 ms on a
+  400,000-event ledger and gained nothing over the old query.
 - **The fetcher stops re-reading the same download events every cycle** - the sync that turns
   `honeypot_file_download` events into fetch rows anti-joined every such event against
   `fetch_attempt` on `TRIM(url)` each cycle. An event whose URL the fetcher never stores (an
@@ -587,9 +592,13 @@
   event ids past a persisted watermark (new review migration `0008`, table
   `fetch_event_cursor`, one row shared by every node), in bounded chunks, so each event is
   decided once whether or not it yields a row. Skipped URLs are counted in one INFO line and
-  still get no `fetch_attempt` row, as before. The first sync after the upgrade walks the
-  existing ledger once; on a 400,000-event test ledger the old query took 311 ms per cycle
-  and the steady-state sync query now takes 0.4 ms.
+  still get no `fetch_attempt` row, as before. A URL that differs from a stored one only by a
+  character Rust `trim` strips but Postgres `TRIM` leaves (a trailing carriage return from a
+  telnet line) shares the stored row's `url_hash`, so it never got a row either and the old
+  query returned it every cycle; the watermark covers it too. The first sync after the upgrade
+  walks the whole existing ledger once, in bounded chunks (133 ms for the first chunk on a
+  400,000-event test ledger, since downloads are sparse there); the old query took 311 ms per
+  cycle and the steady-state sync query now takes under a millisecond.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

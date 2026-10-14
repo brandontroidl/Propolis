@@ -216,6 +216,8 @@ pub(super) async fn sync_new_events_chunked(pool: &PgPool, chunk: i64) -> Result
         }
 
         if !hashes.is_empty() {
+            // Same fixed columns as `insert_pending_if_absent` (depth 0, 'pending', attempts 0);
+            // a column added to one must be added to the other.
             sqlx::query(
                 "INSERT INTO fetch_attempt \
                  (url_hash, url, host, scheme, port, source_ip, depth, status, attempts, last_attempt) \
@@ -425,6 +427,9 @@ pub async fn claim_candidates(pool: &PgPool, limits: ClaimLimits) -> Result<Clai
 ///
 /// Returns whether a row was actually inserted, so a caller can tell a genuine new enqueue from
 /// a no-op (`record_success` uses this to keep its `enqueued_children` stat honest).
+///
+/// `sync_new_events` bulk-inserts the same row shape for parentless rows; a column added here
+/// must be added there.
 pub async fn insert_pending_if_absent(
     pool: &PgPool,
     row: &NewPendingRow,

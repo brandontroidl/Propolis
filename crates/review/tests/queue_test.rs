@@ -302,7 +302,7 @@ async fn deciding_an_unknown_ip_fails_closed(pool: PgPool) {
     // Never seeded and never populated: no review_queue row exists for it.
     let test_ip: IpAddr = "203.0.113.216".parse().unwrap();
 
-    let queue = ReviewQueue::new().offering_reserved_addresses();
+    let queue = ReviewQueue::new();
     let result = queue.approve(&pool, test_ip, None).await;
     assert!(
         matches!(result, Err(ReviewError::NotFound(ip)) if ip == test_ip),
@@ -444,10 +444,7 @@ async fn unsnoozing_an_entry_that_does_not_exist_fails_closed(pool: PgPool) {
     migrate(&pool).await;
     let test_ip: IpAddr = "192.0.2.220".parse().unwrap();
 
-    let result = ReviewQueue::new()
-        .offering_reserved_addresses()
-        .unsnooze(&pool, test_ip)
-        .await;
+    let result = ReviewQueue::new().unsnooze(&pool, test_ip).await;
     assert!(
         matches!(result, Err(ReviewError::NotFound(ip)) if ip == test_ip),
         "unsnoozing an IP with no queue entry must fail closed, not silently no-op"
@@ -490,19 +487,33 @@ async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(po
 }
 
 // Live: the queue offered, and the operator approved, an RFC 1918 address that the gatekeeper then
-// held as Reserved on every pass. The control address is public, so a populate that excluded
-// everything would fail here too.
+// held as Reserved on every pass. The control address is unreserved, so a populate that excluded
+// everything would fail here too. The queue is given a narrower classifier than production's so
+// the control can sit in a documentation range (the repository writes no real public address);
+// the production classifier is wired in by default and exercised through the real daemon in
+// cli_test.
+fn private_and_loopback_only(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 #[sqlx::test(migrations = false)]
 async fn populate_never_offers_a_reserved_address(pool: PgPool) {
     migrate(&pool).await;
-    let public = "45.10.32.230";
-    let reserved = ["10.20.30.1", "192.168.7.7", "192.0.2.51", "127.0.0.9"];
+    let public = "198.51.100.230";
+    let reserved = ["10.20.30.1", "192.168.7.7", "127.0.0.9"];
     seed_recommended(&pool, public).await;
     for ip in reserved {
         seed_recommended(&pool, ip).await;
     }
 
-    let inserted = ReviewQueue::new().populate(&pool).await.unwrap();
+    let inserted = ReviewQueue::new()
+        .with_reserved_classifier(private_and_loopback_only)
+        .populate(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(inserted, 1, "only the public address is offered");
     assert_eq!(row_count(&pool, public).await, 1);
@@ -542,11 +553,11 @@ async fn resolve_reserved_rejects_unfinished_entries_and_records_why(pool: PgPoo
     insert("10.20.30.3", ReviewState::Approved, Some("looks real")).await;
     insert("192.168.1.5", ReviewState::Snoozed, None).await;
     insert("10.20.30.4", ReviewState::Rejected, Some("earlier")).await;
-    insert("45.10.32.231", ReviewState::Approved, Some("keep")).await;
+    insert("198.51.100.231", ReviewState::Approved, Some("keep")).await;
     let rejected_before = fetch_row(&pool, "10.20.30.4").await;
-    let public_before = fetch_row(&pool, "45.10.32.231").await;
+    let public_before = fetch_row(&pool, "198.51.100.231").await;
 
-    let queue = ReviewQueue::new();
+    let queue = ReviewQueue::new().with_reserved_classifier(private_and_loopback_only);
     assert_eq!(queue.resolve_reserved(&pool).await.unwrap(), 3);
 
     for (ip, was, operator_note) in [
@@ -575,14 +586,14 @@ async fn resolve_reserved_rejects_unfinished_entries_and_records_why(pool: PgPoo
         );
     }
     assert_eq!(fetch_row(&pool, "10.20.30.4").await, rejected_before);
-    assert_eq!(fetch_row(&pool, "45.10.32.231").await, public_before);
+    assert_eq!(fetch_row(&pool, "198.51.100.231").await, public_before);
     assert!(
         queue
             .list_approved(&pool)
             .await
             .unwrap()
             .iter()
-            .all(|e| e.source_ip.to_string() == "45.10.32.231"),
+            .all(|e| e.source_ip.to_string() == "198.51.100.231"),
         "no reserved address is left for the submission runner to hold on every pass"
     );
     assert_eq!(

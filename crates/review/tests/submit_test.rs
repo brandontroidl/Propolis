@@ -615,7 +615,7 @@ async fn run_once_gates_each_configured_vendor_independently(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn run_once_reports_held_pairs_by_reason(pool: PgPool) {
     migrate(&pool).await;
-    seed_and_approve(&pool, "45.10.32.248").await;
+    seed_and_approve(&pool, "45.10.32.240").await;
 
     let vendors: Vec<Box<dyn VendorAdapter>> = vec![
         Box::new(MockVendor::new("mockvendor-held-off")),

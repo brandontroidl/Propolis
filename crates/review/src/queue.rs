@@ -59,17 +59,38 @@ pub struct QueueEntry {
 /// decisions and the pending listing. Stateless - every method takes the
 /// pool it operates against, so callers can share one instance or build a
 /// fresh one per call.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ReviewQueue {
     allowlist: Arc<OperatorAllowlist>,
-    /// Test fixtures only: see [`Self::offering_reserved_addresses`]. False in every default
-    /// queue, so a production queue never offers or keeps a reserved address.
-    offer_reserved: bool,
+    /// Which addresses are never offered and are resolved when found queued.
+    /// [`core_scoring::is_reserved_ip`] in every default queue, so a production queue never
+    /// offers or keeps a reserved address; only the test builders below replace it.
+    is_reserved: fn(IpAddr) -> bool,
+}
+
+impl Default for ReviewQueue {
+    fn default() -> Self {
+        Self {
+            allowlist: Arc::default(),
+            is_reserved: is_reserved_ip,
+        }
+    }
 }
 
 impl ReviewQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the reserved-address test with `is_reserved`.
+    ///
+    /// For tests only. It lets a test of the reserved-address handling keep an ordinary
+    /// "unreserved" control address inside the documentation ranges instead of writing a real
+    /// public address into the repository.
+    #[doc(hidden)]
+    pub fn with_reserved_classifier(mut self, is_reserved: fn(IpAddr) -> bool) -> Self {
+        self.is_reserved = is_reserved;
+        self
     }
 
     /// Stop excluding reserved addresses ([`core_scoring::is_reserved_ip`]) from [`Self::populate`]
@@ -80,9 +101,9 @@ impl ReviewQueue {
     /// console behaviour on such an address needs the queue to accept it. No daemon calls this:
     /// a reserved address is never reported to a vendor (the gatekeeper holds it first), so
     /// offering one to the operator only invites an approval that can never take effect.
-    pub fn offering_reserved_addresses(mut self) -> Self {
-        self.offer_reserved = true;
-        self
+    #[doc(hidden)]
+    pub fn offering_reserved_addresses(self) -> Self {
+        self.with_reserved_classifier(|_| false)
     }
 
     /// Honour the operator allowlist: an allowlisted address is never surfaced
@@ -239,9 +260,6 @@ impl ReviewQueue {
     /// approved reserved address on every pass for as long as it stays approved, which is
     /// exactly how a live node came to count 10.x addresses among thousands of held pairs.
     pub async fn resolve_reserved(&self, pool: &PgPool) -> Result<usize, ReviewError> {
-        if self.offer_reserved {
-            return Ok(0);
-        }
         let rows = sqlx::query(
             "SELECT host(source_ip) AS source_ip, state, notes FROM review_queue WHERE state <> $1",
         )
@@ -255,7 +273,7 @@ impl ReviewQueue {
             let ip: IpAddr = text
                 .parse()
                 .map_err(|e| ReviewError::Corrupt(format!("stored source_ip {text}: {e}")))?;
-            if !is_reserved_ip(ip) {
+            if !(self.is_reserved)(ip) {
                 continue;
             }
             let was: ReviewState = row.try_get("state")?;
@@ -296,16 +314,13 @@ impl ReviewQueue {
         &self,
         ips: Vec<String>,
     ) -> Result<(Vec<String>, Vec<String>), ReviewError> {
-        if self.offer_reserved {
-            return Ok((ips, Vec::new()));
-        }
         let mut kept = Vec::new();
         let mut reserved = Vec::new();
         for text in ips {
             let ip: IpAddr = text
                 .parse()
                 .map_err(|e| ReviewError::Corrupt(format!("stored source_ip {text}: {e}")))?;
-            if is_reserved_ip(ip) {
+            if (self.is_reserved)(ip) {
                 reserved.push(text);
             } else {
                 kept.push(text);

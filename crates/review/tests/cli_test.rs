@@ -343,7 +343,7 @@ async fn history_reports_no_history_for_unsubmitted_ip(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
     migrate(&pool).await;
-    let test_ip = "45.10.32.255";
+    let test_ip = "45.10.32.240";
     let reserved_recommended = "203.0.113.255";
     let reserved_approved = "10.20.30.1";
     seed_recommended(&pool, test_ip).await;

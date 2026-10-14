@@ -91,14 +91,19 @@ console rDNS parse booleans more broadly (called out below).
   which installs an `EnvFilter` with an `info` default directive, and `sensor-framework` enables
   the `env-filter` feature itself, so the default is the same however the binary is built.
 - Every other binary - `gateway`, `shipper`, and the standalone `intake`, `review` and `feed` -
-  logs **errors only**. Each calls `tracing_subscriber::fmt::init()` (for example
-  `crates/gateway/src/main.rs#main`), whose default filter is `error` once the `env-filter`
-  feature is on, and a workspace build (`cargo build --release` at the workspace root, as the
-  deployment manual has you run it before `deploy/install.sh`, or
-  `cargo build --release --workspace --locked` as `deploy/upgrade.sh` runs it) turns the feature
-  on for every member because `propolis`, `console` and `sensor-framework` enable it. Set
-  `RUST_LOG=info` in such a unit's env file to see its startup and warning lines: with it unset,
-  a healthy release-built `gateway` prints nothing at all (observed 2026-09-28).
+  logs **errors only**. Each calls `log_format::init(LevelFilter::ERROR)` (for example
+  `crates/gateway/src/main.rs#main`), an `EnvFilter` whose default directive is `error`. That is
+  what the former `tracing_subscriber::fmt::init()` gave a workspace build (`cargo build
+  --release` at the workspace root, as the deployment manual has you run it before
+  `deploy/install.sh`, or `cargo build --release --workspace --locked` as `deploy/upgrade.sh`
+  runs it), but it is now fixed in code instead of depending on which crates enable
+  `env-filter`. Set `RUST_LOG=info` in such a unit's env file to see its startup and warning
+  lines: with it unset, a healthy release-built `gateway` prints nothing at all (observed
+  2026-09-28).
+- The output format (colour only on a terminal, journal priority prefixes under systemd) is the
+  same for every binary and independent of `RUST_LOG`; see
+  [logging and journal priorities](../operations/health-and-observability.md#logging-and-journal-priorities).
+  `NO_COLOR` set to a non-empty value turns terminal colour off.
 
 ### `PROPOLIS_HOSTNAME`
 - Read by: `sensor-framework::persona::hostname()`

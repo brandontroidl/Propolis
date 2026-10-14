@@ -22,7 +22,7 @@ Every workspace crate is edition 2024.
 ## Build
 
 ```
-cargo build            # debug build, all 28 workspace members
+cargo build            # debug build, all 29 workspace members
 cargo build --release  # release binaries into target/release/
 ```
 

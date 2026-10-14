@@ -708,6 +708,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "log-format",
  "minijinja",
  "rand 0.10.2",
  "review",
@@ -1173,6 +1174,7 @@ dependencies = [
  "core-scoring",
  "geoip",
  "ipnet",
+ "log-format",
  "review",
  "serde",
  "serde_json",
@@ -1182,7 +1184,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1378,6 +1379,7 @@ name = "gateway"
 version = "0.1.0"
 dependencies = [
  "collector-wire",
+ "log-format",
  "provision-certs",
  "sensor-framework",
  "serde",
@@ -1386,7 +1388,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1820,6 +1821,7 @@ dependencies = [
  "chrono",
  "core-scoring",
  "fleet",
+ "log-format",
  "log-tailer",
  "sensor-wire",
  "serde_json",
@@ -1828,7 +1830,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2006,6 +2007,14 @@ name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
+name = "log-format"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "log-tailer"
@@ -2563,6 +2572,7 @@ dependencies = [
  "hex",
  "intake",
  "ipnet",
+ "log-format",
  "log-tailer",
  "nix",
  "rand 0.10.2",
@@ -2917,6 +2927,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hmac",
+ "log-format",
  "rand 0.10.2",
  "rcgen",
  "reqwest",
@@ -3428,6 +3439,7 @@ version = "0.4.0"
 dependencies = [
  "chrono",
  "libc",
+ "log-format",
  "md-5",
  "memchr",
  "rcgen",
@@ -3441,7 +3453,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
  "unicode-normalization",
  "uuid",
 ]
@@ -3731,6 +3742,7 @@ version = "0.1.0"
 dependencies = [
  "collector-wire",
  "gateway",
+ "log-format",
  "log-tailer",
  "provision-certs",
  "sensor-framework",
@@ -3741,7 +3753,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

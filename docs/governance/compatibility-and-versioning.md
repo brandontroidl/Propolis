@@ -19,8 +19,8 @@ Pre-1.0, treat minor bumps as potentially breaking.
 
 ## Current version/tag state
 
-- **Crate version: `0.4.0`** for twenty-two of the 28 workspace crates; `0.1.0` for
-  `collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`.
+- **Crate version: `0.4.0`** for twenty-two of the 29 workspace crates; `0.1.0` for
+  `collector-wire`, `fleet`, `gateway`, `log-format`, `log-tailer`, `provision-certs` and `shipper`.
 - **Only release tag: `v0.1.0`** (points at commit `e0bfd513`,
   2026-08-02). There is no `v0.2.0`, `v0.3.0` or `v0.4.0` tag.
 - The `0.4.0` tree is therefore **unreleased/untagged** - roughly three minor

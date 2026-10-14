@@ -17,7 +17,7 @@ libc = "0.2.186"
 memchr = "2.8.3"
 unicode-normalization = "0.1.25"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+log-format = { path = "../log-format" }
 uuid = { version = "1", features = ["v7", "serde"] }
 tokio-rustls = "0.26.4"
 rustls-pki-types = "1.15.1"

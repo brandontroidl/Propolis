@@ -10,9 +10,9 @@ last-verified: 2026-10-07
 # Components
 
 The workspace (`Cargo.toml`, `resolver = "2"`, every crate `edition = "2024"`) has
-**28 member crates** under `crates/`, producing **21 binaries**. Twenty-two crates are at
-version `0.4.0`; the other six (`collector-wire`, `fleet`, `gateway`, `log-tailer`,
-`provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
+**29 member crates** under `crates/`, producing **21 binaries**. Twenty-two crates are at
+version `0.4.0`; the other seven (`collector-wire`, `fleet`, `gateway`, `log-format`,
+`log-tailer`, `provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
 owner of the component inventory and the inter-crate dependency graph.
 
 ## Crate inventory
@@ -42,6 +42,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `propolis` | binary only | `propolis` | Unified daemon composing intake + review + feed + console + VirusTotal + fetcher + ops-monitor as concurrent tokio tasks on one `PgPool`. |
 | `fleet` | library (leaf) | none | Fleet health: the listener inventory the control plane believes exists, the durable result of probing it, and the rules that turn both into an operator verdict; owns its own migrations under its own bookkeeping table. |
 | `log-tailer` | library (leaf) | none | File tailing with a durable, rotation-aware cursor and the over-length line discard; extracted from `intake` so the shipper can tail sensor logs without the control-plane database stack. Also owns the one `name:path` sensor-log list parser, and a cursorless mode (`LogTailer::without_cursor`) that persists nothing, for the live watcher. |
+| `log-format` | library (leaf) | none | The one `tracing` output format every binary installs (`log_format::init`, or `log_format::layer` for the two that build their own registry): colour only on a terminal, and under systemd a `<N>` priority prefix per line so journald records the real level. Pulls in only `tracing` and `tracing-subscriber`, which is why the control-plane crates that do not link `sensor-framework` can share it. See [logging](../operations/health-and-observability.md#logging-and-journal-priorities). |
 | `collector-wire` | library (leaf) | none | Collector-to-gateway wire protocol: sequenced, hash-chained batch frames, acks, and the mutual-TLS configs both ends build from one pinned CA. |
 | `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
 | `gateway` | lib + bin | `gateway` | Control-plane side of the split deployment: a client-certificate-required TLS accept loop that verifies each collector's sequence and hash chain and appends accepted records to a per-collector spool in sensor NDJSON shape, which intake tails unchanged. |
@@ -53,8 +54,8 @@ Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml
 
 ### Library vs. binary
 
-- **Pure libraries (no binary, 7):** `sensor-wire`, `core-scoring`, `geoip`,
-  `sensor-framework`, `fleet`, `log-tailer`, `collector-wire`.
+- **Pure libraries (no binary, 8):** `sensor-wire`, `core-scoring`, `geoip`,
+  `sensor-framework`, `fleet`, `log-tailer`, `log-format`, `collector-wire`.
 - **Sensor lib+bin crates (12):** `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
   `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
   `sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-cred`. These 12 sensor crates cover 15 protocols (the `cred`
@@ -77,7 +78,7 @@ config/environment set by the deploy units, not from source. See
 ## Dependency graph
 
 Internal dependencies are declared as `path=` entries. Leaves (no internal deps):
-`sensor-wire`, `geoip`, `fleet`, `log-tailer`, `collector-wire`. `core-scoring` depends only
+`sensor-wire`, `geoip`, `fleet`, `log-tailer`, `log-format`, `collector-wire`. `core-scoring` depends only
 on `geoip` (for the shared operator allowlist's ASN lookup).
 
 ```mermaid
@@ -87,6 +88,7 @@ graph TD
   geoip[geoip]
   fleet[fleet]
   tailer[log-tailer]
+  logfmt[log-format]
   cwire[collector-wire]
   fw[sensor-framework]
   sensors["sensor-{catchall,ssh,telnet,redis,<br/>adb,http,ftp,smtp,tftp,mqtt,dns,cred}"]
@@ -102,20 +104,25 @@ graph TD
 
   core --> geoip
   fw --> wire
+  fw --> logfmt
   sensors --> wire
   sensors --> fw
   intake --> wire
   intake --> core
   intake --> fleet
   intake --> tailer
+  intake --> logfmt
   review --> core
   review --> fw
+  review --> logfmt
   feed --> core
   feed --> geoip
+  feed --> logfmt
   console --> core
   console --> fleet
   console --> geoip
   console --> review
+  console --> logfmt
   propolis --> console
   propolis --> core
   propolis --> feed
@@ -125,11 +132,14 @@ graph TD
   propolis --> tailer
   propolis --> review
   propolis --> fw
+  propolis --> logfmt
   shipper --> cwire
   shipper --> tailer
   shipper --> fw
+  shipper --> logfmt
   gateway --> cwire
   gateway --> fw
+  gateway --> logfmt
   certs --> cwire
   watchc --> tailer
 ```

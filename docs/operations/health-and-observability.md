@@ -198,6 +198,46 @@ For a live view of the NDJSON files themselves, every event as the sensor wrote 
 the read-only `propolis-watch`, locally or over a forced-command SSH key; see
 [live watch](./live-watch.md).
 
+### Logging and journal priorities
+
+Every binary installs one output format, the `log-format` crate
+(`crates/log-format/src/lib.rs#init`, `crates/log-format/src/lib.rs#layer`), so the journal
+carries the real level of each line and plain text:
+
+| `tracing` level | journal `PRIORITY` | `journalctl -p` name |
+|---|---|---|
+| `ERROR` | 3 | `err` |
+| `WARN` | 4 | `warning` |
+| `INFO` | 6 | `info` |
+| `DEBUG`, `TRACE` | 7 | `debug` |
+
+`journalctl -u 'sensor-*' -u propolis -p warning` therefore lists the warnings and errors, and any
+alert keyed on journal priority sees them. Before this, every line was priority 6 with ANSI colour
+escapes in the message, so a priority filter matched nothing.
+
+The mechanism is the `<N>` line prefix of sd-daemon(3). Under a service, systemd connects stdout
+to the journal and journald strips a leading `<N>` into the entry's priority unless the unit sets
+`SyslogLevelPrefix=false` (default on; systemd.exec(5)). No unit in `deploy/` turns it off; with it
+off the prefix would show as text at the start of each message. The prefix is written only when
+`$JOURNAL_STREAM` names this process's own stdout (device and inode, as systemd.exec(5)
+prescribes), so a process whose stdout was redirected to a file or pipe, or one that merely
+inherited the variable, writes plain lines (`crates/log-format/src/lib.rs#is_journal_stream`).
+
+- **Terminal:** unchanged, the stock coloured format. `NO_COLOR` set to a non-empty value turns the
+  colour off.
+- **File or pipe:** the same text with no colour and no prefix.
+- **Journal:** the same text with the prefix and no colour.
+
+Off a terminal each event is also one line: control characters in a message or field value, a
+newline above all, are written as `\n`, `\u{1b}` and so on. The stock formatter leaves a newline in
+message text alone, and journald reads a priority prefix at the start of every line, so a captured
+attacker string containing a newline and `<0>` would otherwise forge an emergency entry
+(`crates/log-format/tests/format.rs#journal_mode_cannot_be_made_to_forge_a_priority_line`).
+
+The timestamp the format prints stays, although journald stamps each entry itself, so the text is
+identical whether it was read from the journal or from a captured stdout. Entries journaled before
+the upgrade keep priority 6.
+
 ### Overload counters
 
 Two capture-hand-off counters, surfaced as journal WARNs, tell an operator that samples are

@@ -35,7 +35,7 @@ Read this before forming an opinion - the version signals diverge and the
 marketing-grade claims are called out where they are not source-evidenced.
 
 - **Source-available and actively developed; not certified or
-  production-blessed.** Crate version is `0.4.0` (six crates are still at `0.1.0`), but
+  production-blessed.** Crate version is `0.4.0` (seven crates are still at `0.1.0`), but
   the only release tag is `v0.1.0` - the current tree is untagged, roughly three
   unpublished minor bumps past the tag. `CHANGELOG.md` is a single undated
   `## Unreleased` section. Details, plus which subsystems are substantial vs

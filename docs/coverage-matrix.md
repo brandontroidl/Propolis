@@ -30,7 +30,7 @@ liveness alert). Every component, stage, invariant, and procedure has a canonica
 owner. The `partial` rows carry a documented caveat, noted in the last
 column.
 
-## Component crates (28 crates / 21 binaries)
+## Component crates (29 crates / 21 binaries)
 
 Inventory and dependency graph owned by
 [architecture/components.md](architecture/components.md). Per-crate behavior lives in

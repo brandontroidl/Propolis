@@ -17,8 +17,8 @@ operate at your own risk.
 
 The version signals diverge across surfaces; read them together, not in isolation:
 
-- **Crate version: `0.4.0`** for twenty-two of the 28 workspace crates; six
-  (`collector-wire`, `fleet`, `gateway`, `log-tailer`, `provision-certs` and `shipper`) are at
+- **Crate version: `0.4.0`** for twenty-two of the 29 workspace crates; seven
+  (`collector-wire`, `fleet`, `gateway`, `log-format`, `log-tailer`, `provision-certs` and `shipper`) are at
   `0.1.0`. There is no shared `[workspace.package]` version key - each crate pins
   its own.
 - **Only one release tag exists: `v0.1.0`** (annotated, at commit `e0bfd513`,

@@ -540,6 +540,18 @@
   kernel and returned when freed; the same eight bodies leave under 0.5 MB. A build whose
   allocator refuses the setting logs a warning at startup. See
   [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
+- **Every log line reached the journal at priority 6 with ANSI escapes in it** - the stock
+  `tracing` format colours its output whether or not stdout is a terminal and gives journald no
+  level, so `journalctl -p warning` and anything keyed on priority saw no warning or error from
+  the daemon, the console, the sensors, the gateway or the shipper, and a plain `journalctl`
+  showed `\x1b[33m WARN\x1b[0m`. A new `log-format` crate, installed by every binary, writes
+  colour only to a terminal, and when `$JOURNAL_STREAM` names the process's own stdout (the
+  check systemd.exec(5) prescribes) prefixes each line with the sd-daemon(3) `<N>` level that
+  journald turns into the entry's priority: 3 error, 4 warning, 6 info, 7 debug. Off a terminal an
+  event is one line, with newlines and other control characters written as escapes, so a
+  captured attacker string cannot start a second line carrying a forged priority. No new
+  dependency; terminal output is unchanged. See
+  [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

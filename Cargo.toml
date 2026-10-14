@@ -19,6 +19,7 @@ members = [
     "crates/sensor-cred",
     "crates/geoip",
     "crates/log-tailer",
+    "crates/log-format",
     "crates/fleet",
     "crates/intake",
     "crates/review",

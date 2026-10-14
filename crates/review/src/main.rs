@@ -457,7 +457,7 @@ async fn run_daemon(pool: PgPool, config: Config) {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    log_format::init(tracing::level_filters::LevelFilter::ERROR);
 
     let cli = Cli::parse();
 

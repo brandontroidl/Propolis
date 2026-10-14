@@ -17,12 +17,12 @@ tables, ports, routes, and constants are owned by the
 
 | Path | What it holds |
 |---|---|
-| `Cargo.toml` | Workspace root: `resolver = "2"`, 28 members, no `[workspace.dependencies]` and no `[workspace.package]` (every crate declares its own version and deps). |
+| `Cargo.toml` | Workspace root: `resolver = "2"`, 29 members, no `[workspace.dependencies]` and no `[workspace.package]` (every crate declares its own version and deps). |
 | `Cargo.lock` | Committed, frozen in CI via `--locked`. |
 | `rust-toolchain.toml` | Pins the exact toolchain (`1.96.1`) + `clippy`, `rustfmt`. See [toolchain-and-environment](toolchain-and-environment.md). |
 | `.cargo/config.toml` | Redirects crates-io to the vendored source tree. |
 | `vendor/` | All dependencies vendored in-tree. Do not edit. See [schema-and-migrations](schema-and-migrations.md#vendoring) and [`reference/dependencies`](../reference/dependencies.md). |
-| `crates/` | The 28 workspace members (below). |
+| `crates/` | The 29 workspace members (below). |
 | `deploy/` | systemd units + `install.sh`. Owns real bind ports/paths at deploy time. See [`reference/ports-and-protocols`](../reference/ports-and-protocols.md). |
 | `.github/workflows/ci.yml` | The authoritative build/test gate. See [build-and-test](build-and-test.md). |
 | `.env` | Gitignored local dev config (test `DATABASE_URL`, podman recipe). Not committed. |
@@ -32,13 +32,14 @@ tables, ports, routes, and constants are owned by the
 
 ## Crates
 
-28 workspace members (`Cargo.toml#members`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
+29 workspace members (`Cargo.toml#members`). Full component inventory with binaries and dependency edges lives in [`architecture/components`](../architecture/components.md); the summary by concern:
 
 **Foundation libraries (no internal deps):**
 - `core-scoring` - event ledger, chain-hashing, scoring, blocklist eligibility; owns the core DB migrations (`crates/core-scoring/migrations/`).
 - `sensor-wire` - the frozen sensor→intake NDJSON wire format (`WIRE_VERSION = 1`); imported by every sensor and by intake.
 - `geoip` - offline MaxMind GeoLite2 City + ASN reader (local file reads only, no network).
 - `log-tailer` - file tailing with a durable, rotation-aware cursor, shared by `intake` and `shipper`.
+- `log-format` - the one `tracing` output format every binary installs: no colour off a terminal, a journald priority prefix under systemd.
 - `collector-wire` - the collector-to-gateway batch frame, ack and mutual-TLS configuration.
 
 **Sensor layer:**

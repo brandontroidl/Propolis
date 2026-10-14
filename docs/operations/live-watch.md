@@ -61,7 +61,7 @@ One JSON object per line, valid UTF-8, never longer than 8 MiB
 | `start` | first line | `ts`, `version`, `sources` (each `label`, `path`), `sources_from` (`env` or `/etc/propolis/watch.env`), `start_at` (`end` or `beginning`), `journal`, `filters` (`sensor`, `signal`, `source_ip`) |
 | `event` | one per log line | `label`, `path`, and either `event` (the line, when it is a JSON object, embedded byte for byte as the sensor wrote it) or `raw` (the line as a string, when it is not) |
 | `dropped` | a line was not streamed | `reason`: `line_too_long` (over the tailer's 1 MiB `MAX_LINE_BYTES`; carries `label`, `path`, `bytes`, `max_bytes`) or `record_too_long` (an output line over the 8 MiB bound; carries `label`, `bytes`, `max_bytes`) |
-| `journal` | one per journal entry, with `--journal` | `unit`, `priority` (0 to 7), `message`, `ts` |
+| `journal` | one per journal entry, with `--journal` | `unit`, `priority` (0 to 7; the line's real level: 3 error, 4 warning, 6 info, 7 debug), `message`, `ts` |
 | `heartbeat` | at start, then every 10 s | `ts`, `sources_from`, `files`: per configured log `label`, `path`, `status`, `size`, `lines_seen` |
 | `error` | something the watcher could not do | `ts`, `source` (`config` or `journal`), `message` |
 

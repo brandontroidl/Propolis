@@ -298,7 +298,7 @@ async fn run_sensor_loop(
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    log_format::init(tracing::level_filters::LevelFilter::ERROR);
 
     let config = match load_config_from_env() {
         Ok(c) => c,

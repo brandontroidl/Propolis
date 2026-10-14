@@ -47,7 +47,9 @@ composes rather than reimplements:
 
 A minimal sensor `main.rs` (pattern, from `crates/sensor-catchall/src/main.rs`):
 
-1. `sensor_framework::init_logging()` (`info` by default, `RUST_LOG` overrides it).
+1. `sensor_framework::init_logging()` (`info` by default, `RUST_LOG` overrides it; the output
+   format, including journal priorities, comes with it from `log-format`). Do not call
+   `tracing_subscriber::fmt::init()` instead: `crates/log-format/tests/no_stock_fmt.rs` fails on it.
 2. Load and **validate** config through the shared typed readers
    (`crates/sensor-framework/src/env.rs#Env`: `socket_addr`, `duration_ms`, `positive_u64`,
    `positive_u32`, `wan_map`, `path`), never a local parser; on any malformed or zero-valued

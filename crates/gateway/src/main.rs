@@ -18,7 +18,7 @@ use sensor_framework::shutdown_signal;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    log_format::init(tracing::level_filters::LevelFilter::ERROR);
 
     let config = match load_config_from_env() {
         Ok(c) => c,

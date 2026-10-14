@@ -245,18 +245,54 @@ fn parse_cut(args: &[&str]) -> Result<CutPlan, CommandResult> {
             "suppressing non-delimited lines makes sense\n\tonly when operating on fields",
         ));
     }
-    plan.spans = parse_list(&list, mode)?;
+    plan.spans = merged(parse_list(&list, mode)?);
     Ok(plan)
 }
 
+/// The spans of a list in ascending order with every overlapping or adjacent pair joined, as
+/// GNU's `set_fields` leaves them, so a position is found by binary search: a list of thousands
+/// of spans is searched for each byte of the input.
+fn merged(mut spans: Vec<Span>) -> Vec<Span> {
+    spans.sort_by_key(|span| span.from);
+    let mut out: Vec<Span> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match out.last_mut() {
+            Some(last) if last.to.is_none_or(|to| span.from <= to.saturating_add(1)) => {
+                last.to = match (last.to, span.to) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            }
+            _ => out.push(span),
+        }
+    }
+    out
+}
+
+/// Whether 1-based `index` is selected by `spans`, which [`merged`] sorted and joined.
 fn selected(spans: &[Span], index: usize, complement: bool) -> bool {
-    let inside = spans
-        .iter()
-        .any(|s| index >= s.from && s.to.is_none_or(|to| index <= to));
+    let after = spans.partition_point(|span| span.from <= index);
+    let inside = after
+        .checked_sub(1)
+        .and_then(|at| spans.get(at))
+        .is_some_and(|span| span.to.is_none_or(|to| index <= to));
     inside != complement
 }
 
-fn cut_line(line: &[u8], plan: &CutPlan, out: &mut Vec<u8>, terminator: u8) {
+/// `out` with `piece` added, unless that takes it past `room` bytes: the output delimiter is the
+/// attacker's length and goes in before every field, so what one line of input makes is bounded
+/// by what the line may still spend, not by the input.
+fn put(out: &mut Vec<u8>, piece: &[u8], room: usize) -> bool {
+    if out.len().saturating_add(piece.len()) > room {
+        return false;
+    }
+    out.extend_from_slice(piece);
+    true
+}
+
+/// One line of input cut into `out`. False, with `out` left short, once the output would pass
+/// `room` bytes.
+fn cut_line(line: &[u8], plan: &CutPlan, out: &mut Vec<u8>, terminator: u8, room: usize) -> bool {
     match plan.mode {
         Mode::Bytes => {
             let mut first_run = true;
@@ -267,39 +303,41 @@ fn cut_line(line: &[u8], plan: &CutPlan, out: &mut Vec<u8>, terminator: u8) {
                     if let Some(sep) = &plan.output_delimiter
                         && !previous_kept
                         && !first_run
+                        && !put(out, sep, room)
                     {
-                        out.extend_from_slice(sep);
+                        return false;
                     }
-                    out.push(byte);
+                    if !put(out, &[byte], room) {
+                        return false;
+                    }
                     first_run = false;
                 }
                 previous_kept = keep;
             }
-            out.push(terminator);
+            put(out, &[terminator], room)
         }
         Mode::Fields => {
             if !line.contains(&plan.delimiter) {
-                if !plan.only_delimited {
-                    out.extend_from_slice(line);
-                    out.push(terminator);
+                if plan.only_delimited {
+                    return true;
                 }
-                return;
+                return put(out, line, room) && put(out, &[terminator], room);
             }
-            let sep = plan
-                .output_delimiter
-                .clone()
-                .unwrap_or_else(|| vec![plan.delimiter]);
+            let own = [plan.delimiter];
+            let sep = plan.output_delimiter.as_deref().unwrap_or(&own);
             let mut first = true;
             for (index, field) in line.split(|b| *b == plan.delimiter).enumerate() {
                 if selected(&plan.spans, index.saturating_add(1), plan.complement) {
-                    if !first {
-                        out.extend_from_slice(&sep);
+                    if !first && !put(out, sep, room) {
+                        return false;
                     }
-                    out.extend_from_slice(field);
+                    if !put(out, field, room) {
+                        return false;
+                    }
                     first = false;
                 }
             }
-            out.push(terminator);
+            put(out, &[terminator], room)
         }
     }
 }
@@ -320,6 +358,7 @@ impl FakeShell {
         let cap = self.read_cap();
         let mut acc = CommandResult::silent(0);
         let mut failed = false;
+        let mut produced = 0usize;
         for name in names {
             let bytes = match self.read_source(parts, name.as_deref(), cap) {
                 Ok(bytes) => bytes,
@@ -339,13 +378,21 @@ impl FakeShell {
             if !self.charge_work(len_u64(bytes.len())) {
                 return stopped();
             }
+            // What the line can still pay for, less what earlier operands produced: the output
+            // is charged once the command returns, so it is bounded here, as it is built.
+            let room = usize::try_from(self.line.remaining())
+                .unwrap_or(usize::MAX)
+                .saturating_sub(produced);
             let mut out = Vec::new();
             if !bytes.is_empty() {
                 let body = bytes.strip_suffix(&[terminator]).unwrap_or(&bytes);
                 for line in body.split(|b| *b == terminator) {
-                    cut_line(line, &plan, &mut out, terminator);
+                    if !cut_line(line, &plan, &mut out, terminator, room) {
+                        return stopped();
+                    }
                 }
             }
+            produced = produced.saturating_add(out.len());
             acc.append(CommandResult::stdout(out));
         }
         acc.status = u8::from(failed);

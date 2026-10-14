@@ -678,7 +678,11 @@
   copy of its input to its output for every `-` operand, so `head -c 1000000 /dev/zero | tee`
   with a hundred dashes asked for over 300 MB; `-` is now a file name, as GNU's tee treats it
   (`echo hi | tee - | wc -c` is 3 and leaves a file named `-`), and each file's copy is charged
-  before it is made. `crates/sensor-telnet/tests/shell_cost.rs` runs each reproducer through the real listener and
+  before it is made. `cut --output-delimiter` put an attacker-sized delimiter before every field
+  and charged the output only after building all of it (20 KB of commas and a 3,000-byte
+  delimiter made 218 MB); its output now stops the line once it would pass what the line can
+  still pay for, and a long `-b`/`-f` list is merged and binary-searched as GNU's is, where
+  65,536 spans were scanned for every input byte. `crates/sensor-telnet/tests/shell_cost.rs` runs each reproducer through the real listener and
   holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap.
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and

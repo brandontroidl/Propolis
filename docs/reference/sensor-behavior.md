@@ -319,7 +319,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
 - The work allowance pays for what a command does, not only for what it prints: a file a command
   reads for its own use is charged before it is read
   (`crates/sensor-framework/src/shell/read.rs#FakeShell::read_charged`), every copy `tee` makes is
-  charged before it is made, and a count a command is given (`tr`'s `[c*n]`, up to 2^64-2) is
+  charged before it is made, output that can outgrow its input (`cut --output-delimiter`) stops
+  the line once it passes what the line can still pay for, and a count a command is given (`tr`'s `[c*n]`, up to 2^64-2) is
   costed by its constructs, never walked. A line runs synchronously on the sensor's runtime, so
   what its allowance buys is the longest one line can hold a worker.
 - On SSH, telnet and ADB the session's own heap is counted too

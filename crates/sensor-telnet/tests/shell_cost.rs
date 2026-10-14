@@ -244,3 +244,23 @@ fn tee_copies_its_input_once_per_file_and_pays_for_each() {
     let out = session.run("cat ./-");
     assert!(out.contains("\r\nhi\r\n"), "{out:?}");
 }
+
+/// `cut --output-delimiter` puts the attacker's delimiter before every field: 20,000 fields and a
+/// 3,000-byte delimiter made 60 MB (twice over) from 20 KB of input. And a byte list of 65,536
+/// spans was searched span by span for each of four million bytes.
+#[test]
+fn cut_output_is_bounded_by_what_the_line_can_pay() {
+    let _turn = one_at_a_time();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::login(sensor(dir.path().to_path_buf()));
+    let delimiter = "x".repeat(3000);
+    session.run(&format!(
+        "head -c 20000 /dev/zero | tr '\\0' , | cut -d, -f1- --output-delimiter={delimiter} | wc -c"
+    ));
+    session.run("l=1; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do l=$l,$l; done");
+    session.run("head -c 4000000 /dev/zero | cut -b $l | wc -c");
+    let out = session.run("echo a,b,c | cut -d, -f1- --output-delimiter=XYZ");
+    assert!(out.contains("\r\naXYZbXYZc\r\n"), "{out:?}");
+    let out = session.run("echo abcdef | cut -b 5-,1,2-3 --output-delimiter=:");
+    assert!(out.contains("\r\nabc:ef\r\n"), "{out:?}");
+}

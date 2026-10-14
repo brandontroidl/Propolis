@@ -176,7 +176,9 @@ procedure in [split deployment](../operations/split-deployment.md), and the wire
 
 `deploy/blocklist-sync.sh` copies the built feed into a git checkout and pushes it to
 the remote you configured, using the deploy key you name. Nothing in the daemon or
-the shipped units schedules it; it runs when your cron runs it. Publishing exposes
+the shipped units schedules it; it runs when your cron runs it, as the
+`propolis-blocklist` account, and copies nothing from the feed directory but the
+publisher's own regular files. Publishing exposes
 the listed IP addresses and, through the repository, that you operate a honeypot.
 The push is monitored by the `feed-push-stale` condition once configured; see
 [routine procedures](../operations/routine-procedures.md).

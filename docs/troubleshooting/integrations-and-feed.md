@@ -157,13 +157,23 @@ stale threshold has elapsed since the daemon started; set it once the cron is
 installed, so a push that has never succeeded is reported rather than read as
 "syncing is optional". If the public repo is stale:
 
-- Confirm the cron entry exists and runs as a user whose SSH agent/key can push.
-  The classic failure is cron lacking the push credential; the script always
-  attempts `git push origin HEAD` (to ship any previously-stranded commit) and
-  exits non-zero with a diagnostic if the push fails.
-- The script is fail-closed: it aborts if the source has no `manifest.json`, is
-  not a git checkout, or has no tier files. Read its output for which guard
-  fired.
+- Confirm the cron entry exists, runs as `propolis-blocklist` (`crontab -u
+  propolis-blocklist -l`), and that its key can push. The classic failure is cron
+  lacking the push credential; the script always attempts `git push origin HEAD`
+  (to ship any previously-stranded commit) and exits non-zero with a diagnostic if
+  the push fails. Moved from root? The checkout must be owned by the account, or
+  git refuses it as dubious ownership.
+- The script is fail-closed: it aborts if the source has no `manifest.json`, the
+  target is not a git checkout, or the feed directory holds anything the
+  publisher does not write (an unexpected name, a missing format, a link, a FIFO,
+  a file over 32 MiB). Each refusal names the file and ends "refusing to push";
+  one that names a link or an unexpected file in the feed directory means
+  something other than the publisher wrote there, so investigate the daemon
+  before clearing it.
+- `feed-push-stale` firing while pushes succeed: the log says "could not update
+  push marker". `/var/lib/propolis/blocklist-status` must exist (re-run
+  `deploy/provision.sh`), be owned by the cron's account or root, and be writable
+  by no one else.
 
 ## Ops alerts never fire, or the daemon won't start with ops enabled
 

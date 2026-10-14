@@ -287,8 +287,8 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
 - an intake/feed stall for `STALL_FOR_SECS` (600 s), and feed staleness at
   `FEED_STALE_MULTIPLE` (2x) the build interval - both for the local publish
   (`feed-stale`) and for the public repo falling that far behind the local feed
-  (`feed-push-stale`, read from the marker `deploy/blocklist-sync.sh` touches after
-  each successful push; a box that has never pushed is paged only when
+  (`feed-push-stale`, read from the marker `/var/lib/propolis/blocklist-status/last-pushed`
+  that `deploy/blocklist-sync.sh` rewrites after each successful push; a box that has never pushed is paged only when
   `FEED_PUSH_EXPECTED` is set, and then only after the same threshold has elapsed
   since the daemon started, since without the flag the monitor cannot tell a broken
   cron from no cron and a fresh deployment must not page before its first cron run);

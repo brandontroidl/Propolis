@@ -103,15 +103,60 @@ platform does not schedule it for you - you install the crontab.
 > posture is owned by
 > [security/outbound-controls.md](../security/outbound-controls.md).
 
+**Run it as `propolis-blocklist`, not root.** The feed directory belongs to the
+daemon, the process that parses attacker input, and this script reads it. Run as
+root, any gap in its checks would let a compromised daemon have root copy a file
+only root can read into the public repository. `deploy/provision.sh` creates the
+`propolis-blocklist` account (home `/var/lib/propolis-blocklist`, no login shell)
+and its status directory; it can read the world-readable feed and its own files,
+nothing of root's. Set it up once (`<remote>` is your repository's SSH URL):
+
+```
+sudo install -d -o propolis-blocklist -g propolis-blocklist -m 0755 /var/lib/propolis/blocklist-repo
+sudo -u propolis-blocklist ssh-keygen -t ed25519 -N '' -f /var/lib/propolis-blocklist/deploy_key
+# add deploy_key.pub to the repository as a deploy key with write access, then:
+sudo -u propolis-blocklist env GIT_SSH_COMMAND='ssh -i /var/lib/propolis-blocklist/deploy_key' \
+    git clone <remote> /var/lib/propolis/blocklist-repo   # accept the host key once
+sudo crontab -u propolis-blocklist -e
+```
+
+with a crontab entry such as:
+
+```
+PROPOLIS_BLOCKLIST_SSH_KEY=/var/lib/propolis-blocklist/deploy_key
+5 * * * * /path/to/deploy/blocklist-sync.sh >> /var/lib/propolis-blocklist/sync.log 2>&1
+```
+
+Moving an existing root crontab: `chown -R propolis-blocklist:propolis-blocklist`
+the checkout, move the deploy key into `/var/lib/propolis-blocklist` owned by the
+account (mode `0600`), copy root's `known_hosts` entry for the remote into
+`/var/lib/propolis-blocklist/.ssh/known_hosts`, and move the crontab entry. The script still runs
+as root, with a warning in its log, so an old crontab keeps publishing until then.
+
 The script is fail-closed: it aborts if the source has no `manifest.json` or the
-target is not a git checkout, and refuses to publish if the tier files are
-missing. It always attempts a push (to ship any commit stranded by a prior failed
-run) and exits non-zero with a diagnostic if the push fails. After a successful
-push it touches a "last-pushed" marker beside the feed directory; the ops
-monitor's `feed-push-stale` condition pages when the local feed has moved on from
-that marker by more than `FEED_STALE_MULTIPLE` build cycles (see
-[health and observability](health-and-observability.md)). Schedule it to run
-after a build interval so it never races the atomic swap.
+target is not a git checkout, and refuses the whole build, touching nothing in the
+checkout, if anything in the feed directory is not exactly what the publisher
+writes:
+
+- the feed directory itself is a symbolic link;
+- an entry is not `manifest.json` or `aggressive`, `standard` or `all-<n>h|d`
+  with one of the publisher's ten formats, a feed is missing one of those
+  formats, or there are more than 16 retention windows;
+- a file is not a regular file with exactly one link (a symlink, a hard link, a
+  FIFO, a device), is over 32 MiB, or the build is over 256 MiB in all;
+- a file is replaced between its check and its open: each one is checked again
+  on the open descriptor before it is read.
+
+It always attempts a push (to ship any commit stranded by a prior failed run) and
+exits non-zero with a diagnostic if the push fails. After a successful push it
+rewrites the marker `/var/lib/propolis/blocklist-status/last-pushed`, in a
+directory only `propolis-blocklist` (or root) writes, never the daemon's feed
+directory; it skips the marker, with a warning, if that directory is writable by
+anyone else. The ops monitor's `feed-push-stale` condition pages when the local
+feed has moved on from that marker by more than `FEED_STALE_MULTIPLE` build cycles
+(see [health and observability](health-and-observability.md)). Schedule it to run
+after a build interval so it never races the atomic swap; a run that does race it
+refuses that build and the next run publishes.
 
 ## Rotating secrets
 

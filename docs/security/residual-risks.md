@@ -95,6 +95,16 @@ the feed contents does not leak your vantage. However, the publish-to-repo step
 deploy key, repository visibility, and cron/SSH-agent setup are operator
 responsibilities and out of the code's control.
 
+The script reads a directory the daemon writes, so a compromised daemon chooses
+what it finds there. It copies only single-link regular files with the publisher's
+names, checks each again on the open descriptor, and writes nothing in that
+directory, so a planted link, FIFO or stray file is refused. What it cannot stop is
+the daemon publishing false content under the right names: the feed is the
+daemon's output, and a compromised daemon can list any address it likes. The
+account it runs as is the operator's choice; the documented one,
+`propolis-blocklist`, cannot read root's files, but a crontab left under root still
+runs (with a warning), and then the checks are the only boundary.
+
 ## Unauthenticated console metrics
 
 `/health`, `/ready`, and `/metrics` are unauthenticated. This is safe *only*

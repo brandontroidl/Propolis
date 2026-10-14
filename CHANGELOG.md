@@ -10,6 +10,14 @@
   command. The hash chain is unaffected. See
   [split deployment](docs/operations/split-deployment.md#upgrading) and
   [upgrade](docs/operations/upgrade-rollback-and-dr.md#upgrade-the-intake-side-before-the-sensors).
+- **Move the public-feed cron to `propolis-blocklist`** if you publish the feed. The upgrade
+  creates the account and `/var/lib/propolis/blocklist-status`; a root crontab keeps working,
+  with a warning, until you move it (steps in
+  [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
+  The push marker moved there from `/var/lib/propolis/feed/.current.last_pushed`, so until the
+  first push after the upgrade `feed-push-stale` sees no push; with `PROPOLIS_OPS_FEED_PUSH_EXPECTED`
+  set it can page once if that push is more than the stale threshold away. Run the sync by hand
+  after upgrading to avoid it. The old marker file is no longer read and can be deleted.
 
 ### Added
 
@@ -635,6 +643,21 @@
   from one address kept 25 cores busy. The parser now resumes where the last read left it and
   returns the arguments as ranges of the buffer, which the commands read in place: the same
   multi-bulk now costs less than the 900 commands.
+- **The public-feed push no longer copies, opens or writes through what the daemon plants** -
+  `deploy/blocklist-sync.sh` runs from cron, as root on the documented layout, over the feed
+  directory the daemon owns, and copied `aggressive.* standard.* all-*.*` with `cp -f`: a symlink
+  planted there by a compromised daemon made root copy any file (a host key, the deploy key) into
+  the public repository and push it, a FIFO hung the cron for good, and the push marker was
+  written with `>` and `chmod` at a path in the same directory, so a link there made root
+  truncate, chmod or create any file. The script now enters the feed directory once (refusing a
+  symlinked one), accepts only the publisher's names and formats with every format present,
+  copies only single-link regular files of at most 32 MiB (256 MiB a build), checks each again
+  on the open descriptor before reading it, and stages the copies so a refusal leaves the
+  checkout untouched. The marker moved to `/var/lib/propolis/blocklist-status/last-pushed`, a
+  directory the daemon cannot write, written by temporary file and rename. `provision.sh`
+  creates a `propolis-blocklist` account to run it as, which cannot read root's files at all.
+  See [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron).
+
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

@@ -113,8 +113,11 @@ references by construction. The feed *contents* are safe to publish. Still:
 
 - Decide deliberately whether the blocklist Git repository is public.
 - The publish-to-repo step (`deploy/blocklist-sync.sh`) is an operator cron job;
-  it is **not** wired into any shipped systemd timer. If you run it, secure the
-  deploy key it pushes with and verify the cron/SSH-agent setup.
+  it is **not** wired into any shipped systemd timer. If you run it, run it from
+  the `propolis-blocklist` account's crontab, never root's: it reads the
+  daemon's feed directory, and as root a gap in its checks would reach every file
+  on the host. Secure the deploy key it pushes with and verify the cron/SSH setup
+  (see [routine procedures](../operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
 
 ## 8. Verify database privileges and backups
 

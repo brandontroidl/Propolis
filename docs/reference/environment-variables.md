@@ -982,11 +982,14 @@ with the unit's `MemoryMax`.
 
 Read by the blocklist publish script, not by any daemon, so they are set in the
 **cron environment** rather than an `/etc/propolis/*.env` file the units load.
+That cron belongs to the `propolis-blocklist` account, not root (see
+[routine procedures](../operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
 | `PROPOLIS_FEED_OUTPUT_DIR` | no | auto-detected | the publisher output holding `manifest.json`; when unset the script probes `<spool>/feed/current` then the older flat `<spool>/feed`, so both layouts work |
-| `PROPOLIS_BLOCKLIST_REPO` | no | `/var/lib/propolis/blocklist-repo` | the git checkout that is committed and pushed |
+| `PROPOLIS_BLOCKLIST_REPO` | no | `/var/lib/propolis/blocklist-repo` | the git checkout that is committed and pushed; owned by the account the cron runs as |
+| `PROPOLIS_BLOCKLIST_STATUS_DIR` | no | `/var/lib/propolis/blocklist-status` | where the script writes `last-pushed` after each successful push. The daemon's `feed-push-stale` condition reads only the default path, so change it only for a test. It must be a real directory owned by the running account or root and writable by no one else; otherwise the marker is skipped with a warning (the push still counts) |
 | `PROPOLIS_BLOCKLIST_SSH_KEY` | no | unset | path to a **passphraseless** deploy key for the push. Set for cron: cron has no ssh-agent, so a passphrase-protected key cannot be used non-interactively. When set, the script exports `GIT_SSH_COMMAND` with `IdentitiesOnly=yes`; a configured-but-unreadable key **fails closed (exit 1)** rather than falling back to another identity, since a fallback that succeeds by hand and fails under cron is the exact trap being avoided. When unset in a non-interactive run with no agent, the script warns before pushing. |
 
 Naming the key here rather than in the checkout's `core.sshCommand` is

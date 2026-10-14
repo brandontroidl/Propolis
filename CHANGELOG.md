@@ -367,6 +367,16 @@
 
 ### Fixed
 
+- **The SMTP sensor no longer records a password as the username** - `AUTH LOGIN <base64
+  user>` (the RFC 4954 initial response, Python smtplib's default) had its argument ignored, so
+  the sensor prompted `Username:`, the client answered with its password, and that password
+  was stored as the `honeypot_login_attempt` username. The initial response is now the
+  username and only the password is prompted for (`=` is an empty initial response). A
+  one-NUL AUTH PLAIN blob (`user\0pass`) used to record its second field, the password; it
+  now records an empty username. `AUTH PLAIN` without an initial response is answered `334 `
+  and read from the next line, as Postfix does, instead of `502`, and a `*` answering a
+  challenge gets `501 5.7.0 Authentication aborted`. See
+  [sensor-smtp](docs/reference/sensor-behavior.md#sensor-smtp).
 - **The HTTP sensor cuts credentials out of the request fields it records** - the platform
   rule is that a submitted password is never placed in any event field, and the SSH and
   credential sensors keep it, but sensor-http stored the request target, the query string and

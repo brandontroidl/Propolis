@@ -1573,8 +1573,14 @@ Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
   LOGIN, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING (`crates/sensor-smtp/src/handler.rs#handle_connection`). Verbs
   (`crates/sensor-smtp/src/handler.rs#handle_connection`): HELO/EHLO, STARTTLS (`454 TLS not available` unless TLS is
   configured, see "SMTP over TLS" below),
-  AUTH PLAIN (decodes username, drops password → `honeypot_login_attempt`), AUTH
-  LOGIN (username captured, password dropped), MAIL FROM / RCPT TO, DATA (captures
+  AUTH PLAIN and AUTH LOGIN (`crates/sensor-smtp/src/handler.rs#authenticate`; the username
+  goes into one `honeypot_login_attempt` and the password is read and dropped, never recorded
+  in any field). Both take an RFC 4954 initial response or none: `AUTH PLAIN` alone gets
+  `334 ` and reads the blob from the next line, as Postfix does; `AUTH LOGIN <base64 user>`
+  (Python smtplib's default) takes the initial response as the username and prompts only
+  `334 UGFzc3dvcmQ6`; `=` is an empty initial response. A PLAIN blob without both NUL
+  separators is malformed and records an empty username. `*` answering a `334` gets
+  `501 5.7.0 Authentication aborted` and no event. MAIL FROM / RCPT TO, DATA (captures
   mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
   Postfix queue id; without the terminating `.` line nothing is acknowledged or recorded),
   BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate as bytes until LAST, then the same

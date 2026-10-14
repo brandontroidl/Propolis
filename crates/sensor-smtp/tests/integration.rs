@@ -256,6 +256,154 @@ async fn auth_login_credential_capture() {
     srv.handle.abort();
 }
 
+/// Every event the server wrote, serialized whole, so a test can assert a secret appears in no
+/// field at all rather than only in the field it expects.
+fn all_event_text(events: &[sensor_wire::SensorEvent]) -> String {
+    events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Python's smtplib (and other clients) send the username as the RFC 4954 initial response:
+/// `AUTH LOGIN <base64 user>`. The sensor used to ignore it, prompt "Username:", and record the
+/// next line - the password - as the username.
+#[tokio::test]
+async fn auth_login_initial_response_is_the_username_and_the_password_is_never_recorded() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    // "probeuser" / "S3cretPassw0rd"
+    let r = client.send("AUTH LOGIN cHJvYmV1c2Vy").await;
+    assert_eq!(
+        r, "334 UGFzc3dvcmQ6\r\n",
+        "with an initial response only the password is prompted for"
+    );
+    let r = client.send("UzNjcmV0UGFzc3cwcmQ=").await;
+    assert!(r.starts_with("235 2.7.0"), "{r}");
+    let r = client.send("QUIT").await;
+    assert!(r.starts_with("221"), "the dialogue stays in step: {r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let logins: Vec<_> = events
+        .iter()
+        .filter(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .collect();
+    assert_eq!(logins.len(), 1, "{events:?}");
+    assert_eq!(logins[0].metadata["username"], "probeuser");
+    let text = all_event_text(&events);
+    for secret in ["S3cretPassw0rd", "UzNjcmV0UGFzc3cwcmQ"] {
+        assert!(!text.contains(secret), "password in an event: {text}");
+    }
+    srv.handle.abort();
+}
+
+/// RFC 4954: an initial response of "=" is a present but empty response, so the username is
+/// empty and the server goes straight to the password.
+#[tokio::test]
+async fn auth_login_empty_initial_response_prompts_only_for_the_password() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let r = client.send("AUTH LOGIN =").await;
+    assert_eq!(r, "334 UGFzc3dvcmQ6\r\n");
+    // "hunter2xyz"
+    let r = client.send("aHVudGVyMnh5eg==").await;
+    assert!(r.starts_with("235"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .expect("a login attempt");
+    assert_eq!(login.metadata["username"], "");
+    assert!(!all_event_text(&events).contains("hunter2xyz"));
+    srv.handle.abort();
+}
+
+/// `AUTH PLAIN` without an initial response is answered `334 ` and the credential is read from
+/// the next line, as Postfix does. The sensor used to answer 502 to an advertised mechanism.
+#[tokio::test]
+async fn auth_plain_without_initial_response_is_answered_334_and_captured() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let r = client.send("AUTH PLAIN").await;
+    assert_eq!(r, "334 \r\n");
+    // base64("\0probeuser\0S3cretPassw0rd")
+    let r = client.send("AHByb2JldXNlcgBTM2NyZXRQYXNzdzByZA==").await;
+    assert!(r.starts_with("235 2.7.0"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    let login = events
+        .iter()
+        .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+        .expect("a login attempt");
+    assert_eq!(login.metadata["username"], "probeuser");
+    assert!(!all_event_text(&events).contains("S3cretPassw0rd"));
+    srv.handle.abort();
+}
+
+/// A PLAIN blob with one NUL (`user\0pass`, no authzid) is malformed; its second field is the
+/// password, which must not be recorded as the username.
+#[tokio::test]
+async fn auth_plain_malformed_blob_never_records_its_password() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    // base64("probeuser\0S3cretPassw0rd")
+    let r = client
+        .send("AUTH PLAIN cHJvYmV1c2VyAFMzY3JldFBhc3N3MHJk")
+        .await;
+    assert!(r.starts_with("235"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT)
+    );
+    assert!(
+        !all_event_text(&events).contains("S3cretPassw0rd"),
+        "{events:?}"
+    );
+    srv.handle.abort();
+}
+
+/// A `*` answering a 334 cancels the exchange (RFC 4954) with Postfix's reply; nothing is
+/// recorded and the session continues.
+#[tokio::test]
+async fn auth_cancelled_with_star_is_aborted_and_not_recorded() {
+    let srv = TestServer::start().await;
+    let mut client = SmtpClient::connect(srv.addr).await;
+    client.ehlo().await;
+    let r = client.send("auth login").await;
+    assert!(r.starts_with("334 VXNlcm5hbWU6"), "{r}");
+    let r = client.send("*").await;
+    assert_eq!(r, "501 5.7.0 Authentication aborted\r\n");
+    let r = client.send("AUTH PLAIN").await;
+    assert_eq!(r, "334 \r\n");
+    let r = client.send("*").await;
+    assert_eq!(r, "501 5.7.0 Authentication aborted\r\n");
+    let r = client.send("NOOP").await;
+    assert!(r.starts_with("250"), "{r}");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let events = srv.events().await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_LOGIN_ATTEMPT),
+        "{events:?}"
+    );
+    srv.handle.abort();
+}
+
 /// EHLO advertises CHUNKING, so a client may deliver by BDAT instead of DATA. It used to get
 /// "502 command not recognized", contradicting the advertisement and losing the message.
 #[tokio::test]

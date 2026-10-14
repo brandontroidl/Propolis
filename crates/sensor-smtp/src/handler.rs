@@ -154,44 +154,26 @@ pub async fn handle_connection(
                 )
                 .await;
             }
-        } else if upper.starts_with("AUTH PLAIN ") {
-            // AUTH PLAIN <base64(NUL user NUL pass)> - decode username, drop password
-            let encoded = line[11..].trim();
-            let username = decode_auth_plain(encoded).unwrap_or_default();
-            let _ = emitter
-                .append(&login_event(
-                    source_ip,
-                    wan_ip,
-                    &username,
-                    session_id,
-                    reader.get_ref().is_tls(),
-                ))
-                .await;
-            let _ = write_reply(&mut reader, b"235 2.7.0 Authentication successful\r\n").await;
-        } else if upper.starts_with("AUTH LOGIN") {
-            // AUTH LOGIN: server prompts for username then password base64
-            let _ = write_reply(&mut reader, b"334 VXNlcm5hbWU6\r\n").await; // "Username:"
-            let Some(user_b64) = read_line_bounded(&mut reader, &bounds, &mut total_read).await
-            else {
-                return;
-            };
-            let username = base64_decode_lossy(user_b64.trim());
-            let _ = write_reply(&mut reader, b"334 UGFzc3dvcmQ6\r\n").await; // "Password:"
-            let Some(_pass_b64) = read_line_bounded(&mut reader, &bounds, &mut total_read).await
-            else {
-                return;
-            };
-            // Password decoded only to advance the protocol, then dropped.
-            let _ = emitter
-                .append(&login_event(
-                    source_ip,
-                    wan_ip,
-                    &sanitize_value(&username, MAX_USERNAME_LEN),
-                    session_id,
-                    reader.get_ref().is_tls(),
-                ))
-                .await;
-            let _ = write_reply(&mut reader, b"235 2.7.0 Authentication successful\r\n").await;
+        } else if let Some((mechanism, initial)) = parse_auth(&line) {
+            match authenticate(&mut reader, &bounds, &mut total_read, mechanism, initial).await {
+                Auth::Username(username) => {
+                    let _ = emitter
+                        .append(&login_event(
+                            source_ip,
+                            wan_ip,
+                            &sanitize_value(&username, MAX_USERNAME_LEN),
+                            session_id,
+                            reader.get_ref().is_tls(),
+                        ))
+                        .await;
+                    let _ =
+                        write_reply(&mut reader, b"235 2.7.0 Authentication successful\r\n").await;
+                }
+                Auth::Aborted => {
+                    let _ = write_reply(&mut reader, b"501 5.7.0 Authentication aborted\r\n").await;
+                }
+                Auth::Closed => return,
+            }
         } else if upper.starts_with("MAIL FROM:") {
             mail_from = extract_angle_bracket(&line[10..]);
             rcpt_to.clear();
@@ -486,16 +468,111 @@ fn extract_angle_bracket(s: &str) -> String {
     trimmed.to_string()
 }
 
-/// Decode AUTH PLAIN: base64 of `\0username\0password`. Returns the username; password is dropped.
+/// The two SASL mechanisms EHLO advertises (`AUTH PLAIN LOGIN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mechanism {
+    Plain,
+    Login,
+}
+
+/// `AUTH <mechanism> [initial-response]`, mechanism matched case-insensitively. `None` for any
+/// other line, including a mechanism that is not advertised.
+fn parse_auth(line: &str) -> Option<(Mechanism, Option<&str>)> {
+    let mut words = line.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("AUTH") {
+        return None;
+    }
+    let mechanism = words.next()?;
+    let mechanism = if mechanism.eq_ignore_ascii_case("PLAIN") {
+        Mechanism::Plain
+    } else if mechanism.eq_ignore_ascii_case("LOGIN") {
+        Mechanism::Login
+    } else {
+        return None;
+    };
+    Some((mechanism, words.next()))
+}
+
+/// How a SASL exchange ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Auth {
+    /// The decoded username; the password was read only to keep the dialogue in step.
+    Username(String),
+    /// The client answered a challenge with `*` (RFC 4954 section 4).
+    Aborted,
+    /// The connection ended or ran out of budget mid-exchange.
+    Closed,
+}
+
+/// Runs the server side of AUTH PLAIN or AUTH LOGIN. The username is taken from where the
+/// mechanism carries it: the PLAIN blob's authcid, or the LOGIN initial response when the
+/// client sent one (smtplib does), otherwise the answer to "Username:". The password is read
+/// and dropped, never decoded into anything that outlives this function.
+async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    bounds: &ConnectionBounds,
+    total: &mut u64,
+    mechanism: Mechanism,
+    initial: Option<&str>,
+) -> Auth {
+    // RFC 4954 section 4: "=" as the initial response is a present, zero-length response,
+    // distinct from no initial response at all.
+    let initial = initial.map(|ir| if ir == "=" { "" } else { ir }.to_string());
+    match mechanism {
+        Mechanism::Plain => {
+            let blob = match initial {
+                Some(blob) => blob,
+                None => match challenge(reader, bounds, total, b"334 \r\n").await {
+                    Ok(blob) => blob,
+                    Err(end) => return end,
+                },
+            };
+            Auth::Username(decode_auth_plain(blob.trim()).unwrap_or_default())
+        }
+        Mechanism::Login => {
+            let user = match initial {
+                Some(user) => user,
+                // "Username:"
+                None => match challenge(reader, bounds, total, b"334 VXNlcm5hbWU6\r\n").await {
+                    Ok(user) => user,
+                    Err(end) => return end,
+                },
+            };
+            // "Password:"
+            if let Err(end) = challenge(reader, bounds, total, b"334 UGFzc3dvcmQ6\r\n").await {
+                return end;
+            }
+            Auth::Username(base64_decode_lossy(user.trim()))
+        }
+    }
+}
+
+/// Sends one 334 challenge and reads the client's response line, mapping a `*` to
+/// [`Auth::Aborted`] and a closed or exhausted connection to [`Auth::Closed`].
+async fn challenge<S: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<S>,
+    bounds: &ConnectionBounds,
+    total: &mut u64,
+    prompt: &[u8],
+) -> Result<String, Auth> {
+    if write_reply(reader, prompt).await.is_err() {
+        return Err(Auth::Closed);
+    }
+    match read_line_bounded(reader, bounds, total).await {
+        None => Err(Auth::Closed),
+        Some(line) if line.trim() == "*" => Err(Auth::Aborted),
+        Some(line) => Ok(line),
+    }
+}
+
+/// Decode AUTH PLAIN: base64 of `authzid NUL authcid NUL passwd` (RFC 4616). Returns the authcid.
+/// Anything without both separators is malformed and yields `None`: with one NUL the second
+/// field is the password, so taking "the field after the first NUL" would record it.
 fn decode_auth_plain(encoded: &str) -> Option<String> {
     let decoded = base64_decode_bytes(encoded)?;
-    // Format: \0user\0pass - split on NUL bytes
-    let parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
-    if parts.len() >= 2 {
-        Some(String::from_utf8_lossy(parts[1]).into_owned())
-    } else {
-        None
-    }
+    let mut parts = decoded.splitn(3, |&b| b == 0);
+    let (_authzid, authcid, _passwd) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(String::from_utf8_lossy(authcid).into_owned())
 }
 
 fn base64_decode_lossy(encoded: &str) -> String {
@@ -800,6 +877,26 @@ mod tests {
         // base64 of "\0admin\0secret"
         let encoded = "AGFkbWluAHNlY3JldA==";
         assert_eq!(decode_auth_plain(encoded), Some("admin".to_string()));
+        // base64 of "admin\0secret": one NUL, so the second field is the password
+        assert_eq!(decode_auth_plain("YWRtaW4Ac2VjcmV0"), None);
+        assert_eq!(decode_auth_plain(""), None);
+    }
+
+    #[test]
+    fn parse_auth_reads_mechanism_and_initial_response() {
+        assert_eq!(parse_auth("AUTH PLAIN"), Some((Mechanism::Plain, None)));
+        assert_eq!(
+            parse_auth("auth login  eA=="),
+            Some((Mechanism::Login, Some("eA==")))
+        );
+        assert_eq!(
+            parse_auth("AUTH LOGIN ="),
+            Some((Mechanism::Login, Some("=")))
+        );
+        assert_eq!(parse_auth("AUTH CRAM-MD5"), None);
+        assert_eq!(parse_auth("AUTH"), None);
+        assert_eq!(parse_auth("AUTHX PLAIN"), None);
+        assert_eq!(parse_auth("AUTH PLAINX"), None);
     }
 
     #[test]

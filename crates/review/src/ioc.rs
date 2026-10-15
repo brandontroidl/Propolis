@@ -685,49 +685,92 @@ const REDACTED: &str = "<redacted>";
 /// every `scheme://user:pass@host`, and the value after an `Authorization:` or
 /// `Proxy-Authorization:` scheme. A `%s`-style template value is not a secret and is kept.
 pub fn redact_secrets(text: &str) -> String {
+    redact_authorization(&redact_url_userinfo(text))
+}
+
+/// The user information of every `scheme://user:pass@host` in `text` replaced by [`REDACTED`].
+///
+/// One pass that copies what it keeps into a new string. Replacing in place moved the rest of the
+/// text for every credential found, which made a megabyte of `://a@` quadratic.
+fn redact_url_userinfo(text: &str) -> String {
     let ends_authority = |c: char| c == '/' || c.is_whitespace() || "'\"`".contains(c);
-    let mut out = text.to_string();
-    let mut from = 0;
-    while let Some(rel) = out.get(from..).and_then(|s| s.find("://")) {
+    let mut out = String::with_capacity(text.len());
+    let (mut copied, mut from) = (0, 0);
+    while let Some(rel) = text.get(from..).and_then(|s| s.find("://")) {
         let start = from + rel + 3;
-        let end = out[start..]
+        let end = text[start..]
             .find(ends_authority)
-            .map_or(out.len(), |e| start + e);
-        match out[start..end].rfind('@') {
+            .map_or(text.len(), |e| start + e);
+        match text[start..end].rfind('@') {
             Some(at) => {
-                out.replace_range(start..start + at, REDACTED);
-                from = start + REDACTED.len() + 1;
+                out.push_str(&text[copied..start]);
+                out.push_str(REDACTED);
+                // The `@` and everything after it stay.
+                copied = start + at;
+                from = start + at + 1;
             }
             None => from = end,
         }
     }
-    let mut from = 0;
-    loop {
-        // ASCII lowercasing keeps every byte offset, so positions carry over to `out`.
-        let lower = out.to_ascii_lowercase();
-        let Some(rel) = lower.get(from..).and_then(|s| s.find("authorization:")) else {
-            break;
-        };
-        let after = from + rel + "authorization:".len();
-        let rest = &out[after..];
-        let scheme_start = rest.len() - rest.trim_start().len();
-        let scheme_len = rest[scheme_start..]
-            .find(char::is_whitespace)
-            .unwrap_or(rest.len() - scheme_start);
-        let value_at = scheme_start + scheme_len;
-        let value_start = value_at + (rest[value_at..].len() - rest[value_at..].trim_start().len());
-        let value_len = rest[value_start..]
-            .find(|c: char| c.is_whitespace() || "'\"\\".contains(c))
-            .unwrap_or(rest.len() - value_start);
-        let value = &rest[value_start..value_start + value_len];
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// The nearest byte offset at or after a position where `is_break` holds, remembering the last
+/// answer: a run of text with no break in it is scanned once however many queries land inside it.
+/// Without that, `authorization:authorization:...` rescanned to the end of the text from every
+/// marker.
+struct NextBreak {
+    /// Queries at positions in `lo..=hi` have the answer `hi`.
+    known: Option<(usize, usize)>,
+}
+
+impl NextBreak {
+    fn new() -> Self {
+        Self { known: None }
+    }
+
+    fn at(&mut self, text: &str, from: usize, is_break: impl Fn(char) -> bool) -> usize {
+        if let Some((lo, hi)) = self.known
+            && (lo..=hi).contains(&from)
+        {
+            return hi;
+        }
+        let hi = text[from..].find(is_break).map_or(text.len(), |e| from + e);
+        self.known = Some((from, hi));
+        hi
+    }
+}
+
+/// The value after every `Authorization:` or `Proxy-Authorization:` scheme in `text` replaced by
+/// [`REDACTED`], except a `%`-template value. Same single-pass construction as
+/// [`redact_url_userinfo`]; ASCII lowercasing keeps every byte offset, so positions in the
+/// lowercased copy are positions in `text`.
+fn redact_authorization(text: &str) -> String {
+    const MARKER: &str = "authorization:";
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let (mut copied, mut from) = (0, 0);
+    let (mut scheme_end, mut value_end) = (NextBreak::new(), NextBreak::new());
+    while let Some(rel) = lower.get(from..).and_then(|s| s.find(MARKER)) {
+        let after = from + rel + MARKER.len();
+        let scheme_start = after + (text[after..].len() - text[after..].trim_start().len());
+        let value_at = scheme_end.at(text, scheme_start, char::is_whitespace);
+        let value_start = value_at + (text[value_at..].len() - text[value_at..].trim_start().len());
+        let value_stop = value_end.at(text, value_start, |c| {
+            c.is_whitespace() || "'\"\\".contains(c)
+        });
+        let value = &text[value_start..value_stop];
         if value.is_empty() || value.starts_with('%') {
             from = after;
             continue;
         }
-        let (a, b) = (after + value_start, after + value_start + value_len);
-        out.replace_range(a..b, REDACTED);
-        from = a + REDACTED.len();
+        out.push_str(&text[copied..value_start]);
+        out.push_str(REDACTED);
+        copied = value_stop;
+        from = value_stop;
     }
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -1936,6 +1979,135 @@ Jx4u80n/q0WquQbw1QIDAQAB
             redact_url_credentials("http://u:p@203.0.113.1/x"),
             (Some("http://203.0.113.1/x".to_string()), true)
         );
+    }
+
+    /// The in-place implementation `redact_secrets` replaced, kept as the reference the single-pass
+    /// one is held to: it replaced each secret inside one growing string and lowercased the whole
+    /// string again for every `authorization:` it met, so it was quadratic.
+    fn redact_secrets_reference(text: &str) -> String {
+        let ends_authority = |c: char| c == '/' || c.is_whitespace() || "'\"`".contains(c);
+        let mut out = text.to_string();
+        let mut from = 0;
+        while let Some(rel) = out.get(from..).and_then(|s| s.find("://")) {
+            let start = from + rel + 3;
+            let end = out[start..]
+                .find(ends_authority)
+                .map_or(out.len(), |e| start + e);
+            match out[start..end].rfind('@') {
+                Some(at) => {
+                    out.replace_range(start..start + at, REDACTED);
+                    from = start + REDACTED.len() + 1;
+                }
+                None => from = end,
+            }
+        }
+        let mut from = 0;
+        loop {
+            let lower = out.to_ascii_lowercase();
+            let Some(rel) = lower.get(from..).and_then(|s| s.find("authorization:")) else {
+                break;
+            };
+            let after = from + rel + "authorization:".len();
+            let rest = &out[after..];
+            let scheme_start = rest.len() - rest.trim_start().len();
+            let scheme_len = rest[scheme_start..]
+                .find(char::is_whitespace)
+                .unwrap_or(rest.len() - scheme_start);
+            let value_at = scheme_start + scheme_len;
+            let value_start =
+                value_at + (rest[value_at..].len() - rest[value_at..].trim_start().len());
+            let value_len = rest[value_start..]
+                .find(|c: char| c.is_whitespace() || "'\"\\".contains(c))
+                .unwrap_or(rest.len() - value_start);
+            let value = &rest[value_start..value_start + value_len];
+            if value.is_empty() || value.starts_with('%') {
+                from = after;
+                continue;
+            }
+            let (a, b) = (after + value_start, after + value_start + value_len);
+            out.replace_range(a..b, REDACTED);
+            from = a + REDACTED.len();
+        }
+        out
+    }
+
+    /// Text assembled from the fragments the two redactions branch on, so that markers, userinfo,
+    /// quotes, templates and whitespace land next to each other in every order.
+    fn fragment_text(seed: &mut u64, pieces: usize) -> String {
+        const FRAGMENTS: [&str; 24] = [
+            "://",
+            "http",
+            "https",
+            "u:p@",
+            "@",
+            "x@y",
+            "/",
+            " ",
+            "  ",
+            "\t",
+            "'",
+            "\"",
+            "`",
+            "\\",
+            "Authorization:",
+            "authorization:",
+            "Proxy-Authorization:",
+            "AUTHORIZATION:",
+            "Bearer",
+            "Basic",
+            "%s",
+            "%",
+            "tok.en",
+            "\u{e9}\u{1f600}",
+        ];
+        let mut text = String::new();
+        for _ in 0..pieces {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            text.push_str(FRAGMENTS[(*seed >> 20) as usize % FRAGMENTS.len()]);
+        }
+        text
+    }
+
+    #[test]
+    fn redaction_matches_the_in_place_reference_on_generated_text() {
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for case in 0..30_000 {
+            let text = fragment_text(&mut seed, 1 + case % 40);
+            assert_eq!(
+                redact_secrets(&text),
+                redact_secrets_reference(&text),
+                "case {case}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_cost_is_linear_in_the_text() {
+        // 256 KiB of each shape the old implementation was quadratic on: a marker every few bytes
+        // (a whole-text lowercase per marker), markers with no whitespace between them (a scan to
+        // the end of the text per marker), and a credential every few bytes (a move of the rest of
+        // the text per credential). Eight seconds each in a release build at 1 MiB before.
+        let shapes = [
+            "authorization: ".repeat(1 << 14),
+            "authorization:".repeat(1 << 14),
+            "Authorization: Bearer tok ".repeat(1 << 13),
+            "://a@".repeat(1 << 15),
+            "u://v:w@x ".repeat(1 << 14),
+        ];
+        for text in &shapes {
+            let started = std::time::Instant::now();
+            let redacted = redact_secrets(text);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(1),
+                "{} bytes took {took:?}",
+                text.len()
+            );
+            // At most `<redacted>` (10 bytes) for each 1-byte userinfo, so a small multiple.
+            assert!(redacted.len() <= text.len() * 3);
+        }
     }
 
     #[test]

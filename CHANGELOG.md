@@ -565,6 +565,13 @@
   directory first (at most once a second) and counts the files actually present plus the stores
   in progress, under the same lock as the reservation. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-storage-properties).
+- **Redacting secrets from attacker text is linear** - `ioc::redact_secrets` replaced each
+  credential inside one growing string and lowercased the whole string again for every
+  `authorization:` it found, and scanned to the end of the text from every marker in
+  `authorization:authorization:...`. A megabyte of the first shape took 8.2 s in a release build,
+  256 KiB 12 s in a debug test run; the campaign indexer, the ATT&CK tags and the indicator
+  extraction all call it. It is now two single passes that copy what they keep, held byte for
+  byte to the old implementation over 30,000 generated texts. No behaviour change.
 - **A writer waiting for the append lock no longer holds a pooled connection** - every ledger
   writer took its connection first and the Postgres advisory lock second, so with sixteen intake
   tailers on a pool of the same size every waiting tailer was a connection doing nothing, and the

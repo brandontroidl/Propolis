@@ -104,6 +104,20 @@ impl std::fmt::Display for SpoolError {
     }
 }
 
+impl SpoolError {
+    /// The `not_stored_reason` an upload event carries when the spool refused its body. A closed
+    /// set of short labels, so an analyst can filter on it and nothing attacker-supplied reaches
+    /// the event through it.
+    pub fn not_stored_reason(&self) -> &'static str {
+        match self {
+            SpoolError::BudgetExhausted { .. } => "spool_full",
+            SpoolError::FileSizeExceeded { .. } => "file_too_large",
+            SpoolError::HashMismatch { .. } | SpoolError::NotRegularFile => "spool_entry_invalid",
+            SpoolError::InvalidHash { .. } | SpoolError::Io(_) => "spool_error",
+        }
+    }
+}
+
 impl std::error::Error for SpoolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -217,6 +231,18 @@ impl QuarantineSpool {
             // The body is on disk under its name and keeps its budget; only the name's
             // durability across a crash is unconfirmed, so the caller must not treat it as stored.
             Err(Publish::NameNotSynced(e)) => Err(e.into()),
+        }
+    }
+
+    /// The reference a body would have had, without storing it: its digest and length. For a body
+    /// the spool refused, so the event that records the observation can still carry the hash and
+    /// size the sensor saw. `capture_id` is `None` because no capture was made.
+    pub fn describe(body: &[u8]) -> SampleRef {
+        SampleRef {
+            sha256: hex_digest(&Sha256::digest(body)),
+            size: body.len() as u64,
+            orig_name: String::new(),
+            capture_id: None,
         }
     }
 

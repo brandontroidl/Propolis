@@ -253,7 +253,8 @@ spool](./queue-and-spool.md); in summary:
   (first drop, then 2, 4, 8, ...) so a sustained flood degrades to logarithmic noise instead of
   filling the log partition (`crates/sensor-framework/src/handoff.rs#submit`).
 - **Spool-refused.** A body the spool rejects (per-file cap or exhausted global budget)
-  increments `spool_refused_count` and logs a per-refusal WARN; no sample and no event result
+  increments `spool_refused_count` and logs a WARN at power-of-two totals. No sample results, but
+  the upload event is still emitted, marked `stored: false` with a `not_stored_reason`
   (`crates/sensor-framework/src/handoff.rs#process_job`).
 
 A rising drop or spool-refused count means the capture layer is shedding load; it is expected

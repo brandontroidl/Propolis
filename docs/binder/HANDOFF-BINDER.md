@@ -478,7 +478,7 @@ body), `GET /metrics` (Prometheus, derived live per scrape;
 unauthenticated, so keep loopback). Watch `propolis_feed_last_build_timestamp`
 (feed still publishing), the review-queue depth, and two capture-loss counters:
 `dropped_count` (queue full - WARNs at powers of two) and `spool_refused_count`
-(per-file cap or budget - WARN per refusal). The daemon and sensors log via
+(per-file cap or budget - WARN at powers of two; the upload event is still emitted, marked not stored). The daemon and sensors log via
 `tracing` to the journal; a session-gated `/logs` viewer tails a 1000-event ring
 buffer.
 

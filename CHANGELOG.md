@@ -531,6 +531,15 @@
   the AppName offset pair (bytes 48..52) instead of UserName (40..44, MS-TDS 2.2.6.4), so every
   captured username was a driver name such as `Core Microsoft SqlClient Data Provider`. The
   password stays unread.
+- **A full sensor spool no longer erases the uploads it refuses** - once a sensor's spool was
+  full (100 MB) or a body was over its per-file cap, the hand-off logged a line and built no
+  event, so the source, topic, size and hash of every later upload were lost from the ledger.
+  The upload event is now always emitted, for every body-capturing sensor: without a `sample`
+  (nothing is on disk to name), with `stored: false` and a `not_stored_reason` (`spool_full`,
+  `file_too_large`, `spool_entry_invalid`, `spool_error`), and with `sha256`, `size` and
+  `orig_name` of the body that was seen. The Samples list does not show such a row. The refusal
+  WARN is now logged at power-of-two totals, as the queue-drop WARN is. See
+  [queue and spool](docs/operations/queue-and-spool.md#spool-refusals-spool_refused_count).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

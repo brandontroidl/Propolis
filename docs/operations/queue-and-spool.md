@@ -31,7 +31,7 @@ flowchart LR
   w --> s["QuarantineSpool<br/>per-file + global budget"]
   s --> ev["NDJSON event<br/>appended to log"]
   q -.->|queue full| d["dropped_count++<br/>no spool, no event"]
-  s -.->|refused| r["spool_refused_count++<br/>no event"]
+  s -.->|refused| r["spool_refused_count++<br/>event, marked not stored"]
 ```
 
 Key properties:
@@ -75,7 +75,13 @@ Log line (example): `capture hand-off: queue full, sample dropped (no spool, no 
 ### Spool refusals (`spool_refused_count`)
 
 A body that reaches the worker but the spool rejects increments `spool_refused_count` and logs
-a WARN **per refusal** (`crates/sensor-framework/src/handoff.rs#process_job`). The spool refuses in two cases
+a WARN at power-of-two totals (`crates/sensor-framework/src/handoff.rs#process_job`). The upload
+event is still emitted: it carries the digest, size and name the sensor saw and the other metadata
+its sensor wrote (source, topic, `complete`, `end_reason`), but no `sample`, because no file backs
+it, and two keys that say so: `stored: false` and `not_stored_reason`
+(`crates/sensor-framework/src/handoff.rs#mark_not_stored`). The ledger therefore keeps the
+observation; only the body is lost. The Samples list and sample pages, which are built from
+`sample_sha256`, do not show it. The spool refuses in two cases
 (`crates/sensor-framework/src/spool.rs#store`, `crates/sensor-framework/src/spool.rs#reserve_budget`):
 
 - **`FileSizeExceeded`** - the body is larger than the per-file cap (10 MB for the spooling
@@ -85,8 +91,16 @@ a WARN **per refusal** (`crates/sensor-framework/src/handoff.rs#process_job`). T
   reserved. Reservation is atomic (`compare_exchange`), so the budget is a hard ceiling
   (`sensor-framework/src/spool.rs#reserve_budget`).
 
-Unlike a queue drop, a spool refusal is the only in-process record that a capture was lost at
-that stage, which is why every refusal logs (not just powers of two).
+| `not_stored_reason` | Cause |
+|---|---|
+| `spool_full` | `BudgetExhausted`: the global budget is reserved |
+| `file_too_large` | `FileSizeExceeded`: over the per-file cap |
+| `spool_entry_invalid` | the file already filed under this digest is corrupt or not a regular file |
+| `spool_error` | any other write failure (a read-only or missing spool directory, a full disk) |
+
+Unlike a queue drop, a spool refusal leaves a ledger event: filter on
+`metadata->>'stored' = 'false'` to list uploads whose body was not kept. A queue drop still leaves
+nothing.
 
 ## Spool storage properties
 

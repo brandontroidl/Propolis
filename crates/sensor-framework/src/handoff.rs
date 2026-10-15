@@ -348,8 +348,8 @@ pub struct CaptureHandoff {
     truncated_captures: AtomicU64,
     /// Submitted captures that got zero bytes (the budget was already full), so no sample exists.
     refused_captures: AtomicU64,
-    /// Captures the worker discarded because the spool refused the body (per-file cap or exhausted
-    /// global budget). Behind an `Arc` because the worker task increments it; `submit` touches only
+    /// Captures whose body the spool refused (per-file cap or exhausted global budget); the event
+    /// is still emitted, marked not stored. Behind an `Arc` because the worker task increments it; `submit` touches only
     /// `dropped`. Its counterpart accessor is `spool_refused_count`.
     spool_refused: Arc<AtomicU64>,
     spool: Arc<QuarantineSpool>,
@@ -607,11 +607,11 @@ impl CaptureHandoff {
         self.refused_captures.load(Ordering::Relaxed)
     }
 
-    /// Total captures the worker discarded because the spool refused the body - the per-file cap or
-    /// the exhausted global budget (`spool.rs`). Unlike a queue drop, a spool refusal yields neither
-    /// a stored sample nor an event, so this counter is the only in-process record that a capture
-    /// was lost there; surfaced (alongside a per-refusal WARN) so the loss is a metric the operator
-    /// can read rather than a silent gap.
+    /// Total captures whose body the spool refused - the per-file cap or the exhausted global
+    /// budget (`spool.rs`). Unlike a queue drop, a spool refusal still emits the upload event
+    /// (without a sample, marked `stored: false`), so the ledger keeps the observation; this
+    /// counter, surfaced with a WARN at power-of-two totals, is how an operator sees that bodies
+    /// are being lost.
     pub fn spool_refused_count(&self) -> u64 {
         self.spool_refused.load(Ordering::Relaxed)
     }
@@ -811,15 +811,30 @@ async fn process_job(
     let stored = tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let stored = spool.store(body.as_slice());
+            // A refused body is still an observation: keep its digest and size so the event can
+            // say what was seen, computed before the body's budget is refunded below.
+            let refused_ref = stored
+                .is_err()
+                .then(|| QuarantineSpool::describe(body.as_slice()));
             // `store` has copied the bytes to a synced file (or refused them) by the time it
             // returns, so the in-memory body is dead weight from here: refund its budget now,
             // before the manifest write and the event append (both can block on slow I/O) rather
             // than at the end of the job. Unwinding out of `store` drops `body` the same way.
             drop(body);
-            stored.map(|mut sample_ref| {
-                sample_ref.orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
-                event_builder(sample_ref)
-            })
+            let orig_name = sanitize_value(&orig_name, MAX_ORIG_NAME_LEN);
+            match (stored, refused_ref) {
+                (Ok(mut sample_ref), _) => {
+                    sample_ref.orig_name = orig_name;
+                    Ok(event_builder(sample_ref))
+                }
+                (Err(error), Some(mut sample_ref)) => {
+                    sample_ref.orig_name = orig_name;
+                    let mut event = event_builder(sample_ref.clone());
+                    mark_not_stored(&mut event, &sample_ref, &error);
+                    Err((error, Box::new(event)))
+                }
+                (Err(error), None) => unreachable!("a refusal always has its digest: {error}"),
+            }
         }))
     })
     .await;
@@ -837,14 +852,21 @@ async fn process_job(
             }
             event
         }
-        Ok(Err(e)) => {
+        Ok(Err((e, mut event))) => {
             let refused = spool_refused.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::warn!(
-                error = %e,
-                spool_refused_total = refused,
-                "capture hand-off: spool refused body; sample not retained, no event emitted"
-            );
-            return;
+            // The event is emitted either way, so the log line is only the operator's cue: at
+            // power-of-two totals, because a full spool refuses every upload that follows.
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    error = %e,
+                    spool_refused_total = refused,
+                    "capture hand-off: spool refused body; sample not retained, event emitted marked not stored"
+                );
+            }
+            if budget_truncated {
+                mark_budget_truncated(&mut event.metadata);
+            }
+            *event
         }
         Err(payload) => {
             tracing::error!(
@@ -899,6 +921,27 @@ async fn process_job(
             error = %e,
             "capture hand-off: event emit failed after spool store succeeded"
         );
+    }
+}
+
+/// Turns the event built for a refused body into the record of an upload that was seen and not
+/// kept: no `sample` (no file exists for it to name, and a consumer that follows one would find
+/// nothing), `stored` false, and the reason. The digest, size and name go into the metadata when
+/// the sensor's own builder has not put them there, since intake only folds them in from a
+/// `sample` and this event has none. Done here, once, so no sensor can forget one of the keys.
+fn mark_not_stored(event: &mut SensorEvent, seen: &SampleRef, error: &crate::spool::SpoolError) {
+    event.sample = None;
+    if let Some(map) = event.metadata.as_object_mut() {
+        map.insert("stored".into(), serde_json::Value::Bool(false));
+        map.insert(
+            "not_stored_reason".into(),
+            serde_json::Value::String(error.not_stored_reason().into()),
+        );
+        map.entry("sha256")
+            .or_insert_with(|| seen.sha256.clone().into());
+        map.entry("size").or_insert_with(|| seen.size.into());
+        map.entry("orig_name")
+            .or_insert_with(|| seen.orig_name.clone().into());
     }
 }
 
@@ -1509,55 +1552,119 @@ mod tests {
         assert_eq!(budget.current_bytes(), 0);
     }
 
-    #[tokio::test]
-    async fn spool_store_failure_does_not_crash_worker_and_does_not_emit() {
-        // A job whose body exceeds the spool's per-file cap makes `store` return `Err`. The
-        // worker must log and move on (proving the `Ok(Err(e))` branch does not panic or wedge
-        // the loop), and - documenting current, deliberate behavior rather than leaving it a
-        // silent gap - no event is emitted for the refused capture, since `CaptureJob`'s frozen
-        // `event_builder: FnOnce(SampleRef) -> SensorEvent` shape has no way to build an event
-        // without a real `SampleRef` (see the task report's Concerns re: the design doc's "still
-        // a recorded sighting" line). A well-behaved job submitted right after still succeeds.
+    /// Runs `jobs` (body, orig_name) through a real worker over a spool with the given caps and
+    /// returns the events it logged, once `want` lines exist.
+    async fn run_through_spool(
+        max_file: u64,
+        budget: u64,
+        jobs: &[(&[u8], &str)],
+        want: usize,
+    ) -> (CaptureHandoff, Vec<SensorEvent>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
         std::fs::create_dir(&spool_dir).unwrap();
         let log_path = dir.path().join("events.jsonl");
-        let spool = crate::spool::QuarantineSpool::new(spool_dir, 8, 1_000_000);
+        let spool = crate::spool::QuarantineSpool::new(spool_dir, max_file, budget);
         let emitter = crate::emit::EventEmitter::new(log_path.clone());
         let handoff = test_handoff(spool, emitter, 16, dir.path());
         handoff.start_worker();
+        for (body, name) in jobs {
+            let wire = body.len() as u64;
+            handoff
+                .submit(CaptureJob {
+                    body: body_of(body),
+                    orig_name: (*name).to_string(),
+                    event_builder: Box::new(move |sample| {
+                        let mut event = test_event(Some(sample.clone()));
+                        event.metadata =
+                            upload_metadata("test", &sample, wire, UploadEnd::TransferComplete);
+                        event
+                    }),
+                })
+                .unwrap();
+        }
+        wait_for_lines(&log_path, want).await;
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let events = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (handoff, events, dir)
+    }
 
-        handoff
-            .submit(CaptureJob {
-                body: body_of(b"this body exceeds the eight byte limit"),
-                orig_name: String::new(),
-                event_builder: Box::new(|sample| test_event(Some(sample))),
-            })
-            .unwrap();
-        handoff
-            .submit(CaptureJob {
-                body: body_of(b"ok"),
-                orig_name: String::new(),
-                event_builder: Box::new(|sample| test_event(Some(sample))),
-            })
-            .unwrap();
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        crate::sanitize::to_hex_bounded(&Sha256::digest(bytes), 32)
+    }
 
-        wait_for_lines(&log_path, 1).await;
+    /// A full spool must not erase the observation: the upload event still reaches the log with
+    /// the hash, size and name the sensor saw, carrying no sample (nothing is on disk to point
+    /// at) and saying why. Before, the refusal was a log line and a counter, and the event was
+    /// never built, so the ledger lost the source, the topic and the hash of every upload after
+    /// the spool filled.
+    #[tokio::test]
+    async fn a_full_spool_still_emits_the_upload_event_marked_not_stored() {
+        let stored = b"first body fills the spool";
+        let refused = b"second body cannot fit at all";
+        let (handoff, events, dir) = run_through_spool(
+            1024,
+            stored.len() as u64,
+            &[(stored, "first.bin"), (refused, "second.bin")],
+            2,
+        )
+        .await;
 
-        // The spool refusal is now counted (previously it was only a log line with no metric),
-        // giving parity with the queue-drop `dropped_count`.
         assert_eq!(handoff.spool_refused_count(), 1);
-        assert_eq!(
-            handoff.dropped_count(),
-            0,
-            "neither submit was queue-dropped"
+        assert_eq!(events.len(), 2, "both uploads are in the log");
+        let kept = &events[0];
+        assert_eq!(kept.sample.as_ref().unwrap().sha256, sha256_hex(stored));
+        assert!(
+            kept.metadata.get("stored").is_none(),
+            "a stored body is unmarked"
         );
 
-        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1, "only the well-behaved job is emitted");
-        let event: SensorEvent = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(event.sample.unwrap().size, 2);
+        let lost = &events[1];
+        assert_eq!(lost.signal_type, SIGNAL_HONEYPOT_MALWARE_UPLOAD);
+        assert!(lost.sample.is_none(), "no sample: no file backs it");
+        assert!(
+            lost.occurrence_id.is_some(),
+            "it is an ordinary ledger event"
+        );
+        assert_eq!(lost.metadata["stored"], false);
+        assert_eq!(lost.metadata["not_stored_reason"], "spool_full");
+        assert_eq!(lost.metadata["sha256"], sha256_hex(refused));
+        assert_eq!(lost.metadata["size"], refused.len() as u64);
+        assert_eq!(lost.metadata["orig_name"], "second.bin");
+        assert!(
+            !dir.path().join("spool").join(sha256_hex(refused)).exists(),
+            "the refused body was not stored"
+        );
+        let manifest_rows = std::fs::read_dir(dir.path().join("outbox"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(
+            manifest_rows, 1,
+            "custody is recorded only for the stored body"
+        );
+    }
+
+    /// The per-file cap is the other refusal the spool makes: same treatment, its own reason, and
+    /// the worker carries on with the next job.
+    #[tokio::test]
+    async fn an_oversize_body_still_emits_its_event_and_the_worker_carries_on() {
+        let big = b"this body exceeds the eight byte limit";
+        let (handoff, events, _dir) =
+            run_through_spool(8, 1_000_000, &[(big, "big.bin"), (b"ok", "ok.bin")], 2).await;
+
+        assert_eq!(handoff.spool_refused_count(), 1);
+        assert_eq!(handoff.dropped_count(), 0);
+        let lost = &events[0];
+        assert!(lost.sample.is_none());
+        assert_eq!(lost.metadata["stored"], false);
+        assert_eq!(lost.metadata["not_stored_reason"], "file_too_large");
+        assert_eq!(lost.metadata["sha256"], sha256_hex(big));
+        assert_eq!(lost.metadata["size"], big.len() as u64);
+        assert_eq!(events[1].sample.as_ref().unwrap().size, 2);
     }
 
     #[test]

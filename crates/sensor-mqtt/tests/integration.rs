@@ -50,9 +50,28 @@ impl TestServer {
     }
 
     async fn start_with(bounds: ConnectionBounds, ceiling: u64) -> TestServer {
+        Self::start_with_spool_filler(bounds, ceiling, None).await
+    }
+
+    /// Starts a sensor whose spool already holds `filler` bytes of earlier samples (a sparse
+    /// file, so it costs no disk): the sensor recovers its usage from the directory at startup,
+    /// which is how a restarted sensor finds a full spool. The filler's name is returned for a
+    /// test that plays the retention pass and removes it.
+    async fn start_with_spool_filler(
+        bounds: ConnectionBounds,
+        ceiling: u64,
+        filler: Option<u64>,
+    ) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
+        if let Some(bytes) = filler {
+            std::fs::create_dir(&spool_dir).unwrap();
+            std::fs::File::create(spool_dir.join(FILLER_NAME))
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
         let budget = Arc::new(CaptureMemoryBudget::new(ceiling));
         let (addr, handle, handoff) = sensor_mqtt::start_test_server_with_handoff(
@@ -1273,6 +1292,55 @@ fn never_outbound_static_check() {
         found.is_empty(),
         "sensor-mqtt must not open outbound sockets: {found:?}"
     );
+}
+
+/// A sample the spool already holds, named the way the spool names one. 100 MB is the sensor's
+/// whole spool budget (`SPOOL_GLOBAL_BUDGET`), so with it present nothing more fits.
+const FILLER_NAME: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const FULL_SPOOL_BYTES: u64 = 100_000_000;
+
+async fn publish_binary(srv: &TestServer, topic: &[u8], payload: &[u8]) {
+    let mut client = Client::connect(srv.addr).await;
+    client.handshake().await;
+    let mut b = lenp(topic);
+    b.extend_from_slice(&[0x12, 0x34]);
+    b.extend_from_slice(payload);
+    client.send(&packet(0x32, &b)).await; // qos1
+    assert_eq!(client.read_n(4).await, vec![0x40, 0x02, 0x12, 0x34]);
+}
+
+/// Once the spool is full, a binary PUBLISH used to leave no event at all: the source, topic,
+/// size and hash of every upload after the first 100 MB were gone from the ledger. The event is
+/// now emitted without a sample, marked not stored, with the hash and size the sensor computed.
+#[tokio::test]
+async fn a_full_spool_still_records_the_upload_marked_not_stored() {
+    let srv = TestServer::start_with_spool_filler(
+        test_bounds(),
+        DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+        Some(FULL_SPOOL_BYTES),
+    )
+    .await;
+    let payload = elf_like(4096);
+    publish_binary(&srv, b"fw/update", &payload).await;
+
+    let uploads = srv.wait_for_uploads(1).await;
+    let up = &uploads[0];
+    assert!(up.sample.is_none(), "nothing was stored to point at");
+    let m = &up.metadata;
+    assert_eq!(m["stored"], false);
+    assert_eq!(m["not_stored_reason"], "spool_full");
+    assert_eq!(m["sha256"], sha256_hex(&payload));
+    assert_eq!(m["size"], payload.len());
+    assert_eq!(m["topic"], "fw/update");
+    assert_eq!(m["protocol_label"], "mqtt");
+    assert_eq!(m["complete"], true);
+    assert!(up.occurrence_id.is_some());
+    assert!(
+        !srv.spool_dir.join(sha256_hex(&payload)).exists(),
+        "the body was not written"
+    );
+    assert_eq!(srv.handoff.spool_refused_count(), 1);
+    srv.handle.abort();
 }
 
 #[test]

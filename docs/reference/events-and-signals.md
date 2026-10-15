@@ -93,6 +93,12 @@ a lower bound, see below) and
 `truncated` (`wire_size > size`), built by `sensor_framework::upload_metadata`.
 When `truncated` is true the `sha256` and `size` describe a prefix, not the file;
 the IP detail page shows such rows with status `truncated` instead of `captured`.
+An upload whose body the sensor's spool refused (full, over its per-file cap, or unwritable) is
+still emitted, so the ledger keeps its source, topic, size and hash: it has no `sample`, carries
+`stored: false` and a `not_stored_reason` (`spool_full`, `file_too_large`, `spool_entry_invalid`,
+`spool_error`), and `sha256`, `size` and `orig_name` describe the body that was seen but not kept
+([queue and spool](../operations/queue-and-spool.md#spool-refusals-spool_refused_count)). Such a
+row has no `sample_sha256`, so the Samples list does not show it.
 FTP drains at most a further 10 MB past its cap before closing the data
 connection, so a `wire_size` of 20 MB on an FTP row is a floor, not the total.
 Every upload row also carries `complete`: false when the transfer did not end the way

@@ -23,7 +23,7 @@ use core_scoring::IpScore;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use review::gatekeeper::{GateReason, GateResult, VendorConfig, check};
+use review::gatekeeper::{CooldownBook, GateReason, GateResult, VendorConfig, check, check_with};
 
 async fn migrate(pool: &PgPool) {
     // Core-scoring first (review_state_enum, etc. must exist), then this crate's own.
@@ -320,4 +320,197 @@ async fn reserved_ranges_are_refused_ahead_of_every_configurable_check(pool: PgP
         .await,
         GateResult::Pass
     );
+}
+
+async fn insert_attempt(
+    pool: &PgPool,
+    ip: &str,
+    vendor: &str,
+    submitted_at: DateTime<Utc>,
+    success: bool,
+    n: usize,
+) {
+    sqlx::query(
+        "INSERT INTO vendor_submission \
+         (source_ip, vendor, idempotency_key, categories, comment, submitted_at, success) \
+         VALUES ($1::inet, $2, $3, $4, 'differential', $5, $6)",
+    )
+    .bind(ip)
+    .bind(vendor)
+    .bind(format!("{ip}:{vendor}:{n}"))
+    .bind(vec!["test".to_string()])
+    .bind(submitted_at)
+    .bind(success)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A pass reads every pair's cooldown in one query (`CooldownBook`) instead of one per pair, and
+/// must decide exactly what the per-pair query decides. Every pair of 40 addresses and three
+/// vendors is checked both ways over a database seeded with each shape of history the cooldown
+/// can meet: nothing, a recent success, a success older than the cooldown, a recent FAILURE only,
+/// an old success beside a recent failure, a recent success beside older ones, and a vendor with
+/// a zero-hour cooldown. Pairs outside what the book was loaded for must fall back to the query.
+#[sqlx::test(migrations = false)]
+async fn the_batched_cooldown_decides_exactly_what_the_per_pair_query_decides(pool: PgPool) {
+    migrate(&pool).await;
+    let vendors = ["vend-a", "vend-b", "vend-c"];
+    let configs = [
+        permissive_config("vend-a"),
+        VendorConfig {
+            cooldown_hours: 0,
+            ..permissive_config("vend-b")
+        },
+        VendorConfig {
+            cooldown_hours: 72,
+            ..permissive_config("vend-c")
+        },
+    ];
+    let now = Utc::now();
+    let ips: Vec<String> = (1..=40).map(|n| format!("203.0.113.{n}")).collect();
+    let mut n = 0;
+    for (i, ip) in ips.iter().enumerate() {
+        for (v, vendor) in vendors.iter().enumerate() {
+            n += 1;
+            match (i + v) % 7 {
+                0 => {}
+                1 => insert_attempt(&pool, ip, vendor, now - Duration::hours(1), true, n).await,
+                2 => insert_attempt(&pool, ip, vendor, now - Duration::hours(30), true, n).await,
+                3 => insert_attempt(&pool, ip, vendor, now - Duration::hours(1), false, n).await,
+                4 => {
+                    insert_attempt(&pool, ip, vendor, now - Duration::hours(40), true, n).await;
+                    insert_attempt(&pool, ip, vendor, now - Duration::hours(1), false, n + 1000)
+                        .await;
+                }
+                5 => {
+                    // The newest success decides, whatever order the rows were written in.
+                    insert_attempt(&pool, ip, vendor, now - Duration::hours(50), true, n).await;
+                    insert_attempt(
+                        &pool,
+                        ip,
+                        vendor,
+                        now - Duration::minutes(5),
+                        true,
+                        n + 1000,
+                    )
+                    .await;
+                    insert_attempt(&pool, ip, vendor, now - Duration::hours(26), true, n + 2000)
+                        .await;
+                }
+                _ => {
+                    // Just inside and just outside a 24-hour cooldown, with minutes to spare so
+                    // the two checks cannot straddle the edge.
+                    let age = if (i + v) % 2 == 0 {
+                        Duration::hours(24) - Duration::minutes(5)
+                    } else {
+                        Duration::hours(24) + Duration::minutes(5)
+                    };
+                    insert_attempt(&pool, ip, vendor, now - age, true, n).await;
+                }
+            }
+        }
+    }
+    // An address the book will not be loaded for, with a history that would hold it.
+    insert_attempt(
+        &pool,
+        "203.0.113.200",
+        "vend-a",
+        now - Duration::hours(1),
+        true,
+        9000,
+    )
+    .await;
+
+    let covered: Vec<IpAddr> = ips.iter().map(|s| s.parse().unwrap()).collect();
+    let book = CooldownBook::load(&pool, &covered, &["vend-a", "vend-b", "vend-c"])
+        .await
+        .unwrap();
+
+    let (mut passes, mut cooldowns) = (0, 0);
+    for ip in &covered {
+        let score = fake_score(*ip, Decimal::from(80), &["Honeypot"]);
+        for config in &configs {
+            let per_pair = check(&pool, *ip, config, &score).await;
+            let batched = check_with(&pool, *ip, config, &score, Some(&book)).await;
+            assert_eq!(batched, per_pair, "{ip} x {}", config.name);
+            match per_pair {
+                GateResult::Pass => passes += 1,
+                GateResult::Held(GateReason::Cooldown) => cooldowns += 1,
+                other => panic!("unexpected outcome for {ip} x {}: {other:?}", config.name),
+            }
+        }
+    }
+    // A fixture where both paths hold every pair (or pass every pair) would agree for the wrong
+    // reason; the grid is built to land on both sides.
+    assert!(
+        passes > 20 && cooldowns > 20,
+        "{passes} passes, {cooldowns} holds"
+    );
+
+    // Outside the book, the answer still comes from the database.
+    let outside: IpAddr = "203.0.113.200".parse().unwrap();
+    let score = fake_score(outside, Decimal::from(80), &["Honeypot"]);
+    assert_eq!(book.latest_success(outside, "vend-a"), None);
+    assert_eq!(
+        check_with(&pool, outside, &configs[0], &score, Some(&book)).await,
+        GateResult::Held(GateReason::Cooldown)
+    );
+    let other_vendor = permissive_config("vend-z");
+    let first: IpAddr = covered[0];
+    assert_eq!(book.latest_success(first, "vend-z"), None);
+    insert_attempt(
+        &pool,
+        &ips[0],
+        "vend-z",
+        now - Duration::hours(1),
+        true,
+        9001,
+    )
+    .await;
+    assert_eq!(
+        check_with(&pool, first, &other_vendor, &score, Some(&book)).await,
+        GateResult::Held(GateReason::Cooldown)
+    );
+}
+
+/// The book keys on the address Postgres prints for the stored `inet`, parsed back, so every
+/// spelling of an address must find its own pair: an IPv6 address Rust and Postgres both print
+/// compressed, an IPv4-mapped IPv6 address, and a plain IPv4.
+#[sqlx::test(migrations = false)]
+async fn the_book_finds_each_pair_whatever_the_address_family(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let spellings = [
+        "203.0.113.7",
+        "2001:db8::7",
+        "::ffff:203.0.113.7",
+        "2001:db8:0:0:1::7",
+    ];
+    for (n, ip) in spellings.iter().enumerate() {
+        insert_attempt(
+            &pool,
+            ip,
+            "vend-a",
+            now - Duration::hours(n as i64 + 1),
+            true,
+            n,
+        )
+        .await;
+    }
+    let ips: Vec<IpAddr> = spellings.iter().map(|s| s.parse().unwrap()).collect();
+    let book = CooldownBook::load(&pool, &ips, &["vend-a"]).await.unwrap();
+    for ip in &ips {
+        let per_pair: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT submitted_at FROM vendor_submission \
+             WHERE source_ip = $1::inet AND vendor = 'vend-a' AND success = TRUE \
+             ORDER BY submitted_at DESC LIMIT 1",
+        )
+        .bind(ip.to_string())
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(per_pair.is_some(), "{ip} was seeded");
+        assert_eq!(book.latest_success(*ip, "vend-a"), Some(per_pair), "{ip}");
+    }
 }

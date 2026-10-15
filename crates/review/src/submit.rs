@@ -16,9 +16,13 @@
 //!    gate's score-floor/category-filter checks and the report's category
 //!    codes reflect the IP's CURRENT state.
 //! 3. For each configured vendor (an adapter + its gatekeeper-scoped
-//!    config, matched by name): [`crate::gatekeeper::check`]. A held
+//!    config, matched by name): [`crate::gatekeeper::check_with`], with the
+//!    pass's cooldowns read up front in one query ([`CooldownBook`]) rather
+//!    than one per pair. A held
 //!    (ip, vendor) pair is skipped before anything is written - only an
-//!    attempted submission ever produces a `vendor_submission` row.
+//!    attempted submission ever produces a `vendor_submission` row. The
+//!    per-category protocol labels (below) are read only once a pair has
+//!    passed its gate, so an address every vendor holds costs no label query.
 //! 4. Build the [`VendorReport`] and a date-scoped idempotency key, INSERT a
 //!    `success = false` row, call `adapter.submit`, then UPDATE that row
 //!    with the outcome. See "Idempotency" below.
@@ -113,7 +117,7 @@ use sqlx::{PgPool, Row};
 
 use core_scoring::{Category, IpScore, OperatorAllowlist, read_score};
 
-use crate::gatekeeper::{self, GateReason, GateResult, VendorConfig};
+use crate::gatekeeper::{self, CooldownBook, GateReason, GateResult, VendorConfig};
 use crate::queue::{ReviewError, ReviewQueue};
 use crate::vendor::{
     VendorAdapter, VendorError, VendorReport, build_categories, build_dshield_categories,
@@ -288,10 +292,35 @@ impl SubmissionRunner {
         self
     }
 
+    /// The cooldown lookups of the whole pass in one query: every approved address that is not on
+    /// the allowlist, for every configured vendor. A pass used to look each pair up on its own
+    /// (17,000 `SELECT ... LIMIT 1` for 5,600 addresses and three vendors). A failed load is
+    /// logged and returns `None`, and the gates then query pair by pair exactly as before, so a
+    /// database error here changes the cost of the pass, not what it decides.
+    async fn load_cooldowns(&self, approved: &[crate::queue::QueueEntry]) -> Option<CooldownBook> {
+        let ips: Vec<IpAddr> = approved
+            .iter()
+            .map(|e| e.source_ip)
+            .filter(|ip| !self.allowlist.contains(*ip))
+            .collect();
+        let vendors: Vec<&str> = self.vendors.iter().map(|v| v.name()).collect();
+        match CooldownBook::load(&self.pool, &ips, &vendors).await {
+            Ok(book) => Some(book),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cooldown lookups for the pass failed; checking pair by pair"
+                );
+                None
+            }
+        }
+    }
+
     /// Run one pass. See the module doc comment's numbered algorithm.
     pub async fn run_once(&self) -> Result<SubmitResult, SubmitError> {
         let approved = ReviewQueue::new().list_approved(&self.pool).await?;
         let today = Utc::now().date_naive();
+        let cooldowns = self.load_cooldowns(&approved).await;
 
         let mut result = SubmitResult::default();
         for entry in approved {
@@ -327,16 +356,10 @@ impl SubmissionRunner {
                 }
             };
 
-            let protocol_labels = match category_protocol_labels(&self.pool, ip).await {
-                Ok(map) => map,
-                Err(e) => {
-                    tracing::error!(
-                        %ip, error = %e,
-                        "protocol-label lookup failed; skipping this poll"
-                    );
-                    continue;
-                }
-            };
+            // Read when the first vendor's gate passes, not before the gates: the labels only
+            // shape a report, and a pass over thousands of approved addresses that are nearly all
+            // held by cooldown would otherwise run this query for every one of them.
+            let mut protocol_labels: Option<HashMap<Category, Option<String>>> = None;
 
             for adapter in &self.vendors {
                 let name = adapter.name();
@@ -350,7 +373,15 @@ impl SubmissionRunner {
                     continue;
                 };
 
-                match gatekeeper::check(&self.pool, ip, config, &current_score).await {
+                match gatekeeper::check_with(
+                    &self.pool,
+                    ip,
+                    config,
+                    &current_score,
+                    cooldowns.as_ref(),
+                )
+                .await
+                {
                     GateResult::Held(reason) => {
                         match &reason {
                             // Expected steady state: an already-sent (cooldown), rate-limited,
@@ -379,7 +410,20 @@ impl SubmissionRunner {
                     GateResult::Pass => {}
                 }
 
-                let report = match build_report(ip, &current_score, &protocol_labels, name) {
+                let labels = match &protocol_labels {
+                    Some(labels) => labels,
+                    None => match category_protocol_labels(&self.pool, ip).await {
+                        Ok(map) => protocol_labels.insert(map),
+                        Err(e) => {
+                            tracing::error!(
+                                %ip, error = %e,
+                                "protocol-label lookup failed; skipping this poll"
+                            );
+                            break;
+                        }
+                    },
+                };
+                let report = match build_report(ip, &current_score, labels, name) {
                     Ok(r) => r,
                     Err(e) => {
                         tracing::error!(

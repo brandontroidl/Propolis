@@ -153,7 +153,10 @@ review queue, and the report must pass the gatekeeper.
 - **Gatekeeper.** An ordered sequence of checks that stops at the first hold: reserved
   address, vendor disabled, last seen more than 48 hours ago, a successful report to
   this vendor within the cooldown, the vendor-wide rate limit, the score floor, and the
-  category filter. A database error during a check holds the report.
+  category filter. A database error during a check holds the report. A pass reads every
+  pair's latest successful report in one query up front
+  (`crates/review/src/gatekeeper.rs#CooldownBook`) instead of one lookup per address and
+  vendor; the decisions are the same, and if that read fails the checks query pair by pair.
 - **Idempotency.** The runner claims a row keyed by IP, vendor and UTC date before
   calling the vendor, and records the outcome afterwards. A retry the same day reuses
   the row. If the row exists with no recorded outcome, an earlier attempt died between

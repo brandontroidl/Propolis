@@ -9,11 +9,12 @@
 //! [`GateReason::DbError`] rather than propagating an error a caller might
 //! mishandle as "not held".
 
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 
 use core_scoring::IpScore;
 
@@ -90,6 +91,92 @@ pub async fn check(
     config: &VendorConfig,
     current_score: &IpScore,
 ) -> GateResult {
+    check_with(pool, ip, config, current_score, None).await
+}
+
+/// The latest successful submission of each (address, vendor) pair, read for a whole submission
+/// pass in one query instead of one `SELECT ... LIMIT 1` per pair.
+///
+/// A pass over 5,600 approved addresses and three vendors made 17,000 cooldown lookups, each a
+/// round trip whose elapsed time included any wait for a free worker or connection (backlog J10).
+/// The book holds exactly what those lookups would have returned at the moment it was read, for
+/// the addresses and vendors it was loaded for; [`check_with`] answers a pair outside that set
+/// from the database as [`check`] does, so a pair the book does not cover can never read as
+/// "never submitted".
+///
+/// It is a snapshot: a success another process records after the load is not seen until the next
+/// pass. Nothing in this pass can make that matter for its own pairs (each is visited once, and
+/// its own row is written after its check), and a pair a second node submitted in the meantime is
+/// stopped by the day-scoped idempotency key at insert time (`submit::insert_pending`).
+#[derive(Debug, Default)]
+pub struct CooldownBook {
+    covered_ips: HashSet<IpAddr>,
+    covered_vendors: HashSet<String>,
+    latest: HashMap<(IpAddr, String), DateTime<Utc>>,
+}
+
+impl CooldownBook {
+    /// One query for every (address, vendor) pair of `ips` x `vendors`.
+    pub async fn load(
+        pool: &PgPool,
+        ips: &[IpAddr],
+        vendors: &[&str],
+    ) -> Result<Self, sqlx::Error> {
+        let mut book = CooldownBook {
+            covered_ips: ips.iter().copied().collect(),
+            covered_vendors: vendors.iter().map(|v| (*v).to_string()).collect(),
+            latest: HashMap::new(),
+        };
+        if ips.is_empty() || vendors.is_empty() {
+            return Ok(book);
+        }
+        let ip_texts: Vec<String> = ips.iter().map(ToString::to_string).collect();
+        let vendor_names: Vec<&str> = vendors.to_vec();
+        let rows = sqlx::query(
+            "SELECT host(source_ip) AS source_ip, vendor, MAX(submitted_at) AS latest \
+             FROM vendor_submission \
+             WHERE success = TRUE AND vendor = ANY($2) AND source_ip = ANY($1::text[]::inet[]) \
+             GROUP BY source_ip, vendor",
+        )
+        .bind(&ip_texts)
+        .bind(&vendor_names)
+        .fetch_all(pool)
+        .await?;
+        for row in rows {
+            let text: String = row.try_get("source_ip")?;
+            // An address Postgres prints that Rust cannot read back cannot be matched to the
+            // pairs asked about, so the book then covers nothing and every pair is answered by
+            // the per-pair query: never as "no submission".
+            let Ok(ip) = text.parse::<IpAddr>() else {
+                book.covered_ips.clear();
+                return Ok(book);
+            };
+            book.latest
+                .insert((ip, row.try_get("vendor")?), row.try_get("latest")?);
+        }
+        Ok(book)
+    }
+
+    /// `Some(latest)` when the book covers the pair (`latest` is `None` for a pair with no
+    /// successful submission), `None` when it does not and the database must be asked.
+    pub fn latest_success(&self, ip: IpAddr, vendor: &str) -> Option<Option<DateTime<Utc>>> {
+        if !self.covered_ips.contains(&ip) || !self.covered_vendors.contains(vendor) {
+            return None;
+        }
+        Some(self.latest.get(&(ip, vendor.to_string())).copied())
+    }
+}
+
+/// [`check`], reading the cooldown from `book` when it covers the pair. The decisions are the
+/// same as [`check`]'s for the same data: the book only replaces the query that fetches the
+/// pair's latest success.
+pub async fn check_with(
+    pool: &PgPool,
+    ip: IpAddr,
+    config: &VendorConfig,
+    current_score: &IpScore,
+    book: Option<&CooldownBook>,
+) -> GateResult {
     // FIRST, and ahead of every operator-configurable check: an address in a reserved range must
     // never leave this system, whatever the score says and whoever approved it. The blocklist feed
     // has always filtered these (twice - at build and again at publish); this path had no such
@@ -113,7 +200,7 @@ pub async fn check(
         return GateResult::Held(GateReason::Stale);
     }
 
-    if let Err(reason) = check_cooldown(pool, ip, config).await {
+    if let Err(reason) = check_cooldown(pool, ip, config, book).await {
         return GateResult::Held(reason);
     }
 
@@ -146,17 +233,22 @@ async fn check_cooldown(
     pool: &PgPool,
     ip: IpAddr,
     config: &VendorConfig,
+    book: Option<&CooldownBook>,
 ) -> Result<(), GateReason> {
-    let most_recent: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT submitted_at FROM vendor_submission \
-         WHERE source_ip = $1::inet AND vendor = $2 AND success = TRUE \
-         ORDER BY submitted_at DESC LIMIT 1",
-    )
-    .bind(ip.to_string())
-    .bind(&config.name)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| GateReason::DbError(e.to_string()))?;
+    let most_recent: Option<DateTime<Utc>> =
+        match book.and_then(|b| b.latest_success(ip, &config.name)) {
+            Some(latest) => latest,
+            None => sqlx::query_scalar(
+                "SELECT submitted_at FROM vendor_submission \
+                 WHERE source_ip = $1::inet AND vendor = $2 AND success = TRUE \
+                 ORDER BY submitted_at DESC LIMIT 1",
+            )
+            .bind(ip.to_string())
+            .bind(&config.name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| GateReason::DbError(e.to_string()))?,
+        };
 
     if most_recent
         .is_some_and(|last| Utc::now() - last < Duration::hours(config.cooldown_hours as i64))

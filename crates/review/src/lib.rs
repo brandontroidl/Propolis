@@ -20,7 +20,7 @@ pub mod vendor;
 pub mod virustotal;
 
 pub use cli::{Cli, CliError, Command};
-pub use gatekeeper::{GateReason, GateResult, VendorConfig, check};
+pub use gatekeeper::{CooldownBook, GateReason, GateResult, VendorConfig, check, check_with};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
 pub use submit::{HeldBreakdown, SubmissionRunner, SubmitError, SubmitResult};
 pub use vendor::{

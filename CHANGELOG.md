@@ -575,6 +575,17 @@
   directory first (at most once a second) and counts the files actually present plus the stores
   in progress, under the same lock as the reservation. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-storage-properties).
+- **The submission pass reads its cooldowns in one query** - every pass looked up each approved
+  address and vendor on its own (`SELECT submitted_at FROM vendor_submission ... LIMIT 1`, about
+  17,000 a pass on the live node for 5,600 addresses and three vendors), and read each address's
+  protocol labels before any vendor's gate had passed, so a pass in which nearly every pair is held
+  by cooldown (the steady state) still ran thousands of single-row queries, each timed by sqlx as
+  a stall (backlog J10). The pass now reads the latest successful submission of every
+  (address, vendor) pair in one query (`CooldownBook`) and the protocol labels only for an
+  address whose gate passed. Decisions are unchanged: a differential test checks all 120 pairs of
+  a seeded history against the per-pair query, and a pair the book does not cover, or a book that
+  fails to load, falls back to the per-pair query. The vendor-wide rate-limit count still runs
+  only for pairs that pass the cooldown. No setting, no behaviour change.
 - **Steps that held an async worker for tens of milliseconds now run off it** - the daemon runs
   every subsystem on one tokio runtime, and sqlx times a statement from issue to poll, so a task
   stuck in synchronous code shows up as 1-2 s `COMMIT`s and primary-key lookups with the database

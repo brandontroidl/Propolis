@@ -685,3 +685,108 @@ async fn run_once_holds_vendor_with_no_matching_gatekeeper_config(pool: PgPool) 
         0
     );
 }
+
+/// The statements sqlx logs while the guard is held: sqlx emits each at DEBUG on the
+/// `sqlx::query` target with the SQL text in `db.statement`.
+#[derive(Clone, Default)]
+struct StatementLog(Arc<Mutex<Vec<String>>>);
+
+struct StatementText(Option<String>);
+
+impl tracing::field::Visit for StatementText {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0 = Some(value.to_string());
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "db.statement" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatementLog {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() == "sqlx::query" {
+            let mut text = StatementText(None);
+            event.record(&mut text);
+            if let Some(sql) = text.0 {
+                self.0.lock().unwrap().push(sql);
+            }
+        }
+    }
+}
+
+impl StatementLog {
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::prelude::*;
+        let log = StatementLog::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(log.clone())
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG);
+        (log, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains(needle))
+            .count()
+    }
+}
+
+/// A pass over many addresses that are all held by cooldown (the steady state: every approved
+/// address stays Approved) used to run one cooldown lookup per address and vendor, plus one
+/// protocol-label query per address that no held pair ever uses. 5,600 addresses and three vendors
+/// made 17,000 of the first on the live node, each timed by sqlx as a stall.
+#[sqlx::test(migrations = false)]
+async fn a_pass_over_held_addresses_reads_cooldowns_in_one_query(pool: PgPool) {
+    migrate(&pool).await;
+    const ADDRESSES: usize = 12;
+    for n in 0..ADDRESSES {
+        seed_and_approve(&pool, &format!("203.0.113.{}", 20 + n)).await;
+    }
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![
+        Box::new(MockVendor::new("dshield")),
+        Box::new(MockVendor::new("otx")),
+    ];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("dshield"), permissive_config("otx")],
+    );
+
+    // The first pass submits everything and so puts every pair into cooldown.
+    let first = runner.run_once().await.unwrap();
+    assert_eq!(first.submitted, ADDRESSES * 2);
+
+    let (log, guard) = StatementLog::capture();
+    let second = runner.run_once().await.unwrap();
+    drop(guard);
+
+    assert_eq!(second.held, ADDRESSES * 2);
+    assert_eq!(second.held_by.cooldown, ADDRESSES * 2);
+    assert_eq!(second.submitted, 0);
+    assert_eq!(
+        log.count("ORDER BY submitted_at DESC LIMIT 1"),
+        0,
+        "no per-pair cooldown lookup"
+    );
+    assert_eq!(
+        log.count("MAX(submitted_at)"),
+        1,
+        "one batched cooldown read for the whole pass"
+    );
+    assert_eq!(
+        log.count("enum_range"),
+        0,
+        "no protocol-label read for an address every vendor held"
+    );
+}

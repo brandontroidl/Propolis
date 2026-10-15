@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sqlx::{PgPool, Row};
 
-use core_scoring::{FeedTier, RepoError};
+use core_scoring::{FeedTier, RepoError, off_worker};
 
 use crate::exclusion::ExclusionEngine;
 
@@ -180,41 +180,47 @@ impl FeedBuilder {
 
         let mut candidates = Vec::with_capacity(rows.len());
 
-        for row in rows {
-            let ip_text: String = row.try_get("source_ip")?;
-            let ip: IpAddr = match ip_text.parse() {
-                Ok(ip) => ip,
-                Err(_) => {
-                    // Fail closed: an unparseable stored IP is excluded, never guessed at.
-                    tracing::warn!(
-                        ip_text = %ip_text,
-                        "feed builder: unparseable stored source_ip, excluding"
-                    );
+        // The row loops decode, parse and test every address against the exclusions with no
+        // await in between: 3 ms for 5,000 addresses and 31 ms for 50,000 (the `cpu_budget`
+        // example), so they run off the async worker.
+        off_worker(|| -> Result<(), FeedError> {
+            for row in rows {
+                let ip_text: String = row.try_get("source_ip")?;
+                let ip: IpAddr = match ip_text.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => {
+                        // Fail closed: an unparseable stored IP is excluded, never guessed at.
+                        tracing::warn!(
+                            ip_text = %ip_text,
+                            "feed builder: unparseable stored source_ip, excluding"
+                        );
+                        continue;
+                    }
+                };
+
+                if exclusions.is_excluded(ip) {
                     continue;
                 }
-            };
 
-            if exclusions.is_excluded(ip) {
-                continue;
+                // `tier IS NOT NULL` in the query above already excluded the untiered rows, so this
+                // only fails on a value the enum cannot represent - fail closed rather than guess.
+                let Some(tier): Option<FeedTier> = row.try_get("tier")? else {
+                    tracing::warn!(%ip, "feed builder: stored tier unreadable, excluding fail-closed");
+                    continue;
+                };
+
+                candidates.push(Candidate {
+                    ip,
+                    tier: Some(tier),
+                    first_seen: row.try_get("first_seen")?,
+                    last_seen: row.try_get("last_seen")?,
+                    event_count: row.try_get("event_count")?,
+                    distinct_categories: row.try_get("distinct_categories")?,
+                    categories: row.try_get("categories")?,
+                });
             }
-
-            // `tier IS NOT NULL` in the query above already excluded the untiered rows, so this
-            // only fails on a value the enum cannot represent - fail closed rather than guess.
-            let Some(tier): Option<FeedTier> = row.try_get("tier")? else {
-                tracing::warn!(%ip, "feed builder: stored tier unreadable, excluding fail-closed");
-                continue;
-            };
-
-            candidates.push(Candidate {
-                ip,
-                tier: Some(tier),
-                first_seen: row.try_get("first_seen")?,
-                last_seen: row.try_get("last_seen")?,
-                event_count: row.try_get("event_count")?,
-                distinct_categories: row.try_get("distinct_categories")?,
-                categories: row.try_get("categories")?,
-            });
-        }
+            Ok(())
+        })?;
 
         // Volume-listed floods: recommended for the blocklist on connection volume alone (no
         // confirmed-real latch, so eligible = false, so tier = NULL and no operator approval). They
@@ -233,31 +239,34 @@ impl FeedBuilder {
         .fetch_all(pool)
         .await?;
 
-        for row in volume_rows {
-            let ip_text: String = row.try_get("source_ip")?;
-            let ip: IpAddr = match ip_text.parse() {
-                Ok(ip) => ip,
-                Err(_) => {
-                    tracing::warn!(
-                        ip_text = %ip_text,
-                        "feed builder: unparseable stored source_ip (volume), excluding"
-                    );
+        off_worker(|| -> Result<(), FeedError> {
+            for row in volume_rows {
+                let ip_text: String = row.try_get("source_ip")?;
+                let ip: IpAddr = match ip_text.parse() {
+                    Ok(ip) => ip,
+                    Err(_) => {
+                        tracing::warn!(
+                            ip_text = %ip_text,
+                            "feed builder: unparseable stored source_ip (volume), excluding"
+                        );
+                        continue;
+                    }
+                };
+                if exclusions.is_excluded(ip) {
                     continue;
                 }
-            };
-            if exclusions.is_excluded(ip) {
-                continue;
+                candidates.push(Candidate {
+                    ip,
+                    tier: None,
+                    first_seen: row.try_get("first_seen")?,
+                    last_seen: row.try_get("last_seen")?,
+                    event_count: row.try_get("event_count")?,
+                    distinct_categories: row.try_get("distinct_categories")?,
+                    categories: row.try_get("categories")?,
+                });
             }
-            candidates.push(Candidate {
-                ip,
-                tier: None,
-                first_seen: row.try_get("first_seen")?,
-                last_seen: row.try_get("last_seen")?,
-                event_count: row.try_get("event_count")?,
-                distinct_categories: row.try_get("distinct_categories")?,
-                categories: row.try_get("categories")?,
-            });
-        }
+            Ok(())
+        })?;
 
         let now = Utc::now();
         let aggressive = materialize(&candidates, now, config.aggressive_ttl, |c| {

@@ -594,7 +594,8 @@
   with the fsync); a feed publish 167 ms for 5,000 entries and 905 ms for 50,000; the chain hash
   of an 8 MiB intake batch 77 ms, run with the ledger's append lock held; the tailer's read of one
   8 MiB batch 13 ms from a warm cache; the ops-monitor's walk of a 20,000-file spool 85 ms on
-  every tick; and the campaign indexer's analysis of a command line, 0.4 ms at the sensors' 1 KiB
+  every tick; the feed builder's row loops, 3 ms for 5,000 addresses but 31 ms for 50,000; and the
+  campaign indexer's analysis of a command line, 0.4 ms at the sensors' 1 KiB
   cap but 16 ms at 64 KiB and 60 ms at 1 MiB. Each now runs through the new
   `core_scoring::off_worker`, which hands the rest of the worker's queue to another thread while
   the step runs (a command line over 16 KiB; every other step always). The ATT&CK tagger, indicator

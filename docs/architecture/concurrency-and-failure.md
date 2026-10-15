@@ -88,7 +88,8 @@ data. The steps it covers are the digest and spool write of a fetched body
 (`crates/review/src/fetcher/mod.rs#record_success`), the feed publish
 (`crates/propolis/src/main.rs#publish_snapshot`), the chain hash of an intake batch
 (`crates/core-scoring/src/repository/batch.rs#chain_links`), the tailer's read of a batch, the
-campaign indexer's analysis of a long command line, and the ops-monitor's spool walk. On a
+campaign indexer's analysis of a long command line, the feed builder's row loops, and the
+ops-monitor's spool walk. On a
 current-thread runtime (the test harness) there is no other worker and the step runs in place.
 The measured cost of each, and the probe that reports scheduling lag when one is missed, are in
 [health and observability](../operations/health-and-observability.md#runtime-scheduling-lag).

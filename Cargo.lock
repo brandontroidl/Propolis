@@ -3552,6 +3552,8 @@ dependencies = [
  "ctr",
  "ed25519-dalek",
  "hmac",
+ "num-bigint",
+ "p256",
  "poly1305",
  "proptest",
  "rand 0.10.2",

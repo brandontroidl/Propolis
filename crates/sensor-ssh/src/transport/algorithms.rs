@@ -47,11 +47,14 @@ macro_rules! algorithms {
 }
 
 algorithms! {
-    /// Key exchange methods. `Curve25519Sha256Libssh` is RFC 8731's `curve25519-sha256` under the
-    /// name OpenSSH and PuTTY used before it was standardised: the same exchange, byte for byte.
+    /// Key exchange methods, in OpenSSH 8.9's order. `Curve25519Sha256Libssh` is RFC 8731's
+    /// `curve25519-sha256` under the name OpenSSH and PuTTY used before it was standardised: the
+    /// same exchange, byte for byte. All hash with SHA-256.
     Kex {
         Curve25519Sha256 => "curve25519-sha256",
         Curve25519Sha256Libssh => "curve25519-sha256@libssh.org",
+        EcdhSha2Nistp256 => "ecdh-sha2-nistp256",
+        DiffieHellmanGroup14Sha256 => "diffie-hellman-group14-sha256",
     }
 }
 

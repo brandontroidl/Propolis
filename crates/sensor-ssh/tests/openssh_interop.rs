@@ -112,39 +112,74 @@ async fn openssh_connects_with_the_libssh_alias_of_curve25519() {
     assert_each_connects(&[option("KexAlgorithms", "curve25519-sha256@libssh.org")]).await;
 }
 
-/// The negative control: a real client restricted to a cipher the sensor does not speak fails,
-/// and what it asked for is on the sensor's end-of-handshake event. Without this, "the client
-/// succeeded" would not show that a restriction took effect.
+/// Each key exchange the sensor offers, with the client restricted to it. The Diffie-Hellman
+/// prime and the P-256 point encoding are typed in or hand-assembled here, so a mistake in either
+/// shows only against an implementation that did not copy it.
 #[tokio::test]
-async fn openssh_restricted_to_an_unsupported_cipher_is_refused_and_logged() {
-    let dir = tempfile::tempdir().unwrap();
-    let (addr, handle) = start(dir.path()).await;
-    let out = openssh_exec(addr, dir.path(), &["-o", "Ciphers=aes128-cbc"]).await;
-    assert!(!out.status.success(), "{out:?}");
+async fn openssh_connects_with_each_key_exchange() {
+    let sets: Vec<_> = [
+        "curve25519-sha256",
+        "curve25519-sha256@libssh.org",
+        "ecdh-sha2-nistp256",
+        "diffie-hellman-group14-sha256",
+    ]
+    .iter()
+    .map(|k| option("KexAlgorithms", k))
+    .collect();
+    assert_each_connects(&sets).await;
+}
 
-    let log = dir.path().join("events.jsonl");
-    let mut end = None;
-    for _ in 0..100 {
-        end = std::fs::read_to_string(&log)
-            .unwrap_or_default()
-            .lines()
-            .map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).unwrap())
-            .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_SESSION_END);
-        if end.is_some() {
-            break;
+/// The negative controls: a real client restricted to an algorithm the sensor does not speak
+/// fails, and what it asked for is on the sensor's end-of-handshake event. Without these, "the
+/// client succeeded" would not show that a restriction took effect.
+#[tokio::test]
+async fn openssh_restricted_to_an_unsupported_algorithm_is_refused_and_logged() {
+    // (ssh option, the list the sensor names as failed, the key of the client's offer to read)
+    let cases = [
+        ("Ciphers=aes128-cbc", "cipher_c2s", "aes128-cbc"),
+        (
+            "KexAlgorithms=diffie-hellman-group1-sha1",
+            "kex",
+            "diffie-hellman-group1-sha1",
+        ),
+        (
+            "HostKeyAlgorithms=ecdsa-sha2-nistp384",
+            "host_key",
+            "ecdsa-sha2-nistp384",
+        ),
+    ];
+    for (option, failed, offered) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, handle) = start(dir.path()).await;
+        let out = openssh_exec(addr, dir.path(), &["-o", option]).await;
+        assert!(!out.status.success(), "{option}: {out:?}");
+
+        let log = dir.path().join("events.jsonl");
+        let mut end = None;
+        for _ in 0..100 {
+            end = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<sensor_wire::SensorEvent>(l).unwrap())
+                .find(|e| e.signal_type == sensor_wire::SIGNAL_HONEYPOT_SESSION_END);
+            if end.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let end = end.expect("no honeypot_session_end event was logged");
+        assert_eq!(end.metadata["negotiation_failed"], failed, "{option}");
+        // The client adds its extension markers (`ext-info-c` and the like) after its own list.
+        let listed = end.metadata["client_kex"][failed].as_str().unwrap();
+        assert!(listed.starts_with(offered), "{option}: {listed}");
+        assert!(
+            end.metadata["client_version"]
+                .as_str()
+                .unwrap()
+                .starts_with("SSH-2.0-OpenSSH_")
+        );
     }
-    handle.abort();
-    let end = end.expect("no honeypot_session_end event was logged");
-    assert_eq!(end.metadata["negotiation_failed"], "cipher_c2s");
-    assert_eq!(end.metadata["client_kex"]["cipher_c2s"], "aes128-cbc");
-    assert!(
-        end.metadata["client_version"]
-            .as_str()
-            .unwrap()
-            .starts_with("SSH-2.0-OpenSSH_")
-    );
 }
 
 #[tokio::test]

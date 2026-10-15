@@ -879,7 +879,9 @@ captures SCP/SFTP transfers.
   against the same tables per RFC 4253 section 7.1: for each list, the first algorithm the
   client names that the sensor also supports
   (`crates/sensor-ssh/src/transport/algorithms.rs#negotiate`). Currently: KEX
-  `curve25519-sha256` and its pre-standard name `curve25519-sha256@libssh.org`, host key
+  `curve25519-sha256`, its pre-standard name `curve25519-sha256@libssh.org`,
+  `ecdh-sha2-nistp256` and `diffie-hellman-group14-sha256`
+  (`crates/sensor-ssh/src/transport/kex.rs#perform_kex_server`), host key
   `ssh-ed25519` (loaded-or-generated and persisted so it is stable across restarts), ciphers in
   OpenSSH 8.9's order `chacha20-poly1305@openssh.com`, `aes128-ctr`, `aes192-ctr`, `aes256-ctr`,
   `aes128-gcm@openssh.com`, `aes256-gcm@openssh.com`, MACs `hmac-sha2-256-etm@openssh.com`,
@@ -889,6 +891,18 @@ captures SCP/SFTP transfers.
   (`crates/sensor-ssh/src/transport/packet_cipher.rs#PacketCipher`). Banner default is the persona OpenSSH version
   (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability
   from the narrower KEXINIT offer is a tracked follow-up.
+- **Offered by OpenSSH 8.9 but not by the sensor.** `rsa-sha2-256` and `rsa-sha2-512` host
+  keys: the only RSA implementation in the dependency tree is the `rsa` crate, a release candidate
+  with RUSTSEC-2023-0071 (a timing side channel on private-key operations, no fixed release),
+  which `deny.toml` accepts only as a dependency of the SSH test client. Linking it into the
+  sensor would put that advisory in a production binary, so it is left out until the owner
+  decides to accept it or the crate is fixed. A client that offers no host key but RSA is refused
+  and logged like any other mismatch (`negotiation_failed` `host_key`). Also not offered:
+  `sntrup761x25519-sha512@openssh.com` and the other post-quantum exchanges, `ecdh-sha2-nistp384`
+  and `-nistp521`, `diffie-hellman-group16-sha512`, `-group18-sha512` and
+  `-group-exchange-sha256`, an `ecdsa-sha2-nistp256` host key, and the UMAC MACs. The
+  `client_kex` lists on handshake-end events show whether any client population needs one of
+  them.
 - **No common algorithm.** A client whose lists share nothing with the sensor's (any of key
   exchange, host key, either cipher, compression) is sent `SSH_MSG_DISCONNECT` with reason 3
   (key exchange failed) and the description `no matching key exchange method found` (or the host

@@ -88,16 +88,22 @@ load-bearing ones and their roles are listed here.
 | `sqlx` | 0.9.0 | Async PostgreSQL access, compile-time-checked queries, migrations, and the `sqlx::test` harness. Features differ per crate (core-scoring includes `uuid`; console omits it - `crates/core-scoring/Cargo.toml#sqlx`, `crates/console/Cargo.toml#sqlx`). |
 
 `sensor-ssh` additionally carries its own cryptographic primitives
-(x25519 / ed25519-dalek, chacha20, poly1305, aes, ctr, aes-gcm, hmac, sha1) so it can
+(x25519 / ed25519-dalek, chacha20, poly1305, aes, ctr, aes-gcm, hmac, sha1, p256, num-bigint) so it can
 complete a real SSH handshake without a general SSH library
 (`crates/sensor-ssh/Cargo.toml#x25519-dalek`, `crates/sensor-ssh/Cargo.toml#ed25519-dalek`,
 `crates/sensor-ssh/Cargo.toml#chacha20`, `crates/sensor-ssh/Cargo.toml#poly1305`,
 `crates/sensor-ssh/Cargo.toml#aes`, `crates/sensor-ssh/Cargo.toml#ctr`,
 `crates/sensor-ssh/Cargo.toml#aes-gcm`, `crates/sensor-ssh/Cargo.toml#hmac`,
-`crates/sensor-ssh/Cargo.toml#sha1`). The AES, CTR, GCM, HMAC and SHA-1 crates were already
-vendored (for the SSH test client and the console); the sensor links them directly so it can speak
-the ciphers and MACs OpenSSH offers by default. Each is a RustCrypto primitive used through its
-published interface; the sensor writes only the SSH packet framing around them.
+`crates/sensor-ssh/Cargo.toml#sha1`, `crates/sensor-ssh/Cargo.toml#p256`,
+`crates/sensor-ssh/Cargo.toml#num-bigint`). These crates were already vendored (the SSH test
+client, the console and the collector's certificate parsing pull them in); the sensor links them
+directly so it can speak the ciphers, MACs and key exchanges OpenSSH offers by default. The
+cipher, MAC and curve crates are RustCrypto primitives used through their published interface (P-256
+with only its `ecdh` feature, so no ECDSA or PKCS code is compiled in); the sensor writes only
+the SSH packet framing around them. `num-bigint` does the one modular exponentiation of
+`diffie-hellman-group14-sha256`; it is not constant time, which is acceptable for an exponent that
+exists for a single exchange with the peer that takes part in it. RSA is deliberately not linked:
+see [sensor behavior](sensor-behavior.md#sensor-ssh).
 
 ### HTTP clients and the egress model
 

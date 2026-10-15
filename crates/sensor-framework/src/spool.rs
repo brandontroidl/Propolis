@@ -44,6 +44,23 @@ enum Publish {
 /// flood of refused uploads from becoming a flood of directory scans.
 const RESCAN_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a sample stays in a sensor's spool before the sensor removes it. A compile-time
+/// constant, not a setting: it is the documented retention policy, and the daemon's pass over the
+/// malware fetcher's spool uses the same number.
+pub const SAMPLE_RETENTION: Duration = Duration::from_secs(30 * 86_400);
+
+/// How often a sensor looks for samples past [`SAMPLE_RETENTION`] (once at start, then this).
+pub const SAMPLE_RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// What one [`QuarantineSpool::prune_older_than`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Entries removed.
+    pub removed: u64,
+    /// Entries that were due and could not be removed (permissions, a read-only mount).
+    pub failed: u64,
+}
+
 /// What the budget counts. Both fields change only under the spool's lock, which is what lets a
 /// rescan replace `used` without losing a reservation made while it ran.
 struct Accounting {
@@ -266,6 +283,57 @@ impl QuarantineSpool {
                 Err(e.into())
             }
         }
+    }
+
+    /// Remove the samples in this spool that were last modified more than `max_age` ago, and
+    /// recount the budget from what is left. A sample is a regular file, or any other entry, named
+    /// with a canonical digest directly in the spool directory: `remove_file` removes a planted
+    /// link itself and never follows it, and nothing below the root (the outbox manifest, staging)
+    /// or under another name is touched.
+    ///
+    /// A sensor prunes its own spool because it is the account that owns the directory and the
+    /// files: the daemon runs under a different user with the spool read-only, and cannot.
+    ///
+    /// Runs under the budget lock, so a store cannot reserve against a count that is about to
+    /// change, and the recount that follows cannot be undone by one that was already running.
+    /// Blocking file I/O: call it from a blocking thread.
+    pub fn prune_older_than(&self, max_age: Duration) -> PruneReport {
+        let mut report = PruneReport::default();
+        let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
+            return report;
+        };
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return report;
+        };
+        let mut acct = self.accounting.lock().unwrap();
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_canonical_sha256_hex)
+            {
+                continue;
+            }
+            // `DirEntry::metadata` does not traverse a link, so a link is aged by its own time.
+            let due = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|modified| modified < cutoff);
+            if !due {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => report.removed += 1,
+                // Removed by someone else between the listing and now: nothing left to do.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => report.failed += 1,
+            }
+        }
+        if report.removed > 0 {
+            acct.used = scan_existing_usage(&self.dir).saturating_add(acct.in_flight);
+            acct.last_rescan = Some(Instant::now());
+        }
+        report
     }
 
     /// The reference a body would have had, without storing it: its digest and length. For a body
@@ -900,6 +968,89 @@ mod tests {
             std::thread::sleep(RESCAN_MIN_INTERVAL + std::time::Duration::from_millis(200));
         }
         assert_eq!(spool.used_bytes(), 100);
+    }
+
+    fn backdate(path: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    const THIRTY_ONE_DAYS: Duration = Duration::from_secs(31 * 86_400);
+
+    /// A sensor removes the samples that have outlived retention from its own spool, and the bytes
+    /// are available to the next capture at once, not a rescan later.
+    #[test]
+    fn prune_removes_old_samples_and_frees_their_budget_at_once() {
+        let (dir, spool) = test_spool(100, 250);
+        let old = spool.store(&[0u8; 100]).unwrap();
+        let young = spool.store(&[1u8; 100]).unwrap();
+        backdate(&dir.path().join(&old.sha256), THIRTY_ONE_DAYS);
+        assert!(matches!(
+            spool.store(&[2u8; 100]),
+            Err(SpoolError::BudgetExhausted { .. })
+        ));
+
+        let report = spool.prune_older_than(SAMPLE_RETENTION);
+        assert_eq!((report.removed, report.failed), (1, 0));
+        assert!(!dir.path().join(&old.sha256).exists());
+        assert!(
+            dir.path().join(&young.sha256).exists(),
+            "a young sample stays"
+        );
+        assert_eq!(spool.used_bytes(), 100);
+        spool
+            .store(&[2u8; 100])
+            .expect("the pruned space is usable without waiting for a rescan");
+    }
+
+    /// Only what the spool itself filed is touched: a planted old link is removed as a link (its
+    /// target is not followed), and a file that is not a sample, or sits below the spool root
+    /// (the outbox manifest, staging), is never listed.
+    #[test]
+    #[cfg(unix)]
+    fn prune_touches_only_digest_named_entries_in_the_spool_root() {
+        let (dir, spool) = test_spool(100, 1000);
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("precious");
+        std::fs::write(&target, b"not a sample").unwrap();
+        let link = dir.path().join("c".repeat(64));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let other = dir.path().join("not-a-digest");
+        std::fs::write(&other, b"x").unwrap();
+        let outbox = dir.path().join("outbox");
+        std::fs::create_dir(&outbox).unwrap();
+        let manifest = outbox.join(format!("{}.json", "d".repeat(64)));
+        std::fs::write(&manifest, b"{}").unwrap();
+        for old in [&other, &manifest] {
+            backdate(old, THIRTY_ONE_DAYS);
+        }
+        // `set_modified` follows a link, so age the link itself with utimensat.
+        let name = std::ffi::CString::new(link.to_str().unwrap()).unwrap();
+        let long_ago = libc::timespec {
+            tv_sec: 1_000_000,
+            tv_nsec: 0,
+        };
+        let times = [long_ago, long_ago];
+        // SAFETY: `name` is a valid NUL-terminated path and `times` holds the two timespecs.
+        let rc = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                name.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        let report = spool.prune_older_than(SAMPLE_RETENTION);
+        assert_eq!(report.removed, 1, "only the digest-named link");
+        assert!(link.symlink_metadata().is_err(), "the link is gone");
+        assert!(target.exists(), "its target was not followed");
+        assert!(other.exists() && manifest.exists());
     }
 
     /// A store that has reserved its bytes but not yet written them is not on disk for a rescan to

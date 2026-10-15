@@ -53,23 +53,22 @@ impl TestServer {
         Self::start_with_spool_filler(bounds, ceiling, None).await
     }
 
-    /// Starts a sensor whose spool already holds `filler` bytes of earlier samples (a sparse
-    /// file, so it costs no disk): the sensor recovers its usage from the directory at startup,
-    /// which is how a restarted sensor finds a full spool. The filler's name is returned for a
-    /// test that plays the retention pass and removes it.
+    /// Starts a sensor whose spool already holds `filler` bytes of an earlier sample last
+    /// modified `age` ago (a sparse file, so it costs no disk): the sensor recovers its usage from
+    /// the directory at startup, which is how a restarted sensor finds a full spool.
     async fn start_with_spool_filler(
         bounds: ConnectionBounds,
         ceiling: u64,
-        filler: Option<u64>,
+        filler: Option<(u64, Duration)>,
     ) -> TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let spool_dir = dir.path().join("spool");
-        if let Some(bytes) = filler {
+        if let Some((bytes, age)) = filler {
             std::fs::create_dir(&spool_dir).unwrap();
-            std::fs::File::create(spool_dir.join(FILLER_NAME))
-                .unwrap()
-                .set_len(bytes)
+            let file = std::fs::File::create(spool_dir.join(FILLER_NAME)).unwrap();
+            file.set_len(bytes).unwrap();
+            file.set_modified(std::time::SystemTime::now() - age)
                 .unwrap();
         }
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
@@ -1317,7 +1316,7 @@ async fn a_full_spool_still_records_the_upload_marked_not_stored() {
     let srv = TestServer::start_with_spool_filler(
         test_bounds(),
         DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-        Some(FULL_SPOOL_BYTES),
+        Some((FULL_SPOOL_BYTES, Duration::ZERO)),
     )
     .await;
     let payload = elf_like(4096);
@@ -1351,7 +1350,7 @@ async fn capture_resumes_when_retention_frees_a_full_spool() {
     let srv = TestServer::start_with_spool_filler(
         test_bounds(),
         DEFAULT_CAPTURE_BUDGET_BYTES_256M,
-        Some(FULL_SPOOL_BYTES),
+        Some((FULL_SPOOL_BYTES, Duration::ZERO)),
     )
     .await;
     let first = elf_like(4096);
@@ -1376,6 +1375,38 @@ async fn capture_resumes_when_retention_frees_a_full_spool() {
     assert_eq!(sample.sha256, sha256_hex(&second));
     assert!(uploads[1].metadata.get("stored").is_none());
     assert!(srv.spool_dir.join(&sample.sha256).exists());
+    srv.handle.abort();
+}
+
+/// Sample retention for a sensor's spool runs in the sensor, as the account that owns the
+/// directory: under the shipped units the daemon's own pass cannot delete there (its unit mounts
+/// the sensor spools read-only and the directories are not writable by its user). A sensor that
+/// starts with a spool full of samples past retention ages them out and captures again with no
+/// rescan interval to wait for and no restart.
+#[tokio::test]
+async fn a_sensor_ages_its_own_old_samples_out_of_a_full_spool() {
+    let thirty_one_days = Duration::from_secs(31 * 86_400);
+    let srv = TestServer::start_with_spool_filler(
+        test_bounds(),
+        DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+        Some((FULL_SPOOL_BYTES, thirty_one_days)),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while srv.spool_dir.join(FILLER_NAME).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the 31-day-old sample was not aged out of the spool"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let payload = elf_like(4096);
+    publish_binary(&srv, b"fw/update", &payload).await;
+    let uploads = srv.wait_for_uploads(1).await;
+    let sample = uploads[0].sample.as_ref().expect("stored, not refused");
+    assert_eq!(sample.sha256, sha256_hex(&payload));
+    assert_eq!(srv.handoff.spool_refused_count(), 0);
     srv.handle.abort();
 }
 

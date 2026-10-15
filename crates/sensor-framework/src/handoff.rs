@@ -68,7 +68,7 @@ use crate::connection_tracker::{CONNECTION_GRACE, ConnectionTracker, QuiesceOutc
 use crate::emit::EventEmitter;
 use crate::outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
 use crate::sanitize::sanitize_value;
-use crate::spool::QuarantineSpool;
+use crate::spool::{QuarantineSpool, SAMPLE_RETENTION, SAMPLE_RETENTION_INTERVAL};
 
 /// POSIX `NAME_MAX`: the conventional ceiling on one filename component on Linux (ext4, btrfs,
 /// xfs, ...). `orig_name` is attacker-supplied free text carried purely as an indicator (see
@@ -379,6 +379,9 @@ pub struct CaptureHandoff {
     /// what makes the final line exactly once.
     stats_name: Mutex<Option<String>>,
     stats_task: Mutex<Option<JoinHandle<()>>>,
+    /// The task that ages samples out of this sensor's spool (see `start_retention`), retained so
+    /// `drain` can stop it.
+    retention_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl CaptureHandoff {
@@ -428,6 +431,7 @@ impl CaptureHandoff {
             started: std::time::Instant::now(),
             stats_name: Mutex::new(None),
             stats_task: Mutex::new(None),
+            retention_task: Mutex::new(None),
         }
     }
 
@@ -674,6 +678,48 @@ impl CaptureHandoff {
             }
         });
         *self.worker.lock().unwrap() = Some(handle);
+        self.start_retention();
+    }
+
+    /// Age samples out of this sensor's own spool: once now, then every
+    /// [`SAMPLE_RETENTION_INTERVAL`], remove what is older than [`SAMPLE_RETENTION`]. It runs in
+    /// the sensor because the sensor's account owns the spool directory and its files and is the
+    /// only one the shipped units let delete from it (the daemon's unit mounts the sensor spools
+    /// read-only), and it is started by `start_worker` so a sensor that stores samples cannot
+    /// forget it. The pass runs on the blocking pool and recounts the spool's budget, so the space
+    /// is usable at once.
+    fn start_retention(&self) {
+        let spool = self.spool.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let pass = Arc::clone(&spool);
+                let report =
+                    tokio::task::spawn_blocking(move || pass.prune_older_than(SAMPLE_RETENTION))
+                        .await;
+                match report {
+                    Ok(report) if report.removed > 0 || report.failed > 0 => {
+                        if report.removed > 0 {
+                            tracing::info!(
+                                removed = report.removed,
+                                "capture hand-off: aged old samples out of the spool"
+                            );
+                        }
+                        if report.failed > 0 {
+                            tracing::warn!(
+                                failed = report.failed,
+                                "capture hand-off: samples past retention could not be removed from the spool; check its ownership and mode"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "capture hand-off: spool retention pass lost")
+                    }
+                }
+                tokio::time::sleep(SAMPLE_RETENTION_INTERVAL).await;
+            }
+        });
+        *self.retention_task.lock().unwrap() = Some(task);
     }
 
     /// End the live connections, then stop accepting captures and finish the ones queued, all
@@ -683,6 +729,9 @@ impl CaptureHandoff {
     /// service manager's stop timeout) and the unprocessed jobs are lost; the report says which
     /// happened so the caller can log it.
     pub async fn drain(&self, timeout: Duration) -> DrainReport {
+        if let Some(task) = self.retention_task.lock().unwrap().take() {
+            task.abort();
+        }
         let started = std::time::Instant::now();
         let phase = (timeout / 4).min(CONNECTION_GRACE);
         let connections = self.connections.quiesce(phase, timeout / 4).await;

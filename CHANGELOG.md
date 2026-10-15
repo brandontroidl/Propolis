@@ -490,8 +490,9 @@
   that accepted the connection and never replied held the submission loop on that request with no
   error; VirusTotal had only a total deadline and fell back to a deadline-free client if its
   builder failed; and the shipper's gateway dial and ack wait had none, so a silent gateway
-  stopped shipping for every log. They now have connect, per-read and total deadlines (vendors
-  10/30/60 s, VirusTotal 10/15/30 s, shipper 20 s dial and 60 s per batch) that end as a
+  stopped shipping for every log. They now have connect, read and total deadlines (vendors
+  10/30/60 s, VirusTotal 10/30/30 s, shipper 20 s dial and 60 s per batch; the read deadline is
+  the wait for response headers, then a per-read timer on the body) that end as a
   retryable error. A vendor 2xx whose body never finished was also recorded as an accepted
   submission with an empty body; it is now retried. The ntfy poster, the heartbeat pinger and the
   fetcher already had deadlines. See [integrations](docs/reference/integrations.md#vendor-abuse-submitters).
@@ -506,7 +507,9 @@
   re-page cooldown away. It is now queued, retried at 30 s doubling to 15 minutes, and logged at
   WARN on each failed retry; the queue is persisted to `ops-alert-undelivered.json` in the cursor
   directory and a restart reports what was never delivered (journal WARN and one summary alert).
-  The dead-man's heartbeat is unaffected.
+  The retry pass runs after the heartbeat, stops at its first failure and is capped at 20 s per
+  tick, so an ntfy host that accepts and never answers cannot push the next round or the
+  dead-man's heartbeat back.
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

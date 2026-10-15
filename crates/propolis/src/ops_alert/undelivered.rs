@@ -21,8 +21,8 @@ const RETRY_BASE: Duration = Duration::from_secs(30);
 const RETRY_CAP: Duration = Duration::from_secs(900);
 /// Queue bound: an outage that makes every condition fail cannot grow this without limit.
 const MAX_ENTRIES: usize = 64;
-/// Retries attempted per monitor tick. A hung transport costs the dispatcher up to about two
-/// minutes per alert, so the cap keeps one tick from stalling the loop for long.
+/// Retries attempted per monitor tick at most; the monitor also caps the pass in wall-clock time
+/// (`RETRY_PASS_BUDGET`) because a hung transport costs about two minutes per attempt.
 pub const MAX_RETRIES_PER_TICK: usize = 4;
 /// The state file is small; refuse to parse anything larger (it lives in a daemon-writable dir).
 const MAX_STATE_BYTES: u64 = 256 * 1024;

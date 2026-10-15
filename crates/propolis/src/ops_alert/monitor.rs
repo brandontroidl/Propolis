@@ -43,16 +43,31 @@ async fn deliver<P: Poster>(
     }
 }
 
-/// Retry the queued alerts that are due. Runs after the heartbeat so a stalled transport can never
-/// delay the dead-man's switch, and at most `MAX_RETRIES_PER_TICK` per tick.
+/// Wall-clock allowance for the whole retry pass of one tick. A transport that accepts and never
+/// answers costs the dispatcher about two minutes per alert; without this cap the next round (its
+/// heartbeat and every condition) would start that much later, per queued alert.
+const RETRY_PASS_BUDGET: Duration = Duration::from_secs(20);
+
+/// Retry the queued alerts that are due. Runs after the heartbeat, spends at most
+/// [`RETRY_PASS_BUDGET`] per tick, and stops at the first failure: the remaining alerts share the
+/// transport that just failed, so trying them would only repeat the wait. An alert cut off by the
+/// budget is recorded as failed so it backs off like any other and the next tick does not re-pay.
 async fn retry_undelivered<P: Poster>(
     dispatcher: &Dispatcher<P>,
     undelivered: &mut UndeliveredQueue,
     now: Instant,
 ) {
+    let deadline = tokio::time::Instant::now() + RETRY_PASS_BUDGET;
     for (alert, attempts) in undelivered.due(now) {
         let key = alert.key.clone();
-        match dispatcher.dispatch(alert.clone(), now).await {
+        let outcome = tokio::time::timeout_at(deadline, dispatcher.dispatch(alert.clone(), now))
+            .await
+            .unwrap_or_else(|_| {
+                Err(super::dispatch::DispatchError::Undelivered(
+                    "retry pass budget exhausted".to_string(),
+                ))
+            });
+        match outcome {
             Ok(()) => {
                 if attempts > 0 {
                     tracing::info!(key = %key, attempts, "ops-alert: delivered after earlier failures");
@@ -62,6 +77,7 @@ async fn retry_undelivered<P: Poster>(
             Err(e) => {
                 tracing::warn!(key = %key, attempts = attempts + 1, error = %e, "ops-alert: retry failed; will retry again");
                 undelivered.failed(alert, e.to_string(), now);
+                return;
             }
         }
     }
@@ -998,6 +1014,59 @@ mod tests {
             "a ping every round despite failed alerts"
         );
         assert!(!m.undelivered.is_empty());
+    }
+
+    /// A transport that accepts and never answers: one tick's retry pass is bounded by its
+    /// budget, not by (due alerts x dispatcher wait), so the next round and its heartbeat are not
+    /// pushed back by minutes. Fails without the budget (that tick took about 485 s).
+    struct HungPoster;
+    impl Poster for &HungPoster {
+        async fn post(&self, _req: PostReq) -> Result<u16, PostErr> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_transport_cannot_stretch_a_tick_with_only_retries_due() {
+        let hung = HungPoster;
+        let out = firing_outcome();
+        let ids = ["c1", "c2", "c3", "c4", "c5"];
+        let conds: Vec<Box<dyn Condition>> = ids
+            .iter()
+            .map(|id| {
+                Box::new(StubCond {
+                    id,
+                    for_dur: Duration::ZERO,
+                    out: out.clone(),
+                }) as Box<dyn Condition>
+            })
+            .collect();
+        let d = Dispatcher::with_poster(
+            &hung,
+            "https://ntfy.example",
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let mut m = Monitor::new(conds, test_ctx(), d);
+        let base = Instant::now();
+        m.process_tick(base).await; // five new pages, all queued after the dispatcher gives up
+        assert_eq!(m.undelivered.len(), 5);
+
+        // Later ticks, inside the 300 s re-page cooldown, raise no new alert; only retries are due.
+        // Each must stay inside the budget even though entries the earlier pass never reached are
+        // still due.
+        for i in 1..=5u64 {
+            let started = tokio::time::Instant::now();
+            m.process_tick(base + Duration::from_secs(40 * i)).await;
+            let spent = started.elapsed();
+            assert!(
+                spent <= Duration::from_secs(30),
+                "tick {} spent {spent:?} on retries; one hung attempt alone is 30 s",
+                i + 1
+            );
+        }
+        assert_eq!(m.undelivered.len(), 5, "nothing was lost to the cutoff");
     }
 
     /// The failure survives a restart: the old run's queue file is read by the next one, which

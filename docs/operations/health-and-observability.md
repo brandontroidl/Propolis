@@ -411,8 +411,10 @@ condition is now clear, on the first reading that works
 **A failed delivery is retried and reported.** The dispatcher makes four attempts per alert
 (0.2 s, 0.4 s, 0.8 s apart). An alert that still fails is no longer dropped after one journal
 line: it is queued and retried at the end of later monitor ticks, 30 s after the failure and
-then at doubling intervals up to 15 minutes, at most four retries per tick
-(`crates/propolis/src/ops_alert/undelivered.rs`). The newest state per condition wins, so a
+then at doubling intervals up to 15 minutes. A tick's retry pass stops at its first failure (the
+other queued alerts share the transport that just failed), makes at most four attempts and is cut
+off after 20 s in all; an alert cut off that way backs off like any failure
+(`crates/propolis/src/ops_alert/undelivered.rs`, `monitor.rs#RETRY_PASS_BUDGET`). The newest state per condition wins, so a
 `[recovered]` notice replaces a queued page that never went out. The queue holds 64 alerts; a
 full queue drops the oldest with a WARN. What to look for in the journal
 (`journalctl -u propolis`):
@@ -432,11 +434,14 @@ the summary is itself queued and persisted until it is delivered. With only the 
 (`PROPOLIS_OPS_NTFY_URL` unset) delivery cannot fail and the file is never written.
 
 The dead-man's switch is independent of all of this. Retries run after the heartbeat in each
-tick, so a dead ntfy server cannot delay or suppress the ping, and the ping is not conditional on
+tick and are capped at 20 s per tick, so a dead ntfy server cannot suppress the ping and delays
+the next round (its ping included) by at most that long, and the ping is not conditional on
 alerts having been delivered. Each ntfy attempt has its own 30 s deadline and the heartbeat
-request 15 s, so a server that accepts and never answers costs one bounded wait per attempt, not
-the monitor. That a `ping` stops arriving is still how the service on the other end learns the
-daemon is down.
+request 15 s. A page raised in the same tick as an outage is not covered by the retry cap: its
+dispatch can wait about two minutes per alert (four attempts of 30 s) before it is queued, so a
+round in which many conditions newly fire against a hung host is slow; that is the cost of
+trying to deliver a new page at once. That a `ping` stops arriving is still how the service on
+the other end learns the daemon is down.
 
 ### When the daemon or the host is down
 

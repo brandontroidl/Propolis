@@ -88,3 +88,37 @@ impl Group14Permit {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pacing hold is what keeps group14 under the CPU quota: a permit handed back at once
+    /// would allow a full core.
+    #[tokio::test]
+    async fn a_released_permit_stays_taken_for_the_cost_and_is_then_free() {
+        let gate = Group14Gate::new();
+        let permit = gate.acquire().await.unwrap();
+        permit.release_after(Duration::from_millis(400));
+
+        assert!(
+            gate.permits.try_acquire().is_err(),
+            "the permit was free during the pacing hold"
+        );
+        let began = std::time::Instant::now();
+        let again = gate.acquire().await.unwrap();
+        assert!(
+            began.elapsed() >= Duration::from_millis(300),
+            "re-acquired after {:?}, before the hold ended",
+            began.elapsed()
+        );
+        drop(again);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_permit_frees_it_at_once() {
+        let gate = Group14Gate::new();
+        drop(gate.acquire().await.unwrap());
+        assert!(gate.permits.try_acquire().is_ok());
+    }
+}

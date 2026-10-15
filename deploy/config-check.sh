@@ -1735,9 +1735,15 @@ watcher_can_read() {
     local owner group mode
     read -r owner group mode < <(stat -c '%U %G %a' -- "$1" 2>/dev/null) || return 0
     case "$mode" in '' | *[!0-7]*) return 0 ;; esac
-    if [ "$owner" = "$WATCH_ACCOUNT" ] && [ $(( 8#$mode & 8#400 )) -ne 0 ]; then return 0; fi
-    if [ "$group" = "$WATCH_ACCOUNT" ] && [ $(( 8#$mode & 8#040 )) -ne 0 ]; then return 0; fi
-    [ $(( 8#$mode & 8#004 )) -ne 0 ]
+    # The kernel picks ONE class (owner, else group, else other) and applies only its bits, so a
+    # file the account owns at 0044 is unreadable to it although group and other can read it.
+    if [ "$owner" = "$WATCH_ACCOUNT" ]; then
+        [ $(( 8#$mode & 8#400 )) -ne 0 ]
+    elif [ "$group" = "$WATCH_ACCOUNT" ]; then
+        [ $(( 8#$mode & 8#040 )) -ne 0 ]
+    else
+        [ $(( 8#$mode & 8#004 )) -ne 0 ]
+    fi
 }
 
 check_watcher() {

@@ -1677,6 +1677,40 @@ fn a_watch_env_the_watcher_account_cannot_read_is_a_failure() {
     assert_eq!(r.code, 2, "{}", r.out);
 }
 
+/// The correctly provisioned shape is root:propolis-watch 0640: the watcher reads it through the
+/// GROUP bit. Without the group branch config-check fails every good box. The kernel then applies
+/// only the group class, so 0604 (other can read, the group cannot) is still unreadable.
+#[test]
+fn a_watch_env_is_readable_through_the_group_bit_and_only_the_group_bit() {
+    let fx = Fx::new();
+    let me = current_user();
+    let out = std::process::Command::new("id").arg("-Gn").output().unwrap();
+    let groups = String::from_utf8(out.stdout).unwrap();
+    let Some(group) = groups.split_whitespace().find(|g| *g != me) else {
+        eprintln!("skipped: {me} has no group named differently from the user");
+        return;
+    };
+    let status = std::process::Command::new("chgrp")
+        .arg(group)
+        .arg(fx.p("etc/watch.env"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "chgrp {group}");
+    *fx.watch_account.borrow_mut() = group.to_string();
+    let flagged = |fx: &Fx, mode: u32| -> bool {
+        std::fs::set_permissions(fx.p("etc/watch.env"), std::fs::Permissions::from_mode(mode))
+            .unwrap();
+        fx.json()["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "watch-env-owner")
+    };
+    assert!(!flagged(&fx, 0o640), "group-readable watch.env wrongly failed");
+    assert!(flagged(&fx, 0o600), "owner-only watch.env must fail");
+    assert!(flagged(&fx, 0o604), "the group class has no bits at 0604");
+}
+
 #[test]
 fn an_enabled_sensor_unit_with_no_bind_is_a_failure_that_names_the_cause() {
     let fx = Fx::new();

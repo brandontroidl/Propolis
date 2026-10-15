@@ -112,7 +112,7 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4557 test functions** (2805 unit + 1752 integration).
+- **Total: 4558 test functions** (2805 unit + 1753 integration).
 - **DB-backed (`sqlx::test`): 426** - console 219, review 106, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -162,7 +162,7 @@ Per-crate breakdown:
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 41 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1460 | 278 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1460 | 279 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 62 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
@@ -174,7 +174,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 26 | acceptance, audit_regressions, batcher, config, end_to_end, logging |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **2805** | **1752** | |
+| **Total** | **2805** | **1753** | |
 
 ### Test styles by layer
 

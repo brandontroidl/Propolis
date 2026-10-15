@@ -470,8 +470,8 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 
 When the daemon stalls (unrelated trivial statements all finishing within a fraction of a
 millisecond of each other, seconds late), the first question is whether the database or the
-daemon's own runtime held things up. PostgreSQL's defaults log nothing that answers it. Set these
-four in `postgresql.conf` (on Debian `/etc/postgresql/<version>/main/postgresql.conf`):
+daemon's own runtime held things up. The statement-duration, lock-wait and autovacuum logs are off by
+default (checkpoint logging is on by default from PostgreSQL 15). Set these four in `postgresql.conf` (on Debian `/etc/postgresql/<version>/main/postgresql.conf`):
 
 ```
 log_min_duration_statement = 500ms
@@ -486,6 +486,12 @@ log_autovacuum_min_duration = 1s
 | `log_lock_waits = on` | A session that waited on a lock longer than `deadlock_timeout` (1 s by default), and who held it. |
 | `log_checkpoints = on` | Each checkpoint's start, the buffers written, and the write, sync and total times. |
 | `log_autovacuum_min_duration = 1s` | Each autovacuum or autoanalyze run that took 1 s or longer, with the table and what it did. |
+
+`log_min_duration_statement` logs a slow statement's bind parameters too (`log_parameter_max_length`
+defaults to unlimited), and in this database those can be captured attacker credentials or console
+data, which then reach any log you stream, `propolis-watch --journal` included. Add
+`log_parameter_max_length = 0` to log the statement text without its parameters; leave it out only
+if you need the values to diagnose a statement and accept that trade-off.
 
 All four apply on a reload (`sudo systemctl reload postgresql@<version>-main`, or `SELECT
 pg_reload_conf();`), no restart; confirm with `SHOW log_min_duration_statement;`. They log only

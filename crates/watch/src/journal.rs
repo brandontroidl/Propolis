@@ -1,4 +1,4 @@
-//! The optional `--journal` source: the sensor units' and the daemon's own journal, read from a
+//! The optional `--journal` source: the sensor units', the daemon's and the PostgreSQL units' own journal, read from a
 //! journalctl child. This is the watcher's only child process and its argument vector is the
 //! constant [`JOURNAL_ARGS`]: nothing from the command line, the environment or the logs ever
 //! reaches it, and no shell is involved.

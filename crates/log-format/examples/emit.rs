@@ -19,6 +19,8 @@ fn main() {
     if std::env::var_os("EMIT_RUSTLS").is_some() {
         log::warn!(target: "rustls::server::hs", "Illegal SNI extension: ignoring IP address presented as hostname (c0000201)");
         log::error!(target: "rustls::server::hs", "rustls-error-line");
+        // And what an SSH client's channel request makes russh log, with text the client chose.
+        log::warn!(target: "russh::server::encrypted", "unknown channel request client-chosen-name");
     }
     // A field past journald's LineMax with a priority prefix straddling the old 48K boundary.
     if std::env::var_os("EMIT_LONG").is_some() {

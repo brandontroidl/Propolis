@@ -218,8 +218,10 @@ where
 /// Crates whose log lines are driven by whatever a remote peer sends, so at WARN they would let
 /// one scanner fill the journal ("Illegal SNI extension: ignoring IP address presented as
 /// hostname", "Received a ApplicationData message while expecting [Handshake]", "TLS alert warning
-/// received ... CloseNotify"). Held at ERROR unless `RUST_LOG` names them.
-const PEER_DRIVEN_TARGETS: &[&str] = &["rustls"];
+/// received ... CloseNotify"), and russh (the SSH sensor's library), whose WARN lines carry
+/// text the client chooses ("unknown channel request {name}", "strict kex violated"). Held at
+/// ERROR unless `RUST_LOG` names them; russh's ERROR lines stay visible (a per-site decision).
+const PEER_DRIVEN_TARGETS: &[&str] = &["rustls", "russh"];
 
 /// The filter for `rust_log` (the `RUST_LOG` value) and `default_level`. An unset or blank
 /// `RUST_LOG` gives `default_level` with [`PEER_DRIVEN_TARGETS`] held at ERROR; a set one is the

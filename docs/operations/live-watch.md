@@ -241,7 +241,8 @@ entries, which are none; whatever `journalctl` writes to stderr, such as a permi
 relayed as `error` records with `source` `journal`, and the event logs keep streaming. If
 `/usr/bin/journalctl` cannot be started at all, the watcher emits one `error` record and carries
 on without it. The journal adds the daemon's, sensors' and database server's own log lines, which can
-name internal paths, configuration and SQL text; grant it only if the reader should see them.
+name internal paths, configuration and SQL text (with its bind parameters, unless the database sets
+`log_parameter_max_length = 0`; see [database](../reference/database.md#server-settings-that-make-a-stall-attributable)); grant it only if the reader should see them.
 
 ## Reading the stream safely
 

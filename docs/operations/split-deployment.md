@@ -69,7 +69,7 @@ Several parts of the split are not finished. Read this before building anything.
   no user, directory or unit for the gateway or the shipper; the steps below create them by hand.
   `deploy/upgrade.sh` must not be run on a collector (see [Upgrading](#upgrading)).
 - **Quiet by default.** The gateway and the shipper log only errors unless `RUST_LOG` is set, so a
-  healthy gateway prints nothing at all. The env files below set `RUST_LOG=info`.
+  healthy gateway prints nothing at all. The env files below set `RUST_LOG=info,rustls=error`: a set `RUST_LOG` replaces the built-in default that holds `rustls` and `russh` at `error`, so the example restates it for `rustls`.
 - **The malware fetcher runs on the control plane.** If you enable it, it fetches attacker URLs
   from the control plane's own address, which the split otherwise keeps out of attackers' sight,
   and its guard against fetching from its own hosts does not know about the collector. Add the
@@ -159,7 +159,7 @@ still holding the previous run's files can no longer connect.
    PROPOLIS_GATEWAY_CA_CERT_PATH=/etc/propolis/certs/ca.crt
    PROPOLIS_GATEWAY_SERVER_CERT_PATH=/etc/propolis/certs/gateway.crt
    PROPOLIS_GATEWAY_SERVER_KEY_PATH=/etc/propolis/certs/gateway.key
-   RUST_LOG=info
+   RUST_LOG=info,rustls=error
    ```
 
    The bind is a literal `ip:port` on port 1024 or above. The unit runs with `PrivateUsers=yes`,
@@ -251,7 +251,7 @@ files expect it to match the shipper's. Then:
    PROPOLIS_SHIPPER_CLIENT_KEY_PATH=/etc/propolis/certs/collector-01.key
    PROPOLIS_COLLECTOR_ID=collector-01
    PROPOLIS_SHIPPER_SENSOR_LOGS=ssh:/var/log/propolis/ssh/events.jsonl,catchall:/var/log/propolis/catchall/events.jsonl
-   RUST_LOG=info
+   RUST_LOG=info,rustls=error
    ```
 
    - `PROPOLIS_SHIPPER_GATEWAY_ADDR` is a literal IP address and port; a host name is refused at

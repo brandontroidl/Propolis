@@ -45,6 +45,13 @@ the console password. After changing `PROPOLIS_SENSOR_LOGS`, run `sudo ./deploy/
 the next upgrade) to refresh the copy. On a fresh install where `propolis.env` is not filled in
 yet, the script writes nothing and says so.
 
+`watch.env` must stay root:propolis-watch 0640. A blanket `chmod 600 /etc/propolis/*.env` makes
+the watcher fail with `cannot read /etc/propolis/watch.env: Permission denied`, followed by the
+owner and mode it needs and the fix, `sudo chown root:propolis-watch /etc/propolis/watch.env &&
+sudo chmod 0640 /etc/propolis/watch.env` (`crates/watch/src/config.rs#read_error`); running
+`sudo ./deploy/watch-env.sh` rewrites it correctly too. `deploy/config-check.sh` names `watch.env`
+and `fleet-listeners.env` as the two env files allowed to be wider than 0600.
+
 The `start` record and every heartbeat name the source in `sources_from`: `env`, or the file's
 path.
 

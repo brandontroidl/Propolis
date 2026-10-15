@@ -28,12 +28,11 @@ pub struct SensorLogsSource {
 /// matching surrounding quotes removed, the same reading `deploy/fleet-listeners.sh` gives an env
 /// file. Every other line is skipped unread.
 pub fn sensor_logs_from_file(path: &Path) -> Result<SensorLogsSource, String> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let file = std::fs::File::open(path).map_err(|e| read_error(path, &e))?;
     let mut bytes = Vec::new();
     file.take(MAX_WATCH_ENV_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        .map_err(|e| read_error(path, &e))?;
     if bytes.len() as u64 > MAX_WATCH_ENV_BYTES {
         return Err(format!(
             "{} is larger than {MAX_WATCH_ENV_BYTES} bytes",
@@ -52,6 +51,21 @@ pub fn sensor_logs_from_file(path: &Path) -> Result<SensorLogsSource, String> {
         raw: unquote(value.trim_end()).to_string(),
         from: path.display().to_string(),
     })
+}
+
+/// A permission error is the one a blanket `chmod 600 /etc/propolis/*.env` causes (the live watcher
+/// lost its log list that way), and "Permission denied" alone does not say what the file should
+/// be, so it names the owner, the mode and the line that restores them.
+fn read_error(path: &Path, e: &std::io::Error) -> String {
+    let shown = path.display();
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "cannot read {shown}: {e}; it must be owned root:propolis-watch with mode 0640, \
+             fix: sudo chown root:propolis-watch {shown} && sudo chmod 0640 {shown}"
+        )
+    } else {
+        format!("cannot read {shown}: {e}")
+    }
 }
 
 fn unquote(value: &str) -> &str {

@@ -51,3 +51,40 @@ fn a_file_without_the_key_a_missing_file_and_an_oversized_file_are_errors() {
     assert!(sensor_logs_from_file(Path::new("/nonexistent/watch.env")).is_err());
     assert!(read(&"#".repeat(70 * 1024)).is_err());
 }
+
+#[test]
+fn a_permission_error_names_the_owner_the_mode_and_the_one_line_fix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("watch.env");
+    std::fs::write(&path, "PROPOLIS_SENSOR_LOGS=ssh:/x\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        return; // root ignores the mode, so there is no permission error to read
+    }
+    let shown = path.display();
+    let err = sensor_logs_from_file(&path).unwrap_err();
+    assert!(
+        err.starts_with(&format!("cannot read {shown}: Permission denied")),
+        "{err}"
+    );
+    assert!(err.contains("root:propolis-watch"), "{err}");
+    assert!(err.contains("0640"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "sudo chown root:propolis-watch {shown} && sudo chmod 0640 {shown}"
+        )),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_missing_file_is_not_given_ownership_advice() {
+    let err = sensor_logs_from_file(Path::new("/nonexistent/watch.env")).unwrap_err();
+    assert!(
+        err.starts_with("cannot read /nonexistent/watch.env:"),
+        "{err}"
+    );
+    assert!(!err.contains("chown"), "{err}");
+}

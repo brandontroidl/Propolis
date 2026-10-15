@@ -540,6 +540,13 @@
   `orig_name` of the body that was seen. The Samples list does not show such a row. The refusal
   WARN is now logged at power-of-two totals, as the queue-drop WARN is. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-refusals-spool_refused_count).
+- **A sensor whose spool filled up now captures again once files are removed** - the spool's
+  byte count was recovered from the directory at startup and then only ever grew, so removing
+  files from a running sensor's spool (sample retention, an operator) freed nothing and every
+  capture was refused until the sensor restarted. A store that would be refused now re-reads the
+  directory first (at most once a second) and counts the files actually present plus the stores
+  in progress, under the same lock as the reservation. See
+  [queue and spool](docs/operations/queue-and-spool.md#spool-storage-properties).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

@@ -41,7 +41,9 @@ shipped config.
 
 Captured malware bodies are written to disk under per-sensor and fetcher spool directories,
 each with a hard global byte budget and a per-file cap. Reservation is atomic and the spool
-refuses (fail-closed) once the budget is reached (`crates/sensor-framework/src/spool.rs`).
+refuses (fail-closed) once the budget is reached (`crates/sensor-framework/src/spool.rs`). Space
+freed by sample retention is available again within a second of the next refused capture; the
+sensor need not restart.
 
 | Spool | Per-file cap | Global budget | Cite |
 |---|---|---|---|

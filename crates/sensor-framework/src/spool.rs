@@ -9,7 +9,8 @@
 //! module owns only the naming, sizing, and budget logic.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use sensor_wire::SampleRef;
 use sha2::{Digest, Sha256};
@@ -35,6 +36,26 @@ enum Publish {
     NotPublished(std::io::Error),
     /// The body is published under its name, but syncing the directory failed.
     NameNotSynced(std::io::Error),
+}
+
+/// The least time between two rescans of the spool directory. A rescan reads the directory to
+/// find space freed by whatever removes files from it (the daemon's sample retention, an
+/// operator), and happens only when a store would otherwise be refused; the interval keeps a
+/// flood of refused uploads from becoming a flood of directory scans.
+const RESCAN_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What the budget counts. Both fields change only under the spool's lock, which is what lets a
+/// rescan replace `used` without losing a reservation made while it ran.
+struct Accounting {
+    /// Bytes of published files plus bytes reserved by stores still in progress, against
+    /// `global_budget`. Recovered at construction from the directory's existing contents (see
+    /// `scan_existing_usage`) so a restart does not reset the ceiling to zero while previously
+    /// spooled files still occupy it, and again by a rescan when space was freed under it.
+    used: u64,
+    /// The part of `used` reserved by stores that have not yet finished. A rescan counts files on
+    /// disk, which cannot include a body still being written, so it adds these back.
+    in_flight: u64,
+    last_rescan: Option<Instant>,
 }
 
 /// Hex-encode a digest via the crate's shared hex helper rather than `{:x}` - the `sha2`/
@@ -148,10 +169,7 @@ pub struct QuarantineSpool {
     dir: PathBuf,
     max_file_size: u64,
     global_budget: u64,
-    /// Bytes currently on disk against `global_budget`. Recovered at construction from the
-    /// directory's existing contents (see `scan_existing_usage`) so a restart does not reset the
-    /// ceiling to zero while previously spooled files still occupy it.
-    used: AtomicU64,
+    accounting: Mutex<Accounting>,
 }
 
 impl QuarantineSpool {
@@ -162,8 +180,18 @@ impl QuarantineSpool {
             dir,
             max_file_size,
             global_budget,
-            used: AtomicU64::new(used),
+            accounting: Mutex::new(Accounting {
+                used,
+                in_flight: 0,
+                last_rescan: None,
+            }),
         }
+    }
+
+    /// Bytes the budget currently counts: published files plus stores in progress.
+    #[cfg(test)]
+    fn used_bytes(&self) -> u64 {
+        self.accounting.lock().unwrap().used
     }
 
     /// Write `body` to the spool, named by its SHA-256, and return the reference an event
@@ -214,7 +242,10 @@ impl QuarantineSpool {
             capture_id,
         };
         match self.publish(&file_path, body) {
-            Ok(()) => Ok(sample),
+            Ok(()) => {
+                self.finish_reservation(size);
+                Ok(sample)
+            }
             Err(Publish::Lost) => {
                 // Another call published this exact content between the existence check above
                 // and our publish. Its file is complete (a name is only ever linked to a written,
@@ -230,7 +261,10 @@ impl QuarantineSpool {
             }
             // The body is on disk under its name and keeps its budget; only the name's
             // durability across a crash is unconfirmed, so the caller must not treat it as stored.
-            Err(Publish::NameNotSynced(e)) => Err(e.into()),
+            Err(Publish::NameNotSynced(e)) => {
+                self.finish_reservation(size);
+                Err(e.into())
+            }
         }
     }
 
@@ -291,31 +325,32 @@ impl QuarantineSpool {
         verify_streamed(&self.dir, hash)
     }
 
-    /// Atomically check-and-reserve `size` bytes against the global budget. `SeqCst` throughout:
-    /// this counter is touched once per capture, so disk I/O dominates cost by orders of
-    /// magnitude and the ordering choice is not a performance concern - it is chosen only so the
-    /// operation is trivially correct to reason about.
+    /// Check-and-reserve `size` bytes against the global budget, atomically under the lock. When
+    /// the budget would be exceeded, the directory is rescanned first (at most once per
+    /// `RESCAN_MIN_INTERVAL`) in case files were removed since the count was last taken, and the
+    /// reservation is retried against the corrected count. The scan runs under the lock so a
+    /// concurrent reservation is neither lost nor counted twice.
     fn reserve_budget(&self, size: u64) -> Result<(), SpoolError> {
-        loop {
-            let current = self.used.load(Ordering::SeqCst);
-            let Some(next) = current
-                .checked_add(size)
-                .filter(|&n| n <= self.global_budget)
-            else {
-                return Err(SpoolError::BudgetExhausted {
-                    used: current,
-                    budget: self.global_budget,
-                    attempted: size,
-                });
-            };
-            if self
-                .used
-                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Ok(());
-            }
+        let mut acct = self.accounting.lock().unwrap();
+        let fits = |used: u64| used.checked_add(size).filter(|&n| n <= self.global_budget);
+        if fits(acct.used).is_none()
+            && acct
+                .last_rescan
+                .is_none_or(|at| at.elapsed() >= RESCAN_MIN_INTERVAL)
+        {
+            acct.last_rescan = Some(Instant::now());
+            acct.used = scan_existing_usage(&self.dir).saturating_add(acct.in_flight);
         }
+        let Some(next) = fits(acct.used) else {
+            return Err(SpoolError::BudgetExhausted {
+                used: acct.used,
+                budget: self.global_budget,
+                attempted: size,
+            });
+        };
+        acct.used = next;
+        acct.in_flight += size;
+        Ok(())
     }
 
     /// Give back a reservation that turned out not to be needed (the write failed, or another
@@ -323,11 +358,16 @@ impl QuarantineSpool {
     /// security-relevant guard must never wrap silently even if release were ever called out of
     /// balance with reserve.
     fn release_budget(&self, size: u64) {
-        let _ = self
-            .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                Some(used.saturating_sub(size))
-            });
+        let mut acct = self.accounting.lock().unwrap();
+        acct.used = acct.used.saturating_sub(size);
+        acct.in_flight = acct.in_flight.saturating_sub(size);
+    }
+
+    /// A reservation became a file on disk: it keeps its bytes in `used` and is no longer in
+    /// progress, so a rescan (which counts the file itself) must not add it again.
+    fn finish_reservation(&self, size: u64) {
+        let mut acct = self.accounting.lock().unwrap();
+        acct.in_flight = acct.in_flight.saturating_sub(size);
     }
 }
 
@@ -515,6 +555,7 @@ fn scan_existing_usage(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn test_spool(max_file: u64, budget: u64) -> (tempfile::TempDir, QuarantineSpool) {
         let dir = tempfile::tempdir().unwrap();
@@ -813,11 +854,139 @@ mod tests {
             // One body is on disk, so the budget is charged for one: every caller that found
             // the name already published gave its reservation back.
             assert_eq!(
-                spool.used.load(Ordering::SeqCst),
+                spool.used_bytes(),
                 body.len() as u64,
                 "round {round}: the budget was charged more than once for one stored body"
             );
         }
+    }
+
+    /// The budget is bytes on disk, and something else removes files from the spool (the daemon's
+    /// sample retention, an operator): a spool that only counted up stayed full until the sensor
+    /// restarted, so capture stopped for good once 100 MB had ever been written. Space freed
+    /// outside the spool is picked up from the directory when a store would otherwise be refused.
+    #[test]
+    fn space_freed_outside_the_spool_is_reclaimed() {
+        let (dir, spool) = test_spool(100, 150);
+        let first = spool.store(&[0u8; 100]).unwrap();
+        assert!(matches!(
+            spool.store(&[1u8; 100]),
+            Err(SpoolError::BudgetExhausted { .. })
+        ));
+
+        std::fs::remove_file(dir.path().join(&first.sha256)).unwrap();
+        std::thread::sleep(RESCAN_MIN_INTERVAL + std::time::Duration::from_millis(200));
+
+        spool
+            .store(&[1u8; 100])
+            .expect("the freed 100 bytes are available again");
+        assert!(matches!(
+            spool.store(&[2u8; 100]),
+            Err(SpoolError::BudgetExhausted { .. })
+        ));
+    }
+
+    /// Re-reading the directory must never forgive bytes that are still there: a refused store
+    /// that rescans, with nothing removed, leaves the spool exactly as full as it was.
+    #[test]
+    fn a_rescan_with_nothing_removed_frees_nothing() {
+        let (_dir, spool) = test_spool(100, 150);
+        spool.store(&[0u8; 100]).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                spool.store(&[1u8; 100]),
+                Err(SpoolError::BudgetExhausted { .. })
+            ));
+            std::thread::sleep(RESCAN_MIN_INTERVAL + std::time::Duration::from_millis(200));
+        }
+        assert_eq!(spool.used_bytes(), 100);
+    }
+
+    /// A store that has reserved its bytes but not yet written them is not on disk for a rescan to
+    /// count; forgetting it would let a second store take the same space.
+    #[test]
+    fn a_rescan_keeps_the_reservation_of_a_store_in_progress() {
+        let (_dir, spool) = test_spool(100, 150);
+        spool.reserve_budget(100).unwrap();
+        assert!(matches!(
+            spool.store(&[1u8; 100]),
+            Err(SpoolError::BudgetExhausted { used: 100, .. })
+        ));
+        spool.finish_reservation(100);
+        assert_eq!(spool.used_bytes(), 100);
+    }
+
+    /// A refused upload flood must not turn into a directory scan per upload.
+    #[test]
+    fn rescans_are_rate_limited() {
+        let (dir, spool) = test_spool(100, 150);
+        let first = spool.store(&[0u8; 100]).unwrap();
+        assert!(spool.store(&[1u8; 100]).is_err());
+        std::fs::remove_file(dir.path().join(&first.sha256)).unwrap();
+        assert!(
+            matches!(
+                spool.store(&[1u8; 100]),
+                Err(SpoolError::BudgetExhausted { .. })
+            ),
+            "a second refusal inside the interval does not rescan"
+        );
+    }
+
+    /// Stores race a thread that keeps deleting and a reader that keeps measuring the directory:
+    /// reclaiming must never let the bytes on disk pass the budget, whichever way the rescan
+    /// interleaves with a store that has reserved but not yet published.
+    #[test]
+    fn rescans_racing_stores_never_exceed_the_budget() {
+        const BUDGET: u64 = 1000;
+        let (dir, spool) = test_spool(100, BUDGET);
+        let spool = std::sync::Arc::new(spool);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0u8..6)
+            .map(|w| {
+                let (spool, stop) = (spool.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut n = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut body = vec![w; 100];
+                        body[..4].copy_from_slice(&n.to_le_bytes());
+                        let _ = spool.store(&body);
+                        n += 1;
+                    }
+                })
+            })
+            .collect();
+        let deleter = {
+            let (path, stop) = (dir.path().to_path_buf(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(Ok(entry)) = std::fs::read_dir(&path).unwrap().next()
+                        && entry.metadata().is_ok_and(|m| m.is_file())
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+            })
+        };
+        let mut worst = 0;
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(3500);
+        while std::time::Instant::now() < until {
+            worst = worst.max(scan_existing_usage(dir.path()));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in writers {
+            t.join().unwrap();
+        }
+        deleter.join().unwrap();
+        assert!(
+            worst <= BUDGET,
+            "{worst} bytes were on disk against a budget of {BUDGET}"
+        );
+        assert!(
+            worst > 0,
+            "the writers stored nothing, so nothing was tested"
+        );
     }
 
     #[test]

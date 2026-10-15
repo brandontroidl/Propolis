@@ -1343,6 +1343,42 @@ async fn a_full_spool_still_records_the_upload_marked_not_stored() {
     srv.handle.abort();
 }
 
+/// The daemon's sample retention removes old files from a running sensor's spool. The sensor used
+/// to count its budget up only, so capture stayed stopped until a restart; now the freed space is
+/// found when an upload would otherwise be refused.
+#[tokio::test]
+async fn capture_resumes_when_retention_frees_a_full_spool() {
+    let srv = TestServer::start_with_spool_filler(
+        test_bounds(),
+        DEFAULT_CAPTURE_BUDGET_BYTES_256M,
+        Some(FULL_SPOOL_BYTES),
+    )
+    .await;
+    let first = elf_like(4096);
+    publish_binary(&srv, b"fw/one", &first).await;
+    let uploads = srv.wait_for_uploads(1).await;
+    assert!(uploads[0].sample.is_none(), "the spool starts full");
+
+    std::fs::remove_file(srv.spool_dir.join(FILLER_NAME)).unwrap();
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+
+    let second = {
+        let mut b = elf_like(4096);
+        b[100] ^= 0xff;
+        b
+    };
+    publish_binary(&srv, b"fw/two", &second).await;
+    let uploads = srv.wait_for_uploads(2).await;
+    let sample = uploads[1]
+        .sample
+        .as_ref()
+        .expect("the freed space is used again");
+    assert_eq!(sample.sha256, sha256_hex(&second));
+    assert!(uploads[1].metadata.get("stored").is_none());
+    assert!(srv.spool_dir.join(&sample.sha256).exists());
+    srv.handle.abort();
+}
+
 #[test]
 fn manifest_has_no_http_client_and_no_tokio_process_feature() {
     let manifest = std::fs::read_to_string(

@@ -122,7 +122,12 @@ doc of `crates/sensor-framework/src/spool.rs`):
 - duplicate content dedups on the existing hash and consumes no extra budget (`sensor-framework/src/spool.rs#store`);
 - on restart, `new()` re-scans the directory to recover used bytes, so a restart does not reset
   the budget ceiling (`sensor-framework/src/spool.rs#scan_existing_usage`), and removes staged files older than an
-  hour that a stopped process left behind (`sensor-framework/src/spool.rs#remove_stale_staging`).
+  hour that a stopped process left behind (`sensor-framework/src/spool.rs#remove_stale_staging`);
+- the budget also follows files removed under a running sensor (the daemon's sample retention, an
+  operator): when a store would be refused, the spool re-reads the directory, at most once a
+  second, and counts what is actually there plus the stores still in progress
+  (`sensor-framework/src/spool.rs#reserve_budget`). Before, the count only grew, so a sensor
+  whose spool had ever reached its budget refused every capture until it was restarted.
 
 Sample files are trimmed at 30 days; see [retention](./retention.md). Spool paths and budgets
 are owned by [filesystem paths](../reference/filesystem-paths.md) and

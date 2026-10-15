@@ -91,8 +91,8 @@ Feed retention windows and tier TTLs, the 30-day captured-sample cleanup, and ev
 score storage are owned by [retention](../operations/retention.md). Two facts that bite
 operators:
 
-- The 30-day sample cleanup runs hourly in the daemon's always-on `sample-retention`
-  subsystem, independent of VirusTotal; the global byte budget bounds a burst between
+- The 30-day sample cleanup runs hourly, independent of VirusTotal: in each spooling sensor for its own
+  spool, and in the daemon's always-on `sample-retention` subsystem for the fetcher's `fetched` spool; the global byte budget bounds a burst between
   passes.
 - There is **no built-in pruning of the `event` table** - it grows with ingest and never
   self-truncates. Plan DB storage for sustained ingest; deletions break hash-chain

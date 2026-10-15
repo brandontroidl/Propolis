@@ -50,8 +50,10 @@ sensor-*  ->  /var/log/propolis/<sensor>/...
 
 The collector dials the gateway; the gateway never dials a collector. Captured sample bodies do not
 cross: the shipper sends log lines only (`crates/shipper/src/main.rs#main`), so files a sensor
-stores on the collector stay there and never reach the control plane's review, VirusTotal scanning
-or sample retention.
+stores on the collector stay there and never reach the control plane's review or VirusTotal scanning.
+The collector's own sensors age them out after 30 days (the sensor's pass, [retention](retention.md)),
+which deletes the only copy of each body; whether that should wait for the planned `CustodyComplete`
+receipt is an open owner decision, recorded in [retention](retention.md#why-the-sensors-prune-their-own-spools).
 
 ## What is and is not supported
 

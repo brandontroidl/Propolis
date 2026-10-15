@@ -822,8 +822,7 @@ with 0640 permissions and re-hash-on-read fail-closed integrity
 (`crates/sensor-framework/src/spool.rs#QuarantineSpool`).
 
 - `store(body)` rejects `FileSizeExceeded` when `size > max_file_size`, dedups on
-  an existing hash (no extra budget), reserves budget atomically via
-  `compare_exchange`, and rejects `BudgetExhausted` past `global_budget`
+  an existing hash (no extra budget), reserves budget under the spool's accounting lock, and rejects `BudgetExhausted` past `global_budget`
   (`sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#reserve_budget`). A body is written to a staging file at 0640,
   synced, then hard-linked to its digest name (`sensor-framework/src/spool.rs#publish`, `sensor-framework/src/spool.rs#write_and_seal`).
 - `new()` recovers used bytes by scanning the directory at startup so a restart
@@ -846,7 +845,7 @@ never delays the reply - response latency must not leak whether a capture happen
 (`start_worker` panics on a second call), so `spool.store` is never called
 concurrently (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::start_worker`). `orig_name` is sanitized and capped at
 `MAX_ORIG_NAME_LEN = 255` (`crates/sensor-framework/src/handoff.rs#MAX_ORIG_NAME_LEN`, `crates/sensor-framework/src/handoff.rs#process_job`); a spool refusal is counted in
-`spool_refused_count` with no event emitted (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::spool_refused_count`, `crates/sensor-framework/src/handoff.rs#process_job`); a panicking event builder
+`spool_refused_count` and the upload event is still emitted, without a `sample` and marked `stored: false` with a `not_stored_reason` (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::spool_refused_count`, `crates/sensor-framework/src/handoff.rs#process_job`); a panicking event builder
 is isolated with `catch_unwind` and the worker continues (`crates/sensor-framework/src/handoff.rs#process_job`).
 
 ### Event emission

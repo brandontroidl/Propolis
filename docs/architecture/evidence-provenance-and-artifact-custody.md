@@ -441,7 +441,10 @@ The artifact-shipper consumes manifest rows, not files.
    durable, they are provable - inside a Merkle-committable sequence). It binds `collector_id + capture_id +
    occurrence_id + sha256 + size` and carries the `commitment_id`s (or their `global_sequence`s) it requires.
 
-A collector may delete its only copy of a body **only on `CustodyComplete`**. Stages 1 and 2 are
+A collector may delete its only copy of a body **only on `CustodyComplete`**. (Current state: until SP-B-3
+lands, each sensor's 30-day spool pass deletes bodies by age alone and does not read the outbox; that pass must
+be gated on this receipt when SP-B-3 lands, or limited to non-collector roles. See
+[retention](../operations/retention.md#why-the-sensors-prune-their-own-spools).) Stages 1 and 2 are
 prerequisites; neither alone authorizes deletion. This closes both the "durable body, lost attribution"
 hole (if the observation never committed, `CustodyComplete` is never issued) **and** the
 "durable body, unprovable attribution" hole (if the commitments are missing, `CustodyComplete` is withheld,

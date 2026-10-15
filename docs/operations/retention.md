@@ -71,8 +71,9 @@ The 30-day age and the hourly cadence are compile-time constants, not env vars. 
 performs egress (it is local file deletion). There is no hold mechanism: a file that must be kept
 (for example one that may be illegal material) has to be moved out of the spool first, see
 [captured content handling](./captured-content-handling.md#quarantine-one-sample). A pass that finds
-a sample past retention and cannot remove it logs a WARN naming the directory (`samples past
-retention could not be removed`); a spool whose passes keep logging it is not being trimmed, and
+a sample past retention and cannot remove it logs a WARN with the directory in its `spool` field (the sensor's text is `samples past retention could
+not be removed from the spool`, the daemon's `a sample past retention could not be removed`; grep for
+`past retention could not be removed` to match both); a spool whose passes keep logging it is not being trimmed, and
 the cause is that directory's owner or mode.
 
 The daemon's pass is always spawned, independent of VirusTotal. It used to be a step of the VT scan
@@ -101,6 +102,16 @@ entries there (the cross-account write `install_script_var_lib_root_is_root_owne
 prevent for `/var/lib/propolis`). Pruning in the sensor loosens nothing, also covers a collector in
 a [split deployment](./split-deployment.md) that runs no daemon, and releases the sensor's budget
 directly. **Unit and provisioning changes made: none.**
+
+**Open policy question for a collector.** Sample bodies never leave a collector (the shipper sends log
+lines only), so on a collector the sensor's 30-day pass deletes the only copy of each body, whether or
+not the control plane ever saw its event. The planned custody design says a collector may delete its
+only copy of a body only on `CustodyComplete`
+([evidence provenance and artifact custody](../architecture/evidence-provenance-and-artifact-custody.md));
+that handshake is not implemented, so the pass does not consult the outbox. Until the owner decides
+between limiting the sensor-side pass to non-collector roles and gating it on `CustodyComplete` once
+that handshake lands, an operator who needs a collector's bodies for longer must copy them off within
+30 days. A deleted body keeps its event (hash, size, name) in the log and the ledger.
 
 `crates/propolis/tests/retention_deploy.rs` keeps this true: for every spool a retention pass
 walks, the account that runs the pass owns the directory with `rwx` in `provision.sh` and has the

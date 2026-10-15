@@ -71,7 +71,7 @@ single `DailyBudget` owned across every scan cycle - a counter local to one
 skips samples already analyzed, and consumes one budget unit per new sample; on
 exhaustion it logs and returns early (`crates/review/src/virustotal.rs#scan_spool`; filename filter
 in `crates/review/src/spool.rs#list_samples`). Spool dirs scanned:
-`/var/spool/propolis/{ssh,adb,ftp,telnet}` (`crates/review/src/spool.rs#BODY_SPOOLERS`)
+`/var/spool/propolis/{ssh,adb,ftp,telnet,tftp,mqtt}` (`crates/review/src/spool.rs#BODY_SPOOLERS`)
 plus the fetcher spool tagged `fetched`. Samples older than 30 days are checked hourly,
 independent of whether VirusTotal is enabled: each sensor does it for its own spool, and the
 daemon's `sample-retention` task for `fetched`

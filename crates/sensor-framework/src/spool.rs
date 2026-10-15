@@ -39,7 +39,7 @@ enum Publish {
 }
 
 /// The least time between two rescans of the spool directory. A rescan reads the directory to
-/// find space freed by whatever removes files from it (the daemon's sample retention, an
+/// find space freed by whatever removes files from it (the sensor's own retention pass, an
 /// operator), and happens only when a store would otherwise be refused; the interval keeps a
 /// flood of refused uploads from becoming a flood of directory scans.
 const RESCAN_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -190,6 +190,11 @@ pub struct QuarantineSpool {
 }
 
 impl QuarantineSpool {
+    /// The directory this spool stores into, for log lines that must say which one.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn new(dir: PathBuf, max_file_size: u64, global_budget: u64) -> Self {
         remove_stale_staging(&dir.join(STAGING_DIR));
         let used = scan_existing_usage(&dir);

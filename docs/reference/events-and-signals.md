@@ -98,7 +98,11 @@ still emitted, so the ledger keeps its source, topic, size and hash: it has no `
 `stored: false` and a `not_stored_reason` (`spool_full`, `file_too_large`, `spool_entry_invalid`,
 `spool_error`), and `sha256`, `size` and `orig_name` describe the body that was seen but not kept
 ([queue and spool](../operations/queue-and-spool.md#spool-refusals-spool_refused_count)). Such a
-row has no `sample_sha256`, so the Samples list does not show it.
+row has no `sample_sha256`, so the Samples list, the IP page's malware panel and the campaign
+indexer (which links a sample and tags an upload only on `sample_sha256`) do not show or link it; the
+IP timeline and the review queue read `sha256`, `size` and `orig_name` instead and show it as
+`name (hash..., size, not stored: spool full)`. Scoring counts it like any upload. Whether the
+indexer should key on `sha256` when `stored` is false is undecided.
 FTP drains at most a further 10 MB past its cap before closing the data
 connection, so a `wire_size` of 20 MB on an FTP row is a floor, not the total.
 Every upload row also carries `complete`: false when the transfer did not end the way

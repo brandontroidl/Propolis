@@ -707,6 +707,7 @@ impl CaptureHandoff {
                         if report.failed > 0 {
                             tracing::warn!(
                                 failed = report.failed,
+                                spool = %spool.dir().display(),
                                 "capture hand-off: samples past retention could not be removed from the spool; check its ownership and mode"
                             );
                         }

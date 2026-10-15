@@ -180,7 +180,7 @@ path**, for covertness - response latency must not leak whether a capture happen
 `QuarantineSpool` stores every captured body under its **SHA-256 as the filename**
 (never the attacker-supplied name → traversal impossible), with `0640` permissions
 and re-hash-on-read fail-closed (`sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#read_verified`). It enforces a per-file
-size cap and a global byte budget via an atomic `compare_exchange` reservation, dedups
+size cap and a global byte budget by reserving under an accounting lock, dedups
 on existing hash, and recovers its used-byte count by scanning the directory on
 startup so a restart does not reset the ceiling. FTP/ADB use a 10 MB per-file cap and SSH
 a 16 MiB one (`crates/sensor-framework/src/spool.rs#SPOOL_MAX_FILE_BYTES`, the largest kept

@@ -537,7 +537,9 @@
   The upload event is now always emitted, for every body-capturing sensor: without a `sample`
   (nothing is on disk to name), with `stored: false` and a `not_stored_reason` (`spool_full`,
   `file_too_large`, `spool_entry_invalid`, `spool_error`), and with `sha256`, `size` and
-  `orig_name` of the body that was seen. The Samples list does not show such a row. The refusal
+  `orig_name` of the body that was seen. The Samples list, the IP malware panel and the campaign
+  indexer (which keys on `sample_sha256`) do not show or link such a row; the IP timeline and the
+  review queue show it as `name (hash..., size, not stored: spool full)`. The refusal
   WARN is now logged at power-of-two totals, as the queue-drop WARN is. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-refusals-spool_refused_count).
 - **Sample retention now works on the shipped units: each sensor ages out its own spool** - the
@@ -549,7 +551,9 @@
   start and hourly, as the account that owns the directory, and recounts its budget; this needs no
   unit or directory change and gives the daemon no new write access. The daemon's pass now walks
   only the spool it owns (`fetched`) and logs a WARN when it finds a sample it cannot remove, as
-  the sensors do. A collector in a split deployment, which runs no daemon, is now trimmed too.
+  the sensors do. A collector in a split deployment, which runs no daemon, is now trimmed too; that deletes the
+  only copy of each body there after 30 days, which the planned custody design allows only on
+  `CustodyComplete`, so it is an open owner decision (see [retention](docs/operations/retention.md)).
   `retention_deploy` checks the units and `provision.sh` for every spool a pass walks. See
   [retention](docs/operations/retention.md).
 - **A sensor whose spool filled up now captures again once files are removed** - the spool's

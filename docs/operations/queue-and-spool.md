@@ -88,7 +88,7 @@ observation; only the body is lost. The Samples list and sample pages, which are
   sensors, 16 MiB for SSH, 256 KiB for MQTT, whose body is one PUBLISH packet,
   `crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) (`sensor-framework/src/spool.rs#store`).
 - **`BudgetExhausted`** - the global byte budget (100 MB per spooling sensor) is already
-  reserved. Reservation is atomic (`compare_exchange`), so the budget is a hard ceiling
+  reserved. Reservation happens under the spool's accounting lock, so the budget is a hard ceiling
   (`sensor-framework/src/spool.rs#reserve_budget`).
 
 | `not_stored_reason` | Cause |
@@ -123,7 +123,7 @@ doc of `crates/sensor-framework/src/spool.rs`):
 - on restart, `new()` re-scans the directory to recover used bytes, so a restart does not reset
   the budget ceiling (`sensor-framework/src/spool.rs#scan_existing_usage`), and removes staged files older than an
   hour that a stopped process left behind (`sensor-framework/src/spool.rs#remove_stale_staging`);
-- the budget also follows files removed under a running sensor (the daemon's sample retention, an
+- the budget also follows files removed under a running sensor (the sensor's own retention pass, an
   operator): when a store would be refused, the spool re-reads the directory, at most once a
   second, and counts what is actually there plus the stores still in progress
   (`sensor-framework/src/spool.rs#reserve_budget`). Before, the count only grew, so a sensor

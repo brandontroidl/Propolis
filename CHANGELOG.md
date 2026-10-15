@@ -517,12 +517,13 @@
   write filled one of the 16 slots a shell tracks and none could ever be captured (a one-chunk
   file is a probe, not an upload), so the ELF typed next (120 `echo -ne` appends, `chmod +x`, a
   run) was never tracked and live sessions captured nothing. A bare `echo > f` (a lone newline) is
-  no longer an assembly by itself, though the first append to it starts one (a script dropper
-  built that way is still captured), and a full table drops its oldest file that could not be captured
-  rather than refusing the new one; the session's end-of-session list does the same. The 16-slot
-  bound stays: a record is a path, a digest and one terminal line (about 70 KiB for a full table),
-  and the file bytes are charged to the filesystem budget. See
-  [events and signals](docs/reference/events-and-signals.md).
+  now a dead one-chunk record: a script dropper built from it by appends continues it, a bare
+  `echo > f` over a tracked file replaces that file's record (in the session's list too, so a
+  rebuilt dropper is captured), and a full table drops its oldest file that would not be taken at
+  the session's end (fewer than two chunks, and not an ELF) rather than refusing the new one; the
+  session's end-of-session list does the same. The 16-slot bound stays: a record is a path, a
+  digest and one terminal line (about 70 KiB for a full table), and the file bytes are charged to
+  the filesystem budget. See [events and signals](docs/reference/events-and-signals.md).
 - **The MSSQL sensor records the Login7 UserName, not the AppName** - the username was read from
   the AppName offset pair (bytes 48..52) instead of UserName (40..44, MS-TDS 2.2.6.4), so every
   captured username was a driver name such as `Core Microsoft SqlClient Data Provider`. The

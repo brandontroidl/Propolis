@@ -53,6 +53,8 @@ pub(super) struct Assembled {
     sha256: [u8; 32],
     len: u64,
     chunks: u32,
+    /// Whether the first chunk began with the ELF magic.
+    elf: bool,
     /// The line that wrote the last chunk.
     command: String,
     /// Which assembly this was to start in its shell, counting from 0: the smaller, the older.
@@ -63,7 +65,7 @@ impl Assembled {
     /// Whether the session's end would skip this file: too few chunks to be an upload. One that
     /// was run was captured when it ran, so forgetting it costs nothing.
     fn is_dead(&self) -> bool {
-        self.chunks < MIN_UNRUN_CHUNKS
+        self.chunks < MIN_UNRUN_CHUNKS && !self.elf
     }
 }
 
@@ -157,6 +159,7 @@ impl FakeShell {
                         sha256: file.sha256,
                         len: file.len,
                         chunks: file.chunk_count,
+                        elf: file.elf,
                         command: file.command,
                         born,
                     },
@@ -208,18 +211,7 @@ impl FakeShell {
             .assembled
             .get(path)
             .is_some_and(|known| known.len == len_u64(prior.len()));
-        // A bare `echo > f` is not tracked (below), but a script dropper starts that way and
-        // grows the file by appends: an append to an untracked file holding only that newline
-        // starts the assembly, counting the newline as its first chunk.
-        let after_bare_echo = prior == b"\n" && !self.assembled.contains_key(path);
-        if !prior.is_empty() && !continues && !after_bare_echo {
-            self.assembled.remove(path);
-            return;
-        }
-        // A bare `echo > f` (a write probe: is this directory writable) leaves a newline and
-        // nothing a loader would build on, so it is not an assembly's start. It truncated the
-        // file, so any record of the old content is stale and no longer holds a slot.
-        if prior.is_empty() && content == b"\n" {
+        if !prior.is_empty() && !continues {
             self.assembled.remove(path);
             return;
         }
@@ -236,8 +228,6 @@ impl FakeShell {
                 .as_ref()
                 .filter(|decoded| decoded.sha256 == sha256)
                 .map_or(1, |decoded| decoded.chunks)
-        } else if after_bare_echo {
-            2
         } else {
             match self.assembled.get(path) {
                 Some(known) if known.sha256 == prior_sha256 => known.chunks.saturating_add(1),
@@ -250,6 +240,10 @@ impl FakeShell {
         if !self.assembled.contains_key(path) && !self.make_room() {
             return;
         }
+        let elf = match self.assembled.get(path) {
+            Some(known) if !prior.is_empty() => known.elf,
+            _ => content.starts_with(b"\x7fELF"),
+        };
         let born = match self.assembled.get(path) {
             Some(known) => known.born,
             None => self.next_born(),
@@ -260,6 +254,7 @@ impl FakeShell {
                 sha256,
                 len: len_u64(content.len()),
                 chunks,
+                elf,
                 command: self.line_command.clone(),
                 born,
             },
@@ -406,6 +401,7 @@ impl FakeShell {
                     len: known.len,
                     chunk_count: known.chunks,
                     command: known.command.clone(),
+                    elf: known.elf,
                 })
                 .collect();
             captures.track_assembled(&self.fs, tracked);

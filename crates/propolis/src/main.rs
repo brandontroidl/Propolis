@@ -1749,6 +1749,9 @@ async fn main() {
                     // not alerting at all. Same conditions, same cooldown/dedup policy, different
                     // transport - see `dispatch::LogPoster`.
                     let local_only = ops_cfg.ntfy_url.is_empty();
+                    // Alerts the transport could not deliver survive a restart here, so the next
+                    // run reports them. The cursor directory is the daemon's own writable state.
+                    let delivery_state = pg_data_volume.join(ops_alert::undelivered::STATE_FILE);
                     let ctx = ops_alert::condition::MonitorCtx {
                         pool,
                         pg_data_volume,
@@ -1785,6 +1788,7 @@ async fn main() {
                             dispatcher,
                         )
                         .with_configured_heartbeat(&ops_cfg)
+                        .with_delivery_state(delivery_state)
                         .run(token)
                         .await;
                     } else {
@@ -1804,6 +1808,7 @@ async fn main() {
                             dispatcher,
                         )
                         .with_configured_heartbeat(&ops_cfg)
+                        .with_delivery_state(delivery_state)
                         .run(token)
                         .await;
                     }

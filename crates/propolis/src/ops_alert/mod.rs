@@ -9,5 +9,6 @@ pub mod config;
 pub mod debounce;
 pub mod dispatch;
 pub mod monitor;
+pub mod undelivered;
 
 pub use config::OpsAlertConfig;

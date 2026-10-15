@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::condition::{Condition, MonitorCtx, Outcome};
 use super::debounce::{Action, DebounceMachine};
 use super::dispatch::{Dispatcher, OpsAlert, Poster, Severity};
+use super::undelivered::{UndeliveredQueue, lost_alert};
 
 /// How long a probe may stay `Unknown` (cannot read its source) before the monitor pages a
 /// `probe-stale` warning about the probe itself. Longer than any single transient blip.
@@ -25,12 +26,44 @@ struct Tracked {
     probe_stale_active: bool,
 }
 
-/// Deliver one alert, logging (never propagating) a delivery failure - a failed page must be loud
-/// but must not stop the monitor.
-async fn deliver<P: Poster>(dispatcher: &Dispatcher<P>, alert: OpsAlert, now: Instant) {
-    let key = alert.key.clone();
-    if let Err(e) = dispatcher.dispatch(alert, now).await {
-        tracing::error!(key = %key, error = %e, "ops-alert: delivery failed");
+/// Deliver one alert. A failure never stops the monitor, but it is not forgotten either: the alert
+/// is queued for retry on a slower backoff (see `undelivered`), and the failure is logged.
+async fn deliver<P: Poster>(
+    dispatcher: &Dispatcher<P>,
+    undelivered: &mut UndeliveredQueue,
+    alert: OpsAlert,
+    now: Instant,
+) {
+    match dispatcher.dispatch(alert.clone(), now).await {
+        Ok(()) => undelivered.delivered(&alert.key),
+        Err(e) => {
+            tracing::error!(key = %alert.key, error = %e, "ops-alert: delivery failed; will retry");
+            undelivered.failed(alert, e.to_string(), now);
+        }
+    }
+}
+
+/// Retry the queued alerts that are due. Runs after the heartbeat so a stalled transport can never
+/// delay the dead-man's switch, and at most `MAX_RETRIES_PER_TICK` per tick.
+async fn retry_undelivered<P: Poster>(
+    dispatcher: &Dispatcher<P>,
+    undelivered: &mut UndeliveredQueue,
+    now: Instant,
+) {
+    for (alert, attempts) in undelivered.due(now) {
+        let key = alert.key.clone();
+        match dispatcher.dispatch(alert.clone(), now).await {
+            Ok(()) => {
+                if attempts > 0 {
+                    tracing::info!(key = %key, attempts, "ops-alert: delivered after earlier failures");
+                }
+                undelivered.delivered(&key);
+            }
+            Err(e) => {
+                tracing::warn!(key = %key, attempts = attempts + 1, error = %e, "ops-alert: retry failed; will retry again");
+                undelivered.failed(alert, e.to_string(), now);
+            }
+        }
     }
 }
 
@@ -105,6 +138,7 @@ pub struct Monitor<P: Poster> {
     dispatcher: Dispatcher<P>,
     probe_stale_after: Duration,
     heartbeat: Option<Heartbeat>,
+    undelivered: UndeliveredQueue,
 }
 
 impl<P: Poster> Monitor<P> {
@@ -132,7 +166,32 @@ impl<P: Poster> Monitor<P> {
             dispatcher,
             probe_stale_after: PROBE_STALE_AFTER,
             heartbeat: None,
+            undelivered: UndeliveredQueue::in_memory(),
         }
+    }
+
+    /// Persist undelivered alerts at `path`, and report what the previous run left there: a journal
+    /// WARN per lost alert plus one summary alert, sent on the first tick.
+    pub fn with_delivery_state(mut self, path: std::path::PathBuf) -> Self {
+        let (queue, lost) = UndeliveredQueue::persisted(path);
+        self.undelivered = queue;
+        if !lost.is_empty() {
+            for l in &lost {
+                tracing::warn!(
+                    key = %l.key,
+                    attempts = l.attempts,
+                    first_failed_unix = l.first_failed_unix,
+                    error = %l.last_error,
+                    "ops-alert: an alert was never delivered before the previous run ended"
+                );
+            }
+            self.undelivered.enqueue_due(
+                lost_alert(&lost),
+                "reported after restart",
+                Instant::now(),
+            );
+        }
+        self
     }
 
     /// The heartbeat `cfg` configures (`PROPOLIS_OPS_HEARTBEAT_URL`), if any. A client that cannot
@@ -182,6 +241,7 @@ impl<P: Poster> Monitor<P> {
             dispatcher,
             probe_stale_after,
             heartbeat,
+            undelivered,
         } = self;
 
         for t in tracked.iter_mut() {
@@ -200,6 +260,7 @@ impl<P: Poster> Monitor<P> {
                     };
                     deliver(
                         dispatcher,
+                        undelivered,
                         OpsAlert {
                             key: format!("probe-stale:{id}"),
                             severity: Severity::Warning,
@@ -227,6 +288,7 @@ impl<P: Poster> Monitor<P> {
                     t.probe_stale_active = false;
                     deliver(
                         dispatcher,
+                        undelivered,
                         OpsAlert {
                             key: format!("probe-stale:{id}"),
                             severity: Severity::Warning,
@@ -249,6 +311,7 @@ impl<P: Poster> Monitor<P> {
                     if let Outcome::Firing { severity, detail } = &outcome {
                         deliver(
                             dispatcher,
+                            undelivered,
                             OpsAlert {
                                 key: id.to_string(),
                                 severity: *severity,
@@ -268,6 +331,7 @@ impl<P: Poster> Monitor<P> {
                 Action::Recovered => {
                     deliver(
                         dispatcher,
+                        undelivered,
                         OpsAlert {
                             key: id.to_string(),
                             severity: Severity::Warning,
@@ -288,6 +352,10 @@ impl<P: Poster> Monitor<P> {
         if let Some(heartbeat) = heartbeat {
             heartbeat.after_round(now).await;
         }
+
+        // After the heartbeat on purpose: retrying a dead transport can take minutes, and the
+        // dead-man's switch must not wait on it or be touched by it.
+        retry_undelivered(dispatcher, undelivered, now).await;
     }
 
     /// Run until cancelled. A clean return on cancel (the supervisor treats it as intentional
@@ -764,6 +832,309 @@ mod tests {
         m.process_tick(base + Duration::from_secs(310)).await;
         assert_eq!(rec.count(), 3, "one recovered notice when it comes back");
         assert_eq!(rec.last_priority(), "2", "recovered maps to priority 2");
+    }
+
+    /// Answers 503 (or 200 once `ok` is set) to every request and records how many arrived.
+    struct Toggle {
+        sent: Mutex<Vec<PostReq>>,
+        ok: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Toggle {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                ok: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+        fn count(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+        fn heal(&self) {
+            self.ok.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl Poster for &Toggle {
+        async fn post(&self, req: PostReq) -> Result<u16, PostErr> {
+            self.sent.lock().unwrap().push(req);
+            if self.ok.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(200)
+            } else {
+                Ok(503)
+            }
+        }
+    }
+
+    fn firing_stub(out: &Arc<Mutex<Outcome>>) -> Box<StubCond> {
+        Box::new(StubCond {
+            id: "stub",
+            for_dur: Duration::ZERO,
+            out: out.clone(),
+        })
+    }
+
+    fn firing_outcome() -> Arc<Mutex<Outcome>> {
+        Arc::new(Mutex::new(Outcome::Firing {
+            severity: Severity::Critical,
+            detail: "db 4% free".into(),
+        }))
+    }
+
+    /// A page the transport rejects is kept and retried on a slower backoff until it lands, then
+    /// forgotten. Paused time makes the dispatcher's own backoff sleeps instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_that_fails_to_deliver_is_retried_with_backoff_until_it_lands() {
+        let t = Toggle::new();
+        let out = firing_outcome();
+        let d = Dispatcher::with_poster(
+            &t,
+            "https://ntfy.example",
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let mut m = Monitor::new(vec![firing_stub(&out)], test_ctx(), d);
+        let base = Instant::now();
+
+        m.process_tick(base).await;
+        assert_eq!(t.count(), 4, "the dispatcher's own attempts");
+        assert_eq!(m.undelivered.len(), 1, "the failed page is kept");
+
+        m.process_tick(base + Duration::from_secs(10)).await;
+        assert_eq!(t.count(), 4, "not retried before the 30 s backoff");
+
+        m.process_tick(base + Duration::from_secs(31)).await;
+        assert_eq!(
+            t.count(),
+            8,
+            "retried once the backoff elapsed, still failing"
+        );
+        assert_eq!(m.undelivered.len(), 1);
+
+        m.process_tick(base + Duration::from_secs(60)).await;
+        assert_eq!(
+            t.count(),
+            8,
+            "the second wait is longer (60 s from the last failure)"
+        );
+
+        t.heal();
+        m.process_tick(base + Duration::from_secs(92)).await;
+        assert_eq!(t.count(), 9, "one successful retry");
+        assert!(m.undelivered.is_empty(), "delivered, so forgotten");
+        let sent = t.sent.lock().unwrap();
+        let last = sent.last().unwrap();
+        assert!(
+            last.headers
+                .iter()
+                .any(|(k, v)| k == "X-Priority" && v == "5")
+        );
+        assert_eq!(
+            last.body, "db 4% free",
+            "the retried alert is the original page"
+        );
+    }
+
+    /// While the page is stuck in the queue the condition clears: only the recovered notice is
+    /// owed, and the stale page is not delivered after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_notice_supersedes_a_queued_page() {
+        let t = Toggle::new();
+        let out = firing_outcome();
+        let d = Dispatcher::with_poster(
+            &t,
+            "https://ntfy.example",
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let mut m = Monitor::new(vec![firing_stub(&out)], test_ctx(), d);
+        let base = Instant::now();
+        m.process_tick(base).await; // page fails, queued
+        *out.lock().unwrap() = Outcome::Ok;
+        m.process_tick(base + Duration::from_secs(5)).await; // recovered fails, replaces the page
+        assert_eq!(m.undelivered.len(), 1);
+        t.heal();
+        m.process_tick(base + Duration::from_secs(40)).await;
+        let sent = t.sent.lock().unwrap();
+        let last = sent.last().unwrap();
+        assert!(
+            last.headers
+                .iter()
+                .any(|(k, v)| k == "X-Title" && v.starts_with("[recovered]")),
+            "the surviving alert is the recovered notice"
+        );
+        drop(sent);
+        assert!(m.undelivered.is_empty());
+    }
+
+    /// Delivery failing does not touch the dead-man's switch: it still pings on schedule.
+    #[tokio::test(start_paused = true)]
+    async fn failing_deliveries_do_not_disturb_the_heartbeat() {
+        let t = Toggle::new();
+        let out = firing_outcome();
+        let d = Dispatcher::with_poster(
+            &t,
+            "https://ntfy.example",
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let pings = Arc::new(Mutex::new(Vec::new()));
+        let mut m = Monitor::new(vec![firing_stub(&out)], test_ctx(), d).with_heartbeat(
+            "https://hc.example/abc".into(),
+            Duration::from_secs(30),
+            Box::new(CountingPinger {
+                pings: pings.clone(),
+                fail: Arc::new(Mutex::new(false)),
+            }),
+        );
+        let base = Instant::now();
+        for i in 0..4u64 {
+            m.process_tick(base + Duration::from_secs(31 * i)).await;
+        }
+        assert_eq!(
+            pings.lock().unwrap().len(),
+            4,
+            "a ping every round despite failed alerts"
+        );
+        assert!(!m.undelivered.is_empty());
+    }
+
+    /// The failure survives a restart: the old run's queue file is read by the next one, which
+    /// sends one summary alert naming what was lost and consumes the file.
+    #[tokio::test(start_paused = true)]
+    async fn an_alert_undelivered_at_shutdown_is_reported_by_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::ops_alert::undelivered::STATE_FILE);
+        let down = Toggle::new();
+        let out = firing_outcome();
+        {
+            let d = Dispatcher::with_poster(
+                &down,
+                "https://ntfy.example",
+                "propolis-ops",
+                None,
+                Duration::from_secs(300),
+            );
+            let mut m = Monitor::new(vec![firing_stub(&out)], test_ctx(), d)
+                .with_delivery_state(path.clone());
+            m.process_tick(Instant::now()).await;
+            assert!(path.exists(), "the failure is persisted");
+        }
+
+        let up = Toggle::new();
+        up.heal();
+        let d = Dispatcher::with_poster(
+            &up,
+            "https://ntfy.example",
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let mut m = Monitor::new(Vec::new(), test_ctx(), d).with_delivery_state(path.clone());
+        // The old queue was consumed; what is on disk now is only the pending summary, so it too
+        // survives a crash before it is sent.
+        let pending = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            pending.contains("alert-delivery-lost") && !pending.contains("\"stub\""),
+            "{pending}"
+        );
+        m.process_tick(Instant::now()).await;
+        assert_eq!(up.count(), 1, "one summary alert");
+        let sent = up.sent.lock().unwrap();
+        assert!(sent[0].url.ends_with("/propolis-ops"));
+        assert!(sent[0].body.contains("never delivered"), "{}", sent[0].body);
+        assert!(sent[0].body.contains("propolis: stub"), "{}", sent[0].body);
+        assert!(sent[0].body.contains("503"), "{}", sent[0].body);
+        drop(sent);
+        assert!(m.undelivered.is_empty());
+        assert!(!path.exists());
+    }
+
+    /// The same path over a real socket and the production reqwest poster: a local endpoint that
+    /// answers 503 until it is told to heal. Real clock (the dispatcher backs off about 1.4 s).
+    #[tokio::test]
+    async fn a_failing_local_ntfy_endpoint_is_retried_over_a_real_socket() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let healthy = Arc::new(AtomicBool::new(false));
+        {
+            let (hits, healthy) = (hits.clone(), healthy.clone());
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut s) = stream else { return };
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    // Headers, then the declared body, so closing never resets a half-read request.
+                    let (head_end, want) = loop {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break (0, 0);
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..p]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (p + 4, len);
+                        }
+                    };
+                    while buf.len() < head_end + want {
+                        let n = s.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let status = if healthy.load(Ordering::SeqCst) {
+                        "200 OK"
+                    } else {
+                        "503 Service Unavailable"
+                    };
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+            });
+        }
+
+        let out = firing_outcome();
+        let d = Dispatcher::with_poster(
+            super::super::dispatch::ReqwestPoster::new().unwrap(),
+            &format!("http://{addr}"),
+            "propolis-ops",
+            None,
+            Duration::from_secs(300),
+        );
+        let mut m = Monitor::new(vec![firing_stub(&out)], test_ctx(), d);
+        let base = Instant::now();
+
+        m.process_tick(base).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            4,
+            "four attempts against the failing endpoint"
+        );
+        assert_eq!(m.undelivered.len(), 1);
+
+        healthy.store(true, Ordering::SeqCst);
+        m.process_tick(base + Duration::from_secs(31)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert!(
+            m.undelivered.is_empty(),
+            "delivered once the endpoint recovered"
+        );
     }
 
     #[tokio::test]

@@ -7,10 +7,10 @@
 //!   variants that supersede it once `SSH_MSG_NEWKEYS` completes are added alongside it once
 //!   `TransportCipher` exists (Task 10/11).
 //! - The version-string handshake: `do_version_exchange_server`.
-//! - KEXINIT: `build_kexinit`/`parse_kexinit`, this server's fixed algorithm offer (curve25519-
-//!   sha256 / ssh-ed25519 / chacha20-poly1305@openssh.com / no compression - the pinned crypto
-//!   primitives ADR-0011 accepts) and the parser for the client's own KEXINIT so a later task can
-//!   read the client's offer.
+//! - KEXINIT: `build_kexinit`/`parse_kexinit`, this server's algorithm offer (rendered from the
+//!   tables in `algorithms`, which also negotiates against the client's lists) and the parser for
+//!   the client's own KEXINIT. A client with nothing in common with the offer is refused with
+//!   `SSH_MSG_DISCONNECT` (`refuse_and_close`), never left waiting.
 //! - The SSH message type constants (RFC 4253 section 12) every later task in this crate
 //!   dispatches on.
 //!
@@ -32,6 +32,7 @@
 use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod algorithms;
 pub mod cipher;
 pub mod kex;
 pub mod keys;
@@ -59,6 +60,10 @@ pub const SSH_MSG_CHANNEL_EOF: u8 = 96;
 pub const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
 pub const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
 pub const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
+
+/// RFC 4253 section 11.1, `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`: what a server says when the
+/// client's algorithm lists leave nothing to negotiate.
+pub const SSH_DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
 
 /// RFC 4253 section 6.1's recommended ceiling: "All implementations MUST be able to process
 /// packets with ... a total packet size of 35000 bytes." Applied here to the `packet_length`
@@ -98,10 +103,9 @@ pub struct SshPacket {
     pub payload: Vec<u8>,
 }
 
-/// A parsed KEXINIT message (RFC 4253 section 7.1). `languages_*` and `first_kex_packet_follows`
-/// are consumed while parsing (to validate the message and reach the fields after them) but not
-/// retained: this server always ignores a guessed first packet, and languages are unused by every
-/// later task in this crate.
+/// A parsed KEXINIT message (RFC 4253 section 7.1). `languages_*` are consumed while parsing (to
+/// validate the message and reach the fields after them) but not retained: nothing in this crate
+/// uses them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KexInit {
     pub cookie: [u8; 16],
@@ -113,6 +117,24 @@ pub struct KexInit {
     pub mac_server_to_client: String,
     pub compression_client_to_server: String,
     pub compression_server_to_client: String,
+    /// The client sent a key exchange packet right behind this message, betting on its own first
+    /// choices; see `algorithms::Negotiated::discard_guess` for what the server does with it.
+    pub first_kex_packet_follows: bool,
+}
+
+impl KexInit {
+    /// The lists `algorithms::negotiate` reads.
+    pub fn lists(&self) -> algorithms::ClientLists<'_> {
+        algorithms::ClientLists {
+            kex_algorithms: &self.kex_algorithms,
+            server_host_key_algorithms: &self.server_host_key_algorithms,
+            encryption_client_to_server: &self.encryption_client_to_server,
+            encryption_server_to_client: &self.encryption_server_to_client,
+            compression_client_to_server: &self.compression_client_to_server,
+            compression_server_to_client: &self.compression_server_to_client,
+            first_kex_packet_follows: self.first_kex_packet_follows,
+        }
+    }
 }
 
 /// Every error this module's parsing and framing can produce. Every variant is constructed from a
@@ -135,6 +157,10 @@ pub enum TransportError {
     /// A KEXINIT name-list was not valid UTF-8. (A malformed version line is not an error - see
     /// `do_version_exchange_server_with_version`'s doc comment for why.)
     InvalidEncoding(&'static str),
+    /// The client's KEXINIT lists share no algorithm with the server's, in the list named. Not
+    /// malformed input: the client spoke SSH correctly and the server has nothing to say to it
+    /// but `SSH_MSG_DISCONNECT`.
+    Negotiation(algorithms::NegotiationFailure),
     Io(std::io::Error),
 }
 
@@ -149,6 +175,9 @@ impl std::fmt::Display for TransportError {
             }
             TransportError::Malformed(reason) => write!(f, "malformed SSH message: {reason}"),
             TransportError::InvalidEncoding(reason) => write!(f, "invalid encoding: {reason}"),
+            TransportError::Negotiation(failure) => {
+                write!(f, "algorithm negotiation failed: {failure}")
+            }
             TransportError::Io(e) => write!(f, "SSH transport i/o error: {e}"),
         }
     }
@@ -462,19 +491,10 @@ where
 
 // ---- KEXINIT (RFC 4253 section 7.1) ----
 
-/// This server's sole key-exchange offer (ADR-0011: curve25519-sha256 key exchange over the
-/// vendored, pinned primitives).
-const KEX_ALGORITHMS: &str = "curve25519-sha256";
-/// This server's sole host-key type: the ed25519 host key persisted per the design doc's "Host
-/// key" section.
-const SERVER_HOST_KEY_ALGORITHMS: &str = "ssh-ed25519";
-/// This server's sole cipher, both directions: an AEAD, so no separate MAC algorithm is ever
-/// negotiated (see `build_kexinit`).
-const ENCRYPTION_ALGORITHMS: &str = "chacha20-poly1305@openssh.com";
-
-/// Build this server's KEXINIT message: the fixed algorithm offer above, a fresh random cookie,
-/// no compression, and no MAC or language preferences (chacha20-poly1305@openssh.com is an AEAD,
-/// so RFC 4253's `mac_algorithms_*` name-lists are sent empty rather than naming a separate MAC).
+/// Build this server's KEXINIT message: the algorithm offer rendered from the `algorithms`
+/// tables, a fresh random cookie, no compression, and no MAC or language preferences
+/// (chacha20-poly1305@openssh.com is an AEAD, so RFC 4253's `mac_algorithms_*` name-lists are sent
+/// empty rather than naming a separate MAC).
 /// Returns the raw message payload (starting with `SSH_MSG_KEXINIT`) - the same bytes
 /// `write_packet_unencrypted`'s `payload` argument expects, and the same bytes a later task feeds
 /// to the exchange-hash computation as `I_S`.
@@ -482,13 +502,17 @@ pub fn build_kexinit() -> Vec<u8> {
     let mut cookie = [0u8; 16];
     rand::rng().fill(&mut cookie);
 
+    let ciphers = algorithms::name_list::<algorithms::Cipher>();
     let mut out = Vec::new();
     out.push(SSH_MSG_KEXINIT);
     out.extend_from_slice(&cookie);
-    write_name_list(&mut out, KEX_ALGORITHMS);
-    write_name_list(&mut out, SERVER_HOST_KEY_ALGORITHMS);
-    write_name_list(&mut out, ENCRYPTION_ALGORITHMS); // encryption_algorithms_client_to_server
-    write_name_list(&mut out, ENCRYPTION_ALGORITHMS); // encryption_algorithms_server_to_client
+    write_name_list(&mut out, &algorithms::name_list::<algorithms::Kex>());
+    write_name_list(
+        &mut out,
+        &algorithms::name_list::<algorithms::HostKeyAlgorithm>(),
+    );
+    write_name_list(&mut out, &ciphers); // encryption_algorithms_client_to_server
+    write_name_list(&mut out, &ciphers); // encryption_algorithms_server_to_client
     write_name_list(&mut out, ""); // mac_algorithms_client_to_server (implicit with AEAD)
     write_name_list(&mut out, ""); // mac_algorithms_server_to_client
     write_name_list(&mut out, "none"); // compression_algorithms_client_to_server
@@ -533,7 +557,7 @@ pub fn parse_kexinit(payload: &[u8]) -> Result<KexInit, TransportError> {
     let compression_server_to_client = read_name_list(payload, &mut cursor)?;
     let _languages_client_to_server = read_name_list(payload, &mut cursor)?;
     let _languages_server_to_client = read_name_list(payload, &mut cursor)?;
-    let _first_kex_packet_follows = read_u8(payload, &mut cursor)?;
+    let first_kex_packet_follows = read_u8(payload, &mut cursor)? != 0;
     let _reserved = read_u32(payload, &mut cursor)?;
 
     Ok(KexInit {
@@ -546,7 +570,55 @@ pub fn parse_kexinit(payload: &[u8]) -> Result<KexInit, TransportError> {
         mac_server_to_client,
         compression_client_to_server,
         compression_server_to_client,
+        first_kex_packet_follows,
     })
+}
+
+// ---- SSH_MSG_DISCONNECT (RFC 4253 section 11.1) ----
+
+/// The payload of an `SSH_MSG_DISCONNECT`: reason code, human-readable description, and an empty
+/// language tag.
+pub fn build_disconnect(reason: u32, description: &str) -> Vec<u8> {
+    let mut out = vec![SSH_MSG_DISCONNECT];
+    out.extend_from_slice(&reason.to_be_bytes());
+    write_name_list(&mut out, description);
+    write_name_list(&mut out, "");
+    out
+}
+
+/// How long `refuse_and_close` waits for the peer to finish sending before it lets go.
+const REFUSAL_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+/// The most `refuse_and_close` reads and discards from a peer that keeps sending.
+const REFUSAL_DRAIN_MAX_BYTES: usize = 64 * 1024;
+
+/// Tell the peer why it is being refused and close, so a client that cannot be served is told
+/// rather than left waiting. Sends `SSH_MSG_DISCONNECT`, shuts the write side, then reads and
+/// discards whatever the peer already has in flight (bounded in time and bytes): closing a socket
+/// with unread data makes the kernel answer with a reset, and a reset can overtake the DISCONNECT
+/// so the peer never reads it.
+pub async fn refuse_and_close<S>(
+    stream: &mut S,
+    reason: u32,
+    description: &str,
+) -> Result<(), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_packet_unencrypted(stream, &build_disconnect(reason, description)).await?;
+    stream.flush().await?;
+    stream.shutdown().await?;
+    let drain = async {
+        let mut buf = [0u8; 1024];
+        let mut total = 0usize;
+        while total < REFUSAL_DRAIN_MAX_BYTES {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(REFUSAL_DRAIN, drain).await;
+    Ok(())
 }
 
 fn read_u8(data: &[u8], cursor: &mut usize) -> Result<u8, TransportError> {

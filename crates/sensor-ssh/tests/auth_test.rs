@@ -128,6 +128,8 @@ fn handshake_end_event_is_unscored_telemetry_with_a_sanitized_client_version() {
         CaptureEnd::MalformedInput,
         "key_exchange",
         Some(evil),
+        None,
+        None,
         std::time::Duration::from_millis(42),
     );
     assert_eq!(event.signal_type, sensor_wire::SIGNAL_HONEYPOT_SESSION_END);
@@ -140,6 +142,8 @@ fn handshake_end_event_is_unscored_telemetry_with_a_sanitized_client_version() {
     let none = state.handshake_end_event(
         CaptureEnd::PeerClosed,
         "version_exchange",
+        None,
+        None,
         None,
         std::time::Duration::ZERO,
     );

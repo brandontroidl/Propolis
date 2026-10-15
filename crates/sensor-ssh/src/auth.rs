@@ -29,8 +29,9 @@ use sensor_wire::{
     SIGNAL_HONEYPOT_SESSION_END, SensorEvent, WIRE_VERSION,
 };
 
+use crate::transport::algorithms::NegotiationFailure;
 use crate::transport::{
-    SSH_MSG_USERAUTH_FAILURE, SSH_MSG_USERAUTH_REQUEST, SSH_MSG_USERAUTH_SUCCESS,
+    KexInit, SSH_MSG_USERAUTH_FAILURE, SSH_MSG_USERAUTH_REQUEST, SSH_MSG_USERAUTH_SUCCESS,
 };
 
 /// Cap applied to every attacker-controlled string this module embeds in an event (`username`,
@@ -38,6 +39,12 @@ use crate::transport::{
 /// padding either field. Matches `transport::MAX_VERSION_LINE_LEN`, this crate's existing
 /// convention for "a generously bounded protocol string."
 const MAX_METADATA_STRING_LEN: usize = 255;
+
+/// Cap on each algorithm list of a client's KEXINIT recorded in a handshake-end event. A real
+/// client's longest list (OpenSSH's key exchange list) runs to about 500 bytes; the cap leaves
+/// room for that twice over and no more, because the lists are attacker-controlled and the wire
+/// allows 35000 bytes of them.
+const MAX_OFFER_LIST_LEN: usize = 1024;
 
 /// Per-connection user-authentication state. Constructed once, immediately after transport
 /// establishment (key exchange + `SSH_MSG_NEWKEYS`), with the connection's real parameters -
@@ -137,12 +144,18 @@ impl AuthState {
     /// The `honeypot_session_end` event for a connection that ended before the encrypted
     /// transport existed (banner grab, bare probe, garbage or stalled handshake). `end` is the
     /// reason, `phase` the handshake step it ended in, `client_version` the identification string
-    /// when one was received (sanitized: it is attacker-controlled). Telemetry only, never scored.
+    /// when one was received (sanitized: it is attacker-controlled). `offer` is the client's
+    /// KEXINIT once it parsed: its algorithm lists are recorded as `client_kex` (sanitized and
+    /// bounded) so an operator can see what a client that never got a session was asking for, and
+    /// `failure` names the list that shared nothing with the sensor's as `negotiation_failed`.
+    /// Telemetry only, never scored.
     pub fn handshake_end_event(
         &self,
         end: CaptureEnd,
         phase: &str,
         client_version: Option<&str>,
+        offer: Option<&KexInit>,
+        failure: Option<NegotiationFailure>,
         elapsed: Duration,
     ) -> SensorEvent {
         let mut metadata = session_end_metadata("ssh", end, elapsed);
@@ -150,6 +163,22 @@ impl AuthState {
         if let Some(version) = client_version {
             metadata["client_version"] =
                 serde_json::Value::String(sanitize_value(version, MAX_METADATA_STRING_LEN));
+        }
+        if let Some(offer) = offer {
+            let list = |names: &str| sanitize_value(names, MAX_OFFER_LIST_LEN);
+            metadata["client_kex"] = serde_json::json!({
+                "kex": list(&offer.kex_algorithms),
+                "host_key": list(&offer.server_host_key_algorithms),
+                "cipher_c2s": list(&offer.encryption_client_to_server),
+                "cipher_s2c": list(&offer.encryption_server_to_client),
+                "mac_c2s": list(&offer.mac_client_to_server),
+                "mac_s2c": list(&offer.mac_server_to_client),
+                "compression_c2s": list(&offer.compression_client_to_server),
+                "compression_s2c": list(&offer.compression_server_to_client),
+            });
+        }
+        if let Some(failure) = failure {
+            metadata["negotiation_failed"] = serde_json::Value::String(failure.label().to_owned());
         }
         SensorEvent {
             v: WIRE_VERSION,

@@ -870,13 +870,28 @@ Impersonates OpenSSH on Ubuntu (conventional port 22). Performs a full real SSH
 handshake using the crate's own crypto primitives, then presents the fake shell and
 captures SCP/SFTP transfers.
 
-- **Handshake / crypto** (fixed offer): KEX `curve25519-sha256`, host key
-  `ssh-ed25519` (ed25519, loaded-or-generated and persisted so it is stable across
-  restarts), cipher `chacha20-poly1305@openssh.com` both directions (AEAD),
-  compression `none` (`crates/sensor-ssh/src/transport/mod.rs#KEX_ALGORITHMS`, `crates/sensor-ssh/src/transport/mod.rs#SERVER_HOST_KEY_ALGORITHMS`, `crates/sensor-ssh/src/transport/mod.rs#ENCRYPTION_ALGORITHMS`, `crates/sensor-ssh/src/transport/mod.rs#build_kexinit`,
-  `crates/sensor-ssh/src/main.rs#main`). Banner default is the persona OpenSSH version
-  (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability from the minimal
-  KEXINIT offer is a tracked follow-up (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`).
+- **Handshake / crypto.** The offer is rendered from one table per KEXINIT slot
+  (`crates/sensor-ssh/src/transport/algorithms.rs#Kex`,
+  `crates/sensor-ssh/src/transport/algorithms.rs#HostKeyAlgorithm`,
+  `crates/sensor-ssh/src/transport/algorithms.rs#Cipher`,
+  `crates/sensor-ssh/src/transport/mod.rs#build_kexinit`), and the client's lists are negotiated
+  against the same tables per RFC 4253 section 7.1: for each list, the first algorithm the
+  client names that the sensor also supports
+  (`crates/sensor-ssh/src/transport/algorithms.rs#negotiate`). Currently: KEX
+  `curve25519-sha256` and its pre-standard name `curve25519-sha256@libssh.org`, host key
+  `ssh-ed25519` (loaded-or-generated and persisted so it is stable across restarts), cipher
+  `chacha20-poly1305@openssh.com` both directions (AEAD), compression `none`
+  (`crates/sensor-ssh/src/main.rs#main`). Banner default is the persona OpenSSH version
+  (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability
+  from the narrower KEXINIT offer is a tracked follow-up.
+- **No common algorithm.** A client whose lists share nothing with the sensor's (any of key
+  exchange, host key, either cipher, compression) is sent `SSH_MSG_DISCONNECT` with reason 3
+  (key exchange failed) and the description `no matching key exchange method found` (or the host
+  key, cipher or compression equivalent), and the connection is closed
+  (`crates/sensor-ssh/src/transport/mod.rs#refuse_and_close`). Before this it was sent nothing and
+  held its connection until the idle timeout. A `first_kex_packet_follows` guess that the
+  negotiation shows wrong is dropped unread, as RFC 4253 section 7 requires; a right guess is
+  used as the exchange's first packet.
 - **Connection event at accept.** `honeypot_connection` (`authenticated=false`) is emitted
   once per connection at accept, before the version exchange, like every other TCP sensor
   (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/auth.rs#AuthState::emit_connection_event`).
@@ -889,7 +904,13 @@ captures SCP/SFTP transfers.
   (telemetry, never scored) with `end_reason` (`peer_closed`, `idle_timeout`, `malformed_input`,
   or `transport_error`), `phase` (`version_exchange` or `key_exchange`), `duration_ms`, and
   `client_version` (sanitized, bounded) when the client's identification line arrived
-  (`crates/sensor-ssh/src/auth.rs#AuthState::handshake_end_event`). A connection that completes
+  (`crates/sensor-ssh/src/auth.rs#AuthState::handshake_end_event`). Once the client's KEXINIT has
+  parsed, the event also carries `client_kex`, the client's offered lists (`kex`, `host_key`,
+  `cipher_c2s`, `cipher_s2c`, `mac_c2s`, `mac_s2c`, `compression_c2s`, `compression_s2c`, each
+  sanitized and cut at 1024 bytes), so an operator can see which algorithms a client that never
+  got a session was asking for. A refusal for no common algorithm ends `malformed_input` (the
+  framework has no refusal ending) with `negotiation_failed` naming the list that failed:
+  `kex`, `host_key`, `cipher_c2s`, `cipher_s2c` or `compression`. A connection that completes
   key exchange emits none (its later endings are recorded on the capture events), and none is
   emitted when `max_duration` cancels the handler. The sensor still proceeds into key exchange
   after a non-`SSH-` identification line; the line is not rejected.

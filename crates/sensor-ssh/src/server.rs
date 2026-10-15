@@ -42,6 +42,7 @@ use crate::output::{OUTPUT_STALL_LIMIT, OutputLedger, Registration};
 use crate::shell::{CommandResult, EmitContext, FakeShell, LineStep, OutputFd, onlcr};
 use crate::timeout_stream::TimeoutStream;
 use crate::transfer::{ScpReceiver, SftpHandler};
+use crate::transport::algorithms::{NegotiationFailure, negotiate};
 use crate::transport::cipher::TransportCipher;
 use crate::transport::kex::perform_kex_server;
 use crate::transport::{
@@ -710,6 +711,8 @@ async fn handle_session(
     // event below, with the client version if it got that far.
     let mut handshake_phase = HandshakePhase::VersionExchange;
     let mut client_version_seen: Option<String> = None;
+    let mut client_offer_seen: Option<transport::KexInit> = None;
+    let mut negotiation_failure: Option<NegotiationFailure> = None;
     let handshake: Result<_, transport::TransportError> = async {
         // ---- Phase 1: version exchange ----
         let (client_version, server_version) =
@@ -725,7 +728,30 @@ async fn handle_session(
 
         // Read client's KEXINIT (c2s packet #0).
         let client_kexinit_pkt = transport::read_packet_unencrypted(&mut stream).await?;
-        let _client_kexinit = transport::parse_kexinit(&client_kexinit_pkt.payload)?;
+        let client_kexinit = transport::parse_kexinit(&client_kexinit_pkt.payload)?;
+        let client_kexinit = client_offer_seen.insert(client_kexinit);
+
+        // A client whose lists share nothing with ours is told so and let go: left unanswered it
+        // waits out the idle timeout, and that silence is how every scanner that spoke only
+        // algorithms we lacked was lost.
+        let negotiated = match negotiate(&client_kexinit.lists()) {
+            Ok(negotiated) => negotiated,
+            Err(failure) => {
+                negotiation_failure = Some(failure);
+                transport::refuse_and_close(
+                    &mut stream,
+                    transport::SSH_DISCONNECT_KEY_EXCHANGE_FAILED,
+                    failure.description(),
+                )
+                .await?;
+                return Err(transport::TransportError::Negotiation(failure));
+            }
+        };
+        if negotiated.discard_guess {
+            // The client bet on its own first choices and lost; the packet it sent behind its
+            // KEXINIT is for an exchange we are not running (RFC 4253 section 7).
+            transport::read_packet_unencrypted(&mut stream).await?;
+        }
 
         // Read client's ECDH_INIT (c2s packet #1).
         let client_ecdh_init = transport::read_packet_unencrypted(&mut stream).await?;
@@ -763,6 +789,8 @@ async fn handle_session(
                 classify_read_failure(&e),
                 handshake_phase.label(),
                 client_version_seen.as_deref(),
+                client_offer_seen.as_ref(),
+                negotiation_failure,
                 started.elapsed(),
             );
             if let Err(append_err) = emitter.append(&end).await {
@@ -1975,9 +2003,12 @@ fn classify_read_failure(err: &transport::TransportError) -> CaptureEnd {
             std::io::ErrorKind::TimedOut => CaptureEnd::IdleTimeout,
             _ => CaptureEnd::TransportError,
         },
+        // Recorded as malformed input because the framework's `CaptureEnd` has no variant for a
+        // refusal; the `negotiation_failed` key on the event names the list that failed.
         transport::TransportError::TooLarge { .. }
         | transport::TransportError::Malformed(_)
-        | transport::TransportError::InvalidEncoding(_) => CaptureEnd::MalformedInput,
+        | transport::TransportError::InvalidEncoding(_)
+        | transport::TransportError::Negotiation(_) => CaptureEnd::MalformedInput,
     }
 }
 

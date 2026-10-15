@@ -15,23 +15,30 @@ use tokio::net::TcpListener;
 const GATEWAY_DNS: &str = "gateway.local";
 const COLLECTOR_ID: &str = "collector-test";
 
-/// (ca, gateway cert, gateway key, collector cert, collector key)
-fn mint(dir: &Path) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+struct Certs {
+    ca: Vec<u8>,
+    gateway_cert: Vec<u8>,
+    gateway_key: Vec<u8>,
+    collector_cert: Vec<u8>,
+    collector_key: Vec<u8>,
+}
+
+fn mint(dir: &Path) -> Certs {
     provision_certs::provision(dir, GATEWAY_DNS, COLLECTOR_ID).expect("provision");
     let read = |name: &str| std::fs::read(dir.join(name)).expect("read cert file");
-    (
-        read("ca.crt"),
-        read("gateway.crt"),
-        read("gateway.key"),
-        read(&format!("{COLLECTOR_ID}.crt")),
-        read(&format!("{COLLECTOR_ID}.key")),
-    )
+    Certs {
+        ca: read("ca.crt"),
+        gateway_cert: read("gateway.crt"),
+        gateway_key: read("gateway.key"),
+        collector_cert: read(&format!("{COLLECTOR_ID}.crt")),
+        collector_key: read(&format!("{COLLECTOR_ID}.key")),
+    }
 }
 
 #[tokio::test]
 async fn a_gateway_that_accepts_tcp_but_never_handshakes_times_out() {
     let dir = tempfile::tempdir().unwrap();
-    let (ca, _gc, _gk, cc, ck) = mint(dir.path());
+    let c = mint(dir.path());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _held = tokio::spawn(async move {
@@ -40,7 +47,7 @@ async fn a_gateway_that_accepts_tcp_but_never_handshakes_times_out() {
             held.push(s);
         }
     });
-    let tls = client_config(&ca, &cc, &ck).unwrap();
+    let tls = client_config(&c.ca, &c.collector_cert, &c.collector_key).unwrap();
 
     let started = Instant::now();
     let res = tokio::time::timeout(
@@ -49,9 +56,7 @@ async fn a_gateway_that_accepts_tcp_but_never_handshakes_times_out() {
     )
     .await
     .expect("connect never returned: the dial has no deadline");
-    let err = res
-        .err()
-        .expect("a silent gateway cannot complete a handshake");
+    let err = res.expect_err("a silent gateway cannot complete a handshake");
     assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
     assert!(started.elapsed() < Duration::from_secs(3));
 }
@@ -60,8 +65,10 @@ async fn a_gateway_that_accepts_tcp_but_never_handshakes_times_out() {
 #[tokio::test]
 async fn a_batch_the_gateway_never_acks_times_out() {
     let dir = tempfile::tempdir().unwrap();
-    let (ca, gc, gk, cc, ck) = mint(dir.path());
-    let acceptor = tokio_rustls::TlsAcceptor::from(server_config(&ca, &gc, &gk).unwrap());
+    let c = mint(dir.path());
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        server_config(&c.ca, &c.gateway_cert, &c.gateway_key).unwrap(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _server = tokio::spawn(async move {
@@ -74,10 +81,13 @@ async fn a_batch_the_gateway_never_acks_times_out() {
             }
         }
     });
-    let mut stream =
-        ShipperClient::connect(addr, client_config(&ca, &cc, &ck).unwrap(), GATEWAY_DNS)
-            .await
-            .unwrap();
+    let mut stream = ShipperClient::connect(
+        addr,
+        client_config(&c.ca, &c.collector_cert, &c.collector_key).unwrap(),
+        GATEWAY_DNS,
+    )
+    .await
+    .unwrap();
     let frame = encode_frame(&Batch::new(1, [0u8; 32], vec![b"one".to_vec()]));
 
     let started = Instant::now();
@@ -87,7 +97,7 @@ async fn a_batch_the_gateway_never_acks_times_out() {
     )
     .await
     .expect("send_batch never returned: the ack wait has no deadline");
-    let err = res.err().expect("no ack was sent");
+    let err = res.expect_err("no ack was sent");
     assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
     assert!(started.elapsed() < Duration::from_secs(3));
 }

@@ -43,8 +43,8 @@ use crate::shell::{CommandResult, EmitContext, FakeShell, LineStep, OutputFd, on
 use crate::timeout_stream::TimeoutStream;
 use crate::transfer::{ScpReceiver, SftpHandler};
 use crate::transport::algorithms::{NegotiationFailure, negotiate};
-use crate::transport::cipher::TransportCipher;
-use crate::transport::kex::perform_kex_server;
+use crate::transport::kex::{Transcript, perform_kex_server};
+use crate::transport::packet_cipher::PacketCipher;
 use crate::transport::{
     self, SSH_MSG_CHANNEL_CLOSE, SSH_MSG_CHANNEL_DATA, SSH_MSG_CHANNEL_EOF, SSH_MSG_CHANNEL_OPEN,
     SSH_MSG_CHANNEL_REQUEST, SSH_MSG_CHANNEL_SUCCESS, SSH_MSG_CHANNEL_WINDOW_ADJUST,
@@ -761,11 +761,14 @@ async fn handle_session(
         let session_keys = perform_kex_server(
             &mut stream,
             &host_key,
-            &client_kexinit_pkt.payload,
-            &server_kexinit,
-            &client_version,
-            &server_version,
+            &Transcript {
+                client_version: &client_version,
+                server_version: &server_version,
+                client_kexinit: &client_kexinit_pkt.payload,
+                server_kexinit: &server_kexinit,
+            },
             &client_ecdh_init.payload,
+            &negotiated,
         )
         .await?;
 
@@ -2015,7 +2018,7 @@ fn classify_read_failure(err: &transport::TransportError) -> CaptureEnd {
 /// Write one encrypted packet and increment the sequence number.
 async fn write_encrypted<W: tokio::io::AsyncWrite + Unpin>(
     stream: &mut W,
-    cipher: &mut TransportCipher,
+    cipher: &mut PacketCipher,
     seq: &mut u32,
     payload: &[u8],
 ) -> Result<(), transport::TransportError> {
@@ -2033,7 +2036,7 @@ fn channel_recipient(payload: &[u8], expected_type: u8) -> Option<u32> {
 
 async fn flush_channel_output(
     stream: &mut TimeoutStream<TcpStream>,
-    cipher: &mut TransportCipher,
+    cipher: &mut PacketCipher,
     seq: &mut u32,
     channel: u32,
     flow: &mut ChannelFlow,

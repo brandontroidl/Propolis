@@ -153,11 +153,25 @@ proptest::proptest! {
 
 // ---- Task 11: key exchange + encrypted channel ----
 
+use sensor_ssh::transport::algorithms::{Cipher, HostKeyAlgorithm, Kex, Mac, Negotiated};
+
+fn negotiated(cipher: Cipher, mac: Option<Mac>) -> Negotiated {
+    Negotiated {
+        kex: Kex::Curve25519Sha256,
+        host_key: HostKeyAlgorithm::SshEd25519,
+        cipher_client_to_server: cipher,
+        cipher_server_to_client: cipher,
+        mac_client_to_server: mac,
+        mac_server_to_client: mac,
+        discard_guess: false,
+    }
+}
+
 #[tokio::test]
 async fn key_exchange_completes_and_encrypted_channel_works() {
     use sensor_ssh::hostkey::HostKey;
     use sensor_ssh::transport::kex::{
-        build_client_ecdh_init, complete_kex_client, perform_kex_server,
+        Transcript, build_client_ecdh_init, complete_kex_client, perform_kex_server,
     };
     use sensor_ssh::transport::{
         SSH_MSG_IGNORE, SSH_MSG_NEWKEYS, build_kexinit, read_packet_encrypted,
@@ -180,11 +194,14 @@ async fn key_exchange_completes_and_encrypted_channel_works() {
             let session_keys = perform_kex_server(
                 &mut server_stream,
                 &host_key,
-                &client_kexinit_pkt.payload,
-                &server_kexinit,
-                "SSH-2.0-TestClient",
-                "SSH-2.0-TestServer",
+                &Transcript {
+                    client_version: "SSH-2.0-TestClient",
+                    server_version: "SSH-2.0-TestServer",
+                    client_kexinit: &client_kexinit_pkt.payload,
+                    server_kexinit: &server_kexinit,
+                },
                 &client_ecdh_init.payload,
+                &negotiated(Cipher::Chacha20Poly1305, None),
             )
             .await
             .unwrap();
@@ -210,10 +227,13 @@ async fn key_exchange_completes_and_encrypted_channel_works() {
     let client_keys = complete_kex_client(
         client_ephemeral,
         &ecdh_reply.payload,
-        &client_kexinit,
-        &server_kexinit_pkt.payload,
-        "SSH-2.0-TestClient",
-        "SSH-2.0-TestServer",
+        &Transcript {
+            client_version: "SSH-2.0-TestClient",
+            server_version: "SSH-2.0-TestServer",
+            client_kexinit: &client_kexinit,
+            server_kexinit: &server_kexinit_pkt.payload,
+        },
+        &negotiated(Cipher::Chacha20Poly1305, None),
     )
     .unwrap();
     write_packet_unencrypted(&mut client_stream, &[SSH_MSG_NEWKEYS])
@@ -245,20 +265,22 @@ fn session_key_derivation_deterministic() {
     let shared_secret = [0x42u8; 32];
     let exchange_hash = [0x43u8; 32];
     let session_id = exchange_hash;
-    let keys1 = derive_keys(&shared_secret, &exchange_hash, &session_id);
-    let keys2 = derive_keys(&shared_secret, &exchange_hash, &session_id);
-    assert_eq!(keys1.client_to_server_key, keys2.client_to_server_key);
-    assert_eq!(keys1.server_to_client_key, keys2.server_to_client_key);
+    let n = negotiated(Cipher::Chacha20Poly1305, None);
+    let keys1 = derive_keys(&shared_secret, &exchange_hash, &session_id, &n);
+    let keys2 = derive_keys(&shared_secret, &exchange_hash, &session_id, &n);
+    assert_eq!(keys1.client_to_server.key, keys2.client_to_server.key);
+    assert_eq!(keys1.server_to_client.key, keys2.server_to_client.key);
     assert_eq!(keys1.session_id, keys2.session_id);
 }
 
 #[test]
 fn session_key_derivation_different_inputs_produce_different_keys() {
     use sensor_ssh::transport::keys::derive_keys;
-    let keys_a = derive_keys(&[0x42u8; 32], &[0x43u8; 32], &[0x43u8; 32]);
-    let keys_b = derive_keys(&[0x99u8; 32], &[0x43u8; 32], &[0x43u8; 32]);
+    let n = negotiated(Cipher::Chacha20Poly1305, None);
+    let keys_a = derive_keys(&[0x42u8; 32], &[0x43u8; 32], &[0x43u8; 32], &n);
+    let keys_b = derive_keys(&[0x99u8; 32], &[0x43u8; 32], &[0x43u8; 32], &n);
     assert_ne!(
-        keys_a.client_to_server_key, keys_b.client_to_server_key,
+        keys_a.client_to_server.key, keys_b.client_to_server.key,
         "different shared secrets must produce different keys"
     );
 }
@@ -266,12 +288,137 @@ fn session_key_derivation_different_inputs_produce_different_keys() {
 #[test]
 fn session_keys_cipher_split_is_correct_length() {
     use sensor_ssh::transport::keys::derive_keys;
-    let keys = derive_keys(&[0x11u8; 32], &[0x22u8; 32], &[0x22u8; 32]);
-    assert_eq!(keys.client_to_server_key.len(), 64);
-    assert_eq!(keys.server_to_client_key.len(), 64);
+    let n = negotiated(Cipher::Chacha20Poly1305, None);
+    let keys = derive_keys(&[0x11u8; 32], &[0x22u8; 32], &[0x22u8; 32], &n);
+    assert_eq!(keys.client_to_server.key.len(), 64);
+    assert_eq!(keys.server_to_client.key.len(), 64);
     // Must be able to construct ciphers without panic.
     let _c2s = keys.client_to_server_cipher();
     let _s2c = keys.server_to_client_cipher();
+}
+
+/// Every cipher, with every MAC it can be paired with, carries packets of every size in both
+/// directions over a long run of sequence numbers. Both ends derive their keys from the same
+/// inputs, as a real exchange does, so this proves the framing and the key schedule are
+/// self-consistent; the system OpenSSH client (`kex_negotiation.rs`) is what proves they are
+/// the SSH ones.
+#[tokio::test]
+async fn every_negotiable_cipher_and_mac_round_trips_packets() {
+    use sensor_ssh::transport::algorithms::Algorithm;
+    use sensor_ssh::transport::keys::derive_keys;
+    use sensor_ssh::transport::{read_packet_encrypted, write_packet_encrypted};
+
+    let mut combos = Vec::new();
+    for &cipher in Cipher::ALL {
+        if cipher.is_aead() {
+            combos.push((cipher, None));
+        } else {
+            combos.extend(Mac::ALL.iter().map(|&mac| (cipher, Some(mac))));
+        }
+    }
+    // Three AEADs, and each of the three CTR key sizes with each of the six MACs.
+    assert_eq!(combos.len(), 3 + 3 * 6, "{combos:?}");
+
+    for (cipher, mac) in combos {
+        let n = negotiated(cipher, mac);
+        let keys = derive_keys(&[0x5au8; 32], &[0xa5u8; 32], &[0xa5u8; 32], &n);
+        let peer = derive_keys(&[0x5au8; 32], &[0xa5u8; 32], &[0xa5u8; 32], &n);
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let (mut tx_c2s, mut rx_c2s) = (
+            keys.client_to_server_cipher(),
+            peer.client_to_server_cipher(),
+        );
+        let (mut tx_s2c, mut rx_s2c) = (
+            keys.server_to_client_cipher(),
+            peer.server_to_client_cipher(),
+        );
+        for seq in 0..40u32 {
+            // The large sizes cost a debug build seconds across 21 combinations, and a size
+            // class needs no more than a few sequence numbers.
+            let sizes: &[usize] = if seq < 3 {
+                &[1, 2, 15, 16, 17, 31, 32, 33, 100, 1000, 20_000]
+            } else {
+                &[1, 15, 16, 17, 33, 100]
+            };
+            for &len in sizes {
+                let payload: Vec<u8> = (0..len).map(|i| (i as u32 ^ seq) as u8).collect();
+                write_packet_encrypted(&mut a, &mut tx_c2s, seq, &payload)
+                    .await
+                    .unwrap();
+                let got = read_packet_encrypted(&mut b, &mut rx_c2s, seq)
+                    .await
+                    .unwrap_or_else(|e| panic!("{cipher:?}/{mac:?} c2s seq {seq} len {len}: {e}"));
+                assert_eq!(got, payload, "{cipher:?}/{mac:?}");
+                write_packet_encrypted(&mut b, &mut tx_s2c, seq, &payload)
+                    .await
+                    .unwrap();
+                let got = read_packet_encrypted(&mut a, &mut rx_s2c, seq)
+                    .await
+                    .unwrap_or_else(|e| panic!("{cipher:?}/{mac:?} s2c seq {seq} len {len}: {e}"));
+                assert_eq!(got, payload, "{cipher:?}/{mac:?}");
+            }
+        }
+    }
+}
+
+/// A packet altered anywhere on the wire, or presented at the wrong sequence number, is refused
+/// by every cipher and MAC rather than decrypted to something.
+#[tokio::test]
+async fn every_cipher_and_mac_refuses_a_packet_that_was_altered() {
+    use sensor_ssh::transport::algorithms::Algorithm;
+    use sensor_ssh::transport::keys::derive_keys;
+    use sensor_ssh::transport::{read_packet_encrypted, write_packet_encrypted};
+    use tokio::io::AsyncWriteExt;
+
+    let mut combos = Vec::new();
+    for &cipher in Cipher::ALL {
+        if cipher.is_aead() {
+            combos.push((cipher, None));
+        } else {
+            combos.extend(Mac::ALL.iter().map(|&mac| (cipher, Some(mac))));
+        }
+    }
+    for (cipher, mac) in combos {
+        let n = negotiated(cipher, mac);
+        let payload = vec![0x41u8; 40];
+        // One wire image, then every byte of it flipped in turn, each against a fresh receiver.
+        let keys = derive_keys(&[7u8; 32], &[8u8; 32], &[8u8; 32], &n);
+        let mut tx = keys.client_to_server_cipher();
+        let (mut w, mut r) = tokio::io::duplex(1 << 16);
+        write_packet_encrypted(&mut w, &mut tx, 0, &payload)
+            .await
+            .unwrap();
+        drop(w);
+        let mut wire = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut r, &mut wire)
+            .await
+            .unwrap();
+        for i in 0..wire.len() {
+            let mut altered = wire.clone();
+            altered[i] ^= 0x01;
+            let rx_keys = derive_keys(&[7u8; 32], &[8u8; 32], &[8u8; 32], &n);
+            let mut rx = rx_keys.client_to_server_cipher();
+            let (mut w, mut r) = tokio::io::duplex(1 << 16);
+            w.write_all(&altered).await.unwrap();
+            drop(w);
+            let got = read_packet_encrypted(&mut r, &mut rx, 0).await;
+            assert!(
+                got.is_err(),
+                "{cipher:?}/{mac:?}: a flip at byte {i} was accepted ({got:?})"
+            );
+        }
+        // Wrong sequence number: the MAC, tag or nonce no longer fits.
+        let rx_keys = derive_keys(&[7u8; 32], &[8u8; 32], &[8u8; 32], &n);
+        let mut rx = rx_keys.client_to_server_cipher();
+        let (mut w, mut r) = tokio::io::duplex(1 << 16);
+        w.write_all(&wire).await.unwrap();
+        drop(w);
+        let got = read_packet_encrypted(&mut r, &mut rx, 1).await;
+        // GCM binds the packet to its position by its invocation counter, not the sequence
+        // number, so it alone accepts a repeat of seq 0 at "seq 1".
+        let is_gcm = matches!(cipher, Cipher::Aes128Gcm | Cipher::Aes256Gcm);
+        assert_eq!(got.is_err(), !is_gcm, "{cipher:?}/{mac:?}: wrong seq");
+    }
 }
 
 #[test]

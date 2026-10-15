@@ -1,6 +1,6 @@
-//! Algorithm negotiation (RFC 4253 section 7.1) seen from the wire, the only vantage that cannot
-//! share a bug with the server: a hand-rolled client that offers whatever lists a test wants, and
-//! the system OpenSSH client restricted to one algorithm at a time.
+//! Algorithm negotiation (RFC 4253 section 7.1) seen from the wire: a hand-rolled client that
+//! offers whatever lists a test wants. The system OpenSSH client, restricted to one algorithm at a
+//! time, is in `openssh_interop.rs`.
 //!
 //! Live evidence the file answers: every PuTTY-banner and Go-banner scanner abandoned key exchange
 //! with the sensor and got KEXINIT then silence, because the sensor offered one algorithm per slot
@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sensor_framework::{ConnectionBounds, WanResolver};
+use sensor_ssh::transport::algorithms::{Cipher, HostKeyAlgorithm, Kex, Negotiated};
+use sensor_ssh::transport::kex::Transcript;
 use sensor_ssh::transport::{
     SSH_MSG_DISCONNECT, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS, SshPacket, kex, parse_kexinit,
     read_packet_encrypted, read_packet_unencrypted, write_packet_encrypted,
@@ -319,10 +321,21 @@ async fn complete_exchange(
     let keys = kex::complete_kex_client(
         secret,
         &reply.payload,
-        client_kexinit,
-        server_kexinit,
-        client_version,
-        server_version,
+        &Transcript {
+            client_version,
+            server_version,
+            client_kexinit,
+            server_kexinit,
+        },
+        &Negotiated {
+            kex: Kex::Curve25519Sha256,
+            host_key: HostKeyAlgorithm::SshEd25519,
+            cipher_client_to_server: Cipher::Chacha20Poly1305,
+            cipher_server_to_client: Cipher::Chacha20Poly1305,
+            mac_client_to_server: None,
+            mac_server_to_client: None,
+            discard_guess: false,
+        },
     )
     .unwrap();
     let newkeys = read_packet_unencrypted(stream).await.unwrap();
@@ -347,66 +360,4 @@ async fn complete_exchange(
     .expect("no SERVICE_ACCEPT")
     .expect("the sensor and the client derived different keys");
     assert_eq!(accept[0], SSH_MSG_SERVICE_ACCEPT);
-}
-
-// ---- the system OpenSSH client, restricted to one algorithm at a time ----
-
-/// Run `ssh` against the sensor with `options` appended and `echo interop-ok` as the command.
-/// The password goes through `SSH_ASKPASS`, so no `sshpass` is needed. Fails (not skips) when
-/// there is no `ssh` binary: an interop test that silently does not run proves nothing.
-async fn openssh_exec(addr: SocketAddr, dir: &Path, options: &[&str]) -> std::process::Output {
-    let askpass = dir.join("askpass.sh");
-    std::fs::write(&askpass, "#!/bin/sh\necho interop\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let options: Vec<String> = options.iter().map(|s| s.to_string()).collect();
-    let port = addr.port().to_string();
-    tokio::task::spawn_blocking(move || {
-        std::process::Command::new("ssh")
-            .args(["-F", "/dev/null", "-p", &port])
-            .args(["-o", "StrictHostKeyChecking=no"])
-            .args(["-o", "UserKnownHostsFile=/dev/null"])
-            .args(["-o", "GlobalKnownHostsFile=/dev/null"])
-            .args(["-o", "PreferredAuthentications=password"])
-            .args(["-o", "PubkeyAuthentication=no"])
-            .args(["-o", "NumberOfPasswordPrompts=1"])
-            .args(["-o", "ConnectTimeout=10"])
-            .args(["-o", "LogLevel=ERROR"])
-            .args(&options)
-            .args(["root@127.0.0.1", "echo", "interop-ok"])
-            .env("SSH_ASKPASS", &askpass)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env_remove("SSH_AUTH_SOCK")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("the system `ssh` client is required for the interop tests")
-    })
-    .await
-    .unwrap()
-}
-
-fn assert_interop(out: &std::process::Output, what: &str) {
-    assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("interop-ok"),
-        "{what}: status {:?}\nstdout: {}\nstderr: {}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[tokio::test]
-async fn openssh_connects_with_the_libssh_alias_of_curve25519() {
-    let dir = tempfile::tempdir().unwrap();
-    let (addr, handle) = start(dir.path()).await;
-    let out = openssh_exec(
-        addr,
-        dir.path(),
-        &["-o", "KexAlgorithms=curve25519-sha256@libssh.org"],
-    )
-    .await;
-    handle.abort();
-    assert_interop(&out, "curve25519-sha256@libssh.org");
 }

@@ -874,14 +874,19 @@ captures SCP/SFTP transfers.
   (`crates/sensor-ssh/src/transport/algorithms.rs#Kex`,
   `crates/sensor-ssh/src/transport/algorithms.rs#HostKeyAlgorithm`,
   `crates/sensor-ssh/src/transport/algorithms.rs#Cipher`,
+  `crates/sensor-ssh/src/transport/algorithms.rs#Mac`,
   `crates/sensor-ssh/src/transport/mod.rs#build_kexinit`), and the client's lists are negotiated
   against the same tables per RFC 4253 section 7.1: for each list, the first algorithm the
   client names that the sensor also supports
   (`crates/sensor-ssh/src/transport/algorithms.rs#negotiate`). Currently: KEX
   `curve25519-sha256` and its pre-standard name `curve25519-sha256@libssh.org`, host key
-  `ssh-ed25519` (loaded-or-generated and persisted so it is stable across restarts), cipher
-  `chacha20-poly1305@openssh.com` both directions (AEAD), compression `none`
-  (`crates/sensor-ssh/src/main.rs#main`). Banner default is the persona OpenSSH version
+  `ssh-ed25519` (loaded-or-generated and persisted so it is stable across restarts), ciphers in
+  OpenSSH 8.9's order `chacha20-poly1305@openssh.com`, `aes128-ctr`, `aes192-ctr`, `aes256-ctr`,
+  `aes128-gcm@openssh.com`, `aes256-gcm@openssh.com`, MACs `hmac-sha2-256-etm@openssh.com`,
+  `hmac-sha2-512-etm@openssh.com`, `hmac-sha1-etm@openssh.com`, `hmac-sha2-256`,
+  `hmac-sha2-512`, `hmac-sha1` (negotiated only for a direction whose cipher is not an AEAD),
+  compression `none` (`crates/sensor-ssh/src/main.rs#main`). Each cipher frames its own packets
+  (`crates/sensor-ssh/src/transport/packet_cipher.rs#PacketCipher`). Banner default is the persona OpenSSH version
   (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability
   from the narrower KEXINIT offer is a tracked follow-up.
 - **No common algorithm.** A client whose lists share nothing with the sensor's (any of key

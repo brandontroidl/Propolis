@@ -36,6 +36,7 @@ pub mod algorithms;
 pub mod cipher;
 pub mod kex;
 pub mod keys;
+pub mod packet_cipher;
 
 // ---- SSH message type constants (RFC 4253 section 12; channel types are RFC 4254) ----
 
@@ -70,7 +71,7 @@ pub const SSH_DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
 /// field itself (the 4-byte header value, which excludes only that header) on every read and
 /// write, so both ends of this server agree on the same bound and a forged header can be refused
 /// before it costs an allocation or a read.
-const MAX_PACKET_SIZE: u32 = 35_000;
+pub(crate) const MAX_PACKET_SIZE: u32 = 35_000;
 
 /// RFC 4253 section 6: `packet_length + padding_length`'s combined field-and-payload-and-padding
 /// total must be a multiple of this many bytes (the "none" cipher's block size, the only cipher
@@ -78,7 +79,7 @@ const MAX_PACKET_SIZE: u32 = 35_000;
 const BLOCK_SIZE: usize = 8;
 
 /// RFC 4253 section 6: "There MUST be at least four bytes of padding."
-const MIN_PADDING: usize = 4;
+pub(crate) const MIN_PADDING: usize = 4;
 
 /// RFC 4253 section 4.2: "the maximum length of the string is 255 characters, including the
 /// Carriage Return and Line Feed."
@@ -130,6 +131,8 @@ impl KexInit {
             server_host_key_algorithms: &self.server_host_key_algorithms,
             encryption_client_to_server: &self.encryption_client_to_server,
             encryption_server_to_client: &self.encryption_server_to_client,
+            mac_client_to_server: &self.mac_client_to_server,
+            mac_server_to_client: &self.mac_server_to_client,
             compression_client_to_server: &self.compression_client_to_server,
             compression_server_to_client: &self.compression_server_to_client,
             first_kex_packet_follows: self.first_kex_packet_follows,
@@ -291,94 +294,36 @@ fn encode_packet_unencrypted(payload: &[u8]) -> Result<Vec<u8>, TransportError> 
     Ok(packet)
 }
 
-// ---- Encrypted binary packet framing (chacha20-poly1305@openssh.com) ----
+// ---- Encrypted binary packet framing (RFC 4253 section 6; per-cipher in `packet_cipher`) ----
 
-/// Write `payload` as one encrypted SSH binary packet: build the inner framing
-/// (`padding_length || payload || padding`), encrypt it with `cipher` at sequence number `seq`,
-/// and write the result (encrypted length + encrypted body + Poly1305 tag) in a single call.
+/// Write `payload` as one encrypted SSH binary packet: frame and encrypt it with `cipher` at
+/// sequence number `seq`, and write the result in a single call.
 pub async fn write_packet_encrypted<W>(
     writer: &mut W,
-    cipher: &mut cipher::TransportCipher,
+    cipher: &mut packet_cipher::PacketCipher,
     seq: u32,
     payload: &[u8],
 ) -> Result<(), TransportError>
 where
     W: AsyncWrite + Unpin,
 {
-    let padding_length = compute_padding_length_encrypted(payload.len());
-    let inner_len = 1 + payload.len() + padding_length as usize;
-
-    let mut inner = Vec::with_capacity(inner_len);
-    inner.push(padding_length);
-    inner.extend_from_slice(payload);
-    let mut padding = vec![0u8; padding_length as usize];
-    rand::rng().fill(&mut padding[..]);
-    inner.extend_from_slice(&padding);
-
-    let encrypted = cipher.encrypt(seq, &inner);
-    writer.write_all(&encrypted).await?;
+    let wire = cipher.seal(seq, payload);
+    writer.write_all(&wire).await?;
     Ok(())
 }
 
-/// Read one encrypted SSH binary packet. Reads the 4-byte encrypted length field first,
-/// decrypts it to learn the packet body size, bounds-checks against `MAX_PACKET_SIZE`, reads
-/// the remaining encrypted body + 16-byte Poly1305 tag, authenticates and decrypts, then strips
-/// the inner framing to return only the payload.
+/// Read one encrypted SSH binary packet and return its payload. Each cipher reads its own wire
+/// format (see `packet_cipher`), bounding the claimed length against `MAX_PACKET_SIZE` before
+/// allocating anything from it.
 pub async fn read_packet_encrypted<R>(
     reader: &mut R,
-    cipher: &mut cipher::TransportCipher,
+    cipher: &mut packet_cipher::PacketCipher,
     seq: u32,
 ) -> Result<Vec<u8>, TransportError>
 where
     R: AsyncRead + Unpin,
 {
-    // Read the 4-byte encrypted length field.
-    let mut enc_len = [0u8; 4];
-    reader.read_exact(&mut enc_len).await?;
-
-    // Decrypt the length to know how many body bytes follow.
-    let packet_length = cipher.decrypt_length(seq, &enc_len);
-
-    if packet_length == 0 {
-        return Err(TransportError::Malformed(
-            "encrypted packet_length is zero; too small to hold padding_length",
-        ));
-    }
-    if packet_length > MAX_PACKET_SIZE {
-        return Err(TransportError::TooLarge {
-            claimed: packet_length,
-            max: MAX_PACKET_SIZE,
-        });
-    }
-
-    // Read the encrypted body + the 16-byte Poly1305 tag.
-    let remaining = packet_length as usize + cipher::TAG_LEN;
-    let mut rest = vec![0u8; remaining];
-    reader.read_exact(&mut rest).await?;
-
-    // Reassemble the full wire blob for the cipher's decrypt (which re-derives the header
-    // decryption and authenticates the whole thing).
-    let mut full = Vec::with_capacity(4 + remaining);
-    full.extend_from_slice(&enc_len);
-    full.extend_from_slice(&rest);
-
-    let inner = cipher
-        .decrypt(seq, &full)
-        .map_err(|_| TransportError::Malformed("encrypted packet authentication failed"))?;
-
-    // Parse inner framing: padding_length(1) || payload || padding.
-    if inner.is_empty() {
-        return Err(TransportError::Malformed("decrypted packet body is empty"));
-    }
-    let padding_length = inner[0] as usize;
-    let payload_len = (inner.len())
-        .checked_sub(1)
-        .and_then(|r| r.checked_sub(padding_length))
-        .ok_or(TransportError::Malformed(
-            "padding_length exceeds decrypted packet body",
-        ))?;
-
-    Ok(inner[1..1 + payload_len].to_vec())
+    cipher.open(reader, seq).await
 }
 
 /// Padding for unencrypted packets. RFC 4253 section 6: "the total length of
@@ -386,34 +331,7 @@ where
 /// the cipher block size or 8." The 4-byte packet_length prefix is included in the
 /// alignment target.
 fn compute_padding_length_unencrypted(payload_len: usize) -> u8 {
-    let base = 4 + 1 + payload_len;
-    let remainder = base % BLOCK_SIZE;
-    let mut padding_length = if remainder == 0 {
-        0
-    } else {
-        BLOCK_SIZE - remainder
-    };
-    if padding_length < MIN_PADDING {
-        padding_length += BLOCK_SIZE;
-    }
-    padding_length as u8
-}
-
-/// Padding for encrypted packets (chacha20-poly1305@openssh.com). The 4-byte packet_length
-/// is encrypted separately with the header key, so the body alignment (padding_length ||
-/// payload || padding) excludes it. The body must be a multiple of 8.
-fn compute_padding_length_encrypted(payload_len: usize) -> u8 {
-    let base = 1 + payload_len;
-    let remainder = base % BLOCK_SIZE;
-    let mut padding_length = if remainder == 0 {
-        0
-    } else {
-        BLOCK_SIZE - remainder
-    };
-    if padding_length < MIN_PADDING {
-        padding_length += BLOCK_SIZE;
-    }
-    padding_length as u8
+    packet_cipher::padding_for(4 + 1 + payload_len, BLOCK_SIZE)
 }
 
 // ---- Version exchange (RFC 4253 section 4.2) ----
@@ -492,9 +410,7 @@ where
 // ---- KEXINIT (RFC 4253 section 7.1) ----
 
 /// Build this server's KEXINIT message: the algorithm offer rendered from the `algorithms`
-/// tables, a fresh random cookie, no compression, and no MAC or language preferences
-/// (chacha20-poly1305@openssh.com is an AEAD, so RFC 4253's `mac_algorithms_*` name-lists are sent
-/// empty rather than naming a separate MAC).
+/// tables, a fresh random cookie, no compression and no language preferences.
 /// Returns the raw message payload (starting with `SSH_MSG_KEXINIT`) - the same bytes
 /// `write_packet_unencrypted`'s `payload` argument expects, and the same bytes a later task feeds
 /// to the exchange-hash computation as `I_S`.
@@ -503,6 +419,7 @@ pub fn build_kexinit() -> Vec<u8> {
     rand::rng().fill(&mut cookie);
 
     let ciphers = algorithms::name_list::<algorithms::Cipher>();
+    let macs = algorithms::name_list::<algorithms::Mac>();
     let mut out = Vec::new();
     out.push(SSH_MSG_KEXINIT);
     out.extend_from_slice(&cookie);
@@ -513,8 +430,8 @@ pub fn build_kexinit() -> Vec<u8> {
     );
     write_name_list(&mut out, &ciphers); // encryption_algorithms_client_to_server
     write_name_list(&mut out, &ciphers); // encryption_algorithms_server_to_client
-    write_name_list(&mut out, ""); // mac_algorithms_client_to_server (implicit with AEAD)
-    write_name_list(&mut out, ""); // mac_algorithms_server_to_client
+    write_name_list(&mut out, &macs); // mac_algorithms_client_to_server
+    write_name_list(&mut out, &macs); // mac_algorithms_server_to_client
     write_name_list(&mut out, "none"); // compression_algorithms_client_to_server
     write_name_list(&mut out, "none"); // compression_algorithms_server_to_client
     write_name_list(&mut out, ""); // languages_client_to_server
@@ -678,16 +595,23 @@ mod tests {
     }
 
     #[test]
-    fn compute_padding_length_encrypted_aligns_body_only() {
-        for payload_len in 0..=200usize {
-            let padding_length = compute_padding_length_encrypted(payload_len);
-            assert!(padding_length as usize >= MIN_PADDING);
-            let body = 1 + payload_len + padding_length as usize;
-            assert_eq!(
-                body % BLOCK_SIZE,
-                0,
-                "payload_len={payload_len}: encrypted body {body} not block-aligned"
-            );
+    fn padding_aligns_the_encrypted_part_to_each_ciphers_block() {
+        for block in [8usize, 16] {
+            for payload_len in 0..=200usize {
+                let padding_length = packet_cipher::padding_for(1 + payload_len, block);
+                assert!(padding_length as usize >= MIN_PADDING);
+                let body = 1 + payload_len + padding_length as usize;
+                assert_eq!(
+                    body % block,
+                    0,
+                    "block={block} payload_len={payload_len}: body {body} not aligned"
+                );
+                // The least padding that does: one block more would be waste.
+                assert!(
+                    (padding_length as usize) < MIN_PADDING + block,
+                    "block={block} payload_len={payload_len}: {padding_length} is more than needed"
+                );
+            }
         }
     }
 

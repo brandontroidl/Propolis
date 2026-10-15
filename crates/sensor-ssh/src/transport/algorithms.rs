@@ -63,9 +63,94 @@ algorithms! {
 }
 
 algorithms! {
-    /// Transport ciphers. Each is an AEAD, so none negotiates a separate MAC.
+    /// Transport ciphers, in OpenSSH 8.9's order. The AEADs (`Chacha20Poly1305`, the GCMs)
+    /// authenticate themselves and negotiate no MAC; the CTR modes need one.
     Cipher {
         Chacha20Poly1305 => "chacha20-poly1305@openssh.com",
+        Aes128Ctr => "aes128-ctr",
+        Aes192Ctr => "aes192-ctr",
+        Aes256Ctr => "aes256-ctr",
+        Aes128Gcm => "aes128-gcm@openssh.com",
+        Aes256Gcm => "aes256-gcm@openssh.com",
+    }
+}
+
+algorithms! {
+    /// Message authentication codes, in OpenSSH 8.9's order (its UMAC entries are not offered).
+    /// `*Etm` is encrypt-then-MAC: the MAC covers the ciphertext and the packet length is sent
+    /// in the clear.
+    Mac {
+        HmacSha256Etm => "hmac-sha2-256-etm@openssh.com",
+        HmacSha512Etm => "hmac-sha2-512-etm@openssh.com",
+        HmacSha1Etm => "hmac-sha1-etm@openssh.com",
+        HmacSha256 => "hmac-sha2-256",
+        HmacSha512 => "hmac-sha2-512",
+        HmacSha1 => "hmac-sha1",
+    }
+}
+
+impl Cipher {
+    /// An AEAD cipher authenticates its own packets, so no MAC is negotiated for its direction.
+    pub fn is_aead(self) -> bool {
+        matches!(
+            self,
+            Self::Chacha20Poly1305 | Self::Aes128Gcm | Self::Aes256Gcm
+        )
+    }
+
+    /// Key bytes derived for one direction (RFC 4253 section 7.2). ChaCha20-Poly1305 takes two
+    /// 32-byte keys, one for the payload and one for the length field.
+    pub fn key_len(self) -> usize {
+        match self {
+            Self::Chacha20Poly1305 => 64,
+            Self::Aes128Ctr | Self::Aes128Gcm => 16,
+            Self::Aes192Ctr => 24,
+            Self::Aes256Ctr | Self::Aes256Gcm => 32,
+        }
+    }
+
+    /// Initial IV bytes derived for one direction: the CTR counter block, or the GCM fixed field
+    /// and invocation counter.
+    pub fn iv_len(self) -> usize {
+        match self {
+            Self::Chacha20Poly1305 => 0,
+            Self::Aes128Ctr | Self::Aes192Ctr | Self::Aes256Ctr => 16,
+            Self::Aes128Gcm | Self::Aes256Gcm => 12,
+        }
+    }
+
+    /// The unit a packet's encrypted part is padded to (RFC 4253 section 6: the larger of 8 and
+    /// the cipher's block size).
+    pub fn block_len(self) -> usize {
+        match self {
+            Self::Chacha20Poly1305 => 8,
+            _ => 16,
+        }
+    }
+}
+
+impl Mac {
+    /// Integrity key bytes derived for one direction; also the length of the MAC's output for the
+    /// SHA-2 variants. SHA-1's output (20 bytes) is its key length too.
+    pub fn key_len(self) -> usize {
+        match self {
+            Self::HmacSha256Etm | Self::HmacSha256 => 32,
+            Self::HmacSha512Etm | Self::HmacSha512 => 64,
+            Self::HmacSha1Etm | Self::HmacSha1 => 20,
+        }
+    }
+
+    /// Bytes of MAC appended to each packet.
+    pub fn tag_len(self) -> usize {
+        self.key_len()
+    }
+
+    /// Encrypt-then-MAC: the MAC covers the ciphertext and the length field stays in the clear.
+    pub fn is_etm(self) -> bool {
+        matches!(
+            self,
+            Self::HmacSha256Etm | Self::HmacSha512Etm | Self::HmacSha1Etm
+        )
     }
 }
 
@@ -89,18 +174,22 @@ pub struct ClientLists<'a> {
     pub server_host_key_algorithms: &'a str,
     pub encryption_client_to_server: &'a str,
     pub encryption_server_to_client: &'a str,
+    pub mac_client_to_server: &'a str,
+    pub mac_server_to_client: &'a str,
     pub compression_client_to_server: &'a str,
     pub compression_server_to_client: &'a str,
     pub first_kex_packet_follows: bool,
 }
 
-/// What both ends will run.
+/// What both ends will run. A direction's MAC is `None` when its cipher is an AEAD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Negotiated {
     pub kex: Kex,
     pub host_key: HostKeyAlgorithm,
     pub cipher_client_to_server: Cipher,
     pub cipher_server_to_client: Cipher,
+    pub mac_client_to_server: Option<Mac>,
+    pub mac_server_to_client: Option<Mac>,
     /// The client sent a key exchange packet right behind its KEXINIT (RFC 4253 section 7,
     /// `first_kex_packet_follows`) and guessed wrong, so that packet is to be dropped unread.
     /// A right guess is the real first packet of the exchange and is used as such.
@@ -114,6 +203,8 @@ pub enum NegotiationFailure {
     HostKey,
     CipherClientToServer,
     CipherServerToClient,
+    MacClientToServer,
+    MacServerToClient,
     Compression,
 }
 
@@ -125,6 +216,8 @@ impl NegotiationFailure {
             Self::HostKey => "host_key",
             Self::CipherClientToServer => "cipher_c2s",
             Self::CipherServerToClient => "cipher_s2c",
+            Self::MacClientToServer => "mac_c2s",
+            Self::MacServerToClient => "mac_s2c",
             Self::Compression => "compression",
         }
     }
@@ -135,6 +228,7 @@ impl NegotiationFailure {
             Self::Kex => "no matching key exchange method found",
             Self::HostKey => "no matching host key type found",
             Self::CipherClientToServer | Self::CipherServerToClient => "no matching cipher found",
+            Self::MacClientToServer | Self::MacServerToClient => "no matching MAC found",
             Self::Compression => "no matching compression method found",
         }
     }
@@ -165,6 +259,24 @@ pub fn negotiate(client: &ClientLists<'_>) -> Result<Negotiated, NegotiationFail
         .ok_or(NegotiationFailure::CipherClientToServer)?;
     let cipher_server_to_client: Cipher = first_supported(client.encryption_server_to_client)
         .ok_or(NegotiationFailure::CipherServerToClient)?;
+    // An AEAD cipher makes the MAC list irrelevant for its direction (RFC 5647, OpenSSH's
+    // PROTOCOL): a client may leave it empty or fill it, and neither is an error.
+    let mac_client_to_server = if cipher_client_to_server.is_aead() {
+        None
+    } else {
+        Some(
+            first_supported(client.mac_client_to_server)
+                .ok_or(NegotiationFailure::MacClientToServer)?,
+        )
+    };
+    let mac_server_to_client = if cipher_server_to_client.is_aead() {
+        None
+    } else {
+        Some(
+            first_supported(client.mac_server_to_client)
+                .ok_or(NegotiationFailure::MacServerToClient)?,
+        )
+    };
     if !lists_name(client.compression_client_to_server, COMPRESSION_NONE)
         || !lists_name(client.compression_server_to_client, COMPRESSION_NONE)
     {
@@ -183,6 +295,8 @@ pub fn negotiate(client: &ClientLists<'_>) -> Result<Negotiated, NegotiationFail
         host_key,
         cipher_client_to_server,
         cipher_server_to_client,
+        mac_client_to_server,
+        mac_server_to_client,
         discard_guess: client.first_kex_packet_follows && !guessed_right,
     })
 }
@@ -202,6 +316,8 @@ mod tests {
             server_host_key_algorithms: host_key,
             encryption_client_to_server: cipher,
             encryption_server_to_client: cipher,
+            mac_client_to_server: "hmac-sha2-256",
+            mac_server_to_client: "hmac-sha2-256",
             compression_client_to_server: compression,
             compression_server_to_client: compression,
             first_kex_packet_follows: false,
@@ -209,6 +325,54 @@ mod tests {
     }
 
     const CIPHER: &str = "chacha20-poly1305@openssh.com";
+
+    #[test]
+    fn a_mac_is_negotiated_only_for_a_direction_without_an_aead() {
+        let mut l = lists("curve25519-sha256", "ssh-ed25519", "aes256-ctr", "none");
+        l.mac_client_to_server = "hmac-md5,hmac-sha2-512,hmac-sha2-256-etm@openssh.com";
+        l.mac_server_to_client = "hmac-sha1";
+        let n = negotiate(&l).unwrap();
+        assert_eq!(n.mac_client_to_server, Some(Mac::HmacSha512));
+        assert_eq!(n.mac_server_to_client, Some(Mac::HmacSha1));
+
+        l.mac_client_to_server = "hmac-md5";
+        assert_eq!(
+            negotiate(&l).unwrap_err(),
+            NegotiationFailure::MacClientToServer
+        );
+        l.mac_client_to_server = "hmac-sha2-256";
+        l.mac_server_to_client = "";
+        assert_eq!(
+            negotiate(&l).unwrap_err(),
+            NegotiationFailure::MacServerToClient
+        );
+
+        // Direction by direction: an AEAD one needs no MAC even beside a CTR one that does.
+        l.encryption_server_to_client = "aes128-gcm@openssh.com";
+        let n = negotiate(&l).unwrap();
+        assert_eq!(n.mac_server_to_client, None);
+        assert_eq!(n.mac_client_to_server, Some(Mac::HmacSha256));
+        l.mac_client_to_server = "";
+        l.mac_server_to_client = "";
+        l.encryption_client_to_server = "chacha20-poly1305@openssh.com";
+        let n = negotiate(&l).unwrap();
+        assert_eq!(
+            (n.mac_client_to_server, n.mac_server_to_client),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn derived_sizes_follow_the_algorithm() {
+        assert_eq!(Cipher::Aes192Ctr.key_len(), 24);
+        assert_eq!(Cipher::Aes128Gcm.iv_len(), 12);
+        assert_eq!(Cipher::Chacha20Poly1305.iv_len(), 0);
+        assert_eq!(Mac::HmacSha1.tag_len(), 20);
+        assert!(Mac::HmacSha512Etm.is_etm() && !Mac::HmacSha512.is_etm());
+        for c in Cipher::ALL {
+            assert_eq!(c.is_aead(), c.iv_len() != 16, "{c:?}");
+        }
+    }
 
     #[test]
     fn the_client_orders_the_choice_not_the_server() {

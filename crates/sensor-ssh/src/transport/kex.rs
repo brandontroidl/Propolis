@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWrite;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+use super::algorithms::Negotiated;
 use super::keys::{SessionKeys, derive_keys};
 use super::{
     SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY, TransportError, write_packet_unencrypted,
@@ -49,19 +50,29 @@ pub fn encode_mpint(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// What both ends have already said to each other before the key exchange proper: the
+/// identification strings (`V_C`, `V_S`, without the line terminator) and the KEXINIT payloads
+/// (`I_C`, `I_S`). Every exchange hash starts with these four, so a man in the middle who changed
+/// an algorithm list or a banner would change the hash and break the signature.
+#[derive(Debug, Clone, Copy)]
+pub struct Transcript<'a> {
+    pub client_version: &'a str,
+    pub server_version: &'a str,
+    pub client_kexinit: &'a [u8],
+    pub server_kexinit: &'a [u8],
+}
+
 /// Compute the exchange hash H = SHA-256(V_C || V_S || I_C || I_S || K_S || Q_C || Q_S || K)
 /// with each component SSH-string encoded and K as SSH mpint.
-#[allow(clippy::too_many_arguments)]
 fn compute_exchange_hash(
-    v_c: &str,
-    v_s: &str,
-    i_c: &[u8],
-    i_s: &[u8],
+    transcript: &Transcript<'_>,
     k_s: &[u8],
     q_c: &[u8; 32],
     q_s: &[u8; 32],
     shared_secret: &[u8],
 ) -> [u8; 32] {
+    let (v_c, v_s) = (transcript.client_version, transcript.server_version);
+    let (i_c, i_s) = (transcript.client_kexinit, transcript.server_kexinit);
     let k_mpint = encode_mpint(shared_secret);
 
     let mut hasher = Sha256::new();
@@ -109,11 +120,9 @@ fn compute_exchange_hash(
 pub async fn perform_kex_server<W>(
     writer: &mut W,
     host_key: &HostKey,
-    client_kexinit: &[u8],
-    server_kexinit: &[u8],
-    client_version: &str,
-    server_version: &str,
+    transcript: &Transcript<'_>,
     client_ecdh_init: &[u8],
+    negotiated: &Negotiated,
 ) -> Result<SessionKeys, TransportError>
 where
     W: AsyncWrite + Unpin,
@@ -158,16 +167,7 @@ where
     let k_s = host_key.public_key_blob();
 
     // Exchange hash H.
-    let h = compute_exchange_hash(
-        client_version,
-        server_version,
-        client_kexinit,
-        server_kexinit,
-        &k_s,
-        &q_c_bytes,
-        &q_s,
-        k,
-    );
+    let h = compute_exchange_hash(transcript, &k_s, &q_c_bytes, &q_s, k);
 
     // Sign H with the host key.
     let signature = host_key.sign(&h);
@@ -182,7 +182,7 @@ where
     write_packet_unencrypted(writer, &reply).await?;
 
     // Session ID = H on first key exchange.
-    Ok(derive_keys(k, &h, &h))
+    Ok(derive_keys(k, &h, &h, negotiated))
 }
 
 /// Build a client's `SSH_MSG_KEX_ECDH_INIT` message. Returns the ephemeral secret (caller
@@ -206,10 +206,8 @@ pub fn build_client_ecdh_init() -> (EphemeralSecret, Vec<u8>) {
 pub fn complete_kex_client(
     client_ephemeral: EphemeralSecret,
     ecdh_reply_payload: &[u8],
-    client_kexinit: &[u8],
-    server_kexinit: &[u8],
-    client_version: &str,
-    server_version: &str,
+    transcript: &Transcript<'_>,
+    negotiated: &Negotiated,
 ) -> Result<SessionKeys, TransportError> {
     // Parse SSH_MSG_KEX_ECDH_REPLY: byte(31) + string(K_S) + string(Q_S) + string(signature).
     if ecdh_reply_payload.first() != Some(&SSH_MSG_KEX_ECDH_REPLY) {
@@ -240,19 +238,10 @@ pub fn complete_kex_client(
     let k = shared_secret.as_bytes();
 
     // Exchange hash H.
-    let h = compute_exchange_hash(
-        client_version,
-        server_version,
-        client_kexinit,
-        server_kexinit,
-        &k_s,
-        &q_c,
-        &q_s,
-        k,
-    );
+    let h = compute_exchange_hash(transcript, &k_s, &q_c, &q_s, k);
 
     // Session ID = H on first exchange.
-    Ok(derive_keys(k, &h, &h))
+    Ok(derive_keys(k, &h, &h, negotiated))
 }
 
 /// Write `string data` (RFC 4251 section 5: uint32 length prefix + raw bytes) into `out`.

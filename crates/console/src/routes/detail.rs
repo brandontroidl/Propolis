@@ -1541,21 +1541,36 @@ pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) ->
             .map(|u| format!("user: {u}"))
             .unwrap_or_else(|| "-".into()),
         "honeypot_malware_upload" => {
-            let name = metadata
-                .get("sample_orig_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let sha = metadata
-                .get("sample_sha256")
-                .and_then(|v| v.as_str())
+            // A body the sensor's spool refused is emitted with no `sample`, so intake adds no
+            // `sample_*` keys; the sensor puts the same facts under the bare names, with
+            // `stored: false` and the reason. Read those so the row still names what was seen.
+            let not_stored = metadata.get("stored").and_then(|v| v.as_bool()) == Some(false);
+            let text = |sample_key: &str, bare_key: &str| {
+                metadata
+                    .get(sample_key)
+                    .or_else(|| not_stored.then(|| metadata.get(bare_key)).flatten())
+                    .and_then(|v| v.as_str())
+            };
+            let name = text("sample_orig_name", "orig_name").unwrap_or("unknown");
+            let sha = text("sample_sha256", "sha256")
                 .map(|s| &s[..s.len().min(12)])
                 .unwrap_or("?");
             let size = metadata
                 .get("sample_size")
+                .or_else(|| not_stored.then(|| metadata.get("size")).flatten())
                 .and_then(|v| v.as_u64())
                 .map(format_bytes)
                 .unwrap_or_default();
-            format!("{name} ({sha}..., {size})")
+            if not_stored {
+                let reason = metadata
+                    .get("not_stored_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .replace('_', " ");
+                format!("{name} ({sha}..., {size}, not stored: {reason})")
+            } else {
+                format!("{name} ({sha}..., {size})")
+            }
         }
         "honeypot_file_download" => metadata
             .get("url")
@@ -1886,6 +1901,34 @@ mod tests {
         assert_eq!(
             extract_detail("honeypot_malware_upload", &metadata),
             "payload.sh (a1b2c3d4e5f6..., 4.2 KB)"
+        );
+    }
+
+    #[test]
+    fn extract_detail_not_stored_upload_names_what_was_seen_and_why_it_was_not_kept() {
+        // The exact metadata a sensor emits for a body its full spool refused: no `sample_*`
+        // keys, the facts under the bare names.
+        let metadata = json!({
+            "orig_name": "sensors/temp",
+            "sha256": "a1b2c3d4e5f6a7b8c9d0",
+            "size": 4300u64,
+            "stored": false,
+            "not_stored_reason": "spool_full",
+        });
+        assert_eq!(
+            extract_detail("honeypot_malware_upload", &metadata),
+            "sensors/temp (a1b2c3d4e5f6..., 4.2 KB, not stored: spool full)"
+        );
+    }
+
+    #[test]
+    fn extract_detail_stored_upload_ignores_bare_keys() {
+        // `sha256` alone (no `stored: false`) is the stored row's own digest of the same body;
+        // the `sample_*` keys stay authoritative and the fallback must not fire.
+        let metadata = json!({ "sha256": "ffffffffffffffff", "size": 1u64 });
+        assert_eq!(
+            extract_detail("honeypot_malware_upload", &metadata),
+            "unknown (?..., )"
         );
     }
 

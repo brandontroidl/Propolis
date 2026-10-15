@@ -144,8 +144,30 @@ where
         Kex::EcdhSha2Nistp256 => {
             ecdh_p256_server(host_key, transcript, &k_s, client_init, &mut cursor)?
         }
+        // Two 2048-bit exponentiations, about 3 ms: off the async worker (the sensor runs two), so
+        // a burst of these cannot stall every other session. How many run at once is the caller's
+        // to bound (`group14_gate`).
         Kex::DiffieHellmanGroup14Sha256 => {
-            dh_group14_server(host_key, transcript, &k_s, client_init, &mut cursor)?
+            let host_key = host_key.clone();
+            let k_s = k_s.clone();
+            let client_init = client_init.to_vec();
+            let owned = (
+                transcript.client_version.to_owned(),
+                transcript.server_version.to_owned(),
+                transcript.client_kexinit.to_vec(),
+                transcript.server_kexinit.to_vec(),
+            );
+            tokio::task::spawn_blocking(move || {
+                let transcript = Transcript {
+                    client_version: &owned.0,
+                    server_version: &owned.1,
+                    client_kexinit: &owned.2,
+                    server_kexinit: &owned.3,
+                };
+                dh_group14_server(&host_key, &transcript, &k_s, &client_init, &mut cursor)
+            })
+            .await
+            .map_err(|e| TransportError::Io(std::io::Error::other(e)))??
         }
     };
     write_packet_unencrypted(writer, &reply).await?;

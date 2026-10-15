@@ -34,6 +34,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub mod algorithms;
 pub mod cipher;
+pub mod group14_gate;
 pub mod kex;
 pub mod keys;
 pub mod packet_cipher;
@@ -65,6 +66,9 @@ pub const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
 /// RFC 4253 section 11.1, `SSH_DISCONNECT_KEY_EXCHANGE_FAILED`: what a server says when the
 /// client's algorithm lists leave nothing to negotiate.
 pub const SSH_DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
+/// RFC 4253 section 11.1, `SSH_DISCONNECT_TOO_MANY_CONNECTIONS`: what a server says when it is at
+/// capacity. Used when the group14 gate (`group14_gate`) refuses a client that waited too long.
+pub const SSH_DISCONNECT_TOO_MANY_CONNECTIONS: u32 = 12;
 
 /// RFC 4253 section 6.1's recommended ceiling: "All implementations MUST be able to process
 /// packets with ... a total packet size of 35000 bytes." Applied here to the `packet_length`
@@ -164,6 +168,9 @@ pub enum TransportError {
     /// malformed input: the client spoke SSH correctly and the server has nothing to say to it
     /// but `SSH_MSG_DISCONNECT`.
     Negotiation(algorithms::NegotiationFailure),
+    /// The client negotiated `diffie-hellman-group14-sha256` and the throttle
+    /// (`group14_gate`) did not admit it within its wait. Not malformed input either.
+    KexBusy,
     Io(std::io::Error),
 }
 
@@ -180,6 +187,9 @@ impl std::fmt::Display for TransportError {
             TransportError::InvalidEncoding(reason) => write!(f, "invalid encoding: {reason}"),
             TransportError::Negotiation(failure) => {
                 write!(f, "algorithm negotiation failed: {failure}")
+            }
+            TransportError::KexBusy => {
+                f.write_str("diffie-hellman-group14-sha256 throttle is full")
             }
             TransportError::Io(e) => write!(f, "SSH transport i/o error: {e}"),
         }

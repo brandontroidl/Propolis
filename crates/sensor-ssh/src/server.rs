@@ -42,7 +42,8 @@ use crate::output::{OUTPUT_STALL_LIMIT, OutputLedger, Registration};
 use crate::shell::{CommandResult, EmitContext, FakeShell, LineStep, OutputFd, onlcr};
 use crate::timeout_stream::TimeoutStream;
 use crate::transfer::{ScpReceiver, SftpHandler};
-use crate::transport::algorithms::{NegotiationFailure, negotiate};
+use crate::transport::algorithms::{Kex, NegotiationFailure, negotiate};
+use crate::transport::group14_gate::{GROUP14_BUSY_DESCRIPTION, Group14Gate};
 use crate::transport::kex::{Transcript, perform_kex_server};
 use crate::transport::packet_cipher::PacketCipher;
 use crate::transport::{
@@ -713,6 +714,7 @@ async fn handle_session(
     let mut client_version_seen: Option<String> = None;
     let mut client_offer_seen: Option<transport::KexInit> = None;
     let mut negotiation_failure: Option<NegotiationFailure> = None;
+    let mut throttled = false;
     let handshake: Result<_, transport::TransportError> = async {
         // ---- Phase 1: version exchange ----
         let (client_version, server_version) =
@@ -756,6 +758,29 @@ async fn handle_session(
         // Read client's ECDH_INIT (c2s packet #1).
         let client_ecdh_init = transport::read_packet_unencrypted(&mut stream).await?;
 
+        // A group14 exchange costs the sensor about 3.5 ms of CPU against curve25519's 1: only so
+        // many run at once, and a client that waits too long for its turn is told so
+        // (`group14_gate`). Taken after the client's value has arrived, so a connection that never
+        // sends it holds nothing.
+        let group14_permit = if negotiated.kex == Kex::DiffieHellmanGroup14Sha256 {
+            match Group14Gate::global().acquire().await {
+                Ok(permit) => Some(permit),
+                Err(_busy) => {
+                    throttled = true;
+                    transport::refuse_and_close(
+                        &mut stream,
+                        transport::SSH_DISCONNECT_TOO_MANY_CONNECTIONS,
+                        GROUP14_BUSY_DESCRIPTION,
+                    )
+                    .await?;
+                    return Err(transport::TransportError::KexBusy);
+                }
+            }
+        } else {
+            None
+        };
+        let kex_started = std::time::Instant::now();
+
         // Perform key exchange: computes shared secret, signs exchange hash, sends ECDH_REPLY
         // (s2c packet #1).
         let session_keys = perform_kex_server(
@@ -770,7 +795,11 @@ async fn handle_session(
             &client_ecdh_init.payload,
             &negotiated,
         )
-        .await?;
+        .await;
+        if let Some(permit) = group14_permit {
+            permit.release_after(kex_started.elapsed());
+        }
+        let session_keys = session_keys?;
 
         // Server sends NEWKEYS (s2c packet #2).
         transport::write_packet_unencrypted(&mut stream, &[SSH_MSG_NEWKEYS]).await?;
@@ -788,7 +817,7 @@ async fn handle_session(
     let (session_keys, discarded_guess) = match handshake {
         Ok(done) => done,
         Err(e) => {
-            let end = auth_state.handshake_end_event(
+            let mut end = auth_state.handshake_end_event(
                 classify_read_failure(&e),
                 handshake_phase.label(),
                 client_version_seen.as_deref(),
@@ -796,6 +825,9 @@ async fn handle_session(
                 negotiation_failure,
                 started.elapsed(),
             );
+            if throttled {
+                end.metadata["kex_refused"] = serde_json::Value::String("group14_busy".to_owned());
+            }
             if let Err(append_err) = emitter.append(&end).await {
                 tracing::error!(error = %append_err, "ssh: failed to append handshake end event");
             }
@@ -2009,11 +2041,13 @@ fn classify_read_failure(err: &transport::TransportError) -> CaptureEnd {
             _ => CaptureEnd::TransportError,
         },
         // Recorded as malformed input because the framework's `CaptureEnd` has no variant for a
-        // refusal; the `negotiation_failed` key on the event names the list that failed.
+        // refusal; the `negotiation_failed` key on the event names the list that failed, and
+        // `kex_refused` marks a client the group14 throttle turned away.
         transport::TransportError::TooLarge { .. }
         | transport::TransportError::Malformed(_)
         | transport::TransportError::InvalidEncoding(_)
-        | transport::TransportError::Negotiation(_) => CaptureEnd::MalformedInput,
+        | transport::TransportError::Negotiation(_)
+        | transport::TransportError::KexBusy => CaptureEnd::MalformedInput,
     }
 }
 

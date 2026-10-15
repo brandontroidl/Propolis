@@ -100,16 +100,18 @@ console rDNS parse booleans more broadly (called out below).
   `env-filter`. Set `RUST_LOG=info` in such a unit's env file to see its startup and warning
   lines: with it unset, a healthy release-built `gateway` prints nothing at all (observed
   2026-09-28).
-- **`rustls` is held at `error` unless `RUST_LOG` is set.** With `RUST_LOG` unset, every binary
+- **`rustls` and `russh` are held at `error` unless `RUST_LOG` is set.** With `RUST_LOG` unset, every binary
   that goes through `log_format::default_filter` (the sensors, `propolis`, `console` and the
-  `log_format::init` binaries) appends `rustls=error` to its default level
+  `log_format::init` binaries) appends `rustls=error,russh=error` to its default level
   (`crates/log-format/src/lib.rs#default_filter`). rustls writes a WARN for what any scanner's
   malformed hello causes: `Illegal SNI extension: ignoring IP address presented as hostname
   (<hex>)` (the hex is the address the scanner sent, the box's own whenever it targets the host
   by IP), `Received a ApplicationData message while expecting [Handshake]`, `TLS alert warning
   received ... CloseNotify`. At `info` one scanner could fill the journal with them. A set
   `RUST_LOG` is used exactly as written, so `RUST_LOG=info,rustls=warn` brings them back for a
-  diagnosis. The sensors' per-connection `handler exceeded max_duration; connection dropped` line
+  diagnosis. Any set `RUST_LOG` drops both holds, so `RUST_LOG=info` also brings back russh's WARN lines
+  (the SSH sensor's library: `unknown channel request <name>`, `strict kex violated`, text the client chooses); restate
+  `russh=error` next to it to keep them quiet. The sensors' per-connection `handler exceeded max_duration; connection dropped` line
   (and the tftp and dns equivalents) is `debug`, and the `max_concurrent reached` refusal lines
   are logged at power-of-two totals, as the per-source cap lines already were
   (`crates/sensor-framework/tests/listener_log_volume.rs`).

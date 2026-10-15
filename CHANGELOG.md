@@ -418,7 +418,7 @@
   hostname (<hex>)`, which carries the box's own address whenever the scanner targets it by IP;
   `Received a ApplicationData message while expecting [Handshake]`; `TLS alert warning received
   ... CloseNotify`), and the listener logged `handler exceeded max_duration; connection dropped`
-  and `max_concurrent reached` once per connection. With `RUST_LOG` unset, `rustls` is now held at
+  and `max_concurrent reached` once per connection. With `RUST_LOG` unset, `rustls` and `russh` (whose WARN lines carry client-chosen text) are now held at
   `error` (`log_format::default_filter`, shared by the sensors, `propolis` and `console`; a set
   `RUST_LOG` is used as written), the max_duration lines (tcp listener, tftp, dns) are `debug`,
   and the `max_concurrent` refusals are logged at power-of-two totals. See

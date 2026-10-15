@@ -25,10 +25,14 @@
 #   - create, seed, or migrate the PostgreSQL database. The propolis binary runs its own migrations
 #     (core-scoring + review) at startup once DATABASE_URL is reachable; provisioning the database
 #     server itself is an independent operator/DBA action.
-#   - create or edit any OPERATOR-owned /etc/propolis/*.env file. Each one carries secrets (a
+#   - put a value in any OPERATOR-owned /etc/propolis/*.env file. Each one carries secrets (a
 #     database URL, the console password, vendor API keys) this script has no business fabricating
-#     or touching - internal/design/07-runtime-coordination-deployment.md's "Unified configuration"
-#     documents the full variable set the operator must populate by hand. The one exception is
+#     - internal/design/07-runtime-coordination-deployment.md's "Unified configuration"
+#     documents the full variable set the operator must populate by hand. All it does to them is
+#     the mode: provision.sh (deploy/env-files.sh) creates each missing service env file EMPTY,
+#     root:root 0600, and removes group and other access from existing ones, so the operator's
+#     copy of an example lands in a file that is already closed instead of starting at 0644.
+#     The exceptions are /etc/propolis/watch.env (derived and 0640 by deploy/watch-env.sh) and
 #     /etc/propolis/fleet-listeners.env, which is written wholly by deploy/fleet-listeners.sh in
 #     step 7: it is generated, carries no secret, and is a derived copy of values the operator
 #     already set elsewhere (see that script's header for why it is derived rather than

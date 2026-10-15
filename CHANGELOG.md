@@ -430,6 +430,16 @@
   The watcher's own `cannot read /etc/propolis/watch.env: Permission denied` now adds the owner
   and mode it needs (root:propolis-watch, 0640) and the one-line `chown` and `chmod` that
   restores them.
+- **A fresh box no longer starts with its env files at 0644** - the operator copies the
+  `.env.example` files into `/etc/propolis`, which leaves `0644`, so every secret-bearing file was
+  world-readable until `config-check.sh` said so. Provisioning (`deploy/env-files.sh`, run by
+  `provision.sh`, so by every install and upgrade) now creates each missing service env file
+  (`propolis.env` and one per sensor) empty, root:root `0600`, so the copy lands in a closed file,
+  and removes group and other access from existing ones. It never writes a value, never loosens a
+  mode or changes an owner, does not follow a symbolic link, and leaves `watch.env` (0640) and
+  `fleet-listeners.env` (0644) to the scripts that write them. Upgrade note: an existing env file
+  that was group- or world-readable is now `0600` after the upgrade; systemd reads
+  `EnvironmentFile=` as root, so the units are unaffected.
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

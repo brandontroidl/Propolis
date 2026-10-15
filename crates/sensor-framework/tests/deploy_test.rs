@@ -3499,6 +3499,204 @@ fn provision_derives_watch_env_after_creating_the_account() {
     assert!(deploy_file("upgrade.sh").contains("/provision.sh\""));
 }
 
+// ---- env file modes: a fresh box never starts with a secret-bearing file at 0644 ----
+
+fn run_env_files(dir: &std::path::Path, dry_run: bool) -> String {
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/env-files.sh"
+    ))
+    .arg(dir)
+    .env("DRY_RUN", if dry_run { "1" } else { "0" })
+    .fenced_output()
+    .expect("run deploy/env-files.sh");
+    assert!(
+        out.status.success(),
+        "env-files.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The files env-files.sh creates must be exactly the ones the production units load, or a new
+/// sensor's env file is the one that starts at 0644 again.
+#[test]
+fn env_files_covers_exactly_the_env_files_the_production_units_load() {
+    let script = deploy_file("env-files.sh");
+    let listed: std::collections::BTreeSet<String> = script
+        .lines()
+        .find_map(|l| l.strip_prefix("SERVICE_ENV_FILES=("))
+        .expect("env-files.sh has no SERVICE_ENV_FILES=(...) line at column 0")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let deploy = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    let mut loaded = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(deploy).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name != "propolis.service"
+            && !(name.starts_with("sensor-") && name.ends_with(".service"))
+        {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            let Some(target) = line.strip_prefix("EnvironmentFile=") else {
+                continue;
+            };
+            let target = target.trim_start_matches('-');
+            let file = target
+                .strip_prefix("/etc/propolis/")
+                .and_then(|f| f.strip_suffix(".env"))
+                .unwrap_or_else(|| panic!("{name}: unexpected EnvironmentFile={target}"));
+            if file != "fleet-listeners" {
+                loaded.insert(file.to_string());
+            }
+        }
+    }
+    assert_eq!(listed, loaded);
+    assert_eq!(listed.len(), 13);
+}
+
+#[test]
+fn env_files_creates_each_missing_service_file_empty_and_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    run_env_files(dir.path(), false);
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 13, "{names:?}");
+    for name in &names {
+        let path = dir.path().join(name);
+        assert_eq!(mode_of(&path), 0o600, "{name}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "{name} holds a value"
+        );
+    }
+    // The two files other scripts write at their own modes are not created here.
+    assert!(!names.contains(&"watch.env".to_string()));
+    assert!(!names.contains(&"fleet-listeners.env".to_string()));
+}
+
+#[test]
+fn env_files_closes_loose_files_without_touching_the_two_exceptions_or_loosening_any() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, mode: u32| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("# {name}\nKEY=EXAMPLE-VALUE\n")).unwrap();
+        set_mode(&path, mode);
+        path
+    };
+    let propolis = write("propolis.env", 0o644);
+    let ssh = write("ssh.env", 0o640);
+    let gateway = write("gateway.env", 0o664); // a split-deployment file with no unit in this set
+    let tftp = write("tftp.env", 0o400);
+    let watch = write("watch.env", 0o640);
+    let fleet = write("fleet-listeners.env", 0o644);
+
+    let first = run_env_files(dir.path(), false);
+    for (path, want) in [
+        (&propolis, 0o600),
+        (&ssh, 0o600),
+        (&gateway, 0o600),
+        (&tftp, 0o400),
+        (&watch, 0o640),
+        (&fleet, 0o644),
+    ] {
+        assert_eq!(mode_of(path), want, "{}", path.display());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("KEY=EXAMPLE-VALUE"),
+            "{} lost its content",
+            path.display()
+        );
+    }
+    assert!(first.contains("propolis.env was mode 644"), "{first}");
+    assert!(!first.contains("watch.env"), "{first}");
+    assert!(!first.contains("fleet-listeners.env"), "{first}");
+
+    let second = run_env_files(dir.path(), false);
+    assert!(second.contains("no env file under"), "{second}");
+    assert!(!second.contains("was mode"), "idempotent: {second}");
+}
+
+#[test]
+fn env_files_dry_run_changes_nothing_and_a_symlink_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let loose = dir.path().join("propolis.env");
+    std::fs::write(&loose, "KEY=EXAMPLE-VALUE\n").unwrap();
+    set_mode(&loose, 0o644);
+    let out = run_env_files(dir.path(), true);
+    assert!(
+        out.contains("[dry-run] would remove group and other access"),
+        "{out}"
+    );
+    assert!(out.contains("[dry-run] would create empty"), "{out}");
+    assert_eq!(mode_of(&loose), 0o644);
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "dry run created a file"
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("target");
+    std::fs::write(&target, "x\n").unwrap();
+    set_mode(&target, 0o644);
+    std::os::unix::fs::symlink(&target, dir.path().join("ssh.env")).unwrap();
+    run_env_files(dir.path(), false);
+    assert_eq!(
+        mode_of(&target),
+        0o644,
+        "chmod followed the link out of the directory"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.path().join("ssh.env"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(mode_of(&loose), 0o600);
+}
+
+/// After the directory exists and before watch-env.sh reads propolis.env; dry runs stay dry.
+#[test]
+fn provision_runs_env_files_between_the_directories_and_watch_env() {
+    let provision = deploy_file("provision.sh");
+    let lines: Vec<&str> = provision.lines().collect();
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("provision.sh has no line with {needle}"))
+    };
+    let dir = at("ensure_dir /etc/propolis ");
+    let env_files = at("/env-files.sh\"");
+    let watch = at("/watch-env.sh\"");
+    assert!(dir < env_files && env_files < watch);
+    assert!(lines[env_files].contains("DRY_RUN=\"$DRY_RUN\""));
+}
+
 // ---- log rotation: Propolis runs logrotate itself, with a free-space guard ----
 //
 // In October 2026 the distro's logrotate.timer was inactive for eleven days, nothing rotated, and

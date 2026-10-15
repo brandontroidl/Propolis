@@ -17,8 +17,12 @@ installer, read from argv, or written back to disk by the platform.
 
 All secrets are set in the per-service files under `/etc/propolis/`:
 
-- Files are mode `0600`, owned by the service user (`install.sh` creates the
-  users; the `.env` files themselves are authored by hand - `crates/propolis/src/config.rs` reads them, `deploy/install.sh#OPERATOR-owned`).
+- Files are mode `0600` (`install.sh` creates the users; the `.env` files themselves are
+  authored by hand - `crates/propolis/src/config.rs` reads them, `deploy/install.sh#OPERATOR-owned`).
+  Provisioning creates each missing service env file empty, `root:root` `0600`, and removes group
+  and other access from any existing one (`deploy/env-files.sh`, run by `provision.sh`, so by
+  every install and upgrade), so a copy of an example lands in a file that is already closed.
+  systemd reads `EnvironmentFile=` as root, so the owner does not need to be the service user.
 - `deploy/config-check.sh` fails on an env file that accounts other than its owner can read
   (`env-mode`: anything looser than `0600`, or than `0640` for `watch.env` and `0644` for the
   generated `fleet-listeners.env`) and prints the `chmod` that closes it; a stricter mode is
@@ -28,10 +32,12 @@ All secrets are set in the per-service files under `/etc/propolis/`:
   (`deploy/sensor-ssh.service#InaccessiblePaths=`), so a sensor process cannot open the
   daemon's env file even after a `chmod` slip; systemd reads a unit's own env file before that
   namespace exists, so the sensor still gets its variables.
-- `deploy/install.sh` **does not create or edit any operator-owned `.env` file** -
-  the script "has no business fabricating" secret-bearing files; its only
-  generated env file, `/etc/propolis/fleet-listeners.env`, carries no secret
+- `deploy/install.sh` **puts no value in any operator-owned `.env` file** -
+  the script "has no business fabricating" secret-bearing files; the files it creates are empty,
+  and the only env files it generates, `/etc/propolis/fleet-listeners.env` (no secret) and the
+  derived `watch.env` (one key), are written by their own scripts
   (`deploy/install.sh#has no business fabricating`, `deploy/install.sh#fleet-listeners.sh`).
+  Do not `chmod 0600` those two: the watcher's account needs `watch.env` at `0640`.
 - Configuration is parsed from environment variables only; **no secret is read
   from argv** (all via `env::var`), so secrets do not appear in process listings
   or shell history.

@@ -13,8 +13,9 @@
 # Idempotent and safe to re-run on a live box: users are skip-if-exists; `install -d` reasserts
 # mode/owner/group on directories that already exist (see ensure_dir below).
 #
-# This script does NOT start, enable, restart, or stop any service, and does NOT touch env files or
-# binaries - provisioning only.
+# This script does NOT start, enable, restart, or stop any service, and does NOT touch binaries.
+# It creates the service env files empty and keeps them 0600 (env-files.sh) and derives
+# watch.env (watch-env.sh); it never writes a value into an operator's env file.
 #
 # Usage: sudo ./provision.sh          (provisions for real)
 #        DRY_RUN=1 ./provision.sh     (prints every action without touching the system; no
@@ -223,6 +224,12 @@ ensure_dir /var/spool/propolis/mqtt       0750 propolis-mqtt     propolis-mqtt
 # written by its own standalone sensor process), the malware fetcher runs inside propolis.service
 # itself - see deploy/propolis.service's own ReadWritePaths grant for this exact path.
 ensure_dir /var/spool/propolis/fetched   0750 propolis          propolis
+
+# The service env files, created empty 0600 root:root when missing and stripped of group and other
+# access when not, so a fresh box never has a secret-bearing file at 0644; see env-files.sh's
+# header. Before watch-env.sh, which reads propolis.env, and leaving watch.env's 0640 to it.
+log "creating and tightening the service env files in /etc/propolis"
+DRY_RUN="$DRY_RUN" "$(dirname "${BASH_SOURCE[0]}")/env-files.sh"
 
 # The watcher's copy of PROPOLIS_SENSOR_LOGS, derived from propolis.env on every provision (so on
 # every upgrade); see watch-env.sh's header. After the users exist, since it sets the file's group.

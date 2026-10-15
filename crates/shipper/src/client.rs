@@ -46,6 +46,12 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use crate::batcher::Batcher;
 use crate::state::ConfirmedState;
 
+/// TCP connect plus TLS handshake. Generous for a WAN link with packet loss, short next to "never".
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// One framed batch written and its fixed-size ack read back. The gateway acks after a durable
+/// spool write, so this is well above a loaded disk and far below an unbounded wait.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The connected, handshake-complete transport `ship_cycle` ships batches over.
 pub type ShipperStream = TlsStream<TcpStream>;
 
@@ -65,12 +71,35 @@ impl ShipperClient {
         tls: Arc<ClientConfig>,
         server_dns: &str,
     ) -> io::Result<ShipperStream> {
-        let tcp = TcpStream::connect(gateway_addr).await?;
+        Self::connect_within(gateway_addr, tls, server_dns, CONNECT_TIMEOUT).await
+    }
+
+    /// [`connect`](Self::connect) with an explicit deadline over the TCP connect and the TLS
+    /// handshake together. A gateway host that accepts the connection and never answers the
+    /// handshake would otherwise hold the single ship loop, and with it every log's shipping,
+    /// until the kernel gives up (minutes to never) with nothing in the journal.
+    pub async fn connect_within(
+        gateway_addr: SocketAddr,
+        tls: Arc<ClientConfig>,
+        server_dns: &str,
+        limit: Duration,
+    ) -> io::Result<ShipperStream> {
         let domain = ServerName::try_from(server_dns)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
             .to_owned();
-        let connector = TlsConnector::from(tls);
-        connector.connect(domain, tcp).await
+        let dial = async {
+            let tcp = TcpStream::connect(gateway_addr).await?;
+            TlsConnector::from(tls).connect(domain, tcp).await
+        };
+        tokio::time::timeout(limit, dial).await.unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "gateway connect and handshake exceeded {}s",
+                    limit.as_secs_f32()
+                ),
+            ))
+        })
     }
 
     /// Sends one length-prefixed frame and reads back its ack: a `u32` big-endian byte length
@@ -78,6 +107,28 @@ impl ShipperClient {
     /// [`ACK_LEN`]-byte ack. Mirrors `gateway::server::handle_connection`'s read side exactly, so
     /// the two ends agree on the wire shape without either importing the other.
     pub async fn send_batch(stream: &mut ShipperStream, frame_bytes: &[u8]) -> io::Result<Ack> {
+        Self::send_batch_within(stream, frame_bytes, BATCH_TIMEOUT).await
+    }
+
+    /// [`send_batch`](Self::send_batch) with an explicit deadline over the write and the ack. On
+    /// expiry the caller gets `TimedOut`, `ship_cycle` rewinds the tailer over the unconfirmed
+    /// batch, and the next pass redials: the same path as any other dead connection.
+    pub async fn send_batch_within(
+        stream: &mut ShipperStream,
+        frame_bytes: &[u8],
+        limit: Duration,
+    ) -> io::Result<Ack> {
+        tokio::time::timeout(limit, Self::exchange(stream, frame_bytes))
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("gateway ack not received within {}s", limit.as_secs_f32()),
+                ))
+            })
+    }
+
+    async fn exchange(stream: &mut ShipperStream, frame_bytes: &[u8]) -> io::Result<Ack> {
         let len = frame_bytes.len() as u32;
         stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(frame_bytes).await?;

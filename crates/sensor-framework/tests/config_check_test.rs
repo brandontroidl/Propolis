@@ -3048,6 +3048,31 @@ fn an_env_file_readable_by_other_accounts_is_a_failure_with_the_chmod_that_close
     );
     assert_eq!(global_state(&fx.json(), "env-files"), "fail");
 
+    // The text must name BOTH exceptions. It once said every env file but fleet-listeners.env
+    // carries a secret, which led to a blanket `chmod 600` that locked the watcher's account out
+    // of watch.env (live, 2026-10-14).
+    let message = fx.json()["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "env-mode")
+        .map(|f| f["message"].as_str().unwrap().to_string())
+        .unwrap();
+    assert!(
+        message.contains("watch.env")
+            && message.contains("0640")
+            && message.contains("propolis-watch"),
+        "{message}"
+    );
+    assert!(
+        message.contains("fleet-listeners.env") && message.contains("0644"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("every env file but"),
+        "a blanket claim again: {message}"
+    );
+
     // The watcher's copy may be group-readable, not world-readable, and each loose file is its
     // own finding.
     chmod(&fx, "etc/watch.env", 0o644);

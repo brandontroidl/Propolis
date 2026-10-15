@@ -1828,7 +1828,9 @@ check_unconfigured_units() {
 # The widest mode an env file may have. fleet-listeners.env is generated, secret-free and written
 # 0644 (deploy/fleet-listeners.sh); watch.env is written root:propolis-watch 0640 so the watcher's
 # account can read its one line (deploy/watch-env.sh); every other env file carries a secret and
-# is created by the operator 0600 under its service user (docs/operations/secret-management.md).
+# is 0600 (docs/operations/secret-management.md).
+# A blanket chmod 0600 over *.env breaks the watcher, which is why the finding text names both
+# exceptions: it is the only text an operator reads before running the fix.
 env_mode_limit() {
     case "${1##*/}" in
         fleet-listeners.env) printf '644' ;;
@@ -1851,7 +1853,7 @@ check_env_files() {
         if [ "$extra" -ne 0 ]; then
             loose+=("${f##*/}")
             finding fail "env-files" "env-mode:$f" \
-                "$f is mode 0$mode, so accounts other than its owner can read or write it; it must be 0$limit (every env file but the generated fleet-listeners.env carries a secret: the database URL, the console password, vendor keys, a bind list another sensor need not see)" \
+                "$f is mode 0$mode, so accounts other than its owner can read or write it; it must be 0$limit (two files are meant to be wider and must NOT be chmod 0600: watch.env is 0640 root:propolis-watch so the watcher's account can read its one line, and the generated fleet-listeners.env is 0644; every other env file carries a secret: the database URL, the console password, vendor keys, a bind list another sensor need not see)" \
                 "sudo chmod 0$limit $(q "$f")"
         fi
     done

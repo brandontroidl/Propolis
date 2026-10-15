@@ -423,6 +423,10 @@
   `RUST_LOG` is used as written), the max_duration lines (tcp listener, tftp, dns) are `debug`,
   and the `max_concurrent` refusals are logged at power-of-two totals. See
   [environment variables](docs/reference/environment-variables.md#rust_log).
+- **The `env-mode` finding names the two files that are meant to be wider** - its text said every
+  env file but `fleet-listeners.env` carries a secret, and a blanket `chmod 600` over `*.env` took
+  `watch.env` (0640, group `propolis-watch`) away from the live watcher. It now names both
+  exceptions, `watch.env` 0640 and `fleet-listeners.env` 0644, and says not to chmod them 0600.
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

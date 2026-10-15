@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sensor_framework::bounds::ConnectionBounds;
-use sensor_framework::listener::run_tcp_listener;
+use sensor_framework::listener::{run_tcp_listener, run_udp_listener};
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
@@ -120,4 +120,33 @@ async fn a_flood_past_max_concurrent_logs_a_logarithmic_number_of_warnings() {
     // Refusal totals 1, 2, 4 and 8 are logged; the other six are not.
     assert_eq!(sink.lines_at("WARN", "max_concurrent"), 4);
     drop(held);
+}
+
+#[tokio::test]
+async fn a_udp_flood_past_max_concurrent_logs_a_logarithmic_number_of_warnings() {
+    let (sink, _guard) = capture();
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (bound, handle) = run_udp_listener(
+        addr,
+        bounds(Duration::from_secs(60), 1),
+        None,
+        |_data, _peer| async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        },
+    )
+    .await
+    .unwrap();
+
+    // One datagram holds the only slot; ten more are each dropped.
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(b"hold", bound).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for _ in 0..10 {
+        client.send_to(b"drop", bound).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    handle.abort();
+
+    // Drop totals 1, 2, 4 and 8 are logged; the other six are not.
+    assert_eq!(sink.lines_at("WARN", "udp max_concurrent"), 4);
 }

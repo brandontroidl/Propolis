@@ -300,7 +300,7 @@ fn session_keys_cipher_split_is_correct_length() {
 /// Every cipher, with every MAC it can be paired with, carries packets of every size in both
 /// directions over a long run of sequence numbers. Both ends derive their keys from the same
 /// inputs, as a real exchange does, so this proves the framing and the key schedule are
-/// self-consistent; the system OpenSSH client (`kex_negotiation.rs`) is what proves they are
+/// self-consistent; the system OpenSSH client (`openssh_interop.rs`) is what proves they are
 /// the SSH ones.
 #[tokio::test]
 async fn every_negotiable_cipher_and_mac_round_trips_packets() {

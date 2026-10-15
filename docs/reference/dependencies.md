@@ -95,12 +95,16 @@ complete a real SSH handshake without a general SSH library
 `crates/sensor-ssh/Cargo.toml#aes`, `crates/sensor-ssh/Cargo.toml#ctr`,
 `crates/sensor-ssh/Cargo.toml#aes-gcm`, `crates/sensor-ssh/Cargo.toml#hmac`,
 `crates/sensor-ssh/Cargo.toml#sha1`, `crates/sensor-ssh/Cargo.toml#p256`,
-`crates/sensor-ssh/Cargo.toml#num-bigint`). These crates were already vendored (the SSH test
-client, the console and the collector's certificate parsing pull them in); the sensor links them
+`crates/sensor-ssh/Cargo.toml#num-bigint`). These crates were already vendored, but not all were
+on a production path: `hmac`, `sha1` and `num-bigint` already were (the console, the framework and
+the collector's certificate parsing), while `aes`, `aes-gcm`, `ctr` and `p256` (with `elliptic-curve`
+and `primeorder`) were reached only by the SSH test client, so this change moves them from
+test-only to the internet-facing sensor, their only production consumer. That is a supply-chain
+posture change awaiting the owner's sign-off. The sensor links them
 directly so it can speak the ciphers, MACs and key exchanges OpenSSH offers by default. The
 cipher, MAC and curve crates are RustCrypto primitives used through their published interface (P-256
 with only its `ecdh` feature, so no ECDSA or PKCS code is compiled in); the sensor writes only
-the SSH packet framing around them. `num-bigint` does the one modular exponentiation of
+the SSH packet framing around them. `num-bigint` does the two modular exponentiations of
 `diffie-hellman-group14-sha256`; it is not constant time, which is acceptable for an exponent that
 exists for a single exchange with the peer that takes part in it. RSA is deliberately not linked:
 see [sensor behavior](sensor-behavior.md#sensor-ssh).

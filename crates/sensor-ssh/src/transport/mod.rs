@@ -3,9 +3,9 @@
 //! ADR-0011 and "SSH honeypot" in `internal/design/02-sensor-framework.md`). This module owns:
 //!
 //! - The unencrypted wire format: `write_packet_unencrypted`/`read_packet_unencrypted`. Key
-//!   exchange (Task 11) runs entirely over this framing before any cipher exists; the encrypted
-//!   variants that supersede it once `SSH_MSG_NEWKEYS` completes are added alongside it once
-//!   `TransportCipher` exists (Task 10/11).
+//!   exchange runs entirely over this framing before any cipher exists; the encrypted variants
+//!   that supersede it once `SSH_MSG_NEWKEYS` completes live alongside it
+//!   (`write_packet_encrypted`/`read_packet_encrypted`).
 //! - The version-string handshake: `do_version_exchange_server`.
 //! - KEXINIT: `build_kexinit`/`parse_kexinit`, this server's algorithm offer (rendered from the
 //!   tables in `algorithms`, which also negotiates against the client's lists) and the parser for

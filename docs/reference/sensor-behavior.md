@@ -904,13 +904,28 @@ captures SCP/SFTP transfers.
   `client_kex` lists on handshake-end events show whether any client population needs one of
   them.
 - **No common algorithm.** A client whose lists share nothing with the sensor's (any of key
-  exchange, host key, either cipher, compression) is sent `SSH_MSG_DISCONNECT` with reason 3
+  exchange, host key, either cipher, either MAC when its cipher is not an AEAD, compression) is
+  sent `SSH_MSG_DISCONNECT` with reason 3
   (key exchange failed) and the description `no matching key exchange method found` (or the host
-  key, cipher or compression equivalent), and the connection is closed
+  key, cipher, MAC or compression equivalent), and the connection is closed
   (`crates/sensor-ssh/src/transport/mod.rs#refuse_and_close`). Before this it was sent nothing and
   held its connection until the idle timeout. A `first_kex_packet_follows` guess that the
-  negotiation shows wrong is dropped unread, as RFC 4253 section 7 requires; a right guess is
-  used as the exchange's first packet.
+  negotiation shows wrong is dropped unread, as RFC 4253 section 7 requires, and counted in the
+  client-to-server sequence number (section 6.4), so the first encrypted client packet is
+  number 4; a right guess is used as the exchange's first packet.
+- **Cost of `diffie-hellman-group14-sha256`.** Measured on the release binary over loopback
+  (400 serial connections that send KEXINIT and one key-exchange packet, sensor CPU read from
+  `/proc`): about 1.0-1.2 ms of sensor CPU per connection for `curve25519-sha256`, 1.7 ms for
+  `ecdh-sha2-nistp256` and 3.5-4.2 ms for group14, so a group14 connection costs about 3-4 times
+  a curve25519 one (the 25-fold gap is the exchange function alone). The concurrency and
+  per-source caps bound simultaneous connections, not their rate, and a client can send a
+  trivial value and spend no CPU of its own, so about 200 group14 connections per second from one
+  source fill the unit's `CPUQuota=75%` (`deploy/sensor-ssh.service`). The two modular
+  exponentiations run on a tokio worker (`crates/sensor-ssh/src/transport/kex.rs#dh_group14_server`)
+  for about 4 ms in all. The owner's options are to accept this, to drop the group14 row in
+  `algorithms.rs` together with the `Kex::DiffieHellmanGroup14Sha256` arm in
+  `perform_kex_server` (the build fails with only one of the two removed), or to add a
+  semaphore or `spawn_blocking`.
 - **Connection event at accept.** `honeypot_connection` (`authenticated=false`) is emitted
   once per connection at accept, before the version exchange, like every other TCP sensor
   (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/auth.rs#AuthState::emit_connection_event`).

@@ -66,9 +66,9 @@ const ENV_CAPTURE_MEMORY_BYTES: &str = "PROPOLIS_SSH_CAPTURE_MEMORY_BYTES";
 /// real KEXINIT always advertises the kex-strict / ext-info Terrapin mitigation that this server
 /// does not emit, so a Terrapin scanner flagged the mismatch; 8.9p1 predates those, so omitting them
 /// is consistent. Operators SHOULD still set `PROPOLIS_SSH_BANNER` per host so the fleet does not
-/// share one value. Residual: the KEXINIT algorithm set is a minimal fixed offer (ADR-0011), so a
-/// HASSHServer probe can still distinguish this from a real OpenSSH; aligning the KEXINIT needs more
-/// crypto than the ADR currently permits and is tracked as a separate follow-up.
+/// share one value. Residual: the KEXINIT offer follows OpenSSH 8.9's order but omits its RSA host
+/// keys, `ecdh-sha2-nistp384`/`-nistp521`, the post-quantum exchanges and the UMAC MACs, so a
+/// HASSHServer probe can still distinguish this from a real OpenSSH.
 const DEFAULT_BANNER: &str = sensor_framework::persona::OPENSSH_VERSION;
 
 const DEFAULT_LOG_PATH: &str = "/var/log/propolis/ssh/events.jsonl";

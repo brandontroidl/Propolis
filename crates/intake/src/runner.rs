@@ -340,9 +340,13 @@ impl IntakeRunner {
     /// window absorbs their weight but not their ledger rows or event counters. That is the
     /// at-least-once guarantee's price and the only duplicate source on a healthy database.
     pub async fn run_batch(&mut self) -> RunBatchResult {
-        let lines = self
-            .tailer
-            .read_batch_bounded(self.batch_size, MAX_BATCH_BYTES as u64);
+        // Synchronous file reads of up to `MAX_BATCH_BYTES`: 13 ms from a warm page cache (the
+        // `cpu_budget` example) and a disk read's worth more from a cold one, so not on an async
+        // worker.
+        let (batch_size, tailer) = (self.batch_size, &mut self.tailer);
+        let lines = core_scoring::off_worker(|| {
+            tailer.read_batch_bounded(batch_size, MAX_BATCH_BYTES as u64)
+        });
         let lines_read = lines.len();
         let mut result = RunBatchResult::default();
         let mut events: Vec<EventInput> = Vec::with_capacity(lines_read);

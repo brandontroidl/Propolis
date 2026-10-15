@@ -76,6 +76,21 @@ capturing. So the sensor handler does no more than build a `CaptureJob` and `sub
 - A panicking sensor `event_builder` is caught, logged, and dropped; **the worker
   survives**.
 
+### Synchronous work on the daemon's async runtime
+
+The unified daemon runs every subsystem as a task on one multi-thread tokio runtime. A task in
+synchronous code cannot be preempted: it holds its worker until it returns, and every other task
+queued on that worker (and sqlx, which times a statement from issue to poll) waits with it. A step
+that can take longer than about 10 ms on a worst-case input therefore runs through
+`core_scoring::off_worker` (`crates/core-scoring/src/blocking.rs`), which hands the rest of the
+worker's queue to another thread for the step's duration and lets the step borrow its caller's
+data. The steps it covers are the digest and spool write of a fetched body
+(`crates/review/src/fetcher/mod.rs#record_success`), the feed publish
+(`crates/propolis/src/main.rs#publish_snapshot`), the chain hash of an intake batch
+(`crates/core-scoring/src/repository/batch.rs#chain_links`), the tailer's read of a batch, the
+campaign indexer's analysis of a long command line, and the ops-monitor's spool walk. On a
+current-thread runtime (the test harness) there is no other worker and the step runs in place.
+
 ### Serialized single-writer append
 
 All appends to the event ledger serialize against **one transaction-scoped Postgres

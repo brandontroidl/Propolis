@@ -405,9 +405,14 @@ async fn record_success(
     transport_auth: TransportAuth,
     stats: &Mutex<CycleStats>,
 ) {
-    let sha = Sha256::digest(&bytes).to_vec();
+    // A body can be 16 MiB: the digest is 140 ms and the spool write (which hashes again and
+    // syncs) 240 ms, with fsync outliers near a second (the `cpu_budget` example in the
+    // `propolis` crate). Neither may hold an async worker, or every other task's scheduling waits
+    // that long (`core_scoring::off_worker`).
+    let (sha, stored) =
+        core_scoring::off_worker(|| (Sha256::digest(&bytes).to_vec(), deps.spool.store(&bytes)));
 
-    if let Err(e) = deps.spool.store(&bytes) {
+    if let Err(e) = stored {
         tracing::warn!(url = %candidate.url, error = ?e, "fetcher: spool store failed, recording as a failed attempt");
         record_failure(
             deps,
@@ -714,6 +719,87 @@ mod orchestration_tests {
                 .or_else(|| self.default.clone())
                 .unwrap_or_else(|| panic!("unscripted url in MockFetcher: {}", candidate.url))
         }
+    }
+
+    /// Recording a large captured body digests and spools it, which takes hundreds of milliseconds
+    /// at the 16 MiB limit. On a runtime with one worker, a ticker task must keep running while it
+    /// does. The database is unreachable on purpose: the digest and the spool write come first, and
+    /// the failed upsert afterwards is only counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn recording_a_large_body_leaves_the_runtime_responsive() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .unwrap();
+        let spool_dir = TempDir::new().unwrap();
+        let deps = std::sync::Arc::new(test_deps(pool, &spool_dir, 100));
+        let candidate = std::sync::Arc::new(store::Candidate {
+            url_hash: vec![1; 32],
+            url: "http://fetch-lag.example/big.bin".into(),
+            host: "fetch-lag.example".into(),
+            scheme: "http".into(),
+            port: None,
+            source_ip: None,
+            parent_hash: None,
+            depth: 0,
+            attempts: 0,
+        });
+        // Non-repeating bytes, so the spool does not see a short, compressible or duplicate body.
+        let body: Vec<u8> = (0..(8u32 << 20))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+
+        let worst_us = std::sync::Arc::new(AtomicU64::new(0));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let (worst_us, stop) = (worst_us.clone(), stop.clone());
+            async move {
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let now = Instant::now();
+                    worst_us.fetch_max((now - last).as_micros() as u64, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = Instant::now();
+        let stats = Mutex::new(CycleStats::default());
+        let recorder = tokio::spawn({
+            let (deps, candidate) = (deps.clone(), candidate.clone());
+            async move {
+                record_success(
+                    &deps,
+                    &candidate,
+                    body,
+                    None,
+                    None,
+                    TransportAuth::Plaintext,
+                    &stats,
+                )
+                .await;
+            }
+        });
+        recorder.await.unwrap();
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+
+        let gap = Duration::from_micros(worst_us.load(Ordering::Relaxed));
+        // Without the hand-off the ticker is starved for the digest plus the spool write, which is
+        // most of `took`; with it the worst gap is a scheduling hiccup.
+        assert!(
+            gap < took / 3 && gap < Duration::from_millis(150),
+            "ticker starved for {gap:?} of the {took:?} the body took to record"
+        );
+        assert!(
+            std::fs::read_dir(spool_dir.path()).unwrap().count() >= 1,
+            "the body is still spooled"
+        );
     }
 
     // (a) a honeypot_file_download event with a public-resolving URL -> spool gets the sample,

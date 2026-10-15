@@ -565,6 +565,20 @@
   directory first (at most once a second) and counts the files actually present plus the stores
   in progress, under the same lock as the reservation. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-storage-properties).
+- **Steps that held an async worker for tens of milliseconds now run off it** - the daemon runs
+  every subsystem on one tokio runtime, and sqlx times a statement from issue to poll, so a task
+  stuck in synchronous code shows up as 1-2 s `COMMIT`s and primary-key lookups with the database
+  idle (backlog J10). Measured with the new `cpu_budget` example (release build), the steps over
+  10 ms were: digest of a 16 MiB fetched body 142 ms and its spool write 242 ms (outliers 950 ms
+  with the fsync); a feed publish 167 ms for 5,000 entries and 905 ms for 50,000; the chain hash
+  of an 8 MiB intake batch 77 ms, run with the ledger's append lock held; the tailer's read of one
+  8 MiB batch 13 ms from a warm cache; the ops-monitor's walk of a 20,000-file spool 85 ms on
+  every tick; and the campaign indexer's analysis of a command line, 0.4 ms at the sensors' 1 KiB
+  cap but 16 ms at 64 KiB and 60 ms at 1 MiB. Each now runs through the new
+  `core_scoring::off_worker`, which hands the rest of the worker's queue to another thread while
+  the step runs (a command line over 16 KiB; every other step always). The ATT&CK tagger, indicator
+  extraction at its cap, dropper URL extraction, batch JSON parsing and the upload filter measured
+  under 10 ms and are unchanged. No setting, no behaviour change.
 - **Redacting secrets from attacker text is linear** - `ioc::redact_secrets` replaced each
   credential inside one growing string and lowercased the whole string again for every
   `authorization:` it found, and scanned to the end of the text from every marker in

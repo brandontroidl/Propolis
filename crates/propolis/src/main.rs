@@ -384,6 +384,19 @@ fn preflight_output_dir(output_dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Publishes `snapshot` without holding an async worker. The publish renders every format and
+/// syncs each file to disk, all synchronously: 170 ms for 5,000 entries and 900 ms for 50,000
+/// (the `cpu_budget` example), which is that long of every other task's scheduling latency if it
+/// runs on the worker.
+fn publish_snapshot(
+    snapshot: &feed::FeedSnapshot,
+    output_dir: &std::path::Path,
+    exclusions: &ExclusionEngine,
+    feed_config: &FeedConfig,
+) -> Result<(), feed::PublishError> {
+    core_scoring::off_worker(|| Publisher::publish(snapshot, output_dir, exclusions, feed_config))
+}
+
 /// Feed build loop: build snapshot, publish atomically. Mirrors `feed/src/main.rs`'s loop.
 async fn run_feed_loop(
     pool: PgPool,
@@ -438,7 +451,7 @@ async fn run_feed_loop(
             Ok(snapshot) => {
                 let aggressive = snapshot.aggressive.len();
                 let standard = snapshot.standard.len();
-                match Publisher::publish(&snapshot, &output_dir, &exclusions, &feed_config) {
+                match publish_snapshot(&snapshot, &output_dir, &exclusions, &feed_config) {
                     Ok(()) => {
                         tracing::info!(aggressive, standard, "feed: build published");
                         // Record the publish time for the ops-monitor's feed-stale condition. A
@@ -2086,6 +2099,82 @@ mod coverage_cli_tests {
         ));
         assert_eq!(events[0].order_key, (at.timestamp_micros(), 7));
         assert_eq!(events[3].signal, CoverageSignal::LoginAttempt);
+    }
+}
+
+#[cfg(test)]
+mod feed_publish_tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use super::*;
+
+    /// Publishing a large feed takes hundreds of milliseconds of rendering and fsyncs. On a runtime
+    /// with one worker, a ticker task must keep running while `publish_snapshot` does it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn publishing_a_large_feed_leaves_the_runtime_responsive() {
+        let when = chrono::Utc::now();
+        // Addresses counted up from a block outside the reserved ranges, which a publish refuses.
+        let entries: Vec<feed::FeedEntry> = (0..20_000u32)
+            .map(|i| feed::FeedEntry {
+                source_ip: IpAddr::V4(std::net::Ipv4Addr::from(0x5A5A_0000 + i)),
+                tier: Some(core_scoring::FeedTier::Standard),
+                first_seen: when,
+                last_seen: when,
+                event_count: 10,
+                distinct_categories: 2,
+                categories: vec!["ssh_brute_force".into()],
+                valid_from: when,
+                valid_until: when + chrono::Duration::hours(24),
+            })
+            .collect();
+        let snapshot = Arc::new(feed::FeedSnapshot {
+            build_time: when,
+            aggressive: Vec::new(),
+            standard: entries,
+            windows: Vec::new(),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let output_dir = root.path().join("feed");
+        let exclusions = ExclusionEngine::new(Vec::new(), Vec::new());
+        let config = FeedConfig::default();
+
+        let worst_us = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let (worst_us, stop) = (worst_us.clone(), stop.clone());
+            async move {
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let now = Instant::now();
+                    worst_us.fetch_max((now - last).as_micros() as u64, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = Instant::now();
+        tokio::spawn({
+            let (snapshot, output_dir) = (snapshot.clone(), output_dir.clone());
+            async move {
+                publish_snapshot(&snapshot, &output_dir, &exclusions, &config).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+
+        let gap = Duration::from_micros(worst_us.load(Ordering::Relaxed));
+        assert!(
+            gap < took / 3 && gap < Duration::from_millis(150),
+            "ticker starved for {gap:?} of the {took:?} the publish took"
+        );
+        assert!(
+            output_dir.join("manifest.json").exists(),
+            "the feed is published"
+        );
     }
 }
 

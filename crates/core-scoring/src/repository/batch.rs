@@ -46,6 +46,7 @@ use std::net::IpAddr;
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgPool, Row};
 
+use crate::blocking::off_worker;
 use crate::domain::enums::{FeedTier, Protocol, SignalType};
 use crate::domain::types::{EventInput, IpScore};
 use crate::hashing::chain_hash;
@@ -136,15 +137,10 @@ async fn append_atomic(pool: &PgPool, events: &[EventInput]) -> Result<(), RepoE
         sqlx::query_scalar("SELECT hash FROM event ORDER BY id DESC LIMIT 1")
             .fetch_optional(&mut *tx)
             .await?;
-    let mut prev_hashes: Vec<Option<Vec<u8>>> = Vec::with_capacity(events.len());
-    let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(events.len());
-    let mut prev = head;
-    for event in events {
-        let hash = chain_hash(prev.as_deref(), event).to_vec();
-        prev_hashes.push(prev.take());
-        prev = Some(hash.clone());
-        hashes.push(hash);
-    }
+    // A full batch is up to 8 MiB of metadata to serialize and hash (77 ms measured), and the
+    // hash cannot start before the head is read, so it runs here with the lock held. It must not
+    // hold this async worker for that long (`blocking::off_worker`).
+    let (prev_hashes, hashes) = off_worker(|| chain_links(head, events));
 
     // Read every input the scored events need, before this batch's rows exist.
     let scored: Vec<&EventInput> = events
@@ -210,6 +206,23 @@ async fn append_atomic(pool: &PgPool, events: &[EventInput]) -> Result<(), RepoE
     write_sources(&mut tx, &sources).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Each event's `prev_hash` and `hash`, in order, from the chain head the batch starts after.
+fn chain_links(
+    head: Option<Vec<u8>>,
+    events: &[EventInput],
+) -> (Vec<Option<Vec<u8>>>, Vec<Vec<u8>>) {
+    let mut prev_hashes: Vec<Option<Vec<u8>>> = Vec::with_capacity(events.len());
+    let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(events.len());
+    let mut prev = head;
+    for event in events {
+        let hash = chain_hash(prev.as_deref(), event).to_vec();
+        prev_hashes.push(prev.take());
+        prev = Some(hash.clone());
+        hashes.push(hash);
+    }
+    (prev_hashes, hashes)
 }
 
 fn ip_texts<'a>(ips: impl Iterator<Item = &'a IpAddr>) -> Vec<String> {
@@ -511,4 +524,100 @@ async fn write_sources(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_links_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// A batch near the intake byte budget: four events with a megabyte of metadata each.
+    fn fat_batch() -> Vec<EventInput> {
+        (0..4)
+            .map(|n| {
+                EventInput::from_signal(
+                    format!("203.0.113.{}", 10 + n).parse().unwrap(),
+                    None,
+                    "sensor-a".into(),
+                    SignalType::HoneypotCommandExec,
+                    Protocol::Tcp,
+                    true,
+                    "2026-07-17T00:00:00Z".parse().unwrap(),
+                    serde_json::json!({ "command": "x".repeat(1 << 20), "n": n }),
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// The longest gap between polls of a 5 ms ticker over `step`, on a one-worker runtime, so the
+    /// step can only leave the ticker running by getting off the worker.
+    async fn longest_ticker_gap(step: impl FnOnce() + Send + 'static) -> Duration {
+        let worst_us = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker = tokio::spawn({
+            let (worst_us, stop) = (worst_us.clone(), stop.clone());
+            async move {
+                let mut last = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let now = Instant::now();
+                    worst_us.fetch_max((now - last).as_micros() as u64, Ordering::Relaxed);
+                    last = now;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::spawn(async move { step() }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+        Duration::from_micros(worst_us.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn links_chain_each_event_to_the_one_before_and_the_head() {
+        let events = fat_batch();
+        let head = Some(vec![7u8; 32]);
+        let (prevs, hashes) = chain_links(head.clone(), &events);
+        assert_eq!(prevs[0], head);
+        for i in 1..events.len() {
+            assert_eq!(prevs[i].as_deref(), Some(hashes[i - 1].as_slice()));
+        }
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(hashes[i], chain_hash(prevs[i].as_deref(), e).to_vec());
+        }
+    }
+
+    /// The hash of a full batch takes tens of milliseconds even in a release build. Run through
+    /// `off_worker` as `append_atomic` does, it must not stop the runtime's only worker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn hashing_a_full_batch_leaves_the_runtime_responsive() {
+        let events = Arc::new(fat_batch());
+        let gap = longest_ticker_gap({
+            let events = events.clone();
+            move || {
+                off_worker(|| chain_links(None, &events));
+            }
+        })
+        .await;
+        let control = longest_ticker_gap({
+            let events = events.clone();
+            move || {
+                chain_links(None, &events);
+            }
+        })
+        .await;
+        assert!(
+            control >= Duration::from_millis(40),
+            "control: hashing in place should starve the ticker, gap {control:?}"
+        );
+        assert!(
+            gap < control / 2 && gap < Duration::from_millis(100),
+            "off_worker gap {gap:?} against in-place gap {control:?}"
+        );
+    }
 }

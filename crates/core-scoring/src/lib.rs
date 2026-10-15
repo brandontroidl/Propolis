@@ -22,6 +22,7 @@
 //! crate's constants on the next tuning change).
 
 pub mod allowlist;
+pub mod blocking;
 pub mod domain;
 mod hashing;
 pub mod net;
@@ -29,6 +30,7 @@ pub mod repository;
 mod scoring;
 
 pub use allowlist::{AllowlistFileError, OperatorAllowlist, load_allowlist_file};
+pub use blocking::off_worker;
 pub use domain::enums::{Category, FeedTier, Protocol, ReviewState, SignalType};
 pub use domain::types::{EventInput, IpScore, ValidationError};
 pub use domain::weights::{SignalWeight, signal_weight};

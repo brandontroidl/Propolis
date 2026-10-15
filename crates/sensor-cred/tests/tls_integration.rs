@@ -560,16 +560,23 @@ fn reply_encryption(payload: &[u8]) -> Option<u8> {
     None
 }
 
-/// Login7 with `user` at offset 94 (UTF-16LE).
+/// Login7 with `user` as UserName at offset 94 and a different AppName after it (UTF-16LE),
+/// at the offsets MS-TDS 2.2.6.4 gives them (UserName 40..44, AppName 48..52).
 fn login7(user: &str) -> Vec<u8> {
     let mut l = vec![0u8; 200];
     l[0..4].copy_from_slice(&200u32.to_le_bytes());
     l[4..8].copy_from_slice(&0x7400_0004u32.to_le_bytes());
-    l[48..50].copy_from_slice(&94u16.to_le_bytes());
+    l[40..42].copy_from_slice(&94u16.to_le_bytes());
     let units: Vec<u16> = user.encode_utf16().collect();
-    l[50..52].copy_from_slice(&(units.len() as u16).to_le_bytes());
+    l[42..44].copy_from_slice(&(units.len() as u16).to_le_bytes());
     for (i, u) in units.iter().enumerate() {
         l[94 + 2 * i..96 + 2 * i].copy_from_slice(&u.to_le_bytes());
+    }
+    let app: Vec<u16> = "ODBC".encode_utf16().collect();
+    l[48..50].copy_from_slice(&150u16.to_le_bytes());
+    l[50..52].copy_from_slice(&(app.len() as u16).to_le_bytes());
+    for (i, u) in app.iter().enumerate() {
+        l[150 + 2 * i..152 + 2 * i].copy_from_slice(&u.to_le_bytes());
     }
     l
 }

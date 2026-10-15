@@ -296,29 +296,40 @@ fn build_loginack() -> Vec<u8> {
     wrap_tds_packet(TDS_RESPONSE, &payload)
 }
 
-/// Parse username from a TDS Login7 packet. The Login7 body has fixed offsets at known positions
-/// for the client name, username, password, etc. Username is at OffsetIbUserName (offset 48-49)
-/// and CchUserName (offset 50-51), stored as UTF-16LE.
+/// Byte offset of the UserName offset/length pair in a Login7 body (MS-TDS 2.2.6.4: ibUserName,
+/// cchUserName). The pair at 48 is AppName, the client's driver name, which is not a credential.
+const LOGIN7_USERNAME_PAIR: usize = 40;
+
+/// The shortest Login7 body: the fixed part through the SSPI offset, before any variable data.
+const LOGIN7_FIXED_LEN: usize = 94;
+
+/// Parse the username from a TDS Login7 body: UserName is `cchUserName` UTF-16LE code units at
+/// byte `ibUserName`, counted from the start of the body. The password beside it is never read.
 fn parse_login7_username(data: &[u8]) -> String {
-    if data.len() < 94 {
+    if data.len() < LOGIN7_FIXED_LEN {
         return String::new();
     }
-    // Login7 layout: first 4 bytes are total length, then fixed fields
-    // Username offset is at byte 48 (relative to start of Login7 body)
-    // Username length (in chars) at byte 50
-    let offset = u16::from_le_bytes([data[48], data[49]]) as usize;
-    let length = u16::from_le_bytes([data[50], data[51]]) as usize;
-
-    if length == 0 || offset + length * 2 > data.len() {
+    let pair = |at: usize| -> Option<usize> {
+        let bytes = data.get(at..at.checked_add(2)?)?;
+        Some(usize::from(u16::from_le_bytes([
+            *bytes.first()?,
+            *bytes.get(1)?,
+        ])))
+    };
+    let (Some(offset), Some(chars)) = (pair(LOGIN7_USERNAME_PAIR), pair(LOGIN7_USERNAME_PAIR + 2))
+    else {
         return String::new();
-    }
-
-    let utf16_bytes = &data[offset..offset + length * 2];
-    let utf16: Vec<u16> = utf16_bytes
+    };
+    let Some(raw) = offset
+        .checked_add(chars.saturating_mul(2))
+        .and_then(|end| data.get(offset..end))
+    else {
+        return String::new();
+    };
+    let utf16: Vec<u16> = raw
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
-
     String::from_utf16_lossy(&utf16)
 }
 
@@ -420,22 +431,37 @@ fn login_event(
 mod tests {
     use super::*;
 
+    /// A Login7-shaped buffer with `user` as UserName (40..44) at offset 94 and `app` as AppName
+    /// (48..52) at offset 150, so a parser reading the wrong pair returns the wrong string.
+    fn login7(user: &str, app: &str) -> Vec<u8> {
+        let mut data = vec![0u8; 300];
+        data[0..4].copy_from_slice(&300u32.to_le_bytes());
+        for (slot, at, text) in [(40, 94, user), (48, 150, app)] {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            data[slot..slot + 2].copy_from_slice(&u16::try_from(at).unwrap().to_le_bytes());
+            data[slot + 2..slot + 4]
+                .copy_from_slice(&u16::try_from(units.len()).unwrap().to_le_bytes());
+            for (i, unit) in units.iter().enumerate() {
+                data[at + 2 * i..at + 2 * i + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+        }
+        data
+    }
+
     #[test]
-    fn parse_login7_username_extracts_utf16le() {
-        // Build a minimal Login7-shaped buffer with username "sa" at offset 94
-        let mut data = vec![0u8; 200];
-        // Total length
-        data[0..4].copy_from_slice(&200u32.to_le_bytes());
-        // Username offset at byte 48-49: point to byte 94
-        data[48..50].copy_from_slice(&94u16.to_le_bytes());
-        // Username length (in chars) at byte 50-51: 2 chars
-        data[50..52].copy_from_slice(&2u16.to_le_bytes());
-        // Write "sa" as UTF-16LE at offset 94
-        data[94] = b's';
-        data[95] = 0;
-        data[96] = b'a';
-        data[97] = 0;
-        assert_eq!(parse_login7_username(&data), "sa");
+    fn parse_login7_username_reads_username_not_appname() {
+        assert_eq!(parse_login7_username(&login7("sa", "ODBC")), "sa");
+        assert_eq!(
+            parse_login7_username(&login7(
+                "r\u{f6}\u{f6}t",
+                "Core Microsoft SqlClient Data Provider"
+            )),
+            "r\u{f6}\u{f6}t"
+        );
+        // A client that sends no AppName still has its UserName read.
+        assert_eq!(parse_login7_username(&login7("sa", "")), "sa");
+        // A client that sends no UserName (integrated auth) is not given its AppName.
+        assert_eq!(parse_login7_username(&login7("", "ODBC")), "");
     }
 
     #[test]

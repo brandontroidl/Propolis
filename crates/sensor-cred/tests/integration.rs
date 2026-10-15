@@ -209,20 +209,13 @@ async fn mssql_login7_captures_username() {
         conn.read_exact(&mut resp_body).await.unwrap();
     }
 
-    // Build Login7 packet with username "sa" at offset 94
-    let mut login7 = vec![0u8; 200];
-    login7[0..4].copy_from_slice(&200u32.to_le_bytes()); // total length
-    // TDS version at offset 4
-    login7[4..8].copy_from_slice(&0x74000004u32.to_le_bytes());
-    // Username offset at 48-49: offset 94 within login7 body
-    login7[48..50].copy_from_slice(&94u16.to_le_bytes());
-    // Username length at 50-51: 2 chars
-    login7[50..52].copy_from_slice(&2u16.to_le_bytes());
-    // "sa" as UTF-16LE at offset 94
-    login7[94] = b's';
-    login7[95] = 0;
-    login7[96] = b'a';
-    login7[97] = 0;
+    // A Login7 whose UserName and AppName differ, as every real client's do.
+    let login7 = build_login7(
+        "WORKSTATION",
+        "sa",
+        "hunter2",
+        "Core Microsoft SqlClient Data Provider",
+    );
 
     let login7_pkt = wrap_tds(0x10, &login7);
     conn.write_all(&login7_pkt).await.unwrap();
@@ -253,7 +246,44 @@ async fn mssql_login7_captures_username() {
             .and_then(|v| v.as_str()),
         Some("mssql")
     );
+    // The password is dropped by policy, in either form: plaintext or the wire's obfuscation.
+    let wire = serde_json::to_string(&login.metadata).unwrap();
+    assert!(!wire.contains("hunter2"), "{wire}");
+    assert!(login.metadata.get("password").is_none());
     srv.handle.abort();
+}
+
+/// A TDS 7.4 Login7 body (MS-TDS 2.2.6.4): the 94-byte fixed part, whose offset/length pairs at 36
+/// (HostName), 40 (UserName), 44 (Password) and 48 (AppName) point into the data that follows.
+/// The password is obfuscated as the wire does (swap nibbles, XOR 0xA5).
+fn build_login7(host: &str, user: &str, password: &str, app: &str) -> Vec<u8> {
+    let utf16 =
+        |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let mut body = vec![0u8; 94];
+    body[4..8].copy_from_slice(&0x74000004u32.to_le_bytes());
+    let mut data = Vec::new();
+    for (slot, bytes, chars) in [
+        (36, utf16(host), host.encode_utf16().count()),
+        (40, utf16(user), user.encode_utf16().count()),
+        (
+            44,
+            utf16(password)
+                .iter()
+                .map(|b| b.rotate_left(4) ^ 0xA5)
+                .collect(),
+            password.encode_utf16().count(),
+        ),
+        (48, utf16(app), app.encode_utf16().count()),
+    ] {
+        let offset = u16::try_from(94 + data.len()).unwrap();
+        body[slot..slot + 2].copy_from_slice(&offset.to_le_bytes());
+        body[slot + 2..slot + 4].copy_from_slice(&u16::try_from(chars).unwrap().to_le_bytes());
+        data.extend_from_slice(&bytes);
+    }
+    body.extend_from_slice(&data);
+    let total = u32::try_from(body.len()).unwrap();
+    body[0..4].copy_from_slice(&total.to_le_bytes());
+    body
 }
 
 fn wrap_tds(pkt_type: u8, payload: &[u8]) -> Vec<u8> {

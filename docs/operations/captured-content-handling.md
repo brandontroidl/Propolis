@@ -75,7 +75,8 @@ Know these before an incident, because each one is the opposite of what you need
    `PROPOLIS_VT_UPLOAD` off** if captures of illegal material are a concern. Hash lookup
    alone sends only the digest.
 2. **Samples are deleted automatically after 30 days**, by age, with no hold mechanism
-   (`crates/review/src/virustotal.rs#cleanup_old_samples`). Where a preservation duty may
+   (`crates/sensor-framework/src/spool.rs#prune_older_than` in each sensor,
+   `crates/review/src/virustotal.rs#cleanup_old_samples` in the daemon for `fetched`). Where a preservation duty may
    apply, an automatic delete is the wrong default; see "Quarantine one sample" for how to
    take a file out of the cleanup's reach.
 3. **The recommended spool mounts are `tmpfs`** (printed by `deploy/install.sh`), so a body
@@ -139,7 +140,7 @@ sample's digest, without ever reading it:
    (for example `sudo install -d -m 0700 -o root -g root /srv/propolis-hold`; the path is yours
    to choose).
 4. Move the file there by name: `sudo mv -- /var/spool/propolis/<sensor>/<digest> /srv/propolis-hold/`.
-   A move takes it outside `cleanup_old_samples`, which only walks the spool directories
+   A move takes it outside retention, which only looks in the spool directories
    (`crates/review/src/spool.rs#all_body_dirs`), and outside the Samples page, the VirusTotal
    scan and the download route. Confirm with `sudo ls -l /srv/propolis-hold/` (metadata only) and
    that the Samples detail page now reads "Not in any spool".

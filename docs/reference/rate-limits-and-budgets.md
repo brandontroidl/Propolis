@@ -289,7 +289,7 @@ A zero interval is rejected for the review loops (would busy-loop)
 
 | Item | Value | Source |
 |---|---|---|
-| Sample spool max age | 30 days, checked hourly by the `sample-retention` task regardless of whether VirusTotal is enabled *(hard-coded)* | `SAMPLE_RETENTION_DAYS` (`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`); cleanup call in `crates/propolis/src/main.rs#main` |
+| Sample spool max age | 30 days, checked hourly: by each spooling sensor for its own spool, and by the daemon's `sample-retention` task for the fetcher's, regardless of whether VirusTotal is enabled *(hard-coded)* | `SAMPLE_RETENTION` (`crates/sensor-framework/src/spool.rs#SAMPLE_RETENTION`); the daemon's `SAMPLE_RETENTION_DAYS` (`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`) is derived from it |
 
 Operational spool and queue sizing (disk headroom, backpressure) is covered in
 [../operations/queue-and-spool.md](../operations/queue-and-spool.md).

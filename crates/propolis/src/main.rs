@@ -51,9 +51,11 @@ fn fetch_spool_dir() -> std::path::PathBuf {
 /// often that pass runs. Compile-time like the spool byte caps, not an env var: retention is a
 /// property of the evidence model (`docs/operations/retention.md`), and the DB row recording a
 /// sample's analysis outlives the bytes. The pass is a directory walk, so hourly is cheap and
-/// keeps a spool from sitting full for a whole day after its oldest bodies expire.
-const SAMPLE_RETENTION_DAYS: u64 = 30;
-const SAMPLE_RETENTION_INTERVAL: Duration = Duration::from_secs(3600);
+/// keeps a spool from sitting full for a whole day after its oldest bodies expire. Both are the
+/// sensors' own values (`sensor_framework::spool`), so a sensor ages its spool out by the same
+/// policy; the daemon's pass covers the spool it owns (`review::spool::daemon_retention_dirs`).
+const SAMPLE_RETENTION_DAYS: u64 = sensor_framework::spool::SAMPLE_RETENTION.as_secs() / 86_400;
+const SAMPLE_RETENTION_INTERVAL: Duration = sensor_framework::spool::SAMPLE_RETENTION_INTERVAL;
 
 /// How long a stored shell reply that no event names is kept before the same housekeeping pass
 /// deletes it. Must exceed the hour by which a re-stored reply refreshes `last_stored`, so a row an
@@ -1432,7 +1434,7 @@ async fn main() {
         move |token| {
             let pool = pool_retention.clone();
             async move {
-                let spool_dirs = review::spool::all_body_dirs();
+                let spool_dirs = review::spool::daemon_retention_dirs();
                 loop {
                     if token.is_cancelled() {
                         return;

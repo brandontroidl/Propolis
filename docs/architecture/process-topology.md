@@ -81,8 +81,10 @@ After startup, the daemon spawns each subsystem via `spawn_supervised` under a s
    `/var/spool/propolis`, sharing one daily budget across cycles. (`crates/propolis/src/main.rs#main`,
    `crates/review/src/virustotal.rs#DailyBudget`, `crates/review/src/virustotal.rs#scan_spool`)
    **Sample retention** - always spawned (`sample-retention`): hourly, deletes spooled
-   bodies older than 30 days from every body directory, independent of VirusTotal
-   (`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`).
+   bodies older than 30 days from the spool the daemon owns (the fetcher's `fetched`),
+   independent of VirusTotal (`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`). Each
+   capturing sensor ages out its own spool by the same rule, from its own process, because the
+   daemon's unit mounts the sensor spools read-only ([retention](../operations/retention.md)).
    **Campaign indexer** - always spawned (`campaigns`): every 15 s, or every 0.5 s while it
    works through a backlog, folds up to 25 batches of 2,000 ledger rows into the campaign tables,
    links downloads to fetched samples and extracts indicators from up to 16 captured artifacts;

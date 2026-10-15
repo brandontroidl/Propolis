@@ -122,6 +122,71 @@ mod tests {
         ts.parse::<DateTime<Utc>>().unwrap()
     }
 
+    fn aged(path: &std::path::Path, days: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_old_digest_named_samples_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("a".repeat(64));
+        let young = dir.path().join("b".repeat(64));
+        let stray = dir.path().join("old-but-not-a-sample");
+        for f in [&old, &young, &stray] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        aged(&old, 31);
+        aged(&stray, 31);
+
+        let report = cleanup_old_samples(&[("test", dir.path().to_path_buf())], 30).await;
+
+        assert_eq!(
+            report,
+            CleanupReport {
+                removed: 1,
+                failed: 0
+            }
+        );
+        assert!(!old.exists() && young.exists() && stray.exists());
+    }
+
+    /// A pass that cannot delete used to be indistinguishable from one with nothing to delete,
+    /// which is how retention sat broken under the shipped units without anyone noticing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cleanup_reports_samples_it_could_not_remove() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("a".repeat(64));
+        std::fs::write(&old, b"x").unwrap();
+        aged(&old, 31);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable_anyway = std::fs::File::create(dir.path().join("probe")).is_ok();
+
+        let report = cleanup_old_samples(&[("test", dir.path().to_path_buf())], 30).await;
+
+        // Restore before asserting so the temp dir can be cleaned up whatever happens.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if writable_anyway {
+            return; // running as root: the mode does not bind, so there is no failure to report
+        }
+        assert_eq!(
+            report,
+            CleanupReport {
+                removed: 0,
+                failed: 1
+            }
+        );
+        assert!(old.exists());
+    }
+
     #[test]
     fn budget_refuses_past_limit_then_resets_on_new_utc_day() {
         let day1 = at("2026-08-21T23:00:00Z");
@@ -488,15 +553,30 @@ async fn store_result(pool: &PgPool, result: &VtResult, sensor: &str) -> Result<
     Ok(())
 }
 
-pub async fn cleanup_old_samples(spool_dirs: &[(&str, PathBuf)], max_age_days: u64) {
+/// What one [`cleanup_old_samples`] pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub removed: u64,
+    /// Samples past the age limit that could not be removed (permissions, a read-only mount). Each
+    /// is retried on the next pass; a non-zero count on every pass means retention is not working
+    /// for that directory, and the pass logs a warning saying so rather than failing silently.
+    pub failed: u64,
+}
+
+pub async fn cleanup_old_samples(
+    spool_dirs: &[(&str, PathBuf)],
+    max_age_days: u64,
+) -> CleanupReport {
     let cutoff =
         std::time::SystemTime::now() - std::time::Duration::from_secs(max_age_days * 86400);
     let mut removed = 0u64;
+    let mut failed = 0u64;
 
     for (_sensor, dir) in spool_dirs {
         let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
             continue;
         };
+        let mut dir_warned = false;
         while let Ok(Some(entry)) = entries.next_entry().await {
             // Deliberately not `list_samples`: a planted digest-named link or FIFO ages out here
             // too. `remove_file` removes the entry itself and never touches a link's target.
@@ -510,9 +590,24 @@ pub async fn cleanup_old_samples(spool_dirs: &[(&str, PathBuf)], max_age_days: u
             if let Ok(meta) = entry.metadata().await
                 && let Ok(modified) = meta.modified()
                 && modified < cutoff
-                && tokio::fs::remove_file(entry.path()).await.is_ok()
             {
-                removed += 1;
+                match tokio::fs::remove_file(entry.path()).await {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        failed += 1;
+                        // First failure per directory only: one unwritable directory fails
+                        // every old file in it the same way.
+                        if !dir_warned {
+                            dir_warned = true;
+                            tracing::warn!(
+                                error = %e,
+                                spool = %dir.display(),
+                                "spool: a sample past retention could not be removed"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -520,4 +615,5 @@ pub async fn cleanup_old_samples(spool_dirs: &[(&str, PathBuf)], max_age_days: u
     if removed > 0 {
         tracing::info!(removed, max_age_days, "spool: cleaned up old samples");
     }
+    CleanupReport { removed, failed }
 }

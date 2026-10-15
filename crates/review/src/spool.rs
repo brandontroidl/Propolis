@@ -119,13 +119,24 @@ pub fn body_spool_dirs() -> Vec<(&'static str, PathBuf)> {
 }
 
 /// Every directory that holds captured bodies: the sensor spools plus the malware fetcher's own
-/// `fetched` bucket. The VT scan, sample retention and the console samples view all walk this one
-/// list, so `fetched` is appended here once rather than hand-appended at each caller (which is how
-/// one of them ends up walking three directories while another walks four).
+/// `fetched` bucket. The VT scan, the console samples view and the ops spool check all walk this
+/// one list, so `fetched` is appended here once rather than hand-appended at each caller (which is
+/// how one of them ends up walking three directories while another walks four). Sample retention
+/// does not: it walks [`daemon_retention_dirs`].
 pub fn all_body_dirs() -> Vec<(&'static str, PathBuf)> {
     let mut dirs = body_spool_dirs();
     dirs.push(("fetched", spool_subdir("fetched")));
     dirs
+}
+
+/// The spools the daemon ages samples out of: only the ones it owns and its unit can write.
+/// A sensor's spool is owned by the sensor's account and mounted read-only into the daemon's
+/// sandbox (`deploy/propolis.service`), so the daemon cannot delete there, and each sensor ages
+/// out its own (`sensor_framework::spool::QuarantineSpool::prune_older_than`, started by
+/// `CaptureHandoff::start_worker`). `crates/propolis/tests/retention_deploy.rs` checks that
+/// everything listed here is writable by the daemon under the shipped unit and provisioning.
+pub fn daemon_retention_dirs() -> Vec<(&'static str, PathBuf)> {
+    vec![("fetched", spool_subdir("fetched"))]
 }
 
 #[cfg(test)]

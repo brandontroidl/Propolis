@@ -153,13 +153,17 @@ paths: [Filesystem paths](../reference/filesystem-paths.md).
   1 GB on `/var/spool/propolis/fetched` (`FETCH_SPOOL_GLOBAL_BUDGET`,
   `crates/propolis/src/main.rs#FETCH_SPOOL_GLOBAL_BUDGET`). At the budget it stops writing new
   fetched samples; this is a cap, not an error. It is not operator-configurable.
-- **Sample retention** - `cleanup_old_samples` removes spool files older than 30
-  days each cycle, run by the `sample-retention` supervised task
+- **Sample retention** - a spooling sensor removes files older than 30 days from its own
+  spool, once at start and then hourly (`crates/sensor-framework/src/spool.rs#prune_older_than`,
+  started by `crates/sensor-framework/src/handoff.rs#start_worker`); the daemon's
+  `sample-retention` supervised task does the same for the fetcher's `fetched` spool
   (`crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`;
-  `cleanup_old_samples`, `crates/review/src/virustotal.rs#cleanup_old_samples`). This runs unconditionally,
+  `crates/review/src/virustotal.rs#cleanup_old_samples`). Both run unconditionally,
   independent of whether VT scanning is enabled, so a box with VT disabled still
   ages out old spool files; only the standalone `review` binary (which does not
   run this task) needs you to prune manually or rely on logrotate/disk policy.
+  A pass that finds samples it cannot remove logs a WARN naming the directory
+  (`samples past retention could not be removed`): check that directory's owner and mode.
   Plan retention accordingly: [Retention](../operations/retention.md).
 - **Disk full** - the spool mounts are recommended `noexec,nosuid,nodev` but
   `install.sh` does not create them; it prints fstab guidance. A full spool

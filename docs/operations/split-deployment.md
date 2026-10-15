@@ -483,11 +483,11 @@ gateway's state directory is not in the archive), steps 3.6 and 3.7, and reset t
   again. Intake treats the emptied file as rotated and reads new lines from its start. Do not
   rotate it with `copytruncate`: lines appended between the copy and the truncate are lost after
   the collector was told they were stored.
-- **Collector.** Nothing trims the capture spools there (`/var/spool/propolis/ssh`, `telnet`, `ftp`,
-  `adb`): sample retention runs in the `propolis` daemon, which the collector does not run. Once a
-  sensor has used its 100 MB budget, its later captures are refused
-  ([queue and spool](queue-and-spool.md)). Rebuild the collector periodically, or delete files
-  older than your retention window from those directories. The sensor logs rotate by
+- **Collector.** Each sensor trims its own capture spool (`/var/spool/propolis/ssh`, `telnet`,
+  `ftp`, `adb`, `tftp`, `mqtt`): files older than 30 days are removed at start and hourly, in the
+  sensor, so the collector needs no daemon for it ([retention](retention.md)). A sensor that
+  reaches its 100 MB budget inside that window refuses later bodies but still records the upload
+  event, marked not stored ([queue and spool](queue-and-spool.md)). The sensor logs rotate by
   `copytruncate` at 100 MB. The shipper uses the same tailer as intake, so lines it had not sent
   when a log was rotated, for example during a gateway outage, are read from `events.jsonl.1`
   before the new file, and the rotation guard skips a log whose `.1` it has not finished (it reads

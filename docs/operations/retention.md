@@ -4,7 +4,7 @@ audience: operator
 status: current
 owner: maintainer
 applies-to: 0.4.0 (untagged; latest tag v0.1.0)
-last-verified: 2026-10-08
+last-verified: 2026-10-14
 -->
 
 # Retention
@@ -51,19 +51,66 @@ controls](../security/outbound-controls.md).
 
 ## Captured-sample cleanup (30 days)
 
-Spooled sample files are removed after **30 days** by the daemon's `sample-retention`
-subsystem: `cleanup_old_samples(spool_dirs, 30)` runs hourly over every body directory
-(`review::spool::all_body_dirs`: the sensor spools plus the fetcher's `fetched` bucket;
-`crates/review/src/virustotal.rs` `cleanup_old_samples`, wired in `crates/propolis/src/main.rs`
-as `SAMPLE_RETENTION_DAYS` / `SAMPLE_RETENTION_INTERVAL`). The 30-day age and the hourly cadence
-are compile-time constants, not env vars. The cleanup itself performs no egress (it is local
-file deletion). It has no hold mechanism: a file that must be kept (for example one that may
-be illegal material) has to be moved out of the spool first, see [captured content
-handling](./captured-content-handling.md#quarantine-one-sample).
+Spooled sample files are removed after **30 days**, by whichever process owns the spool:
 
-The subsystem is always spawned, independent of VirusTotal. It used to be a step of the VT scan
+- **Each spooling sensor ages out its own spool** (ssh, telnet, adb, ftp, tftp, mqtt): once when it
+  starts and then hourly, `QuarantineSpool::prune_older_than(SAMPLE_RETENTION)`, started by
+  `CaptureHandoff::start_worker` so a sensor that stores samples through the framework has it
+  (`crates/sensor-framework/src/spool.rs#prune_older_than`,
+  `crates/sensor-framework/src/handoff.rs#start_worker`). It removes only entries named with a
+  canonical SHA-256 directly in the spool directory (a planted link is removed as a link, never
+  followed; the outbox manifest below the root is not touched) and recounts the spool's byte
+  budget, so the freed space is usable by the next capture.
+- **The daemon's `sample-retention` subsystem** does the same hourly for the one spool it owns,
+  the malware fetcher's `fetched` bucket (`review::spool::daemon_retention_dirs`;
+  `crates/review/src/virustotal.rs` `cleanup_old_samples`, wired in `crates/propolis/src/main.rs`
+  as `SAMPLE_RETENTION_DAYS` / `SAMPLE_RETENTION_INTERVAL`, both derived from the sensors'
+  `SAMPLE_RETENTION` / `SAMPLE_RETENTION_INTERVAL`).
+
+The 30-day age and the hourly cadence are compile-time constants, not env vars. Neither pass
+performs egress (it is local file deletion). There is no hold mechanism: a file that must be kept
+(for example one that may be illegal material) has to be moved out of the spool first, see
+[captured content handling](./captured-content-handling.md#quarantine-one-sample). A pass that finds
+a sample past retention and cannot remove it logs a WARN naming the directory (`samples past
+retention could not be removed`); a spool whose passes keep logging it is not being trimmed, and
+the cause is that directory's owner or mode.
+
+The daemon's pass is always spawned, independent of VirusTotal. It used to be a step of the VT scan
 cycle, so a deployment without a VT key never aged out a sample and its spools were bounded only
 by the byte budgets below, which then refused new evidence once old samples had filled them.
+
+### Why the sensors prune their own spools
+
+Until this change the daemon's pass walked every sensor spool, and under the shipped units it could
+not delete from any of them, with no log line to say so. Two independent causes, either enough:
+
+1. **The sandbox.** `deploy/propolis.service` runs with `ProtectSystem=strict` and lists only
+   `/var/lib/propolis` and `/var/spool/propolis/fetched` in `ReadWritePaths`, so
+   `/var/spool/propolis/<sensor>` is a read-only mount in the daemon's namespace and `unlink`
+   fails with `EROFS`.
+2. **The directory mode.** `deploy/provision.sh` creates each sensor spool `0750` for the sensor's
+   own user and group. The daemon's user reaches it as a member of that group (so it can read the
+   samples), and `unlink` needs write permission on the directory, which the group does not have.
+
+The sensors' own units already list their spool in `ReadWritePaths`, and the directory belongs to
+the sensor's user at `0700` or wider, so a sensor can delete there with **no change to any unit or
+directory**. Letting the daemon do it instead would have meant adding six sensor spools to
+`propolis.service`'s `ReadWritePaths` and giving the group (or the daemon) write access to
+directories owned by the internet-facing sensors, which lets a compromised daemon unlink or replace
+entries there (the cross-account write `install_script_var_lib_root_is_root_owned` exists to
+prevent for `/var/lib/propolis`). Pruning in the sensor loosens nothing, also covers a collector in
+a [split deployment](./split-deployment.md) that runs no daemon, and releases the sensor's budget
+directly. **Unit and provisioning changes made: none.**
+
+`crates/propolis/tests/retention_deploy.rs` keeps this true: for every spool a retention pass
+walks, the account that runs the pass owns the directory with `rwx` in `provision.sh` and has the
+path in `ReadWritePaths` in its unit, the daemon's list is limited to spools its unit can write,
+and `propolis.service` grants nothing more under `/var/spool/propolis`. If you relocate a sensor's
+spool with `PROPOLIS_<SENSOR>_SPOOL_DIR`, give that sensor's unit the new path in `ReadWritePaths`
+(a drop-in), or the sensor cannot write there at all.
+
+A sensor that is stopped does not prune its spool, and a sensor started with samples already past
+retention removes them in its first pass. The fetcher spool stays as before.
 
 Note that the sample-analysis DB rows (`sample_analysis`) recording VT verdicts are not deleted
 by this pass; only the spooled file bytes are. See [integrations](../reference/integrations.md)
@@ -71,8 +118,10 @@ and [queue and spool](./queue-and-spool.md).
 
 Independently of age, each spool is capped by a global byte budget (100 MB per spooling sensor,
 1 GB for the fetcher), enforced fail-closed at store time; a burst can be trimmed by budget
-refusal regardless of whether the cleanup pass runs. See [capacity
-planning](./capacity-planning.md).
+refusal regardless of whether the cleanup pass runs. A refused sensor upload still leaves its event
+in the ledger, marked `stored: false` with a `not_stored_reason`, so the observation is kept and
+only the body is lost ([queue and spool](./queue-and-spool.md#spool-refusals-spool_refused_count)).
+See [capacity planning](./capacity-planning.md).
 
 ## Event and score retention
 

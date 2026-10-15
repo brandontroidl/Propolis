@@ -540,6 +540,18 @@
   `orig_name` of the body that was seen. The Samples list does not show such a row. The refusal
   WARN is now logged at power-of-two totals, as the queue-drop WARN is. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-refusals-spool_refused_count).
+- **Sample retention now works on the shipped units: each sensor ages out its own spool** - the
+  daemon's retention pass walked every sensor spool but could not delete from any: its unit
+  (`ProtectSystem=strict`) lists only `fetched` in `ReadWritePaths`, and the spool directories
+  are `0750` for the sensor, so the daemon's group membership gives it read and no write. The pass
+  logged nothing, so spools filled to their 100 MB budget and stayed full. Each spooling sensor
+  (ssh, telnet, adb, ftp, tftp, mqtt) now removes samples older than 30 days from its own spool at
+  start and hourly, as the account that owns the directory, and recounts its budget; this needs no
+  unit or directory change and gives the daemon no new write access. The daemon's pass now walks
+  only the spool it owns (`fetched`) and logs a WARN when it finds a sample it cannot remove, as
+  the sensors do. A collector in a split deployment, which runs no daemon, is now trimmed too.
+  `retention_deploy` checks the units and `provision.sh` for every spool a pass walks. See
+  [retention](docs/operations/retention.md).
 - **A sensor whose spool filled up now captures again once files are removed** - the spool's
   byte count was recovered from the directory at startup and then only ever grew, so removing
   files from a running sensor's spool (sample retention, an operator) freed nothing and every

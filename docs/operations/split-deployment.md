@@ -525,8 +525,10 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
 - `PROPOLIS_GATEWAY_READ_TIMEOUT_MS` and `PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS` are validated but not
   applied, so a connection that stops sending holds one of the gateway's connection slots until
   `PROPOLIS_GATEWAY_MAX_DURATION_SECS` runs out (`crates/gateway/src/server.rs#handle_connection`).
-- The shipper sets no timeouts: a gateway that accepts a connection but never completes the
-  handshake or never answers a batch stalls its ship loop
+- The shipper bounds the dial (TCP connect plus handshake, 20 s) and each batch (write plus ack,
+  60 s). A gateway that accepts a connection but never completes the handshake or never answers a
+  batch costs one such wait and then a logged error (`shipper: failed to connect to gateway` or
+  `shipper: ship cycle IO error`); the batch is re-read and resent on the next pass
   (`crates/shipper/src/client.rs#ShipperClient::connect`, `crates/shipper/src/client.rs#ShipperClient::send_batch`).
 - If the shipper cannot write its state after the gateway accepted a batch (a full or read-only
   disk), every batch it builds while the write keeps failing is taken as a resend and dropped, and

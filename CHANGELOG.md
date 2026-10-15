@@ -485,6 +485,28 @@
   a handshake-end event with `kex_refused` `group14_busy`. curve25519 and ecdh clients never
   wait on it. See the cost note in
   [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh).
+- **A vendor, VirusTotal or gateway that stops answering no longer stalls its caller forever** -
+  the abuse-vendor adapters shared a `reqwest::Client::new()` with no timeout, so one vendor
+  that accepted the connection and never replied held the submission loop on that request with no
+  error; VirusTotal had only a total deadline and fell back to a deadline-free client if its
+  builder failed; and the shipper's gateway dial and ack wait had none, so a silent gateway
+  stopped shipping for every log. They now have connect, per-read and total deadlines (vendors
+  10/30/60 s, VirusTotal 10/15/30 s, shipper 20 s dial and 60 s per batch) that end as a
+  retryable error. A vendor 2xx whose body never finished was also recorded as an accepted
+  submission with an empty body; it is now retried. The ntfy poster, the heartbeat pinger and the
+  fetcher already had deadlines. See [integrations](docs/reference/integrations.md#vendor-abuse-submitters).
+- **An unreadable probe no longer sends a false "recovered"** - an ops-alert condition whose
+  source could not be read for one tick counted as healthy, so an open incident got a
+  `[recovered]` notice and then re-paged as a new one. An unreadable probe now holds the
+  condition where it was; a probe unreadable for 30 minutes already warned, and that warning now
+  says when an earlier page is still open. See
+  [unreadable probes](docs/operations/health-and-observability.md#unreadable-probes-and-undeliverable-alerts).
+- **An alert the push channel rejected is no longer lost** - a delivery that failed past the
+  dispatcher's two-second retry was logged once and forgotten, and the next page was a full
+  re-page cooldown away. It is now queued, retried at 30 s doubling to 15 minutes, and logged at
+  WARN on each failed retry; the queue is persisted to `ops-alert-undelivered.json` in the cursor
+  directory and a restart reports what was never delivered (journal WARN and one summary alert).
+  The dead-man's heartbeat is unaffected.
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

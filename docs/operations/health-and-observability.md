@@ -392,6 +392,52 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
 [integrations](../reference/integrations.md) and [troubleshooting: integrations and
 feed](../troubleshooting/integrations-and-feed.md).
 
+### Unreadable probes and undeliverable alerts
+
+Two failures used to be silent; neither is now.
+
+**A probe that cannot read its source does not clear an alert.** A condition whose query or
+file read fails reports unknown, which is neither firing nor healthy
+(`crates/propolis/src/ops_alert/debounce.rs#Signal::Unknown`). Unknown holds the condition
+exactly where it was: it never pages, never re-pages, never cancels or restarts a debounce in
+progress, and in particular never sends a `[recovered]` notice for an incident that is still
+open. Only a reading that says healthy recovers an incident, once. A probe that stays unknown
+for 30 minutes raises its own `probe-stale` warning, and when an earlier page for that condition
+is still open the warning says so ("an earlier page for it is still open: it cannot be confirmed
+cleared until the probe reads again"). It recovers, with the incident's own notice if the
+condition is now clear, on the first reading that works
+(`crates/propolis/src/ops_alert/monitor.rs#Monitor::process_tick`). The threshold is fixed.
+
+**A failed delivery is retried and reported.** The dispatcher makes four attempts per alert
+(0.2 s, 0.4 s, 0.8 s apart). An alert that still fails is no longer dropped after one journal
+line: it is queued and retried at the end of later monitor ticks, 30 s after the failure and
+then at doubling intervals up to 15 minutes, at most four retries per tick
+(`crates/propolis/src/ops_alert/undelivered.rs`). The newest state per condition wins, so a
+`[recovered]` notice replaces a queued page that never went out. The queue holds 64 alerts; a
+full queue drops the oldest with a WARN. What to look for in the journal
+(`journalctl -u propolis`):
+
+| Message | Level | Meaning |
+|---|---|---|
+| `ops-alert: delivery failed; will retry` | ERROR | the first delivery of an alert failed; it is queued |
+| `ops-alert: retry failed; will retry again` | WARN | a queued alert failed again; carries `attempts` and `error` |
+| `ops-alert: delivered after earlier failures` | INFO | a queued alert finally went out |
+| `ops-alert: an alert was never delivered before the previous run ended` | WARN | at startup, one per alert the previous run left queued |
+
+The queue is written to `ops-alert-undelivered.json` in `PROPOLIS_CURSOR_DIR` (key, title,
+severity, when it first failed, attempts, last error; never the alert body). If the daemon stops
+with alerts queued, the next run logs the WARN above for each and sends one summary alert,
+"propolis: alerts were not delivered", listing each with its age, attempt count and the failure;
+the summary is itself queued and persisted until it is delivered. With only the local log sink
+(`PROPOLIS_OPS_NTFY_URL` unset) delivery cannot fail and the file is never written.
+
+The dead-man's switch is independent of all of this. Retries run after the heartbeat in each
+tick, so a dead ntfy server cannot delay or suppress the ping, and the ping is not conditional on
+alerts having been delivered. Each ntfy attempt has its own 30 s deadline and the heartbeat
+request 15 s, so a server that accepts and never answers costs one bounded wait per attempt, not
+the monitor. That a `ping` stops arriving is still how the service on the other end learns the
+daemon is down.
+
 ### When the daemon or the host is down
 
 The monitor runs inside the daemon, so it cannot report the daemon's own death, nor the host's.

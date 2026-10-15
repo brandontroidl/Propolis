@@ -565,6 +565,17 @@
   directory first (at most once a second) and counts the files actually present plus the stores
   in progress, under the same lock as the reservation. See
   [queue and spool](docs/operations/queue-and-spool.md#spool-storage-properties).
+- **A writer waiting for the append lock no longer holds a pooled connection** - every ledger
+  writer took its connection first and the Postgres advisory lock second, so with sixteen intake
+  tailers on a pool of the same size every waiting tailer was a connection doing nothing, and the
+  console, the review loops and the campaign indexer queued for one (`acquired_after_secs`
+  3.256 on the live node). Writers in a process now queue on a fair in-process gate, one per
+  database, before they ask the pool for anything, so only the writer at the head of the queue
+  sits on the advisory lock; the lock itself is unchanged and still orders writers across
+  processes and nodes. The console's delist, relist and delete queue on the same gate
+  (`begin_exclusive` now returns `core_scoring::ExclusiveTx`, which derefs to the connection and
+  has the same `commit`). No setting, no migration. See
+  [storage](docs/architecture/storage.md#serialized-single-writer-append).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

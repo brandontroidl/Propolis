@@ -53,6 +53,7 @@ use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
 use crate::scoring::engine::apply_event;
 
+use super::append_gate;
 use super::events::{APPEND_LOCK_KEY, RepoError, normalize_in_place, score_from_row};
 
 /// Outcome of [`append_events`]. `events[..appended]` are durably in the ledger, in order;
@@ -117,6 +118,8 @@ struct SourceState {
 
 /// One transaction over `events` (already validated and normalized). All or nothing.
 async fn append_atomic(pool: &PgPool, events: &[EventInput]) -> Result<(), RepoError> {
+    // This process's turn at the lock, taken before a connection (see `append_gate`).
+    let _turn = append_gate::enter(pool).await;
     let mut tx = pool.begin().await?;
     // Same preconditions as `append_event`: READ COMMITTED so the head read after the lock sees
     // the previous appender's commit, then the global lock before anything is read.

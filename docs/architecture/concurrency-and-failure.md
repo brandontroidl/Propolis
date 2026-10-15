@@ -87,7 +87,9 @@ number of concurrent callers this guarantees the hash chain cannot fork, the pro
 UPSERT cannot lose an update, the breadth sets hold every scored event committed before the
 append that reads them, and the dedup-window read cannot be bypassed by an interleaved
 insert. The lock auto-releases at transaction end, so a rolled-back append
-never leaves it held. See [storage](./storage.md).
+never leaves it held. Writers in one process wait their turn on an in-process gate before they
+take a pooled connection, so a queue of appenders never pins the pool (see
+[storage](./storage.md)).
 
 Intake takes the lock once per **batch**, not once per line: `append_events`
 (`crates/core-scoring/src/repository/batch.rs#append_events`) runs the same critical section for

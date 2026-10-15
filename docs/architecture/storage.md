@@ -106,6 +106,15 @@ cannot lose an update. The lock auto-releases at transaction end, so a rolled-ba
 append never leaves it held. See
 [concurrency and failure](./concurrency-and-failure.md).
 
+Writers in one process queue on a fair in-process gate before they ask the pool for a
+connection (`crates/core-scoring/src/repository/append_gate.rs`; one gate per database). Without
+it each waiting writer was a checked-out connection parked on the advisory lock, and sixteen
+tailers on a pool of sixteen left nothing for the console or the review loops. With it, one
+writer per database waits on the advisory lock and the rest wait on the gate holding nothing.
+The advisory lock is unchanged: it is what orders writers in different processes (a standalone
+`intake` beside the daemon, a second node on the same database), which the gate cannot see. The
+console's delist, relist and delete (`begin_exclusive`) queue on the same gate.
+
 Because every sensor's appends wait on this one lock, the cost of the reads inside it is the
 intake rate for the whole node. The chain-head read is a single backward step on the primary
 key, and the dedup read (the newest prior event of the same source and signal) a single step on

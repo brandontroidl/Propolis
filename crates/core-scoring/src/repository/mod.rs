@@ -7,6 +7,7 @@
 //! stored raw score to now without ever writing the projected value back - the
 //! double-decay guard depends on the stored value staying un-projected.
 
+mod append_gate;
 pub mod batch;
 #[cfg(test)]
 mod breadth_sets_tests;
@@ -18,6 +19,7 @@ pub mod shell_output;
 pub use batch::{BatchAppend, append_events};
 pub use coverage::{CoverageEventRow, CoverageEvents, MAX_COVERAGE_ROWS, coverage_events};
 pub use events::{
-    RepoError, append_event, append_telemetry_event, begin_exclusive, read_score, read_stored_score,
+    ExclusiveTx, RepoError, append_event, append_telemetry_event, begin_exclusive, read_score,
+    read_stored_score,
 };
 pub use replay::{ChainStatus, rebuild_projection, verify_chain, verify_chain_in_batches};

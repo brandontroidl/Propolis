@@ -15,8 +15,13 @@ serde_json = "1.0.150"
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "macros", "rust_decimal", "chrono", "uuid", "json"] }
 thiserror = "2.0.18"
+# "sync" for the in-process append gate (src/repository/append_gate.rs). sqlx's runtime-tokio
+# already pulls tokio in, so this adds a feature, not a crate.
+tokio = { version = "1.53.1", features = ["sync"] }
 tracing = "0.1.44"
 uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 proptest = "1.11.0"
+# The append-gate tests spawn contending writers and time-box a pool acquire.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }

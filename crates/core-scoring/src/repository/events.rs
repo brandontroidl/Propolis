@@ -32,6 +32,11 @@
 //! `pg_advisory_xact_lock` auto-releases at transaction end (commit or
 //! rollback), so a failed/rolled-back append never leaves the lock held.
 //!
+//! Writers in one process queue on an in-process gate BEFORE they take a pooled connection
+//! (`append_gate`), so a waiter holds no connection: only the writer at the head of the queue sits
+//! on the advisory lock. The advisory lock itself is unchanged and still what serializes writers
+//! in different processes.
+//!
 //! [`append_events`](super::batch::append_events) takes the same lock once for a whole batch and
 //! leaves the state these per-event functions would; it is the reference these functions are
 //! proven against, so a change to one path's rules must reach the other
@@ -56,6 +61,8 @@ use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
 use crate::scoring::engine::{CategoryStat, apply_event, project_to_now};
+
+use super::append_gate;
 
 /// Errors from the repository layer. Every variant is a fail-closed outcome:
 /// the caller gets an error and (for the append path) the transaction rolls
@@ -107,6 +114,41 @@ macro_rules! stored_score_columns {
 }
 pub(crate) use stored_score_columns;
 
+/// A transaction that holds the append lock, from [`begin_exclusive`]. Derefs to the connection, so
+/// queries run on it as on a bare `sqlx::Transaction`; finish it with [`ExclusiveTx::commit`] or
+/// [`ExclusiveTx::rollback`], or drop it to roll back.
+///
+/// It owns this process's turn at the lock (`append_gate`) for as long as it lives, released after
+/// the transaction, so writers queued behind it wait without a pooled connection.
+pub struct ExclusiveTx {
+    tx: sqlx::Transaction<'static, Postgres>,
+    _turn: append_gate::AppendGate,
+}
+
+impl ExclusiveTx {
+    pub async fn commit(self) -> Result<(), sqlx::Error> {
+        self.tx.commit().await
+    }
+
+    pub async fn rollback(self) -> Result<(), sqlx::Error> {
+        self.tx.rollback().await
+    }
+}
+
+impl std::ops::Deref for ExclusiveTx {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
+    }
+}
+
+impl std::ops::DerefMut for ExclusiveTx {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tx
+    }
+}
+
 /// Open a transaction that holds the append lock, for a writer OUTSIDE this module that changes
 /// `ip_score` (the console's delist, relist and delete). An append reads an address's projection
 /// when it starts and writes it back when it commits; a change made in between is overwritten by
@@ -116,9 +158,8 @@ pub(crate) use stored_score_columns;
 ///
 /// READ COMMITTED is pinned first for the reason `append_event` pins it: each later statement
 /// must take a fresh snapshot after the lock is granted.
-pub async fn begin_exclusive(
-    pool: &PgPool,
-) -> Result<sqlx::Transaction<'static, Postgres>, sqlx::Error> {
+pub async fn begin_exclusive(pool: &PgPool) -> Result<ExclusiveTx, sqlx::Error> {
+    let turn = append_gate::enter(pool).await;
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *tx)
@@ -127,7 +168,7 @@ pub async fn begin_exclusive(
         .bind(APPEND_LOCK_KEY)
         .execute(&mut *tx)
         .await?;
-    Ok(tx)
+    Ok(ExclusiveTx { tx, _turn: turn })
 }
 
 // Manual `From` (not thiserror `#[from]`) so we do not require `ValidationError`
@@ -244,6 +285,8 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
 
     let event = normalize_event(event);
 
+    // This process's turn at the lock, taken before a connection (see `append_gate`).
+    let _turn = append_gate::enter(pool).await;
     let mut tx = pool.begin().await?;
 
     // Pin READ COMMITTED for this transaction regardless of the server's default
@@ -479,6 +522,7 @@ pub async fn append_telemetry_event(pool: &PgPool, event: EventInput) -> Result<
     }
     let event = normalize_event(event);
 
+    let _turn = append_gate::enter(pool).await;
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
         .execute(&mut *tx)

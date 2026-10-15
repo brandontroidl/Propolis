@@ -793,3 +793,50 @@ fn the_production_vendor_timeouts_are_conservative_and_ordered() {
     assert!(!t.connect.is_zero());
     review::vendor::http_client(t).expect("the production client builds");
 }
+
+/// reqwest's read timeout is one timer from the start of the request until the response headers
+/// arrive, not a gap between reads: a server that is merely slow to answer is cut at `read` even
+/// though `total` has plenty left. This pins that behaviour, which is why VirusTotal (an upload
+/// followed by server-side processing) must not set `read` below `total`.
+#[tokio::test]
+async fn the_read_deadline_bounds_the_wait_for_response_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = read_request(&mut stream).await;
+                tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+    let url = format!("http://{addr}");
+    let slow_read = review::vendor::http_client(review::vendor::ClientTimeouts {
+        connect: std::time::Duration::from_secs(5),
+        read: std::time::Duration::from_millis(300),
+        total: std::time::Duration::from_secs(5),
+    })
+    .unwrap();
+    assert!(slow_read.post(&url).body("x").send().await.is_err());
+    let read_equals_total = review::vendor::http_client(review::vendor::ClientTimeouts {
+        connect: std::time::Duration::from_secs(5),
+        read: std::time::Duration::from_secs(5),
+        total: std::time::Duration::from_secs(5),
+    })
+    .unwrap();
+    assert!(read_equals_total.post(&url).body("x").send().await.is_ok());
+}
+
+/// VirusTotal's upload plus its processing share one header wait, so `read` may not undercut
+/// `total` (it did, at 15 s against 30 s, halving the upload window).
+#[test]
+fn the_virustotal_read_deadline_does_not_undercut_its_total() {
+    let t = review::vendor::ClientTimeouts::VIRUSTOTAL;
+    assert!(t.read >= t.total, "{t:?}");
+    assert!(t.total <= std::time::Duration::from_secs(120));
+    assert!(!t.connect.is_zero());
+    review::vendor::http_client(t).expect("the VirusTotal client builds");
+}

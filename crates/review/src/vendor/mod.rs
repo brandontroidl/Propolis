@@ -26,7 +26,11 @@ pub use otx::OtxAdapter;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientTimeouts {
     pub connect: std::time::Duration,
-    /// Longest gap between two reads of the response, so a trickling body is cut off too.
+    /// reqwest's `read_timeout`. It is one timer armed when the request starts and it expires if
+    /// the response headers have not arrived by then, so it bounds connect + upload + the server's
+    /// think time together, and upload progress does not reset it. Only once the headers are in
+    /// does it become a per-read timer on the body, which cuts off a trickling body. A caller that
+    /// uploads a large body must therefore set it at least as long as `total`.
     pub read: std::time::Duration,
     pub total: std::time::Duration,
 }
@@ -39,6 +43,15 @@ impl ClientTimeouts {
         connect: std::time::Duration::from_secs(10),
         read: std::time::Duration::from_secs(30),
         total: std::time::Duration::from_secs(60),
+    };
+
+    /// VirusTotal uploads a sample of up to `PROPOLIS_FETCH_MAX_BYTES` (10 MB by default). The
+    /// whole exchange keeps the 30 s total it always had, and `read` equals `total` because it
+    /// would otherwise cap the upload and VirusTotal's processing below that total (see `read`).
+    pub const VIRUSTOTAL: Self = Self {
+        connect: std::time::Duration::from_secs(10),
+        read: std::time::Duration::from_secs(30),
+        total: std::time::Duration::from_secs(30),
     };
 }
 

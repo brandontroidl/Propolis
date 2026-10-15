@@ -208,14 +208,6 @@ impl VtApi for HttpVt {
     }
 }
 
-/// The whole-request deadline stays the 30 s this client always had; the connect and per-read
-/// deadlines are new, so a connection that opens and goes quiet is cut at 10 s / 15 s.
-pub(crate) const VT_TIMEOUTS: crate::vendor::ClientTimeouts = crate::vendor::ClientTimeouts {
-    connect: std::time::Duration::from_secs(10),
-    read: std::time::Duration::from_secs(15),
-    total: std::time::Duration::from_secs(30),
-};
-
 pub async fn scan_spool(
     pool: &PgPool,
     config: &VtConfig,
@@ -224,7 +216,7 @@ pub async fn scan_spool(
 ) -> Vec<VtResult> {
     // No `unwrap_or_default()`: the default client has no deadlines, which is the stall this
     // builder exists to prevent. A build failure skips the pass and says so.
-    let client = match crate::vendor::http_client(VT_TIMEOUTS) {
+    let client = match crate::vendor::http_client(crate::vendor::ClientTimeouts::VIRUSTOTAL) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "virustotal: http client build failed; skipping the scan pass");

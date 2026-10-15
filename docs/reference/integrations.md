@@ -130,15 +130,20 @@ Error classification (`crates/review/src/vendor/mod.rs#send_and_classify`): 2xx 
 failure (no response, `status:0`) or 5xx is `Transient` (retried next poll); any
 other 4xx is `Permanent` (marked failed, not auto-retried).
 
-Every vendor call goes through one shared client with a 10 s connect, 30 s per-read and 60 s
-whole-request deadline (`crates/review/src/vendor/mod.rs#ClientTimeouts::VENDOR`). A vendor that
+Every vendor call goes through one shared client with a 10 s connect, 30 s read and 60 s
+whole-request deadline (`crates/review/src/vendor/mod.rs#ClientTimeouts::VENDOR`). The read
+deadline is reqwest's `read_timeout`: one timer from the start of the request until the response
+headers arrive (upload progress does not reset it), and a per-read timer on the body after that.
+So a vendor has 30 s to start answering and the whole exchange is capped at 60 s. A vendor that
 accepts the connection and never answers, or sends headers and stalls the body, ends as a
 `Transient` error with `status:0` and is retried on the next poll; before the deadlines existed
 it held the submission loop on that one request indefinitely. A 2xx whose body does not finish
 is also `Transient`, never an accepted submission. The VirusTotal client keeps its 30 s total
-and adds a 10 s connect and 15 s per-read deadline
-(`crates/review/src/virustotal.rs#VT_TIMEOUTS`). If the client cannot be built the vendor loop
-refuses to start, and the scan pass is skipped, rather than running without deadlines.
+and adds a 10 s connect deadline; its read deadline is also 30 s, because the read timer covers
+the sample upload and VirusTotal's processing together and a shorter one would cut uploads that
+the total still allows (`crates/review/src/vendor/mod.rs#ClientTimeouts::VIRUSTOTAL`). If the
+client cannot be built the vendor loop refuses to start, and the scan pass is skipped, rather
+than running without deadlines.
 
 ### Gating (the gatekeeper)
 

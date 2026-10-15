@@ -913,19 +913,36 @@ captures SCP/SFTP transfers.
   negotiation shows wrong is dropped unread, as RFC 4253 section 7 requires, and counted in the
   client-to-server sequence number (section 6.4), so the first encrypted client packet is
   number 4; a right guess is used as the exchange's first packet.
-- **Cost of `diffie-hellman-group14-sha256`.** Measured on the release binary over loopback
-  (400 serial connections that send KEXINIT and one key-exchange packet, sensor CPU read from
-  `/proc`): about 1.0-1.2 ms of sensor CPU per connection for `curve25519-sha256`, 1.7 ms for
-  `ecdh-sha2-nistp256` and 3.5-4.2 ms for group14, so a group14 connection costs about 3-4 times
-  a curve25519 one (the 25-fold gap is the exchange function alone). The concurrency and
-  per-source caps bound simultaneous connections, not their rate, and a client can send a
-  trivial value and spend no CPU of its own, so about 200 group14 connections per second from one
-  source fill the unit's `CPUQuota=75%` (`deploy/sensor-ssh.service`). The two modular
-  exponentiations run on a tokio worker (`crates/sensor-ssh/src/transport/kex.rs#dh_group14_server`)
-  for about 4 ms in all. The owner's options are to accept this, to drop the group14 row in
-  `algorithms.rs` together with the `Kex::DiffieHellmanGroup14Sha256` arm in
-  `perform_kex_server` (the build fails with only one of the two removed), or to add a
-  semaphore or `spawn_blocking`.
+- **Cost and throttle of `diffie-hellman-group14-sha256`.** Measured on the release binary over
+  whole loopback connections that send KEXINIT and one key-exchange packet, with the sensor's CPU
+  read from `/proc`: 3.50-3.73 ms per group14 connection against 0.90-1.15 ms for
+  `curve25519-sha256`, so a group14 connection costs about 3-4 times a curve25519 one. The two
+  modular exponentiations (`crates/sensor-ssh/src/transport/kex.rs#dh_group14_server`) are about
+  2.7 ms of the group14 figure. The concurrency and per-source caps bound simultaneous
+  connections, not their rate, and a client can send a trivial value and spend no CPU of its own,
+  so unthrottled about 200 group14 connections per second (0.75 core over 3.6 ms) from one source
+  would fill the unit's `CPUQuota=75%` (`deploy/sensor-ssh.service`) and slow every other
+  session of the process.
+  The owner decided on 2026-10-15 to keep offering group14 in OpenSSH 8.9's order and throttle it
+  (`crates/sensor-ssh/src/transport/group14_gate.rs`). The exponentiation runs on the blocking
+  pool, not on one of the sensor's two async workers, and one process-wide permit
+  (`GROUP14_PERMITS`) is held for twice the exchange's cost, which holds group14 to half a core
+  (about 140 exchanges a second) and leaves 25 points of the quota for everything else; a
+  concurrency cap alone would still allow a full core, above the quota. A client that negotiates
+  group14 while the permit is taken waits at most `GROUP14_WAIT` (2 s), then is sent
+  `SSH_MSG_DISCONNECT` with reason 12 (too many connections) and the description `too many
+  concurrent diffie-hellman-group14-sha256 exchanges, try again or use another key exchange
+  method`, and the connection is closed. Its handshake-end `honeypot_session_end` event ends
+  `malformed_input` (the framework has no refusal ending) with `kex_refused` `group14_busy`.
+  `curve25519` and `ecdh-sha2-nistp256` clients never touch the gate and are answered while it is
+  full (`crates/sensor-ssh/tests/group14_throttle.rs`). The permit is taken after the client's
+  exchange value has arrived, so a connection that never sends it holds nothing.
+- **Known limit: the packets before key exchange are counted, not typed.** The server reads a
+  fixed number of unencrypted packets (the KEXINIT, an optional discarded guess, then the
+  exchange's first message), so an `SSH_MSG_IGNORE` or `SSH_MSG_DEBUG` that a client sends in
+  that window (RFC 4253 section 11 allows them at any time) would be read as the key-exchange
+  value and fail the exchange. No scanner or OpenSSH client seen sends one there; it is not
+  handled, and a change would be separate work.
 - **Connection event at accept.** `honeypot_connection` (`authenticated=false`) is emitted
   once per connection at accept, before the version exchange, like every other TCP sensor
   (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/auth.rs#AuthState::emit_connection_event`).

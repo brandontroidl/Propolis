@@ -456,17 +456,35 @@
   `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256`, `aes128/192/256-ctr`, `aes128-gcm` and
   `aes256-gcm`, and `hmac-sha2-256`, `hmac-sha2-512` and `hmac-sha1` with their `-etm` forms. A
   wrongly guessed `first_kex_packet_follows` packet is dropped instead of being taken for the
-  key exchange, and counted in the client-to-server sequence number. The handshake-end `honeypot_session_end` event now carries the client's offered
-  lists as `client_kex` and, on a refusal, `negotiation_failed` (`kex`, `host_key`,
-  `cipher_c2s`, `cipher_s2c`, `mac_c2s`, `mac_s2c` or `compression`) naming the list, so the
-  operator can see which algorithms a client that never got a session was asking for. The new
-  primitives are crates already in the vendor tree, but `aes`, `aes-gcm`, `ctr` and `p256` were
-  reached only by the SSH test client until now and the internet-facing sensor is their first
-  production user; no RSA host key is offered (the `rsa` crate carries RUSTSEC-2023-0071), see
-  [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh). A client choosing
-  `diffie-hellman-group14-sha256` costs the sensor about 3.5-4 ms of CPU per connection against
-  about 1 ms for curve25519 (3-4 times; the concurrency caps do not bound the rate), see the
-  cost note in sensor behavior.
+  key exchange, and counted in the client-to-server sequence number. The handshake-end
+  `honeypot_session_end` event now carries the client's offered lists as `client_kex` and, on a
+  refusal, `negotiation_failed` (`kex`, `host_key`, `cipher_c2s`, `cipher_s2c`, `mac_c2s`,
+  `mac_s2c` or `compression`) naming the list, so the operator can see which algorithms a client
+  that never got a session was asking for. No RSA host key is offered (the `rsa` crate carries
+  RUSTSEC-2023-0071), see [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh).
+  Reading the pre-key-exchange packets still counts them rather than typing them, so an
+  `SSH_MSG_IGNORE` sent there would be read as the exchange's first message (documented, not
+  changed).
+- **Production dependencies: 18 crates join the sensor's graph, approved by the owner on
+  2026-10-15** - the new ciphers and key exchanges link `aes`, `aes-gcm`, `ctr` and `p256` into
+  `sensor-ssh`, which until now only its test client reached, and with them `aead`,
+  `base16ct`, `cpubits`, `crypto-bigint`, `der`, `elliptic-curve`, `ff`, `ghash`, `group`,
+  `polyval`, `primefield`, `primeorder`, `sec1` and `wnaf`. All 18 are vendored, none has a
+  `build.rs`, and `cargo deny check` is clean for `bans`, `licenses` and `sources` with no
+  advisory against any of them (`advisories` fails on `rustls` 0.23.45, locked at that version
+  before this change). Versions and the chain that pulls each in are in
+  [dependencies](docs/reference/dependencies.md).
+- **`diffie-hellman-group14-sha256` is throttled** - a client picks it before authenticating and
+  it costs the sensor 3.50-3.73 ms of CPU per connection (the modular exponentiations are about
+  2.7 ms of that) against 0.90-1.15 ms for curve25519, with the concurrency caps bounding
+  simultaneous connections rather than their rate. The owner decided on 2026-10-15 to keep
+  offering it in OpenSSH 8.9's order and cap it: the exponentiation moves off the async workers,
+  one process-wide permit is held for twice an exchange's cost (half a core, about 140 exchanges
+  a second, inside the unit's `CPUQuota=75%`), and a client that negotiates group14 while the
+  permit is taken waits at most 2 s, then gets `SSH_MSG_DISCONNECT` (too many connections) and
+  a handshake-end event with `kex_refused` `group14_busy`. curve25519 and ecdh clients never
+  wait on it. See the cost note in
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

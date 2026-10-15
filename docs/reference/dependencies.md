@@ -97,10 +97,37 @@ complete a real SSH handshake without a general SSH library
 `crates/sensor-ssh/Cargo.toml#sha1`, `crates/sensor-ssh/Cargo.toml#p256`,
 `crates/sensor-ssh/Cargo.toml#num-bigint`). These crates were already vendored, but not all were
 on a production path: `hmac`, `sha1` and `num-bigint` already were (the console, the framework and
-the collector's certificate parsing), while `aes`, `aes-gcm`, `ctr` and `p256` (with `elliptic-curve`
-and `primeorder`) were reached only by the SSH test client, so this change moves them from
-test-only to the internet-facing sensor, their only production consumer. That is a supply-chain
-posture change awaiting the owner's sign-off. The sensor links them
+the collector's certificate parsing), while the SSH test client alone reached the rest. Linking
+`aes`, `aes-gcm`, `ctr` and `p256` into the sensor moves 18 crates from test-only to the
+internet-facing sensor, their only production consumer. The owner approved all 18 on 2026-10-15:
+
+| Crate | Version | Pulled in by |
+|---|---|---|
+| `aes` | 0.9.2 | `sensor-ssh`, `aes-gcm` |
+| `ctr` | 0.10.1 | `sensor-ssh`, `aes-gcm` |
+| `aes-gcm` | 0.11.0 | `sensor-ssh` |
+| `aead` | 0.6.1 | `aes-gcm` |
+| `ghash` | 0.6.0 | `aes-gcm` |
+| `polyval` | 0.7.3 | `ghash` |
+| `p256` | 0.14.0 | `sensor-ssh` |
+| `elliptic-curve` | 0.14.1 | `p256`, `primeorder` |
+| `primeorder` | 0.14.0 | `p256` |
+| `primefield` | 0.14.0 | `p256`, `primeorder`, `wnaf` |
+| `crypto-bigint` | 0.7.5 | `elliptic-curve`, `primefield` |
+| `cpubits` | 0.1.1 | `aes`, `crypto-bigint`, `polyval` |
+| `ff` | 0.14.0 | `elliptic-curve`, `group`, `primefield`, `wnaf` |
+| `group` | 0.14.0 | `elliptic-curve`, `wnaf` |
+| `wnaf` | 0.14.1 | `primeorder` |
+| `sec1` | 0.8.1 | `elliptic-curve` |
+| `der` | 0.8.1 | `sec1` |
+| `base16ct` | 1.0.0 | `elliptic-curve`, `sec1` |
+
+Versions are those in `Cargo.lock`; the last column is `cargo tree -p sensor-ssh -e normal -i
+<crate> --depth 1`. Evidence recorded with the sign-off: every one is vendored under `vendor/` (the
+build resolves offline from there), none has a `build.rs`, and `cargo deny check` reports
+`bans ok, licenses ok, sources ok` with no advisory against any of the 18. The same run fails
+`advisories` on `rustls` 0.23.45 (RUSTSEC-2026-0346 to -0349), which is none of the 18 and was
+locked at the same version before this change. The sensor links them
 directly so it can speak the ciphers, MACs and key exchanges OpenSSH offers by default. The
 cipher, MAC and curve crates are RustCrypto primitives used through their published interface (P-256
 with only its `ecdh` feature, so no ECDSA or PKCS code is compiled in); the sensor writes only

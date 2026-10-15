@@ -602,8 +602,9 @@ async fn serve_sample(dirs: &[(&'static str, PathBuf)], sha256: &str) -> Respons
 }
 
 fn spool_dirs() -> Vec<(&'static str, PathBuf)> {
-    // The one canonical list (sensor spools + the fetcher's bucket), shared with the VT scan and
-    // sample retention so this view never walks a different set than they do.
+    // The one canonical list (sensor spools + the fetcher's bucket), shared with the VT scan so
+    // this view never walks a different set than it does. Retention is not tied to this list:
+    // each sensor ages out its own spool and the daemon only its `fetched` bucket.
     review::spool::all_body_dirs()
 }
 

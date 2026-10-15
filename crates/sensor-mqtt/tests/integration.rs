@@ -1342,7 +1342,7 @@ async fn a_full_spool_still_records_the_upload_marked_not_stored() {
     srv.handle.abort();
 }
 
-/// The daemon's sample retention removes old files from a running sensor's spool. The sensor used
+/// Space freed under a running sensor's spool (an operator, a sweep) is found again. The sensor used
 /// to count its budget up only, so capture stayed stopped until a restart; now the freed space is
 /// found when an upload would otherwise be refused.
 #[tokio::test]

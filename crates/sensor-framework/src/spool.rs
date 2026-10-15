@@ -934,8 +934,8 @@ mod tests {
         }
     }
 
-    /// The budget is bytes on disk, and something else removes files from the spool (the daemon's
-    /// sample retention, an operator): a spool that only counted up stayed full until the sensor
+    /// The budget is bytes on disk, and something else removes files from the spool (an operator,
+    /// an external sweep): a spool that only counted up stayed full until the sensor
     /// restarted, so capture stopped for good once 100 MB had ever been written. Space freed
     /// outside the spool is picked up from the directory when a store would otherwise be refused.
     #[test]

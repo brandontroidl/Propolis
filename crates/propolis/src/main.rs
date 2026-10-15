@@ -37,8 +37,9 @@ use review::submit::SubmissionRunner;
 use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter};
 
 /// Path the malware fetcher writes captured samples to - the same `fetched` bucket
-/// `review::spool::all_body_dirs` hands the VT scan, sample retention and the console samples
-/// view, so the writer and every reader agree by construction. Not an operator env var, same
+/// `review::spool::all_body_dirs` hands the VT scan and the console samples view (sample retention
+/// walks `daemon_retention_dirs`, which includes it), so the writer and every reader agree by
+/// construction. Not an operator env var, same
 /// convention as every other sensor's `SPOOL_MAX_FILE_SIZE`/`SPOOL_GLOBAL_BUDGET` constants.
 /// Resolved from the shared spool root, never hardcoded, so it follows `PROPOLIS_SPOOL_ROOT` like
 /// every other directory under the tree and a deployment that relocates the spool does not leave the

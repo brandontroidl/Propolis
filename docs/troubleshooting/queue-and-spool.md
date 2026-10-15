@@ -160,8 +160,9 @@ paths: [Filesystem paths](../reference/filesystem-paths.md).
   (`crates/propolis/src/main.rs#main`, `crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`;
   `crates/review/src/virustotal.rs#cleanup_old_samples`). Both run unconditionally,
   independent of whether VT scanning is enabled, so a box with VT disabled still
-  ages out old spool files; only the standalone `review` binary (which does not
-  run this task) needs you to prune manually or rely on logrotate/disk policy.
+  ages out old `fetched` files; the sensor spools prune themselves either way. Only the
+  standalone `review` binary (which does not run the daemon task) needs you to prune `fetched`
+  manually or rely on logrotate/disk policy.
   A pass that finds samples it cannot remove logs a WARN with the directory in its `spool` field
   (grep for `past retention could not be removed`; the sensor's and the daemon's texts differ before that): check that directory's owner and mode.
   Plan retention accordingly: [Retention](../operations/retention.md).

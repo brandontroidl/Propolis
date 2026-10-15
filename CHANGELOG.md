@@ -440,6 +440,25 @@
   `fleet-listeners.env` (0644) to the scripts that write them. Upgrade note: an existing env file
   that was group- or world-readable is now `0600` after the upgrade; systemd reads
   `EnvironmentFile=` as root, so the units are unaffected.
+- **SSH clients with no algorithm in common are told so, and the sensor speaks what OpenSSH 8.9
+  offers by default** - the sensor offered one algorithm per KEXINIT slot (curve25519-sha256,
+  ssh-ed25519, chacha20-poly1305, no MACs), parsed the client's KEXINIT and threw it away, so a
+  client that shared nothing with that got KEXINIT and then silence until the idle close. Live,
+  every PuTTY-banner (581 connections, no login) and Go-banner (741, one login) scanner
+  abandoned key exchange that way. Negotiation now follows RFC 4253 section 7.1 (per list, the
+  first algorithm the client names that the sensor supports), a list with nothing in common is
+  answered with `SSH_MSG_DISCONNECT` (key exchange failed) and a closed connection, and the
+  offer is widened, in OpenSSH 8.9's order, to `curve25519-sha256@libssh.org`,
+  `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256`, `aes128/192/256-ctr`, `aes128-gcm` and
+  `aes256-gcm`, and `hmac-sha2-256`, `hmac-sha2-512` and `hmac-sha1` with their `-etm` forms. A
+  wrongly guessed `first_kex_packet_follows` packet is dropped instead of being taken for the
+  key exchange. The handshake-end `honeypot_session_end` event now carries the client's offered
+  lists as `client_kex` and, on a refusal, `negotiation_failed` naming the list, so the
+  operator can see which algorithms a client that never got a session was asking for. The new
+  primitives are crates that were already vendored; no RSA host key is offered (the `rsa` crate
+  carries RUSTSEC-2023-0071), see [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh).
+  A client choosing `diffie-hellman-group14-sha256` costs the sensor about 4 ms of CPU per
+  handshake, against 0.2 ms for curve25519.
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

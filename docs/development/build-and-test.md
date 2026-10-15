@@ -53,6 +53,10 @@ Details that are load-bearing:
   longer compiles fails at clippy rather than silently vanishing from the suite
   (`.github/workflows/ci.yml#Clippy (deny warnings)`).
 - **`--test-threads=1`** runs the suite serially.
+- **The `sensor-ssh` interop tests run the system `ssh` client**
+  (`crates/sensor-ssh/tests/openssh_interop.rs`; OpenSSH 8.4 or later, for `SSH_ASKPASS_REQUIRE`).
+  They fail, not skip, when it is not on `PATH`: they are the independent check on the transport
+  that no test built from this crate's own code can be. The GitHub runner image has it.
 - **`set -o pipefail`** is mandatory in the tests job: without it, piping `cargo
   test` through `tee` would report `tee`'s success and pass a red suite
   (`.github/workflows/ci.yml#Tests (serial, frozen lockfile)`).

@@ -7,9 +7,10 @@
 //! a success cannot be a fallback to something else, and `an_unsupported_...` is the negative
 //! control showing the restriction does take effect.
 //!
-//! Only the public `serve` entry point and the `ssh` binary are used, so the same file runs
-//! unchanged against an older checkout of the sensor, which is how the fails-without evidence for
-//! each algorithm was taken.
+//! Needs the system `ssh` (OpenSSH 8.4 or later, for `SSH_ASKPASS_REQUIRE`) on `PATH`, and fails
+//! rather than skips without it. Only the public `serve` entry point and the `ssh` binary are
+//! used, so the same file runs unchanged against an older checkout of the sensor, which is how the
+//! fails-without evidence for each algorithm was taken.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -138,9 +139,9 @@ async fn openssh_restricted_to_an_unsupported_algorithm_is_refused_and_logged() 
     let cases = [
         ("Ciphers=aes128-cbc", "cipher_c2s", "aes128-cbc"),
         (
-            "KexAlgorithms=diffie-hellman-group1-sha1",
+            "KexAlgorithms=ecdh-sha2-nistp384",
             "kex",
-            "diffie-hellman-group1-sha1",
+            "ecdh-sha2-nistp384",
         ),
         (
             "HostKeyAlgorithms=ecdsa-sha2-nistp384",

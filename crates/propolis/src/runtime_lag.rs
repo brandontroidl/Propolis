@@ -4,9 +4,16 @@
 //! being polled with the answer, so a runtime whose workers are all inside synchronous code makes
 //! a trivial statement look like a slow one while the database sits idle. This task separates the
 //! two: it sleeps for a fixed interval and measures how much later than that it was actually
-//! polled. That excess is time the runtime had no free worker for a ready task, and it is the same
-//! delay a statement's completion waits out. A warning here with a quiet database means the stall
-//! is the process; a quiet probe with slow statements means the database.
+//! polled. That excess is the same delay a statement's completion waits out. A warning here with a
+//! quiet database means the stall is the process; a quiet probe with slow statements means the
+//! database.
+//!
+//! Lag alone does not say WHY the process was slow to poll. Workers all inside synchronous code is
+//! one cause; the others freeze every thread of the process at once and read identically: CFS
+//! bandwidth throttling (the unit's `CPUQuota=`) and direct memory reclaim near `MemoryMax=`. So
+//! each report carries the cgroup's own counters over the same window (`cpu.stat` throttling,
+//! `memory.events`): throttle or reclaim deltas beside the lag name the cgroup, and a lag with
+//! zero deltas names the workers.
 //!
 //! The probe is deliberately small: one timer, two integer comparisons per wake-up, and a warning
 //! that is rate limited, so it cannot add load to the condition it reports. Nothing in it can
@@ -64,29 +71,119 @@ impl LagReporter {
         }
     }
 
-    /// Records one wake-up that arrived `lag` after it was due, at `now`. Returns a report when the
-    /// lag is over the threshold and the previous report is at least `every` ago.
+    /// Records one wake-up that arrived `lag` after it was due, at `now`. Returns a report when
+    /// something over the threshold is pending and the previous report is at least `every` ago.
+    ///
+    /// The window is checked on EVERY wake-up, not only late ones: a stall that landed inside the
+    /// window is held back, and the next on-time wake-up after the window flushes it. Gating the
+    /// flush on a further late wake-up would drop the worst stall of a burst whenever the runtime
+    /// then recovered.
     pub fn observe(&mut self, lag: Duration, now: Instant) -> Option<LagReport> {
-        if lag <= self.threshold {
+        if lag > self.threshold {
+            self.late = self.late.saturating_add(1);
+            self.worst = self.worst.max(lag);
+        }
+        if self.late == 0 {
             return None;
         }
-        self.late = self.late.saturating_add(1);
-        self.worst = self.worst.max(lag);
         let due = self
             .last_report
             .is_none_or(|at| now.saturating_duration_since(at) >= self.every);
         if !due {
             return None;
         }
+        self.last_report = Some(now);
+        Some(self.take())
+    }
+
+    /// Hands out whatever is still held back, ignoring the window; for shutdown, so a stall inside
+    /// the final window is not lost with the task.
+    pub fn flush(&mut self) -> Option<LagReport> {
+        (self.late > 0).then(|| self.take())
+    }
+
+    fn take(&mut self) -> LagReport {
         let report = LagReport {
             worst_ms: u64::try_from(self.worst.as_millis()).unwrap_or(u64::MAX),
             late_wakeups: self.late,
         };
-        self.last_report = Some(now);
         self.worst = Duration::ZERO;
         self.late = 0;
-        Some(report)
+        report
     }
+}
+
+/// The process's cgroup counters that rival a blocked worker as the cause of a scheduling stall.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CgroupCounters {
+    /// `cpu.stat` `nr_throttled`: periods in which the quota ran out.
+    pub nr_throttled: u64,
+    /// `cpu.stat` `throttled_usec`: time all threads spent frozen by the quota.
+    pub throttled_usec: u64,
+    /// `memory.events` `high`: times the cgroup was pushed into reclaim over `memory.high`.
+    pub mem_high: u64,
+    /// `memory.events` `max`: times usage hit `memory.max` and allocation had to reclaim.
+    pub mem_max: u64,
+    /// `memory.events` `oom` and `oom_kill`, summed.
+    pub mem_oom: u64,
+}
+
+impl CgroupCounters {
+    /// Parses the two files' text. Unknown keys and unparsable lines are skipped: a kernel that adds
+    /// or lacks a key must not blind the probe.
+    pub fn parse(cpu_stat: &str, memory_events: &str) -> Self {
+        let mut c = Self::default();
+        for (key, value) in kv(cpu_stat) {
+            match key {
+                "nr_throttled" => c.nr_throttled = value,
+                "throttled_usec" => c.throttled_usec = value,
+                _ => {}
+            }
+        }
+        for (key, value) in kv(memory_events) {
+            match key {
+                "high" => c.mem_high = value,
+                "max" => c.mem_max = value,
+                "oom" | "oom_kill" => c.mem_oom = c.mem_oom.saturating_add(value),
+                _ => {}
+            }
+        }
+        c
+    }
+
+    /// Growth since `earlier` (a counter that went backwards, e.g. a cgroup recreated, reads as 0).
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            nr_throttled: self.nr_throttled.saturating_sub(earlier.nr_throttled),
+            throttled_usec: self.throttled_usec.saturating_sub(earlier.throttled_usec),
+            mem_high: self.mem_high.saturating_sub(earlier.mem_high),
+            mem_max: self.mem_max.saturating_sub(earlier.mem_max),
+            mem_oom: self.mem_oom.saturating_sub(earlier.mem_oom),
+        }
+    }
+
+    /// Reads this process's own cgroup (v2). `None` where there is no cgroup v2 hierarchy or the
+    /// files are unreadable; the probe then reports lag without the cause counters.
+    pub fn read_own() -> Option<Self> {
+        let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let rel = membership
+            .lines()
+            .find_map(|l| l.strip_prefix("0::"))?
+            .trim();
+        let dir = std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+        let cpu = std::fs::read_to_string(dir.join("cpu.stat")).ok()?;
+        // memory.events is absent when the memory controller is not delegated; cpu.stat alone
+        // still separates quota throttling.
+        let mem = std::fs::read_to_string(dir.join("memory.events")).unwrap_or_default();
+        Some(Self::parse(&cpu, &mem))
+    }
+}
+
+fn kv(text: &str) -> impl Iterator<Item = (&str, u64)> {
+    text.lines().filter_map(|l| {
+        let (k, v) = l.split_once(' ')?;
+        Some((k, v.trim().parse().ok()?))
+    })
 }
 
 /// Runs until `cancel` fires, handing every report to `sink`. The production sink logs a warning;
@@ -101,7 +198,12 @@ pub async fn run(
         let started = Instant::now();
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => {
+                if let Some(report) = reporter.flush() {
+                    sink(report);
+                }
+                return;
+            }
         }
         let now = Instant::now();
         let lag = now
@@ -114,22 +216,42 @@ pub async fn run(
 }
 
 /// The daemon's probe: [`PROBE_INTERVAL`], [`WARN_THRESHOLD`], [`WARN_EVERY`], reporting through
-/// the log with the runtime's own view of its load beside the lag.
+/// the log with the runtime's own view of its load and the cgroup's throttle and reclaim deltas
+/// over the same window beside the lag.
 pub async fn run_in_daemon(cancel: CancellationToken) {
     let handle = tokio::runtime::Handle::current();
+    let mut previous = CgroupCounters::read_own();
     run(
         PROBE_INTERVAL,
         LagReporter::new(WARN_THRESHOLD, WARN_EVERY),
         cancel,
         move |report| {
             let metrics = handle.metrics();
+            // Delta since the previous report (or since start): the window the lag is from.
+            let now = CgroupCounters::read_own();
+            let delta = match (now, previous) {
+                (Some(n), Some(p)) => Some(n.since(p)),
+                _ => None,
+            };
+            if now.is_some() {
+                previous = now;
+            }
+            let d = delta.unwrap_or_default();
             tracing::warn!(
                 worst_lag_ms = report.worst_ms,
                 late_wakeups = report.late_wakeups,
                 workers = metrics.num_workers(),
                 queued_tasks = metrics.global_queue_depth(),
+                cgroup_visible = delta.is_some(),
+                cgroup_nr_throttled = d.nr_throttled,
+                cgroup_throttled_ms = d.throttled_usec / 1000,
+                cgroup_mem_high = d.mem_high,
+                cgroup_mem_max = d.mem_max,
+                cgroup_mem_oom = d.mem_oom,
                 "runtime: the async runtime was slow to poll a ready task; statements timed in \
-                 this window include time waiting for a free worker, not only database time"
+                 this window include that delay, not only database time. Cause is one of: workers \
+                 held in synchronous code (cgroup deltas all zero), CPUQuota throttling \
+                 (cgroup_throttled_ms), or memory reclaim at MemoryMax (cgroup_mem_*)"
             );
         },
     )
@@ -262,5 +384,102 @@ mod tests {
             .await
             .expect("the probe must not sleep out its interval after cancellation")
             .unwrap();
+    }
+
+    #[test]
+    fn a_stall_inside_the_window_is_flushed_by_the_next_on_time_wakeup() {
+        let mut r = LagReporter::new(T, EVERY);
+        let t0 = Instant::now();
+        let first = r.observe(Duration::from_millis(300), t0).expect("first");
+        assert_eq!(first.worst_ms, 300);
+        // The real stall lands inside the window and is held back.
+        assert_eq!(r.observe(Duration::from_secs(2), t0 + EVERY / 2), None);
+        // Normal wake-ups inside the window stay quiet.
+        assert_eq!(r.observe(Duration::ZERO, t0 + EVERY / 2 + EVERY / 4), None);
+        // The first on-time wake-up after the window carries it.
+        let carried = r
+            .observe(Duration::ZERO, t0 + EVERY)
+            .expect("the held-back stall must be reported once the window has passed");
+        assert_eq!((carried.worst_ms, carried.late_wakeups), (2000, 1));
+        // Nothing pending afterwards.
+        assert_eq!(r.observe(Duration::ZERO, t0 + EVERY * 3), None);
+    }
+
+    #[test]
+    fn flush_hands_out_pending_and_only_pending() {
+        let mut r = LagReporter::new(T, EVERY);
+        let t0 = Instant::now();
+        assert_eq!(r.flush(), None);
+        r.observe(Duration::from_millis(300), t0);
+        r.observe(Duration::from_secs(2), t0 + EVERY / 2);
+        let f = r.flush().expect("pending");
+        assert_eq!((f.worst_ms, f.late_wakeups), (2000, 1));
+        assert_eq!(r.flush(), None);
+    }
+
+    #[tokio::test]
+    async fn a_stall_pending_at_cancellation_is_reported() {
+        let seen = Arc::new(Mutex::new(Vec::<LagReport>::new()));
+        let cancel = CancellationToken::new();
+        let probe = tokio::spawn({
+            let (seen, cancel) = (seen.clone(), cancel.clone());
+            run(
+                Duration::from_millis(10),
+                LagReporter::new(Duration::from_millis(30), Duration::from_secs(60)),
+                cancel,
+                move |r| seen.lock().unwrap().push(r),
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Two blocking holds on the current-thread runtime: the first reports at once, the second
+        // is inside the 60 s window and is held back until cancellation.
+        std::thread::sleep(Duration::from_millis(120));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        std::thread::sleep(Duration::from_millis(150));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        probe.await.unwrap();
+        let reports = seen.lock().unwrap();
+        let total: u64 = reports.iter().map(|r| r.late_wakeups).sum();
+        assert!(
+            reports.len() >= 2 && total >= 2,
+            "second stall lost: {reports:?}"
+        );
+    }
+
+    const CPU: &str = "usage_usec 9\nuser_usec 5\nsystem_usec 4\nnr_periods 100\n\
+                       nr_throttled 7\nthrottled_usec 1234567\nnr_bursts 0\n";
+    const MEM: &str = "low 0\nhigh 3\nmax 5\noom 1\noom_kill 2\noom_group_kill 0\n";
+
+    #[test]
+    fn cgroup_counters_parse_the_kernel_formats_and_diff() {
+        let a = CgroupCounters::parse(CPU, MEM);
+        assert_eq!(
+            a,
+            CgroupCounters {
+                nr_throttled: 7,
+                throttled_usec: 1_234_567,
+                mem_high: 3,
+                mem_max: 5,
+                mem_oom: 3,
+            }
+        );
+        let b = CgroupCounters::parse(
+            "nr_throttled 10\nthrottled_usec 1300000\n",
+            "high 3\nmax 9\n",
+        );
+        let d = b.since(CgroupCounters::parse(
+            "nr_throttled 8\nthrottled_usec 1000000\n",
+            MEM,
+        ));
+        assert_eq!(
+            (d.nr_throttled, d.throttled_usec, d.mem_max),
+            (2, 300_000, 4)
+        );
+        // Garbage and a missing memory.events degrade to zeros, not a panic.
+        assert_eq!(
+            CgroupCounters::parse("x\n nr_throttled y\n", ""),
+            CgroupCounters::default()
+        );
     }
 }

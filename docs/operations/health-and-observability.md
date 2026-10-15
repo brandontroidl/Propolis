@@ -269,20 +269,33 @@ being polled with the answer. If the daemon's async runtime has no free worker f
 trivial statement (`COMMIT`, a primary-key lookup) logs one or two seconds with the database
 idle. The daemon therefore runs a small probe (`crates/propolis/src/runtime_lag.rs`) that sleeps
 100 ms at a time and measures how much later than that it was polled. When the lag passes 250 ms
-it logs one WARN, at most one per 10 s, carrying the worst lag since the last line, how many
-wake-ups were late, the runtime's worker count and its queued-task depth:
+it logs one WARN, at most one per 10 s. A stall that lands inside the 10 s window is held back and
+logged by the first wake-up after the window (or at shutdown), so the line carries the worst lag
+since the last line and how many wake-ups were late. It also carries the runtime's worker count and
+queued-task depth, and the process cgroup's growth over the same window:
 
 ```text
-WARN runtime: the async runtime was slow to poll a ready task; statements timed in this window
-include time waiting for a free worker, not only database time  worst_lag_ms=1840 late_wakeups=7 ...
+WARN runtime: the async runtime was slow to poll a ready task; ...  worst_lag_ms=1840 late_wakeups=7
+workers=4 queued_tasks=12 cgroup_visible=true cgroup_nr_throttled=0 cgroup_throttled_ms=0
+cgroup_mem_high=0 cgroup_mem_max=0 cgroup_mem_oom=0
 ```
 
-Reading it: slow statements **with** this warning in the same window are the process, not the
-database. Slow statements **without** it point at the database (check `log_min_duration_statement`,
-`log_lock_waits` and `log_checkpoints` on the server). The probe is a measurement, not a
-subsystem: it is not in `/ready` or the monitor's subsystem conditions, and its failure restarts
-nothing. With several workers, a single blocked worker is visible only when the probe's wake-up
-lands on it, so a quiet probe does not prove that no step ever ran long.
+Reading it: lag alone does not name the cause, because three different things freeze task polling
+and look the same to the probe:
+
+| Lag with | Cause | Fix |
+|---|---|---|
+| all `cgroup_*` deltas zero | workers held in synchronous code (or a host-level stall) | move the step off the workers (`cpu_budget` below) |
+| `cgroup_nr_throttled` / `cgroup_throttled_ms` above zero | the unit's `CPUQuota=` ran out; every thread was frozen, whatever it was doing | raise `CPUQuota=` or cut the load; moving work to another thread does not help |
+| `cgroup_mem_max` / `cgroup_mem_high` above zero | direct reclaim at `MemoryMax=` | raise `MemoryMax=` or cut memory use |
+
+`cgroup_visible=false` means the process is not under a readable cgroup v2 hierarchy, so the
+deltas are not available and read zero. Slow statements **with** this warning in the same window
+are the process, not the database; slow statements **without** it point at the database (check
+`log_min_duration_statement`, `log_lock_waits` and `log_checkpoints` on the server). The probe is a
+measurement, not a subsystem: it is not in `/ready` or the monitor's subsystem conditions, and its
+failure restarts nothing. With several workers, a single blocked worker is visible only when the
+probe's wake-up lands on it, so a quiet probe does not prove that no step ever ran long.
 
 The steps that run synchronously inside async tasks are timed by an example that needs no
 database and no network, on inputs at the limits the daemon enforces (a 1 MiB log line, an 8 MiB

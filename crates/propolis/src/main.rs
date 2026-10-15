@@ -7,6 +7,7 @@
 mod config;
 mod ops_alert;
 mod pg_exec;
+mod runtime_lag;
 mod supervisor;
 
 use std::collections::{HashMap, HashSet};
@@ -1152,6 +1153,15 @@ async fn main() {
 
     let cancel = CancellationToken::new();
     let mut handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
+
+    // Scheduling-lag probe (docs/operations/health-and-observability.md, "Runtime scheduling
+    // lag"). Spawned directly rather than through `spawn_supervised`: it is a measurement, not a
+    // subsystem, so it has no supervisor state for /ready or the ops-monitor to page on. It is
+    // still drained at shutdown with the rest.
+    handles.push((
+        "runtime-lag",
+        tokio::spawn(runtime_lag::run_in_daemon(cancel.clone())),
+    ));
 
     let events_ingested = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let events_rejected = Arc::new(std::sync::atomic::AtomicU64::new(0));

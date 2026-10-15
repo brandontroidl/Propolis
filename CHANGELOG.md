@@ -35,6 +35,16 @@
   now names the `postgresql.conf` settings that make a stall attributable
   (`log_min_duration_statement = 500ms`, `log_lock_waits`, `log_checkpoints`,
   `log_autovacuum_min_duration = 1s`) and the journal caveat on Debian.
+- **A runtime scheduling-lag probe, and a harness that times the steps behind it** - the daemon
+  now sleeps 100 ms at a time and logs one WARN (at most one per 10 s) when it was polled more
+  than 250 ms late, with the worst lag, the late wake-up count, the worker count and the queued
+  task depth. Slow statements with that warning in the same window are the process, not the
+  database; without it they point at the database. It is not a supervised subsystem, so it never
+  pages or restarts anything. `cargo run --release --example cpu_budget -p propolis` times the
+  synchronous steps the daemon runs on async workers on inputs at the limits it enforces (a 1 MiB
+  line, an 8 MiB intake batch, a 16 MiB body, a 20,000-file spool) and flags any over 10 ms that
+  still run on a worker. See
+  [runtime scheduling lag](docs/operations/health-and-observability.md#runtime-scheduling-lag).
 - **The upgrade pull is checked before it is built as root** - `upgrade.sh` did a plain
   `git pull`, so whatever the remote served, or whatever had been edited or committed on the
   box, was built and installed. It now refuses a dirty checkout (naming the files), a remote

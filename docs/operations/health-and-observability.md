@@ -262,6 +262,59 @@ behavior under a flood (covertness over completeness), not a crash. Separately, 
 monitor's capacity condition watches free space on the spool volume (`CAPACITY_FREE_PCT`), a
 related but distinct signal from these counters.
 
+### Runtime scheduling lag
+
+sqlx reports a statement's elapsed time as everything between the task issuing it and the task
+being polled with the answer. If the daemon's async runtime has no free worker for a while, a
+trivial statement (`COMMIT`, a primary-key lookup) logs one or two seconds with the database
+idle. The daemon therefore runs a small probe (`crates/propolis/src/runtime_lag.rs`) that sleeps
+100 ms at a time and measures how much later than that it was polled. When the lag passes 250 ms
+it logs one WARN, at most one per 10 s, carrying the worst lag since the last line, how many
+wake-ups were late, the runtime's worker count and its queued-task depth:
+
+```text
+WARN runtime: the async runtime was slow to poll a ready task; statements timed in this window
+include time waiting for a free worker, not only database time  worst_lag_ms=1840 late_wakeups=7 ...
+```
+
+Reading it: slow statements **with** this warning in the same window are the process, not the
+database. Slow statements **without** it point at the database (check `log_min_duration_statement`,
+`log_lock_waits` and `log_checkpoints` on the server). The probe is a measurement, not a
+subsystem: it is not in `/ready` or the monitor's subsystem conditions, and its failure restarts
+nothing. With several workers, a single blocked worker is visible only when the probe's wake-up
+lands on it, so a quiet probe does not prove that no step ever ran long.
+
+The steps that run synchronously inside async tasks are timed by an example that needs no
+database and no network, on inputs at the limits the daemon enforces (a 1 MiB log line, an 8 MiB
+intake batch, a 16 MiB captured body, a 20,000-file spool):
+
+```text
+cargo run --release --example cpu_budget -p propolis
+```
+
+It marks every step over 10 ms that still runs on an async worker. Measured in a release build
+on the development machine (a shared 28-core host; the quietest of several runs is shown, and a
+busy run was up to five times slower, 464 ms against 85 ms for the spool walk, so run it on the
+box that matters), the steps over 10 ms were:
+
+| Step | Worst-case input | Median | Now |
+|---|---|---|---|
+| Digest of a fetched body | 16 MiB | 142 ms | off the worker |
+| Spool write of a fetched body (hash, write, fsync) | 16 MiB | 242 ms (fsync outliers 950 ms) | off the worker |
+| Feed publish (render, write, fsync) | 5,000 / 50,000 entries | 167 ms / 905 ms | off the worker |
+| Ledger chain hash of one intake batch | 8 MiB | 77 ms | off the worker |
+| Intake tailer read of one batch | 8 MiB, warm cache | 13 ms | off the worker |
+| Ops-monitor spool walk | 20,000 files | 85 ms | off the worker |
+| Campaign indexer: shape, indicators, tags of one command | 64 KiB / 1 MiB line | 16 ms / 60 ms | off the worker above 16 KiB (sensors cap a line at 1 KiB: 0.4 ms) |
+| `redact_secrets` | 1 MiB of `authorization: ` | 8,185 ms | linear (a few ms) |
+
+Everything else measured, including the ATT&CK tagger (bounded to 4 KiB of shell and 8 KiB of SQL
+per line, under 0.3 ms), indicator extraction at its 64 KiB cap, dropper URL extraction (2 ms at
+64 KiB), JSON parsing of a full batch (3 ms) and the upload type filter, stayed under 10 ms. The
+captured-artifact scan (65-107 ms for a 16 MiB binary) already ran under `spawn_blocking`. A step
+moved "off the worker" runs under `core_scoring::off_worker`, which hands the rest of that
+worker's queue to another thread for the duration.
+
 ## Ops-alert monitor (opt-in)
 
 The daemon can run an internal monitor that pages via [ntfy](https://ntfy.sh) when the system

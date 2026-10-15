@@ -709,3 +709,87 @@ async fn otx_4xx_is_permanent() {
     );
     server.await.unwrap();
 }
+
+// ---------------------------------------------------------------------
+// Outbound deadlines: a vendor that accepts and never answers
+// ---------------------------------------------------------------------
+
+/// A server that accepts every connection and then says nothing, holding the sockets open so the
+/// client sees neither a response nor a reset. With `trickle`, it first reads the request and sends
+/// a status line and headers promising a body it never finishes.
+async fn stalled_server(trickle: bool) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            if trickle {
+                let _ = read_request(&mut stream).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+                    .await;
+            }
+            held.push(stream);
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn short_timeouts() -> review::vendor::ClientTimeouts {
+    review::vendor::ClientTimeouts {
+        connect: std::time::Duration::from_millis(500),
+        read: std::time::Duration::from_millis(300),
+        total: std::time::Duration::from_millis(900),
+    }
+}
+
+/// Every adapter, one stalled server per stall shape: the submit must come back `Transient`
+/// (retried by the runner) well inside the outer guard, which only fires if the deadline is missing.
+#[tokio::test]
+async fn every_adapter_gives_up_on_a_vendor_that_never_answers() {
+    for trickle in [false, true] {
+        let base = stalled_server(trickle).await;
+        let client = review::vendor::http_client(short_timeouts()).unwrap();
+        let adapters: Vec<Box<dyn VendorAdapter>> = vec![
+            Box::new(AbuseIpDb::new(client.clone(), "k", base.clone())),
+            Box::new(DShield::new(client.clone(), "k:k", base.clone())),
+            Box::new(OtxAdapter::new(client.clone(), "k", base.clone())),
+        ];
+        for adapter in adapters {
+            let report = sample_report(vec!["22".to_string()]);
+            let started = std::time::Instant::now();
+            let res =
+                tokio::time::timeout(std::time::Duration::from_secs(10), adapter.submit(&report))
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{} (trickle={trickle}) never returned: the client has no deadline",
+                            adapter.name()
+                        )
+                    });
+            let err = res.unwrap_err();
+            assert!(
+                matches!(err, VendorError::Transient { status: 0, .. }),
+                "{} (trickle={trickle}): expected a transient request error, got {err:?}",
+                adapter.name()
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{} (trickle={trickle}) took {:?}",
+                adapter.name(),
+                started.elapsed()
+            );
+        }
+    }
+}
+
+/// The production constants are finite and ordered, so a future edit cannot quietly turn a deadline
+/// into "effectively never".
+#[test]
+fn the_production_vendor_timeouts_are_conservative_and_ordered() {
+    let t = review::vendor::ClientTimeouts::VENDOR;
+    assert!(t.connect <= t.read && t.read <= t.total);
+    assert!(t.total <= std::time::Duration::from_secs(120));
+    assert!(!t.connect.is_zero());
+    review::vendor::http_client(t).expect("the production client builds");
+}

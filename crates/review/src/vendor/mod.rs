@@ -20,6 +20,38 @@ pub use abuseipdb::AbuseIpDb;
 pub use dshield::DShield;
 pub use otx::OtxAdapter;
 
+/// Connect, per-read and whole-request deadlines for an outbound HTTP client. `reqwest::Client::new()`
+/// sets none, so a vendor that accepts the connection and never answers parks the submission loop
+/// on one request forever, with no error and no log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTimeouts {
+    pub connect: std::time::Duration,
+    /// Longest gap between two reads of the response, so a trickling body is cut off too.
+    pub read: std::time::Duration,
+    pub total: std::time::Duration,
+}
+
+impl ClientTimeouts {
+    /// Vendor report APIs answer a small JSON body in well under a second; 60 s is far past any
+    /// healthy response and still short enough that one stalled vendor delays a pass by a minute,
+    /// not indefinitely. A timeout is classified `Transient` by `send_and_classify` and retried.
+    pub const VENDOR: Self = Self {
+        connect: std::time::Duration::from_secs(10),
+        read: std::time::Duration::from_secs(30),
+        total: std::time::Duration::from_secs(60),
+    };
+}
+
+/// The shared client for every vendor adapter. Fallible on purpose: a builder failure must stop the
+/// caller, never fall back to a client with no deadlines.
+pub fn http_client(timeouts: ClientTimeouts) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.total)
+        .build()
+}
+
 /// Evidence for one vendor submission: the reported IP, the vendor-specific
 /// category codes for THIS vendor (already resolved via
 /// [`build_categories`]/[`build_dshield_categories`]/[`build_otx_categories`]
@@ -303,7 +335,19 @@ pub(crate) async fn send_and_classify(
         body: format!("request error: {e}"),
     })?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = match resp.text().await {
+        Ok(body) => body,
+        // A 2xx whose body never finished is not an acknowledgement: reading `""` here recorded a
+        // stalled vendor as accepted. Retry it. An error status keeps its classification below
+        // whether or not its explanatory body arrived.
+        Err(e) if status.is_success() => {
+            return Err(VendorError::Transient {
+                status: 0,
+                body: format!("response body error: {e}"),
+            });
+        }
+        Err(_) => String::new(),
+    };
     if status.is_success() {
         return Ok(VendorResponse {
             status: status.as_u16(),

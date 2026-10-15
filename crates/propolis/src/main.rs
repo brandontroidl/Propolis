@@ -1280,7 +1280,15 @@ async fn main() {
                 let vendors = vendors.clone();
                 let allowlist = review_allowlist.clone();
                 async move {
-                    let client = reqwest::Client::new();
+                    let client = match review::vendor::http_client(
+                        review::vendor::ClientTimeouts::VENDOR,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(error = %e, "review: vendor http client build failed; not starting");
+                            return;
+                        }
+                    };
                     let (adapters, gate_configs) = build_adapters(&vendors, client);
                     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
                         .with_allowlist(allowlist.clone());

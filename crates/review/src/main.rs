@@ -446,7 +446,13 @@ async fn run_daemon(pool: PgPool, config: Config) {
 
     review::vendor::log_vendor_startup(&config.vendors);
 
-    let client = reqwest::Client::new();
+    let client = match review::vendor::http_client(review::vendor::ClientTimeouts::VENDOR) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "review: vendor http client build failed; not starting");
+            return;
+        }
+    };
     let (adapters, gate_configs) = build_adapters(&config.vendors, client);
     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
         .with_allowlist(config.allowlist.clone());

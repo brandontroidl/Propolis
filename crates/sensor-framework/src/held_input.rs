@@ -61,7 +61,7 @@ const MAX_TRACKED_FILES: usize = 16;
 
 /// A file assembled in fewer chunks than this, and never made executable or run, is not captured
 /// when the session ends: one `echo x > f` is a write probe or a note, not an upload.
-const MIN_UNRUN_CHUNKS: u32 = 2;
+pub(crate) const MIN_UNRUN_CHUNKS: u32 = 2;
 
 /// Distinct bodies one session holds for deduplication. A further distinct body is submitted at
 /// once, on its own, so the bound costs deduplication and never a capture.
@@ -532,6 +532,15 @@ impl StdinCaptures {
             if let Some(known) = set.tracked.iter_mut().find(|t| t.path == file.path) {
                 *known = file;
             } else if set.tracked.len() < MAX_TRACKED_FILES {
+                set.tracked.push(file);
+            } else if let Some(dead) = set
+                .tracked
+                .iter()
+                .position(|t| t.chunk_count < MIN_UNRUN_CHUNKS)
+            {
+                // Full of files the end of the session would skip: the oldest of them makes
+                // room, so a sweep of write probes cannot hide the assembly typed after it.
+                set.tracked.remove(dead);
                 set.tracked.push(file);
             }
         }
@@ -1092,6 +1101,79 @@ mod tests {
         assert_eq!(meta["capture_reason"], "echo_loader");
         assert_eq!(meta["chunk_count"], chunks);
         assert_eq!(meta["end_reason"], "transfer_complete");
+    }
+
+    /// The shape live sessions showed: the loader probes 24 directories with
+    /// `echo > DIR/.b && sh DIR/.b && cd DIR/`, each leaving a one-chunk file that can never be
+    /// captured, then types its ELF as 120 `echo -ne` appends, `chmod +x` and a run. The probes
+    /// must not use up the table the ELF needs: the whole ELF is captured once.
+    #[tokio::test]
+    async fn a_directory_probe_sweep_does_not_hide_the_elf_typed_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        let mut elf = DOWNLOADER.to_vec();
+        elf.resize(960, 0xa5);
+        for index in 0..24 {
+            shell.handle_input(format!("mkdir -p /data/p{index}"));
+        }
+        for index in 0..24 {
+            let (out, _) = shell.handle_input(format!(
+                "echo > /data/p{index}/.b && sh /data/p{index}/.b && cd /data/p{index}/"
+            ));
+            assert_eq!(out.status, 0, "{out}");
+        }
+        let chunks = upload_chunks(&mut shell, ".d", &elf);
+        assert_eq!(chunks, 120);
+        shell.handle_input("chmod +x .d");
+        shell.handle_input("./.d");
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let meta = &events[0]["metadata"];
+        assert_eq!(meta["capture_reason"], "echo_loader");
+        assert_eq!(meta["chunk_count"], 120);
+        assert_eq!(meta["size"], elf.len());
+        assert_eq!(meta["destination"], "/data/p23/.d");
+    }
+
+    /// A bare `echo > f` leaves a newline: a write probe, no start of an assembly, so it takes no
+    /// slot; a file that starts with real bytes does.
+    #[tokio::test]
+    async fn a_bare_echo_redirect_does_not_start_an_assembly() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = StdinCaptures::new(handoff(dir.path()), source());
+        let mut shell = loader_shell(&captures);
+        shell.handle_input("echo > /tmp/probe");
+        shell.handle_input("echo -ne 'ab' > /tmp/real");
+        assert!(!shell.is_assembled("/tmp/probe"));
+        assert!(shell.is_assembled("/tmp/real"));
+    }
+
+    /// Once the table is full of files that can never be submitted, a new assembly takes the
+    /// oldest such slot, and a file that could be submitted is never the one evicted.
+    #[tokio::test]
+    async fn a_full_table_evicts_a_dead_probe_before_an_assembly_that_could_be_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = StdinCaptures::new(handoff(dir.path()), source());
+        let mut shell = loader_shell(&captures);
+        shell.handle_input("echo -ne 'ab' > /tmp/keep1");
+        shell.handle_input("echo -ne 'cd' >> /tmp/keep1");
+        for index in 0..24 {
+            shell.handle_input(format!("echo -ne 'n{index}' > /tmp/note{index}"));
+        }
+        assert!(shell.is_assembled("/tmp/keep1"), "a submittable file stays");
+        assert!(
+            !shell.is_assembled("/tmp/note0"),
+            "the oldest dead note goes"
+        );
+        assert!(
+            shell.is_assembled("/tmp/note23"),
+            "the newest note is tracked"
+        );
     }
 
     /// An assembly the session never ran is taken as the session leaves it; a single `echo > f`

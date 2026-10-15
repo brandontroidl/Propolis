@@ -30,14 +30,18 @@ use sha2::{Digest, Sha256};
 
 use super::{FakeShell, MAX_URL_LEN, TraceEventKind, len_u64};
 use crate::fakefs::READ_CAP;
-use crate::held_input::{AssembledFile, StdinCaptures, TrackedFile};
+use crate::held_input::{AssembledFile, MIN_UNRUN_CHUNKS, StdinCaptures, TrackedFile};
 use crate::sanitize_value;
 
 /// `metadata.derived_from` of a download URL read off an assembled downloader's arguments.
 pub const DERIVED_FROM_ECHO_LOADER_ARGS: &str = "echo_loader_args";
 
-/// Assembled files one shell keeps. A loader builds one; the bound only keeps a session that
-/// writes many small files from growing the map.
+/// Assembled files one shell keeps. A loader builds one or a few; the bound only keeps a session
+/// that writes many small files from growing the map. A record is a path, a digest and the line
+/// that wrote the last chunk (at most a terminal line, 4 KiB), so a full table is about 70 KiB;
+/// the file bytes themselves live in the filesystem, under its own budget. A full table makes
+/// room by dropping its oldest [`dead`](Assembled::is_dead) record, so write probes cannot
+/// crowd out the loader that follows them.
 const MAX_ASSEMBLED: usize = 16;
 
 /// The longest request path read out of a downloader.
@@ -51,6 +55,16 @@ pub(super) struct Assembled {
     chunks: u32,
     /// The line that wrote the last chunk.
     command: String,
+    /// Which assembly this was to start in its shell, counting from 0: the smaller, the older.
+    born: u64,
+}
+
+impl Assembled {
+    /// Whether the session's end would skip this file: too few chunks to be an upload. One that
+    /// was run was captured when it ran, so forgetting it costs nothing.
+    fn is_dead(&self) -> bool {
+        self.chunks < MIN_UNRUN_CHUNKS
+    }
 }
 
 /// The bytes a `base64 -d` decoded from typed input, and how many typed writes built that input.
@@ -91,7 +105,7 @@ impl FakeShell {
 
     /// Whether the file at `path` is one this shell is tracking as an assembly of typed bytes.
     #[cfg(test)]
-    pub(super) fn is_assembled(&self, path: &str) -> bool {
+    pub(crate) fn is_assembled(&self, path: &str) -> bool {
         self.assembled.contains_key(path)
     }
 
@@ -132,18 +146,44 @@ impl FakeShell {
             return;
         };
         for file in captures.tracked_assembled() {
-            if self.assembled.len() >= MAX_ASSEMBLED {
-                break;
+            if !self.assembled.contains_key(&file.path) {
+                if !self.make_room() {
+                    break;
+                }
+                let born = self.next_born();
+                self.assembled.insert(
+                    file.path,
+                    Assembled {
+                        sha256: file.sha256,
+                        len: file.len,
+                        chunks: file.chunk_count,
+                        command: file.command,
+                        born,
+                    },
+                );
             }
-            self.assembled
-                .entry(file.path.clone())
-                .or_insert(Assembled {
-                    sha256: file.sha256,
-                    len: file.len,
-                    chunks: file.chunk_count,
-                    command: file.command,
-                });
         }
+    }
+
+    fn next_born(&mut self) -> u64 {
+        let born = self.assembly_count;
+        self.assembly_count = born.saturating_add(1);
+        born
+    }
+
+    /// Room for one more record: true when the table has it, after dropping the oldest dead
+    /// record if it was full. False when every record is one the session's end would take.
+    fn make_room(&mut self) -> bool {
+        if self.assembled.len() < MAX_ASSEMBLED {
+            return true;
+        }
+        let oldest = self
+            .assembled
+            .iter()
+            .filter(|(_, known)| known.is_dead())
+            .min_by_key(|(_, known)| known.born)
+            .map(|(path, _)| path.clone());
+        oldest.is_some_and(|path| self.assembled.remove(&path).is_some())
     }
 
     /// Typed bytes reached the file `path`: it held `prior` before the write and `content` after.
@@ -172,6 +212,11 @@ impl FakeShell {
             self.assembled.remove(path);
             return;
         }
+        // A bare `echo > f` (a write probe: is this directory writable) leaves a newline and
+        // nothing a loader would build on, so it is not an assembly's start.
+        if prior.is_empty() && content == b"\n" {
+            return;
+        }
         if !paid {
             self.charge_work(len_u64(content.len()));
         }
@@ -194,9 +239,13 @@ impl FakeShell {
                 }
             }
         };
-        if !self.assembled.contains_key(path) && self.assembled.len() >= MAX_ASSEMBLED {
+        if !self.assembled.contains_key(path) && !self.make_room() {
             return;
         }
+        let born = match self.assembled.get(path) {
+            Some(known) => known.born,
+            None => self.next_born(),
+        };
         self.assembled.insert(
             path.to_string(),
             Assembled {
@@ -204,6 +253,7 @@ impl FakeShell {
                 len: len_u64(content.len()),
                 chunks,
                 command: self.line_command.clone(),
+                born,
             },
         );
         self.loader_line.chunk = Some((path.to_string(), chunks));

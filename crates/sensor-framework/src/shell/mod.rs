@@ -507,6 +507,8 @@ pub struct FakeShell {
     /// Files this session built from `echo`/`printf` output, by path, as their last chunk left
     /// them.
     assembled: std::collections::BTreeMap<String, loader::Assembled>,
+    /// Assemblies started so far, which numbers each one's age for [`loader`]'s eviction.
+    assembly_count: u64,
     /// Where each file the session fetched came from, by path; see [`arch`].
     origins: std::collections::BTreeMap<String, arch::Origin>,
     /// The origin of the one file `cat` just read, for the redirection that writes its output.
@@ -733,6 +735,7 @@ impl FakeShell {
             input_sinks: Vec::new(),
             captures: None,
             assembled: std::collections::BTreeMap::new(),
+            assembly_count: 0,
             origins: std::collections::BTreeMap::new(),
             cat_origin: None,
             read_paid: 0,
@@ -801,6 +804,7 @@ impl FakeShell {
                 input_sinks: self.input_sinks.clone(),
                 captures: self.captures.clone(),
                 assembled: self.assembled.clone(),
+                assembly_count: self.assembly_count,
                 origins: self.origins.clone(),
                 cat_origin: self.cat_origin.clone(),
                 read_paid: 0,

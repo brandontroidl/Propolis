@@ -512,6 +512,20 @@
   tick, so it can delay the next round by at most that long and never suppresses the dead-man's
   heartbeat. A new page raised during an outage is still sent inline, before the heartbeat, and
   against a host that never answers can take about two minutes per alert; see the operations page.
+- **The echo-loader tracker no longer loses the ELF typed after a directory probe sweep** - the
+  common loader first tries 24 directories with `echo > DIR/.b && sh DIR/.b && cd DIR/`; each
+  write filled one of the 16 slots a shell tracks and none could ever be captured (a one-chunk
+  file is a probe, not an upload), so the ELF typed next (120 `echo -ne` appends, `chmod +x`, a
+  run) was never tracked and live sessions captured nothing. A bare `echo > f` (a lone newline) no
+  longer starts an assembly, and a full table drops its oldest file that could not be captured
+  rather than refusing the new one; the session's end-of-session list does the same. The 16-slot
+  bound stays: a record is a path, a digest and one terminal line (about 70 KiB for a full table),
+  and the file bytes are charged to the filesystem budget. See
+  [events and signals](docs/reference/events-and-signals.md).
+- **The MSSQL sensor records the Login7 UserName, not the AppName** - the username was read from
+  the AppName offset pair (bytes 48..52) instead of UserName (40..44, MS-TDS 2.2.6.4), so every
+  captured username was a driver name such as `Core Microsoft SqlClient Data Provider`. The
+  password stays unread.
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

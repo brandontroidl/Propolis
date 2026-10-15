@@ -221,8 +221,10 @@ A file the shell built from the output of `echo` or `printf` redirected into it 
 `busybox echo -ne '\xNN...' > .i`, then `>> .i` per chunk) is captured with `capture_reason`
 `echo_loader` through the same per-session set (`crates/sensor-framework/src/shell/loader.rs`,
 `crates/sensor-framework/src/held_input.rs#CAPTURE_REASON_ECHO_LOADER`). An assembly starts with a
-write to an empty file and grows by appends to the content its last chunk left; appending to any
-other file starts none. It is submitted once the line that makes it executable (`chmod`) or runs
+write to an empty file (other than a bare `echo > f`, a write probe, whose lone newline starts
+none) and grows by appends to the content its last chunk left; appending to any other file starts
+none. A shell tracks 16 files; when it is full, the oldest one that could not be captured (fewer
+than two chunks) makes room for a new one. It is submitted once the line that makes it executable (`chmod`) or runs
 it has run, at most once per distinct SHA-256 per session, a body already captured as standard
 input included. A file is recognized by content, so a copy of the assembly made under another
 name (the loader's `cp /bin/ls .j && cat .i>.j && rm .i && cp .j .i` fallback) is the same

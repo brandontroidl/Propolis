@@ -158,6 +158,63 @@ async fn group14_clients_are_served_when_the_gate_has_room() {
     handle.abort();
 }
 
+/// The pacing hold through the real server path: after a group14 reply the permit stays taken for
+/// about as long as the exchange took, then frees. Handing it back at once (a plain drop where the
+/// server calls `release_after`) would allow a full core and leaves the permit free right after
+/// the reply, which this test rejects.
+#[tokio::test]
+async fn the_server_holds_the_group14_permit_for_the_exchange_cost_after_the_reply() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, handle) = start(dir.path()).await;
+    let gate = Group14Gate::global();
+
+    // A previous test's pacing hold may still be running.
+    let settle = Instant::now();
+    while gate.available_permits() != GROUP14_PERMITS {
+        assert!(
+            settle.elapsed() < Duration::from_secs(5),
+            "gate never freed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut stream = connect_offering(addr, "diffie-hellman-group14-sha256").await;
+    let sent = Instant::now();
+    write_packet_unencrypted(&mut stream, &[30, 0, 0, 0, 1, 2])
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(10),
+        read_packet_unencrypted(&mut stream),
+    )
+    .await
+    .expect("no reply")
+    .unwrap();
+    let cost = sent.elapsed();
+    assert_eq!(reply.payload[0], SSH_MSG_KEX_ECDH_REPLY);
+
+    let replied = Instant::now();
+    assert_eq!(
+        gate.available_permits(),
+        0,
+        "the permit was free as soon as the reply arrived"
+    );
+    while gate.available_permits() != GROUP14_PERMITS {
+        assert!(
+            replied.elapsed() < cost * 4 + Duration::from_secs(1),
+            "never freed"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let held = replied.elapsed();
+    assert!(
+        held >= cost / 2,
+        "permit held {held:?} after the reply, expected about the exchange cost {cost:?}"
+    );
+    handle.abort();
+}
+
 #[tokio::test]
 async fn a_group14_client_that_finds_the_gate_full_is_disconnected_after_the_bounded_wait() {
     let _serial = ONE_AT_A_TIME.lock().await;

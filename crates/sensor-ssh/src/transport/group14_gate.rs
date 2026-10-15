@@ -61,6 +61,12 @@ impl Group14Gate {
         GATE.get_or_init(Group14Gate::new)
     }
 
+    /// How many permits are free right now. For tests and diagnostics; a reading can be stale by
+    /// the time it is used.
+    pub fn available_permits(&self) -> usize {
+        self.permits.available_permits()
+    }
+
     /// Wait up to [`GROUP14_WAIT`] for the right to run one group14 exchange.
     pub async fn acquire(&self) -> Result<Group14Permit, Group14Busy> {
         match tokio::time::timeout(GROUP14_WAIT, self.permits.clone().acquire_owned()).await {

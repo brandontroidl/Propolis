@@ -1684,7 +1684,10 @@ fn a_watch_env_the_watcher_account_cannot_read_is_a_failure() {
 fn a_watch_env_is_readable_through_the_group_bit_and_only_the_group_bit() {
     let fx = Fx::new();
     let me = current_user();
-    let out = std::process::Command::new("id").arg("-Gn").output().unwrap();
+    let out = std::process::Command::new("id")
+        .arg("-Gn")
+        .output()
+        .unwrap();
     let groups = String::from_utf8(out.stdout).unwrap();
     let Some(group) = groups.split_whitespace().find(|g| *g != me) else {
         eprintln!("skipped: {me} has no group named differently from the user");
@@ -1706,7 +1709,10 @@ fn a_watch_env_is_readable_through_the_group_bit_and_only_the_group_bit() {
             .iter()
             .any(|f| f["id"] == "watch-env-owner")
     };
-    assert!(!flagged(&fx, 0o640), "group-readable watch.env wrongly failed");
+    assert!(
+        !flagged(&fx, 0o640),
+        "group-readable watch.env wrongly failed"
+    );
     assert!(flagged(&fx, 0o600), "owner-only watch.env must fail");
     assert!(flagged(&fx, 0o604), "the group class has no bits at 0604");
 }

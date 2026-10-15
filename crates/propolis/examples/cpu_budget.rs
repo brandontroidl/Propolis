@@ -423,5 +423,53 @@ fn main() {
     }
     let _ = std::fs::remove_dir_all(&publish_dir);
 
+    // --- Console: the daemon serves the operator console on the same async workers ---
+    // The IP detail page's evidence list: up to 200 events a page, each with its metadata
+    // pretty-printed and then HTML-escaped. A sensor keeps a captured HTTP or SMTP body up to
+    // 64 KiB, so 200 such events is the worst page an attacker can make an operator open. The body
+    // is dense in characters the escaper rewrites.
+    let templates = console::templates::environment();
+    let body = repeat_to("<a href=\"x\">&'\n\t", 64 * 1024);
+    for (count, label) in [
+        (200usize, "200 events, 64 KiB body"),
+        (200, "200 events, 1 KiB body"),
+    ] {
+        let len = if label.contains("64 KiB") {
+            body.len()
+        } else {
+            1024
+        };
+        let metadata: Vec<serde_json::Value> = (0..count)
+            .map(|i| serde_json::json!({ "method": "POST", "path": "/", "body": &body[..len], "n": i }))
+            .collect();
+        report.measure(
+            "console: evidence page (build + render)",
+            label,
+            true,
+            || console::routes::detail::measure_evidence_fragment(&templates, metadata.clone()),
+        );
+    }
+    // The Entries tab of the feed page reads a published feed file back: up to 50,000 entries.
+    for n in [5_000usize, 50_000] {
+        let entries: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "ip": format!("192.0.2.{}", i % 250),
+                    "first_seen": "2026-10-14T12:00:00Z",
+                    "last_seen": "2026-10-14T12:00:00Z",
+                    "events": 10,
+                    "signals": ["ssh_brute_force", "honeypot_command_exec"],
+                })
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({ "entries": entries })).unwrap();
+        report.measure(
+            "console: feed entries tab (parse + render)",
+            &format!("{n} entries"),
+            true,
+            || console::routes::feed::measure_feed_entries(&templates, &bytes),
+        );
+    }
+
     report.print();
 }

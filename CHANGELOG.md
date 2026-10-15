@@ -37,13 +37,18 @@
   `log_autovacuum_min_duration = 1s`) and the journal caveat on Debian.
 - **A runtime scheduling-lag probe, and a harness that times the steps behind it** - the daemon
   now sleeps 100 ms at a time and logs one WARN (at most one per 10 s) when it was polled more
-  than 250 ms late, with the worst lag, the late wake-up count, the worker count and the queued
-  task depth. Slow statements with that warning in the same window are the process, not the
-  database; without it they point at the database. It is not a supervised subsystem, so it never
-  pages or restarts anything. `cargo run --release --example cpu_budget -p propolis` times the
+  than 250 ms late, with the worst lag, the late wake-up count, the worker count, the queued
+  task depth and the process cgroup's CPU-throttle and memory-reclaim growth over the same window
+  (a `CPUQuota=` or `MemoryMax=` stall looks identical to a blocked worker without them). A stall
+  inside the 10 s window is held and reported by the next wake-up after it, or at shutdown. Slow
+  statements with that warning in the same window are the process, not the database; without it
+  they point at the database. It is not a supervised subsystem, so it never pages or restarts
+  anything. `cargo run --release --example cpu_budget -p propolis` times the
   synchronous steps the daemon runs on async workers on inputs at the limits it enforces (a 1 MiB
-  line, an 8 MiB intake batch, a 16 MiB body, a 20,000-file spool) and flags any over 10 ms that
-  still run on a worker. See
+  line, an 8 MiB intake batch, a 16 MiB body, a 20,000-file spool, a 200-event evidence page of
+  64 KiB bodies, a 50,000-entry published feed) and flags any over 10 ms that still run on a
+  worker. The console's evidence page and feed Entries tab, 225 ms and 165 ms in the worst case,
+  now run off the async workers. See
   [runtime scheduling lag](docs/operations/health-and-observability.md#runtime-scheduling-lag).
 - **The upgrade pull is checked before it is built as root** - `upgrade.sh` did a plain
   `git pull`, so whatever the remote served, or whatever had been edited or committed on the

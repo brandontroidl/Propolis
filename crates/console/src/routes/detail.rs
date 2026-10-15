@@ -675,12 +675,12 @@ async fn detail(
     let next_cursor = all_events
         .last()
         .map(|e| format_cursor(e.raw_observed_at, e.id));
-    let (mut sessions, ungrouped) = group_into_sessions(all_events, 3);
+    let (mut sessions, ungrouped) = core_scoring::off_worker(|| group_into_sessions(all_events, 3));
     degraded.soft(
         "session techniques",
         attach_session_tags(&state.db, &mut sessions).await,
     );
-    let session_folds = fold_repeated_sessions(sessions);
+    let session_folds = core_scoring::off_worker(|| fold_repeated_sessions(sessions));
 
     let wan_rows = sqlx::query(
         "SELECT host(wan_ip) AS wan_ip, COUNT(*) AS event_count, \
@@ -831,62 +831,65 @@ async fn detail(
     let ip_timeline_data = script_json(&ip_timeline_data);
 
     let tmpl = state.templates.get_template("detail.html")?;
-    let html = tmpl.render(context! {
-        layout,
-        is_drawer,
-        csrf_token,
-        active_nav => "detail",
-        pending_count,
-        uptime,
-        version,
-        degraded,
-        ip => ip.to_string(),
-        raw_score => format!("{:.1}", score.raw_score),
-        raw_score_pct => crate::routes::format::score_pct(raw_f64),
-        effective_score => format!("{:.1}", effective),
-        effective_score_pct => crate::routes::format::score_pct(effective_f64),
-        tier => score.tier.map(tier_label).unwrap_or("-"),
-        eligible => score.eligible,
-        // Which way the delist control points. Delisting is reversible by design ("until you say
-        // otherwise"), so the page has to be able to offer the reverse - see `routes::queue`'s
-        // `relist`.
-        delisted => score.delisted,
-        recommended_for_vendor => score.recommended_for_vendor,
-        recommended_for_blocklist => score.recommended_for_blocklist,
-        has_confirmed_real => score.has_confirmed_real,
-        event_count => score.event_count,
-        distinct_categories => score.distinct_categories,
-        distinct_wan_count => score.distinct_wan_count,
-        distinct_sensor_count => score.distinct_sensor_count,
-        // Persistence: distinct active days and the score-point bonus they earn. Shown so a tier
-        // driven by persistence (raw below the tier floor, but many active days) is legible rather
-        // than looking like a contradiction.
-        active_days => score.active_days,
-        persistence_bonus => format!("{:.0}", persistence_points(score.active_days as i64)),
-        max_confidence => format!("{:.3}", score.max_confidence),
-        first_seen => format_timestamp(score.first_seen),
-        last_seen => format_timestamp(score.last_seen),
-        session_folds,
-        ungrouped,
-        timeline_counts,
-        has_more_events,
-        next_cursor,
-        per_wan,
-        categories,
-        submissions,
-        services,
-        malware,
-        via_other_reporters,
-        urls,
-        external_links,
-        geo,
-        rdns,
-        ip_timeline_labels,
-        ip_timeline_data,
-        current_range,
-        campaigns,
-        techniques,
-        campaign_indexer_behind => newest.saturating_sub(indexed),
+    // The session cards embed every row's raw JSON, so the render is off the async workers.
+    let html = core_scoring::off_worker(|| {
+        tmpl.render(context! {
+            layout,
+            is_drawer,
+            csrf_token,
+            active_nav => "detail",
+            pending_count,
+            uptime,
+            version,
+            degraded,
+            ip => ip.to_string(),
+            raw_score => format!("{:.1}", score.raw_score),
+            raw_score_pct => crate::routes::format::score_pct(raw_f64),
+            effective_score => format!("{:.1}", effective),
+            effective_score_pct => crate::routes::format::score_pct(effective_f64),
+            tier => score.tier.map(tier_label).unwrap_or("-"),
+            eligible => score.eligible,
+            // Which way the delist control points. Delisting is reversible by design ("until you say
+            // otherwise"), so the page has to be able to offer the reverse - see `routes::queue`'s
+            // `relist`.
+            delisted => score.delisted,
+            recommended_for_vendor => score.recommended_for_vendor,
+            recommended_for_blocklist => score.recommended_for_blocklist,
+            has_confirmed_real => score.has_confirmed_real,
+            event_count => score.event_count,
+            distinct_categories => score.distinct_categories,
+            distinct_wan_count => score.distinct_wan_count,
+            distinct_sensor_count => score.distinct_sensor_count,
+            // Persistence: distinct active days and the score-point bonus they earn. Shown so a tier
+            // driven by persistence (raw below the tier floor, but many active days) is legible rather
+            // than looking like a contradiction.
+            active_days => score.active_days,
+            persistence_bonus => format!("{:.0}", persistence_points(score.active_days as i64)),
+            max_confidence => format!("{:.3}", score.max_confidence),
+            first_seen => format_timestamp(score.first_seen),
+            last_seen => format_timestamp(score.last_seen),
+            session_folds,
+            ungrouped,
+            timeline_counts,
+            has_more_events,
+            next_cursor,
+            per_wan,
+            categories,
+            submissions,
+            services,
+            malware,
+            via_other_reporters,
+            urls,
+            external_links,
+            geo,
+            rdns,
+            ip_timeline_labels,
+            ip_timeline_data,
+            current_range,
+            campaigns,
+            techniques,
+            campaign_indexer_behind => newest.saturating_sub(indexed),
+        })
     })?;
     Ok(Html(html).into_response())
 }
@@ -930,20 +933,23 @@ async fn events_fragment(
     // No auto-expanded card on a "Load more" page - `recent_expanded: 0` - unlike the initial
     // page load's newest-first cards, these are all strictly older than what is already on
     // screen, so none of them is "the current activity" an operator lands on an open view of.
-    let (mut sessions, ungrouped) = group_into_sessions(events, 0);
+    let (mut sessions, ungrouped) = core_scoring::off_worker(|| group_into_sessions(events, 0));
     Degraded::new().soft(
         "session techniques",
         attach_session_tags(&state.db, &mut sessions).await,
     );
-    let session_folds = fold_repeated_sessions(sessions);
+    let session_folds = core_scoring::off_worker(|| fold_repeated_sessions(sessions));
 
     let tmpl = state.templates.get_template("events_fragment.html")?;
-    let html = tmpl.render(context! {
-        ip => ip.to_string(),
-        session_folds,
-        ungrouped,
-        has_more_events,
-        next_cursor,
+    // Rendering escapes every row's raw-JSON block: tens of ms for a page of large captures.
+    let html = core_scoring::off_worker(|| {
+        tmpl.render(context! {
+            ip => ip.to_string(),
+            session_folds,
+            ungrouped,
+            has_more_events,
+            next_cursor,
+        })
     })?;
     Ok(Html(html))
 }
@@ -1138,47 +1144,129 @@ async fn fetch_evidence_rows(
             .await?,
         };
 
-    let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        let sensor: String = row.try_get("sensor")?;
-        let signal_type: SignalType = row.try_get("signal_type")?;
-        let protocol: Protocol = row.try_get("protocol")?;
-        let observed_at: DateTime<Utc> = row.try_get("observed_at")?;
-        let metadata: serde_json::Value = row.try_get("metadata")?;
-        let signal_snake = signal_type_snake(signal_type);
-        let metadata_json =
-            serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| "{}".to_string());
-        events.push(EventRow {
-            id: row.try_get("id")?,
-            observed_at: format_timestamp(observed_at),
-            relative_time: format_relative_time(observed_at),
-            activity: format_activity(&sensor, &signal_snake),
-            detail: extract_detail(&signal_snake, &metadata),
-            xor_badge: metadata
-                .get("xor_key")
-                .and_then(|v| v.as_u64())
-                .map(|k| format!("0x{k:02x}")),
-            lines: command_lines(&metadata),
-            lines_truncated: metadata
-                .get("command_lines_truncated")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            reply: None,
-            fetch: None,
-            protocol: protocol_label(protocol).to_string(),
-            authenticated: row.try_get("authenticated")?,
-            wan_ip: row
-                .try_get::<Option<String>, _>("wan_ip")?
-                .unwrap_or_else(|| "-".to_string()),
-            metadata_json,
-            session_id: row.try_get("session_id")?,
-            raw_observed_at: observed_at,
-            sensor_raw: sensor,
-            signal_type_raw: signal_snake,
-            metadata,
-        });
+    // Decoding each row's JSON metadata and pretty-printing it for the "raw" toggle is CPU work in
+    // proportion to the rows' size, and an attacker chooses that size (a captured HTTP or SMTP body
+    // is kept up to 64 KiB, 200 rows a page), so it runs off the async workers.
+    core_scoring::off_worker(|| {
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            events.push(build_event(EvidenceRow {
+                id: row.try_get("id")?,
+                wan_ip: row.try_get("wan_ip")?,
+                sensor: row.try_get("sensor")?,
+                signal_type: row.try_get("signal_type")?,
+                protocol: row.try_get("protocol")?,
+                authenticated: row.try_get("authenticated")?,
+                observed_at: row.try_get("observed_at")?,
+                metadata: row.try_get("metadata")?,
+                session_id: row.try_get("session_id")?,
+            }));
+        }
+        Ok::<_, sqlx::Error>(events)
+    })
+    .map_err(AppError::from)
+}
+
+/// One `event` row as the database returns it, before display formatting.
+struct EvidenceRow {
+    id: i64,
+    wan_ip: Option<String>,
+    sensor: String,
+    signal_type: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    observed_at: DateTime<Utc>,
+    metadata: serde_json::Value,
+    session_id: Option<String>,
+}
+
+/// Formats one evidence row for display. Pure CPU, linear in the metadata's size.
+fn build_event(raw: EvidenceRow) -> EventRow {
+    let EvidenceRow {
+        id,
+        wan_ip,
+        sensor,
+        signal_type,
+        protocol,
+        authenticated,
+        observed_at,
+        metadata,
+        session_id,
+    } = raw;
+    let signal_snake = signal_type_snake(signal_type);
+    let metadata_json =
+        serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| "{}".to_string());
+    EventRow {
+        id,
+        observed_at: format_timestamp(observed_at),
+        relative_time: format_relative_time(observed_at),
+        activity: format_activity(&sensor, &signal_snake),
+        detail: extract_detail(&signal_snake, &metadata),
+        xor_badge: metadata
+            .get("xor_key")
+            .and_then(|v| v.as_u64())
+            .map(|k| format!("0x{k:02x}")),
+        lines: command_lines(&metadata),
+        lines_truncated: metadata
+            .get("command_lines_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        reply: None,
+        fetch: None,
+        protocol: protocol_label(protocol).to_string(),
+        authenticated,
+        wan_ip: wan_ip.unwrap_or_else(|| "-".to_string()),
+        metadata_json,
+        session_id,
+        raw_observed_at: observed_at,
+        sensor_raw: sensor,
+        signal_type_raw: signal_snake,
+        metadata,
     }
-    Ok(events)
+}
+
+/// The synchronous half of an evidence page after its rows are fetched: group the events into
+/// sessions, fold repeats and render `events_fragment.html`. The page's session-technique tags
+/// (a database read) are not part of it, so a measurement with no database is a lower bound that
+/// misses only that read's few rows.
+#[doc(hidden)]
+pub fn measure_evidence_fragment(
+    templates: &minijinja::Environment<'static>,
+    metadata: Vec<serde_json::Value>,
+) -> usize {
+    let observed_at = Utc::now();
+    let events: Vec<EventRow> = metadata
+        .into_iter()
+        .enumerate()
+        .map(|(i, metadata)| {
+            build_event(EvidenceRow {
+                id: i as i64,
+                wan_ip: Some("203.0.113.9".into()),
+                sensor: "http".into(),
+                signal_type: SignalType::HoneypotCommandExec,
+                protocol: Protocol::Tcp,
+                authenticated: false,
+                observed_at,
+                metadata,
+                session_id: Some(format!("00000000-0000-0000-0000-{:012}", i / 10)),
+            })
+        })
+        .collect();
+    let (sessions, ungrouped) = group_into_sessions(events, 0);
+    let session_folds = fold_repeated_sessions(sessions);
+    templates
+        .get_template("events_fragment.html")
+        .and_then(|t| {
+            t.render(context! {
+                ip => "203.0.113.9",
+                session_folds,
+                ungrouped,
+                has_more_events => false,
+                next_cursor => "",
+            })
+        })
+        .map(|html| html.len())
+        .unwrap_or(0)
 }
 
 /// Fetches up to [`MALWARE_PAGE_SIZE`] `fetch_attempt` rows whose `source_ip` is this IP, newest

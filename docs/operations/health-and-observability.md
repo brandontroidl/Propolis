@@ -320,6 +320,8 @@ box that matters), the steps over 10 ms were:
 | Ops-monitor spool walk | 20,000 files | 85 ms | off the worker |
 | Campaign indexer: shape, indicators, tags of one command | 64 KiB / 1 MiB line | 16 ms / 60 ms | off the worker above 16 KiB (sensors cap a line at 1 KiB: 0.4 ms) |
 | `redact_secrets` | 1 MiB of `authorization: ` | 8,185 ms | linear (a few ms) |
+| Console IP detail: build, group and render one evidence page | 200 events, 64 KiB body each (about 27 MB of HTML) | 225 ms (1 KiB bodies: 5 ms) | off the worker |
+| Console feed Entries tab: read, parse, render one load | 5,000 / 50,000 entries | 19 ms / 165 ms | off the worker |
 
 Everything else measured, including the ATT&CK tagger (bounded to 4 KiB of shell and 8 KiB of SQL
 per line, under 0.3 ms), indicator extraction at its 64 KiB cap, dropper URL extraction (2 ms at

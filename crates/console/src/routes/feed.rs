@@ -128,16 +128,22 @@ async fn feed_entries(
     if !known {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
-    let all = read_published_feed(dir, &name).unwrap_or_default();
-    let t = EntryTable::load(&name, all, query.after.as_deref()).unwrap_or(EntryTable {
-        key: name.clone(),
-        total: 0,
-        rows: Vec::new(),
-        next_after: None,
-        cursor_lost: true,
-    });
     let tmpl = state.templates.get_template("feed_entries_fragment.html")?;
-    Ok(Html(tmpl.render(context! { t })?).into_response())
+    // A published feed holds up to 50,000 entries: reading and parsing it, finding the cursor and
+    // rendering a load are tens to hundreds of ms of synchronous work, so none of it runs on an
+    // async worker.
+    let html = core_scoring::off_worker(|| {
+        let all = read_published_feed(dir, &name).unwrap_or_default();
+        let t = EntryTable::load(&name, all, query.after.as_deref()).unwrap_or(EntryTable {
+            key: name.clone(),
+            total: 0,
+            rows: Vec::new(),
+            next_after: None,
+            cursor_lost: true,
+        });
+        tmpl.render(context! { t })
+    })?;
+    Ok(Html(html).into_response())
 }
 
 /// Tab accepted via `?tab=` - `Status` (the original manifest summary, unchanged default) or
@@ -243,50 +249,52 @@ async fn feed_page(
     let first = |name: &str, rows: Vec<FeedEntryRow>| {
         EntryTable::load(name, rows, None).expect("a first load always has a start")
     };
-    let (aggressive_entries, standard_entries, window_entries) = match query.tab {
-        Tab::Entries => {
-            let has_build = manifest.is_some();
-            let mut windows: Vec<(String, EntryTable)> = Vec::new();
-            for w in manifest
-                .as_ref()
-                .map(|m| m.windows.as_slice())
-                .unwrap_or_default()
-            {
-                let name = format!("all-{}", w.label);
-                match read_published_feed(dir, &name) {
-                    Some(rows) => windows.push((w.label.clone(), first(&name, rows))),
-                    None if has_build => degraded.note("retention feed entries"),
-                    None => {}
-                }
-            }
-            let mut read = |name: &str, what: &'static str| -> EntryTable {
-                match read_published_feed(dir, name) {
-                    Some(rows) => first(name, rows),
-                    None => {
-                        if has_build {
-                            degraded.note(what);
-                        }
-                        first(name, Vec::new())
+    // Reads and parses up to three feed files of up to 50,000 entries each: off the async workers.
+    let (aggressive_entries, standard_entries, window_entries) =
+        core_scoring::off_worker(|| match query.tab {
+            Tab::Entries => {
+                let has_build = manifest.is_some();
+                let mut windows: Vec<(String, EntryTable)> = Vec::new();
+                for w in manifest
+                    .as_ref()
+                    .map(|m| m.windows.as_slice())
+                    .unwrap_or_default()
+                {
+                    let name = format!("all-{}", w.label);
+                    match read_published_feed(dir, &name) {
+                        Some(rows) => windows.push((w.label.clone(), first(&name, rows))),
+                        None if has_build => degraded.note("retention feed entries"),
+                        None => {}
                     }
                 }
-            };
-            (
-                read("aggressive", "aggressive feed entries"),
-                read("standard", "standard feed entries"),
-                windows,
-            )
-        }
-        Tab::Status => (
-            first("aggressive", Vec::new()),
-            first("standard", Vec::new()),
-            Vec::new(),
-        ),
-    };
+                let mut read = |name: &str, what: &'static str| -> EntryTable {
+                    match read_published_feed(dir, name) {
+                        Some(rows) => first(name, rows),
+                        None => {
+                            if has_build {
+                                degraded.note(what);
+                            }
+                            first(name, Vec::new())
+                        }
+                    }
+                };
+                (
+                    read("aggressive", "aggressive feed entries"),
+                    read("standard", "standard feed entries"),
+                    windows,
+                )
+            }
+            Tab::Status => (
+                first("aggressive", Vec::new()),
+                first("standard", Vec::new()),
+                Vec::new(),
+            ),
+        });
     let degraded = degraded.names();
     let tab = query.tab.as_str();
 
     let tmpl = state.templates.get_template("feed.html")?;
-    let html = match manifest {
+    let html = core_scoring::off_worker(|| match manifest {
         Some(m) => tmpl.render(context! {
             csrf_token,
             active_nav => "feed",
@@ -314,7 +322,7 @@ async fn feed_page(
             aggressive_entries,
             standard_entries,
             window_entries,
-        })?,
+        }),
         None => tmpl.render(context! {
             csrf_token,
             active_nav => "feed",
@@ -329,8 +337,8 @@ async fn feed_page(
             aggressive_entries,
             standard_entries,
             window_entries,
-        })?,
-    };
+        }),
+    })?;
     Ok(Html(html))
 }
 
@@ -377,7 +385,12 @@ struct PublishedEntry {
 /// `None`: "nothing in this feed" is a different statement from "no build yet".
 fn read_published_feed(dir: Option<&Path>, name: &str) -> Option<Vec<FeedEntryRow>> {
     let bytes = std::fs::read(dir?.join(format!("{name}.json"))).ok()?;
-    let parsed: PublishedFeed = serde_json::from_slice(&bytes).ok()?;
+    parse_published_feed(&bytes)
+}
+
+/// The rows of one published feed file's bytes; `None` when they do not parse.
+fn parse_published_feed(bytes: &[u8]) -> Option<Vec<FeedEntryRow>> {
+    let parsed: PublishedFeed = serde_json::from_slice(bytes).ok()?;
     Some(
         parsed
             .entries
@@ -476,4 +489,18 @@ fn download_not_found() -> Response {
         <link rel=\"stylesheet\" href=\"/assets/console.css\">\
         <p class=\"message-page\">No feed file available for that tier/format.</p>";
     (StatusCode::NOT_FOUND, Html(BODY)).into_response()
+}
+
+/// The synchronous work behind one Entries-tab load of a published feed file's `bytes`: parse,
+/// first load, render `feed_entries_fragment.html`. For `propolis/examples/cpu_budget.rs`, which
+/// times it on a feed at the 50,000-entry limit; the handlers run the same functions.
+#[doc(hidden)]
+pub fn measure_feed_entries(templates: &minijinja::Environment<'static>, bytes: &[u8]) -> usize {
+    let rows = parse_published_feed(bytes).unwrap_or_default();
+    let t = EntryTable::load("aggressive", rows, None);
+    templates
+        .get_template("feed_entries_fragment.html")
+        .and_then(|tmpl| tmpl.render(context! { t }))
+        .map(|html| html.len())
+        .unwrap_or(0)
 }

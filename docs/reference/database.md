@@ -466,6 +466,40 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 `transport_auth` is the exception on this table: its value set, and its pairing with
 `tls_verify_error`, are enforced by CHECK constraints (`0007`).
 
+## Server settings that make a stall attributable
+
+When the daemon stalls (unrelated trivial statements all finishing within a fraction of a
+millisecond of each other, seconds late), the first question is whether the database or the
+daemon's own runtime held things up. PostgreSQL's defaults log nothing that answers it. Set these
+four in `postgresql.conf` (on Debian `/etc/postgresql/<version>/main/postgresql.conf`):
+
+```
+log_min_duration_statement = 500ms
+log_lock_waits = on
+log_checkpoints = on
+log_autovacuum_min_duration = 1s
+```
+
+| Setting | What it makes visible |
+|---|---|
+| `log_min_duration_statement = 500ms` | Every statement the server itself ran for 500 ms or longer, with its text. A stall where this logs nothing is not the database. Server-side time excludes pool wait and a blocked client runtime, which is the point. |
+| `log_lock_waits = on` | A session that waited on a lock longer than `deadlock_timeout` (1 s by default), and who held it. |
+| `log_checkpoints = on` | Each checkpoint's start, the buffers written, and the write, sync and total times. |
+| `log_autovacuum_min_duration = 1s` | Each autovacuum or autoanalyze run that took 1 s or longer, with the table and what it did. |
+
+All four apply on a reload (`sudo systemctl reload postgresql@<version>-main`, or `SELECT
+pg_reload_conf();`), no restart; confirm with `SHOW log_min_duration_statement;`. They log only
+slow or rare events, so the volume is small.
+
+Where the lines land depends on the packaging. Debian's default writes the server log to
+`/var/log/postgresql/postgresql-<version>-main.log`, not the journal, so
+`propolis-watch --journal` (which follows the `postgresql*` units alongside `propolis` and
+`sensor-*`; see [live watch](../operations/live-watch.md#journal-access-opt-in)) shows them only
+when the server logs to the journal: `log_destination = 'syslog'` sends them through journald's
+syslog socket, attributed to the server's unit by the sender's cgroup [unverified on a Debian
+host; check with `journalctl -u 'postgresql*' -n 20`]. Without that, read the log file next to
+the watch stream and compare timestamps.
+
 ## Migration change map
 
 **core-scoring** (`crates/core-scoring/migrations/`):

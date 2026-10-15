@@ -27,6 +27,14 @@
 
 ### Added
 
+- **`propolis-watch --journal` follows the PostgreSQL server too** - the fixed `journalctl`
+  vector gained `-u postgresql*` (Debian's `postgresql@<version>-<cluster>`, the vendor
+  `postgresql-<version>`, the plain `postgresql`), so a daemon stall can be set beside what the
+  database logged. The vector is still constant and read-only. The
+  [database reference](docs/reference/database.md#server-settings-that-make-a-stall-attributable)
+  now names the `postgresql.conf` settings that make a stall attributable
+  (`log_min_duration_statement = 500ms`, `log_lock_waits`, `log_checkpoints`,
+  `log_autovacuum_min_duration = 1s`) and the journal caveat on Debian.
 - **The upgrade pull is checked before it is built as root** - `upgrade.sh` did a plain
   `git pull`, so whatever the remote served, or whatever had been edited or committed on the
   box, was built and installed. It now refuses a dirty checkout (naming the files), a remote

@@ -20,7 +20,11 @@ use crate::record;
 /// Absolute, so no `PATH` lookup decides what runs.
 pub const JOURNAL_PROGRAM: &str = "/usr/bin/journalctl";
 
-pub const JOURNAL_ARGS: [&str; 8] = [
+/// `postgresql*` is the one pattern that covers every packaging of the server unit the daemon's
+/// database runs under: Debian's per-cluster `postgresql@<version>-<cluster>`, the vendor
+/// repositories' `postgresql-<version>`, and the plain `postgresql`. A stall in the daemon
+/// (`propolis`) is only attributable to the database, or cleared of it, with both in one stream.
+pub const JOURNAL_ARGS: [&str; 10] = [
     "-f",
     "-o",
     "json",
@@ -29,6 +33,8 @@ pub const JOURNAL_ARGS: [&str; 8] = [
     "sensor-*",
     "-u",
     "propolis",
+    "-u",
+    "postgresql*",
 ];
 
 /// journald's own stream line limit (`LineMax=`) defaults to 48 KiB, so a real entry is far below
@@ -131,8 +137,39 @@ mod tests {
         assert_eq!(JOURNAL_PROGRAM, "/usr/bin/journalctl");
         assert_eq!(
             JOURNAL_ARGS.join(" "),
-            "-f -o json --no-pager -u sensor-* -u propolis"
+            "-f -o json --no-pager -u sensor-* -u propolis -u postgresql*"
         );
+    }
+
+    #[test]
+    fn the_vector_stays_read_only_follow_mode_with_only_unit_filters() {
+        // Everything after the fixed prefix is a `-u <pattern>` pair: no other journalctl option
+        // (--vacuum-*, --rotate, --flush, --setup-keys, --update-catalog, --output-fields) and no
+        // positional match can slip in with a new unit.
+        let (prefix, units) = JOURNAL_ARGS.split_at(4);
+        assert_eq!(prefix, ["-f", "-o", "json", "--no-pager"]);
+        assert!(units.len().is_multiple_of(2));
+        for pair in units.chunks(2) {
+            assert_eq!(pair[0], "-u");
+            assert!(!pair[1].starts_with('-'), "{}", pair[1]);
+            assert!(
+                pair[1]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_@.*".contains(c)),
+                "unit pattern {:?} holds more than a unit name and globs",
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn the_database_unit_is_in_the_vector() {
+        let units: Vec<&str> = JOURNAL_ARGS
+            .windows(2)
+            .filter(|w| w[0] == "-u")
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(units, ["sensor-*", "propolis", "postgresql*"]);
     }
 
     #[test]

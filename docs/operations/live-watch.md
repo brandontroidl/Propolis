@@ -48,8 +48,16 @@ yet, the script writes nothing and says so.
 The `start` record and every heartbeat name the source in `sources_from`: `env`, or the file's
 path.
 
-With `--journal` it also streams the `sensor-*` units' and `propolis.service`'s journal by running
-`journalctl -f -o json --no-pager -u sensor-* -u propolis`.
+With `--journal` it also streams the `sensor-*` units', `propolis.service`'s and the PostgreSQL
+server's journal by running
+`journalctl -f -o json --no-pager -u sensor-* -u propolis -u postgresql*`. The last pattern covers
+Debian's `postgresql@<version>-<cluster>`, the vendor repositories' `postgresql-<version>` and the
+plain `postgresql`. It is there so a daemon stall can be set beside what the database logged at
+the same moment; for that the server has to log slow statements, lock waits, checkpoints and
+long autovacuums, and to log to the journal at all (Debian's default is a file), which
+[the database reference](../reference/database.md#server-settings-that-make-a-stall-attributable)
+sets out: `log_min_duration_statement = 500ms`, `log_lock_waits = on`, `log_checkpoints = on`,
+`log_autovacuum_min_duration = 1s`.
 
 ## Output
 
@@ -225,8 +233,8 @@ It takes effect at the next login. Without it, `journalctl` shows this account o
 entries, which are none; whatever `journalctl` writes to stderr, such as a permissions hint, is
 relayed as `error` records with `source` `journal`, and the event logs keep streaming. If
 `/usr/bin/journalctl` cannot be started at all, the watcher emits one `error` record and carries
-on without it. The journal adds the daemon's and sensors' own log lines, which can name internal
-paths and configuration; grant it only if the reader should see them.
+on without it. The journal adds the daemon's, sensors' and database server's own log lines, which can
+name internal paths, configuration and SQL text; grant it only if the reader should see them.
 
 ## Reading the stream safely
 

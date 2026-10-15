@@ -17,7 +17,7 @@ Streams every sensor event log named in PROPOLIS_SENSOR_LOGS as JSON Lines on st
   --sensor <label>   only events from this PROPOLIS_SENSOR_LOGS label (repeatable)
   --signal <type>    only events whose signal_type is <type>
   --source-ip <ip>   only events whose source_ip is <ip>
-  --journal          also stream the sensor-* and propolis units' journal
+  --journal          also stream the sensor-*, propolis and postgresql units' journal
   --since-start      replay each log from the start of its current file instead of its end
   --help             print this text and exit
 

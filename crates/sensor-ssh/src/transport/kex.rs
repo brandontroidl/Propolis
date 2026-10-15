@@ -239,9 +239,12 @@ fn group14_prime() -> BigUint {
         .clone()
 }
 
-/// The server's private exponent size: 512 bits, well over twice the roughly 112-bit strength of a
-/// 2048-bit group, which is the usual rule for a short exponent and far cheaper than a full one.
-const DH_EXPONENT_BYTES: usize = 64;
+/// The server's private exponent size: 256 bits, over twice the roughly 112-bit strength of a
+/// 2048-bit group (a short exponent costs a discrete-log attack its square root, so it needs twice
+/// the strength in bits) and about half the running time of a 512-bit one. A client picks this
+/// exchange at will and each one costs the sensor two modular exponentiations before any
+/// authentication, so the time per exchange is worth keeping down.
+const DH_EXPONENT_BYTES: usize = 32;
 
 /// Largest encoded `e` accepted: the 2048-bit modulus plus the mpint sign byte.
 const DH_MAX_PUBLIC_BYTES: usize = 257;

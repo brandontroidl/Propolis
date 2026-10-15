@@ -92,8 +92,10 @@ credential/topic. Enable only what you need, and confirm each is intended:
 
 ## 6. Provision secrets correctly
 
-- Fill in `/etc/propolis/*.env`. Provisioning creates them empty, mode `0600`, `root:root`
-  (`deploy/env-files.sh`); keep that mode when you copy the examples over them.
+- Fill in `/etc/propolis/*.env`. Provisioning creates `propolis.env` and the twelve sensor files empty, mode `0600`, `root:root`
+  (`deploy/env-files.sh`) and tightens any other existing one; create the rest (`console.env`,
+  `feed.env`, `review.env`, `intake.env`, `gateway.env`, `shipper.env`) yourself the same way.
+  Keep that mode when you copy the examples over them.
   `deploy/config-check.sh` warns while all of them are empty and fails on one that other
   accounts can read and prints the `chmod` to run.
 - Set a strong `PROPOLIS_CONSOLE_PASSWORD` (the console refuses to start without

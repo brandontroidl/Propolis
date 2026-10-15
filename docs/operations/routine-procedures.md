@@ -180,8 +180,8 @@ refuses that build and the next run publishes.
 
 ## Rotating secrets
 
-Secrets live in per-service `/etc/propolis/*.env` files (mode `0600`, owned by
-the service user), created and edited **by hand** - never by `install.sh`. The
+Secrets live in per-service `/etc/propolis/*.env` files (mode `0600`, `root:root`),
+created empty by provisioning and edited **by hand** - `install.sh` writes no value into them. The
 full inventory and handling rules are owned by
 [secret management](secret-management.md); edit those files per that page, then
 restart the affected service.
@@ -205,8 +205,7 @@ restart commands):
 
 > **Never place these values in a repository, a commit, argv, or a subagent
 > prompt.** No secret is read from argv; all are read from the environment at
-> startup. After editing, confirm the file is still `0600` and owned by the
-> service user.
+> startup. After editing, confirm the file is still `0600` and `root:root`.
 
 ## Checking health
 

@@ -114,8 +114,8 @@ Only after all four does it spawn subsystems and log `starting unified daemon`.
 
 ## `.env` files are operator-authored
 
-`deploy/install.sh` deliberately does **not** create or edit any operator-owned
-`/etc/propolis/*.env` file (the one exception is the generated, secret-free
+`deploy/install.sh` deliberately puts no value in any operator-owned
+`/etc/propolis/*.env` file (provisioning creates them empty at `0600`; the one file with generated content is the secret-free
 `fleet-listeners.env`, `deploy/install.sh#fleet-listeners.env`) - it prints `Next: populate
 /etc/propolis/*.env files` and stops (`deploy/install.sh#Next: populate`). A freshly installed but unconfigured
 box will fail every startup on the missing required variables above until you

@@ -401,8 +401,8 @@ files under `/etc/propolis/` - no config-file format, no runtime CLI flags, no
 config in the database. Each systemd unit reads one `EnvironmentFile`:
 `propolis.service` → `/etc/propolis/propolis.env` (the whole data plane), each
 `sensor-<name>.service` → `/etc/propolis/<name>.env`. These files are
-operator-authored, mode `0600`, owned by the service user; `install.sh` never
-creates them.
+operator-authored, mode `0600`, `root:root` (systemd reads them as root); provisioning
+creates each one empty and the operator fills in the values.
 
 Grouped by subsystem: database (`DATABASE_URL` required,
 `PROPOLIS_DB_MAX_CONNECTIONS`), intake (`PROPOLIS_SENSOR_LOGS` required,

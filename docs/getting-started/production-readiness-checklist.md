@@ -17,8 +17,8 @@ is ticked.
 
 ## Secrets
 
-- [ ] Every secret is in a per-service `/etc/propolis/*.env` file, mode 0600, owned by
-      that service's user. You write these by hand; `install.sh` never does.
+- [ ] Every secret is in a per-service `/etc/propolis/*.env` file, mode 0600, `root:root`
+      (systemd reads it as root). Provisioning creates each one empty; you fill in the values.
 - [ ] `DATABASE_URL` is set. It carries the database password, and the daemon refuses
       to start without it.
 - [ ] `PROPOLIS_CONSOLE_PASSWORD` is a strong value, for example from

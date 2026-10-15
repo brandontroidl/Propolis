@@ -152,7 +152,7 @@ still holding the previous run's files can no longer connect.
    sudo install -m 0600 -o propolis-gateway -g propolis-gateway /root/propolis-certs/gateway.key /etc/propolis/certs/
    ```
 
-3. Write `/etc/propolis/gateway.env`, mode 0600, owned by `propolis-gateway`:
+3. Write `/etc/propolis/gateway.env`, mode 0600, `root:root` (systemd reads it as root; nothing creates it on this host):
 
    ```sh
    PROPOLIS_GATEWAY_BIND=0.0.0.0:9443
@@ -241,7 +241,7 @@ files expect it to match the shipper's. Then:
    rm -r ~/certs-in
    ```
 
-3. Write `/etc/propolis/shipper.env`, mode 0600, owned by `propolis-shipper`:
+3. Write `/etc/propolis/shipper.env`, mode 0600, `root:root` (systemd reads it as root; nothing creates it on this host):
 
    ```sh
    PROPOLIS_SHIPPER_GATEWAY_ADDR=203.0.113.10:9443

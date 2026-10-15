@@ -229,8 +229,8 @@ Owners: [security/filesystem-and-db-protections.md](security/filesystem-and-db-p
 | `SystemCallFilter` is a documented PLACEHOLDER; the tight allowlist must be derived empirically before production. | `deploy/sensor-ssh.service:80-99`; `deploy/propolis.service:176-187` | PLACEHOLDER / [planned] |
 | Whether the `noexec,nosuid,nodev` spool mounts are actually mounted on the production box - install.sh only PRINTS the fstab guidance. | `deploy/install.sh:172-182` | [not-evidenced] (runtime) |
 | `/var/lib/propolis` is root-owned `0755` so an unprivileged sensor cannot swap the host-key dir for a symlink. | `deploy/install.sh:132-137` | IMPLEMENTED |
-| install.sh creates `--system --no-create-home --shell /usr/sbin/nologin` users; does NOT start services, create/migrate the DB, or write any `/etc/propolis/*.env`. | `deploy/install.sh:86-101,19-32,232-233` | IMPLEMENTED |
-| Secrets live only in per-service `/etc/propolis/*.env` (mode 0600, service-owned); no secret is read from argv. | unit headers e.g. `deploy/console.service:36-37`; `crates/propolis/src/config.rs` env reads | IMPLEMENTED |
+| install.sh creates `--system --no-create-home --shell /usr/sbin/nologin` users; does NOT start services, create/migrate the DB, or put a value in any `/etc/propolis/*.env` (provisioning creates them empty, `deploy/env-files.sh`). | `deploy/install.sh:86-101,19-32,232-233` | IMPLEMENTED |
+| Secrets live only in per-service `/etc/propolis/*.env` (mode 0600, `root:root`); no secret is read from argv. | unit headers e.g. `deploy/console.service:36-37`; `crates/propolis/src/config.rs` env reads | IMPLEMENTED |
 | The daemon supervises its own subsystems (panic restart with backoff, `MAX_CONSECUTIVE_PANICS=3`), which is why `propolis.service` uses `Restart=on-failure` not `always`. | `crates/propolis/src/supervisor.rs:16-25`; `deploy/propolis.service:123-124` | IMPLEMENTED |
 
 ---

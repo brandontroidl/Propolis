@@ -170,11 +170,12 @@ itself) and `/var/log/propolis`.
 ## Config
 
 - **Config root `/etc/propolis`** (0755 root, `deploy/provision.sh#ensure_dir /etc/propolis`). Per-service env
-  files `/etc/propolis/<service>.env` (mode 0600, service-owned) carry all
+  files `/etc/propolis/<service>.env` (mode 0600, `root:root`) carry all
   config **including secrets**, named in each unit's `EnvironmentFile=` (e.g.
   `console.env`, `ssh.env`, `catchall.env`, `propolis.env` at
-  `deploy/propolis.service#EnvironmentFile=/etc/propolis/propolis.env`). `install.sh` does **not** create these env files
-  (`deploy/install.sh#OPERATOR-owned /etc/propolis/*.env file`) - the operator populates them.
+  `deploy/propolis.service#EnvironmentFile=/etc/propolis/propolis.env`). `install.sh` writes no value into them
+  (`deploy/install.sh#OPERATOR-owned /etc/propolis/*.env file`): provisioning (`deploy/env-files.sh`)
+  creates each missing one empty and closes any that is open, and the operator populates them.
   Each sensor unit makes every env file it does not load, plus `watch.env` and `certs/`,
   inaccessible by mount (`InaccessiblePaths=`, `-`-prefixed so an absent file does not fail
   the unit); the unit's own file is read by systemd before the namespace exists.

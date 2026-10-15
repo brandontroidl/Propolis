@@ -62,8 +62,7 @@ required). The installer is idempotent and creates users, directories, binaries,
 ## 3. Configuration
 
 Propolis is configured entirely through environment variables in
-operator-authored per-service files under `/etc/propolis/` (`0600`, owned by the
-service user). Startup is fail-fast on any missing-required or present-but-zero
+operator-authored per-service files under `/etc/propolis/` (`0600`, `root:root`). Startup is fail-fast on any missing-required or present-but-zero
 numeric bound - a misconfiguration cannot silently disable a guard.
 
 - Model and which file configures what:
@@ -73,7 +72,7 @@ numeric bound - a misconfiguration cannot silently disable a guard.
 
 ## 4. Secrets
 
-Author the `.env` files by hand; no secret is created by the installer, read
+Fill in the `.env` files by hand (provisioning creates them empty at `0600`); no secret is created by the installer, read
 from argv, or written back to disk. At minimum set `DATABASE_URL` (carries the
 DB password inline - use a least-privilege role, not `trust` auth) and
 `PROPOLIS_CONSOLE_PASSWORD` (Argon2id-hashed at startup, plaintext dropped).

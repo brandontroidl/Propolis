@@ -80,8 +80,8 @@ security-load-bearing choices:
   a given host is an operator step, not enforceable from the repo - see
   [malware custody](./malware-custody.md) and
   [residual risks](./residual-risks.md).
-- **Secrets live only in `/etc/propolis/*.env`, mode `0600`, owned by the service
-  user** - created by hand by the operator, never by `install.sh`. No secret is
+- **Secrets live only in `/etc/propolis/*.env`, mode `0600`, `root:root`** - provisioning
+  creates them empty and the operator fills them in; `install.sh` writes no value. No secret is
   read from argv or baked into a unit file. See
   [../operations/secret-management.md](../operations/secret-management.md).
 - **Sensor TLS keys** (`/etc/propolis/tls/<sensor>.key`, `0600`, owned by that sensor's own

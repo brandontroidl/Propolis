@@ -123,7 +123,7 @@ checklist are owned by [backup and restore](../operations/backup-and-restore.md)
 
 - Working the queue, publishing, rotating secrets, and health checks:
   [routine procedures](../operations/routine-procedures.md).
-- Secret handling (per-service `0600` env files, created by hand, never by `install.sh`):
+- Secret handling (per-service `0600` `root:root` env files, created empty by provisioning and filled in by hand):
   [secret management](../operations/secret-management.md).
 - Configuration surface: [configuration](../operations/configuration.md); exact values in
   [environment variables](../reference/environment-variables.md).

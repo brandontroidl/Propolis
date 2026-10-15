@@ -180,8 +180,8 @@ not strictly need backup - a database backup implies it.
 
 ### 3. Configuration and secrets
 
-Per-service environment files under `/etc/propolis/*.env` (mode `0600`, owned by
-each service user), created by hand by the operator. They carry the database
+Per-service environment files under `/etc/propolis/*.env` (mode `0600`, `root:root`),
+created empty by provisioning and filled in by the operator. They carry the database
 password (inline in `DATABASE_URL`), the console password, the optional session
 secret, and any vendor / VirusTotal / ntfy keys. The full inventory and handling
 rules are owned by [secret management](secret-management.md).
@@ -255,7 +255,7 @@ if you can, so a data-restore workflow never needs to touch the secret material.
    writes while you restore.
 2. **Restore configuration.** Unpack `/etc/propolis` (or recreate the `*.env`
    files by hand per [secret management](secret-management.md)). Confirm modes
-   are `0600` and ownership matches each service user.
+   are `0600`, `root:root` (`watch.env` is `root:propolis-watch` `0640`).
 3. **Restore the database.** `pg_dump` records object ownership and grants but
    not roles, so on a new PostgreSQL server create the daemon's `propolis` role
    first, then an empty database it owns, then load the dump:

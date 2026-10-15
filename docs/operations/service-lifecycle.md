@@ -38,9 +38,10 @@ daemon and [deployment models](./deployment-models.md) for single-node vs cluste
 
 ## Start and enable
 
-Configuration and secrets must exist first (`install.sh` never writes any
-operator-owned `/etc/propolis/*.env` file - it only generates the secret-free
-`fleet-listeners.env` - and never starts, enables, or migrates anything). See
+Configuration and secrets must exist first (`install.sh` puts no value in any
+operator-owned `/etc/propolis/*.env` file - provisioning only creates them empty at `0600` and
+generates the secret-free `fleet-listeners.env` and the derived `watch.env` - and it never
+starts, enables, or migrates anything). See
 [configuration](./configuration.md) and [secret management](./secret-management.md).
 
 Once every service has its `/etc/propolis/*.env`:
@@ -270,7 +271,7 @@ The exit status is `0` all ok, `1` warnings or checks
 that could not be answered, `2` at least one failure; a usage error is `64`.
 
 **Without root** it still runs, and says what it could not see under `LIMITED CHECKS`. Sensor
-env files are mode 0600 and owned by each sensor's account, so as an ordinary user part of the
+env files are mode 0600 and owned by root, so as an ordinary user part of the
 inventory may be unreadable; `ss` cannot name another account's process, so a bound port shows
 `bound, owner unknown (run as root to name it)`; `ufw` and `nft` cannot list rules; and
 `/var/log/propolis/*` is not traversable. These are reported as `?`, which is neither a pass

@@ -195,9 +195,9 @@ sudo ./deploy/install.sh              # installs binaries + units; starts/enable
 
 `install.sh` provisions OS users (including the `propolis-watch` login for the live watcher),
 directories, spool mountpoints, the release binaries (including `propolis-watch`), `propolis.service` + the 12 sensor units, and a logrotate config. It
-does **not** start or enable any service, create/migrate the database, or write
-any operator-owned `/etc/propolis/*.env` file; the one env file it does write is
-the generated, secret-free `fleet-listeners.env`
+does **not** start or enable any service, create/migrate the database, or put a value in
+any operator-owned `/etc/propolis/*.env` file (provisioning creates them empty at `0600`); the one env file it generates with content is
+the secret-free `fleet-listeners.env`
 (`deploy/install.sh#This script does NOT`, `deploy/install.sh#fleet-listeners.env`). Starting a
 service is a separate operator action taken only after populating the env files:
 

@@ -30,10 +30,11 @@ Each systemd unit reads one `EnvironmentFile`:
 - each `sensor-<name>.service` → `/etc/propolis/<name>.env` (that sensor's binds
   and connection bounds)
 
-These `.env` files are **operator-authored**. `deploy/install.sh` does not
-create them - it only prints "Next: populate /etc/propolis/*.env files"
-(`deploy/install.sh#populate /etc/propolis`). They are mode `0600` and owned by the service user,
-and each sensor unit additionally mounts every env file it does not load as inaccessible
+These `.env` files are **operator-authored**. Provisioning creates each one empty
+(`deploy/env-files.sh`), mode `0600`, `root:root`; systemd reads an `EnvironmentFile=` as root
+before it drops privileges, so the service account needs no read access. What goes in is yours:
+`deploy/install.sh` prints "Next: populate /etc/propolis/*.env files". Each sensor unit
+additionally mounts every env file it does not load as inaccessible
 (`InaccessiblePaths=`), so a sensor cannot read `propolis.env` even if its mode slips.
 The defaults documented in the reference table are the **code** defaults applied
 when a variable is unset or blank; they are authoritative for runtime behavior

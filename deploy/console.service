@@ -33,7 +33,7 @@
 #   - a dedicated, unprivileged system user/group `propolis-console` (no login shell, no home
 #     directory), matching the convention already established for `propolis-intake`/
 #     `propolis-review`/`propolis-feed`.
-#   - /etc/propolis/console.env (mode 0600, owned by propolis-console), carrying this process's
+#   - /etc/propolis/console.env (mode 0600, root:root; systemd reads it as root), carrying this process's
 #     configuration. Env vars (crates/console/src/main.rs): DATABASE_URL (required, PostgreSQL
 #     connection string); PROPOLIS_CONSOLE_BIND (default 127.0.0.1:8080); PROPOLIS_CONSOLE_PASSWORD
 #     (required - the operator's console password, hashed with Argon2id at startup and never

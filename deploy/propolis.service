@@ -52,7 +52,7 @@
 # deploy/install.sh):
 #   - a dedicated, unprivileged system user/group `propolis` (no login shell, no home directory),
 #     added as a supplementary member of `propolis-catchall` and `propolis-ssh` (see above).
-#   - /etc/propolis/propolis.env (mode 0600, owned by propolis), carrying this process's
+#   - /etc/propolis/propolis.env (mode 0600, root:root; systemd reads it as root), carrying this process's
 #     configuration - internal/design/07-runtime-coordination-deployment.md's "Unified
 #     configuration" has the full example. Env vars (crates/propolis/src/config.rs):
 #     DATABASE_URL (required), PROPOLIS_DB_MAX_CONNECTIONS (default 10),

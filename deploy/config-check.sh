@@ -30,7 +30,7 @@
 # binary (an old binary that predates --version would START its service).
 #
 # WITHOUT ROOT it still runs, with these checks limited: sensor env files are 0600 and owned by
-# each sensor's account, so the listener inventory itself may be unreadable; `ss` cannot name a
+# root, so the listener inventory itself may be unreadable; `ss` cannot name a
 # socket's owner; ufw and nft cannot list rules; /var/log/propolis/* is not traversable; the
 # database URL is unreadable. A check that cannot be answered is reported as unknown ("?"), counts
 # as a warning in the exit status, and is listed under LIMITED CHECKS: it is never a pass.
@@ -47,7 +47,7 @@
 # Test seams (all default to the production path; set only by tests): PROPOLIS_CC_NOW (epoch),
 # PROPOLIS_CC_EUID, PROPOLIS_CC_BIN_DIR, PROPOLIS_CC_REPO_DIR, PROPOLIS_CC_BUILD_DIR,
 # PROPOLIS_CC_STAMP, PROPOLIS_CC_LOGROTATE_STATE, PROPOLIS_CC_LOGROTATE_POLICY,
-# PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME. PROPOLIS_CC_LOG_STALE_HOURS (default 24)
+# PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME, PROPOLIS_CC_WATCH_ACCOUNT. PROPOLIS_CC_LOG_STALE_HOURS (default 24)
 # is the age past which a log on a running sensor is reported as quiet.
 #
 # The output is plain ASCII: every value read from an env file is passed through `clean` first, so
@@ -118,6 +118,7 @@ ROTATE_STATE="${PROPOLIS_CC_LOGROTATE_STATE:-/var/lib/propolis/logrotate.state}"
 ROTATE_POLICY="${PROPOLIS_CC_LOGROTATE_POLICY:-/etc/logrotate.d/propolis-sensors}"
 ROTATE_GUARD="${PROPOLIS_CC_LOGROTATE_GUARD:-/usr/local/sbin/propolis-logrotate-guard}"
 WATCH_HOME="${PROPOLIS_CC_WATCH_HOME:-/var/lib/propolis-watch}"
+WATCH_ACCOUNT="${PROPOLIS_CC_WATCH_ACCOUNT:-propolis-watch}"
 BACKUP_STATUS="${PROPOLIS_CC_BACKUP_STATUS:-/var/lib/propolis/backup-status}"
 ALERT_HOOK="${PROPOLIS_CC_ALERT_HOOK:-/usr/local/sbin/propolis-alert}"
 STALE_HOURS="${PROPOLIS_CC_LOG_STALE_HOURS:-24}"
@@ -1727,6 +1728,18 @@ check_intake_list() {
     fi
 }
 
+# Whether the watcher's own account can read $1, from the file's owner, group and mode. The
+# check's own `-r` test answers for root in practice, and a watch.env at 0600 root:root passes
+# it while propolis-watch cannot read the file (live, 2026-10-14).
+watcher_can_read() {
+    local owner group mode
+    read -r owner group mode < <(stat -c '%U %G %a' -- "$1" 2>/dev/null) || return 0
+    case "$mode" in '' | *[!0-7]*) return 0 ;; esac
+    if [ "$owner" = "$WATCH_ACCOUNT" ] && [ $(( 8#$mode & 8#400 )) -ne 0 ]; then return 0; fi
+    if [ "$group" = "$WATCH_ACCOUNT" ] && [ $(( 8#$mode & 8#040 )) -ne 0 ]; then return 0; fi
+    [ $(( 8#$mode & 8#004 )) -ne 0 ]
+}
+
 check_watcher() {
     local installed=0 worst=ok text parts=() src_line watch_line key_file
     if [ -x "$BIN_DIR/propolis-watch" ] || id -u propolis-watch >/dev/null 2>&1; then
@@ -1746,6 +1759,11 @@ check_watcher() {
         worst=unknown
         parts+=("watch.env unreadable")
         limit "watch.env not readable as this user"
+    elif ! watcher_can_read "$wenv"; then
+        worst=fail
+        parts+=("watch.env not readable by $WATCH_ACCOUNT")
+        finding fail "watcher" "watch-env-owner" "$wenv is not readable by the $WATCH_ACCOUNT account (it must be owned by root, group $WATCH_ACCOUNT, mode 0640): the watcher cannot read its log list and exits" \
+            "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
     else
         watch_line="$(grep -E '^PROPOLIS_SENSOR_LOGS=' "$wenv" 2>/dev/null | tail -n 1 || true)"
         if [ -z "$watch_line" ]; then
@@ -1844,8 +1862,20 @@ env_mode_limit() {
 # unrelated service, and a file's mode can be read without root even where its content cannot.
 # A mode stricter than the limit (0400, or 0000 for a file being rotated) is not a finding.
 check_env_files() {
-    local f mode limit extra loose=()
+    local f mode limit extra loose=() filled=0
     for f in "${ENV_FILES[@]}"; do
+        # A file env-files.sh created empty is not configuration, and the two generated files
+        # (a copy of one propolis.env line, the listener inventory) are not the operator's. An
+        # unreadable file is counted as filled: its content is unknown, and UNREADABLE_ENV
+        # already reports that limit.
+        case "${f##*/}" in
+            watch.env | fleet-listeners.env) ;;
+            *)
+                if [ ! -r "$f" ] || grep -Eq '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' -- "$f" 2>/dev/null; then
+                    filled=$((filled + 1))
+                fi
+                ;;
+        esac
         mode="$(stat -c %a -- "$f" 2>/dev/null)" || continue
         case "$mode" in '' | *[!0-7]*) continue ;; esac
         limit="$(env_mode_limit "$f")"
@@ -1865,6 +1895,10 @@ check_env_files() {
         global env-files fail "${#ENV_FILES[@]} env files, readable or writable by other accounts: ${loose[*]}"
     elif [ "${#UNREADABLE_ENV[@]}" -gt 0 ]; then
         global env-files unknown "${#UNREADABLE_ENV[@]} of ${#ENV_FILES[@]} env files unreadable as this user"
+    elif [ "$filled" -eq 0 ]; then
+        global env-files warn "${#ENV_FILES[@]} env files, none sets anything"
+        finding warn "env-files" "env-empty" "no env file in $ENV_DIR sets anything (provisioning creates them empty): nothing is configured on this host" \
+            "copy deploy/sensor.env.example and deploy/propolis.env.example over the files in $ENV_DIR and fill them in (docs/operations/installation.md)" manual
     elif [ "$ROW_COUNT" -eq 0 ]; then
         global env-files ok "${#ENV_FILES[@]} env files, no sensor listener configured (a control-plane-only host)"
     else

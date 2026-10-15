@@ -31,7 +31,7 @@
 # Prerequisites this unit assumes and does not itself create:
 #   - a dedicated, unprivileged system user/group `propolis-review` (no login shell, no home
 #     directory), matching the convention already established for `propolis-intake`.
-#   - /etc/propolis/review.env (mode 0600, owned by propolis-review), carrying this process's
+#   - /etc/propolis/review.env (mode 0600, root:root; systemd reads it as root), carrying this process's
 #     configuration. Env vars (crates/review/src/main.rs): DATABASE_URL (required, PostgreSQL
 #     connection string); PROPOLIS_VENDOR_ABUSEIPDB_KEY/_URL, PROPOLIS_VENDOR_DSHIELD_KEY/_USER/_URL,
 #     PROPOLIS_VENDOR_OTX_KEY/_URL (all optional - a missing/empty key fails that vendor closed,

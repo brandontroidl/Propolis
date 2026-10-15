@@ -41,7 +41,7 @@
 #   - a dedicated, unprivileged system user/group `propolis-feed` (no login shell, no home
 #     directory), matching the convention already established for `propolis-intake`/
 #     `propolis-review`.
-#   - /etc/propolis/feed.env (mode 0600, owned by propolis-feed), carrying this process's
+#   - /etc/propolis/feed.env (mode 0600, root:root; systemd reads it as root), carrying this process's
 #     configuration. Env vars (crates/feed/src/main.rs): DATABASE_URL (required, PostgreSQL
 #     connection string); PROPOLIS_FEED_OUTPUT_DIR (default /var/lib/propolis/feed/current);
 #     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900); PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS (default

@@ -119,5 +119,5 @@ Only after all four does it spawn subsystems and log `starting unified daemon`.
 `fleet-listeners.env`, `deploy/install.sh#fleet-listeners.env`) - it prints `Next: populate
 /etc/propolis/*.env files` and stops (`deploy/install.sh#Next: populate`). A freshly installed but unconfigured
 box will fail every startup on the missing required variables above until you
-author those files (mode 0600, owned by the service user). See
+author those files (mode 0600, `root:root` as provisioning creates them). See
 [Secret management](../operations/secret-management.md).

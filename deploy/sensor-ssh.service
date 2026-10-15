@@ -11,7 +11,7 @@
 #     directory, holds no database handle and no secrets per the spec's "Least authority" -
 #     the host key below is not a platform secret, see internal/design/02-sensor-framework.md's
 #     "Host key" and ADR-0011).
-#   - /etc/propolis/ssh.env (mode 0600, owned by propolis-ssh), carrying this sensor's
+#   - /etc/propolis/ssh.env (mode 0600, root:root; systemd reads it as root), carrying this sensor's
 #     configuration. Env vars (crates/sensor-ssh/src/main.rs): PROPOLIS_SSH_BIND (required, one
 #     ip:port), PROPOLIS_SSH_WAN_MAP (optional, comma-separated local=wan pairs),
 #     PROPOLIS_SSH_LOG_PATH, PROPOLIS_SSH_SPOOL_DIR, PROPOLIS_SSH_HOST_KEY_PATH.

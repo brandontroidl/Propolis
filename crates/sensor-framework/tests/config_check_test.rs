@@ -93,9 +93,21 @@ fn install_bins() -> Vec<String> {
         .collect()
 }
 
+/// The account the test runs as, standing in for propolis-watch: it owns every fixture file.
+fn current_user() -> String {
+    let out = std::process::Command::new("id")
+        .arg("-un")
+        .output()
+        .expect("run id -un");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 struct Fx {
     root: tempfile::TempDir,
     head: String,
+    /// The account config-check treats as propolis-watch; the tests' own user unless a test
+    /// names another.
+    watch_account: std::cell::RefCell<String>,
 }
 
 const UFW_ALL: &str = "Status: active\nLogging: on (low)\nDefault: deny (incoming), allow (outgoing), disabled (routed)\nNew profiles: skip\n\nTo                         Action      From\n--                         ------      ----\n22/tcp                     ALLOW IN    Anywhere\n1883/tcp                   ALLOW IN    Anywhere\n5432/tcp                   ALLOW IN    Anywhere\n69/udp                     ALLOW IN    Anywhere\n53                         ALLOW IN    Anywhere\n22/tcp (v6)                ALLOW IN    Anywhere (v6)\n";
@@ -170,6 +182,7 @@ impl Fx {
         let fx = Fx {
             root,
             head: String::new(),
+            watch_account: std::cell::RefCell::new(current_user()),
         };
         let logs = fx.p("logs").display().to_string();
 
@@ -458,6 +471,7 @@ cat "$d/psql_out"
                 self.p("etc-logrotate/dropin"),
             )
             .env("PROPOLIS_CC_WATCH_HOME", self.p("home-watch"))
+            .env("PROPOLIS_CC_WATCH_ACCOUNT", &*self.watch_account.borrow())
             .env("PROPOLIS_CC_BACKUP_STATUS", self.p("state/backup-status"))
             .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"));
         for (k, v) in env {
@@ -1634,6 +1648,35 @@ fn the_watcher_is_checked_only_where_installed_and_drift_from_propolis_env_fails
     assert!(w["state"] == "skip" || w["state"] == "fail", "{w}");
 }
 
+/// A watch.env that exists and is readable to the check (root reads everything) but not to the
+/// watcher's own account is the 2026-10-14 incident: the file was 0600 root:root, the watcher
+/// exited, and every check passed.
+#[test]
+fn a_watch_env_the_watcher_account_cannot_read_is_a_failure() {
+    let fx = Fx::new();
+    let ids = |fx: &Fx, account: &str| -> Vec<String> {
+        *fx.watch_account.borrow_mut() = account.to_string();
+        fx.json()["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Owned by the watcher's account, owner-readable: fine (the fixture default).
+    assert!(!ids(&fx, &current_user()).contains(&"watch-env-owner".to_string()));
+    // Owned and grouped by someone else, no other-read bit: the watcher cannot read it.
+    std::fs::set_permissions(
+        fx.p("etc/watch.env"),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    assert!(ids(&fx, "no-such-watch-account").contains(&"watch-env-owner".to_string()));
+    // Group read does not help an account that is not the group.
+    let r = fx.run(&[]);
+    assert_eq!(r.code, 2, "{}", r.out);
+}
+
 #[test]
 fn an_enabled_sensor_unit_with_no_bind_is_a_failure_that_names_the_cause() {
     let fx = Fx::new();
@@ -2219,6 +2262,20 @@ type Scenario = (&'static str, fn(&Fx));
 /// One fixture per way the host can be wrong; together they raise every finding id.
 fn fix_scenarios() -> Vec<Scenario> {
     vec![
+        ("env files all empty", |fx| {
+            for name in ["ssh", "mqtt", "cred", "tftp", "dns", "propolis"] {
+                // Comments only, as a copied example file leaves them.
+                fx.write(&format!("etc/{name}.env"), "# BIND is set here\n");
+            }
+        }),
+        ("watch.env the watcher account cannot read", |fx| {
+            *fx.watch_account.borrow_mut() = "no-such-watch-account".to_string();
+            std::fs::set_permissions(
+                fx.p("etc/watch.env"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+        }),
         ("bad bind", |fx| {
             fx.write("etc/telnet.env", "PROPOLIS_TELNET_BIND=0.0.0.0:99999\n");
         }),
@@ -2987,6 +3044,56 @@ fn each_intake_log_with_content_needs_a_cursor_file_and_a_visible_cursor_directo
             .to_string()
             .contains("does not read that file")
     );
+}
+
+/// On a fresh box provisioning creates every service env file EMPTY. That must read as "nothing
+/// is configured" (the same warning as no files at all), not as a control-plane-only host that
+/// passed; one assignment in one file is enough to clear it.
+#[test]
+fn env_files_created_empty_by_provisioning_are_not_configuration() {
+    let fx = Fx::new();
+    let etc = fx.p("etc");
+    for entry in std::fs::read_dir(&etc).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "env") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/env-files.sh"
+    ))
+    .arg(&etc)
+    .env("DRY_RUN", "0")
+    .output()
+    .expect("run deploy/env-files.sh");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fx.p("etc/propolis.env").exists());
+
+    let findings = |v: &serde_json::Value| -> Vec<String> {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "env-empty")
+            .map(|f| f["level"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let v = fx.json();
+    assert_eq!(global_state(&v, "env-files"), "warn", "{v}");
+    assert_eq!(findings(&v), ["warn"], "{}", v["findings"]);
+
+    // A comment and blank lines are still nothing; a real assignment is configuration.
+    fx.write("etc/propolis.env", "# fill me in\n\n");
+    assert_eq!(global_state(&fx.json(), "env-files"), "warn");
+    fx.write("etc/propolis.env", "PROPOLIS_CONSOLE_BIND=127.0.0.1:8080\n");
+    let v = fx.json();
+    assert_eq!(global_state(&v, "env-files"), "ok", "{v}");
+    assert!(findings(&v).is_empty(), "{}", v["findings"]);
 }
 
 /// An env file another account can read is a failure naming the chmod that closes it: 0600 for

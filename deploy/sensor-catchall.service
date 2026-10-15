@@ -9,7 +9,7 @@
 # Prerequisites this unit assumes and does not itself create:
 #   - a dedicated, unprivileged system user/group `propolis-catchall` (no login shell, no home
 #     directory, holds no database handle and no secrets per the spec's "Least authority").
-#   - /etc/propolis/catchall.env (mode 0600, owned by propolis-catchall), carrying this sensor's
+#   - /etc/propolis/catchall.env (mode 0600, root:root; systemd reads it as root), carrying this sensor's
 #     configuration. crates/sensor-catchall/src/main.rs reads env vars, not a TOML/CLI config
 #     file: PROPOLIS_CATCHALL_BIND_ADDRS (required, comma-separated ip:port list),
 #     PROPOLIS_CATCHALL_LOG_PATH, PROPOLIS_CATCHALL_WAN_MAP, PROPOLIS_CATCHALL_READ_TIMEOUT_MS,

@@ -24,7 +24,7 @@
 #     it) - matching the same `usermod -aG` pattern deploy/provision.sh already uses to give the
 #     aggregated `propolis` daemon read access to sensor logs on a single-box deployment. Without
 #     this, the shipper silently ships nothing from sensors it cannot read.
-#   - /etc/propolis/shipper.env (mode 0600, owned by propolis-shipper). Required env vars
+#   - /etc/propolis/shipper.env (mode 0600, root:root; systemd reads it as root). Required env vars
 #     (crates/shipper/src/config.rs): PROPOLIS_SHIPPER_GATEWAY_ADDR, PROPOLIS_SHIPPER_GATEWAY_DNS,
 #     PROPOLIS_SHIPPER_CA_CERT_PATH, PROPOLIS_SHIPPER_CLIENT_CERT_PATH,
 #     PROPOLIS_SHIPPER_CLIENT_KEY_PATH, PROPOLIS_COLLECTOR_ID (deprecated alias

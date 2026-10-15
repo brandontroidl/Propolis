@@ -23,7 +23,7 @@
 #     group scope (see deploy/sensor-catchall.service's UMask comment - "No group is wired up
 #     yet - SP3 owns that provisioning" - this is that provisioning step). ReadOnlyPaths below
 #     grants the path; it cannot grant the underlying file permission bits.
-#   - /etc/propolis/intake.env (mode 0600, owned by propolis-intake), carrying this process's
+#   - /etc/propolis/intake.env (mode 0600, root:root; systemd reads it as root), carrying this process's
 #     configuration. Env vars (crates/intake/src/main.rs): DATABASE_URL (required, PostgreSQL
 #     connection string), PROPOLIS_SENSOR_LOGS (required, comma-separated name:path pairs, e.g.
 #     "catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl"),

@@ -23,7 +23,7 @@
 # Prerequisites this unit assumes and does not itself create:
 #   - a dedicated, unprivileged system user/group `propolis-gateway` (no login shell, no home
 #     directory, no database handle, no vendor secrets).
-#   - /etc/propolis/gateway.env (mode 0600, owned by propolis-gateway). Required env vars
+#   - /etc/propolis/gateway.env (mode 0600, root:root; systemd reads it as root). Required env vars
 #     (crates/gateway/src/config.rs): PROPOLIS_GATEWAY_BIND, PROPOLIS_GATEWAY_CA_CERT_PATH,
 #     PROPOLIS_GATEWAY_SERVER_CERT_PATH, PROPOLIS_GATEWAY_SERVER_KEY_PATH. Optional:
 #     PROPOLIS_GATEWAY_SPOOL_DIR (default /var/spool/propolis/gateway), PROPOLIS_GATEWAY_STATE_DIR

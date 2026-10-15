@@ -208,13 +208,19 @@ impl FakeShell {
             .assembled
             .get(path)
             .is_some_and(|known| known.len == len_u64(prior.len()));
-        if !prior.is_empty() && !continues {
+        // A bare `echo > f` is not tracked (below), but a script dropper starts that way and
+        // grows the file by appends: an append to an untracked file holding only that newline
+        // starts the assembly, counting the newline as its first chunk.
+        let after_bare_echo = prior == b"\n" && !self.assembled.contains_key(path);
+        if !prior.is_empty() && !continues && !after_bare_echo {
             self.assembled.remove(path);
             return;
         }
         // A bare `echo > f` (a write probe: is this directory writable) leaves a newline and
-        // nothing a loader would build on, so it is not an assembly's start.
+        // nothing a loader would build on, so it is not an assembly's start. It truncated the
+        // file, so any record of the old content is stale and no longer holds a slot.
         if prior.is_empty() && content == b"\n" {
+            self.assembled.remove(path);
             return;
         }
         if !paid {
@@ -230,6 +236,8 @@ impl FakeShell {
                 .as_ref()
                 .filter(|decoded| decoded.sha256 == sha256)
                 .map_or(1, |decoded| decoded.chunks)
+        } else if after_bare_echo {
+            2
         } else {
             match self.assembled.get(path) {
                 Some(known) if known.sha256 == prior_sha256 => known.chunks.saturating_add(1),

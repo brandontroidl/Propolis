@@ -134,8 +134,10 @@ pub enum Outcome {
     /// The failure condition holds.
     Firing { severity: Severity, detail: String },
     /// The probe could not read its source this tick (a query error, an unreadable path). This does
-    /// NOT fire the primary condition - fail-open on a read error, so one broken probe cannot mask
-    /// the others. The monitor separately warns if a probe stays Unknown for too long.
+    /// NOT fire the primary condition, so one broken probe cannot page for a failure nobody saw,
+    /// and it does NOT clear one either: an open incident stays open and no "recovered" is sent
+    /// until a probe actually reads healthy. The monitor warns separately if a probe stays Unknown
+    /// for too long.
     Unknown { why: String },
 }
 
@@ -143,7 +145,8 @@ impl Outcome {
     pub fn to_signal(&self) -> Signal {
         match self {
             Outcome::Firing { .. } => Signal::Firing,
-            Outcome::Ok | Outcome::Unknown { .. } => Signal::Ok,
+            Outcome::Ok => Signal::Ok,
+            Outcome::Unknown { .. } => Signal::Unknown,
         }
     }
 
@@ -270,14 +273,14 @@ mod tests {
     }
 
     #[test]
-    fn ok_and_unknown_both_map_to_the_ok_signal() {
+    fn unknown_maps_to_its_own_signal_not_to_ok() {
         assert_eq!(Outcome::Ok.to_signal(), Signal::Ok);
         assert_eq!(
             Outcome::Unknown {
                 why: "query failed".into()
             }
             .to_signal(),
-            Signal::Ok
+            Signal::Unknown
         );
         assert!(Outcome::Unknown { why: "x".into() }.is_unknown());
         assert!(!Outcome::Ok.is_unknown());

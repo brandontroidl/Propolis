@@ -5,6 +5,11 @@
 //! momentary blip is silent); while it stays firing it re-pages every `repage_cooldown` (a slow-burn
 //! problem overnight must not rest on one missed push); when it clears after having paged, it emits
 //! one `Recovered` notice.
+//!
+//! A probe that could not read its source this tick reports `Unknown`, which is not evidence of
+//! health: it holds the state exactly where it was, so an unreadable probe can neither clear an
+//! open incident (a false "recovered") nor restart or cancel a debounce in progress. How long a
+//! probe may stay unknown is the monitor's `probe-stale` alert, not this machine's concern.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +18,8 @@ use std::time::{Duration, Instant};
 pub enum Signal {
     Ok,
     Firing,
+    /// The probe could not tell. Holds the current state; never clears, pages or re-pages.
+    Unknown,
 }
 
 /// What the monitor should do with the dispatcher this tick.
@@ -49,9 +56,18 @@ impl DebounceMachine {
         }
     }
 
+    /// Whether a page has gone out for the current incident and no recovery has followed.
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, State::Firing { .. })
+    }
+
     /// Advance the machine with this tick's `signal` at time `now`, returning the action to take.
     pub fn step(&mut self, signal: Signal, now: Instant) -> Action {
         match (self.state, signal) {
+            // No reading: hold. Treating this as `Ok` sent a false "recovered" for an open incident
+            // whenever the probe's source (a query, a file) failed to read for one tick.
+            (_, Signal::Unknown) => Action::None,
+
             // Not firing: any clear (or staying clear) leaves us Clear with nothing to do. A
             // Pending that clears before `for_dur` never paged, so there is nothing to recover.
             (State::Clear, Signal::Ok) => Action::None,
@@ -160,6 +176,74 @@ mod tests {
             m.step(Signal::Firing, base + FOR + COOLDOWN),
             Action::RePage
         );
+    }
+
+    #[test]
+    fn unknown_in_every_state_holds_and_does_nothing() {
+        let base = Instant::now();
+        // Clear stays Clear: a following Firing starts the debounce, it does not page.
+        let mut m = machine();
+        assert_eq!(m.step(Signal::Unknown, base), Action::None);
+        assert!(!m.is_open());
+        assert_eq!(
+            m.step(Signal::Firing, base + Duration::from_secs(1)),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn unknown_never_clears_an_open_incident() {
+        let base = Instant::now();
+        let mut m = machine();
+        m.step(Signal::Firing, base);
+        assert_eq!(m.step(Signal::Firing, base + FOR), Action::Page);
+        // Any number of unreadable ticks: no Recovered, incident still open.
+        for i in 1..=5u64 {
+            assert_eq!(
+                m.step(Signal::Unknown, base + FOR + Duration::from_secs(30 * i)),
+                Action::None
+            );
+            assert!(m.is_open(), "unknown must not close the incident");
+        }
+        // A reading that says healthy is what recovers it, exactly once.
+        assert_eq!(
+            m.step(Signal::Ok, base + FOR + Duration::from_secs(200)),
+            Action::Recovered
+        );
+        assert_eq!(
+            m.step(Signal::Ok, base + FOR + Duration::from_secs(230)),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn an_incident_that_outlasts_an_unknown_gap_still_repages_on_schedule() {
+        let base = Instant::now();
+        let mut m = machine();
+        m.step(Signal::Firing, base);
+        assert_eq!(m.step(Signal::Firing, base + FOR), Action::Page);
+        assert_eq!(
+            m.step(Signal::Unknown, base + FOR + Duration::from_secs(60)),
+            Action::None
+        );
+        // The cooldown counts from the last page, unknown ticks included.
+        assert_eq!(
+            m.step(Signal::Firing, base + FOR + COOLDOWN),
+            Action::RePage
+        );
+    }
+
+    #[test]
+    fn unknown_during_the_debounce_neither_cancels_nor_restarts_it() {
+        let base = Instant::now();
+        let mut m = machine();
+        assert_eq!(m.step(Signal::Firing, base), Action::None);
+        assert_eq!(
+            m.step(Signal::Unknown, base + Duration::from_secs(300)),
+            Action::None
+        );
+        // Still the same debounce window: pages when it has held for FOR from the first sighting.
+        assert_eq!(m.step(Signal::Firing, base + FOR), Action::Page);
     }
 
     #[test]

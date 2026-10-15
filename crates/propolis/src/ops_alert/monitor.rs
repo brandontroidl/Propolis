@@ -205,8 +205,16 @@ impl<P: Poster> Monitor<P> {
                             severity: Severity::Warning,
                             title: format!("propolis: probe {id} stalled"),
                             body: format!(
-                                "probe {id} could not read its source for over {}s: {why}",
-                                probe_stale_after.as_secs()
+                                "probe {id} could not read its source for over {}s: {why}{}",
+                                probe_stale_after.as_secs(),
+                                // An unreadable probe holds an open incident open; say so, or the
+                                // silence reads as "still firing, still handled".
+                                if t.machine.is_open() {
+                                    ". An earlier page for it is still open: it cannot be \
+                                     confirmed cleared until the probe reads again"
+                                } else {
+                                    ""
+                                }
                             ),
                             recovered: false,
                         },
@@ -627,6 +635,102 @@ mod tests {
         m.process_tick(base + Duration::from_secs(603)).await;
         assert_eq!(rec.count(), 2, "probe-stale recovered notice sent");
         assert_eq!(rec.last_priority(), "2");
+    }
+
+    /// The false-recovery path: an open incident whose probe then cannot read must not send a
+    /// "recovered", must say after the bounded time that it can no longer vouch for the incident,
+    /// and must recover exactly once, when a probe reads healthy.
+    #[tokio::test]
+    async fn unknown_never_recovers_an_open_incident_and_the_stale_alert_says_so() {
+        let rec = Recorder::new();
+        let out = Arc::new(Mutex::new(Outcome::Firing {
+            severity: Severity::Critical,
+            detail: "db 4% free".into(),
+        }));
+        let cond = Box::new(StubCond {
+            id: "stub",
+            for_dur: Duration::ZERO,
+            out: out.clone(),
+        });
+        let mut m = Monitor::new(vec![cond], test_ctx(), dispatcher(&rec));
+        m.probe_stale_after = Duration::from_secs(600);
+        let base = Instant::now();
+
+        m.process_tick(base).await;
+        assert_eq!(rec.count(), 1, "the page");
+
+        *out.lock().unwrap() = Outcome::Unknown {
+            why: "db unreachable".into(),
+        };
+        m.process_tick(base + Duration::from_secs(30)).await;
+        m.process_tick(base + Duration::from_secs(60)).await;
+        assert_eq!(rec.count(), 1, "unknown sends no recovered notice");
+        assert!(
+            !rec.sent.lock().unwrap().iter().any(|r| r
+                .headers
+                .iter()
+                .any(|(k, v)| k == "X-Title" && v.contains("recovered"))),
+            "no [recovered] title was sent"
+        );
+
+        m.process_tick(base + Duration::from_secs(700)).await;
+        assert_eq!(rec.count(), 2, "unknown past the bound alerts on its own");
+        {
+            let sent = rec.sent.lock().unwrap();
+            let stale = sent.last().unwrap();
+            assert!(
+                stale.body.contains("could not read its source"),
+                "{}",
+                stale.body
+            );
+            assert!(
+                stale.body.contains("earlier page for it is still open"),
+                "{}",
+                stale.body
+            );
+        }
+
+        // The probe reads again and the condition really is clear: the probe-stale notice and the
+        // incident's own recovered notice, once each.
+        *out.lock().unwrap() = Outcome::Ok;
+        m.process_tick(base + Duration::from_secs(730)).await;
+        assert_eq!(rec.count(), 4, "probe-stale recovered + incident recovered");
+        m.process_tick(base + Duration::from_secs(760)).await;
+        assert_eq!(rec.count(), 4, "nothing further once clear");
+    }
+
+    /// A probe that stays unknown with no incident open alerts after the bound without the
+    /// open-incident sentence, and a Firing reading that follows an unknown gap pages normally.
+    #[tokio::test]
+    async fn unknown_with_nothing_open_alerts_after_the_bound_and_then_pages_normally() {
+        let rec = Recorder::new();
+        let out = Arc::new(Mutex::new(Outcome::Unknown {
+            why: "no marker".into(),
+        }));
+        let cond = Box::new(StubCond {
+            id: "stub",
+            for_dur: Duration::ZERO,
+            out: out.clone(),
+        });
+        let mut m = Monitor::new(vec![cond], test_ctx(), dispatcher(&rec));
+        m.probe_stale_after = Duration::from_secs(600);
+        let base = Instant::now();
+
+        m.process_tick(base).await;
+        m.process_tick(base + Duration::from_secs(601)).await;
+        assert_eq!(rec.count(), 1);
+        assert!(
+            !rec.sent.lock().unwrap()[0].body.contains("still open"),
+            "no incident was open"
+        );
+
+        *out.lock().unwrap() = Outcome::Firing {
+            severity: Severity::Warning,
+            detail: "stale".into(),
+        };
+        m.process_tick(base + Duration::from_secs(602)).await;
+        // probe-stale recovered + the page.
+        assert_eq!(rec.count(), 3);
     }
 
     #[tokio::test]

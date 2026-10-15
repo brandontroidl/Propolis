@@ -283,6 +283,9 @@ async fn a_wrongly_guessed_first_kex_packet_is_ignored_and_the_exchange_complete
         &server_kexinit,
         &client_kexinit,
         "SSH-2.0-PuTTY_Release_0.82",
+        // KEXINIT 0, the discarded guess 1, ECDH_INIT 2, NEWKEYS 3: RFC 4253 section 6.4 counts
+        // every packet, so the first encrypted one is 4.
+        4,
     )
     .await;
     handle.abort();
@@ -299,7 +302,14 @@ async fn a_correctly_guessed_first_kex_packet_is_used() {
     };
     let (mut stream, server_kexinit, client_kexinit) =
         handshake_to_kexinit(addr, "SSH-2.0-Go", &offer).await;
-    complete_exchange(&mut stream, &server_kexinit, &client_kexinit, "SSH-2.0-Go").await;
+    complete_exchange(
+        &mut stream,
+        &server_kexinit,
+        &client_kexinit,
+        "SSH-2.0-Go",
+        3,
+    )
+    .await;
     handle.abort();
 }
 
@@ -310,6 +320,7 @@ async fn complete_exchange(
     server_kexinit: &[u8],
     client_kexinit: &[u8],
     client_version: &str,
+    first_encrypted_seq: u32,
 ) {
     let (secret, init) = kex::build_client_ecdh_init();
     write_packet_unencrypted(stream, &init).await.unwrap();
@@ -349,7 +360,7 @@ async fn complete_exchange(
     let mut request = vec![SSH_MSG_SERVICE_REQUEST];
     request.extend_from_slice(&12u32.to_be_bytes());
     request.extend_from_slice(b"ssh-userauth");
-    write_packet_encrypted(stream, &mut to_server, 3, &request)
+    write_packet_encrypted(stream, &mut to_server, first_encrypted_seq, &request)
         .await
         .unwrap();
     let accept = tokio::time::timeout(

@@ -782,11 +782,11 @@ async fn handle_session(
                 "expected SSH_MSG_NEWKEYS",
             ));
         }
-        Ok(session_keys)
+        Ok((session_keys, negotiated.discard_guess))
     }
     .await;
-    let session_keys = match handshake {
-        Ok(keys) => keys,
+    let (session_keys, discarded_guess) = match handshake {
+        Ok(done) => done,
         Err(e) => {
             let end = auth_state.handshake_end_event(
                 classify_read_failure(&e),
@@ -810,8 +810,10 @@ async fn handle_session(
     let mut s2c_cipher = session_keys.server_to_client_cipher();
 
     // Sequence numbers: 3 unencrypted packets sent/received per direction (KEXINIT,
-    // ECDH_INIT/REPLY, NEWKEYS), so the first encrypted packet is seq 3.
-    let mut c2s_seq: u32 = 3;
+    // ECDH_INIT/REPLY, NEWKEYS), so the first encrypted packet is seq 3. A discarded wrong guess
+    // is still a packet the client sent and counted (RFC 4253 section 6.4), so it moves the
+    // client-to-server number to 4; the cipher nonce or MAC input would otherwise not match.
+    let mut c2s_seq: u32 = 3 + u32::from(discarded_guess);
     let mut s2c_seq: u32 = 3;
 
     // The one budget of this connection, cloned into every shell it opens. It carries the sensor's

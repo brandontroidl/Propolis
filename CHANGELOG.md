@@ -521,7 +521,10 @@
   `echo > f` over a tracked file replaces that file's record (in the session's list too, so a
   rebuilt dropper is captured), and a full table drops its oldest file that would not be taken at
   the session's end (fewer than two chunks, and not an ELF) rather than refusing the new one; the
-  session's end-of-session list does the same. The 16-slot bound stays: a record is a path, a
+  session's end-of-session list does the same. A one-line ELF (a first chunk holding a full
+  16-byte `e_ident`) is exempt from that eviction, and so is now also captured when the session
+  ends without ever running it, where before it was skipped as a one-chunk probe; the bare
+  four-byte magic typed as text is not an ELF. The 16-slot bound stays: a record is a path, a
   digest and one terminal line (about 70 KiB for a full table), and the file bytes are charged to
   the filesystem budget. See [events and signals](docs/reference/events-and-signals.md).
 - **The MSSQL sensor records the Login7 UserName, not the AppName** - the username was read from

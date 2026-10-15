@@ -449,9 +449,19 @@ pub(crate) struct TrackedFile {
     pub len: u64,
     pub chunk_count: u32,
     pub command: String,
-    /// Whether the first chunk began with the ELF magic: a one-line binary is a program however
-    /// few writes built it.
+    /// Whether the first chunk began with a full ELF identification ([`begins_elf`]): a one-line
+    /// binary is a program however few writes built it.
     pub elf: bool,
+}
+
+/// Whether `first` opens like an ELF file: the whole 16-byte `e_ident` with a valid class, byte
+/// order and version, not only the 4-byte magic, which is a string an attacker can type as a note.
+pub(crate) fn begins_elf(first: &[u8]) -> bool {
+    first.len() >= 16
+        && first.starts_with(b"\x7fELF")
+        && matches!(first.get(4), Some(1 | 2))
+        && matches!(first.get(5), Some(1 | 2))
+        && first.get(6) == Some(&1)
 }
 
 impl TrackedFile {
@@ -1314,6 +1324,28 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["metadata"]["destination"], "/tmp/e");
         assert_eq!(events[0]["metadata"]["size"], 200);
+    }
+
+    /// A one-line ELF typed and never run is a program, so the session's end takes it; the same
+    /// line with only the 4-byte magic, or the magic in front of text, is a note or a probe.
+    #[tokio::test]
+    async fn an_unrun_one_line_elf_is_captured_at_the_end_but_a_bare_magic_is_not() {
+        let mut elf = DOWNLOADER.to_vec();
+        elf.resize(200, 0xa5);
+        let text: String = elf.iter().map(|b| format!("\\x{b:02x}")).collect();
+        let events = loader_captures(&[format!("echo -ne '{text}' > /tmp/e")]).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["metadata"]["destination"], "/tmp/e");
+        assert_eq!(events[0]["metadata"]["chunk_count"], 1);
+        assert_eq!(events[0]["metadata"]["size"], 200);
+
+        let magic = "echo -ne '\\x7fELF' > /tmp/m".to_string();
+        let events = loader_captures(&[magic]).await;
+        assert!(events.is_empty(), "{events:?}");
+
+        let prose = "echo -ne '\\x7fELF is the magic of an executable' > /tmp/n".to_string();
+        let events = loader_captures(&[prose]).await;
+        assert!(events.is_empty(), "{events:?}");
     }
 
     /// Case F: a bare echo and one append, never run, is taken when the session ends.

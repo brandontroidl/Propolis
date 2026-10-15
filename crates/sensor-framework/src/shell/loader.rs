@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use super::{FakeShell, MAX_URL_LEN, TraceEventKind, len_u64};
 use crate::fakefs::READ_CAP;
-use crate::held_input::{AssembledFile, MIN_UNRUN_CHUNKS, StdinCaptures, TrackedFile};
+use crate::held_input::{AssembledFile, MIN_UNRUN_CHUNKS, StdinCaptures, TrackedFile, begins_elf};
 use crate::sanitize_value;
 
 /// `metadata.derived_from` of a download URL read off an assembled downloader's arguments.
@@ -53,7 +53,7 @@ pub(super) struct Assembled {
     sha256: [u8; 32],
     len: u64,
     chunks: u32,
-    /// Whether the first chunk began with the ELF magic.
+    /// Whether the first chunk began with a full ELF identification (`begins_elf`).
     elf: bool,
     /// The line that wrote the last chunk.
     command: String,
@@ -242,7 +242,7 @@ impl FakeShell {
         }
         let elf = match self.assembled.get(path) {
             Some(known) if !prior.is_empty() => known.elf,
-            _ => content.starts_with(b"\x7fELF"),
+            _ => begins_elf(content),
         };
         let born = match self.assembled.get(path) {
             Some(known) => known.born,

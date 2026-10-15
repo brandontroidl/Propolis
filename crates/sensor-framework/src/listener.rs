@@ -166,6 +166,7 @@ where
     let max_duration = bounds.max_duration;
     let limiter = per_source_cap.map(PerSourceLimiter::new);
     let mut source_refused: u64 = 0;
+    let mut capacity_refused: u64 = 0;
 
     let accept_handle = tokio::spawn(async move {
         loop {
@@ -203,11 +204,16 @@ where
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    tracing::warn!(
-                        %peer,
-                        local = %bound_addr,
-                        "max_concurrent reached; refusing connection"
-                    );
+                    capacity_refused += 1;
+                    // Power-of-two totals, like the per-source cap above.
+                    if capacity_refused.is_power_of_two() {
+                        tracing::warn!(
+                            refused_total = capacity_refused,
+                            %peer,
+                            local = %bound_addr,
+                            "max_concurrent reached; refusing connection"
+                        );
+                    }
                     drop(stream);
                     continue;
                 }
@@ -242,7 +248,9 @@ where
                         tracing::debug!(%peer, "connection cancelled by shutdown");
                     }
                     Ok(Some(Err(_elapsed))) => {
-                        tracing::warn!(%peer, "handler exceeded max_duration; connection dropped");
+                        // Any scanner can hold a connection open this long, so a line per
+                        // connection would let one fill the journal.
+                        tracing::debug!(%peer, "handler exceeded max_duration; connection dropped");
                     }
                     Err(join_err) if join_err.is_panic() => {
                         tracing::error!(
@@ -302,6 +310,7 @@ where
     let max_duration = bounds.max_duration;
     let limiter = per_source_cap.map(PerSourceLimiter::new);
     let mut source_refused: u64 = 0;
+    let mut capacity_refused: u64 = 0;
 
     let recv_handle = tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
@@ -334,10 +343,14 @@ where
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    tracing::warn!(
-                        local = %bound_addr, %peer,
-                        "udp max_concurrent reached; dropping datagram"
-                    );
+                    capacity_refused += 1;
+                    if capacity_refused.is_power_of_two() {
+                        tracing::warn!(
+                            refused_total = capacity_refused,
+                            local = %bound_addr, %peer,
+                            "udp max_concurrent reached; dropping datagram"
+                        );
+                    }
                     continue;
                 }
             };

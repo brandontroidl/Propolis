@@ -215,13 +215,34 @@ where
     layer_for(Mode::detect(), std::io::stdout)
 }
 
-/// Installs the process-wide subscriber: this crate's layer under an `EnvFilter` that reads
-/// `RUST_LOG` and falls back to `default_level` when it is unset. Invalid `RUST_LOG` directives
-/// are skipped (lossy), never a startup failure.
+/// Crates whose log lines are driven by whatever a remote peer sends, so at WARN they would let
+/// one scanner fill the journal ("Illegal SNI extension: ignoring IP address presented as
+/// hostname", "Received a ApplicationData message while expecting [Handshake]", "TLS alert warning
+/// received ... CloseNotify"). Held at ERROR unless `RUST_LOG` names them.
+const PEER_DRIVEN_TARGETS: &[&str] = &["rustls"];
+
+/// The filter for `rust_log` (the `RUST_LOG` value) and `default_level`. An unset or blank
+/// `RUST_LOG` gives `default_level` with [`PEER_DRIVEN_TARGETS`] held at ERROR; a set one is the
+/// operator's word and is used as written (invalid directives skipped), so `RUST_LOG=rustls=debug`
+/// brings the library lines back for a diagnosis.
+pub fn default_filter(rust_log: Option<&str>, default_level: LevelFilter) -> EnvFilter {
+    let builder = EnvFilter::builder().with_default_directive(default_level.into());
+    match rust_log.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(directives) => builder.parse_lossy(directives),
+        None => {
+            let mut spec = default_level.to_string();
+            for target in PEER_DRIVEN_TARGETS {
+                spec.push_str(&format!(",{target}=error"));
+            }
+            builder.parse_lossy(spec)
+        }
+    }
+}
+
+/// Installs the process-wide subscriber: this crate's layer under [`default_filter`] applied to
+/// `RUST_LOG`. Invalid `RUST_LOG` directives are skipped (lossy), never a startup failure.
 pub fn init(default_level: LevelFilter) {
-    let filter = EnvFilter::builder()
-        .with_default_directive(default_level.into())
-        .from_env_lossy();
+    let filter = default_filter(std::env::var("RUST_LOG").ok().as_deref(), default_level);
     tracing_subscriber::registry()
         .with(filter)
         .with(layer())

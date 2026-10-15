@@ -25,3 +25,4 @@ rustls-pki-types = "1.15.1"
 [dev-dependencies]
 tempfile = "3.27.0"
 rcgen = "0.14.9"
+tracing-subscriber = "0.3.23"

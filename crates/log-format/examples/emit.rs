@@ -15,6 +15,11 @@ fn main() {
     tracing::info!(value = %hostile, "hostile-field");
     // The stock formatter leaves a newline in the message text itself untouched.
     tracing::info!("hostile-message {hostile}");
+    // What a scanner's malformed hello makes rustls log through the `log` facade.
+    if std::env::var_os("EMIT_RUSTLS").is_some() {
+        log::warn!(target: "rustls::server::hs", "Illegal SNI extension: ignoring IP address presented as hostname (c0000201)");
+        log::error!(target: "rustls::server::hs", "rustls-error-line");
+    }
     // A field past journald's LineMax with a priority prefix straddling the old 48K boundary.
     if std::env::var_os("EMIT_LONG").is_some() {
         let long = format!("{}<0>tail", "A".repeat(49_149));

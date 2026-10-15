@@ -405,6 +405,16 @@
 
 ### Fixed
 
+- **One scanner can no longer fill the sensor journals** - rustls logged a WARN for what a
+  scanner's malformed TLS hello causes (`Illegal SNI extension: ignoring IP address presented as
+  hostname (<hex>)`, which carries the box's own address whenever the scanner targets it by IP;
+  `Received a ApplicationData message while expecting [Handshake]`; `TLS alert warning received
+  ... CloseNotify`), and the listener logged `handler exceeded max_duration; connection dropped`
+  and `max_concurrent reached` once per connection. With `RUST_LOG` unset, `rustls` is now held at
+  `error` (`log_format::default_filter`, shared by the sensors, `propolis` and `console`; a set
+  `RUST_LOG` is used as written), the max_duration lines (tcp listener, tftp, dns) are `debug`,
+  and the `max_concurrent` refusals are logged at power-of-two totals. See
+  [environment variables](docs/reference/environment-variables.md#rust_log).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

@@ -84,6 +84,28 @@ fn rust_log_still_filters() {
 }
 
 #[test]
+fn rustls_warnings_are_held_back_by_default_but_errors_are_not() {
+    let out = run(&[("EMIT_RUSTLS", "1".to_string())], true);
+    assert!(!out.contains("Illegal SNI"), "{out:?}");
+    assert!(
+        out.contains("<3>") && out.contains("rustls-error-line"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn rust_log_brings_the_rustls_lines_back() {
+    let out = run(
+        &[
+            ("EMIT_RUSTLS", "1".to_string()),
+            ("RUST_LOG", "rustls=warn".to_string()),
+        ],
+        true,
+    );
+    assert!(out.contains("Illegal SNI"), "{out:?}");
+}
+
+#[test]
 fn a_field_past_journald_line_max_stays_one_capped_line() {
     for journal in [true, false] {
         let out = run(&[("EMIT_LONG", "1".to_string())], journal);

@@ -274,10 +274,10 @@ async fn main() {
     {
         use tracing_subscriber::prelude::*;
         tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
+            .with(log_format::default_filter(
+                std::env::var("RUST_LOG").ok().as_deref(),
+                tracing::level_filters::LevelFilter::INFO,
+            ))
             .with(log_format::layer())
             .with(LogBufferLayer::new(log_buffer.clone()))
             .init();

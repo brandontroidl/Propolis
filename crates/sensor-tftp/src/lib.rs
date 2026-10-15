@@ -245,7 +245,7 @@ async fn serve(
             ));
             // `None` is a shutdown cancellation: dropping the transfer submitted its capture.
             if let Some(Err(_elapsed)) = handled.await {
-                tracing::warn!(%peer, "tftp: transfer exceeded max_duration; dropped");
+                tracing::debug!(%peer, "tftp: transfer exceeded max_duration; dropped");
             }
         });
     }

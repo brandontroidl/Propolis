@@ -110,7 +110,7 @@ pub(crate) async fn serve(
             let handled =
                 tokio::time::timeout(read_timeout, sensor.handle_datagram(peer, datagram));
             if handled.await.is_err() {
-                tracing::warn!(%peer, "dns: datagram handling exceeded read_timeout; dropped");
+                tracing::debug!(%peer, "dns: datagram handling exceeded read_timeout; dropped");
             }
         });
     }

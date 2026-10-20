@@ -356,8 +356,11 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
 - **Order: control plane first, collectors after.** A sensor that records a shell reply puts it in
   a new field of its log line. An intake that predates the field ignores it, so a reply recorded
   while the collector runs the new build and the control plane the old one is dropped: the event
-  is ingested without it and the console shows no reply for that command. Nothing else is
-  affected and the hash chain stays intact. Upgrading the control plane first avoids the gap.
+  is ingested without it and the console shows no reply for that command. The same order covers
+  the cred sensor's connection and login summaries: an intake that predates them scores one as a
+  single event, so a flooder's volume count is low, and a summary ingested that way stays counted
+  once (nothing re-projects it). The hash chain stays intact. Upgrading the control plane first
+  avoids both gaps.
 - **Control plane.** `deploy/upgrade.sh` works as on a single host: it reinstalls and restarts
   `gateway.service` because the unit is enabled, then restarts `propolis`.
 - **Collector.** Do not run `deploy/upgrade.sh`. It restarts `propolis.service` on every host

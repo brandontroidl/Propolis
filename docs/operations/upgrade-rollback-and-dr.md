@@ -214,7 +214,9 @@ ignores it rather than refusing the line. When sensors and intake run on differe
 ([split deployment](split-deployment.md#upgrading)), upgrade the control plane (intake) first and
 the collectors after. The shell reply field is the current case: a reply recorded while a sensor
 is newer than intake is dropped, the event is still ingested and the chain is unaffected, and the
-console shows no reply for that command. On one host the daemon runs sensors' intake and the
+console shows no reply for that command. The cred sensor's connection and login summaries are the
+second case: an intake that predates them scores one as a single event, and a summary ingested
+that way stays counted once (nothing re-projects it). On one host the daemon runs sensors' intake and the
 sensors together, so the order only matters when the sensors are upgraded separately.
 
 ## Rollback

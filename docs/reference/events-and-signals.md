@@ -333,17 +333,22 @@ arithmetic from the observed loop, not a measured scoring run].
 A cred-sensor connection or login event over its source's budget is not written; it is counted
 into one summary per source address per 10 minute window, marked `event_summary: true`
 (`crates/sensor-framework/src/source_flood.rs#source_summary_event`; when and why in
-[sensor-behavior](sensor-behavior.md#connection-and-login-event-budget-cred)). The summary is a
-`honeypot_login_attempt` with `authenticated: true` when any folded event was an attempt, and a
-`honeypot_connection` with `authenticated: false` otherwise. Its `source_ip` is the address the
-events came from (the first one, for `overflow`), its `wan_ip` and `sensor` are the first folded
-event's, its protocol is `tcp` and its `session_id` is fresh.
+[sensor-behavior](sensor-behavior.md#connection-and-login-event-budget-cred)). An address's summary
+is a `honeypot_login_attempt` with `authenticated: true` when any folded event was an attempt, and
+a `honeypot_connection` with `authenticated: false` otherwise. The overflow summary (addresses that
+arrived with the table full) and a per-network summary (addresses beyond the 64 one network may
+hold) stand for many addresses, so each is always a `honeypot_connection` with
+`authenticated: false`, whatever attempts it folded (they stay in `suppressed_attempts`): written
+as a login it would mark the first address it names, which may only have connected, as having
+authenticated. Its `source_ip` is the address the events came from (the first one folded, for the
+overflow and network summaries), its `wan_ip` and `sensor` are the first folded event's, its
+protocol is `tcp` and its `session_id` is fresh.
 
 | key | type | meaning |
 |---|---|---|
 | `event_summary` | boolean | always `true`; marks the event as a summary |
 | `source_prefix` | string | the address's network in CIDR form (`198.51.100.0/24`), or `overflow` for addresses that arrived while the window's address table was full |
-| `overflow_summary` | boolean | `true` on the overflow summary only, absent otherwise; it stands for many addresses but is attributed to one, so scoring counts it as one event |
+| `overflow_summary` | boolean | `true` on the overflow and per-network summaries only, absent otherwise; they stand for many addresses but are attributed to one, so scoring counts one event with no weight and no confirmed-real latch |
 | `suppressed_count` | integer | events this summary stands for: `suppressed_connections` plus `suppressed_attempts` |
 | `suppressed_connections`, `suppressed_attempts` | integer | the folded `honeypot_connection` and `honeypot_login_attempt` events |
 | `client_versions` | array of strings | distinct client versions among the folded events (VNC's `client_version`), at most 8, sanitized, at most 128 characters each; only events that carry one contribute |
@@ -359,10 +364,12 @@ about the client beyond its source.
 
 Scoring treats a summary as the events it replaces for the two counters that measure volume:
 `event_count` and `established_event_count` grow by `suppressed_count` (clamped to 1,000,000; a
-missing, zero or non-integer count is one; the overflow summary and any summary that is not a
-`honeypot_connection` or `honeypot_login_attempt` is one), so a flooder's volume-list threshold arrives as it did
-when every event was written. Weight is not multiplied: the summary is one sighting of its signal
-type, which after the 60 s dedup is all a continuous flood ever contributed
+missing, zero or non-integer count is one; the overflow and per-network summaries and any summary
+that is not a `honeypot_connection` or `honeypot_login_attempt` is one), so a flooder's
+volume-list threshold arrives as it did when every event was written. Weight is not multiplied:
+an address's summary is one sighting of its signal type, which after the 60 s dedup is all a
+continuous flood ever contributed, and the overflow and per-network summaries add none and latch
+no confirmed-real
 (`crates/core-scoring/src/scoring/engine.rs#represented_events`; see
 [scoring-and-feed](scoring-and-feed.md)). Only a summary marked `event_summary: true` counts as
 more than one: `suppressed_count` on a command summary or a UDP rate-limit summary is still data

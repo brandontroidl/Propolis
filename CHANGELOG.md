@@ -9,7 +9,10 @@
   meantime is dropped: the event is ingested without it and the console shows none for that
   command. The same order applies to the cred sensor's connection and login summaries: an intake
   that predates them scores one as a single event, so a flooder's volume count is low, and a
-  summary an old intake ingested stays counted once: nothing re-projects it. The hash chain is unaffected. See
+  summary an old intake ingested stays counted once: nothing re-projects it. A rebuild of that
+  address's projection from the ledger (`rebuild_projection`) counts the summary as the events it
+  stands for, so the rebuilt score and the stored one disagree until the address is rescored.
+  The hash chain is unaffected. See
   [split deployment](docs/operations/split-deployment.md#upgrading) and
   [upgrade](docs/operations/upgrade-rollback-and-dr.md#upgrade-the-intake-side-before-the-sensors).
 - **Move the public-feed cron to `propolis-blocklist`** if you publish the feed. The upgrade
@@ -58,17 +61,23 @@
   source. Every cred listener (vnc, mysql, mssql, postgresql, mongodb) now writes at most 10
   `honeypot_connection` and 10 `honeypot_login_attempt` events per source address per 10 minute
   window, 40 of each per source network (/24 or /56) and 200 repeats of each per listener; an
-  address's first event of each kind in a window never spends the listener budget, so a source seen
-  once is always written (`SourceEventGate` in `sensor_framework::source_flood`, attached to the listener's
-  `EventEmitter`). The rest is counted into one event per address per window marked
+  address's first event of each kind in a window does not spend the listener budget (its address
+  and network budgets, and the table, still apply), so a source seen once is written unless its
+  network has already spent 40. One network holds at most 64 of the 1,024 tracked addresses per
+  window and its further addresses are counted into one summary for the network, so a single /24
+  or IPv6 /56 cannot fill the table (`SourceEventGate` in `sensor_framework::source_flood`,
+  attached to the listener's `EventEmitter`). The rest is counted into one event per address per
+  window marked
   `event_summary: true` (a `honeypot_login_attempt` when an attempt was folded, else a
   `honeypot_connection`) with `suppressed_count`, `suppressed_connections`, `suppressed_attempts`,
   up to 8 distinct `client_versions` and `usernames`, `first_seen`, `last_seen` and
   `session_count`, written when the window ends and at shutdown. Past the budget an address's
   individual events and the usernames beyond the first 8 per window are not kept; passwords never
   were. Scoring counts an address's summary as the events it replaces in `event_count` and
-  `established_event_count` (weight is one sighting; the overflow summary, marked
-  `overflow_summary: true`, is one event), so the volume-list threshold arrives as
+  `established_event_count` (weight is one sighting). The overflow and per-network summaries,
+  marked `overflow_summary: true`, stand for many addresses but are attributed to one: they are
+  written as a `honeypot_connection` with `authenticated: false`, and scoring counts them as one
+  event with no weight and no confirmed-real latch. The volume-list threshold arrives as
   before: `core_scoring::scoring::engine::represented_events`, with a differential test against
   the unbounded stream. The console timeline reads "N events summarized". The VNC
   `honeypot_login_attempt` now carries `client_version`. postgresql's query events go through the

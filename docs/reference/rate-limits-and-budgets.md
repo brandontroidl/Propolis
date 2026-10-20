@@ -121,8 +121,10 @@ kind (connection, login) has its own count against each limit.
 | Per listener | 200 repeats of each kind per window; an address's first event of each kind does not spend it *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#DEFAULT_TOTAL_BUDGET` |
 | Window | 600 s, tumbling for the listener, checked every second *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#SOURCE_EVENT_WINDOW` |
 | Addresses tracked | 1024 per window, then one overflow summary *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_CAPACITY` |
+| Addresses tracked per network | 64 per window; further addresses of that network fold into one summary for the network *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#DEFAULT_NETWORK_ADDRESS_CAP` |
 | Per summary | 8 client versions, 8 usernames, 32 sessions *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#MAX_SUMMARY_VALUES`, `crates/sensor-framework/src/command_flood.rs#MAX_SUMMARY_SESSIONS` |
-| Worst case written per window | 2 x 1024 first events plus 2 x 200 repeats verbatim, plus at most 1025 summaries | derived from the rows above |
+| Worst case written per window | 2 x 1024 first events plus 2 x 200 repeats verbatim, plus at most 1041 summaries (1024 addresses, 16 networks at their cap, 1 overflow): 3489 lines | derived from the rows above |
+| Worst case bytes per listener | about 11 MB an hour: (2448 verbatim lines at about 380 B + 1041 summaries at about 743 B) x 6 windows; about 55 MB an hour if all five cred listeners are flooded at once | derived from the rows above and the measured line sizes (366 B connection, 399 B login, 743 B summary) |
 | Shutdown flush | open windows written within 5 s per listener *(hard-coded)* | `crates/sensor-cred/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT` |
 
 postgresql's query events are charged to the shell command-event budget above with its defaults.

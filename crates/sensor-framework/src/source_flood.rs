@@ -12,8 +12,9 @@
 //! events and how many login events were written for each source address, each source network
 //! (the [`SourceKey`] /24 or /56) and in total. An event is written verbatim while all three are
 //! under their budget, except that an address's first event of each kind in a window skips the
-//! total: the listener budget caps repeats, so a source seen once is never folded for others'
-//! volume. Past any of them it is not written: it is folded into the pending summary
+//! total: the listener budget caps repeats, so an address's first event of a kind is not folded
+//! for others' volume (its own address and network budgets and the table still apply). Past any of
+//! them it is not written: it is folded into the pending summary
 //! of its own address, and when the window ends each address with anything folded gets one
 //! `honeypot_login_attempt` (when an attempt was folded) or `honeypot_connection` event marked
 //! `event_summary: true`, carrying the connection and attempt counts, the distinct client versions
@@ -27,9 +28,14 @@
 //!
 //! Memory is fixed: at most [`SourceEventConfig::address_capacity`] addresses are tracked per
 //! window, each holding at most [`MAX_SUMMARY_VALUES`] versions, as many usernames and
-//! [`MAX_SUMMARY_SESSIONS`] session ids. An address that arrives with the table full is folded
-//! into one overflow summary. The lock is a plain mutex held for a few map updates, never across
-//! an `.await`; time is `tokio::time::Instant`, so tests drive it with a paused clock.
+//! [`MAX_SUMMARY_SESSIONS`] session ids. One network holds at most
+//! [`SourceEventConfig::network_address_cap`] of them, so one network cannot take the table; its
+//! further addresses fold into one per-network summary, and an address that arrives with the table
+//! full folds into one overflow summary. Both stand for many addresses, so each is written as a
+//! `honeypot_connection` that authenticated nothing, marked `overflow_summary: true`, and scoring
+//! counts it as one event with no weight and no confirmed-real latch. The lock is a plain mutex
+//! held for a few map updates, never across an `.await`; time is `tokio::time::Instant`, so tests
+//! drive it with a paused clock.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -54,17 +60,18 @@ use crate::sanitize_value;
 
 /// The metadata key that marks a connection or login summary event.
 pub const EVENT_SUMMARY_KEY: &str = "event_summary";
-/// The metadata key set to `true` on the overflow summary only. That summary is attributed to one
-/// address but stands for many, so scoring must count it as one event, not its `suppressed_count`.
+/// The metadata key set to `true` on the overflow and per-network summaries only. They are
+/// attributed to one address but stand for many, so scoring must count one event, not the
+/// `suppressed_count`, and must neither weight it nor latch confirmed-real from it.
 pub const OVERFLOW_SUMMARY_KEY: &str = "overflow_summary";
 /// How long the budgets and the pending summaries last. A source whose events are all folded is
 /// seen in the log at most this late.
 pub const SOURCE_EVENT_WINDOW: Duration = Duration::from_secs(600);
 /// Events of each kind (connection, login) written verbatim per source address per window. The
 /// live VNC flood's heaviest address sent about 70 of each per ten minutes, so it costs 20 lines
-/// and a summary instead of 140, about 126 lines an hour; a source below ten of each is untouched
-/// as long as its network budget holds, because an address's first event of each kind never
-/// spends the listener budget.
+/// and a summary instead of 140, about 126 lines an hour. Under this budget an event is still
+/// folded when its network budget or the table is spent, or, unless it is the address's first of
+/// its kind in the window, when the listener budget is.
 pub const DEFAULT_ADDRESS_BUDGET: u32 = 10;
 /// Events of each kind written verbatim per source network per window, so a /24 of hosts cannot
 /// multiply the address budget by 254.
@@ -72,10 +79,19 @@ pub const DEFAULT_NETWORK_BUDGET: u32 = 40;
 /// Repeat events of each kind written verbatim per window across every source. An address's first
 /// event of each kind does not spend it, so it bounds repeats only: a flood spread over many
 /// networks writes at most two first sightings per tracked address (2 x 1,024 lines) plus
-/// 2 x 200 repeats and up to 1,025 summaries per window. Measured on the live distribution
-/// (5 heavy sources, 1,624 tail sources) that is about 5,800 lines an hour against the 9,300 an
-/// hour of the incident, summaries included; a summary line is about twice a verbatim line's size.
+/// 2 x 200 repeats and up to 1,041 summaries (one per tracked address, one per network at its
+/// address cap, one overflow) per window: 3,489 lines at the worst. Measured on the live
+/// distribution (5 heavy sources, 1,624 tail sources) that is about 5,800 lines an hour against
+/// the 9,300 an hour of the incident, summaries included; a summary line is about twice a verbatim
+/// line's size.
 pub const DEFAULT_TOTAL_BUDGET: u32 = 200;
+/// Addresses one source network (the [`SourceKey`] /24 or /56) may hold in the table per window.
+/// Without it one /24, or one IPv6 /64 whose addresses cost nothing, takes the whole 1,024-address
+/// table with about 1,024 connections and every later source of the window folds into the single
+/// overflow summary, which scoring cannot attribute. 64 is a quarter of a /24 and a sixteenth of
+/// the table: a network that large is a scanner fleet, not a few hosts, and filling the table then
+/// takes sixteen such networks. Addresses past it fold into one per-network summary.
+pub const DEFAULT_NETWORK_ADDRESS_CAP: usize = 64;
 /// Distinct client versions and usernames one summary names.
 pub const MAX_SUMMARY_VALUES: usize = 8;
 /// Longest version or username kept in a summary, after sanitization.
@@ -95,6 +111,8 @@ pub struct SourceEventConfig {
     pub network_budget: NonZeroU32,
     pub total_budget: NonZeroU32,
     pub address_capacity: NonZeroUsize,
+    /// Addresses one source network may hold in the table per window.
+    pub network_address_cap: NonZeroUsize,
 }
 
 impl Default for SourceEventConfig {
@@ -106,6 +124,8 @@ impl Default for SourceEventConfig {
             network_budget: nz(DEFAULT_NETWORK_BUDGET),
             total_budget: nz(DEFAULT_TOTAL_BUDGET),
             address_capacity: NonZeroUsize::new(DEFAULT_SUMMARY_CAPACITY)
+                .unwrap_or(NonZeroUsize::MIN),
+            network_address_cap: NonZeroUsize::new(DEFAULT_NETWORK_ADDRESS_CAP)
                 .unwrap_or(NonZeroUsize::MIN),
         }
     }
@@ -147,12 +167,32 @@ pub enum SourceAdmission {
     Summarized,
 }
 
-/// One address's (or the overflow's) suppressed connection and login events over one window.
+/// Whom a summary is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryScope {
+    /// One tracked address; scoring attributes it to that address.
+    Address(SourceKey),
+    /// Addresses that arrived after their network already held its share of the table.
+    Network(SourceKey),
+    /// Addresses that arrived while the table was full.
+    Overflow,
+}
+
+impl SummaryScope {
+    /// Whether the summary stands for many addresses and so belongs to none of them.
+    pub fn is_unattributed(self) -> bool {
+        !matches!(self, SummaryScope::Address(_))
+    }
+}
+
+/// One address's (or a network's, or the overflow's) suppressed connection and login events over
+/// one window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSummary {
-    /// `None` for the overflow summary: addresses that arrived while the table was full.
-    pub key: Option<SourceKey>,
-    /// The address the summary is about; for the overflow, the first address folded into it.
+    /// What the summary stands for.
+    pub scope: SummaryScope,
+    /// The address the summary is about; for a network or overflow summary, the first address
+    /// folded into it.
     pub source: IpAddr,
     pub sensor: String,
     pub wan_ip: Option<IpAddr>,
@@ -184,10 +224,10 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(key: Option<SourceKey>, event: &SensorEvent, now: Instant) -> Self {
+    fn new(scope: SummaryScope, event: &SensorEvent, now: Instant) -> Self {
         Self {
             summary: SourceSummary {
-                key,
+                scope,
                 source: event.source_ip,
                 sensor: event.sensor.clone(),
                 wan_ip: event.wan_ip,
@@ -259,11 +299,20 @@ struct Address {
     pending: Option<Pending>,
 }
 
+#[derive(Debug, Default)]
+struct Network {
+    written: [u32; 2],
+    /// Tracked addresses of this network in the window.
+    addresses: usize,
+    /// Addresses refused a table slot because the network already held its share.
+    pending: Option<Pending>,
+}
+
 #[derive(Debug)]
 struct State {
     started: Instant,
     total: [u32; 2],
-    networks: HashMap<SourceKey, [u32; 2]>,
+    networks: HashMap<SourceKey, Network>,
     addresses: HashMap<IpAddr, Address>,
     overflow: Option<Pending>,
     /// Summaries of windows that ended while an event arrived, before the writer took them.
@@ -283,6 +332,7 @@ pub struct SourceEventGate {
     network_budget: u32,
     total_budget: u32,
     capacity: usize,
+    network_address_cap: usize,
 }
 
 impl SourceEventGate {
@@ -308,6 +358,7 @@ impl SourceEventGate {
             network_budget: config.network_budget.get(),
             total_budget: config.total_budget.get(),
             capacity,
+            network_address_cap: config.network_address_cap.get(),
         }
     }
 
@@ -335,14 +386,23 @@ impl SourceEventGate {
         let state = &mut *guard;
         self.rotate(state, now);
 
-        let tracked =
-            state.addresses.contains_key(&event.source_ip) || state.addresses.len() < self.capacity;
-        if !tracked {
-            state
-                .overflow
-                .get_or_insert_with(|| Pending::new(None, event, now))
-                .fold(kind, event, now);
-            return SourceAdmission::Summarized;
+        if !state.addresses.contains_key(&event.source_ip) {
+            if state.addresses.len() >= self.capacity {
+                state
+                    .overflow
+                    .get_or_insert_with(|| Pending::new(SummaryScope::Overflow, event, now))
+                    .fold(kind, event, now);
+                return SourceAdmission::Summarized;
+            }
+            let network = state.networks.entry(key).or_default();
+            if network.addresses >= self.network_address_cap {
+                network
+                    .pending
+                    .get_or_insert_with(|| Pending::new(SummaryScope::Network(key), event, now))
+                    .fold(kind, event, now);
+                return SourceAdmission::Summarized;
+            }
+            network.addresses += 1;
         }
         let address = state.addresses.entry(event.source_ip).or_default();
         let network = state.networks.entry(key).or_default();
@@ -352,11 +412,11 @@ impl SourceEventGate {
         // listener budget exists to cap repeats. First sightings are bounded by the address table.
         let first = address.written[slot] == 0;
         if address.written[slot] < self.address_budget
-            && network[slot] < self.network_budget
+            && network.written[slot] < self.network_budget
             && (first || state.total[slot] < self.total_budget)
         {
             address.written[slot] += 1;
-            network[slot] += 1;
+            network.written[slot] += 1;
             if !first {
                 state.total[slot] += 1;
             }
@@ -364,7 +424,7 @@ impl SourceEventGate {
         }
         address
             .pending
-            .get_or_insert_with(|| Pending::new(Some(key), event, now))
+            .get_or_insert_with(|| Pending::new(SummaryScope::Address(key), event, now))
             .fold(kind, event, now);
         SourceAdmission::Summarized
     }
@@ -377,15 +437,15 @@ impl SourceEventGate {
         }
         state.started = now;
         state.total = [0; 2];
-        state.networks.clear();
         let ended: Vec<Pending> = state
             .addresses
             .drain()
             .filter_map(|(_, a)| a.pending)
+            .chain(state.networks.drain().filter_map(|(_, n)| n.pending))
             .chain(state.overflow.take())
             .collect();
         for pending in ended {
-            if state.ready.len() <= self.capacity {
+            if state.ready.len() <= self.ready_limit() {
                 state.ready.push(pending.summary);
             } else {
                 state.dropped = state.dropped.saturating_add(1);
@@ -397,6 +457,12 @@ impl SourceEventGate {
                 }
             }
         }
+    }
+
+    /// The most summaries parked for the writer: one per tracked address, one per network that
+    /// reached its share (at most `capacity / network_address_cap` of them), and the overflow.
+    fn ready_limit(&self) -> usize {
+        self.capacity + self.capacity / self.network_address_cap + 1
     }
 
     /// The summaries of every window that has ended at `now`.
@@ -417,6 +483,7 @@ impl SourceEventGate {
                 .addresses
                 .values_mut()
                 .filter_map(|a| a.pending.take())
+                .chain(state.networks.values_mut().filter_map(|n| n.pending.take()))
                 .chain(state.overflow.take())
                 .map(|p| p.summary),
         );
@@ -466,9 +533,11 @@ impl SourceEventGate {
 /// One address's suppressed connection and login events over one window, as the
 /// `honeypot_login_attempt` (when an attempt was folded) or `honeypot_connection` one of them
 /// would have been, marked `event_summary: true`. `suppressed_count` is the events it stands for:
-/// scoring counts that many. `first_seen` and `last_seen` are wall-clock times reconstructed from
-/// the monotonic instants at emission. The session id is fresh: the events came from up to
-/// `session_count` sessions, none of which the summary belongs to alone.
+/// scoring counts that many. A network or overflow summary is always a `honeypot_connection` with
+/// `authenticated: false` (the folded attempts stay in `suppressed_attempts`). `first_seen` and
+/// `last_seen` are wall-clock times reconstructed from the monotonic instants at emission. The
+/// session id is fresh: the events came from up to `session_count` sessions, none of which the
+/// summary belongs to alone.
 pub fn source_summary_event(
     s: &SourceSummary,
     window: Duration,
@@ -479,11 +548,14 @@ pub fn source_summary_event(
         let ago = chrono::Duration::from_std(now.saturating_duration_since(at)).unwrap_or_default();
         (now_utc - ago).to_rfc3339_opts(SecondsFormat::Millis, true)
     };
-    let source_prefix = match s.key {
-        Some(key) => key.to_string(),
-        None => "overflow".to_string(),
+    let source_prefix = match s.scope {
+        SummaryScope::Address(key) | SummaryScope::Network(key) => key.to_string(),
+        SummaryScope::Overflow => "overflow".to_string(),
     };
-    let login = s.attempts > 0;
+    // A summary that stands for many addresses is a connection that authenticated nothing: it is
+    // attributed to the first address folded into it, which may only have connected, and a login
+    // here would latch that address as confirmed-real. The folded attempt count stays a field.
+    let login = s.attempts > 0 && !s.scope.is_unattributed();
     let mut metadata = json!({
             "protocol_label": s.sensor,
             EVENT_SUMMARY_KEY: true,
@@ -501,7 +573,7 @@ pub fn source_summary_event(
             "session_count": s.sessions as u64,
             "session_count_capped": s.sessions_capped,
     });
-    if s.key.is_none() {
+    if s.scope.is_unattributed() {
         metadata[OVERFLOW_SUMMARY_KEY] = Value::Bool(true);
     }
     SensorEvent {
@@ -822,7 +894,7 @@ mod tests {
         for s in g.drain() {
             let e = source_summary_event(&s, g.window(), t0, Utc::now());
             let overflow = e.metadata.get(OVERFLOW_SUMMARY_KEY) == Some(&Value::Bool(true));
-            assert_eq!(overflow, s.key.is_none());
+            assert_eq!(overflow, s.scope == SummaryScope::Overflow);
             flagged += usize::from(overflow);
         }
         assert_eq!(flagged, 1);
@@ -862,10 +934,130 @@ mod tests {
         assert!(logged(&g, &connection("198.51.100.1"), t0));
         let summaries = g.drain();
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].key, None);
+        assert_eq!(summaries[0].scope, SummaryScope::Overflow);
         assert_eq!(summaries[0].connections, 7);
         let event = source_summary_event(&summaries[0], g.window(), t0, Utc::now());
         assert_eq!(event.metadata["source_prefix"], "overflow");
+    }
+
+    /// A summary that stands for many addresses is attributed to the first of them, which may only
+    /// have connected: it must never be an authenticated login, whatever attempts were folded.
+    #[test]
+    fn an_unattributed_summary_is_a_connection_that_authenticated_nothing() {
+        let t0 = Instant::now();
+        // Table of one: the first address is tracked, so A's connection is the overflow's first.
+        let g = gate_at(t0, 5, 5, 100, 1);
+        assert!(logged(&g, &connection("198.51.100.1"), t0));
+        assert!(!logged(&g, &connection("198.51.100.2"), t0)); // A: connects only
+        for _ in 0..3 {
+            assert!(!logged(&g, &login("198.51.100.3", "RFB 003.008"), t0)); // B: logs in
+        }
+        let summaries = g.drain();
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.source, "198.51.100.2".parse::<IpAddr>().unwrap());
+        assert_eq!((s.connections, s.attempts), (1, 3));
+        let event = source_summary_event(s, g.window(), t0, Utc::now());
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+        assert!(!event.authenticated);
+        assert_eq!(event.metadata["suppressed_attempts"], 3);
+        assert_eq!(event.metadata["suppressed_count"], 4);
+        assert_eq!(event.metadata[OVERFLOW_SUMMARY_KEY], true);
+    }
+
+    #[test]
+    fn an_address_first_event_is_written_after_the_listener_budget_is_spent() {
+        let t0 = Instant::now();
+        let g = gate_at(t0, 1000, 1000, 200, 64);
+        // One address spends the whole listener budget of repeats.
+        let written = (0..400)
+            .filter(|_| logged(&g, &connection("198.51.100.1"), t0))
+            .count();
+        assert_eq!(written, 201, "its first event plus 200 repeats");
+        // Another address's first event of that kind is still written; its second is a repeat.
+        assert!(logged(&g, &connection("203.0.113.9"), t0));
+        assert!(!logged(&g, &connection("203.0.113.9"), t0));
+    }
+
+    #[test]
+    fn one_network_cannot_take_more_than_its_share_of_the_table() {
+        let t0 = Instant::now();
+        let config = SourceEventConfig::default();
+        let (cap, capacity) = (
+            config.network_address_cap.get(),
+            config.address_capacity.get(),
+        );
+        let g = SourceEventGate::new_at(config, t0);
+        // 2,000 addresses of one IPv6 /64, two events each.
+        let mut written = 0;
+        for n in 0..2000u32 {
+            let ip = format!("2001:db8:0:1::{n:x}");
+            for _ in 0..2 {
+                written += usize::from(logged(&g, &connection(&ip), t0));
+            }
+        }
+        // Fifty sources from other networks keep their first events.
+        for n in 0..50u32 {
+            assert!(
+                logged(&g, &connection(&format!("127.{n}.0.1")), t0),
+                "source {n}"
+            );
+        }
+        let summaries = g.drain();
+        assert!(
+            written <= 40,
+            "the network budget bounds the verbatim lines: {written}"
+        );
+        let by_scope =
+            |f: fn(&SummaryScope) -> bool| summaries.iter().filter(|s| f(&s.scope)).count();
+        assert!(by_scope(|s| matches!(s, SummaryScope::Address(_))) <= cap);
+        assert_eq!(by_scope(|s| matches!(s, SummaryScope::Network(_))), 1);
+        assert_eq!(by_scope(|s| matches!(s, SummaryScope::Overflow)), 0);
+        assert!(capacity - cap >= 50, "the table kept room for the others");
+        let network = summaries
+            .iter()
+            .find(|s| matches!(s.scope, SummaryScope::Network(_)))
+            .unwrap();
+        let event = source_summary_event(network, g.window(), t0, Utc::now());
+        assert_eq!(event.metadata[OVERFLOW_SUMMARY_KEY], true);
+        assert!(!event.authenticated);
+        assert_eq!(event.metadata["suppressed_count"], 2 * (2000 - cap as u64));
+    }
+
+    /// The worst case the docs state: 2 x capacity first sightings, 2 x total repeats and a summary
+    /// per tracked address, per capped network and the overflow.
+    #[test]
+    fn the_worst_case_line_count_with_the_network_cap_matches_the_documented_bound() {
+        let t0 = Instant::now();
+        let config = SourceEventConfig::default();
+        let (cap, capacity) = (
+            config.network_address_cap.get(),
+            config.address_capacity.get(),
+        );
+        let g = SourceEventGate::new_at(config, t0);
+        let mut written = 0usize;
+        // 40 IPv6 /64s of 100 addresses (the cap is 64), then 600 more single-address networks.
+        for round in 0..30 {
+            let now = t0 + Duration::from_millis(round);
+            for net in 0..40u32 {
+                for host in 0..100u32 {
+                    let ip = format!("2001:db8:{net:x}::{host:x}");
+                    written += usize::from(logged(&g, &connection(&ip), now));
+                    written += usize::from(logged(&g, &login(&ip, "RFB 003.008"), now));
+                }
+            }
+            for n in 0..600u32 {
+                let ip = v4(n);
+                written += usize::from(logged(&g, &connection(&ip), now));
+                written += usize::from(logged(&g, &login(&ip, "RFB 003.008"), now));
+            }
+        }
+        let summaries = g.drain().len();
+        let bound = 2 * capacity + 2 * DEFAULT_TOTAL_BUDGET as usize;
+        assert!(written <= bound, "{written} verbatim lines, bound {bound}");
+        let summary_bound = capacity + capacity / cap + 1;
+        assert!(summaries <= summary_bound, "{summaries} summaries");
+        assert_eq!(bound + summary_bound, 3489);
     }
 
     #[test]

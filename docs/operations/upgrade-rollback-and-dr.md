@@ -216,8 +216,11 @@ the collectors after. The shell reply field is the current case: a reply recorde
 is newer than intake is dropped, the event is still ingested and the chain is unaffected, and the
 console shows no reply for that command. The cred sensor's connection and login summaries are the
 second case: an intake that predates them scores one as a single event, and a summary ingested
-that way stays counted once (nothing re-projects it). On one host the daemon runs sensors' intake and the
-sensors together, so the order only matters when the sensors are upgraded separately.
+that way stays counted once (nothing re-projects it), while a rebuild of that address's projection
+from the ledger (`rebuild_projection`) counts it as the events it stands for, so the rebuilt and
+the stored score disagree until the address is rescored. On one host the daemon runs sensors'
+intake and the sensors together, so the order only matters when the sensors are upgraded
+separately.
 
 ## Rollback
 

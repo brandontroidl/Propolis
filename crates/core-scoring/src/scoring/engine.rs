@@ -129,7 +129,8 @@ pub fn apply_event(
     };
 
     // Step 3: add this event's contribution unless it is a deduped sighting.
-    let new_raw = if deduped {
+    let unattributed = is_unattributed_summary(event);
+    let new_raw = if deduped || unattributed {
         decayed_raw
     } else {
         let entry = breakdown.entry(event.category).or_insert(CategoryStat {
@@ -144,8 +145,11 @@ pub fn apply_event(
     };
 
     // Step 4: sticky latch + counts (a deduped sighting still counts).
+    // An overflow summary is attributed to the first address it folded, which may only have
+    // connected: it proves nothing about that address.
     let has_confirmed_real = prev_has_confirmed_real
-        || is_confirmed_real(event.protocol, event.authenticated, event.category);
+        || (!unattributed
+            && is_confirmed_real(event.protocol, event.authenticated, event.category));
     let represented = represented_events(event);
     let event_count = prev_event_count.saturating_add(represented);
     // Non-spoofable count: only a completed TCP connection proves the source address is genuine (a
@@ -176,6 +180,12 @@ pub fn apply_event(
         now,
         delisted,
     )
+}
+
+/// Whether `event` is a sensor's overflow or per-network summary: it stands for many addresses but
+/// carries one of them as its source, so it adds no weight and latches nothing for that address.
+pub(crate) fn is_unattributed_summary(event: &EventInput) -> bool {
+    event.metadata.get(OVERFLOW_SUMMARY_KEY) == Some(&serde_json::Value::Bool(true))
 }
 
 /// How many sightings `event` counts as in `event_count` and `established_event_count`: one, or for
@@ -817,6 +827,51 @@ mod tests {
         }
         assert_eq!(s.event_count, i32::MAX);
         assert_eq!(s.established_event_count, i32::MAX);
+    }
+
+    /// The overflow summary is attributed to the first address it folded. If that address only
+    /// connected, a login summary written under it (the shape before the sensor stopped writing
+    /// one, still in stored logs) must not make it confirmed-real, eligible or heavier.
+    #[test]
+    fn an_overflow_summary_latches_nothing_and_weighs_nothing() {
+        let when = ts("2026-10-19T00:00:00Z");
+        let overflow = |signal| {
+            vnc_event(
+                signal,
+                when,
+                serde_json::json!({
+                    "event_summary": true, "overflow_summary": true,
+                    "suppressed_count": 900, "suppressed_attempts": 450,
+                }),
+            )
+        };
+        for signal in [
+            SignalType::HoneypotLoginAttempt,
+            SignalType::HoneypotConnection,
+        ] {
+            let s = apply_event(None, &overflow(signal), HALF_LIFE, false, 1, 1);
+            assert!(!s.has_confirmed_real, "{signal:?}");
+            assert!(!s.eligible, "{signal:?}");
+            assert_eq!(s.raw_score, dec!(0), "{signal:?}");
+            assert_eq!(s.event_count, 1, "{signal:?}");
+        }
+        // A real login of the same address still latches, and the summary does not undo it.
+        let real = vnc_event(
+            SignalType::HoneypotLoginAttempt,
+            when,
+            serde_json::json!({}),
+        );
+        let s = apply_event(None, &real, HALF_LIFE, false, 1, 1);
+        assert!(s.has_confirmed_real);
+        let s = apply_event(
+            Some(s),
+            &overflow(SignalType::HoneypotConnection),
+            HALF_LIFE,
+            false,
+            1,
+            1,
+        );
+        assert!(s.has_confirmed_real);
     }
 
     proptest! {

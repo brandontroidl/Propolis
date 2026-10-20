@@ -11,7 +11,9 @@
 //! [`SourceEventGate`] counts, per tumbling [`SourceEventConfig::window`], how many connection
 //! events and how many login events were written for each source address, each source network
 //! (the [`SourceKey`] /24 or /56) and in total. An event is written verbatim while all three are
-//! under their budget. Past any of them it is not written: it is folded into the pending summary
+//! under their budget, except that an address's first event of each kind in a window skips the
+//! total: the listener budget caps repeats, so a source seen once is never folded for others'
+//! volume. Past any of them it is not written: it is folded into the pending summary
 //! of its own address, and when the window ends each address with anything folded gets one
 //! `honeypot_login_attempt` (when an attempt was folded) or `honeypot_connection` event marked
 //! `event_summary: true`, carrying the connection and attempt counts, the distinct client versions
@@ -52,19 +54,27 @@ use crate::sanitize_value;
 
 /// The metadata key that marks a connection or login summary event.
 pub const EVENT_SUMMARY_KEY: &str = "event_summary";
+/// The metadata key set to `true` on the overflow summary only. That summary is attributed to one
+/// address but stands for many, so scoring must count it as one event, not its `suppressed_count`.
+pub const OVERFLOW_SUMMARY_KEY: &str = "overflow_summary";
 /// How long the budgets and the pending summaries last. A source whose events are all folded is
 /// seen in the log at most this late.
 pub const SOURCE_EVENT_WINDOW: Duration = Duration::from_secs(600);
 /// Events of each kind (connection, login) written verbatim per source address per window. The
 /// live VNC flood's heaviest address sent about 70 of each per ten minutes, so it costs 20 lines
-/// and a summary instead of 140, about 126 lines an hour; a source below ten of each is untouched.
+/// and a summary instead of 140, about 126 lines an hour; a source below ten of each is untouched
+/// as long as its network budget holds, because an address's first event of each kind never
+/// spends the listener budget.
 pub const DEFAULT_ADDRESS_BUDGET: u32 = 10;
 /// Events of each kind written verbatim per source network per window, so a /24 of hosts cannot
 /// multiply the address budget by 254.
 pub const DEFAULT_NETWORK_BUDGET: u32 = 40;
-/// Events of each kind written verbatim per window across every source: 200 per ten minutes is
-/// 2,400 lines an hour for the two kinds together, against the 9,300 an hour of the incident, and
-/// bounds a flood spread over many networks.
+/// Repeat events of each kind written verbatim per window across every source. An address's first
+/// event of each kind does not spend it, so it bounds repeats only: a flood spread over many
+/// networks writes at most two first sightings per tracked address (2 x 1,024 lines) plus
+/// 2 x 200 repeats and up to 1,025 summaries per window. Measured on the live distribution
+/// (5 heavy sources, 1,624 tail sources) that is about 5,800 lines an hour against the 9,300 an
+/// hour of the incident, summaries included; a summary line is about twice a verbatim line's size.
 pub const DEFAULT_TOTAL_BUDGET: u32 = 200;
 /// Distinct client versions and usernames one summary names.
 pub const MAX_SUMMARY_VALUES: usize = 8;
@@ -336,13 +346,20 @@ impl SourceEventGate {
         }
         let address = state.addresses.entry(event.source_ip).or_default();
         let network = state.networks.entry(key).or_default();
+        // An address's first event of each kind in a window is written whenever its own budgets
+        // allow, without spending the listener budget: a source seen once is the one a summary
+        // serves worst (743 B against 366 B verbatim, and scoring waits a window for it), and the
+        // listener budget exists to cap repeats. First sightings are bounded by the address table.
+        let first = address.written[slot] == 0;
         if address.written[slot] < self.address_budget
             && network[slot] < self.network_budget
-            && state.total[slot] < self.total_budget
+            && (first || state.total[slot] < self.total_budget)
         {
             address.written[slot] += 1;
             network[slot] += 1;
-            state.total[slot] += 1;
+            if !first {
+                state.total[slot] += 1;
+            }
             return SourceAdmission::Logged;
         }
         address
@@ -467,21 +484,7 @@ pub fn source_summary_event(
         None => "overflow".to_string(),
     };
     let login = s.attempts > 0;
-    SensorEvent {
-        v: WIRE_VERSION,
-        source_ip: s.source,
-        wan_ip: s.wan_ip,
-        sensor: s.sensor.clone(),
-        signal_type: if login {
-            SIGNAL_HONEYPOT_LOGIN_ATTEMPT
-        } else {
-            SIGNAL_HONEYPOT_CONNECTION
-        }
-        .into(),
-        protocol: PROTO_TCP.into(),
-        authenticated: login,
-        observed_at: now_utc,
-        metadata: json!({
+    let mut metadata = json!({
             "protocol_label": s.sensor,
             EVENT_SUMMARY_KEY: true,
             "source_prefix": source_prefix,
@@ -497,7 +500,25 @@ pub fn source_summary_event(
             "window_secs": window.as_secs_f64(),
             "session_count": s.sessions as u64,
             "session_count_capped": s.sessions_capped,
-        }),
+    });
+    if s.key.is_none() {
+        metadata[OVERFLOW_SUMMARY_KEY] = Value::Bool(true);
+    }
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip: s.source,
+        wan_ip: s.wan_ip,
+        sensor: s.sensor.clone(),
+        signal_type: if login {
+            SIGNAL_HONEYPOT_LOGIN_ATTEMPT
+        } else {
+            SIGNAL_HONEYPOT_CONNECTION
+        }
+        .into(),
+        protocol: PROTO_TCP.into(),
+        authenticated: login,
+        observed_at: now_utc,
+        metadata,
         sample: None,
         session_id: Some(Uuid::now_v7()),
         occurrence_id: None,
@@ -628,14 +649,183 @@ mod tests {
     }
 
     #[test]
-    fn the_total_budget_bounds_a_flood_spread_over_many_networks() {
+    fn the_total_budget_bounds_repeats_but_never_an_addresss_first_event() {
         let t0 = Instant::now();
         let g = gate_at(t0, 10, 10, 5, 64);
-        let written = (0..20u8)
+        // 20 addresses in 20 networks, each sending a first event: all written.
+        for n in 0..20u8 {
+            assert!(logged(&g, &connection(&format!("10.0.{n}.1")), t0));
+        }
+        // Their repeats spend the total: 5 written, the other 15 folded, one summary each.
+        let repeats = (0..20u8)
             .filter(|n| logged(&g, &connection(&format!("10.0.{n}.1")), t0))
             .count();
-        assert_eq!(written, 5);
+        assert_eq!(repeats, 5);
         assert_eq!(g.drain().len(), 15, "one summary per folded address");
+    }
+
+    #[test]
+    fn a_first_event_still_obeys_the_address_and_network_budgets() {
+        let t0 = Instant::now();
+        let g = gate_at(t0, 10, 2, 100, 64);
+        assert!(logged(&g, &connection("198.51.100.1"), t0));
+        assert!(logged(&g, &connection("198.51.100.2"), t0));
+        assert!(
+            !logged(&g, &connection("198.51.100.3"), t0),
+            "a third address's first event is past the /24 budget"
+        );
+    }
+
+    #[test]
+    fn a_first_login_is_written_even_when_the_connection_budget_is_spent() {
+        let t0 = Instant::now();
+        let g = gate_at(t0, 10, 100, 1, 64);
+        for _ in 0..5 {
+            g.admit_at(&connection("198.51.100.1"), t0);
+        }
+        assert!(logged(&g, &login("198.51.100.1", "RFB 003.008"), t0));
+        assert!(logged(&g, &login("198.51.100.2", "RFB 003.008"), t0));
+    }
+
+    /// Small deterministic generator (xorshift) so the replay needs no dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn v4(n: u32) -> String {
+        // Loopback only; one /24 per source, as the incident's sources were spread.
+        format!("127.{}.{}.1", (n >> 8) & 255, n & 255)
+    }
+
+    /// The live VNC distribution: 5 heavy sources at 70 connections and 70 logins per window and
+    /// 1,624 tail sources at about 3.2 events an hour (about 0.53 per ten minutes, per kind half).
+    /// Through the real gate with the default config: no tail source's first sighting is folded and
+    /// the lines written per window stay far under the unbounded count.
+    #[test]
+    fn the_live_distribution_loses_no_tail_first_sighting() {
+        let t0 = Instant::now();
+        let g = SourceEventGate::new_at(SourceEventConfig::default(), t0);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let (mut folded_first, mut tail_events, mut written) = (0u32, 0u32, 0u32);
+        let windows = 6u32;
+        for w in 0..windows {
+            let base = t0 + g.window() * w;
+            let mut seen = std::collections::HashSet::new();
+            // An event exactly on the boundary rotates the gate's window onto the replay's.
+            let mut events: Vec<(u64, u32, bool)> = vec![(0, 0, false)];
+            for heavy in 0..5u32 {
+                for _ in 0..70 {
+                    events.push((rng.next() % 600_000, heavy, false));
+                    events.push((rng.next() % 600_000, heavy, true));
+                }
+            }
+            for tail in 5..(5 + 1624u32) {
+                // 3.2 events an hour is 0.53 per window: one probe (a connection and a login)
+                // with probability 0.27, two with a few percent more.
+                let probes = match rng.next() % 100 {
+                    0..=26 => 1,
+                    27..=29 => 2,
+                    _ => 0,
+                };
+                for _ in 0..probes {
+                    let at = rng.next() % 600_000;
+                    events.push((at, tail, false));
+                    events.push((at + 1, tail, true));
+                }
+            }
+            events.sort();
+            for (ms, src, is_login) in events {
+                let now = base + Duration::from_millis(ms);
+                let ip = v4(src);
+                let e = if is_login {
+                    login(&ip, "RFB 003.008")
+                } else {
+                    connection(&ip)
+                };
+                let first_of_kind = seen.insert((src, is_login));
+                let admitted = logged(&g, &e, now);
+                if admitted {
+                    written += 1;
+                }
+                if src >= 5 {
+                    tail_events += 1;
+                    if first_of_kind && !admitted {
+                        folded_first += 1;
+                    }
+                }
+            }
+        }
+        assert!(tail_events > 1000, "the replay must exercise the tail");
+        assert_eq!(folded_first, 0, "of {tail_events} tail events");
+        // 5 heavy sources write 2 x 10 each and the tail about 400 first sightings a window; the
+        // bound is the gate's worst case, not a tuned figure.
+        assert!(
+            written / windows <= 5 * 20 + 2 * 1024 + 2 * 200,
+            "{written}"
+        );
+    }
+
+    /// A flood from more addresses than the table holds, each sending a connection and a login
+    /// many times: lines per window are bounded by two first sightings per tracked address, the
+    /// listener budget for repeats and one summary per tracked address plus the overflow.
+    #[test]
+    fn a_distributed_flood_is_bounded_per_window() {
+        let t0 = Instant::now();
+        let config = SourceEventConfig::default();
+        let capacity = config.address_capacity.get();
+        let g = SourceEventGate::new_at(config, t0);
+        let sources = (capacity as u32) + 500;
+        let mut written = 0usize;
+        for round in 0..30 {
+            for n in 0..sources {
+                let ip = v4(n);
+                if logged(&g, &connection(&ip), t0 + Duration::from_millis(round)) {
+                    written += 1;
+                }
+                if logged(
+                    &g,
+                    &login(&ip, "RFB 003.008"),
+                    t0 + Duration::from_millis(round),
+                ) {
+                    written += 1;
+                }
+            }
+        }
+        let summaries = g.drain().len();
+        let bound = 2 * capacity + 2 * DEFAULT_TOTAL_BUDGET as usize;
+        assert!(written <= bound, "{written} verbatim lines, bound {bound}");
+        assert!(summaries <= capacity + 1, "{summaries} summaries");
+        assert!(written + summaries <= bound + capacity + 1);
+        let events = (30 * sources * 2) as usize;
+        assert!(
+            written + summaries < events / 10,
+            "{} lines for {events} events",
+            written + summaries
+        );
+    }
+
+    #[test]
+    fn only_the_overflow_summary_carries_the_overflow_flag() {
+        let t0 = Instant::now();
+        let g = gate_at(t0, 1, 100, 100, 1);
+        for src in ["198.51.100.1", "198.51.100.2", "198.51.100.3"] {
+            g.admit_at(&connection(src), t0);
+            g.admit_at(&connection(src), t0);
+        }
+        let mut flagged = 0;
+        for s in g.drain() {
+            let e = source_summary_event(&s, g.window(), t0, Utc::now());
+            let overflow = e.metadata.get(OVERFLOW_SUMMARY_KEY) == Some(&Value::Bool(true));
+            assert_eq!(overflow, s.key.is_none());
+            flagged += usize::from(overflow);
+        }
+        assert_eq!(flagged, 1);
     }
 
     #[test]

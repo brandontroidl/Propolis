@@ -1947,10 +1947,16 @@ all covered by the one path every handler writes through.
 
 - **Budget.** Per 10 minute window, tumbling for the whole listener, each source address may write
   10 `honeypot_connection` and 10 `honeypot_login_attempt` events, each source network (/24, /56)
-  40 of each, and the listener 200 of each. An event is written while all three are under budget.
-  The live flood's heaviest address sent about 70 of each per window, so it now costs 20 lines
-  and one summary, about 126 lines an hour at worst, instead of 840; an address under the budget is
-  untouched. Replies are unchanged: only logging is bounded.
+  40 of each, and the listener 200 of each repeats. An event is written while all three are under
+  budget, except that an address's first event of each kind in a window skips the listener budget
+  (its address and network budgets still apply), so a source below ten of each is untouched unless
+  its /24 has already spent 40. The live flood's heaviest address sent about 70 of each per window,
+  so it now costs 20 lines and one summary, about 126 lines an hour at worst, instead of 840.
+  Replayed through the real gate, the incident's distribution (5 heavy sources and 1,624 tail
+  sources at about 3.2 events an hour) writes about 5,800 lines an hour with the summaries
+  included, against 9,300, and folds no tail source's first sighting. A summary line is about
+  twice a verbatim line's size (743 B against 366 and 399 B), so the count of lines understates
+  the bytes. Replies are unchanged: only logging is bounded.
 - **Summary.** Past a budget the event is not written. When the window ends, each address with
   anything folded gets one event marked `event_summary: true` with the counts of connections and
   attempts, the distinct client versions and usernames (a bounded sample), the sessions and the
@@ -1964,9 +1970,10 @@ all covered by the one path every handler writes through.
   flooder's usernames past the first 8 distinct per window are not recorded; for VNC nothing else
   was recorded to begin with. Passwords were never stored.
 - **Bounded memory.** 1024 addresses per window; one more arrives and it joins one `overflow`
-  summary (`source_prefix: "overflow"`, `source_ip` the first of them), which scoring attributes
-  to that one address.
-- **Scoring.** The summary counts as the events it replaces in `event_count` and
+  summary (`source_prefix: "overflow"`, `overflow_summary: true`, `source_ip` the first of them).
+  It is attributed to that one address though it stands for many, so scoring counts it as one
+  event. Worst case per window: 2 x 1,024 first sightings, 2 x 200 repeats and 1,025 summaries.
+- **Scoring.** An address's summary counts as the events it replaces in `event_count` and
   `established_event_count`, with one sighting of weight
   ([events-and-signals.md](events-and-signals.md#connection-and-login-summary-keys)).
 - **Command events (postgresql).** The query loop's `honeypot_command_exec` events go through the

@@ -210,8 +210,11 @@ async fn main() {
     for handle in handles {
         handle.abort();
     }
-    // The listeners are stopped, so no event reaches a gate: write the summaries of the windows
-    // still open, bounded by each gate's address table and by this timeout.
+    // Aborting a listener stops accepting but not the detached connection tasks it spawned, so a
+    // connection mid-handshake can still reach a gate while (or after) the summaries are written;
+    // an event it folds after the flush has no summary. That loss is bounded by the connections
+    // live at shutdown. Write the summaries of the windows still open, bounded by each gate's
+    // address table and by this timeout.
     for (protocol, flush) in &flushes {
         if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, flush.flush())
             .await

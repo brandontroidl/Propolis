@@ -47,7 +47,8 @@
 # Test seams (all default to the production path; set only by tests): PROPOLIS_CC_NOW (epoch),
 # PROPOLIS_CC_EUID, PROPOLIS_CC_BIN_DIR, PROPOLIS_CC_REPO_DIR, PROPOLIS_CC_BUILD_DIR,
 # PROPOLIS_CC_STAMP, PROPOLIS_CC_LOGROTATE_STATE, PROPOLIS_CC_LOGROTATE_POLICY,
-# PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME, PROPOLIS_CC_WATCH_ACCOUNT. PROPOLIS_CC_LOG_STALE_HOURS (default 24)
+# PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME, PROPOLIS_CC_WATCH_ACCOUNT,
+# PROPOLIS_CC_BACKUP_DIR. PROPOLIS_CC_LOG_STALE_HOURS (default 24)
 # is the age past which a log on a running sensor is reported as quiet.
 #
 # The output is plain ASCII: every value read from an env file is passed through `clean` first, so
@@ -137,6 +138,11 @@ ROTATE_STALE_SECS=$((3 * 3600))
 # ops_alert/config.rs).
 BACKUP_STALE_SECS=$((36 * 3600))
 DEFAULT_ROTATE_SIZE=$((100 * 1024 * 1024))
+# What deploy/backup.sh keeps free on the backup volume: the daemon's low-disk default (crates/
+# propolis/src/ops_alert/config.rs) and logrotate-guard.sh's reserve. backup_script_test.rs fails
+# when backup.sh's copies of these drift, and config_check_test.rs holds this script's to backup.sh's.
+DEFAULT_LOW_DISK_PCT=15
+LOGROTATE_RESERVE_BYTES=536870912
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -1327,6 +1333,68 @@ check_rotation() {
     global logrotate "$worst" "$text (rotation size: $ROTATE_SIZE_NOTE)"
 }
 
+# Whether the sets retention keeps can all sit beside the database without leaving the backup volume
+# under the headroom deploy/backup.sh enforces (the ops monitor's low-disk threshold, and the
+# logrotate guard's reserve). backup.sh refuses a run that would break it, so a node that fails this
+# check stops backing up one night instead of filling the disk. Prints a finding and returns 1 when
+# it cannot fit; prints nothing when it fits or when a figure it needs is not known.
+backup_headroom() {
+    local success="$1" unit_env dump archive src_bytes set_bytes keep dir probe size avail pct keep_free
+    local pct_bytes sets total usable tok
+    dump="$(printf '%s' "$success" | sed -n 's/.*"dump_bytes":\([0-9]\{1,15\}\).*/\1/p')"
+    archive="$(printf '%s' "$success" | sed -n 's/.*"archive_bytes":\([0-9]\{1,15\}\).*/\1/p')"
+    src_bytes="$(printf '%s' "$success" | sed -n 's/.*"source_bytes":\([0-9]\{1,15\}\).*/\1/p')"
+    if [ -z "$dump" ] || [ -z "$archive" ] || [ -z "$src_bytes" ]; then
+        return 0
+    fi
+    set_bytes=$((dump + archive))
+    keep=7
+    dir="${PROPOLIS_CC_BACKUP_DIR:-/var/backups/propolis}"
+    if [ "$SYSTEMCTL" -eq 1 ]; then
+        unit_env="$(sysq show --property=Environment --value propolis-backup.service)"
+        for tok in $unit_env; do
+            case "$tok" in
+                PROPOLIS_BACKUP_KEEP=*) keep="${tok#*=}" ;;
+                PROPOLIS_BACKUP_DIR=*) [ -n "${PROPOLIS_CC_BACKUP_DIR:-}" ] || dir="${tok#*=}" ;;
+            esac
+        done
+    fi
+    if ! [[ "$keep" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$keep))" -lt 1 ] || [ "$((10#$keep))" -gt 365 ]; then
+        return 0
+    fi
+    keep=$((10#$keep))
+    if ! have df; then
+        limit "df is not installed: the backup volume's headroom was not checked"
+        return 0
+    fi
+    # The directory is root-only (0750), so a non-root run measures the nearest ancestor it can
+    # reach, which is on the same volume unless the directory is a mount point of its own.
+    probe="$dir"
+    while [ ! -d "$probe" ] || ! { read -r size avail < <(df --output=size,avail -B1 -- "$probe" 2>/dev/null | tail -n 1); [[ "$size" =~ ^[0-9]{1,18}$ && "$avail" =~ ^[0-9]{1,18}$ ]]; }; do
+        [ "$probe" != / ] && [ "$probe" != . ] || { limit "the free space of $dir could not be read: the backup headroom was not checked"; return 0; }
+        probe="$(dirname -- "$probe")"
+    done
+    pct="$(read_env_var_in PROPOLIS_OPS_CAPACITY_FREE_PCT "$ENV_DIR/propolis.env")"
+    if ! [[ "$pct" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$pct))" -lt 1 ] || [ "$((10#$pct))" -gt 100 ]; then
+        pct="$DEFAULT_LOW_DISK_PCT"
+    fi
+    pct=$((10#$pct))
+    # The same arithmetic as backup.sh: the monitor fires strictly below the threshold.
+    # shellcheck disable=SC2017 # dividing first is the overflow guard; the remainder is added back
+    pct_bytes=$(( size / 100 * pct + (size % 100 * pct + 99) / 100 ))
+    keep_free=$pct_bytes
+    [ "$keep_free" -ge "$LOGROTATE_RESERVE_BYTES" ] || keep_free="$LOGROTATE_RESERVE_BYTES"
+    sets=$((keep + 3))
+    total=$((src_bytes + sets * set_bytes))
+    usable=$((size - keep_free))
+    if [ "$usable" -lt 0 ] || [ "$total" -gt "$usable" ]; then
+        finding warn "backup" "backup-headroom" "retention cannot fit beside the database: $keep scheduled + 3 pre-upgrade sets of about $(human_bytes "$set_bytes") is $(human_bytes $((sets * set_bytes))), plus the $(human_bytes "$src_bytes") they were taken from is $(human_bytes "$total"), but $dir's volume is $(human_bytes "$size") and must keep $(human_bytes "$keep_free") free (the larger of the ${pct}% low-disk threshold and logrotate's $(human_bytes "$LOGROTATE_RESERVE_BYTES") reserve), leaving $(human_bytes "$((usable > 0 ? usable : 0))"); backups will start refusing before the volume fills" \
+            "lower PROPOLIS_BACKUP_KEEP for propolis-backup.service (sudo systemctl edit propolis-backup.service), or move the backup directory to a larger volume (PROPOLIS_BACKUP_DIR, and its ReadWritePaths in the same drop-in)" manual
+        return 1
+    fi
+    return 0
+}
+
 # The nightly backup (deploy/backup.sh): the timer, the age of the last good set and whether sets
 # are encrypted. Reads the script's own status files, so it agrees with the daemon's backup-stale.
 check_backup() {
@@ -1369,6 +1437,10 @@ check_backup() {
             worst=fail
             finding fail "backup" "backup-stale" "the last good backup is $(human_age "$age") old (the daemon's backup-stale alert fires at $(human_age "$limit"))${step:+; the last run failed while $step}" \
                 "sudo systemctl start propolis-backup.service; sudo journalctl -u propolis-backup.service -n 30 --no-pager"
+        fi
+        if ! backup_headroom "$success"; then
+            if [ "$worst" = ok ]; then worst=warn; fi
+            parts+=("retention too large for the volume")
         fi
         case "$success" in
             *'"encrypted":false'*)

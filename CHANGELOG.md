@@ -661,6 +661,19 @@
   (`begin_exclusive` now returns `core_scoring::ExclusiveTx`, which derefs to the connection and
   has the same `commit`). No setting, no migration. See
   [storage](docs/architecture/storage.md#serialized-single-writer-append).
+- **Nightly backups no longer fill the volume that log rotation needs** - the free-space check
+  asked only whether the next set fits, and retention pruned only after a good write, so with the
+  defaults (7 scheduled and 3 pre-upgrade sets of about 1 GB each) a 17 GB `/var` holding a 6.6 GB
+  database fell under the ops monitor's 15% low-disk threshold and then to 0.8% free; log rotation
+  refused every log and the node spiralled. `backup.sh` now prunes the run's own reason down to
+  one fewer than its limit (never below one, never the other reason) before it estimates, and
+  refuses before dumping unless the volume would still keep the larger of the monitor's threshold
+  (`PROPOLIS_OPS_CAPACITY_FREE_PCT`, read from `propolis.env`, default 15) and the logrotate
+  guard's 512 MiB reserve, naming the shortfall and the fixes (`PROPOLIS_BACKUP_KEEP`,
+  `PROPOLIS_BACKUP_DIR`). `config-check.sh` gains a `backup-headroom` warning when the retained
+  sets cannot fit beside the database within that headroom, with the numbers. A node already
+  near the line will see backups refuse until you lower `PROPOLIS_BACKUP_KEEP` or move the
+  backup directory; see [backup and restore](docs/operations/backup-and-restore.md).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

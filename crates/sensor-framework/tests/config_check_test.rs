@@ -395,8 +395,15 @@ case "$1" in
   is-enabled) f="$d/enabled/$2"; if [ -f "$f" ]; then cat "$f"; [ "$(cat "$f")" = enabled ]; exit $?; fi; echo not-found; exit 4 ;;
   is-active) f="$d/active/$2"; if [ -f "$f" ]; then cat "$f"; [ "$(cat "$f")" = active ]; exit $?; fi; echo inactive; exit 3 ;;
   is-failed) f="$d/failed/$2"; if [ -f "$f" ]; then cat "$f"; exit 0; fi; echo active; exit 1 ;;
+  show) [ -f "$d/backup_env" ] && cat "$d/backup_env"; exit 0 ;;
 esac
 exit 1
+"#,
+        );
+        self.exec(
+            "stubs/df",
+            r#"d="$STUB_STATE"
+printf 'Size Avail\n%s %s\n' "$(cat "$d/df_size" 2>/dev/null || echo 1099511627776)" "$(cat "$d/df_avail" 2>/dev/null || echo 1099511627776)"
 "#,
         );
         self.exec(
@@ -473,6 +480,7 @@ cat "$d/psql_out"
             .env("PROPOLIS_CC_WATCH_HOME", self.p("home-watch"))
             .env("PROPOLIS_CC_WATCH_ACCOUNT", &*self.watch_account.borrow())
             .env("PROPOLIS_CC_BACKUP_STATUS", self.p("state/backup-status"))
+            .env("PROPOLIS_CC_BACKUP_DIR", self.p("state/backups"))
             .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"));
         for (k, v) in env {
             cmd.env(k, v);
@@ -2583,6 +2591,9 @@ fn fix_scenarios() -> Vec<Scenario> {
                 ),
             );
         }),
+        ("retention too large for the backup volume", |fx| {
+            seed_backup_volume(fx, 17 * GIB, 7);
+        }),
         ("no backup has run yet", |fx| {
             std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
         }),
@@ -2602,6 +2613,103 @@ fn fix_scenarios() -> Vec<Scenario> {
             },
         ),
     ]
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// A 17 GiB backup volume whose last good set was 1 GiB from a 6 GiB source, with `keep` scheduled
+/// sets kept. Retention then holds (keep + 3) GiB beside the 6 GiB database.
+fn seed_backup_volume(fx: &Fx, volume: u64, keep: u32) {
+    fx.write("state/df_size", &volume.to_string());
+    fx.write("state/df_avail", &(volume / 2).to_string());
+    fx.write(
+        "state/backup-status/last-success",
+        &format!(
+            "{{\"completed_at\":\"{}\",\"reason\":\"scheduled\",\"set\":\"x-scheduled\",\"encrypted\":true,\"dump_bytes\":{},\"archive_bytes\":{},\"source_bytes\":{}}}\n",
+            iso(NOW - 3600),
+            GIB - 1024,
+            1024,
+            6 * GIB
+        ),
+    );
+    fx.write(
+        "state/backup_env",
+        &format!("PROPOLIS_BACKUP_KEEP={keep}\n"),
+    );
+}
+
+fn finding_ids(fx: &Fx) -> Vec<String> {
+    fx.json()["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The numbers behind the warning are on the volume, not the disk the test runs on: 7 + 3 sets of
+/// 1 GiB plus the 6 GiB source is 16 GiB, over the 17 GiB volume's 14.45 GiB usable after its
+/// 15% (2.55 GiB); 2 + 3 sets is 11 GiB, which fits.
+#[test]
+fn retention_that_cannot_fit_beside_the_database_is_warned_with_the_numbers() {
+    let fx = Fx::new();
+    seed_backup_volume(&fx, 17 * GIB, 7);
+    assert!(finding_ids(&fx).contains(&"backup-headroom".to_string()));
+    let v = fx.json();
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "backup-headroom")
+        .unwrap();
+    assert_eq!(f["level"], "warn");
+    assert_eq!(f["fix_kind"], "manual");
+    let msg = f["message"].as_str().unwrap();
+    for needle in [
+        "7 scheduled + 3 pre-upgrade",
+        "10G",
+        "6G",
+        "16G",
+        "17G",
+        "15%",
+        "PROPOLIS_BACKUP_KEEP",
+    ] {
+        assert!(
+            msg.contains(needle) || f["fix"].as_str().unwrap().contains(needle),
+            "{needle} missing: {msg}"
+        );
+    }
+
+    seed_backup_volume(&fx, 17 * GIB, 2);
+    assert!(!finding_ids(&fx).contains(&"backup-headroom".to_string()));
+    // A larger volume holds the default retention too.
+    seed_backup_volume(&fx, 40 * GIB, 7);
+    assert!(!finding_ids(&fx).contains(&"backup-headroom".to_string()));
+    // The monitor's own threshold is the line: at 70% the 40 GiB volume keeps 28 GiB, leaving 12 for 16.
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_CAPACITY_FREE_PCT=",
+        Some("PROPOLIS_OPS_CAPACITY_FREE_PCT=70"),
+    );
+    assert!(finding_ids(&fx).contains(&"backup-headroom".to_string()));
+}
+
+/// config-check.sh and backup.sh each carry the daemon's default and the guard's reserve; they must
+/// carry the same ones.
+#[test]
+fn the_headroom_constants_match_backup_sh() {
+    let read = |rel: &str| {
+        std::fs::read_to_string(format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    };
+    let check = read("deploy/config-check.sh");
+    let backup = read("deploy/backup.sh");
+    for line in [
+        "DEFAULT_LOW_DISK_PCT=15\n",
+        "LOGROTATE_RESERVE_BYTES=536870912\n",
+    ] {
+        assert!(check.contains(line), "config-check.sh lacks {line:?}");
+        assert!(backup.contains(line), "backup.sh lacks {line:?}");
+    }
 }
 
 /// The staleness limit is the one the daemon alerts on, PROPOLIS_OPS_BACKUP_MAX_AGE_SECS when it

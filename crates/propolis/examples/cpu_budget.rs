@@ -411,7 +411,7 @@ fn main() {
         report.measure(
             "ExclusionEngine::is_excluded",
             &format!("{n} addresses"),
-            false,
+            true,
             || {
                 snapshot
                     .standard

@@ -108,8 +108,8 @@ append never leaves it held. See
 
 Writers in one process queue on a fair in-process gate before they ask the pool for a
 connection (`crates/core-scoring/src/repository/append_gate.rs`; one gate per database). Without
-it each waiting writer was a checked-out connection parked on the advisory lock, and sixteen
-tailers on a pool of sixteen left nothing for the console or the review loops. With it, one
+it each waiting writer was a checked-out connection parked on the advisory lock, and as many
+tailers (one per sensor log) as the pool has connections (10 by default) left nothing for the console or the review loops. With it, one
 writer per database waits on the advisory lock and the rest wait on the gate holding nothing.
 The advisory lock is unchanged: it is what orders writers in different processes (a standalone
 `intake` beside the daemon, a second node on the same database), which the gate cannot see. The

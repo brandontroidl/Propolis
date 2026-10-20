@@ -614,8 +614,8 @@
   extraction all call it. It is now two single passes that copy what they keep, held byte for
   byte to the old implementation over 30,000 generated texts. No behaviour change.
 - **A writer waiting for the append lock no longer holds a pooled connection** - every ledger
-  writer took its connection first and the Postgres advisory lock second, so with sixteen intake
-  tailers on a pool of the same size every waiting tailer was a connection doing nothing, and the
+  writer took its connection first and the Postgres advisory lock second, so with as many intake
+  tailers (one per sensor log) as the pool has connections (10 by default) every waiting tailer was a connection doing nothing, and the
   console, the review loops and the campaign indexer queued for one (`acquired_after_secs`
   3.256 on the live node). Writers in a process now queue on a fair in-process gate, one per
   database, before they ask the pool for anything, so only the writer at the head of the queue

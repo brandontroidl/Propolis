@@ -301,7 +301,8 @@ probe's wake-up lands on it, so a quiet probe does not prove that no step ever r
 
 The steps that run synchronously inside async tasks are timed by an example that needs no
 database and no network, on inputs at the limits the daemon enforces (a 1 MiB log line, an 8 MiB
-intake batch, a 16 MiB captured body, a 20,000-file spool):
+intake batch, a 16 MiB captured body, a 20,000-file spool, a 200-event evidence page with 64 KiB
+bodies, a 50,000-entry feed):
 
 ```text
 cargo run --release --example cpu_budget -p propolis
@@ -327,7 +328,7 @@ box that matters), the steps over 10 ms were:
 
 Everything else measured, including the ATT&CK tagger (bounded to 4 KiB of shell and 8 KiB of SQL
 per line, under 0.3 ms), indicator extraction at its 64 KiB cap, dropper URL extraction (2 ms at
-64 KiB), JSON parsing of a full batch (3 ms) and the upload type filter, stayed under 10 ms. The
+64 KiB), JSON parsing of a full batch (3 ms) and the upload type filter, stayed under 10 ms; the exceptions are the rows in the table above, console pages included. The
 captured-artifact scan (65-107 ms for a 16 MiB binary) already ran under `spawn_blocking`. A step
 moved "off the worker" runs under `core_scoring::off_worker`, which hands the rest of that
 worker's queue to another thread for the duration.

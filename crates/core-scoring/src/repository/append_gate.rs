@@ -3,9 +3,9 @@
 //! Every writer to the ledger holds the Postgres advisory lock `APPEND_LOCK_KEY` for its whole
 //! transaction. Taking it inside the transaction means a writer that has to wait is already
 //! holding a pooled connection while it waits, so N concurrent writers in one process pin N
-//! connections to do nothing, and every other user of the pool queues behind them: a sixteen-tailer
-//! daemon on a pool of the same size starved its own console and review loops of connections for
-//! 3.256 s at a time (`acquired_after_secs` in the daemon's pool warnings).
+//! connections to do nothing, and every other user of the pool queues behind them: a daemon with a
+//! tailer per sensor log, as many as its pool had connections, starved its own console and review
+//! loops of connections for 3.256 s at a time (`acquired_after_secs` in the daemon's pool warnings).
 //!
 //! This gate puts the wait in front of the connection instead. A writer takes the gate first, so
 //! within one process at most one writer per database holds a connection waiting on the advisory

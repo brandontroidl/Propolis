@@ -11,12 +11,15 @@
 //! Lag alone does not say WHY the process was slow to poll. Workers all inside synchronous code is
 //! one cause; the others freeze every thread of the process at once and read identically: CFS
 //! bandwidth throttling (the unit's `CPUQuota=`) and direct memory reclaim near `MemoryMax=`. So
-//! each report carries the cgroup's own counters over the same window (`cpu.stat` throttling,
-//! `memory.events`): throttle or reclaim deltas beside the lag name the cgroup, and a lag with
+//! each report carries the cgroup's own counters (`cpu.stat` throttling, `memory.events`) as
+//! growth since the last on-time wake-up that had nothing pending, so the delta starts at most one
+//! probe interval before the first stall it reports (a stall held back by the rate limit widens it
+//! to the report time). Throttle or reclaim deltas beside the lag name the cgroup, and a lag with
 //! zero deltas names the workers.
 //!
-//! The probe is deliberately small: one timer, two integer comparisons per wake-up, and a warning
-//! that is rate limited, so it cannot add load to the condition it reports. Nothing in it can
+//! The probe is deliberately small: one timer, two integer comparisons and three small cgroup
+//! file reads per wake-up, and a warning that is rate limited, so it cannot add load to the
+//! condition it reports. Nothing in it can
 //! panic on input, and it runs outside the supervisor: it is a measurement, not a subsystem, so its
 //! absence must never page and its failure must never restart anything.
 //!
@@ -96,6 +99,11 @@ impl LagReporter {
         Some(self.take())
     }
 
+    /// Whether a late wake-up is waiting for a report.
+    pub fn pending(&self) -> bool {
+        self.late > 0
+    }
+
     /// Hands out whatever is still held back, ignoring the window; for shutdown, so a stall inside
     /// the final window is not lost with the task.
     pub fn flush(&mut self) -> Option<LagReport> {
@@ -118,7 +126,8 @@ impl LagReporter {
 pub struct CgroupCounters {
     /// `cpu.stat` `nr_throttled`: periods in which the quota ran out.
     pub nr_throttled: u64,
-    /// `cpu.stat` `throttled_usec`: time all threads spent frozen by the quota.
+    /// `cpu.stat` `throttled_usec`: throttled time summed across CPUs, so it can exceed the
+    /// wall-clock time that passed; it is not the length of a freeze.
     pub throttled_usec: u64,
     /// `memory.events` `high`: times the cgroup was pushed into reclaim over `memory.high`.
     pub mem_high: u64,
@@ -186,13 +195,45 @@ fn kv(text: &str) -> impl Iterator<Item = (&str, u64)> {
     })
 }
 
-/// Runs until `cancel` fires, handing every report to `sink`. The production sink logs a warning;
-/// a test passes one that records.
+/// The cgroup counters' baseline: the last reading taken while the runtime was healthy, so a
+/// report's deltas cover the stall and not everything since the previous warning or daemon start
+/// (a CPUQuota throttle from hours earlier must not be blamed for a stall now).
+#[derive(Debug, Default)]
+pub struct CgroupWindow {
+    baseline: Option<CgroupCounters>,
+}
+
+impl CgroupWindow {
+    /// An on-time wake-up with nothing pending: restart the window here.
+    pub fn quiet(&mut self, now: Option<CgroupCounters>) {
+        if now.is_some() {
+            self.baseline = now;
+        }
+    }
+
+    /// Growth since the baseline, or `None` where the cgroup is unreadable or there was no
+    /// baseline. Moves the baseline to `now`.
+    pub fn report(&mut self, now: Option<CgroupCounters>) -> Option<CgroupCounters> {
+        let delta = match (now, self.baseline) {
+            (Some(n), Some(b)) => Some(n.since(b)),
+            _ => None,
+        };
+        if now.is_some() {
+            self.baseline = now;
+        }
+        delta
+    }
+}
+
+/// Runs until `cancel` fires, handing every report to `sink` and calling `quiet` after every
+/// wake-up that was on time with nothing pending. The production sink logs a warning and `quiet`
+/// refreshes the cgroup baseline; a test passes a recording sink.
 pub async fn run(
     interval: Duration,
     mut reporter: LagReporter,
     cancel: CancellationToken,
     mut sink: impl FnMut(LagReport) + Send,
+    mut quiet: impl FnMut() + Send,
 ) {
     loop {
         let started = Instant::now();
@@ -211,31 +252,27 @@ pub async fn run(
             .saturating_sub(interval);
         if let Some(report) = reporter.observe(lag, now) {
             sink(report);
+        } else if !reporter.pending() {
+            quiet();
         }
     }
 }
 
 /// The daemon's probe: [`PROBE_INTERVAL`], [`WARN_THRESHOLD`], [`WARN_EVERY`], reporting through
-/// the log with the runtime's own view of its load and the cgroup's throttle and reclaim deltas
-/// over the same window beside the lag.
+/// the log with the runtime's own view of its load and the cgroup's throttle and reclaim growth
+/// since the last healthy wake-up beside the lag.
 pub async fn run_in_daemon(cancel: CancellationToken) {
     let handle = tokio::runtime::Handle::current();
-    let mut previous = CgroupCounters::read_own();
+    let window = std::sync::Arc::new(std::sync::Mutex::new(CgroupWindow::default()));
+    window.lock().unwrap().quiet(CgroupCounters::read_own());
+    let on_quiet = window.clone();
     run(
         PROBE_INTERVAL,
         LagReporter::new(WARN_THRESHOLD, WARN_EVERY),
         cancel,
         move |report| {
             let metrics = handle.metrics();
-            // Delta since the previous report (or since start): the window the lag is from.
-            let now = CgroupCounters::read_own();
-            let delta = match (now, previous) {
-                (Some(n), Some(p)) => Some(n.since(p)),
-                _ => None,
-            };
-            if now.is_some() {
-                previous = now;
-            }
+            let delta = window.lock().unwrap().report(CgroupCounters::read_own());
             let d = delta.unwrap_or_default();
             tracing::warn!(
                 worst_lag_ms = report.worst_ms,
@@ -254,6 +291,7 @@ pub async fn run_in_daemon(cancel: CancellationToken) {
                  (cgroup_throttled_ms), or memory reclaim at MemoryMax (cgroup_mem_*)"
             );
         },
+        move || on_quiet.lock().unwrap().quiet(CgroupCounters::read_own()),
     )
     .await;
 }
@@ -324,6 +362,7 @@ mod tests {
                 LagReporter::new(Duration::from_millis(100), Duration::from_secs(60)),
                 cancel,
                 move |r| seen.lock().unwrap().push(r),
+                || {},
             )
         });
         // Let the probe start its first sleep, then hold the only worker from inside a task (the
@@ -362,6 +401,7 @@ mod tests {
                 LagReporter::new(Duration::from_millis(200), Duration::from_secs(60)),
                 cancel,
                 move |r| seen.lock().unwrap().push(r),
+                || {},
             )
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -378,6 +418,7 @@ mod tests {
             LagReporter::new(T, EVERY),
             cancel.clone(),
             |_| {},
+            || {},
         ));
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(2), probe)
@@ -428,6 +469,7 @@ mod tests {
                 LagReporter::new(Duration::from_millis(30), Duration::from_secs(60)),
                 cancel,
                 move |r| seen.lock().unwrap().push(r),
+                || {},
             )
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -447,6 +489,73 @@ mod tests {
             reports.len() >= 2 && total >= 2,
             "second stall lost: {reports:?}"
         );
+    }
+
+    fn throttled(n: u64, usec: u64) -> Option<CgroupCounters> {
+        Some(CgroupCounters {
+            nr_throttled: n,
+            throttled_usec: usec,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn cgroup_deltas_start_at_the_last_quiet_reading_not_the_last_report() {
+        let mut w = CgroupWindow::default();
+        w.quiet(throttled(0, 0));
+        // Hours of throttling happen while the runtime is healthy, then a stall with none.
+        w.quiet(throttled(500, 9_000_000));
+        let d = w.report(throttled(500, 9_000_000)).expect("visible");
+        assert_eq!((d.nr_throttled, d.throttled_usec), (0, 0), "{d:?}");
+        // The report moves the baseline: the next one starts there.
+        let d = w.report(throttled(503, 9_100_000)).expect("visible");
+        assert_eq!((d.nr_throttled, d.throttled_usec), (3, 100_000));
+    }
+
+    #[test]
+    fn cgroup_window_without_a_baseline_or_reading_reports_nothing() {
+        let mut w = CgroupWindow::default();
+        assert_eq!(w.report(throttled(1, 1)), None);
+        let mut w = CgroupWindow::default();
+        w.quiet(None);
+        assert_eq!(w.report(None), None);
+        w.quiet(throttled(2, 2));
+        // An unreadable cgroup keeps the old baseline rather than losing it.
+        assert_eq!(w.report(None), None);
+        assert_eq!(w.report(throttled(3, 5)).map(|d| d.nr_throttled), Some(1));
+    }
+
+    #[tokio::test]
+    async fn quiet_fires_on_on_time_wakeups_and_not_while_a_stall_is_pending() {
+        let quiet = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cancel = CancellationToken::new();
+        let probe = tokio::spawn({
+            let (quiet, cancel) = (quiet.clone(), cancel.clone());
+            run(
+                Duration::from_millis(10),
+                LagReporter::new(Duration::from_millis(30), Duration::from_secs(60)),
+                cancel,
+                |_| {},
+                move || {
+                    quiet.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = quiet.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(before >= 3, "on-time wake-ups must refresh: {before}");
+        // First stall reports at once (nothing pending afterwards), the second is held inside the
+        // 60 s window and stays pending, so no further refresh may happen.
+        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let held = quiet.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = quiet.load(std::sync::atomic::Ordering::Relaxed);
+        cancel.cancel();
+        probe.await.unwrap();
+        assert_eq!(after, held, "the baseline moved while a stall was pending");
     }
 
     const CPU: &str = "usage_usec 9\nuser_usec 5\nsystem_usec 4\nnr_periods 100\n\

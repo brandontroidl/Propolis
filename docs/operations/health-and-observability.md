@@ -272,7 +272,9 @@ idle. The daemon therefore runs a small probe (`crates/propolis/src/runtime_lag.
 it logs one WARN, at most one per 10 s. A stall that lands inside the 10 s window is held back and
 logged by the first wake-up after the window (or at shutdown), so the line carries the worst lag
 since the last line and how many wake-ups were late. It also carries the runtime's worker count and
-queued-task depth, and the process cgroup's growth over the same window:
+queued-task depth, and the process cgroup's growth since the last on-time wake-up that had nothing
+pending (so the deltas begin at most one 100 ms interval before the first stall the line reports; a
+stall held back by the 10 s limit widens the window to the moment of the report):
 
 ```text
 WARN runtime: the async runtime was slow to poll a ready task; ...  worst_lag_ms=1840 late_wakeups=7
@@ -286,11 +288,11 @@ and look the same to the probe:
 | Lag with | Cause | Fix |
 |---|---|---|
 | all `cgroup_*` deltas zero | workers held in synchronous code (or a host-level stall) | move the step off the workers (`cpu_budget` below) |
-| `cgroup_nr_throttled` / `cgroup_throttled_ms` above zero | the unit's `CPUQuota=` ran out; every thread was frozen, whatever it was doing | raise `CPUQuota=` or cut the load; moving work to another thread does not help |
+| `cgroup_nr_throttled` / `cgroup_throttled_ms` above zero | the unit's `CPUQuota=` ran out; every thread was frozen, whatever it was doing (`cgroup_throttled_ms` is throttled time summed across CPUs, so it can exceed the lag; it is not the length of the freeze) | raise `CPUQuota=` or cut the load; moving work to another thread does not help |
 | `cgroup_mem_max` / `cgroup_mem_high` above zero | direct reclaim at `MemoryMax=` | raise `MemoryMax=` or cut memory use |
 
 `cgroup_visible=false` means the process is not under a readable cgroup v2 hierarchy, so the
-deltas are not available and read zero. Slow statements **with** this warning in the same window
+deltas are not available and read zero. Slow statements logged around the time of this warning
 are the process, not the database; slow statements **without** it point at the database (check
 `log_min_duration_statement`, `log_lock_waits` and `log_checkpoints` on the server). The probe is a
 measurement, not a subsystem: it is not in `/ready` or the monitor's subsystem conditions, and its

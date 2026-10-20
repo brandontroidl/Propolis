@@ -38,10 +38,10 @@
 - **A runtime scheduling-lag probe, and a harness that times the steps behind it** - the daemon
   now sleeps 100 ms at a time and logs one WARN (at most one per 10 s) when it was polled more
   than 250 ms late, with the worst lag, the late wake-up count, the worker count, the queued
-  task depth and the process cgroup's CPU-throttle and memory-reclaim growth over the same window
+  task depth and the process cgroup's CPU-throttle and memory-reclaim growth since the last healthy wake-up
   (a `CPUQuota=` or `MemoryMax=` stall looks identical to a blocked worker without them). A stall
   inside the 10 s window is held and reported by the next wake-up after it, or at shutdown. Slow
-  statements with that warning in the same window are the process, not the database; without it
+  statements logged around that warning are the process, not the database; without it
   they point at the database. It is not a supervised subsystem, so it never pages or restarts
   anything. `cargo run --release --example cpu_budget -p propolis` times the
   synchronous steps the daemon runs on async workers on inputs at the limits it enforces (a 1 MiB

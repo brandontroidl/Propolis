@@ -436,7 +436,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         tokio::time::sleep(Duration::from_millis(30)).await;
         std::thread::sleep(Duration::from_millis(150));
-        tokio::task::yield_now().await;
+        // Long enough for the probe's timer to fire and be observed first: its select is unbiased,
+        // so cancelling at once could win the race and skip the stall this test is about.
+        tokio::time::sleep(Duration::from_millis(15)).await;
         cancel.cancel();
         probe.await.unwrap();
         let reports = seen.lock().unwrap();

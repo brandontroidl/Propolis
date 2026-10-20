@@ -116,7 +116,7 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4633 test functions** (2857 unit + 1776 integration).
+- **Total: 4651 test functions** (2869 unit + 1782 integration).
 - **DB-backed (`sqlx::test`): 426** - console 219, review 106, core-scoring 44,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -150,7 +150,7 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 168 | 243 | auth_test, campaigns_test, ledger_count_test, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, server_test, timeline_test |
+| console | 170 | 243 | auth_test, campaigns_test, ledger_count_test, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, server_test, timeline_test |
 | core-scoring | 80 | 38 | batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 35 | 66 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
@@ -159,17 +159,17 @@ Per-crate breakdown:
 | intake | 29 | 49 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine, sensor_stats, shell_reply |
 | log-format | 0 | 15 | format, no_stock_fmt, process |
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
-| propolis | 177 | 38 | capture_to_console, coverage, docs_agreement, logging, production_features, restore_rehearsal, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| propolis | 177 | 41 | capture_to_console, coverage, docs_agreement, logging, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
 | provision-certs | 0 | 16 | provision |
-| review | 224 | 113 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
+| review | 226 | 113 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 41 | arrival, env_strict, integration, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1473 | 280 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1481 | 280 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
-| sensor-mqtt | 64 | 62 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
+| sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
 | sensor-redis | 97 | 46 | arrival, env_strict, integration, memory_bound, parse_cost, tls |
 | sensor-smtp | 18 | 52 | arrival, env_strict, integration, memory_bounds, tls |
 | sensor-ssh | 90 | 166 | arrival, auth_test, capture_heap_test, capture_limit, crypto_test, env_strict, group14_throttle, integration, kex_negotiation, memory_budget_test, openssh_interop, output_backpressure, session_memory_limit, shell_test, shutdown_tracking, transport_test |
@@ -178,7 +178,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 28 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **2857** | **1776** | |
+| **Total** | **2869** | **1782** | |
 
 ### Test styles by layer
 

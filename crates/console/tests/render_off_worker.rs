@@ -10,9 +10,12 @@
 //! The events carry session ids (20 sessions of 10 events), as sensor traffic does: without them
 //! the session-tag lookup returns before its first await and everything after the row build is
 //! already off the worker whatever the handler does, so the fold and the render would go
-//! unguarded. Each test pins the sites its request reaches (`core_scoring::off_worker` in
-//! `routes/detail.rs` and `routes/feed.rs`): inlining any one of them fails exactly the test that
-//! requests it.
+//! unguarded. The tests pin the `core_scoring::off_worker` sites that can hold a worker past the
+//! 100 ms bound: the evidence row build and both detail renders in `routes/detail.rs`, and the two
+//! feed reads in `routes/feed.rs`; inlining one of those fails the test that requests it. The
+//! group and fold steps in `routes/detail.rs` stay under 100 ms even on the worst page, and the
+//! feed page render runs after the Entries read has already left the worker, so those sites are
+//! deliberately not guarded here.
 //!
 //! Each test serves the request on a runtime with ONE worker and watches a ticker task on it: a
 //! handler that keeps the worker for its CPU work freezes the ticker for that long, one that hands

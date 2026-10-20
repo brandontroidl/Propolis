@@ -237,7 +237,10 @@ pub async fn run(
 ) {
     loop {
         let started = Instant::now();
+        // Biased toward the timer: when a late wake-up and the shutdown are both ready, the
+        // wake-up is observed first, so a stall at shutdown still reaches the flush.
         tokio::select! {
+            biased;
             _ = tokio::time::sleep(interval) => {}
             _ = cancel.cancelled() => {
                 if let Some(report) = reporter.flush() {
@@ -505,11 +508,12 @@ mod tests {
         w.quiet(throttled(0, 0));
         // Hours of throttling happen while the runtime is healthy, then a stall with none.
         w.quiet(throttled(500, 9_000_000));
-        let d = w.report(throttled(500, 9_000_000)).expect("visible");
-        assert_eq!((d.nr_throttled, d.throttled_usec), (0, 0), "{d:?}");
-        // The report moves the baseline: the next one starts there.
+        // The stall itself saw one throttled period; the hours before it are not counted.
+        let d = w.report(throttled(501, 9_050_000)).expect("visible");
+        assert_eq!((d.nr_throttled, d.throttled_usec), (1, 50_000), "{d:?}");
+        // The report moves the baseline: the next one starts there, not at the quiet reading.
         let d = w.report(throttled(503, 9_100_000)).expect("visible");
-        assert_eq!((d.nr_throttled, d.throttled_usec), (3, 100_000));
+        assert_eq!((d.nr_throttled, d.throttled_usec), (2, 50_000));
     }
 
     #[test]

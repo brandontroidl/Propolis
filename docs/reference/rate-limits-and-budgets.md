@@ -103,6 +103,31 @@ The per-connection cap of 256 command events
 budget is what a source spreading its commands over many sessions meets. A zero or non-numeric
 rate or burst aborts startup; no value turns the budget off.
 
+## Cred connection and login event budget (vnc, mysql, mssql, postgresql, mongodb)
+
+Bounds how many `honeypot_connection` and `honeypot_login_attempt` events one source writes per
+window, not what the listener does: every probe is answered the same, and the events over the
+budget are counted into one summary per address per window
+(`crates/sensor-framework/src/source_flood.rs#SourceEventGate`). Behavior and the cost of the
+budget are owned by
+[sensor-behavior.md](sensor-behavior.md#connection-and-login-event-budget-cred); the summary's
+keys by [events-and-signals.md](events-and-signals.md#connection-and-login-summary-keys). Each
+kind (connection, login) has its own count against each limit.
+
+| Item | Value | Source |
+|---|---|---|
+| Per source address | 10 of each kind per window *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#DEFAULT_ADDRESS_BUDGET` |
+| Per source network | 40 of each kind per window; IPv4 /24, IPv6 /56 *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#DEFAULT_NETWORK_BUDGET`, `crates/sensor-framework/src/rate_limit.rs#SourceKey` |
+| Per listener | 200 of each kind per window *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#DEFAULT_TOTAL_BUDGET` |
+| Window | 600 s, tumbling for the listener, checked every second *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#SOURCE_EVENT_WINDOW` |
+| Addresses tracked | 1024 per window, then one overflow summary *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_CAPACITY` |
+| Per summary | 8 client versions, 8 usernames, 32 sessions *(hard-coded)* | `crates/sensor-framework/src/source_flood.rs#MAX_SUMMARY_VALUES`, `crates/sensor-framework/src/command_flood.rs#MAX_SUMMARY_SESSIONS` |
+| Worst case written per window | 2 x 200 verbatim plus at most 1025 summaries | derived from the rows above |
+| Shutdown flush | open windows written within 5 s per listener *(hard-coded)* | `crates/sensor-cred/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT` |
+
+postgresql's query events are charged to the shell command-event budget above with its defaults.
+There is no variable for either budget.
+
 ## VirusTotal daily cap
 
 Enforced by a single `DailyBudget` owned across every scan cycle

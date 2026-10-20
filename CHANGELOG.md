@@ -7,7 +7,9 @@
 - **Upgrade intake before the sensors** when they run on different hosts (a split deployment). An
   intake that predates the shell reply field ignores it, so a reply a newer sensor records in the
   meantime is dropped: the event is ingested without it and the console shows none for that
-  command. The hash chain is unaffected. See
+  command. The same order applies to the cred sensor's connection and login summaries: an intake
+  that predates them scores one as a single event, so a flooder's volume count is low until intake
+  is upgraded. The hash chain is unaffected. See
   [split deployment](docs/operations/split-deployment.md#upgrading) and
   [upgrade](docs/operations/upgrade-rollback-and-dr.md#upgrade-the-intake-side-before-the-sensors).
 - **Move the public-feed cron to `propolis-blocklist`** if you publish the feed. The upgrade
@@ -50,6 +52,29 @@
   worker. The console's evidence page and feed Entries tab, 225 ms and 165 ms in the worst case,
   now run off the async workers. See
   [runtime scheduling lag](docs/operations/health-and-observability.md#runtime-scheduling-lag).
+- **Per-source budget for the cred sensor's connection and login events** - the VNC listener
+  wrote about 10,000 lines an hour for 42 hours (392,838 events from 1,629 addresses) and filled
+  the log volume; a VNC attempt is a DES challenge-response, so each carried little beyond its
+  source. Every cred listener (vnc, mysql, mssql, postgresql, mongodb) now writes at most 10
+  `honeypot_connection` and 10 `honeypot_login_attempt` events per source address per 10 minute
+  window, 40 of each per source network (/24 or /56) and 200 of each per listener
+  (`SourceEventGate` in `sensor_framework::source_flood`, attached to the listener's
+  `EventEmitter`). The rest is counted into one event per address per window marked
+  `event_summary: true` (a `honeypot_login_attempt` when an attempt was folded, else a
+  `honeypot_connection`) with `suppressed_count`, `suppressed_connections`, `suppressed_attempts`,
+  up to 8 distinct `client_versions` and `usernames`, `first_seen`, `last_seen` and
+  `session_count`, written when the window ends and at shutdown. Past the budget an address's
+  individual events and the usernames beyond the first 8 per window are not kept; passwords never
+  were. Scoring counts a summary as the events it replaces in `event_count` and
+  `established_event_count` (weight is one sighting), so the volume-list threshold arrives as
+  before: `core_scoring::scoring::engine::represented_events`, with a differential test against
+  the unbounded stream. The console timeline reads "N events summarized". The VNC
+  `honeypot_login_attempt` now carries `client_version`. postgresql's query events go through the
+  shell sensors' command-event budget (defaults), which closes its missing command-event limit.
+  No new variable. See
+  [sensor-behavior](docs/reference/sensor-behavior.md#connection-and-login-event-budget-cred),
+  [events-and-signals](docs/reference/events-and-signals.md#connection-and-login-summary-keys) and
+  [rate limits](docs/reference/rate-limits-and-budgets.md#cred-connection-and-login-event-budget-vnc-mysql-mssql-postgresql-mongodb).
 - **The upgrade pull is checked before it is built as root** - `upgrade.sh` did a plain
   `git pull`, so whatever the remote served, or whatever had been edited or committed on the
   box, was built and installed. It now refuses a dirty checkout (naming the files), a remote

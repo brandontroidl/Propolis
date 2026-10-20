@@ -1924,7 +1924,7 @@ per-protocol bind var is required.
 
 | Protocol | Impersonates (conventional port) | Capture behavior |
 |---|---|---|
-| **vnc** (`vnc.rs`) | RFB 3.8, VNC Auth type 2 (5900) | Sends a 16-byte random challenge, reads the DES response; the attempt is the signal (plaintext unrecoverable) → `honeypot_login_attempt` with no username (`crates/sensor-cred/src/vnc.rs#handle_connection`). |
+| **vnc** (`vnc.rs`) | RFB 3.8, VNC Auth type 2 (5900) | Sends a 16-byte random challenge, reads the DES response; the attempt is the signal (plaintext unrecoverable) → `honeypot_login_attempt` with no username and the client's RFB version as `client_version` (`crates/sensor-cred/src/vnc.rs#handle_connection`). |
 | **mysql** (`mysql.rs`) | MySQL 5.7.42 (3306) | Sends a greeting with per-connection random thread id + 20-byte scramble, parses the username from HandshakeResponse41, drops the password → login event (`crates/sensor-cred/src/mysql.rs#handle_connection`, `crates/sensor-cred/src/mysql.rs#build_greeting`). |
 | **mssql** (`mssql.rs`) | SQL Server 2019 (15.0.16.57) TDS (1433) | PreLogin/Login7; parses the UTF-16LE username from Login7, sends LOGINACK (`crates/sensor-cred/src/mssql.rs#handle_connection`, `crates/sensor-cred/src/mssql.rs#parse_login7_username`, `crates/sensor-cred/src/mssql.rs#build_loginack`). |
 | **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (a GSSENCRequest is declined with `N`; an SSLRequest is declined with `N`, or accepted with `S` when TLS is configured, see below), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. Extended protocol: Parse records the SQL and answers ParseComplete; Bind, Describe (ParameterDescription then NoData for a statement, NoData for a portal) and Close get their completions; Execute is refused with 42501 and everything after it, a simple Query included, is discarded until Sync. |
@@ -1932,7 +1932,51 @@ per-protocol bind var is required.
 
 - Every cred protocol emits `honeypot_connection` + `honeypot_login_attempt`
   (authenticated=true). Username sanitized cap 255. **No spool**; passwords, DES
-  responses, and MD5 responses are never stored.
+  responses, and MD5 responses are never stored. What one source may write of them is bounded,
+  next.
+
+#### Connection and login event budget (cred)
+
+A VNC attempt is a DES challenge-response, so each carries little beyond its source, its client
+version and the count, and a scanner fleet sends them without end: one listener wrote about 10,000
+lines an hour for 42 hours (392,838 events from 1,629 addresses, 60% connections and 40% logins)
+and filled the log volume. Each listener's emitter now holds a `SourceEventGate`
+(`crates/sensor-framework/src/source_flood.rs#SourceEventGate`, attached in
+`crates/sensor-cred/src/lib.rs#start_listener`), so vnc, mysql, mssql, postgresql and mongodb are
+all covered by the one path every handler writes through.
+
+- **Budget.** Per 10 minute window, tumbling for the whole listener, each source address may write
+  10 `honeypot_connection` and 10 `honeypot_login_attempt` events, each source network (/24, /56)
+  40 of each, and the listener 200 of each. An event is written while all three are under budget.
+  The live flood's heaviest address sent about 70 of each per window, so it now costs 20 lines
+  and one summary, about 126 lines an hour at worst, instead of 840; an address under the budget is
+  untouched. Replies are unchanged: only logging is bounded.
+- **Summary.** Past a budget the event is not written. When the window ends, each address with
+  anything folded gets one event marked `event_summary: true` with the counts of connections and
+  attempts, the distinct client versions and usernames (a bounded sample), the sessions and the
+  first and last time ([keys](events-and-signals.md#connection-and-login-summary-keys)). It is
+  written within about a second of the window's end and, for the window in progress, at shutdown
+  (`crates/sensor-cred/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, 5 s per listener). A crash loses the
+  open window's counts.
+- **What the budget costs.** Past the first 10 of each kind, an address's individual events and
+  their timestamps are gone; the counts, the first and last time and a sample of distinct
+  usernames and client versions remain. For mysql, mssql, postgresql and mongodb that means a
+  flooder's usernames past the first 8 distinct per window are not recorded; for VNC nothing else
+  was recorded to begin with. Passwords were never stored.
+- **Bounded memory.** 1024 addresses per window; one more arrives and it joins one `overflow`
+  summary (`source_prefix: "overflow"`, `source_ip` the first of them), which scoring attributes
+  to that one address.
+- **Scoring.** The summary counts as the events it replaces in `event_count` and
+  `established_event_count`, with one sighting of weight
+  ([events-and-signals.md](events-and-signals.md#connection-and-login-summary-keys)).
+- **Command events (postgresql).** The query loop's `honeypot_command_exec` events go through the
+  shell sensors' command-event budget (`CommandEventGate`, defaults: 12 a minute per network, burst
+  200, a `command_summary` event per window; see
+  [command-event budget](#command-event-budget-ssh-telnet-adb)). A session still ends at 200
+  statements, so the budget is what a source spreading queries over many sessions meets. mongodb
+  and the other protocols emit no command events.
+- **Not configurable.** The values are constants in `source_flood.rs`; no variable turns the
+  budget off.
 - **Bind failures:** a protocol whose bind the OS refuses is logged and skipped; the others keep
   running, and the sensor exits 1 only when every configured protocol failed to bind
   (`crates/sensor-cred/src/main.rs#main`). The five are independent traps, and TLS adds no

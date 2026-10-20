@@ -7,17 +7,57 @@
 //! right independently.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use sensor_wire::SensorEvent;
 use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
+
+use crate::command_flood::{Admission, CommandEventGate, summarizable};
+use crate::source_flood::{SourceAdmission, SourceEventGate};
 
 pub struct EventEmitter {
     log_path: PathBuf,
+    source_gate: Option<Arc<SourceEventGate>>,
+    command_gate: Option<Arc<CommandEventGate>>,
 }
 
 impl EventEmitter {
     pub fn new(log_path: PathBuf) -> Self {
-        Self { log_path }
+        Self {
+            log_path,
+            source_gate: None,
+            command_gate: None,
+        }
+    }
+
+    /// Bound the connection and login events this emitter writes per source (see
+    /// [`SourceEventGate`]); the rest are folded into summaries the gate's writer emits.
+    #[must_use]
+    pub fn with_source_gate(mut self, gate: Arc<SourceEventGate>) -> Self {
+        self.source_gate = Some(gate);
+        self
+    }
+
+    /// Bound the plain command events this emitter writes per source network (see
+    /// [`CommandEventGate`]) for a sensor whose handlers emit them directly rather than through
+    /// the shell's `ConnectionBudget`.
+    #[must_use]
+    pub fn with_command_gate(mut self, gate: Arc<CommandEventGate>) -> Self {
+        self.command_gate = Some(gate);
+        self
+    }
+
+    /// Whether a gate folded `event` into a summary instead of letting it be written.
+    fn suppressed(&self, event: &SensorEvent) -> bool {
+        if let Some(gate) = &self.source_gate
+            && gate.admit(event) == SourceAdmission::Summarized
+        {
+            return true;
+        }
+        self.command_gate.as_ref().is_some_and(|gate| {
+            summarizable(event) && gate.admit_at(event, Instant::now()) == Admission::Summarized
+        })
     }
 
     /// Serialize `event` and append it as one NDJSON line.
@@ -45,7 +85,14 @@ impl EventEmitter {
     ///
     /// The same chokepoint stamps `metadata.local_port` from the listener the calling task is
     /// serving (see [`crate::arrival`]), so no sensor builds that key itself either.
+    ///
+    /// With a gate attached, an event over its source's budget is not written: it is counted into
+    /// a summary and `append` returns `Ok` with an id that names no line. Only connection, login
+    /// and plain command events are ever gated, and none of their callers use the id.
     pub async fn append(&self, event: &SensorEvent) -> std::io::Result<uuid::Uuid> {
+        if self.suppressed(event) {
+            return Ok(event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7));
+        }
         let occurrence_id = event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7);
         let arrival = crate::arrival::current();
 

@@ -30,13 +30,14 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let wan_resolver = Arc::new(WanResolver::new(HashMap::new()));
-        let (addr, handle) = sensor_cred::start_listener(
+        let (addr, handle, _flush) = sensor_cred::start_listener(
             "127.0.0.1:0".parse().unwrap(),
             log_path.clone(),
             wan_resolver,
             test_bounds(),
             protocol,
             None,
+            sensor_framework::SourceEventConfig::default(),
         )
         .await
         .unwrap();

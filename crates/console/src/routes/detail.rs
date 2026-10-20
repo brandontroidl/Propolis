@@ -1609,11 +1609,27 @@ pub(crate) fn signal_type_snake(signal_type: SignalType) -> String {
     })
 }
 
+/// The events a connection or login summary stands for (`event_summary: true`,
+/// `suppressed_count`), `None` for an ordinary event.
+fn summary_events(metadata: &serde_json::Value) -> Option<u64> {
+    (metadata.get("event_summary") == Some(&serde_json::Value::Bool(true)))
+        .then(|| metadata.get("suppressed_count")?.as_u64())
+        .flatten()
+}
+
 /// Signal-type-dependent extraction of the single most useful `metadata` field for the evidence
 /// timeline's "Detail" column - `internal/design/11-console-forensics.md`'s "Detail column
 /// extraction by signal type" table. `pub(crate)` because `routes::search` (console-forensics
 /// task 5) reuses it verbatim for the same column in event search results.
 pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) -> String {
+    // A sensor's per-source summary stands for the events its budget kept out of the log.
+    if matches!(
+        signal_type,
+        "honeypot_login_attempt" | "honeypot_connection"
+    ) && let Some(n) = summary_events(metadata)
+    {
+        return format!("{n} events summarized");
+    }
     match signal_type {
         // Prefer the de-obfuscated command when the sensor recovered one (an XOR-encoded probe), so
         // the timeline reads `enable` rather than `lghkel`; the raw form stays in the raw expander.
@@ -1975,6 +1991,20 @@ mod tests {
         let metadata = json!({ "username": "root" });
         assert_eq!(
             extract_detail("honeypot_login_attempt", &metadata),
+            "user: root"
+        );
+    }
+
+    #[test]
+    fn extract_detail_names_the_events_a_summary_stands_for() {
+        let summary = json!({ "event_summary": true, "suppressed_count": 580u64 });
+        for signal in ["honeypot_login_attempt", "honeypot_connection"] {
+            assert_eq!(extract_detail(signal, &summary), "580 events summarized");
+        }
+        // Without the marker the count means nothing here.
+        let plain = json!({ "suppressed_count": 580u64, "username": "root" });
+        assert_eq!(
+            extract_detail("honeypot_login_attempt", &plain),
             "user: root"
         );
     }

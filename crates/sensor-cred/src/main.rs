@@ -3,7 +3,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sensor_framework::{ConnectionBounds, Env, EnvError, WanResolver, shutdown_signal};
+use sensor_framework::{
+    ConnectionBounds, Env, EnvError, SourceEventConfig, WanResolver, shutdown_signal,
+};
 
 const ENV_WAN_MAP: &str = "PROPOLIS_CRED_WAN_MAP";
 const ENV_LOG_DIR: &str = "PROPOLIS_CRED_LOG_DIR";
@@ -24,6 +26,9 @@ const BIND_VARS: [(&str, &str); 5] = [
 ];
 /// The protocols `start_listener` hands the TLS config to; vnc ignores it.
 const TLS_CAPABLE: [&str; 4] = ["postgresql", "mysql", "mssql", "mongodb"];
+
+/// How long shutdown waits for one listener to write its open summaries.
+const SHUTDOWN_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const DEFAULT_LOG_DIR: &str = "/var/log/propolis/cred";
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
@@ -167,6 +172,7 @@ async fn main() {
     // Unlike sensors whose TLS adds a listener, a bind failure here skips that one protocol: the
     // five are independent traps and TLS adds no listener whose loss could hide behind the others.
     let mut handles = Vec::new();
+    let mut flushes = Vec::new();
     for pc in &config.ports {
         let log_path = config.log_dir.join(format!("{}.jsonl", pc.protocol));
         match sensor_cred::start_listener(
@@ -176,12 +182,14 @@ async fn main() {
             config.bounds.clone(),
             pc.protocol,
             tls.clone(),
+            SourceEventConfig::default(),
         )
         .await
         {
-            Ok((bound, handle)) => {
+            Ok((bound, handle, flush)) => {
                 tracing::info!(protocol = pc.protocol, local = %bound, "sensor-cred: listening");
                 handles.push(handle);
+                flushes.push((pc.protocol, flush));
             }
             Err(e) => {
                 let e = sensor_framework::listener_start_error(pc.bind, e);
@@ -201,6 +209,19 @@ async fn main() {
     tracing::info!("sensor-cred: shutdown signal received; stopping");
     for handle in handles {
         handle.abort();
+    }
+    // The listeners are stopped, so no event reaches a gate: write the summaries of the windows
+    // still open, bounded by each gate's address table and by this timeout.
+    for (protocol, flush) in &flushes {
+        if tokio::time::timeout(SHUTDOWN_FLUSH_TIMEOUT, flush.flush())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                protocol,
+                "sensor-cred: event summaries not all written before shutdown"
+            );
+        }
     }
 }
 

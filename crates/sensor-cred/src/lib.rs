@@ -9,9 +9,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sensor_framework::command_flood::with_writers;
 use sensor_framework::{
-    ConnectionBounds, EventEmitter, MaybeTlsStream, TlsConfigError, TlsServer, WanResolver,
-    load_server_config, run_tcp_listener, server_config_from_pem,
+    Arrival, CommandEventConfig, CommandEventGate, ConnectionBounds, EventEmitter, MaybeTlsStream,
+    SourceEventConfig, SourceEventGate, TlsConfigError, TlsServer, WanResolver, load_server_config,
+    run_tcp_listener, server_config_from_pem,
 };
 use sensor_wire::SensorEvent;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -52,9 +54,34 @@ impl CredTls {
     }
 }
 
+/// What a listener still owes the log when it stops: the connection and login summaries of the
+/// window in progress and, for postgresql, the command summaries. The listener's own summary
+/// writer only writes a window once it has ended, so a shutdown that skipped this would lose up to
+/// one window of counts.
+pub struct SummaryFlush {
+    source: Arc<SourceEventGate>,
+    commands: Arc<CommandEventGate>,
+    emitter: Arc<EventEmitter>,
+    arrival: Arrival,
+}
+
+impl SummaryFlush {
+    /// Write every summary still accumulating. Call once the listener has been aborted.
+    pub async fn flush(&self) {
+        self.source.flush(&self.emitter, self.arrival).await;
+        self.commands.flush(&self.emitter, self.arrival).await;
+    }
+}
+
 /// One protocol's listener on its plaintext port. With `tls` set, postgresql (SSLRequest), mysql
 /// (CLIENT_SSL) and mssql (PRELOGIN ENCRYPTION) negotiate TLS in-band and mongodb accepts a TLS
 /// ClientHello on the same port; vnc ignores it. `None` is the plaintext-only behavior.
+///
+/// Every protocol's connection and login events are bounded per source by `flood`
+/// ([`SourceEventGate`]) and its plain command events (postgresql's queries) by the default
+/// command-event budget, both through the emitter every handler writes to. The returned handle
+/// also owns the writer tasks that emit the summaries of each ended window; [`SummaryFlush`]
+/// writes the window in progress at shutdown.
 pub async fn start_listener(
     addr: SocketAddr,
     log_path: PathBuf,
@@ -62,9 +89,42 @@ pub async fn start_listener(
     bounds: ConnectionBounds,
     protocol: &'static str,
     tls: Option<CredTls>,
-) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
-    let emitter = Arc::new(EventEmitter::new(log_path));
+    flood: SourceEventConfig,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>, SummaryFlush)> {
+    let source = Arc::new(SourceEventGate::new(flood));
+    let commands = Arc::new(CommandEventGate::new(CommandEventConfig::default()));
+    let emitter = Arc::new(
+        EventEmitter::new(log_path)
+            .with_source_gate(source.clone())
+            .with_command_gate(commands.clone()),
+    );
+    let (bound, handle) =
+        start_protocol(addr, bounds, protocol, tls, emitter.clone(), wan_resolver).await?;
+    let arrival = Arrival::new(bound.port());
+    let writers = vec![
+        source.spawn_writer(emitter.clone(), arrival),
+        commands.spawn_writer(emitter.clone(), arrival),
+    ];
+    Ok((
+        bound,
+        with_writers(handle, writers),
+        SummaryFlush {
+            source,
+            commands,
+            emitter,
+            arrival,
+        },
+    ))
+}
 
+async fn start_protocol(
+    addr: SocketAddr,
+    bounds: ConnectionBounds,
+    protocol: &'static str,
+    tls: Option<CredTls>,
+    emitter: Arc<EventEmitter>,
+    wan_resolver: Arc<WanResolver>,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
     match protocol {
         "vnc" => {
             start_with(

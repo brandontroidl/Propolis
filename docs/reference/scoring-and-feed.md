@@ -154,7 +154,11 @@ Derived in `derive_projection`, the single source of truth shared by
 The volume path is independent of confirmed-real and score. It counts ONLY
 `established_event_count` (completed-TCP events: `prev + (protocol == Tcp)`,
 `crates/core-scoring/src/scoring/engine.rs#apply_event`), so a spoofed UDP/ICMP flood cannot volume-list an innocent
-third party. Vendor reporting always gates on `recommended_for_vendor`
+third party. A cred sensor's connection or login summary (`event_summary: true`) counts as the
+`suppressed_count` events it replaces, in both `event_count` and `established_event_count`, so a
+flooder whose events a per-source budget kept out of the log reaches the threshold as before
+(`crates/core-scoring/src/scoring/engine.rs#represented_events`;
+[keys](events-and-signals.md#connection-and-login-summary-keys)). Vendor reporting always gates on `recommended_for_vendor`
 (confirmed-real), so a bare flood is blocked locally but never reported upstream
 (`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
 

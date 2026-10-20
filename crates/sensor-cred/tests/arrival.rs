@@ -41,13 +41,14 @@ async fn each_protocol_listener_stamps_its_own_port() {
     let mut ports = HashMap::new();
     let mut handles = Vec::new();
     for protocol in PROTOCOLS {
-        let (addr, handle) = sensor_cred::start_listener(
+        let (addr, handle, _flush) = sensor_cred::start_listener(
             "127.0.0.1:0".parse().unwrap(),
             log.clone(),
             wan.clone(),
             bounds(),
             protocol,
             None,
+            sensor_framework::SourceEventConfig::default(),
         )
         .await
         .unwrap();

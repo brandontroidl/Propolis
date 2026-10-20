@@ -617,7 +617,12 @@ impl CommandEventGate {
 /// One handle for a listener and the summary writer that serves it: aborting it, or the listener
 /// ending, stops both.
 pub fn with_writer(listener: JoinHandle<()>, writer: JoinHandle<()>) -> JoinHandle<()> {
-    struct AbortOnDrop([tokio::task::AbortHandle; 2]);
+    with_writers(listener, vec![writer])
+}
+
+/// [`with_writer`] for a listener served by several summary writers.
+pub fn with_writers(listener: JoinHandle<()>, writers: Vec<JoinHandle<()>>) -> JoinHandle<()> {
+    struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
             for handle in &self.0 {
@@ -625,7 +630,11 @@ pub fn with_writer(listener: JoinHandle<()>, writer: JoinHandle<()>) -> JoinHand
             }
         }
     }
-    let guard = AbortOnDrop([listener.abort_handle(), writer.abort_handle()]);
+    let guard = AbortOnDrop(
+        std::iter::once(listener.abort_handle())
+            .chain(writers.iter().map(JoinHandle::abort_handle))
+            .collect(),
+    );
     tokio::spawn(async move {
         let _guard = guard;
         let _ = listener.await;

@@ -328,6 +328,45 @@ observed loop that is roughly 60 established events a minute instead of about 45
 the 1000-event threshold in about a quarter of an hour instead of a few minutes [inferred:
 arithmetic from the observed loop, not a measured scoring run].
 
+#### Connection and login summary keys
+
+A cred-sensor connection or login event over its source's budget is not written; it is counted
+into one summary per source address per 10 minute window, marked `event_summary: true`
+(`crates/sensor-framework/src/source_flood.rs#source_summary_event`; when and why in
+[sensor-behavior](sensor-behavior.md#connection-and-login-event-budget-cred)). The summary is a
+`honeypot_login_attempt` with `authenticated: true` when any folded event was an attempt, and a
+`honeypot_connection` with `authenticated: false` otherwise. Its `source_ip` is the address the
+events came from (the first one, for `overflow`), its `wan_ip` and `sensor` are the first folded
+event's, its protocol is `tcp` and its `session_id` is fresh.
+
+| key | type | meaning |
+|---|---|---|
+| `event_summary` | boolean | always `true`; marks the event as a summary |
+| `source_prefix` | string | the address's network in CIDR form (`198.51.100.0/24`), or `overflow` for addresses that arrived while the window's address table was full |
+| `suppressed_count` | integer | events this summary stands for: `suppressed_connections` plus `suppressed_attempts` |
+| `suppressed_connections`, `suppressed_attempts` | integer | the folded `honeypot_connection` and `honeypot_login_attempt` events |
+| `client_versions` | array of strings | distinct client versions among the folded events (VNC's `client_version`), at most 8, sanitized, at most 128 characters each; only events that carry one contribute |
+| `client_versions_capped` | boolean | more distinct versions than that |
+| `usernames`, `usernames_capped` | array, boolean | the same for `username` (mysql, mssql, postgresql, mongodb); VNC has none |
+| `first_seen`, `last_seen` | string | RFC 3339 times of the first and last folded event |
+| `window_secs` | number | the window length, 600 |
+| `session_count`, `session_count_capped` | integer, boolean | distinct sessions folded, at most 32 |
+
+The VNC `honeypot_login_attempt` carries `client_version`, the twelve bytes the client sent in its
+RFB protocol-version message (`RFB 003.008`), sanitized. It is the one thing a VNC attempt says
+about the client beyond its source.
+
+Scoring treats a summary as the events it replaces for the two counters that measure volume:
+`event_count` and `established_event_count` grow by `suppressed_count` (clamped to 1,000,000; a
+missing, zero or non-integer count is one), so a flooder's volume-list threshold arrives as it did
+when every event was written. Weight is not multiplied: the summary is one sighting of its signal
+type, which after the 60 s dedup is all a continuous flood ever contributed
+(`crates/core-scoring/src/scoring/engine.rs#represented_events`; see
+[scoring-and-feed](scoring-and-feed.md)). Only a summary marked `event_summary: true` counts as
+more than one: `suppressed_count` on a command summary or a UDP rate-limit summary is still data
+for the analyst. A raw count of rows in the `event` table, as the console's event search and the
+metrics endpoint's per-signal counts read it, counts a summary once.
+
 ### Arrival metadata key
 
 Every event a sensor emits carries the local port of the listener its connection or datagram

@@ -760,6 +760,22 @@ mod tests {
     use crate::shell::{EmitContext, LineStep};
     use crate::spool::QuarantineSpool;
 
+    #[test]
+    fn begins_elf_requires_the_whole_identification() {
+        let valid: [u8; 16] = *b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0";
+        assert!(begins_elf(&valid));
+        // Each rejected input differs from a valid header in exactly one position.
+        assert!(!begins_elf(&valid[..15]), "short by one byte");
+        for (index, bad) in [(4, 0), (4, 3), (5, 0), (5, 3), (6, 0), (6, 2)] {
+            let mut header = valid;
+            header[index] = bad;
+            assert!(!begins_elf(&header), "byte {index} = {bad}");
+        }
+        let mut longer = valid.to_vec();
+        longer.extend_from_slice(b"trailing program bytes");
+        assert!(begins_elf(&longer));
+    }
+
     fn ctx() -> EmitContext {
         EmitContext {
             source_ip: "203.0.113.7".parse().unwrap(),

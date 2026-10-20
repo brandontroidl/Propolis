@@ -116,7 +116,7 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4688 test functions** (2895 unit + 1793 integration).
+- **Total: 4716 test functions** (2918 unit + 1798 integration).
 - **DB-backed (`sqlx::test`): 437** - console 223, review 109, core-scoring 48,
   intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -150,8 +150,8 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 170 | 247 | auth_test, campaigns_test, ledger_count_test, render_off_worker, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, server_test, timeline_test |
-| core-scoring | 87 | 42 | append_gate, batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
+| console | 171 | 247 | auth_test, campaigns_test, ledger_count_test, render_off_worker, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, server_test, timeline_test |
+| core-scoring | 90 | 42 | append_gate, batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 35 | 66 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
 | gateway | 11 | 15 | handshake, logging, spool, verify |
@@ -164,9 +164,9 @@ Per-crate breakdown:
 | review | 231 | 116 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
 | sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
-| sensor-cred | 37 | 41 | arrival, env_strict, integration, tls_integration |
+| sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1481 | 280 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1500 | 280 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
@@ -178,7 +178,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 28 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **2895** | **1793** | |
+| **Total** | **2918** | **1798** | |
 
 ### Test styles by layer
 

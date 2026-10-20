@@ -670,10 +670,21 @@
   refuses before dumping unless the volume would still keep the larger of the monitor's threshold
   (`PROPOLIS_OPS_CAPACITY_FREE_PCT`, read from `propolis.env`, default 15) and the logrotate
   guard's 512 MiB reserve, naming the shortfall and the fixes (`PROPOLIS_BACKUP_KEEP`,
-  `PROPOLIS_BACKUP_DIR`). `config-check.sh` gains a `backup-headroom` warning when the retained
-  sets cannot fit beside the database within that headroom, with the numbers. A node already
-  near the line will see backups refuse until you lower `PROPOLIS_BACKUP_KEEP` or move the
-  backup directory; see [backup and restore](docs/operations/backup-and-restore.md).
+  `PROPOLIS_BACKUP_DIR`). `config-check.sh` gains a `backup-headroom` warning when the worst
+  night's sets (`KEEP - 1` scheduled, 3 pre-upgrade, the next one a fifth larger) cannot fit
+  beside what else the volume holds within that headroom, with the numbers; it counts the
+  database only when the backup directory shares its volume. A node already near the line will
+  see backups refuse until you lower `PROPOLIS_BACKUP_KEEP` or move the backup directory. On
+  the incident's numbers (17 GiB `/var`, 6.6 GiB database, 1.07 GiB sets) steady backups need
+  `PROPOLIS_BACKUP_KEEP=3` or a separate backup volume. **An upgrade can now be blocked by this
+  rule**: `upgrade.sh` runs `backup.sh --reason pre-upgrade` before it installs anything, and a
+  refusal stops the upgrade with the box untouched. The refusal names the ways out: free space on
+  the volume, run a scheduled backup with a lower `PROPOLIS_BACKUP_KEEP` to prune, move
+  `PROPOLIS_BACKUP_DIR`, or `PROPOLIS_UPGRADE_SKIP_BACKUP=1` for that upgrade (no database to roll
+  back to). `PROPOLIS_OPS_CAPACITY_FREE_PCT` is read the way systemd and the daemon read it
+  (whitespace around the key, `=` and value, a leading `+` or zeros accepted); see
+  [backup and restore](docs/operations/backup-and-restore.md) and
+  [upgrade, rollback and DR](docs/operations/upgrade-rollback-and-dr.md).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

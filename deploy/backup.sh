@@ -80,6 +80,29 @@ STATE_PATHS=(etc/propolis var/spool/propolis var/lib/propolis/ssh)
 DEFAULT_LOW_DISK_PCT=15
 LOGROTATE_RESERVE_BYTES=536870912
 
+# low_disk_pct FILE: the monitor's low-disk threshold as the daemon will read it from FILE. systemd
+# strips whitespace around the key, the '=' and the value and the last assignment wins; the daemon
+# then runs trim().parse::<u64>() (crates/propolis/src/ops_alert/config.rs, get_u64), which accepts
+# a leading '+' and leading zeros, and refuses to start outside 1..=100, so only such a value is
+# the threshold it alerts on; anything else leaves its default in force. The same function is in
+# config-check.sh (backup_script_test.rs and config_check_test.rs hold the two to one table).
+low_disk_pct() {
+    local v re='^\+?[0-9]+$'
+    v="$(sed -n 's/^[[:space:]]*PROPOLIS_OPS_CAPACITY_FREE_PCT[[:space:]]*=//p' "$1" 2>/dev/null | tail -n 1 || true)"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    if [[ "$v" =~ $re ]]; then
+        v="${v#+}"
+        v="${v#"${v%%[!0]*}"}"
+        if [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    fi
+    printf '%s' "$DEFAULT_LOW_DISK_PCT"
+}
+
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # Written by a temporary file and a rename, so a reader never sees half a file.
@@ -137,21 +160,12 @@ fi
 
 STEP="reading DATABASE_URL"
 DATABASE_URL=""
-LOW_DISK_PCT=""
 if [ -r "$ENV_FILE" ]; then
     DATABASE_URL="$(sed -n 's/^DATABASE_URL=//p' "$ENV_FILE" | tail -n 1)"
     DATABASE_URL="${DATABASE_URL%\"}"; DATABASE_URL="${DATABASE_URL#\"}"
     DATABASE_URL="${DATABASE_URL%\'}"; DATABASE_URL="${DATABASE_URL#\'}"
-    LOW_DISK_PCT="$(sed -n 's/^PROPOLIS_OPS_CAPACITY_FREE_PCT=//p' "$ENV_FILE" | tail -n 1)"
-    LOW_DISK_PCT="${LOW_DISK_PCT%\"}"; LOW_DISK_PCT="${LOW_DISK_PCT#\"}"
-    LOW_DISK_PCT="${LOW_DISK_PCT%\'}"; LOW_DISK_PCT="${LOW_DISK_PCT#\'}"
 fi
-# The daemon refuses to start on a value outside 1..=100, so only such a value is the threshold it
-# is alerting on; anything else leaves its default in force.
-if ! [[ "$LOW_DISK_PCT" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$LOW_DISK_PCT))" -lt 1 ] || [ "$((10#$LOW_DISK_PCT))" -gt 100 ]; then
-    LOW_DISK_PCT="$DEFAULT_LOW_DISK_PCT"
-fi
-LOW_DISK_PCT=$((10#$LOW_DISK_PCT))
+LOW_DISK_PCT="$(low_disk_pct "$ENV_FILE")"
 if [ -z "$DATABASE_URL" ]; then
     # Not a failure to page about: the daemon cannot run without it either, so a node in this state
     # is still being installed. Recorded so config-check.sh can say why there is no backup.
@@ -242,7 +256,13 @@ keep_free=$pct_bytes
 [ "$keep_free" -ge "$LOGROTATE_RESERVE_BYTES" ] || keep_free="$LOGROTATE_RESERVE_BYTES"
 if [ "$avail" -lt $(( need + keep_free )) ]; then
     shortfall=$(( need + keep_free - avail ))
-    echo "error: $BACKUP_DIR has $avail of $size bytes free; this backup may need $need and the volume must keep $keep_free free afterwards (the larger of the ${LOW_DISK_PCT}% low-disk threshold, $pct_bytes, and logrotate's $LOGROTATE_RESERVE_BYTES reserve), short by $shortfall bytes. Lower PROPOLIS_BACKUP_KEEP (now $KEEP) or point PROPOLIS_BACKUP_DIR at another volume" >&2
+    if [ "$REASON" = pre-upgrade ]; then
+        # KEEP is fixed at 3 here, so lowering PROPOLIS_BACKUP_KEEP changes nothing for this run.
+        remedy="Free space on the volume, run a scheduled backup with a lower PROPOLIS_BACKUP_KEEP to prune the old sets, point PROPOLIS_BACKUP_DIR at another volume, or set PROPOLIS_UPGRADE_SKIP_BACKUP=1 to upgrade without a backup this once"
+    else
+        remedy="Lower PROPOLIS_BACKUP_KEEP (now $KEEP) or point PROPOLIS_BACKUP_DIR at another volume"
+    fi
+    echo "error: $BACKUP_DIR has $avail of $size bytes free; this backup may need $need and the volume must keep $keep_free free afterwards (the larger of the ${LOW_DISK_PCT}% low-disk threshold, $pct_bytes, and logrotate's $LOGROTATE_RESERVE_BYTES reserve), short by $shortfall bytes. $remedy" >&2
     false
 fi
 

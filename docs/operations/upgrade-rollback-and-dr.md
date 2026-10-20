@@ -31,7 +31,15 @@ The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin]`):
    before anything is installed, so a failure in either leaves the box as it was. The backup
    runs the binary just built, because the installed one may predate the `propolis pg-exec`
    it needs. `PROPOLIS_UPGRADE_SKIP_BACKUP=1` skips the backup (the release is still kept),
-   leaving no database to roll back to.
+   leaving no database to roll back to. The backup refuses, and so stops the upgrade here
+   with nothing installed, when the backup volume would not keep the ops monitor's low-disk
+   threshold and logrotate's 512 MiB reserve free after the set is written
+   ([free space](backup-and-restore.md#the-nightly-backup)). Free space on that volume, run
+   a scheduled backup with a lower `PROPOLIS_BACKUP_KEEP` (`sudo systemctl edit
+   propolis-backup.service`, then `sudo systemctl start propolis-backup.service`) to prune
+   the old sets, move `PROPOLIS_BACKUP_DIR` to a larger volume, or skip the backup for this
+   one upgrade with `PROPOLIS_UPGRADE_SKIP_BACKUP=1`. `config-check.sh` warns about a
+   retention that cannot fit before an upgrade meets it.
 3. Installs the built binaries (`propolis`, the 12 sensors, `gateway`, `shipper`)
    to `/usr/local/bin/` with `install -m 0755`.
 4. Runs `deploy/provision.sh` (idempotent users + directories), then

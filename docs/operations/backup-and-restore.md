@@ -49,18 +49,33 @@ options or archived paths stop matching the commands on this page.
   good set: its real dump and archive size, scaled by how much the database and state
   directories have grown since (each good run records that source size as `source_bytes` in
   `last-success`), plus a fifth. With no earlier set the estimate is the raw database size
-  plus the state directories' size, which is several times what the compressed set takes;
-  with an earlier set that predates `source_bytes`, half again that set's size, never more
-  than the raw estimate. What the volume must keep free afterwards is the larger of two
+  plus the state directories' size, plus a fifth, which is several times what the
+  compressed set takes; with an earlier set that predates `source_bytes`, half again that
+  set's size, never more than the raw estimate. What the volume must keep free afterwards is the larger of two
   lines: the ops monitor's low-disk threshold (`PROPOLIS_OPS_CAPACITY_FREE_PCT`, default 15,
   read from `/etc/propolis/propolis.env` so the two agree; a value the daemon would reject
   leaves 15 in force) and the 512 MiB reserve the logrotate guard keeps
   (`deploy/logrotate-guard.sh`). A set that fits but leaves the volume under either line
   starves log rotation and trips the disk alert, so it is refused too. The refusal names the
-  free space, the estimate, the line and the shortfall; the fixes are a lower
-  `PROPOLIS_BACKUP_KEEP` or a `PROPOLIS_BACKUP_DIR` on another volume. Retention holds up to
-  `KEEP` scheduled and 3 pre-upgrade sets at once, each about the size of the last set, so
-  `config-check.sh` warns when that cannot fit beside the database within the headroom.
+  free space, the estimate, the line and the shortfall; the fixes for a scheduled run are a
+  lower `PROPOLIS_BACKUP_KEEP` or a `PROPOLIS_BACKUP_DIR` on another volume. A
+  `-pre-upgrade` run keeps a fixed 3 sets, so its refusal names different remedies, and
+  because [the upgrade](upgrade-rollback-and-dr.md) runs it before installing anything, a
+  refusal stops the upgrade: free space on the volume, run a scheduled backup with a lower
+  `PROPOLIS_BACKUP_KEEP` to prune the old sets, move `PROPOLIS_BACKUP_DIR`, or set
+  `PROPOLIS_UPGRADE_SKIP_BACKUP=1` to upgrade once without a database backup.
+  On its worst night a run finds `KEEP - 1` scheduled sets and 3 pre-upgrade sets already
+  on the volume (never fewer than one scheduled), writes one more a fifth larger than the
+  last, and still has to leave the line free, beside everything else on the volume.
+  `config-check.sh` warns (`backup-headroom`) when that sum, measured from the volume's real
+  usage as root, exceeds the volume, so it speaks before the first refusal. It counts the
+  database and state only when the backup directory shares their volume; a dedicated backup
+  volume is charged for the sets alone. Reading the warning on the numbers of the incident
+  (a 17 GiB `/var` holding a 6.6 GiB database and 7.2 GiB of everything but sets, sets of
+  1.07 GiB): with the default 7 the worst night needs the 7.2 GiB, 9 sets (9.6 GiB), the
+  next set (1.3 GiB) and the 2.55 GiB line, 20.7 GiB against 17; at
+  `PROPOLIS_BACKUP_KEEP=4` it is still 0.5 GB short. Steady nightly backups on those
+  numbers need `PROPOLIS_BACKUP_KEEP=3` or a separate backup volume.
 - **No password on a command line.** The dump runs through `propolis pg-exec`, which
   parses `DATABASE_URL` from `/etc/propolis/propolis.env` with the daemon's own parser
   and hands `pg_dump` the connection in libpq's `PG*` variables (`crates/propolis/src/pg_exec.rs#run`).

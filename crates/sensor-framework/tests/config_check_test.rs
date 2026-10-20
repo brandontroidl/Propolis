@@ -360,6 +360,7 @@ impl Fx {
             "grep",
             "sed",
             "stat",
+            "du",
             "cat",
             "cmp",
             "head",
@@ -2592,7 +2593,7 @@ fn fix_scenarios() -> Vec<Scenario> {
             );
         }),
         ("retention too large for the backup volume", |fx| {
-            seed_backup_volume(fx, 17 * GIB, 7);
+            seed_backup_volume(fx, 7);
         }),
         ("no backup has run yet", |fx| {
             std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
@@ -2616,26 +2617,71 @@ fn fix_scenarios() -> Vec<Scenario> {
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
-/// A 17 GiB backup volume whose last good set was 1 GiB from a 6 GiB source, with `keep` scheduled
-/// sets kept. Retention then holds (keep + 3) GiB beside the 6 GiB database.
-fn seed_backup_volume(fx: &Fx, volume: u64, keep: u32) {
-    fx.write("state/df_size", &volume.to_string());
-    fx.write("state/df_avail", &(volume / 2).to_string());
+/// The live incident's volume: 17 GiB holding 7 767 448 361 bytes of everything but backup sets
+/// (a 6.6 GiB database among them), whose last good set was 1 148 903 751 bytes.
+const INCIDENT_SIZE: u64 = 18_253_611_008;
+const INCIDENT_OTHER: u64 = 7_767_448_361;
+const INCIDENT_SET: u64 = 1_148_903_751;
+
+fn backups_dir(fx: &Fx) -> std::path::PathBuf {
+    let dir = fx.p("state/backups");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// What `du -s -B1` reports for `dir`, which is what the script subtracts from the volume's used space.
+fn du_bytes(dir: &std::path::Path) -> u64 {
+    let out = Command::new("du")
+        .args(["-s", "-B1", "--"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// A backup volume of `size` bytes holding `other` bytes besides the backup directory, whose last
+/// good set was `set` bytes taken from `source` bytes, with `keep` scheduled sets kept.
+fn seed_volume(fx: &Fx, size: u64, other: u64, set: u64, source: u64, keep: &str) {
+    let used = other + du_bytes(&backups_dir(fx));
+    fx.write("state/df_size", &size.to_string());
+    fx.write("state/df_avail", &(size - used).to_string());
     fx.write(
         "state/backup-status/last-success",
         &format!(
             "{{\"completed_at\":\"{}\",\"reason\":\"scheduled\",\"set\":\"x-scheduled\",\"encrypted\":true,\"dump_bytes\":{},\"archive_bytes\":{},\"source_bytes\":{}}}\n",
             iso(NOW - 3600),
-            GIB - 1024,
+            set - 1024,
             1024,
-            6 * GIB
+            source
         ),
     );
     fx.write(
         "state/backup_env",
         &format!("PROPOLIS_BACKUP_KEEP={keep}\n"),
     );
+}
+
+fn seed_incident(fx: &Fx, keep: &str) {
+    seed_volume(
+        fx,
+        INCIDENT_SIZE,
+        INCIDENT_OTHER,
+        INCIDENT_SET,
+        7_086_696_038 + 4096,
+        keep,
+    );
+}
+
+fn seed_backup_volume(fx: &Fx, keep: u32) {
+    seed_incident(fx, &keep.to_string());
 }
 
 fn finding_ids(fx: &Fx) -> Vec<String> {
@@ -2647,52 +2693,262 @@ fn finding_ids(fx: &Fx) -> Vec<String> {
         .collect()
 }
 
-/// The numbers behind the warning are on the volume, not the disk the test runs on: 7 + 3 sets of
-/// 1 GiB plus the 6 GiB source is 16 GiB, over the 17 GiB volume's 14.45 GiB usable after its
-/// 15% (2.55 GiB); 2 + 3 sets is 11 GiB, which fits.
-#[test]
-fn retention_that_cannot_fit_beside_the_database_is_warned_with_the_numbers() {
-    let fx = Fx::new();
-    seed_backup_volume(&fx, 17 * GIB, 7);
-    assert!(finding_ids(&fx).contains(&"backup-headroom".to_string()));
-    let v = fx.json();
-    let f = v["findings"]
+fn headroom_warned(fx: &Fx) -> bool {
+    finding_ids(fx).contains(&"backup-headroom".to_string())
+}
+
+fn headroom_finding(v: &serde_json::Value) -> &serde_json::Value {
+    v["findings"]
         .as_array()
         .unwrap()
         .iter()
         .find(|f| f["id"] == "backup-headroom")
-        .unwrap();
+        .expect("a backup-headroom finding")
+}
+
+/// The incident's numbers, through the real script and a stub `df`: on that 17 GiB volume the
+/// default retention and KEEP 5 and 4 cannot fit (KEEP 4 is short by 524 MB, which is what
+/// backup.sh refuses by every night), while KEEP 3 and below can.
+#[test]
+fn retention_that_backup_sh_would_refuse_is_warned_with_the_numbers() {
+    let fx = Fx::new();
+    for keep in ["7", "5", "4"] {
+        seed_incident(&fx, keep);
+        assert!(headroom_warned(&fx), "KEEP {keep} refuses every night");
+    }
+    for keep in ["3", "2", "1"] {
+        seed_incident(&fx, keep);
+        assert!(!headroom_warned(&fx), "KEEP {keep} fits");
+    }
+
+    seed_incident(&fx, "4");
+    let v = fx.json();
+    let f = headroom_finding(&v);
     assert_eq!(f["level"], "warn");
     assert_eq!(f["fix_kind"], "manual");
     let msg = f["message"].as_str().unwrap();
     for needle in [
-        "7 scheduled + 3 pre-upgrade",
-        "10G",
-        "6G",
-        "16G",
-        "17G",
-        "15%",
-        "PROPOLIS_BACKUP_KEEP",
+        "4 scheduled backups",
+        "6 sets of about 1.1G",
+        "7.2G of other data",
+        "the next set needs 1.3G",
+        "the larger of the 15% low-disk threshold",
+        "short by 499.7M",
+        "17G volume",
     ] {
-        assert!(
-            msg.contains(needle) || f["fix"].as_str().unwrap().contains(needle),
-            "{needle} missing: {msg}"
-        );
+        assert!(msg.contains(needle), "{needle} missing: {msg}");
     }
+    assert!(f["fix"].as_str().unwrap().contains("PROPOLIS_BACKUP_KEEP"));
 
-    seed_backup_volume(&fx, 17 * GIB, 2);
-    assert!(!finding_ids(&fx).contains(&"backup-headroom".to_string()));
-    // A larger volume holds the default retention too.
-    seed_backup_volume(&fx, 40 * GIB, 7);
-    assert!(!finding_ids(&fx).contains(&"backup-headroom".to_string()));
-    // The monitor's own threshold is the line: at 70% the 40 GiB volume keeps 28 GiB, leaving 12 for 16.
+    // The monitor's own threshold is the line: 70% of the volume is kept free, so even KEEP 1 fails.
+    seed_incident(&fx, "1");
     fx.set_env_line(
         "etc/propolis.env",
         "PROPOLIS_OPS_CAPACITY_FREE_PCT=",
         Some("PROPOLIS_OPS_CAPACITY_FREE_PCT=70"),
     );
-    assert!(finding_ids(&fx).contains(&"backup-headroom".to_string()));
+    assert!(headroom_warned(&fx));
 }
+
+/// Exactly what backup.sh needs passes and one byte less does not: the line is `total <= size`, with
+/// the threshold's share rounded up (15% of 10 000 000 050 is 1 500 000 007.5).
+#[test]
+fn the_headroom_line_is_the_volume_size_to_the_byte_with_the_share_rounded_up() {
+    let fx = Fx::new();
+    let size: u64 = 10_000_000_050;
+    let keep_free: u64 = 1_500_000_008;
+    let set: u64 = 100_000_000;
+    // KEEP 3: 2 scheduled + 3 pre-upgrade sets, and the next set a fifth over.
+    let exact_other = size - 5 * set - (set + set / 5) - keep_free;
+    seed_volume(&fx, size, exact_other, set, 1000, "3");
+    assert!(!headroom_warned(&fx), "needing exactly the volume fits");
+    seed_volume(&fx, size, exact_other + 1, set, 1000, "3");
+    assert!(headroom_warned(&fx), "one byte over does not");
+}
+
+/// A small volume is held to logrotate's 512 MiB reserve, not to the threshold's smaller share: 15%
+/// of 2 GiB is 307 MiB.
+#[test]
+fn the_logrotate_reserve_binds_the_headroom_on_a_small_volume() {
+    let fx = Fx::new();
+    // other 1500 MiB + 4 sets of 40 MiB + a next set of 48 MiB is 1708 MiB: with 307 MiB kept free
+    // that is 2015 MiB of 2048, with the 512 MiB reserve it is 2220.
+    seed_volume(&fx, 2 * GIB, 1500 * MIB, 40 * MIB, 1000, "1");
+    assert!(headroom_warned(&fx));
+    seed_volume(&fx, 2 * GIB, 1000 * MIB, 40 * MIB, 1000, "1");
+    assert!(!headroom_warned(&fx));
+}
+
+/// A dedicated backup volume holds neither the database nor the logs, so the same retention that
+/// cannot fit beside them on /var fits on it.
+#[test]
+fn a_dedicated_backup_volume_is_not_charged_for_the_database() {
+    let fx = Fx::new();
+    seed_volume(&fx, 20 * GIB, 0, GIB + 70 * MIB, 6 * GIB, "7");
+    assert!(!headroom_warned(&fx));
+    // The same sets beside the incident's other data on a 20 GiB volume do not fit.
+    seed_volume(&fx, 20 * GIB, 8 * GIB, GIB + 70 * MIB, 6 * GIB, "7");
+    assert!(headroom_warned(&fx));
+}
+
+/// Not root, the backup directory (0750) cannot be measured, so the database and state are counted
+/// only when the directory shares a device with them.
+#[test]
+fn an_unmeasurable_backup_directory_is_charged_for_the_database_only_on_its_device() {
+    use std::os::unix::fs::MetadataExt;
+    if is_root() {
+        return;
+    }
+    let fx = Fx::new();
+    seed_volume(&fx, 17 * GIB, 0, GIB, 6 * GIB, "7");
+    let same = backups_dir(&fx);
+    std::fs::set_permissions(&same, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let v = fx
+        .run_with(
+            &["--json"],
+            &[("PROPOLIS_CC_BACKUP_DIR", same.to_str().unwrap())],
+        )
+        .json();
+    std::fs::set_permissions(&same, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "backup-headroom"),
+        "6 GiB of source plus 9 GiB of sets plus the 15% share does not fit 17 GiB"
+    );
+
+    // A directory on another device (tmpfs, where there is one) is charged only for the sets.
+    let Ok(other_dir) = tempfile::tempdir_in("/dev/shm") else {
+        return;
+    };
+    if std::fs::metadata(other_dir.path()).unwrap().dev() == std::fs::metadata(&same).unwrap().dev()
+    {
+        return;
+    }
+    let sub = other_dir.path().join("b");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let v = fx
+        .run_with(
+            &["--json"],
+            &[("PROPOLIS_CC_BACKUP_DIR", sub.to_str().unwrap())],
+        )
+        .json();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "backup-headroom"),
+        "{}",
+        v["findings"]
+    );
+}
+
+/// The backup row itself goes to warn (not left ok) and says why, unless a worse state already holds it.
+#[test]
+fn a_retention_that_cannot_fit_raises_the_backup_row_to_warn() {
+    let fx = Fx::new();
+    let row = |v: &serde_json::Value| {
+        v["global"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == "backup")
+            .unwrap()
+            .clone()
+    };
+    seed_incident(&fx, "3");
+    let g = row(&fx.json());
+    assert_eq!(g["state"], "ok", "{g}");
+    seed_incident(&fx, "7");
+    let g = row(&fx.json());
+    assert_eq!(g["state"], "warn", "{g}");
+    assert!(
+        g["text"]
+            .as_str()
+            .unwrap()
+            .contains("retention too large for the volume"),
+        "{g}"
+    );
+}
+
+/// The unit's own PROPOLIS_BACKUP_DIR is the directory measured when the test hook is not set.
+#[test]
+fn the_units_backup_directory_is_the_one_measured() {
+    let fx = Fx::new();
+    seed_incident(&fx, "7");
+    let unit_dir = fx.p("state/unit-sets");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    fx.write(
+        "state/backup_env",
+        &format!(
+            "PROPOLIS_BACKUP_KEEP=7 PROPOLIS_BACKUP_DIR={}\n",
+            unit_dir.display()
+        ),
+    );
+    let v = fx
+        .run_with(&["--json"], &[("PROPOLIS_CC_BACKUP_DIR", "")])
+        .json();
+    let msg = headroom_finding(&v)["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        msg.contains(&format!("{}'s 17G volume", unit_dir.display())),
+        "{msg}"
+    );
+}
+
+/// PROPOLIS_BACKUP_KEEP outside 1..=365 is one backup.sh refuses to run with, so there is no
+/// retention to size; the ends of the range are in it.
+#[test]
+fn the_keep_range_matches_backup_sh() {
+    let fx = Fx::new();
+    // 10 GiB holding 7.2 GiB: even KEEP 1 (1 + 3 sets) cannot fit with the next set and the 15%.
+    for (keep, warns) in [
+        ("1", true),
+        ("365", true),
+        ("007", true),
+        ("", true),
+        ("0", false),
+        ("366", false),
+        ("1000", false),
+        ("x", false),
+    ] {
+        seed_volume(&fx, 10 * GIB, INCIDENT_OTHER, INCIDENT_SET, 1000, keep);
+        assert_eq!(headroom_warned(&fx), warns, "KEEP {keep:?}");
+    }
+}
+
+/// The threshold is read as the daemon reads it (whitespace around the key, the '=' and the value,
+/// a leading '+', leading zeros; the last assignment wins; a value the daemon refuses leaves 15),
+/// and backup.sh reads it the same way: backup_script_test.rs runs this same table.
+#[test]
+fn the_threshold_is_parsed_as_the_daemon_parses_it() {
+    for (line, pct) in LOW_DISK_TABLE {
+        let fx = Fx::new();
+        seed_incident(&fx, "7");
+        fx.set_env_line("etc/propolis.env", "PROPOLIS_OPS_CAPACITY_FREE_PCT=", None);
+        let env = fx.read("etc/propolis.env");
+        fx.write("etc/propolis.env", &format!("{env}{line}\n"));
+        let v = fx.json();
+        let msg = headroom_finding(&v)["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let want = format!("the larger of the {pct}% low-disk threshold");
+        assert!(msg.contains(&want), "{line:?} should read as {pct}: {msg}");
+    }
+}
+
+/// Lines of propolis.env and the percentage each means. Every one is at least the default 15, so the
+/// 14%-free volume in backup_script_test.rs refuses under all of them and names the figure it used.
+/// One table (fixtures/low_disk_table.in) for both scripts' tests.
+const LOW_DISK_TABLE: &[(&str, u32)] = include!("fixtures/low_disk_table.in");
 
 /// config-check.sh and backup.sh each carry the daemon's default and the guard's reserve; they must
 /// carry the same ones.

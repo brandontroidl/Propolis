@@ -660,6 +660,106 @@ fn the_threshold_is_read_from_the_monitors_setting() {
     assert!(stderr_of(&output).contains("15%"), "{}", stderr_of(&output));
 }
 
+// The value is read as the daemon reads it: whitespace around the key, the '=' and the value, a
+// leading '+' and leading zeros accepted, the last assignment wins, and a value the daemon refuses
+// to start on (0, over 100, not a number, too long for a u64) leaves 15. Every row is at least 15,
+// so the volume below (14% free) refuses under all of them and the message names the figure used.
+// config_check_test.rs runs the same table through config-check.sh.
+#[test]
+fn the_threshold_is_parsed_as_the_daemon_parses_it() {
+    const TABLE: &[(&str, u32)] = include!("fixtures/low_disk_table.in");
+    let df = [
+        ("STUB_DF_SIZE", (100 * GIB).to_string()),
+        ("STUB_DF_AVAIL", (14 * GIB).to_string()),
+    ];
+    let df: Vec<(&str, &str)> = df.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    for (line, pct) in TABLE {
+        let fx = Fixture::new();
+        let env = fx.root.join("etc/propolis/propolis.env");
+        let base = std::fs::read_to_string(&env).unwrap();
+        std::fs::write(&env, format!("{base}{line}\n")).unwrap();
+        let output = fx.run(&[], &df);
+        assert!(
+            !output.status.success(),
+            "{line:?} left 14% free acceptable"
+        );
+        let want = format!("the larger of the {pct}% low-disk threshold");
+        assert!(
+            stderr_of(&output).contains(&want),
+            "{line:?} should read as {pct}: {}",
+            stderr_of(&output)
+        );
+    }
+}
+
+// The line is `avail >= need + keep_free`: exactly that much free passes and one byte less does not,
+// and the threshold's share is rounded UP (15% of 10 000 000 050 is 1 500 000 007.5, so 8 not 7).
+// With no source size recorded and a small database the estimate is the last set, to the byte.
+#[test]
+fn the_free_space_line_is_exact_and_the_share_is_rounded_up() {
+    let size: u64 = 10_000_000_050;
+    let keep_free: u64 = 1_500_000_008;
+    let set: u64 = 100_000_000;
+    let last = r#"{"completed_at":"2026-10-14T09:04:27Z","reason":"scheduled","set":"20261014T033000Z-scheduled","encrypted":false,"dump_bytes":99999000,"archive_bytes":1000}"#;
+    for (avail, passes) in [(set + keep_free, true), (set + keep_free - 1, false)] {
+        let fx = Fixture::new();
+        seed_last_success(&fx, last);
+        let output = fx.run(
+            &[],
+            &[
+                ("STUB_DF_SIZE", &size.to_string()),
+                ("STUB_DF_AVAIL", &avail.to_string()),
+            ],
+        );
+        assert_eq!(
+            output.status.success(),
+            passes,
+            "avail {avail}: {}",
+            stderr_of(&output)
+        );
+        if !passes {
+            assert!(
+                stderr_of(&output).contains("short by 1 bytes"),
+                "{}",
+                stderr_of(&output)
+            );
+        }
+    }
+}
+
+// A refusal names the remedy that works for the run that was refused. A scheduled run's KEEP is the
+// operator's to lower; a pre-upgrade run's is fixed at 3, so "lower KEEP" would be advice that
+// changes nothing, and the way out of a blocked upgrade is different.
+#[test]
+fn the_refusal_names_the_remedy_for_its_reason() {
+    let df = [
+        ("STUB_DF_SIZE", (100 * GIB).to_string()),
+        ("STUB_DF_AVAIL", (14 * GIB).to_string()),
+    ];
+    let df: Vec<(&str, &str)> = df.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let fx = Fixture::new();
+    let output = fx.run(&["--reason", "scheduled"], &df);
+    assert!(!output.status.success());
+    let err = stderr_of(&output);
+    assert!(err.contains("Lower PROPOLIS_BACKUP_KEEP (now 7)"), "{err}");
+    assert!(err.contains("PROPOLIS_BACKUP_DIR"), "{err}");
+    assert!(!err.contains("PROPOLIS_UPGRADE_SKIP_BACKUP"), "{err}");
+
+    let fx = Fixture::new();
+    let output = fx.run(&["--reason", "pre-upgrade"], &df);
+    assert!(!output.status.success());
+    let err = stderr_of(&output);
+    assert!(err.contains("PROPOLIS_UPGRADE_SKIP_BACKUP=1"), "{err}");
+    assert!(
+        err.contains("run a scheduled backup with a lower PROPOLIS_BACKUP_KEEP"),
+        "{err}"
+    );
+    assert!(err.contains("PROPOLIS_BACKUP_DIR"), "{err}");
+    assert!(!err.contains("(now"), "pre-upgrade's KEEP is fixed: {err}");
+    assert!(!err.contains("Lower PROPOLIS_BACKUP_KEEP"), "{err}");
+}
+
 // Under the threshold's share the logrotate guard's 512 MiB reserve still binds: a small volume has
 // 15% below the reserve.
 #[test]

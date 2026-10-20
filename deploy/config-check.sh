@@ -144,6 +144,29 @@ DEFAULT_ROTATE_SIZE=$((100 * 1024 * 1024))
 DEFAULT_LOW_DISK_PCT=15
 LOGROTATE_RESERVE_BYTES=536870912
 
+# low_disk_pct FILE: the monitor's low-disk threshold as the daemon will read it from FILE. systemd
+# strips whitespace around the key, the '=' and the value and the last assignment wins; the daemon
+# then runs trim().parse::<u64>() (crates/propolis/src/ops_alert/config.rs, get_u64), which accepts
+# a leading '+' and leading zeros, and refuses to start outside 1..=100, so only such a value is
+# the threshold it alerts on; anything else leaves its default in force. The same function is in
+# backup.sh (backup_script_test.rs and config_check_test.rs hold the two to one table).
+low_disk_pct() {
+    local v re='^\+?[0-9]+$'
+    v="$(sed -n 's/^[[:space:]]*PROPOLIS_OPS_CAPACITY_FREE_PCT[[:space:]]*=//p' "$1" 2>/dev/null | tail -n 1 || true)"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    if [[ "$v" =~ $re ]]; then
+        v="${v#+}"
+        v="${v#"${v%%[!0]*}"}"
+        if [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ]; then
+            printf '%s' "$v"
+            return 0
+        fi
+    fi
+    printf '%s' "$DEFAULT_LOW_DISK_PCT"
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -167,10 +190,10 @@ trim() {
 human_bytes() {
     local b="$1" t
     if [ "$b" -ge 1073741824 ]; then
-        t=$((b * 10 / 1073741824))
+        t=$(((b * 10 + 536870912) / 1073741824))
         printf '%s%sG' $((t / 10)) "$([ $((t % 10)) -eq 0 ] || printf '.%s' $((t % 10)))"
     elif [ "$b" -ge 1048576 ]; then
-        t=$((b * 10 / 1048576))
+        t=$(((b * 10 + 524288) / 1048576))
         printf '%s%sM' $((t / 10)) "$([ $((t % 10)) -eq 0 ] || printf '.%s' $((t % 10)))"
     elif [ "$b" -ge 1024 ]; then
         printf '%sK' $((b / 1024))
@@ -1340,7 +1363,7 @@ check_rotation() {
 # it cannot fit; prints nothing when it fits or when a figure it needs is not known.
 backup_headroom() {
     local success="$1" unit_env dump archive src_bytes set_bytes keep dir probe size avail pct keep_free
-    local pct_bytes sets total usable tok
+    local pct_bytes sets total tok used_sets other dev sd need
     dump="$(printf '%s' "$success" | sed -n 's/.*"dump_bytes":\([0-9]\{1,15\}\).*/\1/p')"
     archive="$(printf '%s' "$success" | sed -n 's/.*"archive_bytes":\([0-9]\{1,15\}\).*/\1/p')"
     src_bytes="$(printf '%s' "$success" | sed -n 's/.*"source_bytes":\([0-9]\{1,15\}\).*/\1/p')"
@@ -1354,7 +1377,7 @@ backup_headroom() {
         unit_env="$(sysq show --property=Environment --value propolis-backup.service)"
         for tok in $unit_env; do
             case "$tok" in
-                PROPOLIS_BACKUP_KEEP=*) keep="${tok#*=}" ;;
+                PROPOLIS_BACKUP_KEEP=?*) keep="${tok#*=}" ;; # empty means backup.sh's default
                 PROPOLIS_BACKUP_DIR=*) [ -n "${PROPOLIS_CC_BACKUP_DIR:-}" ] || dir="${tok#*=}" ;;
             esac
         done
@@ -1374,21 +1397,37 @@ backup_headroom() {
         [ "$probe" != / ] && [ "$probe" != . ] || { limit "the free space of $dir could not be read: the backup headroom was not checked"; return 0; }
         probe="$(dirname -- "$probe")"
     done
-    pct="$(read_env_var_in PROPOLIS_OPS_CAPACITY_FREE_PCT "$ENV_DIR/propolis.env")"
-    if ! [[ "$pct" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$pct))" -lt 1 ] || [ "$((10#$pct))" -gt 100 ]; then
-        pct="$DEFAULT_LOW_DISK_PCT"
-    fi
-    pct=$((10#$pct))
+    pct="$(low_disk_pct "$ENV_DIR/propolis.env")"
     # The same arithmetic as backup.sh: the monitor fires strictly below the threshold.
     # shellcheck disable=SC2017 # dividing first is the overflow guard; the remainder is added back
     pct_bytes=$(( size / 100 * pct + (size % 100 * pct + 99) / 100 ))
     keep_free=$pct_bytes
     [ "$keep_free" -ge "$LOGROTATE_RESERVE_BYTES" ] || keep_free="$LOGROTATE_RESERVE_BYTES"
-    sets=$((keep + 3))
-    total=$((src_bytes + sets * set_bytes))
-    usable=$((size - keep_free))
-    if [ "$usable" -lt 0 ] || [ "$total" -gt "$usable" ]; then
-        finding warn "backup" "backup-headroom" "retention cannot fit beside the database: $keep scheduled + 3 pre-upgrade sets of about $(human_bytes "$set_bytes") is $(human_bytes $((sets * set_bytes))), plus the $(human_bytes "$src_bytes") they were taken from is $(human_bytes "$total"), but $dir's volume is $(human_bytes "$size") and must keep $(human_bytes "$keep_free") free (the larger of the ${pct}% low-disk threshold and logrotate's $(human_bytes "$LOGROTATE_RESERVE_BYTES") reserve), leaving $(human_bytes "$((usable > 0 ? usable : 0))"); backups will start refusing before the volume fills" \
+    # What else lives on the volume. Run as root, the backup directory is measurable, so everything
+    # that is not a set (the database, the logs, the system) is the volume's used space minus it.
+    # Without that (not root, or du failed), count the database and state only when the directory
+    # shares a device with them; a dedicated backup volume holds neither.
+    if used_sets="$(du -s -B1 -- "$dir" 2>/dev/null)" && [[ "${used_sets%%[[:space:]]*}" =~ ^[0-9]{1,18}$ ]]; then
+        used_sets="${used_sets%%[[:space:]]*}"
+        other=$((size - avail - used_sets))
+        [ "$other" -ge 0 ] || other=0
+    else
+        other=0
+        dev="$(stat -c %d -- "$probe" 2>/dev/null || true)"
+        for sd in "$(dirname -- "$BACKUP_STATUS")" /var/lib/postgresql; do
+            if [ -n "$dev" ] && [ "$(stat -c %d -- "$sd" 2>/dev/null || true)" = "$dev" ]; then
+                other=$src_bytes
+                break
+            fi
+        done
+    fi
+    # What backup.sh needs on the night it is tightest: it prunes the scheduled sets to KEEP-1, the
+    # 3 pre-upgrade sets may all be present, and the new set is estimated at a fifth over the last.
+    sets=$(( (keep > 1 ? keep - 1 : 1) + 3 ))
+    need=$((set_bytes + set_bytes / 5))
+    total=$((other + sets * set_bytes + need + keep_free))
+    if [ "$total" -gt "$size" ]; then
+        finding warn "backup" "backup-headroom" "retention cannot fit beside the rest of the volume: before a run of $keep scheduled backups the volume holds $(human_bytes "$other") of other data and $sets sets of about $(human_bytes "$set_bytes") ($(human_bytes $((sets * set_bytes)))), the next set needs $(human_bytes "$need") and the volume must keep $(human_bytes "$keep_free") free (the larger of the ${pct}% low-disk threshold and logrotate's $(human_bytes "$LOGROTATE_RESERVE_BYTES") reserve), which is $(human_bytes "$total") on $dir's $(human_bytes "$size") volume, short by $(human_bytes $((total - size))); backups will start refusing before the volume fills" \
             "lower PROPOLIS_BACKUP_KEEP for propolis-backup.service (sudo systemctl edit propolis-backup.service), or move the backup directory to a larger volume (PROPOLIS_BACKUP_DIR, and its ReadWritePaths in the same drop-in)" manual
         return 1
     fi

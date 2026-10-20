@@ -16,10 +16,12 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::domain::enums::{Category, Protocol, is_confirmed_real};
+use crate::domain::enums::{Category, Protocol, SignalType, is_confirmed_real};
 use crate::domain::types::{EventInput, IpScore};
 use crate::scoring::breadth::effective_score;
-use crate::scoring::constants::{EVENT_SUMMARY_KEY, MAX_SUMMARY_EVENTS, SCORE_CAP};
+use crate::scoring::constants::{
+    EVENT_SUMMARY_KEY, MAX_SUMMARY_EVENTS, OVERFLOW_SUMMARY_KEY, SCORE_CAP,
+};
 use crate::scoring::decay::decay;
 use crate::scoring::eligibility::eligible;
 use crate::scoring::persistence::persistence_points;
@@ -177,12 +179,18 @@ pub fn apply_event(
 }
 
 /// How many sightings `event` counts as in `event_count` and `established_event_count`: one, or for
-/// a sensor's connection or login summary (`event_summary: true`) the `suppressed_count` events it
-/// replaces, so a source whose events a per-source budget folded away measures the same volume as
-/// if each had been written. Anything else, and a summary whose count is missing or not a
-/// positive integer, is one. Clamped to [`MAX_SUMMARY_EVENTS`].
+/// a sensor's connection or login summary (`event_summary: true` on a `honeypot_connection` or
+/// `honeypot_login_attempt`) the `suppressed_count` events it replaces, so a source whose events a
+/// per-source budget folded away measures the same volume as if each had been written. Anything
+/// else (other signals, the overflow summary, which stands for many addresses), and a summary whose
+/// count is missing or not a positive integer, is one. Clamped to [`MAX_SUMMARY_EVENTS`].
 pub(crate) fn represented_events(event: &EventInput) -> i32 {
-    let is_summary = event.metadata.get(EVENT_SUMMARY_KEY) == Some(&serde_json::Value::Bool(true));
+    let flagged = |key: &str| event.metadata.get(key) == Some(&serde_json::Value::Bool(true));
+    let is_summary = matches!(
+        event.signal_type,
+        SignalType::HoneypotConnection | SignalType::HoneypotLoginAttempt
+    ) && flagged(EVENT_SUMMARY_KEY)
+        && !flagged(OVERFLOW_SUMMARY_KEY);
     let count = is_summary
         .then(|| event.metadata.get("suppressed_count")?.as_u64())
         .flatten()
@@ -784,6 +792,19 @@ mod tests {
         assert_eq!(count(summary(serde_json::json!(u64::MAX))), 1_000_000);
         // A count without the marker (a command summary, a UDP rate-limit summary) is one event.
         assert_eq!(count(serde_json::json!({"suppressed_count": 500})), 1);
+        // The overflow summary stands for many addresses but belongs to one: one event.
+        assert_eq!(
+            count(
+                serde_json::json!({"event_summary": true, "overflow_summary": true, "suppressed_count": 7952})
+            ),
+            1
+        );
+        // Only a connection or login summary is expanded, whatever else carries the marker.
+        let other =
+            |signal| represented_events(&vnc_event(signal, when, summary(serde_json::json!(500))));
+        assert_eq!(other(SignalType::HoneypotCommandExec), 1);
+        assert_eq!(other(SignalType::HoneypotMalwareUpload), 1);
+        assert_eq!(other(SignalType::HoneypotConnection), 500);
         assert_eq!(
             count(serde_json::json!({"event_summary": "true", "suppressed_count": 500})),
             1

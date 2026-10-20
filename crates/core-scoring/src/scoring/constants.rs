@@ -58,6 +58,12 @@ pub const VOLUME_LIST_WINDOW_SECONDS: i64 = 86_400;
 /// sighting of its signal type, as a flood of the originals was after the 60 s dedup.
 pub const EVENT_SUMMARY_KEY: &str = "event_summary";
 
+/// The metadata key only a sensor's overflow summary carries
+/// (`sensor_framework::source_flood::OVERFLOW_SUMMARY_KEY`). That summary stands for events of many
+/// addresses but is attributed to the first one, so it counts as one event, never its
+/// `suppressed_count`, which would credit one address with thousands of other sources' events.
+pub const OVERFLOW_SUMMARY_KEY: &str = "overflow_summary";
+
 /// The most events one summary can stand for. A sensor writes one per address per ten-minute
 /// window, so no honest value approaches this; the clamp keeps a malformed one from overflowing
 /// the `i32` counters in one step.

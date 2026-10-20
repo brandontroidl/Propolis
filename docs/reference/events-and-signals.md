@@ -343,6 +343,7 @@ event's, its protocol is `tcp` and its `session_id` is fresh.
 |---|---|---|
 | `event_summary` | boolean | always `true`; marks the event as a summary |
 | `source_prefix` | string | the address's network in CIDR form (`198.51.100.0/24`), or `overflow` for addresses that arrived while the window's address table was full |
+| `overflow_summary` | boolean | `true` on the overflow summary only, absent otherwise; it stands for many addresses but is attributed to one, so scoring counts it as one event |
 | `suppressed_count` | integer | events this summary stands for: `suppressed_connections` plus `suppressed_attempts` |
 | `suppressed_connections`, `suppressed_attempts` | integer | the folded `honeypot_connection` and `honeypot_login_attempt` events |
 | `client_versions` | array of strings | distinct client versions among the folded events (VNC's `client_version`), at most 8, sanitized, at most 128 characters each; only events that carry one contribute |
@@ -358,7 +359,8 @@ about the client beyond its source.
 
 Scoring treats a summary as the events it replaces for the two counters that measure volume:
 `event_count` and `established_event_count` grow by `suppressed_count` (clamped to 1,000,000; a
-missing, zero or non-integer count is one), so a flooder's volume-list threshold arrives as it did
+missing, zero or non-integer count is one; the overflow summary and any summary that is not a
+`honeypot_connection` or `honeypot_login_attempt` is one), so a flooder's volume-list threshold arrives as it did
 when every event was written. Weight is not multiplied: the summary is one sighting of its signal
 type, which after the 60 s dedup is all a continuous flood ever contributed
 (`crates/core-scoring/src/scoring/engine.rs#represented_events`; see

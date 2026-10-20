@@ -551,9 +551,11 @@
   start and hourly, as the account that owns the directory, and recounts its budget; this needs no
   unit or directory change and gives the daemon no new write access. The daemon's pass now walks
   only the spool it owns (`fetched`) and logs a WARN when it finds a sample it cannot remove, as
-  the sensors do. A collector in a split deployment, which runs no daemon, is now trimmed too; that deletes the
-  only copy of each body there after 30 days, which the planned custody design allows only on
-  `CustodyComplete`, so it is an open owner decision (see [retention](docs/operations/retention.md)).
+  the sensors do. A collector in a split deployment, which runs no daemon, is now trimmed too; that
+  deletes the only copy of each body there after 30 days, which the planned custody design allows
+  only on `CustodyComplete`; the owner accepted age-only pruning on collectors on 2026-10-20 until
+  that receipt lands (see [retention](docs/operations/retention.md)). Retention frees space by age
+  only, so a spool that fills in days stays full until its oldest bodies turn 30 days.
   `retention_deploy` checks the units and `provision.sh` for every spool a pass walks. See
   [retention](docs/operations/retention.md).
 - **A sensor whose spool filled up now captures again once files are removed** - the spool's

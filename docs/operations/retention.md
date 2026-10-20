@@ -103,15 +103,16 @@ prevent for `/var/lib/propolis`). Pruning in the sensor loosens nothing, also co
 a [split deployment](./split-deployment.md) that runs no daemon, and releases the sensor's budget
 directly. **Unit and provisioning changes made: none.**
 
-**Open policy question for a collector.** Sample bodies never leave a collector (the shipper sends log
-lines only), so on a collector the sensor's 30-day pass deletes the only copy of each body, whether or
-not the control plane ever saw its event. The planned custody design says a collector may delete its
-only copy of a body only on `CustodyComplete`
+**Collectors: age-only pruning, by decision.** Sample bodies never leave a collector (the shipper
+sends log lines only), so on a collector the sensor's 30-day pass deletes the only copy of each body,
+whether or not the control plane ever saw its event. The planned custody design says a collector may
+delete its only copy of a body only on `CustodyComplete`
 ([evidence provenance and artifact custody](../architecture/evidence-provenance-and-artifact-custody.md));
-that handshake is not implemented, so the pass does not consult the outbox. Until the owner decides
-between limiting the sensor-side pass to non-collector roles and gating it on `CustodyComplete` once
-that handshake lands, an operator who needs a collector's bodies for longer must copy them off within
-30 days. A deleted body keeps its event (hash, size, name) in the log and the ledger.
+that handshake is not implemented, so the pass does not consult the outbox. The owner decided on
+2026-10-20 to accept age-only pruning on collectors until that handshake (SP-B-3) lands, rather than
+add a role setting or let collector spools fill and stop capture. An operator who needs a collector's
+bodies for longer than 30 days must copy them off before then. A deleted body keeps its event (hash,
+size, name) in the log and the ledger.
 
 `crates/propolis/tests/retention_deploy.rs` keeps this true: for every spool a retention pass
 walks, the account that runs the pass owns the directory with `rwx` in `provision.sh` and has the
@@ -132,6 +133,9 @@ Independently of age, each spool is capped by a global byte budget (100 MB per s
 refusal regardless of whether the cleanup pass runs. A refused sensor upload still leaves its event
 in the ledger, marked `stored: false` with a `not_stored_reason`, so the observation is kept and
 only the body is lost ([queue and spool](./queue-and-spool.md#spool-refusals-spool_refused_count)).
+Retention frees space by age only, so a spool that fills in days stays full until its oldest bodies
+turn 30 days: the SSH spool holds about six bodies at its 16 MiB per-file cap, and on 2026-10-17 a
+live node's SSH spool filled within days of large miner uploads and refused every body after that.
 See [capacity planning](./capacity-planning.md).
 
 ## Event and score retention

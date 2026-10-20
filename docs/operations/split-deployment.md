@@ -52,8 +52,9 @@ The collector dials the gateway; the gateway never dials a collector. Captured s
 cross: the shipper sends log lines only (`crates/shipper/src/main.rs#main`), so files a sensor
 stores on the collector stay there and never reach the control plane's review or VirusTotal scanning.
 The collector's own sensors age them out after 30 days (the sensor's pass, [retention](retention.md)),
-which deletes the only copy of each body; whether that should wait for the planned `CustodyComplete`
-receipt is an open owner decision, recorded in [retention](retention.md#why-the-sensors-prune-their-own-spools).
+which deletes the only copy of each body. The owner accepted that age-only pruning on 2026-10-20
+until the planned `CustodyComplete` receipt lands; copy bodies off within 30 days if you need them
+longer ([retention](retention.md#why-the-sensors-prune-their-own-spools)).
 
 ## What is and is not supported
 

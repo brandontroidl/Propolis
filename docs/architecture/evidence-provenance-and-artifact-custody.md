@@ -442,7 +442,8 @@ The artifact-shipper consumes manifest rows, not files.
    occurrence_id + sha256 + size` and carries the `commitment_id`s (or their `global_sequence`s) it requires.
 
 A collector may delete its only copy of a body **only on `CustodyComplete`**. (Current state: until SP-B-3
-lands, each sensor's 30-day spool pass deletes bodies by age alone and does not read the outbox; that pass must
+lands, each sensor's 30-day spool pass deletes bodies by age alone and does not read the outbox, an interim the
+owner accepted on 2026-10-20; that pass must
 be gated on this receipt when SP-B-3 lands, or limited to non-collector roles. See
 [retention](../operations/retention.md#why-the-sensors-prune-their-own-spools).) Stages 1 and 2 are
 prerequisites; neither alone authorizes deletion. This closes both the "durable body, lost attribution"

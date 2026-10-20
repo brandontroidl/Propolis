@@ -747,8 +747,9 @@ code and deployment model, stated plainly, not defects to be discovered later.
 - **Unauthenticated console metrics/health/ready.** Safe *only* because the
   console defaults to loopback; rebinding off-loopback without a fronting proxy
   exposes them.
-- **No built-in `event`-table pruning**, and the 30-day sample cleanup runs only
-  when VirusTotal is enabled - plan storage and prune accordingly.
+- **No built-in `event`-table pruning** - plan storage and prune accordingly. Sample
+  files are trimmed at 30 days by each spooling sensor, by age only, so a spool that
+  fills sooner stays full until its oldest files age out.
 - **Coverage-test gap.** The explicit no-HTTP-client dependency assertion exists
   only for `sensor-ssh`; extending it to the other sensors would make the
   "sensors are egress-free" claim machine-checked for all of them. `sensor-catchall`
@@ -786,7 +787,7 @@ consult each for the authoritative table:
 session-gated); scoring half-life 6h; tiers Aggressive (score ≥ 90, confidence ≥
 0.95) and Standard (≥ 75, ≥ 0.70); tier TTLs 24h/48h; retention windows
 `24h,7d,30d,60d,90d`; feed build interval 900s; spool budgets 100 MB per spooling
-sensor and 1 GB fetcher; sample cleanup at 30 days (VT-enabled only); capture
+sensor and 1 GB fetcher; sample cleanup at 30 days (by each sensor); capture
 queue depth 64; default pool 10 connections; console default bind
 `127.0.0.1:8080`.
 

@@ -5185,11 +5185,17 @@ async fn healthy_pages_render_no_degraded_banner(pool: PgPool) {
     assert!(body.contains("0 events in the ledger"), "{body}");
 }
 
+/// `VERIFY_IN_FLIGHT` is one permit per process, and the tests below share this binary's process:
+/// while one holds the permit the other's verify answers 409. Each takes this lock for its whole
+/// run so they take turns instead of failing about half the time when run in parallel.
+static INTEGRITY_VERIFY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The integrity page's POST starts a full-ledger scan, so it carries the session's CSRF token
 /// like every other console POST. The page must render the token and the route must refuse a
 /// request without the right one.
 #[sqlx::test(migrations = false)]
 async fn integrity_verify_requires_the_session_csrf_token(pool: PgPool) {
+    let _turn = INTEGRITY_VERIFY_TESTS.lock().await;
     migrate(&pool).await;
     let state = test_state(pool);
     let (session_id, cookie) = state.sessions.create();
@@ -5251,6 +5257,7 @@ async fn integrity_verify_requires_the_session_csrf_token(pool: PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn integrity_verify_runs_one_at_a_time(pool: PgPool) {
+    let _turn = INTEGRITY_VERIFY_TESTS.lock().await;
     migrate(&pool).await;
     let state = test_state(pool);
     let (session_id, cookie) = state.sessions.create();

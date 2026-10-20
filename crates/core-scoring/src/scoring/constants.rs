@@ -50,3 +50,15 @@ pub const PERSIST_CAP: Decimal = dec!(60);
 /// locally but never reported upstream.
 pub const VOLUME_LIST_THRESHOLD: u32 = 1000;
 pub const VOLUME_LIST_WINDOW_SECONDS: i64 = 86_400;
+
+/// The metadata key a sensor's connection or login summary carries (`event_summary: true`,
+/// `sensor_framework::source_flood::EVENT_SUMMARY_KEY`). A summary stands for the events a
+/// per-source budget kept out of the log, so the counters that measure volume count it as that
+/// many events (`suppressed_count`) instead of one. Weight is unaffected: the summary is one
+/// sighting of its signal type, as a flood of the originals was after the 60 s dedup.
+pub const EVENT_SUMMARY_KEY: &str = "event_summary";
+
+/// The most events one summary can stand for. A sensor writes one per address per ten-minute
+/// window, so no honest value approaches this; the clamp keeps a malformed one from overflowing
+/// the `i32` counters in one step.
+pub const MAX_SUMMARY_EVENTS: u64 = 1_000_000;

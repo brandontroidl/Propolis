@@ -19,7 +19,7 @@ use rust_decimal_macros::dec;
 use crate::domain::enums::{Category, Protocol, is_confirmed_real};
 use crate::domain::types::{EventInput, IpScore};
 use crate::scoring::breadth::effective_score;
-use crate::scoring::constants::SCORE_CAP;
+use crate::scoring::constants::{EVENT_SUMMARY_KEY, MAX_SUMMARY_EVENTS, SCORE_CAP};
 use crate::scoring::decay::decay;
 use crate::scoring::eligibility::eligible;
 use crate::scoring::persistence::persistence_points;
@@ -144,13 +144,17 @@ pub fn apply_event(
     // Step 4: sticky latch + counts (a deduped sighting still counts).
     let has_confirmed_real = prev_has_confirmed_real
         || is_confirmed_real(event.protocol, event.authenticated, event.category);
-    let event_count = prev_event_count + 1;
+    let represented = represented_events(event);
+    let event_count = prev_event_count.saturating_add(represented);
     // Non-spoofable count: only a completed TCP connection proves the source address is genuine (a
     // spoofed source cannot finish the handshake). UDP/ICMP datagrams carry a forgeable sender, so
     // they never count toward volume-based blocklisting - otherwise a spoofed flood could list an
     // innocent third party (see `recommended_by_volume` in `derive_projection`).
-    let established_event_count =
-        prev_established_event_count + i32::from(event.protocol == Protocol::Tcp);
+    let established_event_count = if event.protocol == Protocol::Tcp {
+        prev_established_event_count.saturating_add(represented)
+    } else {
+        prev_established_event_count
+    };
 
     // Steps 5-6: derive facts + assemble. Both decay_anchor and last_seen are `now`
     // (the event's observed_at) because an event WAS seen at this instant.
@@ -170,6 +174,21 @@ pub fn apply_event(
         now,
         delisted,
     )
+}
+
+/// How many sightings `event` counts as in `event_count` and `established_event_count`: one, or for
+/// a sensor's connection or login summary (`event_summary: true`) the `suppressed_count` events it
+/// replaces, so a source whose events a per-source budget folded away measures the same volume as
+/// if each had been written. Anything else, and a summary whose count is missing or not a
+/// positive integer, is one. Clamped to [`MAX_SUMMARY_EVENTS`].
+pub(crate) fn represented_events(event: &EventInput) -> i32 {
+    let is_summary = event.metadata.get(EVENT_SUMMARY_KEY) == Some(&serde_json::Value::Bool(true));
+    let count = is_summary
+        .then(|| event.metadata.get("suppressed_count")?.as_u64())
+        .flatten()
+        .filter(|&n| n > 0)
+        .map_or(1, |n| n.min(MAX_SUMMARY_EVENTS));
+    i32::try_from(count).unwrap_or(i32::MAX)
 }
 
 /// Compute all derived facts (eligibility, tier, recommendations, live-decayed `max_confidence`)
@@ -630,6 +649,153 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    fn vnc_event(
+        signal: SignalType,
+        when: DateTime<Utc>,
+        metadata: serde_json::Value,
+    ) -> EventInput {
+        EventInput::from_signal(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            "vnc".into(),
+            signal,
+            Protocol::Tcp,
+            signal == SignalType::HoneypotLoginAttempt,
+            when,
+            metadata,
+            None,
+        )
+    }
+
+    /// Fold `events` in time order with the repository's dedup rule (a same-signal sighting within
+    /// the dedup window of the newest earlier one adds no weight).
+    fn fold_with_dedup(mut events: Vec<EventInput>) -> IpScore {
+        events.sort_by_key(|e| e.observed_at);
+        let mut newest: std::collections::HashMap<SignalType, DateTime<Utc>> = Default::default();
+        let mut acc: Option<IpScore> = None;
+        for e in &events {
+            let deduped = newest.get(&e.signal_type).is_some_and(|prior| {
+                (e.observed_at - *prior).num_seconds().abs()
+                    <= crate::scoring::constants::DEDUP_WINDOW_SECONDS
+            });
+            newest.insert(e.signal_type, e.observed_at);
+            acc = Some(apply_event(acc, e, HALF_LIFE, deduped, 1, 1));
+        }
+        acc.unwrap()
+    }
+
+    /// The flood the VNC sensor wrote about 10,000 lines an hour for: a connection and a login
+    /// every 1.4 s for two hours. `bounded` is what the sensor now writes for it: the first ten of
+    /// each kind per ten-minute window verbatim and one login summary per window carrying the
+    /// rest. The two streams must measure the same volume, and the bounded one must not score
+    /// lower.
+    fn vnc_flood(bounded: bool) -> Vec<EventInput> {
+        const WINDOW_MS: i64 = 600_000;
+        const BUDGET: i64 = 10;
+        let start = ts("2026-10-19T00:00:00Z");
+        let mut out = Vec::new();
+        let (mut window, mut seen, mut folded) = (0i64, 0i64, 0u64);
+        let close = |out: &mut Vec<EventInput>, window: i64, folded: u64| {
+            if folded > 0 {
+                out.push(vnc_event(
+                    SignalType::HoneypotLoginAttempt,
+                    start + Duration::milliseconds((window + 1) * WINDOW_MS),
+                    serde_json::json!({
+                        "event_summary": true,
+                        "suppressed_count": folded * 2,
+                        "suppressed_connections": folded,
+                        "suppressed_attempts": folded,
+                    }),
+                ));
+            }
+        };
+        for i in 0..(7_200_000 / 1400) {
+            let at = i * 1400;
+            if at / WINDOW_MS != window {
+                close(&mut out, window, folded);
+                (window, seen, folded) = (at / WINDOW_MS, 0, 0);
+            }
+            seen += 1;
+            if !bounded || seen <= BUDGET {
+                let when = start + Duration::milliseconds(at);
+                out.push(vnc_event(
+                    SignalType::HoneypotConnection,
+                    when,
+                    serde_json::json!({}),
+                ));
+                out.push(vnc_event(
+                    SignalType::HoneypotLoginAttempt,
+                    when,
+                    serde_json::json!({}),
+                ));
+            } else {
+                folded += 1;
+            }
+        }
+        close(&mut out, window, folded);
+        out
+    }
+
+    #[test]
+    fn a_bounded_flood_measures_the_same_volume_and_never_scores_lower() {
+        let before = fold_with_dedup(vnc_flood(false));
+        let after = fold_with_dedup(vnc_flood(true));
+        assert!(before.event_count > 5000, "the fixture is a real flood");
+        assert_eq!(after.event_count, before.event_count);
+        assert_eq!(
+            after.established_event_count,
+            before.established_event_count
+        );
+        assert_eq!(after.has_confirmed_real, before.has_confirmed_real);
+        assert_eq!(after.eligible, before.eligible);
+        assert!(
+            after.raw_score >= before.raw_score,
+            "raw {} fell below {}",
+            after.raw_score,
+            before.raw_score
+        );
+        // The volume path is what separates them if a summary counted as one event: the bounded
+        // stream has about 100 events and would not be volume-listed.
+        assert!(before.recommended_for_blocklist);
+        assert!(after.recommended_for_blocklist);
+    }
+
+    #[test]
+    fn only_an_event_summary_stands_for_more_than_one_event() {
+        let when = ts("2026-10-19T00:00:00Z");
+        let signal = SignalType::HoneypotLoginAttempt;
+        let count =
+            |metadata: serde_json::Value| represented_events(&vnc_event(signal, when, metadata));
+        let summary = |n: serde_json::Value| serde_json::json!({"event_summary": true, "suppressed_count": n});
+        assert_eq!(count(serde_json::json!({})), 1);
+        assert_eq!(count(summary(serde_json::json!(84))), 84);
+        // A malformed or hostile count is one event or a clamped one, never a wrap or a panic.
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-5),
+            serde_json::json!("84"),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(count(summary(bad.clone())), 1, "{bad}");
+        }
+        assert_eq!(count(summary(serde_json::json!(u64::MAX))), 1_000_000);
+        // A count without the marker (a command summary, a UDP rate-limit summary) is one event.
+        assert_eq!(count(serde_json::json!({"suppressed_count": 500})), 1);
+        assert_eq!(
+            count(serde_json::json!({"event_summary": "true", "suppressed_count": 500})),
+            1
+        );
+        // Folding saturates instead of overflowing the i32 counter.
+        let big = || vnc_event(signal, when, summary(serde_json::json!(1_000_000)));
+        let mut s = apply_event(None, &big(), HALF_LIFE, false, 1, 1);
+        for _ in 0..3000 {
+            s = apply_event(Some(s), &big(), HALF_LIFE, true, 1, 1);
+        }
+        assert_eq!(s.event_count, i32::MAX);
+        assert_eq!(s.established_event_count, i32::MAX);
     }
 
     proptest! {

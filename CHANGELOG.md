@@ -63,7 +63,8 @@
   window, 40 of each per source network (/24 or /56) and 200 repeats of each per listener; an
   address's first event of each kind in a window does not spend the listener budget (its address
   and network budgets, and the table, still apply), so a source seen once is written unless its
-  network has already spent 40. One network holds at most 64 of the 1,024 tracked addresses per
+  network has already spent 40, its network already holds 64 tracked addresses, or the table is
+  full. One network holds at most 64 of the 1,024 tracked addresses per
   window and its further addresses are counted into one summary for the network, so a single /24
   or IPv6 /56 cannot fill the table (`SourceEventGate` in `sensor_framework::source_flood`,
   attached to the listener's `EventEmitter`). The rest is counted into one event per address per

@@ -504,7 +504,8 @@ impl SourceEventGate {
     }
 
     /// Write every summary still accumulating, ended or not, stamped with `arrival`. Called at
-    /// shutdown once the listener has stopped; bounded by the address table's capacity.
+    /// shutdown once the listener has stopped; bounded by `ready_limit`: one per tracked address,
+    /// one per capped network and the overflow.
     pub async fn flush(&self, emitter: &EventEmitter, arrival: Arrival) {
         let summaries = self.drain();
         arrival::scope(arrival, self.write(emitter, summaries)).await;
@@ -1024,10 +1025,49 @@ mod tests {
         assert_eq!(event.metadata["suppressed_count"], 2 * (2000 - cap as u64));
     }
 
-    /// The worst case the docs state: 2 x capacity first sightings, 2 x total repeats and a summary
-    /// per tracked address, per capped network and the overflow.
+    /// A window that ends with every kind of summary parked hands every one of them to the writer:
+    /// 16 networks of 100 addresses (the table fills at the 16th network's 64th address, so 15
+    /// networks reach their cap and the rest goes to the overflow) and 50 more sources, then one
+    /// event after the window rotates it. Each tracked address that folded repeats has a summary,
+    /// plus 15 network summaries and the overflow.
     #[test]
-    fn the_worst_case_line_count_with_the_network_cap_matches_the_documented_bound() {
+    fn a_rotated_window_parks_every_address_network_and_overflow_summary() {
+        let t0 = Instant::now();
+        let g = SourceEventGate::new_at(SourceEventConfig::default(), t0);
+        for _ in 0..3 {
+            for net in 0..16u32 {
+                for host in 1..=100u32 {
+                    let ip = format!("127.{net}.0.{host}");
+                    g.admit_at(&connection(&ip), t0);
+                    g.admit_at(&login(&ip, "RFB 003.008"), t0);
+                }
+            }
+        }
+        for n in 0..50u32 {
+            g.admit_at(&connection(&format!("127.200.{n}.1")), t0);
+        }
+        let later = t0 + g.window() + Duration::from_secs(1);
+        g.admit_at(&connection("127.201.0.1"), later);
+        let due = g.take_due(later);
+        let networks = due
+            .iter()
+            .filter(|s| matches!(s.scope, SummaryScope::Network(_)))
+            .count();
+        let overflow = due
+            .iter()
+            .filter(|s| s.scope == SummaryScope::Overflow)
+            .count();
+        assert_eq!((networks, overflow), (15, 1), "{} summaries", due.len());
+        assert_eq!(due.len(), 1040, "every parked summary reaches the writer");
+    }
+
+    /// An upper bound on the lines one window can write: 2 x capacity first sightings, 2 x total
+    /// repeats and a summary per tracked address, per capped network and the overflow. The bound
+    /// is not tight (the table fills before a 16th network reaches its cap, so at most 1,040
+    /// summaries and 3,473 lines are reachable) and holds with or without the network cap; the
+    /// test above is the one that depends on the cap.
+    #[test]
+    fn the_worst_case_line_count_stays_under_the_documented_bound() {
         let t0 = Instant::now();
         let config = SourceEventConfig::default();
         let (cap, capacity) = (

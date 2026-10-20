@@ -192,7 +192,8 @@ pub(crate) fn is_unattributed_summary(event: &EventInput) -> bool {
 /// a sensor's connection or login summary (`event_summary: true` on a `honeypot_connection` or
 /// `honeypot_login_attempt`) the `suppressed_count` events it replaces, so a source whose events a
 /// per-source budget folded away measures the same volume as if each had been written. Anything
-/// else (other signals, the overflow summary, which stands for many addresses), and a summary whose
+/// else (other signals, the overflow and per-network summaries, which stand for many addresses
+/// and carry `overflow_summary: true`), and a summary whose
 /// count is missing or not a positive integer, is one. Clamped to [`MAX_SUMMARY_EVENTS`].
 pub(crate) fn represented_events(event: &EventInput) -> i32 {
     let flagged = |key: &str| event.metadata.get(key) == Some(&serde_json::Value::Bool(true));

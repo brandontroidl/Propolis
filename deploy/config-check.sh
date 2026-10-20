@@ -147,9 +147,13 @@ LOGROTATE_RESERVE_BYTES=536870912
 # low_disk_pct FILE: the monitor's low-disk threshold as the daemon will read it from FILE. systemd
 # strips whitespace around the key, the '=' and the value and the last assignment wins; the daemon
 # then runs trim().parse::<u64>() (crates/propolis/src/ops_alert/config.rs, get_u64), which accepts
-# a leading '+' and leading zeros, and refuses to start outside 1..=100, so only such a value is
-# the threshold it alerts on; anything else leaves its default in force. The same function is in
-# backup.sh (backup_script_test.rs and config_check_test.rs hold the two to one table).
+# a leading '+' and leading zeros, and refuses to start outside 1..=100. A value that is not a whole
+# number in that range is one the daemon refuses to start on, so no alert runs on it; this returns
+# the default 15 for it, the figure to size against while the operator fixes the file. Only the
+# forms in fixtures/low_disk_table.in are held to systemd's reading. Forms this does not model and
+# systemd reads differently: backslash escapes and line continuations inside a value, a ';' or '#'
+# comment after a quoted value, and a line that is itself continued from the one above. The same
+# function is in backup.sh (backup_script_test.rs and config_check_test.rs hold the two to one table).
 low_disk_pct() {
     local v re='^\+?[0-9]+$'
     v="$(sed -n 's/^[[:space:]]*PROPOLIS_OPS_CAPACITY_FREE_PCT[[:space:]]*=//p' "$1" 2>/dev/null | tail -n 1 || true)"
@@ -158,8 +162,10 @@ low_disk_pct() {
     v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
     if [[ "$v" =~ $re ]]; then
         v="${v#+}"
+        # With the zeros gone a match starts at a non-zero digit (zero itself is left empty and
+        # fails the pattern), so only the upper bound needs testing.
         v="${v#"${v%%[!0]*}"}"
-        if [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ]; then
+        if [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -le 100 ]; then
             printf '%s' "$v"
             return 0
         fi
@@ -194,7 +200,12 @@ human_bytes() {
         printf '%s%sG' $((t / 10)) "$([ $((t % 10)) -eq 0 ] || printf '.%s' $((t % 10)))"
     elif [ "$b" -ge 1048576 ]; then
         t=$(((b * 10 + 524288) / 1048576))
-        printf '%s%sM' $((t / 10)) "$([ $((t % 10)) -eq 0 ] || printf '.%s' $((t % 10)))"
+        if [ "$t" -ge 10240 ]; then
+            # Just under 1 GiB rounds to 1024.0M; the next unit up reads better and is the same size.
+            printf '1G'
+        else
+            printf '%s%sM' $((t / 10)) "$([ $((t % 10)) -eq 0 ] || printf '.%s' $((t % 10)))"
+        fi
     elif [ "$b" -ge 1024 ]; then
         printf '%sK' $((b / 1024))
     else
@@ -1360,14 +1371,20 @@ check_rotation() {
 # under the headroom deploy/backup.sh enforces (the ops monitor's low-disk threshold, and the
 # logrotate guard's reserve). backup.sh refuses a run that would break it, so a node that fails this
 # check stops backing up one night instead of filling the disk. Prints a finding and returns 1 when
-# it cannot fit; prints nothing when it fits or when a figure it needs is not known.
+# it cannot fit; prints nothing when it fits, or when the status predates the figures it needs or
+# the retention is one backup.sh refuses to run with. A volume it cannot measure is reported with
+# limit(), never as a pass.
 backup_headroom() {
-    local success="$1" unit_env dump archive src_bytes set_bytes keep dir probe size avail pct keep_free
-    local pct_bytes sets total tok used_sets other dev sd need
+    local success="$1" unit_env dump archive set_bytes keep dir probe size avail pct keep_free
+    local pct_bytes sets total tok used_sets other need
     dump="$(printf '%s' "$success" | sed -n 's/.*"dump_bytes":\([0-9]\{1,15\}\).*/\1/p')"
     archive="$(printf '%s' "$success" | sed -n 's/.*"archive_bytes":\([0-9]\{1,15\}\).*/\1/p')"
-    src_bytes="$(printf '%s' "$success" | sed -n 's/.*"source_bytes":\([0-9]\{1,15\}\).*/\1/p')"
-    if [ -z "$dump" ] || [ -z "$archive" ] || [ -z "$src_bytes" ]; then
+    # A status from before source_bytes was recorded predates the sizing this models.
+    case "$success" in
+        *'"source_bytes":'[0-9]*) ;;
+        *) return 0 ;;
+    esac
+    if [ -z "$dump" ] || [ -z "$archive" ]; then
         return 0
     fi
     set_bytes=$((dump + archive))
@@ -1390,8 +1407,8 @@ backup_headroom() {
         limit "df is not installed: the backup volume's headroom was not checked"
         return 0
     fi
-    # The directory is root-only (0750), so a non-root run measures the nearest ancestor it can
-    # reach, which is on the same volume unless the directory is a mount point of its own.
+    # The directory is root-only (0750), so a non-root run reads the volume's size from the nearest
+    # ancestor it can reach; the sets themselves are measured below, and only as root.
     probe="$dir"
     while [ ! -d "$probe" ] || ! { read -r size avail < <(df --output=size,avail -B1 -- "$probe" 2>/dev/null | tail -n 1); [[ "$size" =~ ^[0-9]{1,18}$ && "$avail" =~ ^[0-9]{1,18}$ ]]; }; do
         [ "$probe" != / ] && [ "$probe" != . ] || { limit "the free space of $dir could not be read: the backup headroom was not checked"; return 0; }
@@ -1403,23 +1420,18 @@ backup_headroom() {
     pct_bytes=$(( size / 100 * pct + (size % 100 * pct + 99) / 100 ))
     keep_free=$pct_bytes
     [ "$keep_free" -ge "$LOGROTATE_RESERVE_BYTES" ] || keep_free="$LOGROTATE_RESERVE_BYTES"
-    # What else lives on the volume. Run as root, the backup directory is measurable, so everything
-    # that is not a set (the database, the logs, the system) is the volume's used space minus it.
-    # Without that (not root, or du failed), count the database and state only when the directory
-    # shares a device with them; a dedicated backup volume holds neither.
+    # What else lives on the volume: everything that is not a set (the database, the logs, the
+    # system) is the volume's used space minus the backup directory's. When the directory cannot be
+    # measured (this user cannot read it, as for any non-root run of the real 0750 directory) the
+    # answer is unknown, not zero: charging only the source size would drop the logs and the rest of
+    # the system and stay silent where backup.sh refuses, so this is a limited check, never a pass.
     if used_sets="$(du -s -B1 -- "$dir" 2>/dev/null)" && [[ "${used_sets%%[[:space:]]*}" =~ ^[0-9]{1,18}$ ]]; then
         used_sets="${used_sets%%[[:space:]]*}"
         other=$((size - avail - used_sets))
         [ "$other" -ge 0 ] || other=0
     else
-        other=0
-        dev="$(stat -c %d -- "$probe" 2>/dev/null || true)"
-        for sd in "$(dirname -- "$BACKUP_STATUS")" /var/lib/postgresql; do
-            if [ -n "$dev" ] && [ "$(stat -c %d -- "$sd" 2>/dev/null || true)" = "$dev" ]; then
-                other=$src_bytes
-                break
-            fi
-        done
+        limit "the backup directory $dir cannot be read as this user: the backup volume's headroom was not checked (run as root)"
+        return 0
     fi
     # What backup.sh needs on the night it is tightest: it prunes the scheduled sets to KEEP-1, the
     # 3 pre-upgrade sets may all be present, and the new set is estimated at a fifth over the last.

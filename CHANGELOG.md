@@ -672,8 +672,9 @@
   guard's 512 MiB reserve, naming the shortfall and the fixes (`PROPOLIS_BACKUP_KEEP`,
   `PROPOLIS_BACKUP_DIR`). `config-check.sh` gains a `backup-headroom` warning when the worst
   night's sets (`KEEP - 1` scheduled, 3 pre-upgrade, the next one a fifth larger) cannot fit
-  beside what else the volume holds within that headroom, with the numbers; it counts the
-  database only when the backup directory shares its volume. A node already near the line will
+  beside what else the volume holds within that headroom, with the numbers; run without root it
+  cannot read the 0750 backup directory, so it lists the headroom under LIMITED CHECKS instead
+  of guessing (run it with `sudo` for the verdict). A node already near the line will
   see backups refuse until you lower `PROPOLIS_BACKUP_KEEP` or move the backup directory. On
   the incident's numbers (17 GiB `/var`, 6.6 GiB database, 1.07 GiB sets) steady backups need
   `PROPOLIS_BACKUP_KEEP=3` or a separate backup volume. **An upgrade can now be blocked by this
@@ -681,8 +682,13 @@
   refusal stops the upgrade with the box untouched. The refusal names the ways out: free space on
   the volume, run a scheduled backup with a lower `PROPOLIS_BACKUP_KEEP` to prune, move
   `PROPOLIS_BACKUP_DIR`, or `PROPOLIS_UPGRADE_SKIP_BACKUP=1` for that upgrade (no database to roll
-  back to). `PROPOLIS_OPS_CAPACITY_FREE_PCT` is read the way systemd and the daemon read it
-  (whitespace around the key, `=` and value, a leading `+` or zeros accepted); see
+  back to). At `PROPOLIS_BACKUP_KEEP=1` a refusal says retention cannot shrink further, and a
+  `PROPOLIS_BACKUP_KEEP` written with leading zeros (`08`, `010`) is read as decimal.
+  `PROPOLIS_OPS_CAPACITY_FREE_PCT` is read the way systemd and the daemon read it for the forms
+  the tests cover (whitespace around the key, `=` and value, a leading `+` or zeros, matching
+  quotes, the last assignment winning); backslash escapes, line continuations and trailing
+  comments after a quoted value are not modelled, and a value the daemon refuses sizes against the
+  default 15. See
   [backup and restore](docs/operations/backup-and-restore.md) and
   [upgrade, rollback and DR](docs/operations/upgrade-rollback-and-dr.md).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the

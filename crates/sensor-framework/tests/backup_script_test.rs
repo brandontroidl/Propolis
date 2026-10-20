@@ -760,6 +760,31 @@ fn the_refusal_names_the_remedy_for_its_reason() {
     assert!(!err.contains("Lower PROPOLIS_BACKUP_KEEP"), "{err}");
 }
 
+// At KEEP=1 there is nothing left to lower, so a scheduled refusal must not tell the operator to
+// lower it; it names the ways out that exist. Higher KEEPs still get the lower-KEEP advice.
+#[test]
+fn a_scheduled_refusal_at_keep_one_gives_advice_that_can_be_followed() {
+    let df = [
+        ("STUB_DF_SIZE", (100 * GIB).to_string()),
+        ("STUB_DF_AVAIL", (14 * GIB).to_string()),
+    ];
+    let df: Vec<(&str, &str)> = df.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let mut env = df.clone();
+    env.push(("PROPOLIS_BACKUP_KEEP", "1"));
+    let output = Fixture::new().run(&[], &env);
+    assert!(!output.status.success());
+    let err = stderr_of(&output);
+    assert!(!err.contains("Lower PROPOLIS_BACKUP_KEEP"), "{err}");
+    assert!(err.contains("already 1"), "{err}");
+    assert!(err.contains("PROPOLIS_BACKUP_DIR"), "{err}");
+
+    let mut env = df;
+    env.push(("PROPOLIS_BACKUP_KEEP", "2"));
+    let err = stderr_of(&Fixture::new().run(&[], &env));
+    assert!(err.contains("Lower PROPOLIS_BACKUP_KEEP (now 2)"), "{err}");
+}
+
 // Under the threshold's share the logrotate guard's 512 MiB reserve still binds: a small volume has
 // 15% below the reserve.
 #[test]
@@ -852,6 +877,23 @@ fn bad_arguments_and_a_bad_keep_are_usage_errors() {
         assert_eq!(output.status.code(), Some(2), "{args:?} {env:?}");
     }
     assert!(fx.sets().is_empty());
+}
+
+// KEEP is a decimal count however it is spelled: bash would read 010 as octal 8 and abort on 08 and
+// 09. With 12 old sets, KEEP=010 leaves 10 (9 pruned to, plus the new one), not 8.
+#[test]
+fn a_leading_zero_keep_is_read_as_decimal() {
+    for (keep, left) in [("010", 10), ("08", 8), ("09", 9), ("007", 7)] {
+        let fx = Fixture::new();
+        for day in 1..=12 {
+            make_set(&fx, &format!("202001{day:02}T000000Z-scheduled"));
+        }
+        let output = fx.run(&[], &[("PROPOLIS_BACKUP_KEEP", keep)]);
+        assert_ok(&output);
+        assert_eq!(fx.sets().len(), left, "KEEP={keep}: {:?}", fx.sets());
+    }
+    let output = Fixture::new().run(&[], &[("PROPOLIS_BACKUP_KEEP", "1000")]);
+    assert_eq!(output.status.code(), Some(2));
 }
 
 /// A propolis binary from before pg-exec would start the daemon when handed `pg-exec`; the script

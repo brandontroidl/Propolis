@@ -2791,61 +2791,135 @@ fn a_dedicated_backup_volume_is_not_charged_for_the_database() {
     assert!(headroom_warned(&fx));
 }
 
-/// Not root, the backup directory (0750) cannot be measured, so the database and state are counted
-/// only when the directory shares a device with them.
+/// Not root, the real backup directory (0750 root) cannot be measured, so what else the volume
+/// holds is unknown. That is a limited check, never a pass: on the incident's volume KEEP 4 is
+/// refused by backup.sh every night, and the fallback that used to charge only the source size
+/// stayed silent about it.
 #[test]
-fn an_unmeasurable_backup_directory_is_charged_for_the_database_only_on_its_device() {
-    use std::os::unix::fs::MetadataExt;
+fn an_unmeasurable_backup_directory_is_a_limited_check_not_a_pass() {
     if is_root() {
         return;
     }
     let fx = Fx::new();
-    seed_volume(&fx, 17 * GIB, 0, GIB, 6 * GIB, "7");
-    let same = backups_dir(&fx);
-    std::fs::set_permissions(&same, std::fs::Permissions::from_mode(0o000)).unwrap();
+    seed_incident(&fx, "4");
+    let dir = backups_dir(&fx);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
     let v = fx
         .run_with(
             &["--json"],
-            &[("PROPOLIS_CC_BACKUP_DIR", same.to_str().unwrap())],
+            &[("PROPOLIS_CC_BACKUP_DIR", dir.to_str().unwrap())],
         )
         .json();
-    std::fs::set_permissions(&same, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
-        v["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f["id"] == "backup-headroom"),
-        "6 GiB of source plus 9 GiB of sets plus the 15% share does not fit 17 GiB"
+        v["limited"].as_array().unwrap().iter().any(|l| {
+            let l = l.as_str().unwrap();
+            l.contains("backup") && l.contains("headroom was not checked")
+        }),
+        "an unreadable backup directory must be listed under LIMITED CHECKS: {}",
+        v["limited"]
     );
-
-    // A directory on another device (tmpfs, where there is one) is charged only for the sets.
-    let Ok(other_dir) = tempfile::tempdir_in("/dev/shm") else {
-        return;
-    };
-    if std::fs::metadata(other_dir.path()).unwrap().dev() == std::fs::metadata(&same).unwrap().dev()
-    {
-        return;
-    }
-    let sub = other_dir.path().join("b");
-    std::fs::create_dir(&sub).unwrap();
-    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let v = fx
-        .run_with(
-            &["--json"],
-            &[("PROPOLIS_CC_BACKUP_DIR", sub.to_str().unwrap())],
-        )
-        .json();
-    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         !v["findings"]
             .as_array()
             .unwrap()
             .iter()
             .any(|f| f["id"] == "backup-headroom"),
-        "{}",
-        v["findings"]
+        "no verdict either way when nothing was measured"
     );
+
+    // The same directory, readable, is measured and KEEP 4 warns.
+    let v = fx.json();
+    assert!(headroom_warned(&fx), "{}", v["findings"]);
+    assert!(
+        !v["limited"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("headroom was not checked")),
+        "{}",
+        v["limited"]
+    );
+}
+
+/// The backup directory's own usage is subtracted from the volume's used space, so a set is not
+/// counted twice (once as "other data", once as a set). Real, non-sparse bytes in the directory make
+/// du report them, and the line is still the volume size to the byte: without the subtraction the
+/// exactly-fitting case is warned.
+#[test]
+fn the_backup_directorys_own_usage_is_not_charged_as_other_data() {
+    let fx = Fx::new();
+    let set_dir = backups_dir(&fx).join("20200101T000000Z-scheduled");
+    std::fs::create_dir_all(&set_dir).unwrap();
+    // Pseudo-random so no filesystem compresses or deduplicates it away.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let data: Vec<u8> = (0..16 * MIB)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    std::fs::write(set_dir.join("propolis.dump.age"), data).unwrap();
+    assert!(
+        du_bytes(&backups_dir(&fx)) >= 16 * MIB,
+        "the bytes are real"
+    );
+
+    let size: u64 = 10_000_000_050;
+    let keep_free: u64 = 1_500_000_008;
+    let set: u64 = 100_000_000;
+    let exact_other = size - 5 * set - (set + set / 5) - keep_free;
+    seed_volume(&fx, size, exact_other, set, 1000, "3");
+    assert!(!headroom_warned(&fx), "needing exactly the volume fits");
+    seed_volume(&fx, size, exact_other + 1, set, 1000, "3");
+    assert!(headroom_warned(&fx), "one byte over does not");
+}
+
+/// With KEEP 1 backup.sh still holds the one set it must keep while the new one is written, the same
+/// count as KEEP 2: the night is (max(KEEP-1, 1) + 3) sets, not (KEEP-1) + 3. Each KEEP's line is
+/// exact to the byte.
+#[test]
+fn keep_one_is_sized_with_the_set_backup_sh_must_keep() {
+    let size: u64 = 10_000_000_050;
+    let keep_free: u64 = 1_500_000_008;
+    let set: u64 = 100_000_000;
+    for (keep, sets) in [("1", 4), ("2", 4), ("3", 5)] {
+        let fx = Fx::new();
+        let exact_other = size - sets * set - (set + set / 5) - keep_free;
+        seed_volume(&fx, size, exact_other, set, 1000, keep);
+        assert!(!headroom_warned(&fx), "KEEP {keep}: exactly fitting passes");
+        seed_volume(&fx, size, exact_other + 1, set, 1000, keep);
+        assert!(headroom_warned(&fx), "KEEP {keep}: one byte over warns");
+    }
+}
+
+/// Sizes in the finding read to one decimal in MiB and GiB, rounded half up, and a size that rounds
+/// up to 1024.0M is written as 1G rather than "1024M".
+#[test]
+fn sizes_in_the_finding_round_and_never_read_1024m() {
+    // 4 sets of this size are named in "sets of about X"; the 100 MiB volume cannot hold the 512 MiB
+    // reserve, so the finding is raised whatever the size.
+    let about = |set: u64| -> String {
+        let fx = Fx::new();
+        seed_volume(&fx, 100 * MIB, 0, set, 1000, "1");
+        let v = fx.json();
+        let msg = headroom_finding(&v)["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let rest = msg.split("sets of about ").nth(1).expect("sets of about");
+        rest.split(' ').next().unwrap().to_string()
+    };
+    // Just under and just at the half-tenth: 5.04999 MiB reads 5M, 5.05000095 MiB reads 5.1M.
+    assert_eq!(about(5 * MIB + 52_428), "5M");
+    assert_eq!(about(5 * MIB + 52_429), "5.1M");
+    // The last byte count that reads in MiB, and the first that reads as a GiB.
+    assert_eq!(about(1_073_689_395), "1023.9M");
+    assert_eq!(about(1_073_689_396), "1G");
+    assert_eq!(about(1_073_741_823), "1G");
+    assert_eq!(about(1_073_741_824), "1G");
 }
 
 /// The backup row itself goes to warn (not left ok) and says why, unless a worse state already holds it.

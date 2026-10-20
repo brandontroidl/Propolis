@@ -58,10 +58,13 @@ case "$REASON" in
     pre-upgrade) KEEP=3 ;;
     *) echo "error: --reason must be scheduled or pre-upgrade, not '$REASON'" >&2; exit 2 ;;
 esac
-if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ] || [ "$KEEP" -gt 365 ]; then
+# Base 10 whatever the spelling: bash would read 010 as octal and die on 08 and 09. Three digits
+# at most, so the arithmetic cannot overflow before the range is tested.
+if ! [[ "$KEEP" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$KEEP))" -lt 1 ] || [ "$((10#$KEEP))" -gt 365 ]; then
     echo "error: PROPOLIS_BACKUP_KEEP must be a whole number from 1 to 365, not '$KEEP'" >&2
     exit 2
 fi
+KEEP=$((10#$KEEP))
 
 ROOT="${PROPOLIS_BACKUP_ROOT:-}"
 if [ -z "$ROOT" ] && [ "$(id -u)" -ne 0 ]; then
@@ -83,9 +86,13 @@ LOGROTATE_RESERVE_BYTES=536870912
 # low_disk_pct FILE: the monitor's low-disk threshold as the daemon will read it from FILE. systemd
 # strips whitespace around the key, the '=' and the value and the last assignment wins; the daemon
 # then runs trim().parse::<u64>() (crates/propolis/src/ops_alert/config.rs, get_u64), which accepts
-# a leading '+' and leading zeros, and refuses to start outside 1..=100, so only such a value is
-# the threshold it alerts on; anything else leaves its default in force. The same function is in
-# config-check.sh (backup_script_test.rs and config_check_test.rs hold the two to one table).
+# a leading '+' and leading zeros, and refuses to start outside 1..=100. A value that is not a whole
+# number in that range is one the daemon refuses to start on, so no alert runs on it; this returns
+# the default 15 for it, the figure to size against while the operator fixes the file. Only the
+# forms in fixtures/low_disk_table.in are held to systemd's reading. Forms this does not model and
+# systemd reads differently: backslash escapes and line continuations inside a value, a ';' or '#'
+# comment after a quoted value, and a line that is itself continued from the one above. The same
+# function is in config-check.sh (backup_script_test.rs and config_check_test.rs hold the two to one table).
 low_disk_pct() {
     local v re='^\+?[0-9]+$'
     v="$(sed -n 's/^[[:space:]]*PROPOLIS_OPS_CAPACITY_FREE_PCT[[:space:]]*=//p' "$1" 2>/dev/null | tail -n 1 || true)"
@@ -94,8 +101,10 @@ low_disk_pct() {
     v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
     if [[ "$v" =~ $re ]]; then
         v="${v#+}"
+        # With the zeros gone a match starts at a non-zero digit (zero itself is left empty and
+        # fails the pattern), so only the upper bound needs testing.
         v="${v#"${v%%[!0]*}"}"
-        if [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 100 ]; then
+        if [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -le 100 ]; then
             printf '%s' "$v"
             return 0
         fi
@@ -259,8 +268,10 @@ if [ "$avail" -lt $(( need + keep_free )) ]; then
     if [ "$REASON" = pre-upgrade ]; then
         # KEEP is fixed at 3 here, so lowering PROPOLIS_BACKUP_KEEP changes nothing for this run.
         remedy="Free space on the volume, run a scheduled backup with a lower PROPOLIS_BACKUP_KEEP to prune the old sets, point PROPOLIS_BACKUP_DIR at another volume, or set PROPOLIS_UPGRADE_SKIP_BACKUP=1 to upgrade without a backup this once"
-    else
+    elif [ "$KEEP" -gt 1 ]; then
         remedy="Lower PROPOLIS_BACKUP_KEEP (now $KEEP) or point PROPOLIS_BACKUP_DIR at another volume"
+    else
+        remedy="PROPOLIS_BACKUP_KEEP is already 1, so retention cannot shrink further: free space on the volume or point PROPOLIS_BACKUP_DIR at another volume"
     fi
     echo "error: $BACKUP_DIR has $avail of $size bytes free; this backup may need $need and the volume must keep $keep_free free afterwards (the larger of the ${LOW_DISK_PCT}% low-disk threshold, $pct_bytes, and logrotate's $LOGROTATE_RESERVE_BYTES reserve), short by $shortfall bytes. $remedy" >&2
     false

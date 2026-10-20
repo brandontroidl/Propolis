@@ -377,7 +377,7 @@ u32.
 | `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
 | `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
 | `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
-| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | 1..=100 | 0/>100 -> abort |
+| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | 1..=100 | 0/>100 -> abort. Also read from `propolis.env` by `deploy/backup.sh` (a backup refuses to leave the volume under this share free) and `deploy/config-check.sh` (the `backup-headroom` warning); both size against the default 15 when the daemon would refuse the value |
 | `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u32 |
 | `PROPOLIS_OPS_FEED_PUSH_EXPECTED` | no | `false` | bool | set once `deploy/blocklist-sync.sh` is in cron: `feed-push-stale` then pages when the feed has gone unpushed for the stale threshold (`FEED_STALE_MULTIPLE` build cycles) since the daemon started, instead of treating "no push marker" as grace forever |
 | `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |

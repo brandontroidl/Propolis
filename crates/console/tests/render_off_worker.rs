@@ -7,6 +7,13 @@
 //! pretty-printed and HTML-escaped) and the feed Entries tab (a published feed of up to 50,000
 //! entries read back and parsed).
 //!
+//! The events carry session ids (20 sessions of 10 events), as sensor traffic does: without them
+//! the session-tag lookup returns before its first await and everything after the row build is
+//! already off the worker whatever the handler does, so the fold and the render would go
+//! unguarded. Each test pins the sites its request reaches (`core_scoring::off_worker` in
+//! `routes/detail.rs` and `routes/feed.rs`): inlining any one of them fails exactly the test that
+//! requests it.
+//!
 //! Each test serves the request on a runtime with ONE worker and watches a ticker task on it: a
 //! handler that keeps the worker for its CPU work freezes the ticker for that long, one that hands
 //! the worker's queue to another thread (`core_scoring::off_worker`) does not. The runtime is the
@@ -161,16 +168,14 @@ fn serve_watching_ticker(
     .unwrap()
 }
 
-#[sqlx::test(migrations = false)]
-async fn a_page_of_large_captures_does_not_hold_the_async_worker(pool: PgPool) {
-    migrate(&pool).await;
-    let ip = "203.0.113.50";
-    // The worst page an attacker can make an operator open: a full page of events, each with the
-    // largest body a sensor keeps (64 KiB), in the characters the escaper rewrites.
+/// 200 events of the largest body a sensor keeps (64 KiB, in the characters the escaper rewrites)
+/// in 20 sessions of 10: the worst page an attacker can make an operator open.
+async fn seed_sessions(pool: &PgPool, ip: &str) {
     let body = "<a href=\"x\">&'\n\t".repeat(4096);
-    for i in 0..200 {
+    let ids: Vec<uuid::Uuid> = (0..20).map(|_| uuid::Uuid::now_v7()).collect();
+    for i in 0..200usize {
         append_event(
-            &pool,
+            pool,
             EventInput::from_signal(
                 ip.parse().unwrap(),
                 None,
@@ -178,15 +183,55 @@ async fn a_page_of_large_captures_does_not_hold_the_async_worker(pool: PgPool) {
                 SignalType::HoneypotCommandExec,
                 Protocol::Tcp,
                 false,
-                chrono::Utc::now() - chrono::Duration::seconds(i),
+                chrono::Utc::now() - chrono::Duration::seconds(i as i64),
                 serde_json::json!({ "command": "POST /", "body": body, "n": i }),
-                None,
+                Some(ids[i / 10]),
             ),
         )
         .await
         .unwrap();
     }
+}
 
+/// A published feed directory with `entries` (the most a feed holds is 50,000) in both tiers. The
+/// addresses repeat, which the reader does not mind.
+fn write_feed(entries: usize) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let valid_until = "2026-10-15T12:00:00Z";
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::json!({
+            "build_time": "2026-10-14T12:00:00Z",
+            "tiers": {
+                "aggressive": { "count": entries, "valid_until": valid_until },
+                "standard": { "count": entries, "valid_until": valid_until },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let entries: Vec<serde_json::Value> = (0..entries)
+        .map(|i| {
+            serde_json::json!({
+                "ip": format!("192.0.2.{}", i % 250),
+                "first_seen": "2026-10-14T12:00:00Z",
+                "last_seen": "2026-10-14T12:00:00Z",
+                "events": 10,
+                "signals": ["ssh_brute_force", "honeypot_command_exec"],
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({ "entries": entries }).to_string();
+    std::fs::write(dir.path().join("aggressive.json"), &doc).unwrap();
+    std::fs::write(dir.path().join("standard.json"), &doc).unwrap();
+    dir
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_evidence_fragment_does_not_hold_the_async_worker(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.50";
+    seed_sessions(&pool, ip).await;
     let (html, gap) = serve_watching_ticker(
         (*pool.connect_options()).clone(),
         None,
@@ -204,40 +249,27 @@ async fn a_page_of_large_captures_does_not_hold_the_async_worker(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn the_full_detail_page_does_not_hold_the_async_worker(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.52";
+    seed_sessions(&pool, ip).await;
+    let (html, gap) =
+        serve_watching_ticker((*pool.connect_options()).clone(), None, format!("/ip/{ip}"));
+    assert!(
+        html.len() > 5_000_000,
+        "the page must really carry the large captures ({} bytes)",
+        html.len()
+    );
+    assert!(
+        gap < MAX_GAP,
+        "the full detail page held the only async worker for {gap:?}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn a_full_size_published_feed_does_not_hold_the_async_worker(pool: PgPool) {
     migrate(&pool).await;
-    let dir = tempfile::tempdir().unwrap();
-    let valid_until = "2026-10-15T12:00:00Z";
-    std::fs::write(
-        dir.path().join("manifest.json"),
-        serde_json::json!({
-            "build_time": "2026-10-14T12:00:00Z",
-            "tiers": {
-                "aggressive": { "count": 50_000, "valid_until": valid_until },
-                "standard": { "count": 0, "valid_until": valid_until },
-            },
-        })
-        .to_string(),
-    )
-    .unwrap();
-    // 50,000 entries is the most a feed holds; the addresses repeat, which the reader does not mind.
-    let entries: Vec<serde_json::Value> = (0..50_000)
-        .map(|i| {
-            serde_json::json!({
-                "ip": format!("192.0.2.{}", i % 250),
-                "first_seen": "2026-10-14T12:00:00Z",
-                "last_seen": "2026-10-14T12:00:00Z",
-                "events": 10,
-                "signals": ["ssh_brute_force", "honeypot_command_exec"],
-            })
-        })
-        .collect();
-    std::fs::write(
-        dir.path().join("aggressive.json"),
-        serde_json::json!({ "entries": entries }).to_string(),
-    )
-    .unwrap();
-
+    let dir = write_feed(50_000);
     let (html, gap) = serve_watching_ticker(
         (*pool.connect_options()).clone(),
         Some(dir.path().to_path_buf()),
@@ -247,5 +279,21 @@ async fn a_full_size_published_feed_does_not_hold_the_async_worker(pool: PgPool)
     assert!(
         gap < MAX_GAP,
         "the feed entries load held the only async worker for {gap:?}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_feed_page_entries_tab_does_not_hold_the_async_worker(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = write_feed(50_000);
+    let (html, gap) = serve_watching_ticker(
+        (*pool.connect_options()).clone(),
+        Some(dir.path().to_path_buf()),
+        "/feed?tab=entries".to_string(),
+    );
+    assert!(html.contains("192.0.2."), "the tab must render entries");
+    assert!(
+        gap < MAX_GAP,
+        "the feed page's entries tab held the only async worker for {gap:?}"
     );
 }

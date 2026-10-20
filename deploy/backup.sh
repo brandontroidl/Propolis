@@ -22,6 +22,14 @@
 # pg_exec.rs) parses DATABASE_URL with the daemon's own parser and runs pg_dump with libpq's PG*
 # variables, so `ps` shows no secret while the dump runs.
 #
+# Free space is checked against the VOLUME, not just the set: a run refuses before dumping unless,
+# after the estimated set is written, the backup volume still has the ops monitor's low-disk
+# threshold free (PROPOLIS_OPS_CAPACITY_FREE_PCT, read from propolis.env, default 15, the daemon's
+# own default in crates/propolis/src/ops_alert/config.rs) and the logrotate guard's reserve
+# (deploy/logrotate-guard.sh, 512 MiB). A backup that fits but leaves the volume under either line
+# starves log rotation and trips the disk alert. Old sets of the run's reason are pruned BEFORE the
+# estimate, down to KEEP-1 (at least 1), so retention frees room for the new set instead of after it.
+#
 # Usage: propolis-backup [--reason scheduled|pre-upgrade]
 # Environment, all optional:
 #   PROPOLIS_BACKUP_DIR   where sets are written (default /var/backups/propolis)
@@ -67,6 +75,10 @@ BACKUP_DIR="${PROPOLIS_BACKUP_DIR:-$ROOT/var/backups/propolis}"
 # Relative to $ROOT/, so the archive's member names are the same whatever the root: restoring
 # with `tar -xpzf state.tgz -C /` puts each file back where it came from.
 STATE_PATHS=(etc/propolis var/spool/propolis var/lib/propolis/ssh)
+# Must equal the daemon's PROPOLIS_OPS_CAPACITY_FREE_PCT default and logrotate-guard.sh's reserve;
+# backup_script_test.rs fails when either drifts.
+DEFAULT_LOW_DISK_PCT=15
+LOGROTATE_RESERVE_BYTES=536870912
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -78,6 +90,18 @@ write_status() {
     printf '%s\n' "$body" > "$STATUS_DIR/.$name.tmp"
     chmod 0644 "$STATUS_DIR/.$name.tmp"
     mv -f "$STATUS_DIR/.$name.tmp" "$STATUS_DIR/$name"
+}
+
+# prune_sets KEEP: delete this reason's sets beyond the newest KEEP. A set under its final name is
+# whole (it is renamed into place last), so the newest ones are the good ones to keep.
+prune_sets() {
+    local keep="$1" sets=() excess i
+    mapfile -t sets < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name "*-$REASON" -printf '%f\n' \
+        | grep -E "^[0-9]{8}T[0-9]{6}Z-$REASON\$" | sort)
+    excess=$(( ${#sets[@]} - keep ))
+    for (( i = 0; i < excess; i++ )); do
+        rm -rf -- "${BACKUP_DIR:?}/${sets[$i]}"
+    done
 }
 
 STEP="starting"
@@ -113,11 +137,21 @@ fi
 
 STEP="reading DATABASE_URL"
 DATABASE_URL=""
+LOW_DISK_PCT=""
 if [ -r "$ENV_FILE" ]; then
     DATABASE_URL="$(sed -n 's/^DATABASE_URL=//p' "$ENV_FILE" | tail -n 1)"
     DATABASE_URL="${DATABASE_URL%\"}"; DATABASE_URL="${DATABASE_URL#\"}"
     DATABASE_URL="${DATABASE_URL%\'}"; DATABASE_URL="${DATABASE_URL#\'}"
+    LOW_DISK_PCT="$(sed -n 's/^PROPOLIS_OPS_CAPACITY_FREE_PCT=//p' "$ENV_FILE" | tail -n 1)"
+    LOW_DISK_PCT="${LOW_DISK_PCT%\"}"; LOW_DISK_PCT="${LOW_DISK_PCT#\"}"
+    LOW_DISK_PCT="${LOW_DISK_PCT%\'}"; LOW_DISK_PCT="${LOW_DISK_PCT#\'}"
 fi
+# The daemon refuses to start on a value outside 1..=100, so only such a value is the threshold it
+# is alerting on; anything else leaves its default in force.
+if ! [[ "$LOW_DISK_PCT" =~ ^[0-9]{1,3}$ ]] || [ "$((10#$LOW_DISK_PCT))" -lt 1 ] || [ "$((10#$LOW_DISK_PCT))" -gt 100 ]; then
+    LOW_DISK_PCT="$DEFAULT_LOW_DISK_PCT"
+fi
+LOW_DISK_PCT=$((10#$LOW_DISK_PCT))
 if [ -z "$DATABASE_URL" ]; then
     # Not a failure to page about: the daemon cannot run without it either, so a node in this state
     # is still being installed. Recorded so config-check.sh can say why there is no backup.
@@ -151,8 +185,14 @@ for path in "${STATE_PATHS[@]}"; do
     [ -e "$ROOT/$path" ] && existing+=("$path")
 done
 
-STEP="checking free space"
+STEP="pruning old sets before writing"
 install -d -m 0750 "$BACKUP_DIR"
+# Keep the newest KEEP-1 (never fewer than 1) so the new set makes KEEP and the volume holds one
+# fewer set while it is written. A refusal or failure below therefore never costs the newest good
+# set of either reason, and never the only one.
+prune_sets $(( KEEP > 1 ? KEEP - 1 : 1 ))
+
+STEP="checking free space"
 db_bytes="$("$PROPOLIS_BIN" pg-exec psql -X -A -t -c 'SELECT pg_database_size(current_database())')"
 # At most 18 digits each, so the sum below cannot overflow bash's 64-bit arithmetic and wrap to a
 # negative "need" that every disk satisfies.
@@ -191,9 +231,18 @@ if [ -n "$prev_dump" ] && [ -n "$prev_archive" ]; then
     [ "$scaled" -ge "$prev_set" ] || scaled="$prev_set"
     need="$scaled"
 fi
-avail="$(df --output=avail -B1 "$BACKUP_DIR" | tail -n 1 | tr -d ' ')"
-if [ "$avail" -lt "$need" ]; then
-    echo "error: $BACKUP_DIR has $avail bytes free; this backup may need $need" >&2
+read -r size avail < <(df --output=size,avail -B1 "$BACKUP_DIR" | tail -n 1)
+[[ "$size" =~ ^[0-9]{1,18}$ && "$avail" =~ ^[0-9]{1,18}$ ]] || { echo "error: could not read the free space of $BACKUP_DIR: $size $avail" >&2; false; }
+# The monitor fires when free space is strictly below the threshold, so the volume must keep at least
+# that share (rounded up) AND the logrotate guard's reserve. Split before multiplying so a large
+# volume cannot overflow bash's 64-bit arithmetic.
+# shellcheck disable=SC2017 # dividing first is the overflow guard; the remainder is added back
+pct_bytes=$(( size / 100 * LOW_DISK_PCT + (size % 100 * LOW_DISK_PCT + 99) / 100 ))
+keep_free=$pct_bytes
+[ "$keep_free" -ge "$LOGROTATE_RESERVE_BYTES" ] || keep_free="$LOGROTATE_RESERVE_BYTES"
+if [ "$avail" -lt $(( need + keep_free )) ]; then
+    shortfall=$(( need + keep_free - avail ))
+    echo "error: $BACKUP_DIR has $avail of $size bytes free; this backup may need $need and the volume must keep $keep_free free afterwards (the larger of the ${LOW_DISK_PCT}% low-disk threshold, $pct_bytes, and logrotate's $LOGROTATE_RESERVE_BYTES reserve), short by $shortfall bytes. Lower PROPOLIS_BACKUP_KEEP (now $KEEP) or point PROPOLIS_BACKUP_DIR at another volume" >&2
     false
 fi
 
@@ -246,12 +295,7 @@ mv -- "$PARTIAL" "$BACKUP_DIR/$SET"
 PARTIAL=""
 
 STEP="pruning old sets"
-mapfile -t sets < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name "*-$REASON" -printf '%f\n' \
-    | grep -E "^[0-9]{8}T[0-9]{6}Z-$REASON\$" | sort)
-excess=$(( ${#sets[@]} - KEEP ))
-for (( i = 0; i < excess; i++ )); do
-    rm -rf -- "${BACKUP_DIR:?}/${sets[$i]}"
-done
+prune_sets "$KEEP"
 
 dump_size="$(stat -c %s "$BACKUP_DIR/$SET/${files[0]}")"
 archive_size="$(stat -c %s "$BACKUP_DIR/$SET/${files[1]}")"

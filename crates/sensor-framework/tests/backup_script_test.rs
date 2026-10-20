@@ -1,7 +1,8 @@
 //! Runs `deploy/backup.sh` against a scratch filesystem root (`PROPOLIS_BACKUP_ROOT`) with stub
 //! `propolis`, `pg_restore` and `age` programs on `PATH`, and asserts what a set holds, that a
 //! failed run leaves nothing a reader could mistake for a backup, and that the database password
-//! never reaches a stub's command line. The real tar, sha256sum, flock, df and du run as shipped.
+//! never reaches a stub's command line. The real tar, sha256sum, flock and du run as shipped; `df` is a
+//! stub so the volume's size and free space are whatever each test says.
 //! Lives beside deploy_test.rs, which asserts how the deploy scripts install and enable it.
 
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +26,7 @@ printf '%s | url=%s\n' "$*" "${DATABASE_URL:+set}" >> "$STUB_LOG"
 case "$1" in
     psql) echo "${STUB_DB_BYTES:-4096}" ;;
     pg_dump)
+        [ -n "${STUB_SNAPSHOT:-}" ] && ls -1A "$PROPOLIS_BACKUP_ROOT/var/backups/propolis" > "$STUB_SNAPSHOT"
         [ -n "${STUB_DUMP_FAIL:-}" ] && exit 3
         if [ -n "${STUB_DUMP_SLOW:-}" ]; then
             for a in "$@"; do
@@ -42,6 +44,24 @@ esac
 
 const PG_RESTORE_STUB: &str = r#"#!/usr/bin/env bash
 [ "$1" = --list ] && head -c 5 "$2" | grep -q PGDMP
+"#;
+
+/// A `df` that reports the volume the test says it is, so the headroom rules do not depend on how
+/// full the machine running the tests is. By default it is a roomy 1 TiB volume. STUB_DF_SIZE and
+/// STUB_DF_AVAIL set the figures; STUB_DF_SHARE_DIR makes the free space shrink with the apparent
+/// size of that directory, so a prune that happens before the check is visible to it.
+const DF_STUB: &str = r#"#!/usr/bin/env bash
+size="${STUB_DF_SIZE:-1099511627776}"
+avail="${STUB_DF_AVAIL:-$size}"
+if [ -n "${STUB_DF_SHARE_DIR:-}" ]; then
+    used="$(du -s -b --apparent-size "$STUB_DF_SHARE_DIR" | cut -f1)"
+    avail=$(( size - used ))
+fi
+case "$1" in
+    --output=avail) printf 'Avail\n%s\n' "$avail" ;;
+    --output=size,avail) printf 'Size Avail\n%s %s\n' "$size" "$avail" ;;
+    *) exit 2 ;;
+esac
 "#;
 
 const AGE_STUB: &str = r#"#!/usr/bin/env bash
@@ -82,6 +102,7 @@ impl Fixture {
                 ("propolis", PROPOLIS_STUB),
                 ("pg_restore", PG_RESTORE_STUB),
                 ("age", AGE_STUB),
+                ("df", DF_STUB),
             ] {
                 let path = bin.join(name);
                 std::fs::write(&path, body).unwrap();
@@ -444,6 +465,270 @@ fn old_sets_beyond_keep_are_pruned_and_the_other_reason_is_left_alone() {
         "never deletes a name it did not make"
     );
     assert_eq!(sets.iter().filter(|s| s.ends_with("-scheduled")).count(), 2);
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn make_set(fx: &Fixture, name: &str) {
+    let dir = fx.backups().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("propolis.dump"), b"PGDMP old").unwrap();
+}
+
+// Retention used to run only after a good write, so the volume held KEEP+1 sets while the new one
+// was written. The old sets beyond KEEP-1 must be gone by the time the dump starts.
+#[test]
+fn old_sets_are_pruned_before_the_dump_starts() {
+    let fx = Fixture::new();
+    for day in 1..=4 {
+        make_set(&fx, &format!("2020010{day}T000000Z-scheduled"));
+    }
+    make_set(&fx, "20200101T000000Z-pre-upgrade");
+    let snapshot = fx.root.join("listing-at-dump");
+    assert_ok(&fx.run(
+        &[],
+        &[
+            ("PROPOLIS_BACKUP_KEEP", "3"),
+            ("STUB_SNAPSHOT", snapshot.to_str().unwrap()),
+        ],
+    ));
+    let at_dump: Vec<String> = std::fs::read_to_string(&snapshot)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let scheduled_at_dump: Vec<&String> = at_dump
+        .iter()
+        .filter(|n| n.ends_with("-scheduled") && !n.starts_with('.'))
+        .collect();
+    assert_eq!(
+        scheduled_at_dump,
+        ["20200103T000000Z-scheduled", "20200104T000000Z-scheduled"],
+        "KEEP-1 newest sets remain when the dump starts: {at_dump:?}"
+    );
+    assert!(
+        at_dump.contains(&"20200101T000000Z-pre-upgrade".to_string()),
+        "the other reason is untouched: {at_dump:?}"
+    );
+    assert_eq!(
+        fx.sets()
+            .iter()
+            .filter(|s| s.ends_with("-scheduled"))
+            .count(),
+        3,
+        "KEEP sets once the new one lands: {:?}",
+        fx.sets()
+    );
+}
+
+// Pruning ahead of the write must never cost the newest good set: a run that then fails leaves the
+// newest KEEP-1 sets, and with KEEP=1 the only good set survives both the prune and the failure.
+#[test]
+fn pruning_before_the_write_keeps_the_newest_good_sets() {
+    let fx = Fixture::new();
+    for day in 1..=3 {
+        make_set(&fx, &format!("2020010{day}T000000Z-scheduled"));
+    }
+    let snapshot = fx.root.join("listing-at-dump");
+    let output = fx.run(
+        &[],
+        &[
+            ("PROPOLIS_BACKUP_KEEP", "1"),
+            ("STUB_DUMP_FAIL", "1"),
+            ("STUB_SNAPSHOT", snapshot.to_str().unwrap()),
+        ],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        fx.sets(),
+        ["20200103T000000Z-scheduled"],
+        "KEEP=1 still leaves the newest good set after a failed run"
+    );
+    let at_dump = std::fs::read_to_string(&snapshot).unwrap();
+    assert!(
+        at_dump.contains("20200103T000000Z-scheduled"),
+        "the only good set was present while the new one was dumped: {at_dump}"
+    );
+
+    let fx = Fixture::new();
+    for day in 1..=4 {
+        make_set(&fx, &format!("2020010{day}T000000Z-pre-upgrade"));
+    }
+    let output = fx.run(&["--reason", "pre-upgrade"], &[("STUB_DUMP_FAIL", "1")]);
+    assert!(!output.status.success());
+    assert_eq!(
+        fx.sets(),
+        [
+            "20200103T000000Z-pre-upgrade",
+            "20200104T000000Z-pre-upgrade"
+        ],
+        "pre-upgrade keeps 3, so 2 stand while the third is written"
+    );
+}
+
+// Free space that retention gives back counts: three 600 MiB sets leave a 2 GiB volume under the
+// 512 MiB reserve, and the run passes only because the prune ran before the check.
+#[test]
+fn the_prune_frees_room_the_headroom_check_then_counts() {
+    let fx = Fixture::new();
+    for day in 1..=3 {
+        let name = format!("2020010{day}T000000Z-scheduled");
+        make_set(&fx, &name);
+        let dump = std::fs::OpenOptions::new()
+            .write(true)
+            .open(fx.backups().join(&name).join("propolis.dump"))
+            .unwrap();
+        dump.set_len(600 * MIB).unwrap();
+    }
+    let backups = fx.backups();
+    let output = fx.run(
+        &[],
+        &[
+            ("PROPOLIS_BACKUP_KEEP", "2"),
+            ("STUB_DF_SIZE", &(2 * GIB).to_string()),
+            ("STUB_DF_SHARE_DIR", backups.to_str().unwrap()),
+        ],
+    );
+    assert_ok(&output);
+    assert_eq!(fx.sets().len(), 2, "{:?}", fx.sets());
+}
+
+// The live incident: a set that fits, written to a volume it leaves under the monitor's 15%
+// low-disk line, starved log rotation. The run must refuse before pg_dump, naming the shortfall
+// and the two fixes.
+#[test]
+fn a_set_that_would_leave_the_volume_under_the_low_disk_threshold_refuses() {
+    let fx = Fixture::new();
+    // 100 GiB volume, 14 GiB free: the set fits but free space is already under 15%.
+    let output = fx.run(
+        &[],
+        &[
+            ("STUB_DF_SIZE", &(100 * GIB).to_string()),
+            ("STUB_DF_AVAIL", &(14 * GIB).to_string()),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(fx.sets().is_empty());
+    assert!(
+        !fx.stub_log().contains("pg_dump"),
+        "refused before the dump started"
+    );
+    assert_eq!(
+        fx.status("last-failure").unwrap()["step"],
+        "checking free space"
+    );
+    let err = stderr_of(&output);
+    for needle in [
+        "15%",
+        "short by",
+        "PROPOLIS_BACKUP_KEEP",
+        "PROPOLIS_BACKUP_DIR",
+    ] {
+        assert!(err.contains(needle), "{needle} missing from: {err}");
+    }
+}
+
+// The threshold is the monitor's own setting, read from propolis.env, not a copy.
+#[test]
+fn the_threshold_is_read_from_the_monitors_setting() {
+    let fx = Fixture::new();
+    let env = fx.root.join("etc/propolis/propolis.env");
+    let base = std::fs::read_to_string(&env).unwrap();
+    let df = [
+        ("STUB_DF_SIZE", (100 * GIB).to_string()),
+        ("STUB_DF_AVAIL", (14 * GIB).to_string()),
+    ];
+    let df: Vec<(&str, &str)> = df.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    std::fs::write(&env, format!("{base}PROPOLIS_OPS_CAPACITY_FREE_PCT=10\n")).unwrap();
+    assert_ok(&fx.run(&[], &df));
+
+    std::fs::write(&env, format!("{base}PROPOLIS_OPS_CAPACITY_FREE_PCT=30\n")).unwrap();
+    let output = fx.run(&[], &df);
+    assert!(!output.status.success(), "30% of 100 GiB is not free");
+    assert!(stderr_of(&output).contains("30%"), "{}", stderr_of(&output));
+
+    // A value the daemon would refuse to start on leaves its default in force.
+    std::fs::write(&env, format!("{base}PROPOLIS_OPS_CAPACITY_FREE_PCT=0\n")).unwrap();
+    let output = fx.run(&[], &df);
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("15%"), "{}", stderr_of(&output));
+}
+
+// Under the threshold's share the logrotate guard's 512 MiB reserve still binds: a small volume has
+// 15% below the reserve.
+#[test]
+fn the_logrotate_reserve_binds_on_a_small_volume() {
+    let fx = Fixture::new();
+    // 15% of 2 GiB is 307 MiB; 450 MiB free is over that and under the 512 MiB reserve.
+    let output = fx.run(
+        &[],
+        &[
+            ("STUB_DF_SIZE", &(2 * GIB).to_string()),
+            ("STUB_DF_AVAIL", &(450 * MIB).to_string()),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(!fx.stub_log().contains("pg_dump"));
+    assert!(
+        stderr_of(&output).contains("536870912"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn a_volume_with_room_to_spare_writes_the_set() {
+    let fx = Fixture::new();
+    let output = fx.run(
+        &[],
+        &[
+            ("STUB_DF_SIZE", &(100 * GIB).to_string()),
+            ("STUB_DF_AVAIL", &(50 * GIB).to_string()),
+        ],
+    );
+    assert_ok(&output);
+    assert_eq!(fx.sets().len(), 1);
+}
+
+// The script cannot import the daemon's default or the guard's reserve, so it carries both and
+// this fails when either source moves.
+#[test]
+fn the_headroom_constants_agree_with_the_monitor_and_the_guard() {
+    let read = |rel: &str| {
+        std::fs::read_to_string(format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    };
+    let script = read("deploy/backup.sh");
+    let config = read("crates/propolis/src/ops_alert/config.rs");
+    let guard = read("deploy/logrotate-guard.sh");
+
+    let daemon_default = config
+        .lines()
+        .find_map(|l| {
+            l.split("get_pct(get, \"PROPOLIS_OPS_CAPACITY_FREE_PCT\", ")
+                .nth(1)
+        })
+        .and_then(|rest| rest.split(')').next())
+        .expect("the daemon's default is readable");
+    assert!(
+        script.contains(&format!("DEFAULT_LOW_DISK_PCT={daemon_default}\n")),
+        "backup.sh default differs from the daemon's {daemon_default}"
+    );
+
+    let guard_reserve = guard
+        .lines()
+        .find_map(|l| l.split("PROPOLIS_LOGROTATE_RESERVE_BYTES:-").nth(1))
+        .and_then(|rest| rest.split('}').next())
+        .expect("the guard's reserve is readable");
+    assert!(
+        script.contains(&format!("LOGROTATE_RESERVE_BYTES={guard_reserve}\n")),
+        "backup.sh reserve differs from the guard's {guard_reserve}"
+    );
 }
 
 #[test]

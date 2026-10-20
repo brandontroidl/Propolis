@@ -38,16 +38,29 @@ options or archived paths stop matching the commands on this page.
   file, sets are plaintext and readable only by root. A recipients file with `age`
   missing fails the run rather than writing plaintext.
 - **Retention.** The newest 7 scheduled sets are kept (`PROPOLIS_BACKUP_KEEP`, 1-365,
-  in the unit's environment); older ones are deleted after a good run.
-  [Upgrades](upgrade-rollback-and-dr.md) write `-pre-upgrade` sets, of which the
-  newest 3 are kept.
-- **Free space.** A run refuses to start, before dumping anything, unless the backup
-  directory has room for the set it is about to write, plus a fifth. The size comes from the
-  last good set: its real dump and archive size, scaled by how much the database and state
+  in the unit's environment). [Upgrades](upgrade-rollback-and-dr.md) write `-pre-upgrade`
+  sets, of which the newest 3 are kept. Pruning runs twice: before the free-space check, down
+  to one fewer than the limit (never fewer than one), so the old sets give their room back
+  before the new one is written; and after a good run, down to the limit. A refused or
+  failed run therefore leaves the newest good set of each reason, and never deletes the only
+  one.
+- **Free space.** A run refuses to start, before dumping anything, unless the backup volume
+  would still have enough free after the set is written. The set's size comes from the last
+  good set: its real dump and archive size, scaled by how much the database and state
   directories have grown since (each good run records that source size as `source_bytes` in
-  `last-success`). With no earlier set the estimate is the raw database size plus the state
-  directories' size, which is several times what the compressed set takes; with an earlier set
-  that predates `source_bytes`, half again that set's size, never more than the raw estimate.
+  `last-success`), plus a fifth. With no earlier set the estimate is the raw database size
+  plus the state directories' size, which is several times what the compressed set takes;
+  with an earlier set that predates `source_bytes`, half again that set's size, never more
+  than the raw estimate. What the volume must keep free afterwards is the larger of two
+  lines: the ops monitor's low-disk threshold (`PROPOLIS_OPS_CAPACITY_FREE_PCT`, default 15,
+  read from `/etc/propolis/propolis.env` so the two agree; a value the daemon would reject
+  leaves 15 in force) and the 512 MiB reserve the logrotate guard keeps
+  (`deploy/logrotate-guard.sh`). A set that fits but leaves the volume under either line
+  starves log rotation and trips the disk alert, so it is refused too. The refusal names the
+  free space, the estimate, the line and the shortfall; the fixes are a lower
+  `PROPOLIS_BACKUP_KEEP` or a `PROPOLIS_BACKUP_DIR` on another volume. Retention holds up to
+  `KEEP` scheduled and 3 pre-upgrade sets at once, each about the size of the last set, so
+  `config-check.sh` warns when that cannot fit beside the database within the headroom.
 - **No password on a command line.** The dump runs through `propolis pg-exec`, which
   parses `DATABASE_URL` from `/etc/propolis/propolis.env` with the daemon's own parser
   and hands `pg_dump` the connection in libpq's `PG*` variables (`crates/propolis/src/pg_exec.rs#run`).

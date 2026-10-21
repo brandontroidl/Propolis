@@ -59,6 +59,12 @@ async fn bulk_events(pool: &PgPool, n: i64) {
         .execute(pool)
         .await
         .unwrap();
+    // An auto-analyze landing on the insert makes the planner's row estimate exactly `n`, which
+    // the estimate test below cannot tell from a count: it failed 4 runs in 20 before this.
+    sqlx::query("ALTER TABLE event SET (autovacuum_enabled = off)")
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
                             weight, confidence, observed_at, hash) \

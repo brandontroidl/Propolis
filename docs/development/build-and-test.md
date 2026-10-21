@@ -116,9 +116,9 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4742 test functions** (2918 unit + 1824 integration).
-- **DB-backed (`sqlx::test`): 437** - console 223, review 109, core-scoring 48,
-  intake 30, feed 11, fleet 9, propolis 7. These provision a fresh database per test.
+- **Total: 4795 test functions** (2938 unit + 1857 integration).
+- **DB-backed (`sqlx::test`): 470** - console 255, review 109, core-scoring 48,
+  intake 30, feed 12, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -150,9 +150,9 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 171 | 247 | auth_test, campaigns_test, ledger_count_test, render_off_worker, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, server_test, timeline_test |
+| console | 191 | 279 | auth_test, campaigns_test, ledger_count_test, ledger_scan_test, render_off_worker, rollup_pages_test, rollup_test, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, search_signal_type_test, server_test, timeline_test |
 | core-scoring | 90 | 42 | append_gate, batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
-| feed | 35 | 66 | builder_test, exclusion_test, export_test, publisher_test |
+| feed | 35 | 67 | builder_test, exclusion_test, export_test, publisher_test |
 | fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
 | gateway | 11 | 15 | handshake, logging, spool, verify |
 | geoip | 4 | 0 | - |
@@ -178,7 +178,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 28 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **2918** | **1824** | |
+| **Total** | **2938** | **1857** | |
 
 ### Test styles by layer
 
@@ -188,7 +188,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (47 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (387 uses) - needed wherever a test needs more than
+  applies migrations manually (420 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

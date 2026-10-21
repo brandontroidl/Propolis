@@ -177,7 +177,7 @@ Owners: [reference/scoring-and-feed.md](reference/scoring-and-feed.md),
 
 | Claim | Source | Status |
 |---|---|---|
-| `wan_ip` (the honeypot's own ingress address) is carried on events and stored, but never in the public feed - the feed selects only `host(source_ip)` + tier/first_seen/last_seen/categories. | `crates/feed/src/builder.rs:169-172,226`; grep of `crates/feed/src/**` returns zero `wan_ip` | IMPLEMENTED |
+| `wan_ip` (the honeypot's own ingress address) is carried on events and stored, but never in the public feed - the feed selects only `host(source_ip)` + tier/first_seen/last_seen/categories. | `crates/feed/src/builder.rs:316-324,329-336`; grep of `crates/feed/src/**` returns zero `wan_ip` | IMPLEMENTED |
 | No `VendorReport` (or adapter payload) has a field that could carry a WAN vantage; multi-WAN data feeds only the internal breadth multiplier. | `crates/review/src/vendor/mod.rs:29-35`; `abuseipdb.rs:43-49`, `dshield.rs:103-113`, `otx.rs:38-53` | [inferred] (from absence, all three payloads read) |
 | In the console, `wan_ip` appears only in detail/search views behind `require_session`. | `crates/console/src/routes/{detail,search}.rs` | IMPLEMENTED |
 
@@ -191,7 +191,7 @@ Owner: [security/filesystem-and-db-protections.md](security/filesystem-and-db-pr
 |---|---|---|
 | No SQL string is built with `format!` in non-test src (grep for `format!` containing SELECT/INSERT/UPDATE/DELETE/WHERE returns zero). | evidence 08 §10 | [inferred] (grep-negative over all src) |
 | Event insert and advisory lock fully parameterized. | `crates/core-scoring/src/repository/events.rs:151,167-171` | IMPLEMENTED |
-| Feed builder, review CLI, and VirusTotal use `$`-placeholders / static SQL. | `feed/src/builder.rs:169-176,226`; `review/src/cli.rs:165-166`; `virustotal.rs:278-280` | IMPLEMENTED |
+| Feed builder, review CLI, and VirusTotal use `$`-placeholders / static SQL. | `feed/src/builder.rs:316-324,329-336`; `review/src/cli.rs:165-166`; `virustotal.rs:278-280` | IMPLEMENTED |
 | Console sort/filter columns chosen from fixed literal matches, not interpolated; search `q` LIKE-metachars escaped. | `crates/console/src/routes/ips.rs:44-53`; `search.rs:100-104,469-522` | IMPLEMENTED |
 
 ---
@@ -262,8 +262,8 @@ Owner: [reference/scoring-and-feed.md](reference/scoring-and-feed.md),
 | Claim | Source | Status |
 |---|---|---|
 | Feed membership is decided by RETENTION windows against stored (last-event) fields, not a live-decayed score, so tier cannot slide between builds. | `crates/feed/src/builder.rs:110-128,135-153` | IMPLEMENTED |
-| Merit-tiered entries require operator approval (`q.state='approved'`); volume entries auto-publish into retention windows only, never the tier files. | `builder.rs:168-179,225-234` | IMPLEMENTED |
-| Exported timestamps coarsened to the hour boundary (anti-deanonymization). | `builder.rs:330-340`; `export/mod.rs:39-41` | IMPLEMENTED |
+| Merit-tiered entries require operator approval (`q.state='approved'`); volume entries auto-publish into retention windows only, never the tier files. | `builder.rs:174-176,226-236,316-336` | IMPLEMENTED |
+| Exported timestamps coarsened to the hour boundary (anti-deanonymization). | `builder.rs:372-384`; `export/mod.rs:39-41` | IMPLEMENTED |
 | One `is_reserved_ip` list guards BOTH outbound paths (feed publish + vendor submit); previously feed-only. | `crates/core-scoring/src/net.rs:1-9,57-59`; `crates/feed/src/exclusion.rs:24-27` | IMPLEMENTED |
 | ASN suppression is opt-in and empty by default; an empty allowlist short-circuits before any DB lookup; ASN ownership is RIR-registered, not per-IP spoofable. | `crates/core-scoring/src/allowlist.rs:10-14,217-222`; `crates/propolis/src/config.rs:498` | IMPLEMENTED |
 | The operator allowlist (CIDR, range file, ASN) is one definition shared by the feed and the review stage: a listed address is not queued, a Pending one is withdrawn with the reason logged, and the submission runner refuses it even if approved before the list covered it. Scoring is unchanged. | `crates/core-scoring/src/allowlist.rs:206`; `crates/review/src/queue.rs`; `crates/review/src/submit.rs`; test `crates/review/tests/allowlist_test.rs` | IMPLEMENTED |

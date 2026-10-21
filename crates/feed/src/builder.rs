@@ -159,24 +159,22 @@ impl FeedBuilder {
     ) -> Result<FeedSnapshot, FeedError> {
         let build_time = coarsen_to_hour(Utc::now());
 
-        // The `categories` subquery is correlated but cheap: the outer set is already narrowed to
-        // approved, eligible, tiered candidates, and `event_source_ip_idx` covers the lookup. It
-        // reads `signal_type::text` rather than mapping through the Rust enum because the database
-        // enum's labels ARE the wire vocabulary (`0001_enums.sql`), so there is no second casing
-        // to keep in sync - and `SignalType`'s Serialize is frozen to bare Rust identifiers for
-        // chain hashing, which is the wrong vocabulary to publish.
-        let rows = sqlx::query(
-            "SELECT host(s.source_ip) AS source_ip, s.tier, s.first_seen, s.last_seen, \
-                    s.event_count, s.distinct_categories, \
-                    ARRAY(SELECT DISTINCT e.signal_type::text FROM event e \
-                          WHERE e.source_ip = s.source_ip ORDER BY 1) AS categories \
-             FROM ip_score s \
-             INNER JOIN review_queue q ON q.source_ip = s.source_ip \
-             WHERE s.recommended_for_blocklist = true AND s.eligible = true \
-               AND q.state = 'approved' AND s.tier IS NOT NULL",
-        )
-        .fetch_all(pool)
-        .await?;
+        // An entry leaves every feed once its last event is older than the longest window it can
+        // appear in, so a candidate past the longest one cannot be published and its signal types
+        // are not worth reading. `materialize` applies the exact per-feed cutoffs; this is only the
+        // superset those can never exceed (a minute of margin for the clock moving between this
+        // read and `materialize`'s).
+        let merit_horizon = [config.aggressive_ttl, config.standard_ttl]
+            .into_iter()
+            .chain(config.windows.iter().map(|(_, retention)| *retention))
+            .max()
+            .unwrap_or_else(Duration::zero);
+        let merit_cutoff = Utc::now() - merit_horizon - Duration::minutes(1);
+
+        let rows = sqlx::query(sqlx::AssertSqlSafe(merit_candidates_sql()))
+            .bind(merit_cutoff)
+            .fetch_all(pool)
+            .await?;
 
         let mut candidates = Vec::with_capacity(rows.len());
 
@@ -228,16 +226,18 @@ impl FeedBuilder {
         // hyperactive flooder the dedup would otherwise erase still gets blocked. `eligible = false`
         // AND `recommended_for_blocklist = true` uniquely identifies them (see core-scoring's
         // derive_projection). Exclusions still apply, the same as for merit candidates.
-        let volume_rows = sqlx::query(
-            "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
-                    s.event_count, s.distinct_categories, \
-                    ARRAY(SELECT DISTINCT e.signal_type::text FROM event e \
-                          WHERE e.source_ip = s.source_ip ORDER BY 1) AS categories \
-             FROM ip_score s \
-             WHERE s.recommended_for_blocklist = true AND s.eligible = false",
-        )
-        .fetch_all(pool)
-        .await?;
+        //
+        // Only a retention window can publish one, so with none configured there is nothing to
+        // read, and with some the longest bounds the candidates as above.
+        let volume_rows = match config.windows.iter().map(|(_, retention)| *retention).max() {
+            None => Vec::new(),
+            Some(longest) => {
+                sqlx::query(sqlx::AssertSqlSafe(volume_candidates_sql()))
+                    .bind(Utc::now() - longest - Duration::minutes(1))
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
 
         off_worker(|| -> Result<(), FeedError> {
             for row in volume_rows {
@@ -299,6 +299,49 @@ impl FeedBuilder {
             windows,
         })
     }
+}
+
+/// The distinct signal types an address triggered, as the wire vocabulary, sorted by name: one
+/// index probe per member of the closed `signal_type_enum` (`event_dedup_idx` starts with the
+/// source address and then the signal type, so each probe is a single descent), keeping the
+/// members the address has at least one event of. The cost is the number of signal types (17),
+/// not the number of events the address produced: `SELECT DISTINCT signal_type FROM event WHERE
+/// source_ip = ...` read every one of them, 4.3 s for 5,566 addresses on the live node.
+///
+/// The `LIMIT 1` inside a `LATERAL` keeps the planner from turning the probes back into a join
+/// that reads the address's whole history, which `WHERE EXISTS (...)` does. It reads the enum's
+/// labels as text rather than mapping through the Rust enum because the database enum's labels ARE
+/// the wire vocabulary (`0001_enums.sql`), so there is no second casing to keep in sync - and
+/// `SignalType`'s Serialize is frozen to bare Rust identifiers for chain hashing, which is the
+/// wrong vocabulary to publish. `s` is the outer `ip_score` row.
+const CATEGORIES_SQL: &str = "ARRAY(SELECT t.v::text \
+         FROM unnest(enum_range(NULL::signal_type_enum)) AS t(v) \
+         CROSS JOIN LATERAL ( \
+             SELECT 1 FROM event e WHERE e.source_ip = s.source_ip AND e.signal_type = t.v LIMIT 1 \
+         ) x ORDER BY 1)";
+
+/// The approved, eligible, tiered candidates, read as stored. `$1` is the oldest `last_seen` any
+/// feed can still publish (see [`FeedBuilder::build`]).
+pub fn merit_candidates_sql() -> String {
+    format!(
+        "SELECT host(s.source_ip) AS source_ip, s.tier, s.first_seen, s.last_seen, \
+                s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
+         FROM ip_score s \
+         INNER JOIN review_queue q ON q.source_ip = s.source_ip \
+         WHERE s.recommended_for_blocklist = true AND s.eligible = true \
+           AND q.state = 'approved' AND s.tier IS NOT NULL AND s.last_seen > $1"
+    )
+}
+
+/// The volume-listed floods. `$1` is the oldest `last_seen` any retention window can still
+/// publish.
+pub fn volume_candidates_sql() -> String {
+    format!(
+        "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
+                s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
+         FROM ip_score s \
+         WHERE s.recommended_for_blocklist = true AND s.eligible = false AND s.last_seen > $1"
+    )
 }
 
 /// Select the candidates that `include` accepts and whose last event falls inside `ttl`, and

@@ -21,8 +21,9 @@
 //! `event.sensor`, `event.protocol` and the `metadata.local_port` the sensor framework stamps on
 //! every event (`sensor_framework::arrival`). Events from before that stamp existed are given to
 //! their sensor's listener when it declares exactly one, and otherwise shown on one `port not
-//! recorded` row per sensor rather than guessed onto a port. Activity is read from two ranges on
-//! `observed_at` (the last 24 hours, and the 30 days before), never the whole ledger.
+//! recorded` row per sensor rather than guessed onto a port. Activity is read in two parts, never
+//! from the whole ledger: the last 24 hours from the hourly roll-ups (`crate::rollup`), and the
+//! newest event in the 30 days before from `event_listener_idx`, one probe per listener.
 //!
 //! **Every panel soft-fails; nothing here returns a 503.** On this page a hard error would hide
 //! the very failure the operator came to see, and a query error rendering as "0" would be worse
@@ -255,35 +256,75 @@ impl Activity {
     }
 }
 
-/// Per-listener activity from two range-bounded reads, neither of which touches the ledger
-/// outside the lookback: the last 24 hours (the count and the newest event), then the rest of the
-/// lookback (the newest event only, for listeners quiet today). Both are ranges on `observed_at`,
-/// which `event_observed_at_idx` serves.
+/// The rest of the lookback, per listener: the newest event only, for listeners quiet today. It
+/// used to be `GROUP BY` over every event from 30 days ago to 24 hours ago, which on a ledger
+/// that old is most of the ledger (552 ms on 1,500,000 events, per 30 s poll per open tab). It now
+/// steps through `event_listener_idx` (core-scoring migration 0022), one key per listener
+/// (`sensor`, `protocol`, the stamped port with `''` for none), and takes each listener's newest
+/// event in the window with one backward probe, so the cost is the number of listeners, not the
+/// number of events (3.4 ms on the same ledger). A listener with nothing in the window yields no
+/// row, as a `GROUP BY` would not have made one.
+pub fn listener_newest_sql() -> String {
+    format!(
+        "WITH RECURSIVE keys AS ( \
+             (SELECT sensor, protocol, COALESCE(metadata->>'local_port', '') AS port \
+                FROM event \
+               ORDER BY sensor, protocol, COALESCE(metadata->>'local_port', '') LIMIT 1) \
+             UNION ALL \
+             SELECT n.sensor, n.protocol, n.port FROM keys k CROSS JOIN LATERAL ( \
+                 SELECT e.sensor, e.protocol, COALESCE(e.metadata->>'local_port', '') AS port \
+                   FROM event e \
+                  WHERE (e.sensor, e.protocol, COALESCE(e.metadata->>'local_port', '')) \
+                        > (k.sensor, k.protocol, k.port) \
+                  ORDER BY e.sensor, e.protocol, COALESCE(e.metadata->>'local_port', '') \
+                  LIMIT 1) n \
+         ) \
+         SELECT k.sensor, k.protocol::text AS protocol, k.port AS local_port, \
+                0::bigint AS events_24h, l.last_event_at \
+         FROM keys k CROSS JOIN LATERAL ( \
+             SELECT max(e.observed_at) AS last_event_at FROM event e \
+              WHERE e.sensor = k.sensor AND e.protocol = k.protocol \
+                AND COALESCE(e.metadata->>'local_port', '') = k.port \
+                AND e.observed_at >= now() - interval '{ACTIVITY_LOOKBACK}' \
+                AND e.observed_at < now() - interval '24 hours') l \
+         WHERE l.last_event_at IS NOT NULL"
+    )
+}
+
+/// The last 24 hours per listener: the count and the newest event. Summed from the hourly roll-ups
+/// (`crate::rollup::listener_window_sql`), exact whether or not they are current, where it used to
+/// group every event of the window (314 ms on 1,500,000 events, per 30 s poll per open tab).
+pub fn listener_recent_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT sensor, protocol::text AS protocol, local_port, \
+                sum(events)::bigint AS events_24h, max(last_event_at) AS last_event_at \
+         FROM parts GROUP BY 1, 2, 3",
+        window = crate::rollup::listener_window_sql("now() - interval '24 hours'", cursor_hint),
+    )
+}
+
+/// Per-listener activity from two bounded reads, neither of which scans the ledger outside the
+/// last 24 hours: the last 24 hours ([`listener_recent_sql`]), then the rest of the lookback
+/// ([`listener_newest_sql`]).
 ///
 /// The two statements see different `now()`s, a few milliseconds apart. That can only make an
 /// event fall in both ranges, never in neither, and the second read contributes nothing but a
 /// `max`, so the overlap changes no number.
-async fn listener_activity(db: &PgPool) -> Result<HashMap<ActivityKey, Activity>, sqlx::Error> {
-    let recent = sqlx::query(
-        "SELECT sensor, protocol::text AS protocol, metadata->>'local_port' AS local_port, \
-                count(*) AS events_24h, max(observed_at) AS last_event_at \
-         FROM event \
-         WHERE observed_at >= now() - interval '24 hours' \
-         GROUP BY 1, 2, 3",
-    )
-    .fetch_all(db)
-    .await?;
+async fn listener_activity(
+    db: &PgPool,
+    rollup: &crate::rollup::Health,
+) -> Result<HashMap<ActivityKey, Activity>, sqlx::Error> {
+    let cursor_hint = rollup.refresh_for_page(db).await;
+    // Audited: built from constants and one integer, never user input.
+    let recent = sqlx::query(sqlx::AssertSqlSafe(listener_recent_sql(cursor_hint)))
+        .persistent(false)
+        .fetch_all(db)
+        .await?;
     // Audited: interpolates only the `ACTIVITY_LOOKBACK` constant, never user input.
-    let earlier = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT sensor, protocol::text AS protocol, metadata->>'local_port' AS local_port, \
-                0::bigint AS events_24h, max(observed_at) AS last_event_at \
-         FROM event \
-         WHERE observed_at >= now() - interval '{ACTIVITY_LOOKBACK}' \
-           AND observed_at < now() - interval '24 hours' \
-         GROUP BY 1, 2, 3"
-    )))
-    .fetch_all(db)
-    .await?;
+    let earlier = sqlx::query(sqlx::AssertSqlSafe(listener_newest_sql()))
+        .fetch_all(db)
+        .await?;
 
     let mut out: HashMap<ActivityKey, Activity> = HashMap::new();
     for row in recent.iter().chain(earlier.iter()) {
@@ -370,6 +411,45 @@ fn last_event_text(last_event_at: Option<DateTime<Utc>>) -> String {
         .unwrap_or_else(|| ACTIVITY_LOOKBACK_LABEL.to_string())
 }
 
+/// [`capture_rows`]'s statement. Both capture statements read the uploads of the window through
+/// `event_upload_observed_idx` (core-scoring migration 0023), which holds only the
+/// `honeypot_malware_upload` events and is why they state that predicate verbatim; they used to
+/// walk every event of the window to find the 1-2% that are uploads (240 ms and 250 ms on 1,500,000
+/// events per 30 s poll per open tab; about 40 ms and 30 ms with the index).
+pub fn capture_rows_sql() -> String {
+    // Audited: interpolates only the `CAPTURE_WINDOW_DAYS` constant, never user input. It is a
+    // constant rather than two literals so this query and `top_end_reasons` cannot come to
+    // describe two different windows while the page presents them as one reading.
+    format!(
+        "SELECT sensor, \
+                count(*) AS captures, \
+                count(*) FILTER (WHERE metadata->'complete' = 'true'::jsonb) AS complete, \
+                count(*) FILTER (WHERE metadata->'complete' = 'false'::jsonb) AS incomplete, \
+                count(*) FILTER (WHERE metadata->'complete' IS NULL) AS unlabelled, \
+                count(*) FILTER (WHERE metadata->'truncated' = 'true'::jsonb) AS truncated \
+         FROM event \
+         WHERE signal_type = 'honeypot_malware_upload' \
+           AND observed_at >= now() - interval '{CAPTURE_WINDOW_DAYS}' \
+         GROUP BY sensor ORDER BY sensor"
+    )
+}
+
+/// [`top_end_reasons`]'s statement (see [`capture_rows_sql`] for the index it reads through).
+pub fn top_end_reasons_sql() -> String {
+    // Audited: interpolates only the `CAPTURE_WINDOW_DAYS` constant, never user input.
+    format!(
+        "SELECT sensor, \
+                coalesce(metadata->>'end_reason', 'unrecorded') AS end_reason, \
+                count(*) AS n \
+         FROM event \
+         WHERE signal_type = 'honeypot_malware_upload' \
+           AND observed_at >= now() - interval '{CAPTURE_WINDOW_DAYS}' \
+           AND metadata->'complete' IS DISTINCT FROM 'true'::jsonb \
+         GROUP BY sensor, coalesce(metadata->>'end_reason', 'unrecorded') \
+         ORDER BY sensor, n DESC"
+    )
+}
+
 /// Capture completeness per sensor.
 ///
 /// Two deliberate departures from `routes::detail`'s malware query, each wrong for the other's
@@ -383,23 +463,9 @@ fn last_event_text(last_event_at: Option<DateTime<Utc>>) -> String {
 /// 2. `metadata->'complete' = 'true'::jsonb` is a jsonb comparison rather than a `::boolean` cast,
 ///    so a malformed value can never raise inside the aggregate and take the panel down.
 async fn capture_rows(db: &PgPool) -> Result<Vec<CaptureRow>, sqlx::Error> {
-    // Audited: interpolates only the `CAPTURE_WINDOW_DAYS` constant, never user input. It is a
-    // constant rather than two literals so this query and `top_end_reasons` cannot come to
-    // describe two different windows while the page presents them as one reading.
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT sensor, \
-                count(*) AS captures, \
-                count(*) FILTER (WHERE metadata->'complete' = 'true'::jsonb) AS complete, \
-                count(*) FILTER (WHERE metadata->'complete' = 'false'::jsonb) AS incomplete, \
-                count(*) FILTER (WHERE metadata->'complete' IS NULL) AS unlabelled, \
-                count(*) FILTER (WHERE metadata->'truncated' = 'true'::jsonb) AS truncated \
-         FROM event \
-         WHERE signal_type = 'honeypot_malware_upload' \
-           AND observed_at >= now() - interval '{CAPTURE_WINDOW_DAYS}' \
-         GROUP BY sensor ORDER BY sensor"
-    )))
-    .fetch_all(db)
-    .await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(capture_rows_sql()))
+        .fetch_all(db)
+        .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -441,20 +507,9 @@ async fn capture_rows(db: &PgPool) -> Result<Vec<CaptureRow>, sqlx::Error> {
 /// samples; this says why, and `capture_budget` or `idle_timeout` dominating points straight at a
 /// bound set too low rather than at a flaky attacker.
 async fn top_end_reasons(db: &PgPool) -> Result<HashMap<String, (String, i64)>, sqlx::Error> {
-    // Audited: interpolates only the `CAPTURE_WINDOW_DAYS` constant, never user input.
-    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT sensor, \
-                coalesce(metadata->>'end_reason', 'unrecorded') AS end_reason, \
-                count(*) AS n \
-         FROM event \
-         WHERE signal_type = 'honeypot_malware_upload' \
-           AND observed_at >= now() - interval '{CAPTURE_WINDOW_DAYS}' \
-           AND metadata->'complete' IS DISTINCT FROM 'true'::jsonb \
-         GROUP BY sensor, coalesce(metadata->>'end_reason', 'unrecorded') \
-         ORDER BY sensor, n DESC"
-    )))
-    .fetch_all(db)
-    .await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(top_end_reasons_sql()))
+        .fetch_all(db)
+        .await?;
 
     let mut out: HashMap<String, (String, i64)> = HashMap::new();
     for row in rows {
@@ -795,9 +850,15 @@ async fn build_view(state: &AppState, mut degraded: Degraded) -> FleetView {
         .collect();
 
     let activity = attribute(
-        degraded.soft("listener activity", listener_activity(&state.db).await),
+        degraded.soft(
+            "listener activity",
+            listener_activity(&state.db, &state.read_state.rollup).await,
+        ),
         &state.fleet_listeners,
     );
+    if state.read_state.rollup.failing() {
+        degraded.note("event roll-up refresh (counts read from the ledger)");
+    }
 
     let mut listeners = Vec::with_capacity(state.fleet_listeners.len());
     let mut levels = Vec::with_capacity(state.fleet_listeners.len());

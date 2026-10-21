@@ -38,6 +38,7 @@ fn state(db: PgPool) -> AppState {
         trusted_proxy: false,
         metrics_token: None,
         gave_up_subsystems: console::no_subsystem_health(),
+        read_state: console::read_state::ReadState::uncached(),
         intake_lag: console::intake_lag::no_intake_lag(),
     }
 }
@@ -173,4 +174,58 @@ async fn a_ledger_past_the_counting_cap_is_labelled_an_estimate(pool: PgPool) {
         .unwrap_or_else(|_| panic!("a number follows 'about': {cell}"));
     // Never below what was counted before falling back (a never-analyzed table's reltuples is -1).
     assert!(shown >= 100_001, "{shown}: {cell}");
+}
+
+/// The Chain integrity page's body.
+async fn integrity_body(pool: PgPool) -> String {
+    let state = state(pool);
+    let (_, cookie) = state.sessions.create();
+    let response = routes::router(state)
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))))
+        .oneshot(
+            Request::builder()
+                .uri("/integrity")
+                .header("cookie", format!("{}={cookie}", auth::SESSION_COOKIE))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// The page used to run `count(*)` over the ledger on every load (113 ms on 1,500,000 events).
+/// It now says what the fleet pane's ledger panel says: exact below the cap, an estimate past it.
+#[sqlx::test(migrations = false)]
+async fn the_integrity_page_estimates_a_ledger_past_the_counting_cap(pool: PgPool) {
+    migrate(&pool).await;
+    bulk_events(&pool, 100_003).await;
+    let body = integrity_body(pool).await;
+    assert!(
+        body.contains("events in the ledger (estimate).") && body.contains("About "),
+        "a ledger past the cap is labelled an estimate: {body}"
+    );
+    assert!(
+        !body.contains(">100,003 events in the ledger.") && !body.contains(" 100,003 events"),
+        "the page must not have counted the ledger: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_integrity_page_counts_a_small_ledger_exactly(pool: PgPool) {
+    migrate(&pool).await;
+    bulk_events(&pool, 37).await;
+    let body = integrity_body(pool).await;
+    assert!(body.contains("37 events in the ledger."), "{body}");
+    assert!(!body.contains("estimate"), "{body}");
 }

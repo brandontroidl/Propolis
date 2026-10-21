@@ -90,7 +90,39 @@ Base `0002_event.sql`; hardened by `0004`; `session_id` added by `0007`.
 | `session_id` | UUID | nullable; correlates one sensor session | `crates/core-scoring/migrations/0007_session_id.sql#session_id` |
 
 Indexes: `event_source_ip_idx (source_ip)` (`crates/core-scoring/migrations/0002_event.sql#event_source_ip_idx`), `event_observed_at_idx
-(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`), `event_dedup_idx (source_ip, signal_type, observed_at)` (`crates/core-scoring/migrations/0013_event_dedup_index.sql#event_dedup_idx`), `event_source_category_observed_idx (source_ip, category, observed_at DESC)` (`crates/core-scoring/migrations/0020_event_source_category_index.sql#event_source_category_observed_idx`).
+(observed_at)` (`crates/core-scoring/migrations/0002_event.sql#event_observed_at_idx`), `event_session_idx (source_ip, session_id)` (`crates/core-scoring/migrations/0007_session_id.sql#event_session_idx`), `event_dedup_idx (source_ip, signal_type, observed_at)` (`crates/core-scoring/migrations/0013_event_dedup_index.sql#event_dedup_idx`), `event_source_category_observed_idx (source_ip, category, observed_at DESC)` (`crates/core-scoring/migrations/0020_event_source_category_index.sql#event_source_category_observed_idx`), `event_listener_idx (sensor, protocol, (COALESCE(metadata->>'local_port', '')), observed_at)` (`crates/core-scoring/migrations/0022_event_listener_index.sql#event_listener_idx`), and two partial indexes: `event_upload_observed_idx (observed_at) WHERE signal_type = 'honeypot_malware_upload'` (`crates/core-scoring/migrations/0023_event_upload_and_sample_indexes.sql#event_upload_observed_idx`) and `event_sample_sha_idx ((metadata->>'sample_sha256'), source_ip) WHERE metadata ? 'sample_sha256'` (`crates/core-scoring/migrations/0023_event_upload_and_sample_indexes.sql#event_sample_sha_idx`). `event_output_sha256_idx` (`crates/core-scoring/migrations/0019_shell_output_retention.sql#event_output_sha256_idx`) is the same kind for stored replies.
+
+The two partial indexes hold only the events they name (uploads; events that name a captured
+sample), so they stay small however large the ledger grows. `event_upload_observed_idx` serves the
+fleet pane's capture-completeness panel (`crates/console/src/routes/fleet.rs#capture_rows_sql`,
+`crates/console/src/routes/fleet.rs#top_end_reasons_sql`); `event_sample_sha_idx` serves the
+Samples page's source addresses and truncated captures for the digests it shows
+(`crates/console/src/routes/samples.rs#SAMPLE_SOURCE_IPS_SQL`,
+`crates/console/src/routes/samples.rs#TRUNCATED_SAMPLES_SQL`) and an address page's malware panel
+(`crates/console/src/routes/detail.rs#MALWARE_SQL`). A statement can only use a partial index when it
+repeats the index's predicate, so those statements state `metadata ? 'sample_sha256'` and
+`signal_type = 'honeypot_malware_upload'`; the sample predicate is a key test rather than `->> IS NOT
+NULL` because the planner estimates the latter at every row on a partial index of its own
+expression and keeps to the table.
+
+`event_listener_idx` serves the two console reads that ask a question of every sensor or listener
+without reading the ledger: the search form's sensor menu and the fleet pane's newest event per
+listener over 30 days. Each walks the index from one distinct key to the next (a loose index scan,
+a recursive statement) instead of grouping the events, so its cost is the number of listeners
+(`crates/console/src/routes/search.rs#FILTER_SENSORS_SQL`,
+`crates/console/src/routes/fleet.rs#listener_newest_sql`). A missing port is `''` in the index, not
+NULL, because the step from one key to the next is a row comparison and a comparison with NULL
+never holds. It costs one index entry per appended event (about 6 us) and 59 MB per 1,500,000
+events.
+
+`event_signal_observed_idx (signal_type, observed_at)`
+(`crates/core-scoring/migrations/0026_event_signal_type_index.sql#event_signal_observed_idx`)
+serves the search page's signal-type menu, which steps from one type to the next
+(`crates/console/src/routes/search.rs#FILTER_SIGNAL_TYPES_SQL`), and its signal-type filter,
+which compares the enum column itself (`crates/console/src/routes/search.rs#event_search_sql`;
+`signal_type::text = $n` cannot use an index). It costs one index entry per appended event
+(about 6 us) and 49 MB per 1,600,000 events; the migration header records the measured cost of
+the append path with `0021`, `0022`, `0023` and this index together.
 
 `event_dedup_idx` serves the dedup read every scored append makes inside the append lock
 (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`). That statement hides the
@@ -220,7 +252,15 @@ result.
 | `last_active_day` | DATE | nullable | `crates/core-scoring/migrations/0010_active_days.sql#last_active_day` |
 | `established_event_count` | INTEGER | NOT NULL DEFAULT 0 | `crates/core-scoring/migrations/0011_established_event_count.sql#established_event_count` |
 
-No indexes are defined beyond the `source_ip` PRIMARY KEY.
+One index beyond the `source_ip` PRIMARY KEY: `ip_score_order_idx`, on
+`(ip_score_order_key(raw_score, distinct_wan_count, decay_anchor) DESC, source_ip DESC)`
+(`crates/core-scoring/migrations/0021_ip_score_order_key.sql#ip_score_order_idx`). The function
+is the time-invariant key that ranks rows exactly as their live (decayed-to-now) scores rank at any
+instant, so the console's top attacker and the Attackers table's default sort read the top of the
+index instead of scoring every address
+(`crates/console/src/routes/mod.rs#SCORE_ORDER_KEY_SQL`). Raw score and anchor are indexed
+columns, so a scored append's update of this row is no longer heap-only: 9 us against 24 us per
+row measured over 100,000 updates.
 
 `has_confirmed_real` latches true only for an authenticated TCP honeypot event:
 `is_confirmed_real(p, authenticated, c) = p==Tcp && authenticated && c==Honeypot`
@@ -284,6 +324,60 @@ migration's two `INSERT ... SELECT` statements again with the daemon stopped.
 `rebuild_projection` does not read them: it counts from the ledger rows, so a replay is an
 independent check (`crates/core-scoring/src/repository/breadth_sets_tests.rs#breadth_sets_match_the_whole_history_aggregates_after_every_append`).
 
+<a id="event-rollups"></a>
+## Event roll-up (`0025_event_rollups.sql`)
+
+Hourly counts of the ledger by listener, for the console's windowed panels (the dashboard's charts
+and sensor split; the fleet pane's per-listener counts), which used to group every event in the
+window on each load. Derived from the ledger like the breadth sets, never part of it; the append
+path does not write it.
+
+| table | grain | holds | kept |
+|---|---|---|---|
+| `event_hour_listener` | UTC hour, sensor, protocol, port (`''` when the sensor stamped none) | events, newest `observed_at` | 45 days |
+| `event_rollup_cursor` | one row | the highest event id folded into the table | - |
+
+`event_hour(ts)` is the UTC hour of a timestamp, independent of the session time zone
+(`crates/core-scoring/migrations/0025_event_rollups.sql#event_hour`).
+
+The console folds the events past the cursor into the table, and advances the cursor, in one
+transaction (`crates/console/src/rollup.rs#refresh`), before the pages that read it. Appends hold
+the global advisory lock until they commit, so ids commit in order and everything at or below the
+cursor is final. A window is assembled from the roll-up rows for whole hours, the ledger's own
+events for the partial hour at the window's start, and the ledger's own events past the cursor
+(`crates/console/src/rollup.rs#listener_window_sql`), so a count is exact whether or not the
+roll-up has caught up. If nothing refreshes it, the unfolded part grows and the page costs more,
+bounded by the width of the window read by time, about four times what the old single-column
+count cost (279 ms against 73 ms for the sensor split with the cursor 7 days behind, on 1.5M
+events; 8.7 ms with it current): the statement carries the
+cursor the page just read as a literal beside the cursor subquery, which tells the planner how much
+of the ledger lies past it, so it reads the window by time when the cursor is far behind and the
+id range when it is near. The subquery stays the authority, so the hint cannot change a count.
+A refresh that fails is counted (`crates/console/src/rollup.rs#Health`); three in a row are named
+in the dashboard's and the fleet pane's degraded banner and exported as
+`propolis_console_rollup_refresh_failures`.
+
+The migration fills the table from the ledger under a `SHARE` lock on `event`, as `0014` does (one
+read of the heap: 1.7 s for 1,500,000 events). To rebuild it, empty the table and set the cursor
+to 0: the next refresh folds the whole ledger back in batches, and until it has caught up the pages
+read the unfolded part from the ledger. A refresh that finds the cursor ahead of the ledger's
+newest id (ids were reset) discards the table and starts over. A job that deletes events leaves the
+roll-up counting them until the affected hours age out of the table.
+
+The dashboard's most-active panel groups by source address, which this table cannot answer. A
+roll-up by hour and source address was built for it and removed: a day's (hour, source) rows are
+about half as many as its events, and summing them took 275 ms where the ledger took 535 ms. The
+panel is served from the last answer computed, at most 15 minutes old (counted from when its
+computation started): a background task started with the console recomputes it at every
+quarter-hour boundary and ten minutes after the previous attempt (two aggregates per quarter
+hour, about 0.33% of one backend at the live 1.5 s), and a load that finds it more than 30
+seconds old starts one more recomputation behind the request. The ten-minute trigger is what keeps
+an idle console covered, since the age cap equals the quarter hour. A held answer older than 15
+minutes, or more than one quarter hour behind, is not served: that load waits for the aggregate,
+as does the first load after a start, so the first view is fast except on a cold start or after
+the process was stopped or refreshes failed for longer than the cap
+(`crates/console/src/read_state.rs#SwrCell`).
+
 <a id="campaign-tables"></a>
 ## Campaign and indicator tables (`0015_campaigns.sql`, `0016_campaign_fingerprint.sql`)
 
@@ -337,6 +431,11 @@ Derived by the same indexer, in the same transaction as each batch; the rules ar
 `campaign_session.attack_pending` holds a shell run's tags (a JSON array of rule, event id and
 matched token) until the run joins a campaign
 (`crates/core-scoring/migrations/0017_attack_tags.sql#attack_pending`).
+
+`attack_tag_source_idx (source_ip)` (`crates/core-scoring/migrations/0024_attack_tag_source_index.sql#attack_tag_source_idx`)
+serves the address page's technique read (`crates/review/src/attack/mod.rs#SOURCE_TAGS_SQL`): the two
+partial unique indexes both start with the address, but that read names no session condition, so
+neither can answer it and it read the whole table.
 
 <a id="shell-output-table"></a>
 ## Shell output table (`0018_shell_output.sql`, `0019_shell_output_retention.sql`)
@@ -534,6 +633,12 @@ the watch stream and compare timestamps.
 | `0018` | the [shell output table](#shell-output-table) `shell_output`; no backfill |
 | `0019` | `shell_output.last_stored` and the partial index `event_output_sha256_idx` on `event` (built inside the migration transaction like `0013`, so writes to `event` wait for the build; no event carries a reply yet when it runs) |
 | `0020` | index `event_source_category_observed_idx (source_ip, category, observed_at DESC)`, which serves the submission runner's newest-event-per-category lookup; built inside the migration transaction like `0013`, so writes to `event` wait for the build |
+| `0021` | function `ip_score_order_key` and index `ip_score_order_idx` on `ip_score`, which serve the console's score ordering (top attacker, Attackers table) without scoring every address |
+| `0022` | index `event_listener_idx (sensor, protocol, port, observed_at)`, which serves the search form's sensor menu and the fleet pane's newest event per listener without reading the ledger; built inside the migration transaction like `0013`, so writes to `event` wait for the build |
+| `0023` | partial indexes `event_upload_observed_idx` (uploads, by time) and `event_sample_sha_idx` (events that name a captured sample, by digest and address), which serve the fleet capture panel, the Samples page and an address page's malware panel without reading the ledger; built inside the migration transaction like `0013` |
+| `0024` | index `attack_tag_source_idx (source_ip)`, which serves the address page's technique read |
+| `0025` | the [event roll-up](#event-rollups): function `event_hour`, tables `event_hour_listener` and `event_rollup_cursor`, backfilled from the ledger under a `SHARE` lock on `event` |
+| `0026` | index `event_signal_observed_idx (signal_type, observed_at)`, which serves the search page's signal-type menu and filter without reading the ledger; built inside the migration transaction like `0013` |
 
 **review** (`crates/review/migrations/`):
 

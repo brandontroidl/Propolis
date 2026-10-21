@@ -12,6 +12,8 @@ pub mod auth;
 pub mod intake_lag;
 pub mod log_buffer;
 pub mod rdns;
+pub mod read_state;
+pub mod rollup;
 pub mod routes;
 pub mod server;
 pub mod templates;
@@ -137,6 +139,10 @@ pub struct AppState {
     /// to its intake loops; the standalone console binary and tests use
     /// [`intake_lag::no_intake_lag`], which reports nothing, so no lag series is published.
     pub intake_lag: intake_lag::IntakeLagSource,
+    /// What the pages remember between requests: roll-up refresh health and the held most-active
+    /// panel ([`read_state::ReadState`]). A running console uses [`read_state::ReadState::new`];
+    /// tests that insert events and read a page back use [`read_state::ReadState::uncached`].
+    pub read_state: Arc<read_state::ReadState>,
 }
 
 /// Reports the supervised subsystems that have given up; empty when everything is running or

@@ -5,9 +5,11 @@
 //! Loading more is keyset, not `OFFSET`: the button carries the address of the last row shown
 //! (`after=`), and the query resumes strictly past that row's `(sort key, source_ip)` - looked up
 //! by `ip_score`'s primary key - so the list never repeats or skips a row because addresses were
-//! scored while the operator read it, and its cost does not grow with depth. `ip_score` has no
-//! index on any sort column, so each load is one bounded scan of the projection table with a
-//! top-500 sort (the table holds one row per address, never the event ledger).
+//! scored while the operator read it, and its cost does not grow with depth. The score sort is
+//! read off `ip_score_order_idx` (core-scoring migration 0021), so the default view touches 501
+//! index entries however many addresses are scored. The other three sorts have no index: each of
+//! their loads is one bounded scan of the projection table with a top-500 sort (the table holds
+//! one row per address, never the event ledger).
 //!
 //! The score sort orders by a TIME-INVARIANT key rather than the live score itself. Every row's
 //! live score decays with the same half-life, so `ln(raw * breadth) + ln 2 * anchor / half_life`
@@ -48,15 +50,6 @@ pub fn router() -> Router<AppState> {
 /// Rows per load.
 const PAGE_SIZE: usize = 500;
 
-/// The score sort's order key: equal in order to the live effective score at every instant, but
-/// constant over time (module doc comment). The literals are `LIVE_EFFECTIVE_SCORE_SQL`'s: the
-/// 21600 s half-life and the 0.15-per-WAN breadth factor capped at 0.60. A zero score has no
-/// logarithm and sorts last.
-const SCORE_ORDER_KEY: &str = "(CASE WHEN raw_score > 0 \
-    THEN ln(raw_score::float8 * (1.0 + LEAST(0.60, 0.15 * GREATEST(0, distinct_wan_count - 1)))) \
-         + EXTRACT(EPOCH FROM decay_anchor)::float8 * ln(2.0) / 21600.0 \
-    ELSE '-Infinity'::float8 END)";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortKey {
     Score,
@@ -87,7 +80,7 @@ impl SortKey {
     /// The SQL the list orders and resumes by. One of four literals, never user input.
     fn order_key(self) -> &'static str {
         match self {
-            SortKey::Score => SCORE_ORDER_KEY,
+            SortKey::Score => crate::routes::SCORE_ORDER_KEY_SQL,
             SortKey::Events => "event_count",
             SortKey::First => "first_seen",
             SortKey::Last => "last_seen",
@@ -193,6 +186,33 @@ async fn is_scored(db: &PgPool, ip: IpAddr) -> Result<bool, AppError> {
     )
 }
 
+/// One load's statement for the sort whose order key is `key`; `resuming` adds the keyset
+/// condition past the address bound as `$1`.
+fn batch_sql(key: &str, desc: bool, resuming: bool) -> String {
+    let (dir, past) = if desc { ("DESC", "<") } else { ("ASC", ">") };
+    let resume = if resuming {
+        format!(
+            "WHERE ({key}, source_ip) {past} \
+             (SELECT {key}, source_ip FROM ip_score WHERE source_ip = $1::inet)"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT host(source_ip) AS ip, ({live})::float8 AS score, \
+         COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, \
+         first_seen, last_seen, eligible FROM ip_score {resume} \
+         ORDER BY {key} {dir}, source_ip {dir} LIMIT {limit}",
+        live = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
+        limit = PAGE_SIZE + 1,
+    )
+}
+
+/// The statement the default (score) sort runs, for the tests that hold its plan.
+pub fn score_batch_sql(desc: bool, resuming: bool) -> String {
+    batch_sql(crate::routes::SCORE_ORDER_KEY_SQL, desc, resuming)
+}
+
 /// The batch after `after` (the first one when `None`), read one row past [`PAGE_SIZE`] so
 /// whether more follow is known without a count.
 async fn fetch_batch(
@@ -201,23 +221,7 @@ async fn fetch_batch(
     desc: bool,
     after: Option<IpAddr>,
 ) -> Result<Batch, AppError> {
-    let key = sort.order_key();
-    let (dir, past) = if desc { ("DESC", "<") } else { ("ASC", ">") };
-    let resume = match after {
-        None => String::new(),
-        Some(_) => format!(
-            "WHERE ({key}, source_ip) {past} \
-             (SELECT {key}, source_ip FROM ip_score WHERE source_ip = $1::inet)"
-        ),
-    };
-    let sql = format!(
-        "SELECT host(source_ip) AS ip, ({live})::float8 AS score, \
-         COALESCE(tier::text, '') AS tier, event_count, distinct_categories, distinct_wan_count, \
-         first_seen, last_seen, eligible FROM ip_score {resume} \
-         ORDER BY {key} {dir}, source_ip {dir} LIMIT {limit}",
-        live = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
-        limit = PAGE_SIZE + 1,
-    );
+    let sql = batch_sql(sort.order_key(), desc, after.is_some());
     // Audited: `sql` interpolates only `LIVE_EFFECTIVE_SCORE_SQL`, one of `SortKey::order_key`'s
     // four literals, fixed direction words and the page-size constant. The cursor address is a
     // bound parameter.

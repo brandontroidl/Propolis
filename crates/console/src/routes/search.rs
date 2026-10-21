@@ -503,19 +503,124 @@ async fn render_search_page(
 /// fails to an empty list on a query error rather than propagating: the dropdowns are supplementary
 /// form chrome, not the search itself, matching `routes::context::base_context`'s own
 /// supplementary-chrome soft-fail policy.
+///
+/// Neither menu scans the ledger. The sensors are found by stepping through `event_listener_idx`
+/// ([`FILTER_SENSORS_SQL`]); `SELECT DISTINCT sensor FROM event` read every row (2.4 s on the live
+/// node). The signal types are the ones the ledger holds, found by one index probe per type
+/// present ([`FILTER_SIGNAL_TYPES_SQL`], on `event_signal_observed_idx`, core-scoring
+/// migration 0026); `SELECT DISTINCT signal_type` read every row (3.1 s). The menu is therefore the
+/// one it always was: a type appears when the first event of that type arrives.
 async fn filter_options(db: &PgPool) -> (Vec<String>, Vec<String>) {
-    let sensors =
-        sqlx::query_scalar::<_, String>("SELECT DISTINCT sensor FROM event ORDER BY sensor")
-            .fetch_all(db)
-            .await
-            .unwrap_or_default();
-    let signal_types = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT signal_type::text FROM event ORDER BY signal_type",
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    let sensors = sqlx::query_scalar::<_, String>(FILTER_SENSORS_SQL)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let signal_types = sqlx::query_scalar::<_, String>(FILTER_SIGNAL_TYPES_SQL)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
     (sensors, signal_types)
+}
+
+/// The signal types the ledger holds, sorted by name as `SELECT DISTINCT signal_type::text ...
+/// ORDER BY signal_type` sorted them (that `ORDER BY` resolves to the text output column, so it is
+/// alphabetical, not the enum's declaration order): a loose index scan on
+/// `event_signal_observed_idx` like [`FILTER_SENSORS_SQL`], one probe per type present. (A probe
+/// per member of the enum, `EXISTS (... WHERE signal_type = t)`, was tried first: the planner turns
+/// an `EXISTS` into a join that reads the table, and a `LIMIT` subquery in its place is planned as
+/// a sequential scan that stops at the first match, which for a type with no events is the whole
+/// ledger. 1.9 s on 580,000 events.)
+pub const FILTER_SIGNAL_TYPES_SQL: &str = "\
+    WITH RECURSIVE s AS ( \
+        (SELECT signal_type FROM event ORDER BY signal_type LIMIT 1) \
+        UNION ALL \
+        SELECT (SELECT e.signal_type FROM event e WHERE e.signal_type > s.signal_type \
+                ORDER BY e.signal_type LIMIT 1) \
+        FROM s WHERE s.signal_type IS NOT NULL \
+    ) \
+    SELECT signal_type::text FROM s WHERE signal_type IS NOT NULL ORDER BY signal_type";
+
+/// The distinct `event.sensor` values, sorted: a loose index scan on `event_listener_idx`
+/// (core-scoring migration 0022). The first sensor is the smallest key; each step takes the
+/// smallest sensor greater than the last one found, so the cost is one index probe per sensor.
+pub const FILTER_SENSORS_SQL: &str = "\
+    WITH RECURSIVE s AS ( \
+        (SELECT sensor FROM event ORDER BY sensor LIMIT 1) \
+        UNION ALL \
+        SELECT (SELECT e.sensor FROM event e WHERE e.sensor > s.sensor ORDER BY e.sensor LIMIT 1) \
+        FROM s WHERE s.sensor IS NOT NULL \
+    ) \
+    SELECT sensor FROM s WHERE sensor IS NOT NULL ORDER BY sensor";
+
+/// The filter's signal type as the database enum value to compare with, so the comparison is on
+/// the column itself and `event_signal_observed_idx` can serve it (`signal_type::text = $n` cannot).
+/// `None` when no signal type is filtered; `Some(None)` when one is but it names no signal type,
+/// which matches no event (and must not reach the enum cast, which would be an error).
+fn signal_type_filter(filters: &Filters) -> Option<Option<&str>> {
+    let wanted = filters.signal_type.as_deref()?;
+    let known = signal_type_names().iter().any(|name| name == wanted);
+    Some(known.then_some(wanted))
+}
+
+/// Every signal-type name the filter accepts, in the wire spelling the database enum uses. The
+/// filter and the test that these are the enum's values share this one conversion.
+pub fn signal_type_names() -> Vec<String> {
+    SignalType::ALL
+        .iter()
+        .map(|s| signal_type_snake(*s))
+        .collect()
+}
+
+/// The signal-type condition of the search statements, over `$3`, a known signal-type name
+/// ([`signal_type_filter`]) when `filtered` and NULL otherwise. It compares the column to the enum
+/// so `event_signal_observed_idx` can serve it: `signal_type::text = $3` cannot use an index on the
+/// column, and for a type the ledger holds little or none of that walked the whole ledger to return
+/// nothing (1.1 to 2.9 s on 1,500,000 events for a type with no events). It is a separate statement
+/// text when filtered, and not `$3 IS NULL OR signal_type = $3`, because a prepared statement that
+/// is reused runs a plan made without the value, and that plan cannot use the index.
+fn signal_type_condition(filtered: bool) -> &'static str {
+    if filtered {
+        "signal_type = $3::signal_type_enum"
+    } else {
+        "$3::text IS NULL"
+    }
+}
+
+/// The event search statement ([`signal_type_condition`] for `$3`).
+pub fn event_search_sql(signal_type_filtered: bool) -> String {
+    format!(
+        "SELECT id, host(source_ip) AS source_ip, sensor, signal_type, observed_at, metadata, \
+                session_id::text AS session_id \
+         FROM event \
+         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%' ESCAPE '\\') \
+           AND ($2::text IS NULL OR sensor = $2) \
+           AND {signal_type} \
+           AND ($4::inet IS NULL OR source_ip = $4::inet) \
+           AND ($5::timestamptz IS NULL OR observed_at >= $5) \
+           AND ($6::timestamptz IS NULL OR observed_at <= $6) \
+           AND ($7::bigint IS NULL OR id < $7) \
+         ORDER BY observed_at DESC, id DESC \
+         LIMIT $8",
+        signal_type = signal_type_condition(signal_type_filtered),
+    )
+}
+
+/// The IP search statement ([`signal_type_condition`] for `$3`).
+fn ip_search_sql(signal_type_filtered: bool) -> String {
+    format!(
+        "SELECT host(source_ip) AS source_ip, COUNT(*) AS match_count, \
+                MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen \
+         FROM event \
+         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%' ESCAPE '\\') \
+           AND ($2::text IS NULL OR sensor = $2) \
+           AND {signal_type} \
+           AND ($4::timestamptz IS NULL OR observed_at >= $4) \
+           AND ($5::timestamptz IS NULL OR observed_at <= $5) \
+         GROUP BY source_ip \
+         ORDER BY match_count DESC \
+         LIMIT 50",
+        signal_type = signal_type_condition(signal_type_filtered),
+    )
 }
 
 /// Fetches up to `SEARCH_PAGE_SIZE + 1` matching `event` rows, newest first, per the design's
@@ -528,41 +633,35 @@ async fn filter_options(db: &PgPool) -> (Vec<String>, Vec<String>) {
 /// Postgres does not implicitly cast `text` to `inet` at a second, uncast usage site even though an
 /// earlier cast in the same statement fixed the parameter's type for ITS OWN clause; the result is
 /// `operator does not exist: inet = text`, reproduced with `sensor=catchall` (a query where $4 is
-/// NULL) confirming this is a static type-resolution error, not a data-dependent one. `sensor`/
-/// `signal_type` need no such fix (both compare `text` to `text`); `observed_at`/`id` need none
-/// either (`DateTime<Utc>`/`i64` already declare `timestamptz`/`bigint` directly, matching their
-/// columns). Returning one extra row is the same fetch-51-display-50 "is there a next page" signal
-/// `fetch_evidence_rows` uses in `routes::detail`.
+/// NULL) confirming this is a static type-resolution error, not a data-dependent one. `sensor`
+/// needs no such fix (it compares `text` to `text`); `signal_type` is cast to the enum on purpose
+/// (see [`signal_type_condition`]); `observed_at`/`id` need none either (`DateTime<Utc>`/`i64` already
+/// declare `timestamptz`/`bigint` directly, matching their columns). Returning one extra row is the
+/// same fetch-51-display-50 "is there a next page" signal `fetch_evidence_rows` uses in
+/// `routes::detail`.
 async fn fetch_search_events(
     db: &PgPool,
     filters: &Filters,
     cursor: Option<(DateTime<Utc>, i64)>,
 ) -> Result<Vec<SearchEventRow>, AppError> {
     let cursor_id = cursor.map(|(_, id)| id);
-    let rows = sqlx::query(
-        "SELECT id, host(source_ip) AS source_ip, sensor, signal_type, observed_at, metadata, \
-                session_id::text AS session_id \
-         FROM event \
-         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%' ESCAPE '\\') \
-           AND ($2::text IS NULL OR sensor = $2) \
-           AND ($3::text IS NULL OR signal_type::text = $3) \
-           AND ($4::inet IS NULL OR source_ip = $4::inet) \
-           AND ($5::timestamptz IS NULL OR observed_at >= $5) \
-           AND ($6::timestamptz IS NULL OR observed_at <= $6) \
-           AND ($7::bigint IS NULL OR id < $7) \
-         ORDER BY observed_at DESC, id DESC \
-         LIMIT $8",
-    )
-    .bind(filters.q.as_deref())
-    .bind(filters.sensor.as_deref())
-    .bind(filters.signal_type.as_deref())
-    .bind(filters.parsed_ip().map(|ip| ip.to_string()))
-    .bind(filters.parsed_from())
-    .bind(filters.parsed_to())
-    .bind(cursor_id)
-    .bind(SEARCH_PAGE_SIZE + 1)
-    .fetch_all(db)
-    .await?;
+    let signal_type = match signal_type_filter(filters) {
+        None => None,
+        Some(Some(known)) => Some(known),
+        Some(None) => return Ok(Vec::new()),
+    };
+    // Audited: the text differs only by `signal_type_condition`, never by input.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(event_search_sql(signal_type.is_some())))
+        .bind(filters.q.as_deref())
+        .bind(filters.sensor.as_deref())
+        .bind(signal_type)
+        .bind(filters.parsed_ip().map(|ip| ip.to_string()))
+        .bind(filters.parsed_from())
+        .bind(filters.parsed_to())
+        .bind(cursor_id)
+        .bind(SEARCH_PAGE_SIZE + 1)
+        .fetch_all(db)
+        .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -594,26 +693,20 @@ async fn fetch_search_events(
 /// entries, not batched into a single SQL join because the decay projection lives in the scoring
 /// engine, not in a column this query can read directly.
 async fn fetch_search_ips(db: &PgPool, filters: &Filters) -> Result<Vec<SearchIpRow>, AppError> {
-    let rows = sqlx::query(
-        "SELECT host(source_ip) AS source_ip, COUNT(*) AS match_count, \
-                MIN(observed_at) AS first_seen, MAX(observed_at) AS last_seen \
-         FROM event \
-         WHERE ($1::text IS NULL OR metadata::text ILIKE '%' || $1 || '%' ESCAPE '\\') \
-           AND ($2::text IS NULL OR sensor = $2) \
-           AND ($3::text IS NULL OR signal_type::text = $3) \
-           AND ($4::timestamptz IS NULL OR observed_at >= $4) \
-           AND ($5::timestamptz IS NULL OR observed_at <= $5) \
-         GROUP BY source_ip \
-         ORDER BY match_count DESC \
-         LIMIT 50",
-    )
-    .bind(filters.q.as_deref())
-    .bind(filters.sensor.as_deref())
-    .bind(filters.signal_type.as_deref())
-    .bind(filters.parsed_from())
-    .bind(filters.parsed_to())
-    .fetch_all(db)
-    .await?;
+    let signal_type = match signal_type_filter(filters) {
+        None => None,
+        Some(Some(known)) => Some(known),
+        Some(None) => return Ok(Vec::new()),
+    };
+    // Audited: the text differs only by `signal_type_condition`, never by input.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(ip_search_sql(signal_type.is_some())))
+        .bind(filters.q.as_deref())
+        .bind(filters.sensor.as_deref())
+        .bind(signal_type)
+        .bind(filters.parsed_from())
+        .bind(filters.parsed_to())
+        .fetch_all(db)
+        .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {

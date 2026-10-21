@@ -29,6 +29,13 @@
   first push after the upgrade `feed-push-stale` sees no push; with `PROPOLIS_OPS_FEED_PUSH_EXPECTED`
   set it can page once if that push is more than the stale threshold away. Run the sync by hand
   after upgrading to avoid it. The old marker file is no longer read and can be deleted.
+- **The first start on this version is slower on a large ledger** - core-scoring migrations `0021`
+  to `0026` build indexes on `event`, `ip_score` and `attack_tag` and fill the new hourly
+  roll-up table from the ledger, holding a lock that blocks writes to `event` (reads proceed)
+  while they run, before intake starts. On a ledger of 7.5M events plan on up to a few minutes
+  of extra start-up `[estimated from 1,500,000 events: about 6 s per index build and a few
+  seconds for the roll-ups]`; later starts are unaffected. See
+  [schema and migrations](docs/development/schema-and-migrations.md#index-builds).
 
 ### Added
 
@@ -417,7 +424,8 @@
   The count is exact up to 100,000 events and shown bare; past that it is the planner's row
   estimate, shown as `about N` and labelled `(estimate)`. The newest ingest is read off the
   newest row by `id`. The Attackers total shares the rule (`routes::rowcount`) and skips its
-  bounded scan once statistics put the table past the cap. The integrity page still counts on load.
+  bounded scan once statistics put the table past the cap. The Chain integrity page shares it
+  (see below).
 - **The evidence timeline's header says what it counts** - it read "54 events", which looked like
   the address's total or its commands. It now reads, for example, `newest 200 events: 199
   commands, 1 session, 1 outside any session`: ledger rows on the page, of which command
@@ -691,6 +699,128 @@
   default 15. See
   [backup and restore](docs/operations/backup-and-restore.md) and
   [upgrade, rollback and DR](docs/operations/upgrade-rollback-and-dr.md).
+- **The dashboard and the fleet pane count their time windows from an hourly roll-up, not from the
+  ledger** - the hourly chart, the sensor split, the 7- and 30-day charts and the fleet pane's
+  24-hour listener counts each grouped every event in their window on every load and every 30 s
+  poll of every open tab (160 ms, 161 ms, 1.2 s and 314 ms on 1,500,000 events, growing with the
+  ledger). New core-scoring migration `0025` adds `event_hour_listener` (events and newest event
+  per UTC hour by sensor, protocol and port) and a cursor, filled from the ledger by the
+  migration; the console folds the events appended since its last read into it before it reads. The pages now cost the
+  number of hours in the window (10 ms, 10 ms, 13 ms and 11 ms). Every number is the one the
+  ledger gives: the partial hour at the start of a window, and any event the roll-up has not
+  folded yet, are counted from the ledger itself, so a count is exact whether or not the roll-up
+  is current. A roll-up nobody refreshes costs more as it falls behind, but is bounded: the page
+  tells the planner how far behind the roll-up is, so it reads the window by time rather than
+  walking every event past the cursor. That bound is about four times the old single-column
+  count, not the old cost itself: with the cursor set back 7 days on the 1.5M-event seed the
+  sensor split took 279 ms against 73 ms for the previous `GROUP BY sensor` (each row now also
+  goes through the hour function and a JSON extraction, and groups by four keys), and 8.7 ms
+  with the cursor current. The pages refresh it on every load; three failures in a row are named
+  in the dashboard's and the fleet pane's degraded banner and counted by the
+  `propolis_console_rollup_refresh_failures` metric. In a time zone whose offset is not a whole
+  number of hours at any point in the last 45 days (India, Nepal, Lord Howe) the hourly and daily
+  charts read the ledger as before. The roll-up is derived and disposable: it can be emptied and
+  refills from the ledger. See [database](docs/reference/database.md#event-rollups).
+- **The dashboard's most-active panel is served from the last answer, at most 15 minutes old, and
+  refreshed behind the request** - it groups every event of the last 24 hours by source address
+  (330 ms on 274,000 events, 1.5 s on the live node), which no index or roll-up answers exactly (a
+  roll-up by source address was built, measured at 275 ms against 535 ms, and removed). A page
+  load answers from the last panel computed, and the panel can lag by up to a quarter hour. A
+  background task started with the console recomputes it at every quarter-hour boundary, ten
+  minutes after the previous attempt if none has run since (the age cap equals the quarter hour, so
+  an idle console would otherwise pass the cap in the 1.5 s before the replacement landed and make
+  that view wait), and once at start; a load that finds it more than 30 seconds old starts one
+  more recomputation behind the request (the dashboard's second load on 1.6M events: 440 ms to 120
+  ms). Age is counted from when the computation started, so the data shown is at most 15 minutes
+  old. A held panel older than that, or more than one quarter hour behind, is never shown: that
+  load waits for a fresh computation, and if that fails the dashboard's degraded banner says so.
+  So the first view is fast except on a cold start, before the first computation lands, and after
+  the process was stopped (SIGSTOP, a frozen container) for longer than the cap or refreshes
+  failed for that long. The cost is two aggregates per quarter hour, about 0.33% of one
+  database backend on the live node (3 s in 900 s). A wall clock stepped back by more than a
+  quarter hour no longer pins the held panel: the next computation replaces it. Across an hour
+  boundary the old panel's hourly strip is one cell off until the refresh. The panel's "last seen"
+  is worded when it is served, so it ages; the held answer is per process and is never shared or
+  stored. A failed scheduled refresh keeps the previous answer (until the age cap), is logged, and
+  is retried at the next trigger.
+- **An address page no longer reads every ATT&CK tag to show one address's** - the technique
+  read named no session condition, so neither of `attack_tag`'s two partial unique indexes (each
+  partial on whether a session is recorded) could serve it, and it read the whole table on every
+  page: 45 ms for 300,000 tags, and the table has no retention. New core-scoring migration `0024`
+  adds `attack_tag_source_idx (source_ip)` (0.5 ms). See
+  [database](docs/reference/database.md#attack-tag-tables).
+- **`/metrics` reads the scored addresses once, not four times** - the four address gauges
+  (`propolis_ips_scored`, `_eligible`, `_recommended_vendor`, `_recommended_blocklist`) were four
+  `count(*)` statements, each reading every `ip_score` row on every scrape; one statement with
+  filtered counts now gives all four (about 200 ms to 119 ms on 500,000 addresses). The values are
+  unchanged.
+- **The Chain integrity page no longer counts the ledger on every load** - it ran `count(*)`
+  over the event table (113 ms on 1,500,000 events, growing with the ledger). It now shows what
+  the fleet pane's ledger panel shows: the exact count up to 100,000 events, and past that the
+  planner's estimate, labelled "About N events in the ledger (estimate)". Running the
+  verification still states the exact number of events it verified, since it has just read them
+  all.
+- **The Samples page, the address page's malware panel and the fleet capture panel stop reading
+  the ledger to find uploads** - the Samples page read the source addresses of every sample ever
+  captured (250 ms on 1,500,000 events) and tested every event for a truncated capture (150 ms) to
+  use the 200 digests it lists; an address page found its samples by reading all of that
+  address's events (226 ms for one with 187,000); the fleet pane's capture rate and dominant end
+  reason walked 7 days of the ledger twice per 30 s poll to find the 1-2% that are uploads (240
+  ms and 250 ms). New core-scoring migration `0023` adds two partial indexes that hold only those
+  events (504 kB and 2 MB per 1,500,000 events): `event_upload_observed_idx` and
+  `event_sample_sha_idx`. The Samples page now asks only about the digests it shows. The
+  statements repeat the indexes' predicates, which is what lets the planner use them (12 ms, 5
+  ms, 20 ms, and 37 ms plus 27 ms). The index is built inside the migration transaction, so
+  writes to `event` wait for the build at the first start on the new version (see `0013`). See
+  [database](docs/reference/database.md).
+- **The feed build no longer reads every approved address's whole history** - each candidate's
+  `categories` were `SELECT DISTINCT signal_type FROM event WHERE source_ip = ...`, which reads
+  every event the address ever produced: 4.3 s for 5,566 approved addresses on the live node, on
+  every build, and it ran even for addresses too old for any feed to carry. The statement now
+  probes the 17 members of `signal_type_enum` through `event_dedup_idx`, one descent each, so its
+  cost is the number of types and not the number of events (an address with 1,042 events on
+  average: 236 ms to 74 ms per 200 addresses, and the gap grows with the history), and the build
+  skips the candidates whose last event is older than the longest feed window, which
+  `materialize` would discard anyway; with no retention window configured it no longer reads the
+  volume-listed floods at all, since only a window publishes one. The published files are
+  unchanged.
+- **The search menus and the fleet pane no longer read the whole ledger** - the search form's
+  sensor menu was `SELECT DISTINCT sensor FROM event` (2.4 s on the live node) and its signal-type
+  menu `SELECT DISTINCT signal_type FROM event` (3.1 s), run on every load of either search page;
+  the fleet pane, polled every 30 s by every open tab, grouped every event from 30 days ago to
+  24 hours ago just to find each listener's newest one (552 ms on 1,500,000 events, and on a
+  ledger that old most of it). New core-scoring migration `0022` adds `event_listener_idx
+  (sensor, protocol, port, observed_at)`; the sensor menu and the fleet read step through it from
+  one listener to the next, so they cost the number of listeners (236 ms to 1.4 ms, and 552 ms to
+  3.4 ms). The index is built inside the migration transaction, so writes to `event` wait for
+  the build at the first start on the new version (see `0013` for the cost on a large ledger:
+  about 6 s per 1,500,000 events), and each appended event writes one more index entry (about 6
+  us). The signal-type menu is covered by the next entry. See
+  [database](docs/reference/database.md).
+- **The search page's signal-type menu and filter no longer read the ledger** - the menu was
+  `SELECT DISTINCT signal_type FROM event` (3.1 s on the live node) and the filter compared
+  `signal_type::text`, which no index serves, so choosing a type with few or no events walked the
+  whole ledger by time (1.1 to 2.9 s for a type with none on 1,500,000 events). New core-scoring
+  migration `0026` adds `event_signal_observed_idx (signal_type, observed_at)`; the menu steps
+  through it from one type to the next and lists the types the ledger holds, as it always did
+  (1.1 ms), and the filter compares the enum column itself (11 ms for a type with no events,
+  page included). A name that is not a signal type finds nothing, as before. Each appended event
+  writes one more index entry (about 6 us). The append path as a whole, with `0021`, `0022`,
+  `0023` and `0026`, was measured end to end against a ledger without them (batches of 200, 20,000
+  events, 1.5M-event ledger, six alternating runs on a shared host): 420 us against 470 us per
+  event at best (about +10%), single appends 3.8 against 4.0 ms; the added time is inside the
+  append lock. See [database](docs/reference/database.md).
+- **The dashboard's top attacker and the Attackers table no longer score every address** - the
+  hero's top attacker computed the decayed score of every `ip_score` row to keep one (1.1 s on the
+  live node, 3.5 s on a 500,000-address test table), and the Attackers table's default sort scored
+  and sorted them all for each 500 rows. New core-scoring migration `0021` adds the function
+  `ip_score_order_key` (the time-invariant key that ranks rows as their live scores rank at any
+  instant, already used for the table's keyset cursor) and `ip_score_order_idx` on it; both pages
+  now read the top of the index (3.5 s to 0.8 ms, and 490 ms to 5.6 ms). Both rank by the same
+  key, so the hero names the address the table lists first; two addresses tied at the 100 cap
+  used to be left to the planner and are now ordered by how far past the cap they are. A scored
+  append's update of an address's `ip_score` row is no longer heap-only (9 us against 24 us per
+  row over 100,000 updates). See [database](docs/reference/database.md#table-ip_score-per-ip-aggregate).
 - **A backup no longer refuses a disk with room for it** - the free-space check asked for the
   raw database size plus the state directories, plus a fifth, but the set it writes is a
   compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every

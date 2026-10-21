@@ -146,6 +146,10 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
   `propolis_console_login_verify_busy_total`, `propolis_console_connections_shed_total`,
   `propolis_console_body_timeouts_total`. Limits: [rate limits and
   budgets](../reference/rate-limits-and-budgets.md#console-connection-bounds).
+- `propolis_console_rollup_refresh_failures` (gauge): refreshes of the console's hourly event
+  roll-up that failed in a row since the last one that worked. Above zero the dashboard and the
+  fleet pane stay exact but read more of the ledger; at 3 they say so in the degraded banner. It
+  moves only when a page that reads the roll-up is loaded.
 
 `propolis_feed_last_build_timestamp` is the primary signal that the feed loop is still
 publishing; see [retention](./retention.md) and [scoring and feed

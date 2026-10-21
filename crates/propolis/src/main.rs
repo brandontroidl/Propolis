@@ -611,6 +611,7 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
         metrics_token: metrics_token.map(Arc::from),
         gave_up_subsystems,
         intake_lag,
+        read_state: console::read_state::ReadState::new(),
     };
 
     console::warn_if_console_exposed(bind_addr);
@@ -623,6 +624,11 @@ async fn run_console(rt: ConsoleRuntime, cancel: CancellationToken) {
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");
+
+    console::routes::dashboard::start_most_active_refresher(
+        &state,
+        cancel.clone().cancelled_owned(),
+    );
 
     // Bounded connections, header reads and body reads; see `console::server`. The grace period
     // sits inside the daemon's own SHUTDOWN_TIMEOUT so the console never holds shutdown past it.

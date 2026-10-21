@@ -175,6 +175,24 @@ does not yet mention it (see
   request**; the login page is public specifically so it can load the same fonts and
   theme pre-auth.
 
+## Windowed counts
+
+The dashboard's charts and sensor split and the fleet pane's 24-hour listener counts are counts
+over a time window of the ledger. They come from an hourly roll-up table
+([database](../reference/database.md#event-rollups)) that the console keeps current by folding the
+events appended since the last read into it before it reads. A count never depends on the
+roll-up being current: the partial hour at the start of a window and the events not yet folded are
+counted from the ledger itself, so the number is exact either way and only its cost depends on how
+recently the roll-up was folded (`crates/console/src/rollup.rs`). A refresh that keeps failing is
+named in the degraded banner and exported as a metric. The one windowed panel with no roll-up,
+the dashboard's most-active table (a group by source address), is served from the last answer
+computed, at most 15 minutes old: a background task started with the console recomputes it at each
+quarter-hour boundary and ten minutes after the previous attempt (so an idle console always has a
+panel younger than the cap to show), and stops when the console shuts down, even mid-computation.
+A held answer past 15 minutes is recomputed on the request instead of served, so the first view
+is fast except on a cold start or after refreshes failed or the process was stopped for longer
+than that (`crates/console/src/read_state.rs`).
+
 ## Health, readiness, and metrics
 
 Supplementary panels (charts, the most-active table, sample links and verdicts, the

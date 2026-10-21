@@ -1312,44 +1312,11 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
     //
     // `origin` distinguishes them in the UI so an operator is never shown an inference where a
     // direct observation exists, or the reverse.
-    let rows = sqlx::query(
-        "SELECT 'uploaded' AS origin, \
-                max(coalesce(e.metadata->>'sample_orig_name', '')) AS url, \
-                max(e.sensor) AS host, \
-                NULL::text AS pinned_ip, \
-                CASE WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
-                      AND NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
-                     THEN 'truncated, incomplete' \
-                     WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
-                     THEN 'truncated' \
-                     WHEN NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
-                     THEN 'incomplete' ELSE 'captured' END AS status, \
-                CASE WHEN count(e.metadata->>'end_reason') = count(*) \
-                      AND count(DISTINCT e.metadata->>'end_reason') = 1 \
-                     THEN max(e.metadata->>'end_reason') END AS end_reason, \
-                max((e.metadata->>'sample_size')::int) AS bytes, \
-                e.metadata->>'sample_sha256' AS sha256_hex, \
-                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
-                max(e.observed_at) AS sort_at \
-         FROM event e \
-         LEFT JOIN sample_analysis sa ON e.metadata->>'sample_sha256' = sa.sha256 \
-         WHERE e.source_ip = $1::inet AND e.metadata->>'sample_sha256' IS NOT NULL \
-         GROUP BY e.metadata->>'sample_sha256', sa.sha256 \
-         UNION ALL \
-         SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, \
-                NULL::text AS end_reason, fa.bytes, \
-                encode(fa.sha256, 'hex') AS sha256_hex, \
-                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
-                fa.last_attempt AS sort_at \
-         FROM fetch_attempt fa \
-         LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
-         WHERE fa.source_ip = $1::inet \
-         ORDER BY sort_at DESC LIMIT $2",
-    )
-    .bind(ip.to_string())
-    .bind(MALWARE_PAGE_SIZE)
-    .fetch_all(db)
-    .await?;
+    let rows = sqlx::query(MALWARE_SQL)
+        .bind(ip.to_string())
+        .bind(MALWARE_PAGE_SIZE)
+        .fetch_all(db)
+        .await?;
 
     let mut malware = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1383,6 +1350,45 @@ async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, 
     }
     Ok(malware)
 }
+
+/// [`fetch_malware_rows`]'s statement; `$1` is the address, `$2` the page size. The uploaded arm
+/// states `event_sample_sha_idx`'s predicate (`metadata ? 'sample_sha256'`, core-scoring migration
+/// 0023) so the address's sample events are read through that index rather than by reading all of
+/// its events and testing each one's metadata (226 ms for an address with 187,000 events on a
+/// 1,500,000-event ledger; 20 ms with the index).
+pub const MALWARE_SQL: &str = "SELECT 'uploaded' AS origin, \
+                max(coalesce(e.metadata->>'sample_orig_name', '')) AS url, \
+                max(e.sensor) AS host, \
+                NULL::text AS pinned_ip, \
+                CASE WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
+                      AND NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
+                     THEN 'truncated, incomplete' \
+                     WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
+                     THEN 'truncated' \
+                     WHEN NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
+                     THEN 'incomplete' ELSE 'captured' END AS status, \
+                CASE WHEN count(e.metadata->>'end_reason') = count(*) \
+                      AND count(DISTINCT e.metadata->>'end_reason') = 1 \
+                     THEN max(e.metadata->>'end_reason') END AS end_reason, \
+                max((e.metadata->>'sample_size')::int) AS bytes, \
+                e.metadata->>'sample_sha256' AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
+                max(e.observed_at) AS sort_at \
+         FROM event e \
+         LEFT JOIN sample_analysis sa ON e.metadata->>'sample_sha256' = sa.sha256 \
+         WHERE e.source_ip = $1::inet AND e.metadata ? 'sample_sha256' \
+           AND e.metadata->>'sample_sha256' IS NOT NULL \
+         GROUP BY e.metadata->>'sample_sha256', sa.sha256 \
+         UNION ALL \
+         SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, \
+                NULL::text AS end_reason, fa.bytes, \
+                encode(fa.sha256, 'hex') AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
+                fa.last_attempt AS sort_at \
+         FROM fetch_attempt fa \
+         LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
+         WHERE fa.source_ip = $1::inet \
+         ORDER BY sort_at DESC LIMIT $2";
 
 /// A sample the fetcher captured from a URL this address also reported, but which the fetcher
 /// credited to another address (`fetch_attempt` keeps only the first reporter), so the

@@ -52,6 +52,15 @@ use crate::auth::require_session;
 /// against drift by comparing this expression to `core_scoring::effective_score` over real rows.
 pub const LIVE_EFFECTIVE_SCORE_SQL: &str = "LEAST(100, raw_score * power(0.5, EXTRACT(EPOCH FROM (now() - decay_anchor)) / 21600.0) * (1.0 + LEAST(0.60, 0.15 * GREATEST(0, distinct_wan_count - 1))))";
 
+/// The order key behind `ip_score_order_idx` (core-scoring migration 0021): a time-invariant
+/// number that ranks `ip_score` rows exactly as [`LIVE_EFFECTIVE_SCORE_SQL`] does at any instant,
+/// because every row's live score decays by the same factor (see `routes::ips`). Ordering by it,
+/// then by `source_ip` in the same direction, is read off the index; ordering by the live score is
+/// not, because the live score changes with the clock. Rows tied at the 100 cap are ordered by how
+/// far past the cap they are, which is what the Attackers table has always shown.
+pub const SCORE_ORDER_KEY_SQL: &str =
+    "ip_score_order_key(raw_score, distinct_wan_count, decay_anchor)";
+
 /// Builds the full console router for the given state.
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()

@@ -130,7 +130,10 @@ the same filters. At least one filter is required.
 
 Runs the hash-chain verification over the whole ledger and reports intact or broken,
 with the first bad row if broken. The same check runs on a schedule in the daemon; this
-is the on-demand version.
+is the on-demand version. The page states the size of the ledger: the exact
+count up to 100,000 events, and past that the planner's estimate, worded "About N events in the
+ledger (estimate)", so that loading the page does not count the whole ledger. A verification
+states the exact number of events it verified.
 
 ## Logs
 

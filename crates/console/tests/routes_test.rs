@@ -92,6 +92,7 @@ fn test_state_full(
         trusted_proxy: false,
         metrics_token: None,
         gave_up_subsystems: console::no_subsystem_health(),
+        read_state: console::read_state::ReadState::uncached(),
         intake_lag: console::intake_lag::no_intake_lag(),
     }
 }
@@ -4562,6 +4563,56 @@ async fn metrics_returns_prometheus_text_format(pool: PgPool) {
         "expected exactly one pending review entry: {body}"
     );
     assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
+}
+
+/// The four address gauges come from one statement, so each must keep counting its own flag:
+/// the counts below are all different, and one row sets none of them.
+#[sqlx::test(migrations = false)]
+async fn metrics_counts_each_address_flag_on_its_own(pool: PgPool) {
+    migrate(&pool).await;
+    for (i, (eligible, vendor, blocklist)) in [
+        (true, true, true),
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+        (false, false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, \
+                 event_count, distinct_categories, has_confirmed_real, distinct_wan_count, \
+                 distinct_sensor_count, first_seen, last_seen, eligible, recommended_for_vendor, \
+                 recommended_for_blocklist) \
+             VALUES ($1::inet, 10, now(), 0.5, 1, 1, false, 1, 1, now(), now(), $2, $3, $4)",
+        )
+        .bind(format!("203.0.113.{}", 70 + i))
+        .bind(eligible)
+        .bind(vendor)
+        .bind(blocklist)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let response = test_app(test_state(pool))
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    for (metric, count) in [
+        ("propolis_ips_scored", 5),
+        ("propolis_ips_eligible", 3),
+        ("propolis_ips_recommended_vendor", 2),
+        ("propolis_ips_recommended_blocklist", 1),
+    ] {
+        assert!(
+            body.contains(&format!("{metric} {count}\n")),
+            "{metric}: {body}"
+        );
+    }
 }
 
 /// The shell reply table is the one store with no per-source bound, so its size is on /metrics:

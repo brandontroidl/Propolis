@@ -142,34 +142,69 @@ struct ProtocolCount {
 /// One hourly cell of an IP's 24-hour activity strip. `height` is a pixel height derived from the
 /// hour's event volume (sqrt-scaled so small-but-real hours stay visible); `class` is the strip
 /// severity class (`s1`..`s4`, or empty for an idle hour) from the worst signal that hour.
-#[derive(Debug, Serialize)]
-struct StripCell {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StripCell {
     height: u32,
     class: &'static str,
 }
 
 /// A "what it did" severity tag for the most-active table.
-#[derive(Debug, Serialize)]
-struct SigTag {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SigTag {
     label: &'static str,
     sev: &'static str,
 }
 
 /// One row of the dashboard's "most active" table: an attacker IP with its 24-hour activity strip
 /// and the worst signals it triggered.
-#[derive(Debug, Serialize)]
-struct MostActiveRow {
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MostActiveRow {
     ip: String,
     event_count: i64,
+    /// `last_seen_at` as "N minutes ago", worded when the row is served (the panel is held for a
+    /// short while, and a held "just now" would not age).
     last_seen: String,
+    #[serde(skip)]
+    last_seen_at: chrono::DateTime<chrono::Utc>,
     strip: Vec<StripCell>,
     tags: Vec<SigTag>,
+}
+
+/// The statement for the hero's top attacker: the first row of the Attackers table, shown with
+/// its live effective score (`LIVE_EFFECTIVE_SCORE_SQL`, decayed to now - not the stored
+/// `raw_score` anchored at the IP's last event, or a long-idle high score would outrank an active
+/// attacker). It orders by the time-invariant key `ip_score_order_idx` holds, which ranks rows as
+/// the live score does at any instant, so it reads one index entry instead of scoring every
+/// address. Addresses tied at the 100 cap now resolve the way the Attackers table lists them, by
+/// how far past the cap they are, where the old ordering left the tie to the planner.
+pub fn top_attacker_sql() -> String {
+    format!(
+        "SELECT host(source_ip), round(({live})::numeric, 1)::text \
+         FROM ip_score ORDER BY {key} DESC, source_ip DESC LIMIT 1",
+        live = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
+        key = crate::routes::SCORE_ORDER_KEY_SQL,
+    )
+}
+
+/// The events of the last 24 hours by sensor, most first: the dashboard's protocol-distribution
+/// chart. Summed from the hourly roll-ups (`crate::rollup::listener_window_sql`), exact whether
+/// or not they are current, where it used to group every event of the window (161 ms on
+/// 1,500,000 events, per load).
+pub fn protocol_distribution_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT sensor, sum(events)::bigint AS cnt FROM parts GROUP BY sensor ORDER BY cnt DESC",
+        window = crate::rollup::listener_window_sql("now() - interval '24 hours'", cursor_hint),
+    )
 }
 
 async fn dashboard(
     State(state): State<AppState>,
     Extension(session): Extension<Session>,
 ) -> Result<Html<String>, AppError> {
+    // Fold what has been appended since the last page that read the roll-ups; the counts below
+    // are exact either way (`crate::rollup`), this only keeps them cheap.
+    let cursor_hint = state.read_state.rollup.refresh_for_page(&state.db).await;
     let total_scored_ips: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_score")
         .fetch_one(&state.db)
         .await?;
@@ -186,6 +221,9 @@ async fn dashboard(
     // Supplementary stats below: each soft-fails to its own placeholder rather than propagating,
     // per the module doc comment - through `degraded`, so the page names it as a placeholder.
     let mut degraded = Degraded::new();
+    if state.read_state.rollup.failing() {
+        degraded.note("event roll-up refresh (counts read from the ledger)");
+    }
     // -1 is the template's own "unknown" sentinel (it renders "last 24 hours" instead of "+N in
     // the last hour"); 0 would claim a quiet hour the query never measured.
     let events_last_hour: i64 = degraded.soft_or(
@@ -216,19 +254,12 @@ async fn dashboard(
         None => ("none".to_string(), false),
     };
 
-    // Rank by the live effective score (decayed to now), not the stored `raw_score` anchored at the
-    // IP's last event - otherwise a long-idle high score outranks an active attacker. Matches the
-    // detail page and the Attackers table (`LIVE_EFFECTIVE_SCORE_SQL`).
-    // Audited: interpolates only the constant `LIVE_EFFECTIVE_SCORE_SQL`, never user input.
+    // Audited: interpolates only the constants behind `top_attacker_sql`, never user input.
     let top_attacker: Option<(String, String)> = degraded.soft(
         "top attacker",
-        sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(format!(
-            "SELECT host(source_ip), round(({frag})::numeric, 1)::text \
-             FROM ip_score ORDER BY ({frag}) DESC LIMIT 1",
-            frag = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
-        )))
-        .fetch_optional(&state.db)
-        .await,
+        sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(top_attacker_sql()))
+            .fetch_optional(&state.db)
+            .await,
     );
     let top_attacker_ip = top_attacker.as_ref().map(|t| t.0.as_str()).unwrap_or("--");
     let top_attacker_score = top_attacker.as_ref().map(|t| t.1.as_str()).unwrap_or("");
@@ -261,13 +292,10 @@ async fn dashboard(
 
     let protocol_rows = degraded.soft(
         "protocol distribution",
-        sqlx::query(
-            "SELECT sensor, COUNT(*) AS cnt FROM event \
-             WHERE observed_at >= now() - interval '24 hours' \
-             GROUP BY sensor ORDER BY cnt DESC",
-        )
-        .fetch_all(&state.db)
-        .await,
+        sqlx::query(sqlx::AssertSqlSafe(protocol_distribution_sql(cursor_hint)))
+            .persistent(false)
+            .fetch_all(&state.db)
+            .await,
     );
     let mut protocol_dist = Vec::with_capacity(protocol_rows.len());
     for row in protocol_rows {
@@ -286,8 +314,10 @@ async fn dashboard(
     // sparkline below always have real (possibly all-zero) data, never an empty array.
     // `dashboard_chart_fragment` (below) reuses the same helper for the adjustable-range HTMX
     // endpoint the "1h/24h/7d/30d" buttons hit.
-    let (timeline_labels, timeline_data) =
-        degraded.soft("events timeline", hourly_series(&state.db).await);
+    let (timeline_labels, timeline_data) = degraded.soft(
+        "events timeline",
+        hourly_series(&state.db, cursor_hint).await,
+    );
     // The status band's "Events / 24h" cell: the buckets and the event filter now share the same
     // `now() - 24h` lower bound, so their sum is the EXACT rolling-24h total (no in-window event
     // falls outside a bucket) at no extra query cost.
@@ -296,7 +326,7 @@ async fn dashboard(
 
     // The "most active" table with its 24-hour activity strips - the signature dashboard element.
     // Soft-fails to empty (shows the waiting-for-events copy) rather than 503 on a query error.
-    let most_active = degraded.soft("most active", most_active_rows(&state.db).await);
+    let most_active = degraded.soft("most active", held_most_active_rows(&state).await);
 
     // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
     // displays "--"; `read_manifest` already collapses every one of those cases to `None`.
@@ -377,6 +407,57 @@ async fn dashboard(
         degraded,
     })?;
     Ok(Html(html))
+}
+
+fn most_active_loader(db: &PgPool) -> crate::read_state::Loader<Vec<MostActiveRow>> {
+    let db = db.clone();
+    std::sync::Arc::new(move || {
+        let db = db.clone();
+        Box::pin(async move { most_active_rows(&db).await })
+    })
+}
+
+/// Starts the task that recomputes the most-active panel once at start, at each quarter-hour
+/// boundary and ten minutes after its previous attempt, so a replacement always lands before the
+/// held panel reaches the 15-minute cap; it ends when `shutdown` completes. Costs two aggregates
+/// per quarter hour on an idle console. Does nothing for a state that holds no answer
+/// ([`crate::read_state::ReadState::uncached`]). Call it once, where the console is started.
+pub fn start_most_active_refresher(
+    state: &AppState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    // The task ends with `shutdown`; nothing awaits its handle.
+    drop(
+        state
+            .read_state
+            .spawn_refresher(most_active_loader(&state.db), shutdown),
+    );
+}
+
+/// [`most_active_rows`] through the console's held answer (`crate::read_state`): the aggregate
+/// behind it groups every event of the last 24 hours by source address (330 ms on 274,000 events,
+/// 1.5 s on the live node), which no index or roll-up answers exactly (the rows would have to be
+/// every address's events). So a page load answers from the last panel computed while that is at
+/// most 15 minutes old: a background refresher replaces it at each quarter-hour boundary and ten
+/// minutes after its previous attempt, and a
+/// load that finds it more than half a minute old or from an earlier quarter hour starts one more
+/// recomputation behind the request. Only a load with no panel held (the first after a start,
+/// before the refresher's first computation lands), or one whose held panel is past 15 minutes or
+/// more than a quarter hour behind (the refreshes have been failing), waits for the aggregate; a
+/// failure of that wait reaches the page's degraded banner. "Last seen" is worded when the row is
+/// served, so a held row still ages.
+///
+/// The key is the quarter hour: the strip lays its cells out by hours ago in the session time
+/// zone, whose hour starts on a quarter hour wherever it is, so a panel computed before the hour
+/// turned has every cell one place off until it is replaced.
+async fn held_most_active_rows(state: &AppState) -> Result<Vec<MostActiveRow>, sqlx::Error> {
+    let load = most_active_loader(&state.db);
+    let quarter_hour = state.read_state.quarter_hour();
+    let mut rows = state.read_state.most_active.get(quarter_hour, load).await?;
+    for row in &mut rows {
+        row.last_seen = format_relative_time(row.last_seen_at);
+    }
+    Ok(rows)
 }
 
 /// The top attacker IPs of the last 24 hours, each with a 24-cell hourly activity strip (worst
@@ -497,6 +578,7 @@ async fn most_active_rows(db: &PgPool) -> Result<Vec<MostActiveRow>, sqlx::Error
                     ip,
                     event_count: acc.cnt,
                     last_seen: format_relative_time(acc.last_seen),
+                    last_seen_at: acc.last_seen,
                     strip,
                     tags,
                 },
@@ -515,15 +597,20 @@ async fn dashboard_chart_fragment(
     Query(params): Query<ChartRangeQuery>,
 ) -> Result<Html<String>, AppError> {
     let current_range = normalize_dashboard_range(params.range.as_deref());
+    let cursor_hint = if current_range != "1h" {
+        state.read_state.rollup.refresh_for_page(&state.db).await
+    } else {
+        0
+    };
     // A fragment has no page banner to carry the name; the failure is still logged, and the
     // full-page render names the panel.
     let (labels, data) = Degraded::new().soft(
         "events timeline",
         match current_range {
             "1h" => five_minute_series(&state.db).await,
-            "7d" => daily_series(&state.db, 6).await,
-            "30d" => daily_series(&state.db, 29).await,
-            _ => hourly_series(&state.db).await,
+            "7d" => daily_series(&state.db, 6, cursor_hint).await,
+            "30d" => daily_series(&state.db, 29, cursor_hint).await,
+            _ => hourly_series(&state.db, cursor_hint).await,
         },
     );
     let timeline_labels = script_json(&labels);
@@ -569,24 +656,25 @@ fn normalize_dashboard_range(raw: Option<&str>) -> &'static str {
 /// hour-aligned `date_trunc('hour', now()) - 23h` series dropped a whole hour of in-window events at
 /// each hour boundary). Soft-fails to two empty vectors on a query error, per the module doc
 /// comment's chart policy.
-async fn hourly_series(db: &PgPool) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
-         FROM generate_series( \
-             date_trunc('hour', now() - interval '24 hours'), \
-             date_trunc('hour', now()), \
-             interval '1 hour' \
-         ) AS bucket \
-         LEFT JOIN ( \
-             SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
-             FROM event \
-             WHERE observed_at >= now() - interval '24 hours' \
-             GROUP BY hour \
-         ) sub ON sub.hour = bucket \
-         ORDER BY bucket",
-    )
-    .fetch_all(db)
-    .await?;
+///
+/// Counted from the hourly roll-ups (`crate::rollup`), exact whether or not they are current: the
+/// ledger grouped by hour cost 160 ms per load on 1,500,000 events and grew with the ledger. In a
+/// time zone whose offset is not a whole number of hours a local hour is not a UTC hour, and the
+/// ledger is read as before ([`HOURLY_SERIES_RAW_SQL`]).
+async fn hourly_series(
+    db: &PgPool,
+    cursor_hint: i64,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let sql = if crate::rollup::whole_hour_zone(db).await? {
+        hourly_series_sql(cursor_hint)
+    } else {
+        HOURLY_SERIES_RAW_SQL.to_string()
+    };
+    // Audited: both are fixed text built from constants and one integer.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .fetch_all(db)
+        .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
@@ -602,23 +690,94 @@ async fn hourly_series(db: &PgPool) -> Result<(Vec<String>, Vec<i64>), sqlx::Err
     Ok((labels, data))
 }
 
-/// `days + 1` daily buckets (oldest to newest, zero-filled), site-wide - the "7d"/"30d"
-/// range-selector buttons.
-async fn daily_series(db: &PgPool, days: i32) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
+/// The hourly timeline straight from the ledger: the statement [`hourly_series_sql`] replaces, kept
+/// for a time zone the roll-ups cannot answer in, and as the oracle the tests hold the roll-up
+/// statement to.
+pub const HOURLY_SERIES_RAW_SQL: &str = "\
+    SELECT bucket, COALESCE(cnt, 0) AS cnt \
+    FROM generate_series( \
+        date_trunc('hour', now() - interval '24 hours'), \
+        date_trunc('hour', now()), \
+        interval '1 hour' \
+    ) AS bucket \
+    LEFT JOIN ( \
+        SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
+        FROM event \
+        WHERE observed_at >= now() - interval '24 hours' \
+        GROUP BY hour \
+    ) sub ON sub.hour = bucket \
+    ORDER BY bucket";
+
+/// [`hourly_series`]'s statement over the hourly roll-ups: the same buckets, the same window, the
+/// counts summed from `crate::rollup::listener_window_sql`.
+pub fn hourly_series_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT bucket, COALESCE(sub.cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_trunc('hour', now() - interval '24 hours'), \
+             date_trunc('hour', now()), \
+             interval '1 hour' \
+         ) AS bucket \
+         LEFT JOIN (SELECT hour, sum(events)::bigint AS cnt FROM parts GROUP BY hour) sub \
+             ON sub.hour = bucket \
+         ORDER BY bucket",
+        window = crate::rollup::listener_window_sql("now() - interval '24 hours'", cursor_hint),
+    )
+}
+
+/// The daily timeline straight from the ledger (see [`HOURLY_SERIES_RAW_SQL`]); `$1` is the number
+/// of days before today.
+pub const DAILY_SERIES_RAW_SQL: &str = "\
+    SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
+    FROM generate_series(current_date - ($1::int * interval '1 day'), current_date, interval '1 day') AS bucket \
+    LEFT JOIN ( \
+        SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
+        FROM event \
+        WHERE observed_at >= current_date - ($1::int * interval '1 day') \
+        GROUP BY day \
+    ) sub ON sub.day = bucket::date \
+    ORDER BY bucket";
+
+/// [`daily_series`]'s statement over the hourly roll-ups: each local day is the sum of its hours
+/// (a local day is a run of UTC hours in a whole-hour zone, which the caller checks); `$1` as in
+/// [`DAILY_SERIES_RAW_SQL`].
+pub fn daily_series_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT bucket::date AS bucket, COALESCE(sub.cnt, 0) AS cnt \
          FROM generate_series(current_date - ($1::int * interval '1 day'), current_date, interval '1 day') AS bucket \
          LEFT JOIN ( \
-             SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
-             FROM event \
-             WHERE observed_at >= current_date - ($1::int * interval '1 day') \
-             GROUP BY day \
+             SELECT date_trunc('day', hour)::date AS day, sum(events)::bigint AS cnt \
+             FROM parts GROUP BY 1 \
          ) sub ON sub.day = bucket::date \
          ORDER BY bucket",
+        window = crate::rollup::listener_window_sql(
+            "(current_date - ($1::int * interval '1 day'))::timestamptz",
+            cursor_hint
+        ),
     )
-    .bind(days)
-    .fetch_all(db)
-    .await?;
+}
+
+/// `days + 1` daily buckets (oldest to newest, zero-filled), site-wide - the "7d"/"30d"
+/// range-selector buttons. From the hourly roll-ups like [`hourly_series`] (the 30-day button
+/// grouped most of the ledger: 1.2 s on 1,500,000 events).
+async fn daily_series(
+    db: &PgPool,
+    days: i32,
+    cursor_hint: i64,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let sql = if crate::rollup::whole_hour_zone(db).await? {
+        daily_series_sql(cursor_hint)
+    } else {
+        DAILY_SERIES_RAW_SQL.to_string()
+    };
+    // Audited: both are fixed text built from constants and one integer.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .bind(days)
+        .fetch_all(db)
+        .await?;
     let mut labels = Vec::with_capacity(rows.len());
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {

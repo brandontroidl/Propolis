@@ -12,6 +12,7 @@ use crate::auth::Session;
 use crate::routes::context::base_context;
 use crate::routes::degraded::Degraded;
 use crate::routes::error::AppError;
+use crate::routes::rowcount::{Count, capped_total};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -33,15 +34,22 @@ struct VerifyForm {
 
 /// The ledger's row count, or `None` when it could not be read - the template says so rather
 /// than rendering the placeholder as "0 events", which on this page reads as an empty ledger.
-async fn event_count(db: &sqlx::PgPool, degraded: &mut Degraded) -> Option<i64> {
-    degraded.soft_or(
-        "event count",
+///
+/// `exact` asks for a real count, which reads every row (113 ms on 1,500,000 events and growing
+/// with the ledger). Only the verification result wants one, because it states how many events
+/// were verified and the verification has just read them all anyway. The page itself is the
+/// bounded count the fleet pane's ledger panel shows: exact up to the counting cap, the planner's
+/// estimate past it, and `Count::exact` says which.
+async fn event_count(db: &sqlx::PgPool, degraded: &mut Degraded, exact: bool) -> Option<Count> {
+    let counted = if exact {
         sqlx::query_scalar("SELECT COUNT(*) FROM event")
             .fetch_one(db)
             .await
-            .map(Some),
-        None,
-    )
+            .map(|value| Count { value, exact: true })
+    } else {
+        capped_total(db, "event").await
+    };
+    degraded.soft_or("event count", counted.map(Some), None)
 }
 
 async fn integrity_page(
@@ -82,7 +90,10 @@ enum Outcome {
 async fn render(state: &AppState, session: &Session, outcome: Outcome) -> Result<String, AppError> {
     let base = base_context(&state.db, state.startup_time, state.version).await;
     let mut degraded = base.degraded;
-    let event_count = event_count(&state.db, &mut degraded).await;
+    let event_count =
+        event_count(&state.db, &mut degraded, matches!(outcome, Outcome::Ran(_))).await;
+    let event_count_exact = event_count.is_none_or(|c| c.exact);
+    let event_count = event_count.map(|c| c.value);
     let csrf_token = state
         .sessions
         .generate_csrf(&session.id)
@@ -118,6 +129,7 @@ async fn render(state: &AppState, session: &Session, outcome: Outcome) -> Result
         degraded => degraded.names(),
         csrf_token,
         event_count,
+        event_count_exact,
         status,
         verified,
         intact,

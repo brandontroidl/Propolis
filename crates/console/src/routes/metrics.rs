@@ -61,42 +61,40 @@ async fn metrics(
 
     let mut out = String::new();
 
-    let ips_scored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_score")
-        .fetch_one(&state.db)
-        .await?;
+    // One pass over the projection for all four gauges: they were four statements, each reading
+    // every scored address (54 ms apiece on 500,000 rows, per scrape).
+    let (ips_scored, ips_eligible, ips_recommended_vendor, ips_recommended_blocklist): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT COUNT(*), \
+                COUNT(*) FILTER (WHERE eligible = true), \
+                COUNT(*) FILTER (WHERE recommended_for_vendor = true), \
+                COUNT(*) FILTER (WHERE recommended_for_blocklist = true) \
+         FROM ip_score",
+    )
+    .fetch_one(&state.db)
+    .await?;
     push_gauge(
         &mut out,
         "propolis_ips_scored",
         "Total IPs with an ip_score projection.",
         ips_scored,
     );
-
-    let ips_eligible: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE eligible = true")
-            .fetch_one(&state.db)
-            .await?;
     push_gauge(
         &mut out,
         "propolis_ips_eligible",
         "IPs currently eligible for review.",
         ips_eligible,
     );
-
-    let ips_recommended_vendor: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE recommended_for_vendor = true")
-            .fetch_one(&state.db)
-            .await?;
     push_gauge(
         &mut out,
         "propolis_ips_recommended_vendor",
         "IPs currently recommended for vendor reporting.",
         ips_recommended_vendor,
     );
-
-    let ips_recommended_blocklist: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE recommended_for_blocklist = true")
-            .fetch_one(&state.db)
-            .await?;
     push_gauge(
         &mut out,
         "propolis_ips_recommended_blocklist",
@@ -353,6 +351,13 @@ async fn metrics(
         "propolis_intake_lines_quarantined_total",
         "Log lines the database kept refusing that intake set aside in the quarantine directory and skipped, since process start.",
         crate::intake_lag::LINES_QUARANTINED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+
+    push_gauge(
+        &mut out,
+        "propolis_console_rollup_refresh_failures",
+        "Refreshes of the console's hourly event roll-up that failed in a row, since the last one that worked. Pages stay exact while it is above zero but read more of the ledger; at 3 the dashboard says so.",
+        i64::from(state.read_state.rollup.consecutive_failures()),
     );
 
     // Console saturation: each of these moves only when a bound refused work, so a non-zero rate

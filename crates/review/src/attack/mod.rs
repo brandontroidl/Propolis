@@ -227,14 +227,10 @@ pub async fn source_tags(
     if ips.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = sqlx::query(
-        "SELECT DISTINCT ON (source_ip, rule_id) host(source_ip) AS ip, rule_id, event_id, matched \
-         FROM attack_tag WHERE source_ip = ANY($1::inet[]) \
-         ORDER BY source_ip, rule_id, event_id",
-    )
-    .bind(ips)
-    .fetch_all(pool)
-    .await?;
+    let rows = sqlx::query(SOURCE_TAGS_SQL)
+        .bind(ips)
+        .fetch_all(pool)
+        .await?;
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         out.push((
@@ -249,6 +245,16 @@ pub async fn source_tags(
     }
     Ok(group(out))
 }
+
+/// [`source_tags`]'s statement; `$1` is the addresses. It reads `attack_tag` through
+/// `attack_tag_source_idx` (core-scoring migration 0024). The two unique indexes the table already
+/// has start with the address too, but each is partial on whether a session is recorded, and this
+/// statement does not say, so neither can serve it: it read the whole table on every address
+/// page (45 ms for 300,000 tags, and the table has no retention).
+pub const SOURCE_TAGS_SQL: &str = "\
+    SELECT DISTINCT ON (source_ip, rule_id) host(source_ip) AS ip, rule_id, event_id, matched \
+    FROM attack_tag WHERE source_ip = ANY($1::inet[]) \
+    ORDER BY source_ip, rule_id, event_id";
 
 /// The techniques tagged in each of the shell sessions `session_ids` (UUID text, as the pages
 /// carry them), by session id as given. A session with no tags is absent. One query for any number

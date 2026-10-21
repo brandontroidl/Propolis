@@ -558,3 +558,125 @@ async fn retention_windows_are_built_with_their_configured_label_and_duration(po
     }
     assert!(snapshot.windows[1].entries.len() >= snapshot.windows[0].entries.len());
 }
+
+/// Rows the plan's scans of `event` produced, summed over their loops: what the statement read
+/// from the ledger, which a test can bound without depending on timing.
+fn event_rows_read(plan: &[String]) -> f64 {
+    let number_after = |line: &str, key: &str| -> f64 {
+        let at = line.find(key).expect(key) + key.len();
+        let end = line[at..]
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(line.len() - at);
+        line[at..at + end].parse().unwrap()
+    };
+    plan.iter()
+        .filter(|l| l.contains(" on event ") && l.contains("(actual"))
+        .map(|l| number_after(l, "rows=") * number_after(l, "loops="))
+        .sum()
+}
+
+/// A scored, approved, blocklist-recommended address with `events` ledger rows of three signal
+/// types, written directly (the chain trigger is off for the test) and last seen `last_seen_ago`
+/// ago.
+async fn seed_heavy_approved(pool: &PgPool, ip: &str, events: i32, last_seen_ago: &str) {
+    sqlx::query(
+        "INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
+                            weight, confidence, observed_at, hash) \
+         SELECT $1::inet, 'feed-test-sensor', \
+                (ARRAY['port_scan', 'honeypot_connection', 'honeypot_session_end'])[1 + g % 3] \
+                    ::signal_type_enum, \
+                'tcp', false, 'honeypot', 1, 0.5, now() - g * interval '1 second', \
+                sha256(convert_to($1 || g::text, 'UTF8')) \
+         FROM generate_series(1, $2) g",
+    )
+    .bind(ip)
+    .bind(events)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen, eligible, recommended_for_blocklist, tier) \
+         VALUES ($1::inet, 95, now(), 0.9, $2, 2, true, 1, 1, now() - interval '30 days', \
+                 now() - $3::interval, true, true, 'aggressive')",
+    )
+    .bind(ip)
+    .bind(events)
+    .bind(last_seen_ago)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO review_queue (source_ip, state, score_at_surface, categories_at_surface) \
+         VALUES ($1::inet, 'approved', 95, '{}'::jsonb)",
+    )
+    .bind(ip)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_build_reads_signal_types_by_probe_and_only_for_addresses_a_feed_can_still_publish(
+    pool: PgPool,
+) {
+    // The signal types of an address were `SELECT DISTINCT signal_type FROM event WHERE source_ip
+    // = ...`, which reads the address's whole history (4.3 s for 5,566 approved addresses on the
+    // live node), and it ran for every approved address, including those whose last event is too
+    // old for any feed to carry. The statement now probes the 17 enum members and skips the
+    // expired, so what it reads from the ledger is bounded by the number of live candidates.
+    migrate(&pool).await;
+    sqlx::query("ALTER TABLE event DISABLE TRIGGER trg_enforce_chain_linkage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // 3,000 events and seen an hour ago: published. 2,000 events and last seen ten days ago: past
+    // the longest default TTL (48 h), so never published.
+    seed_heavy_approved(&pool, "45.10.30.201", 3000, "1 hour").await;
+    seed_heavy_approved(&pool, "45.10.30.202", 2000, "10 days").await;
+    sqlx::query("ANALYZE event").execute(&pool).await.unwrap();
+
+    let cutoff = Utc::now() - chrono::Duration::hours(48) - chrono::Duration::minutes(1);
+    let mut conn = pool.acquire().await.unwrap();
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF) {}",
+        feed::builder::merit_candidates_sql()
+    )))
+    .bind(cutoff)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    let read = event_rows_read(&plan);
+    assert!(
+        read < 4.0,
+        "the live address has 3 signal types among 17 enum members, so its 17 probes return 3 \
+         rows (the plan prints averages to two places) and the expired address none; read {read} \
+         ledger rows\n{}",
+        plan.join("\n")
+    );
+
+    let snapshot = FeedBuilder::build(
+        &pool,
+        &ExclusionEngine::new(Vec::new(), Vec::new()),
+        &FeedConfig::default(),
+    )
+    .await
+    .unwrap();
+    let live = snapshot
+        .aggressive
+        .iter()
+        .find(|e| e.source_ip == "45.10.30.201".parse::<IpAddr>().unwrap())
+        .expect("the live address is published");
+    assert_eq!(
+        live.categories,
+        ["honeypot_connection", "honeypot_session_end", "port_scan"]
+    );
+    assert!(
+        !snapshot
+            .aggressive
+            .iter()
+            .any(|e| e.source_ip == "45.10.30.202".parse::<IpAddr>().unwrap()),
+        "an address last seen ten days ago is not published"
+    );
+}

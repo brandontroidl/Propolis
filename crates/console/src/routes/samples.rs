@@ -208,33 +208,46 @@ fn max_source_ips_shown() -> usize {
 ///   Rows whose `source_ip` was never recorded (NULL) are simply absent.
 async fn sample_source_ips(
     pool: &sqlx::PgPool,
+    shas: &[String],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, sqlx::Error> {
-    // Unions the two ways a sample is attributable: an address that UPLOADED it to a sensor (the
-    // event carries the sha - a first-party observation, and the only link an FTP/SCP upload has,
-    // since it never goes through the fetcher), and an address whose reported url the fetcher
-    // retrieved. Uploads sort first so the stronger attribution is what gets shown when the
-    // per-sample display cap truncates.
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT sha, ip FROM ( \
-           SELECT e.metadata->>'sample_sha256' AS sha, host(e.source_ip) AS ip, \
-                  0 AS rank, max(e.observed_at) AS at \
-           FROM event e \
-           WHERE e.metadata->>'sample_sha256' IS NOT NULL \
-           GROUP BY 1, 2 \
-           UNION ALL \
-           SELECT encode(fa.sha256, 'hex') AS sha, host(fa.source_ip) AS ip, \
-                  1 AS rank, max(fa.last_attempt) AS at \
-           FROM fetch_attempt fa \
-           WHERE fa.sha256 IS NOT NULL AND fa.source_ip IS NOT NULL \
-           GROUP BY 1, 2 \
-         ) linked \
-         ORDER BY rank, at DESC",
-    )
-    .fetch_all(pool)
-    .await?;
+    // Not short-circuited on an empty page: a database that is down must still be named as a
+    // placeholder by the page's banner, and an empty digest list makes this a no-row read.
+    let rows: Vec<(String, String)> = sqlx::query_as(SAMPLE_SOURCE_IPS_SQL)
+        .bind(shas)
+        .fetch_all(pool)
+        .await?;
 
     Ok(group_source_ips(rows))
 }
+
+/// [`sample_source_ips`]'s statement; `$1` is the digests the page is showing. It used to read the
+/// source addresses of every sample ever captured, which meant every event that names one (250 ms
+/// on 1,500,000 events, and growing with the ledger), to use the 200 the page lists. Asking only
+/// about the listed digests reads their events through `event_sample_sha_idx` (core-scoring
+/// migration 0023), which is why the statement states the index's predicate, `metadata ?
+/// 'sample_sha256'`.
+///
+/// Unions the two ways a sample is attributable: an address that UPLOADED it to a sensor (the
+/// event carries the sha - a first-party observation, and the only link an FTP/SCP upload has,
+/// since it never goes through the fetcher), and an address whose reported url the fetcher
+/// retrieved. Uploads sort first so the stronger attribution is what gets shown when the
+/// per-sample display cap truncates.
+pub const SAMPLE_SOURCE_IPS_SQL: &str = "\
+    SELECT sha, ip FROM ( \
+       SELECT e.metadata->>'sample_sha256' AS sha, host(e.source_ip) AS ip, \
+              0 AS rank, max(e.observed_at) AS at \
+       FROM event e \
+       WHERE e.metadata ? 'sample_sha256' AND e.metadata->>'sample_sha256' = ANY($1) \
+       GROUP BY 1, 2 \
+       UNION ALL \
+       SELECT encode(fa.sha256, 'hex') AS sha, host(fa.source_ip) AS ip, \
+              1 AS rank, max(fa.last_attempt) AS at \
+       FROM fetch_attempt fa \
+       WHERE fa.sha256 IS NOT NULL AND fa.source_ip IS NOT NULL \
+         AND encode(fa.sha256, 'hex') = ANY($1) \
+       GROUP BY 1, 2 \
+     ) linked \
+     ORDER BY rank, at DESC";
 
 /// Which of `shas` (lowercase hex) a sensor kept only a prefix of: any upload event that names the
 /// sample and says `truncated`. The same rule as the address page's malware panel.
@@ -245,16 +258,20 @@ async fn truncated_samples(
     if shas.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT e.metadata->>'sample_sha256' FROM event e \
-         WHERE e.metadata->>'sample_sha256' = ANY($1) \
-           AND e.metadata->'truncated' = 'true'::jsonb",
-    )
-    .bind(shas)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<String> = sqlx::query_scalar(TRUNCATED_SAMPLES_SQL)
+        .bind(shas)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().collect())
 }
+
+/// [`truncated_samples`]'s statement; `$1` is the digests to ask about. Like
+/// [`SAMPLE_SOURCE_IPS_SQL`], it states `event_sample_sha_idx`'s predicate so the digests are
+/// looked up in the index rather than found by reading every event.
+pub const TRUNCATED_SAMPLES_SQL: &str = "\
+    SELECT DISTINCT e.metadata->>'sample_sha256' FROM event e \
+    WHERE e.metadata ? 'sample_sha256' AND e.metadata->>'sample_sha256' = ANY($1) \
+      AND e.metadata->'truncated' = 'true'::jsonb";
 
 /// Groups `(sha, ip)` pairs by sha, preserving input order (the query's newest-attempt-first) and
 /// dropping repeats: one attacker can appear on several URLs that resolved to the same body, and it
@@ -391,7 +408,7 @@ async fn load_samples(
         .filter(|_| start + files.len() < total);
     let shas: Vec<String> = files.iter().map(|(_, f)| f.sha256.clone()).collect();
 
-    let source_ips_by_sha = degraded.soft("sample source IPs", sample_source_ips(db).await);
+    let source_ips_by_sha = degraded.soft("sample source IPs", sample_source_ips(db, &shas).await);
     let transport_by_sha = degraded.soft("fetch transport", sample_transport(db).await);
 
     let vt_results: std::collections::HashMap<String, (i32, i32, String)> = degraded

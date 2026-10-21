@@ -352,10 +352,12 @@ async fn main() {
         metrics_token: config.metrics_token.map(Arc::from),
         gave_up_subsystems: console::no_subsystem_health(),
         intake_lag: console::intake_lag::no_intake_lag(),
+        read_state: console::read_state::ReadState::new(),
     };
 
     tracing::info!(bind = %bind_addr, "console: starting");
 
+    console::routes::dashboard::start_most_active_refresher(&state, shutdown_signal());
     console::server::serve(
         listener,
         routes::router(state),

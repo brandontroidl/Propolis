@@ -133,8 +133,10 @@ its connections to a pool of its own the same way; its sizing is in
   arriving at once, not after the packet (`crates/sensor-mqtt/src/handler.rs#read_body`). When
   the pool has no room:
   - a session within its floor still takes what it asked for, and the pool counts it past its
-    ceiling; floors add up to the pool, so this is at most the pool again, except in SSH, which
-    caps what is held that way at once (below);
+    ceiling; floors add up to the pool, so this is at most the pool again (grants are whole
+    64 KiB chunks and each floor rounds up to one, so the figure is 167,772,160 bytes for SSH,
+    83,886,080 for telnet and ADB, 100,663,296 for MQTT with both listeners). SSH caps what it
+    RESERVES that way at once, which is not the same as capping what is held (below);
   - a session past its floor gets no more: its running line stops, and after the line (for SSH
     and ADB, after the packet or message) it is ended unless it is back within what it had
     reserved or its share;
@@ -154,21 +156,37 @@ its connections to a pool of its own the same way; its sizing is in
   within its floor is given the shell and the session holding the most above its share is asked
   to let go (`crates/sensor-framework/src/session_memory.rs#make_room`). Its queued output is
   charged to the output budget, not to the session.
-- SSH bounds what sessions within their floor hold past a full pool to 13,421,773 bytes at once
-  (`crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`, half of the 26,843,547 that
+- SSH bounds what sessions within their floor RESERVE past a full pool to 13,421,773 bytes at
+  once (`crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`, half of the 26,843,547 that
   `MemoryMax` has left; `crates/sensor-framework/src/session_memory.rs#configure_with_overdraft`).
   Past it a shell or exec is refused (`SSH_MSG_CHANNEL_FAILURE`) and a running line is stopped,
   the session surviving, until room returns; the holder is asked to let go each time. Room
-  returns when the session asked ends. One asked while blocked writing to a peer that does not
-  read ends at the output stall limit, 30 s (`crates/sensor-ssh/src/output.rs#OUTPUT_STALL_LIMIT`),
-  so newcomers may be refused for up to that long once the cap is spent, and no other session
-  is asked meanwhile. With the pool not full nothing is refused on the cap's account.
+  returns when the session asked ends, and no other session is asked meanwhile, so refusals
+  chain one asked session at a time. A session asked while it is blocked writing to a peer that
+  does not read is not woken: it ends when the write deadline of its `TimeoutStream` fires
+  (`crates/sensor-ssh/src/timeout_stream.rs`, the idle timeout, 60 s by default, restarted by
+  every write that moves a byte) or at `max_duration` (600 s), whichever is first. A peer that
+  accepts one byte inside each 60 s therefore holds a refusal for up to 600 s, and the asks
+  behind it wait their turn. The output stall limit, 30 s
+  (`crates/sensor-ssh/src/output.rs#OUTPUT_STALL_LIMIT`), and the wake on being asked apply only
+  while the session waits at the top of its loop (`crates/sensor-ssh/src/server.rs`, the `select!`
+  over `session_memory::evicted`), not inside a write already started
+  (`crates/sensor-ssh/src/server.rs#write_encrypted`). With the pool not full nothing is refused
+  on the cap's account.
+- The cap does not bound live bytes. It is checked in `make_room` without reserving, so
+  concurrent shells can all pass it; a session it refuses keeps what it had allocated and
+  survives `check_retained` up to its own share; and allocations that are not shell heap (key
+  exchange, login, packets) are never stopped by it. Measured: seven refused newcomers held
+  2,800,112 live bytes, 21 times a 131,072-byte cap, while the bytes reserved past the ceiling
+  stayed 0. That unreserved remainder is bounded by about the sum of the session shares, each
+  rounded up to whole chunks: up to the pool again.
 
 The pool, the capture budget (40%) and, for SSH, the 64 MiB output budget leave the rest of
 `MemoryMax` to the runtime, the allocation headers and the worker threads' line working sets.
 Sessions can hold more than the pool for as long as the asked sessions take to end: what the
-sessions within their floors took past it (at most the pool again; for SSH at most its cap, above),
-and what a session past its floor allocated before its line stopped.
+sessions within their floors took past it (at most the pool again; for SSH the cap bounds only
+the reserved part, above), and what a session past its floor, or one the cap refused, allocated
+before its line stopped.
 
 ## Kernel socket memory
 
@@ -222,9 +240,9 @@ the limit and was OOM-killed, losing all ten uploads.
 |---|---|
 | Capture bodies | 17,039,360 (65 x 262,144: the hand-off queue holds 64 jobs, `CAPTURE_QUEUE_SIZE` in `sensor-mqtt/src/lib.rs`, and one is being written, each at most one packet, `MAX_PACKET_BYTES`; the 107,374,182-byte budget is never reached) |
 | What sessions hold, PUBLISH bodies still arriving included | 80,530,635 (the session pool [above](#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt)) |
-| The pool's residual | 80,530,635 (sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms) |
+| The pool's residual | 100,663,296 (512 floors of 157,286 bytes, each rounded up to three 64 KiB chunks; sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms) |
 | Socket memory | 512 x 65,536 = 33,554,432, plus a segment each |
-| Sum | 211,655,062, 56,780,394 left for the runtime, TLS state from the handshake (allocated before a session's scope) and allocation headers |
+| Sum | 231,787,723, 36,647,733 left for the runtime, TLS state from the handshake (allocated before a session's scope) and allocation headers |
 
 The residual row is the session memory section's "at most the pool again". Measured on loopback with the client
 MSS set to 1460 (debug build, no swap): 256 plaintext connections stalled on SUBACKs behind 600 KB
@@ -260,16 +278,29 @@ frees, is now kept out (below):
 | Output queued for peers, and input waiting behind it | 67,108,864 (64 MiB) | `crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; a unit of work reserves `crates/sensor-ssh/src/server.rs#OUTPUT_UNIT_BYTES` before it runs and `ChannelFlow::queue` hands out only that |
 | Sum | 442,918,501 | |
 | Runtime allowance (estimate) | 67,108,864 | code, stacks, packet buffers, the hand-off queue, allocation headers, socket memory |
-| The pool's overdraft cap | 13,421,773 (half of the 26,843,547 `MemoryMax` has left) | sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms; one compare-exchange on the pool's reserved bytes stops the total past the ceiling at the cap (`crates/sensor-framework/src/session_memory.rs#charge`, `crates/sensor-framework/src/session_memory.rs#make_room`, `crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`) |
-| Sum with the cap | 456,340,274 | |
-| Total against `MemoryMax=512M` (536,870,912) | 523,449,138, 13,421,774 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
+| The pool's overdraft cap (reserved room only) | 13,421,773 (half of the 26,843,547 `MemoryMax` has left) | sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms; one compare-exchange on the pool's reserved bytes stops the RESERVED total past the ceiling at the cap (`crates/sensor-framework/src/session_memory.rs#charge`, `crates/sensor-framework/src/session_memory.rs#make_room`, `crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`) |
+| Sum of the reserved terms | 456,340,274 | |
+| Reserved terms against `MemoryMax=512M` (536,870,912) | 523,449,138, 13,421,774 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs#the_reserved_terms_plus_the_runtime_allowance_stay_under_memorymax` |
+| Unreserved residual (open) | up to 167,772,160 (256 sessions x their 629,145-byte share rounded up to ten 64 KiB chunks) | live bytes a session the cap refused keeps until it is ended, and allocations the cap never stops (key exchange, login, packets); not charged to the cap, not stopped by `make_room` |
+| Worst case with the residual | 691,221,298, which is 154,350,386 OVER `MemoryMax` | `crates/sensor-ssh/tests/memory_budget_test.rs#the_unreserved_residual_still_takes_the_total_past_memorymax` pins the gap |
 
-Without the cap, sessions within their floor could take the pool again (161,061,273 bytes, as the
-MQTT table still lists for MQTT): 134,217,726 over `MemoryMax`. The cap is half the spare, not
-all of it, so the rest covers what the estimates miss. It bounds what is held reserved past the
-pool. A line stopped for want of room has allocated what it held until its next check, the same
-residual a session past its floor leaves. The size is a choice to revisit: a larger cap refuses
-fewer newcomers while a holder ends, a smaller one leaves more of `MemoryMax` spare.
+The worst case does not fit `MemoryMax`. The residual is a bound on a worst case where every one
+of 256 sessions holds its whole share unreserved while the pool and the capture and output
+budgets are full; it is derived, not measured (the review probe above reached 2,800,112 bytes
+with seven sessions), and nothing in the code stops it. Without
+the cap, sessions within their floor could take the pool again (167,772,160 bytes with chunk
+rounding; the MQTT table lists its own) on top of the reserved terms. The cap is half the spare,
+not all of it, so the rest covers what the estimates miss. A line stopped for want of room has
+allocated what it held until its next check, the same residual a session past its floor leaves.
+The size is a choice to revisit: a larger cap refuses fewer newcomers while a holder ends, a
+smaller one leaves more of `MemoryMax` spare.
+
+Open decision for the owner: how to close the residual. (a) A session the cap refuses survives
+only up to its own reservation (`check_retained` ends it once its live bytes pass what it holds
+reserved, not the larger of that and its share). (b) Reserve a login allowance at admission and
+refuse connections the pool plus the cap cannot cover. (c) Accept it, with this table as the
+statement of the risk. Until one is chosen, this section and the CHANGELOG describe the cap as
+bounding reserved overdraft only.
 
 Why each term holds:
 

@@ -483,11 +483,17 @@
   (`session_memory::AccountRef::make_room`); a session past its own floor is still refused. The
   shell alone reserves 393,216 bytes in a process's first session and 458,752 in later ones,
   under the 512 KiB the check asks for by one 64 KiB chunk (measured; a test fails first if that
-  grows). What sessions within their floor hold past a full pool is capped at 13,421,773 bytes
+  grows). What sessions within their floor RESERVE past a full pool is capped at 13,421,773 bytes
   (half of what `MemoryMax=512M` has left, `session_memory::configure_with_overdraft`): without
-  the cap that could be the pool again, 134,217,726 bytes over `MemoryMax`. Past the cap a shell
-  is refused and a running line stopped, the session kept, until the session asked to let go
-  ends, up to 30 s when its peer is not reading. See
+  the cap that could be the pool again, 167,772,160 bytes with chunk rounding. Past the cap a
+  shell is refused and a running line stopped, the session kept, until the session asked to let
+  go ends: up to 600 s (`max_duration`) when it is blocked writing to a peer that is not
+  reading, since only the write deadline (60 s, restarted by every byte accepted) ends that
+  write. The cap bounds reserved room, not live bytes: a session it refuses keeps what it
+  allocated, and key exchange, login and packet allocations are never stopped by it, so the SSH
+  worst case is not closed. The unreserved residual is up to 167,772,160 bytes and takes the
+  total to 691,221,298, over `MemoryMax` (536,870,912); how to close it is an open owner
+  decision. See
   [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
 - **One typed line can no longer exhaust a shell sensor's memory or CPU through a command's
   operand loop** - the fake shell's handlers for `printenv`, `alias`, `type`, `command -V`,

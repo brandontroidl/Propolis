@@ -1026,11 +1026,16 @@ captures SCP/SFTP transfers.
   session memory pool has under 512 KiB left and the session would pass its floor with that much
   added; a session within its floor is accepted and the session holding the most above its share
   is asked to let go (`crates/sensor-ssh/src/server.rs#shell_room`, `crates/sensor-framework/src/session_memory.rs#make_room`).
-  What sessions within their floor hold past a full pool is capped at 13,421,773 bytes at once
+  What sessions within their floor RESERVE past a full pool is capped at 13,421,773 bytes at once
   (`crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`): past it a `shell` or `exec` is
   refused the same way, and a running line is stopped with its session kept, until room returns.
-  Room returns when the session asked to let go ends; if its peer is not reading that is the
-  output stall limit, 30 s, so a newcomer may be refused for up to that long.
+  The cap bounds reserved room, not live bytes: a session it refuses keeps what it allocated, and
+  key exchange, login and packet allocations are never stopped by it, so the worst case is not
+  closed (see the table in [capacity planning](../operations/capacity-planning.md#ssh-sensor-worst-case-memory)).
+  Room returns when the session asked to let go ends, and no other is asked meanwhile. One
+  blocked inside a write to a peer that is not reading is not woken: it ends at the write
+  deadline (the idle timeout, 60 s, restarted by every byte the peer accepts) or `max_duration`
+  (600 s), so a newcomer may be refused for up to 600 s, and asks chain one session at a time.
 - **Interactive shell vs exec:** the `pty-req` flag selects terminal behavior. With a
   pty the shell prints its state-derived prompt, echoes typed bytes, converts bare LF
   to CR-LF with `onlcr`, and sends both streams merged on `CHANNEL_DATA`. Without a pty

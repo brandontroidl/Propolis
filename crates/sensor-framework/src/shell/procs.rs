@@ -2937,6 +2937,17 @@ fn parse_selector(cmd: &str, args: &[&str]) -> Result<Selector, CommandResult> {
     Ok(sel)
 }
 
+/// The bytes of `lines` joined by `separator` and ended with a newline, worked out before they
+/// are built: a separator the session typed lands between every two lines.
+fn joined_len(lines: &[String], separator: &str) -> usize {
+    let gaps = separator
+        .len()
+        .saturating_mul(lines.len().saturating_sub(1));
+    lines.iter().fold(gaps.saturating_add(1), |sum, line| {
+        sum.saturating_add(line.len())
+    })
+}
+
 fn bad_signal(cmd: &str, spec: &str) -> CommandResult {
     CommandResult::stderr(1, format!("{cmd}: Unknown signal \"{spec}\"\n"))
 }
@@ -2993,15 +3004,15 @@ impl FakeShell {
                 }
             })
             .collect();
-        let mut result = match sel.delimiter.as_deref() {
-            Some(delimiter) if !lines.is_empty() => {
-                CommandResult::stdout(format!("{}\n", lines.join(delimiter)))
-            }
-            _ if lines.is_empty() => CommandResult::silent(1),
-            _ => CommandResult::stdout(format!("{}\n", lines.join("\n"))),
-        };
-        result.status = u8::from(hits.is_empty());
-        result
+        if lines.is_empty() {
+            return CommandResult::silent(1);
+        }
+        // The delimiter is the session's to size: it lands between every two rows.
+        let delimiter = sel.delimiter.as_deref().unwrap_or("\n");
+        if !self.pay_operand(0, joined_len(&lines, delimiter)) {
+            return stopped();
+        }
+        CommandResult::stdout(format!("{}\n", lines.join(delimiter)))
     }
 
     /// `pkill [-SIGNAL] [-f] [-x] [-i] [-v] [-n|-o] [-e] [-c] [-P PPID] [-t TTY] [-u USER] PATTERN`.
@@ -3052,6 +3063,14 @@ impl FakeShell {
                 _ => names.push(arg),
             }
         }
+        // Every process is tested against every name and every omitted pid.
+        let tests = names
+            .len()
+            .saturating_add(omit.len())
+            .saturating_mul(table.procs.len());
+        if !self.charge_work(len_u64(tests)) {
+            return stopped();
+        }
         let mut pids: Vec<u32> = table
             .procs
             .iter()
@@ -3081,6 +3100,9 @@ impl FakeShell {
             return CommandResult::silent(0);
         }
         let line: Vec<String> = pids.iter().map(u32::to_string).collect();
+        if !self.pay_operand(0, joined_len(&line, &separator)) {
+            return stopped();
+        }
         CommandResult::stdout(format!("{}\n", line.join(&separator)))
     }
 }
@@ -3340,6 +3362,9 @@ impl FakeShell {
         let mut result = CommandResult::silent(0);
         let mut failed = false;
         for target in targets {
+            if !self.pay_operand(target.len(), 0) {
+                return stopped();
+            }
             // A signal a shell sends itself runs the handler `trap` set for it.
             if signal != 0
                 && target.parse::<u32>().ok() == Some(self.state().pid)
@@ -3352,7 +3377,9 @@ impl FakeShell {
                 Ok(()) => {}
                 Err(text) => {
                     failed = true;
-                    result.append(CommandResult::stderr(1, text));
+                    if !self.append_paid(&mut result, CommandResult::stderr(1, text)) {
+                        return stopped();
+                    }
                 }
             }
         }

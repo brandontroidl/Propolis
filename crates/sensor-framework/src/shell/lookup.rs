@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use super::ast::{FunctionDef, POSIX_SPECIAL};
 use super::registry::{CommandKind, Registry};
+use super::texttools::stopped;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, ShellLevel, command_basename};
 
 pub(super) fn register(r: &mut Registry) {
@@ -222,13 +223,24 @@ impl FakeShell {
         let mut result = CommandResult::silent(0);
         let mut any_found = names.is_empty();
         for name in names {
+            // Each name is answered from a lookup and a sentence about it, so the line pays for
+            // the sentence before it is kept: a thousand names of a long alias are megabytes.
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
             match self.locate(name, false) {
                 Some(located) => {
                     any_found = true;
-                    result.append(CommandResult::stdout(self.describe(name, &located, detail)));
+                    let sentence = CommandResult::stdout(self.describe(name, &located, detail));
+                    if !self.append_paid(&mut result, sentence) {
+                        return stopped();
+                    }
                 }
                 None if detail == Detail::Sentence => {
-                    result.append(self.not_found_report("command", name))
+                    let report = self.not_found_report("command", name);
+                    if !self.append_paid(&mut result, report) {
+                        return stopped();
+                    }
                 }
                 None => {}
             }
@@ -305,12 +317,18 @@ impl FakeShell {
         let mut result = CommandResult::silent(0);
         let mut missing = false;
         for name in parts.get(at..).unwrap_or(&[]) {
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
             let wants_files = all || only_files || force_path;
             let Some(located) = self.locate(name, wants_files) else {
                 missing = true;
                 // `-t`, `-p` and `-P` say nothing about a name they do not find.
                 if !(terse || only_files || force_path) {
-                    result.append(self.not_found_report("type", name));
+                    let report = self.not_found_report("type", name);
+                    if !self.append_paid(&mut result, report) {
+                        return stopped();
+                    }
                 }
                 continue;
             };
@@ -327,7 +345,10 @@ impl FakeShell {
                     && !located.builtin;
                 if force_path || is_file {
                     for file in files {
-                        result.append(CommandResult::stdout(format!("{file}\n")));
+                        let line = CommandResult::stdout(format!("{file}\n"));
+                        if !self.append_paid(&mut result, line) {
+                            return stopped();
+                        }
                     }
                 }
                 missing |= force_path && located.files.is_empty();
@@ -351,11 +372,11 @@ impl FakeShell {
             }
             let shown = if all { forms.len() } else { 1 };
             for (word, sentence) in forms.into_iter().take(shown) {
-                result.append(CommandResult::stdout(if terse {
-                    format!("{word}\n")
-                } else {
-                    sentence
-                }));
+                let line =
+                    CommandResult::stdout(if terse { format!("{word}\n") } else { sentence });
+                if !self.append_paid(&mut result, line) {
+                    return stopped();
+                }
             }
         }
         result.status = if missing {
@@ -408,6 +429,9 @@ impl FakeShell {
         let mut result = CommandResult::silent(0);
         let mut missing = names.is_empty();
         for name in names {
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
             let files = self
                 .locate(name, true)
                 .map(|located| located.files)
@@ -417,7 +441,10 @@ impl FakeShell {
             }
             let shown = if all { files.len() } else { 1 };
             for file in files.iter().take(shown) {
-                result.append(CommandResult::stdout(format!("{file}\n")));
+                let line = CommandResult::stdout(format!("{file}\n"));
+                if !self.append_paid(&mut result, line) {
+                    return stopped();
+                }
             }
         }
         result.status = u8::from(missing);

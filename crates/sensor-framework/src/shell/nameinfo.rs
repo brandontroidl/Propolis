@@ -273,12 +273,14 @@ fn clip(name: &str) -> String {
 }
 
 impl FakeShell {
-    fn read_text(&self, path: &str) -> String {
-        let bytes = self.fs.read_all(path, FILE_MAX).unwrap_or_default();
+    /// A configuration file as text, charged to the line by its size: the session can grow the
+    /// hosts or passwd file to the cap, and a loop of lookups reads it each trip.
+    fn read_text(&mut self, path: &str) -> String {
+        let bytes = self.config_bytes(path, FILE_MAX);
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn hosts(&self) -> Hosts {
+    fn hosts(&mut self) -> Hosts {
         let path = match self.flavor {
             ShellFlavor::Bash => "/etc/hosts",
             ShellFlavor::AndroidSh => "/system/etc/hosts",
@@ -288,7 +290,7 @@ impl FakeShell {
 
     /// The synthetic resolver: the modeled `/etc/resolv.conf`'s first private nameserver, else the
     /// model gateway. Never an address the session typed on a command line.
-    fn resolver(&self) -> String {
+    fn resolver(&mut self) -> String {
         if self.flavor == ShellFlavor::Bash {
             let configured = self.read_text("/etc/resolv.conf").lines().find_map(|line| {
                 let mut words = line.split_whitespace();
@@ -305,7 +307,7 @@ impl FakeShell {
     /// The IPv4 address `ping` and `ssh` would connect to: a dotted address as typed, otherwise
     /// the first one the modeled hosts file lists for the name. `None` is a name `getent hosts`
     /// and `nslookup` also fail to resolve, so the client tools report it the same way.
-    pub(super) fn resolve_host_v4(&self, name: &str) -> Option<String> {
+    pub(super) fn resolve_host_v4(&mut self, name: &str) -> Option<String> {
         if let Some(addr) = parse_v4(name) {
             return Some(v4_text(addr));
         }

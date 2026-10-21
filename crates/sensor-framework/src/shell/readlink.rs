@@ -15,7 +15,8 @@
 )]
 
 use super::registry::Registry;
-use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
+use super::texttools::stopped;
+use super::{CommandResult, FakeShell, HandlerId, ShellFlavor};
 use crate::fakefs::Canonical;
 
 const TRY: &str = "Try 'readlink --help' for more information.\n";
@@ -124,18 +125,29 @@ impl FakeShell {
         let mut out = String::new();
         let mut errors = String::new();
         let mut failed = false;
+        // A relative operand is joined to the working directory and resolved from the root, so
+        // the path walked is as long as both.
+        let cwd_len = self.cwd().len();
         for arg in operands {
+            if !self.pay_operand(arg.len().saturating_add(cwd_len), 0) {
+                return stopped();
+            }
             match self.readlink_operand(arg, &options, reader) {
                 Ok(text) => {
-                    out.push_str(&text);
-                    if terminated {
-                        out.push_str(end);
+                    let end = if terminated { end } else { "" };
+                    if !self.pay_output(text.len().saturating_add(end.len())) {
+                        return stopped();
                     }
+                    out.push_str(&text);
+                    out.push_str(end);
                 }
                 Err(reason) => {
                     failed = true;
                     if options.verbose {
-                        errors.push_str(&format!("readlink: {}: {reason}\n", quoted(arg)));
+                        let line = format!("readlink: {}: {reason}\n", quoted(arg));
+                        if !self.push_paid(&mut errors, &line) {
+                            return stopped();
+                        }
                     }
                 }
             }
@@ -156,7 +168,6 @@ impl FakeShell {
         if arg.is_empty() {
             return Err(MISSING);
         }
-        self.charge_work(len_u64(arg.len()));
         // `/proc/self/exe` and `/proc/<shell pid>/exe` are links the filesystem does not store:
         // `resolve_reading` knows the executable behind them, and returns the path unchanged for
         // anything else.
@@ -291,7 +302,11 @@ impl FakeShell {
         let mut out = String::new();
         let mut errors = String::new();
         let mut failed = false;
+        let cwd_len = self.cwd().len();
         for arg in operands {
+            if !self.pay_operand(arg.len().saturating_add(cwd_len), 0) {
+                return stopped();
+            }
             let answer = if options.no_symlinks {
                 self.realpath_lexical(arg, options.mode)
             } else {
@@ -299,13 +314,19 @@ impl FakeShell {
             };
             match answer {
                 Ok(text) => {
+                    if !self.pay_output(text.len().saturating_add(end.len())) {
+                        return stopped();
+                    }
                     out.push_str(&text);
                     out.push_str(end);
                 }
                 Err(reason) => {
                     failed = true;
                     if !options.quiet {
-                        errors.push_str(&format!("realpath: {}: {reason}\n", quoted(arg)));
+                        let line = format!("realpath: {}: {reason}\n", quoted(arg));
+                        if !self.push_paid(&mut errors, &line) {
+                            return stopped();
+                        }
                     }
                 }
             }
@@ -322,7 +343,6 @@ impl FakeShell {
         if arg.is_empty() {
             return Err(MISSING);
         }
-        self.charge_work(len_u64(arg.len()));
         let path = self.normalize_logical(arg);
         if mode != Canonical::AllowMissing && self.fs.canonicalize(&path, mode).is_none() {
             return Err(MISSING);

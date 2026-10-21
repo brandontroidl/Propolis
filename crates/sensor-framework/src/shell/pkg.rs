@@ -38,6 +38,10 @@ fn ubuntu(shell: &FakeShell, _parts: &[&str]) -> bool {
 
 const NS_PER_MS: u64 = 1_000_000;
 
+/// The bytes around a package's name and version in apt's `Removing NAME (VERSION) ...` line,
+/// plus the separator its name takes in the plan's list.
+const REMOVING_FIXED: usize = 16;
+
 const DPKG_HEADER: &str = "Desired=Unknown/Install/Remove/Purge/Hold
 | Status=Not/Inst/Conf-files/Unpacked/halF-conf/Half-inst/trig-aWait/Trig-pend
 |/ Err?=(none)/Reinst-required (Status,Err: uppercase=bad)
@@ -183,6 +187,9 @@ impl FakeShell {
         let mut rows: Vec<Package> = Vec::new();
         let mut missing = String::new();
         for pattern in patterns {
+            if !self.pay_operand(pattern.len(), 0) {
+                return stopped();
+            }
             let glob = Glob::fnmatch(pattern, false);
             let mut found: Vec<Package> = Vec::new();
             for package in &all {
@@ -193,10 +200,14 @@ impl FakeShell {
                 }
             }
             if found.is_empty() {
-                missing.push_str(&format!(
+                let line = format!(
                     "dpkg-query: no packages found matching {}\n",
                     crate::sanitize_value(pattern, 128)
-                ));
+                );
+                if !self.pay_operand(pattern.len(), line.len()) {
+                    return stopped();
+                }
+                missing.push_str(&line);
             }
             for package in found {
                 if !rows.contains(&package) {
@@ -227,25 +238,28 @@ impl FakeShell {
         let mut result = CommandResult::silent(0);
         let mut missing = false;
         for (index, name) in names.iter().enumerate() {
-            match packages::find(name) {
+            // Each operand answers with a status stanza or an error line; the line pays for it
+            // before it is kept, so a list of thousands of names stops where the allowance does.
+            let piece = match packages::find(name) {
                 Some(package) => {
                     let separator = if index > 0 { "\n" } else { "" };
-                    result.append(CommandResult::stdout(format!(
-                        "{separator}{}",
-                        dpkg_status(&package)
-                    )));
+                    CommandResult::stdout(format!("{separator}{}", dpkg_status(&package)))
                 }
                 None => {
                     missing = true;
-                    result.append(CommandResult::stderr(
+                    CommandResult::stderr(
                         1,
                         format!(
                             "dpkg-query: package '{}' is not installed and no information is available\n",
                             crate::sanitize_value(name, 128)
                         ),
-                    ));
+                    )
                 }
+            };
+            if !self.pay_operand(name.len(), piece.bytes().len()) {
+                return stopped();
             }
+            result.append(piece);
         }
         if missing {
             result.append(CommandResult::stderr(
@@ -360,10 +374,16 @@ impl FakeShell {
                 let mut unknown = String::new();
                 for name in operands {
                     match packages::find(name) {
-                        Some(package) => text.push_str(&format!(
-                            "{} is already the newest version ({}).\n",
-                            package.name, package.version
-                        )),
+                        Some(package) => {
+                            let line = format!(
+                                "{} is already the newest version ({}).\n",
+                                package.name, package.version
+                            );
+                            if !self.pay_operand(name.len(), line.len()) {
+                                return stopped();
+                            }
+                            text.push_str(&line);
+                        }
                         None => {
                             unknown = crate::sanitize_value(name, 128);
                             break;
@@ -386,11 +406,29 @@ impl FakeShell {
                 let mut removing: Vec<Package> = Vec::new();
                 for name in operands {
                     match packages::find(name) {
-                        Some(package) => removing.push(package),
-                        None => text.push_str(&format!(
-                            "Package '{}' is not installed, so not removed\n",
-                            crate::sanitize_value(name, 128)
-                        )),
+                        Some(package) => {
+                            // Listed twice below, as a name and as a `Removing` line.
+                            let listed = package
+                                .name
+                                .len()
+                                .saturating_mul(2)
+                                .saturating_add(package.version.len())
+                                .saturating_add(REMOVING_FIXED);
+                            if !self.pay_operand(name.len(), listed) {
+                                return stopped();
+                            }
+                            removing.push(package);
+                        }
+                        None => {
+                            let line = format!(
+                                "Package '{}' is not installed, so not removed\n",
+                                crate::sanitize_value(name, 128)
+                            );
+                            if !self.pay_operand(name.len(), line.len()) {
+                                return stopped();
+                            }
+                            text.push_str(&line);
+                        }
                     }
                 }
                 if removing.is_empty() {
@@ -434,10 +472,13 @@ impl FakeShell {
             "list" => {
                 let mut text = format!("Listing...{done}\n");
                 let upgradable_only = args.contains(&"--upgradable");
-                let globs: Vec<Glob> = operands
-                    .iter()
-                    .map(|pattern| Glob::fnmatch(pattern, false))
-                    .collect();
+                let mut globs: Vec<Glob> = Vec::new();
+                for pattern in operands {
+                    if !self.pay_operand(pattern.len(), 0) {
+                        return stopped();
+                    }
+                    globs.push(Glob::fnmatch(pattern, false));
+                }
                 for package in packages::installed() {
                     let wanted = if upgradable_only {
                         package.upgrade.is_some()
@@ -466,8 +507,13 @@ impl FakeShell {
                 let mut text = String::new();
                 for name in operands {
                     if let Some(package) = packages::find(name) {
-                        text.push_str(&dpkg_status(&package));
-                        text.push('\n');
+                        let stanza = format!("{}\n", dpkg_status(&package));
+                        if !self.pay_operand(name.len(), stanza.len()) {
+                            return stopped();
+                        }
+                        text.push_str(&stanza);
+                    } else if !self.pay_operand(name.len(), 0) {
+                        return stopped();
                     }
                 }
                 if text.is_empty() {

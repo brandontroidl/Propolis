@@ -18,9 +18,11 @@
 )]
 
 use super::registry::Registry;
+use super::texttools::stopped;
 use super::trace::FsEffect;
 use super::{
     CommandResult, FakeShell, HandlerId, ShellFlavor, budget_refusal_text, command_basename,
+    len_u64,
 };
 use crate::fakefs::{ATTR_APPEND_ONLY, ATTR_IMMUTABLE, AttrChange, FileKind, FsError};
 
@@ -44,6 +46,10 @@ const MAX_TREE_DEPTH: u32 = 24;
 
 /// Nodes one `chattr -R` visits.
 const MAX_WALK: u32 = 4096;
+
+/// What one attribute edit of one node costs the line: it locks the filesystem and resolves the
+/// path from the root, orders of magnitude over the byte of work the allowance is counted in.
+const CHANGE_COST: usize = 64;
 
 const NO_SUCH: &str = "No such file or directory";
 const NO_SPACE: &str = "No space left on device";
@@ -318,19 +324,26 @@ impl FakeShell {
             if name == "-" {
                 continue;
             }
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
             let path = self.resolve_logical(name);
             let gnu = format!("cannot touch '{name}'");
-            match self.fs.stat(&path, true) {
+            let complaint = match self.fs.stat(&path, true) {
                 Some(stat) if stat.read_only => {
-                    err.push_str(&self.fault("touch", &gnu, name, "Read-only file system"));
+                    Some(self.fault("touch", &gnu, name, "Read-only file system"))
                 }
-                Some(_) => {}
-                None if !create => {}
-                None => {
-                    if let Err(error) = self.traced_create(&path) {
-                        err.push_str(&self.fault("touch", &gnu, name, reason(&error)));
-                    }
-                }
+                Some(_) => None,
+                None if !create => None,
+                None => match self.traced_create(&path) {
+                    Ok(_) => None,
+                    Err(error) => Some(self.fault("touch", &gnu, name, reason(&error))),
+                },
+            };
+            if let Some(line) = complaint
+                && !self.push_paid(&mut err, &line)
+            {
+                return stopped();
             }
         }
         finish(String::new(), err)
@@ -357,10 +370,17 @@ impl FakeShell {
             let mut current = operand;
             let mut first = true;
             loop {
+                // `-p` climbs one component at a time, each step resolving the whole path again.
+                if !self.pay_operand(current.len(), 0) {
+                    return stopped();
+                }
                 match self.remove_empty_dir(current) {
                     Ok(()) => {
                         if verbose {
-                            out.push_str(&format!("rmdir: removing directory, '{current}'\n"));
+                            let line = format!("rmdir: removing directory, '{current}'\n");
+                            if !self.push_paid(&mut out, &line) {
+                                return stopped();
+                            }
                         }
                     }
                     Err("Directory not empty") if ignore_non_empty => break,
@@ -371,7 +391,10 @@ impl FakeShell {
                             "failed to remove directory"
                         };
                         let gnu = format!("{verb} '{current}'");
-                        err.push_str(&self.fault("rmdir", &gnu, current, why));
+                        let line = self.fault("rmdir", &gnu, current, why);
+                        if !self.push_paid(&mut err, &line) {
+                            return stopped();
+                        }
                         break;
                     }
                 }
@@ -506,18 +529,24 @@ impl FakeShell {
         let mut out = String::new();
         let mut err = String::new();
         for &target in targets {
+            if !self.pay_operand(target.len(), 0) {
+                return stopped();
+            }
             let name = match (into, link) {
                 (Some(dir), _) => join(dir, base_of(target)),
                 (None, Some(link)) => link.to_string(),
                 (None, None) => continue,
             };
-            match self.link_one(target, &name, opts) {
+            let paid = match self.link_one(target, &name, opts) {
                 Ok(()) if opts.verbose => {
                     let arrow = if opts.symbolic { "->" } else { "=>" };
-                    out.push_str(&format!("'{name}' {arrow} '{target}'\n"));
+                    self.push_paid(&mut out, &format!("'{name}' {arrow} '{target}'\n"))
                 }
-                Ok(()) => {}
-                Err(line) => err.push_str(&line),
+                Ok(()) => true,
+                Err(line) => self.push_paid(&mut err, &line),
+            };
+            if !paid {
+                return stopped();
             }
         }
         finish(out, err)
@@ -625,22 +654,33 @@ impl FakeShell {
         let mut out = String::new();
         let mut err = String::new();
         for &src in &sources {
+            if !self.pay_operand(src.len(), 0) {
+                return stopped();
+            }
             let src_path = self.resolve_logical(src);
             let (dst, dst_path) = if dest_is_dir {
                 let base = base_of(src);
                 if base.is_empty() {
                     let gnu = format!("cannot move '{src}' to '{dest}'");
-                    err.push_str(&self.fault("mv", &gnu, src, "Device or resource busy"));
+                    let line = self.fault("mv", &gnu, src, "Device or resource busy");
+                    if !self.push_paid(&mut err, &line) {
+                        return stopped();
+                    }
                     continue;
                 }
                 (join(dest, base), join(&dest_path, base))
             } else {
                 (dest.to_string(), dest_path.clone())
             };
-            match self.move_one(src, &dst, &src_path, &dst_path, no_clobber) {
-                Ok(true) if verbose => out.push_str(&format!("renamed '{src}' -> '{dst}'\n")),
-                Ok(_) => {}
-                Err(line) => err.push_str(&line),
+            let paid = match self.move_one(src, &dst, &src_path, &dst_path, no_clobber) {
+                Ok(true) if verbose => {
+                    self.push_paid(&mut out, &format!("renamed '{src}' -> '{dst}'\n"))
+                }
+                Ok(_) => true,
+                Err(line) => self.push_paid(&mut err, &line),
+            };
+            if !paid {
+                return stopped();
             }
         }
         finish(out, err)
@@ -845,14 +885,16 @@ impl FakeShell {
         let mut visited = 0u32;
         for name in files {
             let path = self.resolve_logical(name);
-            self.chattr_walk(
+            if !self.chattr_walk(
                 name,
                 &path,
                 &changes,
                 recursive,
                 (0, &mut visited),
                 &mut err,
-            );
+            ) {
+                return stopped();
+            }
         }
         if quiet && !err.is_empty() {
             return CommandResult::silent(1);
@@ -860,7 +902,9 @@ impl FakeShell {
         finish(String::new(), err)
     }
 
-    /// Apply `changes` to `path`, then, for `-R`, to what is under it.
+    /// Apply `changes` to `path`, then, for `-R`, to what is under it. False once the line cannot
+    /// pay: every node costs a step for each change applied to it, so the product of the two lists
+    /// is charged, not just the length of either.
     fn chattr_walk(
         &mut self,
         name: &str,
@@ -869,10 +913,14 @@ impl FakeShell {
         recursive: bool,
         (depth, visited): (u32, &mut u32),
         err: &mut String,
-    ) {
+    ) -> bool {
         *visited = visited.saturating_add(1);
-        if *visited > MAX_WALK || !self.charge_work(1) {
-            return;
+        if *visited > MAX_WALK {
+            return true;
+        }
+        let edits = changes.len().saturating_mul(CHANGE_COST);
+        if !self.charge_work(len_u64(name.len().saturating_add(edits).saturating_add(1))) {
+            return false;
         }
         for &(change, bits) in changes {
             if let Err(error) = self.fs.change_attrs(path, change, bits) {
@@ -882,8 +930,7 @@ impl FakeShell {
                     }
                     other => format!("chattr: {} while setting flags on {name}\n", reason(&other)),
                 };
-                err.push_str(&line);
-                return;
+                return self.push_paid(err, &line);
             }
         }
         let is_dir = self
@@ -891,19 +938,22 @@ impl FakeShell {
             .stat(path, false)
             .is_some_and(|stat| stat.kind == FileKind::Directory);
         if !(recursive && is_dir) || depth > MAX_TREE_DEPTH {
-            return;
+            return true;
         }
         for child in self.fs.list_dir(path).unwrap_or_default() {
             let deeper = (depth.saturating_add(1), &mut *visited);
-            self.chattr_walk(
+            if !self.chattr_walk(
                 &join(name, &child),
                 &join(path, &child),
                 changes,
                 recursive,
                 deeper,
                 err,
-            );
+            ) {
+                return false;
+            }
         }
+        true
     }
 }
 

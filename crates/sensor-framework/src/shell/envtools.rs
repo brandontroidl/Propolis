@@ -21,12 +21,13 @@
     clippy::indexing_slicing
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use super::eval::Var;
 use super::multicall::PURE_BUILTINS;
 use super::registry::{CommandKind, Registry};
-use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, command_basename};
+use super::texttools::stopped;
+use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, command_basename, len_u64};
 
 pub(super) fn register(r: &mut Registry) {
     r.register("env", HandlerId::Env, FakeShell::cmd_env);
@@ -298,10 +299,20 @@ impl FakeShell {
                 .filter(|var| var.exported && !name.contains('='));
             match found {
                 Some(var) => {
+                    // Paid before the value is copied: a value of a megabyte named a thousand
+                    // times is a gigabyte, and the allowance is 4 MiB.
+                    if !self.pay_operand(name.len(), var.value.len().saturating_add(1)) {
+                        return stopped();
+                    }
                     out.push_str(&var.value);
                     out.push(terminator);
                 }
-                None => missing = true,
+                None => {
+                    if !self.pay_operand(name.len(), 0) {
+                        return stopped();
+                    }
+                    missing = true;
+                }
             }
         }
         let mut result = CommandResult::stdout(out);
@@ -331,19 +342,36 @@ impl FakeShell {
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect();
+            // Where each listed name sits, so an assignment finds its slot without a scan of
+            // the list: with thousands of operands the scan was quadratic.
+            let mut slots: HashMap<String, usize> = listed
+                .iter()
+                .enumerate()
+                .map(|(at, (name, _))| (name.clone(), at))
+                .collect();
             for (name, value) in &plan.sets {
-                match listed
-                    .iter_mut()
-                    .find(|(listed_name, _)| listed_name == name)
-                {
-                    Some(slot) => slot.1 = (*value).to_string(),
-                    None => listed.push(((*name).to_string(), (*value).to_string())),
+                if !self.pay_operand(name.len().saturating_add(value.len()), 0) {
+                    return stopped();
+                }
+                match slots.get(*name) {
+                    Some(&at) => {
+                        if let Some(slot) = listed.get_mut(at) {
+                            slot.1 = (*value).to_string();
+                        }
+                    }
+                    None => {
+                        slots.insert((*name).to_string(), listed.len());
+                        listed.push(((*name).to_string(), (*value).to_string()));
+                    }
                 }
             }
             let terminator = if plan.null { '\0' } else { '\n' };
             let mut out = String::new();
             for (name, value) in listed {
-                out.push_str(&format!("{name}={value}{terminator}"));
+                let line = format!("{name}={value}{terminator}");
+                if !self.push_paid(&mut out, &line) {
+                    return stopped();
+                }
             }
             return CommandResult::stdout(out);
         }
@@ -366,6 +394,13 @@ impl FakeShell {
         // and that same frame gets the session's variables back, so a command that opens or leaves
         // a shell level cannot make the restore land on another level's state.
         let frame = self.frames.len().saturating_sub(1);
+        // The assignments are copied into the command's environment, each one a map insert.
+        let assigned = plan.sets.iter().fold(0usize, |sum, (name, value)| {
+            sum.saturating_add(name.len()).saturating_add(value.len())
+        });
+        if !self.charge_work(len_u64(assigned.saturating_add(plan.sets.len()))) {
+            return stopped();
+        }
         let saved = self.state().vars.clone();
         // The command inherits env's own environment, `_` included (bash set it for env), with
         // env's edits applied; no `_` of its own is added for it.

@@ -409,9 +409,10 @@ const MEM_UNREADABLE: &str = "free: Error: /proc must be mounted\n  To mount /pr
 
 impl FakeShell {
     /// The modeled `/proc/meminfo`, parsed. The same file `cat` reads, so a session that edits it
-    /// sees `free` follow.
-    fn read_meminfo(&self) -> Option<Mem> {
-        let bytes = self.fs.read_all("/proc/meminfo", MEMINFO_MAX).ok()?;
+    /// sees `free` follow. Read as `cat` reads it, charged to the line by its size: the session
+    /// can grow the file to the cap, and a loop of `free` reads it each trip.
+    fn read_meminfo(&mut self) -> Option<Mem> {
+        let bytes = self.config_bytes("/proc/meminfo", MEMINFO_MAX);
         parse_meminfo(&String::from_utf8_lossy(&bytes))
     }
 
@@ -459,6 +460,9 @@ impl FakeShell {
             }
         }
         let Some(mem) = self.read_meminfo() else {
+            if self.line.exhausted() {
+                return stopped();
+            }
             let text = if android {
                 "free: /proc/meminfo: No such file or directory\n"
             } else {
@@ -740,6 +744,10 @@ fn df_text(rows: &[Row], plan: &DfPlan<'_>) -> String {
     out
 }
 
+/// Heap one `df` row holds between being found and being printed, charged per operand: the row,
+/// its cells and the error line an operand with no filesystem leaves.
+const DF_ROW_HEAP: usize = 256;
+
 const DF_LONGS: &[(&str, bool)] = &[
     ("all", false),
     ("block-size", true),
@@ -830,6 +838,11 @@ impl FakeShell {
         } else {
             let operands = plan.operands.clone();
             for operand in operands {
+                // A row is held as cells of strings until the table is laid out, many times its
+                // printed length.
+                if !self.pay_operand(operand.len(), DF_ROW_HEAP) {
+                    return stopped();
+                }
                 match self.df_operand_mount(operand) {
                     Some(entry) => rows.push(row_of(flavor, &entry)),
                     None => errors.push_str(&format!("df: {operand}: No such file or directory\n")),

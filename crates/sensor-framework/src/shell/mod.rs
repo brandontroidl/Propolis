@@ -1597,11 +1597,19 @@ impl FakeShell {
                 self.timing.process(seed);
             }
             // Toybox parses its own options before the applet runs, so its refusals come first.
-            if self.flavor == ShellFlavor::AndroidSh
-                && let Some(refusal) =
-                    toyopt::check(command_basename(parts[0]), parts.get(1..).unwrap_or(&[]))
-            {
-                return CommandResult::stderr(1, refusal);
+            if self.flavor == ShellFlavor::AndroidSh {
+                let args = parts.get(1..).unwrap_or(&[]);
+                // The parser reads every byte of every option word, and a word may be megabytes
+                // of clustered letters.
+                let words = args
+                    .iter()
+                    .fold(0usize, |sum, arg| sum.saturating_add(arg.len()));
+                if !self.charge_work(len_u64(words)) {
+                    return texttools::stopped();
+                }
+                if let Some(refusal) = toyopt::check(command_basename(parts[0]), args) {
+                    return CommandResult::stderr(1, refusal);
+                }
             }
             return handler(self, parts);
         }
@@ -1750,6 +1758,9 @@ impl FakeShell {
         let grants = args.next().is_some_and(|mode| mode_grants_execute(mode));
         let mut result = CommandResult::silent(0);
         for target in args {
+            if !self.pay_operand(target.len(), 0) {
+                return texttools::stopped();
+            }
             let path = self.resolve_logical(target);
             // GNU chmod names each missing operand and goes on with the rest; a loop that fetched
             // nothing (`wget ... && chmod +x x && ./x`) then stops there instead of running a
@@ -1760,10 +1771,13 @@ impl FakeShell {
                 && self.fs.stat(&path, true).is_none()
             {
                 if !quiet {
-                    result.append(CommandResult::stderr(
+                    let complaint = CommandResult::stderr(
                         1,
                         format!("chmod: cannot access '{target}': No such file or directory\n"),
-                    ));
+                    );
+                    if !self.append_paid(&mut result, complaint) {
+                        return texttools::stopped();
+                    }
                 }
                 result.status = 1;
                 continue;
@@ -2445,20 +2459,28 @@ impl FakeShell {
         }
         let mut out = String::new();
         for target in targets {
-            let path = self.resolve_logical(target);
-            if self.fs.is_dir(&path) && !recursive {
-                out.push_str(&format!("rm: cannot remove '{target}': Is a directory\n"));
-                continue;
+            if !self.pay_operand(target.len(), 0) {
+                return texttools::stopped();
             }
-            match self.traced_remove(&path) {
-                Ok(true) => {}
-                Ok(false) if force => {}
-                Ok(false) => out.push_str(&format!(
-                    "rm: cannot remove '{target}': No such file or directory\n"
-                )),
-                Err(_) => out.push_str(&format!(
-                    "rm: cannot remove '{target}': Read-only file system\n"
-                )),
+            let path = self.resolve_logical(target);
+            let complaint = if self.fs.is_dir(&path) && !recursive {
+                Some(format!("rm: cannot remove '{target}': Is a directory\n"))
+            } else {
+                match self.traced_remove(&path) {
+                    Ok(true) => None,
+                    Ok(false) if force => None,
+                    Ok(false) => Some(format!(
+                        "rm: cannot remove '{target}': No such file or directory\n"
+                    )),
+                    Err(_) => Some(format!(
+                        "rm: cannot remove '{target}': Read-only file system\n"
+                    )),
+                }
+            };
+            if let Some(line) = complaint
+                && !self.push_paid(&mut out, &line)
+            {
+                return texttools::stopped();
             }
         }
         if out.is_empty() {
@@ -2483,16 +2505,25 @@ impl FakeShell {
         }
         let mut out = String::new();
         for target in targets {
+            // `-p` resolves the path again for each component it builds, so the path is paid for
+            // once per component.
+            let components = target.matches('/').count().saturating_add(1);
+            if !self.pay_operand(target.len().saturating_mul(components), 0) {
+                return texttools::stopped();
+            }
             let path = self.resolve_logical(target);
+            let mut complaint: Option<String> = None;
             match self.traced_make_dir(&path) {
                 Ok(()) => {}
                 // `-p` is silent about an existing directory and creates missing parents.
-                Err(FsError::ReadOnly) => out.push_str(&format!(
-                    "mkdir: cannot create directory '{target}': Read-only file system\n"
-                )),
+                Err(FsError::ReadOnly) => {
+                    complaint = Some(format!(
+                        "mkdir: cannot create directory '{target}': Read-only file system\n"
+                    ));
+                }
                 Err(error) if budget_refusal_text(&error).is_some() => {
                     let reason = budget_refusal_text(&error).unwrap_or_default();
-                    out.push_str(&format!(
+                    complaint = Some(format!(
                         "mkdir: cannot create directory '{target}': {reason}\n"
                     ));
                 }
@@ -2505,19 +2536,28 @@ impl FakeShell {
                         if let Err(error) = self.traced_make_dir(&built)
                             && let Some(reason) = budget_refusal_text(&error)
                         {
-                            out.push_str(&format!(
+                            complaint = Some(format!(
                                 "mkdir: cannot create directory '{target}': {reason}\n"
                             ));
                             break;
                         }
                     }
                 }
-                Err(FsError::Exists) => out.push_str(&format!(
-                    "mkdir: cannot create directory '{target}': File exists\n"
-                )),
-                Err(_) => out.push_str(&format!(
-                    "mkdir: cannot create directory '{target}': No such file or directory\n"
-                )),
+                Err(FsError::Exists) => {
+                    complaint = Some(format!(
+                        "mkdir: cannot create directory '{target}': File exists\n"
+                    ));
+                }
+                Err(_) => {
+                    complaint = Some(format!(
+                        "mkdir: cannot create directory '{target}': No such file or directory\n"
+                    ));
+                }
+            }
+            if let Some(line) = complaint
+                && !self.push_paid(&mut out, &line)
+            {
+                return texttools::stopped();
             }
         }
         if out.is_empty() {

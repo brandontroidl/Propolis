@@ -234,11 +234,9 @@ impl FakeShell {
 
     /// How many `processor` entries `/proc/cpuinfo` holds. The field is lowercase on x86; the
     /// phone's capitalized `Processor` line is its model name, not a core.
-    fn cpu_count(&self) -> usize {
-        let bytes = self
-            .fs
-            .read_all("/proc/cpuinfo", CPUINFO_MAX)
-            .unwrap_or_default();
+    /// Charged by the file's size, as `cat` of it is: the session can grow it to the cap.
+    fn cpu_count(&mut self) -> usize {
+        let bytes = self.config_bytes("/proc/cpuinfo", CPUINFO_MAX);
         String::from_utf8_lossy(&bytes)
             .lines()
             .filter(|line| {

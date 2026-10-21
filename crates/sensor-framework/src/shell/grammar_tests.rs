@@ -1674,7 +1674,8 @@ mod caps {
 
     #[test]
     fn a_line_far_over_the_allowance_never_runs_anything() {
-        let mut sh = limited(|l| l.work_per_line = 100);
+        // The allowance leaves room for the next line's `cat` (a read costs a fee of its own).
+        let mut sh = limited(|l| l.work_per_line = 1_000);
         let (out, _) = sh.handle_input(format!(">/tmp/x; echo {}", "y".repeat(5_000)));
         assert_eq!(out.status, 1);
         assert!(sh.handle_input("cat /tmp/x").0.contains("No such file"));

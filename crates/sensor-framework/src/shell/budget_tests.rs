@@ -607,11 +607,55 @@ fn grep_charges_the_scan_beyond_the_pass_the_read_paid() {
     );
 }
 
+/// The per-operand charge is made as the output is produced and the evaluator nets it out of its
+/// own charge for the command's output, so the bytes cost the line once, not twice.
+#[test]
+fn a_command_over_many_operands_charges_its_output_once() {
+    let mut sh = FakeShell::new(FakeFs::new(), ctx());
+    sh.handle_input(format!("export X={}", "a".repeat(1000)));
+    let work = work_of(
+        &mut sh,
+        &format!("printenv {} > /dev/null", ["X"; 20].join(" ")),
+    );
+    let output = 20 * 1001;
+    assert!(
+        work >= output && work < output + 5_000,
+        "{work} for {output} bytes of output"
+    );
+}
+
+/// A loop over operands stops in the loop, at the line's allowance, and not after it has built
+/// the whole answer: 200 names of a kilobyte value are 200 KB, and the line may spend 50,000.
+#[test]
+fn a_loop_over_operands_stops_when_the_allowance_does() {
+    let (mut sh, _) = limited(|l| l.work_per_line = 50_000);
+    sh.handle_input(format!("export X={}", "a".repeat(1000)));
+    let work = work_of(&mut sh, &format!("printenv {}", ["X"; 200].join(" ")));
+    assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Work));
+    assert!(
+        work < 50_000 + 2_000,
+        "{work} charged against an allowance of 50,000"
+    );
+}
+
+/// A width in a `stat` format pads a directive to 4096 bytes, so a short format is a long
+/// answer; the answer is built only up to what the line may still spend.
+#[test]
+fn a_stat_format_is_built_only_up_to_the_allowance() {
+    let (mut sh, _) = limited(|l| l.work_per_line = 100_000);
+    let format = "%4096n".repeat(100);
+    let out = sh.handle_input(format!("stat -c '{format}' / / / / / /")).0;
+    assert_eq!(sh.last_trace().budget.hit, Some(BudgetHit::Work));
+    assert!(out.bytes().len() < 100_000, "{} bytes", out.bytes().len());
+}
+
 /// Every place the shell takes bytes out of the filesystem. `read_operand` is the door for a
 /// file a command was told to read and charges the line itself; `read_charged` is the other
 /// charging helper. Anything else listed here reads a fixed system file of a few KiB that no
 /// operand names, or charges at the call (noted per file). A new direct read fails this test
-/// until it is routed through those helpers or listed here with its reason.
+/// until it is routed through those helpers or listed here with its reason. The configuration
+/// files a command consults for its answer (passwd, group, hosts, meminfo, cpuinfo) go through
+/// `config_bytes`, which charges by size: the session can grow each of them to 64 KiB.
 #[test]
 fn every_direct_filesystem_read_is_accounted_for() {
     let allowed: &[(&str, usize)] = &[
@@ -622,10 +666,6 @@ fn every_direct_filesystem_read_is_accounted_for() {
         // The ELF header: `HEADER_LEN` bytes.
         ("arch.rs", 1),
         // Fixed system files, each capped at a few KiB.
-        ("hostinfo.rs", 1),
-        ("fileinfo.rs", 2),
-        ("sysres.rs", 1),
-        ("nameinfo.rs", 1),
         ("procs.rs", 2),
         // `>>` append and the typed-assembly tracker (eval), `sh FILE` (mod), the loader hash:
         // each charges the bytes at the call.

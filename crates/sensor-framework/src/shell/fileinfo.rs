@@ -252,7 +252,7 @@ impl Facts {
 }
 
 impl FakeShell {
-    fn user_name(&self, uid: u32) -> String {
+    fn user_name(&mut self, uid: u32) -> String {
         if self.flavor == ShellFlavor::AndroidSh {
             let name = match uid {
                 0 => "root",
@@ -262,7 +262,7 @@ impl FakeShell {
             };
             return name.to_string();
         }
-        let passwd = self.fs.read_all("/etc/passwd", 65_536).unwrap_or_default();
+        let passwd = self.config_bytes("/etc/passwd", 65_536);
         String::from_utf8_lossy(&passwd)
             .lines()
             .find_map(|line| {
@@ -274,10 +274,10 @@ impl FakeShell {
             .unwrap_or_else(|| "UNKNOWN".to_string())
     }
 
-    fn group_name(&self, gid: u32) -> String {
+    fn group_name(&mut self, gid: u32) -> String {
         if self.flavor == ShellFlavor::Bash {
             // The group file the box holds, as `user_name` reads the passwd file.
-            let group = self.fs.read_all("/etc/group", 65_536).unwrap_or_default();
+            let group = self.config_bytes("/etc/group", 65_536);
             return String::from_utf8_lossy(&group)
                 .lines()
                 .find_map(|line| {
@@ -447,14 +447,28 @@ fn escape(chars: &[char], at: usize) -> (String, usize) {
     }
 }
 
+/// [`render_within`] for a format the shell itself holds, whose output is its own size.
+fn render(fmt: &str, printf: bool, value: &dyn Fn(char) -> Option<Val>) -> String {
+    render_within(fmt, printf, value, usize::MAX).unwrap_or_default()
+}
+
 /// `fmt` with each `%` directive replaced by `value(directive)`: flags `-` and `0`, a width and a
 /// precision are honored, `%%` is a percent sign and an unknown directive prints `?`. `printf`
-/// also reads backslash escapes.
-fn render(fmt: &str, printf: bool, value: &dyn Fn(char) -> Option<Val>) -> String {
+/// also reads backslash escapes. A width pads a directive to as many as 4096 bytes, so a format
+/// the session typed can build far more than its own length: `None` once the output passes `cap`.
+fn render_within(
+    fmt: &str,
+    printf: bool,
+    value: &dyn Fn(char) -> Option<Val>,
+    cap: usize,
+) -> Option<String> {
     let chars: Vec<char> = fmt.chars().collect();
     let mut out = String::new();
     let mut i = 0usize;
     while let Some(&c) = chars.get(i) {
+        if out.len() > cap {
+            return None;
+        }
         i = i.saturating_add(1);
         if c == '\\' && printf {
             let (text, next) = escape(&chars, i);
@@ -506,7 +520,7 @@ fn render(fmt: &str, printf: bool, value: &dyn Fn(char) -> Option<Val>) -> Strin
         }
         i = i.saturating_add(1);
     }
-    out
+    (out.len() <= cap).then_some(out)
 }
 
 fn text(s: impl Into<String>) -> Option<Val> {
@@ -729,7 +743,10 @@ impl FakeShell {
         }
         let mut acc = CommandResult::silent(0);
         let mut failed = false;
+        let format_len = format.map_or(0, |(fmt, _)| fmt.len());
         for file in files {
+            // The most this operand may add before the line cannot pay for it.
+            let cap = self.spend_cap();
             let rendered = if file_system {
                 match self.filesystem_facts(file) {
                     Err(()) => return stopped(),
@@ -744,13 +761,16 @@ impl FakeShell {
                     }),
                     Ok(Some(facts)) => {
                         let value = |c| fs_value(&facts, c);
-                        Ok(match (format, terse) {
-                            (Some((fmt, printf)), _) => {
-                                with_newline(render(fmt, printf, &value), printf)
-                            }
-                            (None, true) => render(FS_TERSE, false, &value),
-                            (None, false) => render(FS_DEFAULT, false, &value),
-                        })
+                        let text = match (format, terse) {
+                            (Some((fmt, printf)), _) => render_within(fmt, printf, &value, cap)
+                                .map(|text| with_newline(text, printf)),
+                            (None, true) => Some(render(FS_TERSE, false, &value)),
+                            (None, false) => Some(render(FS_DEFAULT, false, &value)),
+                        };
+                        match text {
+                            Some(text) => Ok(text),
+                            None => return self.overspent(),
+                        }
                     }
                 }
             } else {
@@ -770,19 +790,30 @@ impl FakeShell {
                     }),
                     Ok(Some(facts)) => {
                         let value = |c| stat_value(&facts, c, dialect);
-                        Ok(match (format, terse) {
-                            (Some((fmt, printf)), _) => {
-                                with_newline(render(fmt, printf, &value), printf)
-                            }
-                            (None, true) => render(STAT_TERSE, false, &value),
-                            (None, false) => stat_default(&facts, dialect),
-                        })
+                        let text = match (format, terse) {
+                            (Some((fmt, printf)), _) => render_within(fmt, printf, &value, cap)
+                                .map(|text| with_newline(text, printf)),
+                            (None, true) => Some(render(STAT_TERSE, false, &value)),
+                            (None, false) => Some(stat_default(&facts, dialect)),
+                        };
+                        match text {
+                            Some(text) => Ok(text),
+                            None => return self.overspent(),
+                        }
                     }
                 }
             };
             match rendered {
-                Ok(out) => acc.append(CommandResult::stdout(out)),
+                Ok(out) => {
+                    if !self.pay_operand(file.len().saturating_add(format_len), out.len()) {
+                        return stopped();
+                    }
+                    acc.append(CommandResult::stdout(out));
+                }
                 Err(error) => {
+                    if !self.pay_operand(file.len(), error.len()) {
+                        return stopped();
+                    }
                     failed = true;
                     acc.append(CommandResult::stderr(1, error));
                 }
@@ -830,12 +861,16 @@ impl FakeShell {
         let mut files: Vec<&str> = Vec::new();
         let mut dirs: Vec<&str> = Vec::new();
         for operand in operands {
+            if !self.pay_operand(operand.len(), 0) {
+                return stopped();
+            }
             let path = self.resolve_logical(operand);
             // A link named as an operand is listed as a link by `-l`, and followed otherwise.
             let Some(stat) = self.fs.stat(&path, !long) else {
-                errors.push_str(&format!(
-                    "ls: cannot access '{operand}': No such file or directory\n"
-                ));
+                let line = format!("ls: cannot access '{operand}': No such file or directory\n");
+                if !self.push_paid(&mut errors, &line) {
+                    return stopped();
+                }
                 continue;
             };
             if stat.kind == FileKind::Directory && !as_entries {
@@ -861,6 +896,13 @@ impl FakeShell {
         for dir in dirs {
             let logical = self.resolve_logical(dir);
             let mut names = self.fs.list_dir(&logical).unwrap_or_default();
+            // Reading a directory costs its names, however many times an operand names it.
+            let listed = names.iter().fold(0usize, |sum, name| {
+                sum.saturating_add(name.len().saturating_add(1))
+            });
+            if !self.charge_work(len_u64(listed).saturating_add(super::read::OPERAND_COST)) {
+                return stopped();
+            }
             if !show_hidden {
                 names.retain(|name| !name.starts_with('.'));
             }
@@ -885,8 +927,8 @@ impl FakeShell {
             if !out.is_empty() {
                 out.push('\n');
             }
-            if headed {
-                out.push_str(&format!("{dir}:\n"));
+            if headed && !self.push_paid(&mut out, &format!("{dir}:\n")) {
+                return stopped();
             }
             match self.ls_group(&entries, long, true) {
                 Ok(text) => out.push_str(&text),
@@ -923,6 +965,12 @@ impl FakeShell {
             } else {
                 "\n"
             };
+            let listed = names.iter().fold(0usize, |sum, name| {
+                sum.saturating_add(name.len().saturating_add(separator.len()))
+            });
+            if !self.pay_operand(0, listed) {
+                return Err(());
+            }
             return Ok(names.join(separator) + "\n");
         }
         let mut rows = Vec::with_capacity(entries.len());
@@ -959,7 +1007,7 @@ impl FakeShell {
                 Some(target) => format!("{name} -> {target}"),
                 None => (*name).to_string(),
             };
-            out.push_str(&format!(
+            let row = format!(
                 "{} {:>links_w$} {:<user_w$} {:<group_w$} {:>size_w$} {} {shown}\n",
                 mode_string(facts.stat.mode, facts.stat.kind),
                 facts.links,
@@ -967,7 +1015,10 @@ impl FakeShell {
                 facts.gid_name,
                 size_of(facts),
                 ls_time(facts.stat.mtime, now, self.dialect()),
-            ));
+            );
+            if !self.push_paid(&mut out, &row) {
+                return Err(());
+            }
         }
         Ok(out)
     }

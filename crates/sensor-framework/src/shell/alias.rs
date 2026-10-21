@@ -21,6 +21,7 @@
 )]
 
 use super::registry::Registry;
+use super::texttools::stopped;
 use super::{BudgetHit, CommandResult, FakeShell, HandlerId, ShellLevel};
 
 /// One alias: a name and the text that replaces it.
@@ -222,6 +223,9 @@ impl FakeShell {
         }
         let mut failed = false;
         for arg in args {
+            if !self.pay_operand(arg.len(), 0) {
+                return stopped();
+            }
             // dash looks for the `=` after the first character, so `=x=y` names `=x`.
             let skip = if bash {
                 0
@@ -238,10 +242,13 @@ impl FakeShell {
                     let name = arg.get(..at).unwrap_or("");
                     let value = arg.get(at.saturating_add(1)..).unwrap_or("");
                     if bash && !bash_name_ok(name) {
-                        out.append(CommandResult::stderr(
+                        let refusal = CommandResult::stderr(
                             1,
                             self.shell_error(format_args!("alias: `{name}': invalid alias name")),
-                        ));
+                        );
+                        if !self.append_paid(&mut out, refusal) {
+                            return stopped();
+                        }
                         failed = true;
                     } else if !self.alias_define(name, value) {
                         failed = true;
@@ -253,7 +260,9 @@ impl FakeShell {
                             name: (*arg).to_string(),
                             value,
                         });
-                        out.append(CommandResult::stdout(line));
+                        if !self.append_paid(&mut out, CommandResult::stdout(line)) {
+                            return stopped();
+                        }
                     }
                     None => {
                         let message = if bash {
@@ -261,7 +270,9 @@ impl FakeShell {
                         } else {
                             format!("alias: {arg} not found\n")
                         };
-                        out.append(CommandResult::stderr(1, message));
+                        if !self.append_paid(&mut out, CommandResult::stderr(1, message)) {
+                            return stopped();
+                        }
                         failed = true;
                     }
                 },
@@ -319,6 +330,9 @@ impl FakeShell {
         let mut out = CommandResult::silent(0);
         let mut failed = false;
         for name in args {
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
             let aliases = &mut self.state_mut().aliases;
             let before = aliases.len();
             aliases.retain(|alias| alias.name != *name);
@@ -328,7 +342,9 @@ impl FakeShell {
                 } else {
                     format!("unalias: {name} not found\n")
                 };
-                out.append(CommandResult::stderr(1, message));
+                if !self.append_paid(&mut out, CommandResult::stderr(1, message)) {
+                    return stopped();
+                }
                 failed = true;
             }
         }

@@ -14,12 +14,20 @@
 )]
 
 use super::registry::Registry;
+use super::texttools::stopped;
 use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, len_u64};
 use crate::fakefs::{FileKind, FsError};
 
 /// How much of a file `head -n` asks the filesystem for at a time, so it stops reading at the
 /// Nth newline instead of materializing the whole image.
 const CHUNK: u64 = 4096;
+
+/// What one trip round a command's loop over its operands costs the line before it counts the
+/// operand's bytes: the lookup it does (a path walk, a table scan) and the few allocations it
+/// makes. The allowance is counted in bytes and steps, and a handler that does a lookup per
+/// operand is not one step: at 64, a line that gives a command more than 65,000 operands stops
+/// in the loop and not after answering all of them, and no ordinary line is near that.
+pub(super) const OPERAND_COST: u64 = 64;
 
 /// The one `hexdump -e` format modeled: each byte as a raw character. Any other format is not
 /// interpreted; see [`FakeShell::cmd_hexdump`].
@@ -126,6 +134,11 @@ impl FakeShell {
         off: u64,
         limit: u64,
     ) -> Result<Vec<u8>, FsError> {
+        // The path walk and the buffers of a read cost the line whether or not the file has
+        // bytes, so a command given thousands of empty or missing operands still stops.
+        if !self.charge_work(OPERAND_COST) {
+            return Ok(Vec::new());
+        }
         let own_cmdline = format!("/proc/{}/cmdline", self.state().pid);
         let typed = self.normalize_logical(path);
         let synthetic = if typed == "/proc/self/cmdline" {
@@ -172,6 +185,65 @@ impl FakeShell {
         self.charge_work(n)
     }
 
+    /// One trip round a command's loop over its operands: [`OPERAND_COST`], the `scanned` bytes
+    /// of the operand it examines, and the `produced` bytes of output the trip is about to add.
+    /// Called before the output is built or kept, so a command with many operands stops where the
+    /// allowance does and not after it has answered all of them; the evaluator nets `produced`
+    /// out of its own charge for the command's output, so the bytes cost the line once. False
+    /// once the line cannot pay: the caller returns `stopped()`.
+    pub(super) fn pay_operand(&mut self, scanned: usize, produced: usize) -> bool {
+        let produced = len_u64(produced);
+        self.read_paid = self.read_paid.saturating_add(produced);
+        self.charge_work(
+            len_u64(scanned)
+                .saturating_add(produced)
+                .saturating_add(OPERAND_COST),
+        )
+    }
+
+    /// The most bytes a command may build before the line cannot pay for them: what the line may
+    /// still spend. A builder that expands its input (a range, a width, a repeat) stops at this
+    /// many and ends through [`Self::overspent`].
+    pub(super) fn spend_cap(&self) -> usize {
+        usize::try_from(self.line.remaining()).unwrap_or(usize::MAX)
+    }
+
+    /// The end of a command that found it would build more than [`Self::spend_cap`]: the
+    /// allowance is spent, so the trace notes the work cap as the first hit, and the line stops.
+    pub(super) fn overspent(&mut self) -> CommandResult {
+        self.charge_work(self.line.remaining().saturating_add(1));
+        stopped()
+    }
+
+    /// Charge `produced` bytes of output about to be kept, as [`Self::pay_operand`] does for its
+    /// share of them but without a trip's fee: for the pieces a trip adds after it paid for the
+    /// operand.
+    pub(super) fn pay_output(&mut self, produced: usize) -> bool {
+        let produced = len_u64(produced);
+        self.read_paid = self.read_paid.saturating_add(produced);
+        self.charge_work(produced)
+    }
+
+    /// Append `piece` to `buf` after paying for its bytes; `buf` is left as it was when the line
+    /// cannot pay.
+    pub(super) fn push_paid(&mut self, buf: &mut String, piece: &str) -> bool {
+        if !self.pay_output(piece.len()) {
+            return false;
+        }
+        buf.push_str(piece);
+        true
+    }
+
+    /// Append `add` to `into` after paying for its bytes; `into` is left as it was when the line
+    /// cannot pay.
+    pub(super) fn append_paid(&mut self, into: &mut CommandResult, add: CommandResult) -> bool {
+        if !self.pay_output(add.bytes().len()) {
+            return false;
+        }
+        into.append(add);
+        true
+    }
+
     /// The most one read hands back: the line's whole allowance, as it always bounded a modeled
     /// image (busybox is 2 MiB, past `READ_CAP`). The bytes are charged to the line by the
     /// evaluator once the command returns, and a command reading several operands stops taking
@@ -210,6 +282,17 @@ impl FakeShell {
             }
         }
         Some(read)
+    }
+
+    /// Up to `cap` bytes of a configuration file a command consults for its own answer (the
+    /// passwd, hosts or meminfo file), charged by what was read as [`Self::read_charged`] does, so
+    /// a loop of such commands over a file the session grew costs the line what a loop of `cat`
+    /// does. Empty once the line cannot pay: the allowance then stays spent, and the command's
+    /// own end stops the line.
+    pub(super) fn config_bytes(&mut self, path: &str, cap: u64) -> Vec<u8> {
+        self.read_charged(path, cap)
+            .and_then(Result::ok)
+            .unwrap_or_default()
     }
 
     /// `cat`: every operand in order, standard input for `-` or no operand.

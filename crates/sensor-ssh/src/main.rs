@@ -22,7 +22,9 @@ use sensor_framework::{
     EnvError, EventEmitter, SHUTDOWN_DRAIN_TIMEOUT, WanResolver, shutdown_signal,
 };
 use sensor_ssh::hostkey::HostKey;
-use sensor_ssh::server::{DEFAULT_CAPTURE_BUDGET_BYTES, SESSION_MEMORY_POOL_BYTES};
+use sensor_ssh::server::{
+    DEFAULT_CAPTURE_BUDGET_BYTES, SESSION_MEMORY_POOL_BYTES, SESSION_OVERDRAFT_CAP_BYTES,
+};
 
 /// Every allocation is charged to the session it was made in (`session_memory`).
 #[global_allocator]
@@ -209,9 +211,11 @@ async fn main() {
     };
 
     // Every admitted session must fit in the session memory pool at its floor.
-    if let Err(e) =
-        session_memory::configure(SESSION_MEMORY_POOL_BYTES, config.bounds.max_concurrent)
-    {
+    if let Err(e) = session_memory::configure_with_overdraft(
+        SESSION_MEMORY_POOL_BYTES,
+        config.bounds.max_concurrent,
+        SESSION_OVERDRAFT_CAP_BYTES,
+    ) {
         tracing::error!(error = %e, "sensor-ssh: invalid configuration; refusing to start");
         std::process::exit(1);
     }

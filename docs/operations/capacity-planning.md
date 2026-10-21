@@ -133,7 +133,8 @@ its connections to a pool of its own the same way; its sizing is in
   arriving at once, not after the packet (`crates/sensor-mqtt/src/handler.rs#read_body`). When
   the pool has no room:
   - a session within its floor still takes what it asked for, and the pool counts it past its
-    ceiling; floors add up to the pool, so this is at most the pool again;
+    ceiling; floors add up to the pool, so this is at most the pool again, except in SSH, which
+    caps what is held that way at once (below);
   - a session past its floor gets no more: its running line stops, and after the line (for SSH
     and ADB, after the packet or message) it is ended unless it is back within what it had
     reserved or its share;
@@ -153,12 +154,21 @@ its connections to a pool of its own the same way; its sizing is in
   within its floor is given the shell and the session holding the most above its share is asked
   to let go (`crates/sensor-framework/src/session_memory.rs#make_room`). Its queued output is
   charged to the output budget, not to the session.
+- SSH bounds what sessions within their floor hold past a full pool to 13,421,773 bytes at once
+  (`crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`, half of the 26,843,547 that
+  `MemoryMax` has left; `crates/sensor-framework/src/session_memory.rs#configure_with_overdraft`).
+  Past it a shell or exec is refused (`SSH_MSG_CHANNEL_FAILURE`) and a running line is stopped,
+  the session surviving, until room returns; the holder is asked to let go each time. Room
+  returns when the session asked ends. One asked while blocked writing to a peer that does not
+  read ends at the output stall limit, 30 s (`crates/sensor-ssh/src/output.rs#OUTPUT_STALL_LIMIT`),
+  so newcomers may be refused for up to that long once the cap is spent, and no other session
+  is asked meanwhile. With the pool not full nothing is refused on the cap's account.
 
 The pool, the capture budget (40%) and, for SSH, the 64 MiB output budget leave the rest of
 `MemoryMax` to the runtime, the allocation headers and the worker threads' line working sets.
 Sessions can hold more than the pool for as long as the asked sessions take to end: what the
-sessions within their floors took past it, at most the pool again, and what a session past its
-floor allocated before its line stopped.
+sessions within their floors took past it (at most the pool again; for SSH at most its cap, above),
+and what a session past its floor allocated before its line stopped.
 
 ## Kernel socket memory
 
@@ -250,17 +260,16 @@ frees, is now kept out (below):
 | Output queued for peers, and input waiting behind it | 67,108,864 (64 MiB) | `crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; a unit of work reserves `crates/sensor-ssh/src/server.rs#OUTPUT_UNIT_BYTES` before it runs and `ChannelFlow::queue` hands out only that |
 | Sum | 442,918,501 | |
 | Runtime allowance (estimate) | 67,108,864 | code, stacks, packet buffers, the hand-off queue, allocation headers, socket memory |
-| Total against `MemoryMax=512M` (536,870,912), pool residual not counted | 510,027,365, 26,843,547 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
-| The pool's residual | 161,061,273 (the pool again) | sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms (`crates/sensor-framework/src/session_memory.rs#charge`, `crates/sensor-framework/src/session_memory.rs#make_room`); floors add up to the pool |
-| Total with the residual | 671,088,638, **134,217,726 over** | `the_worst_case_with_the_pool_again_overshoot_is_past_memorymax_until_it_is_bounded` pins it |
+| The pool's overdraft cap | 13,421,773 (half of the 26,843,547 `MemoryMax` has left) | sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms; one compare-exchange on the pool's reserved bytes stops the total past the ceiling at the cap (`crates/sensor-framework/src/session_memory.rs#charge`, `crates/sensor-framework/src/session_memory.rs#make_room`, `crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`) |
+| Sum with the cap | 456,340,274 | |
+| Total against `MemoryMax=512M` (536,870,912) | 523,449,138, 13,421,774 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
 
-The residual row is the session memory section's "at most the pool again", the same row the MQTT
-table lists. It is **not bounded under `MemoryMax` today**: it needs a full pool, every admitted
-session at its floor at once and the capture and output budgets also full, a load no measurement
-has reached, but the code does not prevent it. Closing it means bounding what floor grants may
-take past a full pool to the 26,843,547 spare above, or
-resizing a budget; either is a decision about which sessions are refused or which budget shrinks,
-open for the owner.
+Without the cap, sessions within their floor could take the pool again (161,061,273 bytes, as the
+MQTT table still lists for MQTT): 134,217,726 over `MemoryMax`. The cap is half the spare, not
+all of it, so the rest covers what the estimates miss. It bounds what is held reserved past the
+pool. A line stopped for want of room has allocated what it held until its next check, the same
+residual a session past its floor leaves. The size is a choice to revisit: a larger cap refuses
+fewer newcomers while a holder ends, a smaller one leaves more of `MemoryMax` spare.
 
 Why each term holds:
 

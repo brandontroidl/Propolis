@@ -21,20 +21,18 @@
 //! frees: the sensor pins glibc's mmap threshold so those go back to the kernel, and
 //! `capture_heap_test.rs` measures that they do. The 64 MiB set aside for it is an
 //! estimate, not a measurement (docs/operations/capacity-planning.md says so too). The overshoot
-//! the pool allows while asked sessions end (the pool again) is not in that sum: with it the worst
-//! case passes `MemoryMax`, which a separate test below pins.
+//! the pool allows while asked sessions end is a term of its own: sessions within their floor may
+//! hold room past a full pool, but the sensor caps that (`SESSION_OVERDRAFT_CAP_BYTES`, half the
+//! spare under `MemoryMax`), so it is bounded in the sum below.
 //!
 //! `MemoryMax` is read from the unit file, not restated here.
 
 use sensor_framework::session_memory::{PEAK_LIMIT_BYTES, RETAINED_LIMIT_BYTES, pool_bytes};
 use sensor_framework::{LINE_WORKING_SET_BYTES, default_capture_budget_bytes};
 use sensor_ssh::server::{
-    DEFAULT_CAPTURE_BUDGET_BYTES, OUTPUT_BUDGET_BYTES, OUTPUT_UNIT_BYTES, SPOOL_MAX_FILE_BYTES,
-    UNIT_MEMORY_MAX_BYTES,
+    DEFAULT_CAPTURE_BUDGET_BYTES, OUTPUT_BUDGET_BYTES, OUTPUT_UNIT_BYTES, RUNTIME_ALLOWANCE_BYTES,
+    SESSION_OVERDRAFT_CAP_BYTES, SPOOL_MAX_FILE_BYTES, UNIT_MEMORY_MAX_BYTES,
 };
-
-/// Room kept for everything the budgets do not charge. An estimate.
-const RUNTIME_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn workspace_file(relative: &str) -> String {
     let path = format!("{}/../../{relative}", env!("CARGO_MANIFEST_DIR"));
@@ -63,12 +61,13 @@ fn unit_memory_max() -> u64 {
     }
 }
 
-fn terms() -> [(&'static str, u64); 3] {
+fn terms() -> [(&'static str, u64); 4] {
     let memory_max = unit_memory_max();
     [
         ("capture budget", default_capture_budget_bytes(memory_max)),
         ("session pool", pool_bytes(memory_max)),
         ("output budget", OUTPUT_BUDGET_BYTES),
+        ("session pool overdraft cap", SESSION_OVERDRAFT_CAP_BYTES),
     ]
 }
 
@@ -86,29 +85,21 @@ fn the_worst_case_sum_plus_the_runtime_allowance_stays_under_memorymax() {
     );
 }
 
-/// What sessions within their floors can take past a full pool while the sessions over their share
-/// are asked to let go one at a time (`session_memory::charge`, `AccountRef::make_room`): floors
-/// add up to the pool, so at most the pool again. A term of its own, not part of the pool's.
-fn pool_again_overshoot() -> u64 {
-    pool_bytes(unit_memory_max())
-}
-
-/// OPEN GAP, pinned so it cannot go unnoticed: with the pool-again overshoot counted, the worst
-/// case does not fit `MemoryMax`. The terms above fit only because the overshoot needs the pool
-/// full and every session at its floor at once, with the capture and output budgets also full,
-/// which no measured load has reached. Bounding the overshoot (for instance capping what floor
-/// grants may take past a full pool) or resizing a budget closes it; then add the bounded term to
-/// `terms()` and delete this test. docs/operations/capacity-planning.md has the numbers.
+/// The cap is derived from the other terms, not a number of its own, and leaves real room: it is
+/// half the spare, so the sum stays under `MemoryMax` by the other half.
 #[test]
-fn the_worst_case_with_the_pool_again_overshoot_is_past_memorymax_until_it_is_bounded() {
+fn the_overdraft_cap_is_half_the_spare_under_memorymax() {
     let memory_max = unit_memory_max();
-    let base: u64 = terms().iter().map(|(_, bytes)| bytes).sum();
-    let total = base + pool_again_overshoot() + RUNTIME_ALLOWANCE_BYTES;
-    assert!(
-        total > memory_max,
-        "the overshoot now fits ({total} against {memory_max}): fold it into terms() and drop \
-         this test"
-    );
+    let others: u64 = terms()
+        .iter()
+        .filter(|(name, _)| *name != "session pool overdraft cap")
+        .map(|(_, bytes)| bytes)
+        .sum();
+    let spare = memory_max - others - RUNTIME_ALLOWANCE_BYTES;
+    assert_eq!(SESSION_OVERDRAFT_CAP_BYTES, spare / 2);
+    const {
+        assert!(SESSION_OVERDRAFT_CAP_BYTES > 0);
+    }
 }
 
 /// A line's working set is not a term of its own because the session pays for it: the limit a

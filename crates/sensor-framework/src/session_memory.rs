@@ -134,6 +134,10 @@ struct Pool {
     /// free racing its session's end can reach it first.
     orphan: AtomicI64,
     floor: AtomicU64,
+    /// Most that floor grants may hold reserved past the ceiling at once ([`configure_with_overdraft`]).
+    /// What is held past the ceiling is `reserved` over `ceiling - orphan`, so it falls as the
+    /// memory is freed and needs no counter of its own to release.
+    overdraft_cap: AtomicU64,
     /// The one session asked to let go, as its tag; 0 when none is. No other is asked until it
     /// ends, so its room is not counted twice.
     asked: AtomicU64,
@@ -145,6 +149,7 @@ static POOL: Pool = Pool {
     reserved: AtomicU64::new(0),
     orphan: AtomicI64::new(0),
     floor: AtomicU64::new(u64::MAX),
+    overdraft_cap: AtomicU64::new(u64::MAX),
     asked: AtomicU64::new(0),
     refused: AtomicU64::new(0),
 };
@@ -189,6 +194,21 @@ fn slot_of(tag: u64) -> Option<&'static Slot> {
 /// so all of them together fit. Errors when that share is too small to be useful or the table
 /// cannot hold that many sessions.
 pub fn configure(ceiling: u64, max_concurrent: u32) -> Result<(), String> {
+    configure_with_overdraft(ceiling, max_concurrent, ceiling)
+}
+
+/// [`configure`], and bound what sessions within their floor may hold reserved past a full pool
+/// to `overdraft_cap` bytes at once. A session within its floor is owed the room, so it takes it
+/// even from a full pool (the pool then asks sessions over their shares to let go, one per
+/// watchdog tick); without a bound that is the pool again, the sum of the floors. Past the cap
+/// such a request is refused until room returns: a shell is refused ([`AccountRef::make_room`]),
+/// a running line is stopped and its session survives. `configure` caps at the pool itself,
+/// which the floors never pass, so it bounds nothing.
+pub fn configure_with_overdraft(
+    ceiling: u64,
+    max_concurrent: u32,
+    overdraft_cap: u64,
+) -> Result<(), String> {
     let sessions = u64::from(max_concurrent.max(1));
     if sessions >= SLOT_COUNT as u64 {
         return Err(format!(
@@ -204,6 +224,7 @@ pub fn configure(ceiling: u64, max_concurrent: u32) -> Result<(), String> {
     }
     POOL.ceiling.store(ceiling, Ordering::Release);
     POOL.floor.store(floor, Ordering::Release);
+    POOL.overdraft_cap.store(overdraft_cap, Ordering::Release);
     Ok(())
 }
 
@@ -238,11 +259,18 @@ pub fn pool_refusals() -> u64 {
     POOL.refused.load(Ordering::Relaxed)
 }
 
-fn pool_try_reserve(bytes: u64) -> bool {
-    let limit = POOL
-        .ceiling
+/// What the pool lends out, `past_ceiling` bytes beyond its ceiling counted.
+fn pool_limit(past_ceiling: u64) -> u64 {
+    POOL.ceiling
         .load(Ordering::Acquire)
-        .saturating_sub(orphan_bytes());
+        .saturating_sub(orphan_bytes())
+        .saturating_add(past_ceiling)
+}
+
+/// Reserve `bytes` unless that passes the pool by more than `past_ceiling`. One compare-exchange
+/// on `reserved`, so concurrent grants can never together pass the bound.
+fn pool_try_reserve(bytes: u64, past_ceiling: u64) -> bool {
+    let limit = pool_limit(past_ceiling);
     POOL.reserved
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
             reserved.checked_add(bytes).filter(|next| *next <= limit)
@@ -362,7 +390,7 @@ fn charge(tag: u64, bytes: u64) {
         return;
     }
     let need = round_up_chunks(live - held);
-    if pool_try_reserve(need) {
+    if pool_try_reserve(need, 0) {
         slot.held.fetch_add(need, Ordering::AcqRel);
         return;
     }
@@ -371,16 +399,16 @@ fn charge(tag: u64, bytes: u64) {
         return;
     }
     POOL.refused.fetch_add(1, Ordering::Relaxed);
-    if live > POOL.floor.load(Ordering::Acquire) {
-        // Past its floor it takes no more while the pool is short: its line stops (and after the
-        // line it ends only if it is past its share too).
-        slot.refused.store(true, Ordering::Release);
-    } else {
-        // Within its floor it is owed the room: it takes it, and the pool, now over its ceiling,
-        // asks sessions over their shares to let go until that is paid back. Floors add up to
-        // the pool, so what is taken this way is at most the pool again.
-        POOL.reserved.fetch_add(need, Ordering::AcqRel);
+    // Within its floor it is owed the room: it takes it from a full pool, and the pool, now over
+    // its ceiling, asks sessions over their shares to let go until that is paid back. At most
+    // the overdraft cap is held that way at once; past it, or past its floor, it takes no more
+    // while the pool is short: its line stops (and after the line it ends only if it is past
+    // its share too, which a session within its floor never is).
+    let within_floor = live <= POOL.floor.load(Ordering::Acquire);
+    if within_floor && pool_try_reserve(need, POOL.overdraft_cap.load(Ordering::Acquire)) {
         slot.held.fetch_add(need, Ordering::AcqRel);
+    } else {
+        slot.refused.store(true, Ordering::Release);
     }
     ask_one(fair_share());
 }
@@ -723,8 +751,10 @@ impl AccountRef {
     /// Within its floor a session is owed the room, the rule [`charge`] applies to an allocation
     /// the pool cannot back. Refusing it here instead, on free room alone, starved every newcomer
     /// while one session held far more than its share and nothing asked it to let go, because
-    /// asking happens only when an allocation fails to reserve. Granting adds at most the floor,
-    /// and floors add up to the pool, so the overshoot stays the pool again.
+    /// asking happens only when an allocation fails to reserve. What floor grants hold past the
+    /// ceiling is bounded by the overdraft cap ([`configure_with_overdraft`]): with less than
+    /// `bytes` of it left the request is refused until room returns. That can last as long as the
+    /// session asked to let go takes to end, since no other is asked meanwhile.
     pub fn make_room(&self, bytes: u64) -> bool {
         let Some(slot) = slot_of(self.tag) else {
             return false;
@@ -735,8 +765,17 @@ impl AccountRef {
         if pool_free() >= bytes {
             return true;
         }
-        if slot.live().saturating_add(bytes) > POOL.floor.load(Ordering::Acquire) {
+        let within_floor = slot.live().saturating_add(bytes) <= POOL.floor.load(Ordering::Acquire);
+        let past_ceiling = POOL.overdraft_cap.load(Ordering::Acquire);
+        let overdraft_left =
+            pool_limit(past_ceiling).saturating_sub(POOL.reserved.load(Ordering::Acquire));
+        if !within_floor || overdraft_left < bytes {
             POOL.refused.fetch_add(1, Ordering::Relaxed);
+            if within_floor {
+                // Owed the room, only the cap is in the way: the holder is still asked, so room
+                // returns for the retry.
+                ask_one(fair_share());
+            }
             return false;
         }
         ask_one(fair_share());

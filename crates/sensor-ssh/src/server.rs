@@ -507,6 +507,21 @@ pub const DEFAULT_CAPTURE_BUDGET_BYTES: u64 = default_capture_budget_bytes(UNIT_
 /// [`UNIT_MEMORY_MAX_BYTES`], beside the capture budget's 40% and the output budget.
 pub const SESSION_MEMORY_POOL_BYTES: u64 = session_memory::pool_bytes(UNIT_MEMORY_MAX_BYTES);
 
+/// Room kept in [`UNIT_MEMORY_MAX_BYTES`] for everything no budget charges: code, task stacks,
+/// packet buffers, the hand-off queue, allocation headers, socket memory. An estimate.
+pub const RUNTIME_ALLOWANCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Most that sessions within their floor may hold reserved past a full session pool at once
+/// (`session_memory::configure_with_overdraft`): half of what `MemoryMax` has left after the
+/// pool, the capture budget, the output budget and the runtime allowance. Half, not all, so the
+/// spare also covers what those estimates miss.
+pub const SESSION_OVERDRAFT_CAP_BYTES: u64 = UNIT_MEMORY_MAX_BYTES
+    .saturating_sub(SESSION_MEMORY_POOL_BYTES)
+    .saturating_sub(DEFAULT_CAPTURE_BUDGET_BYTES)
+    .saturating_sub(OUTPUT_BUDGET_BYTES)
+    .saturating_sub(RUNTIME_ALLOWANCE_BYTES)
+    / 2;
+
 /// `serve` plus the capture hand-off, so `main` can `drain` it on shutdown, the process-wide
 /// capture memory budget `main` built from its configured ceiling, and the sensor's per-source
 /// command-event budget, which `main` flushes on shutdown. A separate function rather than a wider
@@ -1904,8 +1919,9 @@ async fn sleep_until_or_never(at: Option<Instant>) {
 }
 
 /// The room the session memory pool must give a new shell or exec: about a new shell's own heap.
-/// A fresh session's login plus its first shell reserve exactly this much (524,288 bytes, measured
-/// by `tests/session_memory_limit.rs`), so it is the least margin there is.
+/// The shell alone reserves 393,216 bytes in the first session of a process and 458,752 in a later
+/// one (64 KiB chunks; measured by `tests/shell_room_test.rs`), so this is one chunk above the
+/// worst measured.
 pub const SHELL_ROOM_BYTES: u64 = 512 * 1024;
 
 /// Whether this session may open another shell or exec: it is not over its memory limit and the

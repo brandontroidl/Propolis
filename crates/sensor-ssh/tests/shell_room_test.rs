@@ -5,7 +5,7 @@
 //! far inside their floor, while a session holding many times its share was never asked to let go
 //! (asking happens only when an allocation fails to reserve). A session within its floor is now
 //! granted the shell and the session over its share is asked to give way; a session past its own
-//! floor is still refused.
+//! floor is still refused, and so is one once the overdraft cap is spent.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -138,26 +138,44 @@ async fn a_short_pool_gives_shells_to_sessions_within_their_floor_and_asks_the_h
     session_memory::configure(u64::MAX / 2, 64).unwrap();
     settle().await;
 
-    // The room a shell is asked for must cover what the real path reserves for a new session
-    // and its first shell, at the pool's 64 KiB granularity. Measured 524,288 = SHELL_ROOM_BYTES,
-    // so there is no margin to spare: a larger login or shell heap fails here before it makes the
-    // room check admit a shell the pool cannot back.
+    // The room a shell is asked for must cover what the shell itself reserves, at the pool's
+    // 64 KiB granularity: the check gates the shell request, after the login's own heap is
+    // already held. The first session of a process reserves less (393,216 measured) than the
+    // ones after it (458,752 measured), so measure sessions after the first and take the most.
+    // The margin under SHELL_ROOM_BYTES is one chunk today; a larger shell heap fails here
+    // before it makes the room check admit a shell the pool cannot back.
+    let first_session = login(addr).await;
+    settle().await;
     let base = session_memory::pool_used();
-    let fresh = login(addr).await;
-    let (first, granted) = shell(&fresh).await;
+    let (warmup, granted) = shell(&first_session).await;
     assert!(granted);
     settle().await;
-    let reserved = session_memory::pool_used() - base;
+    println!(
+        "first session, shell-only reserve {}",
+        session_memory::pool_used() - base
+    );
+    drop((warmup, first_session));
+    settle().await;
+    let mut shell_only = 0;
+    for _ in 0..3 {
+        let fresh = login(addr).await;
+        settle().await;
+        let base = session_memory::pool_used();
+        let (first, granted) = shell(&fresh).await;
+        assert!(granted);
+        settle().await;
+        shell_only = shell_only.max(session_memory::pool_used() - base);
+        drop((first, fresh));
+        settle().await;
+    }
     assert!(
-        reserved <= SHELL_ROOM_BYTES,
-        "a new session and its first shell reserve {reserved}, over the {SHELL_ROOM_BYTES} the room check allows"
+        shell_only <= SHELL_ROOM_BYTES,
+        "a shell reserves {shell_only}, over the {SHELL_ROOM_BYTES} the room check allows"
     );
     println!(
-        "reserve {reserved} of {SHELL_ROOM_BYTES}, margin {}",
-        SHELL_ROOM_BYTES - reserved
+        "shell-only reserve {shell_only} of {SHELL_ROOM_BYTES}, margin {}",
+        SHELL_ROOM_BYTES - shell_only
     );
-    drop((first, fresh));
-    settle().await;
 
     // A holder with eight shells; the pool is then what it holds plus 400 KiB, for four
     // sessions: free room is between a newcomer's login and a shell's room, and the floor
@@ -177,7 +195,6 @@ async fn a_short_pool_gives_shells_to_sessions_within_their_floor_and_asks_the_h
 
     let mut granted = 0;
     let mut refused = 0;
-    let mut peak = 0;
     for _ in 0..20 {
         let session = login(addr).await;
         let (_channel, ok) = shell(&session).await;
@@ -186,7 +203,6 @@ async fn a_short_pool_gives_shells_to_sessions_within_their_floor_and_asks_the_h
         } else {
             refused += 1;
         }
-        peak = peak.max(session_memory::pool_used());
         drop(session);
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -199,12 +215,8 @@ async fn a_short_pool_gives_shells_to_sessions_within_their_floor_and_asks_the_h
         closes_while_idle(&mut held[0], Duration::from_secs(3)).await,
         "the session holding far over its share was asked to let go"
     );
-    // The pool counted past its ceiling is bounded by the floors that were granted: the pool
-    // again at most.
-    assert!(
-        peak <= 2 * ceiling,
-        "pool peaked at {peak} against a ceiling of {ceiling}"
-    );
+    // How far the pool may pass its ceiling is bounded by the overdraft cap, which the
+    // framework's make_room tests pin; here the load never reaches it.
     drop((held, holder));
     settle().await;
     session_memory::configure(u64::MAX / 2, 64).unwrap();
@@ -230,6 +242,37 @@ async fn a_short_pool_gives_shells_to_sessions_within_their_floor_and_asks_the_h
     );
     assert!(!big.is_closed(), "the refusal does not end the session");
     drop((channel, big));
+    settle().await;
+    session_memory::configure(u64::MAX / 2, 64).unwrap();
+
+    // With the overdraft spent (a cap of nothing here), a newcomer within its floor is refused
+    // too, the holder is still asked, and the shell is granted once the room is back.
+    let holder = login(addr).await;
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let (channel, granted) = shell(&holder).await;
+        assert!(granted);
+        held.push(channel);
+    }
+    settle().await;
+    session_memory::configure_with_overdraft(session_memory::pool_used() + 400 * 1024, 4, 0)
+        .unwrap();
+    let newcomer = login(addr).await;
+    let (_refused, granted) = shell(&newcomer).await;
+    assert!(!granted, "no overdraft left, so no shell from a short pool");
+    assert!(
+        !newcomer.is_closed(),
+        "the refusal does not end the session"
+    );
+    assert!(
+        closes_while_idle(&mut held[0], Duration::from_secs(3)).await,
+        "the holder was asked all the same"
+    );
+    drop((held, holder));
+    settle().await;
+    let (_second, granted) = shell(&newcomer).await;
+    assert!(granted, "the room is back");
+    drop((_second, newcomer));
     settle().await;
     session_memory::configure(u64::MAX / 2, 64).unwrap();
     handle.abort();

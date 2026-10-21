@@ -480,13 +480,15 @@
   refused until `max_duration` ended the holder; about 19 connections from one source at 8 MiB
   each could do it. A session that stays within its floor (the pool divided by `max_concurrent`)
   is now given the shell and the session holding the most above its share is asked to let go
-  (`session_memory::AccountRef::make_room`); a session past its own floor is still refused. A new
-  session and its first shell reserve exactly the 512 KiB the check asks for (measured, no
-  margin; a test fails first if that grows). The worst-case table in
-  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory) now lists
-  the pool-again overshoot sessions within their floor may take past a full pool: 671,088,638
-  bytes with it against `MemoryMax=512M`, 134,217,726 over, left open for a decision on how to
-  bound it.
+  (`session_memory::AccountRef::make_room`); a session past its own floor is still refused. The
+  shell alone reserves 393,216 bytes in a process's first session and 458,752 in later ones,
+  under the 512 KiB the check asks for by one 64 KiB chunk (measured; a test fails first if that
+  grows). What sessions within their floor hold past a full pool is capped at 13,421,773 bytes
+  (half of what `MemoryMax=512M` has left, `session_memory::configure_with_overdraft`): without
+  the cap that could be the pool again, 134,217,726 bytes over `MemoryMax`. Past the cap a shell
+  is refused and a running line stopped, the session kept, until the session asked to let go
+  ends, up to 30 s when its peer is not reading. See
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
 - **One typed line can no longer exhaust a shell sensor's memory or CPU through a command's
   operand loop** - the fake shell's handlers for `printenv`, `alias`, `type`, `command -V`,
   `which`, `dpkg -s`, `apt show`, `ls`, `df`, `mv`, `ln`, `touch`, `chmod`, `rm`, `mkdir`,

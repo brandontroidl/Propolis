@@ -1022,6 +1022,10 @@ captures SCP/SFTP transfers.
   `window-change`, `signal`) is not acted on. A reply is sent **only when `want_reply`
   is set**: `CHANNEL_SUCCESS` if accepted, `CHANNEL_FAILURE` for an unknown or refused
   request (`crates/sensor-ssh/src/channel.rs#handle_channel_request`, `crates/sensor-ssh/src/channel.rs#ChannelAction`, `crates/sensor-ssh/src/server.rs#build_channel_failure`).
+  A `shell` or `exec` is also refused while the session is over its memory limit, or while the
+  session memory pool has under 512 KiB left and the session would pass its floor with that much
+  added; a session within its floor is accepted and the session holding the most above its share
+  is asked to let go (`crates/sensor-ssh/src/server.rs#shell_room`, `crates/sensor-framework/src/session_memory.rs#make_room`).
 - **Interactive shell vs exec:** the `pty-req` flag selects terminal behavior. With a
   pty the shell prints its state-derived prompt, echoes typed bytes, converts bare LF
   to CR-LF with `onlcr`, and sends both streams merged on `CHANNEL_DATA`. Without a pty

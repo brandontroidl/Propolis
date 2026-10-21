@@ -148,8 +148,11 @@ its connections to a pool of its own the same way; its sizing is in
   session blocked writing to a peer that does not read ends through the output limits instead
   (the stall limit, the write timeout), and its memory counts against the pool until then. While
   one asked session is still giving its room back, the pool asks no other. SSH also refuses a new
-  shell or exec (`SSH_MSG_CHANNEL_FAILURE`) while the session is over or the pool has under 512 KiB
-  left, and its queued output is charged to the output budget, not to the session.
+  shell or exec (`SSH_MSG_CHANNEL_FAILURE`) while the session is over, or the pool has under
+  512 KiB left and the session would pass its floor with that much added; a session that stays
+  within its floor is given the shell and the session holding the most above its share is asked
+  to let go (`crates/sensor-framework/src/session_memory.rs#make_room`). Its queued output is
+  charged to the output budget, not to the session.
 
 The pool, the capture budget (40%) and, for SSH, the 64 MiB output budget leave the rest of
 `MemoryMax` to the runtime, the allocation headers and the worker threads' line working sets.
@@ -247,7 +250,17 @@ frees, is now kept out (below):
 | Output queued for peers, and input waiting behind it | 67,108,864 (64 MiB) | `crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; a unit of work reserves `crates/sensor-ssh/src/server.rs#OUTPUT_UNIT_BYTES` before it runs and `ChannelFlow::queue` hands out only that |
 | Sum | 442,918,501 | |
 | Runtime allowance (estimate) | 67,108,864 | code, stacks, packet buffers, the hand-off queue, allocation headers, socket memory |
-| Total against `MemoryMax=512M` (536,870,912) | 510,027,365, 26,843,547 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
+| Total against `MemoryMax=512M` (536,870,912), pool residual not counted | 510,027,365, 26,843,547 to spare | `crates/sensor-ssh/tests/memory_budget_test.rs` |
+| The pool's residual | 161,061,273 (the pool again) | sessions within their floor take room from a full pool until the watchdog has ended the sessions over their share, one per 200 ms (`crates/sensor-framework/src/session_memory.rs#charge`, `crates/sensor-framework/src/session_memory.rs#make_room`); floors add up to the pool |
+| Total with the residual | 671,088,638, **134,217,726 over** | `the_worst_case_with_the_pool_again_overshoot_is_past_memorymax_until_it_is_bounded` pins it |
+
+The residual row is the session memory section's "at most the pool again", the same row the MQTT
+table lists. It is **not bounded under `MemoryMax` today**: it needs a full pool, every admitted
+session at its floor at once and the capture and output budgets also full, a load no measurement
+has reached, but the code does not prevent it. Closing it means bounding what floor grants may
+take past a full pool to the 26,843,547 spare above, or
+resizing a budget; either is a decision about which sessions are refused or which budget shrinks,
+open for the owner.
 
 Why each term holds:
 

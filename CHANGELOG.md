@@ -473,6 +473,20 @@
 
 ### Fixed
 
+- **A full session-memory pool no longer starves every new SSH shell while one session holds far
+  over its share** - a shell or exec was refused whenever the pool had under 512 KiB left, but
+  that refusal never asked an over-share session to let go (only an allocation that fails to
+  reserve does), so with free room between a newcomer's login and 512 KiB, every new shell was
+  refused until `max_duration` ended the holder; about 19 connections from one source at 8 MiB
+  each could do it. A session that stays within its floor (the pool divided by `max_concurrent`)
+  is now given the shell and the session holding the most above its share is asked to let go
+  (`session_memory::AccountRef::make_room`); a session past its own floor is still refused. A new
+  session and its first shell reserve exactly the 512 KiB the check asks for (measured, no
+  margin; a test fails first if that grows). The worst-case table in
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory) now lists
+  the pool-again overshoot sessions within their floor may take past a full pool: 671,088,638
+  bytes with it against `MemoryMax=512M`, 134,217,726 over, left open for a decision on how to
+  bound it.
 - **One typed line can no longer exhaust a shell sensor's memory or CPU through a command's
   operand loop** - the fake shell's handlers for `printenv`, `alias`, `type`, `command -V`,
   `which`, `dpkg -s`, `apt show`, `ls`, `df`, `mv`, `ln`, `touch`, `chmod`, `rm`, `mkdir`,

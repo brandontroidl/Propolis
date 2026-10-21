@@ -716,6 +716,33 @@ impl AccountRef {
         slot_of(self.tag).is_some_and(|slot| is_asked(slot, self.tag))
     }
 
+    /// Whether the session may take `bytes` more (a new shell's heap) without waiting for another
+    /// to end, asking the pool to make the room when it is short. False when the session must
+    /// end, or when the pool is short and the session would pass its floor with `bytes` added.
+    ///
+    /// Within its floor a session is owed the room, the rule [`charge`] applies to an allocation
+    /// the pool cannot back. Refusing it here instead, on free room alone, starved every newcomer
+    /// while one session held far more than its share and nothing asked it to let go, because
+    /// asking happens only when an allocation fails to reserve. Granting adds at most the floor,
+    /// and floors add up to the pool, so the overshoot stays the pool again.
+    pub fn make_room(&self, bytes: u64) -> bool {
+        let Some(slot) = slot_of(self.tag) else {
+            return false;
+        };
+        if is_asked(slot, self.tag) {
+            return false;
+        }
+        if pool_free() >= bytes {
+            return true;
+        }
+        if slot.live().saturating_add(bytes) > POOL.floor.load(Ordering::Acquire) {
+            POOL.refused.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        ask_one(fair_share());
+        true
+    }
+
     /// Between lines: mark the session over when it holds more than the retained limit, or, once
     /// the pool refused it room past its floor, more than both its reservation and its share.
     /// True when it must end, for whatever reason.

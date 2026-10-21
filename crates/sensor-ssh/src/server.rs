@@ -1903,14 +1903,16 @@ async fn sleep_until_or_never(at: Option<Instant>) {
     }
 }
 
-/// The least room the session memory pool must have left for a new shell or exec: about a new
-/// shell's own heap.
-const SHELL_ROOM_BYTES: u64 = 512 * 1024;
+/// The room the session memory pool must give a new shell or exec: about a new shell's own heap.
+/// A fresh session's login plus its first shell reserve exactly this much (524,288 bytes, measured
+/// by `tests/session_memory_limit.rs`), so it is the least margin there is.
+pub const SHELL_ROOM_BYTES: u64 = 512 * 1024;
 
 /// Whether this session may open another shell or exec: it is not over its memory limit and the
-/// pool has room for one more. Always true when sessions are not accounted.
+/// pool has room for one more, or is short and the session is within its floor (then another
+/// session over its share is asked to let go). Always true when sessions are not accounted.
 fn shell_room(account: Option<AccountRef>) -> bool {
-    account.is_none_or(|a| !a.is_over() && session_memory::pool_free() >= SHELL_ROOM_BYTES)
+    account.is_none_or(|a| a.make_room(SHELL_ROOM_BYTES))
 }
 
 /// What the packet must reserve to run, and whether it must also wait for room in the channel's

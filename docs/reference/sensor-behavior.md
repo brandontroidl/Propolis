@@ -328,6 +328,26 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   the line once it passes what the line can still pay for, and a count a command is given (`tr`'s `[c*n]`, up to 2^64-2) is
   costed by its constructs, never walked. A line runs synchronously on the sensor's runtime, so
   what its allowance buys is the longest one line can hold a worker.
+- A command that loops over its operands pays for each trip before it builds that trip's output:
+  a fee of 64 steps (`crates/sensor-framework/src/shell/read.rs#OPERAND_COST`), the operand's
+  bytes and the bytes the trip is about to add (`pay_operand`, `push_paid` and `append_paid` in
+  the same file), so a line that gives `printenv`, `alias`, `type`, `command -V`, `which`,
+  `dpkg -s`, `apt show`, `ls`, `df`, `mv`, `ln`, `touch`, `chmod`, `rm`, `mkdir`, `rmdir`, `kill`,
+  `realpath` or `readlink` more operands than the allowance can pay for (about 65,000 at the
+  fee alone) ends there, as when the allowance runs out anywhere else, and a reader that goes
+  through `read_operand` (`cat`, `head`, `tail`, `wc`, `od`, the checksum tools) pays the fee for
+  each file it opens, present or not. A builder whose output outgrows its input stops at what the
+  line can still spend: `stat -c`/`--printf` pads a directive with a width up to 4096 bytes, the
+  Android `tr` expands ranges and classes (`expand_set`), `pgrep -d` and `pidof -S` place the
+  session's delimiter between every two rows, and `chattr` charges each change for each node it
+  visits. The configuration files a command consults for its answer (`/etc/passwd`,
+  `/etc/group`, `/etc/hosts`, `/proc/meminfo`, `/proc/cpuinfo`) are charged by size on each
+  read (`config_bytes`), so a loop of `getent`, `nslookup`, `free`, `nproc` or `ls -l` over a
+  file the session grew to its 64 KiB cap stops where a loop of `cat` would. GNU `tr` reads a
+  SET in linear time (the search for a closing `:]` or `]` remembers where the last one ended)
+  and is charged for the SET's bytes first, `env NAME=VALUE...` finds each name's slot in a hash
+  map, and the toybox option check, which adb runs before an applet, charges the option words'
+  bytes and keeps one entry per distinct letter.
 - On SSH, telnet and ADB the session's own heap is counted too
   (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
   may hold while a line runs stops at its next step, as when its work allowance runs out (the

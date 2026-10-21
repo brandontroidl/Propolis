@@ -473,6 +473,25 @@
 
 ### Fixed
 
+- **One typed line can no longer exhaust a shell sensor's memory or CPU through a command's
+  operand loop** - the fake shell's handlers for `printenv`, `alias`, `type`, `command -V`,
+  `which`, `dpkg -s`, `apt show`, `ls`, `df`, `mv`, `ln`, `touch`, `chmod`, `rm`, `mkdir`,
+  `rmdir`, `kill`, `realpath`, `readlink` and `chattr` answered every operand before the line's
+  work allowance was looked at, and the accounting allocator only counts, so the line ran to
+  completion first. One 8 KB line (`printenv X` four thousand times over a 150 KB value) held
+  1.2 GiB of heap, `realpath -m` over 96,000 operands held 792 MiB, and `dpkg -s` over 132,000
+  names held 1.17 GiB, past the 256 MB and 512 MB units' limits. Each trip now pays a fee, the
+  operand's bytes and its output before the output is built, and a line that cannot pay stops
+  there. The same line shape held a runtime worker through quadratic work that was never
+  charged: a GNU `tr` SET with an opener and no closer (`[:` or `[a*` repeated), the toybox
+  option check on `base64 -ddd...` (362 s for 2 million letters on the adb sensor), and
+  `env NAME=VALUE` with tens of thousands of operands, are now linear; a `stat -c` width
+  (`%4096n`, 4096 bytes per directive per operand), `pgrep -d`/`pidof -S` with a megabyte
+  delimiter, the Android `tr` expanding ranges and classes into tens of megabytes, and `chattr`
+  applying every change to every file are charged before they are built; and the passwd, group,
+  hosts, meminfo and cpuinfo files a command consults, which a session can grow to 64 KiB, are
+  charged by size on each read, so a loop of `getent`, `nslookup`, `free`, `nproc` or `ls -l`
+  stops. Ordinary output is unchanged. See [sensor behavior](docs/reference/sensor-behavior.md).
 - **One scanner can no longer fill the sensor journals** - rustls logged a WARN for what a
   scanner's malformed TLS hello causes (`Illegal SNI extension: ignoring IP address presented as
   hostname (<hex>)`, which carries the box's own address whenever the scanner targets it by IP;

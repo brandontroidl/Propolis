@@ -116,7 +116,7 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 4795 test functions** (2938 unit + 1857 integration).
+- **Total: 4813 test functions** (2943 unit + 1870 integration).
 - **DB-backed (`sqlx::test`): 470** - console 255, review 109, core-scoring 48,
   intake 30, feed 12, fleet 9, propolis 7. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
@@ -166,7 +166,7 @@ Per-crate breakdown:
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1500 | 306 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1505 | 319 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
@@ -178,7 +178,7 @@ Per-crate breakdown:
 | sensor-wire | 18 | 0 | - |
 | shipper | 4 | 28 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **2938** | **1857** | |
+| **Total** | **2943** | **1870** | |
 
 ### Test styles by layer
 

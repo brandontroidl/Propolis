@@ -346,8 +346,8 @@ I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exe
   file the session grew to its 64 KiB cap stops where a loop of `cat` would. GNU `tr` reads a
   SET in linear time (the search for a closing `:]` or `]` remembers where the last one ended)
   and is charged for the SET's bytes first, `env NAME=VALUE...` finds each name's slot in a hash
-  map, and the toybox option check, which adb runs before an applet, charges the option words'
-  bytes and keeps one entry per distinct letter.
+  map, and adb charges every Android command's argument bytes before dispatch (the toybox
+  option check among them), which keeps one entry per distinct letter.
 - On SSH, telnet and ADB the session's own heap is counted too
   (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
   may hold while a line runs stops at its next step, as when its work allowance runs out (the

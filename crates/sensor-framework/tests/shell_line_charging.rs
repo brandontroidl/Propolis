@@ -109,9 +109,9 @@ fn measure(android: bool, setup: &[String], probe: &str) -> Cost {
         }
         let base = CURRENT.load(Ordering::Relaxed);
         PEAK.store(base, Ordering::Relaxed);
-        let started = Instant::now();
+        let started = thread_cpu();
         let (out, _) = shell.handle_input(&probe);
-        let elapsed = started.elapsed();
+        let elapsed = thread_cpu().saturating_sub(started);
         let peak_growth = PEAK.load(Ordering::Relaxed).saturating_sub(base);
         let output = out.bytes().len();
         let head = String::from_utf8_lossy(out.bytes().get(..output.min(100)).unwrap_or(&[]))
@@ -143,9 +143,33 @@ thread_local! {
     static BROKEN: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The time a line may take beyond its control's (a debug build runs the handlers an order of
-/// magnitude slower than a release one, and every handler's cost is a step count).
-const TIME_BOUND: Duration = Duration::from_secs(5);
+/// The CPU time a line may take beyond its control's (a debug build runs the handlers an order of
+/// magnitude slower than a release one, and every handler's cost is a step count). Main took 50 to
+/// 400 s on these inputs, so the bound still tells the two apart with room for a slow runner.
+const TIME_BOUND: Duration = Duration::from_secs(10);
+
+/// This thread's CPU time (user plus system) from `/proc/thread-self/stat`. Wall time failed the
+/// bound whenever other work shared the core (one busy loop pushed cases to 5.5-6.6 s); a thread's
+/// CPU time does not grow while it waits for the core. The probe runs on this thread (one poll of
+/// a no-op waker). Ticks are taken as 100 a second, the Linux `USER_HZ`; where the file cannot be
+/// read the wall clock stands in.
+fn thread_cpu() -> Duration {
+    static WALL: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let ticks = std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()
+        .and_then(|stat| {
+            let after = stat.get(stat.rfind(')')? + 1..)?;
+            let fields: Vec<&str> = after.split_whitespace().collect();
+            // Field 3 (state) is the first after the command name; utime is 14, stime 15.
+            let utime: u64 = fields.get(11)?.parse().ok()?;
+            let stime: u64 = fields.get(12)?.parse().ok()?;
+            Some(utime + stime)
+        });
+    match ticks {
+        Some(ticks) => Duration::from_millis(ticks * 10),
+        None => WALL.get_or_init(Instant::now).elapsed(),
+    }
+}
 
 /// The bound every case holds: the heap the line grew past what its control did (the same
 /// operands given to `true`, which is what building the argument list costs) stays within one
@@ -264,7 +288,9 @@ fn sys1_gnu_tr_set_parsing_is_linear() {
 // SYS-2: stat -c / --printf pads each directive to 4096 with no output bound.
 #[test]
 fn sys2_stat_format_padding_is_bounded() {
-    let format = format!("$({})", awk_repeat("%%4096n", 1_000));
+    // 6,000 directives: enough that one operand's render alone would pass the line working set if
+    // the render cap were gone (32 MiB measured), not only the per-operand charge stopping the line.
+    let format = format!("$({})", awk_repeat("%%4096n", 6_000));
     probe(
         false,
         "SYS-2 stat -c over eight operands",

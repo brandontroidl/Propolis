@@ -22,12 +22,21 @@
 //! `capture_heap_test.rs` measures that they do. The 64 MiB set aside for it is an
 //! estimate, not a measurement (docs/operations/capacity-planning.md says so too). The overshoot
 //! the pool allows while asked sessions end is a term of its own: sessions within their floor may
-//! hold room past a full pool, but the sensor caps that (`SESSION_OVERDRAFT_CAP_BYTES`, half the
-//! spare under `MemoryMax`), so it is bounded in the sum below.
+//! hold room past a full pool, and the sensor caps what is RESERVED that way
+//! (`SESSION_OVERDRAFT_CAP_BYTES`, half the spare under `MemoryMax`).
+//!
+//! The cap bounds reserved room, not live bytes, and the table does not close: a session the cap
+//! refuses keeps what it allocated until it is ended, non-shell allocations (key exchange, login,
+//! packets) are never stopped, and the cap is checked without reserving. That unreserved remainder
+//! is bounded by about the sum of the session shares, up to the pool again, and takes the total
+//! past `MemoryMax`. `the_unreserved_residual_still_takes_the_total_past_memorymax` pins that open
+//! gap; the owner's decision on closing it (docs/operations/capacity-planning.md) replaces it.
 //!
 //! `MemoryMax` is read from the unit file, not restated here.
 
-use sensor_framework::session_memory::{PEAK_LIMIT_BYTES, RETAINED_LIMIT_BYTES, pool_bytes};
+use sensor_framework::session_memory::{
+    CHUNK_BYTES, PEAK_LIMIT_BYTES, RETAINED_LIMIT_BYTES, pool_bytes,
+};
 use sensor_framework::{LINE_WORKING_SET_BYTES, default_capture_budget_bytes};
 use sensor_ssh::server::{
     DEFAULT_CAPTURE_BUDGET_BYTES, OUTPUT_BUDGET_BYTES, OUTPUT_UNIT_BYTES, RUNTIME_ALLOWANCE_BYTES,
@@ -71,8 +80,10 @@ fn terms() -> [(&'static str, u64); 4] {
     ]
 }
 
+/// The reserved terms only: what the budgets and the capped overdraft hold. Not the worst case of
+/// live bytes; see `the_unreserved_residual_still_takes_the_total_past_memorymax`.
 #[test]
-fn the_worst_case_sum_plus_the_runtime_allowance_stays_under_memorymax() {
+fn the_reserved_terms_plus_the_runtime_allowance_stay_under_memorymax() {
     let memory_max = unit_memory_max();
     let terms = terms();
     let sum: u64 = terms.iter().map(|(_, bytes)| bytes).sum();
@@ -83,6 +94,57 @@ fn the_worst_case_sum_plus_the_runtime_allowance_stays_under_memorymax() {
          {memory_max}",
         report.join(" + ")
     );
+}
+
+/// Live bytes a session the cap refused keeps (and non-shell allocations the cap never stops) are
+/// bounded by the sum of the session shares, each rounded up to whole chunks: the pool again, and
+/// more. With the reserved terms the total is over `MemoryMax`. This is the open gap, pinned so
+/// the table cannot be read as closed; when the owner closes it (refuse a cap-refused session's
+/// excess, reserve a login allowance at admission, or accept it) this test changes with the docs.
+#[test]
+fn the_unreserved_residual_still_takes_the_total_past_memorymax() {
+    let main = main_source();
+    assert!(
+        main.contains("const DEFAULT_MAX_CONCURRENT: u32 = 256;"),
+        "the residual below is sized for 256 sessions"
+    );
+    let memory_max = unit_memory_max();
+    let share = pool_bytes(memory_max) / 256;
+    let residual = 256 * share.div_ceil(CHUNK_BYTES) * CHUNK_BYTES;
+    assert_eq!(residual, 167_772_160);
+    let reserved: u64 =
+        terms().iter().map(|(_, bytes)| bytes).sum::<u64>() + RUNTIME_ALLOWANCE_BYTES;
+    assert_eq!(reserved + residual, 691_221_298);
+    assert!(
+        reserved + residual > memory_max,
+        "the table now fits MemoryMax with the unreserved residual: update \
+         docs/operations/capacity-planning.md and this test together"
+    );
+}
+
+/// The cap exists only if `main` installs it: `configure` leaves floor grants unlimited, so a
+/// `main` that called it would run without the bound and every other test here would stay green.
+/// Reads `main.rs`, like the mmap-threshold check; that the cap acts is `make_room.rs`.
+#[test]
+fn main_configures_the_pool_with_the_overdraft_cap() {
+    let main = main_source();
+    let configured = main
+        .find("session_memory::configure_with_overdraft(")
+        .expect("main configures the pool with an overdraft cap");
+    let call = &main[configured..];
+    let call = &call[..call.find(';').expect("the call ends")];
+    assert!(
+        call.contains("SESSION_MEMORY_POOL_BYTES") && call.contains("SESSION_OVERDRAFT_CAP_BYTES"),
+        "the cap passed is SESSION_OVERDRAFT_CAP_BYTES over the session pool: {call}"
+    );
+    assert!(
+        !main.contains("session_memory::configure("),
+        "main must not configure the pool without the cap"
+    );
+    let served = main
+        .find("sensor_ssh::serve_with_handoff(")
+        .expect("main serves");
+    assert!(configured < served, "the pool is configured before serving");
 }
 
 /// The cap is derived from the other terms, not a number of its own, and leaves real room: it is

@@ -194,7 +194,7 @@ fn slot_of(tag: u64) -> Option<&'static Slot> {
 /// so all of them together fit. Errors when that share is too small to be useful or the table
 /// cannot hold that many sessions.
 pub fn configure(ceiling: u64, max_concurrent: u32) -> Result<(), String> {
-    configure_with_overdraft(ceiling, max_concurrent, ceiling)
+    configure_with_overdraft(ceiling, max_concurrent, u64::MAX)
 }
 
 /// [`configure`], and bound what sessions within their floor may hold reserved past a full pool
@@ -202,8 +202,15 @@ pub fn configure(ceiling: u64, max_concurrent: u32) -> Result<(), String> {
 /// even from a full pool (the pool then asks sessions over their shares to let go, one per
 /// watchdog tick); without a bound that is the pool again, the sum of the floors. Past the cap
 /// such a request is refused until room returns: a shell is refused ([`AccountRef::make_room`]),
-/// a running line is stopped and its session survives. `configure` caps at the pool itself,
-/// which the floors never pass, so it bounds nothing.
+/// a running line is stopped and its session survives. `configure` passes `u64::MAX`, which
+/// bounds nothing: floor grants stay unlimited. (A cap equal to the pool is not that: grants are
+/// whole 64 KiB chunks, so floors that are not a multiple of one sum to more than the pool, and
+/// such a cap refuses grants the floors owe.)
+///
+/// The cap bounds what is held RESERVED past the ceiling, not live bytes. A session the cap
+/// refuses keeps what it already allocated until [`AccountRef::check_retained`] ends it, and
+/// allocations that are not shell heap (key exchange, login, packets) are never stopped by it.
+/// That unreserved remainder is bounded by about the sum of the session shares.
 pub fn configure_with_overdraft(
     ceiling: u64,
     max_concurrent: u32,
@@ -755,6 +762,10 @@ impl AccountRef {
     /// ceiling is bounded by the overdraft cap ([`configure_with_overdraft`]): with less than
     /// `bytes` of it left the request is refused until room returns. That can last as long as the
     /// session asked to let go takes to end, since no other is asked meanwhile.
+    ///
+    /// The cap is checked here without reserving, so concurrent callers can each pass it, and
+    /// only RESERVED bytes count against it: live bytes a refused session allocated beyond its
+    /// reservation are not counted (see [`configure_with_overdraft`]).
     pub fn make_room(&self, bytes: u64) -> bool {
         let Some(slot) = slot_of(self.tag) else {
             return false;

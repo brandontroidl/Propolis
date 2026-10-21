@@ -255,6 +255,65 @@ fn concurrent_floor_grants_past_a_full_pool_never_pass_the_cap_and_are_given_bac
     reset_pool();
 }
 
+/// A refusal for the cap's sake still asks the holder to let go: room only returns for the retry
+/// if somebody is ending.
+#[test]
+fn a_shell_refused_for_the_cap_still_asks_the_holder_to_yield() {
+    let _guard = exclusive();
+    // A cap of nothing: any request on a full pool is refused for it.
+    let ((buf, holder, holder_open), _) = full_pool(4 * 1024 * 1024, 8, 0);
+    let (_, newcomer, newcomer_open) = in_session(|| ());
+    assert!(!holder.is_over());
+
+    assert!(
+        !newcomer.make_room(CHUNK_BYTES),
+        "within its floor, but nothing of the cap is left"
+    );
+    assert!(
+        holder.is_over(),
+        "the refusal asked the session far over its share to let go"
+    );
+    assert!(!newcomer.is_over());
+
+    drop((buf, holder_open, newcomer_open));
+    reset_pool();
+}
+
+/// `configure` is the framework default for telnet, ADB and MQTT and must grant floors exactly as
+/// before the cap existed: unlimited. Sixty-three sessions within their floor, each needing two
+/// chunks, take twice the ceiling from a full pool; a cap of the ceiling would stop about half.
+#[test]
+fn configure_leaves_floor_grants_past_a_full_pool_unlimited() {
+    let _guard = exclusive();
+    session_memory::configure(u64::MAX / 2, 256).unwrap();
+    let holder = in_session(|| vec![0u8; 4 * 1024 * 1024]);
+    let ceiling = session_memory::pool_used();
+    let sessions = 64u32;
+    session_memory::configure(ceiling, sessions).unwrap();
+    let floor = ceiling / u64::from(sessions);
+    let len = (floor - 200) as usize;
+
+    let mut stopped = 0;
+    let mut kept = Vec::new();
+    for _ in 0..(sessions - 1) {
+        let ((buf, over), account, open) = in_session(move || {
+            let v = vec![0u8; len];
+            (v, session_memory::current_over())
+        });
+        assert!(account.live() <= floor, "within its floor");
+        stopped += u32::from(over);
+        kept.push((buf, open));
+    }
+    assert!(
+        session_memory::pool_used() - ceiling > ceiling,
+        "the grants passed twice the ceiling, so a cap of the ceiling would have refused some"
+    );
+    assert_eq!(stopped, 0, "configure stopped {stopped} within-floor lines");
+
+    drop((kept, holder));
+    reset_pool();
+}
+
 #[test]
 fn the_cap_does_not_touch_a_pool_that_has_room() {
     let _guard = exclusive();

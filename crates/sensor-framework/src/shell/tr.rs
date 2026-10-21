@@ -129,11 +129,29 @@ fn class_of(rest: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((set, name.len()))
 }
 
-/// `expand_set`: escapes, `a-z` ranges, `[:class:]` and `[=c=]`, as the release does.
-fn expand_set(arg: &[u8]) -> Result<Vec<u8>, String> {
+/// Why a SET did not expand.
+#[derive(Debug, PartialEq, Eq)]
+enum SetError {
+    /// The tool's own refusal, worded as the release words it.
+    Refused(String),
+    /// The set grew past the bytes the caller will hold; it is not built any further.
+    Oversized,
+}
+
+fn refused(text: &str) -> SetError {
+    SetError::Refused(text.to_string())
+}
+
+/// `expand_set`: escapes, `a-z` ranges, `[:class:]` and `[=c=]`, as the release does. A range
+/// or a class makes a set many times longer than its text, so the expansion stops once it holds
+/// more than `cap` bytes.
+fn expand_set(arg: &[u8], cap: usize) -> Result<Vec<u8>, SetError> {
     let mut set = Vec::new();
     let mut at = 0usize;
     while let Some(&c) = arg.get(at) {
+        if set.len() > cap {
+            return Err(SetError::Oversized);
+        }
         let next = arg.get(at.saturating_add(1)).copied().unwrap_or(0);
         if c == b'\\' {
             let (value, resume) = escape(arg, at.saturating_add(1));
@@ -145,7 +163,7 @@ fn expand_set(arg: &[u8]) -> Result<Vec<u8>, String> {
             let end = arg.get(at.saturating_add(2)).copied().unwrap_or(0);
             if end != 0 {
                 if c > end {
-                    return Err("reverse colating order: Success".to_string());
+                    return Err(refused("reverse colating order: Success"));
                 }
                 set.extend(c..=end);
                 at = at.saturating_add(3);
@@ -165,7 +183,7 @@ fn expand_set(arg: &[u8]) -> Result<Vec<u8>, String> {
             let closes = arg.get(at_c.saturating_add(1)) == Some(&b'=')
                 && arg.get(at_c.saturating_add(2)) == Some(&b']');
             if !closes {
-                return Err("bad equiv class".to_string());
+                return Err(refused("bad equiv class"));
             }
             // The release does not step past the class: its character is read again as text.
             at = at_c;
@@ -173,6 +191,9 @@ fn expand_set(arg: &[u8]) -> Result<Vec<u8>, String> {
         }
         set.push(c);
         at = at.saturating_add(1);
+    }
+    if set.len() > cap {
+        return Err(SetError::Oversized);
     }
     Ok(set)
 }
@@ -206,21 +227,42 @@ impl FakeShell {
         let Some(first) = sets.first() else {
             return fail("Needs 1 argument");
         };
-        let mut set1 = match expand_set(first.as_bytes()) {
+        // What the line may still spend bounds each set: a byte of a set costs the line a unit,
+        // paid as the set is built, so ranges and classes cannot make tens of megabytes from a
+        // line the allowance admits.
+        let mut set1 = match expand_set(first.as_bytes(), self.spend_cap()) {
             Ok(set) => set,
-            Err(text) => return fail(&text),
+            Err(SetError::Refused(text)) => return fail(&text),
+            Err(SetError::Oversized) => return self.overspent(),
         };
+        if !self.charge_work(len_u64(set1.len())) {
+            return stopped();
+        }
         if complement {
-            set1 = (0..=255u8).filter(|b| !set1.contains(b)).collect();
+            let mut named = [false; 256];
+            for &byte in &set1 {
+                if let Some(slot) = named.get_mut(usize::from(byte)) {
+                    *slot = true;
+                }
+            }
+            set1 = (0..=255u8)
+                .filter(|b| !named.get(usize::from(*b)).copied().unwrap_or(false))
+                .collect();
         }
         let set2 = match sets.get(1) {
             Some(&"") => return fail("set2 can't be empty string"),
-            Some(text) => match expand_set(text.as_bytes()) {
+            Some(text) => match expand_set(text.as_bytes(), self.spend_cap()) {
                 Ok(set) => Some(set),
-                Err(text) => return fail(&text),
+                Err(SetError::Refused(text)) => return fail(&text),
+                Err(SetError::Oversized) => return self.overspent(),
             },
             None => None,
         };
+        if let Some(set2) = &set2
+            && !self.charge_work(len_u64(set2.len()))
+        {
+            return stopped();
+        }
 
         let mut map: Vec<u16> = (0..=255u16).collect();
         if delete {
@@ -279,6 +321,22 @@ impl FakeShell {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// [`super::expand_set`] with no cap, as the set tests below want it.
+    fn expand_set(arg: &[u8]) -> Result<Vec<u8>, SetError> {
+        super::expand_set(arg, usize::MAX)
+    }
+
+    #[test]
+    fn a_set_past_the_cap_stops_expanding() {
+        // Each `!-~` is 94 bytes: the cap is met long before the text ends.
+        let text = b"!-~".repeat(1_000);
+        assert_eq!(super::expand_set(&text, 1_000), Err(SetError::Oversized));
+        assert_eq!(
+            super::expand_set(&text, 1_000_000).map(|set| set.len()),
+            Ok(94_000)
+        );
+    }
 
     fn phone() -> FakeShell {
         let ctx = crate::shell::EmitContext {
@@ -378,7 +436,7 @@ mod tests {
     #[test]
     fn a_backwards_range_and_a_broken_equivalence_class_are_refused() {
         assert!(expand_set(b"z-a").is_err());
-        assert_eq!(expand_set(b"[=a").unwrap_err(), "bad equiv class");
+        assert_eq!(expand_set(b"[=a").unwrap_err(), refused("bad equiv class"));
     }
 
     #[test]

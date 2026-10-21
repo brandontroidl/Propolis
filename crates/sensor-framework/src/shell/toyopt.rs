@@ -244,7 +244,12 @@ pub(super) fn check(applet: &str, args: &[&str]) -> Option<String> {
                 return fail(format!("Unknown option {rest}"));
             };
             rest = rest.get(letter.len_utf8()..).unwrap_or("");
-            given.push(letter);
+            // A letter given twice changes nothing a group test reads, so the list holds each
+            // letter once: a word of a million letters is a million lookups in a list of the
+            // applet's few options, not in a list as long as the word.
+            if !given.contains(&letter) {
+                given.push(letter);
+            }
             if let Some(group) = spec.exclusive.iter().find(|g| {
                 g.contains(&letter) && g.iter().any(|m| *m != letter && given.contains(m))
             }) && let Some(other) = group.iter().find(|m| **m != letter && given.contains(m))

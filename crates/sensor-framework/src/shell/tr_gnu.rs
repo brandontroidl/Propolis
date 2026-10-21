@@ -32,6 +32,8 @@
 //! Output is never longer than the input, so reading through the shared bounded reader bounds it.
 //! Building the sets costs at most 256 steps per construct: a `[c*n]` count (up to 2^64-2) is
 //! never walked a byte at a time as `tr.c` walks it, since the line runs on the sensor's runtime.
+//! Reading a SET is linear in its length (a search for a closing `:]` or `]` remembers where it
+//! ended), and the line is charged for the SET's bytes before it is read.
 #![deny(
     clippy::arithmetic_side_effects,
     clippy::unwrap_used,
@@ -40,6 +42,12 @@
 
 use super::texttools::stopped;
 use super::{CommandResult, FakeShell, len_u64};
+
+/// Heap held per byte of a SET while it is parsed: its 16-byte construct, the unescaped copy and
+/// the flag that marks it escaped. Charged to the line before the SET is read, so a SET as long
+/// as the line's allowance (a variable repeated into one operand) stops the line instead of
+/// building tens of megabytes of constructs.
+const SET_BYTE_COST: u64 = 24;
 
 /// The largest repeat count: `UINTMAX_MAX - 1`, as `tr.c` reserves the top value for a state.
 const REPEAT_MAX: u64 = u64::MAX - 1;
@@ -548,14 +556,68 @@ fn unquote(s: &[u8], diag: &mut Diag<'_>) -> Esc {
     esc
 }
 
+/// Where the last search of a kind stopped, as `(searched from, first hit at or after it)`. The
+/// searches of one SET start further along each time, and a SET with an opener `[:` or `[a*` and
+/// no closer sends every one of them to the end of the text: the same stretch scanned once per
+/// opener, quadratic in the SET's length. A search that starts at or before the last hit, and
+/// after the point searched from, has the same first hit, so it need not scan again.
+#[derive(Clone, Copy)]
+struct Hit(usize, Option<usize>);
+
+impl Hit {
+    /// The remembered first hit for a search from `start`, if the last search answers it.
+    fn answers(self, start: usize) -> Option<Option<usize>> {
+        let Self(from, found) = self;
+        let covered = match found {
+            Some(at) => from <= start && start <= at,
+            None => from <= start,
+        };
+        covered.then_some(found)
+    }
+}
+
+/// The searches of one SET (see [`Hit`]): one for each closing delimiter and one for a repeat's
+/// end.
+#[derive(Default)]
+struct Searches {
+    closing: [Option<Hit>; 2],
+    repeat_end: Option<Hit>,
+}
+
 /// `find_closing_delim`: the index of the first unescaped `delim` followed by an unescaped `]`.
-fn find_closing_delim(es: &Esc, start: usize, delim: u8) -> Option<usize> {
-    (start..es.len().saturating_sub(1)).find(|&i| {
+fn find_closing_delim(es: &Esc, searches: &mut Searches, start: usize, delim: u8) -> Option<usize> {
+    let slot = usize::from(delim == b'=');
+    if let Some(answer) = searches
+        .closing
+        .get(slot)
+        .copied()
+        .flatten()
+        .and_then(|hit| hit.answers(start))
+    {
+        return answer;
+    }
+    let found = (start..es.len().saturating_sub(1)).find(|&i| {
         es.at(i) == delim
             && es.at(i.saturating_add(1)) == b']'
             && !es.escaped_at(i)
             && !es.escaped_at(i.saturating_add(1))
-    })
+    });
+    if let Some(remembered) = searches.closing.get_mut(slot) {
+        *remembered = Some(Hit(start, found));
+    }
+    found
+}
+
+/// The first index at or after `start` that ends the text a `[c*n]` count is read from: an
+/// escaped byte, an unescaped `]`, or the end of the SET.
+fn repeat_stop(es: &Esc, searches: &mut Searches, start: usize) -> usize {
+    let end = es.len().max(start);
+    if let Some(answer) = searches.repeat_end.and_then(|hit| hit.answers(start)) {
+        return answer.unwrap_or(end);
+    }
+    let found = (start..es.len()).find(|&i| es.escaped_at(i) || es.at(i) == b']');
+    searches.repeat_end = Some(Hit(start, found));
+    found.unwrap_or(end)
 }
 
 /// `star_digits_closebracket`: the text at `idx` is `\*[0-9]*\]` with nothing escaped.
@@ -607,6 +669,7 @@ fn parse_count(digits: &[u8]) -> Option<u64> {
 /// just before `start`, `Ok(None)` when it is not one, `Err` after reporting a bad count.
 fn find_bracketed_repeat(
     es: &Esc,
+    searches: &mut Searches,
     start: usize,
     diag: &mut Diag<'_>,
 ) -> Result<Option<(u8, u64, usize)>, ()> {
@@ -614,30 +677,28 @@ fn find_bracketed_repeat(
         return Ok(None);
     }
     let first = start.saturating_add(2);
-    let mut i = first;
-    while i < es.len() && !es.escaped_at(i) {
-        if es.at(i) == b']' {
-            let digits = es.bytes.get(first..i).unwrap_or(&[]);
-            let count = if digits.is_empty() {
-                0
-            } else if let Some(count) = parse_count(digits) {
-                count
-            } else {
-                diag.say(&format!(
-                    "invalid repeat count {} in [c*n] construct",
-                    diag.quote(&printable_str(digits))
-                ));
-                return Err(());
-            };
-            return Ok(Some((es.at(start), count, i)));
-        }
-        i = i.saturating_add(1);
+    let stop = repeat_stop(es, searches, first);
+    if stop < es.len() && !es.escaped_at(stop) {
+        let digits = es.bytes.get(first..stop).unwrap_or(&[]);
+        let count = if digits.is_empty() {
+            0
+        } else if let Some(count) = parse_count(digits) {
+            count
+        } else {
+            diag.say(&format!(
+                "invalid repeat count {} in [c*n] construct",
+                diag.quote(&printable_str(digits))
+            ));
+            return Err(());
+        };
+        return Ok(Some((es.at(start), count, stop)));
     }
     Ok(None)
 }
 
 /// `build_spec_list`: the constructs of one SET.
 fn build_spec_list(es: &Esc, diag: &mut Diag<'_>) -> Option<Vec<Elem>> {
+    let mut searches = Searches::default();
     let mut elems = Vec::new();
     let mut i = 0usize;
     while i.saturating_add(2) < es.len() {
@@ -646,7 +707,7 @@ fn build_spec_list(es: &Esc, diag: &mut Diag<'_>) -> Option<Vec<Elem>> {
             let mut done = false;
             if es.is(i.saturating_add(1), b':') || es.is(i.saturating_add(1), b'=') {
                 let from = i.saturating_add(2);
-                if let Some(close) = find_closing_delim(es, from, delim) {
+                if let Some(close) = find_closing_delim(es, &mut searches, from, delim) {
                     let name = es.bytes.get(from..close).unwrap_or(&[]);
                     if name.is_empty() {
                         diag.say(if delim == b':' {
@@ -694,7 +755,7 @@ fn build_spec_list(es: &Esc, diag: &mut Diag<'_>) -> Option<Vec<Elem>> {
             if done {
                 continue;
             }
-            match find_bracketed_repeat(es, i.saturating_add(1), diag) {
+            match find_bracketed_repeat(es, &mut searches, i.saturating_add(1), diag) {
                 Ok(Some((c, count, close))) => {
                     elems.push(Elem::Repeat(c, count));
                     i = close.saturating_add(1);
@@ -1153,6 +1214,13 @@ impl FakeShell {
             return diag.fail(1);
         }
 
+        let set_bytes = operands
+            .iter()
+            .map(|operand| len_u64(operand.len()))
+            .fold(0u64, u64::saturating_add);
+        if !self.charge_work(set_bytes.saturating_mul(SET_BYTE_COST)) {
+            return stopped();
+        }
         let Some(mut s1) = operands.first().and_then(|a| parse_set(a, &mut diag)) else {
             return diag.fail(1);
         };
@@ -1218,5 +1286,81 @@ impl FakeShell {
         let mut result = CommandResult::stderr(0, diag.text);
         result.append(CommandResult::stdout(out));
         result
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    /// A SET's text of the characters the searches look at, with some of them escaped.
+    fn random_set(seed: &mut u64, len: usize) -> Esc {
+        const ALPHABET: &[u8] = b"[]:=*a0-";
+        let mut next = || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        let mut bytes = Vec::new();
+        let mut escaped = Vec::new();
+        for _ in 0..len {
+            bytes.push(ALPHABET[(next() % ALPHABET.len() as u64) as usize]);
+            escaped.push(next() % 6 == 0);
+        }
+        Esc { bytes, escaped }
+    }
+
+    /// The scan the searches made before they remembered where the last one ended.
+    fn scanned_closing(es: &Esc, start: usize, delim: u8) -> Option<usize> {
+        (start..es.len().saturating_sub(1)).find(|&i| {
+            es.at(i) == delim && es.at(i + 1) == b']' && !es.escaped_at(i) && !es.escaped_at(i + 1)
+        })
+    }
+
+    fn scanned_stop(es: &Esc, start: usize) -> usize {
+        let mut i = start;
+        while i < es.len() && !es.escaped_at(i) && es.at(i) != b']' {
+            i += 1;
+        }
+        i
+    }
+
+    /// Remembering where a search ended answers every later search as a fresh scan would, for any
+    /// text and any order of starts: later starts (as the parser makes them), the same start
+    /// again, and earlier ones.
+    #[test]
+    fn remembered_searches_answer_as_a_fresh_scan_does() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..400usize {
+            let es = random_set(&mut seed, round % 48);
+            let mut searches = Searches::default();
+            let mut start = 0usize;
+            for step in 0..80usize {
+                start = match step % 4 {
+                    0 => start + (seed as usize % 3),
+                    1 => start,
+                    2 => seed as usize % (es.len() + 3),
+                    _ => start + 1,
+                };
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                for delim in [b':', b'='] {
+                    assert_eq!(
+                        find_closing_delim(&es, &mut searches, start, delim),
+                        scanned_closing(&es, start, delim),
+                        "round {round} step {step}: closing {} from {start} in {:?}",
+                        delim as char,
+                        String::from_utf8_lossy(&es.bytes)
+                    );
+                }
+                assert_eq!(
+                    repeat_stop(&es, &mut searches, start),
+                    scanned_stop(&es, start),
+                    "round {round} step {step}: stop from {start} in {:?}",
+                    String::from_utf8_lossy(&es.bytes)
+                );
+            }
+        }
     }
 }

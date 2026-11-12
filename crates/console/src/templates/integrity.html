@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Chain integrity - Propolis{% endblock %}
+{% block content %}
+<h1>Chain integrity</h1>
+
+<div class="panel">
+  <div class="panel-head">Event chain</div>
+  <div class="panel-body">
+    <p>{% if event_count is none %}<span class="dim">Event count unavailable (the ledger could not be read).</span>{% elif event_count_exact %}{{ event_count | count }} events in the ledger.{% else %}About {{ event_count | count }} events in the ledger (estimate).{% endif %} Each event carries a SHA-256 hash chained to its predecessor.</p>
+    <form method="post" action="/integrity/verify" class="mt-1">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn">Verify chain</button>
+    </form>
+    {% if busy %}
+    <p class="dim mt-1">A verification is already running. Its result appears on the page that started it; try again when it finishes.</p>
+    {% endif %}
+    {% if verified %}
+    <div class="verdict{% if intact %} verdict--good{% endif %}">
+      {% if intact %}
+      <span class="text-good">{{ status }}</span>
+      {% else %}
+      <span class="text-alert">{{ status }}</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

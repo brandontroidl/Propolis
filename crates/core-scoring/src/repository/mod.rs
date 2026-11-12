@@ -1,0 +1,25 @@
+//! Persistence layer: the transactional append path and the read projection.
+//!
+//! `append_event` is the sole write path into the ledger + projection. It
+//! fails closed: `validate()` runs before any transaction opens, and every
+//! error inside the transaction propagates so the transaction rolls back and
+//! NO projection is committed. `read_score` is a pure read that projects the
+//! stored raw score to now without ever writing the projected value back - the
+//! double-decay guard depends on the stored value staying un-projected.
+
+mod append_gate;
+pub mod batch;
+#[cfg(test)]
+mod breadth_sets_tests;
+pub mod coverage;
+pub mod events;
+pub mod replay;
+pub mod shell_output;
+
+pub use batch::{BatchAppend, append_events};
+pub use coverage::{CoverageEventRow, CoverageEvents, MAX_COVERAGE_ROWS, coverage_events};
+pub use events::{
+    ExclusiveTx, RepoError, append_event, append_telemetry_event, begin_exclusive, read_score,
+    read_stored_score,
+};
+pub use replay::{ChainStatus, rebuild_projection, verify_chain, verify_chain_in_batches};

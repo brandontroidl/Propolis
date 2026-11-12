@@ -1,0 +1,503 @@
+<!--
+title: Backup and restore
+audience: operator
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-09-28
+-->
+
+# Backup and restore
+
+Propolis backs itself up every night with the procedure this page documents (see
+[the nightly backup](#the-nightly-backup)). Restoring stays a manual, deliberate
+operation, described [below](#restore-procedure). This page also describes what
+state exists and where it lives.
+
+## The nightly backup
+
+`propolis-backup.timer` runs `/usr/local/sbin/propolis-backup` (`deploy/backup.sh`) at
+03:30 with up to 30 minutes of random delay, and catches up a missed night at the next
+boot. `install.sh` and `upgrade.sh` install and enable it. Each run writes one set,
+`/var/backups/propolis/<UTC time>-scheduled/`:
+
+| File | Contents |
+|---|---|
+| `propolis.dump` | the database, by the `pg_dump` command [below](#database) |
+| `state.tgz` | the spool, configuration and SSH host key, by the `tar` command [below](#spool-and-configuration) |
+| `SHA256SUMS` | the digest of each file as stored, and a comment line `# chain-head <event id> <hash>` (or `# chain-head empty`): the newest ledger event when the dump began |
+
+`crates/propolis/tests/restore_rehearsal.rs` fails the build if the script's dump
+options or archived paths stop matching the commands on this page.
+
+- **Encryption.** Put one or more [age](https://github.com/FiloSottile/age) public
+  keys, one per line, in `/etc/propolis/backup-recipients.txt` and install `age`
+  (`apt install age`). Every later set holds only `propolis.dump.age` and
+  `state.tgz.age`; no plaintext copy is kept. Decrypt with
+  `age --decrypt -i <your key file> -o propolis.dump propolis.dump.age`. Without the
+  file, sets are plaintext and readable only by root. A recipients file with `age`
+  missing fails the run rather than writing plaintext.
+- **Retention.** The newest 7 scheduled sets are kept (`PROPOLIS_BACKUP_KEEP`, 1-365,
+  in the unit's environment). [Upgrades](upgrade-rollback-and-dr.md) write `-pre-upgrade`
+  sets, of which the newest 3 are kept. Pruning runs twice: before the free-space check, down
+  to one fewer than the limit (never fewer than one), so the old sets give their room back
+  before the new one is written; and after a good run, down to the limit. A refused or
+  failed run therefore leaves the newest good set of each reason, and never deletes the only
+  one.
+- **Free space.** A run refuses to start, before dumping anything, unless the backup volume
+  would still have enough free after the set is written. The set's size comes from the last
+  good set: its real dump and archive size, scaled by how much the database and state
+  directories have grown since (each good run records that source size as `source_bytes` in
+  `last-success`), plus a fifth. With no earlier set the estimate is the raw database size
+  plus the state directories' size, plus a fifth, which is several times what the
+  compressed set takes; with an earlier set that predates `source_bytes`, half again that
+  set's size, never more than the raw estimate. What the volume must keep free afterwards is the larger of two
+  lines: the ops monitor's low-disk threshold (`PROPOLIS_OPS_CAPACITY_FREE_PCT`, default 15,
+  read from `/etc/propolis/propolis.env` so the two agree; a value the daemon would reject
+  leaves 15 in force) and the 512 MiB reserve the logrotate guard keeps
+  (`deploy/logrotate-guard.sh`). A set that fits but leaves the volume under either line
+  starves log rotation and trips the disk alert, so it is refused too. The refusal names the
+  free space, the estimate, the line and the shortfall; the fixes for a scheduled run are a
+  lower `PROPOLIS_BACKUP_KEEP` or a `PROPOLIS_BACKUP_DIR` on another volume. A
+  `-pre-upgrade` run keeps a fixed 3 sets, so its refusal names different remedies, and
+  because [the upgrade](upgrade-rollback-and-dr.md) runs it before installing anything, a
+  refusal stops the upgrade: free space on the volume, run a scheduled backup with a lower
+  `PROPOLIS_BACKUP_KEEP` to prune the old sets, move `PROPOLIS_BACKUP_DIR`, or set
+  `PROPOLIS_UPGRADE_SKIP_BACKUP=1` to upgrade once without a database backup.
+  On its worst night a run finds `KEEP - 1` scheduled sets and 3 pre-upgrade sets already
+  on the volume (never fewer than one scheduled), writes one more a fifth larger than the
+  last, and still has to leave the line free, beside everything else on the volume.
+  `config-check.sh` warns (`backup-headroom`) when that sum, measured from the volume's real
+  usage as root, exceeds the volume, so it speaks before the first refusal. It counts the
+  database and state only when the backup directory shares their volume; a dedicated backup
+  volume is charged for the sets alone. Reading the warning on the numbers of the incident
+  (a 17 GiB `/var` holding a 6.6 GiB database and 7.2 GiB of everything but sets, sets of
+  1.07 GiB): with the default 7 the worst night needs the 7.2 GiB, 9 sets (9.6 GiB), the
+  next set (1.3 GiB) and the 2.55 GiB line, 20.7 GiB against 17; at
+  `PROPOLIS_BACKUP_KEEP=4` it is still 0.5 GB short. Steady nightly backups on those
+  numbers need `PROPOLIS_BACKUP_KEEP=3` or a separate backup volume.
+- **No password on a command line.** The dump runs through `propolis pg-exec`, which
+  parses `DATABASE_URL` from `/etc/propolis/propolis.env` with the daemon's own parser
+  and hands `pg_dump` the connection in libpq's `PG*` variables (`crates/propolis/src/pg_exec.rs#run`).
+  The unit lets it execute the distro's own client packages only: on Debian and Ubuntu the
+  `/usr/bin` names are symlinks to `/usr/share/postgresql-common/pg_wrapper`, which the unit
+  allows; PGDG packages on RHEL and Fedora (`/usr/pgsql-<N>/bin`) are outside its allow-list.
+- **Status.** `/var/lib/propolis/backup-status/last-success` records the newest good set
+  (time, reason, set name, encrypted or not, sizes). A failed run writes `last-failure`
+  with the step that failed, leaves no partial set, and exits non-zero, so it shows in
+  `systemctl --failed` and `journalctl -u propolis-backup.service`. A run stopped from
+  outside (its unit's timeout, `systemctl stop`, a shutdown) cleans up the same way, and
+  a half-written set left by one killed outright is removed by the next run. Until
+  `propolis.env` sets `DATABASE_URL`, each run records "not configured" and succeeds;
+  neither the daemon nor `config-check.sh` treats that record as a failure.
+- **Live spools.** The archive is taken while sensors run. Each spool's `.staging`
+  directory (a sample between its write and its rename into place) is left out, and a
+  file a sensor adds or removes mid-archive does not fail the run.
+- **The binary it runs.** Before connecting, the script checks that the `propolis`
+  binary has `pg-exec` and refuses one that predates it, which would otherwise start
+  the daemon.
+
+Run one by hand with `sudo systemctl start propolis-backup.service`, or
+`sudo propolis-backup` to see its output directly.
+
+A set on the same disk survives a bad upgrade, a deleted table or a corrupted ledger.
+It does not survive losing the host: copy sets off the box, as below.
+
+## When the ledger does not match a backup
+
+The hash chain shows that a ledger is consistent with itself. Someone able to rewrite the
+ledger can recompute the chain, so consistency alone does not show the ledger is the one that
+was recorded. The chain head in each set does: before a run prunes or writes anything, it
+looks up in the live ledger the event every set under `/var/backups/propolis` recorded
+(`deploy/backup.sh#checking the ledger against the chain heads earlier sets recorded`). If one
+is missing or carries another hash the run stops, deletes nothing, and fails with the event and
+the set named, which raises the [backup alert](health-and-observability.md). The head is a
+comment line so `sha256sum --check --strict`, and an off-host pull script from before it
+existed, still accept the file.
+
+There are two causes, and the response differs:
+
+- **You restored or rolled back the database.** The ledger really is a different one. Accept
+  it once; the sets that exist now are recorded as belonging to the earlier ledger
+  (`/var/lib/propolis/backup-status/ledger-reset`) and are no longer compared, and the set this
+  run writes pins the new ledger.
+
+  ```
+  # Example - run as root, once, after a restore or a rollback with --with-database.
+  PROPOLIS_BACKUP_ACCEPT_LEDGER_RESET=1 propolis-backup
+  ```
+
+  The variable does nothing on a run that finds no mismatch, so it cannot be left set to
+  switch the check off.
+- **You did neither.** Treat the ledger as rewritten. Keep every set under
+  `/var/backups/propolis` and every off-host copy; do not run the command above. The sets
+  hold the ledger as it was. Compare a set's head with a restored copy of an earlier dump, or
+  with an off-host copy of the same set, to find when the two diverged.
+
+What this cannot see: events appended and removed again between two backups, and anything on
+a host whose root account also controls every copy of its backups. The second is what
+[off-host copies](#off-host-copies) are for.
+
+## Off-host copies
+
+The machine that keeps the copies pulls them; the honeypot holds no credential for anywhere
+else. A dedicated SSH key logs into the `propolis-backup-pull` account, whose forced command
+(`/usr/local/sbin/propolis-backup-serve`, from `deploy/backup-serve.sh`) answers only "list the
+encrypted sets" and "send this file of an encrypted set". A plaintext set is never listed or
+sent, so encryption is required for this, and a stolen pull key yields ciphertext at most.
+
+Once, on the machine that keeps the copies (not the honeypot):
+
+```
+age-keygen -o ~/.config/propolis/backup-age.key
+ssh-keygen -t ed25519 -f ~/.ssh/propolis_backup -C backup@workstation
+```
+
+`age-keygen` prints the public key (`age1...`). Keep the key file somewhere safe and separate:
+it is the only thing that decrypts the backups.
+
+Then on the honeypot, as root:
+
+1. `apt install age`, and put that public key in `/etc/propolis/backup-recipients.txt` (root,
+   0644; one key per line). The next nightly set is encrypted and readable by the pull account;
+   start one now with `systemctl start propolis-backup.service`.
+2. Put the PUBLIC half of the SSH key in `/var/lib/propolis-backup-pull/.ssh/authorized_keys`
+   (root:root 0644), in the form `deploy/backup-pull-authorized-keys.example` shows.
+3. If `sshd_config` (or a file in `/etc/ssh/sshd_config.d/`) sets `AllowUsers` or
+   `AllowGroups`, add `propolis-backup-pull` or its group, then
+   `sshd -t && systemctl reload ssh`. With neither set, nothing changes.
+
+Back on the machine that keeps the copies, pull with `deploy/backup-pull.sh` from a checkout of
+this repository, through the host's real administrative sshd port (not the honeypot's port 22):
+
+```
+deploy/backup-pull.sh --host <honeypot> --port <admin ssh port> --key ~/.ssh/propolis_backup --dest ~/propolis-backups
+```
+
+It fetches the newest encrypted set it does not have, checks every file against the set's
+`SHA256SUMS` before keeping it, keeps the newest 14 (`--keep`), and exits non-zero when it could
+not, so run it from a daily `systemd --user` timer or cron that reports failures. To restore from
+a pulled set, decrypt both files with
+`age --decrypt -i ~/.config/propolis/backup-age.key -o <file> <file>.age` and follow
+[restore procedure](#restore-procedure).
+
+> **Recovery is unverified until you test it.** A backup you have never restored
+> is a hypothesis. Rehearse the restore end to end against a scratch environment
+> before you depend on it. See
+> [upgrade, rollback and DR](upgrade-rollback-and-dr.md) for the single-node
+> blast-radius context that makes this matter.
+
+## What holds state
+
+Three categories of durable state, in descending order of importance.
+
+### 1. PostgreSQL - the canonical datastore
+
+Everything scored, queued, reviewed, and published derives from the database.
+It is the one component whose loss is not recoverable from anything else on the
+node. It holds the append-only `event` ledger (with its tamper-evident hash
+chain), the `ip_score` aggregates, the review queue, vendor-submission records,
+fetch-attempt records, and sample verdicts. Tables and migrations are owned by
+[reference/database.md](../reference/database.md).
+
+The daemon connects via `DATABASE_URL` and manages its own schema; the database
+itself is created and administered by the operator, never by `install.sh`. See
+[secret management](secret-management.md) for where `DATABASE_URL` lives and
+[installation](installation.md) for the database-provisioning step.
+
+### 2. Spool directories
+
+On-disk working state under `/var/spool/propolis` and `/var/lib/propolis`. The
+canonical owner of these paths is
+[reference/filesystem-paths.md](../reference/filesystem-paths.md); the queue and
+spool lifecycle is described in [queue-and-spool](queue-and-spool.md). The parts
+worth backing up:
+
+| Path | Contents | Recoverable elsewhere? |
+|---|---|---|
+| `/var/spool/propolis/<sensor>` | Per-sensor capture spool | No (raw capture) |
+| `/var/spool/propolis/fetched` | Fetched malware samples (quarantine, 1 GB global budget) | No (custody evidence) |
+| `/var/lib/propolis/cursors` | Per-sensor log-read cursors | Rebuilds by re-reading logs, which records their events a second time |
+| `/var/lib/propolis/quarantine` | Log lines the database refused and intake set aside ([quarantined lines](health-and-observability.md#quarantined-intake-lines)) | No (the refused line may be gone from the log; the only copy) |
+| `/var/lib/propolis/ssh` | Persistent SSH host key | Regenerates, but changes the honeypot fingerprint |
+| `/var/lib/propolis/feed/current` | Published feed output | Rebuilds from the database on the next feed cycle |
+
+In a [split deployment](split-deployment.md#backups-and-restores) the archive below also holds
+each collector's gateway spool, under `/var/spool/propolis/gateway`. The gateway's and the
+shipper's chain state is not worth backing up: restoring either host leaves the two sides out of
+step, and both have to be reset. A restored spool file is read again from its start, so its
+events are recorded a second time. On a rebuilt control plane, run `deploy/provision.sh`, create
+the `propolis-gateway` user and add `propolis` to its group before unpacking anything;
+`provision.sh` does neither of the last two.
+
+The captured sample bodies and quarantined fetched malware are custody evidence
+and are **not** reconstructable from the database (the database stores only the
+SHA-256 reference and verdict, per
+[reference/database.md](../reference/database.md)). Losing the SSH host key does
+not lose data but re-mints the honeypot's identity, which attackers can
+fingerprint.
+
+The feed output directory rebuilds itself: the in-process publisher regenerates
+`/var/lib/propolis/feed/current` on each build cycle from `ip_score`, so it does
+not strictly need backup - a database backup implies it.
+
+### 3. Configuration and secrets
+
+Per-service environment files under `/etc/propolis/*.env` (mode `0600`, `root:root`),
+created empty by provisioning and filled in by the operator. They carry the database
+password (inline in `DATABASE_URL`), the console password, the optional session
+secret, and any vendor / VirusTotal / ntfy keys. The full inventory and handling
+rules are owned by [secret management](secret-management.md).
+
+> **These files contain live secrets.** Back them up to encrypted storage only,
+> with access controls at least as strict as the `0600` originals. Never place
+> them in a repository, a shared drive, or any backup that is not encrypted at
+> rest.
+
+## Recommended backup procedure
+
+These are the commands the nightly backup runs; run them by hand to back up to
+anywhere else, or on a node without the shipped timer.
+
+### Database
+
+Use PostgreSQL's own dump tool. A logical dump is portable across minor versions
+and simple to verify:
+
+```
+# Example - run as a role with read access to the propolis database.
+pg_dump --format=custom --file=propolis-$(date +%F).dump "$DATABASE_URL"
+```
+
+The `event` ledger is append-only and the hash chain is self-verifying, so a
+consistent point-in-time dump preserves tamper-evidence: a restored ledger
+re-verifies against the same golden encoding (see the hash-chain description in
+[reference/database.md](../reference/database.md)). For a large or busy node,
+prefer physical base backups plus WAL archiving (`pg_basebackup` +
+`archive_command`) so you can restore to a point in time; that is standard
+PostgreSQL practice and outside the scope of this project.
+
+### Spool and configuration
+
+Archive the durable directories and the config tree. Preserve ownership and
+modes - the `0600` env files and per-sensor `0750` spool dirs are load-bearing.
+
+```
+# Example. Run as root to preserve per-service ownership.
+tar -czf propolis-state-$(date +%F).tgz \
+  /etc/propolis \
+  /var/spool/propolis \
+  /var/lib/propolis/ssh
+```
+
+Name each tree once. `tar` recurses into every directory it is given, and
+`/var/spool/propolis` already contains each per-sensor spool and the `fetched`
+quarantine, so listing a subdirectory beside its parent stores every file under
+it twice. `crates/propolis/tests/docs_agreement.rs` fails the build if a `tar`
+command in the docs names a path inside another one it also names.
+
+Do not add `--numeric-owner`. Without it the archive records each file's owner by
+user and group name as well as number, and a root extraction maps the names onto
+the target host's accounts. `deploy/provision.sh` creates the service users with
+`useradd --system`, which assigns their UIDs dynamically, so the same user can have
+a different number on a rebuilt host; an archive holding only numbers would hand
+each restored file to whichever local account holds the old number, possibly a
+different service.
+
+Store the config/secrets archive encrypted and separately from the data archive
+if you can, so a data-restore workflow never needs to touch the secret material.
+
+## Restore procedure
+
+> **Restore overwrites live state.** Every step below replaces or reconstructs
+> production data. Run it against a fresh node or a scratch database first, and
+> stop the daemon before restoring anything it might be writing.
+
+1. **Stop the platform.** `systemctl stop propolis.service` and each
+   `sensor-*.service` (see [service lifecycle](service-lifecycle.md)) so nothing
+   writes while you restore.
+2. **Restore configuration.** Unpack `/etc/propolis` (or recreate the `*.env`
+   files by hand per [secret management](secret-management.md)). Confirm modes
+   are `0600`, `root:root` (`watch.env` is `root:propolis-watch` `0640`).
+3. **Restore the database.** `pg_dump` records object ownership and grants but
+   not roles, so on a new PostgreSQL server create the daemon's `propolis` role
+   first, then an empty database it owns, then load the dump. Where the
+   [database roles are split](database-roles.md#restoring-a-dump), create both roles
+   and make the owner role (`propolis_owner`) the database's owner instead:
+
+   ```
+   # Example - run as a PostgreSQL superuser on the new server.
+   psql -c 'CREATE ROLE propolis LOGIN'
+   psql -c 'CREATE DATABASE propolis OWNER propolis TEMPLATE template0'
+   pg_restore --exit-on-error --dbname=propolis propolis-2026-09-28.dump
+   ```
+
+   Then give the role the password your `DATABASE_URL` carries (`\password
+   propolis` in `psql`). Without the role the restore fails with `role
+   "propolis" does not exist`; `--exit-on-error` makes it stop there instead of
+   continuing past errors, which is `pg_restore`'s default. Do not add
+   `--no-owner` or `--no-privileges`. With `--no-owner` the restoring superuser
+   owns every table and the daemon's startup migrations fail with `permission
+   denied for table _sqlx_migrations`. With `--no-privileges` the `event`
+   ledger's append-only revoke (see
+   [reference/database.md](../reference/database.md)), which travels in the dump
+   as a privilege statement, is dropped and the `propolis` role can update,
+   delete and truncate the ledger again. `template0` keeps anything added to
+   `template1` on the new server out of the restored database. Because the
+   daemon runs its own migrations at startup and migrations are additive (see
+   [upgrade, rollback and DR](upgrade-rollback-and-dr.md)), restore into a schema
+   the current binary can migrate forward - restoring an older dump and starting
+   a newer binary is the supported direction.
+4. **Restore spool and host key.** On a rebuilt host, run `deploy/provision.sh`
+   first so the service users exist, then unpack the state archive as root, which
+   keeps modes and maps each file's recorded owner name onto the local account:
+
+   ```
+   # Example - run as root on the rebuilt host.
+   tar -xpzf propolis-state-2026-09-28.tgz -C /
+   ```
+
+   The SSH host key under
+   `/var/lib/propolis/ssh` restores the prior fingerprint; omit it only if you
+   intend a fresh identity.
+5. **Tell the backup the ledger changed.** On a host that still holds backup sets
+   of the ledger you replaced, the next backup would stop because the restored
+   ledger does not hold their chain heads. Run one backup with
+   `PROPOLIS_BACKUP_ACCEPT_LEDGER_RESET=1`
+   ([above](#when-the-ledger-does-not-match-a-backup)).
+6. **Start the platform** and verify. On startup the daemon connects, runs
+   migrations, and spawns subsystems; confirm liveness/readiness per
+   [health and observability](health-and-observability.md) and confirm the feed
+   rebuilds. The publisher will regenerate `/var/lib/propolis/feed/current` on
+   its next cycle even if you did not restore it.
+
+## Verification
+
+A restore is not "done" until you have confirmed:
+
+- `/ready` returns 200 (database reachable) - see
+  [health and observability](health-and-observability.md).
+- Recent events are present and the hash chain re-verifies (the daemon's
+  chain-verify pass; DB-layer linkage is enforced on insert per
+  [reference/database.md](../reference/database.md)).
+- The console loads and the review queue shows the expected pending set.
+- The feed directory is regenerating on schedule.
+
+Record the date and result of each restore rehearsal. An untested backup is a
+residual risk, not a control.
+
+## Restore rehearsal
+
+`crates/propolis/tests/restore_rehearsal.rs` runs this page's backup and restore
+end to end against populated data. It supplies its own paths, cluster and
+database, so it runs its own `pg_dump`, `pg_restore` and `tar` commands rather
+than these verbatim, with the same options: a test that needs no PostgreSQL, and
+so runs in CI, fails if a command on this page and the rehearsal's version of it
+pass different options, in either direction. The rehearsal itself is `#[ignore]`d
+in the normal suite because it needs the PostgreSQL server binaries plus a
+`pg_dump` and `pg_restore` of the same major version, which CI does not install. Point it at that `bin` directory:
+
+```
+RESTORE_REHEARSAL_PG_BIN=/usr/lib/postgresql/18/bin \
+  cargo test -p propolis --locked --test restore_rehearsal -- --ignored --nocapture
+```
+
+It needs no `DATABASE_URL` and touches no existing server: it creates two
+throwaway clusters with `initdb` under `target/tmp`, listening only on 127.0.0.1
+in ports 56001-56999, and stops both and deletes its scratch directory whether it
+passes or fails. `--nocapture` prints the figures recorded below. An unset or
+incomplete `RESTORE_REHEARSAL_PG_BIN` fails the test rather than skipping it.
+
+What it does:
+
+1. **Builds a node's state** in a fresh cluster: the `propolis` role and
+   database, the daemon's migrations in startup order, a few hundred hash-chained
+   events from 16 addresses across 7 sensors and 13 signal types (session-end
+   telemetry included), and review, vendor-submission, fetch, verdict and
+   fleet-probe rows. Events and projections, the review queue, fetch attempts and
+   probe results go through the crates' own write paths. Vendor submissions and
+   verdicts are inserted directly in the shape those paths write, because the real
+   paths need a vendor or VirusTotal on the other end. Sample bodies go into the
+   `ssh`, `telnet` and `fetched` spools through the quarantine spool, so every file
+   name is the digest the database references.
+2. **Backs it up** with `pg_dump --format=custom` and the `tar` inputs read from
+   the archive command on this page (re-rooted under a scratch directory), checks
+   the archive holds no member twice, then stops the source cluster and deletes its
+   data directory and spool tree.
+3. **Restores** into a second, freshly `initdb`'d cluster by the procedure above
+   (role, empty database from `template0`, `pg_restore --exit-on-error`) and
+   unpacks the archive into a new root.
+4. **Compares and verifies**, failing on any difference:
+   - every table's row count and an md5 over the text of every row; named
+     aggregates (event max id, chain head hash, weight sum, per-signal counts;
+     `ip_score` raw-score sum, event and established-event sums, eligibility, tier
+     and active-day figures; review, fetch and vendor breakdowns); sequence
+     positions; index, constraint, enum, trigger and function definitions; and the
+     `propolis` role's privileges on `event`;
+   - the daemon's migrations run against the restored database and change nothing;
+   - `verify_chain` returns `Intact` over the whole restored ledger, and every
+     `ip_score` row equals the projection replayed from the restored events;
+   - an event appended after the restore takes the next id, chains onto the
+     restored head and still verifies; a new `vendor_submission` id does not
+     collide; every sequence sits at or above its column's maximum;
+   - the linkage trigger still refuses a forged `prev_hash`, and the `propolis`
+     role still cannot `UPDATE` the ledger;
+   - the restored spool matches the source file for file (size and `0640` mode),
+     and every sample an event, a `fetch_attempt` or a `sample_analysis` row
+     references is read back through the spool's verified reader and re-hashes to
+     its name.
+
+What it proves: a logical `pg_dump`/`pg_restore` of a populated database into a new
+cluster of the same PostgreSQL major version reproduces every row, sequence
+position, grant and schema object; the restored hash chain verifies and accepts new
+events; and the documented archive carries every sample body the database
+references, unaltered.
+
+What it does not prove: physical base backups, WAL archiving or point-in-time
+recovery; file ownership after extraction (it runs unprivileged, so the root-only
+mapping of recorded owner names onto a host whose service users have different
+UIDs is GNU tar's behaviour as documented, not exercised here); restoring
+across PostgreSQL major versions; a dump taken while the daemon is writing; volumes
+beyond a few hundred rows; or recovery of `/etc/propolis` and the SSH host key,
+which placeholders stand in for.
+
+### Rehearsal record
+
+**2026-09-28 - pass.** PostgreSQL 18.0 server, `pg_dump` and `pg_restore` 18.0,
+GNU tar 1.35; restored into a fresh cluster (`initdb`), not only a fresh database.
+Re-run at 2026-09-29 00:03 UTC on the tree that adds the documented-option check,
+with the same result; the review migration count below is from that run, as the
+first record predated review migration `0007`.
+
+| Table | Rows, source = restored |
+|---|---|
+| `event` | 340 (51 session-end telemetry) |
+| `ip_score` | 16 |
+| `review_queue` | 13 (10 pending, 1 approved, 1 rejected, 1 snoozed) |
+| `vendor_submission` | 3 (1 succeeded) |
+| `fetch_attempt` | 7 (2 success, 2 rejected, 1 timeout, 2 pending, 1 still claimed) |
+| `fetch_daily_usage` | 1 |
+| `sample_analysis` | 4 (1 pending verdict) |
+| `listener_probe` | 3 |
+| `_sqlx_migrations`, `_sqlx_migrations_review`, `_sqlx_migrations_fleet` | 12, 7, 1 |
+
+- Every table's row digest, every named aggregate and every schema-object digest
+  matched. Chain head `f6699ed522fc7f4633dc0a358a8f1b52006e1215fae1c4adf3a4bb899e90d994`
+  at id 340; event weight sum 11563.
+- `ip_score`: raw-score sum `1483.287754040193170329669452938`, event-count sum 289,
+  established-event sum 248, active-day sum 42, 16 eligible, 13 recommended for
+  vendor and tiered `aggressive`; all 16 projections replay from the restored ledger.
+- `verify_chain`: `Intact` over 340 restored events, and over 341 after a
+  post-restore append (id 341, `prev_hash` = the restored head).
+- Sequences: `event_id_seq` 340 and `vendor_submission_id_seq` 3, each equal to its
+  column maximum.
+- `event` privileges for `propolis`: of SELECT, INSERT, UPDATE, DELETE and
+  TRUNCATE, only SELECT and INSERT, before and after.
+- Samples: 20 spool files restored identical to the source, at `0640`; 40 event references (9
+  distinct bodies), 2 `fetch_attempt` references and 4 `sample_analysis` rows
+  re-hash to their names. Archive: 28 members, none repeated.
+- Checked the same day that the rehearsal fails when it should: restoring with
+  `--no-privileges` (the revoke is lost), with `--no-owner` (startup migrations are
+  refused), into a server without the `propolis` role, with one restored sample
+  altered, with `fetched` left out of the archive, and with the archive command
+  naming `fetched` beside its parent.

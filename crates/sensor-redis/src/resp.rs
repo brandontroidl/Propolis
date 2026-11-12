@@ -1,0 +1,862 @@
+//! RESP (REdis Serialization Protocol) parsing and response encoding: pure, I/O-free logic with
+//! no `TcpStream` of its own, mirroring sensor-telnet's `telnet` module and sensor-ssh's
+//! `auth`/`channel` modules' own "no I/O of its own" convention so this logic is deterministic and
+//! testable without a live socket. `handler.rs` is the only place that touches an actual
+//! `TcpStream`; it feeds accumulated socket bytes through a [`Parser`] and writes the bytes
+//! this module's encoders produce.
+//!
+//! Redis clients speak two wire forms of the same command stream (see
+//! `internal/design/08-remaining-sensors.md`'s "sensor-redis" section): an inline form
+//! (`PING\r\n`, whitespace-separated arguments on one line - what `redis-cli`'s piped mode and
+//! ad-hoc `nc`/telnet-style probing use) and the multi-bulk array form
+//! (`*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n` - what the real `redis-cli` and every client library send).
+//! [`Parser::parse`] recognizes both from the leading byte (`*` selects multi-bulk, anything else
+//! is inline) and returns the arguments the same way for both, as byte ranges of the buffer, so
+//! `handler.rs`'s dispatch logic never needs to know which form a given command arrived in.
+//! Arguments stay raw bytes: a
+//! bulk string is binary-safe in Redis, and decoding it as text here made a value of `FF` read
+//! back as `EF BF BD` and the keys `FF` and `FE` collide.
+//!
+//! **Every bound below rejects on the attacker's *claim* before buffering to match it.** A
+//! multi-bulk count or a bulk string length is checked against its cap the instant it is parsed
+//! out of the header, before this module waits for that many bytes to actually arrive - so a
+//! single `*999999999\r\n` or `$999999999\r\n` header is a protocol error immediately, never an
+//! invitation to buffer gigabytes waiting for data that may never come. This parses bytes from a
+//! peer that has not proven anything about itself (Redis has no transport-level handshake), so no
+//! path through here may panic on truncated, malformed, or adversarially large input - see the
+//! `proptest` fuzz-lite guards at the bottom of this module's test suite, mirroring
+//! `sensor-telnet::telnet::IacFilter` and `sensor-ssh::auth::parse_userauth_request`'s own
+//! never-panics convention.
+
+use std::ops::Range;
+
+/// Ceiling on a multi-bulk array's declared element count. No real Redis command needs more than
+/// a few dozen arguments; generous enough for any legitimate command, small enough that a header
+/// alone can never be used to force a large allocation.
+const MAX_ARRAY_LEN: i64 = 1024;
+
+/// Ceiling on one bulk string's declared byte length. Bounds a single `SET`/`EVAL` argument this
+/// sensor will ever buffer; independent of `sensor_framework::ConnectionBounds::max_captured_bytes`
+/// (the whole-session cap `handler.rs`'s read loop enforces separately) - this is the per-header
+/// sanity bound that rejects an absurd single-field claim before any of that budget is spent.
+const MAX_BULK_LEN: i64 = 512 * 1024;
+
+/// Ceiling on an inline request line's length before a terminator (`\n`, optionally preceded by
+/// `\r`) has been seen. Matches real Redis's own `PROTO_INLINE_MAX_SIZE` (64 KiB): generous for
+/// any real command line, bounded so a client that never sends a newline cannot grow the buffer
+/// unboundedly while every parse call keeps reporting `Incomplete`.
+const MAX_INLINE_LEN: usize = 64 * 1024;
+
+/// Ceiling on the arguments of one inline line, the same as a multi-bulk array's. A 64 KiB line
+/// of single-byte words splits into about 32,000 arguments, and the ranges, the dispatch slice
+/// and the argument list built from them held about 1.4 MB for it, charged to nothing.
+const MAX_INLINE_ARGS: usize = MAX_ARRAY_LEN as usize;
+
+fn too_many_inline_args() -> RespError {
+    RespError::Protocol(format!(
+        "inline request has more than {MAX_INLINE_ARGS} arguments"
+    ))
+}
+
+/// Ceiling on a multi-bulk header line (`*N\r\n` or `$M\r\n`) before its terminating `\r\n` has
+/// been seen. Real headers are a handful of bytes (`*1024\r\n` is 7); this is generous enough for
+/// any legitimate header and small enough to reject a client streaming digits with no CRLF long
+/// before `MAX_INLINE_LEN` would.
+const MAX_HEADER_LINE: usize = 32;
+
+/// A parsing outcome for [`Parser::parse`]: either not enough bytes are buffered yet to complete
+/// one command (the caller should read more from the socket and retry), or exactly one command was
+/// parsed from the front of the buffer, along with how many bytes to drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseOutcome {
+    /// The buffered bytes are a valid prefix of a command but do not yet contain a complete one.
+    Incomplete,
+    /// One full command was parsed. Each argument is a range of the buffer passed in, so nothing
+    /// is copied: the caller reads the arguments in place and then drains `consumed` bytes.
+    /// `args` is empty for a blank inline line or a zero/negative multi-bulk count (both valid
+    /// RESP, neither naming a command) - `handler.rs`'s read loop skips these and reads the next
+    /// command rather than dispatching an empty one.
+    Complete {
+        args: Vec<Range<usize>>,
+        consumed: usize,
+    },
+}
+
+/// A structural RESP violation that reading more bytes could never fix (as opposed to
+/// [`ParseOutcome::Incomplete`], which more bytes might resolve). Carries a human-readable reason
+/// for logging; `handler.rs` does not match on the reason text, only on the variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RespError {
+    Protocol(String),
+}
+
+/// Parses one command at a time from a buffer that only grows between calls, resuming where the
+/// last call stopped. A command arrives over many socket reads; parsing the whole buffer again
+/// after each read, copying every element finished so far, made one large multi-bulk cost time
+/// quadratic in its size. Here each buffered byte is examined a bounded number of times however
+/// many reads the command takes, and nothing is copied.
+///
+/// Contract: between two calls that return [`ParseOutcome::Incomplete`] the caller may only
+/// append to the buffer. After [`ParseOutcome::Complete`] or an error the parser starts afresh,
+/// so the caller drains `consumed` bytes (or ends the session) before the next call.
+#[derive(Debug, Default)]
+pub struct Parser {
+    state: State,
+}
+
+#[derive(Debug, Default)]
+enum State {
+    /// No byte of the next command examined yet.
+    #[default]
+    Start,
+    /// An inline command; `buf[..scanned]` holds no newline.
+    Inline { scanned: usize },
+    /// A multi-bulk command of `count` elements, `args` of them complete; the next element's
+    /// `$` marker is at `cursor`.
+    Multibulk {
+        count: usize,
+        args: Vec<Range<usize>>,
+        cursor: usize,
+    },
+}
+
+impl Parser {
+    /// Attempt to parse exactly one command from the front of `buf`. Never consumes partial data:
+    /// on [`ParseOutcome::Complete`], `consumed` bytes belong to this command and the rest of
+    /// `buf` (if any - a pipelining client can send several commands in one write) is left for the
+    /// next call. See the module doc for the inline-vs-multi-bulk dispatch rule and the
+    /// early-rejection bound guarantee.
+    pub fn parse(&mut self, buf: &[u8]) -> Result<ParseOutcome, RespError> {
+        let outcome = self.advance(buf);
+        if !matches!(outcome, Ok(ParseOutcome::Incomplete)) {
+            self.state = State::Start;
+        }
+        outcome
+    }
+
+    fn advance(&mut self, buf: &[u8]) -> Result<ParseOutcome, RespError> {
+        if let State::Start = self.state {
+            match buf.first() {
+                None => return Ok(ParseOutcome::Incomplete),
+                Some(b'*') => match start_multibulk(buf)? {
+                    Some(state) => self.state = state,
+                    None => return Ok(ParseOutcome::Incomplete),
+                },
+                Some(_) => self.state = State::Inline { scanned: 0 },
+            }
+        }
+        match &mut self.state {
+            State::Start => Ok(ParseOutcome::Incomplete),
+            State::Inline { scanned } => parse_inline(buf, scanned),
+            State::Multibulk {
+                count,
+                args,
+                cursor,
+            } => parse_elements(buf, *count, args, cursor),
+        }
+    }
+}
+
+/// Parse the inline form: a single line, terminated by `\n` (optionally preceded by `\r`), split
+/// on ASCII whitespace into arguments. See the module doc: this is what a plain `nc`/telnet-style
+/// probe or `redis-cli --pipe` sends. `scanned` is how far an earlier call already looked.
+fn parse_inline(buf: &[u8], scanned: &mut usize) -> Result<ParseOutcome, RespError> {
+    let from = (*scanned).min(buf.len());
+    let Some(nl) = buf[from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| from + i)
+    else {
+        if buf.len() > MAX_INLINE_LEN {
+            return Err(RespError::Protocol("inline request too long".to_string()));
+        }
+        *scanned = buf.len();
+        return Ok(ParseOutcome::Incomplete);
+    };
+    let line_end = if nl > 0 && buf[nl - 1] == b'\r' {
+        nl - 1
+    } else {
+        nl
+    };
+    let mut args = Vec::new();
+    let mut start = None;
+    for (i, b) in buf[..line_end].iter().enumerate() {
+        match (b.is_ascii_whitespace(), start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                if args.len() == MAX_INLINE_ARGS {
+                    return Err(too_many_inline_args());
+                }
+                args.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        if args.len() == MAX_INLINE_ARGS {
+            return Err(too_many_inline_args());
+        }
+        args.push(s..line_end);
+    }
+    Ok(ParseOutcome::Complete {
+        args,
+        consumed: nl + 1,
+    })
+}
+
+/// Read a multi-bulk array's `*<count>\r\n` header: `None` until it has fully arrived, else the
+/// state that parses its elements, or a completed empty command for a zero or negative count. See
+/// the module doc for the early-rejection guarantee on `count`.
+fn start_multibulk(buf: &[u8]) -> Result<Option<State>, RespError> {
+    let Some((line_end, cursor)) = find_header_crlf(buf, 1)? else {
+        return Ok(None);
+    };
+    let count: i64 = std::str::from_utf8(&buf[1..line_end])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| RespError::Protocol("invalid multibulk count".to_string()))?;
+    if count > MAX_ARRAY_LEN {
+        return Err(RespError::Protocol(format!(
+            "multibulk count {count} exceeds maximum {MAX_ARRAY_LEN}"
+        )));
+    }
+    // A zero or negative count names no command (RESP's null-array encoding uses -1) - valid wire
+    // content, not a protocol error, but not a dispatchable command either: it completes with no
+    // elements. See ParseOutcome::Complete's doc.
+    let count = count.max(0) as usize;
+    Ok(Some(State::Multibulk {
+        count,
+        args: Vec::with_capacity(count),
+        cursor,
+    }))
+}
+
+/// Parse the multi-bulk elements still missing (`$<len>\r\n<data>\r\n` each), from `cursor` on.
+/// An element is recorded only once its data and terminator have all arrived, so a call that
+/// returns [`ParseOutcome::Incomplete`] re-reads at most one element's header next time. See the
+/// module doc for the early-rejection guarantee on each element's `len`.
+fn parse_elements(
+    buf: &[u8],
+    count: usize,
+    args: &mut Vec<Range<usize>>,
+    cursor: &mut usize,
+) -> Result<ParseOutcome, RespError> {
+    while args.len() < count {
+        let Some(&marker) = buf.get(*cursor) else {
+            return Ok(ParseOutcome::Incomplete);
+        };
+        if marker != b'$' {
+            return Err(RespError::Protocol(format!(
+                "expected '$' bulk marker, got {:?}",
+                marker as char
+            )));
+        }
+
+        let Some((len_end, data_start)) = find_header_crlf(buf, *cursor + 1)? else {
+            return Ok(ParseOutcome::Incomplete);
+        };
+        let len: i64 = std::str::from_utf8(&buf[*cursor + 1..len_end])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| RespError::Protocol("invalid bulk length".to_string()))?;
+        if len < 0 {
+            return Err(RespError::Protocol(format!("negative bulk length {len}")));
+        }
+        if len > MAX_BULK_LEN {
+            return Err(RespError::Protocol(format!(
+                "bulk length {len} exceeds maximum {MAX_BULK_LEN}"
+            )));
+        }
+        let len = len as usize;
+
+        let data_end = data_start + len;
+        let term_end = data_end + 2;
+        if buf.len() < term_end {
+            return Ok(ParseOutcome::Incomplete);
+        }
+        if &buf[data_end..term_end] != b"\r\n" {
+            return Err(RespError::Protocol(
+                "missing CRLF terminator after bulk data".to_string(),
+            ));
+        }
+
+        args.push(data_start..data_end);
+        *cursor = term_end;
+    }
+
+    Ok(ParseOutcome::Complete {
+        args: std::mem::take(args),
+        consumed: *cursor,
+    })
+}
+
+/// Scan `buf[start..]` for the first `\r\n`, bounded by [`MAX_HEADER_LINE`]. Returns
+/// `Some((index_of_cr, index_after_lf))` once found, `None` if not yet present but still within
+/// bound (caller should treat as [`ParseOutcome::Incomplete`]), or `Err` if the unterminated
+/// header has already grown past the bound - a header line that long can never be legitimate (see
+/// the module doc's early-rejection guarantee).
+fn find_header_crlf(buf: &[u8], start: usize) -> Result<Option<(usize, usize)>, RespError> {
+    let window_end = buf.len().min(start + MAX_HEADER_LINE);
+    let mut i = start;
+    while i + 1 < window_end {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Ok(Some((i, i + 2)));
+        }
+        i += 1;
+    }
+    if buf.len() - start > MAX_HEADER_LINE {
+        return Err(RespError::Protocol("header line too long".to_string()));
+    }
+    Ok(None)
+}
+
+/// Encode a RESP simple string: `+<s>\r\n`. Used for `+OK`, `+PONG`, and similar fixed replies -
+/// `s` is always a static, operator-authored literal in this crate, never attacker-controlled.
+pub fn simple_string(s: &str) -> Vec<u8> {
+    format!("+{s}\r\n").into_bytes()
+}
+
+/// Encode a RESP error reply: `-<s>\r\n`.
+pub fn error_reply(s: &str) -> Vec<u8> {
+    format!("-{s}\r\n").into_bytes()
+}
+
+/// Encode a RESP bulk string: `$<len>\r\n<s>\r\n`, length-prefixed in bytes (not chars), so this is
+/// correct for any UTF-8 `s` including multi-byte characters.
+pub fn bulk_string(s: &str) -> Vec<u8> {
+    bulk_bytes(s.as_bytes())
+}
+
+/// Encode a RESP bulk string from raw bytes: what `GET` returns, so a value SET as arbitrary
+/// bytes reads back byte for byte.
+pub fn bulk_bytes(data: &[u8]) -> Vec<u8> {
+    let mut out = format!("${}\r\n", data.len()).into_bytes();
+    out.extend_from_slice(data);
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Encode the RESP null bulk string (`$-1\r\n`) - the required `GET` reply for a key that was
+/// never actually stored (this sensor never persists anything - see `handler.rs`).
+pub fn nil_bulk_string() -> Vec<u8> {
+    b"$-1\r\n".to_vec()
+}
+
+/// Encode a RESP array of bulk strings: `*<n>\r\n` followed by each item's own [`bulk_string`]
+/// encoding, in order. Used for `CONFIG GET`'s canned reply.
+pub fn array_of_bulk_strings(items: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", items.len()).into_bytes();
+    for item in items {
+        out.extend_from_slice(&bulk_string(item));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A parse outcome with its arguments copied out of the buffer, for comparing in tests.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Parsed {
+        Incomplete,
+        Complete { args: Vec<Vec<u8>>, consumed: usize },
+    }
+
+    fn owned(buf: &[u8], outcome: ParseOutcome) -> Parsed {
+        match outcome {
+            ParseOutcome::Incomplete => Parsed::Incomplete,
+            ParseOutcome::Complete { args, consumed } => Parsed::Complete {
+                args: args.into_iter().map(|r| buf[r].to_vec()).collect(),
+                consumed,
+            },
+        }
+    }
+
+    /// One parse of `buf` by a fresh parser.
+    fn parse_command(buf: &[u8]) -> Result<Parsed, RespError> {
+        Parser::default().parse(buf).map(|o| owned(buf, o))
+    }
+
+    /// Feed `buf` to one parser a growing prefix at a time, `step` bytes more per call, as the
+    /// reader does across socket reads; the first outcome that is not `Incomplete`, else
+    /// `Incomplete`.
+    fn parse_in_steps(buf: &[u8], step: usize) -> Result<Parsed, RespError> {
+        let mut parser = Parser::default();
+        let mut end = 0;
+        loop {
+            end = (end + step).min(buf.len());
+            let prefix = &buf[..end];
+            match parser.parse(prefix) {
+                Ok(ParseOutcome::Incomplete) if end < buf.len() => {}
+                outcome => return outcome.map(|o| owned(prefix, o)),
+            }
+        }
+    }
+
+    fn multibulk(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+        for p in parts {
+            out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            out.extend_from_slice(p);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Parser - resuming across reads
+    // ---------------------------------------------------------------------------------------
+
+    /// A command fed in pieces parses to exactly what it parses to whole, at every piece size,
+    /// including pieces that end inside a header, inside the data and between `\r` and `\n`.
+    #[test]
+    fn a_command_fed_in_pieces_parses_as_it_does_whole() {
+        let mut buf = multibulk(&[b"SET", b"key", &[0xFF; 300], b""]);
+        buf.extend_from_slice(b"PING\r\n");
+        let whole = parse_command(&buf).unwrap();
+        let Parsed::Complete { consumed, .. } = &whole else {
+            panic!("expected Complete, got {whole:?}");
+        };
+        assert_eq!(*consumed, buf.len() - 6, "the pipelined PING is left");
+        for step in 1..=buf.len() {
+            assert_eq!(parse_in_steps(&buf, step).unwrap(), whole, "step {step}");
+        }
+        let inline = b"SET  foo\tbar  \r\nGET foo\r\n";
+        let whole = parse_command(inline).unwrap();
+        assert_eq!(
+            whole,
+            Parsed::Complete {
+                args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
+                consumed: 16,
+            }
+        );
+        for step in 1..=inline.len() {
+            assert_eq!(parse_in_steps(inline, step).unwrap(), whole, "step {step}");
+        }
+    }
+
+    #[test]
+    fn the_parser_starts_afresh_after_a_command_and_after_an_error() {
+        let mut parser = Parser::default();
+        let buf = b"*1\r\n$4\r\nPING\r\n";
+        assert!(matches!(
+            parser.parse(&buf[..9]),
+            Ok(ParseOutcome::Incomplete)
+        ));
+        let Ok(ParseOutcome::Complete { consumed, .. }) = parser.parse(buf) else {
+            panic!("expected Complete");
+        };
+        assert_eq!(consumed, buf.len());
+        // A new buffer (the reader drained the command) parses from its first byte.
+        assert!(matches!(
+            parser.parse(b"PING\r\n"),
+            Ok(ParseOutcome::Complete { consumed: 6, .. })
+        ));
+        assert!(parser.parse(b"*1\r\nX").is_err());
+        assert!(matches!(
+            parser.parse(b"PING\r\n"),
+            Ok(ParseOutcome::Complete { consumed: 6, .. })
+        ));
+    }
+
+    #[test]
+    fn an_inline_line_is_held_to_the_multibulk_argument_cap() {
+        let at_cap = format!("{}\r\n", vec!["a"; MAX_INLINE_ARGS].join(" "));
+        let Ok(Parsed::Complete { args, .. }) = parse_command(at_cap.as_bytes()) else {
+            panic!("a line at the cap parses");
+        };
+        assert_eq!(args.len(), MAX_INLINE_ARGS);
+        // Past it by a word ending at the newline, and by a word followed by a space.
+        for over in [
+            format!("{} a\r\n", vec!["a"; MAX_INLINE_ARGS].join(" ")),
+            format!("{} a \r\n", vec!["a"; MAX_INLINE_ARGS].join(" ")),
+        ] {
+            assert!(matches!(
+                parse_command(over.as_bytes()),
+                Err(RespError::Protocol(_))
+            ));
+        }
+        // A line that fills the whole 64 KiB with one-byte words.
+        let flood = format!("{}\r\n", vec!["a"; MAX_INLINE_LEN / 2].join(" "));
+        assert!(parse_command(flood.as_bytes()).is_err());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // encoders
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn simple_string_encodes_plus_prefix_and_crlf() {
+        assert_eq!(simple_string("PONG"), b"+PONG\r\n");
+        assert_eq!(simple_string("OK"), b"+OK\r\n");
+    }
+
+    #[test]
+    fn error_reply_encodes_minus_prefix_and_crlf() {
+        assert_eq!(
+            error_reply("ERR unknown command"),
+            b"-ERR unknown command\r\n"
+        );
+    }
+
+    #[test]
+    fn bulk_string_encodes_length_prefix_data_and_crlf() {
+        assert_eq!(bulk_string("hello"), b"$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn bulk_string_handles_empty_string() {
+        assert_eq!(bulk_string(""), b"$0\r\n\r\n");
+    }
+
+    #[test]
+    fn bulk_bytes_encodes_arbitrary_bytes_verbatim() {
+        assert_eq!(bulk_bytes(&[0xFF, 0x00, 0xFE]), b"$3\r\n\xFF\x00\xFE\r\n");
+    }
+
+    #[test]
+    fn bulk_string_length_is_byte_length_not_char_count() {
+        // "café" is 4 chars but 5 bytes (é is 2 bytes in UTF-8).
+        assert_eq!(bulk_string("café"), "$5\r\ncafé\r\n".as_bytes());
+    }
+
+    #[test]
+    fn nil_bulk_string_is_dollar_minus_one() {
+        assert_eq!(nil_bulk_string(), b"$-1\r\n");
+    }
+
+    #[test]
+    fn array_of_bulk_strings_encodes_count_and_each_item() {
+        assert_eq!(
+            array_of_bulk_strings(&["a", "bb"]),
+            b"*2\r\n$1\r\na\r\n$2\r\nbb\r\n"
+        );
+    }
+
+    #[test]
+    fn array_of_bulk_strings_handles_empty_slice() {
+        assert_eq!(array_of_bulk_strings(&[]), b"*0\r\n");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // parse_command - inline form
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn parse_empty_buffer_is_incomplete() {
+        assert_eq!(parse_command(b"").unwrap(), Parsed::Incomplete);
+    }
+
+    #[test]
+    fn parse_inline_simple_command() {
+        assert_eq!(
+            parse_command(b"PING\r\n").unwrap(),
+            Parsed::Complete {
+                args: vec![b"PING".to_vec()],
+                consumed: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_inline_bare_lf_terminator() {
+        // Some non-conformant clients send a bare \n with no \r - real Redis accepts this too.
+        assert_eq!(
+            parse_command(b"PING\n").unwrap(),
+            Parsed::Complete {
+                args: vec![b"PING".to_vec()],
+                consumed: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_inline_multiple_args_with_extra_whitespace() {
+        let buf: &[u8] = b"SET  foo   bar\r\n";
+        let outcome = parse_command(buf).unwrap();
+        assert_eq!(
+            outcome,
+            Parsed::Complete {
+                args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
+                consumed: buf.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_inline_incomplete_no_terminator_yet() {
+        assert_eq!(parse_command(b"PIN").unwrap(), Parsed::Incomplete);
+    }
+
+    #[test]
+    fn parse_inline_blank_line_is_complete_with_empty_args() {
+        assert_eq!(
+            parse_command(b"\r\n").unwrap(),
+            Parsed::Complete {
+                args: vec![],
+                consumed: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_inline_too_long_without_terminator_is_protocol_error() {
+        let buf = vec![b'A'; MAX_INLINE_LEN + 10];
+        assert!(matches!(parse_command(&buf), Err(RespError::Protocol(_))));
+    }
+
+    #[test]
+    fn parse_inline_leaves_pipelined_remainder_for_next_call() {
+        let buf = b"PING\r\nPING\r\n";
+        let Parsed::Complete { args, consumed } = parse_command(buf).unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(args, vec![b"PING".to_vec()]);
+        assert_eq!(consumed, 6);
+        assert_eq!(
+            parse_command(&buf[consumed..]).unwrap(),
+            Parsed::Complete {
+                args: vec![b"PING".to_vec()],
+                consumed: 6,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // parse_command - multi-bulk array form
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn parse_multibulk_single_element() {
+        assert_eq!(
+            parse_command(b"*1\r\n$4\r\nPING\r\n").unwrap(),
+            Parsed::Complete {
+                args: vec![b"PING".to_vec()],
+                consumed: 14,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_two_elements() {
+        let buf: &[u8] = b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+        assert_eq!(
+            parse_command(buf).unwrap(),
+            Parsed::Complete {
+                args: vec![b"GET".to_vec(), b"key".to_vec()],
+                consumed: buf.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_incomplete_mid_count_header() {
+        assert_eq!(parse_command(b"*2\r").unwrap(), Parsed::Incomplete);
+    }
+
+    #[test]
+    fn parse_multibulk_incomplete_waiting_on_second_element() {
+        assert_eq!(
+            parse_command(b"*2\r\n$3\r\nGET\r\n").unwrap(),
+            Parsed::Incomplete
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_incomplete_mid_bulk_data() {
+        // Second bulk declares 3 bytes but only 2 have arrived, no trailing CRLF yet.
+        assert_eq!(
+            parse_command(b"*2\r\n$3\r\nGET\r\n$3\r\nke").unwrap(),
+            Parsed::Incomplete
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_zero_count_is_complete_with_empty_args() {
+        assert_eq!(
+            parse_command(b"*0\r\n").unwrap(),
+            Parsed::Complete {
+                args: vec![],
+                consumed: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_negative_count_is_complete_with_empty_args() {
+        // RESP's null-array encoding; never a real command, but must not crash or error - just
+        // resolve to nothing, like a zero count.
+        assert_eq!(
+            parse_command(b"*-1\r\n").unwrap(),
+            Parsed::Complete {
+                args: vec![],
+                consumed: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_non_numeric_count_is_protocol_error() {
+        assert!(matches!(
+            parse_command(b"*abc\r\n"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_count_exceeding_max_rejected_before_elements_arrive() {
+        // Only the header has arrived - no element bytes at all - yet this must already be a
+        // protocol error, not Incomplete: the claim alone is rejected, never buffered toward.
+        assert!(matches!(
+            parse_command(b"*99999\r\n"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_header_too_long_without_terminator_is_protocol_error() {
+        let mut buf = vec![b'*'];
+        buf.extend(std::iter::repeat_n(b'1', 100));
+        assert!(matches!(parse_command(&buf), Err(RespError::Protocol(_))));
+    }
+
+    #[test]
+    fn parse_multibulk_missing_dollar_marker_is_protocol_error() {
+        assert!(matches!(
+            parse_command(b"*1\r\nXYZ\r\n"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_non_numeric_bulk_length_is_protocol_error() {
+        assert!(matches!(
+            parse_command(b"*1\r\n$abc\r\n"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_negative_bulk_length_is_protocol_error() {
+        assert!(matches!(
+            parse_command(b"*1\r\n$-5\r\n"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_bulk_length_exceeding_max_rejected_before_data_arrives() {
+        // Only the "$600000\r\n" header has arrived (600000 > MAX_BULK_LEN) - must already be a
+        // protocol error, not Incomplete waiting for 600000 bytes that may never come.
+        assert!(matches!(
+            parse_command(b"*1\r\n$600000\r\n"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_missing_trailing_crlf_after_data_is_protocol_error() {
+        // Declares 3 bytes of data; the 2 bytes after that data are "XY", not "\r\n".
+        assert!(matches!(
+            parse_command(b"*1\r\n$3\r\nabcXY"),
+            Err(RespError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn parse_multibulk_three_elements_set_command() {
+        let buf: &[u8] = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        assert_eq!(
+            parse_command(buf).unwrap(),
+            Parsed::Complete {
+                args: vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()],
+                consumed: buf.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_keeps_non_utf8_bytes_verbatim() {
+        // Declared length 2, bytes that are not UTF-8. They come out exactly as sent: decoding
+        // them as text turned every such byte into U+FFFD, so distinct keys collided.
+        let mut buf = b"*1\r\n$2\r\n".to_vec();
+        buf.extend_from_slice(&[0xFF, 0xFE]);
+        buf.extend_from_slice(b"\r\n");
+        assert_eq!(
+            parse_command(&buf).unwrap(),
+            Parsed::Complete {
+                args: vec![vec![0xFF, 0xFE]],
+                consumed: buf.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multibulk_leaves_pipelined_remainder_for_next_call() {
+        let buf = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
+        let Parsed::Complete { consumed, .. } = parse_command(buf).unwrap() else {
+            panic!("expected Complete");
+        };
+        assert_eq!(consumed, 14);
+        assert_eq!(
+            parse_command(&buf[consumed..]).unwrap(),
+            Parsed::Complete {
+                args: vec![b"PING".to_vec()],
+                consumed: 14,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // fuzz-lite guards - mirrors sensor-telnet::telnet::IacFilter and
+    // sensor-ssh::auth::parse_userauth_request's own never-panics convention: this parses bytes
+    // from an unauthenticated peer, so arbitrary (including malformed or truncated) input must
+    // never panic, whatever it resolves to.
+    // ---------------------------------------------------------------------------------------
+
+    proptest::proptest! {
+        #[test]
+        fn parse_command_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=1024)
+        ) {
+            let _ = parse_command(&bytes);
+        }
+
+        /// Feeding the same input to one parser a growing prefix at a time (a slow client whose
+        /// bytes trickle in across many small socket reads) never panics, and at every prefix it
+        /// says what a fresh parser says of that prefix: resuming changes the cost, never the
+        /// answer.
+        #[test]
+        fn a_resumed_parse_agrees_with_a_fresh_one_at_every_prefix(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=256)
+        ) {
+            let mut parser = Parser::default();
+            for i in 0..=bytes.len() {
+                let prefix = &bytes[..i];
+                let resumed = parser.parse(prefix).map(|o| owned(prefix, o));
+                proptest::prop_assert_eq!(&resumed, &parse_command(prefix));
+                if !matches!(resumed, Ok(Parsed::Incomplete)) {
+                    break;
+                }
+            }
+        }
+
+        /// A well-formed multi-bulk command, binary elements included, parses to its elements
+        /// whatever size the reads that deliver it are.
+        #[test]
+        fn a_multibulk_command_parses_to_its_elements_at_any_read_size(
+            parts in proptest::collection::vec(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=40), 1..=12),
+            step in 1usize..=64,
+        ) {
+            let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+            let buf = multibulk(&refs);
+            proptest::prop_assert_eq!(
+                parse_in_steps(&buf, step),
+                Ok(Parsed::Complete { args: parts.clone(), consumed: buf.len() })
+            );
+        }
+    }
+}

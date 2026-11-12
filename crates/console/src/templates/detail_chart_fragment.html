@@ -1,0 +1,19 @@
+{% if current_range == "24h" %}{% set chart_aria = "Events per hour, last 24 hours" %}{% elif current_range == "30d" %}{% set chart_aria = "Events per day, last 30 days" %}{% else %}{% set chart_aria = "Events per day, last 7 days" %}{% endif %}
+<div class="chart-box-compact">
+  <canvas id="chart-ip-timeline" data-chart="line" data-labels="ip-timeline-labels" data-values="ip-timeline-data"
+          data-point-radius="3" data-tension="0.3"
+          role="img" aria-label="{{ chart_aria }}"></canvas>
+</div>
+<script type="application/json" id="ip-timeline-labels">{{ ip_timeline_labels|safe }}</script>
+<script type="application/json" id="ip-timeline-data">{{ ip_timeline_data|safe }}</script>
+{# See dashboard_chart_fragment.html: rendering is driven by propolisInitCharts in assets/charts.js. #}
+{% if is_fragment %}
+<div class="range-selector" id="chart-range" hx-swap-oob="true">
+  {% for r in ["24h", "7d", "30d"] %}
+  <a hx-get="/ip/{{ ip }}/chart?range={{ r }}"
+     hx-target="#detail-chart-container" hx-swap="innerHTML"
+     hx-sync="closest .range-selector:replace"
+     class="range-btn {% if r == current_range %}active{% endif %}">{{ r }}</a>
+  {% endfor %}
+</div>
+{% endif %}

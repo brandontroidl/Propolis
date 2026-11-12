@@ -1,0 +1,463 @@
+//! intake: the binary entry point for sub-project 3's event intake pipeline. Runs one
+//! `IntakeRunner` (tailer + converter + `append_event`, wired in Tasks 1-4) per configured sensor
+//! log file, each polling on its own tokio task against a shared `PgPool` - see
+//! `internal/design/03-event-intake-aggregation.md`'s "The runner" and "Configuration".
+//!
+//! Configuration is environment variables (see the `ENV_*` constants below), matching the
+//! convention established by `sensor-catchall/src/main.rs` and `sensor-ssh/src/main.rs`: every
+//! value is validated at startup and the process refuses to start on a malformed one rather than
+//! silently substituting a default that could disable the bound it names.
+
+use std::collections::HashSet;
+use std::env;
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use intake::quarantine::Quarantine;
+use intake::runner::IntakeRunner;
+use log_tailer::LogTailer;
+use sqlx::PgPool;
+
+const ENV_DATABASE_URL: &str = "DATABASE_URL";
+const ENV_CURSOR_DIR: &str = "PROPOLIS_CURSOR_DIR";
+const ENV_QUARANTINE_DIR: &str = "PROPOLIS_QUARANTINE_DIR";
+const ENV_POLL_INTERVAL_MS: &str = "PROPOLIS_POLL_INTERVAL_MS";
+const ENV_SENSOR_LOGS: &str = "PROPOLIS_SENSOR_LOGS";
+const ENV_PROBE_SOURCE_IPS: &str = "PROPOLIS_FLEET_PROBE_SOURCE_IPS";
+const ENV_PROBE_INTERVAL: &str = "PROPOLIS_FLEET_PROBE_INTERVAL";
+
+const DEFAULT_CURSOR_DIR: &str = "/var/lib/propolis/cursors";
+/// Mirrored from `propolis::config`'s own default, same as the cursor directory.
+const DEFAULT_QUARANTINE_DIR: &str = "/var/lib/propolis/quarantine";
+const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
+/// Mirrored from `propolis::config`'s own default; the two must stay equal or the window intake
+/// confirms in and the window the console trusts a confirmation in drift apart.
+const DEFAULT_PROBE_INTERVAL_SECS: u64 = 300;
+
+use log_tailer::SensorLogConfig;
+
+#[derive(Debug)]
+struct Config {
+    database_url: String,
+    cursor_dir: PathBuf,
+    quarantine_dir: PathBuf,
+    poll_interval: Duration,
+    sensor_logs: Vec<SensorLogConfig>,
+    probe_sources: Arc<HashSet<IpAddr>>,
+    probe_grace: Duration,
+}
+
+#[derive(Debug, PartialEq)]
+enum ConfigError {
+    /// `DATABASE_URL` was absent or empty.
+    MissingDatabaseUrl,
+    /// `PROPOLIS_SENSOR_LOGS` was absent, empty, or held only blank entries.
+    NoSensorLogs,
+    InvalidSensorLogEntry(String),
+    /// A bound value failed to parse, or parsed to 0. Zero is always rejected rather than
+    /// silently treated as "poll as fast as possible" - a busy-poll loop pinning a CPU core on
+    /// every idle tailer, the same "zero never means unlimited" convention `sensor-catchall`'s
+    /// `parse_positive_u64` establishes for its own bounds.
+    InvalidBound {
+        field: &'static str,
+        value: String,
+    },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::MissingDatabaseUrl => write!(
+                f,
+                "{ENV_DATABASE_URL} must be set to a PostgreSQL connection string"
+            ),
+            ConfigError::NoSensorLogs => write!(
+                f,
+                "{ENV_SENSOR_LOGS} must name at least one sensor (comma-separated name:path pairs)"
+            ),
+            ConfigError::InvalidSensorLogEntry(s) => {
+                write!(
+                    f,
+                    "invalid {ENV_SENSOR_LOGS} entry {s:?}, expected name:path"
+                )
+            }
+            ConfigError::InvalidBound { field, value } => write!(
+                f,
+                "{field} must be a positive integer, got {value:?} (zero never means \"as fast as possible\")"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Parses `PROPOLIS_SENSOR_LOGS` through the shared `log_tailer::parse_sensor_logs` (e.g.
+/// `catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl`),
+/// mapping its errors into this binary's own. An empty list is rejected: at least one real
+/// sensor is required.
+fn parse_sensor_logs(raw: &str) -> Result<Vec<SensorLogConfig>, ConfigError> {
+    log_tailer::parse_sensor_logs(raw).map_err(|e| match e {
+        log_tailer::SensorLogsError::Empty => ConfigError::NoSensorLogs,
+        log_tailer::SensorLogsError::InvalidEntry(entry) => {
+            ConfigError::InvalidSensorLogEntry(entry)
+        }
+    })
+}
+
+/// Parses an optional positive `u64` bound: `None` (the env var was unset) falls back to
+/// `default`; present-but-zero or present-but-unparseable are both rejected. Mirrors
+/// `sensor-catchall`'s `parse_positive_u64` (kept free of `std::env` itself so it stays
+/// unit-testable without mutating real process environment).
+fn parse_positive_u64(
+    raw: Option<&str>,
+    default: u64,
+    field: &'static str,
+) -> Result<u64, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value: u64 = raw.parse().map_err(|_| ConfigError::InvalidBound {
+        field,
+        value: raw.to_string(),
+    })?;
+    if value == 0 {
+        return Err(ConfigError::InvalidBound {
+            field,
+            value: raw.to_string(),
+        });
+    }
+    Ok(value)
+}
+
+/// Loads and validates configuration from environment variables. Fails closed: a missing
+/// `DATABASE_URL`, an empty or malformed sensor log list, or a zero-valued poll interval is
+/// rejected here rather than silently substituted with a default.
+fn load_config_from_env() -> Result<Config, ConfigError> {
+    let database_url = env::var(ENV_DATABASE_URL)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or(ConfigError::MissingDatabaseUrl)?;
+    let cursor_dir = env::var(ENV_CURSOR_DIR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CURSOR_DIR));
+    let quarantine_dir = env::var(ENV_QUARANTINE_DIR)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_QUARANTINE_DIR));
+    let poll_interval_ms = parse_positive_u64(
+        env::var(ENV_POLL_INTERVAL_MS).ok().as_deref(),
+        DEFAULT_POLL_INTERVAL_MS,
+        ENV_POLL_INTERVAL_MS,
+    )?;
+    let sensor_logs = parse_sensor_logs(&env::var(ENV_SENSOR_LOGS).unwrap_or_default())?;
+    let probe_sources = parse_probe_sources(env::var(ENV_PROBE_SOURCE_IPS).ok().as_deref())?;
+    // Twice the sweep interval, the same window `fleet::health` calls fresh. This binary does not
+    // run the sweep, so it takes the cadence purely to size that window; a value it cannot parse
+    // falls back to the shared default rather than refusing to tail logs.
+    let probe_grace = Duration::from_secs(
+        env::var(ENV_PROBE_INTERVAL)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_PROBE_INTERVAL_SECS)
+            .saturating_mul(2),
+    );
+
+    Ok(Config {
+        database_url,
+        cursor_dir,
+        quarantine_dir,
+        poll_interval: Duration::from_millis(poll_interval_ms),
+        sensor_logs,
+        probe_sources: Arc::new(probe_sources),
+        probe_grace,
+    })
+}
+
+/// The control plane's own egress addresses, whose sensor lines are dropped before conversion.
+///
+/// This binary is the OTHER deployment shape of the same pipeline (the unified daemon runs the
+/// same runner in-process), so it reads the same variable. Omitting it here would leave a node
+/// running standalone intake writing the prober's own connections into the ledger while the daemon
+/// filtered them - the same probe scoring the control plane into the blocklist on one shape and
+/// not the other. A malformed address is rejected rather than skipped: a filter that silently
+/// dropped one of its entries is a filter that stops filtering.
+fn parse_probe_sources(raw: Option<&str>) -> Result<HashSet<IpAddr>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(HashSet::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<IpAddr>().map_err(|_| ConfigError::InvalidBound {
+                field: ENV_PROBE_SOURCE_IPS,
+                value: s.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Resolves when the process receives SIGINT (`Ctrl+C`) or, on Unix, SIGTERM - what `systemctl
+/// stop` sends, not SIGINT, to the hardened `deploy/intake.service` unit this binary ships.
+/// Mirrors `sensor_framework::listener::shutdown_signal` exactly (same reason: graceful shutdown
+/// under systemd), duplicated here rather than taken as a dependency: `intake` is architecturally
+/// distinct from the sensor layer (`internal/design/03-event-intake-aggregation.md`: "no vendor
+/// client, no web surface, no feed publisher, and no sensor"), and pulling in the whole
+/// listener/spool/WAN-resolution surface of `sensor-framework` for one signal-handling helper is
+/// out of proportion to what it buys.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "intake: failed to install SIGTERM handler; shutdown_signal now waits on SIGINT only"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// One sensor's poll loop: read a batch, append what converts, and persist the cursor when the
+/// position moved (`RunBatchResult::cursor_moved`). After a database error the runner leaves the
+/// tailer AT the first line that failed to reach the ledger, never past it, so persisting is the
+/// at-least-once guarantee intact (`internal/design/03-event-intake-aggregation.md`'s "Cursor
+/// advancement rules": "Database error: cursor does NOT advance" past the failed line), and it
+/// stops a restart from replaying the part of a batch that already committed.
+async fn run_sensor_loop(
+    sensor: SensorLogConfig,
+    pool: PgPool,
+    cursor_dir: PathBuf,
+    poll_interval: Duration,
+    probe_sources: Arc<HashSet<IpAddr>>,
+    probe_grace: Duration,
+    quarantine_dir: PathBuf,
+) {
+    let SensorLogConfig { name, log_path } = sensor;
+    let tailer = LogTailer::new(log_path, cursor_dir);
+    let mut runner = IntakeRunner::new(tailer, pool, name.clone(), probe_sources, probe_grace)
+        .with_quarantine(Quarantine::new(quarantine_dir));
+    tracing::info!(sensor = %name, "intake: tailer started");
+
+    loop {
+        let result = runner.run_batch().await;
+
+        if result.ingested > 0
+            || result.rejected > 0
+            || result.probe_confirmations > 0
+            || result.errors > 0
+        {
+            tracing::info!(
+                sensor = %name,
+                ingested = result.ingested,
+                rejected = result.rejected,
+                probe_confirmations = result.probe_confirmations,
+                errors = result.errors,
+                quarantined = result.quarantined,
+                "intake: batch processed"
+            );
+        }
+
+        if result.cursor_moved()
+            && let Err(e) = runner.persist_cursor()
+        {
+            tracing::error!(sensor = %name, error = %e, "intake: cursor persist failed");
+        }
+
+        // A batch of nothing but probe lines still consumed input, so there may be more waiting.
+        // Same for a quarantined line: the lines behind it are waiting.
+        if result.ingested == 0
+            && result.rejected == 0
+            && result.probe_confirmations == 0
+            && result.quarantined == 0
+        {
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    log_format::init(tracing::level_filters::LevelFilter::ERROR);
+
+    let config = match load_config_from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "intake: invalid configuration; refusing to start");
+            std::process::exit(1);
+        }
+    };
+
+    let pool = match PgPool::connect(&config.database_url).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            tracing::error!(error = %e, "intake: failed to connect to PostgreSQL");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&config.cursor_dir) {
+        tracing::error!(
+            path = %config.cursor_dir.display(),
+            error = %e,
+            "intake: failed to create cursor directory"
+        );
+        std::process::exit(1);
+    }
+
+    let mut handles = Vec::new();
+    for sensor in config.sensor_logs {
+        let pool = pool.clone();
+        let cursor_dir = config.cursor_dir.clone();
+        let poll_interval = config.poll_interval;
+        let probe_sources = config.probe_sources.clone();
+        let probe_grace = config.probe_grace;
+        let quarantine_dir = config.quarantine_dir.clone();
+        handles.push(tokio::spawn(async move {
+            run_sensor_loop(
+                sensor,
+                pool,
+                cursor_dir,
+                poll_interval,
+                probe_sources,
+                probe_grace,
+                quarantine_dir,
+            )
+            .await;
+        }));
+    }
+
+    shutdown_signal().await;
+    tracing::info!("intake: shutdown signal received; stopping");
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sensor_logs_accepts_comma_separated_pairs() {
+        let logs = parse_sensor_logs(
+            "catchall:/var/log/propolis/catchall/events.jsonl,ssh:/var/log/propolis/ssh/events.jsonl",
+        )
+        .unwrap();
+        assert_eq!(
+            logs,
+            vec![
+                SensorLogConfig {
+                    name: "catchall".into(),
+                    log_path: "/var/log/propolis/catchall/events.jsonl".into(),
+                },
+                SensorLogConfig {
+                    name: "ssh".into(),
+                    log_path: "/var/log/propolis/ssh/events.jsonl".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_sensor_logs_trims_whitespace_around_entries() {
+        let logs = parse_sensor_logs(" catchall:/var/log/a.jsonl , ssh:/var/log/b.jsonl ").unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].name, "catchall");
+        assert_eq!(logs[1].name, "ssh");
+    }
+
+    #[test]
+    fn parse_sensor_logs_rejects_empty() {
+        assert_eq!(parse_sensor_logs(""), Err(ConfigError::NoSensorLogs));
+        assert_eq!(parse_sensor_logs("   "), Err(ConfigError::NoSensorLogs));
+    }
+
+    #[test]
+    fn parse_sensor_logs_rejects_entry_without_colon() {
+        assert!(matches!(
+            parse_sensor_logs("not-a-pair"),
+            Err(ConfigError::InvalidSensorLogEntry(_))
+        ));
+    }
+
+    #[test]
+    fn parse_sensor_logs_rejects_empty_name_or_path() {
+        assert!(matches!(
+            parse_sensor_logs(":/var/log/x.jsonl"),
+            Err(ConfigError::InvalidSensorLogEntry(_))
+        ));
+        assert!(matches!(
+            parse_sensor_logs("catchall:"),
+            Err(ConfigError::InvalidSensorLogEntry(_))
+        ));
+    }
+
+    #[test]
+    fn parse_sensor_logs_path_may_contain_colon() {
+        // splitn(2, ':') splits only at the first colon, so a path segment after it is kept
+        // intact rather than truncated or rejected.
+        let logs = parse_sensor_logs("weird:/var/log/a:b.jsonl").unwrap();
+        assert_eq!(logs[0].log_path, PathBuf::from("/var/log/a:b.jsonl"));
+    }
+
+    #[test]
+    fn parse_positive_u64_uses_default_when_absent() {
+        assert_eq!(parse_positive_u64(None, 42, "x").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_positive_u64_rejects_zero() {
+        // Zero must never silently mean "poll as fast as possible".
+        assert!(matches!(
+            parse_positive_u64(Some("0"), 42, "x"),
+            Err(ConfigError::InvalidBound { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_positive_u64_rejects_non_numeric() {
+        assert!(matches!(
+            parse_positive_u64(Some("not-a-number"), 42, "x"),
+            Err(ConfigError::InvalidBound { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_positive_u64_accepts_explicit_value() {
+        assert_eq!(parse_positive_u64(Some("100"), 42, "x").unwrap(), 100);
+    }
+
+    #[test]
+    fn load_config_missing_database_url_fails() {
+        // The env is shared across test threads (matches sensor-ssh's
+        // load_config_missing_bind_fails precedent), so only assert what we can reason about
+        // without mutating it.
+        if env::var(ENV_DATABASE_URL).is_err() {
+            assert!(matches!(
+                load_config_from_env(),
+                Err(ConfigError::MissingDatabaseUrl)
+            ));
+        }
+    }
+}

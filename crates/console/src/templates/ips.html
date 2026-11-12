@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Attackers - Propolis{% endblock %}
+{% block content %}
+<h1>Attackers</h1>
+<p class="table-note" id="tier-note"><strong>Tier</strong> is set when an address is scored, from its raw score and its strongest signal's confidence: aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70. <strong>Score</strong> is live, decayed since the last event and weighted for breadth, so a 100.0 can be standard while a 99.9 is aggressive. Rules: <span class="mono">docs/reference/scoring-and-feed.md#tier</span></p>
+{#- The same sort bar as Review and Campaigns: column headers are hidden when the table stacks
+    into cards on a narrow screen, and the bar is not. The active key shows its direction and its
+    link reverses it. -#}
+<nav class="sortbar" aria-label="Sort the addresses">
+  <span class="dim">Sort by</span>
+  {% for key, name in [["score", "score"], ["events", "events"], ["first", "first seen"], ["last", "last seen"]] %}
+  <a href="/ips?sort={{ key }}&dir={% if sort == key and dir == 'desc' %}asc{% else %}desc{% endif %}" class="{% if sort == key %}active{% endif %}">{{ name }}{% if sort == key %} {{ "▲" if dir == "asc" else "▼" }}{% endif %}</a>
+  {% endfor %}
+</nav>
+<div class="panel">
+<div class="panel-head">Addresses{% if ips %} <span class="dim">{% if total_exact %}{{ total | count }}{% else %}about {{ total | count }} (estimate){% endif %} scored</span>{% endif %}</div>
+{% if ips %}
+<table class="table-compact stack">
+  <thead>
+    <tr>
+      <th class="count">Score</th>
+      <th>IP</th>
+      <th title="aggressive: raw score &ge; 90 and confidence &ge; 0.95; standard: &ge; 75 and &ge; 0.70; set when scored" aria-describedby="tier-note">Tier</th>
+      <th class="count">Events</th>
+      <th>Categories</th>
+      <th>WANs</th>
+      <th>First seen</th>
+      <th>Last seen</th>
+      <th>Eligible</th>
+    </tr>
+  </thead>
+  <tbody id="ips-rows">
+{% include "ips_rows.html" %}
+  </tbody>
+</table>
+<div class="load-more-row" id="load-more-container">{% include "ips_load_more.html" %}</div>
+{% else %}
+<p class="empty-line">no scored IPs yet</p>
+{% endif %}
+</div>
+{% endblock %}

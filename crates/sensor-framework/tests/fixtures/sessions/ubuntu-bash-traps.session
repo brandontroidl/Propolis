@@ -1,0 +1,252 @@
+# `trap` in an interactive login bash on Ubuntu 22.04. Setting, listing (`trap -- 'CMD' SIGNAME` in
+# signal order, `EXIT` first, bash's `DEBUG`, `ERR` and `RETURN` last), ignoring with an empty
+# command, resetting with `-` or a lone signal, the refusals (`invalid signal specification`,
+# `invalid option` with a usage line), signal names in any case with or without `SIG`, `RTMIN+N`,
+# the numbers 32 and 33, `trap -l`, a subshell that lists its parent's handlers until it sets one,
+# the `EXIT` handler (which runs when a subshell or a command substitution ends) and the `DEBUG`
+# and `ERR` handlers (`DEBUG` before every simple command, `ERR` after a failing simple command,
+# pipeline or subshell that nothing tests). `$BASH_COMMAND` is not modeled, so none of the
+# handlers here read it. Each reply was produced by `bash --noprofile --norc --noediting -i`
+# started as a login shell (`exec -a -bash`) in the localhost/propolis-survey-ref:jammy container
+# (bash 5.1.16), run with `--network none`, PS1 and PS2 set to markers and these lines fed one at a
+# time on standard input.
+# source: ubuntu:22.04 container run of bash 5.1.16 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ trap
+$ trap 'echo bye' EXIT
+$ trap
+> trap -- 'echo bye' EXIT
+$ trap -p EXIT
+> trap -- 'echo bye' EXIT
+$ trap -p INT
+$ trap 'echo int' INT
+$ trap 'echo hup' 1
+$ trap
+> trap -- 'echo bye' EXIT
+> trap -- 'echo hup' SIGHUP
+> trap -- 'echo int' SIGINT
+$ trap -p HUP INT
+> trap -- 'echo hup' SIGHUP
+> trap -- 'echo int' SIGINT
+$ trap - INT
+$ trap '' TERM
+$ trap 'x' USR1 USR2
+$ trap
+> trap -- 'echo bye' EXIT
+> trap -- 'echo hup' SIGHUP
+> trap -- 'x' SIGUSR1
+> trap -- 'x' SIGUSR2
+> trap -- '' SIGTERM
+$ trap -- 'echo dd' EXIT
+$ trap 'echo e' NOSUCH
+> -bash: trap: NOSUCH: invalid signal specification
+$ echo $?
+> 1
+$ trap 'echo e' 99
+> -bash: trap: 99: invalid signal specification
+$ trap INT TERM
+$ trap
+> trap -- 'echo dd' EXIT
+> trap -- 'echo hup' SIGHUP
+> trap -- 'x' SIGUSR1
+> trap -- 'x' SIGUSR2
+> trap -- 'INT' SIGTERM
+$ trap 'a' 0
+$ trap -x
+> -bash: trap: -x: invalid option
+> trap: usage: trap [-lp] [[arg] signal_spec ...]
+$ echo $?
+> 2
+$ trap -p NOSUCH
+> -bash: trap: NOSUCH: invalid signal specification
+$ trap 'echo q' SIGINT
+$ trap 'echo q' sigterm
+$ trap 'echo q' int
+$ trap
+> trap -- 'a' EXIT
+> trap -- 'echo hup' SIGHUP
+> trap -- 'echo q' SIGINT
+> trap -- 'x' SIGUSR1
+> trap -- 'x' SIGUSR2
+> trap -- 'echo q' SIGTERM
+$ trap 'echo x' KILL STOP 9
+$ echo $?
+> 0
+$ trap -
+> trap: usage: trap [-lp] [[arg] signal_spec ...]
+$ trap -- -
+> trap: usage: trap [-lp] [[arg] signal_spec ...]
+$ trap - -
+> -bash: trap: -: invalid signal specification
+$ trap "echo it's" EXIT
+$ trap -p EXIT
+> trap -- 'echo it'\''s' EXIT
+$ trap 'echo a
+$ echo b' EXIT
+$ trap -p EXIT
+> trap -- 'echo a
+> echo b' EXIT
+$ trap 'x' CHLD WINCH 64 RTMIN RTMAX 32 33
+$ trap 'x' SIGRTMIN+1 RTMIN+3 RTMAX-1
+$ trap
+> trap -- 'echo a
+> echo b' EXIT
+> trap -- 'echo hup' SIGHUP
+> trap -- 'echo q' SIGINT
+> trap -- 'echo x' SIGKILL
+> trap -- 'x' SIGUSR1
+> trap -- 'x' SIGUSR2
+> trap -- 'echo q' SIGTERM
+> trap -- 'x' SIGCHLD
+> trap -- 'echo x' SIGSTOP
+> trap -- 'x' SIGWINCH
+> trap -- 'x' 32
+> trap -- 'x' 33
+> trap -- 'x' SIGRTMIN
+> trap -- 'x' SIGRTMIN+1
+> trap -- 'x' SIGRTMIN+3
+> trap -- 'x' SIGRTMAX-1
+> trap -- 'x' SIGRTMAX
+$ trap 'x' 65
+> -bash: trap: 65: invalid signal specification
+$ trap -l
+>  1) SIGHUP	 2) SIGINT	 3) SIGQUIT	 4) SIGILL	 5) SIGTRAP
+>  6) SIGABRT	 7) SIGBUS	 8) SIGFPE	 9) SIGKILL	10) SIGUSR1
+> 11) SIGSEGV	12) SIGUSR2	13) SIGPIPE	14) SIGALRM	15) SIGTERM
+> 16) SIGSTKFLT	17) SIGCHLD	18) SIGCONT	19) SIGSTOP	20) SIGTSTP
+> 21) SIGTTIN	22) SIGTTOU	23) SIGURG	24) SIGXCPU	25) SIGXFSZ
+> 26) SIGVTALRM	27) SIGPROF	28) SIGWINCH	29) SIGIO	30) SIGPWR
+> 31) SIGSYS	34) SIGRTMIN	35) SIGRTMIN+1	36) SIGRTMIN+2	37) SIGRTMIN+3
+> 38) SIGRTMIN+4	39) SIGRTMIN+5	40) SIGRTMIN+6	41) SIGRTMIN+7	42) SIGRTMIN+8
+> 43) SIGRTMIN+9	44) SIGRTMIN+10	45) SIGRTMIN+11	46) SIGRTMIN+12	47) SIGRTMIN+13
+> 48) SIGRTMIN+14	49) SIGRTMIN+15	50) SIGRTMAX-14	51) SIGRTMAX-13	52) SIGRTMAX-12
+> 53) SIGRTMAX-11	54) SIGRTMAX-10	55) SIGRTMAX-9	56) SIGRTMAX-8	57) SIGRTMAX-7
+> 58) SIGRTMAX-6	59) SIGRTMAX-5	60) SIGRTMAX-4	61) SIGRTMAX-3	62) SIGRTMAX-2
+>e 63) SIGRTMAX-1\t64) SIGRTMAX\t
+$ trap - 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 37 63 64
+$ trap -- '' ERR
+$ trap
+> trap -- '' ERR
+$ trap - ERR
+$ trap '' INT QUIT
+$ trap -p INT QUIT
+> trap -- '' SIGINT
+> trap -- '' SIGQUIT
+$ trap - INT QUIT
+$ (trap 'echo sub' EXIT; echo body)
+> body
+> sub
+$ trap 'echo parent' EXIT; (echo child)
+> child
+$ trap 'echo p' INT; (trap)
+> trap -- 'echo parent' EXIT
+> trap -- 'echo p' SIGINT
+$ trap 'echo p' INT; ( trap - INT; trap )
+$ echo $(trap 'echo S' EXIT; echo body)
+> body S
+$ (trap 'echo S1' EXIT; (trap 'echo S2' EXIT; echo in); echo mid)
+> in
+> S2
+> mid
+> S1
+$ (trap 'echo S' EXIT; exit 4); echo $?
+> S
+> 4
+$ trap - INT EXIT
+$ trap '' USR1; bash -c trap
+> trap -- '' SIGUSR1
+$ trap '' USR1; sh -c trap
+$ trap - USR1
+$ bash -c 'trap "echo bye" EXIT; echo body'
+> body
+> bye
+$ bash -c 'trap "echo bye" EXIT; exit 3'; echo $?
+> bye
+> 3
+$ bash -c 'trap "echo bye; exit 5" EXIT; exit 3'; echo $?
+> bye
+> 5
+$ bash -c 'trap "echo bye \$?" EXIT; false'
+> bye 1
+$ bash -c 'trap "echo A" EXIT; trap "echo B" EXIT'
+> B
+$ bash -c 'trap "echo got" USR1; kill -USR1 $$; echo after'
+> got
+> after
+$ bash -c 'trap "echo bye" EXIT; (trap)'
+> trap -- 'echo bye' EXIT
+> bye
+$ bash -c 'trap "echo bye" EXIT; bash -c "trap"'
+> bye
+$ bash -c 'trap "echo bye" EXIT; f() { return 3; }; f'; echo $?
+> bye
+> 3
+$ bash -c 'trap "echo one;" EXIT; trap'
+> trap -- 'echo one;' EXIT
+> one
+$ bash -c 'trap -p; echo after'
+> after
+$ bash -c 'trap "x" 99; echo rc=$?'
+> bash: line 1: trap: 99: invalid signal specification
+> rc=1
+$ trap 'echo ERR $?' ERR
+$ false
+> ERR 1
+$ true | false
+> ERR 1
+$ false | true
+$ { false; }
+> ERR 1
+$ ( false )
+> ERR 1
+$ f() { false; }; f
+> ERR 1
+$ ! false
+$ false && true
+$ true && false
+> ERR 1
+$ false || false
+> ERR 1
+$ if true; then false; fi
+> ERR 1
+$ if false; then :; fi
+$ while false; do :; done
+$ false; echo x
+> ERR 1
+> x
+$ for i in 1; do false; done
+> ERR 1
+$ x=$(false)
+> ERR 1
+$ [ 1 = 2 ]
+> ERR 1
+$ echo a; false; echo b
+> a
+> ERR 1
+> b
+$ (exit 3)
+> ERR 3
+$ sh -c 'exit 4'
+> ERR 4
+$ f() { return 5; }; f
+> ERR 5
+$ trap - ERR
+$ trap 'echo D' DEBUG
+$ true
+> D
+$ true | true
+> D
+> D
+$ for i in 1 2; do :; done
+> D
+> D
+> D
+> D
+$ f() { :; }
+$ f
+> D
+$ trap - DEBUG
+> D
+$ trap

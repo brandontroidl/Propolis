@@ -1,0 +1,4 @@
+{% include "samples_rows.html" %}
+{#- The rows land through the request's own `beforeend` swap into `#samples-rows`; this replaces
+    the button out of band, as `ips_rows_fragment.html` does. -#}
+<div class="load-more-row" id="load-more-container" hx-swap-oob="true">{% include "samples_load_more.html" %}</div>

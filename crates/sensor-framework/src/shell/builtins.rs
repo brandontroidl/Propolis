@@ -1,0 +1,935 @@
+//! The builtins that act on the shell itself: the working directory, variables, positional
+//! parameters, the umask, loop control, `read`, and leaving. Each returns a [`CommandResult`] like
+//! any other handler and reaches the shell's state through the evaluator, so they behave the same
+//! in a subshell copy as in the login shell.
+//!
+//! `source`, `.` and `eval` only record intent: what they name is checked for existence and
+//! nothing is run, in keeping with the never-exec guarantee that no file is ever handed to an
+//! interpreter here.
+
+use super::eval::Stdin;
+use super::registry::{CommandKind, Registry};
+use super::{CommandResult, FakeShell, Flow, FrameKind, ShellLevel};
+
+/// The default field separators: space, tab, newline.
+const DEFAULT_IFS: &str = " \t\n";
+
+fn is_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with(|c: char| c.is_ascii_digit())
+        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Quote a value the way a listing of variables does: bare when it holds only safe characters,
+/// else in single quotes.
+fn quote_value(value: &str, always: bool) -> String {
+    let safe = !always
+        && !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+impl FakeShell {
+    pub(super) fn builtin_true(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::silent(0)
+    }
+
+    pub(super) fn builtin_false(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::silent(1)
+    }
+
+    pub(super) fn builtin_cd(&mut self, parts: &[&str]) -> CommandResult {
+        // Only into a directory the box presents: a silent `cd` into a directory that
+        // `ls /` never showed is a tell, and a loader's `>/x/.x && cd /x` chain relies on
+        // the two agreeing about what exists.
+        let operand = parts
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-') || **a == "-");
+        let (typed, announce) = match operand {
+            Some(&"-") => match self.state().oldpwd.clone() {
+                Some(previous) => (previous, true),
+                None => {
+                    return CommandResult::stderr(1, self.shell_error("cd: OLDPWD not set"));
+                }
+            },
+            Some(arg) => ((*arg).to_string(), false),
+            None => (
+                self.state().get("HOME").unwrap_or("/root").to_string(),
+                false,
+            ),
+        };
+        let target = self.resolve_logical(&typed);
+        if self.fs.is_dir(&target) {
+            let out = if announce {
+                format!("{target}\n")
+            } else {
+                String::new()
+            };
+            self.state_mut().set_cwd(target);
+            // `/proc/<login pid>/cwd` is the login shell's directory.
+            self.install_processes();
+            CommandResult::stdout(out)
+        } else if self.is_dash() {
+            // Verified on Ubuntu 22.04's dash: its own wording, and status 2.
+            CommandResult::stderr(2, self.shell_error(format_args!("cd: can't cd to {typed}")))
+        } else {
+            CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("cd: {typed}: No such file or directory")),
+            )
+        }
+    }
+
+    /// `exit [n]`. In a subshell, a pipeline stage or a script run by `sh -c` it ends only that;
+    /// in a shell level it leaves the level, and from the login shell it ends the session.
+    pub(super) fn builtin_exit(&mut self, parts: &[&str]) -> CommandResult {
+        let mut complaint = None;
+        let status = match parts.get(1) {
+            None => self.state().last_status,
+            Some(arg) => match arg.parse::<i64>() {
+                Ok(n) => u8::try_from(n & 0xff).unwrap_or(0),
+                Err(_) => {
+                    complaint = Some(
+                        self.shell_error(format_args!("exit: {arg}: numeric argument required")),
+                    );
+                    2
+                }
+            },
+        };
+        let mut result = if self.top_frame_is_scoped() || self.state().exiting {
+            let mut scoped = CommandResult::silent(status);
+            scoped.flow = Flow::ExitSubshell;
+            scoped
+        } else {
+            self.exit_shell(status)
+        };
+        if let Some(message) = complaint {
+            let mut first = CommandResult::stderr(2, message);
+            first.append(result);
+            result = first;
+        }
+        result
+    }
+
+    pub(super) fn builtin_logout(&mut self, _parts: &[&str]) -> CommandResult {
+        self.logout_shell()
+    }
+
+    /// bash's `history`. An interactive login shell lists what was typed as `%5d  %s` lines
+    /// (recorded on Ubuntu 22.04: `    1  echo one`); a shell run by `bash -c`, as an SSH exec is,
+    /// keeps no history and lists nothing (recorded: `history | tail -5` printed nothing, status
+    /// 0). `-c` clears, `-d N` deletes, `N` lists the last N, and a word that is no number is
+    /// bash's `numeric argument required`, status 1, in either shell.
+    pub(super) fn builtin_history(&mut self, parts: &[&str]) -> CommandResult {
+        let args = parts.get(1..).unwrap_or(&[]);
+        let mut count: Option<usize> = None;
+        let mut iter = args.iter();
+        while let Some(&arg) = iter.next() {
+            match arg {
+                "-c" => {
+                    self.history.clear();
+                    return CommandResult::silent(0);
+                }
+                "-d" => {
+                    let Some(position) = iter.next().and_then(|n| n.parse::<usize>().ok()) else {
+                        return CommandResult::stderr(
+                            1,
+                            self.shell_error("history: -d: option requires an argument"),
+                        );
+                    };
+                    if position == 0 || position > self.history.len() {
+                        return CommandResult::stderr(
+                            1,
+                            self.shell_error(format_args!(
+                                "history: {position}: history position out of range"
+                            )),
+                        );
+                    }
+                    self.history.remove(position.saturating_sub(1));
+                    return CommandResult::silent(0);
+                }
+                "-a" | "-n" | "-r" | "-w" | "-p" | "-s" => return CommandResult::silent(0),
+                "--" => {}
+                word => match word.parse::<usize>() {
+                    Ok(n) => count = Some(n),
+                    Err(_) => {
+                        return CommandResult::stderr(
+                            1,
+                            self.shell_error(format_args!(
+                                "history: {word}: numeric argument required"
+                            )),
+                        );
+                    }
+                },
+            }
+        }
+        let keeps = self.context == super::ShellContext::LoginInteractive;
+        if !keeps {
+            return CommandResult::silent(0);
+        }
+        let total = self.history.len();
+        let skip = count.map_or(0, |n| total.saturating_sub(n));
+        let mut out = String::new();
+        for (index, line) in self.history.iter().enumerate().skip(skip) {
+            out.push_str(&format!("{:5}  {line}\n", index.saturating_add(1)));
+        }
+        CommandResult::stdout(out)
+    }
+
+    /// `history` in a shell that has no such builtin (dash, mksh).
+    pub(super) fn builtin_history_not_found(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::stderr(127, self.not_found("history"))
+    }
+
+    /// Note a line typed at the interactive login shell, as bash with Ubuntu's stock
+    /// `HISTCONTROL=ignoreboth` does: a line starting with a space is not kept, nor a repeat of
+    /// the line before it. A login shell without a terminal is not interactive and keeps none.
+    pub(super) fn record_history(&mut self, raw: &str) {
+        if self.context != super::ShellContext::LoginInteractive
+            || !self.tty_input
+            || !matches!(self.active_level(), ShellLevel::Bash { .. })
+            || !self.pending.is_empty()
+        {
+            return;
+        }
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if line.trim().is_empty() || line.starts_with(' ') {
+            return;
+        }
+        let line = super::sanitize_value(line, super::MAX_COMMAND_LEN);
+        if self.history.last() == Some(&line) {
+            return;
+        }
+        if self.history.len() >= super::HISTORY_MAX {
+            self.history.remove(0);
+        }
+        self.history.push(line);
+        let mut held: usize = self.history.iter().map(String::len).sum();
+        while held > super::HISTORY_MAX_BYTES && self.history.len() > 1 {
+            held = held.saturating_sub(self.history.remove(0).len());
+        }
+    }
+
+    pub(super) fn top_frame_is_scoped(&self) -> bool {
+        self.frames
+            .last()
+            .is_some_and(|f| matches!(f.kind, FrameKind::Subshell | FrameKind::Script(_)))
+    }
+
+    // ---- variables and parameters ----------------------------------------------------------
+
+    /// `export [-p] [-n] [-f] [NAME[=value]]...`. Alone it lists what is exported. bash's `-f`
+    /// names functions instead, which a bash started afterwards inherits; dash has no such
+    /// option.
+    pub(super) fn builtin_export(&mut self, parts: &[&str]) -> CommandResult {
+        let mut unexport = false;
+        let mut functions = false;
+        let mut operands: Vec<&str> = Vec::new();
+        for arg in parts.iter().skip(1) {
+            match *arg {
+                "-n" => unexport = true,
+                a if a.starts_with('-') && a.len() > 1 && operands.is_empty() => {
+                    for flag in a.chars().skip(1) {
+                        match flag {
+                            'n' => unexport = true,
+                            'f' if self.is_dash() => {
+                                return self.dash_fatal(2, "export: Illegal option -f");
+                            }
+                            'f' => functions = true,
+                            _ => {}
+                        }
+                    }
+                }
+                a if a.starts_with('-') && operands.is_empty() => {}
+                a => operands.push(a),
+            }
+        }
+        if functions {
+            return self.export_functions(&operands, unexport);
+        }
+        if operands.is_empty() {
+            return CommandResult::stdout(self.list_exported());
+        }
+        let mut errors = String::new();
+        for operand in operands {
+            let (name, value) = match operand.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (operand, None),
+            };
+            if !is_name(name) {
+                errors.push_str(
+                    &self.shell_error(format_args!("export: `{operand}': not a valid identifier")),
+                );
+                continue;
+            }
+            if let Some(value) = value {
+                self.assign_var(name, value.to_string());
+            } else if !unexport && !self.state().vars.contains_key(name) {
+                // `export name` creates it empty, against the allowance like any other variable.
+                self.assign_var(name, String::new());
+            }
+            if let Some(var) = self.state_mut().vars.get_mut(name) {
+                var.exported = !unexport;
+            }
+        }
+        if errors.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, errors)
+        }
+    }
+
+    /// `export -f NAME...`: mark functions for a bash started from this shell.
+    fn export_functions(&mut self, names: &[&str], unexport: bool) -> CommandResult {
+        let mut errors = String::new();
+        for name in names {
+            match self.state_mut().functions.get_mut(*name) {
+                Some(held) => held.exported = !unexport,
+                None => errors
+                    .push_str(&self.shell_error(format_args!("export: {name}: not a function"))),
+            }
+        }
+        if errors.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, errors)
+        }
+    }
+
+    pub(super) fn is_dash(&self) -> bool {
+        matches!(self.active_level(), ShellLevel::Dash { .. })
+    }
+
+    fn list_exported(&self) -> String {
+        let bash = self.is_bash();
+        let mut out = String::new();
+        for (name, var) in &self.state().vars {
+            if !var.exported {
+                continue;
+            }
+            if bash {
+                let mut escaped = String::new();
+                for c in var.value.chars() {
+                    if matches!(c, '\\' | '"' | '$' | '`') {
+                        escaped.push('\\');
+                    }
+                    escaped.push(c);
+                }
+                out.push_str(&format!("declare -x {name}=\"{escaped}\"\n"));
+            } else {
+                out.push_str(&format!(
+                    "export {name}={}\n",
+                    quote_value(&var.value, true)
+                ));
+            }
+        }
+        out
+    }
+
+    /// `unset [-f|-v] NAME...`. Without an option dash unsets variables only, and bash a variable
+    /// or, when there is none by that name, a function.
+    pub(super) fn builtin_unset(&mut self, parts: &[&str]) -> CommandResult {
+        let (mut functions, mut variables) = (false, false);
+        let mut at = 1;
+        while let Some(arg) = parts.get(at) {
+            if *arg == "--" {
+                at = at.saturating_add(1);
+                break;
+            }
+            let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                break;
+            };
+            for flag in flags.chars() {
+                match flag {
+                    'f' => {
+                        functions = true;
+                        // dash takes the last of the two; bash refuses both.
+                        variables &= !self.is_dash();
+                    }
+                    'v' => {
+                        variables = true;
+                        functions &= !self.is_dash();
+                    }
+                    'n' if !self.is_dash() => {}
+                    other if self.is_dash() => {
+                        return self.dash_fatal(2, format_args!("unset: Illegal option -{other}"));
+                    }
+                    other => {
+                        return CommandResult::stderr(
+                            2,
+                            format!(
+                                "{}unset: usage: unset [-f] [-v] [-n] [name ...]\n",
+                                self.shell_error(format_args!("unset: -{other}: invalid option"))
+                            ),
+                        );
+                    }
+                }
+            }
+            at = at.saturating_add(1);
+        }
+        if functions && variables {
+            return CommandResult::stderr(
+                1,
+                self.shell_error("unset: cannot simultaneously unset a function and a variable"),
+            );
+        }
+        let bash = !self.is_dash();
+        for name in parts.get(at..).unwrap_or(&[]) {
+            let state = self.state_mut();
+            if functions {
+                state.functions.remove(*name);
+            } else if variables || !bash || state.vars.contains_key(*name) {
+                state.vars.remove(*name);
+            } else {
+                state.functions.remove(*name);
+            }
+        }
+        CommandResult::silent(0)
+    }
+
+    // ---- functions: return, local, builtin -------------------------------------------------
+
+    /// `return [n]`: ends the running function with status `n` (default the last command's). A
+    /// subshell started inside the function ends alone, as it does for `exit`. Outside a function
+    /// bash refuses; dash treats it as `exit`, ending the shell or script (verified on Ubuntu
+    /// 22.04: `dash -c 'return 3'` exits 3).
+    pub(super) fn builtin_return(&mut self, parts: &[&str]) -> CommandResult {
+        let operands = parts.get(1..).unwrap_or(&[]);
+        let bash = !self.is_dash();
+        if bash && operands.len() > 1 {
+            // The only complaint of a builtin that drops the whole command list.
+            let mut refused =
+                CommandResult::stderr(1, self.shell_error("return: too many arguments"));
+            refused.stop_line = true;
+            return refused;
+        }
+        let mut complaint = None;
+        let status = match operands.first() {
+            None => self.state().last_status,
+            Some(arg) => match exit_number(arg, bash) {
+                Some(status) => status,
+                None if bash => {
+                    complaint = Some(
+                        self.shell_error(format_args!("return: {arg}: numeric argument required")),
+                    );
+                    2
+                }
+                None => {
+                    return self.dash_fatal(2, format_args!("return: Illegal number: {arg}"));
+                }
+            },
+        };
+        if self.state().calls.is_empty() {
+            if bash && matches!(self.active_level(), ShellLevel::Bash { .. }) {
+                return CommandResult::stderr(
+                    2,
+                    self.shell_error("return: can only `return' from a function or sourced script"),
+                );
+            }
+            let text = status.to_string();
+            return self.builtin_exit(&["exit", &text]);
+        }
+        let mut result = match complaint {
+            Some(message) => CommandResult::stderr(status, message),
+            None => CommandResult::silent(status),
+        };
+        result.flow = Flow::Return;
+        result
+    }
+
+    /// `local [NAME[=value]]...` (bash also takes options, which change nothing here). The
+    /// variable is put back, or unset again, when the function returns. dash keeps a variable's
+    /// value for `local NAME`; bash leaves it unset. mksh scopes only the functions written
+    /// `function name` ([unverified]: no mksh to check against).
+    pub(super) fn builtin_local(&mut self, parts: &[&str]) -> CommandResult {
+        let dash = self.is_dash();
+        let Some(call) = self.state().calls.last() else {
+            return if dash {
+                self.dash_fatal(2, "local: not in a function")
+            } else {
+                CommandResult::stderr(1, self.shell_error("local: can only be used in a function"))
+            };
+        };
+        let scoped = call.keyword || !matches!(self.active_level(), ShellLevel::AndroidMksh);
+        let mut errors = String::new();
+        for operand in parts.iter().skip(1) {
+            if operand.starts_with('-') && operand.len() > 1 {
+                if dash {
+                    return self.dash_fatal(2, format_args!("local: {operand}: bad variable name"));
+                }
+                continue;
+            }
+            let (name, value) = match operand.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (*operand, None),
+            };
+            if !is_name(name) {
+                if dash {
+                    // dash words a bad name with a value without the builtin's name.
+                    return if value.is_some() {
+                        self.dash_fatal(2, format_args!("{name}: bad variable name"))
+                    } else {
+                        self.dash_fatal(2, format_args!("local: {name}: bad variable name"))
+                    };
+                }
+                errors.push_str(
+                    &self.shell_error(format_args!("local: `{operand}': not a valid identifier")),
+                );
+                continue;
+            }
+            if scoped {
+                let previous = self.state().vars.get(name).cloned();
+                let state = self.state_mut();
+                if let Some(call) = state.calls.last_mut()
+                    && !call.locals.iter().any(|(held, _)| held == name)
+                {
+                    call.locals.push((name.to_string(), previous));
+                }
+                if value.is_none() && !dash {
+                    state.vars.remove(name);
+                }
+            }
+            if let Some(value) = value {
+                self.assign_var(name, value.to_string());
+            }
+        }
+        if errors.is_empty() {
+            CommandResult::silent(0)
+        } else {
+            CommandResult::stderr(1, errors)
+        }
+    }
+
+    /// bash's `builtin NAME [ARG...]`: runs the shell builtin, never a function of that name.
+    pub(super) fn builtin_builtin(&mut self, parts: &[&str]) -> CommandResult {
+        let mut args = parts.get(1..).unwrap_or(&[]);
+        if args.first() == Some(&"--") {
+            args = args.get(1..).unwrap_or(&[]);
+        }
+        let Some(name) = args.first() else {
+            return CommandResult::silent(0);
+        };
+        if Registry::builtin().kind(name, self) == Some(CommandKind::Builtin) {
+            self.dispatch_nested(args)
+        } else {
+            CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("builtin: {name}: not a shell builtin")),
+            )
+        }
+    }
+
+    /// `set`: alone it lists the variables; `set -- a b` and `set a b` replace the positional
+    /// parameters; option flags are accepted and have no effect.
+    pub(super) fn builtin_set(&mut self, parts: &[&str]) -> CommandResult {
+        let args: Vec<&str> = parts.iter().skip(1).copied().collect();
+        if args.is_empty() {
+            let bash = self.is_bash();
+            let mut out = String::new();
+            for (name, var) in &self.state().vars {
+                out.push_str(&format!("{name}={}\n", quote_value(&var.value, !bash)));
+            }
+            // bash lists its functions after the variables, in the form `declare -f` prints;
+            // dash's `set` does not list them.
+            if bash {
+                for (name, held) in &self.state().functions {
+                    out.push_str(&super::fnprint::bash_function_text(name, &held.def));
+                }
+            }
+            return CommandResult::stdout(out);
+        }
+        let mut i = 0;
+        while let Some(arg) = args.get(i) {
+            if *arg == "--" {
+                i = i.saturating_add(1);
+                break;
+            }
+            if arg.starts_with(['-', '+']) && arg.len() > 1 {
+                // `-o name` and `+o name` take the option's name.
+                if matches!(*arg, "-o" | "+o") {
+                    i = i.saturating_add(1);
+                }
+                i = i.saturating_add(1);
+                continue;
+            }
+            break;
+        }
+        let rest: Vec<String> = args.iter().skip(i).map(|a| (*a).to_string()).collect();
+        let only_flags = i == args.len() && !args.contains(&"--");
+        if !only_flags {
+            self.state_mut().positional = rest;
+        }
+        CommandResult::silent(0)
+    }
+
+    /// `shift [n]`.
+    pub(super) fn builtin_shift(&mut self, parts: &[&str]) -> CommandResult {
+        let count = match parts.get(1) {
+            None => 1usize,
+            Some(arg) => match arg.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return CommandResult::stderr(
+                        1,
+                        self.shell_error(format_args!("shift: {arg}: numeric argument required")),
+                    );
+                }
+            },
+        };
+        if count > self.state().positional.len() {
+            return match self.active_level() {
+                ShellLevel::Bash { .. } => CommandResult::stderr(
+                    1,
+                    self.shell_error(format_args!("shift: {count}: shift count out of range")),
+                ),
+                _ => CommandResult::stderr(2, self.shell_error("shift: can't shift that many")),
+            };
+        }
+        self.state_mut().positional.drain(..count);
+        CommandResult::silent(0)
+    }
+
+    /// `umask [-S] [mode]`. The mask is remembered and reported; created files take a fixed mode.
+    pub(super) fn builtin_umask(&mut self, parts: &[&str]) -> CommandResult {
+        let symbolic = parts.iter().skip(1).any(|a| *a == "-S");
+        let mode = parts.iter().skip(1).find(|a| !a.starts_with('-'));
+        let Some(mode) = mode else {
+            let mask = self.state().umask;
+            if symbolic {
+                let part = |shift: u16| {
+                    let bits = (!mask >> shift) & 0o7;
+                    format!(
+                        "{}{}{}",
+                        if bits & 4 != 0 { "r" } else { "" },
+                        if bits & 2 != 0 { "w" } else { "" },
+                        if bits & 1 != 0 { "x" } else { "" }
+                    )
+                };
+                return CommandResult::stdout(format!(
+                    "u={},g={},o={}\n",
+                    part(6),
+                    part(3),
+                    part(0)
+                ));
+            }
+            return CommandResult::stdout(format!("{mask:04o}\n"));
+        };
+        match u16::from_str_radix(mode, 8) {
+            Ok(mask) if mask <= 0o777 => {
+                self.state_mut().umask = mask;
+                CommandResult::silent(0)
+            }
+            _ => CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("umask: {mode}: octal number out of range")),
+            ),
+        }
+    }
+
+    // ---- loop control ----------------------------------------------------------------------
+
+    pub(super) fn builtin_break(&mut self, parts: &[&str]) -> CommandResult {
+        self.loop_control(parts, "break", Flow::Break)
+    }
+
+    pub(super) fn builtin_continue(&mut self, parts: &[&str]) -> CommandResult {
+        self.loop_control(parts, "continue", Flow::Continue)
+    }
+
+    fn loop_control(
+        &mut self,
+        parts: &[&str],
+        name: &str,
+        flow: impl Fn(u32) -> Flow,
+    ) -> CommandResult {
+        let levels = match parts.get(1) {
+            None => 1u32,
+            Some(arg) => match arg.parse::<u32>() {
+                Ok(0) => {
+                    return CommandResult::stderr(
+                        1,
+                        self.shell_error(format_args!("{name}: 0: loop count out of range")),
+                    );
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    return CommandResult::stderr(
+                        1,
+                        self.shell_error(format_args!("{name}: {arg}: numeric argument required")),
+                    );
+                }
+            },
+        };
+        if self.loop_depth == 0 {
+            // Bash says so; dash ignores it.
+            return match self.active_level() {
+                ShellLevel::Bash { .. } => CommandResult::stderr(
+                    0,
+                    self.shell_error(format_args!(
+                        "{name}: only meaningful in a `for', `while', or `until' loop"
+                    )),
+                ),
+                _ => CommandResult::silent(0),
+            };
+        }
+        let mut result = CommandResult::silent(0);
+        result.flow = flow(levels);
+        result
+    }
+
+    // ---- read ------------------------------------------------------------------------------
+
+    /// `read [-r] [-p prompt] [name...]`: one line of standard input into the variables, split at
+    /// `$IFS`, the last taking the remainder. Status 1 at end of input. From the terminal there is
+    /// nothing to read without another input line, so it reports end of input.
+    pub(super) fn builtin_read(&mut self, parts: &[&str]) -> CommandResult {
+        let mut raw = false;
+        let mut names: Vec<&str> = Vec::new();
+        let mut descriptor: Option<&str> = None;
+        let mut i = 1;
+        while let Some(arg) = parts.get(i) {
+            if *arg == "--" {
+                names.extend(parts.iter().skip(i.saturating_add(1)));
+                break;
+            }
+            match arg.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+                Some(flags) => {
+                    let takes_value = "pnNtduai";
+                    for (at, c) in flags.char_indices() {
+                        if c == 'r' {
+                            raw = true;
+                        } else if takes_value.contains(c) {
+                            let after = at.saturating_add(c.len_utf8());
+                            if c == 'u' {
+                                descriptor = if after == flags.len() {
+                                    parts.get(i.saturating_add(1)).copied()
+                                } else {
+                                    flags.get(after..)
+                                };
+                            }
+                            if after == flags.len() {
+                                i = i.saturating_add(1);
+                            }
+                            break;
+                        }
+                    }
+                }
+                None => names.push(arg),
+            }
+            i = i.saturating_add(1);
+        }
+        for name in &names {
+            if !is_name(name) {
+                return CommandResult::stderr(
+                    1,
+                    self.shell_error(format_args!("read: `{name}': not a valid identifier")),
+                );
+            }
+        }
+        // `-u FD` reads a descriptor `exec` opened, from where the last read of it stopped.
+        let mut swapped: Option<(u16, Stdin)> = None;
+        if let Some(spec) = descriptor {
+            let Ok(fd) = spec.parse::<u16>() else {
+                return CommandResult::stderr(
+                    1,
+                    self.shell_error(format_args!(
+                        "read: {spec}: invalid file descriptor specification"
+                    )),
+                );
+            };
+            if fd != 0 {
+                let Some(open) = self.state().fds.ins.get(&fd) else {
+                    return CommandResult::stderr(
+                        1,
+                        self.shell_error(format_args!(
+                            "read: {fd}: invalid file descriptor: Bad file descriptor"
+                        )),
+                    );
+                };
+                let source = Stdin::data(open.remaining());
+                swapped = Some((fd, std::mem::replace(&mut self.stdin, source)));
+            }
+        }
+        let result = self.read_into(raw, &names);
+        if let Some((fd, previous)) = swapped {
+            self.settle_input(Some(fd));
+            self.stdin = previous;
+        }
+        result
+    }
+
+    /// One line of the input `read` was given into the variables.
+    fn read_into(&mut self, raw: bool, names: &[&str]) -> CommandResult {
+        let Some((mut line, mut ended)) = self.stdin.read_line() else {
+            return CommandResult::silent(1);
+        };
+        let mut text = String::from_utf8_lossy(&line).into_owned();
+        if !raw {
+            // A trailing backslash joins the next line.
+            while ended && text.ends_with('\\') && !text.ends_with("\\\\") {
+                text.pop();
+                match self.stdin.read_line() {
+                    Some((next, next_ended)) => {
+                        line = next;
+                        ended = next_ended;
+                        text.push_str(&String::from_utf8_lossy(&line));
+                    }
+                    None => {
+                        ended = false;
+                        break;
+                    }
+                }
+            }
+            text = unescape_backslashes(&text);
+        }
+        let ifs = self
+            .state()
+            .get("IFS")
+            .map_or_else(|| DEFAULT_IFS.to_string(), str::to_string);
+        if names.is_empty() {
+            self.assign_var("REPLY", text);
+        } else {
+            let values = split_for_read(&text, &ifs, names.len());
+            for (index, name) in names.iter().enumerate() {
+                let value = values.get(index).cloned().unwrap_or_default();
+                self.assign_var(name, value);
+            }
+        }
+        CommandResult::silent(u8::from(!ended))
+    }
+
+    // ---- source, . and eval ----------------------------------------------------------------
+
+    /// `. FILE` and `source FILE`: the file is looked up and nothing is run.
+    pub(super) fn builtin_source(&mut self, parts: &[&str]) -> CommandResult {
+        let Some(file) = parts.get(1) else {
+            return CommandResult::stderr(
+                2,
+                self.shell_error(format_args!(
+                    "{}: filename argument required",
+                    parts.first().unwrap_or(&".")
+                )),
+            );
+        };
+        let path = self.resolve_logical(file);
+        if self.fs.file_exists(&path) {
+            return CommandResult::silent(0);
+        }
+        match self.active_level() {
+            ShellLevel::Bash { .. } => CommandResult::stderr(
+                1,
+                self.shell_error(format_args!(
+                    "{}: {file}: file not found",
+                    parts.first().unwrap_or(&".")
+                )),
+            ),
+            // [unverified] dash's and mksh's wording.
+            _ => CommandResult::stderr(2, self.shell_error(format_args!(".: {file}: not found"))),
+        }
+    }
+
+    /// `eval ARGS`: recorded, not run.
+    pub(super) fn builtin_eval(&mut self, _parts: &[&str]) -> CommandResult {
+        CommandResult::silent(0)
+    }
+
+    /// What a bare `sh` or `bash` does with a script piped to it: run it as a script in a shell
+    /// level of its own. `None` when standard input is a terminal.
+    pub(super) fn take_piped_script(&mut self) -> Option<String> {
+        let cap = self.read_cap();
+        self.stdin
+            .take_script(cap)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// A status operand of `return`: digits, signed for bash, taken modulo 256 (dash keeps the whole
+/// number in `$?` but exits with it modulo 256, which a status of one byte cannot show).
+fn exit_number(arg: &str, signed: bool) -> Option<u8> {
+    let digits = if signed {
+        arg.strip_prefix(['+', '-']).unwrap_or(arg)
+    } else {
+        arg
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude: u64 = digits.parse().ok()?;
+    let value = if signed && arg.starts_with('-') {
+        0u64.wrapping_sub(magnitude)
+    } else {
+        magnitude
+    };
+    u8::try_from(value & 0xff).ok()
+}
+
+/// `\c` becomes `c`, as `read` without `-r` does.
+fn unescape_backslashes(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Split a line into `count` fields at `ifs`, the last holding what remains.
+fn split_for_read(line: &str, ifs: &str, count: usize) -> Vec<String> {
+    let is_ifs = |c: char| ifs.contains(c);
+    let is_space = |c: char| ifs.contains(c) && matches!(c, ' ' | '\t' | '\n');
+    let mut rest = line.trim_start_matches(is_space);
+    let mut fields: Vec<String> = Vec::new();
+    while fields.len() < count.saturating_sub(1) && !rest.is_empty() {
+        let end = rest.find(is_ifs).unwrap_or(rest.len());
+        fields.push(rest.get(..end).unwrap_or("").to_string());
+        rest = rest.get(end..).unwrap_or("");
+        // One delimiter: surrounding whitespace plus at most one non-whitespace character.
+        rest = rest.trim_start_matches(is_space);
+        if let Some(c) = rest.chars().next()
+            && is_ifs(c)
+        {
+            rest = rest.get(c.len_utf8()..).unwrap_or("");
+            rest = rest.trim_start_matches(is_space);
+        }
+    }
+    if fields.len() < count {
+        fields.push(rest.trim_end_matches(is_space).to_string());
+    }
+    fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_splits_at_ifs_and_the_last_variable_takes_the_rest() {
+        assert_eq!(split_for_read("a b c d", DEFAULT_IFS, 2), ["a", "b c d"]);
+        assert_eq!(split_for_read("  a   b  ", DEFAULT_IFS, 3), ["a", "b", ""]);
+        assert_eq!(split_for_read("a:b:c", ":", 2), ["a", "b:c"]);
+        assert_eq!(split_for_read("only", DEFAULT_IFS, 1), ["only"]);
+        assert_eq!(split_for_read("x y  ", DEFAULT_IFS, 1), ["x y"]);
+    }
+
+    #[test]
+    fn values_are_quoted_only_when_they_need_it() {
+        assert_eq!(quote_value("/root", false), "/root");
+        assert_eq!(quote_value("a b", false), "'a b'");
+        assert_eq!(quote_value("it's", false), "'it'\\''s'");
+        assert_eq!(quote_value("plain", true), "'plain'");
+        assert_eq!(quote_value("", false), "''");
+    }
+}

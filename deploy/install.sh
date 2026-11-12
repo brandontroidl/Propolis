@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+#
+# Propolis fresh-node install script.
+#
+# internal/design/07-runtime-coordination-deployment.md's "Install script": provisions OS users,
+# directories, log paths, spool mount points, and systemd units for a fresh node. Idempotent (safe
+# to re-run - every step below converges on the same end state whether the previous run left it
+# half-done, fully done, or never started). Installs only the PRODUCTION deployment surface:
+#
+#   - deploy/propolis.service                        (the unified daemon)
+#   - deploy/sensor-catchall.service, deploy/sensor-ssh.service   (unchanged from sub-project 2)
+#   - deploy/sensor-{telnet,redis,adb,http,ftp,smtp,tftp,mqtt,dns,cred}.service (sub-project 8 sensors)
+#   - per-sensor self-signed TLS pairs in /etc/propolis/tls (deploy/provision-tls.sh), after the binaries.
+#
+# deploy/intake.service, deploy/review.service, deploy/feed.service, and deploy/console.service are
+# deliberately NOT installed here - internal/design/07-runtime-coordination-deployment.md's "What
+# gets retired": those four standalone units are superseded by propolis.service in production and
+# stay in the repo for development/testing only.
+#
+# This script does NOT:
+#   - start or enable any service (`systemctl enable --now <unit>` is an operator action, taken
+#     only after reviewing the populated env files). The exceptions are propolis-logrotate.timer,
+#     which needs no env file and bounds the sensor logs, and propolis-backup.timer, which reads
+#     the daemon's own DATABASE_URL and records "not configured" until it is set.
+#   - create, seed, or migrate the PostgreSQL database. The propolis binary runs its own migrations
+#     (core-scoring + review) at startup once DATABASE_URL is reachable; provisioning the database
+#     server itself is an independent operator/DBA action.
+#   - put a value in any OPERATOR-owned /etc/propolis/*.env file. Each one carries secrets (a
+#     database URL, the console password, vendor API keys) this script has no business fabricating
+#     - internal/design/07-runtime-coordination-deployment.md's "Unified configuration"
+#     documents the full variable set the operator must populate by hand. All it does to them is
+#     the mode: provision.sh (deploy/env-files.sh) creates each missing service env file EMPTY,
+#     root:root 0600, and removes group and other access from existing ones, so the operator's
+#     copy of an example lands in a file that is already closed instead of starting at 0644.
+#     The exceptions are /etc/propolis/watch.env (derived and 0640 by deploy/watch-env.sh) and
+#     /etc/propolis/fleet-listeners.env, which is written wholly by deploy/fleet-listeners.sh in
+#     step 7: it is generated, carries no secret, and is a derived copy of values the operator
+#     already set elsewhere (see that script's header for why it is derived rather than
+#     hand-maintained).
+#   - programmatically create the quarantine-spool noexec,nosuid,nodev mounts. Sizing and backing a
+#     real mount (tmpfs budget vs. a dedicated partition) is a host-specific decision no generic
+#     script can make safely - see step 3 below, which creates the directories and prints the
+#     fstab lines the operator still needs to add.
+#
+# Usage: sudo ./install.sh [--dry-run]
+#   --dry-run   Print every action this script would take without touching the system. Needs no
+#               privilege and does not require the release binaries to already be built.
+#               crates/sensor-framework/tests/deploy_test.rs runs this mode in CI to exercise the
+#               script's full control flow without requiring root.
+
+set -euo pipefail
+
+# ---- args ----
+
+DRY_RUN=0
+if [ "$#" -gt 1 ]; then
+    echo "usage: $0 [--dry-run]" >&2
+    exit 2
+elif [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN=1
+elif [ -n "${1:-}" ]; then
+    echo "usage: $0 [--dry-run]" >&2
+    exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/../target/release}"
+
+log() { printf '==> %s\n' "$*"; }
+
+# Executes "$@" for real, or prints it under --dry-run. Every mutating command in this script goes
+# through this wrapper so the two modes can never drift apart.
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+# ---- 0. privilege check ----
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "error: must run as root (try: sudo $0)" >&2
+    exit 1
+fi
+
+# ---- 1, 2 & 3. users, directories, and spool mountpoints (provisioning: see deploy/provision.sh) ----
+
+# Shared with upgrade.sh so both entry points provision users/dirs through one idempotent routine
+# - see provision.sh's own header for why. Prints its own "1/9 creating OS users" /
+# "2/9 creating directories" / "3/9 creating spool directories" progress lines (verbatim from this
+# script's former inline blocks), so nothing further is logged here.
+run_provision() { DRY_RUN="$DRY_RUN" "$SCRIPT_DIR/provision.sh"; }
+run_provision
+
+cat <<'EOF'
+    NOT DONE BY THIS SCRIPT - back each spool directory with a noexec,nosuid,nodev mount before
+    production use, e.g. in /etc/fstab:
+
+        tmpfs /var/spool/propolis/catchall tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/ssh      tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/adb      tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/ftp      tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/telnet   tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/tftp     tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/mqtt     tmpfs noexec,nosuid,nodev,size=256M 0 0
+        tmpfs /var/spool/propolis/fetched  tmpfs noexec,nosuid,nodev,size=1200M 0 0
+        tmpfs /var/lib/propolis/spool      tmpfs noexec,nosuid,nodev,size=256M 0 0
+
+    Size each mount for the expected upload/sample volume; a dedicated backing partition works
+    identically (replace the tmpfs line with the partition's device and fstype). Run `mount -a`
+    after editing fstab, then confirm with `findmnt <path>` that noexec,nosuid,nodev are actually
+    in effect - a directory alone is one chmod away from being wrong.
+
+    /var/spool/propolis/fetched needs its own sizing thought: its global byte budget
+    (FETCH_SPOOL_GLOBAL_BUDGET in crates/propolis/src/main.rs) is 1 GB, so its mount must be sized
+    at least that large or the OS hits ENOSPC before the daemon's own budget check reports a
+    clean error - see INSTALL.md's "malware fetcher" section for the full sizing/retention
+    tradeoff (tmpfs is RAM-backed and does not survive a reboot; use a persistent partition
+    instead if fetched samples must survive one).
+EOF
+
+# ---- 4. binaries ----
+
+log "4/9 installing binaries to /usr/local/bin"
+INSTALL_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred propolis-watch)
+for bin in "${INSTALL_BINS[@]}"; do
+    src="$BUILD_DIR/$bin"
+    dst="/usr/local/bin/$bin"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        run install -m 0755 "$src" "$dst"
+        continue
+    fi
+    if [ ! -x "$src" ]; then
+        echo "error: $src not found or not executable - run 'cargo build --release' first" >&2
+        exit 1
+    fi
+    install -m 0755 "$src" "$dst"
+done
+if [ "$DRY_RUN" -eq 0 ]; then
+    for bin in "${INSTALL_BINS[@]}"; do
+        if [ ! -x "/usr/local/bin/$bin" ]; then
+            echo "error: /usr/local/bin/$bin is missing or not executable after the install" >&2
+            exit 1
+        fi
+    done
+fi
+
+# Needs the freshly built release binary (the install loop above deliberately does not install
+# provision-certs: it is a deploy tool, not a service), so it runs here and not inside
+# provision.sh, which runs before binaries exist. Creates no env var; the operator still points
+# each sensor's PROPOLIS_<X>_TLS_CERT/_TLS_KEY at the minted files.
+run_provision_tls() { DRY_RUN="$DRY_RUN" PROVISION_CERTS_BIN="$BUILD_DIR/provision-certs" "$SCRIPT_DIR/provision-tls.sh"; }
+run_provision_tls
+
+# ---- 5. systemd units ----
+
+log "5/9 installing systemd units"
+for unit in propolis.service sensor-catchall.service sensor-ssh.service sensor-telnet.service sensor-redis.service sensor-adb.service sensor-http.service sensor-ftp.service sensor-smtp.service sensor-tftp.service sensor-mqtt.service sensor-dns.service sensor-cred.service; do
+    run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
+
+# ---- 6. logrotate config ----
+
+log "6/9 installing logrotate config, free-space guard, and the Propolis rotation timer"
+run install -m 0644 "$SCRIPT_DIR/logrotate-sensors.conf" /etc/logrotate.d/propolis-sensors
+# The policy's prerotate hook calls this; a missing guard fails every rotation closed.
+run install -m 0755 "$SCRIPT_DIR/logrotate-guard.sh" /usr/local/sbin/propolis-logrotate-guard
+# Propolis runs logrotate itself (hourly, own state file) instead of trusting the distro's
+# logrotate.timer to be active; enabled in step 9, once systemd has loaded the units.
+for unit in propolis-logrotate.service propolis-logrotate.timer; do
+    run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
+# The nightly backup, enabled in step 9 like rotation: it needs nothing the operator has not already
+# set for the daemon (it reads DATABASE_URL from propolis.env) and records "not configured" until
+# that exists.
+run install -m 0755 "$SCRIPT_DIR/backup.sh" /usr/local/sbin/propolis-backup
+for unit in propolis-backup.service propolis-backup.timer; do
+    run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
+# The owner-role migration (docs/operations/database-roles.md); inert until the operator splits
+# the database roles and writes /etc/propolis/migrate.env.
+run install -m 0755 "$SCRIPT_DIR/migrate.sh" /usr/local/sbin/propolis-migrate
+# Every Propolis unit names this in OnFailure=, so it is installed with them; it needs no enable.
+run install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+# The public-feed push runs from the operator's cron as propolis-blocklist out of a root-owned copy
+# the account cannot edit (upgrade.sh refreshes it); inert until the operator adds the cron entry.
+run install -d -o root -g root -m 0755 /usr/local/lib/propolis
+run install -o root -g root -m 0755 "$SCRIPT_DIR/blocklist-sync.sh" /usr/local/lib/propolis/blocklist-sync.sh
+run install -o root -g root -m 0644 "$SCRIPT_DIR/blocklist-README.md" /usr/local/lib/propolis/blocklist-README.md
+# The off-host pull's forced command; inert until the operator adds a key for propolis-backup-pull.
+run install -m 0755 "$SCRIPT_DIR/backup-serve.sh" /usr/local/sbin/propolis-backup-serve
+run install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service
+
+# ---- 7. fleet listener inventory ----
+
+# Derived from the sensors' own bind variables rather than hand-maintained; see
+# fleet-listeners.sh's header for why. On a FRESH install the operator has not populated any
+# sensor env file yet, so this normally writes a header-only file and the fleet pane reports
+# every check as unknown until upgrade.sh (or this script, re-run) regenerates it. That is the
+# truth at that moment, not a defect.
+log "7/9 deriving the fleet listener inventory"
+run "$SCRIPT_DIR/fleet-listeners.sh"
+
+# ---- 8. deploy stamp ----
+
+# What this box last deployed, which the console compares against the commit each binary stamped
+# into itself; see deploy-stamp.sh's header. On a fresh install nothing has been restarted yet, so
+# the pane will read "restart required" until the operator enables the units - which is accurate.
+log "8/9 recording the deploy stamp"
+run "$SCRIPT_DIR/deploy-stamp.sh"
+
+# ---- 9. reload systemd ----
+
+log "9/9 reloading systemd unit files"
+run systemctl daemon-reload
+
+# The one thing this script enables: log rotation takes no operator input (no env file, no secret)
+# and an unrotated sensor log fills the disk, so it is not left to a step someone can forget.
+run systemctl enable --now propolis-logrotate.timer
+run systemctl enable --now propolis-backup.timer
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    log "dry-run complete - no changes were made."
+else
+    log "done. Services are installed but NOT started or enabled (except the log rotation and backup timers), and the database is untouched."
+    log "Next: populate /etc/propolis/*.env files, then 'systemctl enable --now <unit>' per service."
+fi

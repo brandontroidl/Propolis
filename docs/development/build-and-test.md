@@ -1,0 +1,248 @@
+<!--
+title: Build and test
+audience: developer
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-09
+-->
+
+# Build and test
+
+The authoritative gate is CI (`.github/workflows/ci.yml`). Treat CI as the source
+of truth; the chained one-liner in [the merge gate](../governance/contribution.md#the-merge-gate) states the
+same intent but omits scope flags (see [drift](#contributing-vs-ci) below).
+
+## Build
+
+```
+cargo build            # debug
+cargo build --release  # release binaries (README.md:42, docs/operations/installation.md:25)
+```
+
+> **After any `cargo vendor`, build in release too.** A debug/test build can pass
+> while a release build fails on vendored-checksum issues. Run
+> `cargo build --release --locked` after re-vendoring. See
+> [schema-and-migrations](schema-and-migrations.md#vendoring-and-rebuild-after-vendor).
+
+## The gate (independent CI jobs)
+
+CI runs **separate jobs**, deliberately not one sequential job: a single chained
+job bailed on the first failure, so an unformatted tree once meant clippy and the
+whole suite never ran for 30+ commits (see the header of `ci.yml`). Split this
+way, a cheap failure cannot hide an expensive one.
+
+| Job | Exact command | Needs DB |
+|---|---|---|
+| **fmt** | `cargo fmt --all --check` | no |
+| **clippy** | `cargo clippy --workspace --all-targets --locked -- -D warnings` | no |
+| **tests** | `cargo test --workspace --locked --no-fail-fast -- --test-threads=1` (under `set -o pipefail`) | yes |
+| **release build** | `cargo build --release --workspace --locked` | no |
+| **dependency policy** | `cargo deny check --all-features` against `deny.toml` (see [supply chain](../security/supply-chain.md#dependency-policy-denytoml)) | no |
+| **shellcheck** | `shellcheck -x deploy/*.sh scripts/**/*.sh`, the `koalaman/shellcheck` v0.11.0 image pinned by digest | no |
+
+The release job compiles the profile `deploy/upgrade.sh` ships. The other three
+compile the dev profile, so a release-only break (the vendored-crate checksum
+regression of 2026-08-22, which `cargo test` passed) reached the box with CI
+green. It is CI-only: the local pre-push gate below stays three steps, and a
+release build is run locally when packaging or vendoring changes.
+
+Details that are load-bearing:
+
+- **`--all-targets` on clippy** compiles the test targets, so a test file that no
+  longer compiles fails at clippy rather than silently vanishing from the suite
+  (`.github/workflows/ci.yml#Clippy (deny warnings)`).
+- **`--no-fail-fast`** runs every test binary even after one fails, so one failing test cannot
+  hide the results of the binaries after it. The job still fails.
+- **`--test-threads=1`** runs the suite serially.
+- **The `sensor-ssh` interop tests run the system `ssh` client**
+  (`crates/sensor-ssh/tests/openssh_interop.rs`; OpenSSH 8.4 or later, for `SSH_ASKPASS_REQUIRE`).
+  They fail, not skip, when it is not on `PATH`: they are the independent check on the transport
+  that no test built from this crate's own code can be. The GitHub runner image has it.
+- **`set -o pipefail`** is mandatory in the tests job: without it, piping `cargo
+  test` through `tee` would report `tee`'s success and pass a red suite
+  (`.github/workflows/ci.yml#Tests (serial, frozen lockfile)`).
+- **`--locked`** enforces the committed `Cargo.lock` frozen (clippy + tests jobs).
+- **The tests job builds with line tables only** (`.github/workflows/ci.yml#CARGO_PROFILE_DEV_DEBUG`)
+  and first removes toolchains the hosted image ships and the job never uses
+  (`.github/workflows/ci.yml#Free runner disk space`). With full debug info the suite's test
+  executables did not fit on the runner and the job stopped while compiling, before any test
+  ran. A panic's backtrace still names the file and line. A local build is unaffected: the
+  setting is in the job's environment, not in `Cargo.toml`. `Report disk use` prints the space
+  left at the end of every run.
+- An advisory `Report test totals` step (`if: always()`) sums passed/failed/ignored
+  and counts test binaries into the run summary; it never fails the job
+  (`.github/workflows/ci.yml#Report test totals`). It exists so a sudden drop in how much ran is visible to a
+  human.
+
+Running the gate locally mirrors CI:
+
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked -- --test-threads=1
+```
+
+The tests job needs the test PostgreSQL running - see
+[toolchain-and-environment](toolchain-and-environment.md#test-postgresql).
+
+<a id="contributing-vs-ci"></a>
+### CONTRIBUTING vs CI
+
+[the merge gate](../governance/contribution.md#the-merge-gate) gives the gate as
+`cargo fmt --check && cargo clippy -- -D warnings && cargo test`. That is the
+intent, but it omits `--all`, `--workspace`, `--all-targets`, `--locked`,
+`--test-threads=1`, and its chained `&&` bails on first failure - the exact
+anti-pattern the split CI jobs exist to avoid. Use the CI commands.
+
+## Fixture addresses
+
+No real internet address may appear in the repository: fixtures use RFC 5737 (192.0.2.0/24,
+198.51.100.0/24, 203.0.113.0/24), RFC 1918 or `2001:db8::/32`. The review gatekeeper and queue
+hold every reserved address first, so a test of the holds behind that check needs an address that
+is not reserved. The `review` crate's `test-public-ranges` feature
+(`crates/review/src/reserved.rs`) treats 203.0.113.0/24, and only that block, as public there.
+
+- It is **test-only and never enabled in a release build.** Its sole enabler is the self
+  dev-dependency in `crates/review/Cargo.toml`, which cargo applies to `cargo test` and
+  `--all-targets` builds (the `review` binary the CLI tests spawn is built with it) and never to
+  `cargo build [--release]`.
+- `core_scoring::is_reserved_ip`, the blocklist feed and the fetcher's SSRF guard do not see the
+  feature: 203.0.113.0/24 stays reserved for them in every build.
+- Use another documentation block (198.51.100.0/24, 192.0.2.0/24) for an address that must stay
+  reserved in `review` tests.
+- `crates/propolis/tests/production_features.rs` fails if the feature appears anywhere in the
+  workspace's shipped dependency graph (`cargo tree --workspace -e features,no-dev`): cargo
+  unifies features across a `--workspace` build, so one crate enabling it would switch it on in
+  the `review` library every binary links.
+- `crates/review/src/reserved.rs` refuses to compile with the feature under the release profile,
+  so a `cargo test --release` or `cargo build --release --all-targets` cannot put a feature-enabled
+  binary in `target/release`, where `install.sh` copies from. `cargo test --release -p review`
+  therefore does not compile; run the review tests in the dev profile.
+
+## Test taxonomy
+
+Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
+`crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
+
+- **Total: 4861 test functions** (2944 unit + 1917 integration).
+- **DB-backed (`sqlx::test`): 482** - console 255, review 109, core-scoring 48, intake 30, propolis 19, feed 12, fleet 9. These provision a fresh database per test.
+- **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
+  in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
+  default suite stays offline-deterministic; run it manually with
+  `cargo test -p console -- --ignored rdns`.
+  `crates/propolis/tests/restore_rehearsal.rs`, the populated backup and restore
+  rehearsal, which needs PostgreSQL server binaries CI does not install; its
+  command and last recorded result are in
+  [backup and restore](../operations/backup-and-restore.md#restore-rehearsal). And
+  `private_sessions_replay_byte_for_byte` in
+  `crates/sensor-framework/tests/shell_replay.rs`, which replays session fixtures
+  kept outside the repository; run it with `PROPOLIS_PRIVATE_SESSIONS=<dir> cargo test
+  -p sensor-framework --test shell_replay -- --ignored`.
+- **Outside the suite entirely: one browser fixture.** The console's stale-poll
+  handling has to be checked in a real browser against a real hung socket - the
+  suite can only check that the guarding code ships. Run by hand when the console's
+  polled panels or the vendored HTMX change; see
+  [browser-fixtures](browser-fixtures.md).
+- **Outside the suite as well: the intake soak.** Hours of sustained load through the real intake
+  path, with rotation and faults, is a harness you run by hand
+  (`crates/propolis/examples/soak/main.rs`); see [intake-soak](intake-soak.md).
+
+These are static attribute counts, not a live `cargo test --list` run. Every figure
+in this section, and the table below row for row, is recomputed from the source and
+`cargo metadata` by `crates/propolis/tests/docs_agreement.rs`, so a change that adds,
+removes or ignores a test fails the suite until this page says so.
+
+Per-crate breakdown:
+
+| Crate | Unit | Integration | Integration files |
+|---|---|---|---|
+| collector-wire | 9 | 0 | - |
+| console | 191 | 279 | auth_test, campaigns_test, ledger_count_test, ledger_scan_test, render_off_worker, rollup_pages_test, rollup_test, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, search_signal_type_test, server_test, timeline_test |
+| core-scoring | 90 | 42 | append_gate, batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
+| feed | 35 | 67 | builder_test, exclusion_test, export_test, publisher_test |
+| fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
+| gateway | 11 | 15 | handshake, logging, spool, verify |
+| geoip | 4 | 0 | - |
+| intake | 29 | 49 | audit_regressions, batched_runner, converter_test, end_to_end, probe_filter, quarantine, sensor_stats, shell_reply |
+| log-format | 0 | 15 | format, no_stock_fmt, process |
+| log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
+| propolis | 192 | 54 | capture_to_console, coverage, db_roles, docs_agreement, logging, migrate_cli, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console |
+| provision-certs | 0 | 16 | provision |
+| review | 231 | 116 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test |
+| sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
+| sensor-catchall | 11 | 10 | arrival, env_strict, integration |
+| sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
+| sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
+| sensor-framework | 1505 | 349 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
+| sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
+| sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
+| sensor-redis | 97 | 46 | arrival, env_strict, integration, memory_bound, parse_cost, tls |
+| sensor-smtp | 18 | 52 | arrival, env_strict, integration, memory_bounds, tls |
+| sensor-ssh | 90 | 170 | arrival, auth_test, capture_heap_test, capture_limit, crypto_test, env_strict, group14_throttle, integration, kex_negotiation, memory_budget_test, openssh_interop, output_backpressure, session_memory_limit, shell_room_test, shell_test, shutdown_tracking, transport_test |
+| sensor-telnet | 53 | 68 | arrival, echo_loader, env_strict, infected_hold, integration, probe_payload, session_memory_limit, shell_cost, shell_cpu, shutdown_tracking |
+| sensor-tftp | 37 | 45 | arrival, env_strict, integration, logging, shutdown |
+| sensor-wire | 18 | 0 | - |
+| shipper | 4 | 28 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
+| watch | 16 | 23 | config, read_only, status, stream |
+| **Total** | **2944** | **1917** | |
+
+### Test styles by layer
+
+- **Sensor crates** test with **real TCP** against an ephemeral `:0` listener per
+  connection (e.g. `crates/sensor-catchall/tests/integration.rs#tcp_probe_emits_catchall_probe_event`), plus static-check tests that enforce the
+  sensor contract (see [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass)).
+- **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
+  `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
+  (47 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
+  applies migrations manually (432 uses) - needed wherever a test needs more than
+  one migration history in one database, a history that keeps its own
+  bookkeeping table (review, fleet), or a history applied only part of the way
+  (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`
+  stops at `0013`, writes a ledger, then applies the rest). A bare
+  `#[sqlx::test]` (3 uses, the console's `/ready` tests) also gets an empty
+  database, because the console crate has no `migrations/` directory; those tests
+  need only a live connection. See
+  [schema-and-migrations](schema-and-migrations.md).
+
+### Notable enforcement test: doc/code agreement
+
+`crates/propolis/tests/docs_agreement.rs` fails CI when the docs and the tree
+disagree on a fact that has drifted before:
+
+- any `PROPOLIS_*` / `CATCHALL_*` env-var name that appears as a string literal in
+  non-test source but is missing from the
+  [environment variable reference](../reference/environment-variables.md)
+  (direction: code to docs). It guards a real twice-shipped drift
+  (`PROPOLIS_CATCHALL_BIND` vs `CATCHALL_BIND_ADDRS`) where a sensor refused to
+  start with no hint why;
+- an em dash in live docs or source;
+- a documented `tar` command that names the same tree twice;
+- a current page whose `applies-to` front matter is not the workspace version;
+- a count of crates, members or binaries in a current page that is not the workspace
+  total from `cargo metadata` (counts qualified as sensor, protocol, installed, test
+  or archive figures are exempt);
+- a backticked version beside "tree", "currently" or "Crate version" that is not the
+  workspace version, or one beside "Rust" or "toolchain" that is not the
+  `rust-toolchain.toml` pin (other versions, such as dependencies', are exempt);
+- a [component inventory](../architecture/components.md) row or dependency edge that
+  differs from `cargo metadata`;
+- a [migration change map](../reference/database.md#migration-change-map) that does
+  not list exactly the migration files on disk;
+- any figure in the test taxonomy above;
+- a citation of code by line number, in any form: `path:N`, `file.rs:N`, a `:N`
+  span, or a `name:N` span naming a Rust item. Code is cited as `path#symbol`
+  ([documentation policy](../documentation-policy.md#citing-code));
+- a `path#symbol` citation whose file does not exist or does not contain the
+  symbol. A path is resolved from the workspace root, from `crates/`, or as the
+  tail of a path in the workspace (`routes/mod.rs`); a tail several files share
+  passes if any of them has the symbol, and `crates/*/` requires it in every crate.
+  A Rust symbol must appear as a whole word; any other anchor, such as a systemd
+  directive or a heading, verbatim.
+
+Historical pages, `CHANGELOG.md`, the dated claim ledger and the sanitizer record
+are exempt from the version, count and citation checks: they record what was true
+when they were written.
+
+Runnable command reference lives in [`reference/commands`](../reference/commands.md).

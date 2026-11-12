@@ -1,0 +1,208 @@
+<!--
+title: External integrations reference
+audience: all
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-08-26
+-->
+
+# External integrations reference
+
+The platform's outbound integrations: VirusTotal, the abuse-reporting vendor
+submitters (AbuseIPDB / DShield / OTX), the ops-alert ntfy POST, and offline
+GeoLite2 enrichment.
+
+> **Egress warning.** Sensors are egress-free by construction (each
+> attacker-facing sensor crate has no HTTP client in its dependency tree,
+> enforced by per-sensor tests). Every integration on this page except GeoLite2
+> produces outbound network traffic, and **every one is opt-in and defaults
+> OFF.** GeoLite2 is local file reads, not network. See
+> [../security/outbound-controls.md](../security/outbound-controls.md) for the
+> complete set of gated egress paths and the forbidden-egress guard.
+
+Env-var defaults and bounds are owned by
+[environment-variables.md](environment-variables.md); rate/budget caps are owned
+by [rate-limits-and-budgets.md](rate-limits-and-budgets.md). This page owns the
+wire contracts and gating semantics.
+
+## VirusTotal (file/hash scanning)
+
+VirusTotal is a **file/hash scanner, not a reporting vendor** - it receives
+sample hashes (and, only if explicitly enabled, sample bytes), never IP abuse
+reports. Implemented in `crates/review/src/virustotal.rs`.
+
+### Gating
+
+Enabled iff `PROPOLIS_VT_ENABLED` is set AND `PROPOLIS_VT_KEY` is non-empty; an
+empty key forces it off, fail-closed (`vt_enabled`/`vt_api_key` in
+`crates/propolis/src/config.rs#load_config`).
+
+| Setting | Value | Source |
+|---|---|---|
+| `PROPOLIS_VT_ENABLED` | default false | `crates/propolis/src/config.rs#load_config` |
+| `PROPOLIS_VT_UPLOAD` (upload unknown samples) | default false | `crates/propolis/src/config.rs#load_config` |
+| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | default 300 | `crates/propolis/src/config.rs#load_config` |
+| Request delay | 15000 ms (hard-coded) | `crates/propolis/src/main.rs#main` |
+| Daily cap | 450 (hard-coded) | `crates/propolis/src/main.rs#main` |
+
+### Endpoints
+
+- **Lookup** - `GET /api/v3/files/{sha256}` with an `x-apikey` header. `404`
+  means "not in VT's database" (returns `None`); a non-200 is an error.
+  `detected = malicious + suspicious`;
+  `total = malicious + suspicious + undetected + harmless`
+  (`crates/review/src/virustotal.rs#lookup_hash`).
+- **Upload** (only if `PROPOLIS_VT_UPLOAD`, and only for executable or script content, see
+  [malware custody](../security/malware-custody.md#virustotal-path-lookup-and-an-opt-in-type-filtered-upload))
+  - `POST /api/v3/files` multipart;
+  stores a pending row with `detected = -1, total = -1`; a body kept local for its type
+  gets `detected = -2, total = -2` and is never uploaded
+  (`crates/review/src/virustotal.rs#scan_spool`, `crates/review/src/virustotal.rs#upload_sample`, `crates/review/src/virustotal.rs#pending_result`).
+
+The documented free-tier limit is 4 req/min, 500/day, verified live against the
+VT v3 API 2026-08-19 (`crates/review/src/virustotal.rs`). The daily cap is enforced by a
+single `DailyBudget` owned across every scan cycle - a counter local to one
+`scan_spool` call would reset each cycle and never enforce a per-day cap
+(`crates/review/src/virustotal.rs#DailyBudget`, `crates/propolis/src/main.rs#main`). See
+[rate-limits-and-budgets.md](rate-limits-and-budgets.md#virustotal-daily-cap).
+
+`scan_spool` walks each spool dir, filters to 64-hex-char (SHA-256) filenames,
+skips samples already analyzed, and consumes one budget unit per new sample; on
+exhaustion it logs and returns early (`crates/review/src/virustotal.rs#scan_spool`; filename filter
+in `crates/review/src/spool.rs#list_samples`). Spool dirs scanned:
+`/var/spool/propolis/{ssh,adb,ftp,telnet,tftp,mqtt}` (`crates/review/src/spool.rs#BODY_SPOOLERS`)
+plus the fetcher spool tagged `fetched`. Samples older than 30 days are checked hourly,
+independent of whether VirusTotal is enabled: each sensor does it for its own spool, and the
+daemon's `sample-retention` task for `fetched`
+(`crates/propolis/src/main.rs#SAMPLE_RETENTION_DAYS`, `crates/propolis/src/main.rs#SAMPLE_RETENTION_INTERVAL`;
+[retention](../operations/retention.md)).
+
+## Vendor abuse submitters
+
+Three adapters, all implementing `VendorAdapter`. The API key lives only on the
+adapter struct and is never placed on a report, response, error, or log line
+(`crates/review/src/vendor/mod.rs#VendorAdapter`). All three vendors are always
+constructed; the gatekeeper's `Disabled` check is what holds a disabled vendor,
+and a vendor enabled with an empty API key is forced disabled, fail-closed
+(`crates/review/src/main.rs#load_vendor_config`, `crates/review/src/main.rs#build_adapters`).
+
+### Wire contracts
+
+| Vendor | Endpoint | Auth | Base |
+|---|---|---|---|
+| AbuseIPDB | `POST /api/v2/report` (form-encoded) | `Key` header | `https://api.abuseipdb.com` |
+| DShield / SANS ISC | `POST /submitapi/` | `X-ISC-Authorization: ISC-HMAC-SHA256 ...` | `https://www.dshield.org` |
+| OTX (AlienVault / LevelBlue) | `POST /api/v1/pulses/create` (JSON) | `X-OTX-API-Key` | `https://otx.alienvault.com` |
+
+- **AbuseIPDB** (`crates/review/src/vendor/abuseipdb.rs#submit`) - a `429` is treated as
+  SUCCESS ("duplicate report within per-IP cooldown", verified live).
+  Categories are numeric strings (e.g. ssh -> `["22"]`).
+- **DShield** (`crates/review/src/vendor/dshield.rs`) - HMAC-SHA256 auth
+  (`Credentials = base64(HMAC-SHA256(key = nonce+userid, msg = api_key))`).
+  Log type `cowrie`; the `LogEntry` carries
+  `{timestamp, source_ip, user, password, lastcommand, hassh, banner}` - every
+  key present, because DShield silently drops a cowrie record missing any key.
+  **`password` is ALWAYS empty**: the honeypot drops captured passwords by
+  design (`crates/review/src/vendor/dshield.rs#LogEntry`). The API key is supplied as
+  `"userid:apikey"`, split on the first `:`
+  (`crates/review/src/vendor/dshield.rs#new`); a missing user or key, or a
+  response body starting `ERROR`, is a permanent error
+  (`crates/review/src/vendor/dshield.rs#submit`).
+  The DShield wire contract is flagged in-code as provisional - the live
+  endpoint 403'd during implementation, and the `"user:key"` single-slot
+  composition is a noted open decision `[inferred]` (`crates/review/src/main.rs#load_config_from_env`).
+- **OTX** (`crates/review/src/vendor/otx.rs#submit`) - pulses are forced
+  `public: true` (OTX rejects private). `name = "propolis: {ip} ({timestamp})"`,
+  one indicator `{indicator: ip, type, description}` where `type` is `"IPv4"`
+  or `"IPv6"` by the address family (`crates/review/src/vendor/otx.rs#indicator_type`).
+
+### Idempotency
+
+The idempotency key is `"{source_ip}:{vendor}:{date}"` where `date` is the UTC
+calendar day of the poll (`crates/review/src/submit.rs#idempotency_key`). The runner
+INSERTs a `success = false` row `ON CONFLICT (idempotency_key) DO NOTHING`
+BEFORE the HTTP call (`crates/review/src/submit.rs#insert_pending`), then UPDATEs that row with the outcome after
+(`crates/review/src/submit.rs#record_result`). The date scoping means a new UTC day permits
+re-reporting. Only an ATTEMPTED
+submission writes a `vendor_submission` row; a held (ip, vendor) pair writes
+nothing (`crates/review/src/submit.rs#run_once`).
+
+Error classification (`crates/review/src/vendor/mod.rs#send_and_classify`): 2xx is success; a connection
+failure (no response, `status:0`) or 5xx is `Transient` (retried next poll); any
+other 4xx is `Permanent` (marked failed, not auto-retried).
+
+Every vendor call goes through one shared client with a 10 s connect, 30 s read and 60 s
+whole-request deadline (`crates/review/src/vendor/mod.rs#ClientTimeouts::VENDOR`). The read
+deadline is reqwest's `read_timeout`: one timer from the start of the request until the response
+headers arrive (upload progress does not reset it), and a per-read timer on the body after that.
+So a vendor has 30 s to start answering and the whole exchange is capped at 60 s. A vendor that
+accepts the connection and never answers, or sends headers and stalls the body, ends as a
+`Transient` error with `status:0` and is retried on the next poll; before the deadlines existed
+it held the submission loop on that one request indefinitely. A 2xx whose body does not finish
+is also `Transient`, never an accepted submission. The VirusTotal client keeps its 30 s total
+and adds a 10 s connect deadline; its read deadline is also 30 s, because the read timer covers
+the sample upload and VirusTotal's processing together and a shorter one would cut uploads that
+the total still allows (`crates/review/src/vendor/mod.rs#ClientTimeouts::VIRUSTOTAL`). If the
+client cannot be built the vendor loop refuses to start, and the scan pass is skipped, rather
+than running without deadlines.
+
+### Gating (the gatekeeper)
+
+Before any submission, `gatekeeper::check` runs an ordered, fail-closed sequence
+that short-circuits on the first hold (`crates/review/src/gatekeeper.rs#check`): **Reserved**
+(reserved-range IP, first and not overridable) -> **Disabled** -> **Stale**
+(last activity older than the 48 h freshness window) -> **Cooldown** ->
+**RateLimit** -> **ScoreFloor** -> **CategoryFilter**. Exact values and the full
+sequence are owned by
+[rate-limits-and-budgets.md](rate-limits-and-budgets.md#vendor-submission-gatekeeper).
+
+An address on the operator allowlist (`PROPOLIS_FEED_ALLOWLIST`, its file, and
+`PROPOLIS_FEED_ASN_ALLOWLIST`) never reaches this sequence: the review queue does not
+surface it, and `SubmissionRunner::run_once` refuses it before any vendor call even if it was
+queued and approved before the list covered it
+(`crates/review/src/submit.rs#run_once`; see
+[Declared crawlers](scoring-and-feed.md#declared-crawlers)).
+
+### What is never sent
+
+The `VendorReport` carries only
+`{source_ip, categories, comment, evidence_window}`
+(`crates/review/src/vendor/mod.rs#VendorReport`). **No WAN / vantage IP, no raw score, no confidence, and
+no per-vantage breakdown is ever placed in a report.** The multi-WAN vantage
+data feeds only the internal breadth multiplier (see
+[scoring-and-feed.md](scoring-and-feed.md#breadth-multiplier)) and never leaves
+the system. `[inferred from absence]`: none of the three adapter payload structs
+(`ReportPayload`, `LogEntry`, `PulsePayload`/`Indicator`) has any field that
+could carry a WAN vantage address - confirmed by reading all three
+(`crates/review/src/vendor/abuseipdb.rs#ReportPayload`, `crates/review/src/vendor/dshield.rs#LogEntry`, `crates/review/src/vendor/otx.rs#PulsePayload`, `crates/review/src/vendor/otx.rs#Indicator`).
+
+The report comment is
+`"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,
+and `evidence_window = (first_seen, last_seen)` (`crates/review/src/submit.rs#build_report`).
+
+## Ops-alert ntfy
+
+Operational alerting posts to an ntfy topic. It is gated by
+`PROPOLIS_OPS_ENABLED` (default off) and is one of the platform's five
+operator-gated egress paths. Full trigger and payload detail live under
+[../operations/health-and-observability.md](../operations/health-and-observability.md);
+the gated-egress inventory is owned by
+[../security/outbound-controls.md](../security/outbound-controls.md).
+
+## GeoLite2 offline enrichment
+
+GeoLite2 enrichment (including the GeoLite2-ASN reads that back
+[ASN suppression](scoring-and-feed.md#exclusions-and-asn-suppression)) is
+**local file reads, not network egress.** The ASN allowlist loads the ASN DB via
+`GeoIp::load_asn_only`; an empty allowlist short-circuits before any lookup
+(`crates/propolis/src/main.rs#main`,
+`crates/feed/src/exclusion.rs#with_asn_allowlist`, `crates/core-scoring/src/allowlist.rs#lookup_asn`). No MaxMind or other host is contacted at
+runtime; keeping the database current is an operator file-management task.
+
+## See also
+
+- [reference/scoring-and-feed.md](scoring-and-feed.md) - how recommendations and tiers gate what reaches these integrations
+- [reference/rate-limits-and-budgets.md](rate-limits-and-budgets.md) - every cap and budget with exact values
+- [security/outbound-controls.md](../security/outbound-controls.md) - the five gated egress paths and the forbidden-egress guard
+- [troubleshooting/integrations-and-feed.md](../troubleshooting/integrations-and-feed.md) - VirusTotal, vendor, and feed troubleshooting

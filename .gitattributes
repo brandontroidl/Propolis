@@ -1,0 +1,14 @@
+* text=auto eol=lf
+*.rs text diff=rust
+*.toml text
+*.md text
+*.yml text
+*.sh text eol=lf
+*.service text
+Cargo.lock -diff linguist-generated
+# Vendored crate sources are byte-exact and checksum-verified by cargo; never
+# apply line-ending normalization to them (eol=lf mangling breaks .cargo-checksum.json).
+vendor/** linguist-vendored -text
+
+# Self-hosted web fonts are binary; EOL/text normalization would corrupt the woff2 bytes.
+*.woff2 binary

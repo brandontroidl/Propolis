@@ -1,0 +1,1374 @@
+//! Log tailer: reads complete NDJSON lines from a sensor's log file, tracking position via
+//! `DurableCursor` across polls, process restarts, and log rotation. See "The runner" and "The
+//! durable log cursor" in `internal/design/03-event-intake-aggregation.md`.
+
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+use crate::cursor::{
+    CursorState, DurableCursor, RotationEvent, detect_rotation, fingerprint_with_len, get_inode,
+    head_matches,
+};
+
+/// One item of a batch read, in file order: a complete line, or the place where an over-length
+/// line ([`MAX_LINE_BYTES`]) was discarded instead of buffered. [`LogTailer::read_batch`] keeps
+/// only the lines; a reader that must not drop anything silently uses
+/// [`LogTailer::read_batch_entries`] and reports the discards itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailEntry {
+    Line(String),
+    /// `bytes` is the discarded line's length including its terminating `\n`.
+    Discarded {
+        bytes: u64,
+    },
+}
+
+/// Where a [`LogTailer::without_cursor`] tailer begins reading the file it finds at start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAt {
+    /// From offset 0 of the current file.
+    Beginning,
+    /// After the last complete line already in the file, so only lines appended later are read.
+    End,
+}
+
+/// Below this size, `compute_fingerprint`'s `min(256, size)` window can shift from ordinary
+/// append growth alone (no rotation at all), producing a fingerprint "mismatch" that does not
+/// reflect real content replacement. See [`LogTailer::maybe_false_positive_replaced`].
+const FINGERPRINT_STABLE_SIZE: u64 = 256;
+
+/// Input a `copytruncate` rotation took from this reader that it could not recover from the
+/// rotated copy, counted over the life of the tailer. In memory only: the WARN each loss logs is
+/// the durable record. See [`LogTailer::rotation_loss`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RotationLoss {
+    /// Truncations whose unread content could not be recovered and may not have been empty.
+    pub events: u64,
+    /// Lower bound on the bytes lost: what the previous poll saw past the read offset. Zero for a
+    /// loss the tailer could not size (it had not yet polled the old content, as after a restart).
+    pub bytes_estimated: u64,
+}
+
+/// Read positions as they stood at the start of the current uncommitted batch, so a caller that
+/// could not process what it read can put the tailer back and re-read it on the next poll.
+///
+/// Without this, "do not persist the cursor on failure" only defers the loss: `read_batch` has
+/// already advanced the IN-MEMORY offset past the whole batch, so the next poll starts beyond
+/// the failed line, and the first later batch that succeeds persists that advanced offset. The
+/// at-least-once guarantee then holds only if the process happens to restart in between.
+struct UncommittedRead {
+    /// `state.offset` before this batch's reads.
+    offset: u64,
+    /// Read offset of each entry in `pending_drains`, in queue order, before this batch's reads.
+    /// Aligned so that `pending_drains[i]` corresponds to `drain_offsets[exhausted.len() + i]`.
+    drain_offsets: Vec<u64>,
+    /// Drains this batch read to exhaustion, oldest-first. Held rather than dropped until the
+    /// batch is committed: these inodes are reachable ONLY through their open descriptors, so
+    /// dropping one before the caller has accepted the batch would make a rewind unable to
+    /// recover the lines it already handed out.
+    exhausted: VecDeque<File>,
+    /// For each line the batch returned, in order: which source it came from (an index into the
+    /// drains as they stood before the batch, or `snapshot_drains` for the current file) and the
+    /// bytes it consumed there, discards before it included. What lets
+    /// [`LogTailer::commit_batch_through`] move the positions over a prefix without reading.
+    spans: Vec<(usize, u64)>,
+    /// For each line the batch returned, in order: its own length including the `\n`. A span
+    /// minus this is the over-length bytes discarded just before the line, so together they give
+    /// the line's exact start offset.
+    lens: Vec<u64>,
+    /// The raw bytes of each returned line that was not valid UTF-8 (keyed by its position in the
+    /// batch), whose `String` form is lossy. Held only so a caller that must preserve a line
+    /// faithfully can; empty for ordinary logs.
+    raw_lossy: Vec<(usize, Vec<u8>)>,
+    /// Number of drains queued before the batch; the source index of the current file.
+    snapshot_drains: usize,
+    /// False once a second read joined the batch: the spans no longer describe all of it.
+    spans_valid: bool,
+}
+
+impl UncommittedRead {
+    /// Notes the lines one read returned, from the source they were read from.
+    fn record_read(&mut self, source: usize, read: &LineRead) {
+        let first = self.spans.len();
+        self.spans.extend(read.spans.iter().map(|&b| (source, b)));
+        self.lens.extend(read.lens.iter().copied());
+        self.raw_lossy.extend(
+            read.raw_lossy
+                .iter()
+                .map(|(i, raw)| (first + i, raw.clone())),
+        );
+    }
+}
+
+/// Where a line of the uncommitted batch came from, for a caller that sets a line aside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchLine {
+    /// Byte offset of the line's first byte in the file it was read from. That is the rotated-out
+    /// file when the line came from one still being drained.
+    pub offset: u64,
+    /// The line's exact bytes when they are not valid UTF-8 (the `String` the batch returned is
+    /// then lossy); `None` when the returned `String` is the line.
+    pub raw: Option<Vec<u8>>,
+}
+
+/// Tails one sensor's NDJSON log file. Holds the in-memory [`CursorState`] for the lifetime of
+/// this instance; [`Self::persist_cursor`] is the only thing that durably saves it; a crash
+/// between reads and persistence re-reads the unpersisted portion on restart (tolerated by the
+/// ledger's dedup window, per the design doc's at-least-once model).
+///
+/// A batch read is uncommitted until the caller says otherwise: [`Self::commit_batch`] accepts
+/// the reads, [`Self::rewind_batch`] undoes them. A caller that does neither gets the historical
+/// behavior (reads advance the in-memory cursor and only `persist_cursor` makes that durable),
+/// which is safe only if it never persists after a failure - see [`UncommittedRead`].
+pub struct LogTailer {
+    log_path: PathBuf,
+    /// `None` for a [`Self::without_cursor`] tailer, which has nowhere to persist to and so can
+    /// never write a file.
+    cursor: Option<DurableCursor>,
+    state: CursorState,
+    /// Handle most recently opened for `log_path`, corresponding to `state.inode`. Kept across
+    /// calls so that when the path is rotated out from under us (rotation by rename), this handle
+    /// is moved to `pending_drains` and the old inode's remaining bytes are drained through it -
+    /// POSIX keeps an inode's data readable via an already-open fd even after the directory entry
+    /// is renamed or unlinked. `None` means we have no such handle (fresh instance, or it was just
+    /// handed to `pending_drains`).
+    file: Option<File>,
+    /// Inodes that were rotated out from under us (by rename) and are still being drained through
+    /// their held-open descriptors, oldest-first, each with our read offset into it. They are
+    /// drained to exhaustion BEFORE the current file, so a backlog larger than one batch is not
+    /// lost across a rotation. Not persisted: a crash mid-drain loses the in-flight tail (the inode
+    /// is reachable only via the open fd, which the crash closes) - the same bounded loss the
+    /// at-least-once model already tolerates, and far narrower than the old always-lose-past-one-
+    /// batch behavior.
+    pending_drains: VecDeque<(File, u64)>,
+    /// The log file's size as of the last time we observed it. Not persisted (restarting a
+    /// process legitimately loses this - the old inode is gone regardless); exists purely to
+    /// disambiguate a `RotationEvent::Replaced` signal caused by ordinary growth of a
+    /// sub-256-byte file from a genuine in-place content swap.
+    last_known_size: u64,
+    /// Positions to restore if the current batch is rewound. `None` between a commit/rewind and
+    /// the next `read_batch`. Spans every read since the last commit or rewind, not just the
+    /// most recent one, so a caller that polls twice before deciding can still undo both.
+    uncommitted: Option<UncommittedRead>,
+    /// Whether `last_known_size` was measured by a poll of this instance. False until the first
+    /// read: the size taken at construction is the file as found, not the content the persisted
+    /// offset points into, so it cannot size what a truncation then discarded.
+    size_observed: bool,
+    /// The inode and content fingerprint of each `copytruncate` generation queued in
+    /// `pending_drains` (pruned to the queue whenever one is added, so never more than the queue).
+    /// While such a generation is the front of the queue, [`Self::persist_cursor`] saves the
+    /// drain's position under its fingerprint instead of the new file's, so a restart (or the
+    /// rotation guard, `deploy/logrotate-guard.sh`) sees the old content as unread until it is
+    /// read, whichever generation is at the front. Matched on inode, so a stale entry can never be
+    /// applied to another drain.
+    resumes: Vec<(u64, [u8; 32], u16)>,
+    loss: RotationLoss,
+}
+
+impl LogTailer {
+    /// Loads any persisted cursor for `log_path` (falling back to a fresh zero state - fail
+    /// closed, matching `DurableCursor::load`'s own missing/corrupt handling), and records the
+    /// log file's current size, if it exists, as the initial growth baseline.
+    pub fn new(log_path: PathBuf, cursor_dir: PathBuf) -> Self {
+        let cursor = DurableCursor::new(log_path.clone(), cursor_dir);
+        let state = cursor.load().ok().flatten().unwrap_or(CursorState {
+            inode: 0, // never a real inode (see `get_inode`); guarantees the first
+            // `detect_rotation` call reports `InodeChanged` so we stamp real state below.
+            offset: 0,
+            fingerprint: [0u8; 32],
+            fingerprint_len: None,
+        });
+        Self::with_state(log_path, Some(cursor), state)
+    }
+
+    /// A tailer that reads and follows rotation exactly like [`Self::new`] but has no cursor: it
+    /// neither loads nor persists a position, so it opens `log_path` read-only and writes nothing
+    /// anywhere. [`Self::persist_cursor`] on it is an error. For a live reader that wants the same
+    /// line, rotation and over-length handling without leaving state behind.
+    pub fn without_cursor(log_path: PathBuf, start: StartAt) -> Self {
+        let state = match start {
+            // Inode 0 is never real (see `get_inode`), so the first read stamps the file it finds
+            // and starts at offset 0, exactly as a fresh `new` tailer does.
+            StartAt::Beginning => CursorState {
+                inode: 0,
+                offset: 0,
+                fingerprint: [0u8; 32],
+                fingerprint_len: None,
+            },
+            // A file that does not exist yet stamps inode 0 here too, so when it appears its
+            // whole content is read: all of it was written after the start.
+            StartAt::End => {
+                let (fingerprint, len) = fingerprint_with_len(&log_path);
+                CursorState {
+                    inode: get_inode(&log_path),
+                    offset: end_of_last_complete_line(&log_path),
+                    fingerprint,
+                    fingerprint_len: Some(len),
+                }
+            }
+        };
+        Self::with_state(log_path, None, state)
+    }
+
+    fn with_state(log_path: PathBuf, cursor: Option<DurableCursor>, state: CursorState) -> Self {
+        let last_known_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            log_path,
+            cursor,
+            state,
+            file: None,
+            pending_drains: VecDeque::new(),
+            last_known_size,
+            uncommitted: None,
+            size_observed: false,
+            resumes: Vec::new(),
+            loss: RotationLoss::default(),
+        }
+    }
+
+    /// Input this tailer saw a `copytruncate` take and could not recover, since it started. A
+    /// truncation whose unread content is found in the rotated copy (`<log>.1`) is not a loss and
+    /// is not counted.
+    pub fn rotation_loss(&self) -> RotationLoss {
+        self.loss
+    }
+
+    /// Reads up to `max_lines` complete (`\n`-terminated) lines starting at the current cursor
+    /// position, handling rotation first. An incomplete trailing line is left unconsumed: the
+    /// cursor stays at its start so the next call re-reads it once it is complete. A missing log
+    /// file yields an empty batch, not an error (the sensor may not have started yet).
+    pub fn read_batch(&mut self, max_lines: usize) -> Vec<String> {
+        self.read_batch_bounded(max_lines, u64::MAX)
+    }
+
+    /// [`Self::read_batch`] that also stops before a line that would take the batch past
+    /// `max_bytes` of line content (newlines included), so a batch's memory is bounded by bytes
+    /// and not only by line count. The first line of a batch is always returned, whatever its
+    /// size (it is at most [`MAX_LINE_BYTES`]), so a budget smaller than one line cannot stall
+    /// the reader. The line that did not fit is not consumed; the next read starts at it.
+    pub fn read_batch_bounded(&mut self, max_lines: usize, max_bytes: u64) -> Vec<String> {
+        self.read_entries(max_lines, max_bytes)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TailEntry::Line(line) => Some(line),
+                TailEntry::Discarded { .. } => None,
+            })
+            .collect()
+    }
+
+    /// [`Self::read_batch`] with each over-length discard reported in place. `max_lines` counts
+    /// lines only; discards ride along uncounted.
+    pub fn read_batch_entries(&mut self, max_lines: usize) -> Vec<TailEntry> {
+        self.read_entries(max_lines, u64::MAX)
+    }
+
+    fn read_entries(&mut self, max_lines: usize, max_bytes: u64) -> Vec<TailEntry> {
+        if max_lines == 0 {
+            return Vec::new();
+        }
+
+        self.handle_rotation();
+
+        // Snapshot AFTER rotation handling: rotation is a state transition we neither can nor
+        // want to undo (the displaced inode has already been moved to `pending_drains`, and the
+        // new inode's pre-batch position is wherever rotation left it). What a rewind must
+        // restore is the reads this batch is about to perform, not the rotation that preceded
+        // them.
+        if let Some(uncommitted) = &mut self.uncommitted {
+            uncommitted.spans_valid = false;
+        } else {
+            self.uncommitted = Some(UncommittedRead {
+                offset: self.state.offset,
+                drain_offsets: self.pending_drains.iter().map(|&(_, off)| off).collect(),
+                exhausted: VecDeque::new(),
+                spans: Vec::new(),
+                lens: Vec::new(),
+                raw_lossy: Vec::new(),
+                snapshot_drains: self.pending_drains.len(),
+                spans_valid: true,
+            });
+        }
+
+        // 1. Drain any inodes rotated out from under us, oldest-first and to exhaustion, BEFORE the
+        //    current file - otherwise a backlog larger than one batch is lost across a rotation.
+        let mut entries = Vec::new();
+        let mut line_count = 0;
+        let mut bytes_taken: u64 = 0;
+        let mut budget_hit = false;
+        while line_count < max_lines && !budget_hit {
+            let want = max_lines - line_count;
+            let exhausted = match self.pending_drains.front_mut() {
+                None => break,
+                Some((old_file, old_offset)) => {
+                    let budget = LineBudget {
+                        left: max_bytes.saturating_sub(bytes_taken),
+                        first_is_free: line_count == 0,
+                    };
+                    match read_lines_from(old_file, *old_offset, want, budget) {
+                        Ok(read) => {
+                            *old_offset += read.consumed;
+                            let got = count_lines(&read.entries);
+                            line_count += got;
+                            bytes_taken += read.line_bytes;
+                            budget_hit = read.budget_hit;
+                            if let Some(u) = &mut self.uncommitted {
+                                let source = u.exhausted.len();
+                                u.record_read(source, &read);
+                            }
+                            entries.extend(read.entries);
+                            // Fewer than requested means this old inode has no more lines,
+                            // unless the byte budget is what stopped the read.
+                            got < want && !budget_hit
+                        }
+                        // Unreadable old handle: abandon it (its data is unrecoverable regardless).
+                        Err(_) => true,
+                    }
+                }
+            };
+            if exhausted && let Some((file, _)) = self.pending_drains.pop_front() {
+                // Park the descriptor instead of dropping it: until this batch is committed, it
+                // is the only way back to the lines just handed out (see `UncommittedRead`).
+                match &mut self.uncommitted {
+                    Some(uncommitted) => uncommitted.exhausted.push_back(file),
+                    None => drop(file),
+                }
+            }
+        }
+        if line_count >= max_lines || budget_hit {
+            self.refresh_last_known_size();
+            return entries;
+        }
+
+        // 2. Read the current inode for the remainder.
+        let Ok(mut file) = File::open(&self.log_path) else {
+            // Missing (or otherwise unopenable) log file: nothing more to read this round.
+            return entries;
+        };
+
+        let remaining = max_lines - line_count;
+        let budget = LineBudget {
+            left: max_bytes.saturating_sub(bytes_taken),
+            first_is_free: line_count == 0,
+        };
+        if let Ok(read) = read_lines_from(&mut file, self.state.offset, remaining, budget) {
+            self.advance(read.consumed as usize);
+            if let Some(u) = &mut self.uncommitted {
+                let source = u.snapshot_drains;
+                u.record_read(source, &read);
+            }
+            entries.extend(read.entries);
+        }
+        self.file = Some(file);
+        self.refresh_last_known_size();
+        entries
+    }
+
+    /// Manually advances the cursor's read position by `bytes`, independent of any particular
+    /// `read_batch` call. `read_batch` itself uses this for the lines it consumes; exposed
+    /// publicly for a caller that needs finer-grained control (e.g. skipping a line without
+    /// going through a batch read).
+    pub fn advance(&mut self, bytes: usize) {
+        self.state.offset += bytes as u64;
+    }
+
+    /// Accepts every read since the last commit or rewind: the advanced positions stand, and the
+    /// exhausted rotated-out descriptors this batch drained are released.
+    ///
+    /// Committing is not persisting. It only says the caller has taken responsibility for these
+    /// lines; [`Self::persist_cursor`] is still what makes the position survive a restart.
+    pub fn commit_batch(&mut self) {
+        self.uncommitted = None;
+    }
+
+    /// Accepts only the first `lines` lines of the uncommitted batch and puts the positions back
+    /// to just after them, so the next read starts at line `lines`. Returns `false`, changing
+    /// nothing, when it cannot do that safely; the caller then calls [`Self::rewind_batch`] and the
+    /// whole batch is read again (replayed, never skipped).
+    ///
+    /// The positions are computed from the byte lengths recorded while the batch was READ, not by
+    /// reading again. A second read goes through rotation handling, and a `copytruncate` that
+    /// landed after the batch was read (while the caller was appending it) would make that read
+    /// return the first lines of the NEW file in place of the lines already handed out, which the
+    /// caller would then commit unread. So this refuses, with `false`, if the log file is no
+    /// longer the one the batch was read from: truncated, or its content replaced in place.
+    /// A rename rotation is fine: the old inode is still held and its offset is still right.
+    ///
+    /// Not possible (`false`) when more than one read joined the batch, or `lines` is more than
+    /// the batch returned.
+    pub fn commit_batch_through(&mut self, lines: usize) -> bool {
+        let Some(uncommitted) = &self.uncommitted else {
+            return false;
+        };
+        if !uncommitted.spans_valid || lines > uncommitted.spans.len() {
+            return false;
+        }
+        // The same judgement `handle_rotation` makes: a content mismatch on a file that was under
+        // the fingerprint window and has only grown is ordinary appending, not a replacement.
+        let changed = match detect_rotation(&self.log_path, &self.state) {
+            RotationEvent::Truncated => true,
+            RotationEvent::Replaced => !self.maybe_false_positive_replaced(),
+            RotationEvent::None | RotationEvent::InodeChanged => false,
+        };
+        // A copytruncate whose old content is still in `<log>.1` is accepted: moving the offset
+        // forward over the prefix makes the next read drain `.1` from there, so the committed
+        // prefix is not read again. Without a verifiable copy the prefix cannot be placed.
+        if changed && find_generations(&self.log_path, &self.state, Gz::Probe).is_err() {
+            return false;
+        }
+        let spans = uncommitted.spans[..lines].to_vec();
+        let snapshot_drains = uncommitted.snapshot_drains;
+        self.rewind_batch();
+        for (source, bytes) in spans {
+            if source < snapshot_drains {
+                if let Some(drain) = self.pending_drains.get_mut(source) {
+                    drain.1 += bytes;
+                }
+            } else {
+                self.state.offset += bytes;
+            }
+        }
+        true
+    }
+
+    /// Where line `index` of the uncommitted batch started, from the lengths recorded while it
+    /// was read (no read happens here, so rotation handling cannot substitute another file's
+    /// line). `None` when the batch has no such line or more than one read joined it.
+    pub fn uncommitted_line(&self, index: usize) -> Option<BatchLine> {
+        let u = self.uncommitted.as_ref()?;
+        if !u.spans_valid || index >= u.spans.len() || u.lens.len() != u.spans.len() {
+            return None;
+        }
+        let (source, span) = u.spans[index];
+        let before: u64 = u.spans[..index]
+            .iter()
+            .filter(|(s, _)| *s == source)
+            .map(|(_, bytes)| bytes)
+            .sum();
+        let base = if source < u.snapshot_drains {
+            *u.drain_offsets.get(source)?
+        } else {
+            u.offset
+        };
+        Some(BatchLine {
+            offset: base + before + (span - u.lens[index]),
+            raw: u
+                .raw_lossy
+                .iter()
+                .find(|(i, _)| *i == index)
+                .map(|(_, raw)| raw.clone()),
+        })
+    }
+
+    /// The log file this tailer follows.
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
+    /// Puts every read since the last commit back, so the next [`Self::read_batch`] returns the
+    /// same lines again.
+    ///
+    /// This is the in-memory half of the at-least-once guarantee. Declining to persist the
+    /// cursor protects a failed batch only across a restart; a long-running poller that keeps
+    /// the same tailer needs the offset itself moved back, or the next successful batch persists
+    /// a position past lines that never reached their destination.
+    ///
+    /// Lines the caller already processed successfully before the failure are re-read too: the
+    /// batch is the unit, and duplicate delivery is what the ledger's dedup window exists to
+    /// absorb. Silently skipping is the failure mode worth designing against; replaying is not.
+    pub fn rewind_batch(&mut self) {
+        let Some(UncommittedRead {
+            offset,
+            drain_offsets,
+            exhausted,
+            ..
+        }) = self.uncommitted.take()
+        else {
+            return;
+        };
+
+        // Drains still queued keep their slot; only their read offsets go back. They sit behind
+        // the exhausted ones, hence the skip.
+        for (slot, saved) in self
+            .pending_drains
+            .iter_mut()
+            .zip(drain_offsets.iter().skip(exhausted.len()))
+        {
+            slot.1 = *saved;
+        }
+
+        // Drains this batch emptied go back on the front, oldest-first, at their pre-batch
+        // offsets - pushed in reverse so the queue order they came off in is restored.
+        for (file, saved) in exhausted
+            .into_iter()
+            .zip(drain_offsets.iter())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            self.pending_drains.push_front((file, *saved));
+        }
+
+        self.state.offset = offset;
+    }
+
+    /// Bytes not yet consumed: the unread remainder of every rotated-out inode still being drained,
+    /// plus the file being read past the read offset. This is how far behind the reader is, in
+    /// bytes, and it costs one `fstat` per held file - no read.
+    ///
+    /// The file being read is measured through the descriptor the last read opened, so a rename
+    /// rotation the tailer has not noticed yet still counts the old inode's remainder, and the new
+    /// file joins the count on the next read. Before any read, the path is measured, and a file
+    /// whose inode is not the cursor's counts in full, as the next read starts it from 0. A file
+    /// shorter than the offset was truncated and counts in full for the same reason. A missing
+    /// file counts 0. An incomplete trailing line counts as unread, because it is.
+    ///
+    /// Call it between batches: the offsets of an uncommitted batch have already moved past the
+    /// lines it handed out.
+    pub fn backlog_bytes(&self) -> u64 {
+        let drains: u64 = self
+            .pending_drains
+            .iter()
+            .map(|(file, offset)| {
+                file.metadata()
+                    .map_or(0, |m| m.len().saturating_sub(*offset))
+            })
+            .sum();
+        let current = match &self.file {
+            Some(file) => file
+                .metadata()
+                .map_or(0, |m| unread_past(m.len(), self.state.offset)),
+            None => match std::fs::metadata(&self.log_path) {
+                Ok(m) if m.ino() == self.state.inode => unread_past(m.len(), self.state.offset),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            },
+        };
+        drains.saturating_add(current)
+    }
+
+    /// Persists the current cursor state via `DurableCursor::save`. A [`Self::without_cursor`]
+    /// tailer has nowhere to persist to: this returns `ErrorKind::Unsupported` and writes nothing.
+    ///
+    /// While the rotated copy of a `copytruncate` is still being drained, what is saved is the
+    /// drain's position in the OLD content (its fingerprint, the shared inode), not the new
+    /// file's offset 0. The old content is unread until the drain ends, and a restart that loaded
+    /// a position in the new file would never go back for it; loaded as saved here, the restart
+    /// sees the truncation again and resumes the drain from `<log>.1`.
+    pub fn persist_cursor(&self) -> io::Result<()> {
+        let resumable = self.pending_drains.front().and_then(|(file, offset)| {
+            let front = file.metadata().ok()?.ino();
+            let (_, fingerprint, len) = self.resumes.iter().find(|(ino, ..)| *ino == front)?;
+            Some(CursorState {
+                inode: self.state.inode,
+                offset: *offset,
+                fingerprint: *fingerprint,
+                fingerprint_len: Some(*len),
+            })
+        });
+        let state = resumable.unwrap_or(self.state);
+        match &self.cursor {
+            Some(cursor) => cursor.save(&state),
+            None => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this tailer was built without a cursor and persists nothing",
+            )),
+        }
+    }
+
+    fn refresh_last_known_size(&mut self) {
+        if let Ok(metadata) = std::fs::metadata(&self.log_path) {
+            self.last_known_size = metadata.len();
+            self.size_observed = true;
+        }
+    }
+
+    /// Checks for rotation and reacts before the batch read proper. On a rename-based rotation the
+    /// displaced inode's still-open handle is moved to `pending_drains`, which `read_batch` then
+    /// drains to exhaustion before the new file.
+    fn handle_rotation(&mut self) {
+        match detect_rotation(&self.log_path, &self.state) {
+            RotationEvent::None => {
+                // The stored window matched. If it is narrower than a full fingerprint and the
+                // file has grown past it, take the wider one now: a stamp made while only the
+                // start of a first line was visible would otherwise stay that short for the whole
+                // generation, too little to tell a refilled file from the same one, or to match
+                // the rotated copy.
+                if self.state.fingerprint_len.is_some_and(|n| n < 256) {
+                    let (fingerprint, len) = fingerprint_with_len(&self.log_path);
+                    if self.state.fingerprint_len.is_some_and(|n| len > n) {
+                        self.state.fingerprint = fingerprint;
+                        self.state.fingerprint_len = Some(len);
+                    }
+                }
+            }
+            RotationEvent::Truncated => self.recover_copytruncated(),
+            RotationEvent::Replaced => {
+                // A rotated copy that carries the stored fingerprint is proof of a copytruncate,
+                // and outranks the growth explanation: a restart mid-drain stores the OLD
+                // fingerprint, so a live file still under 256 bytes always mismatches it.
+                if find_generations(&self.log_path, &self.state, Gz::Probe).is_err()
+                    && self.maybe_false_positive_replaced()
+                {
+                    // Ordinary growth of a still-small file, not a real replacement (see
+                    // `maybe_false_positive_replaced`): re-stamp and keep reading from the same
+                    // offset rather than discarding it.
+                    self.stamp_fingerprint();
+                } else {
+                    self.recover_copytruncated();
+                }
+            }
+            RotationEvent::InodeChanged => {
+                // Preserve the rotated-out inode (with our read position) so read_batch drains its
+                // full backlog before the new file, then point the cursor at the new inode.
+                if let Some(old_file) = self.file.take() {
+                    // Keep `drain_offsets` aligned with the queue when a rotation lands while a
+                    // batch is still uncommitted, so a later rewind restores this inode to where
+                    // reading of it actually left off rather than to another entry's offset.
+                    //
+                    // The offset recorded is where this BATCH began reading this inode
+                    // (`uncommitted.offset`), not where the cursor sits now. Those differ exactly
+                    // when the batch already read from this inode before the rotation displaced
+                    // it, and recording the live offset there silently drops those lines: they
+                    // were handed out, never committed, and a rewind would resume past them.
+                    // `reset_to_current_file` zeroes `uncommitted.offset` for each new inode, so
+                    // for every inode after the first this is 0 - correct, since that is where
+                    // the batch started reading it.
+                    if let Some(uncommitted) = &mut self.uncommitted {
+                        uncommitted.drain_offsets.push(uncommitted.offset);
+                    }
+                    // The queued offset is the LIVE one: draining resumes where reading actually
+                    // left off. Only the rewind target above goes back to the batch's start.
+                    self.pending_drains.push_back((old_file, self.state.offset));
+                }
+                self.state.inode = get_inode(&self.log_path);
+                self.reset_to_current_file();
+            }
+        }
+    }
+
+    /// The log was emptied or its content replaced under the same inode: `copytruncate`, whose
+    /// copy is `<log>.1` (the deployed policy's `delaycompress` leaves it uncompressed until the
+    /// next rotation). Everything this tailer had not yet read lives only there, so it is queued
+    /// as a drain from the read offset, ahead of the new file, and goes through the same
+    /// machinery as a rename-rotated inode (spans, commits, byte budget, rewind).
+    ///
+    /// Only a copy that is provably the old content is read: its first `min(256, size)` bytes must
+    /// hash to the fingerprint stored for the old file, and it must reach the read offset.
+    /// Anything else (no `.1`, only `.1.gz`, a `.1` from an earlier rotation) is NOT read, since
+    /// reading the wrong file would ingest another generation's lines; it is reported as a loss
+    /// instead. Without a `.1` the new file is simply read from 0, as it always was.
+    fn recover_copytruncated(&mut self) {
+        let dir = self.cursor.as_ref().map(|c| c.dir().to_path_buf());
+        let gz = match &dir {
+            Some(dir) => Gz::Expand(Scratch {
+                dir,
+                free_bytes: &statvfs_free,
+            }),
+            None => Gz::Nowhere,
+        };
+        // A generation that cannot be found is a loss; no rotated copy is read in its place, since
+        // nothing says whether one is older (already ingested) or newer than the lost one.
+        let (generations, lost) = match find_generations(&self.log_path, &self.state, gz) {
+            Ok(found) => (found.generations, found.newer_missing),
+            Err(reason) => (Vec::new(), Some(reason)),
+        };
+        let queued: Vec<u64> = self
+            .pending_drains
+            .iter()
+            .filter_map(|(file, _)| file.metadata().ok().map(|m| m.ino()))
+            .collect();
+        self.resumes.retain(|(ino, ..)| queued.contains(ino));
+        for generation in generations {
+            if let Some(uncommitted) = &mut self.uncommitted {
+                let rewind_to = if generation.is_stored {
+                    uncommitted.offset
+                } else {
+                    0
+                };
+                uncommitted.drain_offsets.push(rewind_to);
+            }
+            if let Ok(meta) = generation.file.metadata() {
+                self.resumes.push((
+                    meta.ino(),
+                    generation.fingerprint,
+                    generation.fingerprint_len,
+                ));
+            }
+            self.pending_drains
+                .push_back((generation.file, generation.offset));
+        }
+        if let Some(reason) = lost {
+            self.record_loss(reason);
+        }
+        self.reset_to_current_file();
+    }
+
+    /// Counts and logs a truncation whose unread content could not be recovered. Stays silent when
+    /// the previous poll had read everything the file held: the bytes in the copy-to-truncate gap
+    /// are not knowable and are the loss the policy accepts, which would otherwise be logged on
+    /// every rotation of an idle sensor.
+    fn record_loss(&mut self, reason: &'static str) {
+        let estimate = self
+            .size_observed
+            .then(|| self.last_known_size.saturating_sub(self.state.offset));
+        if estimate == Some(0) {
+            return;
+        }
+        self.loss.events += 1;
+        self.loss.bytes_estimated += estimate.unwrap_or(0);
+        tracing::warn!(
+            path = %self.log_path.display(),
+            offset = self.state.offset,
+            bytes_skipped_estimate = estimate,
+            reason,
+            "log-tailer: a copytruncate rotation discarded input that was never read and the rotated copy could not supply it"
+        );
+    }
+
+    /// Resets the offset to 0 and recomputes the fingerprint against the log file's current
+    /// content; the stale file handle (if any) is dropped since it no longer corresponds to
+    /// where we're about to read.
+    fn reset_to_current_file(&mut self) {
+        self.state.offset = 0;
+        // The pre-batch position on THIS inode is the start of it; a rewind must not restore an
+        // offset that belonged to the file we just rotated away from.
+        if let Some(uncommitted) = &mut self.uncommitted {
+            uncommitted.offset = 0;
+        }
+        self.stamp_fingerprint();
+        self.file = None;
+    }
+
+    /// Records the log file's current leading bytes as the fingerprint, with the window they cover.
+    fn stamp_fingerprint(&mut self) {
+        let (fingerprint, len) = fingerprint_with_len(&self.log_path);
+        self.state.fingerprint = fingerprint;
+        self.state.fingerprint_len = Some(len);
+    }
+
+    /// `compute_fingerprint` hashes `min(256, current_size)` bytes: for a file that has never
+    /// reached 256 bytes, every append changes that window and therefore the hash, even though
+    /// nothing was replaced. Distinguishes that from a genuine in-place swap by checking whether
+    /// the file only grew since we last looked while still under the stable-window threshold -
+    /// growth alone cannot explain a mismatch once the window has stabilized at exactly 256
+    /// bytes on both sides, so a mismatch there is trusted as a real replacement.
+    fn maybe_false_positive_replaced(&self) -> bool {
+        self.last_known_size < FINGERPRINT_STABLE_SIZE
+            && std::fs::metadata(&self.log_path)
+                .map(|m| m.len() > self.last_known_size)
+                .unwrap_or(false)
+    }
+}
+
+/// One rotated generation to read, oldest first.
+struct Generation {
+    file: File,
+    offset: u64,
+    /// Hash of its first `fingerprint_len` bytes: what a cursor names this generation by.
+    fingerprint: [u8; 32],
+    fingerprint_len: u16,
+    /// The generation the stored state points into (as opposed to a newer one, read from 0).
+    is_stored: bool,
+}
+
+/// What [`find_generations`] found.
+struct Found {
+    /// Generations with bytes to read, oldest first. Empty when the stored one matched but ends at
+    /// the offset and nothing newer was rotated.
+    generations: Vec<Generation>,
+    /// Set when a generation newer than the stored one could not be opened: its lines are lost.
+    newer_missing: Option<&'static str>,
+}
+
+fn rotated_path(log_path: &Path, n: u32) -> PathBuf {
+    let mut path = log_path.as_os_str().to_owned();
+    path.push(format!(".{n}"));
+    PathBuf::from(path)
+}
+
+/// Opens `<log>.<n>` (uncompressed only) with its size and fingerprint, both taken from the
+/// opened handle so a rotation that renames the file after the open cannot make the check and the
+/// read disagree.
+fn open_generation(log_path: &Path, n: u32) -> Result<(File, u64, Vec<u8>), &'static str> {
+    let path = rotated_path(log_path, n);
+    let Ok(file) = File::open(&path) else {
+        let mut gz = path.into_os_string();
+        gz.push(".gz");
+        return Err(if Path::new(&gz).exists() {
+            "the rotated copy is compressed"
+        } else {
+            "there is no rotated copy"
+        });
+    };
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return Err("the rotated copy cannot be read");
+    };
+    let mut head = Vec::with_capacity(256);
+    if (&file).take(256).read_to_end(&mut head).is_err() {
+        return Err("the rotated copy cannot be read");
+    }
+    Ok((file, size, head))
+}
+
+/// The fingerprint a generation is named by when it is not the one a stored state points into:
+/// its own leading bytes, over the window they cover.
+fn own_fingerprint(head: &[u8]) -> ([u8; 32], u16) {
+    (Sha256::digest(head).into(), head.len() as u16)
+}
+
+/// The fingerprint and window of the generation `state` points into, as a cursor saves them for it.
+fn stored_fingerprint(state: &CursorState, head: &[u8]) -> ([u8; 32], u16) {
+    (
+        state.fingerprint,
+        state.fingerprint_len.unwrap_or(head.len() as u16),
+    )
+}
+
+/// Where a compressed generation is expanded, and how to ask how much room there is. The probe
+/// is a parameter so the refusal is tested without filling a disk.
+struct Scratch<'a> {
+    dir: &'a Path,
+    free_bytes: &'a dyn Fn(&Path) -> io::Result<u64>,
+}
+
+/// What [`find_generations`] may do with a compressed generation.
+enum Gz<'a> {
+    /// Only check whether `.2.gz` is the stored generation (a probe); expand nothing.
+    Probe,
+    /// Expand it.
+    Expand(Scratch<'a>),
+    /// It would have to be expanded and there is nowhere to put it (a tailer with no cursor
+    /// directory): reported as a loss.
+    Nowhere,
+}
+
+/// Finds the generation of the log that `state` points into, in `<log>.1` or, when a second
+/// rotation has already pushed it back, `<log>.2` or `<log>.2.gz` (expanded into `scratch` when
+/// given, see [`match_gzip_generation`]): its first `min(256, size)` bytes must hash to
+/// the stored fingerprint and it must reach the read offset. Every generation rotated after it
+/// (`.1` when it is `.2`) is unread by construction, since the reader works through generations
+/// in order, and is returned too. `Err(reason)` when the stored generation cannot be found; the
+/// reason is `.1`'s, the likelier home.
+fn find_generations(
+    log_path: &Path,
+    state: &CursorState,
+    gz: Gz<'_>,
+) -> Result<Found, &'static str> {
+    let mut why = "there is no rotated copy";
+    for n in [1u32, 2] {
+        let (file, size, head) = match open_generation(log_path, n) {
+            Ok(opened) => opened,
+            Err(reason) => {
+                if n == 1 {
+                    why = reason;
+                }
+                continue;
+            }
+        };
+        if !head_matches(state, &head) {
+            if n == 1 {
+                why = "the rotated copy is not the content the read offset points into";
+            }
+            continue;
+        }
+        if size < state.offset {
+            if n == 1 {
+                why = "the rotated copy ends before the read offset";
+            }
+            continue;
+        }
+        let mut generations = Vec::new();
+        if size > state.offset {
+            let (fingerprint, fingerprint_len) = stored_fingerprint(state, &head);
+            generations.push(Generation {
+                file,
+                offset: state.offset,
+                fingerprint,
+                fingerprint_len,
+                is_stored: true,
+            });
+        }
+        let newer_missing = push_newer(log_path, n, &mut generations);
+        return Ok(Found {
+            generations,
+            newer_missing,
+        });
+    }
+    // The shipped `compress` + `delaycompress` policy compresses a copy at the rotation after the
+    // one that made it, so a second rotation leaves the first generation only as `.2.gz`.
+    match match_gzip_generation(log_path, state, gz) {
+        Ok(GzipMatch::Absent) => {}
+        Ok(GzipMatch::Present) => {
+            return Ok(Found {
+                generations: Vec::new(),
+                newer_missing: None,
+            });
+        }
+        Ok(GzipMatch::Materialized(file, size, head)) => {
+            let mut generations = Vec::new();
+            if size > state.offset {
+                let (fingerprint, fingerprint_len) = stored_fingerprint(state, &head);
+                generations.push(Generation {
+                    file,
+                    offset: state.offset,
+                    fingerprint,
+                    fingerprint_len,
+                    is_stored: true,
+                });
+            }
+            let newer_missing = push_newer(log_path, 2, &mut generations);
+            return Ok(Found {
+                generations,
+                newer_missing,
+            });
+        }
+        Err(reason) => why = reason,
+    }
+    Err(why)
+}
+
+/// Appends the generations rotated after `<log>.<n>`, oldest first, that have bytes to read.
+/// Returns the reason when one cannot be opened.
+fn push_newer(log_path: &Path, n: u32, out: &mut Vec<Generation>) -> Option<&'static str> {
+    let mut missing = None;
+    for m in (1..n).rev() {
+        match open_generation(log_path, m) {
+            Ok((file, size, head)) => {
+                if size > 0 {
+                    let (fingerprint, fingerprint_len) = own_fingerprint(&head);
+                    out.push(Generation {
+                        file,
+                        offset: 0,
+                        fingerprint,
+                        fingerprint_len,
+                        is_stored: false,
+                    });
+                }
+            }
+            Err(reason) => missing = Some(reason),
+        }
+    }
+    missing
+}
+
+/// The most decompressed bytes a `.2.gz` is expanded to when the reader resumes from it: five
+/// times the shipped `size 100M`. A bigger generation (a log the guard let grow while intake was
+/// behind) is reported as a loss rather than expanded without bound.
+const GZIP_EXPANSION_CAP: u64 = 512 * 1024 * 1024;
+
+enum GzipMatch {
+    /// No `<log>.2.gz`, or it is not the stored generation.
+    Absent,
+    /// It is the stored generation; not expanded (a probe, `scratch` was `None`).
+    Present,
+    /// It is the stored generation, expanded into an unlinked scratch file of this many bytes;
+    /// the last field is its first (up to 256) decompressed bytes.
+    Materialized(File, u64, Vec<u8>),
+}
+
+/// Free space required beyond the expansion itself, the same reserve the rotation guard keeps
+/// (`PROPOLIS_LOGROTATE_RESERVE_BYTES`, 512 MiB): expanding a generation must not be what fills a
+/// volume that holds the database and every sensor log.
+const EXPANSION_RESERVE: u64 = 512 * 1024 * 1024;
+
+/// Bytes available to an unprivileged writer on the filesystem holding `dir`.
+fn statvfs_free(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a plain-old-data out
+    // parameter that statvfs fully initialises on success, which is the only case it is read.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// The reason given when an expansion is refused for lack of space, or runs out of it midway.
+const NO_SPACE: &str = "insufficient disk to expand the compressed rotated copy";
+
+fn is_out_of_space(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(code) if code == libc::ENOSPC || code == libc::EDQUOT)
+}
+
+/// Whether `<log>.2.gz` decompresses to the generation `state` points into: the first
+/// `min(256, size)` decompressed bytes must hash to the stored fingerprint. With a `scratch`
+/// directory the whole generation is then expanded, streaming, into an unlinked file there (so a
+/// resumed position is simply a decompressed offset into an ordinary seekable file, and a crash
+/// leaves nothing behind); without one this is only the cheap check.
+fn match_gzip_generation(
+    log_path: &Path,
+    state: &CursorState,
+    gz: Gz<'_>,
+) -> Result<GzipMatch, &'static str> {
+    use flate2::read::GzDecoder;
+    let mut path = rotated_path(log_path, 2).into_os_string();
+    path.push(".gz");
+    let Ok(file) = File::open(&path) else {
+        return Ok(GzipMatch::Absent);
+    };
+    let mut head = Vec::with_capacity(256);
+    if GzDecoder::new(&file)
+        .take(256)
+        .read_to_end(&mut head)
+        .is_err()
+        || !head_matches(state, &head)
+    {
+        return Ok(GzipMatch::Absent);
+    }
+    let scratch = match gz {
+        Gz::Probe => return Ok(GzipMatch::Present),
+        Gz::Nowhere => {
+            return Err("there is no directory to expand the compressed rotated copy in");
+        }
+        Gz::Expand(scratch) => scratch,
+    };
+    // Refuse before writing a byte: the worst case is the cap, plus the reserve the guard keeps.
+    let needed = GZIP_EXPANSION_CAP + EXPANSION_RESERVE;
+    match (scratch.free_bytes)(scratch.dir) {
+        Ok(free) if free >= needed => {}
+        Ok(_) => return Err(NO_SPACE),
+        Err(_) => return Err("the free space for the compressed rotated copy cannot be read"),
+    }
+    let Ok(file) = File::open(&path) else {
+        return Err("the compressed rotated copy cannot be read");
+    };
+    let mut out = scratch_file(scratch.dir).map_err(|e| {
+        if is_out_of_space(&e) {
+            NO_SPACE
+        } else {
+            "no scratch space to expand the compressed copy"
+        }
+    })?;
+    let mut decoder = GzDecoder::new(file).take(GZIP_EXPANSION_CAP + 1);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied: u64 = 0;
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|_| "the compressed rotated copy is truncated or corrupt")?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n]).map_err(|e| {
+            if is_out_of_space(&e) {
+                NO_SPACE
+            } else {
+                "the compressed rotated copy could not be expanded"
+            }
+        })?;
+        copied += n as u64;
+    }
+    if copied > GZIP_EXPANSION_CAP {
+        return Err("the compressed rotated copy is larger than the expansion cap");
+    }
+    if copied < state.offset {
+        return Err("the rotated copy ends before the read offset");
+    }
+    Ok(GzipMatch::Materialized(out, copied, head))
+}
+
+/// A read-write file in `dir` that is already unlinked: it lives only as long as the descriptor.
+/// There is no fallback directory: the system temp directory can be memory-backed and counted
+/// against the service's memory limit.
+fn scratch_file(dir: &Path) -> io::Result<File> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = dir.join(format!(
+        ".propolis-gzdrain-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
+}
+
+/// Hard cap on a single log line intake will buffer. Sensors already bound their captured fields
+/// (`*_MAX_CAPTURED_BYTES`, ~1 MiB), so a real line never approaches this; the cap defends the
+/// low-trust sensor boundary intake crosses - a compromised or malfunctioning sensor writing an
+/// enormous (or endless, unterminated) line must not drive unbounded allocation here.
+pub const MAX_LINE_BYTES: u64 = 1_048_576;
+
+/// Bytes of a `len`-byte file a reader at `offset` has yet to read. A file shorter than the offset
+/// was truncated under the reader, which restarts it from 0, so all of it is unread.
+fn unread_past(len: u64, offset: u64) -> u64 {
+    if len < offset { len } else { len - offset }
+}
+
+fn count_lines(entries: &[TailEntry]) -> usize {
+    entries
+        .iter()
+        .filter(|e| matches!(e, TailEntry::Line(_)))
+        .count()
+}
+
+/// Reads up to `max_lines` complete (`\n`-terminated) lines from `file`, starting at
+/// `start_offset`, with a [`TailEntry::Discarded`] in place of each over-length line skipped on
+/// the way. Returns the entries and the number of bytes actually consumed (every accepted or
+/// discarded line's length including its trailing `\n`). An incomplete trailing line - EOF
+/// reached without a `\n` - is left unconsumed: `consumed` stops short of it so the next read
+/// starts at its beginning again.
+fn read_lines_from(
+    file: &mut File,
+    start_offset: u64,
+    max_lines: usize,
+    budget: LineBudget,
+) -> io::Result<LineRead> {
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut lines = 0;
+    let mut consumed: u64 = 0;
+    let mut line_bytes: u64 = 0;
+    let mut budget_hit = false;
+    let mut spans: Vec<u64> = Vec::new();
+    let mut lens: Vec<u64> = Vec::new();
+    let mut raw_lossy: Vec<(usize, Vec<u8>)> = Vec::new();
+    // Bytes of discarded over-length lines since the last accepted line, charged to the next one.
+    let mut discarded: u64 = 0;
+
+    while lines < max_lines {
+        let mut buf = Vec::new();
+        // Read at most MAX_LINE_BYTES + 1 so a runaway line cannot allocate without bound.
+        let bytes_read = (&mut reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut buf)?;
+        if bytes_read == 0 {
+            break; // EOF - nothing consumed.
+        }
+        // A complete line that would take the batch past its byte budget stays unread, unless it
+        // is the batch's first line, which always goes through.
+        if buf.last() == Some(&b'\n')
+            && !(budget.first_is_free && lines == 0)
+            && line_bytes + bytes_read as u64 > budget.left
+        {
+            budget_hit = true;
+            break;
+        }
+        if buf.last() != Some(&b'\n') {
+            if buf.len() as u64 > MAX_LINE_BYTES {
+                // Over-length line with no newline inside the cap: discard it and skip past the
+                // rest of the physical line so the tailer advances instead of re-reading the giant
+                // line forever. If the line has not yet ended (EOF before a newline) leave it
+                // unconsumed - it may still be mid-write and complete on a later poll.
+                match skip_to_newline(&mut reader)? {
+                    Some(skipped) => {
+                        let bytes = bytes_read as u64 + skipped;
+                        consumed += bytes;
+                        discarded += bytes;
+                        tracing::warn!(
+                            max_bytes = MAX_LINE_BYTES,
+                            "intake: discarded an over-length log line from a sensor (low-trust boundary)"
+                        );
+                        entries.push(TailEntry::Discarded { bytes });
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            break; // A genuine short incomplete trailing line - leave it unconsumed.
+        }
+        consumed += bytes_read as u64;
+        line_bytes += bytes_read as u64;
+        spans.push(discarded + bytes_read as u64);
+        lens.push(bytes_read as u64);
+        discarded = 0;
+        buf.pop(); // drop the trailing '\n'
+        // Lossy rather than a hard error: a corrupt line should not crash the tailer. The
+        // converter (Task 1) applies the real, fail-closed NDJSON validation downstream.
+        let text = String::from_utf8_lossy(&buf);
+        if matches!(text, std::borrow::Cow::Owned(_)) {
+            raw_lossy.push((lines, buf.clone()));
+        }
+        entries.push(TailEntry::Line(text.into_owned()));
+        lines += 1;
+    }
+
+    Ok(LineRead {
+        entries,
+        consumed,
+        line_bytes,
+        budget_hit,
+        spans,
+        lens,
+        raw_lossy,
+    })
+}
+
+/// How many bytes of line content a read may still take, and whether the first line is exempt.
+#[derive(Clone, Copy)]
+struct LineBudget {
+    left: u64,
+    first_is_free: bool,
+}
+
+struct LineRead {
+    entries: Vec<TailEntry>,
+    /// Bytes to advance the offset by: every accepted or discarded line, newlines included.
+    consumed: u64,
+    /// Bytes of accepted lines only (discards are not buffered, so they do not count).
+    line_bytes: u64,
+    /// The read stopped before a complete line because it would not fit the byte budget.
+    budget_hit: bool,
+    /// Bytes consumed by each accepted line, discards before it included.
+    spans: Vec<u64>,
+    /// Each accepted line's own length, newline included.
+    lens: Vec<u64>,
+    /// Raw bytes of each accepted line that was not valid UTF-8, by its index in this read.
+    raw_lossy: Vec<(usize, Vec<u8>)>,
+}
+
+/// The offset just past the last `\n` in `path`, so a reader starting there never begins inside
+/// a line the writer has not finished. Looks back at most [`MAX_LINE_BYTES`]: a longer unfinished
+/// tail is over-length anyway, and starting at the end of the file then is no worse. A missing or
+/// unreadable file is offset 0.
+fn end_of_last_complete_line(path: &Path) -> u64 {
+    let Ok(mut file) = File::open(path) else {
+        return 0;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return 0;
+    };
+    let window = len.min(MAX_LINE_BYTES);
+    let mut tail = Vec::new();
+    let read = file
+        .seek(SeekFrom::Start(len - window))
+        .and_then(|_| file.take(window).read_to_end(&mut tail));
+    if read.is_err() {
+        return len;
+    }
+    match tail.iter().rposition(|&b| b == b'\n') {
+        Some(i) => len - window + i as u64 + 1,
+        None if window == len => 0,
+        None => len,
+    }
+}
+
+/// Reads and discards bytes (in bounded chunks) until and including the next `\n`. Returns the
+/// number of bytes skipped, or `None` if EOF was reached before any newline.
+fn skip_to_newline(reader: &mut impl BufRead) -> io::Result<Option<u64>> {
+    let mut discarded: u64 = 0;
+    loop {
+        let mut chunk = Vec::new();
+        let n = reader
+            .by_ref()
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut chunk)?;
+        if n == 0 {
+            return Ok(None); // EOF, no terminating newline.
+        }
+        discarded += n as u64;
+        if chunk.last() == Some(&b'\n') {
+            return Ok(Some(discarded));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `<log>.2.gz` holding `content`, and the state of a reader that had read `offset` bytes of it.
+    fn gzipped_generation(dir: &Path, content: &[u8], offset: u64) -> (PathBuf, CursorState) {
+        let log = dir.join("events.jsonl");
+        let mut gz = rotated_path(&log, 2).into_os_string();
+        gz.push(".gz");
+        let mut encoder = flate2::write::GzEncoder::new(
+            File::create(&gz).unwrap(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(content).unwrap();
+        encoder.finish().unwrap();
+        let head = &content[..content.len().min(256)];
+        let state = CursorState {
+            inode: 1,
+            offset,
+            fingerprint: Sha256::digest(head).into(),
+            fingerprint_len: Some(head.len() as u16),
+        };
+        (log, state)
+    }
+
+    fn expand(
+        log: &Path,
+        state: &CursorState,
+        free: &dyn Fn(&Path) -> io::Result<u64>,
+    ) -> Result<Found, &'static str> {
+        let dir = log.parent().unwrap();
+        find_generations(
+            log,
+            state,
+            Gz::Expand(Scratch {
+                dir,
+                free_bytes: free,
+            }),
+        )
+    }
+
+    /// The expansion needs the cap plus the reserve free; short of that it is refused before a
+    /// byte is written, with the reason a page can show, and nothing is left behind.
+    #[test]
+    fn a_compressed_copy_is_not_expanded_without_room_for_it_and_the_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, state) = gzipped_generation(dir.path(), &vec![b'x'; 4096], 10);
+        let needed = GZIP_EXPANSION_CAP + EXPANSION_RESERVE;
+
+        assert_eq!(
+            expand(&log, &state, &|_| Ok(needed - 1)).err(),
+            Some(NO_SPACE)
+        );
+        assert_eq!(
+            expand(&log, &state, &|_| Ok(0)).err(),
+            Some(NO_SPACE),
+            "a full disk"
+        );
+        assert!(
+            expand(&log, &state, &|_| Err(io::Error::other("statvfs failed")))
+                .err()
+                .is_some_and(|why| why.contains("free space")),
+            "an unreadable free-space figure is a refusal, not a guess"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("gzdrain"))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        let found = expand(&log, &state, &|_| Ok(needed)).expect("room for it");
+        assert_eq!(found.generations.len(), 1);
+        assert_eq!(found.generations[0].offset, 10);
+    }
+
+    /// A write that runs out of space midway is reported as that, not as a corrupt archive.
+    #[test]
+    fn running_out_of_space_while_expanding_is_reported_as_such() {
+        assert!(is_out_of_space(&io::Error::from_raw_os_error(libc::ENOSPC)));
+        assert!(is_out_of_space(&io::Error::from_raw_os_error(libc::EDQUOT)));
+        assert!(!is_out_of_space(&io::Error::from_raw_os_error(libc::EIO)));
+    }
+
+    /// A tailer with no cursor directory has nowhere to expand to: a reported loss, and nothing
+    /// is written to the system temp directory.
+    #[test]
+    fn a_compressed_copy_is_not_expanded_when_there_is_no_directory_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, state) = gzipped_generation(dir.path(), &vec![b'x'; 4096], 10);
+        assert!(
+            find_generations(&log, &state, Gz::Nowhere)
+                .err()
+                .is_some_and(|why| why.contains("no directory"))
+        );
+    }
+}

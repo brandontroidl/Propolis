@@ -1,0 +1,174 @@
+<!--
+title: Filesystem and database protections
+audience: security
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-06
+-->
+
+# Filesystem and database protections
+
+How Propolis constrains what its processes can touch on disk and what any
+database client (including a compromised collector) can do to the event store.
+This page owns the *security rationale*; exhaustive values live in the reference
+pages linked below.
+
+## Process isolation (systemd)
+
+Every shipped unit under `deploy/` runs as a dedicated, unprivileged OS user and
+applies a least-authority sandbox. These directives are asserted by
+`crates/sensor-framework/tests/deploy_test.rs` (a dropped directive fails the
+test), not merely documented.
+
+Security-relevant directives common to the unified daemon (`deploy/propolis.service`)
+and every sensor unit:
+
+| Directive | Value | Effect |
+|---|---|---|
+| `User=` / `Group=` | dedicated `propolis-*` user, never root | asserted `User != root` (`crates/sensor-framework/tests/deploy_test.rs#assert_unit_hardened`) |
+| `NoNewPrivileges=yes` | - | no setuid/capability escalation after exec |
+| `ProtectSystem=strict` | - | entire filesystem read-only except explicit `ReadWritePaths` |
+| `ProtectHome=yes` | - | home trees invisible |
+| `MemoryDenyWriteExecute=yes` | correct spelling (the `-ion` form silently installs no rule) | no W^X pages: captured code cannot become executable memory |
+| `RestrictAddressFamilies=` | sensors `AF_INET AF_INET6`; daemon adds `AF_UNIX` (local PostgreSQL socket) | no raw/packet/netlink sockets |
+| `NoExecPaths=/` with `ExecPaths=` | the program `ExecStart=` runs, named first, then `/usr/lib -/usr/lib64` (its libraries and loader; `/usr/lib64` optional because arm64 Debian and Ubuntu have none); the three root-run script units add `/usr/bin` and the extra program each runs, and the backup also Debian's PostgreSQL wrapper (`-/usr/share/postgresql-common/pg_wrapper`, the symlink target of its `/usr/bin/pg_dump`, `psql` and `pg_restore`, since noexec is checked on the resolved file) | nothing on the filesystem can be executed or mapped executable except the unit's own program: a captured upload, a spool entry or a fetched sample cannot run even where the operator's `noexec` mount is missing. Asserted per unit against its own `ExecStart=` (`crates/sensor-framework/tests/deploy_test.rs#every_unit_makes_the_filesystem_non_executable_except_its_own_program`); needs systemd 244 and a merged `/usr` |
+| `PrivateTmp`, `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`, `RemoveIPC`, `ProtectProc=invisible`, `ProcSubset=pid` | - | broad supplementary containment |
+| `InaccessiblePaths=` (sensor units) | every other unit's env file, `/etc/propolis/watch.env` and `/etc/propolis/certs`, each `-`-prefixed so a file absent on a collector box does not fail the unit | a sensor cannot read the daemon's database URL, console password, vendor keys or ntfy token, another sensor's env file, or the split deployment's mTLS keys, even where a file's `0600` mode has slipped; its own env file is read by systemd before the namespace exists, so nothing it needs is denied. Derived from every unit's `EnvironmentFile=` and held exact per sensor unit (`crates/sensor-framework/tests/deploy_test.rs#every_sensor_unit_denies_the_secrets_it_does_not_load`) |
+| `UMask=` | sensors `0027` (logs group-readable so the daemon's group membership can read them); console `0077` | default file mode |
+| Resource caps | `MemoryMax`, `TasksMax`, `CPUQuota`, `LimitNOFILE` per unit | bound resource-exhaustion blast radius |
+
+`ReadWritePaths` is scoped to each service's own log/spool/state directories.
+Only `sensor-ssh` gets a third writable path (`/var/lib/propolis/ssh`) for its
+persistent host key. Sensors binding a privileged port (22/23/80/21/25) carry
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` with a matching bounding set; the
+daemon and non-privileged-port sensors carry an empty `CapabilityBoundingSet=`.
+
+The unified daemon additionally sets `ReadOnlyPaths=/var/log/propolis` and
+`PrivateUsers=yes`. The three units that run as root (`propolis-alert@`,
+`propolis-backup`, `propolis-logrotate`) keep `CAP_SYS_ADMIN`, which could undo the
+`NoExecPaths=` mounts, so they also carry `SystemCallFilter=~@mount` as
+`systemd.exec(5)` advises; the other units have no such capability.
+
+> **Caveat - `SystemCallFilter` is a placeholder, not a delivered control.**
+> Every unit ships `SystemCallFilter=@system-service` minus `@privileged
+> @resources` (`deploy/propolis.service#SystemCallFilter=@system-service`, `deploy/sensor-ssh.service#SystemCallFilter=@system-service`).
+> The unit header explicitly labels this a **broad development allowlist** and
+> instructs the operator to derive the real per-binary allowlist (e.g. via
+> `strace -c -f`) before production. A tightened syscall filter is **not** shipped
+> in the repo. See [residual-risks.md](./residual-risks.md) and the
+> [hardening checklist](./hardening-checklist.md).
+
+## Filesystem permission model (install.sh)
+
+`deploy/install.sh` delegates to `deploy/provision.sh` (`deploy/install.sh#run_provision`;
+idempotent - `ensure_dir`'s `install -d` reasserts mode/owner/group,
+`deploy/provision.sh#ensure_dir`), which lays out the directory tree. The exhaustive
+path/mode table is owned by
+[../reference/filesystem-paths.md](../reference/filesystem-paths.md); the
+security-load-bearing choices:
+
+- **`/var/lib/propolis` is root-owned `0755`** on purpose
+  (`ensure_dir` call, `deploy/provision.sh#ensure_dir /var/lib/propolis`): a parent writable by the `propolis` daemon would let a
+  compromised daemon unlink or swap the sibling `ssh/` host-key directory for a
+  symlink that `ProtectSystem=strict`'s bind-mount would then follow. The host-key
+  dir `/var/lib/propolis/ssh` is `0750` owned `propolis-ssh`.
+- **Captured sample files are written `0640`**
+  (`crates/sensor-framework/src/spool.rs#write_and_seal`) into spool directories that
+  `install.sh` prints (does **not** auto-create) `noexec,nosuid,nodev` fstab lines
+  for (`deploy/install.sh#NOT DONE BY THIS SCRIPT`). Whether those mount options are actually applied on
+  a given host is an operator step, not enforceable from the repo - see
+  [malware custody](./malware-custody.md) and
+  [residual risks](./residual-risks.md).
+- **Secrets live only in `/etc/propolis/*.env`, mode `0600`, `root:root`** - provisioning
+  creates them empty and the operator fills them in; `install.sh` writes no value. No secret is
+  read from argv or baked into a unit file. See
+  [../operations/secret-management.md](../operations/secret-management.md).
+- **Sensor TLS keys** (`/etc/propolis/tls/<sensor>.key`, `0600`, owned by that sensor's own
+  user) are generated on the host at deploy time by `provision-certs --sensor-tls`
+  (`crates/provision-certs/src/lib.rs#provision_sensor_tls`) and never committed. The
+  provisioner writes each file to a new inode created with its final mode, then renames it
+  into place, so a key is never briefly more readable (`crates/provision-certs/src/lib.rs#write`).
+  The directory is `0711` root-owned (traverse-only) so a sensor can open only its own key by
+  name. The shared loader refuses a key with any group or other permission bit set and
+  returns an error that carries no key bytes or PEM text
+  (`crates/sensor-framework/src/tls.rs#TlsConfigError`); it overwrites its read buffers after
+  parsing as a best-effort scrub, not a guarantee: it covers only those buffers, not
+  the parsed key the TLS configuration holds (`crates/sensor-framework/src/tls.rs#load_server_config`). Tests use
+  ephemeral in-memory certificates (`crates/sensor-framework/src/tls.rs#server_config_from_pem`),
+  never a checked-in key. Each TLS unit reads the directory through
+  `ReadOnlyPaths=-/etc/propolis/tls`, so it can never write a key. Operator guidance:
+  [../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+- Dedicated users are created `--system --no-create-home --shell /usr/sbin/nologin`
+  (`ensure_user`, `deploy/provision.sh#ensure_user`); no sensor user can log in.
+
+## Database-layer protections
+
+The event store is defended at the PostgreSQL layer, independently of the
+application, so a compromised collector or direct SQL access cannot forge or
+rewrite history. Table/enum/migration details are owned by
+[../reference/database.md](../reference/database.md).
+
+**Append-only immutability** (`crates/core-scoring/migrations/0004_harden_event_table.sql`):
+in the production database the `propolis` role retains `INSERT` but is stripped of
+`UPDATE`, `DELETE`, and `TRUNCATE` on the `event` table (the `REVOKE` is skipped
+for test databases so fixtures can clean up). `CHECK` constraints enforce
+non-empty `sensor`, a 32-byte `hash`, `confidence` in `[0,1]`, and non-negative
+`weight`, so a direct INSERT bypassing the application cannot inject invalid rows.
+
+**Who the revoke binds.** PostgreSQL applies a revoke to every role except the table's
+owner, who can grant the privilege back, disable the chain trigger, or drop the table. On a
+node with one database role the daemon connects as the role that ran the migrations, so it
+is that owner: the revoke stops a bug or an injected statement and does not stop a daemon
+that has been taken over. With the roles split
+([database roles](../operations/database-roles.md)) an owner role runs the migrations and
+the daemon connects as a runtime role that owns nothing, cannot create objects, and holds
+only `SELECT` and `INSERT` on `event`
+(`crates/propolis/src/db_roles.rs#reconcile_runtime_grants`); it cannot grant itself more,
+touch the trigger, or alter the table
+(`crates/propolis/tests/db_roles.rs#the_runtime_role_appends_to_the_ledger_and_cannot_change_it`).
+The owner's credential is in `/etc/propolis/migrate.env`, which only root's
+`deploy/migrate.sh` reads: no unit loads it, and `deploy/propolis.service` and every sensor
+unit deny the path by mount
+(`crates/sensor-framework/tests/deploy_test.rs#the_daemon_cannot_read_the_schema_owners_credential_and_no_unit_loads_it`).
+The daemon reports at startup which case it is in
+(`crates/propolis/src/db_roles.rs#prepare_schema`), and `propolis-migrate --check` reports it
+on demand. Splitting the roles is an operator step; a node that has not done it runs as
+before.
+
+**Chain heads held off the host.** Neither role split nor hash chain stops root or a
+PostgreSQL superuser, who can rewrite the ledger and recompute every hash. Each backup set
+records the newest event's id and hash, and each backup run first checks the heads earlier
+sets recorded against the live ledger, stopping if one no longer matches
+([backup and restore](../operations/backup-and-restore.md#when-the-ledger-does-not-match-a-backup)).
+A set that has been [pulled off the host](../operations/backup-and-restore.md#off-host-copies)
+keeps a head the host cannot change.
+
+**Hash-chain linkage enforced by trigger**
+(`crates/core-scoring/migrations/0005_chain_enforcement_trigger.sql`): a
+`BEFORE INSERT` trigger (`enforce_chain_linkage`) rejects any row whose
+`prev_hash` does not equal the current chain head - the first event must carry a
+NULL `prev_hash`; every later event must match. The SHA-256 hash *value* is still
+computed application-side over a frozen canonical byte encoding
+(`crates/core-scoring/src/hashing.rs`; see
+[../architecture/storage.md](../architecture/storage.md) for the chain design),
+but the database now enforces the *linkage* a rogue INSERT would try to skip.
+
+**Serialized inserts.** The chain-head read, INSERT, and projection run inside one
+transaction under a `pg_advisory_xact_lock` at READ COMMITTED
+(`crates/core-scoring/src/repository/events.rs#append_event`) so two concurrent inserts
+cannot fork the chain on the same `prev_hash`.
+
+**Parameterized queries only.** No SQL string is built with `format!` in non-test
+source (workspace grep for `format!(...)` containing `SELECT|INSERT|UPDATE|DELETE|WHERE`
+returns zero). The event insert, feed builder, review CLI, and VirusTotal writer
+all use `sqlx` bound placeholders (`$1`, `$2`, …), never string interpolation.
+
+## Related
+
+- [Attack surfaces](./attack-surfaces.md)
+- [Never-execute invariant](./never-execute.md)
+- [Malware custody](./malware-custody.md)
+- [Supply chain](./supply-chain.md)
+- [Hardening checklist](./hardening-checklist.md)
+- [Residual risks](./residual-risks.md)

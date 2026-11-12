@@ -1,0 +1,1040 @@
+<!--
+title: Environment variables
+audience: operator
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-14
+-->
+
+# Environment variables
+
+Authoritative table of every environment variable read by any Propolis binary:
+name, the binary that reads it, required/optional, exact code default, valid
+form, bounds/validation, and fail behavior. This page owns these facts; other
+docs link here rather than restating defaults.
+
+Defaults listed are the **code** defaults applied when a variable is unset or
+blank. All `/etc/propolis/*.env` files except the generated `fleet-listeners.env`
+(`deploy/install.sh#7/9 deriving the fleet listener inventory`,
+`deploy/fleet-listeners.sh#OUT_FILE`) are operator-authored; `deploy/install.sh`
+does not generate them (it only prints a reminder to populate them,
+`deploy/install.sh#Next: populate`).
+
+## Run modes and where variables are read
+
+Propolis ships two ways to run the platform, and the env surface differs:
+
+1. **Unified daemon** `propolis` - one `load_config()`
+   (`crates/propolis/src/config.rs#load_config`) parses intake, review, feed, console,
+   VirusTotal, malware-fetcher, and ops-alert config from a single env set
+   (`EnvironmentFile=/etc/propolis/propolis.env`). It does **not** read sensor
+   `*_BIND`/`*_WAN_MAP` variables; it consumes sensor **log files** via
+   `PROPOLIS_SENSOR_LOGS`.
+2. **Standalone service binaries** - `intake`, `review`, `feed`, `console` - each with its own `load_config_from_env()` and its own
+   `/etc/propolis/<name>.env`. Their variables are a strict subset of the unified
+   daemon's (e.g. standalone `feed` does not read `PROPOLIS_FEED_WINDOWS`;
+   standalone `review` does not read the VT or fetch variables).
+3. **Sensor binaries** - always separate processes regardless of run mode, each
+   with its own `/etc/propolis/<name>.env`.
+
+Which run mode a given deployment uses is an operator choice; both sets of
+`.service` units exist.
+
+## Parse and fail semantics
+
+One fail-closed idiom, everywhere: `propolis`, `intake`, `review`, `feed`, `console` and all
+twelve sensors **abort startup** on a present-but-invalid or present-but-zero numeric bound. A
+missing or blank variable takes its documented default; a value that is set and wrong is never
+replaced by it. The sensors read every variable through one set of typed readers
+(`crates/sensor-framework/src/env.rs#Env`; see "Sensor binaries" below). The `cred` and `smtp`
+sensors used to fall back to the default on an invalid or zero bound; they no longer do.
+
+Unified daemon (`config.rs`) parse helpers:
+
+| Helper | Unset/empty | Invalid | Zero | Other |
+|---|---|---|---|---|
+| `require_env` (`crates/propolis/src/config.rs#require_env`) | `Missing` (abort) | - | - | - |
+| `parse_positive_u64` (`crates/propolis/src/config.rs#parse_positive_u64`) | default | `Invalid` (abort) | `Invalid` (abort) - "zero never means unlimited" | - |
+| `parse_bounded_positive_u64` (`crates/propolis/src/config.rs#parse_bounded_positive_u64`) | default | abort | abort | `> max` → abort |
+| `parse_u32` (`crates/propolis/src/config.rs#parse_u32`) | default | abort | allowed | - |
+| `parse_bounded_u8` (`crates/propolis/src/config.rs#parse_bounded_u8`) | default | abort | allowed (0 = maximally strict) | `> 255` → abort (no wrap) |
+| `parse_bool_flag` (`crates/propolis/src/config.rs#parse_bool_flag`) | default | - | - | case-insensitive `true`/`false` only; **any** other value (incl. `1`, `yes`) → default |
+
+Note `parse_bool_flag` does **not** accept `1`/`yes`; ops-alert `get_bool` and
+console rDNS parse booleans more broadly (called out below).
+
+---
+
+## Universal / cross-cutting
+
+### `DATABASE_URL`
+- Read by: `propolis` (`crates/propolis/src/config.rs#load_config`), `console`
+  (`console/src/main.rs#load_config_from_env`), `feed`
+  (`feed/src/main.rs#load_config_from_env`), `intake`
+  (`intake/src/main.rs#load_config_from_env`), `review`
+  (`review/src/main.rs#load_config_from_env`).
+- Required: **yes**, for every binary that touches PostgreSQL. No default.
+- Form: PostgreSQL connection string (not validated at parse time; `sqlx`
+  validates on connect).
+- Fail: absent **or** empty string → **abort** (empty treated as missing via
+  `.filter(|s| !s.is_empty())`).
+
+### `PROPOLIS_MIGRATE_DATABASE_URL`
+- Read by: `propolis migrate` (`crates/propolis/src/db_roles.rs#run_cli`), never by the
+  daemon. `deploy/migrate.sh` takes it from `/etc/propolis/migrate.env` and hands it over in
+  the environment.
+- Required: no. Set only where the [database roles are split](../operations/database-roles.md):
+  the connection string of the role that owns the schema. With it, `propolis migrate` migrates
+  as that role and resets the grants of the role `DATABASE_URL` names. Without it,
+  `propolis migrate` migrates as `DATABASE_URL`, as the daemon does at startup.
+- It must not be in `propolis.env` or any file a unit loads: the daemon holding the owner's
+  credential is what the split prevents.
+
+### `PROPOLIS_ADMIN_DATABASE_URL`
+- Read by: `propolis migrate --init-roles` only (`crates/propolis/src/db_roles.rs#run_cli`).
+- Required: for that command. The connection string of a PostgreSQL superuser, used once to
+  move ownership of the database from the runtime role to the owner role
+  ([procedure](../operations/database-roles.md#splitting-the-roles-on-an-existing-node)). Pass it
+  on the command's own environment; do not store it.
+
+### `RUST_LOG`
+- Read by: every binary that logs (all except `provision-certs` and `propolis-watch`), as `tracing_subscriber`'s standard `EnvFilter`
+  variable.
+- Required: no. When it is unset or does not parse, `propolis` and `console` log at `info`
+  (`propolis/src/main.rs#main`, `console/src/main.rs#main`).
+- Sensors: all twelve sensor binaries log at `info` when it is unset; a set `RUST_LOG` overrides
+  that default, and an invalid directive in it is skipped rather than failing startup. Each
+  calls `sensor_framework::init_logging` (`crates/sensor-framework/src/logging.rs#init_logging`),
+  which installs an `EnvFilter` with an `info` default directive, and `log-format` enables
+  the `env-filter` feature itself, so the default is the same however the binary is built.
+- Every other binary - `gateway`, `shipper`, and the standalone `intake`, `review` and `feed` -
+  logs **errors only**. Each calls `log_format::init(LevelFilter::ERROR)` (for example
+  `crates/gateway/src/main.rs#main`), an `EnvFilter` whose default directive is `error`. That is
+  what the former `tracing_subscriber::fmt::init()` gave a workspace build (`cargo build
+  --release` at the workspace root, as the deployment manual has you run it before
+  `deploy/install.sh`, or `cargo build --release --workspace --locked` as `deploy/upgrade.sh`
+  runs it), but it is now fixed in code instead of depending on which crates enable
+  `env-filter`. Set `RUST_LOG=info` in such a unit's env file to see its startup and warning
+  lines: with it unset, a healthy release-built `gateway` prints nothing at all (observed
+  2026-09-28).
+- **`rustls` and `russh` are held at `error` unless `RUST_LOG` is set.** With `RUST_LOG` unset, every binary
+  that goes through `log_format::default_filter` (the sensors, `propolis`, `console` and the
+  `log_format::init` binaries) appends `rustls=error,russh=error` to its default level
+  (`crates/log-format/src/lib.rs#default_filter`). rustls writes a WARN for what any scanner's
+  malformed hello causes: `Illegal SNI extension: ignoring IP address presented as hostname
+  (<hex>)` (the hex is the address the scanner sent, the box's own whenever it targets the host
+  by IP), `Received a ApplicationData message while expecting [Handshake]`, `TLS alert warning
+  received ... CloseNotify`. At `info` one scanner could fill the journal with them. A set
+  `RUST_LOG` is used exactly as written, so `RUST_LOG=info,rustls=warn` brings them back for a
+  diagnosis. Any set `RUST_LOG` drops both holds, so `RUST_LOG=info` also brings back russh's WARN lines
+  (the SSH sensor's library: `unknown channel request <name>`, `strict kex violated`, text the client chooses); restate
+  `russh=error` next to it to keep them quiet. The sensors' per-connection `handler exceeded max_duration; connection dropped` line
+  (and the tftp and dns equivalents) is `debug`, and the `max_concurrent reached` refusal lines
+  are logged at power-of-two totals, as the per-source cap lines already were
+  (`crates/sensor-framework/tests/listener_log_volume.rs`).
+- The output format (colour only on a terminal, journal priority prefixes under systemd) is the
+  same for every binary and independent of `RUST_LOG`; see
+  [logging and journal priorities](../operations/health-and-observability.md#logging-and-journal-priorities).
+  `NO_COLOR` set to a non-empty value turns terminal colour off.
+
+### `PROPOLIS_HOSTNAME`
+- Read by: `sensor-framework::persona::hostname()`
+  (`crates/sensor-framework/src/persona.rs#hostname`); used by every sensor presenting
+  a host identity (SSH/telnet shell, fake-fs `/etc/hostname`, redis `INFO`,
+  SMTP/FTP greeting).
+- Required: no. Default `server01` (`sensor-framework/src/persona.rs#DEFAULT_HOSTNAME`).
+- Validation: trimmed; blank after trim → default (`sensor-framework/src/persona.rs#hostname`). Always
+  resolves.
+
+### `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`
+- Read by: `reqwest` itself when each HTTP client is built, not by Propolis
+  config code. Upper case wins over lower case (`http_proxy` and the rest).
+- Honored by: the VirusTotal, vendor-submitter and ops-alert ntfy clients, whose
+  destinations are fixed vendor endpoints or URLs you configured.
+- Ignored by: the malware fetcher, always. A proxy resolves the URL's host
+  itself, so a proxied fetch would bypass the address the SSRF guard pinned; see
+  [outbound controls](../security/outbound-controls.md).
+
+---
+
+## Unified daemon `propolis`
+
+Full env surface, `crates/propolis/src/config.rs`. This binary reads every
+variable in this section plus the universal ones above.
+
+### Database
+
+| Variable | Req | Default | Bounds / validation | Fail |
+|---|---|---|---|---|
+| `PROPOLIS_DB_MAX_CONNECTIONS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_DB_MAX_CONNECTIONS`) | positive u64 → cast u32 | zero/unparseable → abort |
+
+### Intake
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, split on the first colon of each entry (`crates/log-tailer/src/sensor_logs.rs#parse_sensor_logs`, the one parser the daemon, standalone `intake`, `shipper`'s `SENSOR_LOGS` and `propolis-watch` share). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
+| `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`crates/propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | any path; no validation |
+| `PROPOLIS_QUARANTINE_DIR` | no | `/var/lib/propolis/quarantine` (`crates/propolis/src/config.rs#DEFAULT_QUARANTINE_DIR`; standalone `intake`: `crates/intake/src/main.rs#DEFAULT_QUARANTINE_DIR`) | any path; blank = default. One `<sensor-label>.jsonl` per log holds each line the database refused on three polls in a row; created `0750` if missing (the default's parent is root-owned, so `deploy/provision.sh` creates it). Fixed caps of 64 MiB and 10,000 records, never cleaned; see [quarantined intake lines](../operations/health-and-observability.md#quarantined-intake-lines) |
+| `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort. Three intervals, if longer than ten minutes, become the `intake-lagging` age threshold (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#age_threshold`) |
+
+### Review
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_REVIEW_ENABLED` | no | `true` (`crates/propolis/src/config.rs#load_config`) | bool_flag |
+| `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS` | no | `60` (`crates/propolis/src/config.rs#DEFAULT_QUEUE_SCAN_INTERVAL_SECS`) | positive u64; zero → abort |
+| `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS` | no | `30` (`crates/propolis/src/config.rs#DEFAULT_SUBMIT_POLL_INTERVAL_SECS`) | positive u64; zero → abort |
+
+### Vendor abuse submitters (`crates/propolis/src/config.rs#load_config`, `crates/propolis/src/config.rs#load_vendor_config`)
+
+Each vendor `<V>` ∈ {`ABUSEIPDB`, `DSHIELD`, `OTX`}. These are opt-in egress
+paths, default off. See [outbound controls](../security/outbound-controls.md)
+and [integrations](integrations.md).
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_VENDOR_<V>_KEY` | no | `""` | empty key + enabled → vendor forced **disabled** (fail-closed, warns) (`crates/propolis/src/config.rs#load_vendor_config`) |
+| `PROPOLIS_VENDOR_<V>_URL` | no | vendor base URL (below) | no validation |
+| `PROPOLIS_VENDOR_<V>_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_vendor_config`) | bool_flag; stays disabled unless key present |
+| `PROPOLIS_VENDOR_<V>_COOLDOWN_HOURS` | no | `24` (`crates/propolis/src/config.rs#DEFAULT_COOLDOWN_HOURS`) | parse_u32; zero allowed; unparseable → abort |
+| `PROPOLIS_VENDOR_<V>_RATE_LIMIT` | no | `100` (`crates/propolis/src/config.rs#DEFAULT_RATE_LIMIT`) | parse_u32 |
+| `PROPOLIS_VENDOR_<V>_RATE_WINDOW_HOURS` | no | `1` (`crates/propolis/src/config.rs#DEFAULT_RATE_WINDOW_HOURS`) | parse_u32 |
+| `PROPOLIS_VENDOR_DSHIELD_USER` | no | none | DShield only (`crates/propolis/src/config.rs#load_config`); if set with a key, composed as `{user}:{key}` into the single key slot (`crates/propolis/src/config.rs#load_config`). User alone (no key) is ignored. |
+
+Concrete literal names the code reads (the `<V>` rows above, instantiated for each vendor):
+`PROPOLIS_VENDOR_ABUSEIPDB_KEY`, `PROPOLIS_VENDOR_ABUSEIPDB_URL`,
+`PROPOLIS_VENDOR_DSHIELD_KEY`, `PROPOLIS_VENDOR_DSHIELD_URL`,
+`PROPOLIS_VENDOR_OTX_KEY`, `PROPOLIS_VENDOR_OTX_URL`.
+
+Default base URLs (`crates/review/src/vendor/*.rs`):
+- abuseipdb: `https://api.abuseipdb.com` (`review/src/vendor/abuseipdb.rs#DEFAULT_BASE_URL`)
+- dshield: `https://www.dshield.org` (`review/src/vendor/dshield.rs#DEFAULT_BASE_URL`)
+- otx: `https://otx.alienvault.com` (`review/src/vendor/otx.rs#DEFAULT_BASE_URL`)
+
+### Feed
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FEED_ENABLED` | no | `true` (`crates/propolis/src/config.rs#load_config`) | bool_flag |
+| `PROPOLIS_FEED_OUTPUT_DIR` | no | `/var/lib/propolis/feed/current` (`crates/propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR`) | path |
+| `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | no | `900` (`crates/propolis/src/config.rs#DEFAULT_FEED_BUILD_INTERVAL_SECS`) | positive u64; zero → abort |
+| `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` | no | `24` (`crates/propolis/src/config.rs#DEFAULT_AGGRESSIVE_TTL_HOURS`) | positive u64; ×3600 → Duration; zero → abort |
+| `PROPOLIS_FEED_STANDARD_TTL_HOURS` | no | `48` (`crates/propolis/src/config.rs#DEFAULT_STANDARD_TTL_HOURS`) | positive u64; zero → abort |
+| `PROPOLIS_FEED_ALLOWLIST` | no | `""` | comma-sep CIDR list (`crates/propolis/src/config.rs#parse_cidr_list`); **bare IP without prefix is rejected**; invalid entry → abort |
+| `PROPOLIS_FEED_ALLOWLIST_FILE` | no | unset | path to a local text file of CIDRs, one per line, `#` comments (`crates/core-scoring/src/allowlist.rs#load_allowlist_file`), merged into `PROPOLIS_FEED_ALLOWLIST`. Read once at startup; the same list keeps these addresses out of the review queue and vendor submission, so an edit needs a restart. Each of these aborts startup: unreadable file, over 1 MiB or 50,000 entries, not UTF-8, any bad line, a bare address, an entry wider than /8 (IPv4) or /16 (IPv6). See [declared crawlers](scoring-and-feed.md#declared-crawlers). |
+| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`crates/propolis/src/config.rs#parse_ip_list`); invalid → abort |
+| `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`crates/propolis/src/config.rs#parse_asn_list`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
+| `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`) | comma-sep `<count>h`/`<count>d` (`crates/propolis/src/config.rs#parse_window_list`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** `deploy/blocklist-sync.sh` publishes only labels of one to five digits with no leading zero (`24h`, not `024h` or `+24h`) and at most 16 windows, and refuses the whole build otherwise. |
+
+### Console
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_CONSOLE_BIND` | no | `127.0.0.1:8080` (`crates/propolis/src/config.rs#DEFAULT_CONSOLE_BIND`) | must parse as `ip:port` SocketAddr; invalid → abort (`crates/propolis/src/config.rs#load_config`) |
+| `PROPOLIS_CONSOLE_PASSWORD` | **yes** | - | `require_env`; absent/empty → **abort** (`crates/propolis/src/config.rs#load_config`) |
+| `PROPOLIS_CONSOLE_SESSION_SECRET` | no | random 32 bytes generated at startup (`crates/propolis/src/config.rs#load_session_secret`) | if set, must be exactly 64 hex chars (32 bytes), else abort (`crates/propolis/src/config.rs#load_session_secret`). Sessions are in-memory, so a fresh secret per restart only invalidates sessions already dropped on restart. |
+| `PROPOLIS_CONSOLE_MAX_SOURCE_IPS` | no | `3` (`routes/samples.rs`) | how many attacker IPs the Samples page shows inline per sample before collapsing to "+N more"; blank/zero/unparseable falls back to the default (zero never means unlimited) |
+| `PROPOLIS_SPOOL_ROOT` | no | `/var/spool/propolis` (`review/src/spool.rs`) | root of the spool tree. Per-sensor spool dirs default under it, but each sensor's own `PROPOLIS_<SENSOR>_SPOOL_DIR` still wins, so the platform side (VT scan, retention, console) resolves the same directory the sensor actually writes to. Must match what `deploy/install.sh` provisions and what the units grant in `ReadWritePaths`. |
+| `PROPOLIS_GEOIP_DIR` | no | none (`Option`, `crates/propolis/src/config.rs#load_config`) | directory of GeoLite2 `.mmdb` files; empty string treated as unset; missing dir/file degrades gracefully. GeoIP enrichment is **local file reads, not network**. |
+| `PROPOLIS_CONSOLE_RDNS_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; opt-in forward-confirmed reverse DNS - the one outbound DNS lookup. Default off. See [outbound controls](../security/outbound-controls.md). |
+| `PROPOLIS_CONSOLE_TRUSTED_PROXY` | no | `false` | bool_flag; set when the console sits behind a TLS reverse proxy so session cookies are always marked `Secure` (a same-host proxy connects over loopback, which would otherwise drop the flag on a real HTTPS hop). |
+| `PROPOLIS_CONSOLE_METRICS_TOKEN` | no | none | if set, `/metrics` requires `Authorization: Bearer <token>` (constant-time compare); unset leaves `/metrics` open - safe only on a loopback bind. Defense in depth for a non-loopback bind. |
+
+The console serves plain HTTP on a loopback `TcpListener`; there is no in-process
+TLS. Any TLS is operator-provided (e.g. a reverse proxy) [inferred]. See
+[networking and TLS](../operations/networking-tls.md).
+
+### Fleet health (the console's `/fleet` pane)
+
+Read by BOTH the unified daemon and the standalone `console` binary: the daemon
+renders the pane through its embedded console, and the standalone binary is a
+viewer of the same data.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FLEET_LISTENERS` | no | none (empty inventory) | comma-separated `collector/sensor/protocol/port` entries, e.g. `local/ssh/tcp/22,local/catchall/udp/1024`. Unset or blank means "this node was told no inventory": the pane then reports every check as unknown rather than reporting nothing at all. A value that IS set and malformed aborts startup - never a silently shortened list. `protocol` is `tcp` or `udp`; `port` is 1-65535. |
+| `PROPOLIS_FLEET_DEPLOY_STAMP` | no | `/var/lib/propolis/deploy-stamp.json` | path to the deploy stamp JSON, written by `deploy/deploy-stamp.sh` on every install and upgrade. A missing, unreadable, or malformed file leaves the version panel reading `not recorded`, never `current`. Set it only to move the file; the default is the path the deploy scripts write. The file records the deployed checkout's commit, the last fetched `origin/main`, the branch, two timestamps, and an `installed` map holding what each installed binary reports for its own `--version` - the daemon and the standalone console separately, because they are installed separately and either one can be left behind. A stamp written before that map existed, or one whose entry for this binary is empty or not a clean commit id, reads as `not recorded` on that line AND in the verdict: `current` asserts what is on disk as well as what this process runs, and nothing observed the disk. Redeploying with the current `deploy-stamp.sh` records it. |
+| `PROPOLIS_FLEET_COLLECTOR_ENDPOINTS` | no | none | comma-separated `collector=address`, e.g. `local=198.51.100.7`. The address the control plane dials for that collector's listeners. A listener whose collector is absent here is recorded `not probeable` with the reason named, never guessed at. A malformed entry aborts startup. |
+| `PROPOLIS_FLEET_PROBE_INTERVAL` | no | `300` | sweep cadence in seconds, 60-86400. Rejected rather than clamped outside that range. Also the unit the console measures probe staleness in: a row older than twice this alarms, whatever its last outcome was. The standalone `console` binary reads it too, purely to size that rule. |
+| `PROPOLIS_FLEET_PROBE_TIMEOUT` | no | `5` | per-connect deadline in seconds, 1-60. Rejected rather than clamped outside that range. Bounds each connect so a blackholed address cannot hold a sweep open on the OS default connect timeout. |
+
+The next two turn the active probe on, and they go together.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FLEET_PROBE_ENABLED` | no | `false` | whether the daemon runs the reachability sweep. Unified daemon only; the standalone `console` never probes. |
+| `PROPOLIS_FLEET_PROBE_SOURCE_IPS` | when the probe is on | none | comma-separated IP addresses this node's own connects arrive from. Intake drops sensor lines from these before conversion. **Required whenever `PROPOLIS_FLEET_PROBE_ENABLED=true`: startup refuses without it.** Read by the unified daemon and by the standalone `intake` binary. |
+
+Why that refusal exists. Every TCP sensor emits `honeypot_connection` the moment it accepts a
+connection, before reading a byte, and that signal weighs 40 at confidence 0.900. A five-minute
+sweep across a dozen listeners is a few thousand such events a day, all from one address: this
+node's own. Unless intake recognises and drops them, the control plane scores itself into the
+review queue and out into the published blocklist, and nothing downstream can retract that. There
+is no safe default to guess here, because only the operator knows which address this node's
+connects arrive from, so the daemon refuses to start rather than probe unfiltered.
+
+What a `reachable` verdict does and does not prove. The connect proves a socket answered on the
+path the control plane took. On the current single-box deployment the control plane and the
+collector are the same host, so that path is a **hairpin**: the packets never leave the machine,
+and the result is evidence that the listener is up locally, not that anything on the internet can
+reach it. The prober detects this at the socket level and labels the row, so the pane says so
+rather than implying external reachability. A separated control plane, dialling a collector across
+the real network path, is what turns the same check into evidence about external reachability.
+
+The other half of the answer is the intake confirmation. A row reads `ok` only when the socket
+answered AND the resulting sensor line reached intake within two sweep intervals. `reachable` with
+no recent confirmation is a warning, not health: the listener is up and something between the log
+file and intake is broken.
+
+`sensor` is the sensor's OWN reported name, which is what lands in
+`event.sensor` - not the `PROPOLIS_SENSOR_LOGS` label. `sensor-cred` reports its
+five protocols individually, so its names are `vnc`, `mysql`, `mssql`,
+`postgresql` and `mongodb` while its conventional log labels are `cred-vnc` and
+so on. An inventory keyed on the log label would join to nothing.
+
+Do not hand-maintain `PROPOLIS_FLEET_LISTENERS`: it is a second copy of the
+binds that already live in each sensor's own env file, and a hand-kept copy
+drifts invisibly. `deploy/fleet-listeners.sh` derives it from those files and
+writes `/etc/propolis/fleet-listeners.env`, which `propolis.service` and
+`console.service` load BEFORE their operator-owned env file (so an explicit
+operator setting still wins). `deploy/install.sh` and `deploy/upgrade.sh` run
+the generator, so drift is possible only between deploys - and a sensor
+producing events while absent from the inventory shows on the pane as
+`undeclared listener`, which is what catches that window. The exception is a
+[split deployment](../operations/split-deployment.md): the sensor env files live on the collector, the
+generator on the control plane writes an empty inventory, and the list has to be
+set in the control plane's `propolis.env`.
+
+`PROPOLIS_FLEET_COLLECTOR_ID` (default `local`) is read by
+`deploy/fleet-listeners.sh` itself, not by any binary: it stamps the collector
+id onto each generated entry. `PROPOLIS_DEPLOY_PULLED_AT` is read by
+`deploy/deploy-stamp.sh` in the same way: `deploy/upgrade.sh` passes the time it
+pulled, so the stamp's `pulled_at` and `built_at` are two facts rather than one
+number written twice.
+
+#### Compile-time, not configuration
+
+`PROPOLIS_GIT_SHA` and `PROPOLIS_BUILD_TIMESTAMP` are **not** operator
+variables. Each binary's build script (`crates/propolis/build.rs`,
+`crates/console/build.rs`, sharing `crates/build-stamp.rs`) sets them at compile
+time from `git`, and setting them in the environment of a running process has no
+effect. They are listed here only because they read like environment variables
+in the source.
+
+`PROPOLIS_GIT_SHA` is the short commit id, with `+dirty` appended when the
+working tree had uncommitted changes (in the crate being built or in any
+workspace crate it depends on), or the literal `unknown` when the build could
+not run git at all (a tarball, a container with no git, a checkout with no
+`.git`). The version panel treats `unknown` and `+dirty` the same way it treats
+a missing stamp: `not recorded`. A build that cannot say which commit it is must
+never be presented as a build that matches the deploy.
+
+Both binaries print these two values, plus their crate version, in response to
+`--version`, before any configuration, database or network work - so an operator
+can ask a binary what it is on a box whose environment is not populated yet, and
+so `deploy/deploy-stamp.sh` can read back what an install actually left on disk.
+
+### VirusTotal (unified daemon only)
+
+Opt-in egress, default off. See [integrations](integrations.md) and
+[outbound controls](../security/outbound-controls.md).
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_VT_KEY` | no | `""` (`crates/propolis/src/config.rs#load_config`) | empty → VT disabled regardless of `_ENABLED` |
+| `PROPOLIS_VT_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; **and** a non-empty key required to actually enable (`&& !vt_api_key.is_empty()`) |
+| `PROPOLIS_VT_UPLOAD` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag; upload-unknown-samples opt-in. Only executable or script content is uploaded, decided from the bytes (`crates/review/src/upload_filter.rs#decide`); images, video, audio, PDF, office documents and unknown types stay local. Hash lookups (digest only) happen for every type regardless. See [malware custody](../security/malware-custody.md#virustotal-path-lookup-and-an-opt-in-type-filtered-upload) |
+| `PROPOLIS_VT_SCAN_INTERVAL_SECS` | no | `300` (`crates/propolis/src/config.rs#load_config`) | parse_u32 (zero allowed); unparseable → abort. No `PROPOLIS_VT_URL` override exists. |
+| `PROPOLIS_VT_PENDING_RECHECK_SECS` | no | `900` | parse_u32; how long an uploaded sample with no verdict yet (`detected = -1`) waits before its hash is looked up again. Each recheck costs one daily-budget unit. Zero → every scan cycle. unparseable → abort. |
+
+### Malware fetcher (unified daemon only)
+
+Opt-in egress, off by default. See [outbound controls](../security/outbound-controls.md)
+and [rate limits and budgets](rate-limits-and-budgets.md).
+
+| Variable | Req | Default | Max | Bounds / fail |
+|---|---|---|---|---|
+| `PROPOLIS_FETCH_ENABLED` | no | `false` (`crates/propolis/src/config.rs#load_config`) | - | bool_flag |
+| `PROPOLIS_FETCH_INTERVAL_SECS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_FETCH_INTERVAL_SECS`) | `86400` (`crates/propolis/src/config.rs#MAX_FETCH_INTERVAL_SECS`) | bounded positive u64; zero/over-max → abort |
+| `PROPOLIS_FETCH_MAX_BYTES` | no | `10_000_000` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_BYTES`) | `500_000_000` (`crates/propolis/src/config.rs#MAX_FETCH_MAX_BYTES`) | bounded positive u64 → usize; **zero → abort** (would disable the byte guard); over-max → abort |
+| `PROPOLIS_FETCH_MAX_PER_HOST_HOUR` | no | `12` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_PER_HOST_HOUR`) | `1000` (`crates/propolis/src/config.rs#MAX_FETCH_MAX_PER_HOST_HOUR`) | bounded positive u64 → u32 |
+| `PROPOLIS_FETCH_MAX_HOPS` | no | `3` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_HOPS`) | `255` (u8) | bounded_u8; **zero allowed** (no redirects); >255 → abort |
+| `PROPOLIS_FETCH_MAX_DEPTH` | no | `2` (`crates/propolis/src/config.rs#DEFAULT_FETCH_MAX_DEPTH`) | `255` (u8) | bounded_u8; zero allowed (no recursion) |
+| `PROPOLIS_FETCH_DAILY_CAP` | no | `200` (`crates/propolis/src/config.rs#DEFAULT_FETCH_DAILY_CAP`) | `10_000` (`crates/propolis/src/config.rs#MAX_FETCH_DAILY_CAP`) | bounded positive u64 → u32 |
+| `PROPOLIS_FETCH_BATCH_SIZE` | no | `20` (`crates/propolis/src/config.rs#DEFAULT_FETCH_BATCH_SIZE`) | `1000` (`crates/propolis/src/config.rs#MAX_FETCH_BATCH_SIZE`) | bounded positive u64 → usize |
+| `PROPOLIS_FETCH_CONNECT_TIMEOUT_SECS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_FETCH_CONNECT_TIMEOUT_SECS`) | `300` (`crates/propolis/src/config.rs#MAX_FETCH_TIMEOUT_SECS`) | bounded positive u64 |
+| `PROPOLIS_FETCH_READ_TIMEOUT_SECS` | no | `10` (`crates/propolis/src/config.rs#DEFAULT_FETCH_READ_TIMEOUT_SECS`) | `300` | bounded positive u64 |
+| `PROPOLIS_FETCH_TOTAL_TIMEOUT_SECS` | no | `30` (`crates/propolis/src/config.rs#DEFAULT_FETCH_TOTAL_TIMEOUT_SECS`) | `300` | bounded positive u64 |
+| `PROPOLIS_FETCH_USER_AGENT` | no | `Wget/1.21.3` (`crates/propolis/src/config.rs#DEFAULT_FETCH_USER_AGENT`) | - | blank → default |
+| `PROPOLIS_FETCH_OWN_IPS` | no | `""` | - | comma-sep IP list (`parse_ip_list`); invalid → abort. Unioned with live-interface IPs for the SSRF self-target guard. |
+
+Fetcher runtime fail-closed (`own_ips.is_empty()` check, `propolis/src/main.rs#main`): if
+`PROPOLIS_FETCH_OWN_IPS` is unset **and** interface enumeration returns empty, the fetcher **refuses to run**
+(logs an error and returns). If the own-IPs set has only private/loopback/
+link-local addresses (a NAT'd node whose public WAN IP is on no interface), it
+**warns but runs** (`own_ips_lack_a_public_address` check, `propolis/src/main.rs#main`); set `PROPOLIS_FETCH_OWN_IPS` to the
+public egress IP for self-target protection.
+
+### Operational self-alerting (ops-alert)
+
+`crates/propolis/src/ops_alert/config.rs`. Opt-in ntfy POST egress, default off.
+Parsed via an injectable getter over `env::var` that treats blank as absent.
+Helpers: `get_bool` (`crates/propolis/src/ops_alert/config.rs#get_bool`) accepts `true|1|yes|on` (case-insensitive), else
+default - broader than `parse_bool_flag`. `get_u64`/`get_secs` (`crates/propolis/src/ops_alert/config.rs#get_u64`/`crates/propolis/src/ops_alert/config.rs#get_secs`):
+unset -> default; unparseable -> abort; **below min -> abort**. `get_pct` (`crates/propolis/src/ops_alert/config.rs#get_pct`):
+enforces `1..=100`; 0 and >100 -> abort. `get_u32` (`crates/propolis/src/ops_alert/config.rs#get_u32`): u64 range-checked to
+u32.
+
+| Variable | Req | Default | Min/bounds | Notes |
+|---|---|---|---|---|
+| `PROPOLIS_OPS_ENABLED` | no | `false` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | opt-in; a deployment predating ops-alert still starts |
+| `PROPOLIS_OPS_NTFY_URL` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) |
+| `PROPOLIS_OPS_NTFY_TOPIC` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). The `propolis-ops` value seen in tests is not a runtime default. |
+| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | optional bearer token |
+| `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_CAPACITY_FREE_PCT` | no | `15` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | 1..=100 | 0/>100 -> abort. Also read from `propolis.env` by `deploy/backup.sh` (a backup refuses to leave the volume under this share free) and `deploy/config-check.sh` (the `backup-headroom` warning); both size against the default 15 when the daemon would refuse the value |
+| `PROPOLIS_OPS_FEED_STALE_MULTIPLE` | no | `2` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u32 |
+| `PROPOLIS_OPS_FEED_PUSH_EXPECTED` | no | `false` | bool | set once `deploy/blocklist-sync.sh` is in cron: `feed-push-stale` then pages when the feed has gone unpushed for the stale threshold (`FEED_STALE_MULTIPLE` build cycles) since the daemon started, instead of treating "no push marker" as grace forever |
+| `PROPOLIS_OPS_VENDOR_WINDOW_SECS` | no | `3600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_VENDOR_FAIL_PCT` | no | `50` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | 1..=100 | |
+| `PROPOLIS_OPS_VENDOR_MIN_SAMPLES` | no | `20` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u32 |
+| `PROPOLIS_OPS_BACKLOG_MAX` | no | `500` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | u64 |
+| `PROPOLIS_OPS_BACKLOG_FOR_SECS` | no | `900` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_CHAIN_VERIFY_INTERVAL_SECS` | no | `21600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
+| `PROPOLIS_OPS_SCAN_STALE_SECS` | no | `21600` | min 1 | `scan-stale`: a spooled body unscanned, or a VirusTotal upload unverdicted, this long; silent unless VirusTotal is enabled |
+| `PROPOLIS_OPS_FETCH_STALE_SECS` | no | `3600` | min 1 | `fetch-stale`: a fetch url pending this long; silent unless the fetcher is enabled |
+| `PROPOLIS_OPS_HEARTBEAT_URL` | no | none (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | `https://` only, else abort (the value is not echoed) | an external dead-man's switch (a healthchecks.io-style ping URL), requested after each complete evaluation round; the service alerts when the pings stop, which covers a dead daemon or host. The URL is a secret and is never logged |
+| `PROPOLIS_OPS_HEARTBEAT_INTERVAL_SECS` | no | `300` | min 30 | at most one ping per interval; a failed ping is retried on the next round |
+| `PROPOLIS_OPS_BACKUP_MAX_AGE_SECS` | no | `129600` (36 h) | min 3600 | `backup-stale`: the newest good backup (`deploy/backup.sh`) older than this, or none since the backup timer was installed this long ago |
+
+---
+
+## Collector/control-plane split binaries (SP-A)
+
+Two additional binaries, each its own process with its own `load_config_from_env()` and its own
+`/etc/propolis/<name>.env` - the disposable-collector / control-plane topology
+(`deploy/gateway.service`, `deploy/shipper.service`, `deploy/collector.env.example`,
+`deploy/control-plane.env.example`). Neither reads `DATABASE_URL` or any vendor/VT/console
+variable; that boundary is the entire point of the split. Setting them up and running them:
+[split deployment](../operations/split-deployment.md).
+
+### `gateway`
+
+`crates/gateway/src/config.rs`. Control-plane-side mTLS ingest listener. All fields are strict
+parse (present-but-zero or unparseable → **abort**), matching the sensor pattern.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_GATEWAY_BIND` | **yes** | - | single `ip:port`; absent → abort (`ConfigError::NoBind`); unparseable → abort (`ConfigError::InvalidBind`) |
+| `PROPOLIS_GATEWAY_CA_CERT_PATH` | **yes** | - | PEM path used to verify collector client certificates; absent → abort |
+| `PROPOLIS_GATEWAY_SERVER_CERT_PATH` | **yes** | - | PEM path the gateway presents in the TLS handshake; absent → abort |
+| `PROPOLIS_GATEWAY_SERVER_KEY_PATH` | **yes** | - | PEM path, private key for the server cert above; absent → abort |
+| `PROPOLIS_GATEWAY_SPOOL_DIR` | no | `/var/spool/propolis/gateway` | root of the per-collector spool tree; one `events.jsonl` per collector under `<root>/<collector_id>/` (`crates/gateway/src/spool.rs`) |
+| `PROPOLIS_GATEWAY_STATE_DIR` | no | `/var/lib/propolis/gateway` | each collector's position in its batch chain, `<dir>/<collector_id>.json` holding `last_seq` and `last_batch_hash` (`crates/gateway/src/state.rs#CollectorState`). The gateway holds this in memory while it runs, so removing a file takes effect at its next restart, and then only together with the shipper's state, see [split deployment](../operations/split-deployment.md#rebuilding-a-collector) |
+| `PROPOLIS_GATEWAY_MAX_CONCURRENT` | no | `64` | positive u32; zero/unparseable → abort |
+| `PROPOLIS_GATEWAY_MAX_DURATION_SECS` | no | `120` | positive u64 secs; zero/unparseable → abort |
+| `PROPOLIS_GATEWAY_READ_TIMEOUT_MS` | no | `30000` | positive u64 ms; zero/unparseable → abort. Validated but **not applied**: the connection handler sets no read timeout (`crates/gateway/src/server.rs#handle_connection`) |
+| `PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS` | no | `60000` | positive u64 ms; zero/unparseable → abort. Validated but **not applied**, like the read timeout; only `PROPOLIS_GATEWAY_MAX_CONCURRENT` and `PROPOLIS_GATEWAY_MAX_DURATION_SECS` bound a connection |
+
+The gateway's own read loop bounds every frame at `collector_wire::frame::MAX_FRAME_LEN` before
+allocating, so `ConnectionBounds`'s `max_captured_bytes` field is fixed to that ceiling internally
+and is **not** exposed as a separate env var.
+
+### `shipper`
+
+`crates/shipper/src/config.rs`. Collector-side process that tails this collector's sensor logs and
+ships batches to the gateway over mTLS. All fields are strict parse; the collector id below is
+additionally cross-checked against the client certificate's CommonName at startup.
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_SHIPPER_GATEWAY_ADDR` | **yes** | - | literal `ip:port` socket address of the gateway; nothing is resolved, so a host name is refused; absent/unparseable → abort (`crates/shipper/src/config.rs#load_config_from_env`) |
+| `PROPOLIS_SHIPPER_GATEWAY_DNS` | **yes** | - | name checked against the gateway's TLS server certificate during the mTLS handshake; only compared, never resolved, so it need not exist in DNS (`crates/shipper/src/client.rs#ShipperClient::connect`); absent → abort |
+| `PROPOLIS_SHIPPER_CA_CERT_PATH` | **yes** | - | PEM path used to verify the gateway's server certificate; absent → abort |
+| `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | - | PEM path, this collector's client certificate; absent → abort |
+| `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | - | PEM path, private key for the client cert above; absent → abort |
+| `PROPOLIS_COLLECTOR_ID` (deprecated alias `PROPOLIS_SHIPPER_COLLECTOR_ID`, still read) | **yes** | - | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`). Same variable the four body-capturing sensors read (see "Outbox manifest" below) - set the same value on every unit of this collector. Today the sensors only stamp it on their outbox manifest rows, which nothing reads yet; the planned provenance join on `(collector_id, occurrence_id)` depends on it matching. |
+| `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
+| `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | one cursor file per log, named by the SHA-256 of the log's path (`crates/log-tailer/src/cursor.rs#DurableCursor::cursor_file_path`) |
+| `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | this collector's position in its batch chain, `<dir>/<collector_id>.json` (`crates/shipper/src/state.rs#ConfirmedState`) |
+| `PROPOLIS_SHIPPER_POLL_INTERVAL_MS` | no | `1000` | positive u64 ms; zero/unparseable → abort |
+| `PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH` | no | `15` (`batcher::MAX_RECORDS_FRAME_SAFE`) | positive u64 → usize; zero/unparseable → abort; a value above 15 is lowered to 15 (`crates/shipper/src/batcher.rs#Batcher::next_batch`) |
+| `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort. The wait before resending a batch the gateway answered with Retry, at most 5 times in a row (`crates/shipper/src/main.rs#MAX_CONSECUTIVE_RETRIES`); a failed connection is retried on the next poll instead |
+
+`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` only labels log lines: it is not sent to the gateway, and each
+log's cursor is keyed by its path. Every sensor log on a collector ships through one seq/hash chain
+keyed by `PROPOLIS_COLLECTOR_ID`
+(via the gateway's verified client-certificate CommonName), not by the per-log name.
+
+On the control-plane side, intake's `PROPOLIS_SENSOR_LOGS` is re-pointed at the gateway's
+per-collector spool (one `name:path` entry per collector, not per sensor) - see
+[split deployment](../operations/split-deployment.md), [filesystem paths](filesystem-paths.md#split-deployment-gateway-and-shipper)
+and `deploy/control-plane.env.example`.
+
+---
+
+## Standalone service binaries
+
+Each reads a strict subset of the unified daemon's variables with the same
+defaults and the same strict-parse/fail-closed rules unless noted.
+
+- **`console`** (`load_config_from_env`, `crates/console/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
+  `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (req, empty→abort),
+  `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_FEED_OUTPUT_DIR`,
+  `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED`, `RUST_LOG`. Two
+  divergences from the unified daemon: `PROPOLIS_FEED_OUTPUT_DIR` is **not**
+  empty-filtered (`console/src/main.rs#load_config_from_env`), so an explicitly-empty value becomes
+  `Some(PathBuf::from(""))`; and `PROPOLIS_CONSOLE_RDNS_ENABLED` accepts
+  `true|1|yes` case-insensitive (`console/src/main.rs#load_config_from_env`), broader than `bool_flag`.
+- **`feed`** (`crates/feed/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
+  `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`,
+  `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS`, `PROPOLIS_FEED_STANDARD_TTL_HOURS`,
+  `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_DELIST`,
+  `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_GEOIP_DIR`. **Does not read
+  `PROPOLIS_FEED_WINDOWS`** (no `all-{label}` retention feeds in standalone).
+- **`intake`** (`crates/intake/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
+  `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS`, `PROPOLIS_SENSOR_LOGS`
+  (req, empty→abort).
+- **`propolis-watch`** (`crates/watch/src/main.rs#main`): `PROPOLIS_SENSOR_LOGS` only, the same
+  value the daemon reads. When it is unset the watcher reads that one key from
+  `/etc/propolis/watch.env` (`crates/watch/src/config.rs#WATCH_ENV_PATH`), which
+  `deploy/watch-env.sh` derives from `propolis.env`; found in neither, invalid, or not UTF-8 →
+  one `error` record on stdout and exit 1. It also reads `SSH_ORIGINAL_COMMAND`, which sshd sets for a forced command, as extra
+  arguments through the same allowlist as its argv (not UTF-8 → exit 2). It reads no secret and
+  no other variable; see [live watch](../operations/live-watch.md).
+- **`review`** (`crates/review/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
+  `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS`, and
+  the full `PROPOLIS_VENDOR_*` set (`_KEY`/`_URL`/`_ENABLED`/`_COOLDOWN_HOURS`/
+  `_RATE_LIMIT`/`_RATE_WINDOW_HOURS` for abuseipdb/dshield/otx plus
+  `PROPOLIS_VENDOR_DSHIELD_USER`), same defaults as unified. **Does not read the
+  VT or FETCH variables.**
+
+---
+
+## Sensor binaries
+
+Sensors are always separate processes. They have **no compiled-in default port**;
+the bind address comes from config/env set by the deploy units. See
+[ports and protocols](ports-and-protocols.md).
+
+**How every sensor variable is read.** All twelve sensor binaries (ssh, telnet, http, ftp, redis,
+adb, catchall, tftp, mqtt, dns, smtp, cred) read every `PROPOLIS_*` variable below, and the bare
+`COLLECTOR_ID` and `CATCHALL_*` legacy spellings, through one reader,
+`crates/sensor-framework/src/env.rs#strict_env_var` (the legacy-name fallback,
+`crates/sensor-framework/src/env.rs#env_with_legacy`, applies the same rule to both names). Unset
+is unset. The value is trimmed of leading and trailing ASCII whitespace, and a value that is blank
+after the trim counts as unset, the same way `deploy/fleet-listeners.sh` skips a blank bind; for a
+required bind that means a blank value is the same startup error as a missing one. A value that is
+not valid UTF-8 is invalid, never unset and never replaced by a default: the sensor logs
+`environment variable <NAME> is not valid UTF-8` and exits 1 before binding anything.
+
+**What a malformed value does, for every sensor.** The value is then parsed by the typed reader
+for its kind (`crates/sensor-framework/src/env.rs#Env`): an `ip:port` address
+(`crates/sensor-framework/src/env.rs#socket_addr`), a positive whole number of milliseconds,
+seconds, bytes or connections (`crates/sensor-framework/src/env.rs#positive_u64`,
+`crates/sensor-framework/src/env.rs#positive_u32`, digits only), a `local_ip=wan_ip` table
+(`crates/sensor-framework/src/env.rs#wan_map`) or a path. A value that is set but not that shape
+(a bare port, `0`, `-1`, `ten`, `1.5`, a number past `u32` or past a documented maximum, a WAN
+entry that is not two addresses around `=`) is a startup error: the sensor logs
+`<NAME> must be <shape>, got "<value>"` (or `<NAME> must be a positive integer at most <max>,
+got "<value>"`) and exits 1 before binding anything. No sensor ever substitutes the default for a
+value it could not parse, so a typo in an env file cannot silently turn a limit off or change it.
+A number is never clamped: above a maximum it is refused naming the maximum. Only the zero and
+maximum rules differ per variable, and the tables below state them.
+
+### All twelve sensors - ssh, telnet, http, ftp, redis, adb, catchall, tftp, mqtt, dns, smtp, cred
+
+Shared `ConnectionBounds` pattern through the typed readers above: unset → default;
+**present-but-zero, negative or unparseable → abort startup** (no upper clamp - a very large
+timeout/bytes value is accepted, except where a maximum is documented). `<P>WAN_MAP`: comma-sep
+`local_ip=wan_ip`; empty/absent → empty map (valid: no WAN attribution, stamps a null `wan_ip`);
+invalid entry → abort.
+
+| Sensor | Prefix `<P>` | Bind variable (required) | Log path default |
+|---|---|---|---|
+| ssh | `PROPOLIS_SSH_` | `PROPOLIS_SSH_BIND` (unset → abort, `sensor-ssh/src/main.rs#load_config`) | `/var/log/propolis/ssh/events.jsonl` |
+| telnet | `PROPOLIS_TELNET_` | `PROPOLIS_TELNET_BIND` | `/var/log/propolis/telnet/events.jsonl` |
+| http | `PROPOLIS_HTTP_` | `PROPOLIS_HTTP_BIND` | `/var/log/propolis/http/events.jsonl` |
+| ftp | `PROPOLIS_FTP_` | `PROPOLIS_FTP_BIND` | `/var/log/propolis/ftp/events.jsonl` |
+| tftp | `PROPOLIS_TFTP_` | `PROPOLIS_TFTP_BIND` (UDP; unset aborts startup, `sensor-tftp/src/main.rs#load_config`) | `/var/log/propolis/tftp/events.jsonl` |
+| mqtt | `PROPOLIS_MQTT_` | `PROPOLIS_MQTT_BIND` (unset aborts startup, `sensor-mqtt/src/main.rs#load_config`) | `/var/log/propolis/mqtt/events.jsonl` |
+| dns | `PROPOLIS_DNS_` | `PROPOLIS_DNS_BIND` (UDP and TCP; unset aborts startup, `sensor-dns/src/main.rs#load_config`) | `/var/log/propolis/dns/events.jsonl` |
+| redis | `PROPOLIS_REDIS_` | `PROPOLIS_REDIS_BIND` | `/var/log/propolis/redis/events.jsonl` |
+| adb | `PROPOLIS_ADB_` | `PROPOLIS_ADB_BIND` | `/var/log/propolis/adb/events.jsonl` |
+| catchall | `PROPOLIS_CATCHALL_` (bare `CATCHALL_` still read, deprecated) | `PROPOLIS_CATCHALL_BIND_ADDRS` (comma-sep list, empty→abort) | `catchall-events.jsonl` (relative) |
+| smtp | `PROPOLIS_SMTP_` | `PROPOLIS_SMTP_BIND` (unset aborts startup, `sensor-smtp/src/main.rs#load_config`) | `/var/log/propolis/smtp/events.jsonl` |
+| cred | `PROPOLIS_CRED_` | one or more of `PROPOLIS_CRED_VNC_BIND`, `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`, `PROPOLIS_CRED_PG_BIND`, `PROPOLIS_CRED_MONGO_BIND` (none set aborts startup, `sensor-cred/src/main.rs#load_config`) | a directory, `PROPOLIS_CRED_LOG_DIR` default `/var/log/propolis/cred`, one `<protocol>.jsonl` per bound protocol |
+
+Common per-sensor variables (each uses its own prefix; catchall uses `PROPOLIS_CATCHALL_`, with the bare `CATCHALL_` spelling still read but deprecated):
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `<P>WAN_MAP` (catchall `PROPOLIS_CATCHALL_WAN_MAP`) | no | empty map | invalid entry → abort |
+| `<P>LOG_PATH` (catchall `PROPOLIS_CATCHALL_LOG_PATH`; cred `PROPOLIS_CRED_LOG_DIR`, a directory) | no | see table above | |
+| `<P>READ_TIMEOUT_MS` | no | `30_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
+| `<P>IDLE_TIMEOUT_MS` | no | `60_000` (catchall `5_000`; dns `30_000`) | ms; zero → abort |
+| `<P>MAX_DURATION_SECS` | no | `600` (catchall `30`; dns `120`; cred `60`) | secs; zero → abort |
+| `<P>MAX_CAPTURED_BYTES` | no | `1_000_000` (ssh `16_777_216`; catchall `4_096`; dns `262_272`; cred `100_000`) | bytes; zero → abort; tftp also has a maximum (below) |
+| `<P>MAX_CONCURRENT` | no | `256` (http `512`, tftp `128`) | u32; zero or above `4294967295` → abort |
+
+The `<P>` rows above, instantiated per sensor (each name is read literally by that sensor's
+`main.rs`):
+
+- ssh: `PROPOLIS_SSH_READ_TIMEOUT_MS`, `PROPOLIS_SSH_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_SSH_MAX_DURATION_SECS`, `PROPOLIS_SSH_MAX_CAPTURED_BYTES`, `PROPOLIS_SSH_MAX_CONCURRENT`,
+  `PROPOLIS_SSH_LOG_PATH`, `PROPOLIS_SSH_WAN_MAP`. `PROPOLIS_SSH_MAX_CAPTURED_BYTES` defaults to
+  `16_777_216` (16 MiB), the spool's per-file cap
+  (`crates/sensor-ssh/src/server.rs#SPOOL_MAX_FILE_BYTES`), and limits a payload streamed over
+  the shell or an exec's standard input; SCP and SFTP uploads are kept up to 10 MB. A capture
+  cut at the limit is recorded with `truncated: true`; for an `exec_stdin` or `shell_stdin`
+  capture its `wire_size` is a lower bound (the limit plus at most the one data packet, at most
+  32 KiB, that crossed it), not the transfer's size, while a `binary_shell_payload` keeps counting
+  and records the full size. It was
+  `1_000_000`, then `10_000_000`; samples captured then stay as captured. An env file that sets
+  it explicitly keeps that value, and one above the spool's cap loses a body past the cap
+  outright (the spool refuses it) instead of keeping its prefix.
+- telnet: `PROPOLIS_TELNET_READ_TIMEOUT_MS`, `PROPOLIS_TELNET_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_TELNET_MAX_DURATION_SECS`, `PROPOLIS_TELNET_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_TELNET_MAX_CONCURRENT`, `PROPOLIS_TELNET_LOG_PATH`, `PROPOLIS_TELNET_WAN_MAP`.
+- adb: `PROPOLIS_ADB_READ_TIMEOUT_MS`, `PROPOLIS_ADB_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_ADB_MAX_DURATION_SECS`, `PROPOLIS_ADB_MAX_CAPTURED_BYTES`, `PROPOLIS_ADB_MAX_CONCURRENT`,
+  `PROPOLIS_ADB_LOG_PATH`, `PROPOLIS_ADB_WAN_MAP`.
+- ssh, telnet and adb also read a per-source command-event budget
+  (`crates/sensor-framework/src/command_flood.rs#CommandEventConfig::from_env`): how many
+  `honeypot_command_exec` events one source network (the IPv4 /24 or IPv6 /56) may write before
+  its further repeated commands are folded into one summary per 60 s. Each is a positive `u32`;
+  zero, a negative number or a non-number aborts startup, and no value turns the budget off. The
+  shell's replies never depend on it.
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_SSH_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_TELNET_COMMAND_EVENT_RATE_PER_MIN`, `PROPOLIS_ADB_COMMAND_EVENT_RATE_PER_MIN` | `12` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENTS_PER_MIN`) | Command events per minute per source network once the burst is spent. |
+  | `PROPOLIS_SSH_COMMAND_EVENT_BURST`, `PROPOLIS_TELNET_COMMAND_EVENT_BURST`, `PROPOLIS_ADB_COMMAND_EVENT_BURST` | `200` (`crates/sensor-framework/src/command_flood.rs#DEFAULT_COMMAND_EVENT_BURST`) | Command events a quiet source network may write at once. |
+
+  What is never summarized, and the summary event, are in
+  [sensor-behavior](sensor-behavior.md#command-event-budget-ssh-telnet-adb).
+- ftp: `PROPOLIS_FTP_READ_TIMEOUT_MS`, `PROPOLIS_FTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_FTP_MAX_DURATION_SECS`, `PROPOLIS_FTP_MAX_CAPTURED_BYTES`, `PROPOLIS_FTP_MAX_CONCURRENT`,
+  `PROPOLIS_FTP_LOG_PATH`, `PROPOLIS_FTP_WAN_MAP`. The TLS variables `PROPOLIS_FTP_TLS_BIND`,
+  `PROPOLIS_FTP_TLS_CERT` and `PROPOLIS_FTP_TLS_KEY` are documented with the sensor TLS
+  variables below.
+- tftp: `PROPOLIS_TFTP_READ_TIMEOUT_MS`, `PROPOLIS_TFTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_TFTP_MAX_DURATION_SECS`, `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_TFTP_MAX_CONCURRENT`, `PROPOLIS_TFTP_LOG_PATH`, `PROPOLIS_TFTP_WAN_MAP`.
+  Unlike the other sensors, `PROPOLIS_TFTP_MAX_CAPTURED_BYTES` has an upper bound: a value above
+  `10_000_000` (the spool's per-file limit) **aborts startup** instead of being accepted.
+  The `128` default for `PROPOLIS_TFTP_MAX_CONCURRENT` is sized so `max_concurrent` full-cap bodies,
+  the 64-job capture queue and about 15 MB of baseline stay within the unit's `MemoryMax=256M`
+  (`sensor-tftp/src/main.rs#DEFAULT_MAX_CONCURRENT`). Raising `PROPOLIS_TFTP_MAX_CAPTURED_BYTES`
+  toward the 10 MB hard cap requires lowering `PROPOLIS_TFTP_MAX_CONCURRENT` to stay under
+  `MemoryMax`; the worst case is roughly `(max_concurrent + 64) * max_captured_bytes + 15 MB`.
+  Four more variables set the request-socket rate limit
+  (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`), each a positive `u32` where
+  zero or a non-number aborts startup (a rate can never be configured off). The defaults equal
+  sensor-dns's:
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_TFTP_REPLY_RATE_PER_SOURCE` | `5` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_RATE_PER_SOURCE`) | Datagrams on the request socket handled per second per source network (the IPv4 /24 or IPv6 /56). |
+  | `PROPOLIS_TFTP_REPLY_BURST_PER_SOURCE` | `10` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_BURST_PER_SOURCE`) | How many a quiet source network may send at once before the per-second rate applies. |
+  | `PROPOLIS_TFTP_REPLY_RATE_GLOBAL` | `1000` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_RATE_GLOBAL`) | Datagrams on the request socket handled per second across every source. |
+  | `PROPOLIS_TFTP_REPLY_BURST_GLOBAL` | `2000` (`sensor-tftp/src/main.rs#DEFAULT_REPLY_BURST_GLOBAL`) | The global burst. |
+
+  A datagram over either budget gets no reply and no event of its own; it is counted in one
+  `rate_limited` summary event per source network per 10 s (see
+  [sensor-behavior](sensor-behavior.md#sensor-tftp)). A running transfer's packets arrive on its
+  own socket and are not charged.
+- mqtt: `PROPOLIS_MQTT_READ_TIMEOUT_MS`, `PROPOLIS_MQTT_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_MQTT_MAX_DURATION_SECS`, `PROPOLIS_MQTT_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_MQTT_MAX_CONCURRENT`, `PROPOLIS_MQTT_LOG_PATH`, `PROPOLIS_MQTT_WAN_MAP`,
+  `PROPOLIS_MQTT_SPOOL_DIR` (default `/var/spool/propolis/mqtt`,
+  `sensor-mqtt/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_MQTT_OUTBOX_DIR` (default
+  `/var/spool/propolis/mqtt/outbox`; see "Outbox manifest" below), `PROPOLIS_COLLECTOR_ID`,
+  `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` (see "Capture memory budget" below), and the MQTTS
+  variables `PROPOLIS_MQTT_TLS_BIND`, `PROPOLIS_MQTT_TLS_CERT`, `PROPOLIS_MQTT_TLS_KEY` (see
+  "MQTT TLS" below). A PUBLISH
+  payload is spooled only when it looks binary; text payloads stay metadata-only.
+  `PROPOLIS_MQTT_MAX_CAPTURED_BYTES` (default `1_000_000`) bounds the total bytes read per
+  connection; a single packet is separately capped at 262144 bytes of declared remaining length
+  (`sensor-mqtt/src/handler.rs#MAX_PACKET_BYTES`) and a connection at 1024 packets
+  (`sensor-mqtt/src/handler.rs#MAX_PACKETS`), neither configurable.
+  `PROPOLIS_MQTT_MAX_CONCURRENT` (default 256) is per listener, and both listeners share one
+  session memory pool: the sensor refuses to start when the value times the listener count
+  (2 with `PROPOLIS_MQTT_TLS_BIND`, else 1) leaves the 80,530,635-byte pool under 64 KiB a
+  session, which happens past 1,228 sessions, before the 2,047-slot table
+  (`crates/sensor-framework/src/session_memory.rs#configure`). So the largest value is 1,228
+  plaintext only and 614 with the TLS listener, and its log names the configured value and the
+  listener count.
+- dns: `PROPOLIS_DNS_READ_TIMEOUT_MS`, `PROPOLIS_DNS_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_DNS_MAX_DURATION_SECS`, `PROPOLIS_DNS_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_DNS_MAX_CONCURRENT`, `PROPOLIS_DNS_LOG_PATH`, `PROPOLIS_DNS_WAN_MAP`, and the DoT
+  variables `PROPOLIS_DNS_TLS_BIND`, `PROPOLIS_DNS_TLS_CERT`, `PROPOLIS_DNS_TLS_KEY` (see "DNS
+  TLS" below). `PROPOLIS_DNS_MAX_CAPTURED_BYTES` bounds the bytes read per TCP or DoT connection,
+  each message charged its 2-byte length prefix as well as its body: the default
+  `64 * (2 + 4096) = 262_272` (`sensor-dns/src/main.rs#DEFAULT_MAX_CAPTURED_BYTES`) is exactly
+  enough for a connection's 64 queries at the 4096-byte maximum. A message that would pass the
+  cap is not read; the connection ends with a `rejected` event, `reject_reason` `byte_cap`. A UDP
+  datagram is one query and is not counted against it.
+  `PROPOLIS_DNS_MAX_CONCURRENT` applies separately to each of the three surfaces: the UDP handler
+  pool, the TCP listener and the DoT listener. `PROPOLIS_DNS_BIND` is the only switch and serves
+  UDP and TCP on the same `ip:port`: the sensor is off until an operator sets it, and if either
+  transport cannot bind it exits 1 with nothing left listening. A UDP datagram's handling is cut
+  at the read timeout. There are no spool, outbox or collector-id variables: the sensor captures
+  no bodies. Four more variables set the UDP reply rate limit
+  (`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`), each a positive `u32` where
+  zero or a non-number aborts startup (a rate can never be configured off):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_DNS_REPLY_RATE_PER_SOURCE` | `5` (`sensor-dns/src/main.rs#DEFAULT_REPLY_RATE_PER_SOURCE`) | UDP datagrams answered per second per source network (the IPv4 /24 or IPv6 /56). |
+  | `PROPOLIS_DNS_REPLY_BURST_PER_SOURCE` | `10` (`sensor-dns/src/main.rs#DEFAULT_REPLY_BURST_PER_SOURCE`) | How many a quiet source network may send at once before the per-second rate applies. |
+  | `PROPOLIS_DNS_REPLY_RATE_GLOBAL` | `1000` (`sensor-dns/src/main.rs#DEFAULT_REPLY_RATE_GLOBAL`) | UDP datagrams answered per second across every source. |
+  | `PROPOLIS_DNS_REPLY_BURST_GLOBAL` | `2000` (`sensor-dns/src/main.rs#DEFAULT_REPLY_BURST_GLOBAL`) | The global burst. |
+
+  The limit applies to UDP only; a TCP or DoT client is proven by its handshake. A datagram over
+  either budget gets no reply and no event of its own; it is counted in one `rate_limited`
+  summary event per source network per 10 s (see
+  [sensor-behavior](sensor-behavior.md#sensor-dns)).
+- http: `PROPOLIS_HTTP_READ_TIMEOUT_MS`, `PROPOLIS_HTTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_HTTP_MAX_DURATION_SECS`, `PROPOLIS_HTTP_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_HTTP_MAX_CONCURRENT`, `PROPOLIS_HTTP_LOG_PATH`, `PROPOLIS_HTTP_WAN_MAP`, and the
+  HTTPS variables `PROPOLIS_HTTP_TLS_BIND`, `PROPOLIS_HTTP_TLS_CERT`, `PROPOLIS_HTTP_TLS_KEY`
+  (see "HTTP TLS" below).
+- redis: `PROPOLIS_REDIS_READ_TIMEOUT_MS`, `PROPOLIS_REDIS_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_REDIS_MAX_DURATION_SECS`, `PROPOLIS_REDIS_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_REDIS_MAX_CONCURRENT`, `PROPOLIS_REDIS_LOG_PATH`, `PROPOLIS_REDIS_WAN_MAP`, and the
+  Redis TLS variables `PROPOLIS_REDIS_TLS_BIND`, `PROPOLIS_REDIS_TLS_CERT`,
+  `PROPOLIS_REDIS_TLS_KEY` (see "Redis TLS" below).
+- catchall: `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`, `PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_CATCHALL_MAX_CONCURRENT`.
+- smtp: `PROPOLIS_SMTP_READ_TIMEOUT_MS`, `PROPOLIS_SMTP_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_SMTP_MAX_DURATION_SECS`, `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`,
+  `PROPOLIS_SMTP_MAX_CONCURRENT`, `PROPOLIS_SMTP_LOG_PATH`, `PROPOLIS_SMTP_WAN_MAP`
+  (`sensor-smtp/src/main.rs#load_config`). The extra-listener and TLS variables
+  `PROPOLIS_SMTP_SUBMISSION_BIND`, `PROPOLIS_SMTP_TLS_BIND`, `PROPOLIS_SMTP_TLS_CERT` and
+  `PROPOLIS_SMTP_TLS_KEY` are documented with the sensor TLS variables below; the two optional
+  binds take the same `ip:port` rule as every bind (unset or blank is "no listener", a malformed
+  value aborts startup, never a silently dropped listener the fleet inventory still claims).
+- cred: multi-protocol (VNC/MySQL/MSSQL/PostgreSQL/MongoDB), one bind variable per protocol
+  (`PROPOLIS_CRED_VNC_BIND`, `PROPOLIS_CRED_MYSQL_BIND`, `PROPOLIS_CRED_MSSQL_BIND`,
+  `PROPOLIS_CRED_PG_BIND`, `PROPOLIS_CRED_MONGO_BIND`; `sensor-cred/src/main.rs#load_config`):
+  at least one must be set, each set one must parse, and a protocol whose OS bind then fails is
+  logged and skipped while the others keep running; none starting aborts startup. Bounds
+  `PROPOLIS_CRED_READ_TIMEOUT_MS`, `PROPOLIS_CRED_IDLE_TIMEOUT_MS`,
+  `PROPOLIS_CRED_MAX_DURATION_SECS` (**`60`**, shorter than the others' 600: a credential probe
+  is over in seconds), `PROPOLIS_CRED_MAX_CAPTURED_BYTES` (**`100_000`**, smaller than the
+  others' 1_000_000: a login exchange carries no file body), `PROPOLIS_CRED_MAX_CONCURRENT`,
+  plus `PROPOLIS_CRED_WAN_MAP` and `PROPOLIS_CRED_LOG_DIR` (default `/var/log/propolis/cred`,
+  per-protocol file `<protocol>.jsonl`). The TLS variables `PROPOLIS_CRED_TLS_CERT` and
+  `PROPOLIS_CRED_TLS_KEY` are documented with the sensor TLS variables below.
+
+The gate `every_env_var_the_code_reads_is_documented_in_the_env_var_reference`
+(`crates/propolis/tests/docs_agreement.rs`) checks each of these names literally against this file,
+so a shorthand such as `_IDLE_TIMEOUT_MS` does not count as documentation.
+
+### Deprecated catchall aliases (still read, do not use in new configs)
+
+`sensor-catchall` originally shipped with bare, unprefixed names - the only sensor that did. It now
+uses the `PROPOLIS_CATCHALL_` prefix like every other sensor, and still reads the bare spelling as a
+migration path, logging a deprecation warning naming the canonical replacement. An existing config
+keeps working; write new ones with the prefix. The bare names read are `CATCHALL_BIND_ADDRS`,
+`CATCHALL_WAN_MAP`, `CATCHALL_LOG_PATH`, `CATCHALL_READ_TIMEOUT_MS`, `CATCHALL_IDLE_TIMEOUT_MS`,
+`CATCHALL_MAX_DURATION_SECS`, `CATCHALL_MAX_CAPTURED_BYTES`, `CATCHALL_MAX_CONCURRENT`.
+
+Why this is documented rather than quietly dropped: the mismatch between the bare names the binary
+read and the prefixed names an operator would reasonably write left a deployed catch-all sensor dead
+through roughly 4000 restart attempts, its fail-closed config check rejecting an empty bind list
+because nothing read its env file.
+
+### Deprecated collector-id aliases (still read, do not use in new configs)
+
+`ssh`, `ftp`, `adb`, `telnet`, and `shipper` all read `PROPOLIS_COLLECTOR_ID` for the same
+identity value (see "Outbox manifest" below and the `shipper` section above) - before this rename
+the four sensors read the bare `COLLECTOR_ID` and `shipper` read `PROPOLIS_SHIPPER_COLLECTOR_ID`,
+two different names for one value that a config written against one and not the other would
+silently diverge on. Each binary still reads its own pre-rename name via
+`sensor_framework::env_with_legacy` when `PROPOLIS_COLLECTOR_ID` is unset, logging a deprecation
+warning naming the canonical replacement; if both the canonical name and the old one are set to
+different values, the canonical value wins and the warning names the ignored legacy value. An
+existing config keeps working; write new ones with `PROPOLIS_COLLECTOR_ID`.
+
+Why this is documented rather than quietly dropped: the upcoming provenance join keys on
+`(collector_id, occurrence_id)`, so a sensor and `shipper` configured under different collector-id
+env var names (and so, in practice, different values) would silently break attribution - the same
+divergence risk the bare catchall names above already caused once.
+
+Sensor-specific extras:
+- **ssh** (`crates/sensor-ssh/src/main.rs`): `PROPOLIS_SSH_HOST_KEY_PATH`
+  (default `/var/lib/propolis/ssh/host_key`, `sensor-ssh/src/main.rs#DEFAULT_HOST_KEY_PATH`), `PROPOLIS_SSH_SPOOL_DIR`
+  (default `/var/spool/propolis/ssh`, `sensor-ssh/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_SSH_BANNER` (default =
+  persona `OPENSSH_VERSION` = `OpenSSH_8.9p1 Ubuntu-3ubuntu0.10`, `sensor-ssh/src/main.rs#DEFAULT_BANNER` +
+  `sensor-framework/src/persona.rs#OPENSSH_VERSION`; unset or blank → default, `sensor-ssh/src/main.rs#load_config`), `PROPOLIS_SSH_OUTBOX_DIR` (default
+  `/var/spool/propolis/ssh/outbox`; see "Outbox manifest" below).
+- **ftp** (`crates/sensor-ftp/src/main.rs`): `PROPOLIS_FTP_SPOOL_DIR` (default
+  `/var/spool/propolis/ftp`, `sensor-ftp/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_FTP_OUTBOX_DIR` (default
+  `/var/spool/propolis/ftp/outbox`; see "Outbox manifest" below).
+- **adb** (`crates/sensor-adb/src/main.rs`): `PROPOLIS_ADB_SPOOL_DIR` (default
+  `/var/spool/propolis/adb`, `sensor-adb/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_ADB_OUTBOX_DIR` (default
+  `/var/spool/propolis/adb/outbox`; see "Outbox manifest" below).
+- **telnet** (`crates/sensor-telnet/src/main.rs`): `PROPOLIS_TELNET_SPOOL_DIR`
+  (default `/var/spool/propolis/telnet`), `PROPOLIS_TELNET_OUTBOX_DIR` (default
+  `/var/spool/propolis/telnet/outbox`; see "Outbox manifest" below).
+- **tftp** (`crates/sensor-tftp/src/main.rs`): `PROPOLIS_TFTP_SPOOL_DIR` (default
+  `/var/spool/propolis/tftp`, `sensor-tftp/src/main.rs#DEFAULT_SPOOL_DIR`), `PROPOLIS_TFTP_OUTBOX_DIR` (default
+  `/var/spool/propolis/tftp/outbox`; see "Outbox manifest" below). `PROPOLIS_COLLECTOR_ID` is
+  read by its canonical name only; there is no legacy bare spelling for this sensor.
+  `PROPOLIS_TFTP_BIND` is the only switch: the sensor is off until an operator sets it, and with no
+  bind (or an unparseable one) it logs the error and exits 1 without binding anything.
+- **TLS variables** (http, redis, mqtt, smtp, ftp, cred and dns; every `*_TLS_BIND`, `*_TLS_CERT` and
+  `*_TLS_KEY`, and `PROPOLIS_SMTP_SUBMISSION_BIND`) are read by the same reader described under
+  "How every sensor variable is read" above. The per-sensor rules below apply to the values after
+  that step.
+- **http**: `MAX_CONCURRENT` default is `512` (`crates/sensor-http/src/main.rs#DEFAULT_MAX_CONCURRENT`),
+  per listener; both listeners' sessions share one session memory pool sized for all of them, so
+  the sensor refuses to start when `MAX_CONCURRENT` times the listeners bound leaves a session
+  under 64 KiB of it or exceeds the 2,047 session slots
+  ([capacity planning](../operations/capacity-planning.md#http-sensor-worst-case-memory)).
+  `IDLE_TIMEOUT_MS` also bounds a whole request part: the header block from its first byte, and
+  the body from the header's end.
+  HTTP TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_HTTP_TLS_BIND` | unset (the deploy convention is `0.0.0.0:443`) | `ip:port` of the HTTPS listener. The listener exists only when this is set. |
+  | `PROPOLIS_HTTP_TLS_CERT` | unset (deploy value `/etc/propolis/tls/http.crt`) | PEM certificate path. |
+  | `PROPOLIS_HTTP_TLS_KEY` | unset (deploy value `/etc/propolis/tls/http.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-http/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain one included), when exactly one of
+  CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_HTTP_TLS_BIND` is set
+  without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
+  three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
+  without a bind load and validate the pair, start no TLS listener, and log one
+  warning. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/listeners-lib.sh#PROPOLIS_HTTP_TLS_BIND`), a TLS listener never starts implicitly.
+- **redis**: Redis TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_REDIS_TLS_BIND` | unset (the deploy convention is `0.0.0.0:6380`) | `ip:port` of the implicit-TLS (`rediss://`) listener. The listener exists only when this is set. |
+  | `PROPOLIS_REDIS_TLS_CERT` | unset (deploy value `/etc/propolis/tls/redis.crt`) | PEM certificate path. |
+  | `PROPOLIS_REDIS_TLS_KEY` | unset (deploy value `/etc/propolis/tls/redis.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-redis/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain one included), when exactly one of
+  CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_REDIS_TLS_BIND` is set
+  without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
+  three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
+  without a bind load and validate the pair, start no TLS listener, and log one
+  warning. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/listeners-lib.sh#PROPOLIS_REDIS_TLS_BIND`), a TLS listener never starts implicitly.
+- **mqtt**: MQTT TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_MQTT_TLS_BIND` | unset (the deploy convention is `0.0.0.0:8883`) | `ip:port` of the implicit-TLS (MQTTS) listener. The listener exists only when this is set. |
+  | `PROPOLIS_MQTT_TLS_CERT` | unset (deploy value `/etc/propolis/tls/mqtt.crt`) | PEM certificate path. |
+  | `PROPOLIS_MQTT_TLS_KEY` | unset (deploy value `/etc/propolis/tls/mqtt.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-mqtt/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain one included), when exactly one of
+  CERT and KEY is set (a blank value counts as unset), when `PROPOLIS_MQTT_TLS_BIND` is set
+  without both paths, when the bind does not parse, when a file is unreadable, not PEM or a
+  mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of the
+  three is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY
+  without a bind load and validate the pair, start no TLS listener, and log one
+  warning. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/listeners-lib.sh#PROPOLIS_MQTT_TLS_BIND`), a TLS listener never starts implicitly.
+  The plain and TLS listeners share one capture-memory budget
+  (`PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
+- **dns**: DNS TLS (DNS over TLS, RFC 7858; all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_DNS_TLS_BIND` | unset (the deploy convention is `<ip>:853`) | `ip:port` of the DNS over TLS listener. The listener exists only when this is set. |
+  | `PROPOLIS_DNS_TLS_CERT` | unset (deploy value `/etc/propolis/tls/dns.crt`) | PEM certificate path. |
+  | `PROPOLIS_DNS_TLS_KEY` | unset (deploy value `/etc/propolis/tls/dns.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-dns/src/main.rs#parse_tls`): the sensor exits 1 with
+  `refusing to start`, before binding any listener (the plain UDP and TCP pair included), when
+  exactly one of CERT and KEY is set (a blank value counts as unset), when
+  `PROPOLIS_DNS_TLS_BIND` is set without both paths, when the bind does not parse, when a file
+  is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable; a
+  non-UTF-8 value of any of the three is invalid, not unset
+  (`crates/sensor-framework/src/env.rs#strict_env_var`). CERT and KEY without a bind load and
+  validate the pair, start no TLS listener, and log one warning. Because the fleet inventory
+  derives from the `*_BIND` variables (`deploy/listeners-lib.sh#PROPOLIS_DNS_TLS_BIND`), a TLS
+  listener never starts implicitly.
+- **smtp**: SMTP TLS and extra listeners (all four default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_SMTP_SUBMISSION_BIND` | unset (the deploy convention is `0.0.0.0:587`) | `ip:port` of an extra plain listener (submission). It serves the same session as `PROPOLIS_SMTP_BIND`, with STARTTLS iff the cert and key are set. The listener exists only when this is set. |
+  | `PROPOLIS_SMTP_TLS_BIND` | unset (the deploy convention is `0.0.0.0:465`) | `ip:port` of the implicit-TLS (SMTPS) listener. The listener exists only when this is set, and it requires the cert and key. |
+  | `PROPOLIS_SMTP_TLS_CERT` | unset (deploy value `/etc/propolis/tls/smtp.crt`) | PEM certificate path. Together with the key it enables STARTTLS on the plain listeners. |
+  | `PROPOLIS_SMTP_TLS_KEY` | unset (deploy value `/etc/propolis/tls/smtp.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-smtp/src/lib.rs#tls_from_env`,
+  `crates/sensor-smtp/src/main.rs#main`): the sensor exits 1 with `refusing to start`, before
+  binding any listener (the plain one included), when exactly one of CERT and KEY is set (a blank
+  value counts as unset), when `PROPOLIS_SMTP_TLS_BIND` is set without both paths, when
+  `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` does not parse (a bad bind never
+  falls back to a default), when a file is unreadable, not PEM
+  or a mismatched pair, or when the key is group- or world-readable; a non-UTF-8 value of any of
+  the four is invalid, not unset (`crates/sensor-framework/src/env.rs#strict_env_var`,
+  `crates/sensor-smtp/src/lib.rs#tls_from_env`). If the OS refuses any one bind, the listeners
+  already started are stopped and the sensor exits 1
+  (`crates/sensor-smtp/src/lib.rs#start_listeners`). With CERT and KEY set and no
+  `PROPOLIS_SMTP_TLS_BIND`, the pair enables STARTTLS on the plain listeners (25 and, if set, 587)
+  and no implicit-TLS listener starts; unlike the other sensors this logs no warning, because the
+  pair is in use. With no TLS variable set the sensor is unchanged: STARTTLS is advertised and
+  answered with `454`. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/listeners-lib.sh#PROPOLIS_SMTP_SUBMISSION_BIND`,
+  `deploy/listeners-lib.sh#PROPOLIS_SMTP_TLS_BIND`), neither extra listener starts implicitly.
+- **ftp**: FTPS and AUTH TLS (all three default off; none has a compiled default):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_FTP_TLS_BIND` | unset (the deploy convention is `0.0.0.0:990`) | `ip:port` of the implicit-TLS (FTPS) listener. The listener exists only when this is set, and it requires the cert and key. |
+  | `PROPOLIS_FTP_TLS_CERT` | unset (deploy value `/etc/propolis/tls/ftp.crt`) | PEM certificate path. Together with the key it enables AUTH TLS on the plain listener. |
+  | `PROPOLIS_FTP_TLS_KEY` | unset (deploy value `/etc/propolis/tls/ftp.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-ftp/src/main.rs#tls_paths`,
+  `crates/sensor-ftp/src/main.rs#main`): the sensor exits 1 with `refusing to start`, before
+  binding any listener (the plain one included), when exactly one of CERT and KEY is set (a blank
+  value counts as unset), when `PROPOLIS_FTP_TLS_BIND` is set without both paths, when
+  `PROPOLIS_FTP_TLS_BIND` does not parse (a bad bind never falls back to a default), when a file
+  is unreadable, not PEM or a mismatched pair, or when the key is group- or world-readable; a
+  non-UTF-8 value of any of the three is invalid, not unset
+  (`crates/sensor-framework/src/env.rs#strict_env_var`). If the OS refuses any one
+  bind, the listeners already started are stopped and the sensor exits 1
+  (`crates/sensor-ftp/src/lib.rs#start_listeners`). With CERT and KEY set and no
+  `PROPOLIS_FTP_TLS_BIND`, the pair enables AUTH TLS on the plain listener and no implicit-TLS
+  listener starts; unlike the other sensors this logs no warning, because the pair is in use.
+  With no TLS variable set the sensor is unchanged: AUTH, PBSZ and PROT answer `500` and FEAT
+  does not list them. Because the fleet inventory derives from the `*_BIND` variables
+  (`deploy/listeners-lib.sh#PROPOLIS_FTP_TLS_BIND`), the implicit listener never starts
+  implicitly. The plain and implicit listeners share one capture-memory budget
+  (`PROPOLIS_FTP_CAPTURE_MEMORY_BYTES`), so the ceiling covers both together.
+- **cred**: TLS on the existing PostgreSQL, MySQL, MSSQL and MongoDB ports (both default off;
+  neither has a compiled default). There is no TLS bind variable: TLS is negotiated in-band, or
+  sniffed for MongoDB, on the plain binds, so it opens no new port.
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_CRED_TLS_CERT` | unset (deploy value `/etc/propolis/tls/cred.crt`) | PEM certificate path, shared by all four protocols. Together with the key it enables the PostgreSQL SSLRequest, MySQL CLIENT_SSL, MSSQL PRELOGIN encryption and MongoDB ClientHello paths. |
+  | `PROPOLIS_CRED_TLS_KEY` | unset (deploy value `/etc/propolis/tls/cred.key`) | PEM private key path; must be mode `0600`. |
+
+  Fail-closed (`crates/sensor-cred/src/main.rs#main`, `crates/sensor-cred/src/lib.rs#CredTls`):
+  when either variable is set (a blank value counts as unset), the pair must load or the sensor
+  exits 1 with `refusing to start` before binding any protocol. That covers exactly one of the
+  two set, a non-UTF-8 value (invalid, not unset), a file that is unreadable, not PEM or a
+  mismatched pair, and a key that is group- or world-readable. On success it logs
+  `TLS enabled for <protocols>`, naming the TLS-capable protocols (postgresql, mysql, mssql,
+  mongodb) whose bind is set, or warns `TLS is configured but no TLS-capable protocol is bound`
+  when none is. With neither variable set (or both
+  blank) the sensor is unchanged. Because no `*_BIND` variable is added, `deploy/fleet-listeners.sh` derives no extra
+  listener from the pair.
+- **catchall**: no spool variable (never spools file bodies,
+  `crates/sensor-catchall/src/main.rs#Config`); no
+  outbox variable either (captures no file bodies, so nothing for SP-B-1b's
+  manifest to record).
+
+#### Outbox manifest (SP-B-1b)
+
+Every sensor that spools captured file bodies (ssh, ftp, adb, telnet, tftp, mqtt) also writes a
+durable per-capture custody manifest row under its outbox directory as soon as the body is
+sealed - see `sensor_framework::outbox` and `sensor_framework::handoff::process_job`. Two
+variables govern it, read identically by each of those six sensors' `main.rs`:
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_COLLECTOR_ID` (deprecated alias `COLLECTOR_ID`, still read; shared across all six binaries, not `PROPOLIS_<SENSOR>_*`) | no | `local` | Stamped onto every manifest row this sensor writes. **Must equal** the CommonName of the client certificate `shipper`'s `PROPOLIS_COLLECTOR_ID` presents to the gateway on this box, because a later stage joins the gateway's cert-derived collector id against this manifest on `(collector_id, occurrence_id)`. A single-node deployment with no shipper leaves this at `local`. |
+| `PROPOLIS_<SENSOR>_OUTBOX_DIR` | no | `<PROPOLIS_<SENSOR>_SPOOL_DIR>/outbox` | Root of the per-capture manifest JSON files (`<dir>/<capture_id>.json`). The default is derived from the sensor's own resolved spool directory (not a fixed shared path) so it always lands inside the writable root the sensor's systemd unit grants - a fixed shared `/var/lib/propolis/outbox` default is unwritable under `ProtectSystem=strict` and was the SP-B-1c regression this fixed. Manifest rows are keyed by a globally-unique `capture_id`, so even where two sensors' outbox dirs happened to coincide, writes would never collide. |
+
+#### Capture memory budget
+
+Each of the six body-capturing sensors holds a process-wide ceiling on the bytes of captured
+bodies buffered in memory at once (`sensor_framework::capture_budget::CaptureMemoryBudget`), so
+many concurrent uploads cannot together push the process past its systemd `MemoryMax`. A body is
+charged in 64 KiB chunks from its first byte and refunded as soon as the hand-off worker has
+spooled it (`sensor_framework::handoff::process_job`). One variable per sensor, read by that
+sensor's `main.rs`:
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_SSH_CAPTURE_MEMORY_BYTES` | no | `214748364` (40% of the unit's `MemoryMax=512M`, `sensor-ssh/src/server.rs#DEFAULT_CAPTURE_BUDGET_BYTES`) | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_FTP_CAPTURE_MEMORY_BYTES` | no | `107374182` (40% of `MemoryMax=256M`, `sensor-framework/src/capture_budget.rs#DEFAULT_CAPTURE_BUDGET_BYTES_256M`) | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_ADB_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_TELNET_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_TELNET_INFECTED_HOLD_SECS` | no | `21600` (`sensor-telnet/src/infected_hold.rs#DEFAULT_HOLD_SECS`) | whole seconds, `0` to `604800`; `0` turns the infected-source hold off (the startup log says so); anything else aborts startup. See [sensor-behavior](sensor-behavior.md#sensor-telnet) |
+| `PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+| `PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES` | no | `107374182` | positive u64 bytes; zero or unparseable aborts startup |
+
+When a capture hits the ceiling it keeps the prefix already buffered, stops growing, and the
+transfer is ended the way the protocol ends a full disk (FTP `451`, TFTP ERROR 3, SCP error byte,
+SFTP `FAILURE`, ADB sync `FAIL`; a shell-stream capture just stops growing). The sample's event
+metadata carries `truncated: true`, `complete: false` and `end_reason: "capture_memory_budget"`. A
+capture that cannot buffer even one byte submits no sample and no `malware_upload` event (the
+ordinary connection event is unaffected); the hand-off counts it as refused. The 40% share is an
+unmeasured choice that leaves the rest of `MemoryMax` for the runtime, parsers, fake-filesystem
+state and allocator overhead, none of which this budget charges. Raise the variable only together
+with the unit's `MemoryMax`.
+
+---
+
+## Interactions
+
+- **VT enable requires both**: `PROPOLIS_VT_ENABLED=true` **and** a non-empty
+  `PROPOLIS_VT_KEY` (`crates/propolis/src/config.rs#load_config`). Either missing → VT off.
+- **Vendor enable requires key**: `PROPOLIS_VENDOR_<V>_ENABLED=true` with an
+  empty `_KEY` → forced disabled and warns (`crates/propolis/src/config.rs#load_vendor_config`, review
+  `review/src/main.rs#load_vendor_config`).
+- **DShield user+key composition**: `PROPOLIS_VENDOR_DSHIELD_USER` +
+  `PROPOLIS_VENDOR_DSHIELD_KEY` compose to `{user}:{key}` in the single key slot
+  (`crates/propolis/src/config.rs#load_config`). User alone is ignored.
+- **ASN suppression needs GeoIP**: `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless
+  `PROPOLIS_GEOIP_DIR` is set and the GeoLite2-ASN DB loads. The unified daemon
+  warns when the ASN allowlist is set but `GEOIP_DIR` is unset (`propolis/src/main.rs#main`) or
+  the ASN DB failed to load (`propolis/src/main.rs#main`).
+- **Fetcher SSRF guard vs OWN_IPS**: `PROPOLIS_FETCH_OWN_IPS` unions with live
+  interface IPs; an empty union → the fetcher refuses to run; a union without any
+  public address → warn-only.
+- **Console session secret**: regenerated per restart if unset; harmless because
+  sessions are in-memory (dropped on restart anyway).
+- **TTL/interval units**: feed TTL variables are HOURS (×3600 → Duration); most
+  timeouts are MS or SECS as named in the variable suffix.
+
+## Deploy-script variables (`deploy/blocklist-sync.sh`)
+
+Read by the blocklist publish script, not by any daemon, so they are set in the
+**cron environment** rather than an `/etc/propolis/*.env` file the units load.
+That cron belongs to the `propolis-blocklist` account, not root (see
+[routine procedures](../operations/routine-procedures.md#stage-2---publish-to-a-public-repository-operator-cron)).
+
+| Variable | Req | Default | Notes |
+|---|---|---|---|
+| `PROPOLIS_FEED_OUTPUT_DIR` | no | auto-detected | the publisher output holding `manifest.json`; when unset the script probes `<spool>/feed/current` then the older flat `<spool>/feed`, so both layouts work |
+| `PROPOLIS_BLOCKLIST_REPO` | no | `/var/lib/propolis/blocklist-repo` | the git checkout that is committed and pushed; owned by the account the cron runs as |
+| `PROPOLIS_BLOCKLIST_STATUS_DIR` | no | `/var/lib/propolis/blocklist-status` | where the script writes `last-pushed` after each successful push. The daemon's `feed-push-stale` condition reads only the default path, so change it only for a test. It must be a real directory owned by the running account or root and writable by no one else; otherwise the marker is skipped with a warning (the push still counts) |
+| `PROPOLIS_BLOCKLIST_SSH_KEY` | no | unset | path to a **passphraseless** deploy key for the push. Set for cron: cron has no ssh-agent, so a passphrase-protected key cannot be used non-interactively. When set, the script exports `GIT_SSH_COMMAND` with `IdentitiesOnly=yes`; a configured-but-unreadable key **fails closed (exit 1)** rather than falling back to another identity, since a fallback that succeeds by hand and fails under cron is the exact trap being avoided. When unset in a non-interactive run with no agent, the script warns before pushing. |
+
+Naming the key here rather than in the checkout's `core.sshCommand` is
+deliberate: that git config is box-local state outside version control, and it
+has reverted to a passphrase-protected key in practice, silently restoring the
+cron failure it was meant to fix.
+
+## Related
+
+- [Ports and protocols](ports-and-protocols.md) - bind addresses/ports
+- [Filesystem paths](filesystem-paths.md) - log/spool/cursor/feed directories
+- [Integrations](integrations.md) - VirusTotal, vendor submitters, ntfy, GeoLite2
+- [Rate limits and budgets](rate-limits-and-budgets.md) - fetcher/vendor budgets
+- [Outbound controls](../security/outbound-controls.md) - the gated egress paths
+- [Configuration](../operations/configuration.md) - operator configuration guide

@@ -1,0 +1,10 @@
+{% import "macros.html" as m %}
+{% for r in t.rows %}
+    <tr>
+      <td class="ip stack-lead">{{ m.ip_evidence_link(r.ip) }}</td>
+      <td class="mono" data-label="Events">{{ r.event_count | count }}</td>
+      <td class="dim stack-full">{{ r.signals }}</td>
+      <td class="seen" data-label="First seen">{{ r.first_seen }}</td>
+      <td class="seen" data-label="Last seen">{{ r.last_seen }}</td>
+    </tr>
+{% endfor %}

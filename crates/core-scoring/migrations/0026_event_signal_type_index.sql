@@ -1,0 +1,34 @@
+-- An index on the signal type, for the console's event search and its signal-type menu, which
+-- asked about one signal type and answered by reading the ledger.
+--
+--   * The search form's signal-type filter. For a type the ledger holds, the planner could walk
+--     event_observed_at_idx backwards and stop after 51 matches. For a type it holds none of, or
+--     few of, that walk reads every event and returns nothing or little: 1.1 to 2.9 s for a type
+--     with no events and 840 ms for a rare one on 1,500,000 events, growing with the ledger.
+--     With this index the search starts at the type's own newest entry. (The filter also had to
+--     compare the column itself, `signal_type = $n::signal_type_enum`, where it compared
+--     `signal_type::text = $n`, which no index on the column can serve.)
+--   * The menu of types the ledger holds: a recursive loose index scan, one probe of this index
+--     per type present plus one, where `SELECT DISTINCT signal_type` read every row (3.1 s on the
+--     live node). A probe per member of the enum (`EXISTS`) was measured and rejected: for a type
+--     with no events the planner reads the whole ledger.
+--
+-- Cost, paid once per appended event inside the append lock (core-scoring/src/repository/batch.rs,
+-- events.rs): one more index entry, about 6 us. Measured end to end with this migration and 0021,
+-- 0022 and 0023 together against a ledger without any of them (core-scoring `append_events` of
+-- 20,000 events in batches of 200, then `append_event` of 3,000 single events, over a 1,500,000
+-- event ledger and 500,000 scored addresses, six alternating runs on a shared host): batch
+-- appends 420 us per event before and 470 us after at best, 462 and 499 at the median (+8 to
+-- +12%); single appends 3.8 ms and 4.0 ms at best (+5%). Run to run the same configuration
+-- varied by up to 2x, so read these as an order of magnitude, not a constant. The +50 us per event
+-- is the sum of the new work: the ip_score update that 0021's index made non-heap-only (it now
+-- writes a new ip_score_pkey and ip_score_order_idx entry, and leaves a dead tuple the index
+-- must not point at, so ip_score needs vacuum to keep up with a scored append rate), the
+-- event_listener_idx entry from 0022, this entry, and the predicate tests of 0023's two partial
+-- indexes. The time an append holds the lock grows by that fraction.
+--
+-- 49 MB per 1,600,000 events. Plain CREATE INDEX, not CONCURRENTLY, for the reasons given in 0013:
+-- sqlx runs this file in its own transaction at daemon startup, before any intake task exists, so
+-- the SHARE lock it takes on event blocks nothing that is running. The build reads the event heap
+-- once: 1.7 s on 1,638,000 events (an estimate for 7,500,000: under 10 s).
+CREATE INDEX event_signal_observed_idx ON event (signal_type, observed_at);

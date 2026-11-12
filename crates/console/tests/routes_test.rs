@@ -1,0 +1,8299 @@
+//! HTTP-level tests for the dashboard, review queue, login, IP detail, feed status, and metrics
+//! pages (`internal/plans/2026-07-30-console-observability.md`, tasks 2-4) via axum's `oneshot`
+//! test utilities - no real TCP listener.
+//!
+//! Each test runs against a fresh, isolated database (`#[sqlx::test(migrations = false)]`
+//! provisions and later drops a per-test Postgres database; `migrate` below then applies
+//! core-scoring's migrations followed by review's, matching `review/tests/queue_test.rs`'s own
+//! two-crate migration order). Isolation-per-test matters here specifically because
+//! `routes::dashboard`'s stats are UNSCOPED aggregates (`COUNT(*) FROM ip_score`, with no
+//! per-IP filter) - a shared persistent database would make those assertions order- and
+//! leftover-data-dependent.
+//!
+//! `routes::login`'s POST handler extracts the client IP via `ConnectInfo<SocketAddr>` (see that
+//! module's doc comment); `oneshot` never populates real connection info, so every test router
+//! here is layered with `MockConnectInfo`, axum's documented test-only substitute.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::connect_info::MockConnectInfo;
+use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use console::auth::{self, PasswordStore, RateLimiter, SessionStore};
+use console::log_buffer::{LogEntry, LogField};
+use console::{AppState, routes};
+use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use futures::StreamExt;
+use http_body_util::BodyExt;
+use review::queue::ReviewQueue;
+use sqlx::{PgPool, Row};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+mod markup;
+
+const TEST_PASSWORD: &str = "s3cret-test-operator-password";
+const TEST_PEER: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 55555);
+
+fn test_secret() -> [u8; 32] {
+    [11u8; 32]
+}
+
+async fn migrate(pool: &PgPool) {
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(pool)
+        .await
+        .unwrap();
+    review::migrator().run(pool).await.unwrap();
+    fleet::migrator().run(pool).await.unwrap();
+}
+
+fn test_state(db: PgPool) -> AppState {
+    test_state_with_feed_dir(db, None)
+}
+
+fn test_state_with_feed_dir(db: PgPool, feed_output_dir: Option<PathBuf>) -> AppState {
+    test_state_full(db, feed_output_dir, Vec::new(), None)
+}
+
+/// `test_state_with_feed_dir` plus the fleet inventory and deploy-stamp path, for `routes::fleet`.
+fn test_state_full(
+    db: PgPool,
+    feed_output_dir: Option<PathBuf>,
+    fleet_listeners: Vec<fleet::Listener>,
+    deploy_stamp_path: Option<PathBuf>,
+) -> AppState {
+    AppState {
+        db,
+        sessions: Arc::new(SessionStore::new(test_secret())),
+        passwords: Arc::new(PasswordStore::new(TEST_PASSWORD)),
+        login_rate_limiter: Arc::new(RateLimiter::default()),
+        templates: Arc::new(console::templates::environment()),
+        geoip: Arc::new(geoip::GeoIp::disabled()),
+        rdns: Arc::new(console::rdns::RdnsResolver::disabled()),
+        feed_output_dir,
+        fleet_listeners: Arc::new(fleet_listeners),
+        fleet_probe_interval: std::time::Duration::from_secs(300),
+        deploy_stamp_path,
+        startup_time: chrono::Utc::now(),
+        binary_name: "console",
+        version: "test",
+        git_sha: "abc123abc123",
+        built_at: "2026-09-09T00:00:00Z",
+        log_buffer: Arc::new(console::log_buffer::LogBuffer::new(1000)),
+        events_ingested: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        events_rejected: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        trusted_proxy: false,
+        metrics_token: None,
+        gave_up_subsystems: console::no_subsystem_health(),
+        read_state: console::read_state::ReadState::uncached(),
+        intake_lag: console::intake_lag::no_intake_lag(),
+    }
+}
+
+/// The full composed router, layered with `MockConnectInfo` so `routes::login`'s
+/// `ConnectInfo<SocketAddr>` extractor resolves under `oneshot` (see the module doc comment).
+fn test_app(state: AppState) -> Router {
+    routes::router(state).layer(MockConnectInfo(TEST_PEER))
+}
+
+async fn body_text(response: Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// Like [`ev`] but with an explicit `wan_ip` - `routes::detail`'s per-WAN breakdown query
+/// (`WHERE wan_ip IS NOT NULL`) has nothing to show for any event `ev` itself produces.
+fn ev_with_wan(
+    ip: &str,
+    wan_ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        Some(wan_ip.parse().unwrap()),
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        serde_json::json!({}),
+        None,
+    )
+}
+
+fn ev(
+    ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        None,
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        serde_json::json!({}),
+        None,
+    )
+}
+
+/// Like [`ev`] but carrying a non-empty `metadata` payload and a `session_id` -
+/// `routes::detail`'s session-grouping (task 3, `internal/design/11-console-forensics.md`
+/// section 2) groups every event sharing a `session_id` into one collapsible card, and the
+/// evidence timeline's "Detail" column extracts from `metadata` by `signal_type`. Same
+/// eight-argument shape as `core_scoring::EventInput::from_signal` itself (which this wraps),
+/// allowed there for the same reason.
+#[allow(clippy::too_many_arguments)]
+fn ev_with_session(
+    ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+    metadata: serde_json::Value,
+    session_id: Uuid,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        None,
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        metadata,
+        Some(session_id),
+    )
+}
+
+/// Seeds an eligible + vendor-recommended `ip_score` projection: one confirmed-real honeypot login
+/// plus two corroborating categories - raw 85 (clears the 75 STANDARD floor), max_confidence 0.920
+/// (clears the 0.70 STANDARD floor) -> tier Standard -> recommended_for_vendor. Exactly
+/// `review/tests/queue_test.rs`'s `seed_recommended` recipe (a proven, already-verified path to a
+/// recommended projection, not reinvented scoring math), EXCEPT the timestamp is anchored
+/// `seconds_ago` seconds before `Utc::now()` rather than a hardcoded historical date:
+/// `core_scoring::read_score` (which `routes::queue` uses for display) decays raw_score to now with
+/// a 6-HOUR half-life (`HALF_LIFE_SECONDS`), so a fixed date from whenever this fixture was written
+/// decays to ~0 the moment enough real-world time has passed - caught by actually rendering a page
+/// and reading the HTML rather than trusting a passing-but-undiscriminating assertion. Keep
+/// `seconds_ago` well under 21600 (one half-life) so the decayed display values stay close to the
+/// pre-decay raw ones.
+async fn seed_recommended(pool: &PgPool, ip: &str, seconds_ago: i64) {
+    let start = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
+    append_event(
+        pool,
+        ev(
+            ip,
+            "honeypot-sensor",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &start.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        pool,
+        ev(
+            ip,
+            "ssh-sensor",
+            SignalType::SshBruteForce,
+            Protocol::Tcp,
+            true,
+            &(start + chrono::Duration::seconds(10)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        pool,
+        ev(
+            ip,
+            "catchall-sensor",
+            SignalType::CatchallProbe,
+            Protocol::Udp,
+            false,
+            &(start + chrono::Duration::seconds(20)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+fn form_request(uri: &str, body: String, cookie: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(c) = cookie {
+        builder = builder.header("cookie", c.to_string());
+    }
+    builder.body(Body::from(body)).unwrap()
+}
+
+fn get_request(uri: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(c) = cookie {
+        builder = builder.header("cookie", c.to_string());
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+/// Extracts `"propolis_session=<value>"` from a login response's `set-cookie` header, ready to use
+/// as-is for a subsequent request's `cookie` header.
+fn extract_session_cookie(response: &Response) -> String {
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("login success must set a session cookie")
+        .to_str()
+        .unwrap();
+    set_cookie.split(';').next().unwrap().to_string()
+}
+
+// --- dashboard ---
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_authenticated_returns_stats(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.10", 60).await;
+    seed_recommended(&pool, "203.0.113.11", 60).await;
+    // A single event never clears eligibility (`event_count >= 2` is required), so this IP gets an
+    // `ip_score` row but is never surfaced into `review_queue`. That deliberately splits
+    // total_scored_ips (3) from pending_reviews (2) so the two stats cannot coincidentally match
+    // and mask one being wired to the wrong query.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.12",
+            "catchall-sensor",
+            SignalType::CatchallProbe,
+            Protocol::Udp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("<span class=\"label\">Scored IPs</span>\n    <div class=\"v\">3</div>"),
+        "expected total_scored_ips=3 in the status band: {body}"
+    );
+    assert!(
+        body.contains(r#"class="cell cell--call""#),
+        "pending_reviews > 0 must render the band's call cell: {body}"
+    );
+    assert!(
+        body.contains(r#"<a href="/queue">2</a>"#),
+        "expected pending_reviews=2 linked to /queue: {body}"
+    );
+    assert!(
+        body.contains("0 approved today"),
+        "expected approved_today=0 in the Published cell foot: {body}"
+    );
+    assert!(
+        body.contains("+7 in the last hour"),
+        "expected events_last_hour=7 in the Events/24h foot: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="label">Published</span>"#) && body.contains(">--</div>"),
+        "expected the feed-entries placeholder when no feed_output_dir is configured: {body}"
+    );
+    assert!(
+        body.contains(r#"class="insp" href="/ip/203.0.113.10""#)
+            || body.contains(r#"class="insp" href="/ip/203.0.113.11""#),
+        "expected one of the seeded IPs as top attacker in the band: {body}"
+    );
+    assert!(body.contains("Dashboard"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_shows_recent_activity_and_protocol_distribution(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.80",
+            "cowrie",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.81",
+            "suricata",
+            SignalType::SuricataSev2,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("<td>Cowrie login attempt</td>"),
+        "recent-activity row missing human-readable activity label: {body}"
+    );
+    assert!(
+        body.contains(r#"class="insp" href="/ip/203.0.113.80" hx-get="/ip/203.0.113.80?drawer=1""#),
+        "recent-activity row missing source IP drawer link: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="protoChart""#),
+        "protocol-distribution chart canvas missing once events exist: {body}"
+    );
+    // Chart data sits in <script type="application/json"> elements, read by the charts script.
+    assert!(
+        body.contains("application/json") && body.contains("proto-labels"),
+        "protocol-distribution chart data element missing: {body}"
+    );
+    assert!(
+        !body.contains("<tr><td>cowrie</td>"),
+        "raw sensor name must not appear in any table: {body}"
+    );
+    assert!(
+        !body.contains("waiting for sensor events"),
+        "empty-state message should not render once events exist: {body}"
+    );
+}
+
+/// The protocol chart's labels are sensor names, and a sensor name is whatever string an event
+/// carried - in a split deployment, whatever a collector shipped. Placed raw in the chart's JSON
+/// data element, one holding `</script>` would end the element and put the rest into the page as
+/// markup.
+#[sqlx::test(migrations = false)]
+async fn chart_data_cannot_close_its_script_element(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.82",
+            r#"</script><b id="injected">x</b>"#,
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("</script><b id="),
+        "a sensor name closed its script element and reached the page as markup: {body}"
+    );
+    // What the charts script reads: the element's text up to the first `</script`, parsed as
+    // JSON. It must hold the label exactly as the event carried it.
+    let open = r#"<script type="application/json" id="proto-labels">"#;
+    let start = body.find(open).expect("the protocol labels element") + open.len();
+    let text = &body[start..start + body[start..].find("</script").unwrap()];
+    let labels: Vec<String> = serde_json::from_str(text).unwrap_or_else(|e| {
+        panic!("the labels element is not the JSON it should be ({e}): {text}")
+    });
+    assert_eq!(
+        labels,
+        vec![r#"</script><b id="injected">x</b>"#.to_string()]
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_events_last_hour_excludes_events_older_than_an_hour(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    let two_hours_ago = now - chrono::Duration::hours(2);
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.90",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &now.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.90",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &two_hours_ago.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("+1 in the last hour"),
+        "expected events_last_hour=1 in the band foot, excluding the event from 2 hours ago: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_top_attacker_ranks_by_live_score_not_stale_raw(pool: PgPool) {
+    migrate(&pool).await;
+
+    // A long-idle IP whose events landed two days ago, then forced to a HIGH stored raw_score.
+    // Its `decay_anchor` is ~2 days old, so over 8 half-lives (48h / 6h) its live effective score
+    // has decayed to ~95/256 ≈ 0.4.
+    seed_recommended(&pool, "203.0.113.10", 2 * 24 * 60 * 60).await;
+    sqlx::query("UPDATE ip_score SET raw_score = 95 WHERE source_ip = '203.0.113.10'::inet")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // An actively-attacking IP: events 60s ago, so its live effective score ≈ its raw (tens of
+    // points), far above the idle IP's decayed ~0.4 even though its stored raw is lower.
+    seed_recommended(&pool, "203.0.113.20", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // The "top" hero must name the active IP. Ranking by the stored `raw_score` (the bug) would
+    // instead promote the idle IP whose anchored 95 has since decayed to ~0.
+    assert!(
+        body.contains(r#"top <a class="insp" href="/ip/203.0.113.20""#),
+        "expected the actively-scoring IP as top attacker, not the stale high-raw one: {body}"
+    );
+    assert!(
+        !body.contains(r#"top <a class="insp" href="/ip/203.0.113.10""#),
+        "the idle high-raw IP must not be the top attacker (its live score has decayed): {body}"
+    );
+}
+
+/// Drift guard: the SQL `LIVE_EFFECTIVE_SCORE_SQL` fragment must produce the same value the detail
+/// page shows via `core_scoring` (`effective_score(read_score().raw_score, wan)`). If the mirrored
+/// constants (half-life, breadth, cap) ever diverge from core-scoring, this fails.
+#[sqlx::test(migrations = false)]
+async fn live_effective_score_sql_matches_core_scoring(pool: PgPool) {
+    use core_scoring::{effective_score, read_score};
+
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.42", 3600).await;
+    // Multiple WAN vantages so the breadth factor is a non-trivial multiplier, not 1.0.
+    sqlx::query(
+        "UPDATE ip_score SET distinct_wan_count = 3 WHERE source_ip = '203.0.113.42'::inet",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let sql = format!(
+        "SELECT ({})::float8 FROM ip_score WHERE source_ip = '203.0.113.42'::inet",
+        routes::LIVE_EFFECTIVE_SCORE_SQL
+    );
+    let sql_score: f64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let ip: std::net::IpAddr = "203.0.113.42".parse().unwrap();
+    let score = read_score(&pool, ip).await.unwrap().unwrap();
+    let rust_score: f64 = effective_score(score.raw_score, score.distinct_wan_count as u32)
+        .to_string()
+        .parse()
+        .unwrap();
+
+    assert!(
+        rust_score > 0.0,
+        "sanity: the seeded IP should have a positive live score, got {rust_score}"
+    );
+    assert!(
+        (sql_score - rust_score).abs() < 0.05,
+        "SQL live score {sql_score} must match core_scoring {rust_score} within tolerance \
+         (constant drift between LIVE_EFFECTIVE_SCORE_SQL and core-scoring?)"
+    );
+}
+
+/// The rolling-window fix: events ~24h ago but still inside the window land in the oldest partial
+/// hour. The previous hour-aligned bucket series had no bucket for that hour and dropped them from
+/// both the chart and the "Events / 24h" total; the rolling series counts them.
+#[sqlx::test(migrations = false)]
+async fn dashboard_events_24h_counts_the_oldest_in_window_hour(pool: PgPool) {
+    migrate(&pool).await;
+
+    // 30s and 45s inside the 24h boundary: safely within the window (margin >> test latency) yet in
+    // the hour the old `trunc(now) - 23h` series excluded. Two distinct signal types so no dedup.
+    for (secs_inside, sig) in [
+        (30i64, SignalType::HoneypotConnection),
+        (45i64, SignalType::HoneypotLoginAttempt),
+    ] {
+        let when = chrono::Utc::now() - chrono::Duration::seconds(24 * 3600 - secs_inside);
+        append_event(
+            &pool,
+            ev(
+                "203.0.113.77",
+                "cowrie",
+                sig,
+                Protocol::Tcp,
+                true,
+                &when.to_rfc3339(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Both boundary events counted => "Events / 24h" == 2. Under the old hour-aligned series they
+    // fell outside every bucket and the total showed 0.
+    assert!(
+        body.contains(r#"<div class="v">2</div>"#),
+        "expected Events/24h to count both in-window boundary events (2): {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_feed_entries_sums_tier_counts_from_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":4,"sha256":"x","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":9,"sha256":"y","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // aggressive(4) + standard(9) = 13, proving the real `tiers.aggressive.count` /
+    // `tiers.standard.count` manifest shape is read correctly (not a flat `aggressive_count` key,
+    // which this fixture's manifest does not have).
+    assert!(
+        body.contains("<div class=\"v v--ok\">13</div>"),
+        "expected feed_entries = aggressive(4) + standard(9) = 13 in the Published cell: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_empty_state_shows_placeholders(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("waiting for sensor events - start a sensor to begin collecting"),
+        "missing empty recent-activity message: {body}"
+    );
+    assert!(
+        body.contains("waiting for sensor events</p>"),
+        "missing empty protocol-distribution message: {body}"
+    );
+    assert!(
+        body.contains("no vendor submissions yet"),
+        "missing empty vendor-submissions message: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="label">Published</span>"#) && body.contains(">--</div>"),
+        "expected the feed-entries placeholder when unconfigured: {body}"
+    );
+    assert!(
+        body.contains("queue clear"),
+        "expected the queue-clear band state when pending_reviews=0: {body}"
+    );
+    // Both chart sections gate independently on their own source list (`protocol_dist` /
+    // `has_attackers`) - this fixture has neither events nor ip_score rows, so both must show the
+    // page's existing empty-state copy rather than an empty canvas.
+    assert_eq!(
+        body.matches("waiting for sensor events</p>").count(),
+        2,
+        "expected the empty-state message for both the protocol-distribution and top-attackers charts: {body}"
+    );
+    assert!(
+        !body.contains(r#"<canvas id="protoChart""#)
+            && !body.contains(r#"<canvas id="attackerChart""#),
+        "an empty chart canvas must not render when its source list is empty: {body}"
+    );
+    // The events timeline has no empty-state branch - it always renders 24 zero-filled buckets (a
+    // flat line), per the brief's explicit "still renders with all zeros" requirement.
+    assert!(
+        body.contains(r#"<canvas id="timelineChart""#),
+        "the timeline chart must always render, even with no events: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_timeline_chart_reflects_hourly_event_counts(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.85",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // `now()`'s event always lands in the LAST of the 25 ascending-ordered hourly buckets (the
+    // current hour), so the rendered `timeline_data` array's final element must be 1 regardless of
+    // what wall-clock hour the test happens to run in - a broken query (wrong join condition, wrong
+    // window) would instead leave every bucket at 0 and this substring would not appear.
+    assert!(
+        body.contains(r#"id="timeline-data">"#),
+        "timeline chart data element missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_most_active_shows_active_ip_with_strip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.86", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="insp" href="/ip/203.0.113.86" hx-get="/ip/203.0.113.86?drawer=1""#),
+        "most-active table missing the active IP drawer link: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="strip">"#),
+        "most-active row missing its 24h activity strip: {body}"
+    );
+    assert!(
+        body.contains(r#"class="sev sev--"#),
+        "most-active row missing severity tags for what the IP did: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_vendor_submissions_table_shows_at_most_three_rows(pool: PgPool) {
+    migrate(&pool).await;
+    let base = chrono::Utc::now();
+    let ips = [
+        "203.0.113.201",
+        "203.0.113.202",
+        "203.0.113.203",
+        "203.0.113.204",
+        "203.0.113.205",
+    ];
+    for (i, ip) in ips.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO vendor_submission \
+             (source_ip, vendor, idempotency_key, categories, comment, success, submitted_at) \
+             VALUES ($1::inet, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(*ip)
+        .bind("abuseipdb")
+        .bind(format!("compact-table-key-{i}"))
+        .bind(vec!["18".to_string()])
+        .bind("test comment")
+        .bind(true)
+        .bind(base - chrono::Duration::seconds(i as i64))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // `submitted_at DESC` + a 3-row template truncation: IPs .201/.202/.203 (indices 0-2) carry the
+    // most recent timestamps and must be the ones shown; .204/.205 (the oldest two of the five) must
+    // be truncated.
+    assert!(
+        body.contains("203.0.113.201"),
+        "newest submission missing: {body}"
+    );
+    assert!(
+        body.contains("203.0.113.202"),
+        "2nd-newest submission missing: {body}"
+    );
+    assert!(
+        body.contains("203.0.113.203"),
+        "3rd-newest submission missing: {body}"
+    );
+    assert!(
+        !body.contains("203.0.113.204"),
+        "4th-newest submission must be truncated from the compact table: {body}"
+    );
+    assert!(
+        !body.contains("203.0.113.205"),
+        "5th-newest (oldest) submission must be truncated from the compact table: {body}"
+    );
+}
+
+// --- queue ---
+
+#[sqlx::test(migrations = false)]
+async fn queue_lists_pending_entries(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.20", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("203.0.113.20"), "pending IP missing: {body}");
+    assert!(body.contains("Approve") && body.contains("Reject") && body.contains("Snooze"));
+    // The rendered tier BADGE TEXT specifically (">Standard<"), not the bare word "standard" -
+    // which trivially also appears in base.html's static `.tier-standard { ... }` CSS rule
+    // regardless of any row's actual data. Caught by rendering a real page and reading the HTML:
+    // the original looser assertion passed even when every row's tier badge showed "-" (decayed to
+    // None) because it was matching the CSS, not the data - see `seed_recommended`'s doc comment.
+    assert!(
+        body.contains(">Standard<"),
+        "no row rendered a Standard tier badge: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_renders_services_probed_and_egress_free_lookup_links(pool: PgPool) {
+    migrate(&pool).await;
+    // Two sensors for one IP: an authenticated SSH session and an unauthenticated VNC (cred-vnc)
+    // hit. The "Services probed" panel must list both, label each service, and reflect the auth
+    // state; the "Network profile" panel must offer the external lookup links and the
+    // not-yet-configured geo placeholder.
+    let start = chrono::Utc::now() - chrono::Duration::seconds(120);
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.70",
+            "ssh",
+            SignalType::SshBruteForce,
+            Protocol::Tcp,
+            true,
+            &start.to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.70",
+            "cred-vnc",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            false,
+            &(start + chrono::Duration::seconds(10)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.70",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    // Services probed: both services, labelled, with the raw sensor shown too.
+    assert!(body.contains("Services probed"), "services panel missing");
+    assert!(
+        body.contains("SSH (22)"),
+        "ssh service label missing: {body}"
+    );
+    assert!(body.contains("VNC (5900)"), "vnc service label missing");
+    assert!(body.contains("cred-vnc"), "raw sensor name missing");
+
+    // Network profile: egress-free external lookups (operator's browser), geo not yet configured.
+    // The href's slashes are HTML-entity-escaped by minijinja's autoescaper (browsers decode them,
+    // so the link works); assert on the un-escaped vendor domains here and leave the exact URL
+    // construction to the `external_lookup_links_build_per_vendor_urls_for_the_ip` unit test.
+    assert!(
+        body.contains("Network profile"),
+        "network profile panel missing"
+    );
+    assert!(body.contains("www.shodan.io"), "shodan lookup link missing");
+    assert!(
+        body.contains("viz.greynoise.io"),
+        "greynoise lookup link missing"
+    );
+    assert!(body.contains("www.abuseipdb.com"), "abuseipdb link missing");
+    assert!(
+        body.contains("www.virustotal.com"),
+        "virustotal link missing"
+    );
+    assert!(
+        body.contains("GeoLite2 database not configured"),
+        "geo placeholder missing"
+    );
+    // Reverse DNS is opt-in (egress): the resolver is disabled in test_state, so the row must not
+    // render at all - no outbound lookup happens unless PROPOLIS_CONSOLE_RDNS_ENABLED is set.
+    assert!(
+        !body.contains("Hostname (rDNS)"),
+        "rDNS row must be hidden when the resolver is disabled (egress-off default)"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_changes_state_verified_via_db(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.30", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/queue/203.0.113.30/approve",
+            format!("csrf_token={csrf_token}&notes=reviewed-ok"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("approved"),
+        "row partial missing new state: {body}"
+    );
+    assert!(body.contains("reviewed-ok"));
+
+    // Verified via DB, not just the HTTP response, per the task's explicit requirement.
+    let row = sqlx::query("SELECT state, notes FROM review_queue WHERE source_ip = $1::inet")
+        .bind("203.0.113.30")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let state: core_scoring::ReviewState = row.get("state");
+    let notes: Option<String> = row.get("notes");
+    assert_eq!(state, core_scoring::ReviewState::Approved);
+    assert_eq!(notes.as_deref(), Some("reviewed-ok"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn delete_purges_scoring_state_but_keeps_the_event_ledger(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.40", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let scored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scored, 1, "precondition: the IP is scored before delete");
+
+    let response = app
+        .oneshot(form_request(
+            "/ip/203.0.113.40/delete",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    // Derived state gone; the append-only, hash-chained event ledger is retained by design.
+    let scored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(scored, 0, "ip_score must be deleted");
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet")
+            .bind("203.0.113.40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 0, "review_queue must be deleted");
+    let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event WHERE source_ip = $1::inet")
+        .bind("203.0.113.40")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        events > 0,
+        "the event ledger must be retained (append-only, hash-chained)"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn delete_rolls_back_all_derived_state_when_the_final_delete_fails(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.41", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission \
+         (source_ip, vendor, idempotency_key, categories, comment) \
+         VALUES ($1::inet, 'test', 'delete-rollback-test', ARRAY['x'], 'test')",
+    )
+    .bind("203.0.113.41")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION reject_ip_score_delete() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected delete failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_ip_score_delete BEFORE DELETE ON ip_score \
+         FOR EACH ROW EXECUTE FUNCTION reject_ip_score_delete()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/ip/203.0.113.41/delete",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    for (table, sql) in [
+        (
+            "ip_score",
+            "SELECT COUNT(*) FROM ip_score WHERE source_ip = $1::inet",
+        ),
+        (
+            "review_queue",
+            "SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet",
+        ),
+        (
+            "vendor_submission",
+            "SELECT COUNT(*) FROM vendor_submission WHERE source_ip = $1::inet",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(sql)
+            .bind("203.0.113.41")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "{table} must survive the rolled-back purge");
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn reject_changes_state(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.31", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/queue/203.0.113.31/reject",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = sqlx::query("SELECT state FROM review_queue WHERE source_ip = $1::inet")
+        .bind("203.0.113.31")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let state: core_scoring::ReviewState = row.get("state");
+    assert_eq!(state, core_scoring::ReviewState::Rejected);
+}
+
+#[sqlx::test(migrations = false)]
+async fn snooze_changes_state(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.32", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/queue/203.0.113.32/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = sqlx::query("SELECT state FROM review_queue WHERE source_ip = $1::inet")
+        .bind("203.0.113.32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let state: core_scoring::ReviewState = row.get("state");
+    assert_eq!(state, core_scoring::ReviewState::Snoozed);
+}
+
+/// The whole snooze round trip through the browser interface: snooze from the pending tab, find
+/// the entry again on the Snoozed tab WITH working controls, and decide it from there. Nothing
+/// re-surfaces a snoozed entry, so this tab is the only route back - a Snoozed tab that only
+/// listed would make "decide later" mean "never".
+#[sqlx::test(migrations = false)]
+async fn a_snoozed_entry_can_be_decided_from_the_snoozed_tab(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.206", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.206/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+
+    // The tab must offer the way out, not just the row.
+    let snoozed_tab = body_text(
+        app.clone()
+            .oneshot(get_request("/queue?tab=snoozed", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(snoozed_tab.contains("203.0.113.206"), "{snoozed_tab}");
+    for action in ["approve", "reject", "unsnooze"] {
+        assert!(
+            snoozed_tab.contains(&format!("/queue/203.0.113.206/{action}")),
+            "the snoozed tab must offer {action}: {snoozed_tab}"
+        );
+    }
+
+    // And the decision made from it must land.
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.206/approve",
+            format!("csrf_token={csrf_token}&from_tab=snoozed"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = sqlx::query("SELECT state FROM review_queue WHERE source_ip = $1::inet")
+        .bind("203.0.113.206")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let decided: core_scoring::ReviewState = row.get("state");
+    assert_eq!(decided, core_scoring::ReviewState::Approved);
+}
+
+/// `unsnooze` puts the entry back in the working queue, which is the other thing the Snoozed tab
+/// has to be able to do: defer now, deal with it alongside the rest later.
+#[sqlx::test(migrations = false)]
+async fn unsnooze_returns_the_entry_to_the_pending_tab(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.207", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.207/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.207/unsnooze",
+            format!("csrf_token={csrf_token}&from_tab=snoozed"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let pending = body_text(
+        app.clone()
+            .oneshot(get_request("/queue", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        pending.contains("203.0.113.207"),
+        "an unsnoozed entry must be back on the pending tab: {pending}"
+    );
+    let snoozed = body_text(
+        app.oneshot(get_request("/queue?tab=snoozed", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !snoozed.contains("203.0.113.207"),
+        "and must have left the snoozed tab: {snoozed}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn unsnooze_without_csrf_token_returns_403(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.208", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/queue/203.0.113.208/unsnooze",
+            "csrf_token=not-the-real-token".to_string(),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// Delist promises to hold "until you say otherwise", so relist has to be a real inverse: the
+/// latch clears and the gates are RE-DERIVED rather than assigned, so an address rejoins the feed
+/// on its current merit and not merely because it was once listed.
+#[sqlx::test(migrations = false)]
+async fn relist_clears_the_latch_and_rederives_the_gates(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.209", 60).await;
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let before: bool =
+        sqlx::query_scalar("SELECT eligible FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.209")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        before,
+        "precondition: a seeded recommended address is eligible"
+    );
+
+    app.clone()
+        .oneshot(form_request(
+            "/ip/203.0.113.209/delist",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT delisted, eligible, recommended_for_vendor FROM ip_score WHERE source_ip = $1::inet",
+    )
+    .bind("203.0.113.209")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.get::<bool, _>("delisted"));
+    assert!(!row.get::<bool, _>("eligible"));
+
+    let response = app
+        .oneshot(form_request(
+            "/ip/203.0.113.209/relist",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let row = sqlx::query(
+        "SELECT delisted, eligible, recommended_for_vendor FROM ip_score WHERE source_ip = $1::inet",
+    )
+    .bind("203.0.113.209")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!row.get::<bool, _>("delisted"), "the latch must be cleared");
+    assert!(
+        row.get::<bool, _>("eligible"),
+        "an address that still passes the gates must be eligible again after a relist"
+    );
+    assert!(
+        row.get::<bool, _>("recommended_for_vendor"),
+        "the recommendation delist cleared must be re-derived, not left false"
+    );
+}
+
+/// An append in flight reads an address's projection and writes it back at commit, so a console
+/// change to `ip_score` that lands in between is overwritten (a delete is undone, a delist loses
+/// its flags). Holding the append lock stands in for a batch mid-transaction: delist, relist and
+/// delete must all wait for it, change nothing while they wait, and complete once it is released.
+#[sqlx::test(migrations = false)]
+async fn delist_relist_and_delete_wait_for_an_append_in_flight(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.211", 60).await;
+    seed_recommended(&pool, "203.0.113.212", 60).await;
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let in_flight = core_scoring::begin_exclusive(&pool).await.unwrap();
+    for (action, ip) in [
+        ("delist", "203.0.113.211"),
+        ("delete", "203.0.113.212"),
+        ("relist", "203.0.113.212"),
+    ] {
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(400),
+            app.clone().oneshot(form_request(
+                &format!("/ip/{ip}/{action}"),
+                format!("csrf_token={csrf_token}"),
+                Some(&cookie_header),
+            )),
+        )
+        .await;
+        assert!(blocked.is_err(), "{action} must wait for the append lock");
+    }
+    let untouched = sqlx::query(
+        "SELECT source_ip::text AS ip, delisted, eligible FROM ip_score ORDER BY source_ip",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(untouched.len(), 2, "a waiting delete must not have deleted");
+    assert!(
+        untouched
+            .iter()
+            .all(|r| !r.get::<bool, _>("delisted") && r.get::<bool, _>("eligible")),
+        "a waiting delist must not have changed the flags"
+    );
+
+    in_flight.commit().await.unwrap();
+    for (action, ip, status) in [
+        ("delist", "203.0.113.211", StatusCode::SEE_OTHER),
+        ("delete", "203.0.113.212", StatusCode::SEE_OTHER),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(form_request(
+                &format!("/ip/{ip}/{action}"),
+                format!("csrf_token={csrf_token}"),
+                Some(&cookie_header),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{action} after release");
+    }
+    let remaining: Vec<(String, bool)> =
+        sqlx::query_as("SELECT source_ip::text, delisted FROM ip_score")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, vec![("203.0.113.211/32".to_string(), true)]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn delist_rolls_back_queue_removal_when_projection_update_fails(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.210", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION reject_delist_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected delist failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_delist_update BEFORE UPDATE ON ip_score \
+         FOR EACH ROW WHEN (NEW.delisted) EXECUTE FUNCTION reject_delist_update()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/ip/203.0.113.210/delist",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet")
+            .bind("203.0.113.210")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let delisted: bool =
+        sqlx::query_scalar("SELECT delisted FROM ip_score WHERE source_ip = $1::inet")
+            .bind("203.0.113.210")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 1, "queue removal must roll back with the update");
+    assert!(!delisted, "the projection must retain its original latch");
+}
+
+#[sqlx::test(migrations = false)]
+async fn relist_rolls_back_latch_clear_when_gate_update_fails(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.211", 60).await;
+    sqlx::query(
+        "UPDATE ip_score SET delisted = TRUE, eligible = FALSE, \
+         recommended_for_vendor = FALSE, recommended_for_blocklist = FALSE \
+         WHERE source_ip = $1::inet",
+    )
+    .bind("203.0.113.211")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION reject_relist_gate_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected relist failure'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_relist_gate_update BEFORE UPDATE ON ip_score \
+         FOR EACH ROW WHEN (NEW.eligible) EXECUTE FUNCTION reject_relist_gate_update()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/ip/203.0.113.211/relist",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let row = sqlx::query("SELECT delisted, eligible FROM ip_score WHERE source_ip = $1::inet")
+        .bind("203.0.113.211")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.get::<bool, _>("delisted"), "latch clear must roll back");
+    assert!(
+        !row.get::<bool, _>("eligible"),
+        "gates must remain unchanged"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn post_without_csrf_token_returns_403(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.33", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/queue/203.0.113.33/approve",
+            "csrf_token=not-the-real-token".to_string(),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // Fails closed: no state change on a rejected CSRF check.
+    let row = sqlx::query("SELECT state FROM review_queue WHERE source_ip = $1::inet")
+        .bind("203.0.113.33")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let state: core_scoring::ReviewState = row.get("state");
+    assert_eq!(state, core_scoring::ReviewState::Pending);
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_sort_by_first_seen_orders_oldest_first(pool: PgPool) {
+    migrate(&pool).await;
+    // Same recipe (same raw score) for both, so the DEFAULT (score) sort ties them; only
+    // `sort=first_seen` distinguishes the order, proving the sort wiring actually runs a
+    // different comparison rather than always returning surface order.
+    seed_recommended(&pool, "203.0.113.40", 60).await; // later (first_seen ~60s ago)
+    seed_recommended(&pool, "203.0.113.41", 3600).await; // earlier (first_seen ~1h ago)
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?sort=first_seen",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    let earlier_pos = body.find("203.0.113.41").expect("earlier IP present");
+    let later_pos = body.find("203.0.113.40").expect("later IP present");
+    assert!(
+        earlier_pos < later_pos,
+        "sort=first_seen must put the earlier-first-seen IP first: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_page_empty_state_is_contextual(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"<p class="empty-line">queue empty - no IPs have crossed the recommendation threshold yet</p>"#
+        ),
+        "expected the contextual empty-queue message: {body}"
+    );
+    assert!(
+        !body.contains("Nothing pending review"),
+        "old empty-state copy must be gone: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_page_table_uses_compact_class(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.42", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<table class="table-compact stack">"#),
+        "expected the queue table to use the compact density class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_tab_bar_marks_the_requested_tab_active(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/queue?tab=approved" class="tab active">Approved</a>"#),
+        "expected the approved tab link to carry the active class: {body}"
+    );
+    assert!(
+        body.contains(r#"<a href="/queue?tab=pending" class="tab ">Pending</a>"#),
+        "expected the pending tab link to render without the active class: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_approved_tab_lists_decided_entries_with_submission_summary(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.60", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    // Decide it via the real approve route (not a raw UPDATE) so `decided_at`/`notes` land
+    // exactly as the operator flow sets them.
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.60/approve",
+            format!("csrf_token={csrf_token}&notes=looks-malicious"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.60")
+    .bind("abuseipdb")
+    .bind("queue-approved-tab-key-1")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.60")
+    .bind("otx")
+    .bind("queue-approved-tab-key-2")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(false)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.60"),
+        "approved IP missing from the approved tab: {body}"
+    );
+    assert!(
+        body.contains("looks-malicious"),
+        "decision notes missing from the approved tab: {body}"
+    );
+    // minijinja auto-escapes "/" to "&#x2f;" in interpolated text - assert the escaped form
+    // actually rendered, matching what the browser (which unescapes it back to "1/2 vendors")
+    // shows the operator.
+    assert!(
+        body.contains("1&#x2f;2 vendors"),
+        "expected the 1-succeeded-of-2 submission summary on the approved tab: {body}"
+    );
+    // Action buttons only make sense for still-open (pending) decisions. Checks the quoted
+    // `class="btn-approve"` markup specifically, not a bare "btn-approve" substring: base_head.html's
+    // static CSS always has a `.btn-approve { ... }` rule on every page regardless of this row's
+    // data, matching the doctrine's own "no discriminating fixture" trap.
+    assert!(
+        !body.contains(r#"class="btn-approve""#)
+            && !body.contains(r#"class="btn-reject""#)
+            && !body.contains(r#"class="btn-snooze""#),
+        "approved tab must not render pending-only action buttons: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_approved_tab_shows_dash_when_no_submissions_yet(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.61", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.61/approve",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=approved",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.61"),
+        "approved IP missing from the approved tab: {body}"
+    );
+    assert!(
+        body.contains(r#"<td data-label="Submissions">-</td>"#),
+        "expected a dash submission summary for an IP with no vendor_submission rows yet: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_rejected_and_snoozed_tabs_list_only_their_own_state(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.62", 60).await;
+    seed_recommended(&pool, "203.0.113.63", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.62/reject",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(form_request(
+            "/queue/203.0.113.63/snooze",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let rejected_body = body_text(
+        app.clone()
+            .oneshot(get_request(
+                "/queue?tab=rejected",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(rejected_body.contains("203.0.113.62"), "{rejected_body}");
+    assert!(!rejected_body.contains("203.0.113.63"), "{rejected_body}");
+
+    let snoozed_body = body_text(
+        app.oneshot(get_request(
+            "/queue?tab=snoozed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(snoozed_body.contains("203.0.113.63"), "{snoozed_body}");
+    assert!(!snoozed_body.contains("203.0.113.62"), "{snoozed_body}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_history_tab_empty_state_names_the_tab(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=rejected",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">no rejected entries yet</p>"#),
+        "expected a tab-specific empty-state message: {body}"
+    );
+}
+
+// --- login ---
+
+#[sqlx::test(migrations = false)]
+async fn login_form_renders(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // `name="password"`, not `type="password"`: base.html's shared CSS has an
+    // `input[type="password"] { ... }` selector present on EVERY page, so asserting on
+    // `type="password"` alone would pass even if login.html's actual `<input>` element were
+    // missing entirely - `name="password"` appears only on the real form field.
+    assert!(body.contains(r#"name="password""#));
+    assert!(body.contains("Sign in"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_with_correct_password_creates_session_and_redirects(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/login",
+            format!("password={TEST_PASSWORD}"),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/");
+    let cookie = extract_session_cookie(&response);
+    assert!(cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_with_wrong_password_rerenders_with_error(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(form_request(
+            "/login",
+            "password=totally-wrong".to_string(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = body_text(response).await;
+    assert!(body.contains("Invalid password"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_rate_limited_after_five_failed_attempts(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    for _ in 0..5 {
+        let response = app
+            .clone()
+            .oneshot(form_request(
+                "/login",
+                "password=totally-wrong".to_string(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let sixth = app
+        .oneshot(form_request(
+            "/login",
+            "password=totally-wrong".to_string(),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// A login spray must be visible to monitoring, not only to the person locked out.
+#[sqlx::test(migrations = false)]
+async fn login_refusals_are_counted_on_metrics(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    for _ in 0..7 {
+        app.clone()
+            .oneshot(form_request(
+                "/login",
+                "password=totally-wrong".to_string(),
+                None,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let body = body_text(app.oneshot(get_request("/metrics", None)).await.unwrap()).await;
+    assert!(
+        body.contains("# TYPE propolis_console_login_refused_per_ip_total counter"),
+        "{body}"
+    );
+    assert!(
+        body.contains("propolis_console_login_refused_per_ip_total 2\n"),
+        "two of seven attempts from one address are past the per-address limit: {body}"
+    );
+    assert!(body.contains("propolis_console_login_refused_global_total 0\n"));
+    assert!(body.contains("propolis_console_login_verify_busy_total 0\n"));
+    assert!(body.contains("# TYPE propolis_console_connections_shed_total counter"));
+    assert!(body.contains("# TYPE propolis_console_body_timeouts_total counter"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_hides_topnav_entirely(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(r#"class="topnav""#),
+        "login page must not render the topnav bar at all: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_shows_version(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="dim login-foot">vtest</p>"#),
+        "expected the login page's own version line: {body}"
+    );
+    assert!(
+        body.contains("propolis vtest - up"),
+        "expected the shared footer status line to show a real version, not blank: {body}"
+    );
+}
+
+// --- logout ---
+
+#[sqlx::test(migrations = false)]
+async fn logout_clears_session_and_redirects(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/logout",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("logout must clear the session cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(set_cookie.starts_with(&format!("{}=", auth::SESSION_COOKIE)));
+    assert!(
+        set_cookie.contains("Max-Age=0"),
+        "expected an immediately-expiring cookie: {set_cookie}"
+    );
+
+    // Verified server-side, not just a client-side cookie clear: the same cookie value must no
+    // longer authenticate a protected route afterward.
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn logout_without_session_redirects_to_login(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/logout", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- shared chrome (nav badge, sign-out, footer) ---
+
+#[sqlx::test(migrations = false)]
+async fn nav_shows_pending_badge_when_reviews_pending(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.80", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<span class="badge">1</span>"#),
+        "expected a pending-count badge on the review queue nav link: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn nav_hides_pending_badge_when_queue_empty(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(r#"class="badge""#),
+        "no pending reviews, so no badge should render: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn authenticated_page_shows_sign_out_and_footer_status(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"href="/logout""#),
+        "missing sign-out link: {body}"
+    );
+    assert!(body.contains("Sign out"));
+    assert!(
+        body.contains(r#"<div class="status-line">propolis v"#),
+        "missing footer status line: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_page_has_no_sign_out_link(pool: PgPool) {
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/login", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Sign out"),
+        "login page must not show a sign-out link before authentication: {body}"
+    );
+}
+
+// --- detail ---
+
+/// A catch-all probe's evidence row names the port it landed on, read from the `local_port` the
+/// sensor framework stamps. The catch-all binds many ports, so without it every probe row reads
+/// the same `-`.
+#[sqlx::test(migrations = false)]
+async fn detail_shows_the_port_a_catchall_probe_arrived_on(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        EventInput::from_signal(
+            "203.0.113.61".parse().unwrap(),
+            None,
+            "catchall".into(),
+            SignalType::CatchallProbe,
+            Protocol::Tcp,
+            false,
+            chrono::Utc::now(),
+            serde_json::json!({ "payload_hex": "", "observed_len": 0, "local_port": 2323 }),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request(
+                "/ip/203.0.113.61",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("port 2323"),
+        "the probe row must name its arrival port: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_shows_events_for_seeded_ip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.50", 60).await;
+    // A distinct signal type from `seed_recommended`'s own fixed recipe (HoneypotLoginAttempt,
+    // SshBruteForce, CatchallProbe), so this event's presence in the rendered page is
+    // attributable specifically to THIS append, not to the seed's baseline events.
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.50",
+            "198.51.100.9",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.50",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("203.0.113.50"),
+        "IP missing from page: {body}"
+    );
+    assert!(
+        body.contains("198.51.100.9"),
+        "per-WAN breakdown missing the seeded WAN IP: {body}"
+    );
+    assert!(
+        body.contains("port scan"),
+        "evidence timeline missing the activity label for the added event: {body}"
+    );
+    assert!(
+        body.contains(">Standard<"),
+        "score summary missing the Standard tier badge: {body}"
+    );
+    assert!(
+        body.contains("honeypot"),
+        "category breakdown missing: {body}"
+    );
+}
+
+/// Inserts one `fetch_attempt` row for `source_ip` plus a matching `sample_analysis` row, joined
+/// via `encode(sha256,'hex')` exactly as `routes::detail`'s `fetch_malware_rows` does -
+/// `crates/console/src/routes/detail.rs`'s doc comment on that function covers why the join goes
+/// through `encode(...)`: `fetch_attempt.sha256` is raw-digest `BYTEA`, `sample_analysis.sha256`
+/// is lowercase-hex `TEXT`. `n` derives both a unique `url_hash` (the table's primary key) and a
+/// unique, valid 64-char lowercase-hex sha256 (`format!("{:064x}", ...)` zero-pads a `u64` into a
+/// full-width hex string, so `hex::decode` on it always succeeds).
+async fn seed_fetch_attempt_with_analysis(
+    pool: &PgPool,
+    n: u32,
+    source_ip: &str,
+    detected: i32,
+    total: i32,
+) -> String {
+    let sha256_hex = format!("{:064x}", 0xdead_beef_u64 + n as u64);
+    let sha256_bytes = hex::decode(&sha256_hex).unwrap();
+    sqlx::query(
+        "INSERT INTO fetch_attempt \
+            (url_hash, url, host, scheme, pinned_ip, source_ip, status, sha256, bytes, last_attempt) \
+         VALUES ($1, $2, $3, 'http', $4, $5::inet, 'success', $6, $7, now())",
+    )
+    .bind(format!("malware-link-test-hash-{n}").into_bytes())
+    .bind(format!(
+        "http://malware-link-test-{n}.example.invalid/payload.bin"
+    ))
+    .bind(format!("malware-link-test-{n}.example.invalid"))
+    .bind("203.0.113.66")
+    .bind(source_ip)
+    .bind(&sha256_bytes)
+    .bind(4300_i32)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) \
+         VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(&sha256_hex)
+    .bind(detected)
+    .bind(total)
+    .bind(format!("https://www.virustotal.com/gui/file/{sha256_hex}"))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sha256_hex
+}
+
+/// A body UPLOADED straight to a sensor (FTP STOR, SCP, ADB push) never goes through the fetcher,
+/// so it has no `fetch_attempt` row. Attribution comes from the event itself, which carries the
+/// sha - a first-party observation, and the strongest link available. This shipped broken: an FTP
+/// attacker uploaded three samples and the panel still read "no samples linked to this address",
+/// because the query only ever asked `fetch_attempt`.
+#[sqlx::test(migrations = false)]
+async fn detail_links_a_directly_uploaded_sample_to_its_uploader(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.81";
+    seed_recommended(&pool, ip, 60).await;
+
+    append_event(
+        &pool,
+        ev_with_session(
+            ip,
+            "ftp",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": "52ec3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233",
+                "sample_orig_name": "info.zip",
+                "sample_size": 1024,
+            }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("52ec3ba075a5"),
+        "the uploaded sample's sha must appear on its uploader's page: {body}"
+    );
+    assert!(
+        body.contains("info.zip"),
+        "the uploaded file name must appear: {body}"
+    );
+    assert!(
+        body.contains("uploaded"),
+        "the row must be labelled as a direct upload, not presented as a fetch: {body}"
+    );
+    assert!(
+        !body.contains("no samples linked to this address"),
+        "the empty state must not render when an upload links to this ip: {body}"
+    );
+}
+
+/// The uploaded arm of the malware panel used to emit one row per EVENT, so an attacker that
+/// re-uploaded the same body enough times filled the 50-row page with one sha and pushed every
+/// other sample it had uploaded off the panel. Rows are one per sha now.
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_groups_repeated_uploads_of_one_sha(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.82";
+    seed_recommended(&pool, ip, 60).await;
+
+    let repeated = "aaaa3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let distinct = "bbbb3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    // The distinct sample first, so every one of the repeats sorts NEWER than it and the
+    // pre-fix query's LIMIT would have dropped it.
+    let base = chrono::Utc::now() - chrono::Duration::minutes(120);
+    let upload = |sha: &str, name: &str, at: chrono::DateTime<chrono::Utc>| {
+        ev_with_session(
+            ip,
+            "ftp",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &at.to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_orig_name": name,
+                "sample_size": 1024,
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    append_event(&pool, upload(distinct, "rare.bin", base))
+        .await
+        .unwrap();
+    for i in 1..=60 {
+        append_event(
+            &pool,
+            upload(repeated, "spam.bin", base + chrono::Duration::seconds(i)),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Scope to the malware panel: the event timeline below it also renders every upload.
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    assert!(
+        panel.contains("bbbb3ba075a5"),
+        "the distinct sample must not be crowded off the panel by repeats of another: {panel}"
+    );
+    // The table cell renders the 12-char short form followed by an ellipsis; the full sha in the
+    // title attribute does not match this string, so this counts rows.
+    assert_eq!(
+        panel.matches("aaaa3ba075a5&hellip;").count(),
+        1,
+        "the repeated sha must render as ONE row, not one per upload: {panel}"
+    );
+}
+
+/// The panel groups every event carrying one sha into a single row, so a reason can only be shown
+/// when the whole group agrees on it. Three cases in one page, because the risk is that a row is
+/// captioned with a reason that is not true of it:
+///   - one reason, recorded consistently -> shown, in words;
+///   - two sessions that ended differently under the same sha -> no reason, not one of the two;
+///   - a capture from before sensors emitted the field -> no reason, and still "incomplete".
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_shows_an_end_reason_only_when_the_whole_group_agrees(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.86";
+    seed_recommended(&pool, ip, 60).await;
+    let agreed = "aaaa11110000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let mixed = "bbbb22220000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let legacy = "cccc33330000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let partial = "dddd55550000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let upload = |sha: &str, reason: Option<&str>| {
+        let mut metadata = serde_json::json!({
+            "sample_sha256": sha,
+            "sample_orig_name": "drop.bin",
+            "sample_size": 512,
+            "wire_size": 512,
+            "truncated": false,
+            "complete": false,
+        });
+        if let Some(r) = reason {
+            metadata["end_reason"] = serde_json::json!(r);
+        }
+        ev_with_session(
+            ip,
+            "telnet",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            metadata,
+            Uuid::now_v7(),
+        )
+    };
+    // Same sha seen twice, ending the same way both times.
+    append_event(&pool, upload(agreed, Some("idle_timeout")))
+        .await
+        .unwrap();
+    append_event(&pool, upload(agreed, Some("idle_timeout")))
+        .await
+        .unwrap();
+    // Same sha, two different endings: neither may caption the row.
+    append_event(&pool, upload(mixed, Some("idle_timeout")))
+        .await
+        .unwrap();
+    append_event(&pool, upload(mixed, Some("transport_error")))
+        .await
+        .unwrap();
+    // A capture recorded before the field existed at all.
+    append_event(&pool, upload(legacy, None)).await.unwrap();
+    // The same body seen once before the field existed and once after. The surviving reason
+    // describes only one of the two sessions, so it cannot caption a row standing for both -
+    // and `count(DISTINCT ...)` alone would not catch this, since NULLs are not counted.
+    append_event(&pool, upload(partial, None)).await.unwrap();
+    append_event(&pool, upload(partial, Some("idle_timeout")))
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let row_of = |sha_short: &str| {
+        let start = panel
+            .find(sha_short)
+            .unwrap_or_else(|| panic!("{sha_short} row: {panel}"));
+        let row_start = panel[..start].rfind("<tr").unwrap_or(0);
+        let row_end = start + panel[start..].find("</tr>").unwrap_or(0);
+        &panel[row_start..row_end]
+    };
+
+    let agreed_row = row_of("aaaa11110000");
+    assert!(
+        agreed_row.contains("incomplete") && agreed_row.contains("idle timeout"),
+        "an agreed reason must be shown in words beside the status: {agreed_row}"
+    );
+
+    let mixed_row = row_of("bbbb22220000");
+    assert!(
+        mixed_row.contains("incomplete"),
+        "the row is still a fragment: {mixed_row}"
+    );
+    assert!(
+        !mixed_row.contains("idle timeout") && !mixed_row.contains("transport error"),
+        "two sessions ended differently, so neither reason describes this row: {mixed_row}"
+    );
+
+    let legacy_row = row_of("cccc33330000");
+    assert!(
+        legacy_row.contains("incomplete"),
+        "a capture predating the field is still incomplete: {legacy_row}"
+    );
+    assert!(
+        !legacy_row.contains('('),
+        "no reason was recorded, so none may be invented: {legacy_row}"
+    );
+
+    let partial_row = row_of("dddd55550000");
+    assert!(
+        partial_row.contains("incomplete"),
+        "the row is still a fragment: {partial_row}"
+    );
+    assert!(
+        !partial_row.contains("idle timeout"),
+        "one of the two sessions behind this row has no recorded reason, so the other one's \
+         cannot stand for both: {partial_row}"
+    );
+}
+
+/// A capture can be BOTH a prefix and unfinished - the telnet capture-budget path is exactly that
+/// - and the status column used to test `truncated` first and return, so the budget case rendered
+/// as merely "truncated" and its incompleteness was invisible on the page.
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_reports_a_capture_that_is_both_truncated_and_unfinished(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let ip = "203.0.113.87";
+    seed_recommended(&pool, ip, 60).await;
+    let sha = "eeee44440000aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    append_event(
+        &pool,
+        ev_with_session(
+            ip,
+            "telnet",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_orig_name": "drop.bin",
+                "sample_size": 512,
+                "wire_size": 4096,
+                "truncated": true,
+                "complete": false,
+                "end_reason": "capture_budget",
+            }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let start = panel.find("eeee44440000").expect("the capture's row");
+    let row_start = panel[..start].rfind("<tr").unwrap_or(0);
+    let row = &panel[row_start..start + panel[start..].find("</tr>").unwrap_or(0)];
+
+    assert!(
+        row.contains("truncated"),
+        "the stored bytes are a prefix: {row}"
+    );
+    assert!(
+        row.contains("incomplete"),
+        "the rest of the payload was never read, and that must not be hidden by 'truncated': {row}"
+    );
+    assert!(
+        row.contains("capture budget"),
+        "the reason the capture stopped belongs beside it: {row}"
+    );
+}
+
+/// An upload whose transfer never finished (FTP stalled, SCP cut before its trailer) carries
+/// `complete: false` but, below the cap, `truncated: false`; the panel keyed on `truncated`
+/// alone and showed the fragment as an ordinary `captured` sample.
+#[sqlx::test(migrations = false)]
+async fn detail_malware_panel_marks_an_incomplete_upload(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.84";
+    seed_recommended(&pool, ip, 60).await;
+    let fragment = "cccc3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let whole = "dddd3ba075a5aabbccddeeff00112233445566778899aabbccddeeff00112233";
+    let upload = |sha: &str, complete: bool| {
+        ev_with_session(
+            ip,
+            "ftp",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_orig_name": "drop.bin",
+                "sample_size": 512,
+                "wire_size": 512,
+                "truncated": false,
+                "complete": complete,
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    append_event(&pool, upload(fragment, false)).await.unwrap();
+    append_event(&pool, upload(whole, true)).await.unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let panel_start = body
+        .find("Malware from this IP")
+        .expect("malware panel heading must render");
+    let panel = &body[panel_start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let row_of = |sha_short: &str| {
+        let start = panel
+            .find(sha_short)
+            .unwrap_or_else(|| panic!("{sha_short} row: {panel}"));
+        let row_start = panel[..start].rfind("<tr").unwrap_or(0);
+        let row_end = start + panel[start..].find("</tr>").unwrap_or(0);
+        &panel[row_start..row_end]
+    };
+    assert!(
+        row_of("cccc3ba075a5").contains("incomplete"),
+        "the fragment must not read as captured: {}",
+        row_of("cccc3ba075a5")
+    );
+    assert!(
+        row_of("dddd3ba075a5").contains("captured")
+            && !row_of("dddd3ba075a5").contains("incomplete"),
+        "{}",
+        row_of("dddd3ba075a5")
+    );
+}
+
+/// `fetch_attempt` credits a URL to its first reporter, so a later attacker fetching the same URL
+/// had a page reading "no samples linked" while the capture and its verdict sat under another
+/// address. The URL panel joins by URL: the later attacker sees the dated capture, a failed fetch
+/// with its reason, and an ftp URL as unsupported rather than silently absent.
+#[sqlx::test(migrations = false)]
+async fn detail_url_panel_links_each_observed_url_to_its_outcome(pool: PgPool) {
+    migrate(&pool).await;
+    let first = "203.0.113.90";
+    let later = "203.0.113.91";
+    seed_recommended(&pool, first, 60).await;
+    seed_recommended(&pool, later, 60).await;
+
+    // The first reporter's fetch succeeded and was scanned.
+    let captured_url = "http://198.51.100.9/bins/x86";
+    let sha256_hex = format!("{:064x}", 0xfeed_u64);
+    sqlx::query(
+        "INSERT INTO fetch_attempt \
+            (url_hash, url, host, scheme, pinned_ip, source_ip, status, sha256, bytes, attempts, \
+             first_seen, last_attempt) \
+         VALUES (sha256(convert_to($1, 'UTF8')), $1, '198.51.100.9', 'http', '198.51.100.9', \
+                 $2::inet, 'success', $3, 306, 1, now() - interval '3 days', \
+                 now() - interval '3 days')",
+    )
+    .bind(captured_url)
+    .bind(first)
+    .bind(hex::decode(&sha256_hex).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) \
+         VALUES ($1, 7, 61, $2, now())",
+    )
+    .bind(&sha256_hex)
+    .bind(format!("https://www.virustotal.com/gui/file/{sha256_hex}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A tftp URL the fetcher gave up on.
+    let dead_url = "tftp://198.51.100.10/x86";
+    sqlx::query(
+        "INSERT INTO fetch_attempt \
+            (url_hash, url, host, scheme, source_ip, status, attempts, last_attempt) \
+         VALUES (sha256(convert_to($1, 'UTF8')), $1, '198.51.100.10', 'tftp', $2::inet, 'dead', \
+                 4, now())",
+    )
+    .bind(dead_url)
+    .bind(later)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let ftp_url = "ftp://198.51.100.11/x86";
+    for url in [captured_url, dead_url, ftp_url] {
+        append_event(
+            &pool,
+            ev_with_session(
+                later,
+                "telnet",
+                SignalType::HoneypotFileDownload,
+                Protocol::Tcp,
+                true,
+                &chrono::Utc::now().to_rfc3339(),
+                serde_json::json!({ "url": url }),
+                Uuid::now_v7(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{later}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let start = body
+        .find("URLs this IP tried to fetch")
+        .expect("url panel heading must render");
+    let panel = &body[start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    let row_of = |needle: &str| {
+        let at = panel
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} row: {panel}"));
+        let row_start = panel[..at].rfind("<tr").unwrap_or(0);
+        let row_end = at + panel[at..].find("</tr>").unwrap_or(0);
+        &panel[row_start..row_end]
+    };
+    // minijinja escapes `/` in cell text, so rows are located by their host.
+    let captured = row_of("198.51.100.9&#x2f;bins");
+    assert!(
+        captured.contains("captured 20"),
+        "dated capture: {captured}"
+    );
+    assert!(
+        captured.contains(&format!("/ip/{first}")),
+        "credited to the first reporter: {captured}"
+    );
+    assert!(captured.contains("7/61 detected"), "{captured}");
+    assert!(captured.contains(&sha256_hex[..12]), "{captured}");
+    let dead = row_of("198.51.100.10&#x2f;x86");
+    assert!(dead.contains("dead"), "failed with its status: {dead}");
+    assert!(
+        !dead.contains("/ip/"),
+        "queued by this address, no cross-link: {dead}"
+    );
+    let ftp = row_of("198.51.100.11&#x2f;x86");
+    assert!(
+        ftp.contains("unsupported scheme (ftp)"),
+        "ftp is outside the fetcher by design: {ftp}"
+    );
+    // The first-reporter panel above still does not credit the later address with the sample.
+    let malware_start = body.find("Malware from this IP").unwrap();
+    let malware = &body[malware_start..start];
+    // It no longer says "no samples" next to the URL table, but names the sample as reached via
+    // another address's report, never as a row crediting this address.
+    let rows = malware.split("</table>").next().unwrap();
+    assert!(
+        !rows.contains(&sha256_hex[..12]),
+        "the first-reporter panel still credits the capture to the first reporter only: {malware}"
+    );
+    assert!(
+        malware.contains("1 sample via a URL first reported by another address"),
+        "{malware}"
+    );
+    assert!(
+        malware.contains(&sha256_hex[..12]),
+        "the note names the sample: {malware}"
+    );
+}
+
+/// Zero detections is a count, not a verdict: no engine flagged the file, which is not proof it
+/// is harmless. The page used to call such a sample "clean".
+#[sqlx::test(migrations = false)]
+async fn a_zero_detection_sample_is_reported_as_a_count_not_as_clean(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.92", 60).await;
+    seed_fetch_attempt_with_analysis(&pool, 9, "203.0.113.92", 0, 61).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.92",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Scope to the malware panel: the page also embeds minified vendor JS, which contains the
+    // word in unrelated code.
+    let start = body.find("Malware from this IP").expect("malware panel");
+    let panel = &body[start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    assert!(panel.contains("0/61 detections"), "{panel}");
+    assert!(
+        !panel.to_lowercase().contains("clean"),
+        "the panel never calls a zero-detection sample clean: {panel}"
+    );
+}
+
+/// A sample uploaded to VirusTotal but not yet verdicted is stored as `-1/-1`. The samples page
+/// already rendered that as "pending"; the IP page fell through to the clean branch and showed a
+/// green "clean (0/-1)" for a sample nobody has judged yet.
+#[sqlx::test(migrations = false)]
+async fn detail_renders_a_pending_vt_upload_as_pending_not_clean(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.83", 60).await;
+    seed_fetch_attempt_with_analysis(&pool, 2, "203.0.113.83", -1, -1).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.83",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("rel=\"noopener noreferrer\">pending</a>"),
+        "a -1 verdict must render as pending: {body}"
+    );
+    assert!(
+        !body.contains("0/-1 detections"),
+        "a -1 verdict must never render as clean: {body}"
+    );
+}
+
+/// A sample VirusTotal was asked about by hash but never sent, because its content is not
+/// executable or script content, is stored as `-2/-2`. It is not pending and not a verdict.
+#[sqlx::test(migrations = false)]
+async fn detail_renders_a_sample_kept_local_for_its_type_as_not_uploaded(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.84", 60).await;
+    seed_fetch_attempt_with_analysis(&pool, 3, "203.0.113.84", -2, -2).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.84",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let start = body.find("Malware from this IP").expect("malware panel");
+    let panel = &body[start..];
+    let panel = &panel[..panel.find("</table>").unwrap_or(panel.len())];
+    assert!(panel.contains("not uploaded (type)"), "{panel}");
+    assert!(!panel.contains(">pending</a>"), "{panel}");
+    assert!(!panel.contains("detections"), "{panel}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_shows_linked_malware_fetched_from_this_ips_urls(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.80", 60).await;
+    let sha256_hex = seed_fetch_attempt_with_analysis(&pool, 1, "203.0.113.80", 12, 70).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.80",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Malware from this IP"),
+        "malware panel heading missing: {body}"
+    );
+    // minijinja's autoescaper HTML-entity-escapes `/` (`&#x2f;`) inside `{{ m.url }}` - assert on
+    // slash-free fragments of the URL rather than the literal string, same reasoning
+    // `detail_renders_services_probed_and_egress_free_lookup_links`'s own doc comment gives for
+    // asserting on the vendor domain rather than the full escaped href.
+    assert!(
+        body.contains("malware-link-test-1.example.invalid"),
+        "fetched url's host missing: {body}"
+    );
+    assert!(
+        body.contains("payload.bin"),
+        "fetched url's path missing: {body}"
+    );
+    assert!(
+        body.contains(&sha256_hex[..12]),
+        "sha256 short form missing: {body}"
+    );
+    assert!(
+        body.contains("12/70 detected"),
+        "VT verdict missing: {body}"
+    );
+    // The panel must keep saying that a FETCHED link is first-reporter-only, so an inference is
+    // never read as a direct observation. Asserted on the substance, not the exact sentence.
+    assert!(
+        body.contains("first to report"),
+        "attribution caveat missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_shows_empty_state_when_no_fetches_link_to_this_ip(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.81", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.81",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("no samples linked to this address"),
+        "malware panel empty state missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_unknown_ip_returns_404(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.99",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.50", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_page_has_neutral_back_link(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.51", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.51",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/ips" data-history-back>&larr; Back</a>"#),
+        "expected a neutral back link (browser history with an /ips fallback), not a hardcoded \
+         'back to queue' that misleads when the page was reached from elsewhere: {body}"
+    );
+}
+
+/// Finding 8 - the drawer contract now lives in one place (the `ip_evidence_link` macro). These
+/// lock in that ordinary IP links carry it on the pages that previously shipped plain links, so the
+/// per-page drift that broke Review/Feed/Search cannot silently return. Dashboard and Feed links are
+/// covered by the assertions in their own tests above; these add the two remaining feasible pages.
+#[sqlx::test(migrations = false)]
+async fn attackers_ip_links_use_the_drawer_contract(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.20", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/ips",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r##"class="insp" href="/ip/203.0.113.20" hx-get="/ip/203.0.113.20?drawer=1" hx-target="#drawer-body" hx-swap="innerHTML" aria-haspopup="dialog""##
+        ),
+        "attackers row IP must render the full drawer contract via the macro: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_pending_ip_links_use_the_drawer_contract(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.20", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/queue",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="insp" href="/ip/203.0.113.20" hx-get="/ip/203.0.113.20?drawer=1""#),
+        "review-queue row IP must use the drawer contract, not a plain full-page link: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_page_tables_use_compact_class(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.52", 60).await;
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.52",
+            "198.51.100.20",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.52")
+    .bind("abuseipdb")
+    .bind("detail-table-compact-key")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.52",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let table_open_count = body.matches("<table").count();
+    let compact_count = body.matches(r#"<table class="table-compact">"#).count();
+    // The evidence timeline intentionally uses its own `evidence-table` class rather than
+    // `table-compact` (task 3's session-card redesign - `internal/design/11-console-forensics.md`,
+    // "Template: session cards"): this fixture's events all carry `session_id = None`
+    // (`ev`/`ev_with_wan` pass `None`), so they render as exactly one "Ungrouped events" table.
+    let evidence_count = body.matches(r#"<table class="evidence-table">"#).count();
+    assert!(
+        table_open_count >= 5,
+        "expected all 5 detail-page tables to render for this fixture: {body}"
+    );
+    assert_eq!(
+        table_open_count,
+        compact_count + evidence_count,
+        "every table on the detail page must use either the compact density class or the evidence-table class: {body}"
+    );
+    assert_eq!(
+        evidence_count, 1,
+        "expected exactly one evidence table for the fixture's ungrouped events: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_row_shows_relative_time(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.53", 60).await;
+    append_event(
+        &pool,
+        ev_with_wan(
+            "203.0.113.53",
+            "198.51.100.21",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            true,
+            &(chrono::Utc::now() - chrono::Duration::seconds(90)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.53",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<td class="seen dim">1m ago</td>"#),
+        "expected the evidence timeline to show a relative-time column: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_ip_timeline_chart_reflects_daily_event_counts(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.54", 60).await;
+    // A distinct event exactly 6 days before now: the OLDEST of the chart's 7 daily buckets
+    // (`current_date - 6 days`), the far boundary of the window.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.54",
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            &(chrono::Utc::now() - chrono::Duration::days(6)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.54",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<canvas id="chart-ip-timeline""#),
+        "IP timeline chart canvas missing: {body}"
+    );
+    // Chart data is in <script type="application/json"> elements (HTML-escaped by minijinja).
+    // The browser's .textContent unescapes them; we verify the data elements are present.
+    assert!(
+        body.contains(r#"id="ip-timeline-labels">"#) && body.contains(r#"id="ip-timeline-data">"#),
+        "IP timeline chart data elements missing: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_groups_events_sharing_session_id_into_an_expanded_session_card(pool: PgPool) {
+    migrate(&pool).await;
+    let start = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let session_id = Uuid::now_v7();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.60",
+            "ssh-sensor",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &start.to_rfc3339(),
+            serde_json::json!({ "username": "root" }),
+            session_id,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.60",
+            "ssh-sensor",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &(start + chrono::Duration::seconds(5)).to_rfc3339(),
+            serde_json::json!({ "command": "whoami" }),
+            session_id,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.60",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Matched by structure, not by the exact attribute string: the card later gained an `id` for
+    // deep-linking, which silently broke an exact-text assertion while the behaviour it guards was
+    // never affected. Assert that the card's opening tag carries `open`, and let the rest of the
+    // tag change freely.
+    let card_tag = body
+        .split_once(r#"<details class="session-card""#)
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(tag, _)| tag)
+        .expect("expected a session card to render");
+    assert!(
+        card_tag.contains("open"),
+        "expected the sole (most-recent) session card to render expanded, tag was: {card_tag}"
+    );
+    assert!(
+        body.contains(r#"<span class="session-user mono">user: root</span>"#),
+        "expected the session header to show the credential used: {body}"
+    );
+    assert!(
+        body.contains(r#"<td class="mono">whoami</td>"#),
+        "expected the command-exec event row to show the command in its Detail column: {body}"
+    );
+    assert!(
+        body.contains("2 events"),
+        "expected the session header to show the event count: {body}"
+    );
+    assert!(
+        !body.contains("Ungrouped events"),
+        "no event in this fixture lacks a session_id, so no ungrouped section should render: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_mixes_session_cards_with_ungrouped_events(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.61",
+            "ssh-sensor",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &now.to_rfc3339(),
+            serde_json::json!({ "protocol_label": "ssh" }),
+            Uuid::now_v7(),
+        ),
+    )
+    .await
+    .unwrap();
+    // Pre-existing data from before session tracking: no session_id.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.61",
+            "catchall-sensor",
+            SignalType::CatchallProbe,
+            Protocol::Udp,
+            false,
+            &(now - chrono::Duration::seconds(120)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.61",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="session-card""#),
+        "expected the session-tagged event to render as a session card: {body}"
+    );
+    assert!(
+        body.contains("Ungrouped events"),
+        "expected the pre-session-tracking event to render in the Ungrouped events section: {body}"
+    );
+}
+
+/// Extracts the `?cursor=...` value from a "Load more" button's `hx-get` attribute in a rendered
+/// detail page or events fragment - `routes::detail::format_cursor`'s output, HTML-attribute
+/// position. Colons, dots, and commas are never HTML-escaped by minijinja (only
+/// `< > & " ' /`), so the raw cursor string appears verbatim between `cursor=` and the closing
+/// quote - no unescaping needed.
+fn extract_next_cursor(body: &str, ip: &str) -> String {
+    let marker = format!("/ip/{ip}/events?cursor=");
+    let start = body
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no Load more button (cursor href) found in body: {body}"))
+        + marker.len();
+    let rest = &body[start..];
+    let end = rest
+        .find('"')
+        .expect("cursor value in hx-get attribute must be quoted");
+    rest[..end].to_string()
+}
+
+// --- detail: evidence timeline pagination (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_timeline_paginates_past_the_first_page(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.70";
+    let now = chrono::Utc::now();
+    // 205 events, strictly increasing timestamps (index 0 oldest, index 204 newest, one second
+    // apart) - 5 more than `EVIDENCE_PAGE_SIZE` (200, `routes::detail`'s private constant; mirrored
+    // here as a literal since it is not part of this crate's public API). The first page (`GET
+    // /ip/{ip}`) must show only the newest 200 (indices 5..=204); the remaining 5 oldest
+    // (indices 0..=4) must appear only via the "Load more" fragment.
+    for i in 0..205i64 {
+        let session_id = Uuid::now_v7();
+        append_event(
+            &pool,
+            ev_with_session(
+                ip,
+                "ssh-sensor",
+                SignalType::HoneypotCommandExec,
+                Protocol::Tcp,
+                true,
+                &(now - chrono::Duration::seconds(205 - i)).to_rfc3339(),
+                // The `-end` suffix guards against substring false-positives: without it,
+                // `pg-marker-4` is itself a substring of `pg-marker-40`..`pg-marker-49`, so a
+                // `!body.contains("pg-marker-4")` assertion would wrongly fail as soon as any of
+                // those (all on the first page) rendered.
+                serde_json::json!({ "command": format!("pg-marker-{i}-end") }),
+                session_id,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    let first_page = app
+        .clone()
+        .oneshot(get_request(&format!("/ip/{ip}"), Some(&cookie_header)))
+        .await
+        .unwrap();
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_body = body_text(first_page).await;
+    assert!(
+        first_body.contains("pg-marker-204-end"),
+        "newest event must be on the first page: {first_body}"
+    );
+    assert!(
+        !first_body.contains("pg-marker-4-end"),
+        "the 5 oldest events must NOT be on the first page: {first_body}"
+    );
+    assert!(
+        first_body.contains(r#"id="load-more-container""#),
+        "expected a Load more container when more than 200 events exist: {first_body}"
+    );
+
+    let cursor = extract_next_cursor(&first_body, ip);
+    let second_page = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}/events?cursor={cursor}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_page.status(), StatusCode::OK);
+    let second_body = body_text(second_page).await;
+    for i in 0..5 {
+        assert!(
+            second_body.contains(&format!("pg-marker-{i}-end")),
+            "expected the 5 oldest events (index {i}) on the second page: {second_body}"
+        );
+    }
+    assert!(
+        !second_body.contains("pg-marker-204-end"),
+        "the newest (first-page) event must not be re-sent on the second page: {second_body}"
+    );
+    assert!(
+        !second_body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {second_body}"
+    );
+    // Exactly 205 events total, so the second page (5 rows) is the last one: its own "Load more"
+    // out-of-band swap must be empty, not a fresh button.
+    assert!(
+        !second_body.contains("class=\"load-more\""),
+        "the last page must not offer a further Load more button: {second_body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_evidence_timeline_omits_load_more_under_the_page_size(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.71", 60).await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.71",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("class=\"load-more\""),
+        "fewer than 200 events must not show a Load more button: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn events_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.72/events", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn events_fragment_malformed_cursor_returns_an_empty_fragment(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.73", 60).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.73/events?cursor=not-a-valid-cursor",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    // Fails closed (`routes::detail::events_fragment`'s doc comment): a malformed cursor never
+    // guesses a start point, it returns an empty 200 rather than a 500 or leaking the wrong page.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert_eq!(body, "", "a malformed cursor must yield an empty fragment");
+}
+
+// --- detail: adjustable chart time range (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_24h_range_returns_hourly_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.74";
+    append_event(
+        &pool,
+        ev(
+            ip,
+            "catchall-sensor",
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            &format!("/ip/{ip}/chart?range=24h"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per hour, last 24 hours""#),
+        "expected the 24h range's hourly aria-label: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="chart-ip-timeline""#),
+        "chart canvas missing from the range fragment: {body}"
+    );
+    assert!(
+        !body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_unknown_range_falls_back_to_7d(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.75", 60).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/ip/203.0.113.75/chart?range=not-a-real-range",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per day, last 7 days""#),
+        "an unrecognized range must fall back to the page's own 7d default: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_chart_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/ip/203.0.113.76/chart?range=24h", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- dashboard: adjustable chart time range (console-forensics task 4) ---
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_1h_range_returns_five_minute_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.77",
+            "cowrie",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/dashboard/chart?range=1h",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per 5 minutes, last hour""#),
+        "expected the 1h range's five-minute aria-label: {body}"
+    );
+    assert!(
+        body.contains(r#"<canvas id="timelineChart""#),
+        "chart canvas missing from the range fragment: {body}"
+    );
+    assert!(
+        !body.contains("<!doctype html>"),
+        "an HTMX fragment must not carry the full base-page wrapper: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_30d_range_returns_daily_buckets(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/dashboard/chart?range=30d",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"aria-label="Events per day, last 30 days""#),
+        "expected the 30d range's daily aria-label: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_chart_fragment_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/dashboard/chart?range=24h", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- feed ---
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_disabled_empty_state_when_unconfigured(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed builder is disabled on this node</p>"#),
+        "expected the disabled-feed empty state when feed_output_dir is unconfigured: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_awaiting_first_build_when_configured_but_no_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // No manifest.json written: the directory is configured but no build has run yet.
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed enabled - awaiting first build</p>"#),
+        "expected the awaiting-first-build empty state when configured but no manifest exists: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_reads_manifest_correctly(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":2,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Manifest times render in the console's own "YYYY-MM-DD HH:MM UTC" form, never raw RFC 3339.
+    assert!(
+        body.contains("2026-07-29 14:00 UTC"),
+        "missing build time: {body}"
+    );
+    assert!(
+        body.contains(r#"class="mono">3</td>"#),
+        "missing aggressive count: {body}"
+    );
+    assert!(
+        body.contains(r#"class="mono">11</td>"#),
+        "missing standard count: {body}"
+    );
+    assert!(
+        body.contains("2026-07-30 14:00 UTC") && body.contains("2026-07-31 14:00 UTC"),
+        "missing tier valid_until: {body}"
+    );
+    assert!(
+        body.contains("2026-08-05 14:00 UTC"),
+        "missing retention window valid_until: {body}"
+    );
+    assert!(
+        !body.contains("T14:00:00Z"),
+        "a raw RFC 3339 manifest time reached the page: {body}"
+    );
+    // A manifest from before the exclusions field existed still parses (serde default) and renders
+    // ASN suppression as off rather than collapsing the page.
+    assert!(
+        body.contains("Exclusions"),
+        "exclusions panel missing: {body}"
+    );
+    assert!(
+        body.contains(">off<"),
+        "an absent exclusions block should render ASN suppression off: {body}"
+    );
+    // The status tab with a build is the one page the shared panel test cannot reach (it needs a
+    // published manifest), so it is checked here: one table density, nothing flush in a panel.
+    markup::assert_panels(&body);
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_page_shows_asn_suppression_active_and_inert_states(pool: PgPool) {
+    migrate(&pool).await;
+
+    // Active: 3 ASNs configured and the GeoLite2-ASN database loaded.
+    let active = tempfile::tempdir().unwrap();
+    std::fs::write(
+        active.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":3,"sha256":"a","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":11,"sha256":"b","valid_until":"2026-07-31T14:00:00Z"}},"exclusions":{"allowlist_count":2,"delist_count":1,"asn_allowlist_count":3,"asn_db_loaded":true}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_feed_dir(pool.clone(), Some(active.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let body = body_text(
+        app.oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("3 ASNs active"),
+        "active ASN state missing: {body}"
+    );
+    assert!(
+        body.contains("2 ranges"),
+        "CIDR allowlist count missing: {body}"
+    );
+
+    // Inert: ASNs configured but the database did not load - must be flagged, not shown as active.
+    let inert = tempfile::tempdir().unwrap();
+    std::fs::write(
+        inert.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":0,"sha256":"a","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":0,"sha256":"b","valid_until":"2026-07-31T14:00:00Z"}},"exclusions":{"allowlist_count":0,"delist_count":0,"asn_allowlist_count":3,"asn_db_loaded":false}}"#,
+    )
+    .unwrap();
+    let state = test_state_with_feed_dir(pool, Some(inert.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let body = body_text(
+        app.oneshot(get_request(
+            "/feed",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        body.contains("inert"),
+        "inert ASN state not flagged: {body}"
+    );
+    assert!(
+        !body.contains("3 ASNs active"),
+        "an unloaded database must not render as active: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/feed", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+/// Writes a published feed export the entries tab can read back, in the shape
+/// `feed::export::export_json` produces.
+fn write_published_feed(dir: &std::path::Path, name: &str, entries: &str) {
+    std::fs::write(
+        dir.join(format!("{name}.json")),
+        format!(
+            r#"{{"meta":{{"generator":"propolis","tier":"{name}","generated":"2026-07-29T14:00:00Z","valid_until":"2026-07-31T14:00:00Z","count":0}},"entries":[{entries}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_entries_tab_lists_what_was_published_not_a_fresh_derivation(pool: PgPool) {
+    migrate(&pool).await;
+    // The database deliberately DISAGREES with the published files: an approved, recommended
+    // address that is not in any published feed, and published addresses with no database rows at
+    // all. The old implementation re-derived this tab from exactly these tables and so disagreed
+    // with the files it claimed to describe - the 8-vs-7 mismatch. The page must report the
+    // published feed, so the database's opinion must not appear here.
+    seed_recommended(&pool, "203.0.113.99", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    ReviewQueue::new()
+        .approve(&pool, "203.0.113.99".parse().unwrap(), None)
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":1,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":1,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":2,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
+    )
+    .unwrap();
+    write_published_feed(
+        tmp.path(),
+        "aggressive",
+        r#"{"ip":"203.0.113.70","first_seen":"2026-07-20T10:00:00Z","last_seen":"2026-07-29T13:00:00Z","categories":3,"events":47,"signals":["honeypot_malware_upload","ssh_brute_force"]}"#,
+    );
+    write_published_feed(
+        tmp.path(),
+        "standard",
+        r#"{"ip":"203.0.113.71","first_seen":"2026-07-21T10:00:00Z","last_seen":"2026-07-28T13:00:00Z","categories":2,"events":12,"signals":["port_scan"]}"#,
+    );
+    write_published_feed(
+        tmp.path(),
+        "all-7d",
+        r#"{"ip":"203.0.113.72","first_seen":"2026-07-22T10:00:00Z","last_seen":"2026-07-27T13:00:00Z","categories":1,"events":5,"signals":["catchall_probe"]}"#,
+    );
+
+    let state = test_state_with_feed_dir(pool.clone(), Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed?tab=entries",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    for ip in ["203.0.113.70", "203.0.113.71", "203.0.113.72"] {
+        assert!(
+            body.contains(&format!(
+                r#"<a class="insp" href="/ip/{ip}" hx-get="/ip/{ip}?drawer=1""#
+            )),
+            "published address {ip} missing a drawer link: {body}"
+        );
+    }
+    assert!(
+        !body.contains("203.0.113.99"),
+        "an approved address absent from the published files must NOT be listed: {body}"
+    );
+
+    // Each address under the panel for the file it was actually published in.
+    let agg = body.find("Aggressive tier").expect("aggressive panel");
+    let std_p = body.find("Standard tier").expect("standard panel");
+    let win = body.find("Last 7d").expect("retention panel");
+    assert!(body.find("203.0.113.70").unwrap() > agg);
+    assert!(body.find("203.0.113.71").unwrap() > std_p);
+    assert!(body.find("203.0.113.72").unwrap() > win);
+
+    // Activity labels are what make an entry actionable, so they must reach the page.
+    assert!(
+        body.contains("honeypot_malware_upload, ssh_brute_force"),
+        "activity labels missing: {body}"
+    );
+    markup::assert_panels(&body);
+    assert_eq!(markup::stack_violations(&body), Vec::<String>::new());
+}
+
+/// A tier longer than one load shows its true size and loads every address once, in the file's
+/// order; the endpoint reads only files the manifest names, and a rebuild that drops the last
+/// address shown is reported rather than restarting the list.
+#[sqlx::test(migrations = false)]
+async fn feed_entries_load_every_published_address_once(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":1201,"sha256":"deadbeef","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":0,"sha256":"cafef00d","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"7d","count":0,"sha256":"f00d","valid_until":"2026-08-05T14:00:00Z"}]}"#,
+    )
+    .unwrap();
+    let published: Vec<String> = (0..1201)
+        .map(|i| format!("10.7.{}.{}", i / 256, i % 256))
+        .collect();
+    let entries: Vec<String> = published
+        .iter()
+        .map(|ip| {
+            format!(
+                r#"{{"ip":"{ip}","first_seen":"2026-07-20T10:00:00Z","last_seen":"2026-07-29T13:00:00Z","categories":1,"events":3,"signals":["port_scan"]}}"#
+            )
+        })
+        .collect();
+    write_published_feed(tmp.path(), "aggressive", &entries.join(","));
+    write_published_feed(tmp.path(), "standard", "");
+    write_published_feed(tmp.path(), "all-7d", "");
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let listed = |body: &str| -> Vec<String> {
+        body.split(r#"<td class="ip stack-lead"><a class="insp" href="/ip/"#)
+            .skip(1)
+            .map(|r| r[..r.find('"').unwrap()].to_string())
+            .collect()
+    };
+    let load_more = |body: &str| -> Option<String> {
+        let at = body.find("<button hx-get=\"/feed/entries/aggressive?")? + 16;
+        Some(body[at..at + body[at..].find('"')?].to_string())
+    };
+
+    let (status, page) = get_page(state.clone(), "/feed?tab=entries").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains("Aggressive tier <span class=\"dim\">(1,201)</span>"),
+        "{page}"
+    );
+    let mut seen = listed(&page);
+    assert_eq!(seen.len(), 500);
+    let mut next = load_more(&page).expect("a second load");
+    loop {
+        let (status, more) = get_page(state.clone(), &next).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            more.contains("id=\"more-aggressive\" hx-swap-oob=\"true\""),
+            "{more}"
+        );
+        seen.extend(listed(&more));
+        match load_more(&more) {
+            Some(url) => next = url,
+            None => break,
+        }
+    }
+    assert_eq!(seen, published, "every address once, in the file's order");
+    markup::assert_panels(&page);
+
+    for name in ["manifest", "..%2Fmanifest", "all-30d", "aggressive.json"] {
+        let (status, _) = get_page(
+            state.clone(),
+            &format!("/feed/entries/{name}?after=10.7.0.0"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
+    }
+    let (status, lost) = get_page(state, "/feed/entries/aggressive?after=192.0.2.1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        lost.contains("no longer in it. Reload to continue."),
+        "{lost}"
+    );
+    assert!(listed(&lost).is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_entries_tab_shows_awaiting_build_state_when_no_manifest(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // No manifest.json written and no entries approved: entries tab must show the same
+    // "awaiting first build" empty state as the status tab, per the design's framing of this tab
+    // as listing "the actual IPs in the current published feed" - there is no published feed yet.
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed?tab=entries",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">feed enabled - awaiting first build</p>"#),
+        "expected the awaiting-first-build empty state on the entries tab: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_returns_file_content_with_correct_type(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("aggressive.json"), r#"{"entries":[]}"#).unwrap();
+    std::fs::write(tmp.path().join("standard.csv"), "ip,score\n").unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/aggressive/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let body = body_text(response).await;
+    assert_eq!(body, r#"{"entries":[]}"#);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/standard/csv",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
+    let body = body_text(response).await;
+    assert_eq!(body, "ip,score\n");
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_404s_when_feed_disabled(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/aggressive/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_serves_retention_feeds_but_refuses_anything_path_shaped(pool: PgPool) {
+    // The retention feeds are operator-configured, so the accepted names cannot be a literal list
+    // and are matched by shape instead. Every rejected name below names a file that ACTUALLY
+    // EXISTS in the feed directory, so the name check is the only thing standing between the
+    // request and a 200 - a rejected name that happens to match no file would 404 either way and
+    // would prove nothing about the guard.
+    migrate(&pool).await;
+    let feed_dir = tempfile::tempdir().unwrap();
+    let feed_dir = feed_dir.path();
+    std::fs::write(feed_dir.join("all-90d.txt"), "203.0.113.7\n").unwrap();
+    for decoy in [
+        // Written by the publisher itself, but not a feed anyone should be able to pull.
+        "manifest.txt",
+        // Plausible neighbours in the same directory.
+        "secret.txt",
+        "all-.txt",
+        "all-.txt.txt",
+        "all-90.txt",
+        "all-90x.txt",
+        "all-9.0d.txt",
+        "aggressive..txt",
+    ] {
+        std::fs::write(feed_dir.join(decoy), "must not be served").unwrap();
+    }
+
+    let state = test_state_with_feed_dir(pool, Some(feed_dir.to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let cookie_hdr = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    let response = app
+        .clone()
+        .oneshot(get_request("/feed/download/all-90d/txt", Some(&cookie_hdr)))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a configured retention feed must be downloadable"
+    );
+
+    for name in [
+        "manifest",
+        "secret",
+        "all-",
+        "all-.txt",
+        "all-90",
+        "all-90x",
+        "all-9.0d",
+        "aggressive.",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(get_request(
+                &format!("/feed/download/{name}/txt"),
+                Some(&cookie_hdr),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{name:?} names a real file on disk and must still be refused"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn feed_download_404s_on_unknown_tier_or_format(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("aggressive.json"), "{}").unwrap();
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/nonsense/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(get_request(
+            "/feed/download/aggressive/exe",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The manifest exists but this particular file was never written (e.g. a build that failed
+    // partway) - still 404, not a 503 or a panic.
+    let response = app
+        .oneshot(get_request(
+            "/feed/download/standard/json",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// --- metrics ---
+
+#[sqlx::test(migrations = false)]
+async fn metrics_returns_prometheus_text_format(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.60", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    // No session cookie at all: a Prometheus scraper cannot complete an interactive login.
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = body_text(response).await;
+    assert!(body.contains("# TYPE propolis_ips_scored gauge"));
+    assert!(
+        body.contains("propolis_ips_scored 1\n"),
+        "expected exactly one scored IP: {body}"
+    );
+    assert!(
+        body.contains("propolis_review_queue_pending 1\n"),
+        "expected exactly one pending review entry: {body}"
+    );
+    assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
+}
+
+/// The four address gauges come from one statement, so each must keep counting its own flag:
+/// the counts below are all different, and one row sets none of them.
+#[sqlx::test(migrations = false)]
+async fn metrics_counts_each_address_flag_on_its_own(pool: PgPool) {
+    migrate(&pool).await;
+    for (i, (eligible, vendor, blocklist)) in [
+        (true, true, true),
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+        (false, false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, \
+                 event_count, distinct_categories, has_confirmed_real, distinct_wan_count, \
+                 distinct_sensor_count, first_seen, last_seen, eligible, recommended_for_vendor, \
+                 recommended_for_blocklist) \
+             VALUES ($1::inet, 10, now(), 0.5, 1, 1, false, 1, 1, now(), now(), $2, $3, $4)",
+        )
+        .bind(format!("203.0.113.{}", 70 + i))
+        .bind(eligible)
+        .bind(vendor)
+        .bind(blocklist)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let response = test_app(test_state(pool))
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    for (metric, count) in [
+        ("propolis_ips_scored", 5),
+        ("propolis_ips_eligible", 3),
+        ("propolis_ips_recommended_vendor", 2),
+        ("propolis_ips_recommended_blocklist", 1),
+    ] {
+        assert!(
+            body.contains(&format!("{metric} {count}\n")),
+            "{metric}: {body}"
+        );
+    }
+}
+
+/// The shell reply table is the one store with no per-source bound, so its size is on /metrics:
+/// a row estimate and the on-disk size, read from the catalog rather than counted.
+#[sqlx::test(migrations = false)]
+async fn metrics_reports_the_shell_reply_table_size(pool: PgPool) {
+    migrate(&pool).await;
+    let replies: Vec<(String, String)> = (0..25)
+        .map(|i| {
+            let text = format!("reply number {i}");
+            (core_scoring::output_digest(&text), text)
+        })
+        .collect();
+    core_scoring::store_outputs(&pool, &replies).await.unwrap();
+    sqlx::query("ANALYZE shell_output")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = test_app(test_state(pool))
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+    let body = body_text(response).await;
+    assert!(
+        body.contains("# TYPE propolis_shell_output_rows gauge"),
+        "{body}"
+    );
+    assert!(body.contains("propolis_shell_output_rows 25\n"), "{body}");
+    let bytes: i64 = body
+        .lines()
+        .find_map(|l| l.strip_prefix("propolis_shell_output_bytes "))
+        .expect("bytes gauge present")
+        .parse()
+        .unwrap();
+    assert!(bytes > 0, "{body}");
+}
+
+/// The malware pipeline used to be invisible to /metrics: a scanner or fetcher alive but no
+/// longer verdicting or retiring urls looked identical to a healthy one. Queue depth by stage and
+/// the age of the oldest waiting item are what make that visible.
+#[sqlx::test(migrations = false)]
+async fn metrics_report_malware_pipeline_depth_and_oldest_age(pool: PgPool) {
+    migrate(&pool).await;
+    seed_fetch_attempt(&pool, 1, "pending").await;
+    seed_fetch_attempt(&pool, 2, "pending").await;
+    seed_fetch_attempt(&pool, 3, "dead").await;
+    // Back-date one pending url so the oldest-age gauge has something to measure.
+    sqlx::query(
+        "UPDATE fetch_attempt SET first_seen = now() - interval '2 hours' \
+         WHERE url_hash = $1",
+    )
+    .bind("fetch-attempt-test-hash-1".as_bytes())
+    .execute(&pool)
+    .await
+    .unwrap();
+    // One VT upload still awaiting its verdict (-1/-1), stamped an hour ago, one verdicted, and
+    // one kept local for its type (-2/-2), stamped three hours ago: older than the pending
+    // upload, so a gauge that counted it as pending would read ~3h instead of ~1h.
+    sqlx::query(
+        "INSERT INTO sample_analysis (sha256, detected, total, vt_link, analyzed_at) VALUES \
+         ($1, -1, -1, '', now() - interval '1 hour'), ($2, 3, 70, '', now()), \
+         ($3, -2, -2, '', now() - interval '3 hours')",
+    )
+    .bind("c".repeat(64))
+    .bind("d".repeat(64))
+    .bind("e".repeat(64))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(test_state(pool));
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(
+        body.contains("propolis_fetch_attempts{status=\"pending\"} 2\n"),
+        "pending fetch depth: {body}"
+    );
+    assert!(
+        body.contains("propolis_fetch_attempts{status=\"dead\"} 1\n"),
+        "dead fetch count: {body}"
+    );
+    let fetch_age = gauge_value(&body, "propolis_fetch_pending_oldest_age_seconds");
+    assert!(
+        (7100..=7300).contains(&fetch_age),
+        "oldest pending fetch should be ~2h old, got {fetch_age}s"
+    );
+    assert!(
+        body.contains("propolis_sample_analysis{state=\"pending\"} 1\n"),
+        "pending analysis: {body}"
+    );
+    assert!(
+        body.contains("propolis_sample_analysis{state=\"scanned\"} 1\n"),
+        "scanned analysis: {body}"
+    );
+    assert!(
+        body.contains("propolis_sample_analysis{state=\"not_uploaded\"} 1\n"),
+        "a -2 row is counted as not uploaded, neither pending nor scanned: {body}"
+    );
+    let vt_age = gauge_value(&body, "propolis_sample_analysis_pending_oldest_age_seconds");
+    assert!(
+        (3500..=3700).contains(&vt_age),
+        "oldest pending VT upload should be ~1h old, got {vt_age}s"
+    );
+}
+
+/// The integer value on the sample line `name value` of a gauge with no labels.
+fn gauge_value(body: &str, name: &str) -> i64 {
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("gauge {name} missing: {body}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[sqlx::test(migrations = false)]
+async fn login_cookie_is_secure_when_behind_a_trusted_proxy(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool);
+    state.trusted_proxy = true;
+    let app = test_app(state);
+
+    // TEST_PEER is loopback, so without trusted_proxy the Secure flag would be dropped. With it,
+    // the cookie must be Secure so it is never sent back over a plaintext hop to the TLS proxy.
+    let req = form_request("/login", format!("password={TEST_PASSWORD}"), None);
+    let response = app.oneshot(req).await.unwrap();
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .expect("a successful login sets the session cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        set_cookie.contains("Secure"),
+        "trusted_proxy must force a Secure session cookie even for a loopback peer: {set_cookie}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_bearer_gate_rejects_without_token_and_accepts_with_it(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool);
+    state.metrics_token = Some(std::sync::Arc::from("s3cr3t-metrics"));
+    let app = test_app(state);
+
+    // Token configured but no Authorization header: 401.
+    let unauth = app
+        .clone()
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // Wrong token: 401.
+    let wrong = Request::builder()
+        .uri("/metrics")
+        .header("authorization", "Bearer wrong")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(wrong).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Correct bearer token: 200.
+    let ok = Request::builder()
+        .uri("/metrics")
+        .header("authorization", "Bearer s3cr3t-metrics")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_includes_vendor_submissions_by_vendor_and_status(pool: PgPool) {
+    migrate(&pool).await;
+    sqlx::query(
+        "INSERT INTO vendor_submission (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6)",
+    )
+    .bind("203.0.113.70")
+    .bind("abuseipdb")
+    .bind("key-1")
+    .bind(vec!["18".to_string()])
+    .bind("test comment")
+    .bind(true)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(
+            r#"propolis_vendor_submissions_total{vendor="abuseipdb",status="success"} 1"#
+        ),
+        "missing vendor submission metric line: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_includes_feed_entries_when_manifest_present(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":4,"sha256":"x","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":9,"sha256":"y","valid_until":"2026-07-31T14:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains(r#"propolis_feed_entries{tier="aggressive"} 4"#));
+    assert!(body.contains(r#"propolis_feed_entries{tier="standard"} 9"#));
+    // 2026-07-29T14:00:00Z as Unix seconds (`date -u -d "2026-07-29T14:00:00Z" +%s`) - an exact
+    // value, not a loose prefix match, so a wrong parse (wrong field, wrong unit) cannot pass by
+    // accident.
+    assert!(
+        body.contains("propolis_feed_last_build_timestamp 1785333600\n"),
+        "missing or wrong last-build-timestamp gauge: {body}"
+    );
+    // A manifest from a build with no retention feeds must not emit the window metric at all,
+    // rather than emitting an empty HELP/TYPE pair with no series under it.
+    assert!(
+        !body.contains("propolis_feed_window_entries"),
+        "window metric must be absent when no windows are configured: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_reports_each_retention_feed_separately_from_the_tiers(pool: PgPool) {
+    // The retention feeds had no metric, so a window that stopped publishing was invisible from
+    // outside the box. They get their own metric rather than another propolis_feed_entries series:
+    // every tiered entry also appears in the windows containing it, so reusing that metric would
+    // make summing it double-count.
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2026-07-29T14:00:00Z","tiers":{"aggressive":{"count":4,"sha256":"x","valid_until":"2026-07-30T14:00:00Z"},"standard":{"count":9,"sha256":"y","valid_until":"2026-07-31T14:00:00Z"}},"windows":[{"label":"24h","count":11,"sha256":"a","valid_until":"2026-07-30T14:00:00Z"},{"label":"90d","count":0,"sha256":"b","valid_until":"2026-10-27T14:00:00Z"}]}"#,
+    )
+    .unwrap();
+
+    let state = test_state_with_feed_dir(pool, Some(tmp.path().to_path_buf()));
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"propolis_feed_window_entries{window="24h"} 11"#),
+        "missing 24h window series: {body}"
+    );
+    // Emitted even at zero: an absent series and a silently-empty feed look the same on a graph,
+    // and the second is the one worth alerting on.
+    assert!(
+        body.contains(r#"propolis_feed_window_entries{window="90d"} 0"#),
+        "an empty window must still report, as a zero: {body}"
+    );
+    // The tier metric is untouched, so existing dashboards keep working.
+    assert!(body.contains(r#"propolis_feed_entries{tier="aggressive"} 4"#));
+}
+
+#[sqlx::test(migrations = false)]
+async fn metrics_omits_feed_entries_when_unconfigured(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+    let response = app.oneshot(get_request("/metrics", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(!body.contains("propolis_feed_entries"));
+}
+
+/// A lagging telnet log as the daemon would report it: 6.6 GB unread, the last appended event 11
+/// days old, its events carrying the sensor name `telnet`.
+fn telnet_eleven_days_behind() -> console::intake_lag::IntakeLagSource {
+    Arc::new(|| {
+        vec![console::intake_lag::IntakeLag {
+            log: "telnet".into(),
+            sensors: vec!["telnet".into()],
+            bytes_behind: 6_600_000_000,
+            oldest_unread_age: Some(std::time::Duration::from_secs(11 * 86_400 + 60)),
+            behind: true,
+        }]
+    })
+}
+
+/// `/metrics` publishes whatever backlog the daemon hands `AppState`, and a process that tails
+/// nothing publishes no lag series at all rather than a reassuring zero.
+#[sqlx::test(migrations = false)]
+async fn metrics_publish_the_intake_backlog_the_daemon_reports(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state(pool.clone());
+    state.intake_lag = telnet_eleven_days_behind();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(body.contains("propolis_intake_bytes_behind{sensor=\"telnet\"} 6600000000\n"));
+    assert!(body.contains("propolis_intake_oldest_unread_age_seconds{sensor=\"telnet\"} 950460\n"));
+
+    let standalone = body_text(
+        test_app(test_state(pool))
+            .oneshot(get_request("/metrics", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    // The quarantine counter is a process total that reads 0 honestly, so it is published
+    // regardless; only the per-log backlog gauges must be absent when nothing is measured.
+    assert!(
+        !standalone.contains("propolis_intake_bytes_behind")
+            && !standalone.contains("propolis_intake_oldest_unread_age_seconds"),
+        "nothing measured must mean no series: {standalone}"
+    );
+}
+
+// --- logs ---
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_renders_snapshot_with_level_based_markup(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    state.log_buffer.push(LogEntry {
+        timestamp: "2026-08-19T00:00:00Z".to_string(),
+        level: "ERROR".to_string(),
+        target: "propolis::intake".to_string(),
+        message: "<script>alert(1)</script>".to_string(),
+        fields: Vec::new(),
+    });
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/logs",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"class="log-line level-error""#),
+        "expected the seeded ERROR entry to render with error-level markup: {body}"
+    );
+    assert!(
+        body.contains("propolis::intake"),
+        "expected the seeded entry's target in the rendered page: {body}"
+    );
+    // minijinja auto-escapes every interpolated value (`templates.rs`'s own doc comment) - a raw
+    // log message containing HTML metacharacters must never reach the page unescaped.
+    assert!(
+        !body.contains("<script>alert"),
+        "log message markup leaked into the page unescaped: {body}"
+    );
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;&#x2f;script&gt;"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app.oneshot(get_request("/logs", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_stream_is_sse_and_broadcasts_pushed_entries(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let log_buffer = state.log_buffer.clone();
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/logs/stream",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "unexpected content-type for the SSE endpoint: {content_type}"
+    );
+
+    // `logs_stream`'s handler subscribes to the broadcast channel synchronously before
+    // returning the response (`routes::logs`'s own doc comment), so by the time `oneshot`
+    // resolves above, the subscription already exists - a push here is guaranteed to reach it,
+    // no race window to paper over with a sleep.
+    log_buffer.push(LogEntry {
+        timestamp: "2026-08-19T00:00:00Z".to_string(),
+        level: "WARN".to_string(),
+        target: "propolis::review".to_string(),
+        message: "queue scan degraded".to_string(),
+        fields: vec![LogField {
+            key: "reason".to_string(),
+            value: "statement timeout".to_string(),
+        }],
+    });
+
+    let mut body = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+        .await
+        .expect("timed out waiting for the first SSE frame")
+        .expect("stream ended before any frame arrived")
+        .expect("error reading SSE frame");
+    let text = String::from_utf8(chunk.to_vec()).unwrap();
+
+    assert!(
+        text.contains(r#""level":"WARN""#),
+        "expected the pushed entry's level in the SSE frame: {text}"
+    );
+    assert!(
+        text.contains(r#""target":"propolis::review""#),
+        "expected the pushed entry's target in the SSE frame: {text}"
+    );
+    assert!(
+        text.contains(r#""message":"queue scan degraded""#),
+        "expected the pushed entry's message in the SSE frame: {text}"
+    );
+    // The live stream carries the structured fields too, or a live line would lose what the
+    // page's first render shows.
+    assert!(
+        text.contains(r#""fields":[{"key":"reason","value":"statement timeout"}]"#),
+        "expected the pushed entry's fields in the SSE frame: {text}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_stream_unauthenticated_redirects_to_login(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request("/logs/stream", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers().get("location").unwrap(), "/login");
+}
+
+// --- samples ---
+
+/// Inserts one minimal `fetch_attempt` row with the given `status` (a raw `FetchStatus::as_str()`
+/// value - `review::fetcher::FetchStatus`). Only the columns the table requires
+/// (`crates/review/migrations/0003_fetch_attempt.sql`: `url_hash`/`url`/`host`/`scheme`/`status`/
+/// `last_attempt`) are set; every other column keeps its schema default, matching how a real
+/// fetch cycle's own `store::insert_pending_if_absent`/`upsert_attempt` populate a row - this test
+/// only needs a distinct, unique `url_hash` per row (the table's primary key) and the `status` the
+/// samples-page status strip groups by.
+async fn seed_fetch_attempt(pool: &PgPool, n: u32, status: &str) {
+    let url = format!("http://malware-fetch-test-{n}.example.invalid/payload.bin");
+    sqlx::query(
+        "INSERT INTO fetch_attempt (url_hash, url, host, scheme, status, last_attempt) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(format!("fetch-attempt-test-hash-{n}").into_bytes())
+    .bind(&url)
+    .bind(format!("malware-fetch-test-{n}.example.invalid"))
+    .bind("http")
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Reads the count under a given status column of the Fetch attempts table: the label's position
+/// among the header cells picks the body cell at the same position, so each label is paired with
+/// ITS OWN count rather than any other column's.
+fn strip_count(body: &str, label: &str) -> i64 {
+    let panel = &body[body
+        .find("Fetch attempts")
+        .unwrap_or_else(|| panic!("no Fetch attempts panel: {body}"))..];
+    let table = &panel[..panel.find("</table>").expect("unclosed fetch table")];
+    let cells = |open: &str, close: &str| -> Vec<String> {
+        table
+            .split(open)
+            .skip(1)
+            .map(|c| c[..c.find(close).unwrap()].to_string())
+            .collect()
+    };
+    let labels = cells("<th class=\"count\">", "</th>");
+    let counts = cells("<td class=\"count\">", "</td>");
+    let at = labels
+        .iter()
+        .position(|l| l == label)
+        .unwrap_or_else(|| panic!("status label {label:?} missing: {table}"));
+    counts[at]
+        .parse()
+        .unwrap_or_else(|_| panic!("non-numeric count under {label:?}: {table}"))
+}
+
+/// The soft-fail policy used to render a failed query as data: "0 events in the ledger", an empty
+/// samples table, "not linked". With the database gone, the page must still render (the policy
+/// stands) but must NAME the panels that are placeholders and must not print a zero it never
+/// measured.
+#[sqlx::test(migrations = false)]
+async fn integrity_page_names_unavailable_panels_instead_of_rendering_zero(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool.clone());
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    pool.close().await;
+
+    let response = app
+        .oneshot(get_request(
+            "/integrity",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "soft-fail policy: the page still renders"
+    );
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Some panels could not be loaded"),
+        "the degraded banner must render: {body}"
+    );
+    assert!(
+        body.contains("event count") && body.contains("pending review count"),
+        "the banner must name both failed panels: {body}"
+    );
+    assert!(
+        body.contains("Event count unavailable"),
+        "the count must render as unavailable, not as a number: {body}"
+    );
+    assert!(
+        !body.contains("0 events in the ledger"),
+        "a failed count must never render as an empty ledger: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn samples_page_names_unavailable_panels_when_the_db_is_down(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool.clone());
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    pool.close().await;
+
+    let response = app
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    for panel in [
+        "sample source IPs",
+        "VirusTotal verdicts",
+        "fetch status counts",
+        "pending review count",
+    ] {
+        assert!(
+            body.contains(panel),
+            "the banner must name the {panel} panel as a placeholder: {body}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn healthy_pages_render_no_degraded_banner(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/integrity",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Some panels could not be loaded"),
+        "no banner when every panel loaded: {body}"
+    );
+    assert!(body.contains("0 events in the ledger"), "{body}");
+}
+
+/// `VERIFY_IN_FLIGHT` is one permit per process, and the tests below share this binary's process:
+/// while one holds the permit the other's verify answers 409. Each takes this lock for its whole
+/// run so they take turns instead of failing about half the time when run in parallel.
+static INTEGRITY_VERIFY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The integrity page's POST starts a full-ledger scan, so it carries the session's CSRF token
+/// like every other console POST. The page must render the token and the route must refuse a
+/// request without the right one.
+#[sqlx::test(migrations = false)]
+async fn integrity_verify_requires_the_session_csrf_token(pool: PgPool) {
+    let _turn = INTEGRITY_VERIFY_TESTS.lock().await;
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let cookie = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state.clone());
+
+    let page = body_text(
+        app.clone()
+            .oneshot(get_request("/integrity", Some(&cookie)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let token = state.sessions.generate_csrf(&session_id).unwrap();
+    assert!(
+        page.contains(&format!(
+            "<input type=\"hidden\" name=\"csrf_token\" value=\"{token}\">"
+        )),
+        "the verify form must carry the session token: {page}"
+    );
+
+    let wrong = app
+        .clone()
+        .oneshot(form_request(
+            "/integrity/verify",
+            "csrf_token=not-the-token".into(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::FORBIDDEN);
+
+    let missing = app
+        .clone()
+        .oneshot(form_request(
+            "/integrity/verify",
+            String::new(),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        missing.status().is_client_error(),
+        "no token must never run the verification: {}",
+        missing.status()
+    );
+
+    let right = app
+        .oneshot(form_request(
+            "/integrity/verify",
+            format!("csrf_token={token}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(right.status(), StatusCode::OK);
+    assert!(body_text(right).await.contains("Chain intact"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn integrity_verify_runs_one_at_a_time(pool: PgPool) {
+    let _turn = INTEGRITY_VERIFY_TESTS.lock().await;
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (session_id, cookie) = state.sessions.create();
+    let cookie = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    let running = console::routes::integrity::VERIFY_IN_FLIGHT
+        .try_acquire()
+        .expect("no verification should be running when this test starts");
+    let busy = app
+        .clone()
+        .oneshot(form_request(
+            "/integrity/verify",
+            format!("csrf_token={token}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    let body = body_text(busy).await;
+    assert!(body.contains("already running"), "{body}");
+    assert!(!body.contains("Chain intact"), "{body}");
+
+    drop(running);
+    let after = app
+        .oneshot(form_request(
+            "/integrity/verify",
+            format!("csrf_token={token}"),
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+}
+
+#[sqlx::test(migrations = false)]
+async fn samples_page_shows_fetch_attempt_status_counts(pool: PgPool) {
+    migrate(&pool).await;
+    seed_fetch_attempt(&pool, 1, "success").await;
+    seed_fetch_attempt(&pool, 2, "success").await;
+    seed_fetch_attempt(&pool, 3, "success").await;
+    seed_fetch_attempt(&pool, 4, "rejected").await;
+    seed_fetch_attempt(&pool, 5, "rejected").await;
+    seed_fetch_attempt(&pool, 6, "timeout").await;
+    seed_fetch_attempt(&pool, 7, "too_big").await;
+    seed_fetch_attempt(&pool, 8, "empty").await;
+    seed_fetch_attempt(&pool, 9, "dead").await;
+    seed_fetch_attempt(&pool, 10, "pending").await;
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("Fetch attempts"),
+        "expected the fetch-attempt status strip panel: {body}"
+    );
+    assert_eq!(strip_count(&body, "Success"), 3);
+    assert_eq!(strip_count(&body, "Rejected"), 2);
+    assert_eq!(strip_count(&body, "Timeout"), 1);
+    assert_eq!(strip_count(&body, "Too big"), 1);
+    assert_eq!(strip_count(&body, "Empty"), 1);
+    assert_eq!(strip_count(&body, "Dead"), 1);
+    assert_eq!(strip_count(&body, "Pending"), 1);
+}
+
+/// The transport query reads the columns migration review/0007 added; a healthy database must
+/// render the samples page with every panel loaded, the transport one included.
+#[sqlx::test(migrations = false)]
+async fn samples_page_loads_the_fetch_transport_panel_on_a_healthy_database(pool: PgPool) {
+    migrate(&pool).await;
+    seed_fetch_attempt_with_analysis(&pool, 1, "203.0.113.9", 0, 70).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let response = test_app(state)
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        !body.contains("Some panels could not be loaded"),
+        "a healthy database must load every samples panel: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn samples_page_keeps_the_fetch_attempts_panel_and_says_it_is_empty(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/samples",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    // Every panel stays and says it is empty, as the IP page's panels do; a panel that vanishes
+    // when empty reads as a page that lost a section.
+    assert!(body.contains("Fetch attempts"), "the panel stays: {body}");
+    assert!(
+        body.contains(r#"<p class="empty-line">no fetch attempts recorded</p>"#),
+        "{body}"
+    );
+    assert!(
+        !body.contains(r#"<th class="count">Success</th>"#),
+        "{body}"
+    );
+}
+
+// ---- routes::fleet (the fleet pane) ----------------------------------------------------------
+//
+// These are the acceptance layer for `/fleet`. The invariant under test throughout is that the
+// page never renders an unknown as health: a listener with no probe row, a probe too old to
+// trust, a disabled feed builder, and a build with no recorded revision must each say what they
+// are, in words, and must not read as `ok`.
+
+fn listener(sensor: &str, protocol: fleet::Proto, port: u16) -> fleet::Listener {
+    fleet::Listener {
+        collector_id: "local".into(),
+        sensor: sensor.into(),
+        protocol,
+        port,
+    }
+}
+
+/// The listener table's own markup, so an assertion cannot be satisfied by a word appearing in the
+/// bundled stylesheet or script.
+fn listener_table(body: &str) -> &str {
+    let start = body
+        .find("<tbody>")
+        .expect("the listener table must render");
+    let rest = &body[start..];
+    &rest[..rest.find("</tbody>").unwrap_or(rest.len())]
+}
+
+/// Writes a probe row directly. The prober itself does not exist yet; the pane's reading of a row
+/// does, and that reading is what these tests are about.
+#[allow(clippy::too_many_arguments)]
+async fn insert_probe(
+    pool: &PgPool,
+    sensor: &str,
+    protocol: &str,
+    port: i32,
+    outcome: &str,
+    detail: Option<&str>,
+    attempted_at: chrono::DateTime<chrono::Utc>,
+    confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    sqlx::query(
+        "INSERT INTO listener_probe \
+           (collector_id, sensor, protocol, port, target, attempted_at, outcome, detail, \
+            confirmed_at) \
+         VALUES ('local', $1, $2, $3, '198.51.100.7:1', $4, $5, $6, $7)",
+    )
+    .bind(sensor)
+    .bind(protocol)
+    .bind(port)
+    .bind(attempted_at)
+    .bind(outcome)
+    .bind(detail)
+    .bind(confirmed_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The incident's view: telnet's log is days behind, so its listener row says how far, and the
+/// caught-up ssh row says nothing.
+#[sqlx::test(migrations = false)]
+async fn fleet_marks_the_listener_rows_of_a_lagging_log_with_its_backlog(pool: PgPool) {
+    migrate(&pool).await;
+    let mut state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    state.intake_lag = telnet_eleven_days_behind();
+    let body = fleet_body(state).await;
+    let table = listener_table(&body);
+    assert!(
+        listener_row(table, "tcp/23").contains("behind: 6.6 GB &#x2f; 11 d"),
+        "{table}"
+    );
+    assert!(
+        !listener_row(table, "tcp/22").contains("behind:"),
+        "{table}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_requires_a_session(pool: PgPool) {
+    migrate(&pool).await;
+    let app = test_app(test_state(pool));
+
+    let response = app.oneshot(get_request("/fleet", None)).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "the fleet pane must be session-gated like every other page"
+    );
+}
+
+/// The failure this catches is the one the dashboard's single fleet-wide freshness boolean hides:
+/// a sensor unit that was never enabled after a deploy produces nothing, and a page built from the
+/// ledger alone would simply not have a row for it.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_lists_every_configured_listener_even_with_no_events(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.30",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(table.contains("tcp/22"), "ssh row missing: {table}");
+    assert!(
+        table.contains("tcp/23"),
+        "the configured telnet listener has no events and must still appear: {table}"
+    );
+    // Not `never`: the page reads only the 30-day lookback, so it cannot tell a listener that went
+    // quiet a month ago from one that never produced anything, and must not claim the second.
+    assert!(
+        table.contains("none in 30d"),
+        "the eventless listener must say it has nothing in the lookback, not be blank: {table}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_never_probed_as_an_alarm_not_a_blank(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("never probed"),
+        "an unprobed listener must say so: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="unknown""#),
+        "and must carry unknown styling, not ok: {table}"
+    );
+    assert!(
+        body.contains("reachability unproven"),
+        "the headline must not claim health while nothing has been probed: {body}"
+    );
+    assert!(
+        !body.contains("every listener proven"),
+        "an unprobed fleet must never render the proven headline: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_a_refused_probe_with_the_word_refused(pool: PgPool) {
+    migrate(&pool).await;
+    insert_probe(
+        &pool,
+        "telnet",
+        "tcp",
+        23,
+        "refused",
+        Some("connection refused"),
+        chrono::Utc::now(),
+        None,
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("telnet", fleet::Proto::Tcp, 23)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("refused"),
+        "a refused probe must be named in words, not by colour alone: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="alarm""#),
+        "a refused probe is an alarm: {table}"
+    );
+}
+
+/// The prober dying is the failure here, and its signature is a last-known-good result that stays
+/// on screen forever. The row must say `stale`, not `reachable`.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_a_stale_probe_as_stale_even_when_the_last_outcome_was_reachable(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(3);
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        long_ago,
+        Some(long_ago),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("stale, last reachable"),
+        "a probe older than two intervals must read as stale: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="alarm""#),
+        "and must render as an alarm despite the good last outcome: {table}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_flags_a_ledger_sensor_missing_from_the_inventory_as_undeclared(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.31",
+            "redis",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // The inventory names ssh only; redis is producing events nobody declared.
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("undeclared listener"),
+        "a sensor in the ledger but not the inventory must be flagged, not folded in: {table}"
+    );
+    assert!(
+        table.contains("Redis"),
+        "the undeclared sensor must be named: {table}"
+    );
+}
+
+/// One event from `sensor` over `protocol`, stamped with `local_port` as the sensor framework does
+/// (`None` for one written before the stamp existed), observed `ago` in the past. `n` varies the
+/// source and the second so a batch of them are distinct events.
+fn ev_on(
+    sensor: &str,
+    protocol: Protocol,
+    local_port: Option<u16>,
+    ago: chrono::Duration,
+    n: u8,
+) -> EventInput {
+    let metadata = match local_port {
+        Some(port) => serde_json::json!({ "local_port": port }),
+        None => serde_json::json!({}),
+    };
+    EventInput::from_signal(
+        format!("203.0.113.{n}").parse().unwrap(),
+        None,
+        sensor.into(),
+        SignalType::HoneypotConnection,
+        protocol,
+        false,
+        chrono::Utc::now() - ago - chrono::Duration::seconds(i64::from(n)),
+        metadata,
+        None,
+    )
+}
+
+/// Appends `count` events from one listener.
+async fn append_on(
+    pool: &PgPool,
+    sensor: &str,
+    protocol: Protocol,
+    local_port: Option<u16>,
+    ago: chrono::Duration,
+    count: u8,
+) {
+    for n in 1..=count {
+        append_event(pool, ev_on(sensor, protocol, local_port, ago, n))
+            .await
+            .unwrap();
+    }
+}
+
+/// The `<tr>` of the listener table containing `needle`; panics naming the table when there is no
+/// such row, or when there is more than one.
+fn listener_row<'a>(table: &'a str, needle: &str) -> &'a str {
+    let rows: Vec<&str> = table
+        .split("<tr")
+        .skip(1)
+        .filter(|row| row.contains(needle))
+        .collect();
+    assert_eq!(rows.len(), 1, "want one row containing {needle:?}: {table}");
+    rows[0]
+}
+
+/// The 24h count a listener row renders.
+fn count_24h(row: &str) -> i64 {
+    let cell = row
+        .split(r#"<td class="count">"#)
+        .nth(1)
+        .and_then(|rest| rest.split("</td>").next())
+        .unwrap_or_else(|| panic!("no 24h cell in {row}"));
+    cell.trim().parse().unwrap()
+}
+
+/// The defect the owner saw: every port of a sensor showed the sensor's total, because activity
+/// was grouped by sensor alone. Each pair here differs in its counts, so a page that sums a
+/// sensor's listeners renders the same number twice and fails: two Redis ports, HTTP plain vs
+/// TLS, and the catch-all's TCP and UDP listeners on the SAME port number.
+#[sqlx::test(migrations = false)]
+async fn fleet_rows_count_each_listener_not_the_whole_sensor(pool: PgPool) {
+    migrate(&pool).await;
+    let hour = chrono::Duration::hours(1);
+    append_on(&pool, "redis", Protocol::Tcp, Some(6379), hour, 3).await;
+    append_on(&pool, "redis", Protocol::Tcp, Some(6380), hour, 1).await;
+    append_on(&pool, "http", Protocol::Tcp, Some(80), hour, 2).await;
+    append_on(&pool, "http", Protocol::Tcp, Some(443), hour, 5).await;
+    append_on(&pool, "catchall", Protocol::Tcp, Some(1024), hour, 1).await;
+    append_on(&pool, "catchall", Protocol::Udp, Some(1024), hour, 4).await;
+
+    let body = fleet_body(test_state_full(
+        pool,
+        None,
+        vec![
+            listener("redis", fleet::Proto::Tcp, 6379),
+            listener("redis", fleet::Proto::Tcp, 6380),
+            listener("http", fleet::Proto::Tcp, 80),
+            listener("http", fleet::Proto::Tcp, 443),
+            listener("catchall", fleet::Proto::Tcp, 1024),
+            listener("catchall", fleet::Proto::Udp, 1024),
+        ],
+        None,
+    ))
+    .await;
+    let table = listener_table(&body);
+
+    for (listener, want) in [
+        ("tcp/6379<", 3),
+        ("tcp/6380<", 1),
+        ("tcp/80<", 2),
+        ("tcp/443<", 5),
+        ("tcp/1024<", 1),
+        ("udp/1024<", 4),
+    ] {
+        assert_eq!(
+            count_24h(listener_row(table, listener)),
+            want,
+            "{listener}: {table}"
+        );
+    }
+    assert!(
+        !table.contains("undeclared listener") && !table.contains("port not recorded"),
+        "every event here belongs to a declared listener: {table}"
+    );
+}
+
+/// The 24h column counts only the last 24 hours, and LAST EVENT reaches back through the 30-day
+/// lookback but not past it. One listener's only event is three days old: zero today, last seen
+/// `3d ago`. Another's only event is 40 days old: outside the lookback, so it reads like a
+/// listener with no events at all.
+#[sqlx::test(migrations = false)]
+async fn fleet_rows_count_the_last_day_and_look_back_thirty_days(pool: PgPool) {
+    migrate(&pool).await;
+    append_on(
+        &pool,
+        "ssh",
+        Protocol::Tcp,
+        Some(22),
+        chrono::Duration::days(3),
+        1,
+    )
+    .await;
+    append_on(
+        &pool,
+        "telnet",
+        Protocol::Tcp,
+        Some(23),
+        chrono::Duration::days(40),
+        1,
+    )
+    .await;
+    append_on(
+        &pool,
+        "ftp",
+        Protocol::Tcp,
+        Some(21),
+        chrono::Duration::hours(2),
+        2,
+    )
+    .await;
+    append_on(
+        &pool,
+        "ftp",
+        Protocol::Tcp,
+        Some(21),
+        chrono::Duration::hours(30),
+        3,
+    )
+    .await;
+
+    let body = fleet_body(test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+            listener("ftp", fleet::Proto::Tcp, 21),
+        ],
+        None,
+    ))
+    .await;
+    let table = listener_table(&body);
+
+    let ssh = listener_row(table, "tcp/22<");
+    assert_eq!(count_24h(ssh), 0, "{ssh}");
+    assert!(ssh.contains("3d ago"), "{ssh}");
+    let telnet = listener_row(table, "tcp/23<");
+    assert_eq!(count_24h(telnet), 0, "{telnet}");
+    assert!(telnet.contains("none in 30d"), "{telnet}");
+    let ftp = listener_row(table, "tcp/21<");
+    assert_eq!(count_24h(ftp), 2, "{ftp}");
+    assert!(ftp.contains("2h ago"), "{ftp}");
+}
+
+/// History written before sensors stamped their port. A sensor with one declared listener can only
+/// have received it there, so it counts on that row; a sensor with several cannot be split, so its
+/// unstamped events get one `port not recorded` row of their own, which is not a listener and must
+/// not change the listener total. A port the inventory never declared is its own undeclared row.
+#[sqlx::test(migrations = false)]
+async fn fleet_attributes_unstamped_history_without_guessing_a_port(pool: PgPool) {
+    migrate(&pool).await;
+    let hour = chrono::Duration::hours(1);
+    append_on(&pool, "ssh", Protocol::Tcp, None, hour, 2).await;
+    append_on(&pool, "ssh", Protocol::Tcp, Some(22), hour, 1).await;
+    append_on(&pool, "smtp", Protocol::Tcp, None, hour, 4).await;
+    append_on(&pool, "smtp", Protocol::Tcp, Some(25), hour, 1).await;
+    append_on(&pool, "smtp", Protocol::Tcp, Some(587), hour, 2).await;
+    append_on(&pool, "smtp", Protocol::Tcp, Some(2525), hour, 3).await;
+
+    let body = fleet_body(test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("smtp", fleet::Proto::Tcp, 25),
+            listener("smtp", fleet::Proto::Tcp, 587),
+        ],
+        None,
+    ))
+    .await;
+    let table = listener_table(&body);
+
+    assert_eq!(count_24h(listener_row(table, "tcp/22<")), 3, "{table}");
+    assert_eq!(count_24h(listener_row(table, "tcp/25<")), 1, "{table}");
+    assert_eq!(count_24h(listener_row(table, "tcp/587<")), 2, "{table}");
+    let unrecorded = listener_row(table, "port not recorded");
+    assert!(unrecorded.contains("SMTP"), "{unrecorded}");
+    assert_eq!(count_24h(unrecorded), 4, "{unrecorded}");
+    let undeclared = listener_row(table, "tcp/2525<");
+    assert!(undeclared.contains("undeclared listener"), "{undeclared}");
+    assert_eq!(count_24h(undeclared), 3, "{undeclared}");
+    // Three declared listeners and one undeclared one; the unrecorded row is not a listener.
+    assert!(
+        body.contains("<small>/ 4</small>"),
+        "the listener total must not count the port-not-recorded row: {body}"
+    );
+}
+
+/// `detail.rs` reads a MISSING `complete` key as complete, which is right for a per-IP panel and
+/// wrong for a rate: it would flatter the number. Three complete, one incomplete, two unlabelled
+/// gives 75% under the honest rule and 83% under the flattering one, so the fixture can tell the
+/// two implementations apart.
+#[sqlx::test(migrations = false)]
+async fn fleet_capture_rate_excludes_unlabelled_captures_from_the_denominator(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.32";
+    let upload = |sha: &str, complete: Option<bool>| {
+        let mut metadata = serde_json::json!({ "sample_sha256": sha, "sample_size": 10 });
+        if let Some(c) = complete {
+            metadata["complete"] = serde_json::json!(c);
+        }
+        ev_with_session(
+            ip,
+            "telnet",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            metadata,
+            Uuid::now_v7(),
+        )
+    };
+    for (i, complete) in [Some(true), Some(true), Some(true), Some(false), None, None]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = format!("{i:064x}");
+        append_event(&pool, upload(&sha, complete)).await.unwrap();
+    }
+
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains(">75%<"),
+        "3 complete of 4 labelled is 75%; 83% would mean the unlabelled ones were counted: {body}"
+    );
+    assert!(
+        body.contains("2 unlabelled (excluded from the rate)"),
+        "the page must state how many captures the rate excluded: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_capture_panel_names_the_dominant_end_reason(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.33";
+    let upload = |sha: &str, reason: &str| {
+        ev_with_session(
+            ip,
+            "ssh",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_size": 10,
+                "complete": false,
+                "end_reason": reason,
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    // Two budget endings against one idle one, so the panel has to pick the dominant reason rather
+    // than the first or the last it happens to read.
+    for (i, reason) in ["capture_budget", "capture_budget", "idle_timeout"]
+        .into_iter()
+        .enumerate()
+    {
+        let sha = format!("{:064x}", i + 100);
+        append_event(&pool, upload(&sha, reason)).await.unwrap();
+    }
+
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains("capture budget"),
+        "the dominant end reason must be shown next to the rate, in words: {body}"
+    );
+    assert!(
+        !body.contains("idle timeout"),
+        "only the dominant reason belongs on the row: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_page_reports_the_feed_as_unknown_when_no_output_dir_is_configured(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains("builder disabled on this node"),
+        "an unconfigured builder must say so rather than reporting an empty feed: {body}"
+    );
+    assert!(
+        !body.contains("<td>Entries</td><td class=\"mono\">0</td>"),
+        "a disabled builder must never render as 0 published entries: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_not_recorded_when_no_stamp_file_exists(pool: PgPool) {
+    migrate(&pool).await;
+    let missing = PathBuf::from("/nonexistent/propolis/deploy-stamp.json");
+    let state = test_state_full(pool, None, Vec::new(), Some(missing));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains("not recorded"),
+        "with no stamp the version panel must read `not recorded`: {body}"
+    );
+    assert!(
+        !body.contains(">current<"),
+        "and must never claim the running build is current: {body}"
+    );
+}
+
+/// The whole point of the panel: a deploy built and installed new binaries, and the service was
+/// never restarted, so the running process is older than the code on disk. Nothing else on the box
+/// can see that, and it is the most common way a fix that "shipped" is not actually running.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_says_restart_required_when_the_stamp_moved_past_this_binary(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    // test_state_full stamps the binary as abc123abc123; the deploy recorded a different commit.
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "origin_main_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains("restart required"),
+        "a binary older than the deployed commit must say so: {body}"
+    );
+    assert!(
+        body.contains("abc123abc123"),
+        "the running revision must be shown, not just the deployed one: {body}"
+    );
+    assert!(
+        body.contains("f00dcafe"),
+        "the deployed revision must be shown alongside it: {body}"
+    );
+}
+
+/// The healthy case, so the panel is not just a machine for printing warnings: binary, installed
+/// file, deployed checkout and main all name the same commit. All four are required - the stamp
+/// carries the installed entry for the binary serving this page, because `current` claims what is
+/// on disk too.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_current_when_binary_stamp_and_main_agree(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    // The full id the deploy records, of which the binary's stamp is the leading 12 characters.
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "abc123abc123def456def456def456def456def4",
+            "origin_main_sha": "abc123abc123def456def456def456def456def4",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z",
+            "installed": {"propolis": "abc123abc123", "console": "abc123abc123"}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains("current"),
+        "a matching binary, stamp and main must read current: {body}"
+    );
+    assert!(
+        !body.contains("restart required") && !body.contains("behind main"),
+        "and must not also carry a warning verdict: {body}"
+    );
+}
+
+/// A monitoring page that fails in a way that looks like good news is worse than no page. Dropping
+/// the probe table makes one panel's query fail for real; the page must still render, name the
+/// panel, and not 503.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_renders_a_degraded_banner_instead_of_a_503_when_a_panel_query_fails(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    sqlx::query("DROP TABLE listener_probe")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a failed panel must not take the whole monitoring page down"
+    );
+    let body = body_text(response).await;
+    assert!(
+        body.contains("listener probes"),
+        "the degraded banner must name the panel that failed: {body}"
+    );
+    assert!(
+        body.contains(r#"class="degraded""#),
+        "the failure must be shown as a banner, not as data: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_status_fragment_renders_the_same_rows_without_the_page_chrome(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet/status",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("tcp/22") && body.contains("never probed"),
+        "the fragment must carry the same rows as the page: {body}"
+    );
+    assert!(
+        !body.contains("<html") && !body.contains("class=\"topnav\""),
+        "the fragment must not carry the page chrome: {body}"
+    );
+}
+
+/// Blocking the port at the firewall while the sensor still runs looks like this. The distinction
+/// from `refused` is the whole diagnostic payload: refused means the path works and nothing is
+/// listening, a timeout means the packet was dropped, and they call for different repairs.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_a_timeout_apart_from_a_refusal(pool: PgPool) {
+    migrate(&pool).await;
+    insert_probe(
+        &pool,
+        "telnet",
+        "tcp",
+        23,
+        "timeout",
+        Some("no answer within the probe timeout: the packet was dropped"),
+        chrono::Utc::now(),
+        None,
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("telnet", fleet::Proto::Tcp, 23)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("timeout"),
+        "a dropped packet must read as a timeout in words: {table}"
+    );
+    assert!(
+        !table.contains("refused"),
+        "a timeout must never be presented as a refusal - they point at different repairs: {table}"
+    );
+    assert!(
+        table.contains("the packet was dropped"),
+        "the stored diagnosis must reach the page: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="alarm""#),
+        "a timeout is an alarm: {table}"
+    );
+}
+
+/// The socket answered and nothing arrived at the far end. This is the single most useful reading
+/// the pane produces, because it takes the sensor off the list and puts the break in the log,
+/// logrotate, shipper, gateway or intake path.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_reads_reachable_without_a_confirmation_as_a_warning_naming_the_break(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    // Real attacker traffic on this sensor, so the row's liveness half is `ok` and the warning
+    // under test is the only thing keeping the headline off `proven`. Without an event the row
+    // would be `unknown` for a second, unrelated reason and the assertion would prove nothing.
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.33",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        chrono::Utc::now(),
+        None,
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("socket answered, no line reached intake"),
+        "an unconfirmed reachable row must name where the break is: {table}"
+    );
+    assert!(
+        table.contains(r#"data-level="warn""#),
+        "reachable without a confirmation is a warning, not ok: {table}"
+    );
+    assert!(
+        !body.contains("every listener proven"),
+        "an unconfirmed listener is not proven: {body}"
+    );
+    assert!(
+        body.contains("listeners answering, evidence path unconfirmed"),
+        "the headline must say which half of the chain is unproven: {body}"
+    );
+}
+
+/// The hairpin. On a single box the control plane and the collector are the same host, so a probe
+/// connect never leaves the machine. The page must say so: a `reachable` verdict presented without
+/// that qualifier reads as evidence about the external path, which it is not.
+#[sqlx::test(migrations = false)]
+async fn fleet_page_labels_a_same_host_probe_as_a_hairpin(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        Some(
+            "hairpin: this connect never left the host, so it is not evidence of external \
+             reachability",
+        ),
+        now,
+        Some(now),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("hairpin"),
+        "a same-host connect must be labelled a hairpin even when it succeeded: {table}"
+    );
+    assert!(
+        table.contains("not evidence of external reachability"),
+        "and must say what it does not prove: {table}"
+    );
+    assert!(
+        table.contains("control plane to"),
+        "the vantage point stays named beside the verdict: {table}"
+    );
+}
+
+/// A coverage figure that dropped the listeners it cannot test would flatter itself. UDP is a real
+/// third state: named in words, never green, out of the numerator and in the denominator.
+#[sqlx::test(migrations = false)]
+async fn fleet_udp_row_is_not_probeable_and_counts_in_the_total_but_not_in_proven(pool: PgPool) {
+    migrate(&pool).await;
+    let now = chrono::Utc::now();
+    insert_probe(&pool, "ssh", "tcp", 22, "reachable", None, now, Some(now)).await;
+    insert_probe(
+        &pool,
+        "catchall",
+        "udp",
+        1024,
+        "not_probeable",
+        Some("udp reachability is not provable by connect"),
+        now,
+        Some(now),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("catchall", fleet::Proto::Udp, 1024),
+        ],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    let table = listener_table(&body);
+    assert!(
+        table.contains("not probeable"),
+        "the UDP row must name its own state: {table}"
+    );
+    // One of two listeners proven, not one of one: the untestable listener stays in the
+    // denominator so the figure cannot look better than the evidence.
+    assert!(
+        body.contains("1<small>/ 2</small>"),
+        "UDP must be excluded from proven and included in total: {body}"
+    );
+    assert!(
+        !body.contains("every listener proven"),
+        "a fleet with an untestable listener is not fully proven: {body}"
+    );
+}
+
+/// The staleness rule is measured in sweep intervals, so it has to follow the configured cadence.
+/// With a constant, an operator who slowed the sweep down would open the page and find every row
+/// reading stale, which makes the pane useless in exactly the way it exists to prevent.
+#[sqlx::test(migrations = false)]
+async fn fleet_staleness_follows_the_configured_probe_interval(pool: PgPool) {
+    migrate(&pool).await;
+    let probed_at = chrono::Utc::now() - chrono::Duration::seconds(900);
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        probed_at,
+        Some(probed_at),
+    )
+    .await;
+
+    // At the 300s default, a 900s-old row is past two intervals and stale.
+    let state = test_state_full(
+        pool.clone(),
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let body = body_text(
+        test_app(state)
+            .oneshot(get_request(
+                "/fleet",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        listener_table(&body).contains("stale, last reachable"),
+        "at a 300s interval a 900s-old row is stale: {body}"
+    );
+
+    // At an hourly sweep the same row is well inside the window and must not read stale.
+    let mut slow = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    slow.fleet_probe_interval = std::time::Duration::from_secs(3600);
+    let (_, cookie) = slow.sessions.create();
+    let body = body_text(
+        test_app(slow)
+            .oneshot(get_request(
+                "/fleet",
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !listener_table(&body).contains("stale"),
+        "at an hourly sweep the same row is fresh and must not be called stale: {body}"
+    );
+}
+
+// ---- fleet presentation: the computed `Level` states must reach real rendered style classes,
+// not just inert `data-level`/`data-state` attributes no stylesheet selects on. Each test below
+// asserts the actual `.dot`/`.sev` class markup (and the word beside it), never the presence of
+// the dead attribute alone. ----
+
+/// The regression this guards: the version verdict pill used to render `sev sev--watch`
+/// unconditionally, so `current`/`restart required`/`not recorded` were visually identical.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_pill_reads_neutral_when_current(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "abc123abc123def456def456def456def456def4",
+            "origin_main_sha": "abc123abc123def456def456def456def456def4",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z",
+            "installed": {"propolis": "abc123abc123", "console": "abc123abc123"}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--low">current</span>"#),
+        "a matching binary/stamp/main must render the neutral low pill, not the fixed watch one: {body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="sev sev--watch">current</span>"#),
+        "current must not still carry the hard-coded watch colour: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_version_pill_reads_watch_when_not_recorded(pool: PgPool) {
+    migrate(&pool).await;
+    let missing = PathBuf::from("/nonexistent/propolis/deploy-stamp.json");
+    let state = test_state_full(pool, None, Vec::new(), Some(missing));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--watch">not recorded</span>"#),
+        "an unrecorded verdict must render the explicit watch pill: {body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn fleet_version_pill_reads_attention_when_restart_required(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        r#"{"head_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "origin_main_sha": "f00dcafef00dcafef00dcafef00dcafef00dcafe",
+            "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+            "built_at": "2026-09-09T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, None, Vec::new(), Some(stamp));
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--high">restart required</span>"#),
+        "a binary older than the deployed commit must render the attention-orange pill: {body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="sev sev--watch">restart required</span>"#),
+        "restart required must not still carry the fixed watch colour: {body}"
+    );
+}
+
+/// The regression this guards: the capture panel's dominant-end-reason pill was hard-coded
+/// `sev--watch` regardless of how bad the row's own completion rate actually was.
+#[sqlx::test(migrations = false)]
+async fn fleet_capture_end_reason_pill_tracks_the_row_severity(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.90";
+    let upload = |sha: &str| {
+        ev_with_session(
+            ip,
+            "ssh",
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            &chrono::Utc::now().to_rfc3339(),
+            serde_json::json!({
+                "sample_sha256": sha,
+                "sample_size": 10,
+                "complete": false,
+                "end_reason": "capture_budget",
+            }),
+            Uuid::now_v7(),
+        )
+    };
+    // Every capture incomplete: 0% complete, which is Alarm-level, not the merely-Watch severity
+    // the fixed pill always showed.
+    for i in 0..3 {
+        let sha = format!("{:064x}", i + 200);
+        append_event(&pool, upload(&sha)).await.unwrap();
+    }
+
+    let state = test_state_full(pool, None, Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(r#"<span class="sev sev--crit">capture budget</span>"#),
+        "a 0%-complete row's dominant reason must render the alarm pill: {body}"
+    );
+    assert!(
+        !body.contains(r#"<span class="sev sev--watch">capture budget</span>"#),
+        "must not still render the hard-coded watch pill regardless of the row's real severity: {body}"
+    );
+}
+
+/// The regression this guards: the feed panel wrote `data-level` on the whole panel body, which no
+/// stylesheet selects on, so an expired feed looked identical to a current one.
+#[sqlx::test(migrations = false)]
+async fn fleet_expired_feed_renders_the_alarm_dot(pool: PgPool) {
+    migrate(&pool).await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("manifest.json"),
+        r#"{"build_time":"2020-01-01T00:00:00Z","tiers":{"aggressive":{"count":1,"sha256":"a","valid_until":"2020-01-02T00:00:00Z"},"standard":{"count":1,"sha256":"b","valid_until":"2020-01-02T00:00:00Z"}}}"#,
+    )
+    .unwrap();
+
+    let state = test_state_full(pool, Some(tmp.path().to_path_buf()), Vec::new(), None);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains("the published feed has expired"),
+        "the expired feed must say so in words: {body}"
+    );
+    assert!(
+        body.contains(
+            r#"<td>Expires in</td><td><span class="dot dot--crit" aria-hidden="true"></span>"#
+        ),
+        "an expired feed's Expires-in value must carry the alarm dot, not the dead panel-body attribute: {body}"
+    );
+}
+
+/// The regression this guards: the listener table's last-event cell carried a `data-level`
+/// attribute no stylesheet reads, so every row's last-event column looked the same regardless of
+/// whether the sensor was live or had never produced a single event.
+#[sqlx::test(migrations = false)]
+async fn fleet_listener_last_event_column_carries_a_dot_matching_its_level(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.91",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![
+            listener("ssh", fleet::Proto::Tcp, 22),
+            listener("telnet", fleet::Proto::Tcp, 23),
+        ],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let table = listener_table(&body);
+
+    assert!(
+        table.contains(r#"<td class="seen"><span class="dot dot--low" aria-hidden="true"></span>"#),
+        "a listener with a recent event must carry the healthy dot on its last-event cell: {table}"
+    );
+    assert!(
+        table.contains(
+            r#"<td class="seen"><span class="dot dot--watch" aria-hidden="true"></span> none in 30d</td>"#
+        ),
+        "a listener with no event in the lookback must carry the unknown dot, not bare text: {table}"
+    );
+}
+
+/// The reach column's dot was already wired correctly; this proves it with the real class rather
+/// than the inert `data-level="alarm"` attribute the pre-existing stale-probe test checks.
+#[sqlx::test(migrations = false)]
+async fn fleet_stale_probe_row_carries_the_alarm_dot_not_only_the_word(pool: PgPool) {
+    migrate(&pool).await;
+    let long_ago = chrono::Utc::now() - chrono::Duration::hours(3);
+    insert_probe(
+        &pool,
+        "ssh",
+        "tcp",
+        22,
+        "reachable",
+        None,
+        long_ago,
+        Some(long_ago),
+    )
+    .await;
+
+    let state = test_state_full(
+        pool,
+        None,
+        vec![listener("ssh", fleet::Proto::Tcp, 22)],
+        None,
+    );
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let table = listener_table(&body);
+
+    assert!(
+        table.contains(
+            r#"<span class="dot dot--crit" aria-hidden="true"></span> stale, last reachable"#
+        ),
+        "a stale probe must render the real alarm dot next to the word: {table}"
+    );
+}
+
+/// The regression this guards: the Evidence chain panel's "Newest ingest" value carried a
+/// `data-level` attribute the stylesheet never reads. Hits `/fleet/status` directly (the 30-second
+/// refresh fragment), not just the full page, since the two share this exact markup.
+#[sqlx::test(migrations = false)]
+async fn fleet_status_fragment_newest_ingest_carries_a_dot(pool: PgPool) {
+    migrate(&pool).await;
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.92",
+            "ssh",
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let body = body_text(
+        app.oneshot(get_request(
+            "/fleet/status",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+
+    assert!(
+        body.contains(
+            r#"<td>Newest ingest</td><td><span class="dot dot--low" aria-hidden="true"></span>"#
+        ),
+        "a recent ingest must carry the healthy dot on the refresh fragment, not a dead attribute: {body}"
+    );
+}
+
+/// A failed ledger query must read as unknown, not silently keep whatever the dead attribute last
+/// said (which, since nothing rendered from it, always looked the same as healthy).
+#[sqlx::test(migrations = false)]
+async fn fleet_page_shows_the_ingest_state_as_unknown_when_the_ledger_query_fails(pool: PgPool) {
+    migrate(&pool).await;
+    sqlx::query("DROP TABLE event CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let response = app
+        .oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a failed ledger query must not take the whole monitoring page down"
+    );
+    let body = body_text(response).await;
+    assert!(
+        body.contains("ledger head"),
+        "the degraded banner must name the failed ledger panel: {body}"
+    );
+    assert!(
+        body.contains(
+            r#"<td>Newest ingest</td><td><span class="dot dot--watch" aria-hidden="true"></span>"#
+        ),
+        "a failed ledger query must render the unknown dot, not a healthy-looking dead attribute: {body}"
+    );
+}
+
+// ---- the version panel's four identities: what this PROCESS runs, what the deploy left
+// INSTALLED on disk for it, what was CHECKED OUT when that deploy built, and what main held when
+// it last fetched. The tests below drive the page, and the last pair drive it from a stamp the
+// real `deploy/deploy-stamp.sh` wrote, because two halves each tested against their own
+// hand-written fixture leave the field names between them untested in both directions. ----
+
+/// The running binary's own revision in `test_state_full`, and the full id a deploy would record
+/// for the same commit.
+const STAMPED_HEAD: &str = "abc123abc123def456def456def456def456def4";
+/// A valid revision that is not the deployed one, for the binary whose install did not land.
+const OTHER_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+async fn fleet_body(state: AppState) -> String {
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    body_text(
+        app.oneshot(get_request(
+            "/fleet",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await
+}
+
+/// The deploy stamp records one installed revision per binary, and the page must read the entry
+/// for the executable actually serving it: `propolis` for the unified daemon, `console` for the
+/// standalone binary. The two entries below disagree on purpose - a page that read the wrong one
+/// would swap `current` for `install incomplete` here, which is exactly the wrong answer in both
+/// directions.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_the_installed_entry_for_the_binary_serving_the_page(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        format!(
+            r#"{{"head_sha": "{STAMPED_HEAD}", "origin_main_sha": "{STAMPED_HEAD}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "{OTHER_SHA}", "console": "abc123abc123"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let as_console = test_state_full(pool.clone(), None, Vec::new(), Some(stamp.clone()));
+    let body = fleet_body(as_console).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--low">current</span>"#),
+        "the console binary's own installed revision matches the deploy, so this page is current: \
+         {body}"
+    );
+    assert!(
+        body.contains(r#"<td>Installed</td><td><span class="mono">abc123abc123</span>"#),
+        "the panel must show the installed revision of the binary serving it: {body}"
+    );
+    assert!(
+        !body.contains(OTHER_SHA),
+        "and must not report the OTHER binary's installed revision as this process's evidence: \
+         {body}"
+    );
+
+    let as_daemon = AppState {
+        binary_name: "propolis",
+        ..test_state_full(pool, None, Vec::new(), Some(stamp))
+    };
+    let body = fleet_body(as_daemon).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--crit">install incomplete</span>"#),
+        "served by the daemon, the same stamp says the propolis binary on disk is not the commit \
+         the deploy recorded, which is not a current box: {body}"
+    );
+}
+
+/// An install that did not land and a process that has not been restarted look identical from a
+/// checkout SHA alone, and they want opposite responses. The panel must name the install, and must
+/// not send the operator to `systemctl restart`, which would reload the same old bytes.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_separates_a_failed_install_from_a_missing_restart(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // The binary on disk is the old one, and so is this process, because it IS that binary.
+    let failed_install = dir.path().join("failed-install.json");
+    std::fs::write(
+        &failed_install,
+        format!(
+            r#"{{"head_sha": "{OTHER_SHA}", "origin_main_sha": "{OTHER_SHA}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "", "console": "abc123abc123"}}}}"#
+        ),
+    )
+    .unwrap();
+    let body = fleet_body(test_state_full(
+        pool.clone(),
+        None,
+        Vec::new(),
+        Some(failed_install),
+    ))
+    .await;
+    assert!(
+        body.contains("install incomplete") && !body.contains("restart required"),
+        "an install that left the previous binary in place must not be reported as a restart \
+         away from being fixed: {body}"
+    );
+    assert!(
+        body.contains("restarting would not load that commit"),
+        "and the note must say so in words: {body}"
+    );
+
+    // The install DID land; this process is simply still the previous one.
+    let needs_restart = dir.path().join("needs-restart.json");
+    std::fs::write(
+        &needs_restart,
+        format!(
+            r#"{{"head_sha": "{OTHER_SHA}", "origin_main_sha": "{OTHER_SHA}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "", "console": "{OTHER_SHA}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(needs_restart))).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--high">restart required</span>"#),
+        "with the install proven, the same mismatch is a restart: {body}"
+    );
+    assert!(
+        body.contains("until the service restarts") && !body.contains("not guaranteed"),
+        "and the note may name the fix rather than hedging between two causes: {body}"
+    );
+}
+
+/// A stamp written before the installed identity existed is the state every already-deployed box
+/// is in, and it is exactly the state an install that silently no-opped also produces. The page
+/// must say so in the Installed line AND in the verdict: treating the checkout as proof of what
+/// was installed is the assumption this whole field exists to remove, and a `current` pill on an
+/// unobserved install would make the assumption in the loudest place on the panel.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reports_an_older_stamp_as_installed_not_recorded(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        format!(
+            r#"{{"head_sha": "{STAMPED_HEAD}", "origin_main_sha": "{STAMPED_HEAD}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z"}}"#
+        ),
+    )
+    .unwrap();
+
+    let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(stamp))).await;
+    assert!(
+        body.contains(r#"<td>Installed</td><td><span class="faint">not recorded</span>"#),
+        "an older stamp must say plainly that it does not record what was installed: {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="sev sev--watch">not recorded</span>"#),
+        "and the verdict must be the honest unknown, never `current`, when nothing observed the \
+         binary on disk: {body}"
+    );
+    assert!(
+        !body.contains(">current<"),
+        "no part of the panel may present this box as current: {body}"
+    );
+    assert!(
+        body.contains("records no revision for the binary on disk"),
+        "the note must name what is missing, so the operator is pointed at a redeploy rather \
+         than at a phantom fault: {body}"
+    );
+}
+
+/// The same requirement from the other direction: a stamp that DOES record an installed revision
+/// for this binary, but a damaged one, is not an observation either. `+dirty` names bytes no commit
+/// names, and a panel that shrugged it off would report `current` on precisely the box whose deploy
+/// left something unexplained on disk.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_refuses_current_on_a_damaged_installed_revision(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = dir.path().join("deploy-stamp.json");
+    std::fs::write(
+        &stamp,
+        format!(
+            r#"{{"head_sha": "{STAMPED_HEAD}", "origin_main_sha": "{STAMPED_HEAD}",
+                 "branch": "main", "pulled_at": "2026-09-09T00:00:00Z",
+                 "built_at": "2026-09-09T00:00:00Z",
+                 "installed": {{"propolis": "", "console": "abc123abc123+dirty"}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let body = fleet_body(test_state_full(pool, None, Vec::new(), Some(stamp))).await;
+    assert!(
+        body.contains(r#"<span class="sev sev--watch">not recorded</span>"#)
+            && !body.contains(">current<"),
+        "a dirty installed revision must leave the verdict unknown, not current: {body}"
+    );
+    assert!(
+        body.contains("is not a clean commit id"),
+        "and the note must point at the stamp's own damaged value: {body}"
+    );
+}
+
+/// The real producer, driving the real page. Everything above asserts the console against a stamp
+/// this test file wrote, which leaves the field names between `deploy/deploy-stamp.sh` and
+/// `routes::fleet` untested in both directions - a rename on either side would keep both halves
+/// green. This runs the actual script against a disposable git repository and stand-in installed
+/// binaries under a tempdir, then renders the page from the file it produced.
+#[sqlx::test(migrations = false)]
+async fn fleet_version_panel_reads_a_stamp_written_by_the_real_deploy_script(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let head = fixture_git_repo(&repo);
+    let short: &'static str = Box::leak(head[..12].to_string().into_boxed_str());
+
+    // The daemon's binary is the commit the deploy built; the standalone console binary on this
+    // box was not replaced. One stamp, two answers.
+    let bin_dir = dir.path().join("bin");
+    write_fake_installed_binary(
+        &bin_dir,
+        "propolis",
+        &format!("propolis 0.3.0 ({short}, built 2026-09-09T00:00:00Z)"),
+    );
+    write_fake_installed_binary(
+        &bin_dir,
+        "console",
+        "console 0.3.0 (0123456789ab, built 2026-09-09T00:00:00Z)",
+    );
+    let stamp = dir.path().join("deploy-stamp.json");
+    run_deploy_stamp(&repo, &stamp, &bin_dir);
+
+    let as_daemon = AppState {
+        binary_name: "propolis",
+        git_sha: short,
+        ..test_state_full(pool.clone(), None, Vec::new(), Some(stamp.clone()))
+    };
+    let body = fleet_body(as_daemon).await;
+    assert!(
+        body.contains(&format!(
+            r#"<td>Installed</td><td><span class="mono">{short}</span>"#
+        )),
+        "the page must render the revision the deploy script read back off the daemon binary: \
+         {body}"
+    );
+    assert!(
+        body.contains(r#"<span class="sev sev--low">current</span>"#),
+        "binary, installed file, deployed checkout and fetched main all name one commit: {body}"
+    );
+
+    let as_console = AppState {
+        git_sha: short,
+        ..test_state_full(pool, None, Vec::new(), Some(stamp))
+    };
+    let body = fleet_body(as_console).await;
+    assert!(
+        body.contains("install incomplete"),
+        "the console binary on this box was never replaced, and the same stamp says so: {body}"
+    );
+}
+
+/// A disposable git repository with one commit and an `origin/main` pointing at it, returning its
+/// full HEAD sha. `update-ref` rather than a real remote: the script only reads that ref, and no
+/// test here may reach the network. Never this project's own repository.
+fn fixture_git_repo(dir: &std::path::Path) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "fixture"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    git(&["update-ref", "refs/remotes/origin/main", &head]);
+    head
+}
+
+/// An executable stand-in for an installed binary, answering `--version` the way `console` and
+/// `propolis` do. The version line goes in a sibling data file the script `cat`s, so no test input
+/// is ever interpolated into shell text.
+fn write_fake_installed_binary(bin_dir: &std::path::Path, name: &str, version_line: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    std::fs::write(
+        bin_dir.join(format!("{name}.version")),
+        format!("{version_line}\n"),
+    )
+    .unwrap();
+    let path = bin_dir.join(name);
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\ncat \"$0.version\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn run_deploy_stamp(repo: &std::path::Path, out_file: &std::path::Path, bin_dir: &std::path::Path) {
+    let out = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/deploy-stamp.sh"
+    ))
+    .arg(repo)
+    .arg(out_file)
+    .arg(bin_dir)
+    .output()
+    .expect("failed to run deploy/deploy-stamp.sh");
+    assert!(
+        out.status.success(),
+        "deploy/deploy-stamp.sh failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// --- search: control characters and over-length values are refused before SQL ---
+
+/// Percent-encodes a query-string value the same way `routes::search`'s own (private)
+/// `percent_encode` does for its generated links (unreserved set kept literal, everything else
+/// escaped) - duplicated here rather than imported since the production function is private to
+/// that module and these tests build request URIs, not `Filters` values.
+fn qs_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_events_rejects_a_percent_decoded_nul_in_q_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    // The finding this guards: a percent-decoded NUL used to reach PostgreSQL, which rejected it
+    // and surfaced as the console's generic 503 - it must now be a 400 that never touches SQL.
+    let response = app
+        .oneshot(get_request(
+            "/search/events?q=abc%00def",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_events_rejects_another_control_character_in_sensor_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    // %07 is BEL (0x07): a C0 control distinct from NUL, guarding that the check is a general
+    // control-character rule and not a NUL special case.
+    let response = app
+        .oneshot(get_request(
+            "/search/events?sensor=ssh%07server",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_events_rejects_an_over_length_q_value_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    let too_long = "a".repeat(600); // over the 512-byte MAX_QUERY_PARAM_LEN
+    let response = app
+        .oneshot(get_request(
+            &format!("/search/events?q={too_long}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = false)]
+async fn search_ips_rejects_a_control_character_in_ip_with_400(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+
+    // `ip` alone never counts as a filter in IP-search mode (`Filters::any_provided`'s doc
+    // comment), so `sensor` carries the control character here to actually exercise validation.
+    let response = app
+        .oneshot(get_request(
+            "/search/ips?sensor=ssh%00",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Regression: quotes, ILIKE wildcard characters, and HTML-special characters in a search query
+/// must still reach SQL as an ordinary (parameterized, wildcard-escaped) filter value and render
+/// a normal 200 results page - the control-character and length check must not over-block
+/// legitimate operator input.
+#[sqlx::test(migrations = false)]
+async fn search_events_still_searches_normally_with_quotes_wildcards_and_html_like_input(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+
+    for q in [
+        "O'Brien \"the great\"",
+        "100%_off",
+        "<script>alert(1)</script>",
+    ] {
+        let app = test_app(state.clone());
+        let uri = format!("/search/events?q={}", qs_encode(q));
+        let response = app
+            .oneshot(get_request(
+                &uri,
+                Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "expected 200 for legitimate query {q:?}"
+        );
+    }
+}
+
+// --- content security policy and static assets ---
+
+#[sqlx::test(migrations = false)]
+async fn every_page_carries_the_content_security_policy(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let cookie = format!("{}={cookie}", auth::SESSION_COOKIE);
+
+    for (uri, cookie) in [
+        ("/login", None),
+        ("/", Some(cookie.as_str())),
+        ("/ips", Some(cookie.as_str())),
+        ("/integrity", Some(cookie.as_str())),
+    ] {
+        let response = test_app(state.clone())
+            .oneshot(get_request(uri, cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap_or_else(|| panic!("{uri} has no content-security-policy"))
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, routes::CONTENT_SECURITY_POLICY, "{uri}");
+        for directive in [
+            "script-src 'self'",
+            "style-src 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.contains(directive), "{uri}: missing {directive}");
+        }
+        assert!(
+            !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+            "{uri}: the policy must not allow inline script or style"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn assets_are_served_with_their_type_and_revalidated_by_etag(pool: PgPool) {
+    let app = test_app(test_state(pool));
+
+    for (file, content_type) in [
+        ("console.css", "text/css; charset=utf-8"),
+        ("console.js", "text/javascript; charset=utf-8"),
+        ("live-panels.js", "text/javascript; charset=utf-8"),
+        ("htmx.min.js", "text/javascript; charset=utf-8"),
+    ] {
+        let uri = format!("/assets/{file}");
+        let first = app.clone().oneshot(get_request(&uri, None)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "{uri}");
+        assert_eq!(first.headers()["content-type"], content_type, "{uri}");
+        assert_eq!(first.headers()["cache-control"], "no-cache", "{uri}");
+        let etag = first.headers()["etag"].to_str().unwrap().to_string();
+
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{uri}");
+
+        // A tag from before an upgrade must not be taken for the current one, or the browser
+        // keeps running the old script against the new pages.
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("if-none-match", "\"an-older-build\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK, "{uri}: stale tag");
+        assert_eq!(stale.headers()["etag"], etag.as_str(), "{uri}: stale tag");
+        assert!(!body_text(stale).await.is_empty(), "{uri}: stale tag");
+    }
+
+    // Names that reach the handler (one path segment, `..%2F` decoded by the extractor) but are
+    // not in its list. A handler that read the name from disk would serve these.
+    for uri in [
+        "/assets/Cargo.toml",
+        "/assets/..%2FCargo.toml",
+        "/assets/..%2F..%2FCargo.toml",
+    ] {
+        let response = app.clone().oneshot(get_request(uri, None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    // More than one segment never matches the asset route at all.
+    let nested = app
+        .oneshot(get_request("/assets/../Cargo.toml", None))
+        .await
+        .unwrap();
+    assert_eq!(nested.status(), StatusCode::NOT_FOUND);
+}
+
+// --- console polish: folding, paging, log fields, queue context ---
+
+/// Renders `uri` for a logged-in operator and returns the status and body.
+async fn get_page(state: AppState, uri: &str) -> (StatusCode, String) {
+    let (_, cookie) = state.sessions.create();
+    let response = test_app(state)
+        .oneshot(get_request(
+            uri,
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, body_text(response).await)
+}
+
+/// `n` seconds before now, as the RFC 3339 text the event fixtures take.
+fn secs_ago(n: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::seconds(n)).to_rfc3339()
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_labels_the_transport_as_an_acronym(pool: PgPool) {
+    migrate(&pool).await;
+    let sid = Uuid::now_v7();
+    append_event(
+        &pool,
+        ev_with_session(
+            "203.0.113.150",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &secs_ago(60),
+            serde_json::json!({ "command": "uname -a" }),
+            sid,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.150",
+            "tftp",
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            &secs_ago(30),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_page(test_state(pool), "/ip/203.0.113.150").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Telnet / TCP"), "session header: {body}");
+    assert!(body.contains("<td>UDP</td>"), "ungrouped row: {body}");
+    assert!(
+        !body.contains("Tcp") && !body.contains("Udp"),
+        "a Rust enum name reached the page: {body}"
+    );
+}
+
+fn log_entry(level: &str, target: &str, message: &str, fields: &[(&str, &str)]) -> LogEntry {
+    LogEntry {
+        timestamp: "2026-10-07T22:31:04.512+00:00".to_string(),
+        level: level.to_string(),
+        target: target.to_string(),
+        message: message.to_string(),
+        fields: fields
+            .iter()
+            .map(|(k, v)| LogField {
+                key: k.to_string(),
+                value: v.to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn logs_page_shows_fields_and_folds_repeated_info_runs(pool: PgPool) {
+    migrate(&pool).await;
+    let state = test_state(pool);
+    let batch = |sensor, n| {
+        log_entry(
+            "INFO",
+            "intake",
+            "batch processed",
+            &[("sensor", sensor), ("ingested", n), ("rejected", "0")],
+        )
+    };
+    for entry in [
+        batch("telnet", "50"),
+        batch("vnc", "12"),
+        batch("telnet", "48"),
+        batch("telnet", "50"),
+        log_entry(
+            "WARN",
+            "sqlx::query",
+            "slow statement",
+            &[
+                ("statement", "SELECT count(*) FROM event"),
+                ("elapsed", "1.52s"),
+            ],
+        ),
+        batch("ssh", "7"),
+        batch("ssh", "9"),
+        log_entry(
+            "WARN",
+            "review::submit",
+            "submission held",
+            &[("reason", "vendor quota reached")],
+        ),
+    ] {
+        state.log_buffer.push(entry);
+    }
+
+    let (status, body) = get_page(state, "/logs").await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Four rows: the run of four, the WARN, the run of two, the second WARN. A fold that ignored
+    // adjacency would make one row of six.
+    assert_eq!(
+        body.matches(r#"<div class="log-line "#).count(),
+        4,
+        "{body}"
+    );
+    assert!(body.contains(">x4<"), "first run's count: {body}");
+    assert!(body.contains(">x2<"), "second run's count: {body}");
+    assert!(!body.contains(">x6<"), "runs across a WARN folded: {body}");
+    assert!(
+        body.contains(r#"<span class="log-v">telnet</span>/<span class="log-v">vnc</span>"#),
+        "the fold names the sensors it covers: {body}"
+    );
+    // Every folded entry's own fields stay reachable in the expanded row.
+    assert_eq!(
+        body.matches(r#"<span class="log-v">50</span>"#).count(),
+        3,
+        "{body}"
+    );
+    for field in [
+        "SELECT count(*) FROM event",
+        "1.52s",
+        "vendor quota reached",
+        ">statement<",
+        ">reason<",
+    ] {
+        assert!(body.contains(field), "missing {field}: {body}");
+    }
+    // Warnings are what the view opens on; the lower rows are counted, not lost.
+    assert!(body.contains(r#"<option value="WARN" selected>"#), "{body}");
+    assert!(body.contains("2 lower-level rows hidden"), "{body}");
+}
+
+/// Scores `n` addresses under 10.1.0.0/16 directly in `ip_score`. Raw scores and decay anchors
+/// vary independently, so ordering by stored raw score and ordering by live score disagree.
+async fn seed_scored_population(pool: &PgPool, n: i32) {
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         SELECT '10.1.0.0'::inet + i, 10 + (i * 37 % 90), now() - (i * 13 % 48) * interval '1 hour', \
+                0.5, 1 + i % 50, 1, false, 1 + i % 3, 1, now() - interval '3 days', \
+                now() - (i * 13 % 48) * interval '1 hour' \
+         FROM generate_series(1, $1) AS i",
+    )
+    .bind(n)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The addresses an Attackers page lists, in order.
+fn listed_ips(body: &str) -> Vec<String> {
+    body.split(r#"<td class="ip stack-lead"><a class="insp" href="/ip/"#)
+        .skip(1)
+        .map(|rest| rest[..rest.find('"').unwrap()].to_string())
+        .collect()
+}
+
+/// The scores an Attackers page lists, in order.
+fn listed_scores(body: &str) -> Vec<f64> {
+    body.split(r#"<td class="count score">"#)
+        .skip(1)
+        .map(|rest| {
+            let number = &rest[rest.find("</span></span>").unwrap() + "</span></span>".len()..];
+            number[..number.find('<').unwrap()].parse().unwrap()
+        })
+        .collect()
+}
+
+/// The "Load more" request a page or fragment offers: the `/ips/rows` URL its button fetches.
+fn load_more(body: &str) -> Option<String> {
+    let at = body.find("<button hx-get=\"/ips/rows?")? + "<button hx-get=\"".len();
+    Some(body[at..at + body[at..].find('"')?].replace("&amp;", "&"))
+}
+
+/// The `after=` cursor of the "Load more" button.
+fn load_more_after(body: &str) -> Option<String> {
+    let url = load_more(body)?;
+    Some(url[url.find("after=")? + "after=".len()..].to_string())
+}
+
+#[sqlx::test(migrations = false)]
+async fn attackers_loads_every_address_once_in_live_score_order(pool: PgPool) {
+    migrate(&pool).await;
+    seed_scored_population(&pool, 1003).await;
+    let state = test_state(pool.clone());
+
+    let (status, first) = get_page(state.clone(), "/ips").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.contains("1,003 scored"), "{first}");
+    let page1 = listed_ips(&first);
+    assert_eq!(page1.len(), 500);
+    assert_eq!(
+        load_more_after(&first).as_deref(),
+        Some(page1[499].as_str())
+    );
+
+    // An address scored above everything while the operator reads the first 500 must not shift
+    // the next load: it resumes after the row shown last, where an OFFSET would repeat that row.
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         VALUES ('10.2.0.1', 99, now(), 0.5, 1, 1, false, 1, 1, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, second) = get_page(state.clone(), &load_more(&first).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    // A fragment: rows, and the button replaced out of band, never a whole page.
+    assert!(!second.contains("<html"), "{second}");
+    assert!(
+        second.contains(
+            "<div class=\"load-more-row\" id=\"load-more-container\" hx-swap-oob=\"true\">"
+        ),
+        "{second}"
+    );
+    let page2 = listed_ips(&second);
+    assert_eq!(page2.len(), 500);
+    let (_, third) = get_page(state.clone(), &load_more(&second).expect("a third load")).await;
+    let page3 = listed_ips(&third);
+    assert_eq!(page3.len(), 3);
+    assert!(load_more(&third).is_none(), "no button after the last row");
+
+    let mut all: Vec<String> = page1.iter().chain(&page2).chain(&page3).cloned().collect();
+    let in_order = [
+        listed_scores(&first),
+        listed_scores(&second),
+        listed_scores(&third),
+    ]
+    .concat();
+    assert!(
+        in_order.windows(2).all(|w| w[0] >= w[1]),
+        "loads must run in live-score order across their boundaries: {in_order:?}"
+    );
+    all.sort();
+    let listed = all.len();
+    all.dedup();
+    assert_eq!(all.len(), listed, "an address was loaded twice");
+    assert_eq!(
+        listed, 1003,
+        "every originally scored address appears exactly once"
+    );
+
+    // The other sorts load by the same rule, ascending too, and the button keeps the sort.
+    let (_, ev1) = get_page(state.clone(), "/ips?sort=events&dir=asc").await;
+    let next = load_more(&ev1).unwrap();
+    assert!(
+        next.starts_with("/ips/rows?sort=events&dir=asc&after="),
+        "{next}"
+    );
+    let (_, ev2) = get_page(state, &next).await;
+    let counts = |body: &str| -> Vec<i64> {
+        body.split(r#"<td class="count" data-label="Events">"#)
+            .skip(1)
+            .filter(|r| !r.starts_with('<'))
+            .map(|r| r[..r.find('<').unwrap()].parse().unwrap())
+            .collect()
+    };
+    let both = [counts(&ev1), counts(&ev2)].concat();
+    assert_eq!(both.len(), 1000);
+    assert!(both.windows(2).all(|w| w[0] <= w[1]), "{both:?}");
+}
+
+#[sqlx::test(migrations = false)]
+async fn attackers_load_more_survives_a_lost_cursor_orders_capped_ties_and_states_tiers(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    seed_scored_population(&pool, 3).await;
+    let state = test_state(pool);
+
+    // A cursor that names no scored address cannot say where to resume: the fragment adds no
+    // rows (starting over would repeat the ones on the page) and says what happened.
+    for uri in [
+        "/ips/rows?after=192.0.2.250",
+        "/ips/rows?after=not-an-address",
+        "/ips/rows",
+    ] {
+        let (status, body) = get_page(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(
+            body.contains("no longer scored. Reload to continue."),
+            "{uri}: {body}"
+        );
+        assert!(listed_ips(&body).is_empty(), "{uri}");
+        assert!(load_more(&body).is_none(), "{uri}");
+    }
+    let (_, all) = get_page(state.clone(), "/ips").await;
+    assert_eq!(listed_ips(&all).len(), 3);
+    assert!(
+        load_more(&all).is_none(),
+        "three rows fit in one load: {all}"
+    );
+    // Two addresses whose breadth lifts them past the cap both show 100.0. They are ordered by how
+    // far past it they are, the order they keep as they decay, not by address (which would put
+    // .2 first under the descending tiebreak).
+    sqlx::query(
+        "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+             distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
+             first_seen, last_seen) \
+         VALUES ('10.3.0.1', 90, now(), 0.5, 1, 1, false, 5, 1, now(), now()), \
+                ('10.3.0.2', 80, now(), 0.5, 1, 1, false, 5, 1, now(), now())",
+    )
+    .execute(&state.db)
+    .await
+    .unwrap();
+    let (_, plain) = get_page(state, "/ips").await;
+    assert!(!plain.contains("Reload to continue"), "{plain}");
+    assert_eq!(
+        &listed_ips(&plain)[..2],
+        ["10.3.0.1", "10.3.0.2"],
+        "{plain}"
+    );
+    assert_eq!(&listed_scores(&plain)[..2], [100.0, 100.0], "{plain}");
+    // The tier rule is stated where the column is, with where to read the rest.
+    assert!(
+        plain.contains(
+            "aggressive needs raw &ge; 90 and confidence &ge; 0.95, standard &ge; 75 and &ge; 0.70"
+        ),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("docs/reference/scoring-and-feed.md#tier"),
+        "{plain}"
+    );
+}
+
+/// Appends one session's events for `ip` on `sensor`, a second apart, starting `start_ago`
+/// seconds ago.
+async fn append_session(
+    pool: &PgPool,
+    ip: &str,
+    sensor: &str,
+    session_id: Uuid,
+    start_ago: i64,
+    steps: &[(SignalType, serde_json::Value)],
+) {
+    for (i, (signal, metadata)) in steps.iter().enumerate() {
+        append_event(
+            pool,
+            ev_with_session(
+                ip,
+                sensor,
+                *signal,
+                Protocol::Tcp,
+                true,
+                &secs_ago(start_ago - i as i64),
+                metadata.clone(),
+                session_id,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+fn cmd(command: &str) -> (SignalType, serde_json::Value) {
+    (
+        SignalType::HoneypotCommandExec,
+        serde_json::json!({ "command": command }),
+    )
+}
+
+fn telnet_login(user: &str) -> (SignalType, serde_json::Value) {
+    (
+        SignalType::HoneypotLoginAttempt,
+        serde_json::json!({ "username": user }),
+    )
+}
+
+/// The context line rendered under `ip`'s pending row.
+fn queue_context<'a>(body: &'a str, ip: &str) -> &'a str {
+    let start = body
+        .find(&format!(r#"id="context-{ip}""#))
+        .unwrap_or_else(|| panic!("no context row for {ip}: {body}"));
+    &body[start..start + body[start..].find("</tr>").unwrap()]
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_rows_say_where_the_address_came_from_and_what_it_did(pool: PgPool) {
+    migrate(&pool).await;
+    // A: three sessionless events from the seed, then two telnet sessions. Its first command is a
+    // shell-entry preamble line, so the line must skip to the first one that says something.
+    seed_recommended(&pool, "203.0.113.160", 900).await;
+    append_session(
+        &pool,
+        "203.0.113.160",
+        "telnet",
+        Uuid::now_v7(),
+        600,
+        &[
+            telnet_login("admin"),
+            cmd("enable"),
+            cmd("system"),
+            cmd("shell"),
+            cmd("sh"),
+            cmd("cat /proc/mounts"),
+        ],
+    )
+    .await;
+    append_session(
+        &pool,
+        "203.0.113.160",
+        "telnet",
+        Uuid::now_v7(),
+        300,
+        &[telnet_login("cht"), cmd("enable"), cmd("uname -a")],
+    )
+    .await;
+    // B: ran a command and then uploaded a file; the upload is what it came to do.
+    seed_recommended(&pool, "203.0.113.161", 900).await;
+    append_session(
+        &pool,
+        "203.0.113.161",
+        "telnet",
+        Uuid::now_v7(),
+        600,
+        &[
+            cmd("echo hi"),
+            (
+                SignalType::HoneypotMalwareUpload,
+                serde_json::json!({
+                    "sample_orig_name": ".i",
+                    "sample_sha256": "ab".repeat(32),
+                    "sample_size": 5120,
+                }),
+            ),
+        ],
+    )
+    .await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let (status, body) = get_page(test_state(pool), "/queue").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let a = queue_context(&body, "203.0.113.160");
+    // Sensors by event count: telnet's nine first, then the seed's three one-event sensors.
+    assert!(
+        a.contains(
+            r#"<span class="ctx-chip">Telnet</span><span class="ctx-chip">General</span><span class="ctx-chip">Honeypot-sensor</span><span class="ctx-chip">Ssh-sensor</span>"#
+        ),
+        "{a}"
+    );
+    // Two sessions: the seed's events carry none, and nine telnet events are not nine sessions.
+    assert!(a.contains(">2 sessions<"), "{a}");
+    assert!(
+        a.contains(r#"<span class="sev sev--high">command exec 7</span><span class="sev sev--watch">login attempt 3</span><span class="sev sev--low">probe 1</span>"#),
+        "{a}"
+    );
+    assert!(
+        a.contains(
+            r#"ran</span> <code class="mono ctx-code" title="cat &#x2f;proc&#x2f;mounts">cat &#x2f;proc&#x2f;mounts</code>"#
+        ),
+        "{a}"
+    );
+    assert!(!a.contains("counts from"), "{a}");
+
+    let b = queue_context(&body, "203.0.113.161");
+    assert!(
+        a.contains(">2 sessions<") && b.contains(">1 session<"),
+        "{b}"
+    );
+    assert!(
+        b.contains(
+            r#"uploaded</span> <code class="mono ctx-code" title=".i (abababababab..., 5.0 KB)">.i (abababababab..., 5.0 KB)</code>"#
+        ),
+        "{b}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_flooding_queue_entry_is_described_from_a_bounded_sample(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.162", 900).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    // 5,001 more events written straight to the ledger (each linked to the chain head, as the
+    // trigger requires), and the projection told it holds 5,004 in all.
+    sqlx::query(
+        "DO $$ DECLARE head bytea; i int; BEGIN \
+           FOR i IN 1..5001 LOOP \
+             SELECT hash INTO head FROM event ORDER BY id DESC LIMIT 1; \
+             INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
+                                weight, confidence, observed_at, prev_hash, hash) \
+             VALUES ('203.0.113.162', 'telnet', 'honeypot_connection', 'tcp', false, 'network', \
+                     1, 0.5, now() - interval '1 minute', head, \
+                     sha256(convert_to(i::text, 'UTF8'))); \
+           END LOOP; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ip_score SET event_count = 5004 WHERE source_ip = '203.0.113.162'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (_, body) = get_page(test_state(pool), "/queue").await;
+    let c = queue_context(&body, "203.0.113.162");
+    assert!(c.contains("counts from 5,000 of 5,004 events"), "{c}");
+}
+
+/// The Recent activity rows of a dashboard page: (activity, events cell, source).
+fn recent_rows(body: &str) -> Vec<(String, String, String)> {
+    let panel = &body[body.find(">Recent activity ").unwrap()..];
+    let panel = &panel[..panel.find("</table>").unwrap()];
+    panel
+        .split("<tr>")
+        .skip(2)
+        .map(|row| {
+            let cells: Vec<&str> = row.split("<td").skip(1).collect();
+            let text = |cell: &str| -> String {
+                let inner = &cell[cell.find('>').unwrap() + 1..];
+                let mut out = String::new();
+                let mut in_tag = false;
+                for ch in inner[..inner.find("</td>").unwrap()].chars() {
+                    match ch {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        c if !in_tag => out.push(c),
+                        _ => {}
+                    }
+                }
+                out.trim().to_string()
+            };
+            (text(cells[1]), text(cells[2]), text(cells[3]))
+        })
+        .collect()
+}
+
+#[sqlx::test(migrations = false)]
+async fn dashboard_recent_activity_folds_a_flood_into_one_row_per_run(pool: PgPool) {
+    migrate(&pool).await;
+    let sid = Uuid::now_v7();
+    let flood = |ago: i64| {
+        ev_with_session(
+            "203.0.113.170",
+            "telnet",
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            &secs_ago(ago),
+            serde_json::json!({ "command": "echo" }),
+            sid,
+        )
+    };
+    // Oldest first: five from the flooding source, one SSH login from another, then thirty more.
+    for ago in (300..305).rev() {
+        append_event(&pool, flood(ago)).await.unwrap();
+    }
+    append_event(
+        &pool,
+        ev(
+            "203.0.113.171",
+            "ssh",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            false,
+            &secs_ago(200),
+        ),
+    )
+    .await
+    .unwrap();
+    for ago in (10..40).rev() {
+        append_event(&pool, flood(ago)).await.unwrap();
+    }
+
+    let (_, body) = get_page(test_state(pool), "/").await;
+
+    assert_eq!(
+        recent_rows(&body),
+        [
+            (
+                "Telnet command execution".to_string(),
+                "x30".to_string(),
+                "203.0.113.170".to_string()
+            ),
+            (
+                "SSH login attempt".to_string(),
+                "1".to_string(),
+                "203.0.113.171".to_string()
+            ),
+            (
+                "Telnet command execution".to_string(),
+                "x5".to_string(),
+                "203.0.113.170".to_string()
+            ),
+        ],
+        "{body}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn detail_folds_retried_sessions_and_echo_loader_chunks(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.180";
+    let script = [cmd("enable"), cmd("sh"), cmd("cat /proc/mounts")];
+    // A retry loop: the same three commands three times, each under a different username, then a
+    // session that ran something else.
+    for (n, user) in ["admin", "cht", "administrator"].iter().enumerate() {
+        let mut steps = vec![telnet_login(user)];
+        steps.extend(script.iter().cloned());
+        append_session(
+            &pool,
+            ip,
+            "telnet",
+            Uuid::now_v7(),
+            3000 - n as i64 * 100,
+            &steps,
+        )
+        .await;
+    }
+    // The newest session wrote a five-chunk echo loader between two ordinary commands.
+    let mut steps = vec![telnet_login("root"), cmd("cd /tmp")];
+    for index in 1..=5u64 {
+        steps.push((
+            SignalType::HoneypotCommandExec,
+            serde_json::json!({
+                "command": format!("/bin/busybox echo -ne '\\x7f\\x45' >> .i"),
+                "assembled_file": "/tmp/.i",
+                "chunk_index": index,
+            }),
+        ));
+    }
+    steps.push(cmd("chmod 777 .i"));
+    append_session(&pool, ip, "telnet", Uuid::now_v7(), 600, &steps).await;
+
+    let (status, body) = get_page(test_state(pool), &format!("/ip/{ip}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two top-level cards (the loader session and the fold) and three member cards inside the
+    // fold. A fold that also swallowed the loader session would leave one top-level card.
+    assert_eq!(
+        body.matches(r#"class="session-card fold-group""#).count(),
+        1,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<details class="session-card" id="session-"#)
+            .count(),
+        4,
+        "{body}"
+    );
+    assert!(body.contains(">x3 identical sessions<"), "{body}");
+    assert!(body.contains("users: admin, cht, administrator"), "{body}");
+    assert!(body.contains(">3 commands each<"), "{body}");
+
+    // The five chunk writes are one row, the lines behind its expander; the commands around them
+    // keep their own rows.
+    assert!(
+        body.contains(r#"<span class="run-count">5 echo chunks</span> to <span class="mono">&#x2f;tmp&#x2f;.i</span> <span class="dim">(chunks 1-5)</span>"#),
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<tr class="chunk-run">"#).count(),
+        1,
+        "{body}"
+    );
+    assert_eq!(body.matches("&gt;&gt; .i</li>").count(), 5, "{body}");
+    assert!(
+        body.contains("<td class=\"mono\">cd &#x2f;tmp</td>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<td class=\"mono\">chmod 777 .i</td>"),
+        "{body}"
+    );
+}

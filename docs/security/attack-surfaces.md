@@ -1,0 +1,329 @@
+<!--
+title: Attack surfaces
+audience: security
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-07
+-->
+
+# Attack surfaces
+
+Every boundary where untrusted or externally reachable data enters or leaves Propolis,
+what it exposes, and the control that contains it. Exact values (ports, routes, env
+defaults, tables) live in the reference pages this page links to.
+
+For the trust model behind these boundaries see [threat-model.md](threat-model.md).
+
+## Summary
+
+| Surface | Direction | Reachable by | Primary controls |
+|---|---|---|---|
+| Sensor listeners | inbound | internet attacker | never-execute, boundary sanitization, no HTTP client in sensor closure |
+| Malware fetcher | outbound | attacker-chosen URL (opt-in) | SSRF vetter, forbidden-egress guard, default off |
+| Console (HTTP) | inbound | operator (loopback default) | Argon2id auth, session/CSRF gate, security headers |
+| Database | internal | intake/scoring/console | parameterized SQL only, dedicated backend |
+| Quarantine spool | internal file store | worker writes, console reads | SHA-256 naming, `0640`, `noexec` mount, byte budget |
+| Feed publish | outbound (files) | anyone consuming the public feed | field selection excludes internal fields; operator-run sync |
+| Enrichment / reporting egress | outbound | operator-configured services | all opt-in, default off, fail-closed |
+| Live watch (`propolis-watch`) | outbound read path (SSH) | holder of the operator's dedicated watch key | forced command under `restrict`, read-only by construction, group read only |
+
+## Sensor listeners
+
+The attacker-facing surface: **12 sensor crates covering 15 protocols** (the `cred`
+sensor serves VNC / MySQL / MSSQL / PostgreSQL / MongoDB). Sensors have **no compiled-in
+default port** - ports come from the config/env the deploy units set; see
+[../reference/ports-and-protocols.md](../reference/ports-and-protocols.md) and
+[../reference/sensor-behavior.md](../reference/sensor-behavior.md).
+
+Exposes: raw attacker-chosen bytes on each protocol - banners, commands, credentials,
+uploaded sample bytes.
+
+`sensor-http` can also expose an implicit-TLS HTTPS listener (conventionally 443). It exists only
+when `PROPOLIS_HTTP_TLS_BIND` is set, so an operator who sets only the cert and key opens no new
+port. It adds a TLS handshake to the reachable surface: a failed or stalled handshake is cut at the
+read timeout and recorded nowhere but a debug log, no client certificate is requested, and the
+certificate is the deploy-minted self-signed one whose only name is `localhost`. A half-configured
+or unusable cert and key pair makes the sensor refuse to start rather than serve plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+
+`sensor-redis` can likewise expose an implicit-TLS listener (conventionally 6380, `rediss://`). It
+exists only when `PROPOLIS_REDIS_TLS_BIND` is set, so cert and key alone open no new port. The
+surface and its limits match the HTTPS listener: a handshake that fails or stalls is cut at the
+read timeout and logged only at debug level, no client certificate is requested, there is no
+STARTTLS, and the certificate is the deploy-minted self-signed one named `localhost`. The AUTH
+password is never captured over TLS, as on the plain listener. A half-configured or unusable pair
+makes the sensor refuse to start rather than serve plaintext.
+
+`sensor-mqtt` can also expose an implicit-TLS listener (conventionally 8883, MQTTS). It exists only
+when `PROPOLIS_MQTT_TLS_BIND` is set, so cert and key alone open no new port. The surface and its
+limits match the HTTPS listener: a handshake that fails or stalls is cut at the read timeout and
+logged only at debug level, no client certificate is requested, there is no STARTTLS, and the
+certificate is the deploy-minted self-signed one named `localhost`. The MQTT password is never
+captured over TLS, as on the plain listener. Binary PUBLISH payloads sent over TLS are quarantined
+by the same hand-off, byte budget and shutdown drain as the plain listener, and never run. A
+half-configured or unusable pair makes the sensor refuse to start rather than serve plaintext.
+
+`sensor-dns` answers over UDP, so its reply is a reflection surface: a UDP source address is
+whatever the sender wrote. The reply is bounded by construction: it is the query's own header
+rewritten plus its first question, nothing appended, so it is never larger than the query
+(`crates/sensor-dns/src/protocol.rs#refused_reply`). The crate's one UDP `send_to` sits behind
+`crates/sensor-dns/src/guarded.rs#reply_gate`, which re-checks that with a byte budget and
+refuses unspecified, broadcast and multicast sources and the source ports of legacy reflectors
+(0, 7, 13, 17, 19, 37); a static test keeps it the only send site
+(`crates/sensor-dns/tests/integration.rs#never_amplifies_static_check`). It serves no records,
+never resolves or forwards, and never answers a message with QR set, so two DNS sensors cannot
+loop. Bounding size removes amplification but not one-for-one reflection, so UDP replies are
+also rate limited per source network and in total
+(`crates/sensor-framework/src/rate_limit.rs#ReplyRateLimiter`): a spoofer gets at most a burst
+plus the sustained rate of replies aimed at any one network, and an over-limit datagram costs one
+share of a bounded summary event rather than an event of its own, so the flood cannot fill the
+event log either. On TCP 53 a connection is bounded to 64 messages of at most 4096 bytes each.
+
+`sensor-tftp` is the other UDP reflection surface, and it carries the same two controls. A
+request from a refused source (the reflective ports above, or an unspecified, broadcast or
+multicast address, checked after IPv4-mapped normalization by
+`crates/sensor-framework/src/reply_source.rs#check_reply_source`) is recorded and gets no transfer
+socket, so not even the first ERROR or ACK leaves; `crates/sensor-tftp/src/guarded.rs#send`
+repeats the check before every packet. Every datagram on the request port is charged to the same
+per-network and global `ReplyRateLimiter` before it is parsed, so junk cannot slip past the limit,
+and over-limit requests fold into bounded summary events. Packets on an established transfer's
+ephemeral port are not charged: that socket is already tied to the one peer that requested it.
+
+`sensor-dns` can also expose a DNS over TLS listener (conventionally 853). It exists only when
+`PROPOLIS_DNS_TLS_BIND` is set, so cert and key alone open no new port. The surface and its
+limits match the HTTPS listener: a handshake that fails or stalls is cut at the read timeout and
+logged only at debug level, no client certificate is requested, and the certificate is the
+deploy-minted self-signed one named `localhost`. The same REFUSED reply and the same per-connection
+bounds apply as on TCP 53. A half-configured or unusable pair makes the sensor refuse to start
+rather than serve plaintext.
+
+`sensor-smtp` can expose up to two more ports and a protocol upgrade. An implicit-TLS listener
+(conventionally 465, SMTPS) and a submission listener (conventionally 587, plain with STARTTLS)
+each exist only when `PROPOLIS_SMTP_TLS_BIND` or `PROPOLIS_SMTP_SUBMISSION_BIND` is set, so cert
+and key alone open no new port. They do enable STARTTLS on the plain listeners (25, and 587 when
+set), which adds a handshake to those sessions: a failed or stalled handshake ends the session,
+and the same limits as the HTTPS listener apply (no client certificate, a deploy-minted
+self-signed certificate named `localhost`, handshake failures logged only at debug level). The
+STARTTLS upgrade refuses plaintext pipelined behind the command (the injection class of
+CVE-2011-0411): the bytes are counted in one `honeypot_command_exec` event, never captured or
+interpreted, and the connection is closed with a `554` before any handshake begins. Session state
+is reset after the upgrade. AUTH passwords are never captured over TLS, as on the plain
+listener. A half-configured or unusable pair makes the sensor refuse to start rather than serve
+plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-smtp-starttls).
+
+`sensor-ftp` can expose one more port and a protocol upgrade. An implicit-TLS listener
+(conventionally 990, FTPS) exists only when `PROPOLIS_FTP_TLS_BIND` is set, so cert and key alone
+open no new port. They do enable AUTH TLS on the plain listener (21), which adds a handshake to
+those sessions: a failed or stalled handshake ends the session, and the same limits as the HTTPS
+listener apply (no client certificate, a deploy-minted self-signed certificate named `localhost`,
+handshake failures logged only at debug level). The AUTH TLS upgrade refuses plaintext pipelined
+behind the command (the injection class of CVE-2011-0411): the bytes are counted in one
+`honeypot_command_exec` event, never captured or interpreted, and the connection is closed with a
+`504` before any handshake begins. Session state, including login, is reset after the upgrade.
+After `PROT P` a passive data connection also carries a TLS handshake, but only once its source IP
+matched the control connection, and uploads over it are quarantined by the same hand-off, byte
+budget and shutdown drain as plaintext uploads, and never run. Passwords are never captured over
+TLS, as on the plain listener. A half-configured or unusable pair makes the sensor refuse to
+start rather than serve plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-ftp-auth-tls).
+
+`sensor-cred` opens no new port for TLS: with `PROPOLIS_CRED_TLS_CERT` and
+`PROPOLIS_CRED_TLS_KEY` set, the existing PostgreSQL, MySQL, MSSQL and MongoDB ports also accept a
+TLS handshake, in-band after an SSLRequest, a `CLIENT_SSL` SSLRequest or a PRELOGIN asking for
+encryption, or on MongoDB when the first two bytes are a TLS record header. Each handshake is cut
+at the read timeout, no client certificate is requested, the certificate is the deploy-minted
+self-signed one named `localhost`, and a failed handshake ends the session with no plaintext
+fallback. PostgreSQL and MySQL read the pre-upgrade request with exact-length reads and no
+user-space buffer, so plaintext sent behind the request reaches the handshake as garbage and is
+never read as protocol, so an on-path party cannot inject plaintext that a server would read as
+if it had arrived inside TLS. The MSSQL handshake runs inside TDS packets
+through a sensor-specific framing adapter (`crates/sensor-cred/src/tds_tls.rs`), which is parser
+code reachable by any client that offers encryption; it buffers at most one 8-byte TDS header in
+fixed-size storage, passes payload bytes straight to rustls, and frames each handshake write as one
+TDS packet of at most 4096 bytes. Plaintext clients are still served on every port, including
+an MSSQL client that offers `ENCRYPT_OFF` and one that asks for encryption but then sends a
+plaintext Login7 instead of a handshake (one byte is read to tell the two apart; a handshake that
+has begun never falls back). A MongoDB client whose handshake fails is still recorded by its
+connection event. Passwords, DES and MD5 responses are never captured over
+TLS, as in plaintext. A half-configured or unusable pair makes the sensor refuse to start rather
+than serve plaintext. See
+[../operations/networking-tls.md](../operations/networking-tls.md#sensor-cred-in-band-tls).
+
+The fake shell on SSH, telnet and ADB holds a command that reads its standard input open until
+that input ends, so a client can make the sensor keep a channel or stream open and collect bytes
+for it. That collection is bounded the way the binary shell capture is: each held input keeps at
+most `max_captured_bytes`, charged to the process-wide capture memory budget, and ends (the command
+then runs on what was kept) once either is reached; a client that stops sending is cut by the idle
+timeout and every session by `max_duration`. SSH still caps a connection at 10 channels and ADB at
+32 streams. The bodies a session's commands consumed are held, deduplicated, until the session ends,
+at most 16 distinct ones (a further one is submitted at once), so a retried upload costs one copy.
+Deciding whether a line waits runs the line once and rolls back what it did, which copies the
+connection's written-file overlay per line; that overlay is bounded by the connection budget's
+node and content limits. The held bytes are only ever written into the in-memory fake filesystem
+and the quarantine spool; nothing runs them. See
+[../reference/sensor-behavior.md](../reference/sensor-behavior.md#fake-shell-ssh-telnet-adb).
+
+Controls:
+
+- **Never-execute.** No sensor spawns a subprocess or execs; the honeypot captures, it
+  never runs what it captures. Enforced by per-sensor static-check regression tests and
+  deployment W^X. See [never-execute.md](never-execute.md).
+- **Boundary sanitization.** Every attacker-controlled string passes through
+  `sanitize_value` before entering an event record (CR/LF, ANSI, bidi, zero-width, length
+  cap). See [input-handling.md](input-handling.md).
+- **No HTTP client in the sensor dependency closure** (sensors are egress-free by
+  construction). Note the per-crate dependency assertion is enforced by test only for
+  `sensor-ssh`; the workspace lockfile does contain HTTP clients used by the non-sensor
+  paths below. See [never-execute.md](never-execute.md) and
+  [outbound-controls.md](outbound-controls.md).
+- **Credential privacy.** A submitted password is read only far enough to advance the
+  parser, then dropped; it is never placed in any event field. See
+  [sample-and-credential-privacy.md](sample-and-credential-privacy.md).
+
+## Malware fetcher (attacker-directed outbound)
+
+The one path that fetches an **attacker-supplied URL**. It is opt-in
+(`PROPOLIS_FETCH_ENABLED`, default off) and the daemon only spawns it when enabled.
+
+Exposes: an SSRF / internal-scan risk - an attacker who gets the box to fetch a URL of
+their choosing.
+
+Control: a fail-closed URL vetter run on the initial URL **and every redirect hop** - scheme allowlist (http/https/tftp), `user:pass@host` rejected, DNS-rebinding defense
+(a mixed public+internal resolve set rejects the whole host), the connect address pinned
+to the vetted IP (never re-resolved), and a forbidden-target check rejecting own-host and
+reserved IP ranges (with IPv6 canonicalization first). See
+[outbound-controls.md](outbound-controls.md).
+
+A URL the shell derives rather than reads off a typed fetch command (an assembled echo-loader
+downloader run as `PROG a b c d port`, whose request line names the path; `derived_from`
+`echo_loader_args`, see
+[events-and-signals.md](../reference/events-and-signals.md#echo-loader-captures-and-their-keys))
+takes the same path and no other: the sensor only emits it as a `honeypot_file_download` event,
+the fetcher picks it up from the event log like any typed URL, and the vetter decides whether it
+is fetched. The sensor opens no connection for it and never runs the file it came from
+(`crates/sensor-framework/src/shell/loader.rs#FakeShell::loader_exec`).
+
+## Console (HTTP)
+
+Axum + minijinja server-rendered HTML. **39 routes: 8 public, 31 session-gated**
+(canonical table: [../reference/console-routes.md](../reference/console-routes.md)).
+Default bind is loopback-only (`127.0.0.1:8080`); the operator opts into a wider bind.
+
+Exposes: the public group - `/health`, `/ready`, `/metrics`, `/login` (GET+POST),
+`/logout`, `/assets/fonts/{file}` - reachable without a session. Everything else is behind
+the session gate. `/metrics` is Prometheus text and is public because Prometheus cannot
+log in; that is acceptable *because* the default bind is loopback.
+
+Controls:
+
+- **Authentication and session/CSRF boundary** - Argon2id password, HMAC-tagged session
+  cookie, per-session CSRF on mutating routes, login rate limiting. See
+  [authn-authz.md](authn-authz.md).
+- **Security headers on every response:** `X-Frame-Options: DENY` and
+  `X-Content-Type-Options: nosniff`, and a Content-Security-Policy allowing script, style,
+  fonts and requests from this origin only, with nothing inline (no template carries inline
+  script, style or handlers). `/samples/download/{sha256}` keeps a stricter
+  `default-src 'none'` (served `application/octet-stream` as an attachment). XSS defense
+  is minijinja auto-escaping (`.html` templates); the policy is the second line.
+- **Path/traversal-safe route params.** Font names match a fixed four-name allowlist;
+  sample downloads validate a 64-hex SHA-256; feed downloads validate the tier as a shape
+  check that admits no `.`/`/`/`\`. See [../reference/console-routes.md](../reference/console-routes.md).
+- **External-lookup links** on the detail page are followed by the *operator's* browser;
+  the box never leaks a captured IP to a third-party lookup service.
+
+> No in-process TLS. The console listener is plain HTTP; TLS, if any, is operator-provided
+> (e.g. a reverse proxy) `[inferred]`. See
+> [../operations/networking-tls.md](../operations/networking-tls.md).
+
+## Database
+
+Internal surface. All writes are parameterized - no SQL string is built with `format!` in
+non-test source; the event insert and all query paths bind values, never interpolate. See
+[input-handling.md](input-handling.md) and, for tables/enums, [../reference/database.md](../reference/database.md).
+
+## Quarantine spool
+
+Internal file store for captured samples. Files are **named by their SHA-256** (never the
+attacker's filename), written `0640`, size-capped per file and under a global byte budget,
+and `verify()` re-hashes on read and fails closed on mismatch. The spool directory is
+required to be a `noexec,nosuid,nodev` mount (deployment concern). See
+[malware-custody.md](malware-custody.md) and [filesystem-and-db-protections.md](filesystem-and-db-protections.md).
+
+## Feed publish
+
+The public blocklist feed is the outward-facing data product. It selects only attacker
+`source_ip` plus tier / first-seen / last-seen / categories; it carries **zero** references
+to the honeypot's own `wan_ip` (internal-only) - verified across every feed export path.
+See [sample-and-credential-privacy.md](sample-and-credential-privacy.md) and
+[../reference/scoring-and-feed.md](../reference/scoring-and-feed.md).
+
+The feed publish / blocklist-sync cron is an **operator setup step**
+(`deploy/blocklist-sync.sh`, referenced by comment), **not** wired into any shipped
+systemd timer or cron unit. See [../operations/deployment-models.md](../operations/deployment-models.md).
+
+## Live watch (`propolis-watch` over SSH)
+
+An operator-installed read path, not a listener Propolis opens: the honeypot host's administrative
+sshd (not `sensor-ssh`, which is the fake SSH sensor and often holds port 22) accepts
+one dedicated key for the `propolis-watch` account and runs the watcher as that key's forced
+command. Absent until the operator adds a key to `/var/lib/propolis-watch/.ssh/authorized_keys`;
+`deploy/provision.sh` creates the account and the empty `.ssh` directory, never a key. Setup:
+[../operations/live-watch.md](../operations/live-watch.md).
+
+Exposes: everything the sensors record, in real time, to whoever holds the private key. That is
+attacker data (source addresses, submitted usernames, commands, banners, file names) plus the
+honeypot's own `wan_ip` stamped on events, and, with the opt-in `--journal`, the units' journal.
+Treat the key as granting read access to the event ledger's raw input.
+
+Controls:
+
+- **Cannot write.** The account reaches the event logs only through supplementary membership in
+  each sensor's group, and the logs are `0640` in `0750` directories, so the group bit grants read
+  and nothing else (`deploy/provision.sh#propolis-watch`). The watcher itself opens files
+  read-only and persists nothing: it tails through `LogTailer::without_cursor`, which has no
+  cursor to save (`crates/log-tailer/src/tailer.rs#LogTailer::without_cursor`), and a static
+  test fails if its source gains a file-writing call
+  (`crates/watch/tests/read_only.rs#never_writes_a_file`).
+- **Cannot execute.** `command=` forces the watcher whatever the client asks for; the client's
+  request arrives only as `SSH_ORIGINAL_COMMAND`, which the watcher splits on whitespace and
+  checks against a fixed flag allowlist, exiting 2 on any other word
+  (`crates/watch/src/args.rs#parse`). Nothing from it reaches a shell. The watcher's one child is
+  `journalctl` with a constant argument vector (`crates/watch/src/journal.rs#JOURNAL_ARGS`),
+  started only with `--journal`, and a static test keeps that the only spawn
+  (`crates/watch/tests/read_only.rs#never_executes_anything_but_the_fixed_journalctl`).
+- **Cannot forward or get a terminal.** `restrict` disables port, agent and X11 forwarding, pty
+  allocation and `~/.ssh/rc` for the key (`deploy/watch-authorized-keys.example`,
+  pinned by `crates/sensor-framework/tests/deploy_test.rs#watch_authorized_keys_example_forces_the_watcher_under_restrict`).
+  The watcher opens no socket and links no database driver
+  (`crates/watch/tests/read_only.rs#never_opens_a_socket_or_reaches_a_database`).
+- **Cannot add a key.** The account's home is root:propolis-watch 0750, its `.ssh` root:root
+  0755 and `authorized_keys` root:root 0644, so it can read the keys that log in to it but cannot
+  append one, replace the file, or rename `.ssh` aside, even if attacker data ever got it to run
+  code (`deploy/provision.sh#ensure_dir /var/lib/propolis-watch`). sshd's StrictModes accepts
+  root-owned key files and directories that no one else can write.
+- **No secret on the path.** The account cannot read `/etc/propolis/propolis.env`. Its log list
+  comes from `/etc/propolis/watch.env`, which `deploy/watch-env.sh` derives from `propolis.env`
+  by copying the one `PROPOLIS_SENSOR_LOGS` line, checks holds nothing else before renaming it
+  into place, and writes root:propolis-watch 0640
+  (`crates/sensor-framework/tests/deploy_test.rs#watch_env_copies_only_the_sensor_logs_line_from_propolis_env`).
+  The watcher reads only that key from it. No password can log in to the account (its password
+  field is `*`), and journal access is not granted unless the operator adds `systemd-journal` by
+  hand.
+
+The stream carries attacker-controlled text. Sensors sanitize every attacker string before it
+enters an event ([input-handling.md](input-handling.md)), and the watcher JSON-escapes whatever
+it emits, so a control byte arrives as an escape sequence rather than acting on a terminal. But
+the content is still written by attackers: a human or an AI assistant reading the stream must
+treat it as data, never as instructions, the same as any captured payload.
+
+## Enrichment and reporting egress
+
+Five platform-level outbound paths - VirusTotal, vendor abuse submitters
+(AbuseIPDB / DShield / OTX), console forward-confirmed rDNS, offline GeoLite2 (local file
+reads, **not** network), and ops-alert ntfy. **Every one is opt-in and defaults off**;
+several fail closed if their credential or topic is missing, and vendor submission only
+ever sends operator-**approved** review-queue rows. Full list, gating flags, and the
+forbidden-egress guard: [outbound-controls.md](outbound-controls.md) and
+[../reference/integrations.md](../reference/integrations.md).

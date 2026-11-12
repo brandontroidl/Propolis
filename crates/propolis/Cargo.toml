@@ -1,0 +1,63 @@
+[package]
+name = "propolis"
+version = "0.4.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "propolis"
+path = "src/main.rs"
+
+[dependencies]
+console = { path = "../console" }
+core-scoring = { path = "../core-scoring" }
+feed = { path = "../feed" }
+fleet = { path = "../fleet" }
+geoip = { path = "../geoip" }
+intake = { path = "../intake" }
+log-tailer = { path = "../log-tailer" }
+review = { path = "../review" }
+sensor-framework = { path = "../sensor-framework" }
+
+axum = "0.8.9"
+chrono = "0.4.45"
+hex = "0.4.3"
+ipnet = "2.12.0"
+# "net" feature for `nix::ifaddrs::getifaddrs` - enumerating this node's own live interface
+# addresses for the malware fetcher's fail-closed `own_ips` set (crates/review/src/fetcher).
+# Already a transitive dependency of this workspace at this exact version, so promoting it to a
+# direct one with one extra feature is a smaller supply-chain change than adding a new crate.
+nix = { version = "0.31.3", features = ["net", "fs"] }
+async-trait = "0.1"
+rand = { version = "0.10.2", features = ["std"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+sqlx = { version = "0.9.0", features = ["postgres", "runtime-tokio", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio-util = "0.7.16"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+log-format = { path = "../log-format" }
+# The ops-alert undelivered-alert state file (`ops_alert::undelivered`), and the docs agreement
+# test's `cargo metadata` parse. Already in the lockfile and vendored at this version.
+serde_json = "1.0.151"
+
+[dev-dependencies]
+# A real sensor, so one test can carry a record the sensor itself produced through intake into a
+# rendered console page. Asserting each end against its own hand-written fixture leaves the join
+# between them - the metadata key names - untested in both directions. Dev-only: the daemon
+# launches sensors as separate processes and does not link them.
+sensor-telnet = { path = "../sensor-telnet" }
+# The same boundary for the other shell sensor, whose capture metadata the console also reads.
+sensor-ssh = { path = "../sensor-ssh" }
+# An SSH client for that test, so the session is driven over the real transport rather than by
+# calling the handler directly. Already vendored at this version for sensor-ssh's own tests.
+russh = "0.62.4"
+tempfile = "3.27.0"
+# test-util enables tokio's pausable virtual clock (start_paused) so time-based dispatcher tests
+# (per-attempt deadline + backoff) run deterministically and instantly. A tokio feature, not a new
+# crate, so it needs no re-vendoring; dev-only, never shipped in the daemon.
+tokio = { version = "1.53.1", features = ["test-util"] }
+# The `cpu_budget` example builds a wire event and hashes like the ledger does. Both are already in
+# the workspace, so this adds no crate.
+sensor-wire = { path = "../sensor-wire" }
+sha2 = "0.11.0"

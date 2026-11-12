@@ -1,0 +1,272 @@
+# Shell functions as an interactive login bash on Ubuntu 22.04 runs them. Definition and call, the
+# arguments and the `return` status, `local` scope, a function shadowing a command, `type` and
+# `command -v`/`-V` of a function with bash's own listing of the body, `unset -f`, `export -f`,
+# FUNCNAME and FUNCNEST. Each reply was produced by `bash --noprofile --norc --noediting -i`
+# started as a login shell (`exec -a -bash`) in the localhost/propolis-survey-ref:jammy container
+# (bash 5.1.16, dash 0.5.11), run with `--network none`, PS1 and PS2 set to markers and these
+# lines fed one at a time on standard input. The lines that run `sh` ran dash as /bin/sh.
+# The unlimited recursion that kills bash with a stack overflow is not recorded, because the
+# reference shell ends there; the emulator's limit on it is covered by its unit tests.
+# source: ubuntu:22.04 container run of bash 5.1.16 and dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-09
+# protocol: ssh
+# persona: ubuntu
+$ f() { echo hi; }
+$ f
+> hi
+$ echo $?
+> 0
+$ f() { echo "n=$# 1=$1 2=$2 at=$@ zero=$0"; }
+$ set -- x y z
+$ f a b
+> n=2 1=a 2=b at=a b zero=-bash
+$ echo "after n=$# 1=$1 at=$@"
+> after n=3 1=x at=x y z
+$ f() { return 3; }
+$ f; echo $?
+> 3
+$ g() { false; return; }
+$ g; echo $?
+> 1
+$ h() { true; return; }
+$ h; echo $?
+> 0
+$ f() { return 300; }; f; echo $?
+> 44
+$ f() { return -1; }; f; echo $?
+> 255
+$ f() { return abc; }; f; echo $?
+> -bash: return: abc: numeric argument required
+> 2
+$ f() { return 3 4; echo cont; }; f; echo reached
+> -bash: return: too many arguments
+$ echo next
+> next
+$ return 4
+> -bash: return: can only `return' from a function or sourced script
+$ echo "after rc=$?"
+> after rc=2
+$ ls() { echo mine; }
+$ ls
+> mine
+$ \ls
+> mine
+$ command ls /nonexistent_dir; echo rc=$?
+> ls: cannot access '/nonexistent_dir': No such file or directory
+> rc=2
+$ unset -f ls
+$ echo() { printf 'mine %s\n' "$*"; }
+$ echo hi
+> mine hi
+$ command echo hi
+> hi
+$ builtin echo hi
+> hi
+$ unset -f echo
+$ cd() { echo mine; }; cd /tmp; echo $?
+> mine
+> 0
+$ unset -f cd
+$ f() { echo hi; } >/tmp/shfn_o
+$ f; echo --; cat /tmp/shfn_o; f; cat /tmp/shfn_o
+> --
+> hi
+> hi
+$ f() { local x=1; echo "in $x"; }
+$ x=0; f; echo "out $x"
+> in 1
+> out 0
+$ f() { local x; echo "[${x-unset}]"; }
+$ x=0; f
+> [unset]
+$ g() { local x=5; h; echo "g x=$x"; }; h() { x=9; }
+$ g; echo "x=$x"
+> g x=9
+> x=0
+$ local x=1; echo $?
+> -bash: local: can only be used in a function
+> 1
+$ f() { local 1x; echo "rc=$?"; }; f
+> -bash: local: `1x': not a valid identifier
+> rc=1
+$ f() { local a=1 b=2; echo "$a $b"; local a=7; echo "$a"; }; a=0; f; echo "$a"
+> 1 2
+> 7
+> 0
+$ f() { x=1; }; f; echo "x=$x"
+> x=1
+$ f() { echo a; }
+$ type f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo a
+> }
+$ type -t f
+> function
+$ type -a f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo a
+> }
+$ command -v f
+> f
+$ command -V f
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo a
+> }
+$ type -p f; echo $?
+> 0
+$ type f nosuch; echo $?
+> f is a function
+>e f ()\x20
+>e {\x20
+>     echo a
+> }
+> -bash: type: nosuch: not found
+> 1
+$ unset -f f
+$ type f
+> -bash: type: f: not found
+$ command -v f; echo $?
+> 1
+$ function g { echo kw; }; g
+> kw
+$ function h() { echo kw2; }; h
+> kw2
+$ type g
+> g is a function
+>e g ()\x20
+>e {\x20
+>     echo kw
+> }
+$ n=0; f() { n=$((n+1)); if [ $n -lt 5 ]; then f; fi; echo "depth $n"; }; f
+> depth 5
+> depth 5
+> depth 5
+> depth 5
+> depth 5
+$ f() { echo "$FUNCNAME"; g; }; g() { echo "$FUNCNAME"; }; f; echo "<$FUNCNAME>"
+> f
+> g
+> <>
+$ f() { echo "$#"; }; f a "b c" 'd'; f "$@"; set -- 1 2; f "$@"; f "$*"; f $*
+> 3
+> 3
+> 2
+> 1
+> 2
+$ f() { echo in; set -- p q; echo "$# $1"; shift; echo "$# $1"; }; set -- a b c; f x y z; echo "$# $1"
+> in
+> 2 p
+> 1 q
+> 3 a
+$ f() { echo "<$@>"; for a in "$@"; do echo "[$a]"; done; }; f "a b" c ""; f
+> <a b c >
+> [a b]
+> [c]
+> []
+> <>
+$ f() { echo A; }; f2() { f; }; f() { echo B; }; f2
+> B
+$ f() { f2; }; f2() { echo late; }; f
+> late
+$ f() { cat; }; echo piped | f
+> piped
+$ f() { echo a; echo b; }; f | head -1
+> a
+$ f() { echo $?; }; false; f
+> 1
+$ f() { exit 7; }; (f); echo "sub rc=$?"
+> sub rc=7
+$ f() ( echo sub; return 5 ); f; echo "rc=$?"
+> sub
+> rc=5
+$ f() { ( return 4; echo no ); echo "rc=$?"; }; f
+> rc=4
+$ f() { for i in 1 2 3; do if [ $i = 2 ]; then return 9; fi; echo $i; done; echo notreached; }; f; echo "rc=$?"
+> 1
+> rc=9
+$ f() { for i in 1 2 3; do echo $i; break; done; }; f
+> 1
+$ for j in 1 2; do g() { break; }; g; echo "j=$j"; done
+> -bash: break: only meaningful in a `for', `while', or `until' loop
+> j=1
+> -bash: break: only meaningful in a `for', `while', or `until' loop
+> j=2
+$ f-g() { echo hy; }; f-g
+> hy
+$ a.b() { echo dot; }; a.b
+> dot
+$ 1f() { echo digit; }; 1f
+> digit
+$ "f"() { echo q; }
+> -bash: `"f"': not a valid identifier
+$ f ( ) { echo sp; }; f
+> sp
+$ f() echo hi
+> -bash: syntax error near unexpected token `echo'
+$ f() { echo hi; }; f() { echo two; }; f
+> two
+$ f() { g() { echo inner; }; }; f; g
+> inner
+$ f() { echo hi; }; export -f f; echo $?; export -f nosuch; echo $?; bash -c f
+> 0
+> -bash: export: nosuch: not a function
+> 1
+> hi
+$ true && f() { echo cond; } ; f
+> cond
+$ if true; then f() { echo ifdef; }; fi; f
+> ifdef
+$ f() { echo "$1"; [ "$1" -lt 3 ] && f $(($1 + 1)); }; f 0
+> 0
+> 1
+> 2
+> 3
+$ f() { echo X; } ; f; f() ( echo Y ); f; f() if true; then echo Z; fi; f
+> X
+> Y
+> Z
+$ f() { echo err >&2; } 2>/dev/null; f; echo end
+> end
+$ f() { echo A; } 2>&1 >/dev/null; f; echo end
+> end
+$ f() { read a b; echo "[$a][$b]"; }; echo "1 2" | f
+> [1][2]
+$ t() { echo "$#:$*"; }; t "" ""; t; t ''
+>e 2:\x20
+> 0:
+> 1:
+$ f() { echo A; }; unset f; type f
+> -bash: type: f: not found
+$ f() { echo hi; }; v=1; unset -v f; f; unset -f v; echo "v=$v"; unset -f nosuch; echo rc=$?
+> hi
+> v=1
+> rc=0
+$ unset -fv f; echo rc=$?
+> -bash: unset: cannot simultaneously unset a function and a variable
+> rc=1
+$ f() { echo hi; }; env f; echo rc=$?
+> env: 'f': No such file or directory
+> rc=127
+$ f() { echo hi; }; sh -c f; echo rc=$?
+> sh: 1: f: not found
+> rc=127
+$ f() { X=1 local y=2; echo "$X $y"; }; f
+>  2
+$ f() { echo "$X"; }; X=1 f; echo "after [$X]"
+> 1
+> after []
+$ f() { echo hi; }; which f; echo rc=$?
+> rc=1
+$ FUNCNEST=3; f() { echo d; f; }; f; echo rc=$?
+> d
+> d
+> d
+> -bash: f: maximum function nesting level exceeded (3)
+$ echo "rc=$?"
+> rc=1

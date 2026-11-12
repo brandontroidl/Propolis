@@ -1,0 +1,94 @@
+<!--
+title: Documentation and review expectations
+audience: maintainer
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-08-26
+-->
+
+# Documentation and review expectations
+
+What a contribution must satisfy before merge, and how documentation is kept in sync
+with the code.
+
+## The gate is the bar
+
+Every change passes the CI gate - fmt, clippy (`-D warnings`), and the full test suite
+against a real PostgreSQL - on every push and pull request; nothing merges un-gated
+(`.github/workflows/ci.yml`, `docs/governance/contribution.md#PR flow`). See
+[build-and-test](build-and-test.md) for the exact commands and why the three jobs are
+independent.
+
+Review expectations that follow from the tree's conventions:
+
+- **Prove behavior with tests, not the implementation.** Sensor changes test over real
+  TCP; DB changes test with `sqlx::test`. New invariants get a test that would fail
+  without the change.
+- **Conventional, lowercase commits** with a why-focused body; small, bisectable
+  increments (`docs/governance/contribution.md#PR flow`). See [coding-conventions](coding-conventions.md).
+- **Comment the why, not the what.** See [coding-conventions](coding-conventions.md#comments).
+- **Additive migrations only**; never edit an applied migration in place. See
+  [schema-and-migrations](schema-and-migrations.md).
+- **Sensor changes keep the never-exec / no-fetch guarantees** and their static tests.
+  See [adding-a-sensor](adding-a-sensor.md#the-tests-a-sensor-must-pass).
+- **Re-vendor + release-build** after any dependency change
+  ([schema-and-migrations](schema-and-migrations.md#vendoring)); dependency changes are
+  a supply-chain surface ([`security/supply-chain`](../security/supply-chain.md)).
+
+## Documentation stays in sync mechanically, where it can
+
+The repo enforces doc/code agreement in CI, rather than by convention, for every class
+of fact that has drifted before. **`crates/propolis/tests/docs_agreement.rs`** fails the
+build when:
+
+- an env-var name the non-test source reads (`PROPOLIS_*` / `CATCHALL_*` string
+  literals) is missing from the
+  [environment variable reference](../reference/environment-variables.md). Direction is
+  code to docs; the reverse would false-positive on corrective prose that quotes
+  deliberately wrong names. It exists because the project twice shipped install docs
+  naming a variable the code did not read, and a sensor refused to start with no hint
+  why;
+- a current page's `applies-to` version, a stated tree or toolchain version, or a stated
+  crate, member or binary total disagrees with `cargo metadata` and
+  `rust-toolchain.toml`;
+- the [component inventory](../architecture/components.md) is missing a crate or its
+  dependency graph differs from the manifests;
+- the [test taxonomy](build-and-test.md#test-taxonomy) differs from a recount of the
+  test attributes;
+- the [migration change map](../reference/database.md#migration-change-map) does not
+  list exactly the migration files on disk;
+- a page cites code by line number, or a `path#symbol` citation names a missing file
+  or a symbol the file no longer contains;
+- a documented `tar` command names one tree twice, or a live page or source file
+  contains an em dash.
+
+Practical consequence: **when you add or rename an env var, a crate, a dependency
+between crates, a test or a migration, update the page that owns that fact in the same
+change** or CI fails. The full list, with what each check exempts, is in
+[build-and-test](build-and-test.md#notable-enforcement-test-doccode-agreement).
+
+## Published documentation corpus
+
+The narrative and reference documentation under `docs/` follows a **one-canonical-owner**
+model: each fact has exactly one home (reference pages own exact values; guides explain
+and link). When adding docs:
+
+- Reference pages own the exact values - env vars, ports, paths, tables, routes,
+  scoring constants. Guides cite them, they do not re-list.
+- Every published `.md` starts with the metadata header (title / audience / status /
+  owner / applies-to / last-verified).
+- Cross-link with repository-relative Markdown links to the canonical paths.
+- Distinguish implemented behavior from inference (`[inferred]`) or planned work
+  (`[planned]`); never present a comment, plan, or intention as shipped behavior.
+
+The corpus map is [`DOCUMENTATION.md`](../../DOCUMENTATION.md); the policy for
+current/historical/superseded/draft/planned status and the metadata standard is
+[`documentation-policy`](../documentation-policy.md). The claim-to-source mapping lives
+in [`claim-to-source-ledger`](../claim-to-source-ledger.md).
+
+Design docs and architecture decision records referenced from the archived
+`docs/archive/2026-08-26/root/CONTRIBUTING.md#Architecture`
+(`internal/design/`, `internal/architecture/adr/`) are gitignored private material and
+are not part of the published corpus; the code-evidenced decisions surface in
+[`architecture/decisions`](../architecture/decisions.md).

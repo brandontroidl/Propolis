@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Captured samples - Propolis{% endblock %}
+{% block content %}
+<h1>Captured samples <span class="dim">({{ total | count }})</span></h1>
+<p class="page-sub">The files the sensors captured, most widely delivered first. Hosts counts every address that uploaded a file, or reported a URL it was fetched from. A file delivered by a command sequence names that <a href="/campaigns">campaign</a>.</p>
+
+<div class="panel">
+  <div class="panel-head">Fetch attempts <span class="dim">{{ fetch_attempts_total | count }}</span></div>
+  {% if fetch_attempts_total > 0 %}
+  <table class="table-compact">
+    <thead><tr>{% for sc in status_counts %}<th class="count">{{ sc.label }}</th>{% endfor %}</tr></thead>
+    <tbody><tr>{% for sc in status_counts %}<td class="count">{{ sc.count | count }}</td>{% endfor %}</tr></tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">no fetch attempts recorded</p>
+  {% endif %}
+</div>
+
+{% if samples %}
+{% import "macros.html" as m %}
+<div class="panel samples-panel">
+<table class="table-compact stack">
+  {# "Source" is the attacker this sample is attributable to, either way it can arrive:
+     an address that UPLOADED it to a sensor (the event carries the sha - the only link an
+     FTP/SCP upload has, since it never goes through the fetcher), or one whose reported url the
+     fetcher retrieved (fetch_attempt records only the FIRST reporter of each url). Uploaders sort
+     first, so the stronger attribution survives the display cap. #}
+  {# "Transport" is how the fetcher's connection for this body was authenticated, per source URL:
+     an unverified-TLS or plaintext fetch is evidence an on-path party could have altered in
+     transit. A sensor upload was not fetched, so it has none. #}
+  {# Hosts, the sparkline, Active and "Delivered by" all come from the campaign indexer's records
+     of this sample (its same-sample campaign, and the command sequences that uploaded it). #}
+  <colgroup><col class="cs-hash"><col class="cs-hosts"><col class="cs-spark"><col class="cs-active"><col class="cs-by"><col class="cs-src"><col class="cs-tr"><col class="cs-vt"><col class="cs-dl"></colgroup>
+  <thead><tr><th>Sample</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Delivered by</th><th title="The address that uploaded the file, or the first to report a URL the fetcher retrieved it from">Source</th><th title="How the fetcher's connection for this body was authenticated">Transport</th><th>VirusTotal</th><th></th></tr></thead>
+  <tbody id="samples-rows">
+{% include "samples_rows.html" %}
+  </tbody>
+</table>
+<div class="load-more-row" id="load-more-container">{% include "samples_load_more.html" %}</div>
+</div>
+{% else %}
+<div class="panel samples-panel"><p class="empty-line">no captured samples in the spool</p></div>
+{% endif %}
+{% endblock %}

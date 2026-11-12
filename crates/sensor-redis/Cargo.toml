@@ -1,0 +1,25 @@
+[package]
+name = "sensor-redis"
+version = "0.4.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sensor-redis"
+path = "src/main.rs"
+
+[dependencies]
+sensor-wire = { path = "../sensor-wire" }
+sensor-framework = { path = "../sensor-framework" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", features = ["serde"] }
+tracing = "0.1.44"
+rand = { version = "0.10.2", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+proptest = "1.11.0"
+rcgen = "0.14.9"
+# Test client only (TlsConnector); the sensor itself reaches TLS through sensor-framework.
+tokio-rustls = "0.26.4"

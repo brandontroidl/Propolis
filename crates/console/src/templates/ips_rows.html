@@ -1,0 +1,14 @@
+{% import "macros.html" as m %}
+{% for ip in ips %}
+    <tr>
+      <td class="count score">{{ m.score_meter(ip.raw_score, ip.score_pct) }}</td>
+      <td class="ip stack-lead">{{ m.ip_evidence_link(ip.ip) }}</td>
+      <td>{{ m.tier_pill(ip.tier) }}</td>
+      <td class="count" data-label="Events">{{ ip.event_count | count }}</td>
+      <td class="mono" data-label="Categories">{{ ip.distinct_categories | count }}</td>
+      <td class="mono" data-label="WANs">{{ ip.distinct_wan_count | count }}</td>
+      <td class="dim" data-label="First seen">{{ ip.first_seen }}</td>
+      <td data-label="Last seen"><span class="dim" title="{{ ip.last_seen }}">{{ ip.last_seen_relative }}</span></td>
+      <td data-label="Eligible">{{ m.yes_no(ip.eligible) }}</td>
+    </tr>
+{% endfor %}

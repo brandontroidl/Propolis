@@ -1,0 +1,56 @@
+# `exec` as Ubuntu 22.04's dash (/bin/sh, 0.5.11) has it, typed to a bare `sh` started from the
+# login shell. What differs from bash: a descriptor above 9 does not exist, the options of bash's
+# `exec` are command names (`exec -z` is `-z: not found`, status 127), the error lines carry dash's
+# line counter (`sh: 6:`), and a command that cannot be found ends the shell even at the terminal.
+# Redirections without a command, `exec CMD` replacing only a subshell, and a descriptor opened
+# in a function all behave as in bash. Each reply was produced by dash 0.5.11 (`sh -i`) in the
+# localhost/propolis-survey-ref:jammy container, run with `--network none`, PS1 and PS2 set to
+# markers and these lines fed one at a time on standard input.
+# source: ubuntu:22.04 container run of dash 0.5.11 (synthetic command shapes)
+# date: 2026-10-10
+# protocol: ssh
+# persona: ubuntu
+$ sh
+$ exec 3>/tmp/d1
+$ echo one >&3
+$ echo two >&3
+$ cat /tmp/d1
+> one
+> two
+$ exec 3>&-
+$ echo three >&3
+> sh: 6: 3: Bad file descriptor
+$ exec 4</tmp/d1
+$ read a <&4
+$ echo $a
+> one
+$ read b <&4
+$ echo $b
+> two
+$ exec 4<&-
+$ (exec 6>/tmp/d2; echo six >&6)
+$ cat /tmp/d2
+> six
+$ sh -c 'echo child >&7'
+> sh: 1: 7: Bad file descriptor
+$ f() { exec 7>/tmp/d3; }
+$ f
+$ echo seven >&7
+$ cat /tmp/d3
+> seven
+$ (exec echo replaced; echo not-reached)
+> replaced
+$ echo $?
+> 0
+$ (exec cd /tmp)
+> sh: 22: exec: cd: not found
+$ echo $?
+> 127
+$ (exec -z)
+> sh: 24: exec: -z: not found
+$ echo $?
+> 127
+$ trap 'echo bye' EXIT
+$ (exec true)
+$ echo $?
+> 0

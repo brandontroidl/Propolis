@@ -1,0 +1,2055 @@
+//! Per-connection ADB session handler: the 24-byte-header read loop, per-stream dispatch (fake
+//! shell for `shell:`/`shell:<command>`, sync `SEND`/`RECV`/`STAT` capture for `sync:`), and the
+//! `TcpStream` I/O this crate's only stateful, non-pure module owns. See `adb_proto.rs` for the
+//! pure message framing this drives and `internal/design/08-remaining-sensors.md`'s "sensor-adb"
+//! section for the protocol flow.
+//!
+//! **Every event this module builds carries `authenticated: false`, with no exception.** ADB has
+//! no authentication step at all (see `adb_proto`'s module doc); the task's own wire contract
+//! states this plainly enough to repeat here: `is_confirmed_real` requires `authenticated = true
+//! AND category = Honeypot`, so ADB signal alone can never manufacture eligibility on its own -
+//! that is correct, not a gap this handler should try to work around. Unlike every sibling
+//! sensor (SSH/Telnet/Redis), there is no login step here that could ever flip this to `true`.
+//!
+//! **Stream multiplexing.** Real adb multiplexes many logical streams (a shell session, a sync
+//! transfer, ...) over one TCP connection, each identified by a per-side, per-stream id: `OPEN`
+//! carries the opener's own id as `local-id`; every later message about that stream carries
+//! `(sender's own id, recipient's id)` as `(arg0, arg1)` (confirmed against AOSP's protocol
+//! docs: `READY(local-id, remote-id, '')`, `WRITE(...)`/`CLOSE(...)` follow the same shape). This
+//! handler mints its own id per accepted `OPEN` and tracks it in a small table keyed by that
+//! minted id, so a client that concurrently opens a shell and a sync transfer on one connection
+//! (both a real `adb` client and some bots do this) is handled correctly rather than assuming one
+//! stream per connection.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use sensor_framework::fakefs::FakeFs;
+use sensor_framework::listener::normalize_dual_stack;
+use sensor_framework::sanitize_value;
+use sensor_framework::shell::{CommandResult, EmitContext, FakeShell, LineStep, onlcr};
+use sensor_framework::upload_metadata;
+use sensor_framework::{
+    CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN, CaptureBody, CaptureEnd, CaptureHandoff,
+    CaptureJob, CaptureSource, CommandEventGate, ConnectionBounds, ConnectionBudget, EgressState,
+    EventEmitter, HeldEnd, HeldInput, InputMode, StdinCaptures, UploadEnd, Uuid, WanResolver,
+    limits_from,
+};
+use sensor_wire::{
+    PROTO_TCP, SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD, SampleRef, SensorEvent,
+    WIRE_VERSION,
+};
+
+use crate::adb_proto::{self, Destination, Header, SyncHeader};
+
+/// This sensor's identity on both the wire `sensor` field and every event's
+/// `metadata.protocol_label` - see the design spec's "protocol_label: adb" / "sensor name: adb".
+const PROTOCOL_LABEL: &str = "adb";
+
+/// Cap on the interactive shell's partial-line buffer, matching sensor-telnet/sensor-ssh's own
+/// `MAX_LINE_LEN` convention: if an attacker streams continuous non-newline bytes on a `shell:`
+/// stream, the buffer is flushed as a partial line once it hits this limit so memory stays
+/// bounded while the input is still captured.
+const MAX_SHELL_LINE_LEN: usize = 8192;
+
+/// Cap on accumulated `SEND` file body, matching `sensor-ssh`'s `transfer::MAX_CAPTURE_BODY`
+/// convention: bytes beyond this are still drained off the wire (to keep the sync sub-protocol's
+/// state machine aligned with what the client believes it sent) but not retained in memory.
+const MAX_SYNC_BODY: usize = 10_000_000;
+
+/// The prompt an `adb shell` session shows: the device name and the working directory, both from
+/// the shared persona, so it agrees with the CNXN banner and with what the shell itself answers.
+fn shell_prompt(shell: &FakeShell) -> Vec<u8> {
+    shell.prompt().into_bytes()
+}
+
+fn connection_event(source_ip: IpAddr, wan_ip: Option<IpAddr>, session_id: Uuid) -> SensorEvent {
+    SensorEvent {
+        v: WIRE_VERSION,
+        source_ip,
+        wan_ip,
+        sensor: PROTOCOL_LABEL.to_string(),
+        signal_type: SIGNAL_HONEYPOT_CONNECTION.to_string(),
+        protocol: PROTO_TCP.to_string(),
+        authenticated: false,
+        observed_at: chrono::Utc::now(),
+        metadata: serde_json::json!({ "protocol_label": PROTOCOL_LABEL }),
+        sample: None,
+        session_id: Some(session_id),
+        occurrence_id: None,
+        reply: None,
+    }
+}
+
+// ---- per-stream state ----
+
+/// One open ADB stream: the client's own id for it (needed on every reply so the client can
+/// route the response back to the right stream) plus its protocol-specific state.
+struct Stream {
+    client_local_id: u32,
+    kind: StreamKind,
+    outbound: VecDeque<PendingWrite>,
+    awaiting_okay: bool,
+    close_after_drain: bool,
+    drop_after_drain: bool,
+}
+
+struct PendingWrite {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl Stream {
+    fn new(client_local_id: u32, kind: StreamKind) -> Self {
+        Self {
+            client_local_id,
+            kind,
+            outbound: VecDeque::new(),
+            awaiting_okay: false,
+            close_after_drain: false,
+            drop_after_drain: false,
+        }
+    }
+
+    fn queue(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.outbound.push_back(PendingWrite { bytes, offset: 0 });
+        }
+    }
+}
+
+enum StreamKind {
+    /// Interactive `shell:` session: `FakeShell` plus a partial-line buffer for incremental
+    /// input, the raw-byte capture of what the client typed at the shell itself, and the input of
+    /// a typed line that reads it (`cat > f` takes the lines after it until Ctrl-D).
+    /// Boxed: the shell owns a whole filesystem snapshot and dwarfs the sync variant.
+    Shell(Box<FakeShell>, Vec<u8>, ShellCapture, bool, HeldStdin),
+    /// A `shell:<command>` that reads its standard input, held until the input ends. Legacy ADB
+    /// has no end-of-input message on a shell stream, so the peer's CLSE (or the capture ceiling)
+    /// is what ends it.
+    Exec(Box<FakeShell>, HeldStdin),
+    /// A `shell:<command>` whose response is still being paced by peer OKAY messages.
+    OneShot,
+    /// `sync:` file-transfer sub-protocol session.
+    Sync(SyncState),
+}
+
+/// The input of a held shell line, recorded with the session's real ending if the session ends
+/// with it still open: `read_message` records that ending in `SessionEnd` before the streams are
+/// dropped, and on the listener's `max_duration` cancellation it still reads `Cancelled`.
+struct HeldStdin {
+    input: Option<HeldInput>,
+    session_end: SessionEnd,
+}
+
+impl HeldStdin {
+    /// The peer closed the stream with the input still open: the command is killed by the
+    /// hangup with what arrived, and the input is captured as cut off by the close.
+    fn close(&mut self, shell: &mut FakeShell) {
+        if let Some(input) = self.input.take() {
+            let _ = input.finish(shell, HeldEnd::Cut(CaptureEnd::PeerClosed));
+        }
+    }
+}
+
+impl Drop for HeldStdin {
+    fn drop(&mut self) {
+        if let Some(input) = self.input.take() {
+            input.abandon(self.session_end.get());
+        }
+    }
+}
+
+/// How the session as a whole ended, shared between the reader that observes the ending and the
+/// per-stream shell captures that are dropped afterwards.
+///
+/// It has to be shared rather than owned by either: one connection can hold several shell
+/// streams, and on the ending that matters most - the listener dropping this handler's future at
+/// `max_duration` - no code runs at all, so `Cancelled` is simply what the captures still read.
+/// `read_message` collapses EOF, a timeout, a socket error, a malformed header and an exhausted
+/// budget into one `None`, and this is what keeps them apart on the way out.
+#[derive(Clone)]
+struct SessionEnd(Arc<Mutex<CaptureEnd>>);
+
+impl SessionEnd {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(CaptureEnd::Cancelled)))
+    }
+
+    /// Record the ending at the exit path that produced it. A poisoned lock is ignored rather
+    /// than panicked on: losing the reason degrades a capture's label, and taking the sensor
+    /// down over it would lose the capture itself.
+    fn set(&self, end: CaptureEnd) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = end;
+        }
+    }
+
+    fn get(&self) -> CaptureEnd {
+        self.0
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or(CaptureEnd::Cancelled)
+    }
+}
+
+/// Hands the session's ending to its stdin captures when the handler returns, for the files a
+/// shell saw assembled from typed `echo` chunks and never ran, which are captured then. Every exit
+/// records its ending in `SessionEnd` first; on the listener's cancellation it reads `Cancelled`.
+struct CapturesEnd {
+    captures: StdinCaptures,
+    session_end: SessionEnd,
+}
+
+impl Drop for CapturesEnd {
+    fn drop(&mut self) {
+        self.captures.end_session(self.session_end.get());
+    }
+}
+
+/// The raw `shell:` stream bytes of one session, submitted from `Drop`.
+///
+/// The same reasoning as `sensor-ssh`'s guard of the same name: a dropper streaming a payload at
+/// `adb shell` is exactly the long session the listener cancels at `max_duration`, and a
+/// destructor is the only code that still runs then. Until this existed the ADB shell was the one
+/// remaining sensor where that dropper left a flood event and no sample.
+struct ShellCapture {
+    body: CaptureBody,
+    /// Bytes the client sent, including any past the ceiling, so `wire_size` and `truncated` stay
+    /// honest about the stored copy being a prefix.
+    wire_bytes: u64,
+    /// Raised when the shared `FakeShell` flags a binary flood. A plaintext session is never
+    /// spooled - `Drop` falls back to inspecting the bytes, because a payload still mid-line when
+    /// the session ended never produced a complete line for the shell to flag.
+    binary_seen: bool,
+    max_bytes: u64,
+    /// Set when the peer closed THIS stream with a CLSE. A stream the peer closed itself is
+    /// finished whatever later becomes of the connection, so it beats the session-wide ending.
+    stream_end: Option<CaptureEnd>,
+    session_end: SessionEnd,
+    handoff: Arc<CaptureHandoff>,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+}
+
+impl ShellCapture {
+    fn push(&mut self, data: &[u8]) {
+        self.wire_bytes += data.len() as u64;
+        let room = self.max_bytes.saturating_sub(self.body.len() as u64) as usize;
+        if room > 0 {
+            // A refusal keeps the prefix already held; the body remembers it was cut, and the
+            // hand-off marks the capture truncated. The session itself carries on regardless.
+            let _ = self.body.extend_from_slice(&data[..data.len().min(room)]);
+        }
+    }
+
+    fn flag_binary(&mut self) {
+        self.binary_seen = true;
+    }
+}
+
+impl Drop for ShellCapture {
+    fn drop(&mut self) {
+        // An empty body that was starved by the budget still goes to `submit`, which counts it as
+        // a refusal; a merely empty one has nothing to report.
+        if self.body.is_empty() && !self.body.is_exhausted() {
+            return;
+        }
+        if !self.binary_seen && !sensor_framework::shell::looks_binary(self.body.as_slice()) {
+            return;
+        }
+        let end = self.stream_end.unwrap_or_else(|| self.session_end.get());
+        let body = std::mem::replace(&mut self.body, self.handoff.new_capture_body());
+        let wire_size = self.wire_bytes;
+        let (source_ip, wan_ip, session_id) = (self.source_ip, self.wan_ip, self.session_id);
+        let _ = self.handoff.submit(CaptureJob {
+            body,
+            orig_name: format!("adb-shell-{session_id}"),
+            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: PROTOCOL_LABEL.to_string(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                protocol: PROTO_TCP.to_string(),
+                authenticated: false,
+                observed_at: chrono::Utc::now(),
+                metadata: {
+                    let mut m = upload_metadata(
+                        PROTOCOL_LABEL,
+                        &sample,
+                        wire_size,
+                        UploadEnd::Session(end),
+                    );
+                    m["capture_reason"] = serde_json::json!("binary_shell_payload");
+                    m
+                },
+                sample: Some(sample),
+                session_id: Some(session_id),
+                occurrence_id: None,
+                reply: None,
+            }),
+        });
+    }
+}
+
+/// Which sync sub-message a `sync:` stream is midway through parsing, plus the reassembly
+/// buffer it is fed from. Mirrors `sensor-ssh`'s `transfer::SftpHandler` shape: an accumulating
+/// byte buffer, complete sub-messages drained out of it in a loop, one call to `feed` per
+/// inbound `WRTE`.
+struct SyncState {
+    buf: Vec<u8>,
+    /// Set while accumulating a `SEND` transfer's body across possibly many `DATA` chunks.
+    pending_send: Option<PendingSend>,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    /// Held so `Drop` can submit an unfinished SEND whichever way the stream or session ends,
+    /// the listener's `max_duration` cancellation included.
+    handoff: Arc<CaptureHandoff>,
+    /// A share of the connection's filesystem: a completed push is also written into it, so a
+    /// later shell command on the connection can read the file back.
+    fs: FakeFs,
+    /// Set when the peer closed THIS stream with a CLSE, which cuts a SEND still open on it
+    /// whatever later becomes of the connection; otherwise the session's ending did.
+    stream_end: Option<CaptureEnd>,
+    session_end: SessionEnd,
+}
+
+/// The fake-tree path a push to `raw` is written to, or `None` when it must not be: empty,
+/// relative, carrying a control character, or holding any `..` component. The path is
+/// attacker-supplied, so a climbing path is refused rather than normalized into somewhere it did
+/// not name. The overlay has no host filesystem underneath; the result only keys the in-memory tree.
+fn push_destination(raw: &str) -> Option<&str> {
+    let usable = raw.starts_with('/')
+        && !raw.chars().any(char::is_control)
+        && !raw.split('/').any(|component| component == "..");
+    usable.then_some(raw)
+}
+
+/// A SEND still open when the stream is closed, the session ends, or the handler future is
+/// cancelled is submitted as an incomplete capture, cut off by whichever of those happened.
+/// `submit` never blocks, so it is safe here.
+impl Drop for SyncState {
+    fn drop(&mut self) {
+        let end = self.stream_end.unwrap_or_else(|| self.session_end.get());
+        if let Some(job) = self.abandon(end) {
+            let _ = self.handoff.submit(job);
+        }
+    }
+}
+
+/// The permission bits a push gets when its SEND carried no parseable mode.
+const DEFAULT_PUSH_PERM: u32 = 0o644;
+
+struct PendingSend {
+    orig_name: String,
+    /// Permission bits of the SEND's `st_mode`, applied when the file lands in the fake tree.
+    perm: u32,
+    /// Charged to the sensor's process-wide capture memory budget while it is buffered.
+    body: CaptureBody,
+    /// DATA payload bytes the client sent, including any drained past `MAX_SYNC_BODY`;
+    /// `body.len()` is what was retained.
+    wire_bytes: u64,
+}
+
+impl SyncState {
+    fn new(
+        source_ip: IpAddr,
+        wan_ip: Option<IpAddr>,
+        session_id: Uuid,
+        handoff: Arc<CaptureHandoff>,
+        fs: FakeFs,
+        session_end: SessionEnd,
+    ) -> Self {
+        Self {
+            buf: Vec::new(),
+            pending_send: None,
+            source_ip,
+            wan_ip,
+            session_id,
+            handoff,
+            fs,
+            stream_end: None,
+            session_end,
+        }
+    }
+
+    /// Best effort and additive: the quarantine capture is the record of the push, this only gives
+    /// the attacker's next command something to find. A refused write (budget, read-only mount,
+    /// bad name) is dropped. A body cut by `MAX_SYNC_BODY` is not written, since a truncated payload
+    /// that "ran" would be a worse tell than a missing one.
+    fn land_in_fake_fs(&mut self, pending: &PendingSend) {
+        if pending.wire_bytes != pending.body.len() as u64 {
+            return;
+        }
+        if let Some(dest) = push_destination(&pending.orig_name) {
+            let _ = self
+                .fs
+                .write_file_mode(dest, pending.body.as_slice(), pending.perm);
+        }
+    }
+
+    /// The `STAT` answer for `path`, from this connection's fake tree only. A real `adb push` STATs
+    /// its destination first: a directory makes the client append the local basename to the SEND
+    /// path, anything else is taken as the literal target file. So a directory must answer with
+    /// its `S_IFDIR` mode, and an absent path with the all-zero "not found" a new-file push needs.
+    fn stat_reply(&self, path: &str) -> Vec<u8> {
+        let body = match self.fs.stat(path, true) {
+            Some(stat) => adb_proto::stat_body(
+                stat.mode,
+                u32::try_from(stat.size).unwrap_or(u32::MAX),
+                u32::try_from(stat.mtime.max(0)).unwrap_or(u32::MAX),
+            ),
+            None => adb_proto::stat_not_found_body(),
+        };
+        adb_proto::stat_reply(&body)
+    }
+
+    /// Feed newly arrived `WRTE` payload bytes, draining as many complete sync sub-messages as
+    /// are available. Returns the response bytes to send back (a `STAT`/`FAIL`/`OKAY` reply, or
+    /// empty if the sub-message consumed produced no immediate reply - e.g. a bare `SEND`
+    /// header, which only replies once the matching `DONE` arrives) and, if a `SEND` transfer
+    /// just completed, the capture job to hand off.
+    ///
+    /// Never panics on any input, including a length field that does not match what actually
+    /// follows, a `DATA`/`DONE` with no preceding `SEND`, or a completely unrecognized sync id:
+    /// every such case is treated as "this sync sub-stream cannot make forward progress" and
+    /// resets defensively (clears `buf`, drops any `pending_send`) rather than guessing.
+    fn feed(&mut self, data: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
+        self.buf.extend_from_slice(data);
+        let mut response = Vec::new();
+        let mut upload = None;
+
+        while let Some(sync_header) = SyncHeader::parse(&self.buf) {
+            match sync_header.id {
+                adb_proto::SYNC_SEND if self.pending_send.is_none() => {
+                    if sync_header.length > adb_proto::MAX_SYNC_PATH_LEN {
+                        self.reset();
+                        break;
+                    }
+                    let Some(payload) = self.take_payload(sync_header.length) else {
+                        break; // wait for more bytes
+                    };
+                    let path_mode = String::from_utf8_lossy(&payload).into_owned();
+                    let (orig_name, perm) = adb_proto::parse_send_path(&path_mode)
+                        .map(|(path, mode)| (path, mode & 0o777))
+                        .unwrap_or_else(|| (String::new(), DEFAULT_PUSH_PERM));
+                    self.pending_send = Some(PendingSend {
+                        orig_name,
+                        perm,
+                        body: self.handoff.new_capture_body(),
+                        wire_bytes: 0,
+                    });
+                }
+                adb_proto::SYNC_DATA if self.pending_send.is_some() => {
+                    if sync_header.length > adb_proto::SYNC_MAX_CHUNK {
+                        self.reset();
+                        break;
+                    }
+                    let Some(chunk) = self.take_payload(sync_header.length) else {
+                        break;
+                    };
+                    let mut budget_exhausted = false;
+                    if let Some(pending) = self.pending_send.as_mut() {
+                        let storable = MAX_SYNC_BODY.saturating_sub(pending.body.len());
+                        let take = storable.min(chunk.len());
+                        budget_exhausted = pending.body.extend_from_slice(&chunk[..take]).is_err();
+                        pending.wire_bytes += chunk.len() as u64;
+                    }
+                    if budget_exhausted {
+                        // The process-wide capture budget is full. The prefix goes out now as an
+                        // incomplete capture and the push fails the way a full device's does, which
+                        // makes `adb push` abort rather than keep streaming.
+                        if let Some(job) = self.abandon(CaptureEnd::CaptureBudget) {
+                            let _ = self.handoff.submit(job);
+                        }
+                        response.extend_from_slice(&adb_proto::build_sync_message(
+                            adb_proto::SYNC_FAIL,
+                            b"No space left on device",
+                        ));
+                        break;
+                    }
+                }
+                adb_proto::SYNC_DONE if self.pending_send.is_some() => {
+                    // DONE's length field IS the mtime - no further payload bytes to consume.
+                    self.buf.drain(..adb_proto::SYNC_HEADER_LEN);
+                    if let Some(pending) = self.pending_send.take() {
+                        self.land_in_fake_fs(&pending);
+                        upload = Some(self.build_capture_job(pending, UploadEnd::TransferComplete));
+                    }
+                    response.extend_from_slice(&adb_proto::build_sync_message(
+                        adb_proto::SYNC_OKAY,
+                        &[],
+                    ));
+                }
+                adb_proto::SYNC_STAT => {
+                    if sync_header.length > adb_proto::MAX_SYNC_PATH_LEN {
+                        self.reset();
+                        break;
+                    }
+                    let Some(payload) = self.take_payload(sync_header.length) else {
+                        break;
+                    };
+                    let path = String::from_utf8_lossy(&payload);
+                    response.extend_from_slice(&self.stat_reply(&path));
+                }
+                adb_proto::SYNC_RECV => {
+                    if sync_header.length > adb_proto::MAX_SYNC_PATH_LEN {
+                        self.reset();
+                        break;
+                    }
+                    let Some(payload) = self.take_payload(sync_header.length) else {
+                        break;
+                    };
+                    let path = String::from_utf8_lossy(&payload).into_owned();
+                    tracing::info!(
+                        path = %sanitize_value(&path, 255),
+                        "adb: refusing sync RECV (pull); no outbound file data is ever served"
+                    );
+                    response.extend_from_slice(&adb_proto::build_sync_message(
+                        adb_proto::SYNC_FAIL,
+                        b"Permission denied",
+                    ));
+                }
+                _ => {
+                    // Unrecognized id (LIST/QUIT/DENT/a stray OKAY), or a DATA/DONE/SEND arriving
+                    // out of the order this state machine expects: nothing here can make forward
+                    // progress, so the sync sub-stream resets defensively. The outer OPEN stream
+                    // itself is untouched - a well-behaved client can still CLSE it normally.
+                    self.reset();
+                    break;
+                }
+            }
+        }
+
+        (response, upload)
+    }
+
+    /// If `self.buf` holds at least `SYNC_HEADER_LEN + len` bytes, drain and return the `len`
+    /// payload bytes following the sub-header (the sub-header itself is drained too). Otherwise
+    /// leaves `buf` untouched and returns `None` - the caller waits for a later `feed` call to
+    /// supply the rest.
+    fn take_payload(&mut self, len: u32) -> Option<Vec<u8>> {
+        let total_needed = adb_proto::SYNC_HEADER_LEN + len as usize;
+        if self.buf.len() < total_needed {
+            return None;
+        }
+        let payload = self.buf[adb_proto::SYNC_HEADER_LEN..total_needed].to_vec();
+        self.buf.drain(..total_needed);
+        Some(payload)
+    }
+
+    /// The sub-stream cannot make forward progress: the peer sent sync input this state machine
+    /// cannot parse. DATA already received for an open SEND is still evidence, so it goes out as
+    /// an incomplete capture rather than being discarded.
+    fn reset(&mut self) {
+        if let Some(job) = self.abandon(CaptureEnd::MalformedInput) {
+            let _ = self.handoff.submit(job);
+        }
+        self.buf.clear();
+    }
+
+    /// The stream or session is ending, by `end`, with a `SEND` still open (no `DONE` arrived).
+    /// The bytes that did are returned as a capture cut off by `end`; they used to be dropped
+    /// with the stream.
+    fn abandon(&mut self, end: CaptureEnd) -> Option<CaptureJob> {
+        self.buf.clear();
+        let pending = self.pending_send.take()?;
+        (pending.wire_bytes > 0)
+            .then(|| self.build_capture_job(pending, UploadEnd::TransferCut(end)))
+    }
+
+    fn build_capture_job(&self, pending: PendingSend, end: UploadEnd) -> CaptureJob {
+        let source_ip = self.source_ip;
+        let wan_ip = self.wan_ip;
+        let session_id = self.session_id;
+        let wire_size = pending.wire_bytes;
+        CaptureJob {
+            body: pending.body,
+            orig_name: pending.orig_name,
+            event_builder: Box::new(move |sample: SampleRef| SensorEvent {
+                v: WIRE_VERSION,
+                source_ip,
+                wan_ip,
+                sensor: PROTOCOL_LABEL.to_string(),
+                signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.to_string(),
+                protocol: PROTO_TCP.to_string(),
+                authenticated: false,
+                observed_at: chrono::Utc::now(),
+                metadata: upload_metadata(PROTOCOL_LABEL, &sample, wire_size, end),
+                sample: Some(sample),
+                session_id: Some(session_id),
+                occurrence_id: None,
+                reply: None,
+            }),
+        }
+    }
+}
+
+// ---- bounded outer-message reader ----
+
+/// Reads whole ADB messages (24-byte header + `data_length` payload) off the socket, applying
+/// `bounds` the same way `sensor-telnet`'s `LineReader` / `sensor-redis`'s `RespReader` do:
+/// `read_timeout` bounds the wait for the very first bytes of the whole session, `idle_timeout`
+/// bounds every read after that, and a running total checked against `max_captured_bytes` bounds
+/// the whole session's captured input regardless of how many messages it spans.
+struct MessageReader {
+    bounds: ConnectionBounds,
+    first_read: bool,
+    total_captured: u64,
+    /// Where each of the endings below is recorded, so a shell capture dropped afterwards can
+    /// tell an exhausted budget from the peer hanging up. Every `None` this reader returns used
+    /// to mean only "end the session".
+    session_end: SessionEnd,
+}
+
+impl MessageReader {
+    fn new(bounds: ConnectionBounds, session_end: SessionEnd) -> Self {
+        Self {
+            bounds,
+            first_read: true,
+            total_captured: 0,
+            session_end,
+        }
+    }
+
+    /// Read exactly `n` bytes, or `None` on EOF, a read error, a timeout, or the session's
+    /// `max_captured_bytes` budget being exhausted - each recorded on `session_end` before
+    /// returning, because the caller cannot tell them apart from the `None` alone.
+    async fn read_exact_bounded(&mut self, stream: &mut TcpStream, n: usize) -> Option<Vec<u8>> {
+        if self.total_captured.saturating_add(n as u64) > self.bounds.max_captured_bytes {
+            self.session_end.set(CaptureEnd::CaptureBudget);
+            return None;
+        }
+        let timeout = if self.first_read {
+            self.bounds.read_timeout
+        } else {
+            self.bounds.idle_timeout
+        };
+        self.first_read = false;
+
+        let mut buf = vec![0u8; n];
+        match tokio::time::timeout(timeout, stream.read_exact(&mut buf)).await {
+            Ok(Ok(_bytes_read)) => {
+                self.total_captured += n as u64;
+                Some(buf)
+            }
+            // Three different endings. `read_exact` on a socket the peer closed reports
+            // `UnexpectedEof`, which is the peer finishing rather than anything going wrong; an
+            // elapsed timeout is the client going quiet mid-transfer; anything else is the socket
+            // failing under a transfer that was still open.
+            Ok(Err(e)) => {
+                self.session_end
+                    .set(if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        CaptureEnd::PeerClosed
+                    } else {
+                        CaptureEnd::TransportError
+                    });
+                None
+            }
+            Err(_) => {
+                self.session_end.set(CaptureEnd::IdleTimeout);
+                None
+            }
+        }
+    }
+
+    /// Read one full ADB message (header + payload). `None` covers every failure mode uniformly
+    /// (EOF, timeout, budget exhaustion, a malformed header with a bad magic, or a `data_length`
+    /// beyond `adb_proto::MAX_MESSAGE_DATA_LEN`), so the caller has exactly one thing to do on
+    /// `None`: end the session.
+    async fn read_message(&mut self, stream: &mut TcpStream) -> Option<(Header, Vec<u8>)> {
+        let header_bytes = self
+            .read_exact_bounded(stream, adb_proto::HEADER_LEN)
+            .await?;
+        let Some(header) = Header::parse(&header_bytes) else {
+            // A header this transport cannot parse is the peer sending garbage, not a socket
+            // fault and not the peer finishing.
+            self.session_end.set(CaptureEnd::MalformedInput);
+            return None;
+        };
+        if header.data_length > adb_proto::MAX_MESSAGE_DATA_LEN {
+            self.session_end.set(CaptureEnd::MalformedInput);
+            return None;
+        }
+        let data = if header.data_length == 0 {
+            Vec::new()
+        } else {
+            self.read_exact_bounded(stream, header.data_length as usize)
+                .await?
+        };
+        Some((header, data))
+    }
+}
+
+// ---- connection handler ----
+
+/// Handle one accepted ADB connection end to end: the `CNXN` handshake, then a loop dispatching
+/// `OPEN`/`WRTE`/`OKAY`/`CLSE` across however many concurrent streams the client opens. Never
+/// panics and never propagates an I/O error to the caller - any read/write failure or malformed
+/// input simply ends the session early, matching `sensor_framework::run_tcp_listener`'s
+/// per-connection isolation contract.
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    session_id: Uuid,
+    emitter: Arc<EventEmitter>,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    handoff: Arc<CaptureHandoff>,
+    command_events: Arc<CommandEventGate>,
+) {
+    // A session the sensor could not account would hold whatever it liked: refuse it instead.
+    if sensor_framework::session_memory::unaccounted_session() {
+        return;
+    }
+    // Normalize dual-stack mapped addresses before resolving WAN - mirrors sensor-telnet/
+    // sensor-ssh's own handling of the same listener module doc requirement.
+    let norm_peer = normalize_dual_stack(peer_addr);
+    let source_ip: IpAddr = norm_peer.ip();
+    let wan_ip = stream
+        .local_addr()
+        .ok()
+        .map(normalize_dual_stack)
+        .and_then(|local| wan_resolver.resolve(local.ip()));
+
+    // Emit honeypot_connection (authenticated=false) before anything else - the TCP handshake
+    // itself is the observation, independent of whether a CNXN ever arrives.
+    let conn_event = connection_event(source_ip, wan_ip, session_id);
+    if emitter.append(&conn_event).await.is_err() {
+        tracing::error!(%peer_addr, "adb: failed to append connection event");
+    }
+
+    let session_end = SessionEnd::new();
+    let max_captured_bytes = bounds.max_captured_bytes;
+    let write_timeout = bounds.idle_timeout;
+    // The connection's one budget, cloned into every stream's shell so the streams share a ceiling
+    // instead of each holding a full one. It carries the sensor's per-source command-event budget.
+    let budget = ConnectionBudget::with_command_gate(limits_from(&bounds), command_events);
+    // The connection's one filesystem: each shell stream opens a share of it, so a file written on
+    // one stream is readable on the next and a new connection starts clean.
+    let base_fs = FakeFs::android().with_budget(budget.clone());
+    // What shell commands read from their streams, captured once per distinct body and submitted
+    // when this session's future goes, cancelled or not.
+    let stdin_captures = StdinCaptures::new(
+        handoff.clone(),
+        CaptureSource {
+            sensor: PROTOCOL_LABEL,
+            source_ip,
+            wan_ip,
+            session_id,
+            authenticated: false,
+        },
+    );
+    let _captures_end = CapturesEnd {
+        captures: stdin_captures.clone(),
+        session_end: session_end.clone(),
+    };
+    let mut reader = MessageReader::new(bounds, session_end.clone());
+
+    // ---- CNXN handshake ----
+    let Some((header, _data)) = reader.read_message(&mut stream).await else {
+        return;
+    };
+    if header.command != adb_proto::A_CNXN {
+        session_end.set(CaptureEnd::MalformedInput);
+        return; // not a well-formed ADB session opener
+    }
+    let peer_maxdata = header.arg1.clamp(1, adb_proto::MAX_MESSAGE_DATA_LEN) as usize;
+    if write_or_err(
+        &mut stream,
+        write_timeout,
+        &adb_proto::build_cnxn(&adb_proto::device_banner()),
+    )
+    .await
+    .is_err()
+    {
+        session_end.set(CaptureEnd::TransportError);
+        return;
+    }
+
+    let mut streams: HashMap<u32, Stream> = HashMap::new();
+    let mut next_stream_id: u32 = 1;
+
+    // This session's memory account, while the sensor accounts sessions.
+    let account = sensor_framework::session_memory::current_account();
+
+    // A sync stream still holding a half-received SEND when this function returns, or when the
+    // listener cancels it at max_duration, is flushed by `SyncState`'s `Drop`.
+    loop {
+        // Between messages: over the memory a session may keep, or asked to let go.
+        if account.is_some_and(|a| a.check_retained()) {
+            session_end.set(CaptureEnd::MemoryLimit);
+            return;
+        }
+        // A session asked to let go while it waits for its next message ends now, not at its
+        // idle timeout; the message half read is not needed.
+        let next = tokio::select! {
+            message = reader.read_message(&mut stream) => Some(message),
+            () = sensor_framework::session_memory::evicted(account) => None,
+        };
+        let Some(next) = next else {
+            session_end.set(CaptureEnd::MemoryLimit);
+            return;
+        };
+        let Some((header, data)) = next else {
+            return;
+        };
+
+        match header.command {
+            adb_proto::A_OPEN => {
+                if handle_open(
+                    &mut stream,
+                    &header,
+                    &data,
+                    &mut streams,
+                    &mut next_stream_id,
+                    source_ip,
+                    wan_ip,
+                    session_id,
+                    &emitter,
+                    &handoff,
+                    peer_addr,
+                    &session_end,
+                    max_captured_bytes,
+                    &budget,
+                    &base_fs,
+                    &stdin_captures,
+                    peer_maxdata,
+                    write_timeout,
+                )
+                .await
+                .is_err()
+                {
+                    // The only way these return `Err` is a response that could not be written,
+                    // which cut the session with a transfer possibly still arriving.
+                    session_end.set(CaptureEnd::TransportError);
+                    return;
+                }
+            }
+            adb_proto::A_WRTE => {
+                if handle_wrte(
+                    &mut stream,
+                    &header,
+                    &data,
+                    &mut streams,
+                    &emitter,
+                    &handoff,
+                    peer_addr,
+                    &budget,
+                    &stdin_captures,
+                    max_captured_bytes,
+                    peer_maxdata,
+                    write_timeout,
+                )
+                .await
+                .is_err()
+                {
+                    session_end.set(CaptureEnd::TransportError);
+                    return;
+                }
+            }
+            adb_proto::A_OKAY => {
+                let server_id = header.arg1;
+                let should_remove = if let Some(entry) = streams.get_mut(&server_id) {
+                    if header.arg0 != entry.client_local_id || !entry.awaiting_okay {
+                        false
+                    } else {
+                        entry.awaiting_okay = false;
+                        match drive_stream(
+                            &mut stream,
+                            &budget,
+                            server_id,
+                            entry,
+                            peer_maxdata,
+                            write_timeout,
+                        )
+                        .await
+                        {
+                            Ok(remove) => remove,
+                            Err(()) => {
+                                session_end.set(CaptureEnd::TransportError);
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    false
+                };
+                if should_remove {
+                    streams.remove(&server_id);
+                }
+            }
+            adb_proto::A_CLSE => {
+                let server_id = header.arg1;
+                // Removing a sync stream drops its state, which submits a SEND closed
+                // mid-way as an incomplete capture.
+                if let Some(mut s) = streams.remove(&server_id) {
+                    // The peer closed this stream itself, so whatever it streamed at the shell is
+                    // whatever it meant to send - regardless of how the connection later ends.
+                    // Recorded before the remove's value is dropped, which is what submits it.
+                    match &mut s.kind {
+                        StreamKind::Shell(shell, _, capture, _, held) => {
+                            capture.stream_end = Some(CaptureEnd::PeerClosed);
+                            held.close(shell);
+                        }
+                        StreamKind::Exec(shell, held) => held.close(shell),
+                        StreamKind::Sync(sync) => sync.stream_end = Some(CaptureEnd::PeerClosed),
+                        StreamKind::OneShot => {}
+                    }
+                    let _ = write_or_err(
+                        &mut stream,
+                        write_timeout,
+                        &adb_proto::build_clse(server_id, s.client_local_id),
+                    )
+                    .await;
+                }
+                // Unknown stream id (already closed, or never opened): no reply, so garbage
+                // input can never trigger a CLSE reply storm.
+            }
+            _ => {
+                // A second CNXN mid-session, or any other/unknown command: not well-formed ADB
+                // from this point on. Ending the session is simpler and safer than guessing.
+                session_end.set(CaptureEnd::MalformedInput);
+                return;
+            }
+        }
+    }
+}
+
+/// Max concurrently-open ADB streams per connection. Each accepted interactive/sync OPEN pins a
+/// `Stream` (a FakeShell plus its fake filesystem) in the streams map; a real device also bounds
+/// concurrent streams, and this stops an OPEN flood from amplifying wire bytes into unbounded heap.
+const MAX_STREAMS_PER_CONN: usize = 32;
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_open(
+    stream: &mut TcpStream,
+    header: &Header,
+    data: &[u8],
+    streams: &mut HashMap<u32, Stream>,
+    next_stream_id: &mut u32,
+    source_ip: IpAddr,
+    wan_ip: Option<IpAddr>,
+    session_id: Uuid,
+    emitter: &Arc<EventEmitter>,
+    handoff: &Arc<CaptureHandoff>,
+    peer_addr: SocketAddr,
+    session_end: &SessionEnd,
+    max_captured_bytes: u64,
+    budget: &Arc<ConnectionBudget>,
+    base_fs: &FakeFs,
+    stdin_captures: &StdinCaptures,
+    peer_maxdata: usize,
+    write_timeout: Duration,
+) -> Result<(), ()> {
+    let client_local_id = header.arg0;
+    if client_local_id == 0 {
+        // OPEN's local-id "may not be zero" per the protocol; not worth trying to recover a
+        // session that violates this from the very first stream it opens.
+        return Err(());
+    }
+
+    // Cap concurrently-open streams. Without this, a client that floods OPEN with a fresh id and
+    // never CLSEs pins a FakeShell + FakeFs per stream (~30 wire bytes amplified to KBs of resident
+    // heap each), OOM-killing the sensor. Once the cap is hit, refuse further opens with a CLSE
+    // (arg0=0 marks a failed open) instead of allocating another stream.
+    if streams.len() >= MAX_STREAMS_PER_CONN {
+        write_or_err(
+            stream,
+            write_timeout,
+            &adb_proto::build_clse(0, client_local_id),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let dest = String::from_utf8_lossy(data).into_owned();
+
+    match adb_proto::classify_destination(&dest) {
+        Destination::Shell(cmd) => {
+            let server_id = *next_stream_id;
+            *next_stream_id += 1;
+            let ctx = EmitContext {
+                source_ip,
+                wan_ip,
+                authenticated: false,
+                protocol_label: PROTOCOL_LABEL.to_string(),
+                session_id: Some(session_id),
+            };
+            // The Android device this sensor announces, not the Linux server the other sensors
+            // present: a Nexus 5 banner followed by an Ubuntu bash was a one-command tell.
+            let mut shell = FakeShell::android(base_fs.share(), ctx)
+                .with_budget(budget.clone())
+                .with_captures(stdin_captures.clone());
+
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+
+            match cmd {
+                Some(cmd) => {
+                    // One-shot exec: run once, write output (if any), then close - mirrors real
+                    // adb's `shell:<command>` semantics (the stream closes when the command
+                    // exits) and sensor-ssh's `ChannelAction::Exec` one-shot pattern. A command
+                    // that reads its standard input waits for it instead, as on a device.
+                    let (step, events) = shell.start_line(&cmd);
+                    for event in &events {
+                        if emitter.append(event).await.is_err() {
+                            tracing::error!(%peer_addr, "adb: failed to append command event");
+                        }
+                    }
+                    let output = match step {
+                        LineStep::Ran(output) => output,
+                        LineStep::AwaitingInput => {
+                            let input = HeldInput::new(
+                                &shell,
+                                InputMode::Pipe,
+                                stdin_captures,
+                                CAPTURE_REASON_EXEC_STDIN,
+                                max_captured_bytes,
+                            );
+                            let held = HeldStdin {
+                                input: Some(input),
+                                session_end: session_end.clone(),
+                            };
+                            streams.insert(
+                                server_id,
+                                Stream::new(
+                                    client_local_id,
+                                    StreamKind::Exec(Box::new(shell), held),
+                                ),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let mut entry = Stream::new(client_local_id, StreamKind::OneShot);
+                    entry.queue(onlcr(output.bytes()));
+                    entry.close_after_drain = true;
+                    let should_remove = drive_stream(
+                        stream,
+                        budget,
+                        server_id,
+                        &mut entry,
+                        peer_maxdata,
+                        write_timeout,
+                    )
+                    .await?;
+                    if !should_remove {
+                        streams.insert(server_id, entry);
+                    }
+                }
+                None => {
+                    let prompt = shell_prompt(&shell);
+                    let mut entry = Stream::new(
+                        client_local_id,
+                        StreamKind::Shell(
+                            Box::new(shell),
+                            Vec::new(),
+                            ShellCapture {
+                                body: handoff.new_capture_body(),
+                                wire_bytes: 0,
+                                binary_seen: false,
+                                max_bytes: max_captured_bytes,
+                                stream_end: None,
+                                session_end: session_end.clone(),
+                                handoff: handoff.clone(),
+                                source_ip,
+                                wan_ip,
+                                session_id,
+                            },
+                            false,
+                            HeldStdin {
+                                input: None,
+                                session_end: session_end.clone(),
+                            },
+                        ),
+                    );
+                    entry.queue(prompt);
+                    drive_stream(
+                        stream,
+                        budget,
+                        server_id,
+                        &mut entry,
+                        peer_maxdata,
+                        write_timeout,
+                    )
+                    .await?;
+                    streams.insert(server_id, entry);
+                }
+            }
+        }
+        Destination::Sync => {
+            let server_id = *next_stream_id;
+            *next_stream_id += 1;
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+            streams.insert(
+                server_id,
+                Stream::new(
+                    client_local_id,
+                    StreamKind::Sync(SyncState::new(
+                        source_ip,
+                        wan_ip,
+                        session_id,
+                        handoff.clone(),
+                        base_fs.share(),
+                        session_end.clone(),
+                    )),
+                ),
+            );
+        }
+        Destination::Unsupported => {
+            tracing::debug!(
+                %peer_addr,
+                destination = %sanitize_value(&dest, 255),
+                "adb: refusing unsupported OPEN destination"
+            );
+            // arg0=0: this CLOSE indicates a failed OPEN, so no stream id was ever minted for
+            // it - exactly the documented "local-id MAY be zero" case.
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_clse(0, client_local_id),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Run one line typed at the interactive shell and append its events. Returns what it printed,
+/// or `None` when it waits for its input (see `FakeShell::start_line`), which `held` then
+/// collects as a terminal would. `after_cr` says the line ended with a CR, so an LF right after it
+/// is not input.
+#[allow(clippy::too_many_arguments)]
+async fn run_typed_line(
+    shell: &mut FakeShell,
+    line: &str,
+    held: &mut HeldStdin,
+    after_cr: bool,
+    stdin_captures: &StdinCaptures,
+    max_captured_bytes: u64,
+    emitter: &Arc<EventEmitter>,
+    capture: &mut ShellCapture,
+    peer_addr: SocketAddr,
+) -> Option<CommandResult> {
+    let (step, events) = shell.start_line(line);
+    for event in &events {
+        if event.metadata.get("flood").and_then(|v| v.as_str()) == Some("binary") {
+            capture.flag_binary();
+        }
+        if emitter.append(event).await.is_err() {
+            tracing::error!(%peer_addr, "adb: failed to append command event");
+        }
+    }
+    match step {
+        LineStep::Ran(output) => Some(output),
+        LineStep::AwaitingInput => {
+            let mut input = HeldInput::new(
+                shell,
+                InputMode::Terminal,
+                stdin_captures,
+                CAPTURE_REASON_SHELL_STDIN,
+                max_captured_bytes,
+            );
+            if after_cr {
+                input.follow_cr();
+            }
+            input.per_line();
+            held.input = Some(input);
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_wrte(
+    stream: &mut TcpStream,
+    header: &Header,
+    data: &[u8],
+    streams: &mut HashMap<u32, Stream>,
+    emitter: &Arc<EventEmitter>,
+    handoff: &Arc<CaptureHandoff>,
+    peer_addr: SocketAddr,
+    budget: &Arc<ConnectionBudget>,
+    stdin_captures: &StdinCaptures,
+    max_captured_bytes: u64,
+    peer_maxdata: usize,
+    write_timeout: Duration,
+) -> Result<(), ()> {
+    // Routing: arg1 is the recipient's (our) id for the stream - see the module doc's
+    // local-id/remote-id convention.
+    let server_id = header.arg1;
+    let Some(entry) = streams.get_mut(&server_id) else {
+        return Ok(()); // unknown stream (already closed, or never opened): ignore, do not reply
+    };
+    let client_local_id = entry.client_local_id;
+    let mut close_shell = false;
+    let mut queued_response = Vec::new();
+
+    match &mut entry.kind {
+        StreamKind::Shell(shell, line_buf, capture, prev_cr, held) => {
+            let mut responses = Vec::new();
+            // The bytes the shell itself was typed, kept before any line framing: a payload
+            // streamed with no newline never becomes a line, and that is exactly the dropper this
+            // capture exists for. Input a held command consumed is captured as that command's
+            // input instead, so no byte is captured twice.
+            let mut typed = Vec::new();
+            let mut at = 0;
+            while at < data.len() && !close_shell {
+                if let Some(input) = held.input.as_mut() {
+                    let fed = input.feed(&data[at..]);
+                    at += fed.taken;
+                    responses.extend_from_slice(&fed.echo);
+                    // The command may have read what it wanted from this line (`read x`).
+                    let resumed = if fed.ended.is_none() && fed.line {
+                        input
+                            .resume(shell)
+                            .map(|output| (output, input.ended_on_cr()))
+                    } else {
+                        None
+                    };
+                    if let Some(end) = fed.ended
+                        && let Some(input) = held.input.take()
+                    {
+                        let output = input.finish(shell, end);
+                        responses.extend_from_slice(&onlcr(output.bytes()));
+                        close_shell = output.close_session;
+                        if !close_shell {
+                            responses.extend_from_slice(&shell_prompt(shell));
+                        }
+                    } else if let Some((output, after_cr)) = resumed {
+                        // Done; the rest of the packet is the shell's.
+                        *prev_cr = after_cr;
+                        held.input = None;
+                        responses.extend_from_slice(&onlcr(output.bytes()));
+                        close_shell = output.close_session;
+                        if !close_shell {
+                            responses.extend_from_slice(&shell_prompt(shell));
+                        }
+                    }
+                    continue;
+                }
+                let byte = data[at];
+                at += 1;
+                typed.push(byte);
+                if *prev_cr {
+                    *prev_cr = false;
+                    if byte == b'\n' {
+                        continue;
+                    }
+                }
+                if byte == b'\n' || byte == b'\r' {
+                    *prev_cr = byte == b'\r';
+                    responses.extend_from_slice(b"\r\n");
+                    if !line_buf.is_empty() {
+                        let line = String::from_utf8_lossy(line_buf).into_owned();
+                        line_buf.clear();
+                        let Some(output) = run_typed_line(
+                            shell,
+                            &line,
+                            held,
+                            *prev_cr,
+                            stdin_captures,
+                            max_captured_bytes,
+                            emitter,
+                            capture,
+                            peer_addr,
+                        )
+                        .await
+                        else {
+                            // The held input took over the rest of this Enter. The prompt comes
+                            // back when the command ends.
+                            *prev_cr = false;
+                            continue;
+                        };
+                        responses.extend_from_slice(&onlcr(output.bytes()));
+                        close_shell = output.close_session;
+                        if close_shell {
+                            break;
+                        }
+                    }
+                    if !close_shell {
+                        // Re-read the prompt each time: `cd` or a nested shell changes it. Empty
+                        // Enter gets the same fresh prompt as a real interactive shell.
+                        responses.extend_from_slice(&shell_prompt(shell));
+                    }
+                } else if byte == 0x7f || byte == 0x08 {
+                    if line_buf.pop().is_some() {
+                        responses.extend_from_slice(b"\x08 \x08");
+                    }
+                } else if byte >= 0x20 {
+                    line_buf.push(byte);
+                    responses.push(byte);
+                    if line_buf.len() >= MAX_SHELL_LINE_LEN {
+                        let line = String::from_utf8_lossy(line_buf).into_owned();
+                        line_buf.clear();
+                        if let Some(output) = run_typed_line(
+                            shell,
+                            &line,
+                            held,
+                            false,
+                            stdin_captures,
+                            max_captured_bytes,
+                            emitter,
+                            capture,
+                            peer_addr,
+                        )
+                        .await
+                        {
+                            close_shell = output.close_session;
+                        }
+                    }
+                }
+            }
+            capture.push(&typed);
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+            queued_response = responses;
+            if close_shell {
+                capture.stream_end = Some(CaptureEnd::ClientLogout);
+            }
+        }
+        StreamKind::Sync(sync) => {
+            let (response, upload) = sync.feed(data);
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+            if let Some(job) = upload {
+                // Off-response-path: never awaited, never blocks this reply - see
+                // sensor_framework::handoff's module doc. A full queue drops the job and is
+                // counted, not retried on this hot path.
+                let _ = handoff.submit(job);
+            }
+            queued_response = response;
+        }
+        StreamKind::Exec(shell, held) => {
+            write_or_err(
+                stream,
+                write_timeout,
+                &adb_proto::build_okay(server_id, client_local_id),
+            )
+            .await?;
+            if let Some(input) = held.input.as_mut() {
+                let fed = input.feed(data);
+                if let Some(end) = fed.ended
+                    && let Some(input) = held.input.take()
+                {
+                    // The input reached the capture ceiling: the command runs on what was kept
+                    // and the stream closes when it ends, as for any `shell:<command>`.
+                    queued_response = onlcr(input.finish(shell, end).bytes());
+                    close_shell = true;
+                }
+            }
+        }
+        StreamKind::OneShot => {}
+    }
+    let entry = streams.get_mut(&server_id).ok_or(())?;
+    entry.queue(queued_response);
+    if close_shell {
+        entry.close_after_drain = true;
+    }
+    let should_remove = drive_stream(
+        stream,
+        budget,
+        server_id,
+        entry,
+        peer_maxdata,
+        write_timeout,
+    )
+    .await?;
+    if should_remove {
+        streams.remove(&server_id);
+    }
+    Ok(())
+}
+
+async fn write_or_err(
+    stream: &mut TcpStream,
+    write_timeout: Duration,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    tokio::time::timeout(write_timeout, stream.write_all(bytes))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+/// Send at most one queued WRTE for a stream. A second WRTE is never sent until the peer's OKAY
+/// clears `awaiting_okay`; this keeps large shell output bounded by both negotiated `maxdata` and
+/// ADB's per-stream stop-and-wait flow control. Returns true after sending the final CLSE.
+async fn drive_stream(
+    stream: &mut TcpStream,
+    budget: &ConnectionBudget,
+    server_id: u32,
+    entry: &mut Stream,
+    peer_maxdata: usize,
+    write_timeout: Duration,
+) -> Result<bool, ()> {
+    if entry.awaiting_okay {
+        return Ok(false);
+    }
+    while let Some(front) = entry.outbound.front_mut() {
+        if front.offset == front.bytes.len() {
+            entry.outbound.pop_front();
+            continue;
+        }
+        let end = front
+            .offset
+            .saturating_add(peer_maxdata)
+            .min(front.bytes.len());
+        let payload = &front.bytes[front.offset..end];
+        write_or_err(
+            stream,
+            write_timeout,
+            &adb_proto::build_wrte(server_id, entry.client_local_id, payload),
+        )
+        .await?;
+        front.offset = end;
+        entry.awaiting_okay = true;
+        if budget.charge_egress(payload.len() as u64) == EgressState::Spent {
+            // Finish this already-started logical response before dropping the connection. The
+            // old whole-WRTE implementation did that naturally; chunking must not turn the cap
+            // into a partial-response oracle merely because maxdata is smaller than the reply.
+            entry.drop_after_drain = true;
+        }
+        return Ok(false);
+    }
+    if entry.drop_after_drain {
+        return Err(());
+    }
+    if entry.close_after_drain {
+        write_or_err(
+            stream,
+            write_timeout,
+            &adb_proto::build_clse(server_id, entry.client_local_id),
+        )
+        .await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_event_is_unauthenticated_with_adb_label() {
+        let session_id = Uuid::now_v7();
+        let event = connection_event("203.0.113.7".parse().unwrap(), None, session_id);
+        assert!(!event.authenticated);
+        assert_eq!(event.session_id, Some(session_id));
+        assert_eq!(event.sensor, "adb");
+        assert_eq!(event.signal_type, SIGNAL_HONEYPOT_CONNECTION);
+        assert_eq!(event.protocol, PROTO_TCP);
+        assert_eq!(
+            event
+                .metadata
+                .get("protocol_label")
+                .and_then(|v| v.as_str()),
+            Some("adb")
+        );
+        assert_eq!(event.sample, None);
+    }
+
+    /// A hand-off with `slots` queue entries and no worker: `submit` succeeds `slots` times, then
+    /// is refused, which is how a test proves a submission happened. The directory it writes to
+    /// is returned for the caller to hold: dropping it at the end of the test removes it, where
+    /// forgetting it left one directory behind per call and showed up under LeakSanitizer
+    /// (docs/security/sanitizer-results.md).
+    fn test_handoff(slots: usize) -> (Arc<CaptureHandoff>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let outbox_dir = dir.path().join("outbox");
+        let spool =
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_SYNC_BODY as u64, 100_000_000);
+        let emitter = sensor_framework::EventEmitter::new(dir.path().join("events.jsonl"));
+        let handoff = Arc::new(CaptureHandoff::new(
+            spool,
+            emitter,
+            slots,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(outbox_dir),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(u64::MAX)),
+        ));
+        (handoff, dir)
+    }
+
+    fn test_sync_state() -> (SyncState, tempfile::TempDir) {
+        let (handoff, dir) = test_handoff(16);
+        let state = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            FakeFs::android(),
+            SessionEnd::new(),
+        );
+        (state, dir)
+    }
+
+    fn probe_job() -> CaptureJob {
+        let mut body = CaptureBody::unbudgeted();
+        body.extend_from_slice(&[1]).unwrap();
+        CaptureJob {
+            body,
+            orig_name: "probe".into(),
+            event_builder: Box::new(|_sample| unreachable!("never built")),
+        }
+    }
+
+    /// The listener cancels a handler at `max_duration` by dropping its future; no code after
+    /// the message loop runs. `SyncState`'s `Drop` must submit the open SEND on that path, and
+    /// a protocol reset must not discard DATA already received either.
+    #[tokio::test]
+    async fn sync_submits_the_unfinished_send_when_cancelled_or_reset() {
+        let (handoff, _handoff_dir) = test_handoff(1);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            FakeFs::android(),
+            SessionEnd::new(),
+        );
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/x,420",
+        ));
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(10), async move {
+            let _keep = &sync;
+            std::future::pending::<()>().await;
+        })
+        .await;
+        assert!(cancelled.is_err());
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the one slot holds the abandoned SEND"
+        );
+
+        let (handoff, _handoff_dir) = test_handoff(1);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff.clone(),
+            FakeFs::android(),
+            SessionEnd::new(),
+        );
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/y,420",
+        ));
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"CD"));
+        // A stray SEND while one is open is a protocol violation: the state resets.
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/z,420",
+        ));
+        assert!(sync.pending_send.is_none());
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the reset submitted the DATA it had"
+        );
+    }
+
+    /// The process-wide capture budget runs out mid-push: the prefix that fit is queued as a
+    /// truncated capture, the push is failed with a sync FAIL, and a push that gets no bytes at
+    /// all queues nothing and is counted as refused.
+    #[test]
+    fn a_push_that_exhausts_the_capture_memory_budget_fails_and_keeps_the_prefix() {
+        use sensor_framework::CAPTURE_CHUNK_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        std::fs::create_dir(&spool_dir).unwrap();
+        let handoff = Arc::new(CaptureHandoff::new(
+            sensor_framework::QuarantineSpool::new(spool_dir, MAX_SYNC_BODY as u64, 100_000_000),
+            sensor_framework::EventEmitter::new(dir.path().join("events.jsonl")),
+            1,
+            "test".to_string(),
+            sensor_framework::OutboxManifest::new(dir.path().join("outbox")),
+            Arc::new(sensor_framework::CaptureMemoryBudget::new(
+                CAPTURE_CHUNK_BYTES,
+            )),
+        ));
+        let send =
+            || adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/data/local/tmp/big,33188");
+        let data = |n: usize| adb_proto::build_sync_message(adb_proto::SYNC_DATA, &vec![5u8; n]);
+        let new_sync = || {
+            SyncState::new(
+                "203.0.113.7".parse().unwrap(),
+                None,
+                Uuid::now_v7(),
+                handoff.clone(),
+                FakeFs::android(),
+                SessionEnd::new(),
+            )
+        };
+
+        let mut sync = new_sync();
+        let mut wire = send();
+        wire.extend_from_slice(&data(40_000));
+        wire.extend_from_slice(&data(40_000));
+        let (response, upload) = sync.feed(&wire);
+        assert!(
+            upload.is_none(),
+            "the truncated prefix is submitted directly"
+        );
+        assert!(
+            response.starts_with(b"FAIL") && response.ends_with(b"No space left on device"),
+            "the push is failed, not acknowledged: {response:?}"
+        );
+        assert_eq!(handoff.truncated_capture_count(), 1);
+        assert!(
+            handoff.submit(probe_job()).is_err(),
+            "the prefix took the slot"
+        );
+
+        // The queued prefix still holds the only chunk, so the next push gets zero bytes.
+        let mut starved = new_sync();
+        let mut wire = send();
+        wire.extend_from_slice(&data(10));
+        let (response, _) = starved.feed(&wire);
+        assert!(response.starts_with(b"FAIL"));
+        assert_eq!(handoff.refused_capture_count(), 1);
+        assert_eq!(handoff.truncated_capture_count(), 1);
+    }
+
+    fn push(fs: FakeFs, path: &str, body: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
+        push_mode(fs, path, 33188, body)
+    }
+
+    /// A push whose SEND carries `mode` as the decimal `st_mode` a real `adb push` sends
+    /// (33188 is 0o100644, 33261 is 0o100755).
+    fn push_mode(fs: FakeFs, path: &str, mode: u32, body: &[u8]) -> (Vec<u8>, Option<CaptureJob>) {
+        let (handoff, _dir) = test_handoff(16);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            fs,
+            SessionEnd::new(),
+        );
+        let mut wire = adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            format!("{path},{mode}").as_bytes(),
+        );
+        wire.extend_from_slice(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, body));
+        wire.extend_from_slice(&adb_proto::build_sync_done(1_700_000_000));
+        sync.feed(&wire)
+    }
+
+    /// The SEND mode decides whether a pushed file runs: 0755 is executable, 0644 is not, and
+    /// only the permission bits are taken. A SEND with no parseable mode names no path either.
+    #[test]
+    fn a_push_lands_with_the_send_modes_permission_bits() {
+        let base = FakeFs::android();
+        push_mode(base.share(), "/data/local/tmp/bot", 0o100_755, b"ELF-bot");
+        push_mode(base.share(), "/data/local/tmp/data", 0o100_644, b"ELF-data");
+        push_mode(
+            base.share(),
+            "/data/local/tmp/high",
+            0o104_700 | 0o010,
+            b"ELF-high",
+        );
+        assert!(base.is_executable("/data/local/tmp/bot"));
+        assert!(!base.is_executable("/data/local/tmp/data"));
+        assert_eq!(
+            base.stat("/data/local/tmp/bot", true).unwrap().mode,
+            0o100_755
+        );
+        assert_eq!(
+            base.stat("/data/local/tmp/data", true).unwrap().mode,
+            0o100_644
+        );
+        // setuid is dropped, the owner and group execute bits stay.
+        assert_eq!(
+            base.stat("/data/local/tmp/high", true).unwrap().mode,
+            0o100_710
+        );
+
+        let (handoff, _dir) = test_handoff(16);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            base.share(),
+            SessionEnd::new(),
+        );
+        let mut wire =
+            adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/data/local/tmp/nomode");
+        wire.extend_from_slice(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"x"));
+        wire.extend_from_slice(&adb_proto::build_sync_done(1));
+        sync.feed(&wire);
+        assert!(
+            !base.file_exists("/data/local/tmp/nomode"),
+            "an unparseable SEND has no destination, as before"
+        );
+    }
+
+    #[test]
+    fn push_destination_denies_traversal_relative_and_control_characters() {
+        assert_eq!(
+            push_destination("/data/local/tmp/x"),
+            Some("/data/local/tmp/x")
+        );
+        assert_eq!(push_destination("x"), None);
+        assert_eq!(push_destination(""), None);
+        assert_eq!(push_destination("/data/local/tmp/../../etc/x"), None);
+        assert_eq!(push_destination("/data/a\0b"), None);
+        assert_eq!(push_destination("/data/a\nb"), None);
+    }
+
+    #[test]
+    fn a_completed_push_lands_in_the_shared_fs_and_still_yields_the_capture() {
+        let base = FakeFs::android();
+        let (_, upload) = push(base.share(), "/data/local/tmp/adb_payload", b"ELF-adb-5521");
+        assert_eq!(
+            base.read_all("/data/local/tmp/adb_payload", 64).unwrap(),
+            b"ELF-adb-5521"
+        );
+        let job = upload.expect("the capture job is produced exactly as before");
+        assert_eq!(job.body.as_slice(), b"ELF-adb-5521");
+        assert_eq!(job.orig_name, "/data/local/tmp/adb_payload");
+        assert!(
+            base.share().file_exists("/data/local/tmp/adb_payload"),
+            "a share of the same base sees the push"
+        );
+        assert!(
+            !FakeFs::android()
+                .share()
+                .file_exists("/data/local/tmp/adb_payload"),
+            "a share of a different base does not"
+        );
+    }
+
+    /// The reply is `STAT` + mode + size + mtime with no length field, and reflects only the
+    /// connection's fake tree: a directory answers `S_IFDIR`, a file its own mode and size, and
+    /// an absent path the all-zero not-found a new-file push depends on.
+    #[test]
+    fn sync_stat_answers_from_the_fake_tree() {
+        let base = FakeFs::android();
+        push_mode(
+            base.share(),
+            "/data/local/tmp/dropper",
+            0o100_755,
+            b"ELF-12345",
+        );
+        let (handoff, _dir) = test_handoff(16);
+        let mut sync = SyncState::new(
+            "203.0.113.7".parse().unwrap(),
+            None,
+            Uuid::now_v7(),
+            handoff,
+            base.share(),
+            SessionEnd::new(),
+        );
+        let mut stat = |path: &str| {
+            let (reply, upload) = sync.feed(&adb_proto::build_sync_message(
+                adb_proto::SYNC_STAT,
+                path.as_bytes(),
+            ));
+            assert!(upload.is_none());
+            assert_eq!(reply.len(), 16, "id + mode + size + mtime, no length field");
+            assert_eq!(&reply[..4], b"STAT");
+            let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+            (word(4), word(8), word(12))
+        };
+        let (dir_mode, _, _) = stat("/data/local/tmp");
+        assert_eq!(
+            dir_mode & 0o170_000,
+            0o040_000,
+            "a directory carries S_IFDIR"
+        );
+        let (file_mode, file_size, _) = stat("/data/local/tmp/dropper");
+        assert_eq!(file_mode, 0o100_755);
+        assert_eq!(file_size, 9);
+        assert_eq!(stat("/data/local/tmp/not_there"), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_climbing_or_over_budget_push_is_not_stored_but_still_yields_the_capture() {
+        use sensor_framework::{BudgetLimits, ConnectionBudget};
+        let base = FakeFs::android();
+        let (_, upload) = push(
+            base.share(),
+            "/data/local/tmp/../../../tmp/esc",
+            b"esc-0042",
+        );
+        assert!(upload.is_some());
+        assert!(!base.file_exists("/tmp/esc"));
+
+        let small = FakeFs::android().with_budget(ConnectionBudget::new(BudgetLimits {
+            owned_bytes: 1024,
+            ..BudgetLimits::standard()
+        }));
+        let (_, upload) = push(small.share(), "/data/local/tmp/big", &vec![0xCD; 4096]);
+        assert!(!small.file_exists("/data/local/tmp/big"));
+        assert_eq!(
+            upload.expect("evidence regardless of the fs").body.len(),
+            4096
+        );
+    }
+
+    #[test]
+    fn sync_send_data_done_produces_capture_job() {
+        let (mut sync, _sync_dir) = test_sync_state();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/data/local/tmp/evil.bin,33188",
+        ));
+        wire.extend_from_slice(&adb_proto::build_sync_message(
+            adb_proto::SYNC_DATA,
+            b"hello",
+        ));
+        wire.extend_from_slice(&adb_proto::build_sync_done(1_700_000_000));
+
+        let (response, upload) = sync.feed(&wire);
+        let sync_reply = SyncHeader::parse(&response).unwrap();
+        assert_eq!(sync_reply.id, adb_proto::SYNC_OKAY);
+        let job = upload.expect("SEND+DATA+DONE must produce a capture job");
+        assert_eq!(job.body.as_slice(), b"hello");
+        assert_eq!(job.orig_name, "/data/local/tmp/evil.bin");
+    }
+
+    #[test]
+    fn sync_send_split_across_multiple_feed_calls() {
+        // The reassembly buffer must persist state across separate WRTE-driven `feed` calls,
+        // exactly as a real client trickling SEND/DATA/DONE across separate writes would drive
+        // it (see tests/integration.rs's own `sync_push` helper, which does exactly this).
+        let (mut sync, _sync_dir) = test_sync_state();
+        let (r1, u1) = sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/x,420",
+        ));
+        assert!(r1.is_empty());
+        assert!(u1.is_none());
+
+        let (r2, u2) = sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
+        assert!(r2.is_empty());
+        assert!(u2.is_none());
+
+        let (r3, u3) = sync.feed(&adb_proto::build_sync_done(0));
+        assert_eq!(SyncHeader::parse(&r3).unwrap().id, adb_proto::SYNC_OKAY);
+        assert_eq!(u3.unwrap().body.as_slice(), b"AB");
+    }
+
+    /// A SEND whose DONE never arrives (stream closed, session dropped) keeps the DATA that did,
+    /// marked incomplete; a completed SEND is marked complete.
+    #[test]
+    fn sync_abandoned_mid_send_yields_an_incomplete_capture() {
+        let sample = |job: &CaptureJob| SampleRef {
+            sha256: "ef".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: job.orig_name.clone(),
+            capture_id: None,
+        };
+        let (mut sync, _sync_dir) = test_sync_state();
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/data/local/tmp/x,33188",
+        ));
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"AB"));
+        let job = sync
+            .abandon(CaptureEnd::PeerClosed)
+            .expect("DATA arrived, so a capture");
+        assert_eq!(job.body.as_slice(), b"AB");
+        let sample_ref = sample(&job);
+        let event = (job.event_builder)(sample_ref);
+        assert_eq!(event.metadata["complete"], false);
+        assert_eq!(event.metadata["end_reason"], "peer_closed");
+        assert!(sync.abandon(CaptureEnd::PeerClosed).is_none());
+
+        // A SEND with no DATA yet has nothing to keep.
+        let (mut bare, _bare_dir) = test_sync_state();
+        bare.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/y,420",
+        ));
+        assert!(bare.abandon(CaptureEnd::PeerClosed).is_none());
+
+        let (mut done, _done_dir) = test_sync_state();
+        let (_, upload) = done.feed(
+            &[
+                adb_proto::build_sync_message(adb_proto::SYNC_SEND, b"/tmp/z,420"),
+                adb_proto::build_sync_message(adb_proto::SYNC_DATA, b"CD"),
+                adb_proto::build_sync_done(0),
+            ]
+            .concat(),
+        );
+        let job = upload.unwrap();
+        let sample_ref = sample(&job);
+        let event = (job.event_builder)(sample_ref);
+        assert_eq!(event.metadata["complete"], true);
+        assert_eq!(event.metadata["end_reason"], "transfer_complete");
+    }
+
+    #[test]
+    fn sync_recv_is_refused_with_fail_and_no_upload() {
+        let (mut sync, _sync_dir) = test_sync_state();
+        let (response, upload) = sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_RECV,
+            b"/data/secrets.txt",
+        ));
+        assert!(upload.is_none());
+        let reply = SyncHeader::parse(&response).unwrap();
+        assert_eq!(reply.id, adb_proto::SYNC_FAIL);
+        assert!(!response[adb_proto::SYNC_HEADER_LEN..].is_empty());
+    }
+
+    #[test]
+    fn sync_stat_reports_not_found_and_does_not_upload() {
+        let (mut sync, _sync_dir) = test_sync_state();
+        let (response, upload) = sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_STAT,
+            b"/tmp/probe",
+        ));
+        assert!(upload.is_none());
+        assert_eq!(
+            response,
+            adb_proto::stat_reply(&adb_proto::stat_not_found_body())
+        );
+        assert_eq!(response.len(), 16);
+        assert_eq!(&response[..4], b"STAT");
+        assert_eq!(&response[4..], &[0u8; 12]);
+    }
+
+    #[test]
+    fn sync_data_body_capped_at_max_sync_body() {
+        // An attacker declares (and sends) a body larger than MAX_SYNC_BODY across multiple
+        // DATA chunks. The accumulated body must stop growing at the cap - mirrors
+        // sensor-ssh's `transfer::scp_body_capped_at_max_capture_body`.
+        let (mut sync, _sync_dir) = test_sync_state();
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/huge,420",
+        ));
+        let chunk = vec![0xAAu8; 100_000];
+        for _ in 0..(MAX_SYNC_BODY / chunk.len() + 5) {
+            sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, &chunk));
+        }
+        let (_response, upload) = sync.feed(&adb_proto::build_sync_done(0));
+        let job = upload.unwrap();
+        assert!(
+            job.body.len() <= MAX_SYNC_BODY,
+            "body grew to {} bytes, cap is {MAX_SYNC_BODY}",
+            job.body.len()
+        );
+        assert_eq!(job.body.len(), MAX_SYNC_BODY);
+
+        // The emitted event must not present the retained prefix as the whole file.
+        let sent = (chunk.len() * (MAX_SYNC_BODY / chunk.len() + 5)) as u64;
+        let event = (job.event_builder)(SampleRef {
+            sha256: "ab".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: "huge".into(),
+            capture_id: None,
+        });
+        assert_eq!(event.metadata["truncated"], true);
+        assert_eq!(event.metadata["wire_size"], sent);
+        assert_eq!(event.metadata["size"], MAX_SYNC_BODY as u64);
+    }
+
+    #[test]
+    fn sync_body_within_cap_is_not_marked_truncated() {
+        let (mut sync, _sync_dir) = test_sync_state();
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/small,420",
+        ));
+        let chunk = vec![0x55u8; 4096];
+        sync.feed(&adb_proto::build_sync_message(adb_proto::SYNC_DATA, &chunk));
+        let (_response, upload) = sync.feed(&adb_proto::build_sync_done(0));
+        let job = upload.unwrap();
+        let event = (job.event_builder)(SampleRef {
+            sha256: "ab".repeat(32),
+            size: job.body.len() as u64,
+            orig_name: "small".into(),
+            capture_id: None,
+        });
+        assert_eq!(event.metadata["truncated"], false);
+        assert_eq!(event.metadata["wire_size"], 4096u64);
+    }
+
+    #[test]
+    fn sync_oversized_data_chunk_length_resets_state_without_panicking() {
+        let (mut sync, _sync_dir) = test_sync_state();
+        sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_SEND,
+            b"/tmp/x,420",
+        ));
+        // Forge a DATA sub-header claiming far more than SYNC_MAX_CHUNK, followed by only a
+        // little real data - the declared length alone must trigger the reset, not require
+        // actually accumulating toward it.
+        let mut forged = adb_proto::SyncHeader {
+            id: adb_proto::SYNC_DATA,
+            length: adb_proto::SYNC_MAX_CHUNK + 1,
+        }
+        .encode()
+        .to_vec();
+        forged.extend_from_slice(&[0xFF; 16]);
+        let (response, upload) = sync.feed(&forged);
+        assert!(response.is_empty());
+        assert!(upload.is_none());
+        assert!(
+            sync.buf.is_empty(),
+            "buffer must be cleared, not accumulated toward"
+        );
+        assert!(sync.pending_send.is_none());
+    }
+
+    #[test]
+    fn sync_data_or_done_without_preceding_send_is_ignored_without_panicking() {
+        let (mut sync, _sync_dir) = test_sync_state();
+        let (response, upload) = sync.feed(&adb_proto::build_sync_message(
+            adb_proto::SYNC_DATA,
+            b"stray",
+        ));
+        assert!(response.is_empty());
+        assert!(upload.is_none());
+    }
+
+    #[test]
+    fn sync_feed_never_panics_on_arbitrary_bytes() {
+        // Fuzz-lite guard mirroring sensor-telnet's IacFilter convention: `feed` parses fully
+        // attacker-controlled, pre-any-check bytes on a stream ADB has no authentication for at
+        // all, so arbitrary (including malformed or truncated) input must never panic.
+        for seed in 0..20u8 {
+            let (mut sync, _sync_dir) = test_sync_state();
+            let garbage: Vec<u8> = (0..512u32)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
+                .collect();
+            let _ = sync.feed(&garbage);
+        }
+    }
+}

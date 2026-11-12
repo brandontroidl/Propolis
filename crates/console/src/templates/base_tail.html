@@ -1,0 +1,70 @@
+{% block topnav %}
+<div class="topnav">
+<a class="wordmark" href="/">Propolis</a>
+{% block nav %}
+<nav aria-label="Console sections">
+<a href="/"{% if active_nav == "dashboard" %} class="active" aria-current="page"{% endif %}>Dashboard</a>
+<a href="/queue"{% if active_nav == "queue" %} class="active" aria-current="page"{% endif %}>Review{% if pending_count > 0 %} <span class="badge">{{ pending_count | count }}</span>{% endif %}</a>
+<a href="/ips"{% if active_nav == "ips" %} class="active" aria-current="page"{% endif %}>Attackers</a>
+<a href="/campaigns"{% if active_nav == "campaigns" %} class="active" aria-current="page"{% endif %}>Campaigns</a>
+<a href="/feed"{% if active_nav == "feed" %} class="active" aria-current="page"{% endif %}>Feed</a>
+<a href="/search/events"{% if active_nav == "search" %} class="active" aria-current="page"{% endif %}>Search</a>
+<div class="menu" id="opsmenu">
+<button class="navlike{% if active_nav == "fleet" or active_nav == "logs" or active_nav == "samples" or active_nav == "integrity" %} active{% endif %}" id="opsbtn" aria-haspopup="true" aria-expanded="false" aria-controls="opslist">Operations <span aria-hidden="true">&#9662;</span></button>
+<div class="menu-list" id="opslist" role="menu" aria-labelledby="opsbtn" hidden>
+{# First in the menu because "is anything broken" comes before reading logs to find out why. #}
+<a href="/fleet" role="menuitem"{% if active_nav == "fleet" %} aria-current="page"{% endif %}>Fleet <span class="hint">listeners</span></a>
+<a href="/logs" role="menuitem"{% if active_nav == "logs" %} aria-current="page"{% endif %}>Logs <span class="hint">live tail</span></a>
+<a href="/samples" role="menuitem"{% if active_nav == "samples" %} aria-current="page"{% endif %}>Samples <span class="hint">malware</span></a>
+<a href="/integrity" role="menuitem"{% if active_nav == "integrity" %} aria-current="page"{% endif %}>Integrity <span class="hint">chain</span></a>
+</div>
+</div>
+</nav>
+<div class="right">
+<form action="/search/events" method="get" class="nav-search" role="search">
+<input type="text" name="q" placeholder="Quick search" aria-label="Quick search events" autocomplete="off">
+</form>
+<label class="theme-switch">
+<span class="visually-hidden">Theme</span>
+<select id="theme-select" aria-label="Colour theme">
+<option value="graphite">Graphite</option>
+<option value="cream">Cream</option>
+<option value="system">System</option>
+<option value="hacker">1337 |-|4&gt;&lt;0R</option>
+</select>
+</label>
+<span class="nav-meta mono dim">up {{ uptime }}</span>
+<span class="nav-meta mono dim">v{{ version }}</span>
+<a href="/logout">Sign out</a>
+</div>
+{% endblock %}
+</div>
+{% endblock %}
+<main>
+{# Soft-failed panels (routes::degraded): the page rendered, but these panels show placeholders
+   in place of data that could not be read. Named, so a zero or an empty table is never mistaken
+   for a quiet node. #}
+{% if degraded is defined and degraded %}
+<div class="degraded" role="status">Some panels could not be loaded and show placeholders: {{ degraded|join(", ") }}. The cause is in the server log.</div>
+{% endif %}
+{% block content %}{% endblock %}
+</main>
+<div class="status-line">propolis v{{ version }} - up {{ uptime }}</div>
+
+{# Evidence drawer: a slide-over that HTMX-loads the real per-IP dossier fragment. It only ever
+   supplements the real /ip/{ip} page - every attacker row's IP is a real <a href="/ip/{ip}"> that
+   navigates there without JS, and the drawer's own "Open full page" is the same real link. Starts
+   inert + aria-hidden with no aria-modal; those flip only while it is open. #}
+<div class="scrim" id="drawer-scrim" hidden></div>
+<aside class="drawer" id="drawer" role="dialog" aria-labelledby="drawer-title" tabindex="-1" aria-hidden="true" inert>
+<div class="drawer-head">
+<span class="drawer-eyebrow" id="drawer-title">Evidence</span>
+<button type="button" class="iconbtn" id="drawer-close" aria-label="Close evidence drawer">&times;</button>
+</div>
+<div id="drawer-body" aria-live="polite"></div>
+</aside>
+
+<script src="/assets/console.js"></script>
+<script src="/assets/live-panels.js"></script>
+</body>
+</html>

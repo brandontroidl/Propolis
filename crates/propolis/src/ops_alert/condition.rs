@@ -1,0 +1,288 @@
+//! The `Condition` trait every failure-mode check implements, the `Outcome` it returns, and the
+//! `MonitorCtx` of shared read handles it evaluates against.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+
+use super::config::OpsAlertConfig;
+use super::debounce::Signal;
+use super::dispatch::Severity;
+
+/// Per-subsystem liveness state the supervisor publishes and the subsystem conditions read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsysState {
+    Running,
+    BackingOff {
+        consecutive: u32,
+    },
+    /// Restarts exhausted after repeated rapid panics; the supervisor stopped trying.
+    GaveUp,
+    /// The task returned on its own while the daemon was NOT shutting down. Every subsystem is a
+    /// loop that runs until cancelled, so a voluntary return is a startup refusal (the fetcher
+    /// with no own-IP set, say) or a loop that ended - dead either way, and the supervisor does
+    /// not restart a clean return. Read as "down" by `/ready` and the subsystem conditions,
+    /// where it used to stay `Running` forever.
+    Exited,
+}
+
+impl SubsysState {
+    /// Whether the subsystem is no longer running and will not be restarted.
+    pub fn is_down(self) -> bool {
+        matches!(self, SubsysState::GaveUp | SubsysState::Exited)
+    }
+}
+
+/// Shared map from subsystem name to its current supervised state. The supervisor writes it; the
+/// `subsystem-gaveup` and `sensor-down` conditions read it.
+pub type SupervisorHandle = Arc<Mutex<HashMap<&'static str, SubsysState>>>;
+
+/// The daemon's own supervised subsystems, by the exact name each is spawned under in `main.rs`.
+/// Every other entry in the supervisor handle is a per-sensor intake tailer (sensor names are
+/// operator-chosen via `PROPOLIS_SENSOR_LOGS`, e.g. `ssh`, `catchall`, `cred-vnc`, so they cannot
+/// be recognised by a name prefix). The `subsystem-gaveup` condition watches these; `sensor-down`
+/// watches the complement. Keep this in sync with the `spawn_supervised` call sites; the coverage
+/// test `daemon_subsystems_are_disjoint_from_sensor_names` guards the classification.
+pub const DAEMON_SUBSYSTEMS: &[&str] = &[
+    "review",
+    "feed",
+    "virustotal",
+    "fetcher",
+    "console",
+    "ops-monitor",
+    "sample-retention",
+    "listener-probe",
+    "campaigns",
+];
+
+/// True when `name` is a per-sensor intake tailer rather than a daemon subsystem.
+pub fn is_sensor(name: &str) -> bool {
+    !DAEMON_SUBSYSTEMS.contains(&name)
+}
+
+/// Per-sensor intake liveness, written by each sensor's intake loop and read by the
+/// `intake-stalled` and `intake-lagging` conditions, `/metrics` and the fleet pane.
+/// `last_advanced_at` is the monitor-clock instant that sensor last consumed input; `backlog` is
+/// whether the most recent poll left unconsumed input (a full batch, or an append error with a
+/// line in hand). A sensor is stalled when it has backlog but has not advanced for `stall_for` -
+/// the backlog flag is what distinguishes a wedged ingest pipeline from a quiet honeypot with
+/// simply nothing to read.
+#[derive(Debug, Clone)]
+pub struct SensorIntake {
+    pub last_advanced_at: Instant,
+    pub backlog: bool,
+    /// Unread bytes of the log after the latest poll (`LogTailer::backlog_bytes`); `None` until the
+    /// first poll finishes, which readers treat as not measured rather than caught up.
+    pub bytes_behind: Option<u64>,
+    /// `observed_at` of the last event the loop appended; `None` until it appends one.
+    pub last_ingested_observed_at: Option<DateTime<Utc>>,
+    /// The `event.sensor` names the log's appended events carried, for the fleet pane.
+    pub reported_sensors: Vec<String>,
+    /// Set while the database keeps refusing the same line of this log (`IntakeRunner::wedged`);
+    /// `intake-stalled` quotes it, so the page says why the cursor is not moving.
+    pub wedge: Option<String>,
+    /// Input a `copytruncate` rotation took that the rotated copy could not supply, since the
+    /// daemon started (`LogTailer::rotation_loss`); `intake-rotation-loss` reads it.
+    pub rotation_loss: log_tailer::RotationLoss,
+    /// Monitor-clock instant `rotation_loss` last grew; `None` while it never has.
+    pub rotation_loss_at: Option<Instant>,
+    /// When this log's intake last set a refused line aside (`IntakeRunner::last_quarantine`) and
+    /// what it said about it; `intake-line-quarantined` fires on it for a while after.
+    pub last_quarantine: Option<(Instant, String)>,
+}
+
+impl SensorIntake {
+    /// The entry a loop seeds before its first poll: recently alive, nothing measured yet.
+    pub fn started(now: Instant) -> Self {
+        Self {
+            last_advanced_at: now,
+            backlog: false,
+            bytes_behind: None,
+            last_ingested_observed_at: None,
+            reported_sensors: Vec::new(),
+            wedge: None,
+            rotation_loss: log_tailer::RotationLoss::default(),
+            rotation_loss_at: None,
+            last_quarantine: None,
+        }
+    }
+
+    /// Folds the tailer's running total in, stamping `now` only when it grew so the instant means
+    /// "last loss", not "last poll".
+    pub fn record_rotation_loss(&mut self, total: log_tailer::RotationLoss, now: Instant) {
+        if total.events > self.rotation_loss.events {
+            self.rotation_loss_at = Some(now);
+        }
+        self.rotation_loss = total;
+    }
+}
+
+/// Shared per-sensor intake map, keyed by the same leaked sensor name the supervisor uses. Each
+/// sensor's loop writes only its own entry (no cross-sensor write race).
+pub type IntakeProgress = Arc<Mutex<HashMap<&'static str, SensorIntake>>>;
+
+/// One condition's result for a single evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Healthy.
+    Ok,
+    /// The failure condition holds.
+    Firing { severity: Severity, detail: String },
+    /// The probe could not read its source this tick (a query error, an unreadable path). This does
+    /// NOT fire the primary condition, so one broken probe cannot page for a failure nobody saw,
+    /// and it does NOT clear one either: an open incident stays open and no "recovered" is sent
+    /// until a probe actually reads healthy. The monitor warns separately if a probe stays Unknown
+    /// for too long.
+    Unknown { why: String },
+}
+
+impl Outcome {
+    pub fn to_signal(&self) -> Signal {
+        match self {
+            Outcome::Firing { .. } => Signal::Firing,
+            Outcome::Ok => Signal::Ok,
+            Outcome::Unknown { .. } => Signal::Unknown,
+        }
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Outcome::Unknown { .. })
+    }
+}
+
+/// What the log-rotation conditions (`sensor-log-oversized`, `rotation-stale`) read: the sensor
+/// logs the daemon tails, the filesystem that holds them, the rotation timer's state file, and the
+/// policy it rotates by. Paths are fields, not constants in the conditions, so tests point them at
+/// a temp directory.
+#[derive(Clone)]
+pub struct RotationCtx {
+    pub logs: Vec<log_tailer::SensorLogConfig>,
+    pub volume: PathBuf,
+    pub state_path: PathBuf,
+    pub policy_path: PathBuf,
+}
+
+impl RotationCtx {
+    /// The production layout `deploy/` installs (see `conditions::sensor_log`'s constants).
+    pub fn production(logs: Vec<log_tailer::SensorLogConfig>) -> Self {
+        use super::conditions::sensor_log::{
+            LOGROTATE_POLICY_PATH, LOGROTATE_STATE_PATH, SENSOR_LOG_ROOT,
+        };
+        Self {
+            logs,
+            volume: SENSOR_LOG_ROOT.into(),
+            state_path: LOGROTATE_STATE_PATH.into(),
+            policy_path: LOGROTATE_POLICY_PATH.into(),
+        }
+    }
+}
+
+/// The shared handles conditions read from. Cloneable so the supervised monitor task can own a copy.
+#[derive(Clone)]
+pub struct MonitorCtx {
+    pub pool: PgPool,
+    /// A path on the volume backing the Postgres data directory (for `statvfs` free-space).
+    pub pg_data_volume: PathBuf,
+    /// The sensor spool directory (for `statvfs` free-space + a size walk).
+    pub spool_dir: PathBuf,
+    /// Every directory holding captured bodies (`review::spool::all_body_dirs`), walked by
+    /// `conditions::malware::ScanStale` for bodies no scan has ever recorded.
+    pub spool_dirs: Vec<(&'static str, PathBuf)>,
+    /// Whether the VirusTotal scanner and the malware fetcher are spawned at all. The malware
+    /// conditions are silent when their subsystem is off: unscanned-forever and pending-forever
+    /// are then the configured state, not a failure.
+    pub vt_enabled: bool,
+    pub fetch_enabled: bool,
+    pub supervisor: SupervisorHandle,
+    pub intake_progress: IntakeProgress,
+    /// How often an idle intake loop polls its log (`PROPOLIS_POLL_INTERVAL_MS`); three of them
+    /// raise the `intake-lagging` age threshold above its ten-minute floor.
+    pub intake_poll_interval: Duration,
+    /// Sibling marker file the feed loop touches on each successful publish (its mtime is the last
+    /// publish time). See `conditions::feed`.
+    pub feed_marker_path: PathBuf,
+    /// Marker file `deploy/blocklist-sync.sh` rewrites after each successful push to the public
+    /// repo (`conditions::feed::PUSH_MARKER_PATH` in production). Absent when the operator never
+    /// syncs. See `conditions::feed::FeedPushStale`.
+    pub feed_push_marker_path: PathBuf,
+    /// The daemon's feed build interval, used with `cfg.feed_stale_multiple` to derive the staleness
+    /// threshold.
+    pub feed_build_interval: Duration,
+    pub rotation: RotationCtx,
+    /// Where `deploy/backup.sh` writes its status files (`conditions::backup::BACKUP_STATUS_DIR`
+    /// in production; a field so tests point it at a temp directory).
+    pub backup_status_dir: PathBuf,
+    pub cfg: OpsAlertConfig,
+}
+
+/// One operational failure mode to check on each poll.
+#[async_trait]
+pub trait Condition: Send + Sync {
+    /// Stable identifier, used as the dedup/debounce key.
+    fn id(&self) -> &'static str;
+    /// How long the condition must hold before it pages (debounce). Zero pages immediately.
+    fn for_dur(&self, cfg: &OpsAlertConfig) -> Duration;
+    /// Evaluate the condition against the current context.
+    async fn evaluate(&self, ctx: &MonitorCtx) -> Outcome;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops_alert::debounce::{Action, DebounceMachine};
+
+    #[test]
+    fn the_loss_instant_moves_only_when_the_total_grows() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        let t2 = t0 + Duration::from_secs(9);
+        let loss = |events| log_tailer::RotationLoss {
+            events,
+            bytes_estimated: 10 * events,
+        };
+        let mut s = SensorIntake::started(t0);
+        s.record_rotation_loss(loss(0), t0);
+        assert_eq!(s.rotation_loss_at, None, "nothing lost yet");
+        s.record_rotation_loss(loss(1), t1);
+        assert_eq!(s.rotation_loss_at, Some(t1));
+        s.record_rotation_loss(loss(1), t2);
+        assert_eq!(
+            s.rotation_loss_at,
+            Some(t1),
+            "an unchanged total is not a new loss"
+        );
+        assert_eq!(s.rotation_loss, loss(1));
+        s.record_rotation_loss(loss(2), t2);
+        assert_eq!(s.rotation_loss_at, Some(t2));
+    }
+
+    #[test]
+    fn firing_maps_to_the_firing_signal_and_pages_immediately_at_zero_debounce() {
+        let out = Outcome::Firing {
+            severity: Severity::Critical,
+            detail: "db 4% free".into(),
+        };
+        let mut m = DebounceMachine::new(Duration::from_secs(0), Duration::from_secs(300));
+        // for_dur == 0, so the first firing tick pages.
+        assert_eq!(m.step(out.to_signal(), Instant::now()), Action::Page);
+    }
+
+    #[test]
+    fn unknown_maps_to_its_own_signal_not_to_ok() {
+        assert_eq!(Outcome::Ok.to_signal(), Signal::Ok);
+        assert_eq!(
+            Outcome::Unknown {
+                why: "query failed".into()
+            }
+            .to_signal(),
+            Signal::Unknown
+        );
+        assert!(Outcome::Unknown { why: "x".into() }.is_unknown());
+        assert!(!Outcome::Ok.is_unknown());
+    }
+}

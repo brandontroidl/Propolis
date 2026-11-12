@@ -1,0 +1,520 @@
+//! The lookup commands: `command -v`/`-V`, `type` and `which`. Each asks the registry what the name
+//! is and asks the filesystem where its file is, so what they advertise is exactly what dispatch
+//! runs. There is no list of commands here: a name is a command when [`Registry::kind`] says
+//! dispatch has an entry for it, a builtin when the entry was registered as one, and otherwise a
+//! file found by walking `$PATH` over [`crate::fakefs::FakeFs`].
+//!
+//! A name dispatch answers but no `$PATH` directory holds a file for (`more`; a session's own
+//! `PATH=` emptied) is reported at the persona's standard
+//! directory, because dispatch does not consult `$PATH`: agreeing with dispatch outranks
+//! agreeing with the recorded Ubuntu 22.04 layout, where those names are absent.
+//!
+//! Wording, from the 2026-09-29 recordings on Ubuntu 22.04: bash prints `command -v` of a builtin as
+//! its name and of a file as its path, `type` as `X is a shell builtin` or `X is /path`, and
+//! reports a missing `type` name on standard error with status 1; `dash` prints `X: not found` on
+//! standard output for `type` and nothing for `command -v`, status 127 for both. The dash-family
+//! wordings that were not recorded (`command -V`, an invalid option, mksh's status) are marked
+//! [unverified] where they are written.
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used,
+    clippy::indexing_slicing
+)]
+
+use std::sync::Arc;
+
+use super::ast::{FunctionDef, POSIX_SPECIAL};
+use super::registry::{CommandKind, Registry};
+use super::texttools::stopped;
+use super::{CommandResult, FakeShell, HandlerId, ShellFlavor, ShellLevel, command_basename};
+
+pub(super) fn register(r: &mut Registry) {
+    r.register_builtin(
+        "command",
+        HandlerId::CommandBuiltin,
+        FakeShell::builtin_command,
+    );
+    r.register_builtin("type", HandlerId::Type, FakeShell::builtin_type);
+    r.register_if(
+        "which",
+        super::multicall::bare_applet,
+        HandlerId::Which,
+        FakeShell::cmd_which,
+    );
+}
+
+/// The words the grammar reserves, which `type` calls keywords. They are parser syntax, not
+/// commands, so they are not in the registry; the parser's own `if`, `for`, `while`, `until`, `{`
+/// and `!` are the ones the engine acts on.
+const BASH_KEYWORDS: &[&str] = &[
+    "!", "[[", "]]", "{", "}", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for",
+    "function", "if", "in", "select", "then", "time", "until", "while",
+];
+const DASH_KEYWORDS: &[&str] = &[
+    "!", "{", "}", "case", "do", "done", "elif", "else", "esac", "fi", "for", "if", "in", "then",
+    "until", "while",
+];
+
+/// What a name is to the running shell.
+struct Located {
+    /// The value of an alias of this name, which the shell finds before anything else.
+    alias: Option<String>,
+    keyword: bool,
+    /// A function the session defined, which the shell finds before a builtin or a file.
+    function: Option<Arc<FunctionDef>>,
+    builtin: bool,
+    /// The files that answer the name, in `$PATH` order. Filled for a file command and, when every
+    /// file was asked for, for a builtin that also has one (`echo`, `true`).
+    files: Vec<String>,
+}
+
+/// How much of a name `command` prints.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    /// `command -v`: the name of a builtin, the path of a file.
+    Short,
+    /// `command -V`: a sentence.
+    Sentence,
+}
+
+impl FakeShell {
+    fn keywords(&self) -> &'static [&'static str] {
+        if self.is_bash() {
+            BASH_KEYWORDS
+        } else {
+            DASH_KEYWORDS
+        }
+    }
+
+    /// The directory a name that dispatch runs but no `$PATH` directory holds is reported in.
+    fn standard_bin_dir(&self) -> &'static str {
+        match self.flavor {
+            ShellFlavor::Bash => "/usr/bin",
+            ShellFlavor::AndroidSh => "/system/bin",
+        }
+    }
+
+    /// The executable files named `name` in the `$PATH` directories, in order; only the first
+    /// unless `every`. An empty directory entry is the working directory, as in the shell.
+    pub(super) fn path_matches(&mut self, name: &str, every: bool) -> Vec<String> {
+        let path = self.state().get("PATH").unwrap_or("").to_string();
+        let mut found = Vec::new();
+        for directory in path.split(':') {
+            // `$PATH` is the session's to set, so its length is the walk's, charged to the line.
+            if !self.charge_work(1) {
+                break;
+            }
+            let directory = if directory.is_empty() { "." } else { directory };
+            let candidate = format!("{directory}/{name}");
+            let absolute = if candidate.starts_with('/') {
+                candidate.clone()
+            } else {
+                format!("{}/{candidate}", self.cwd().trim_end_matches('/'))
+            };
+            if self.fs.is_executable(&absolute) {
+                found.push(candidate);
+                if !every {
+                    break;
+                }
+            }
+        }
+        found
+    }
+
+    /// What `name` is, or `None` when dispatch would not run it. Mirrors [`FakeShell::resolve`]: a
+    /// bare name is a command exactly when the registry has a live entry for it, and a name with a
+    /// slash runs when the registry knows its basename or the path is an executable file.
+    fn locate(&mut self, name: &str, every_file: bool) -> Option<Located> {
+        if name.contains('/') {
+            let runs = match Registry::builtin().kind(command_basename(name), self) {
+                Some(kind) => kind != CommandKind::Unresolved,
+                None => {
+                    let absolute = self.normalize_logical(name);
+                    self.fs.is_executable(&absolute)
+                }
+            };
+            return runs.then(|| Located {
+                alias: None,
+                keyword: false,
+                function: None,
+                builtin: false,
+                files: vec![name.to_string()],
+            });
+        }
+        let alias = self.alias_value(name).map(str::to_string);
+        let keyword = self.keywords().contains(&name);
+        let function = self
+            .state()
+            .functions
+            .get(name)
+            .map(|held| Arc::clone(&held.def));
+        let kind = Registry::builtin()
+            .kind(name, self)
+            .filter(|kind| *kind != CommandKind::Unresolved);
+        if kind.is_none() && !keyword && function.is_none() && alias.is_none() {
+            return None;
+        }
+        let files = match kind {
+            Some(CommandKind::External) => {
+                let mut files = self.path_matches(name, every_file);
+                if files.is_empty() {
+                    files.push(format!("{}/{name}", self.standard_bin_dir()));
+                }
+                files
+            }
+            Some(CommandKind::Builtin) if every_file => self.path_matches(name, true),
+            _ => Vec::new(),
+        };
+        Some(Located {
+            alias,
+            keyword,
+            function,
+            builtin: kind == Some(CommandKind::Builtin),
+            files,
+        })
+    }
+
+    /// The status a lookup ends with when something asked for was not found.
+    fn missing_status(&self) -> u8 {
+        match self.active_level() {
+            ShellLevel::Bash { .. } | ShellLevel::AndroidMksh => 1,
+            ShellLevel::Dash { .. } => 127,
+        }
+    }
+
+    /// `command [-p] [-v|-V] NAME [ARG...]`. Described with `-v`/`-V`; otherwise `NAME` runs through
+    /// dispatch, which does not look at the session's functions: that is all `command` changes
+    /// here. Aliases, the other thing it skips, are not modeled.
+    pub(super) fn builtin_command(&mut self, parts: &[&str]) -> CommandResult {
+        let mut detail = None;
+        let mut at = 1;
+        while let Some(arg) = parts.get(at) {
+            if *arg == "--" {
+                at = at.saturating_add(1);
+                break;
+            }
+            let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                break;
+            };
+            for flag in flags.chars() {
+                match flag {
+                    'p' => {}
+                    'v' => detail = Some(Detail::Short),
+                    'V' => detail = Some(Detail::Sentence),
+                    other => return self.command_option_error(other),
+                }
+            }
+            at = at.saturating_add(1);
+        }
+        let operands = parts.get(at..).unwrap_or(&[]);
+        let Some(detail) = detail else {
+            return if operands.is_empty() {
+                CommandResult::silent(0)
+            } else {
+                self.dispatch_nested(operands)
+            };
+        };
+        // dash describes only the first name it is given; bash describes each.
+        let names = if self.is_bash() {
+            operands
+        } else {
+            operands.get(..1).unwrap_or(&[])
+        };
+        let mut result = CommandResult::silent(0);
+        let mut any_found = names.is_empty();
+        for name in names {
+            // Each name is answered from a lookup and a sentence about it, so the line pays for
+            // the sentence before it is kept: a thousand names of a long alias are megabytes.
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
+            match self.locate(name, false) {
+                Some(located) => {
+                    any_found = true;
+                    let sentence = CommandResult::stdout(self.describe(name, &located, detail));
+                    if !self.append_paid(&mut result, sentence) {
+                        return stopped();
+                    }
+                }
+                None if detail == Detail::Sentence => {
+                    let report = self.not_found_report("command", name);
+                    if !self.append_paid(&mut result, report) {
+                        return stopped();
+                    }
+                }
+                None => {}
+            }
+        }
+        result.status = if any_found { 0 } else { self.missing_status() };
+        result
+    }
+
+    fn command_option_error(&self, flag: char) -> CommandResult {
+        if self.is_bash() {
+            CommandResult::stderr(
+                2,
+                format!(
+                    "{}command: usage: command [-pVv] command [arg ...]\n",
+                    self.shell_error(format_args!("command: -{flag}: invalid option"))
+                ),
+            )
+        } else {
+            // [unverified] dash's and mksh's wording.
+            CommandResult::stderr(
+                2,
+                self.shell_error(format_args!("command: Illegal option -{flag}")),
+            )
+        }
+    }
+
+    /// How the active shell reports that `builtin` was asked about a name it cannot find: bash on
+    /// standard error, with the builtin's name; dash on standard output, bare.
+    fn not_found_report(&self, builtin: &str, name: &str) -> CommandResult {
+        if self.is_bash() {
+            CommandResult::stderr(
+                1,
+                self.shell_error(format_args!("{builtin}: {name}: not found")),
+            )
+        } else {
+            CommandResult::stdout(format!("{name}: not found\n"))
+        }
+    }
+
+    /// `type [-afptP] NAME...`. bash takes the flags; the shells without them (dash, mksh) take
+    /// every argument as a name.
+    pub(super) fn builtin_type(&mut self, parts: &[&str]) -> CommandResult {
+        let bash = self.is_bash();
+        let (mut all, mut terse, mut only_files, mut force_path) = (false, false, false, false);
+        let mut at = 1;
+        while bash && let Some(arg) = parts.get(at) {
+            if *arg == "--" {
+                at = at.saturating_add(1);
+                break;
+            }
+            let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                break;
+            };
+            for flag in flags.chars() {
+                match flag {
+                    'a' => all = true,
+                    't' => terse = true,
+                    'p' => only_files = true,
+                    'P' => force_path = true,
+                    'f' => {}
+                    other => {
+                        return CommandResult::stderr(
+                            2,
+                            format!(
+                                "{}type: usage: type [-afptP] name [name ...]\n",
+                                self.shell_error(format_args!("type: -{other}: invalid option"))
+                            ),
+                        );
+                    }
+                }
+            }
+            at = at.saturating_add(1);
+        }
+        let mut result = CommandResult::silent(0);
+        let mut missing = false;
+        for name in parts.get(at..).unwrap_or(&[]) {
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
+            let wants_files = all || only_files || force_path;
+            let Some(located) = self.locate(name, wants_files) else {
+                missing = true;
+                // `-t`, `-p` and `-P` say nothing about a name they do not find.
+                if !(terse || only_files || force_path) {
+                    let report = self.not_found_report("type", name);
+                    if !self.append_paid(&mut result, report) {
+                        return stopped();
+                    }
+                }
+                continue;
+            };
+            let files: &[String] = if all {
+                &located.files
+            } else {
+                located.files.get(..1).unwrap_or(&[])
+            };
+            if force_path || only_files {
+                // `-P` looks in `$PATH` only; `-p` prints a path only for what `-t` calls a file.
+                let is_file = located.alias.is_none()
+                    && !located.keyword
+                    && located.function.is_none()
+                    && !located.builtin;
+                if force_path || is_file {
+                    for file in files {
+                        let line = CommandResult::stdout(format!("{file}\n"));
+                        if !self.append_paid(&mut result, line) {
+                            return stopped();
+                        }
+                    }
+                }
+                missing |= force_path && located.files.is_empty();
+                continue;
+            }
+            let mut forms: Vec<(&str, String)> = Vec::new();
+            if let Some(value) = &located.alias {
+                forms.push(("alias", self.alias_sentence(name, value)));
+            }
+            if located.keyword {
+                forms.push(("keyword", format!("{name} is a shell keyword\n")));
+            }
+            if let Some(def) = &located.function {
+                forms.push(("function", function_sentence(name, def, bash)));
+            }
+            if located.builtin {
+                forms.push(("builtin", self.builtin_sentence(name)));
+            }
+            for file in files {
+                forms.push(("file", format!("{name} is {file}\n")));
+            }
+            let shown = if all { forms.len() } else { 1 };
+            for (word, sentence) in forms.into_iter().take(shown) {
+                let line =
+                    CommandResult::stdout(if terse { format!("{word}\n") } else { sentence });
+                if !self.append_paid(&mut result, line) {
+                    return stopped();
+                }
+            }
+        }
+        result.status = if missing {
+            self.type_missing_status()
+        } else {
+            0
+        };
+        result
+    }
+
+    /// bash's `type` fails with 1; the dash family's with 127.
+    fn type_missing_status(&self) -> u8 {
+        match self.active_level() {
+            ShellLevel::Bash { .. } => 1,
+            ShellLevel::Dash { .. } | ShellLevel::AndroidMksh => 127,
+        }
+    }
+
+    /// `which [-a] NAME...`, debianutils' script: each name's first executable match in `$PATH`
+    /// (every match under `-a`) on its own line, status 1 when any name has none or no name was
+    /// given. The search is the registry's, so a name dispatch runs is found and one it does not
+    /// run is not.
+    pub(super) fn cmd_which(&mut self, parts: &[&str]) -> CommandResult {
+        let mut all = false;
+        let mut at = 1;
+        while let Some(arg) = parts.get(at) {
+            if *arg == "--" {
+                at = at.saturating_add(1);
+                break;
+            }
+            let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+                break;
+            };
+            for flag in flags.chars() {
+                if flag == 'a' {
+                    all = true;
+                } else {
+                    // [unverified] the script's getopts complaint and usage line.
+                    let mut usage = CommandResult::stderr(2, format!("Illegal option -{flag}\n"));
+                    usage.append(CommandResult::stdout(
+                        "Usage: /usr/bin/which [-a] args\n".to_string(),
+                    ));
+                    usage.status = 2;
+                    return usage;
+                }
+            }
+            at = at.saturating_add(1);
+        }
+        let names = parts.get(at..).unwrap_or(&[]);
+        let mut result = CommandResult::silent(0);
+        let mut missing = names.is_empty();
+        for name in names {
+            if !self.pay_operand(name.len(), 0) {
+                return stopped();
+            }
+            let files = self
+                .locate(name, true)
+                .map(|located| located.files)
+                .unwrap_or_default();
+            if files.is_empty() {
+                missing = true;
+            }
+            let shown = if all { files.len() } else { 1 };
+            for file in files.iter().take(shown) {
+                let line = CommandResult::stdout(format!("{file}\n"));
+                if !self.append_paid(&mut result, line) {
+                    return stopped();
+                }
+            }
+        }
+        result.status = u8::from(missing);
+        result
+    }
+}
+
+/// How `type` words a function: dash only says so, and bash prints the body it parsed.
+fn function_sentence(name: &str, def: &FunctionDef, bash: bool) -> String {
+    if bash {
+        format!(
+            "{name} is a function\n{}",
+            super::fnprint::bash_function_text(name, def)
+        )
+    } else {
+        format!("{name} is a shell function\n")
+    }
+}
+
+impl FakeShell {
+    /// dash tells a special builtin (`export`, `set`, `return`...) from the others; bash and
+    /// mksh do not.
+    fn builtin_sentence(&self, name: &str) -> String {
+        let special =
+            matches!(self.active_level(), ShellLevel::Dash { .. }) && POSIX_SPECIAL.contains(&name);
+        let kind = if special {
+            "special shell builtin"
+        } else {
+            "shell builtin"
+        };
+        format!("{name} is a {kind}\n")
+    }
+
+    /// How `type` and `command -V` word an alias: bash quotes the value in a backtick and a quote,
+    /// dash and mksh [inferred for mksh] say `is an alias for` and the value as it is.
+    fn alias_sentence(&self, name: &str, value: &str) -> String {
+        if self.is_bash() {
+            format!("{name} is aliased to `{value}'\n")
+        } else {
+            format!("{name} is an alias for {value}\n")
+        }
+    }
+
+    /// The line `command -v` or `-V` prints for a name that was found: a keyword, function or
+    /// builtin by name, a file by path.
+    fn describe(&self, name: &str, located: &Located, detail: Detail) -> String {
+        if let Some(value) = &located.alias {
+            return match detail {
+                // `command -v` writes the definition, in either shell.
+                Detail::Short => format!("alias {name}={}\n", self.alias_quoted(value)),
+                Detail::Sentence => self.alias_sentence(name, value),
+            };
+        }
+        let file = located.files.first();
+        match (
+            detail,
+            located.keyword,
+            &located.function,
+            located.builtin,
+            file,
+        ) {
+            (Detail::Short, true, _, _, _)
+            | (Detail::Short, _, Some(_), _, _)
+            | (Detail::Short, _, _, true, _) => format!("{name}\n"),
+            (Detail::Short, _, _, _, Some(file)) => format!("{file}\n"),
+            (Detail::Sentence, true, _, _, _) => format!("{name} is a shell keyword\n"),
+            (Detail::Sentence, _, Some(def), _, _) => function_sentence(name, def, self.is_bash()),
+            (Detail::Sentence, _, _, true, _) => self.builtin_sentence(name),
+            (Detail::Sentence, _, _, _, Some(file)) => format!("{name} is {file}\n"),
+            (_, _, _, _, None) => String::new(),
+        }
+    }
+}

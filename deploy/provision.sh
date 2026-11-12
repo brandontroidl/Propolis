@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+#
+# Propolis idempotent provisioning: OS users + directories.
+#
+# Extracted verbatim from install.sh so both install.sh (fresh install) and upgrade.sh (in-place
+# upgrade) run the identical provisioning routine. Before this script existed, a directory a change
+# added (e.g. SP-B-1c's /var/spool/propolis/telnet) landed only in install.sh's inline block and
+# was never created on an upgrade - a sensor whose unit file grants ReadWritePaths on that
+# directory then crash-loops under ProtectSystem=strict on the next restart, because the bind-mount
+# target does not exist. Now both entry points call this one script, so a new required directory
+# only ever needs to be declared here once.
+#
+# Idempotent and safe to re-run on a live box: users are skip-if-exists; `install -d` reasserts
+# mode/owner/group on directories that already exist (see ensure_dir below).
+#
+# This script does NOT start, enable, restart, or stop any service, and does NOT touch binaries.
+# It creates the service env files empty and keeps them 0600 (env-files.sh) and derives
+# watch.env (watch-env.sh); it never writes a value into an operator's env file.
+#
+# Usage: sudo ./provision.sh          (provisions for real)
+#        DRY_RUN=1 ./provision.sh     (prints every action without touching the system; no
+#                                       privilege needed)
+
+set -euo pipefail
+
+DRY_RUN="${DRY_RUN:-0}"
+
+log() { printf '==> %s\n' "$*"; }
+
+# Executes "$@" for real, or prints it under DRY_RUN=1. Every mutating command in this script goes
+# through this wrapper so the two modes can never drift apart.
+run() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'
+        printf ' %q' "$@"
+        printf '\n'
+    else
+        "$@"
+    fi
+}
+
+# ---- 0. privilege check ----
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "error: must run as root (try: sudo $0)" >&2
+    exit 1
+fi
+
+# ---- 1. users ----
+
+ensure_user() {
+    local name="$1"
+    if id -u "$name" >/dev/null 2>&1; then
+        log "user $name already exists"
+    else
+        run useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$name"
+        [ "$DRY_RUN" -eq 1 ] || log "created user $name"
+    fi
+}
+
+log "1/9 creating OS users"
+ensure_user propolis
+ensure_user propolis-catchall
+ensure_user propolis-ssh
+ensure_user propolis-telnet
+ensure_user propolis-redis
+ensure_user propolis-adb
+ensure_user propolis-http
+ensure_user propolis-ftp
+ensure_user propolis-smtp
+ensure_user propolis-tftp
+ensure_user propolis-mqtt
+ensure_user propolis-dns
+ensure_user propolis-cred
+
+# propolis reads all sensors' logs (ReadOnlyPaths=/var/log/propolis in propolis.service). The
+# files themselves are group-readable (UMask=0027 in sensor units), so propolis needs
+# supplementary membership in each sensor's own group.
+run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis
+
+# propolis-watch: the account an operator's dedicated SSH key logs into to run the read-only live
+# watcher as a forced command (docs/operations/live-watch.md). Unlike the service users it needs a
+# home (for ~/.ssh/authorized_keys) and a real shell, because sshd runs a forced command through
+# the login shell with -c; the forced command, not the shell, is what the key can run.
+if id -u propolis-watch >/dev/null 2>&1; then
+    log "user propolis-watch already exists"
+else
+    run useradd --system --no-create-home --home-dir /var/lib/propolis-watch --shell /bin/sh --user-group propolis-watch
+    [ "$DRY_RUN" -eq 1 ] || log "created user propolis-watch"
+fi
+# No password can ever match '*', so password login is impossible. Not useradd's default '!':
+# sshd(8) treats a leading '!' as a locked account and refuses it even for a valid key.
+run usermod -p '*' propolis-watch
+# Read access to each sensor's event log and nothing more: the log directories are 0750 and the
+# files 0640 (UMask=0027 in the sensor units), owned by the sensor user and group, so group
+# membership grants read and never write. systemd-journal is deliberately NOT added here; reading
+# the units' journal with --journal is an opt-in step in docs/operations/live-watch.md.
+run usermod -aG propolis-catchall,propolis-ssh,propolis-telnet,propolis-redis,propolis-adb,propolis-http,propolis-ftp,propolis-smtp,propolis-tftp,propolis-mqtt,propolis-dns,propolis-cred propolis-watch
+
+# propolis-backup-pull: the account the off-host copy logs into, with a key whose forced command
+# is deploy/backup-serve.sh (list and fetch ENCRYPTED backup sets, nothing else). Set up like
+# propolis-watch above: a home for authorized_keys, a shell for the forced command, no password.
+# It reads sets through its own group, which deploy/backup.sh gives encrypted sets only.
+if id -u propolis-backup-pull >/dev/null 2>&1; then
+    log "user propolis-backup-pull already exists"
+else
+    run useradd --system --no-create-home --home-dir /var/lib/propolis-backup-pull --shell /bin/sh --user-group propolis-backup-pull
+    [ "$DRY_RUN" -eq 1 ] || log "created user propolis-backup-pull"
+fi
+run usermod -p '*' propolis-backup-pull
+
+# propolis-blocklist: the account the operator's cron runs deploy/blocklist-sync.sh as. That script
+# reads the feed directory the daemon writes, so it must not run as an account that can read what
+# the daemon cannot (root's files, other services' keys): this one reads the world-readable feed,
+# owns its checkout, its deploy key and its status directory below, and nothing else. A home for
+# ssh's known_hosts and the deploy key; no login shell, since cron runs the job with /bin/sh.
+if id -u propolis-blocklist >/dev/null 2>&1; then
+    log "user propolis-blocklist already exists"
+else
+    run useradd --system --no-create-home --home-dir /var/lib/propolis-blocklist --shell /usr/sbin/nologin --user-group propolis-blocklist
+    [ "$DRY_RUN" -eq 1 ] || log "created user propolis-blocklist"
+fi
+
+# ---- 2. directories ----
+
+ensure_dir() {
+    local path="$1" mode="$2" owner="$3" group="$4"
+    # install -d, unlike mkdir -p -m, reasserts mode/owner/group even when the directory already
+    # exists - verified empirically (GNU coreutils 9.7: a 777 directory re-run through
+    # `install -d -m 0750` comes back 0750; `mkdir -p -m 0750` on the same directory leaves it
+    # untouched). That is what makes this idempotent and self-correcting rather than
+    # create-once-and-hope.
+    run install -d -m "$mode" -o "$owner" -g "$group" "$path"
+}
+
+log "2/9 creating directories"
+ensure_dir /etc/propolis                  0755 root              root
+# Per-sensor TLS key material (deploy/provision-tls.sh). 0711 not 0750: the sensor uids are neither
+# owner nor group, so they need x to open their own key by exact name; without r nobody can list
+# which sensors have TLS. The keys themselves are 0600 owned by their own sensor user.
+ensure_dir /etc/propolis/tls              0711 root              root
+ensure_dir /var/log/propolis              0755 root              root
+ensure_dir /var/log/propolis/catchall     0750 propolis-catchall propolis-catchall
+ensure_dir /var/log/propolis/ssh          0750 propolis-ssh      propolis-ssh
+ensure_dir /var/log/propolis/telnet      0750 propolis-telnet   propolis-telnet
+ensure_dir /var/log/propolis/redis       0750 propolis-redis    propolis-redis
+ensure_dir /var/log/propolis/adb         0750 propolis-adb      propolis-adb
+ensure_dir /var/log/propolis/http        0750 propolis-http     propolis-http
+ensure_dir /var/log/propolis/ftp         0750 propolis-ftp      propolis-ftp
+ensure_dir /var/log/propolis/smtp        0750 propolis-smtp     propolis-smtp
+ensure_dir /var/log/propolis/tftp        0750 propolis-tftp     propolis-tftp
+ensure_dir /var/log/propolis/mqtt        0750 propolis-mqtt     propolis-mqtt
+ensure_dir /var/log/propolis/dns         0750 propolis-dns      propolis-dns
+ensure_dir /var/log/propolis/cred        0750 propolis-cred     propolis-cred
+# root-owned, NOT propolis: write permission on this directory would let a compromised propolis
+# daemon unlink/rename any child regardless of the child's own owner - including the sibling
+# /var/lib/propolis/ssh host-key dir (propolis-ssh), which it could swap for a symlink that
+# sensor-ssh.service's ProtectSystem=strict bind-mount would then follow. propolis writes only into
+# its own children below (cursors/, feed/, spool/), never this shared root, so it loses nothing.
+ensure_dir /var/lib/propolis              0755 root              root
+ensure_dir /var/lib/propolis/cursors      0750 propolis          propolis
+# Log lines the database always refuses, set aside by intake (crates/intake/src/quarantine.rs). The
+# daemon cannot create it itself: its parent above is root-owned. Capped by the daemon, not cleaned.
+ensure_dir /var/lib/propolis/quarantine   0750 propolis          propolis
+# 0755, not cursors' 0750: this is feed's PUBLIC output tree (see deploy/propolis.service's own
+# UMask=0022 comment) - the operator's out-of-band distribution mechanism, typically a different
+# unrelated user, must be able to traverse in and read it.
+ensure_dir /var/lib/propolis/feed         0755 propolis          propolis
+# sensor-ssh stores its generated host key here (reused across restarts so the honeypot does not
+# fingerprint itself as freshly minted). Listed in sensor-ssh.service's ReadWritePaths, so it
+# must exist or ProtectSystem=strict's bind-mount setup fails with NAMESPACE.
+ensure_dir /var/lib/propolis/ssh          0750 propolis-ssh      propolis-ssh
+# deploy/backup.sh's status files: root-written, world-readable, so the daemon's backup-stale alert
+# and config-check.sh can read when the last backup finished without being able to forge it.
+ensure_dir /var/lib/propolis/backup-status 0755 root             root
+# deploy/blocklist-sync.sh's last-pushed marker, read by the daemon's feed-push-stale condition. It
+# used to sit beside the feed, in the daemon's own directory, where a link the daemon planted made
+# the cron write through it; here only the sync account writes, and the daemon can still stat it.
+ensure_dir /var/lib/propolis/blocklist-status 0755 propolis-blocklist propolis-blocklist
+# propolis-blocklist's home (known_hosts, the deploy key), outside /var/lib/propolis.
+ensure_dir /var/lib/propolis-blocklist    0750 propolis-blocklist propolis-blocklist
+# The backup sets themselves. Group propolis-backup-pull may enter and list it; each plaintext set
+# inside is 0700 root, so only the encrypted sets backup.sh opens to the group can be read.
+ensure_dir /var/backups/propolis          0750 root              propolis-backup-pull
+# propolis-backup-pull's home: root-owned all the way down, exactly as propolis-watch's below, so
+# the account cannot change which keys log in to it.
+ensure_dir /var/lib/propolis-backup-pull  0750 root              propolis-backup-pull
+ensure_dir /var/lib/propolis-backup-pull/.ssh 0755 root          root
+# propolis-watch's home, outside /var/lib/propolis so it shares nothing with the daemon's state.
+# Root-owned all the way down, so the account cannot change which keys log in to it: owning its
+# home would let it rename a root-owned .ssh aside and create its own, and owning .ssh or
+# authorized_keys would let it append a key. The account only needs to traverse to the key file,
+# which sshd reads with the user's privileges; the group x bit on the home and the world r/x bits
+# on .ssh give it that and nothing more. sshd's StrictModes accepts files and directories owned by
+# root or the user that no one else can write (sshd(8), FILES, ~/.ssh/authorized_keys); these pass.
+# The authorized_keys file inside is the operator's to create, root:root 0644
+# (deploy/watch-authorized-keys.example).
+ensure_dir /var/lib/propolis-watch        0750 root              propolis-watch
+ensure_dir /var/lib/propolis-watch/.ssh   0755 root              root
+
+# ---- 3. spool directories (mount points only - see printed fstab guidance in install.sh) ----
+
+# internal/design/02-sensor-framework.md's "Sample side channel": the spool MUST be backed by a
+# noexec,nosuid,nodev mount, not merely a directory of non-executable files - deploy/sensor-
+# catchall.service's and deploy/sensor-ssh.service's own ReadWritePaths comments already state this
+# and defer enforcing it to "a deployment-time (fstab/provisioning) concern verified against the
+# running system, not the unit file." This step creates the directories those two units' documented
+# prerequisites require (matching their own ReadWritePaths grants) plus propolis.service's reserved
+# /var/lib/propolis/spool - but, same as those unit files, cannot safely choose a backing device or
+# tmpfs size budget on the operator's behalf, so it stops at the mountpoint; install.sh prints the
+# fstab guidance for a fresh install, and an upgrade leaves an already-mounted tmpfs untouched
+# (install -d on an existing mountpoint only reasserts mode/owner, never remounts).
+log "3/9 creating spool directories (mountpoints only)"
+ensure_dir /var/lib/propolis/spool        0750 propolis          propolis
+ensure_dir /var/spool/propolis            0755 root              root
+ensure_dir /var/spool/propolis/catchall   0750 propolis-catchall propolis-catchall
+ensure_dir /var/spool/propolis/ssh        0750 propolis-ssh      propolis-ssh
+ensure_dir /var/spool/propolis/adb       0750 propolis-adb      propolis-adb
+ensure_dir /var/spool/propolis/ftp       0750 propolis-ftp      propolis-ftp
+ensure_dir /var/spool/propolis/telnet     0750 propolis-telnet   propolis-telnet
+ensure_dir /var/spool/propolis/tftp       0750 propolis-tftp     propolis-tftp
+ensure_dir /var/spool/propolis/mqtt       0750 propolis-mqtt     propolis-mqtt
+# propolis-owned, not a dedicated sensor user: unlike catchall/ssh/adb/ftp/telnet above (each
+# written by its own standalone sensor process), the malware fetcher runs inside propolis.service
+# itself - see deploy/propolis.service's own ReadWritePaths grant for this exact path.
+ensure_dir /var/spool/propolis/fetched   0750 propolis          propolis
+
+# The service env files, created empty 0600 root:root when missing and stripped of group and other
+# access when not, so a fresh box never has a secret-bearing file at 0644; see env-files.sh's
+# header. Before watch-env.sh, which reads propolis.env, and leaving watch.env's 0640 to it.
+log "creating and tightening the service env files in /etc/propolis"
+DRY_RUN="$DRY_RUN" "$(dirname "${BASH_SOURCE[0]}")/env-files.sh"
+
+# The watcher's copy of PROPOLIS_SENSOR_LOGS, derived from propolis.env on every provision (so on
+# every upgrade); see watch-env.sh's header. After the users exist, since it sets the file's group.
+log "deriving /etc/propolis/watch.env for propolis-watch"
+DRY_RUN="$DRY_RUN" "$(dirname "${BASH_SOURCE[0]}")/watch-env.sh"

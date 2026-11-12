@@ -1,0 +1,155 @@
+//! Public API surface for `console`: the operator web console's library half (`src/main.rs`, the
+//! binary entry point, is the thin env-config + wiring shell around this). Sub-project 6 task 1
+//! wired the crate scaffold, password/session/CSRF/rate-limit auth (`auth`), and the
+//! health/readiness endpoints (`routes`). Task 2 added the dashboard, review queue, and login
+//! pages (`routes::dashboard`, `routes::queue`, `routes::login`) and the `templates` module that
+//! renders them. Task 3 adds IP detail and feed status (`routes::detail`, `routes::feed`); task 4
+//! adds `/metrics` (`routes::metrics`) and the binary itself. See
+//! `internal/plans/2026-07-30-console-observability.md` and the canonical spec,
+//! `internal/design/06-console-observability.md`.
+
+pub mod auth;
+pub mod intake_lag;
+pub mod log_buffer;
+pub mod rdns;
+pub mod read_state;
+pub mod rollup;
+pub mod routes;
+pub mod server;
+pub mod templates;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use minijinja::Environment;
+use sqlx::PgPool;
+
+use auth::{PasswordStore, RateLimiter, SessionStore};
+use log_buffer::LogBuffer;
+
+/// Shared state handed to every route and to the auth middleware. `PgPool` clones cheaply (it is
+/// already reference-counted internally); the other fields wrap an `RwLock` internally, which is
+/// not itself `Clone`, so they are `Arc`-wrapped to make `AppState` cheaply cloneable per-request.
+/// `templates` is built once at startup (`templates::environment`) rather than per-request: the
+/// templates are static (embedded via `include_str!`), so re-parsing them on every request would
+/// be pure waste.
+/// Logs a loud warning when the console is bound to a NON-loopback address. The console speaks plain
+/// HTTP (no in-process TLS) and mounts `/health`/`/ready`/`/metrics` OUTSIDE session auth, so a
+/// non-loopback bind exposes operational metrics unauthenticated and login credentials in cleartext
+/// unless the operator has placed it behind a TLS reverse proxy with its own access control - the
+/// intended deployment. Called from both binaries at their console bind. Advisory only: an operator
+/// may deliberately front it with a proxy, so this warns rather than refusing to start.
+pub fn warn_if_console_exposed(bind: std::net::SocketAddr) {
+    if !bind.ip().is_loopback() {
+        tracing::warn!(
+            %bind,
+            "console bound to a NON-LOOPBACK address: it serves plain HTTP and exposes /metrics \
+             OUTSIDE authentication. Front it with a TLS reverse proxy that enforces access \
+             control, or bind 127.0.0.1 (see docs/operations/networking-tls.md)."
+        );
+    }
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: PgPool,
+    pub sessions: Arc<SessionStore>,
+    pub passwords: Arc<PasswordStore>,
+    pub login_rate_limiter: Arc<RateLimiter>,
+    pub templates: Arc<Environment<'static>>,
+    /// Offline GeoLite2 geo/ASN enrichment for the IP detail page (`PROPOLIS_GEOIP_DIR`). Built
+    /// once at startup; `GeoIp::disabled()` when unconfigured, so lookups return `None` and the
+    /// "Network profile" panel renders its "not configured" placeholder. Egress-free - see the
+    /// `geoip` crate.
+    pub geoip: Arc<geoip::GeoIp>,
+    /// Forward-confirmed reverse-DNS resolver for the IP-detail page (`PROPOLIS_CONSOLE_RDNS_ENABLED`).
+    /// Opt-in (the one egress in the console's enrichment); `RdnsResolver::disabled()` otherwise.
+    pub rdns: Arc<rdns::RdnsResolver>,
+    /// The feed publisher's output directory (`PROPOLIS_FEED_OUTPUT_DIR`), read by
+    /// `routes::feed` and `routes::metrics` for `manifest.json`. `None` when unconfigured - the
+    /// console and the `feed` binary are independently deployed services that share this
+    /// directory by convention, not a required dependency (`routes::feed`'s own doc comment).
+    pub feed_output_dir: Option<PathBuf>,
+    /// The listener inventory this control plane believes exists, from `PROPOLIS_FLEET_LISTENERS`
+    /// (derived at deploy time from the sensors' own bind variables by
+    /// `deploy/fleet-listeners.sh`). Empty when unconfigured, which makes `routes::fleet` report
+    /// every check as unknown rather than reporting nothing at all: a page with no rows would be
+    /// indistinguishable from a fleet with nothing wrong.
+    pub fleet_listeners: Arc<Vec<fleet::Listener>>,
+    /// The prober's sweep interval (`PROPOLIS_FLEET_PROBE_INTERVAL`), which is the unit
+    /// `routes::fleet` measures probe staleness in: a row older than twice this alarms. It is read
+    /// here rather than hard-coded so an operator who slows the sweep down does not get a page
+    /// where every row reads stale, and so speeding it up tightens the rule rather than leaving it
+    /// loose.
+    pub fleet_probe_interval: Duration,
+    /// Path to the deploy stamp (`PROPOLIS_FLEET_DEPLOY_STAMP`), written by `deploy/upgrade.sh`.
+    /// `None`, a missing file, or a malformed one all leave the fleet pane's version panel reading
+    /// "not recorded", never "current".
+    pub deploy_stamp_path: Option<PathBuf>,
+    /// Process start time, stamped once when the constructing binary builds `AppState`
+    /// (`console::main` for the standalone binary, `propolis::run_console` for the unified
+    /// daemon) - `routes::context::base_context` derives every page's displayed uptime from this
+    /// rather than re-reading the OS clock at process-start time, which is not otherwise
+    /// observable after the fact. `Copy`, so no `Arc` wrapping needed (unlike `sessions` etc.,
+    /// which wrap non-`Clone` interior state).
+    pub startup_time: DateTime<Utc>,
+    /// Which executable is serving this page: `"propolis"` for the unified daemon, `"console"` for
+    /// the standalone binary. Stamped by the constructing binary, because this library crate is
+    /// compiled into both and cannot tell them apart from the inside. The fleet pane needs it to
+    /// look up the right entry in the deploy stamp's `installed` map: the two binaries are
+    /// installed separately, so one of them can be replaced while the other is not, and reading
+    /// the other one's revision would report an install this process has no evidence for.
+    pub binary_name: &'static str,
+    /// The running binary's own crate version (`env!("CARGO_PKG_VERSION")`), stamped by whichever
+    /// binary constructed this `AppState` - so the console always displays the version of the
+    /// process actually serving the page, not a fixed constant baked into this library crate.
+    pub version: &'static str,
+    /// The git revision this binary was BUILT from (`env!("PROPOLIS_GIT_SHA")`, set by that
+    /// binary's build script), or `unknown` when the build could not identify itself. Stamped by
+    /// the constructing binary for the same reason `version` is: the fleet pane reports the
+    /// revision of the process serving the page, and a build that cannot say which commit it is
+    /// must read as unrecorded rather than be compared with the deploy stamp and called current.
+    pub git_sha: &'static str,
+    /// When this binary was built (`env!("PROPOLIS_BUILD_TIMESTAMP")`, RFC 3339 UTC). Paired with
+    /// `git_sha` so the version panel can distinguish a stale binary from a stale checkout.
+    pub built_at: &'static str,
+    /// Shared ring buffer + broadcast channel of recent tracing events, backing `routes::logs`
+    /// (`internal/design/11-console-forensics.md`, task 7). Built once at startup alongside
+    /// `templates` and installed as a `tracing_subscriber::Layer` by whichever binary constructs
+    /// this `AppState` - see `log_buffer`'s own module doc comment.
+    pub log_buffer: Arc<LogBuffer>,
+    pub events_ingested: Arc<std::sync::atomic::AtomicU64>,
+    pub events_rejected: Arc<std::sync::atomic::AtomicU64>,
+    /// When true, the console trusts a fronting TLS reverse proxy: session cookies are always marked
+    /// `Secure` (`PROPOLIS_CONSOLE_TRUSTED_PROXY`). Without it, a same-host proxy appears as a
+    /// loopback peer and the `Secure` heuristic would wrongly drop the flag over a real HTTPS hop.
+    pub trusted_proxy: bool,
+    /// Optional bearer token gating `/metrics` (`PROPOLIS_CONSOLE_METRICS_TOKEN`). `None` leaves the
+    /// endpoint open - safe only on a loopback bind (see [`warn_if_console_exposed`]).
+    pub metrics_token: Option<Arc<str>>,
+    /// Names of supervised subsystems that have given up (exhausted their restart budget), read
+    /// by `GET /ready` so a daemon whose collection pipeline is dead does not keep answering
+    /// ready on the strength of a live database. The unified daemon wires this to its supervisor
+    /// map; the standalone console binary and tests use [`no_subsystem_health`], which reports
+    /// nothing dead because there is nothing supervised.
+    pub gave_up_subsystems: SubsystemHealth,
+    /// Per-log intake backlog, read by `/metrics` and the fleet pane. The unified daemon wires it
+    /// to its intake loops; the standalone console binary and tests use
+    /// [`intake_lag::no_intake_lag`], which reports nothing, so no lag series is published.
+    pub intake_lag: intake_lag::IntakeLagSource,
+    /// What the pages remember between requests: roll-up refresh health and the held most-active
+    /// panel ([`read_state::ReadState`]). A running console uses [`read_state::ReadState::new`];
+    /// tests that insert events and read a page back use [`read_state::ReadState::uncached`].
+    pub read_state: Arc<read_state::ReadState>,
+}
+
+/// Reports the supervised subsystems that have given up; empty when everything is running or
+/// when the constructing process supervises nothing. See `AppState::gave_up_subsystems`.
+pub type SubsystemHealth = Arc<dyn Fn() -> Vec<&'static str> + Send + Sync>;
+
+/// The [`SubsystemHealth`] for a process with no supervised subsystems.
+pub fn no_subsystem_health() -> SubsystemHealth {
+    Arc::new(Vec::new)
+}

@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Campaigns - Propolis{% endblock %}
+{% block content %}
+{% import "macros.html" as m %}
+{#- Every link on this page keeps the other two choices, so changing the sort does not reset the
+    tab and showing single-host groups does not reset the sort. -#}
+{% macro href(kind, sort, single) -%}
+/campaigns?{% if kind %}kind={{ kind }}&amp;{% endif %}sort={{ sort }}{% if single %}&amp;single=1{% endif %}
+{%- endmacro %}
+<h1>Campaigns <span class="dim">({{ total | count }})</span></h1>
+<p class="page-sub">A campaign is a group of addresses doing the same thing: running the same commands, sending the same kind of probe, or reaching the same set of services within an hour. Files that several addresses uploaded are on the <a href="/samples">Samples</a> page. Commands are attacker data, shown as text.</p>
+<div class="tab-bar">
+  <a href="{{ href('', sort, show_single) }}" class="tab {% if not kind %}active{% endif %}">All <span class="tab-count">{{ all_count | count }}</span></a>
+  {% for t in tabs %}
+  <a href="{{ href(t.value, sort, show_single) }}" class="tab {% if kind == t.value %}active{% endif %}">{{ t.label }} <span class="tab-count">{{ t.count | count }}</span></a>
+  {% endfor %}
+</div>
+{% if indexer_behind > 0 %}
+<p class="table-note">The campaign indexer is {{ indexer_behind }} event{% if indexer_behind != 1 %}s{% endif %} behind the ledger (read through event {{ indexed }} of {{ newest }}), so the newest activity is not grouped yet.</p>
+{% endif %}
+<nav class="sortbar" aria-label="Sort the campaigns">
+  <span class="dim">Sort by</span>
+  {% for key, name in [["hosts", "hosts"], ["last_seen", "last seen"], ["first_seen", "first seen"]] %}
+  <a href="{{ href(kind, key, show_single) }}" class="{% if sort == key %}active{% endif %}">{{ name }}</a>
+  {% endfor %}
+  <span class="sortbar-gap"></span>
+  {% if show_single %}
+  <a class="range-btn active" href="{{ href(kind, sort, false) }}" role="switch" aria-checked="true">single-host groups shown</a>
+  {% elif single_hidden > 0 %}
+  <a class="range-btn" href="{{ href(kind, sort, true) }}" role="switch" aria-checked="false">show single-host groups ({{ single_hidden | count }})</a>
+  {% endif %}
+</nav>
+{% if campaigns %}
+<div class="panel campaigns-panel">
+<table class="table-compact stack">
+  <colgroup><col class="cc-what"><col class="cc-hosts"><col class="cc-spark"><col class="cc-active"><col class="cc-sensors"><col class="cc-delivers"></colgroup>
+  <thead>
+    <tr><th>Campaign</th><th class="count">Hosts</th><th title="Distinct hosts per day, last {{ spark_days }} days">Hosts per day</th><th>Active</th><th>Top sensors</th><th>Delivers</th></tr>
+  </thead>
+  <tbody id="campaigns-rows">
+{% include "campaigns_rows.html" %}
+  </tbody>
+</table>
+<div class="load-more-row" id="load-more-container">{% include "campaigns_load_more.html" %}</div>
+</div>
+{% else %}
+<div class="panel campaigns-panel"><p class="empty-line">no campaigns{% if kind %} of this kind{% endif %}{% if single_hidden > 0 %} with more than one host{% endif %} yet</p></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,17 @@
+# /var/lib/propolis-backup-pull/.ssh/authorized_keys for the off-host backup pull.
+# Full procedure: docs/operations/backup-and-restore.md, "Off-host copies".
+#
+# - This file belongs to the host's real administrative sshd. Connect with `ssh -p <admin-port>`,
+#   never to port 22 unless that is the real sshd: on a honeypot host 22 is usually sensor-ssh,
+#   the fake SSH sensor, which reads no authorized_keys. Find the real port with
+#   `sudo ss -ltnp | grep sshd`.
+# - Generate a DEDICATED key on the machine that keeps the copies, used for nothing else:
+#     ssh-keygen -t ed25519 -f ~/.ssh/propolis_backup -C backup@workstation
+#   Paste only its PUBLIC half (~/.ssh/propolis_backup.pub) into the line below, on the honeypot.
+# - The file is root:root 0644, inside the root:root 0755 .ssh directory deploy/provision.sh
+#   creates, so the account can read its keys but never add one.
+# - `restrict` turns off forwarding, pty allocation and ~/.ssh/rc for this key. `command=` forces
+#   propolis-backup-serve, which reads the client's request from SSH_ORIGINAL_COMMAND and answers
+#   only `list` and `get <set> <file>` for ENCRYPTED sets, so this key can fetch ciphertext and do
+#   nothing else.
+restrict,command="/usr/local/sbin/propolis-backup-serve" ssh-ed25519 AAAA... backup@workstation

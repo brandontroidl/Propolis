@@ -1,0 +1,103 @@
+<!--
+title: Never-execute invariant
+audience: security
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-07
+-->
+
+# Never-execute invariant
+
+The honeypot captures what an attacker sends; it never runs it. No Propolis
+code spawns a subprocess or execs. This is a property held **by construction**
+(the code contains no process-spawning call) and reinforced by static-check
+regression tests, deployment-layer W^X, and no-execute spool permissions.
+
+## The invariant
+
+No source file under `crates/*/src/**` (test trees excluded) invokes any
+process-spawning facility. A whole-workspace grep for `Command::new`,
+`process::Command`, `libc::exec`, `nix::unistd::exec`, and `.spawn()` returns
+zero matches. The `std::process` uses in non-test source are `std::process::exit(1)`
+calls for clean shutdown (e.g. `crates/review/src/main.rs#main`), `std::process::id()`,
+and `ExitCode` - process termination and identification, not process creation.
+
+No crate enables Tokio's `process` feature: a grep for `"process"` across every
+`crates/*/Cargo.toml` returns nothing. `sensor-ssh` asserts this directly - its
+`tokio_dependency_lacks_process_feature` test checks that the `tokio = ` line in its own `Cargo.toml` does
+not contain `"process"`
+(`crates/sensor-ssh/tests/shell_test.rs#tokio_dependency_lacks_process_feature`).
+
+Because the capability is simply absent from the dependency tree and the source,
+there is no exec path to reach - not a runtime guard that could be misconfigured
+off.
+
+## Static-check regression tests (10)
+
+Ten per-sensor tests walk their crate's `src/` tree and fail if any `.rs` file
+contains `std::process::Command`, `process::Command`, or `Command::new` (the SSH
+test also bans `libc::exec` and `nix::unistd::exec`). They are regression guards:
+they exist so a future edit that introduces a spawn call fails the gate rather
+than shipping.
+
+| Test | Location |
+|------|----------|
+| `never_exec_static_check` (SSH) | `crates/sensor-ssh/tests/shell_test.rs#never_exec_static_check` |
+| (cred) | `crates/sensor-cred/tests/integration.rs#never_exec_static_check` |
+| (adb) | `crates/sensor-adb/tests/integration.rs#never_exec_static_check` |
+| (ftp) | `crates/sensor-ftp/tests/integration.rs#never_exec_static_check` |
+| (http) | `crates/sensor-http/tests/integration.rs#never_exec_static_check` |
+| (redis) | `crates/sensor-redis/tests/integration.rs#never_exec_static_check` |
+| (smtp) | `crates/sensor-smtp/tests/integration.rs#never_exec_static_check` |
+| (telnet) | `crates/sensor-telnet/tests/integration.rs#never_exec_static_check` |
+| (tftp) | `crates/sensor-tftp/tests/integration.rs#never_exec_static_check` |
+| (mqtt) | `crates/sensor-mqtt/tests/integration.rs#never_exec_static_check` |
+| (dns) | `crates/sensor-dns/tests/integration.rs#never_exec_static_check` |
+
+The SSH test is broader than its own crate: it walks **both** `sensor-ssh/src`
+and `sensor-framework/src` (`crates/sensor-ssh/tests/shell_test.rs#never_exec_static_check`). The `FakeFs`/`FakeShell`
+implementations - the highest-priority surfaces for this guarantee - moved into
+`sensor-framework`, so the check follows the code wherever it lives rather than
+guarding a fixed crate.
+
+### Coverage gap
+
+`sensor-catchall` has an `integration.rs` but no `never_exec_static_check`, so
+nine sensor tests plus the SSH test's framework coverage make ten. The
+whole-workspace grep above still shows `sensor-catchall`'s source is clean; only
+the per-crate regression guard is absent for it. [inferred] Adding the guard to
+`sensor-catchall` would close the asymmetry. See
+[residual-risks.md](residual-risks.md).
+
+## Reinforcing controls
+
+The invariant is defence-in-depth, not source discipline alone:
+
+- **Deployment-layer W^X.** Every systemd unit sets `MemoryDenyWriteExecute=yes`
+  (`deploy/sensor-ssh.service#MemoryDenyWriteExecute=yes`), so a page cannot be both writable and
+  executable even if an exec primitive were somehow reached. A test asserts the
+  directive is present and correctly spelled - `assert_unit_hardened`,
+  `crates/sensor-framework/tests/deploy_test.rs#assert_unit_hardened` - because the `-ion`
+  misspelling silently installs no rule. Owned by
+  [filesystem-and-db-protections.md](filesystem-and-db-protections.md).
+- **Nothing executable but the program itself.** Every unit sets `NoExecPaths=/` and
+  nests back in, with `ExecPaths=`, only the program its `ExecStart=` runs and the library
+  roots it loads (`deploy/sensor-ssh.service#NoExecPaths=/`), so even a file that reached
+  a writable path with its execute bit set cannot be executed or mapped executable. A test
+  walks every unit and checks the named program against its `ExecStart=`
+  (`crates/sensor-framework/tests/deploy_test.rs#every_unit_makes_the_filesystem_non_executable_except_its_own_program`).
+- **No-execute spool.** Captured sample bodies are written mode `0640`
+  (`crates/sensor-framework/src/spool.rs#write_and_seal`) and the spool directory is
+  required to be a `noexec,nosuid,nodev` mount. A captured file is therefore not
+  marked executable and lives on a mount that would refuse execution. The mount
+  option is an operator deployment step, not enforced by the units - see
+  [malware-custody.md](malware-custody.md).
+
+## What this does not claim
+
+The never-execute invariant covers the honeypot's own process behaviour. It is
+distinct from the outbound-network posture (the platform has opt-in egress paths
+- see [outbound-controls.md](outbound-controls.md)) and from whether the
+`noexec` spool mount is actually mounted on a given box, which install.sh only
+prints guidance for and cannot enforce (see [residual-risks.md](residual-risks.md)).

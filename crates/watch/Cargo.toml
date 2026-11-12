@@ -1,0 +1,20 @@
+[package]
+name = "watch"
+version = "0.4.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "propolis-watch"
+path = "src/main.rs"
+
+# Deliberately small: the watcher reads files and one child's stdout and writes stdout. No async
+# runtime, no network, no database, and nothing that could write a file on its behalf;
+# tests/read_only.rs holds this list to exactly these three.
+[dependencies]
+chrono = "0.4.45"
+log-tailer = { path = "../log-tailer" }
+serde_json = "1.0.151"
+
+[dev-dependencies]
+tempfile = "3.27.0"

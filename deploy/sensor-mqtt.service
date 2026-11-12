@@ -1,0 +1,81 @@
+[Unit]
+OnFailure=propolis-alert@%n.service
+Description=Propolis MQTT honeypot sensor
+After=network.target
+
+# Recon trap for TCP/1883: records CONNECT credentials, SUBSCRIBE topics and PUBLISH metadata,
+# spools a PUBLISH payload only when it looks binary, and never delivers, retains or forwards a
+# message. Off until an operator creates
+# /etc/propolis/mqtt.env with PROPOLIS_MQTT_BIND: without it the sensor refuses to start.
+# Optional implicit-TLS twin (MQTTS) on TCP/8883 when PROPOLIS_MQTT_TLS_BIND, _TLS_CERT and
+# _TLS_KEY are all set; a partial or unusable TLS configuration refuses to start.
+# Ports 1883 and 8883 are unprivileged, so this unit deliberately grants no CAP_NET_BIND_SERVICE;
+# an operator who binds a port below 1024 must add the capability to a drop-in.
+
+[Service]
+Type=simple
+User=propolis-mqtt
+Group=propolis-mqtt
+EnvironmentFile=/etc/propolis/mqtt.env
+ExecStart=/usr/local/bin/sensor-mqtt
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/log/propolis/mqtt /var/spool/propolis/mqtt
+# MQTTS cert and key (PROPOLIS_MQTT_TLS_CERT / PROPOLIS_MQTT_TLS_KEY); read-only, never written.
+# The leading "-" lets the unit start where the directory is absent (TLS unused); a configured
+# pair that cannot be read still refuses to start in-process.
+ReadOnlyPaths=-/etc/propolis/tls
+# Nothing on the filesystem is executable except this sensor's own binary and the shared
+# libraries it loads (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64). The
+# sensor execs nothing, so a captured upload or spool entry cannot run here even on a mount that
+# lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/sensor-mqtt /usr/lib -/usr/lib64
+# Secrets this sensor must never read, even where a file's mode slips (config-check.sh reports
+# that): the daemon's and every other unit's env file and the split deployment's mTLS keys. Its
+# own env file is read by systemd before this namespace exists, so nothing it needs is here; its
+# TLS pair under /etc/propolis/tls stays readable. The "-" skips a file absent on this host. See
+# deploy/sensor-ssh.service for the full reasoning.
+InaccessiblePaths=-/etc/propolis/propolis.env -/etc/propolis/fleet-listeners.env -/etc/propolis/watch.env -/etc/propolis/migrate.env
+InaccessiblePaths=-/etc/propolis/console.env -/etc/propolis/feed.env -/etc/propolis/intake.env -/etc/propolis/review.env
+InaccessiblePaths=-/etc/propolis/gateway.env -/etc/propolis/shipper.env -/etc/propolis/certs
+InaccessiblePaths=-/etc/propolis/adb.env -/etc/propolis/catchall.env -/etc/propolis/cred.env -/etc/propolis/dns.env -/etc/propolis/ftp.env -/etc/propolis/http.env -/etc/propolis/redis.env -/etc/propolis/smtp.env -/etc/propolis/ssh.env -/etc/propolis/telnet.env -/etc/propolis/tftp.env
+
+CapabilityBoundingSet=
+
+# PROPOLIS_MQTT_CAPTURE_MEMORY_BYTES (env file) defaults to 40% of this value. If MemoryMax is
+# changed, set that variable too, or the capture ceiling stays at the 256M-derived default.
+MemoryMax=256M
+TasksMax=128
+CPUQuota=50%
+LimitNOFILE=4096
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

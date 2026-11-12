@@ -1,0 +1,15 @@
+//! One module per operational failure-mode check. Each implements `Condition` and is evaluated by
+//! the monitor poll loop.
+
+pub mod backlog;
+pub mod backup;
+pub mod capacity;
+pub mod chain;
+pub mod feed;
+pub mod intake;
+pub mod intake_lag;
+pub mod intake_quarantine;
+pub mod malware;
+pub mod sensor_log;
+pub mod subsystem;
+pub mod vendor;

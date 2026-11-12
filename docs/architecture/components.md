@@ -1,0 +1,153 @@
+<!--
+title: Component inventory
+audience: developer
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-07
+-->
+
+# Components
+
+The workspace (`Cargo.toml`, `resolver = "2"`, every crate `edition = "2024"`) has
+**29 member crates** under `crates/`, producing **21 binaries**. Twenty-two crates are at
+version `0.4.0`; the other seven (`collector-wire`, `fleet`, `gateway`, `log-format`,
+`log-tailer`, `provision-certs`, `shipper`) are at `0.1.0`. This page is the canonical
+owner of the component inventory and the inter-crate dependency graph.
+
+## Crate inventory
+
+| Crate | Kind | Binary | Purpose |
+|---|---|---|---|
+| `sensor-wire` | library (leaf) | none | Frozen sensor->intake NDJSON wire format (`WIRE_VERSION = 1`); the single source of truth imported by every sensor and by intake. |
+| `core-scoring` | library | none | Event ledger and scoring engine: append events, chain-hashing, `ip_score`, blocklist eligibility; owns the core migrations. Also owns the operator allowlist shared by the feed and the review stage (`allowlist.rs`), so it depends on `geoip`. |
+| `geoip` | library (leaf) | none | Offline MaxMind GeoLite2 City + ASN enrichment (local file reads only, egress-free); both DBs optional. |
+| `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. Also provides per-sensor server-side TLS (`crates/sensor-framework/src/tls.rs`): a fail-closed cert/key loader, an implicit-TLS listener and a plaintext-to-TLS stream for STARTTLS-style upgrades. Seven sensors use it (http, redis, mqtt, smtp, ftp, cred, dns); see [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners). |
+| `sensor-catchall` | lib + bin | `sensor-catchall` | Passive protocol-agnostic TCP/UDP catch-all; emits `catchall_probe` for unprompted traffic. |
+| `sensor-ssh` | lib + bin | `sensor-ssh` | SSH honeypot: full handshake via own crypto primitives, fake shell, SCP/SFTP capture. |
+| `sensor-telnet` | lib + bin | `sensor-telnet` | Telnet honeypot: minimal option negotiation, accepts any credential, shared fake shell. |
+| `sensor-redis` | lib + bin | `sensor-redis` | Redis honeypot: parses RESP (inline + multi-bulk), canned replies, captures creds and suspicious commands. Optional implicit-TLS `rediss://` listener (6380 by deploy convention). |
+| `sensor-adb` | lib + bin | `sensor-adb` | ADB honeypot: `CNXN` handshake and fake device banner, serves `shell:` via the fake shell, captures `sync:` pushes to spool. |
+| `sensor-http` | lib + bin | `sensor-http` | HTTP honeypot sensor (per-connection handler over the shared listener). Optional implicit-TLS HTTPS listener (443 by deploy convention). |
+| `sensor-ftp` | lib + bin | `sensor-ftp` | FTP honeypot: capture hand-off and quarantine spool for uploads. TLS on two surfaces: `AUTH TLS` (with `PROT P` data channels) on the plain listener, and an optional implicit-TLS FTPS listener (990 by deploy convention). |
+| `sensor-smtp` | lib + bin | `sensor-smtp` | SMTP honeypot sensor (per-connection handler over the shared listener). TLS on two surfaces: `STARTTLS` on the plain listeners, and an optional implicit-TLS SMTPS listener (465 by deploy convention). |
+| `sensor-tftp` | lib + bin | `sensor-tftp` | TFTP (UDP) honeypot, one of the two sensors that reply over UDP: reads get one fixed tiny error, writes are acknowledged and the body is captured to the quarantine spool; bytes sent never exceed bytes received. Off until `PROPOLIS_TFTP_BIND` is set. |
+| `sensor-mqtt` | lib + bin | `sensor-mqtt` | MQTT 3.1/3.1.1/5.0 honeypot (TCP/1883, optional implicit-TLS MQTTS on 8883): records CONNECT credentials (never the password), SUBSCRIBE topics and PUBLISH topic/payload metadata, and spools a PUBLISH payload that looks binary to the quarantine spool; never delivers, retains or forwards a message. Off until `PROPOLIS_MQTT_BIND` is set. |
+| `sensor-dns` | lib + bin | `sensor-dns` | DNS honeypot (UDP+TCP/53 on one bind, optional DNS over TLS on 853): records every query's header, question and EDNS with derived probe signals (zone transfer, ANY amplification, CHAOS fingerprint, recursion), answers REFUSED with the question echoed and nothing appended so a UDP reply never exceeds its query; serves no records. Off until `PROPOLIS_DNS_BIND` is set. |
+| `sensor-cred` | lib + bin | `sensor-cred` | Credential-capture sensor covering the DB/remote protocols VNC, MySQL, MSSQL, PostgreSQL, MongoDB. With one certificate pair, the last four negotiate TLS in-band on their existing ports (no TLS bind; VNC has none). |
+| `intake` | lib + bin | `intake` | Converts sensor wire events into core-scoring domain events; tails sensor NDJSON logs and appends to the ledger. |
+| `review` | lib + bin | `review` | Review-queue state machine, gatekeeper, vendor adapters (AbuseIPDB/DShield/OTX), VirusTotal scanner, malware fetcher, submission runner, and operator CLI. Owns its own migrator. |
+| `feed` | lib + bin | `feed` | Blocklist feed pipeline: read `ip_score` into a `FeedSnapshot`, export text/JSON/CSV/CIDR, atomic publish with a checksummed manifest. |
+| `console` | lib + bin | `console` | Operator web console (axum): auth (argon2 password / session / CSRF / rate-limit), dashboard, review queue, IP detail, feed status, `/metrics`, live `/logs`. |
+| `propolis` | binary only | `propolis` | Unified daemon composing intake + review + feed + console + VirusTotal + fetcher + ops-monitor as concurrent tokio tasks on one `PgPool`. |
+| `fleet` | library (leaf) | none | Fleet health: the listener inventory the control plane believes exists, the durable result of probing it, and the rules that turn both into an operator verdict; owns its own migrations under its own bookkeeping table. |
+| `log-tailer` | library (leaf) | none | File tailing with a durable, rotation-aware cursor and the over-length line discard; extracted from `intake` so the shipper can tail sensor logs without the control-plane database stack. Also owns the one `name:path` sensor-log list parser, and a cursorless mode (`LogTailer::without_cursor`) that persists nothing, for the live watcher. |
+| `log-format` | library (leaf) | none | The one `tracing` output format every binary installs (`log_format::init`, or `log_format::layer` for the two that build their own registry): colour only on a terminal, and under systemd a `<N>` priority prefix per line so journald records the real level. Pulls in only `tracing` and `tracing-subscriber`, which is why the control-plane crates that do not link `sensor-framework` can share it. See [logging](../operations/health-and-observability.md#logging-and-journal-priorities). |
+| `collector-wire` | library (leaf) | none | Collector-to-gateway wire protocol: sequenced, hash-chained batch frames, acks, and the mutual-TLS configs both ends build from one pinned CA. |
+| `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
+| `gateway` | lib + bin | `gateway` | Control-plane side of the split deployment: a client-certificate-required TLS accept loop that verifies each collector's sequence and hash chain and appends accepted records to a per-collector spool in sensor NDJSON shape, which intake tails unchanged. |
+| `watch` | lib + bin | `propolis-watch` | Read-only live view for the operator: streams every sensor event log named in `PROPOLIS_SENSOR_LOGS` (and, with `--journal`, the units' journal) as JSON Lines on stdout through `log-tailer`'s cursorless mode, with a heartbeat naming each log's status. Writes no file, opens no socket, holds no database handle; meant to run as an SSH forced command. See [live watch](../operations/live-watch.md). |
+| `provision-certs` | lib + bin | `provision-certs` | Mints a private CA, the gateway server certificate and one collector client certificate per run, isolated so its certificate library never enters the daemon dependency trees. With `--sensor-tls <out-dir> <sensor>...` it instead mints one self-signed TLS pair per sensor (kept if both files already exist), driven by `deploy/provision-tls.sh`. |
+
+Source: the `[workspace] members` list in `Cargo.toml`; each crate's `Cargo.toml` and
+`src/lib.rs` / `src/main.rs`.
+
+### Library vs. binary
+
+- **Pure libraries (no binary, 8):** `sensor-wire`, `core-scoring`, `geoip`,
+  `sensor-framework`, `fleet`, `log-tailer`, `log-format`, `collector-wire`.
+- **Sensor lib+bin crates (12):** `sensor-catchall`, `sensor-ssh`, `sensor-telnet`,
+  `sensor-redis`, `sensor-adb`, `sensor-http`, `sensor-ftp`, `sensor-smtp`,
+  `sensor-tftp`, `sensor-mqtt`, `sensor-dns`, `sensor-cred`. These 12 sensor crates cover 15 protocols (the `cred`
+  sensor serves five: VNC/MySQL/MSSQL/PostgreSQL/MongoDB).
+- **Data-plane lib+bin crates (4):** `intake`, `review`, `feed`, `console` each carry
+  both `src/lib.rs` and `src/main.rs`, so each produces a library and a same-named
+  binary from cargo's default binary-from-`main.rs`; none declares a `[[bin]]`.
+- **Split-deployment lib+bin crates (3):** `shipper`, `gateway`, `provision-certs`.
+- **Operator tool lib+bin crate (1):** `watch`, whose binary is `propolis-watch` (a `[[bin]]`
+  entry, so the installed name says what it belongs to).
+- **Binary only:** `propolis` (no `src/lib.rs`).
+
+**21 binaries total:** the 12 sensor binaries plus `intake`, `review`, `feed`,
+`console`, `propolis`, `shipper`, `gateway`, `provision-certs`, and `propolis-watch`.
+
+Sensors have **no compiled-in default port** - listen addresses come from
+config/environment set by the deploy units, not from source. See
+[../reference/ports-and-protocols.md](../reference/ports-and-protocols.md).
+
+## Dependency graph
+
+Internal dependencies are declared as `path=` entries. Leaves (no internal deps):
+`sensor-wire`, `geoip`, `fleet`, `log-tailer`, `log-format`, `collector-wire`. `core-scoring` depends only
+on `geoip` (for the shared operator allowlist's ASN lookup).
+
+```mermaid
+graph TD
+  wire[sensor-wire]
+  core[core-scoring]
+  geoip[geoip]
+  fleet[fleet]
+  tailer[log-tailer]
+  logfmt[log-format]
+  cwire[collector-wire]
+  fw[sensor-framework]
+  sensors["sensor-{catchall,ssh,telnet,redis,<br/>adb,http,ftp,smtp,tftp,mqtt,dns,cred}"]
+  intake[intake]
+  review[review]
+  feed[feed]
+  console[console]
+  propolis[propolis]
+  shipper[shipper]
+  gateway[gateway]
+  certs[provision-certs]
+  watchc[watch]
+
+  core --> geoip
+  fw --> wire
+  fw --> logfmt
+  sensors --> wire
+  sensors --> fw
+  intake --> wire
+  intake --> core
+  intake --> fleet
+  intake --> tailer
+  intake --> logfmt
+  review --> core
+  review --> fw
+  review --> logfmt
+  feed --> core
+  feed --> geoip
+  feed --> logfmt
+  console --> core
+  console --> fleet
+  console --> geoip
+  console --> review
+  console --> logfmt
+  propolis --> console
+  propolis --> core
+  propolis --> feed
+  propolis --> fleet
+  propolis --> geoip
+  propolis --> intake
+  propolis --> tailer
+  propolis --> review
+  propolis --> fw
+  propolis --> logfmt
+  shipper --> cwire
+  shipper --> tailer
+  shipper --> fw
+  shipper --> logfmt
+  gateway --> cwire
+  gateway --> fw
+  gateway --> logfmt
+  certs --> cwire
+  watchc --> tailer
+```
+
+Source: the `[dependencies]` sections of each crate's `Cargo.toml`, as `cargo metadata
+--no-deps` reports them (dev-dependencies excluded).
+
+`propolis` links the four data-plane service libraries directly and re-runs their
+loops in-process; each subsystem-loop carries a `Mirrors <crate>/src/main.rs` doc
+comment. It depends on **no** `sensor-*` binary crate - sensors are separate OS
+processes, covered in [process-topology.md](process-topology.md).

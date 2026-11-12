@@ -1,0 +1,895 @@
+//! `GET /` - the dashboard's summary stats (`internal/design/06-console-observability.md`,
+//! "Pages" > "Dashboard"). Session-gated: mounted under the `protected` group in `routes::mod`.
+//!
+//! Six stat cards: three "core" numbers (`total_scored_ips`, `pending_reviews`, `approved_today`)
+//! that fail the whole page closed via `AppError`/`?` on a query error, matching this page's
+//! pre-existing behavior; and three supplementary ones (`events_last_hour`, `feed_entries`,
+//! `top_attacker`) that soft-fail to their placeholder value instead - same reasoning as
+//! `base_context`'s own doc comment: a transient hiccup on a nice-to-have widget should not take
+//! down an otherwise-fine page render. `feed_entries` reads the feed publisher's `manifest.json`
+//! tier counts via `routes::feed::read_manifest` (the same helper `routes::feed`/`routes::metrics`
+//! already use), rather than re-parsing the file - see that function's doc comment for the on-disk
+//! shape.
+//!
+//! Charts + the most-active strip (sub-project 6, console-charts): two Chart.js charts (events
+//! timeline, protocol distribution) and the "most active" table, whose per-IP 24-hour activity
+//! strips (`most_active_rows`) replaced the old top-attackers bar chart - the chart duplicated
+//! information the strip table shows better. All are fed by supplementary, soft-failing queries: a
+//! slow or errored query degrades to an empty chart / the "waiting for sensor events" copy, never a
+//! 503. The charts script reads its datasets from `<script type="application/json">` elements, so
+//! each array is serialized with `templates::script_json` into a `String` *before* it reaches the
+//! template, then placed with the `|safe` filter - minijinja auto-escapes every `.html` template,
+//! and the browser does not decode entities inside a script element, so an escaped `&quot;` would
+//! reach `JSON.parse` as-is. `script_json` escapes what could end the element instead. The events
+//! timeline always renders (25 buckets, zero-filled by the query's own `generate_series`/`COALESCE`)
+//! even with no events; the protocol-distribution chart instead hides its `<canvas>` and shows the
+//! "waiting for sensor events" copy when `protocol_dist` is empty - an empty Chart.js canvas has
+//! nothing worth looking at.
+
+use axum::extract::{Query, State};
+use axum::response::Html;
+use axum::routing::get;
+use axum::{Extension, Router};
+use minijinja::context;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+
+use crate::AppState;
+use crate::auth::Session;
+use crate::routes::context::{BaseContext, base_context};
+use crate::routes::degraded::Degraded;
+use crate::routes::error::AppError;
+use crate::routes::feed::read_manifest;
+use crate::routes::format::{
+    format_activity, format_relative_time, format_sensor_label, format_timestamp, severity_rank,
+    signal_severity, signal_tag_label,
+};
+use crate::templates::script_json;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/", get(dashboard))
+        .route("/dashboard/chart", get(dashboard_chart_fragment))
+}
+
+#[derive(Debug, Serialize)]
+struct RecentSubmission {
+    source_ip: String,
+    vendor: String,
+    submitted_at: String,
+    success: bool,
+}
+
+/// One row of Recent activity: a run of consecutive events with the same source, sensor and signal
+/// type, newest run first ([`fold_recent`]).
+#[derive(Debug, Serialize)]
+struct RecentEvent {
+    /// How long ago the run's newest event was.
+    relative_time: String,
+    /// The run's oldest and newest event times, for the row's tooltip.
+    first_at: String,
+    last_at: String,
+    activity: String,
+    source_ip: String,
+    count: usize,
+    /// The run reaches the end of what was read, so it may continue further back: its count is
+    /// a lower bound and renders as `N+`.
+    open_ended: bool,
+}
+
+/// One `event` row as Recent activity reads it, newest first.
+#[derive(Debug, Clone, PartialEq)]
+struct RecentRaw {
+    observed_at: chrono::DateTime<chrono::Utc>,
+    sensor: String,
+    signal_type: String,
+    source_ip: String,
+}
+
+/// Events Recent activity reads, newest first, to fill its rows. A flood longer than this shows
+/// as one `N+` row.
+const RECENT_SCAN: i64 = 1000;
+
+/// Rows Recent activity shows.
+const RECENT_ROWS: usize = 20;
+
+/// Folds newest-first `events` into runs of consecutive events from one source with one sensor
+/// and signal type, keeping the newest `rows` runs. Only adjacent events fold, so the panel still
+/// reads in time order; one source flooding the honeypot takes one row instead of every row.
+/// `scan_full` says the read stopped at its limit, so the last run may continue past it.
+fn fold_recent(events: &[RecentRaw], rows: usize, scan_full: bool) -> Vec<RecentEvent> {
+    let mut runs: Vec<(&RecentRaw, &RecentRaw, usize)> = Vec::new();
+    for e in events {
+        match runs.last_mut() {
+            Some((newest, oldest, count))
+                if newest.source_ip == e.source_ip
+                    && newest.sensor == e.sensor
+                    && newest.signal_type == e.signal_type =>
+            {
+                *oldest = e;
+                *count += 1;
+            }
+            _ => {
+                if runs.len() == rows {
+                    break;
+                }
+                runs.push((e, e, 1));
+            }
+        }
+    }
+    let last_run = runs.len();
+    let reached_end = scan_full && runs.iter().map(|r| r.2).sum::<usize>() == events.len();
+    runs.into_iter()
+        .enumerate()
+        .map(|(i, (newest, oldest, count))| RecentEvent {
+            relative_time: format_relative_time(newest.observed_at),
+            first_at: format_timestamp(oldest.observed_at),
+            last_at: format_timestamp(newest.observed_at),
+            activity: format_activity(&newest.sensor, &newest.signal_type),
+            source_ip: newest.source_ip.clone(),
+            count,
+            open_ended: reached_end && i + 1 == last_run,
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+struct ProtocolCount {
+    label: String,
+    count: i64,
+}
+
+/// One hourly cell of an IP's 24-hour activity strip. `height` is a pixel height derived from the
+/// hour's event volume (sqrt-scaled so small-but-real hours stay visible); `class` is the strip
+/// severity class (`s1`..`s4`, or empty for an idle hour) from the worst signal that hour.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StripCell {
+    height: u32,
+    class: &'static str,
+}
+
+/// A "what it did" severity tag for the most-active table.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SigTag {
+    label: &'static str,
+    sev: &'static str,
+}
+
+/// One row of the dashboard's "most active" table: an attacker IP with its 24-hour activity strip
+/// and the worst signals it triggered.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MostActiveRow {
+    ip: String,
+    event_count: i64,
+    /// `last_seen_at` as "N minutes ago", worded when the row is served (the panel is held for a
+    /// short while, and a held "just now" would not age).
+    last_seen: String,
+    #[serde(skip)]
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+    strip: Vec<StripCell>,
+    tags: Vec<SigTag>,
+}
+
+/// The statement for the hero's top attacker: the first row of the Attackers table, shown with
+/// its live effective score (`LIVE_EFFECTIVE_SCORE_SQL`, decayed to now - not the stored
+/// `raw_score` anchored at the IP's last event, or a long-idle high score would outrank an active
+/// attacker). It orders by the time-invariant key `ip_score_order_idx` holds, which ranks rows as
+/// the live score does at any instant, so it reads one index entry instead of scoring every
+/// address. Addresses tied at the 100 cap now resolve the way the Attackers table lists them, by
+/// how far past the cap they are, where the old ordering left the tie to the planner.
+pub fn top_attacker_sql() -> String {
+    format!(
+        "SELECT host(source_ip), round(({live})::numeric, 1)::text \
+         FROM ip_score ORDER BY {key} DESC, source_ip DESC LIMIT 1",
+        live = crate::routes::LIVE_EFFECTIVE_SCORE_SQL,
+        key = crate::routes::SCORE_ORDER_KEY_SQL,
+    )
+}
+
+/// The events of the last 24 hours by sensor, most first: the dashboard's protocol-distribution
+/// chart. Summed from the hourly roll-ups (`crate::rollup::listener_window_sql`), exact whether
+/// or not they are current, where it used to group every event of the window (161 ms on
+/// 1,500,000 events, per load).
+pub fn protocol_distribution_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT sensor, sum(events)::bigint AS cnt FROM parts GROUP BY sensor ORDER BY cnt DESC",
+        window = crate::rollup::listener_window_sql("now() - interval '24 hours'", cursor_hint),
+    )
+}
+
+async fn dashboard(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+) -> Result<Html<String>, AppError> {
+    // Fold what has been appended since the last page that read the roll-ups; the counts below
+    // are exact either way (`crate::rollup`), this only keeps them cheap.
+    let cursor_hint = state.read_state.rollup.refresh_for_page(&state.db).await;
+    let total_scored_ips: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ip_score")
+        .fetch_one(&state.db)
+        .await?;
+
+    // `current_date` is a DATE; Postgres implicitly casts it to a TIMESTAMPTZ at local-midnight
+    // for the `>=` comparison against `decided_at` (matches the design spec's own query text).
+    let approved_today: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM review_queue \
+         WHERE state = 'approved' AND decided_at >= current_date",
+    )
+    .fetch_one(&state.db)
+    .await?;
+
+    // Supplementary stats below: each soft-fails to its own placeholder rather than propagating,
+    // per the module doc comment - through `degraded`, so the page names it as a placeholder.
+    let mut degraded = Degraded::new();
+    if state.read_state.rollup.failing() {
+        degraded.note("event roll-up refresh (counts read from the ledger)");
+    }
+    // -1 is the template's own "unknown" sentinel (it renders "last 24 hours" instead of "+N in
+    // the last hour"); 0 would claim a quiet hour the query never measured.
+    let events_last_hour: i64 = degraded.soft_or(
+        "events in the last hour",
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event WHERE observed_at >= now() - interval '1 hour'",
+        )
+        .fetch_one(&state.db)
+        .await,
+        -1,
+    );
+
+    // Honest pipeline-health signal: the age of the most recent event. This is a real, verifiable
+    // fact (intake wrote something this recently), never a hardcoded "OK" that could disagree with
+    // reality. Fresh (< 1h) reads green; stale reads amber ("check sensors"). No events yet -> not
+    // fresh, so a brand-new node does not claim health it cannot show.
+    let last_event: Option<chrono::DateTime<chrono::Utc>> = degraded.soft(
+        "last event age",
+        sqlx::query_scalar("SELECT max(observed_at) FROM event")
+            .fetch_one(&state.db)
+            .await,
+    );
+    let (last_event_ago, pipeline_fresh) = match last_event {
+        Some(t) => (
+            format_relative_time(t),
+            (chrono::Utc::now() - t).num_minutes() < 60,
+        ),
+        None => ("none".to_string(), false),
+    };
+
+    // Audited: interpolates only the constants behind `top_attacker_sql`, never user input.
+    let top_attacker: Option<(String, String)> = degraded.soft(
+        "top attacker",
+        sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(top_attacker_sql()))
+            .fetch_optional(&state.db)
+            .await,
+    );
+    let top_attacker_ip = top_attacker.as_ref().map(|t| t.0.as_str()).unwrap_or("--");
+    let top_attacker_score = top_attacker.as_ref().map(|t| t.1.as_str()).unwrap_or("");
+
+    // The newest RECENT_SCAN events, read backwards off `event_observed_at_idx`, folded into runs.
+    let recent_event_rows = degraded.soft(
+        "recent events",
+        sqlx::query(
+            "SELECT observed_at, sensor, signal_type::text, host(source_ip) AS source_ip \
+             FROM event ORDER BY observed_at DESC, id DESC LIMIT $1",
+        )
+        .bind(RECENT_SCAN)
+        .fetch_all(&state.db)
+        .await,
+    );
+    let mut recent_raw = Vec::with_capacity(recent_event_rows.len());
+    for row in &recent_event_rows {
+        recent_raw.push(RecentRaw {
+            observed_at: row.try_get("observed_at")?,
+            sensor: row.try_get("sensor")?,
+            signal_type: row.try_get("signal_type")?,
+            source_ip: row.try_get("source_ip")?,
+        });
+    }
+    let recent_events = fold_recent(
+        &recent_raw,
+        RECENT_ROWS,
+        recent_raw.len() as i64 == RECENT_SCAN,
+    );
+
+    let protocol_rows = degraded.soft(
+        "protocol distribution",
+        sqlx::query(sqlx::AssertSqlSafe(protocol_distribution_sql(cursor_hint)))
+            .persistent(false)
+            .fetch_all(&state.db)
+            .await,
+    );
+    let mut protocol_dist = Vec::with_capacity(protocol_rows.len());
+    for row in protocol_rows {
+        let sensor: String = row.try_get("sensor")?;
+        protocol_dist.push(ProtocolCount {
+            label: format_sensor_label(&sensor),
+            count: row.try_get("cnt")?,
+        });
+    }
+    let proto_labels: Vec<String> = protocol_dist.iter().map(|p| p.label.clone()).collect();
+    let proto_data: Vec<i64> = protocol_dist.iter().map(|p| p.count).collect();
+
+    // Default range: 25 hourly buckets covering the rolling 24h window (oldest and newest are
+    // partial hours), oldest to newest, zero-filled where an hour had no events - always exactly 25
+    // rows (the `generate_series` bound is unconditional), so the timeline chart and the events
+    // sparkline below always have real (possibly all-zero) data, never an empty array.
+    // `dashboard_chart_fragment` (below) reuses the same helper for the adjustable-range HTMX
+    // endpoint the "1h/24h/7d/30d" buttons hit.
+    let (timeline_labels, timeline_data) = degraded.soft(
+        "events timeline",
+        hourly_series(&state.db, cursor_hint).await,
+    );
+    // The status band's "Events / 24h" cell: the buckets and the event filter now share the same
+    // `now() - 24h` lower bound, so their sum is the EXACT rolling-24h total (no in-window event
+    // falls outside a bucket) at no extra query cost.
+    let events_24h: i64 = timeline_data.iter().sum();
+    let current_range = "24h";
+
+    // The "most active" table with its 24-hour activity strips - the signature dashboard element.
+    // Soft-fails to empty (shows the waiting-for-events copy) rather than 503 on a query error.
+    let most_active = degraded.soft("most active", held_most_active_rows(&state).await);
+
+    // -1 signals "no data" (unconfigured, missing, or unparsable manifest) -> the template
+    // displays "--"; `read_manifest` already collapses every one of those cases to `None`.
+    let feed_entries: i64 = state
+        .feed_output_dir
+        .as_deref()
+        .and_then(read_manifest)
+        .map(|m| (m.tiers.aggressive.count + m.tiers.standard.count) as i64)
+        .unwrap_or(-1);
+
+    let recent_rows = sqlx::query(
+        "SELECT host(source_ip) AS source_ip, vendor, submitted_at, success \
+         FROM vendor_submission ORDER BY submitted_at DESC LIMIT 10",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut recent_submissions = Vec::with_capacity(recent_rows.len());
+    for row in recent_rows {
+        let submitted_at: chrono::DateTime<chrono::Utc> = row.try_get("submitted_at")?;
+        recent_submissions.push(RecentSubmission {
+            source_ip: row.try_get("source_ip")?,
+            vendor: row.try_get("vendor")?,
+            submitted_at: submitted_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            success: row.try_get("success")?,
+        });
+    }
+
+    // A session is guaranteed here (this route sits behind `require_session`), so the page always
+    // has a real CSRF token to display in `base.html`'s meta tag, matching every other
+    // authenticated page - this route itself has no form that needs one.
+    let csrf_token = state
+        .sessions
+        .generate_csrf(&session.id)
+        .unwrap_or_default();
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+        degraded: base_degraded,
+    } = base_context(&state.db, state.startup_time, state.version).await;
+    degraded.absorb(base_degraded);
+    let degraded = degraded.names();
+
+    // Shadowed into their JSON-string form right before the template needs them - see the module
+    // doc comment for why a string (rendered with `|safe`) rather than a native minijinja list.
+    let timeline_labels = script_json(&timeline_labels);
+    let timeline_data = script_json(&timeline_data);
+    let proto_labels = script_json(&proto_labels);
+    let proto_data = script_json(&proto_data);
+
+    let tmpl = state.templates.get_template("dashboard.html")?;
+    let html = tmpl.render(context! {
+        csrf_token,
+        active_nav => "dashboard",
+        total_scored_ips,
+        pending_reviews => pending_count,
+        approved_today,
+        events_last_hour,
+        events_24h,
+        last_event_ago,
+        pipeline_fresh,
+        feed_entries,
+        top_attacker_ip,
+        top_attacker_score,
+        recent_events,
+        protocol_dist,
+        recent_submissions,
+        timeline_labels,
+        timeline_data,
+        proto_labels,
+        proto_data,
+        most_active,
+        pending_count,
+        uptime,
+        version,
+        current_range,
+        degraded,
+    })?;
+    Ok(Html(html))
+}
+
+fn most_active_loader(db: &PgPool) -> crate::read_state::Loader<Vec<MostActiveRow>> {
+    let db = db.clone();
+    std::sync::Arc::new(move || {
+        let db = db.clone();
+        Box::pin(async move { most_active_rows(&db).await })
+    })
+}
+
+/// Starts the task that recomputes the most-active panel once at start, at each quarter-hour
+/// boundary and ten minutes after its previous attempt, so a replacement always lands before the
+/// held panel reaches the 15-minute cap; it ends when `shutdown` completes. Costs two aggregates
+/// per quarter hour on an idle console. Does nothing for a state that holds no answer
+/// ([`crate::read_state::ReadState::uncached`]). Call it once, where the console is started.
+pub fn start_most_active_refresher(
+    state: &AppState,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    // The task ends with `shutdown`; nothing awaits its handle.
+    drop(
+        state
+            .read_state
+            .spawn_refresher(most_active_loader(&state.db), shutdown),
+    );
+}
+
+/// [`most_active_rows`] through the console's held answer (`crate::read_state`): the aggregate
+/// behind it groups every event of the last 24 hours by source address (330 ms on 274,000 events,
+/// 1.5 s on the live node), which no index or roll-up answers exactly (the rows would have to be
+/// every address's events). So a page load answers from the last panel computed while that is at
+/// most 15 minutes old: a background refresher replaces it at each quarter-hour boundary and ten
+/// minutes after its previous attempt, and a
+/// load that finds it more than half a minute old or from an earlier quarter hour starts one more
+/// recomputation behind the request. Only a load with no panel held (the first after a start,
+/// before the refresher's first computation lands), or one whose held panel is past 15 minutes or
+/// more than a quarter hour behind (the refreshes have been failing), waits for the aggregate; a
+/// failure of that wait reaches the page's degraded banner. "Last seen" is worded when the row is
+/// served, so a held row still ages.
+///
+/// The key is the quarter hour: the strip lays its cells out by hours ago in the session time
+/// zone, whose hour starts on a quarter hour wherever it is, so a panel computed before the hour
+/// turned has every cell one place off until it is replaced.
+async fn held_most_active_rows(state: &AppState) -> Result<Vec<MostActiveRow>, sqlx::Error> {
+    let load = most_active_loader(&state.db);
+    let quarter_hour = state.read_state.quarter_hour();
+    let mut rows = state.read_state.most_active.get(quarter_hour, load).await?;
+    for row in &mut rows {
+        row.last_seen = format_relative_time(row.last_seen_at);
+    }
+    Ok(rows)
+}
+
+/// The top attacker IPs of the last 24 hours, each with a 24-cell hourly activity strip (worst
+/// signal per hour drives the cell colour, event volume its height) and its worst signals as
+/// severity tags. The caller soft-fails it to an empty vec (`Degraded::soft`), per the module's
+/// chart policy, and the page names the panel as a placeholder.
+async fn most_active_rows(db: &PgPool) -> Result<Vec<MostActiveRow>, sqlx::Error> {
+    use std::collections::{BTreeSet, HashMap};
+
+    // One pass: the busiest few source IPs in the window, joined back to their own events grouped by
+    // hour, with the distinct signal types seen in each hour so the strip can colour each cell by
+    // the worst signal that hour rather than only the IP's overall worst.
+    let rows = sqlx::query(
+        "WITH top AS ( \
+             SELECT source_ip, COUNT(*) AS cnt, MAX(observed_at) AS last_seen \
+             FROM event WHERE observed_at >= now() - interval '24 hours' \
+             GROUP BY source_ip ORDER BY cnt DESC, MAX(observed_at) DESC LIMIT 6 \
+         ) \
+         SELECT host(t.source_ip) AS ip, t.cnt, t.last_seen, \
+                (EXTRACT(EPOCH FROM (date_trunc('hour', now()) - date_trunc('hour', e.observed_at))) / 3600)::int AS hours_ago, \
+                COUNT(*) AS hr_cnt, \
+                array_agg(DISTINCT e.signal_type::text) AS hr_sigs \
+         FROM top t \
+         JOIN event e ON e.source_ip = t.source_ip AND e.observed_at >= now() - interval '24 hours' \
+         GROUP BY t.source_ip, t.cnt, t.last_seen, date_trunc('hour', e.observed_at) \
+         ORDER BY t.cnt DESC, hours_ago",
+    )
+    .fetch_all(db)
+    .await?;
+
+    struct Acc {
+        cnt: i64,
+        last_seen: chrono::DateTime<chrono::Utc>,
+        hours: HashMap<i32, (i64, u8)>, // hours_ago -> (event count, worst severity rank)
+        sigs: BTreeSet<String>,
+        order: usize,
+    }
+    let mut accs: HashMap<String, Acc> = HashMap::new();
+    let mut next_order = 0usize;
+    for row in &rows {
+        let Ok(ip) = row.try_get::<String, _>("ip") else {
+            continue;
+        };
+        let Ok(last_seen) = row.try_get::<chrono::DateTime<chrono::Utc>, _>("last_seen") else {
+            continue;
+        };
+        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+        let hours_ago: i32 = row.try_get("hours_ago").unwrap_or(-1);
+        let hr_cnt: i64 = row.try_get("hr_cnt").unwrap_or(0);
+        let hr_sigs: Vec<String> = row.try_get("hr_sigs").unwrap_or_default();
+        let worst = hr_sigs
+            .iter()
+            .map(|s| severity_rank(signal_severity(s)))
+            .max()
+            .unwrap_or(0);
+        let acc = accs.entry(ip).or_insert_with(|| {
+            let o = next_order;
+            next_order += 1;
+            Acc {
+                cnt,
+                last_seen,
+                hours: HashMap::new(),
+                sigs: BTreeSet::new(),
+                order: o,
+            }
+        });
+        if (0..24).contains(&hours_ago) {
+            acc.hours.insert(hours_ago, (hr_cnt, worst));
+        }
+        acc.sigs.extend(hr_sigs);
+    }
+
+    let mut result: Vec<(usize, MostActiveRow)> = accs
+        .into_iter()
+        .map(|(ip, acc)| {
+            let max_hr = acc
+                .hours
+                .values()
+                .map(|(c, _)| *c)
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            // 24 cells, oldest (left) to newest (right): cell h is the hour (23 - h) hours ago.
+            let strip = (0..24)
+                .map(|h| match acc.hours.get(&(23 - h)) {
+                    Some((c, sev)) if *c > 0 => {
+                        let frac = (*c as f64).sqrt() / (max_hr as f64).sqrt();
+                        StripCell {
+                            height: (2.0 + 24.0 * frac).round() as u32,
+                            class: match *sev {
+                                4 => "s4",
+                                3 => "s3",
+                                2 => "s2",
+                                1 => "s1",
+                                _ => "",
+                            },
+                        }
+                    }
+                    _ => StripCell {
+                        height: 2,
+                        class: "",
+                    },
+                })
+                .collect();
+            let mut tags: Vec<SigTag> = acc
+                .sigs
+                .iter()
+                .map(|s| SigTag {
+                    label: signal_tag_label(s),
+                    sev: signal_severity(s),
+                })
+                .collect();
+            tags.sort_by_key(|t| std::cmp::Reverse(severity_rank(t.sev)));
+            tags.truncate(3);
+            (
+                acc.order,
+                MostActiveRow {
+                    ip,
+                    event_count: acc.cnt,
+                    last_seen: format_relative_time(acc.last_seen),
+                    last_seen_at: acc.last_seen,
+                    strip,
+                    tags,
+                },
+            )
+        })
+        .collect();
+    result.sort_by_key(|(o, _)| *o);
+    Ok(result.into_iter().map(|(_, r)| r).collect())
+}
+
+/// `GET /dashboard/chart?range=<1h|24h|7d|30d>` - the range-selector HTMX endpoint for the
+/// dashboard's events timeline chart. Renders the same fragment template `dashboard`'s initial
+/// page load includes, so the two never drift into two different chart markups.
+async fn dashboard_chart_fragment(
+    State(state): State<AppState>,
+    Query(params): Query<ChartRangeQuery>,
+) -> Result<Html<String>, AppError> {
+    let current_range = normalize_dashboard_range(params.range.as_deref());
+    let cursor_hint = if current_range != "1h" {
+        state.read_state.rollup.refresh_for_page(&state.db).await
+    } else {
+        0
+    };
+    // A fragment has no page banner to carry the name; the failure is still logged, and the
+    // full-page render names the panel.
+    let (labels, data) = Degraded::new().soft(
+        "events timeline",
+        match current_range {
+            "1h" => five_minute_series(&state.db).await,
+            "7d" => daily_series(&state.db, 6, cursor_hint).await,
+            "30d" => daily_series(&state.db, 29, cursor_hint).await,
+            _ => hourly_series(&state.db, cursor_hint).await,
+        },
+    );
+    let timeline_labels = script_json(&labels);
+    let timeline_data = script_json(&data);
+
+    let tmpl = state
+        .templates
+        .get_template("dashboard_chart_fragment.html")?;
+    let html = tmpl.render(context! {
+        current_range,
+        timeline_labels,
+        timeline_data,
+        // Emits the out-of-band range-selector swap; unset on the full-page render, which
+        // includes this template inline and draws the selector itself.
+        is_fragment => true,
+    })?;
+    Ok(Html(html))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartRangeQuery {
+    #[serde(default)]
+    range: Option<String>,
+}
+
+/// Normalizes the `?range=` query param to one of the four range-selector buttons
+/// (`templates/dashboard.html`'s `dashboard-chart-range` selector); anything else - missing,
+/// malformed, or a value from a future/removed button - falls back to the same "24h" default
+/// `dashboard`'s own initial render uses, rather than erroring on an operator-editable query string.
+fn normalize_dashboard_range(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("1h") => "1h",
+        Some("7d") => "7d",
+        Some("30d") => "30d",
+        _ => "24h",
+    }
+}
+
+/// 25 hourly buckets covering the rolling 24h window (oldest to newest, zero-filled), site-wide -
+/// the dashboard timeline's default range and the "24h" range-selector button. The bucket series
+/// and the event filter share one `now() - 24h` lower bound, so the oldest and newest buckets are
+/// partial hours and every event within the rolling 24h lands in exactly one bucket (the previous
+/// hour-aligned `date_trunc('hour', now()) - 23h` series dropped a whole hour of in-window events at
+/// each hour boundary). Soft-fails to two empty vectors on a query error, per the module doc
+/// comment's chart policy.
+///
+/// Counted from the hourly roll-ups (`crate::rollup`), exact whether or not they are current: the
+/// ledger grouped by hour cost 160 ms per load on 1,500,000 events and grew with the ledger. In a
+/// time zone whose offset is not a whole number of hours a local hour is not a UTC hour, and the
+/// ledger is read as before ([`HOURLY_SERIES_RAW_SQL`]).
+async fn hourly_series(
+    db: &PgPool,
+    cursor_hint: i64,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let sql = if crate::rollup::whole_hour_zone(db).await? {
+        hourly_series_sql(cursor_hint)
+    } else {
+        HOURLY_SERIES_RAW_SQL.to_string()
+    };
+    // Audited: both are fixed text built from constants and one integer.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .fetch_all(db)
+        .await?;
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%H:00").to_string());
+        data.push(cnt);
+    }
+    Ok((labels, data))
+}
+
+/// The hourly timeline straight from the ledger: the statement [`hourly_series_sql`] replaces, kept
+/// for a time zone the roll-ups cannot answer in, and as the oracle the tests hold the roll-up
+/// statement to.
+pub const HOURLY_SERIES_RAW_SQL: &str = "\
+    SELECT bucket, COALESCE(cnt, 0) AS cnt \
+    FROM generate_series( \
+        date_trunc('hour', now() - interval '24 hours'), \
+        date_trunc('hour', now()), \
+        interval '1 hour' \
+    ) AS bucket \
+    LEFT JOIN ( \
+        SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
+        FROM event \
+        WHERE observed_at >= now() - interval '24 hours' \
+        GROUP BY hour \
+    ) sub ON sub.hour = bucket \
+    ORDER BY bucket";
+
+/// [`hourly_series`]'s statement over the hourly roll-ups: the same buckets, the same window, the
+/// counts summed from `crate::rollup::listener_window_sql`.
+pub fn hourly_series_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT bucket, COALESCE(sub.cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_trunc('hour', now() - interval '24 hours'), \
+             date_trunc('hour', now()), \
+             interval '1 hour' \
+         ) AS bucket \
+         LEFT JOIN (SELECT hour, sum(events)::bigint AS cnt FROM parts GROUP BY hour) sub \
+             ON sub.hour = bucket \
+         ORDER BY bucket",
+        window = crate::rollup::listener_window_sql("now() - interval '24 hours'", cursor_hint),
+    )
+}
+
+/// The daily timeline straight from the ledger (see [`HOURLY_SERIES_RAW_SQL`]); `$1` is the number
+/// of days before today.
+pub const DAILY_SERIES_RAW_SQL: &str = "\
+    SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
+    FROM generate_series(current_date - ($1::int * interval '1 day'), current_date, interval '1 day') AS bucket \
+    LEFT JOIN ( \
+        SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
+        FROM event \
+        WHERE observed_at >= current_date - ($1::int * interval '1 day') \
+        GROUP BY day \
+    ) sub ON sub.day = bucket::date \
+    ORDER BY bucket";
+
+/// [`daily_series`]'s statement over the hourly roll-ups: each local day is the sum of its hours
+/// (a local day is a run of UTC hours in a whole-hour zone, which the caller checks); `$1` as in
+/// [`DAILY_SERIES_RAW_SQL`].
+pub fn daily_series_sql(cursor_hint: i64) -> String {
+    format!(
+        "{window} \
+         SELECT bucket::date AS bucket, COALESCE(sub.cnt, 0) AS cnt \
+         FROM generate_series(current_date - ($1::int * interval '1 day'), current_date, interval '1 day') AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('day', hour)::date AS day, sum(events)::bigint AS cnt \
+             FROM parts GROUP BY 1 \
+         ) sub ON sub.day = bucket::date \
+         ORDER BY bucket",
+        window = crate::rollup::listener_window_sql(
+            "(current_date - ($1::int * interval '1 day'))::timestamptz",
+            cursor_hint
+        ),
+    )
+}
+
+/// `days + 1` daily buckets (oldest to newest, zero-filled), site-wide - the "7d"/"30d"
+/// range-selector buttons. From the hourly roll-ups like [`hourly_series`] (the 30-day button
+/// grouped most of the ledger: 1.2 s on 1,500,000 events).
+async fn daily_series(
+    db: &PgPool,
+    days: i32,
+    cursor_hint: i64,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let sql = if crate::rollup::whole_hour_zone(db).await? {
+        daily_series_sql(cursor_hint)
+    } else {
+        DAILY_SERIES_RAW_SQL.to_string()
+    };
+    // Audited: both are fixed text built from constants and one integer.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .persistent(false)
+        .bind(days)
+        .fetch_all(db)
+        .await?;
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<chrono::NaiveDate, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%b %-d").to_string());
+        data.push(cnt);
+    }
+    Ok((labels, data))
+}
+
+/// 12 five-minute buckets (oldest to newest, zero-filled), site-wide - the "1h" range-selector
+/// button, the one range finer than an hourly bucket. `date_bin` (PostgreSQL 14+; this project
+/// targets current PostgreSQL - see `.github/workflows/ci.yml`'s `postgres:18` service image)
+/// aligns each bucket to a fixed 5-minute grid from an arbitrary UTC origin, the same way
+/// `date_trunc('hour', ..)` aligns the other ranges to the hour - without a shared origin, "now"
+/// rounded down to the nearest 5 minutes would drift by up to 4 minutes between the
+/// `generate_series` bound and each row's own bucket, silently misaligning some events into the
+/// wrong bucket.
+async fn five_minute_series(db: &PgPool) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_bin('5 minutes', now(), TIMESTAMPTZ '2000-01-01 00:00:00+00') - interval '55 minutes', \
+             date_bin('5 minutes', now(), TIMESTAMPTZ '2000-01-01 00:00:00+00'), \
+             interval '5 minutes' \
+         ) AS bucket \
+         LEFT JOIN ( \
+             SELECT date_bin('5 minutes', observed_at, TIMESTAMPTZ '2000-01-01 00:00:00+00') AS slot, COUNT(*) AS cnt \
+             FROM event \
+             WHERE observed_at >= now() - interval '1 hour' \
+             GROUP BY slot \
+         ) sub ON sub.slot = bucket \
+         ORDER BY bucket",
+    )
+    .fetch_all(db)
+    .await?;
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<chrono::DateTime<chrono::Utc>, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%H:%M").to_string());
+        data.push(cnt);
+    }
+    Ok((labels, data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(ip: &str, signal: &str, secs_ago: i64) -> RecentRaw {
+        RecentRaw {
+            observed_at: chrono::Utc::now() - chrono::Duration::seconds(secs_ago),
+            sensor: "telnet".into(),
+            signal_type: signal.into(),
+            source_ip: ip.into(),
+        }
+    }
+
+    #[test]
+    fn fold_recent_keeps_the_newest_runs_and_marks_only_a_run_cut_by_the_scan() {
+        let a = "203.0.113.1";
+        let b = "203.0.113.2";
+        let events = vec![
+            raw(a, "honeypot_command_exec", 1),
+            raw(a, "honeypot_command_exec", 2),
+            raw(a, "honeypot_command_exec", 3),
+            raw(b, "honeypot_command_exec", 4),
+            raw(a, "honeypot_command_exec", 5),
+            raw(a, "honeypot_login_attempt", 6),
+            raw(a, "honeypot_login_attempt", 7),
+        ];
+
+        let all = fold_recent(&events, 20, false);
+        let shape: Vec<(&str, usize, bool)> = all
+            .iter()
+            .map(|r| (r.source_ip.as_str(), r.count, r.open_ended))
+            .collect();
+        assert_eq!(
+            shape,
+            [(a, 3, false), (b, 1, false), (a, 1, false), (a, 2, false)]
+        );
+        assert_eq!(all[3].activity, "Telnet login attempt");
+
+        // The scan stopped at its limit: the last run may go further back.
+        let cut = fold_recent(&events, 20, true);
+        assert!(cut[3].open_ended && !cut[2].open_ended);
+
+        // Fewer rows than runs: the newest two, and neither reaches the end of the scan.
+        let two = fold_recent(&events, 2, true);
+        assert_eq!(two.len(), 2);
+        assert_eq!((two[0].count, two[1].count), (3, 1));
+        assert!(!two[1].open_ended);
+    }
+
+    #[test]
+    fn normalize_dashboard_range_accepts_known_values_and_defaults_to_24h() {
+        assert_eq!(normalize_dashboard_range(Some("1h")), "1h");
+        assert_eq!(normalize_dashboard_range(Some("24h")), "24h");
+        assert_eq!(normalize_dashboard_range(Some("7d")), "7d");
+        assert_eq!(normalize_dashboard_range(Some("30d")), "30d");
+        assert_eq!(normalize_dashboard_range(Some("bogus")), "24h");
+        assert_eq!(normalize_dashboard_range(None), "24h");
+    }
+}

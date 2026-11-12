@@ -1,0 +1,680 @@
+//! The publisher: the last stage of a feed build. See `internal/design/05-blocklist-feed.md`'s
+//! "Publisher" and "Error handling".
+//!
+//! Three responsibilities, run in this order:
+//!
+//! 0. Restore a feed parked by an interrupted earlier swap (see `recover_interrupted_publish`),
+//!    before anything that can reject this build. A build that fails re-validation or staging must
+//!    not leave the public path absent when a complete previous feed is sitting beside it.
+//! 1. Re-validate every entry in the snapshot against the exclusion engine. This is
+//!    defense-in-depth - `FeedBuilder::build` already applies `ExclusionEngine::is_excluded` - but
+//!    the design is explicit that a bug in the builder must not leak a reserved/allowlisted/
+//!    delisted address into a published feed. Unlike the builder (which drops individual
+//!    offending entries and keeps building), the publisher rejects the WHOLE build on the first
+//!    violation: "a single leaked reserved IP would invalidate the operator's trust in the whole
+//!    feed" (design's "Exclusion engine").
+//! 2. Render every exporter format for both tiers plus `manifest.json`, write them to a
+//!    same-filesystem staging directory, and atomically swap that directory into `output_dir` -
+//!    see `swap_into_place` for exactly what "atomic" means here.
+//!
+//! Any error aborts before `output_dir` is touched (re-validation failures, staging I/O errors) or
+//! leaves it holding its previous, complete content (an error surfacing after staging succeeded
+//! but before the swap): "A file write error fails the entire publish. The previous feed version
+//! stays in place" (design's "Error handling").
+//!
+//! `output_dir`'s PARENT must be writable, not merely `output_dir` itself: an atomic swap of the
+//! whole file set requires renaming a staging directory into place, and `rename(2)` acts on a
+//! directory ENTRY within a shared parent, not on the target directory's own contents. The shipped
+//! `deploy/feed.service` grants this correctly - `ReadWritePaths=/var/lib/propolis/feed`, a
+//! dedicated root scoped to this service alone (never the shared `/var/lib/propolis`), with the
+//! default `PROPOLIS_FEED_OUTPUT_DIR` one level inside it (`/var/lib/propolis/feed/current`) so
+//! the sibling staging/previous directories this module creates land inside that same granted
+//! root. See that file's header comment for the full reasoning.
+
+use std::io::{self, Write};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use core_scoring::FeedTier;
+
+use crate::export::{export_cidr, export_csv, export_json, export_plaintext, format_timestamp};
+use crate::{ExclusionEngine, FeedConfig, FeedEntry, FeedSnapshot};
+
+/// Errors from [`Publisher::publish`]. Every variant rejects the build in its entirety - there is
+/// no partial publish. See the module doc comment.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishError {
+    /// An entry failed re-validation against the exclusion engine. Fails the whole snapshot, not
+    /// just this entry - see the module doc comment.
+    #[error(
+        "entry {ip} in the {tier:?} tier failed publisher re-validation against exclusions; \
+         rejecting the entire build"
+    )]
+    ExclusionViolation { ip: IpAddr, tier: Option<FeedTier> },
+
+    /// `output_dir` has no file-name component (e.g. `/`), so a same-filesystem sibling staging
+    /// directory cannot be derived. Fails closed rather than falling back to a system temp
+    /// directory (e.g. `/tmp`), which may be a different filesystem and would silently break the
+    /// atomic-rename guarantee (`rename(2)` returns `EXDEV` across filesystems).
+    #[error("output directory {0:?} has no file name; refusing to publish")]
+    InvalidOutputDir(PathBuf),
+
+    /// A filesystem error while staging, writing, verifying, or swapping in the new build.
+    #[error("i/o error during publish: {0}")]
+    Io(#[from] io::Error),
+
+    /// Staging could not be created under `parent`. Its own variant, rather than a bare `Io`,
+    /// because the bare `io::Error` names no path: a real deployment lost two hours of feed
+    /// publishes to `Permission denied (os error 13)` with nothing to say WHICH directory was
+    /// unwritable. Staging is a SIBLING of `output_dir` (see `create_staging_dir`), so the
+    /// permission that matters is on the output dir's PARENT, which is the non-obvious part worth
+    /// spelling out in the message.
+    #[error(
+        "cannot create the staging directory under {parent:?} (needed to publish to {output_dir:?} \
+         atomically): {source}. Staging is created as a sibling of the output directory, so the \
+         publishing user needs write permission on {parent:?}, not just on {output_dir:?}"
+    )]
+    StagingUnwritable {
+        parent: PathBuf,
+        output_dir: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// `manifest.json` serialization failed. Not expected in practice - every field is a plain
+    /// `String` or `usize` - but `serde_json::to_string` is fallible in general, so this is
+    /// handled rather than `expect`-ed.
+    #[error("manifest serialization error: {0}")]
+    Manifest(#[from] serde_json::Error),
+
+    /// The staged plain-text file's content, re-read from disk, did not hash to the same SHA-256
+    /// just computed from the in-memory string. An integrity self-check - confirming a write's
+    /// post-state landed rather than assuming it did - not expected to ever fire absent a
+    /// filesystem-level bug.
+    #[error(
+        "checksum self-check failed for {0:?}: on-disk content does not match what was generated"
+    )]
+    ChecksumMismatch(PathBuf),
+}
+
+/// Stateless namespace for the publish step (mirrors `FeedBuilder`'s own shape).
+pub struct Publisher;
+
+impl Publisher {
+    /// Re-validates `snapshot` against `exclusions`, renders every export format for both tiers
+    /// plus `manifest.json`, and atomically publishes the result to `output_dir`.
+    ///
+    /// `config` supplies the tier TTLs used to compute each tier's `valid_until` independent of
+    /// whether that tier has any entries: `FeedSnapshot` carries `valid_until` only per-entry, so
+    /// an empty tier has no entry to read it from, and the design requires an empty feed to
+    /// "publish normally" with valid output (design's "Error handling") - callers pass the same
+    /// `FeedConfig` used to build the snapshot.
+    pub fn publish(
+        snapshot: &FeedSnapshot,
+        output_dir: &Path,
+        exclusions: &ExclusionEngine,
+        config: &FeedConfig,
+    ) -> Result<(), PublishError> {
+        // FIRST, before any work that can reject this build: put back a feed that a previously
+        // interrupted swap left parked beside the public path. Recovery used to live only inside
+        // `swap_into_place`, the very last step, so every fallible stage ahead of it - the
+        // re-validation below, staging, rendering - returned with the public path still absent and
+        // the last valid feed still parked. A snapshot that fails re-validation is exactly when
+        // consumers most need the previous feed to still be there; restoring it is independent of
+        // whether this build turns out to be publishable, so it happens first.
+        //
+        // Propagated rather than logged: recovery only acts when the public path is absent AND a
+        // parked build is there to restore, and `swap_into_place` would hit the same failure a
+        // moment later, so failing here fails the same publish without first doing the build work.
+        recover_interrupted_publish(output_dir)?;
+
+        revalidate(snapshot, exclusions)?;
+
+        let file_name = output_dir
+            .file_name()
+            .ok_or_else(|| PublishError::InvalidOutputDir(output_dir.to_path_buf()))?;
+        let parent = match output_dir.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+
+        let staging = create_staging_dir(parent, file_name)?;
+        // From here on, any early return via `?` leaves only a stray staging directory on disk
+        // (overwritten by the next run's `create_staging_dir`, which clears a same-named
+        // leftover) - `output_dir` itself is untouched until `swap_into_place`, the last step.
+        let aggressive = write_tier(
+            &staging,
+            "aggressive",
+            snapshot.build_time,
+            snapshot.build_time + config.aggressive_ttl,
+            &snapshot.aggressive,
+        )?;
+        let standard = write_tier(
+            &staging,
+            "standard",
+            snapshot.build_time,
+            snapshot.build_time + config.standard_ttl,
+            &snapshot.standard,
+        )?;
+
+        // Retention feeds, published alongside the two tiered ones as `all-{label}.*`. Each is
+        // already scoped to its window by the builder; the retention carried on the `WindowFeed`
+        // sets the file header's stated validity, so an empty window still states the window it
+        // covers rather than falling back to a guess.
+        let mut windows = Vec::with_capacity(snapshot.windows.len());
+        for window in &snapshot.windows {
+            let manifest_entry = write_tier(
+                &staging,
+                &format!("all-{}", window.label),
+                snapshot.build_time,
+                snapshot.build_time + window.retention,
+                &window.entries,
+            )?;
+            windows.push(WindowManifest {
+                label: window.label.clone(),
+                count: manifest_entry.count,
+                sha256: manifest_entry.sha256,
+                valid_until: manifest_entry.valid_until,
+            });
+        }
+
+        let manifest = Manifest {
+            build_time: format_timestamp(snapshot.build_time),
+            tiers: ManifestTiers {
+                aggressive,
+                standard,
+            },
+            windows,
+            exclusions: ExclusionsManifest {
+                allowlist_count: exclusions.allowlist_len(),
+                delist_count: exclusions.delist_len(),
+                asn_allowlist_count: exclusions.asn_allowlist_len(),
+                asn_db_loaded: exclusions.asn_db_loaded(),
+            },
+        };
+        let manifest_json = serde_json::to_string(&manifest)?;
+        write_file_synced(&staging.join("manifest.json"), manifest_json.as_bytes())?;
+
+        swap_into_place(&staging, output_dir)?;
+        Ok(())
+    }
+}
+
+/// Fails the whole build on the first entry that should never have reached a `FeedSnapshot` at
+/// all. See the module doc comment for why this is whole-snapshot, not per-entry.
+/// Covers the retention feeds as well as the two tiers. They are built by the same code path and
+/// so carry the same risk, and a reserved address leaking into `all-90d.txt` discredits the feed
+/// exactly as much as one leaking into `aggressive.txt` - a check that only guards the surfaces
+/// that existed when it was written stops guarding as soon as a new one is added.
+fn revalidate(snapshot: &FeedSnapshot, exclusions: &ExclusionEngine) -> Result<(), PublishError> {
+    let tiered = [
+        ("aggressive".to_string(), &snapshot.aggressive),
+        ("standard".to_string(), &snapshot.standard),
+    ];
+    let windowed = snapshot
+        .windows
+        .iter()
+        .map(|w| (format!("all-{}", w.label), &w.entries));
+
+    for (feed, entries) in tiered.into_iter().chain(windowed) {
+        for entry in entries {
+            if exclusions.is_excluded(entry.source_ip) {
+                tracing::error!(
+                    ip = %entry.source_ip,
+                    %feed,
+                    "publisher: entry failed re-validation against exclusions; rejecting the entire build"
+                );
+                return Err(PublishError::ExclusionViolation {
+                    ip: entry.source_ip,
+                    tier: entry.tier,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates a clean same-filesystem staging directory as a sibling of the eventual `output_dir`
+/// (both under `parent`), so the final `swap_into_place` rename is guaranteed same-filesystem.
+///
+/// Uses a FIXED name (`.{file_name}.staging`), not one salted with a pid/timestamp: this crate's
+/// deployment model is a single systemd instance (`deploy/feed.service`, `Type=simple`, no
+/// concurrent invocation), the same single-writer assumption `intake::cursor`'s own
+/// write-temp-then-rename helper makes for its cursor file. A leftover from a run that crashed
+/// after staging began must not silently mix its files with this run's, so an existing leftover is
+/// removed before starting.
+fn create_staging_dir(parent: &Path, file_name: &std::ffi::OsStr) -> Result<PathBuf, PublishError> {
+    // Every failure here is reported as StagingUnwritable, naming `parent`: a bare io::Error says
+    // only "Permission denied (os error 13)" with no path, which is what made a real misconfigured
+    // deployment (output dir set one level too high, so `parent` was a root-owned directory) take
+    // hours to diagnose while the publisher retried silently every build interval.
+    let staged = |source: io::Error| PublishError::StagingUnwritable {
+        parent: parent.to_path_buf(),
+        output_dir: parent.join(file_name),
+        source,
+    };
+    std::fs::create_dir_all(parent).map_err(staged)?;
+    let staging = parent.join(format!(".{}.staging", file_name.to_string_lossy()));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(staged)?;
+    }
+    std::fs::create_dir_all(&staging).map_err(staged)?;
+    Ok(staging)
+}
+
+/// Renders and writes all four export formats for one tier, verifies the plain-text file's
+/// on-disk content against a freshly computed digest, and returns that tier's `manifest.json`
+/// entry. `generated`/`valid_until` are passed explicitly (never derived from `entries`) so a
+/// zero-entry tier still renders a correct header/meta and manifest entry - see the exporters'
+/// own doc comments (`crate::export`'s module doc) for why they take the same two parameters
+/// explicitly rather than reading `entries[0]`.
+fn write_tier(
+    staging: &Path,
+    name: &str,
+    generated: DateTime<Utc>,
+    valid_until: DateTime<Utc>,
+    entries: &[FeedEntry],
+) -> Result<TierManifest, PublishError> {
+    let txt = export_plaintext(name, generated, valid_until, entries);
+    write_file_synced(&staging.join(format!("{name}.txt")), txt.as_bytes())?;
+    write_file_synced(
+        &staging.join(format!("{name}.json")),
+        export_json(name, generated, valid_until, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.csv")),
+        export_csv(entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.cidr")),
+        export_cidr(entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.ipset")),
+        crate::export::export_ipset(name, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.nft")),
+        crate::export::export_nftables(name, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.pf")),
+        crate::export::export_pf(name, generated, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.alias")),
+        crate::export::export_pfsense_alias(name, entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.hosts")),
+        crate::export::export_hosts(entries).as_bytes(),
+    )?;
+    write_file_synced(
+        &staging.join(format!("{name}.rpz")),
+        crate::export::export_rpz(name, generated, entries).as_bytes(),
+    )?;
+
+    // Integrity self-check: re-read the plain-text file just written and confirm its on-disk
+    // digest matches what was just generated, before that digest is recorded in `manifest.json` -
+    // read the post-state, don't assume the write landed.
+    let sha256 = sha256_hex(txt.as_bytes());
+    let txt_path = staging.join(format!("{name}.txt"));
+    let on_disk = std::fs::read(&txt_path)?;
+    if sha256_hex(&on_disk) != sha256 {
+        return Err(PublishError::ChecksumMismatch(txt_path));
+    }
+
+    Ok(TierManifest {
+        count: entries.len(),
+        sha256,
+        valid_until: format_timestamp(valid_until),
+    })
+}
+
+/// Writes `bytes` to `path` and `fsync`s before returning, matching
+/// `intake::cursor::CursorStore::save`'s own durability idiom: a rename that follows a write not
+/// yet flushed to disk can be reordered ahead of it by the filesystem on a crash, so every file
+/// this module writes is synced before the directory that holds it is ever renamed into view.
+fn write_file_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Where a two-step swap parks the previous build while the new one moves into its place.
+///
+/// A sibling of `output_dir` under the same parent, so both renames are same-filesystem. Its name
+/// is derived from `output_dir`'s, so two feeds published side by side under one parent cannot
+/// collide on it, and a leftover one names the output directory it belongs to.
+fn previous_dir(output_dir: &Path) -> Option<PathBuf> {
+    let parent = match output_dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    // `None` only for a path with no final component (`/`, `..`), which `Publisher::publish`
+    // already rejects as `InvalidOutputDir`; the caller falls back to a plain rename.
+    let file_name = output_dir.file_name()?;
+    Some(parent.join(format!(".{}.previous", file_name.to_string_lossy())))
+}
+
+/// Puts the public path back if a previous swap was interrupted between its two renames.
+///
+/// The window is real: [`swap_into_place`] moves the old directory aside and then moves staging
+/// into its place, and a crash (or a kill, or a machine losing power) between those two renames
+/// leaves `output_dir` absent with the complete previous build sitting in [`previous_dir`]. Every
+/// consumer of the feed then gets "not found" until some later build happens to succeed, which on
+/// a 15-minute build interval is a 15-minute outage of a path other people's blocklists fetch -
+/// and indefinitely long if the same fault also stops the builds.
+///
+/// So the recovery is not deferred to the next successful publish: this restores the last valid
+/// feed on its own. It is deliberately conservative - it moves the parked directory back ONLY when
+/// `output_dir` is absent, so it can never overwrite a live feed, and it is safe to call at
+/// startup and before every publish.
+///
+/// Returns `Ok(true)` when it restored something, `Ok(false)` when there was nothing to do.
+pub fn recover_interrupted_publish(output_dir: &Path) -> io::Result<bool> {
+    if output_dir.exists() {
+        return Ok(false);
+    }
+    let Some(old_aside) = previous_dir(output_dir) else {
+        return Ok(false);
+    };
+    if !old_aside.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(&old_aside, output_dir)?;
+    tracing::warn!(
+        output_dir = %output_dir.display(),
+        restored_from = %old_aside.display(),
+        "publisher: the published feed directory was missing and a previous build was parked \
+         beside it - a publish was interrupted between its two renames; the last valid feed has \
+         been restored"
+    );
+    Ok(true)
+}
+
+/// Atomically replaces `output_dir`'s content with `staging`'s.
+///
+/// If `output_dir` does not exist yet, a single `rename` is already atomic and sufficient. If it
+/// does exist, `rename(2)` cannot replace a non-empty directory directly (`ENOTEMPTY` on Linux),
+/// so this takes two rename steps instead: move the old directory aside, then move staging into
+/// its place. Both steps are individually atomic and same-filesystem (`old_aside` and `staging`
+/// are both siblings of `output_dir` under the same parent), so a reader of `output_dir` always
+/// sees either the complete previous build or the complete new one. The one gap this leaves is the
+/// instant between the two renames where `output_dir` does not exist at all - a concurrent reader
+/// at exactly that instant sees "not found yet", never a torn mix of old and new files, which is
+/// the guarantee the design's "Atomic publish" asks for ("consumers never see a partially-written
+/// feed").
+///
+/// Two things close that window rather than leaving it open for the next build to notice:
+///
+/// * If the second rename FAILS (a full filesystem, a permission change, an `EXDEV` from a staging
+///   directory that is not actually a sibling), the parked directory is moved straight back, so a
+///   failed publish leaves the previous feed serving rather than nothing at all. The publish still
+///   reports the original error - the rollback restores availability, it does not hide the fault.
+/// * If the process DIES in the window, nothing here can run; [`recover_interrupted_publish`]
+///   restores the parked build at the next startup and at the head of every publish.
+fn swap_into_place(staging: &Path, output_dir: &Path) -> io::Result<()> {
+    // A prior interrupted swap leaves the public path absent and the previous build parked. Put it
+    // back before deciding which branch below applies: otherwise the "does not exist" branch
+    // publishes over the top and the parked copy is orphaned, keeping the disk cost of a build
+    // nobody will ever serve.
+    recover_interrupted_publish(output_dir)?;
+
+    let Some(old_aside) = previous_dir(output_dir) else {
+        return std::fs::rename(staging, output_dir);
+    };
+    if !output_dir.exists() {
+        return std::fs::rename(staging, output_dir);
+    }
+
+    if old_aside.exists() {
+        std::fs::remove_dir_all(&old_aside)?;
+    }
+
+    std::fs::rename(output_dir, &old_aside)?;
+    if let Err(e) = std::fs::rename(staging, output_dir) {
+        // The public path is empty right now and the only complete feed on disk is the one parked
+        // a moment ago. Put it back before returning, so the failure costs a build rather than the
+        // feed's availability.
+        match std::fs::rename(&old_aside, output_dir) {
+            Ok(()) => tracing::error!(
+                output_dir = %output_dir.display(),
+                error = %e,
+                "publisher: could not move the new build into place; the previous feed was \
+                 restored and stays published"
+            ),
+            Err(rollback) => tracing::error!(
+                output_dir = %output_dir.display(),
+                parked = %old_aside.display(),
+                error = %e,
+                rollback_error = %rollback,
+                "publisher: could not move the new build into place AND could not restore the \
+                 previous one; the published feed path is absent and the last valid build is \
+                 parked beside it - startup recovery will restore it, or move it back by hand"
+            ),
+        }
+        return Err(e);
+    }
+
+    // Best-effort cleanup: every consumer-visible guarantee already holds by this point (the
+    // rename above completed), so a failure here is logged, not propagated as a publish failure.
+    if let Err(e) = std::fs::remove_dir_all(&old_aside) {
+        tracing::warn!(
+            path = %old_aside.display(),
+            error = %e,
+            "publisher: failed to clean up the previous build directory after a successful publish"
+        );
+    }
+    Ok(())
+}
+
+/// `manifest.json`'s document shape - see the design's "Manifest".
+#[derive(Debug, Serialize)]
+struct Manifest {
+    build_time: String,
+    tiers: ManifestTiers,
+    /// One entry per retention feed. Additive: a consumer reading only `tiers` is unaffected, and
+    /// an unconfigured deployment publishes an empty array.
+    windows: Vec<WindowManifest>,
+    /// What this build kept OFF the feed - the exclusion engine's configured counts, so the console
+    /// can show suppression state without reading the feed's env itself. Additive: an older consumer
+    /// ignores it.
+    exclusions: ExclusionsManifest,
+}
+
+/// The exclusion engine's configured state, published so the operator can confirm at a glance what
+/// is being kept off the feed (the ASN suppression especially, which is otherwise only visible in a
+/// one-shot startup log).
+#[derive(Debug, Serialize)]
+struct ExclusionsManifest {
+    allowlist_count: usize,
+    delist_count: usize,
+    asn_allowlist_count: usize,
+    /// `false` with a non-zero `asn_allowlist_count` means the ASN allowlist is configured but the
+    /// GeoLite2-ASN database did not load, so suppression is inert - the console flags that.
+    asn_db_loaded: bool,
+}
+
+/// A retention feed's manifest entry. Carries `label` because - unlike the two fixed tiers - the
+/// set of windows is operator-configured, so a consumer cannot know the filenames in advance.
+#[derive(Debug, Serialize)]
+struct WindowManifest {
+    label: String,
+    count: usize,
+    sha256: String,
+    valid_until: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestTiers {
+    aggressive: TierManifest,
+    standard: TierManifest,
+}
+
+#[derive(Debug, Serialize)]
+struct TierManifest {
+    count: usize,
+    sha256: String,
+    valid_until: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_matches_a_known_vector() {
+        // SHA-256("") - the standard empty-input test vector.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_is_deterministic_and_input_sensitive() {
+        assert_eq!(sha256_hex(b"abc"), sha256_hex(b"abc"));
+        assert_ne!(sha256_hex(b"abc"), sha256_hex(b"abd"));
+    }
+
+    // Reproduces a real outage: the output dir was configured one level too high, so staging (a
+    // SIBLING of the output dir) landed in a root-owned directory and every publish failed with a
+    // bare "Permission denied (os error 13)" naming no path. The error must name the unwritable
+    // parent and explain that the parent, not the output dir, is what needs write permission.
+    #[test]
+    #[cfg(unix)]
+    fn staging_failure_names_the_unwritable_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("readonly-parent");
+        std::fs::create_dir(&parent).expect("create parent");
+        // Strip write permission, mirroring a root-owned dir the publishing user cannot write.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod parent");
+
+        let err = create_staging_dir(&parent, std::ffi::OsStr::new("current"))
+            .expect_err("staging must fail when the parent is not writable");
+
+        let rendered = err.to_string();
+        assert!(
+            matches!(err, PublishError::StagingUnwritable { .. }),
+            "expected StagingUnwritable, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&parent.display().to_string()),
+            "the error must name the unwritable parent directory, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("write permission"),
+            "the error must say what permission is needed, got: {rendered}"
+        );
+
+        // Restore so tempdir cleanup can remove it.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+
+    /// Publishes a directory standing in for a finished build.
+    fn build_dir(at: &Path, marker: &str) {
+        std::fs::create_dir_all(at).expect("create build dir");
+        std::fs::write(at.join("aggressive.txt"), marker).expect("write marker");
+    }
+
+    /// The failure the two-rename swap cannot recover from by itself: the OLD directory has
+    /// already been moved aside and the NEW one cannot take its place. Injected here by handing
+    /// `swap_into_place` a staging path that does not exist, so the second `rename` fails with
+    /// `ENOENT` at exactly the point a full filesystem or a permission change would.
+    ///
+    /// Without the rollback this leaves the published path absent - the feed 404s for every
+    /// consumer until some later build happens to succeed.
+    #[test]
+    fn a_failed_second_rename_restores_the_previous_build_rather_than_leaving_no_feed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_dir = tmp.path().join("current");
+        build_dir(&output_dir, "v1");
+
+        let missing_staging = tmp.path().join(".current.staging");
+        let err = swap_into_place(&missing_staging, &output_dir)
+            .expect_err("the swap must fail when staging cannot be moved into place");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        assert!(
+            output_dir.exists(),
+            "the published path must not be left absent by a failed swap"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+            "v1",
+            "the previous build must be the one restored, with its content intact"
+        );
+        assert!(
+            !previous_dir(&output_dir).unwrap().exists(),
+            "the rollback must leave no parked copy behind"
+        );
+    }
+
+    /// The other half of the same window: the process dies BETWEEN the two renames, so no
+    /// rollback can run. On disk that is exactly a missing output dir beside a complete parked
+    /// build, which is what this constructs.
+    #[test]
+    fn recovery_restores_the_public_path_after_a_crash_between_the_two_renames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_dir = tmp.path().join("current");
+        build_dir(&output_dir, "v1");
+
+        // Crash simulation: the first rename happened, the second never did.
+        let parked = previous_dir(&output_dir).unwrap();
+        std::fs::rename(&output_dir, &parked).expect("park the previous build");
+        assert!(
+            !output_dir.exists(),
+            "precondition: the feed path is absent"
+        );
+
+        assert!(
+            recover_interrupted_publish(&output_dir).expect("recovery must succeed"),
+            "recovery must report that it restored something"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+            "v1",
+            "the last valid feed must be back at the public path"
+        );
+        assert!(
+            !parked.exists(),
+            "the parked copy must be consumed, not copied"
+        );
+    }
+
+    #[test]
+    fn recovery_never_overwrites_a_live_feed_and_is_a_no_op_with_nothing_parked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_dir = tmp.path().join("current");
+        build_dir(&output_dir, "live");
+
+        // Nothing parked: nothing to do.
+        assert!(!recover_interrupted_publish(&output_dir).unwrap());
+
+        // A stale parked copy beside a LIVE feed must never be promoted over it - that would
+        // republish an older build on every restart.
+        let parked = previous_dir(&output_dir).unwrap();
+        build_dir(&parked, "stale");
+        assert!(!recover_interrupted_publish(&output_dir).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(output_dir.join("aggressive.txt")).unwrap(),
+            "live",
+            "the live feed must be left exactly as it was"
+        );
+    }
+}

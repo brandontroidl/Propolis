@@ -1,0 +1,313 @@
+//! Event emission: the single path every sensor uses to append a `sensor-wire` record to its
+//! local NDJSON log. See "Event emission" and "Transport" in
+//! `internal/design/02-sensor-framework.md`: the sensor never talks to intake directly, so an
+//! event exists once (and only once) it lands as a complete line in this file. The error-handling
+//! rule this module enforces - "if an event cannot be serialized or appended, ... a sensor never
+//! ... partially writes an event line" - is a framework guarantee, not left to each sensor to get
+//! right independently.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use sensor_wire::SensorEvent;
+use tokio::io::AsyncWriteExt;
+use tokio::time::Instant;
+
+use crate::command_flood::{Admission, CommandEventGate, summarizable};
+use crate::source_flood::{SourceAdmission, SourceEventGate};
+
+pub struct EventEmitter {
+    log_path: PathBuf,
+    source_gate: Option<Arc<SourceEventGate>>,
+    command_gate: Option<Arc<CommandEventGate>>,
+}
+
+impl EventEmitter {
+    pub fn new(log_path: PathBuf) -> Self {
+        Self {
+            log_path,
+            source_gate: None,
+            command_gate: None,
+        }
+    }
+
+    /// Bound the connection and login events this emitter writes per source (see
+    /// [`SourceEventGate`]); the rest are folded into summaries the gate's writer emits.
+    #[must_use]
+    pub fn with_source_gate(mut self, gate: Arc<SourceEventGate>) -> Self {
+        self.source_gate = Some(gate);
+        self
+    }
+
+    /// Bound the plain command events this emitter writes per source network (see
+    /// [`CommandEventGate`]) for a sensor whose handlers emit them directly rather than through
+    /// the shell's `ConnectionBudget`.
+    #[must_use]
+    pub fn with_command_gate(mut self, gate: Arc<CommandEventGate>) -> Self {
+        self.command_gate = Some(gate);
+        self
+    }
+
+    /// Whether a gate folded `event` into a summary instead of letting it be written.
+    fn suppressed(&self, event: &SensorEvent) -> bool {
+        if let Some(gate) = &self.source_gate
+            && gate.admit(event) == SourceAdmission::Summarized
+        {
+            return true;
+        }
+        self.command_gate.as_ref().is_some_and(|gate| {
+            summarizable(event) && gate.admit_at(event, Instant::now()) == Admission::Summarized
+        })
+    }
+
+    /// Serialize `event` and append it as one NDJSON line.
+    ///
+    /// Every sensor connection appends through the same `EventEmitter` concurrently in
+    /// production (it is held behind an `Arc` by the capture hand-off and by each per-connection
+    /// handler), so this opens the log with `O_APPEND` (`OpenOptions::append`) and issues exactly
+    /// one `write_all` of the whole line rather than seeking manually. Per `open(2)`: "the
+    /// modification of the file offset and the write operation are performed as a single atomic
+    /// step" for O_APPEND on a local filesystem, so concurrent appenders' lines are serialized,
+    /// never interleaved or overwritten - this is not a size-dependent guarantee (it does not
+    /// come from PIPE_BUF, which governs pipes, not regular files) and it does not extend to NFS,
+    /// where the client kernel simulates O_APPEND and can race; the log directory must be local
+    /// storage, consistent with the one-directional-channel model already assuming a local mount.
+    ///
+    /// `flush().await` is required, not decorative: `tokio::fs::File`'s `poll_write` hands the
+    /// buffer to a background blocking-pool task and returns before that task has necessarily
+    /// run, so a caller that skipped the flush could observe `append` return before the OS
+    /// `write(2)` had actually executed.
+    ///
+    /// `append` also mints a UUIDv7 `occurrence_id` when `event` does not already carry one, and
+    /// returns the id actually written. Minting here - the single chokepoint every sensor uses -
+    /// guarantees every event that lands in the local log has a stable id with no per-sensor code
+    /// required to set one.
+    ///
+    /// The same chokepoint stamps `metadata.local_port` from the listener the calling task is
+    /// serving (see [`crate::arrival`]), so no sensor builds that key itself either.
+    ///
+    /// With a gate attached, an event over its source's budget is not written: it is counted into
+    /// a summary and `append` returns `Ok` with an id that names no line. Only connection, login
+    /// and plain command events are ever gated, and none of their callers use the id.
+    pub async fn append(&self, event: &SensorEvent) -> std::io::Result<uuid::Uuid> {
+        if self.suppressed(event) {
+            return Ok(event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7));
+        }
+        let occurrence_id = event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7);
+        let arrival = crate::arrival::current();
+
+        // Only clone when something is added; an event outside any listener scope that already
+        // carries its id (a test, a tool) pays no clone.
+        let line = if event.occurrence_id.is_some() && arrival.is_none() {
+            serde_json::to_string(event)
+        } else {
+            let mut e = event.clone();
+            e.occurrence_id = Some(occurrence_id);
+            if let Some(arrival) = arrival {
+                crate::arrival::stamp(&mut e, arrival);
+            }
+            serde_json::to_string(&e)
+        }
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let line = format!("{line}\n");
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
+        Ok(occurrence_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sensor_wire::*;
+
+    fn sample_event() -> SensorEvent {
+        SensorEvent {
+            v: WIRE_VERSION,
+            source_ip: "203.0.113.7".parse().unwrap(),
+            wan_ip: Some("198.51.100.4".parse().unwrap()),
+            sensor: "ssh".into(),
+            signal_type: SIGNAL_HONEYPOT_COMMAND_EXEC.into(),
+            protocol: PROTO_TCP.into(),
+            authenticated: true,
+            observed_at: "2026-07-20T14:03:11.482913Z".parse().unwrap(),
+            metadata: serde_json::json!({"command": "uname -a"}),
+            sample: None,
+            session_id: None,
+            occurrence_id: None,
+            reply: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn append_produces_valid_ndjson_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log_path.clone());
+        let id = emitter.append(&sample_event()).await.unwrap();
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: SensorEvent = serde_json::from_str(lines[0]).unwrap();
+        let mut expected = sample_event();
+        expected.occurrence_id = Some(id);
+        assert_eq!(parsed, expected);
+    }
+
+    #[tokio::test]
+    async fn multiple_appends_produce_separate_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log_path.clone());
+        for _ in 0..5 {
+            emitter.append(&sample_event()).await.unwrap();
+        }
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 5);
+        for line in &lines {
+            let _: SensorEvent = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn emitted_line_has_no_embedded_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log_path.clone());
+        emitter.append(&sample_event()).await.unwrap();
+        let bytes = tokio::fs::read(&log_path).await.unwrap();
+        // Exactly one newline, at the end.
+        let newline_count = bytes.iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(newline_count, 1);
+        assert_eq!(*bytes.last().unwrap(), b'\n');
+    }
+
+    // Not in the brief's given suite. None of the three tests above call `append` from more than
+    // one task, so none can distinguish this correct, stateless-`OpenOptions`-per-call
+    // implementation from a plausible but broken alternative - e.g. one that caches a single open
+    // file handle and tracks a "next offset" in memory to seek to before writing, which races
+    // under concurrent callers and can interleave or clobber another task's bytes. Every sensor
+    // connection is handled by its own spawned task and all of them append through one shared
+    // `EventEmitter` (see the module doc and Task 6's hand-off), so concurrent calls are the real
+    // production access pattern, not an edge case.
+    #[tokio::test]
+    async fn concurrent_appends_do_not_corrupt_or_lose_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let emitter = std::sync::Arc::new(EventEmitter::new(log_path.clone()));
+
+        const TASKS: u64 = 20;
+        const PER_TASK: u64 = 5;
+        let mut handles = Vec::with_capacity(TASKS as usize);
+        for task_id in 0..TASKS {
+            let emitter = emitter.clone();
+            handles.push(tokio::spawn(async move {
+                for seq in 0..PER_TASK {
+                    let mut event = sample_event();
+                    event.metadata = serde_json::json!({ "task_id": task_id, "seq": seq });
+                    emitter.append(&event).await.unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let content = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len() as u64,
+            TASKS * PER_TASK,
+            "line count must match appends issued: no line lost or merged under concurrency"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for line in &lines {
+            let event: SensorEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("corrupted or interleaved line ({e}): {line:?}"));
+            let task_id = event.metadata["task_id"].as_u64().unwrap();
+            let seq = event.metadata["seq"].as_u64().unwrap();
+            assert!(
+                seen.insert((task_id, seq)),
+                "duplicate (task_id, seq) pair {task_id:?}/{seq:?}: a line was double-counted"
+            );
+        }
+        assert_eq!(seen.len() as u64, TASKS * PER_TASK);
+    }
+
+    #[tokio::test]
+    async fn append_mints_occurrence_id_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log.clone());
+        let e = sample_event(); // occurrence_id: None
+        let id = emitter.append(&e).await.unwrap();
+        let line = std::fs::read_to_string(&log).unwrap();
+        let written: SensorEvent = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(
+            written.occurrence_id,
+            Some(id),
+            "written line carries the returned id"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_preserves_a_present_occurrence_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log.clone());
+        let fixed = uuid::Uuid::now_v7();
+        let mut e = sample_event();
+        e.occurrence_id = Some(fixed);
+        let returned = emitter.append(&e).await.unwrap();
+        assert_eq!(returned, fixed, "a present id is used as-is, not re-minted");
+        let line = std::fs::read_to_string(&log).unwrap();
+        let written: SensorEvent = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(written.occurrence_id, Some(fixed));
+    }
+
+    #[tokio::test]
+    async fn append_stamps_the_arrival_port_inside_a_listener_scope_and_nothing_outside_one() {
+        use crate::arrival::{Arrival, LOCAL_PORT_KEY, scope};
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        let emitter = EventEmitter::new(log.clone());
+        // A pre-minted id must not skip the stamp: the capture worker always arrives with one.
+        let mut with_id = sample_event();
+        with_id.occurrence_id = Some(uuid::Uuid::now_v7());
+        scope(Arrival::new(2222), emitter.append(&with_id))
+            .await
+            .unwrap();
+        scope(Arrival::new(22), emitter.append(&sample_event()))
+            .await
+            .unwrap();
+        emitter.append(&sample_event()).await.unwrap();
+
+        let written: Vec<SensorEvent> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(written[0].metadata[LOCAL_PORT_KEY], 2222);
+        assert_eq!(written[0].occurrence_id, with_id.occurrence_id);
+        assert_eq!(written[1].metadata[LOCAL_PORT_KEY], 22);
+        assert_eq!(written[1].metadata["command"], "uname -a");
+        assert!(written[2].metadata.get(LOCAL_PORT_KEY).is_none());
+    }
+
+    #[tokio::test]
+    async fn two_none_events_get_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let emitter = EventEmitter::new(dir.path().join("events.jsonl"));
+        let a = emitter.append(&sample_event()).await.unwrap();
+        let b = emitter.append(&sample_event()).await.unwrap();
+        assert_ne!(a, b);
+    }
+}

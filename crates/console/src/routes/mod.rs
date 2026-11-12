@@ -1,0 +1,167 @@
+//! Axum router composition. `/health`, `/ready`, `/metrics`, `/login`, and `/assets/fonts/*` are
+//! public - no session required (a monitoring probe or a Prometheus scraper carries no session; the
+//! login page must load its fonts before a session exists; see `health`'s, `metrics`'s, and
+//! `assets`'s own doc comments). Every other route (dashboard, queue, detail, feed) is mounted in
+//! a `protected` group wrapped in [`crate::auth::require_session`] via `Router::route_layer`, so a
+//! new page added in a later task only needs to `.merge()` into `protected` below to be
+//! session-gated automatically.
+
+pub mod assets;
+pub(crate) mod attack;
+pub mod campaigns;
+pub(crate) mod context;
+pub mod dashboard;
+pub(crate) mod degraded;
+pub mod detail;
+pub mod error;
+pub mod feed;
+pub mod fleet;
+pub(crate) mod format;
+pub mod health;
+pub mod integrity;
+pub mod ips;
+pub mod login;
+pub mod logs;
+pub mod metrics;
+pub mod queue;
+pub(crate) mod rowcount;
+pub mod samples;
+pub mod search;
+
+use axum::Router;
+use axum::middleware;
+
+use crate::AppState;
+use crate::auth::require_session;
+
+/// The live effective threat score, expressed in SQL, for ordering and displaying IPs by their
+/// score AS OF NOW rather than by the stored `raw_score` - which is anchored at each IP's last
+/// event via `decay_anchor`, so ordering by it ranks every IP at its own last-event moment and a
+/// long-idle high score outranks an actively-attacking one.
+///
+/// This reproduces exactly what `routes::detail` displays and what `core_scoring::read_score`
+/// projects: the stored `raw_score` decayed to now over the 6h half-life, then scaled by the
+/// breadth factor and clamped to the score cap. Persistence is deliberately NOT folded in - the
+/// detail page's effective score is `effective_score(read_score().raw_score, wan)`, which excludes
+/// it (persistence lifts only the gate-facing score, never the displayed effective one), and these
+/// ranking/display surfaces must agree with that page.
+///
+/// The literals mirror `core-scoring/src/scoring/constants.rs` (`HALF_LIFE_SECONDS` = 21600,
+/// `BREADTH_PER_WAN` = 0.15, `BREADTH_CAP` = 0.60, `SCORE_CAP` = 100); the
+/// `live_effective_score_sql_matches_core_scoring` test in `tests/routes_test.rs` guards them
+/// against drift by comparing this expression to `core_scoring::effective_score` over real rows.
+pub const LIVE_EFFECTIVE_SCORE_SQL: &str = "LEAST(100, raw_score * power(0.5, EXTRACT(EPOCH FROM (now() - decay_anchor)) / 21600.0) * (1.0 + LEAST(0.60, 0.15 * GREATEST(0, distinct_wan_count - 1))))";
+
+/// The order key behind `ip_score_order_idx` (core-scoring migration 0021): a time-invariant
+/// number that ranks `ip_score` rows exactly as [`LIVE_EFFECTIVE_SCORE_SQL`] does at any instant,
+/// because every row's live score decays by the same factor (see `routes::ips`). Ordering by it,
+/// then by `source_ip` in the same direction, is read off the index; ordering by the live score is
+/// not, because the live score changes with the clock. Rows tied at the 100 cap are ordered by how
+/// far past the cap they are, which is what the Attackers table has always shown.
+pub const SCORE_ORDER_KEY_SQL: &str =
+    "ip_score_order_key(raw_score, distinct_wan_count, decay_anchor)";
+
+/// Builds the full console router for the given state.
+pub fn router(state: AppState) -> Router {
+    let protected = Router::new()
+        .merge(dashboard::router())
+        .merge(queue::router())
+        .merge(detail::router())
+        .merge(feed::router())
+        .merge(fleet::router())
+        .merge(search::router())
+        .merge(ips::router())
+        .merge(integrity::router())
+        .merge(samples::router())
+        .merge(campaigns::router())
+        .merge(logs::router())
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_session,
+        ));
+
+    Router::new()
+        .merge(health::router())
+        .merge(metrics::router())
+        .merge(login::router())
+        .merge(assets::router())
+        .merge(protected)
+        .layer(axum::middleware::from_fn(security_headers))
+        .with_state(state)
+}
+
+/// The console's Content-Security-Policy. Scripts, styles, fonts and requests come from this origin
+/// only, and nothing inline runs or applies: every page's script and style is a static file under
+/// `src/assets/` and no template carries an inline `<script>`, `<style>`, `style=""` or event
+/// handler attribute. Auto-escaping remains the XSS defence; this is the second line that stops an
+/// escaping mistake from becoming script execution. `data:` images are the inline favicon.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; \
+     style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+     form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+async fn security_headers(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(axum::http::header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        "nosniff".parse().unwrap(),
+    );
+    // A route that set its own, stricter policy (the sample download) keeps it.
+    headers
+        .entry(axum::http::header::CONTENT_SECURITY_POLICY)
+        .or_insert(axum::http::HeaderValue::from_static(
+            CONTENT_SECURITY_POLICY,
+        ));
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    async fn policy_for(app: Router) -> String {
+        let response = app
+            .layer(middleware::from_fn(security_headers))
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_response_gets_the_console_policy_unless_it_set_its_own() {
+        let plain = Router::new().route("/", axum::routing::get(|| async { "page" }));
+        assert_eq!(policy_for(plain).await, CONTENT_SECURITY_POLICY);
+
+        let own = Router::new().route(
+            "/",
+            axum::routing::get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_SECURITY_POLICY,
+                        "default-src 'none'",
+                    )],
+                    "body",
+                )
+            }),
+        );
+        assert_eq!(
+            policy_for(own).await,
+            "default-src 'none'",
+            "the sample download's stricter policy must not be replaced"
+        );
+    }
+}

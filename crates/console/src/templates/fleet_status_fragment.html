@@ -1,0 +1,188 @@
+{# The whole fleet reading. Rendered standalone by GET /fleet/status for the 30-second refresh and
+   {% include %}-ed by fleet.html on first load, so the two can never drift into two different
+   markups for the same data.
+
+   The degraded banner lives HERE rather than in base.html's chrome: a panel that starts failing
+   after the page loaded must show up on the next refresh, not stay hidden until someone reloads. #}
+{% if degraded_panels %}
+<div class="degraded" role="status">Some panels could not be loaded and show placeholders: {{ degraded_panels|join(", ") }}. The cause is in the server log.</div>
+{% endif %}
+
+<div class="band">
+  <div class="cell{% if summary.alarm > 0 %} cell--alarm{% endif %}">
+    <span class="label">Listeners proven</span>
+    <div class="v {% if summary.proven == summary.total and summary.total > 0 %}v--ok{% elif summary.alarm > 0 %}v--alarm{% endif %}">{{ summary.proven }}<small>/ {{ summary.total | count }}</small></div>
+    <div class="foot">{{ summary.headline }}</div>
+  </div>
+  <div class="cell{% if summary.alarm > 0 %} cell--alarm{% endif %}">
+    <span class="label">Alarms</span>
+    <div class="v {% if summary.alarm > 0 %}v--alarm{% else %}v--ok{% endif %}">{{ summary.alarm }}</div>
+    <div class="foot">{% if summary.alarm > 0 %}not answering, or last probed too long ago{% else %}nothing failing a check{% endif %}</div>
+  </div>
+  {# Warmth goes on the unmeasured count, not on the proven one: an unknown is the thing that
+     wants the operator, and a page where nothing is warm reads as a page where nothing is wrong. #}
+  <div class="cell{% if summary.unknown > 0 %} cell--call{% endif %}">
+    <span class="label">Unknown</span>
+    <div class="v {% if summary.unknown > 0 %}v--call{% else %}v--ok{% endif %}">{{ summary.unknown }}</div>
+    <div class="foot">unmeasured, which is not the same as healthy</div>
+  </div>
+  <div class="cell">
+    <span class="label">Last event</span>
+    <div class="v {% if last_event_level == "ok" %}v--ok{% endif %} value-lg">{{ last_event_ago }}</div>
+    <div class="foot">newest ingest, fleet wide</div>
+  </div>
+  <div class="cell">
+    <span class="label">Ledger</span>
+    <div class="v">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}{% if ledger.events_estimate %}about {% endif %}{{ ledger.events | count }}{% endif %}</div>
+    <div class="foot">{% if ledger_unavailable %}the event count could not be read{% elif ledger.events_estimate %}events recorded (estimate){% else %}events recorded{% endif %} &middot; <a href="/integrity">verify the chain</a></div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head{% if summary.alarm > 0 %} panel-head--alert{% endif %}">Listeners <span class="dim">reachability and output</span></div>
+  {% if listeners %}
+    <table class="table-compact">
+      <thead><tr>
+        <th class="w-90">Collector</th>
+        <th class="w-150">Listener</th>
+        <th class="w-150">Reachability</th>
+        <th class="w-180">Vantage</th>
+        <th class="w-90">Probed</th>
+        <th class="w-90">Confirmed</th>
+        <th class="w-90">Last event</th>
+        <th class="count w-70">24h</th>
+      </tr></thead>
+      <tbody>
+        {% for r in listeners %}
+        <tr data-state="{{ r.state_level }}">
+          <td class="mono dim">{{ r.collector }}</td>
+          <td>{{ r.sensor_label }} <span class="mono dim">{{ r.protocol }}/{{ r.port }}</span></td>
+          {# Every state is a word AND a colour, never a colour alone. #}
+          <td data-level="{{ r.reach_level }}"><span class="{{ r.reach_dot }}" aria-hidden="true"></span> {{ r.reach }}{% if r.reach_detail %}<div class="faint">{{ r.reach_detail }}</div>{% endif %}</td>
+          <td class="mono dim">{% if r.vantage %}{{ r.vantage }}{% else %}<span class="faint">no probe has run</span>{% endif %}</td>
+          <td class="seen dim">{{ r.probe_ago }}</td>
+          <td class="seen dim">{% if r.confirmed_ago %}{{ r.confirmed_ago }}{% else %}<span class="faint">never</span>{% endif %}</td>
+          {# A backlog makes LAST EVENT read like a quiet sensor while its events are still waiting
+             in the intake log, so the badge sits in this cell, and only while the log is behind. #}
+          <td class="seen"><span class="{{ r.last_event_dot }}" aria-hidden="true"></span> {{ r.last_event_ago }}{% if r.behind %}<div><span class="sev sev--high">{{ r.behind }}</span></div>{% endif %}</td>
+          <td class="count">{{ r.events_24h | count }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+  <p class="empty-line">no listener inventory configured - set PROPOLIS_FLEET_LISTENERS, or run deploy/fleet-listeners.sh to derive it from the sensor env files</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Capture completeness <span class="dim">uploads, last 7 days</span></div>
+  {% if captures %}
+    <table class="table-compact">
+      <thead><tr>
+        <th class="w-120">Sensor</th>
+        <th class="w-190">Complete</th>
+        <th class="count w-80">Captures</th>
+        <th class="count w-90">Incomplete</th>
+        <th class="count w-90">Truncated</th>
+        <th>Dominant end reason</th>
+      </tr></thead>
+      <tbody>
+        {% for c in captures %}
+        <tr data-state="{{ c.state_level }}">
+          <td>{{ c.sensor_label }}</td>
+          <td>
+            {% if c.rate_pct is none %}
+            <span class="faint">no labelled capture to rate</span>
+            {% else %}
+            <span class="meter"><span class="{{ c.meter_class }} pct-{{ [c.rate_pct, 100]|min }}"></span></span>
+            <span class="mono">{{ c.rate_pct }}%</span>
+            <span class="dim">{{ c.complete }} of {{ (c.captures - c.unlabelled) | count }}</span>
+            {% endif %}
+            {% if c.unlabelled > 0 %}<div class="dim">{{ c.unlabelled | count }} unlabelled (excluded from the rate)</div>{% endif %}
+          </td>
+          <td class="count">{{ c.captures | count }}</td>
+          <td class="count">{{ c.incomplete | count }}</td>
+          <td class="count">{{ c.truncated | count }}</td>
+          {# Three outcomes, not two: a reason, a reason that could not be read, and a genuinely
+             clean sensor. The middle one used to render as the last, so one failed query made a
+             row with incomplete captures say "nothing incomplete" next to its own count. #}
+          <td>{% if c.top_end_reason %}<span class="{{ c.end_reason_sev }}">{{ c.top_end_reason }}</span> <span class="dim">{{ c.top_end_reason_count | count }}</span>{% elif c.end_reason_unavailable %}<span class="faint">reason unavailable</span>{% else %}<span class="faint">nothing incomplete</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% elif captures_unavailable %}
+  {# A failed query and a quiet week both arrive here as an empty list. Saying "no captures" for
+     the first is the console inventing a finding it never read. #}
+  <p class="empty-line">capture completeness could not be read - this is not the same as "no captures". The cause is in the server log.</p>
+  {% else %}
+  <p class="empty-line">no malware captures in the last 7 days</p>
+  {% endif %}
+</div>
+
+<div class="grid-2">
+  <div class="panel">
+    <div class="panel-head">Evidence chain</div>
+    <table class="table-compact">
+      <tbody>
+        <tr><td>Events</td><td>{% if ledger_unavailable %}<span class="faint">unavailable</span>{% else %}<span class="mono">{% if ledger.events_estimate %}about {% endif %}{{ ledger.events | count }}</span>{% if ledger.events_estimate %} <span class="dim">(estimate)</span>{% endif %}{% endif %}</td></tr>
+        <tr><td>Newest ingest</td><td><span class="{{ ledger.dot }}" aria-hidden="true"></span> <span class="mono">{% if ledger_unavailable %}<span class="faint">unavailable</span>{% elif ledger.newest_ingested_ago %}{{ ledger.newest_ingested_ago }}{% else %}never{% endif %}</span></td></tr>
+      </tbody>
+    </table>
+    <div class="panel-body">
+      {# No verdict is shown here because none is retained anywhere: `/integrity/verify` reports its
+         result in that one response and nothing persists it, so a verification cannot populate this
+         panel. The previous wording ("not stored yet ... run a verification to see it") invited
+         exactly that expectation, and an operator who ran one came back to find the same sentence.
+         Storing a verdict is a schema change, deliberately not made here.
+
+         The daemon's ops-alert condition #7 does verify on an interval, but it is opt-in
+         (`PROPOLIS_OPS_ENABLED` defaults to false) and caches its verdict in its own process, so
+         this panel cannot claim that either without asserting something it never measured. #}
+      <p class="dim">Chain verification runs on the <a href="/integrity">integrity page</a> and its result is shown there. No verdict is retained, so none can be shown here.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">Published feed</div>
+    {% if feed.disabled %}
+    <div class="panel-body">
+      <p><span class="{{ feed.dot }}" aria-hidden="true"></span> {{ feed.note }}</p>
+      <p class="dim">This node publishes nothing, so there is no feed freshness to report. That is a configuration, not a fault.</p>
+    </div>
+    {% else %}
+    <table class="table-compact">
+      <tbody>
+        <tr><td>Entries</td><td class="mono">{{ feed.entries }}</td></tr>
+        <tr><td>Built</td><td><span class="mono">{% if feed.build_ago %}{{ feed.build_ago }}{% else %}never{% endif %}</span>{% if feed.build_time %} <span class="dim">{{ feed.build_time }}</span>{% endif %}</td></tr>
+        <tr><td>Expires in</td><td><span class="{{ feed.dot }}" aria-hidden="true"></span> <span class="mono">{% if feed.expires_in %}{{ feed.expires_in }}{% else %}unknown{% endif %}</span></td></tr>
+      </tbody>
+    </table>
+    <div class="panel-body"><p class="dim">{{ feed.note }}</p></div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">Running version</div>
+  {# Four different identities, kept apart on purpose: what this PROCESS runs, what the deploy
+     left INSTALLED on disk for it, what was CHECKED OUT when that deploy built, and what main
+     held when it last fetched. Collapsing any two of them is the bug. #}
+  <table class="table-compact">
+    <tbody>
+      <tr><td>Version</td><td><span class="mono">v{{ version_status.running_version }}</span> <span class="{{ version_status.verdict_sev }}">{{ version_status.verdict }}</span></td></tr>
+      <tr><td>Running</td><td><span class="mono">{{ version_status.running_sha }}</span> <span class="dim">built {{ version_status.built_at }}</span></td></tr>
+      <tr><td>Installed</td><td>{% if version_status.installed_sha %}<span class="mono">{{ version_status.installed_sha }}</span> <span class="dim">{{ version_status.binary_name }} on disk</span>{% else %}<span class="faint">not recorded</span> <span class="dim">no deploy stamp records which {{ version_status.binary_name }} binary was installed</span>{% endif %}</td></tr>
+      {% if version_status.stamp_head_sha %}
+      <tr><td>Deploy stamp</td><td><span class="mono">{{ version_status.stamp_head_sha }}</span>{% if version_status.stamp_origin_main_sha %} <span class="dim">origin/main {{ version_status.stamp_origin_main_sha }}</span>{% endif %}{% if version_status.stamp_age %} <span class="dim">recorded {{ version_status.stamp_age }}</span>{% endif %}</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+  <div class="panel-body">
+    <p class="dim">{{ version_status.note }}</p>
+    {% if not version_status.stamp_head_sha %}
+    <p class="dim">No deploy stamp file was found, so there is nothing to compare against either.</p>
+    {% endif %}
+  </div>
+</div>

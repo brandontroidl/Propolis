@@ -1,0 +1,75 @@
+[Unit]
+OnFailure=propolis-alert@%n.service
+Description=Propolis TFTP honeypot sensor
+After=network.target
+
+# One of two sensors that answer over UDP (sensor-dns is the other). Replies are bounded in code
+# (bytes sent never exceed bytes received from the peer; reads are never served; no
+# retransmission), so a spoofed request
+# cannot be reflected at a victim with any gain. Off until an operator creates
+# /etc/propolis/tftp.env with PROPOLIS_TFTP_BIND: without it the sensor binds nothing and exits.
+# Open inbound UDP/69 only on hosts that are meant to run it.
+
+[Service]
+Type=simple
+User=propolis-tftp
+Group=propolis-tftp
+EnvironmentFile=/etc/propolis/tftp.env
+ExecStart=/usr/local/bin/sensor-tftp
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/log/propolis/tftp /var/spool/propolis/tftp
+# Nothing on the filesystem is executable except this sensor's own binary and the shared
+# libraries it loads (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64). The
+# sensor execs nothing, so a captured upload or spool entry cannot run here even on a mount that
+# lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/sensor-tftp /usr/lib -/usr/lib64
+# Secrets this sensor must never read, even where a file's mode slips (config-check.sh reports
+# that): the daemon's and every other unit's env file and the split deployment's mTLS keys. Its
+# own env file is read by systemd before this namespace exists, so nothing it needs is here. The
+# "-" skips a file absent on this host. See deploy/sensor-ssh.service for the full reasoning.
+InaccessiblePaths=-/etc/propolis/propolis.env -/etc/propolis/fleet-listeners.env -/etc/propolis/watch.env -/etc/propolis/migrate.env
+InaccessiblePaths=-/etc/propolis/console.env -/etc/propolis/feed.env -/etc/propolis/intake.env -/etc/propolis/review.env
+InaccessiblePaths=-/etc/propolis/gateway.env -/etc/propolis/shipper.env -/etc/propolis/certs
+InaccessiblePaths=-/etc/propolis/adb.env -/etc/propolis/catchall.env -/etc/propolis/cred.env -/etc/propolis/dns.env -/etc/propolis/ftp.env -/etc/propolis/http.env -/etc/propolis/mqtt.env -/etc/propolis/redis.env -/etc/propolis/smtp.env -/etc/propolis/ssh.env -/etc/propolis/telnet.env
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# PROPOLIS_TFTP_CAPTURE_MEMORY_BYTES (env file) defaults to 40% of this value. If MemoryMax is
+# changed, set that variable too, or the capture ceiling stays at the 256M-derived default.
+MemoryMax=256M
+TasksMax=128
+CPUQuota=50%
+LimitNOFILE=4096
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

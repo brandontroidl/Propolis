@@ -1,0 +1,158 @@
+<!--
+title: Configuration model
+audience: operator
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-07
+-->
+
+# Configuration model
+
+Propolis is configured entirely through environment variables loaded from
+per-service files under `/etc/propolis/`. There is no config file format, no
+CLI flags for runtime settings, and no config in the database. This page
+explains the model and points at the reference table that owns every exact
+default and bound.
+
+> The exhaustive list of variables - names, defaults, bounds, and
+> fail-on-invalid behavior - is owned by
+> [../reference/environment-variables.md](../reference/environment-variables.md).
+> This page does not restate those values; it explains how the surface is
+> organized and which file configures what.
+
+## Where configuration lives
+
+Each systemd unit reads one `EnvironmentFile`:
+
+- `deploy/propolis.service` → `/etc/propolis/propolis.env` (the unified daemon:
+  intake + review + feed + console + VirusTotal + fetcher + ops-alert)
+- each `sensor-<name>.service` → `/etc/propolis/<name>.env` (that sensor's binds
+  and connection bounds)
+
+These `.env` files are **operator-authored**. Provisioning creates each one empty
+(`deploy/env-files.sh`), mode `0600`, `root:root`; systemd reads an `EnvironmentFile=` as root
+before it drops privileges, so the service account needs no read access. What goes in is yours:
+`deploy/install.sh` prints "Next: populate /etc/propolis/*.env files". Each sensor unit
+additionally mounts every env file it does not load as inaccessible
+(`InaccessiblePaths=`), so a sensor cannot read `propolis.env` even if its mode slips.
+The defaults documented in the reference table are the **code** defaults applied
+when a variable is unset or blank; they are authoritative for runtime behavior
+even though the `.env` files themselves are not in the repo.
+
+Keep `.env` files out of version control. See
+[secret-management.md](secret-management.md) for the values that carry secrets.
+
+## Which variable configures what
+
+Grouped by subsystem. Names below are indicative; consult the reference table
+for the complete set and exact values.
+
+| Area | Configures | Key variables |
+|---|---|---|
+| Database | PgPool connection and size | `DATABASE_URL` (required), `PROPOLIS_DB_MAX_CONNECTIONS` |
+| Intake | which sensor logs to tail, cursor state, quarantine directory, poll cadence | `PROPOLIS_SENSOR_LOGS` (required), `PROPOLIS_CURSOR_DIR`, `PROPOLIS_QUARANTINE_DIR`, `PROPOLIS_POLL_INTERVAL_MS` |
+| Review | scoring/review loop cadence and vendor submitters | `PROPOLIS_REVIEW_ENABLED`, `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_VENDOR_<V>_*` |
+| Feed | blocklist output dir, build cadence, tiers/windows, allow/delist | `PROPOLIS_FEED_ENABLED`, `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`, `PROPOLIS_FEED_WINDOWS`, `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_FEED_DELIST` |
+| Console | bind address, auth, session, enrichment | `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (required), `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED` |
+| VirusTotal | sample scanning (opt-in egress) | `PROPOLIS_VT_ENABLED`, `PROPOLIS_VT_KEY`, `PROPOLIS_VT_UPLOAD`, `PROPOLIS_VT_SCAN_INTERVAL_SECS` |
+| Malware fetcher | artifact retrieval (opt-in egress) | `PROPOLIS_FETCH_ENABLED` and the `PROPOLIS_FETCH_*` bounds |
+| Ops self-alerting | ntfy paging on degradation (opt-in egress) | `PROPOLIS_OPS_ENABLED` and the `PROPOLIS_OPS_*` set |
+| Sensors | each sensor's listener(s) and connection limits | `<PREFIX>_BIND` (required), `<PREFIX>_WAN_MAP`, `<PREFIX>_LOG_PATH`, and `*_TIMEOUT_MS` / `*_MAX_*` bounds |
+
+Outbound-capable subsystems (vendors, VirusTotal, fetcher, ops-alert, console
+rDNS) all default **off**; see [../security/outbound-controls.md](../security/outbound-controls.md).
+
+## Fail-fast validation
+
+Configuration is validated at startup. Every binary (`propolis`, `intake`, `review`, `feed`,
+`console`, and all twelve sensors) **aborts startup** on a missing required variable or a
+present-but-invalid / present-but-zero numeric bound - "zero never means unlimited"
+(`crates/propolis/src/config.rs#require_env`, `crates/propolis/src/config.rs#parse_positive_u64`;
+the sensors through `crates/sensor-framework/src/env.rs#Env`). A misconfiguration cannot silently
+disable a guard. The `cred` and `smtp` sensors used to fall back to the default on such a value;
+they now refuse to start like the rest.
+
+Fail-closed pairings worth noting (all owned by the reference table):
+
+- A vendor or VirusTotal `*_ENABLED=true` with an empty key is forced disabled
+  and logged (`crates/propolis/src/config.rs#load_vendor_config`, `crates/propolis/src/config.rs#load_config`,
+  `crates/propolis/src/main.rs#main`).
+- `PROPOLIS_OPS_ENABLED=true` with only one of `PROPOLIS_OPS_NTFY_URL` /
+  `PROPOLIS_OPS_NTFY_TOPIC` set fails closed (a half-configured target looks
+  configured but would page nothing); with neither set, alerts fall back to the
+  local log sink instead of aborting startup
+  (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`).
+- `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
+  skipping it (`crates/propolis/src/config.rs#parse_window_list`).
+- `PROPOLIS_FEED_ALLOWLIST_FILE` refuses to start on an unreadable file, a line that is not a
+  CIDR, or an entry wider than /8 (IPv4) or /16 (IPv6); see
+  [the allowlist file procedure](#keeping-declared-crawlers-out-of-the-feed)
+  (`crates/core-scoring/src/allowlist.rs#load_allowlist_file`).
+- `PROPOLIS_FEED_ASN_ALLOWLIST` is inert unless `PROPOLIS_GEOIP_DIR` is set and
+  the GeoLite2-ASN database loads (`crates/propolis/src/config.rs#parse_asn_list`, `crates/propolis/src/main.rs#main`).
+
+## Keeping declared crawlers out of the feed
+
+Research and AI crawlers (ClaudeBot, Googlebot, CensysInspect and others) hit the HTTP
+sensor. To keep a crawler operator's addresses out of the published feed and out of vendor
+reports, list the ranges
+the operator publishes in a local file. A User-Agent never exempts an address: anyone can
+send "ClaudeBot", so a request that claims it from an unlisted address is scored and
+published like any other.
+
+1. Create the file, one CIDR per line, `#` for comments. A bare address is refused; write
+   a single host as `/32` (or `/128`).
+2. Put it where the service user can read it and the unit can see it. Under
+   `ProtectSystem=strict` `/etc` stays readable, so `/etc/propolis/feed-allowlist.txt` works
+   with mode `0640`, owner `root`, group `propolis` (`propolis.service`) or `propolis-feed`
+   (`feed.service`). Do not use a path under `/home` (`ProtectHome=yes` hides it). The file
+   is only read, so no `ReadWritePaths` entry is needed.
+3. Set `PROPOLIS_FEED_ALLOWLIST_FILE=/etc/propolis/feed-allowlist.txt` in the unit's env
+   file and restart the service. The file is read once at startup; edits do nothing until
+   the next restart.
+4. Check the journal: a valid file starts normally. A missing or unreadable file, any line
+   that is not a CIDR, a bare address, an entry wider than /8 (IPv4) or /16 (IPv6), more
+   than 50,000 entries, more than 1 MiB, or non-UTF-8 content stops the service at startup
+   (a bad line is reported with its line number). It never starts with a partial list, so fix the
+   file and start again.
+
+The daemon fetches nothing: you copy the ranges from the operator's own published list.
+
+What the allowlist covers: the same list (`PROPOLIS_FEED_ALLOWLIST`, the file, and
+`PROPOLIS_FEED_ASN_ALLOWLIST`) governs two things.
+
+- **The published feed.** A listed address is kept out at build and again at publish.
+- **Vendor reporting.** The review stage never adds a listed address to the review queue,
+  withdraws one that is already Pending (the journal records each withdrawal with the reason
+  `allowlisted`), and the submission runner refuses a listed address even if it was queued
+  and approved before the list covered it. An Approved entry stays in the queue but is never
+  sent to AbuseIPDB, DShield or OTX. A withdrawn entry is deleted rather than rejected, so it
+  is queued again if you later remove the address from the list.
+
+It does not change scoring: a listed address is still scored, and the console still shows its
+activity. The list is read once at startup, in the unified daemon and in the standalone
+`review` and `feed` binaries alike (a standalone `review` unit needs the variables in its own
+env file), so an edit takes effect only after a restart. With the standalone units, a restart
+of `review` is what ends submission of a newly listed address.
+
+## Sensor binds and WAN attribution
+
+Every sensor requires its bind variable (`<PREFIX>_BIND`, or
+`PROPOLIS_CATCHALL_BIND_ADDRS` for catchall, or the five `PROPOLIS_CRED_*_BIND` vars for
+cred) and refuses to start without it - there is **no compiled-in default
+port**. The "standard" port mapping (SSH 22, telnet 23, etc.) is whatever the
+operator writes into the `.env` files, not a code default. Ports are owned by
+[../reference/ports-and-protocols.md](../reference/ports-and-protocols.md).
+
+`<PREFIX>_WAN_MAP` maps a local bind address to its public WAN IP for
+multi-vantage breadth scoring, as `private=public` (NAT/DNAT) or `public=public`
+(direct bind). An unmapped local address yields a null `wan_ip` - no WAN
+attribution - which is a valid, non-fatal state.
+
+## Related
+
+- [../reference/environment-variables.md](../reference/environment-variables.md) - every variable, default, and bound (canonical)
+- [secret-management.md](secret-management.md) - the secret-bearing variables
+- [networking-tls.md](networking-tls.md) - bind exposure and TLS
+- [../reference/rate-limits-and-budgets.md](../reference/rate-limits-and-budgets.md) - fetcher/vendor budgets

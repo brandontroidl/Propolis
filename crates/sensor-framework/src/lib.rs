@@ -1,0 +1,89 @@
+//! The shared harness every sensor uses: listener lifecycle, WAN attribution, capture
+//! sanitization, event emission, the quarantine spool, and off-response-path capture hand-off.
+//! See `internal/design/02-sensor-framework.md` for the design this crate implements. Every
+//! framework piece the design lists now exists; `sensor-catchall` and `sensor-ssh` (later tasks
+//! of the same sub-project) are thin compositions over it.
+
+pub mod admission;
+pub mod arrival;
+pub mod binaries;
+pub mod bounds;
+pub mod budget;
+pub mod capture_budget;
+pub mod command_codec;
+pub mod command_flood;
+pub mod config;
+pub mod connection_tracker;
+pub mod coverage;
+pub mod elf_body;
+pub mod emit;
+pub mod env;
+pub mod etc;
+pub mod fakefs;
+pub mod handoff;
+pub mod held_input;
+pub mod listener;
+pub mod logging;
+pub mod outbox;
+pub mod packages;
+pub mod persona;
+pub mod rate_limit;
+pub mod replay;
+pub mod reply_source;
+pub mod sanitize;
+pub mod session_memory;
+pub mod shell;
+pub mod source_flood;
+pub mod spool;
+pub mod tls;
+pub mod wan;
+
+pub use admission::{PerSourceLimiter, SourceGuard, default_per_source_cap};
+pub use arrival::Arrival;
+pub use bounds::ConnectionBounds;
+pub use budget::{
+    BudgetLimits, ConnectionBudget, EgressState, LINE_WORKING_SET_BYTES, limits_from,
+};
+pub use capture_budget::{
+    CAPTURE_CHUNK_BYTES, CaptureBody, CaptureExhausted, CaptureMemoryBudget,
+    DEFAULT_CAPTURE_BUDGET_BYTES_256M, Reservation, default_capture_budget_bytes,
+};
+pub use command_codec::CommandCodec;
+pub use command_flood::{
+    CommandEventConfig, CommandEventGate, CommandSummary, command_summary_event,
+};
+pub use config::SensorConfig;
+pub use connection_tracker::{CONNECTION_GRACE, ConnectionTracker, QuiesceOutcome};
+pub use emit::EventEmitter;
+pub use env::{Env, EnvError, env_with_legacy, strict_env_var};
+pub use handoff::{
+    CaptureDropped, CaptureEnd, CaptureHandoff, CaptureJob, DrainOutcome, DrainReport,
+    END_REASON_CAPTURE_MEMORY_BUDGET, SHUTDOWN_DRAIN_TIMEOUT, UploadEnd, session_end_metadata,
+    stamp_end_reason, upload_metadata,
+};
+pub use held_input::{
+    CAPTURE_REASON_ECHO_LOADER, CAPTURE_REASON_EXEC_STDIN, CAPTURE_REASON_SHELL_STDIN,
+    CaptureSource, Fed, HeldEnd, HeldInput, InputMode, MAX_HELD_CAPTURES, StdinCaptures,
+};
+pub use listener::{
+    listener_start_error, run_tcp_listener, run_tcp_listener_tracked, run_udp_listener,
+    shutdown_signal,
+};
+pub use logging::init_logging;
+pub use outbox::{CustodyDisposition, CustodyState, ManifestRow, OutboxManifest};
+pub use rate_limit::{
+    FloodLedger, FloodSummary, Rate, RateDecision, RateLimitConfig, ReplyRateLimiter, SourceKey,
+    rate_limited_event,
+};
+pub use reply_source::{REFLECTIVE_SOURCE_PORTS, SourceRefusal, check_reply_source};
+pub use sanitize::{sanitize_value, to_hex_bounded};
+pub use source_flood::{
+    SourceEventConfig, SourceEventGate, SourceSummary, SummaryScope, source_summary_event,
+};
+pub use spool::{QuarantineSpool, SPOOL_MAX_FILE_BYTES, SpoolError};
+pub use tls::{
+    MaybeTlsStream, TlsConfigError, TlsServer, load_server_config, run_tls_listener,
+    run_tls_listener_tracked, server_config_from_pem, upgrade_buffered,
+};
+pub use uuid::Uuid;
+pub use wan::WanResolver;

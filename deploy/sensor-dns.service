@@ -1,0 +1,82 @@
+[Unit]
+OnFailure=propolis-alert@%n.service
+Description=Propolis DNS honeypot sensor
+After=network.target
+
+# Answers DNS over UDP and TCP on PROPOLIS_DNS_BIND (both, or the sensor refuses to start) and,
+# when PROPOLIS_DNS_TLS_BIND is set, DNS over TLS. It serves no records: every query gets REFUSED
+# with the question echoed and nothing appended, so a UDP reply is never larger than the query
+# that caused it and a spoofed query cannot be reflected at a victim with any gain; UDP replies
+# are also rate limited per source network. Off until an operator creates /etc/propolis/dns.env
+# with PROPOLIS_DNS_BIND. If port 53 is taken, `ss -lunpt 'sport = :53'` names the holder: the
+# systemd-resolved stub (127.0.0.53) blocks only a 0.0.0.0 bind, so bind the public address; a
+# resolver on the wildcard (dnsmasq, named) blocks every bind until it is narrowed to loopback.
+# See deploy/sensor.env.example.
+
+[Service]
+Type=simple
+User=propolis-dns
+Group=propolis-dns
+EnvironmentFile=/etc/propolis/dns.env
+ExecStart=/usr/local/bin/sensor-dns
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/log/propolis/dns
+# Per-sensor cert and key for PROPOLIS_DNS_TLS_CERT / PROPOLIS_DNS_TLS_KEY; read-only. The
+# leading "-" lets the unit start where the directory is absent (TLS unused); a configured pair
+# that cannot be read still refuses to start in-process.
+ReadOnlyPaths=-/etc/propolis/tls
+# Nothing on the filesystem is executable except this sensor's own binary and the shared
+# libraries it loads (libc, libm, libgcc_s and the loader, under /usr/lib or /usr/lib64). The
+# sensor execs nothing, so a captured upload or spool entry cannot run here even on a mount that
+# lost its noexec option. See deploy/sensor-ssh.service for the full reasoning.
+NoExecPaths=/
+ExecPaths=/usr/local/bin/sensor-dns /usr/lib -/usr/lib64
+# Secrets this sensor must never read, even where a file's mode slips (config-check.sh reports
+# that): the daemon's and every other unit's env file and the split deployment's mTLS keys. Its
+# own env file is read by systemd before this namespace exists, so nothing it needs is here; its
+# TLS pair under /etc/propolis/tls stays readable. The "-" skips a file absent on this host. See
+# deploy/sensor-ssh.service for the full reasoning.
+InaccessiblePaths=-/etc/propolis/propolis.env -/etc/propolis/fleet-listeners.env -/etc/propolis/watch.env -/etc/propolis/migrate.env
+InaccessiblePaths=-/etc/propolis/console.env -/etc/propolis/feed.env -/etc/propolis/intake.env -/etc/propolis/review.env
+InaccessiblePaths=-/etc/propolis/gateway.env -/etc/propolis/shipper.env -/etc/propolis/certs
+InaccessiblePaths=-/etc/propolis/adb.env -/etc/propolis/catchall.env -/etc/propolis/cred.env -/etc/propolis/ftp.env -/etc/propolis/http.env -/etc/propolis/mqtt.env -/etc/propolis/redis.env -/etc/propolis/smtp.env -/etc/propolis/ssh.env -/etc/propolis/telnet.env -/etc/propolis/tftp.env
+
+# 53 and 853 are privileged.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+MemoryMax=256M
+TasksMax=128
+CPUQuota=50%
+LimitNOFILE=4096
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+
+ProtectClock=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

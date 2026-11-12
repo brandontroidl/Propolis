@@ -1,0 +1,115 @@
+//! sensor-redis library surface: the per-connection session handler (`handler` module) and the
+//! RESP protocol parsing/encoding it drives (`resp` module), the memory pool its sessions share
+//! (`memory` module), plus `start_test_server`, the composition that wires them to
+//! `sensor_framework`'s shared TCP listener. `main.rs` (the production entry point) and
+//! `tests/integration.rs` both build on this same `start_test_server`, so the test suite exercises
+//! exactly the capture logic the binary runs in production.
+
+pub mod handler;
+pub mod memory;
+pub mod resp;
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use sensor_framework::{
+    CaptureMemoryBudget, ConnectionBounds, EventEmitter, TlsServer, WanResolver, run_tcp_listener,
+    run_tls_listener,
+};
+use tokio::task::JoinHandle;
+
+/// Start the Redis honeypot server on `addr` (use `:0` for an ephemeral port - every test in
+/// `tests/integration.rs` relies on this), appending events to `log_path`. `wan_resolver` maps the
+/// listener's local address to the operator's WAN IP (see `sensor_framework::WanResolver`);
+/// `bounds` governs the per-connection resource limits `handler::RespReader`'s own read loop
+/// enforces plus the concurrency/duration caps `run_tcp_listener` enforces directly. `pool` is the
+/// memory every session's read buffer and store draw on past their floors (`memory.rs`); pass the
+/// same one to [`start_test_server_tls`] so both listeners' sessions share one ceiling. `main.rs`
+/// calls this with operator-configured values; tests build their own fixed `ConnectionBounds`.
+pub async fn start_test_server(
+    addr: SocketAddr,
+    log_path: PathBuf,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    pool: Arc<CaptureMemoryBudget>,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
+    let emitter = Arc::new(EventEmitter::new(log_path));
+
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_tcp_listener(
+        addr,
+        bounds.clone(),
+        per_source_cap,
+        move |stream, peer, session_id| {
+            let local_addr = stream.local_addr().ok();
+            let emitter = emitter.clone();
+            let wan_resolver = wan_resolver.clone();
+            let bounds = bounds.clone();
+            let pool = pool.clone();
+            async move {
+                handler::handle_connection(
+                    stream,
+                    peer,
+                    local_addr,
+                    false,
+                    session_id,
+                    emitter,
+                    wan_resolver,
+                    bounds,
+                    pool,
+                )
+                .await;
+            }
+        },
+    )
+    .await
+}
+
+/// The TLS twin of [`start_test_server`]: same handler, bounds, per-source cap and memory pool,
+/// with a TLS handshake (no client auth) in front of every accepted connection. A failed or
+/// stalled handshake is dropped without an event; events from an established session carry
+/// `"tls": true`.
+pub async fn start_test_server_tls(
+    addr: SocketAddr,
+    log_path: PathBuf,
+    wan_resolver: Arc<WanResolver>,
+    bounds: ConnectionBounds,
+    tls: TlsServer,
+    pool: Arc<CaptureMemoryBudget>,
+) -> std::io::Result<(SocketAddr, JoinHandle<()>)> {
+    let emitter = Arc::new(EventEmitter::new(log_path));
+
+    let per_source_cap = Some(sensor_framework::default_per_source_cap(
+        bounds.max_concurrent,
+    ));
+    run_tls_listener(
+        addr,
+        bounds.clone(),
+        per_source_cap,
+        tls,
+        move |stream, peer, local_addr, session_id| {
+            let emitter = emitter.clone();
+            let wan_resolver = wan_resolver.clone();
+            let bounds = bounds.clone();
+            let pool = pool.clone();
+            async move {
+                handler::handle_connection(
+                    stream,
+                    peer,
+                    local_addr,
+                    true,
+                    session_id,
+                    emitter,
+                    wan_resolver,
+                    bounds,
+                    pool,
+                )
+                .await;
+            }
+        },
+    )
+    .await
+}

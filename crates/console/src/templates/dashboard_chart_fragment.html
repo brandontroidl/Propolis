@@ -1,0 +1,24 @@
+{% if current_range == "1h" %}{% set chart_aria = "Events per 5 minutes, last hour" %}{% elif current_range == "7d" %}{% set chart_aria = "Events per day, last 7 days" %}{% elif current_range == "30d" %}{% set chart_aria = "Events per day, last 30 days" %}{% else %}{% set chart_aria = "Events per hour, last 24 hours" %}{% endif %}
+<div class="chart-box">
+  <canvas id="timelineChart" data-chart="line" data-labels="timeline-labels" data-values="timeline-data"
+          data-point-radius="0" data-tension="0"
+          role="img" aria-label="{{ chart_aria }}"></canvas>
+</div>
+<script type="application/json" id="timeline-labels">{{ timeline_labels|safe }}</script>
+<script type="application/json" id="timeline-data">{{ timeline_data|safe }}</script>
+{# Rendering is driven by propolisInitCharts in assets/charts.js, on DOMContentLoaded for the
+   full-page render and on htmx:afterSwap for this fragment. Nothing here executes on its own. #}
+{% if is_fragment %}
+{# The range selector lives in the panel HEAD, outside this fragment's swap target, so a plain
+   swap leaves its active class frozen at whatever the initial page render set. Re-render it here
+   as an out-of-band swap (matched by id) so the highlighted button tracks the chart. Guarded:
+   the full-page render includes this file and already emits the selector itself. #}
+<div class="range-selector" id="dashboard-chart-range" hx-swap-oob="true">
+  {% for r in ["1h", "24h", "7d", "30d"] %}
+  <a hx-get="/dashboard/chart?range={{ r }}"
+     hx-target="#dashboard-chart-container" hx-swap="innerHTML"
+     hx-sync="closest .range-selector:replace"
+     class="range-btn {% if r == current_range %}active{% endif %}">{{ r }}</a>
+  {% endfor %}
+</div>
+{% endif %}

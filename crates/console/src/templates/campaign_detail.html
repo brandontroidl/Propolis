@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Campaign {{ id }} - Propolis{% endblock %}
+{% block content %}
+{% import "macros.html" as m %}
+<p><a href="/campaigns">&larr; All campaigns</a></p>
+<h1 class="campaign-label">{{ label }}</h1>
+<p class="page-sub">{{ kind }} campaign {{ id }}: {{ member_count | count }} host{% if member_count != 1 %}s{% endif %}, {{ sightings | count }} sighting{% if sightings != "1" %}s{% endif %}, {{ first_seen }} to {{ last_seen }}. Members are treated as: <strong>{{ role }}</strong>.</p>
+{% if self_propagating %}
+<p class="table-note">The sample scans for new hosts and copies itself to them, so the hosts that uploaded it are most likely infected machines rather than its operators. This is shown here only; vendor reports do not use it yet.</p>
+{% endif %}
+
+<div class="panel">
+  <div class="panel-head">Review</div>
+  {% if pending_members > 0 %}
+  <div class="panel-body">
+    <p>{{ pending_members | count }} member{% if pending_members != 1 %}s are{% else %} is{% endif %} pending review. <a class="btn btn-approve" href="/campaigns/{{ id }}/approve">Approve all {{ pending_members | count }}&hellip;</a> <span class="dim">shows the list first; nothing is approved until you confirm</span></p>
+  </div>
+  {% else %}
+  <p class="empty-line">no member is pending review</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Distinct hosts per day <span class="dim">last {{ spark_days }} days</span></div>
+  <div class="panel-body">
+    <p>{{ m.day_strip(spark, spark_days) }}</p>
+    {% if sensors %}<p class="ctx-dim">{% for s in sensors %}<span class="ctx-chip">{{ s.label }} {{ s.sightings | count }}</span>{% endfor %}</p>{% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">Representative <span class="dim">earliest {% if kind_value == "command_sequence" %}session{% elif kind_value == "sample" %}capture{% else %}window{% endif %}</span></div>
+  {% set r = representative %}
+  <div class="panel-body">
+  {% if r.source_ip %}<p>From {{ m.ip_evidence_link(r.source_ip) }}{% if r.session_id %} <span class="dim mono">session {{ r.session_id }}</span>{% endif %}</p>{% endif %}
+  {% if r.shapes %}
+  <p class="dim">Commands, normalized: addresses, ports and payload runs replaced, repeats collapsed.</p>
+  <ol class="shape-list mono">{% for s in r.shapes %}<li>{{ s }}</li>{% endfor %}</ol>
+  {% endif %}
+  {% if r.encoded %}
+  <p class="dim">Sent XOR-encoded by this session; the commands above are the decoded text.</p>
+  <ul class="shape-list mono">{% for e in r.encoded %}<li>{{ e.raw }} <span class="dim">sent XOR-encoded, key {{ e.key }}, decoded</span> {{ e.decoded }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% if r.sha256 %}
+  <p>Sample {{ m.hash_link(r.sha256) }}{% if r.orig_name %} <span class="dim">named</span> <code>{{ r.orig_name }}</code>{% endif %}{% if r.origin %} <span class="dim">({{ r.origin }})</span>{% endif %}</p>
+  {% if r.url %}<p><span class="dim">fetched from</span> <code class="ioc-value">{{ r.url }}</code></p>{% endif %}
+  {% endif %}
+  {% if r.sensors %}<p>Sensors reached within one hour: <span class="ctx-dim">{% for s in r.sensors %}<span class="ctx-chip">{{ s }}</span>{% endfor %}</span></p>{% endif %}
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-head">ATT&amp;CK techniques <span class="dim">labels, not verdicts</span></div>
+  {% if techniques %}
+  <div class="panel-body">{{ m.technique_list(techniques) }}</div>
+  {% else %}
+  <p class="empty-line">none tagged</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Linked samples</div>
+  {% if samples %}
+  <div class="panel-body">
+    <p>{% for s in samples %}{{ m.hash_link(s.sha256) }}{% if not loop.last %} {% endif %}{% endfor %}{% if more_samples > 0 %} <span class="dim">+{{ more_samples | count }} more</span>{% endif %}</p>
+  </div>
+  {% else %}
+  <p class="empty-line">no linked samples</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Indicators <span class="dim">defanged, not published</span></div>
+  {% if artifact_iocs or command_iocs %}
+  <div class="panel-body">
+    <p class="table-note">Command indicators are every indicator the members' own commands carried (the 2,000 most recent members), which can include activity outside this campaign.</p>
+  </div>
+  <table class="table-compact">
+    <thead><tr><th>Kind</th><th>Value</th><th>Detail</th><th>From</th></tr></thead>
+    <tbody>
+      {% for i in artifact_iocs %}
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td>sample {{ m.hash_link(i.sample) }}</td></tr>
+      {% endfor %}
+      {% for i in command_iocs %}
+      <tr><td>{{ i.kind }}</td><td>{{ m.ioc_value(i) }}</td><td class="dim">{{ i.detail }}</td><td class="mono">{{ i.hosts | count }} host{% if i.hosts != 1 %}s{% endif %}, <span class="run-count">x{{ i.sightings | count }}</span> <span class="dim">first</span> {{ m.ip_evidence_link(i.source_ip) }} <span class="dim">event {{ i.event_id }}</span></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">none extracted</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <div class="panel-head">Members <span class="dim">{{ member_count | count }}, most recent first</span></div>
+  <table class="table-compact stack">
+    <thead><tr><th>IP</th><th>First seen</th><th>Last seen</th><th class="count">Sightings</th><th>Review</th></tr></thead>
+    <tbody id="members-rows">
+{% include "campaign_members_rows.html" %}
+    </tbody>
+  </table>
+  <div class="load-more-row" id="load-more-container">{% include "campaign_members_load_more.html" %}</div>
+</div>
+{% endblock %}

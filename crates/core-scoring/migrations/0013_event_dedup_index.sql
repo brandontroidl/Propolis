@@ -1,0 +1,16 @@
+-- Serves the dedup read every scored append makes while it holds the global append lock:
+-- MAX(observed_at) for one (source_ip, signal_type). Without this index the planner answered it by
+-- walking event_observed_at_idx down from the newest row until it met the source, which costs one
+-- row for every ledger event newer than that source's last sighting. An intake that falls behind
+-- appends old observed_at values, so the walk grew with the lag and the lag grew with the walk: a
+-- telnet backlog reached about 1.1 s per event in production and held the append lock long enough
+-- to throttle every other sensor. With the index the read is one backward step.
+--
+-- A plain CREATE INDEX, not CONCURRENTLY. sqlx runs this file in its own transaction at daemon
+-- startup, before any intake task exists, so the SHARE lock it takes on event (writes wait, reads
+-- do not) blocks nothing that is running. If the build fails it rolls back with the migration and
+-- leaves no INVALID index behind for the next start to trip over. The lock lasts as long as the
+-- build, which grows with the ledger: 12 s with two parallel maintenance workers and 20 s with
+-- none, measured on a 7.5M-row (3.9 GB) ledger held in RAM. A disk-backed server also reads the
+-- heap from disk, so plan on up to about a minute of startup at that size (an estimate).
+CREATE INDEX event_dedup_idx ON event (source_ip, signal_type, observed_at);

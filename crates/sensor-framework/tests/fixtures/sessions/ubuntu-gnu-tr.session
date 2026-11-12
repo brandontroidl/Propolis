@@ -1,0 +1,340 @@
+# Ubuntu 22.04's tr is GNU coreutils 8.32: translate, delete, squeeze, complement, the repeat and
+# class constructs, and every refusal wording. Each reply was produced by `bash -c` in an
+# ubuntu:22.04 container (coreutils 8.32-4.1ubuntu1.4, LANG=C.UTF-8 as the persona's login sets
+# it), standard input closed. Where the reply differs from the toybox tr of the Android persona the
+# line is one that tells them apart: `-C` complements here, `\x41` and `\e` are not escapes here,
+# `[y*]` repeats here, and the operand and option errors name `Try 'tr --help'`.
+# source: ubuntu:22.04 container run of /usr/bin/tr, 8.32-4.1ubuntu1.4 (synthetic command shapes)
+# date: 2026-10-08
+# protocol: ssh
+# persona: ubuntu
+$ printf 'Hello World\n' | tr a-z A-Z; echo "rc=$?"
+> HELLO WORLD
+> rc=0
+$ printf 'Hello World\n' | tr '[:lower:]' '[:upper:]'; echo "rc=$?"
+> HELLO WORLD
+> rc=0
+$ printf 'Hello World\n' | tr '[:upper:]' '[:lower:]'; echo "rc=$?"
+> hello world
+> rc=0
+$ printf 'Hello World\n' | tr 'a-y' 'b-z'; echo "rc=$?"
+> Hfmmp Wpsme
+> rc=0
+$ printf 'a1B2 c3\n' | tr -d '[:digit:]'; echo "rc=$?"
+> aB c
+> rc=0
+$ printf 'a1B2 c3\n' | tr -cd '[:digit:]\n'; echo "rc=$?"
+> 123
+> rc=0
+$ printf 'a1B2 c3\n' | tr -Cd '[:digit:]\n'; echo "rc=$?"
+> 123
+> rc=0
+$ printf 'abc abc\n' | tr -c 'a' 'X'; echo "rc=$?"
+> aXXXaXXXrc=0
+$ printf 'abc abc\n' | tr -C 'a' 'X'; echo "rc=$?"
+> aXXXaXXXrc=0
+$ printf 'a  b   c\n' | tr -s ' '; echo "rc=$?"
+> a b c
+> rc=0
+$ printf 'a  b   c\n' | tr -s ' ' '_'; echo "rc=$?"
+> a_b_c
+> rc=0
+$ printf 'aabbccdd\n' | tr -s 'a-b' 'x'; echo "rc=$?"
+> xccdd
+> rc=0
+$ printf 'a\n\n\nb\n' | tr -s '\n'; echo "rc=$?"
+> a
+> b
+> rc=0
+$ printf 'foo bar baz\n' | tr -cs 'a-z' '\n'; echo "rc=$?"
+> foo
+> bar
+> baz
+> rc=0
+$ printf 'aXXbXc\n' | tr -ds 'X' 'a'; echo "rc=$?"
+> abc
+> rc=0
+$ printf 'aXXbXc\n' | tr -d 'X' 'a'; echo "rc=$?"
+> tr: extra operand ‘a’
+> Only one string may be given when deleting without squeezing repeats.
+> Try 'tr --help' for more information.
+> rc=1
+$ printf 'abcdef\n' | tr abcdef 'xy'; echo "rc=$?"
+> xyyyyy
+> rc=0
+$ printf 'abcdef\n' | tr -t abcdef 'xy'; echo "rc=$?"
+> xycdef
+> rc=0
+$ printf 'abcdef\n' | tr abcdef 'x[y*]'; echo "rc=$?"
+> xyyyyy
+> rc=0
+$ printf 'abcdef\n' | tr abcdef '[y*2]z'; echo "rc=$?"
+> yyzzzz
+> rc=0
+$ printf 'abcdef\n' | tr abcdef '[y*010]'; echo "rc=$?"
+> yyyyyy
+> rc=0
+$ printf 'abcdef\n' | tr a-f '[x*]yz'; echo "rc=$?"
+> xxxxyz
+> rc=0
+$ printf 'a1b2\n' | tr 'a[:upper:]' 'x[:lower:]'; echo "rc=$?"
+> x1b2
+> rc=0
+$ printf 'AbC aBc\n' | tr 'a-zA-Z' 'n-za-mN-ZA-M'; echo "rc=$?"
+> NoP nOp
+> rc=0
+$ printf 'a\\b\tc\n' | tr '\\\t' '/ '; echo "rc=$?"
+> a/b c
+> rc=0
+$ printf 'A\n' | tr '\101' z; echo "rc=$?"
+> z
+> rc=0
+$ printf 'xA41e\n' | tr '\x41' 'z'; echo "rc=$?"
+> zAzze
+> rc=0
+$ printf 'eE\n' | tr '\e' 'z'; echo "rc=$?"
+> zE
+> rc=0
+$ printf 'a=b\n' | tr '[=a=]' 'z'; echo "rc=$?"
+> z=b
+> rc=0
+$ printf 'a-b\n' | tr 'a-' 'xy'; echo "rc=$?"
+> xyb
+> rc=0
+$ printf 'a-b\n' | tr -- '-a' 'xy'; echo "rc=$?"
+> yxb
+> rc=0
+$ printf 'hello\n' | tr -d; echo "rc=$?"
+> tr: missing operand
+> Try 'tr --help' for more information.
+> rc=1
+$ tr; echo "rc=$?"
+> tr: missing operand
+> Try 'tr --help' for more information.
+> rc=1
+$ tr a; echo "rc=$?"
+> tr: missing operand after ‘a’
+> Two strings must be given when translating.
+> Try 'tr --help' for more information.
+> rc=1
+$ tr a b c; echo "rc=$?"
+> tr: extra operand ‘c’
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -d a b; echo "rc=$?"
+> tr: extra operand ‘b’
+> Only one string may be given when deleting without squeezing repeats.
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -d a b c; echo "rc=$?"
+> tr: extra operand ‘b’
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -ds a; echo "rc=$?"
+> tr: missing operand after ‘a’
+> Two strings must be given when both deleting and squeezing repeats.
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -s -d a; echo "rc=$?"
+> tr: missing operand after ‘a’
+> Two strings must be given when both deleting and squeezing repeats.
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -z a b; echo "rc=$?"
+> tr: invalid option -- 'z'
+> Try 'tr --help' for more information.
+> rc=1
+$ tr --foo a b; echo "rc=$?"
+> tr: unrecognized option '--foo'
+> Try 'tr --help' for more information.
+> rc=1
+$ tr --complement=1 a b; echo "rc=$?"
+> tr: option '--complement' doesn't allow an argument
+> Try 'tr --help' for more information.
+> rc=1
+$ tr --=x a b; echo "rc=$?"
+> tr: option '--=x' is ambiguous; possibilities: '--complement' '--delete' '--squeeze-repeats' '--truncate-set1' '--help' '--version'
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -- ; echo "rc=$?"
+> tr: missing operand
+> Try 'tr --help' for more information.
+> rc=1
+$ /usr/bin/tr a b c; echo "rc=$?"
+> /usr/bin/tr: extra operand ‘c’
+> Try '/usr/bin/tr --help' for more information.
+> rc=1
+$ /usr/bin/tr -z; echo "rc=$?"
+> /usr/bin/tr: invalid option -- 'z'
+> Try '/usr/bin/tr --help' for more information.
+> rc=1
+$ tr z-a b; echo "rc=$?"
+> tr: range-endpoints of 'z-a' are in reverse collating sequence order
+> rc=1
+$ tr '[:foo:]' b; echo "rc=$?"
+> tr: invalid character class ‘foo’
+> rc=1
+$ tr '[::]' b; echo "rc=$?"
+> tr: missing character class name '[::]'
+> rc=1
+$ tr '[==]' b; echo "rc=$?"
+> tr: missing equivalence class character '[==]'
+> rc=1
+$ tr '[=ab=]' b; echo "rc=$?"
+> tr: ab: equivalence class operand must be a single character
+> rc=1
+$ tr 'a' '[b*x]'; echo "rc=$?"
+> tr: invalid repeat count ‘x’ in [c*n] construct
+> rc=1
+$ tr '[a*]' b; echo "rc=$?"
+> tr: the [c*] repeat construct may not appear in string1
+> rc=1
+$ tr a '[b*][c*]'; echo "rc=$?"
+> tr: only one [c*] repeat construct may appear in string2
+> rc=1
+$ tr -d a '[b*]'; echo "rc=$?"
+> tr: extra operand ‘[b*]’
+> Only one string may be given when deleting without squeezing repeats.
+> Try 'tr --help' for more information.
+> rc=1
+$ tr -ds a '[b*]'; echo "rc=$?"
+> tr: the [c*] construct may appear in string2 only when translating
+> rc=1
+$ tr a '[=b=]'; echo "rc=$?"
+> tr: [=c=] expressions may not appear in string2 when translating
+> rc=1
+$ tr a '[:digit:]'; echo "rc=$?"
+> tr: when translating, the only character classes that may appear in
+> string2 are 'upper' and 'lower'
+> rc=1
+$ tr abc '[:upper:]'; echo "rc=$?"
+> tr: misaligned [:upper:] and/or [:lower:] construct
+> rc=1
+$ tr '[:upper:]' 'a[:lower:]'; echo "rc=$?"
+> tr: misaligned [:upper:] and/or [:lower:] construct
+> rc=1
+$ tr '[:lower:]' '[:upper:]a'; echo "rc=$?"
+> rc=0
+$ tr '[:lower:]' '[:lower:]x'; echo "rc=$?"
+> rc=0
+$ tr -c '[:upper:]' '[:lower:]'; echo "rc=$?"
+> tr: when translating with string1 longer than string2,
+> the latter string must not end with a character class
+> rc=1
+$ tr -c '[:digit:]' 'ab'; echo "rc=$?"
+> tr: when translating with complemented character classes,
+> string2 must map all characters in the domain to one
+> rc=1
+$ tr abc ''; echo "rc=$?"
+> tr: when not truncating set1, string2 must be non-empty
+> rc=1
+$ tr 'abc\' x </dev/null; echo "rc=$?"
+> tr: warning: an unescaped backslash at end of string is not portable
+> rc=0
+$ tr '\777' x </dev/null; echo "rc=$?"
+> tr: warning: the ambiguous octal escape \777 is being
+> 	interpreted as the 2-byte sequence \077, 7
+> rc=0
+$ tr -A a b c; echo "rc=$?"
+> tr: extra operand 'c'
+> Try 'tr --help' for more information.
+> rc=1
+$ tr --help; echo "rc=$?"
+> Usage: tr [OPTION]... SET1 [SET2]
+> Translate, squeeze, and/or delete characters from standard input,
+> writing to standard output.
+>
+>   -c, -C, --complement    use the complement of SET1
+>   -d, --delete            delete characters in SET1, do not translate
+>   -s, --squeeze-repeats   replace each sequence of a repeated character
+>                             that is listed in the last specified SET,
+>                             with a single occurrence of that character
+>   -t, --truncate-set1     first truncate SET1 to length of SET2
+>       --help     display this help and exit
+>       --version  output version information and exit
+>
+> SETs are specified as strings of characters.  Most represent themselves.
+> Interpreted sequences are:
+>
+>   \NNN            character with octal value NNN (1 to 3 octal digits)
+>   \\              backslash
+>   \a              audible BEL
+>   \b              backspace
+>   \f              form feed
+>   \n              new line
+>   \r              return
+>   \t              horizontal tab
+>   \v              vertical tab
+>   CHAR1-CHAR2     all characters from CHAR1 to CHAR2 in ascending order
+>   [CHAR*]         in SET2, copies of CHAR until length of SET1
+>   [CHAR*REPEAT]   REPEAT copies of CHAR, REPEAT octal if starting with 0
+>   [:alnum:]       all letters and digits
+>   [:alpha:]       all letters
+>   [:blank:]       all horizontal whitespace
+>   [:cntrl:]       all control characters
+>   [:digit:]       all digits
+>   [:graph:]       all printable characters, not including space
+>   [:lower:]       all lower case letters
+>   [:print:]       all printable characters, including space
+>   [:punct:]       all punctuation characters
+>   [:space:]       all horizontal or vertical whitespace
+>   [:upper:]       all upper case letters
+>   [:xdigit:]      all hexadecimal digits
+>   [=CHAR=]        all characters which are equivalent to CHAR
+>
+> Translation occurs if -d is not given and both SET1 and SET2 appear.
+> -t may be used only when translating.  SET2 is extended to length of
+> SET1 by repeating its last character as necessary.  Excess characters
+> of SET2 are ignored.  Only [:lower:] and [:upper:] are guaranteed to
+> expand in ascending order; used in SET2 while translating, they may
+> only be used in pairs to specify case conversion.  -s uses the last
+> specified SET, and occurs after translation or deletion.
+>
+> GNU coreutils online help: <https://www.gnu.org/software/coreutils/>
+> Report any translation bugs to <https://translationproject.org/team/>
+> Full documentation <https://www.gnu.org/software/coreutils/tr>
+> or available locally via: info '(coreutils) tr invocation'
+> rc=0
+$ tr --version; echo "rc=$?"
+> tr (GNU coreutils) 8.32
+> Copyright (C) 2020 Free Software Foundation, Inc.
+> License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+> This is free software: you are free to change and redistribute it.
+> There is NO WARRANTY, to the extent permitted by law.
+>
+> Written by Jim Meyering.
+> rc=0
+$ tr --vers --help | head -1; echo "rc=$?"
+> tr (GNU coreutils) 8.32
+> rc=0
+$ tr --del --squeeze-repeats a b </dev/null; echo "rc=$?"
+> rc=0
+$ printf 'aabb\n' | tr --squeeze-repeats --truncate-set1 --complement ab xy; echo "rc=$?"
+> aabb
+> rc=0
+$ printf 'caf\303\251\n' | tr 'a-z' 'A-Z'; echo "rc=$?"
+> CAFé
+> rc=0
+$ printf 'ahi\n' | tr abcdefghi '[y*010]z'; echo "rc=$?"
+> yyz
+> rc=0
+$ printf '09AZaz\n' | tr '[:alnum:]' 'a-zA-Z0-9a-z'; echo "rc=$?"
+> ajkJK9
+> rc=0
+$ printf 'a.b,c d!\n' | tr -d '[:punct:]'; echo "rc=$?"
+> abc d
+> rc=0
+$ printf 'a\t b\tc\n' | tr -s '[:blank:]' '_'; echo "rc=$?"
+> a_b_c
+> rc=0
+$ printf 'ab12gG\n' | tr '[:xdigit:]' X; echo "rc=$?"
+> XXXXgG
+> rc=0
+$ printf 'a b\tc\n' | tr '[:space:]' '[-*]'; echo "rc=$?"
+> a-b-c-rc=0
+$ printf 'A1 b2\n' | tr -c '[:graph:]' '#'; echo "rc=$?"
+> A1#b2#rc=0
+$ printf 'A1 b2\n' | tr -c '[:alpha:]' '#'; echo "rc=$?"
+> A##b##rc=0
+$ printf 'A1 b2\n' | tr '[:cntrl:][:print:]' x; echo "rc=$?"
+> xxxxxxrc=0

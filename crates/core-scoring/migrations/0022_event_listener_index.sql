@@ -1,0 +1,32 @@
+-- Serves two console reads that asked a question about every listener or sensor and answered it by
+-- reading the ledger:
+--
+--   * the search form's sensor menu (SELECT DISTINCT sensor FROM event: 2.4 s on the live node);
+--   * the fleet pane's "newest event per listener over 30 days" (a GROUP BY over everything but
+--     the last day, run on every 30 s poll of every open tab).
+--
+-- A listener is (sensor, protocol, the port the sensor framework stamps as metadata.local_port),
+-- and a ledger has a few dozen of them however many events it holds. With this index each distinct
+-- listener is found by stepping from one key to the next (a loose index scan: a recursive
+-- statement taking the first key past the last one it found), and a listener's newest event in a
+-- window is one backward probe of its own entries. Cost is the number of listeners, not the
+-- number of events: the sensor menu went from 236 ms to 1.4 ms and the fleet pane's 30-day read
+-- from 552 ms to a few milliseconds on a seeded 1,500,000-event ledger.
+--
+-- The port is COALESCE'd to '' for an event written before sensors stamped it. Without that, the
+-- step from one key to the next (a row comparison) skips every key whose port is NULL, because a
+-- comparison with NULL is not true. '' cannot be a port, and the console already files a missing
+-- or unparsable port with the unrecorded events.
+--
+-- Cost: 59 MB per 1,500,000 events, about 300 MB at the 7.5M-row ledger the live node held when
+-- this was written, and one more index entry per appended event: bulk-inserting 800,000 events
+-- took 25.3 s without the index and 30.5 s with it, about 6 us per event.
+--
+-- A plain CREATE INDEX, not CONCURRENTLY, for the reasons given in 0013: sqlx runs this file in
+-- its own transaction at daemon startup, before any intake task exists, so the SHARE lock it takes
+-- on event (writes wait, reads do not) blocks nothing that is running, and a failed build rolls
+-- back with the migration and leaves no INVALID index behind. The lock lasts as long as the build:
+-- 6 s on 1,500,000 events, so plan on well under a minute at 7.5M rows (an estimate).
+CREATE INDEX event_listener_idx ON event (
+    sensor, protocol, (COALESCE(metadata->>'local_port', '')), observed_at
+);

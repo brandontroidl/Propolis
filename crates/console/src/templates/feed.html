@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}Feed {{ tab }} - Propolis{% endblock %}
+{% block content %}
+{% import "macros.html" as m %}
+<h1>Feed</h1>
+<div class="tab-bar">
+  {% for tab_name in ["status", "entries"] %}
+  <a href="/feed?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
+  {% endfor %}
+</div>
+
+{# One format dropdown + one download link, per tier. The tier is fixed by the panel it sits in,
+   so the operator picks only the format. Defaults to the .txt href so it still works with JS off;
+   the page-level listener below rewrites the href as the format select changes. #}
+{% macro download_row(feed) %}
+<span class="dl">
+  <select class="dl-fmt" aria-label="Download format for {{ feed }}">
+    <option value="txt">TXT</option>
+    <option value="json">JSON</option>
+    <option value="csv">CSV</option>
+    <option value="cidr">CIDR</option>
+    <option value="ipset">ipset</option>
+    <option value="nft">nftables</option>
+    <option value="pf">pf</option>
+    <option value="alias">pfSense</option>
+    <option value="hosts">hosts</option>
+    <option value="rpz">RPZ</option>
+  </select>
+  <a class="dl-go" data-feed="{{ feed }}" href="/feed/download/{{ feed }}/txt" download>Download</a>
+</span>
+{% endmacro %}
+
+{#- One feed file's addresses, the first load of them with a "Load more" for the rest; each table
+    has its own body and button, keyed by the file it reads. -#}
+{% macro entry_table(t, empty_text) %}
+{% if t.rows %}
+<table class="table-compact stack">
+  <thead><tr><th>IP</th><th>Events</th><th>Activity</th><th>First seen</th><th>Last seen</th></tr></thead>
+  <tbody id="entries-{{ t.key }}">
+{% include "feed_entries_rows.html" %}
+  </tbody>
+</table>
+<div class="load-more-row" id="more-{{ t.key }}">{% include "feed_entries_load_more.html" %}</div>
+{% else %}
+<p class="empty-line">{{ empty_text }}</p>
+{% endif %}
+{% endmacro %}
+
+{% if tab == "entries" %}
+  {% if has_build %}
+    <div class="panel">
+      <div class="panel-head">
+        <span>Aggressive tier <span class="dim">({{ aggressive_entries.total | count }})</span></span>
+        {{ download_row("aggressive") }}
+      </div>
+      {{ entry_table(aggressive_entries, "no addresses in the aggressive tier") }}
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <span>Standard tier <span class="dim">({{ standard_entries.total | count }})</span></span>
+        {{ download_row("standard") }}
+      </div>
+      {{ entry_table(standard_entries, "no addresses in the standard tier") }}
+    </div>
+    {% for label, t in window_entries %}
+    <div class="panel">
+      <div class="panel-head">
+        <span>Last {{ label }} <span class="dim">({{ t.total | count }})</span></span>
+        {{ download_row("all-" ~ label) }}
+      </div>
+      {{ entry_table(t, "no activity in this window") }}
+    </div>
+    {% endfor %}
+  {% else %}
+  <div class="panel"><p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p></div>
+  {% endif %}
+{% else %}
+  {% if has_build %}
+  <div class="panel">
+    <div class="panel-head">Blocklist tiers <span class="dim">built {{ build_time }}</span></div>
+    <table class="table-compact">
+      <thead><tr><th>Tier</th><th>Entries</th><th>Valid until</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>{{ m.tier_pill("aggressive") }}</td>
+          <td class="mono">{{ aggressive_count | count }}</td>
+          <td class="seen">{{ aggressive_valid_until }}</td>
+        </tr>
+        <tr>
+          <td>{{ m.tier_pill("standard") }}</td>
+          <td class="mono">{{ standard_count | count }}</td>
+          <td class="seen">{{ standard_valid_until }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% if windows %}
+  <div class="panel">
+    <div class="panel-head">Retention feeds <span class="dim">approved, any tier</span></div>
+    <table class="table-compact">
+      <thead><tr><th>Window</th><th>Entries</th><th>Valid until</th><th>File</th></tr></thead>
+      <tbody>
+        {% for w in windows %}
+        <tr>
+          <td>Last {{ w.label }}</td>
+          <td class="mono">{{ w.count | count }}</td>
+          <td class="seen">{{ w.valid_until }}</td>
+          <td class="mono dim">all-{{ w.label }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+  <div class="panel">
+    <div class="panel-head">Exclusions <span class="dim">never published</span></div>
+    <table class="table-compact">
+      <tbody>
+        <tr><td>Reserved / special-purpose ranges</td><td>always on</td></tr>
+        <tr><td>Operator CIDR allowlist</td><td class="mono">{{ exclusions.allowlist_count | count }} range{% if exclusions.allowlist_count != 1 %}s{% endif %}</td></tr>
+        <tr><td>Delisted addresses</td><td class="mono">{{ exclusions.delist_count | count }}</td></tr>
+        <tr>
+          <td>Trusted-org ASN suppression</td>
+          <td>
+            {% if exclusions.asn_allowlist_count == 0 %}<span class="dim">off</span>
+            {% elif exclusions.asn_db_loaded %}{{ exclusions.asn_allowlist_count | count }} ASN{% if exclusions.asn_allowlist_count != 1 %}s{% endif %} active
+            {% else %}<span class="sev sev--watch">{{ exclusions.asn_allowlist_count | count }} configured, GeoLite2-ASN not loaded, inert</span>{% endif %}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="panel"><p class="empty-line">{% if feed_disabled %}feed builder is disabled on this node{% else %}feed enabled - awaiting first build{% endif %}</p></div>
+  {% endif %}
+{% endif %}
+<script src="/assets/feed.js"></script>
+{% endblock %}

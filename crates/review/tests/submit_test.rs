@@ -1,0 +1,792 @@
+//! Real-Postgres, mock-vendor tests for the submission runner (Task 4).
+//!
+//! Each test owns a fresh database (`#[sqlx::test]`). That matters because
+//! `SubmissionRunner::run_once` (unlike `gatekeeper::check` or
+//! `ReviewQueue::approve`) has no IP parameter at all - by design, it polls
+//! `review_queue` for EVERY Approved entry, table-wide - so on a database
+//! shared with other tests or crates, rows those leave Approved would reach
+//! `adapter.submit` alongside the test's own IP.
+//!
+//! The fixture addresses are in 203.0.113.0/24, the one documentation block the
+//! `test-public-ranges` feature (`review::reserved`, enabled for this crate's
+//! own test builds) treats as public, and must stay in it: the gatekeeper's
+//! first check refuses every reserved range outright, so a fixture in any other
+//! documentation block is held as `Reserved` before the runner behaviour under
+//! test is ever reached. Assertions stay scoped to
+//! `(this test's ip, this test's vendor name)` rather than the aggregate
+//! `SubmitResult`, which keeps them independent of fixture count.
+//!
+//! [`MockVendor`] implements `VendorAdapter` directly (per the task brief)
+//! rather than standing up a mock HTTP server like `vendor_test.rs` does for
+//! the adapters themselves - the runner is tested against the trait
+//! boundary, not the HTTP wire. Canned outcomes are scripted PER SOURCE IP
+//! (via [`MockVendor::script`]), not as a bare call-order queue: an
+//! unrelated contaminating IP must never consume the outcome a test
+//! scripted for its own IP, and a source IP with nothing scripted for it
+//! (every contaminating IP) gets an unconditional, harmless `Success` so it
+//! never affects this test's own assertions.
+
+use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use chrono::{Duration, Utc};
+use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use sqlx::{PgPool, Row};
+
+use review::gatekeeper::VendorConfig;
+use review::queue::ReviewQueue;
+use review::submit::SubmissionRunner;
+use review::vendor::{VendorAdapter, VendorError, VendorReport, VendorResponse};
+
+// ---------------------------------------------------------------------
+// Mock vendor
+// ---------------------------------------------------------------------
+
+/// A canned outcome for one [`MockVendor::submit`] call.
+#[derive(Debug, Clone)]
+enum MockOutcome {
+    Success { status: u16, body: &'static str },
+    Transient { status: u16, body: &'static str },
+    Permanent { status: u16, body: &'static str },
+}
+
+/// Records every [`VendorReport`] it is asked to submit. Outcomes are
+/// scripted per source IP (see the module doc comment for why): [`Self::script`]
+/// queues outcomes for one specific IP, returned in order on successive
+/// calls for THAT IP; any IP with nothing scripted (every contaminating
+/// approved entry the shared database also hands this vendor) gets an
+/// unconditional `Success`. `Clone` shares the same underlying
+/// `Arc<Mutex<_>>` state, so a test keeps one handle for assertions while a
+/// cloned `Box<dyn VendorAdapter>` is handed to the runner.
+#[derive(Clone)]
+struct MockVendor {
+    vendor_name: &'static str,
+    submissions: Arc<Mutex<Vec<VendorReport>>>,
+    outcomes: Arc<Mutex<HashMap<IpAddr, VecDeque<MockOutcome>>>>,
+}
+
+impl MockVendor {
+    fn new(vendor_name: &'static str) -> Self {
+        Self {
+            vendor_name,
+            submissions: Arc::new(Mutex::new(Vec::new())),
+            outcomes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Queue `outcomes` to be returned, in order, for `submit` calls whose
+    /// report's `source_ip` is exactly `ip`.
+    fn script(&self, ip: IpAddr, outcomes: Vec<MockOutcome>) {
+        self.outcomes
+            .lock()
+            .unwrap()
+            .insert(ip, VecDeque::from(outcomes));
+    }
+
+    /// Every report submitted whose `source_ip` is exactly `ip` - immune to
+    /// any OTHER approved IP the test's database also hands this vendor.
+    fn submissions_for(&self, ip: IpAddr) -> Vec<VendorReport> {
+        self.submissions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.source_ip == ip)
+            .cloned()
+            .collect()
+    }
+
+    /// The raw, UNFILTERED number of `submit` calls. Safe to assert `== 0`
+    /// only when the gate holds unconditionally for every IP (disabled
+    /// vendor, no matching gatekeeper config) - never as a stand-in for "my
+    /// IP was not submitted", which a contaminating IP could still make
+    /// nonzero.
+    fn call_count(&self) -> usize {
+        self.submissions.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl VendorAdapter for MockVendor {
+    fn name(&self) -> &str {
+        self.vendor_name
+    }
+
+    async fn submit(&self, report: &VendorReport) -> Result<VendorResponse, VendorError> {
+        self.submissions.lock().unwrap().push(report.clone());
+        let outcome = {
+            let mut m = self.outcomes.lock().unwrap();
+            m.get_mut(&report.source_ip)
+                .and_then(|q| q.pop_front())
+                .unwrap_or(MockOutcome::Success {
+                    status: 200,
+                    body: "ok",
+                })
+        };
+        match outcome {
+            MockOutcome::Success { status, body } => Ok(VendorResponse {
+                status,
+                body: body.to_string(),
+                accepted: true,
+            }),
+            MockOutcome::Transient { status, body } => Err(VendorError::Transient {
+                status,
+                body: body.to_string(),
+            }),
+            MockOutcome::Permanent { status, body } => Err(VendorError::Permanent {
+                status,
+                body: body.to_string(),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------
+
+async fn migrate(pool: &PgPool) {
+    // Core-scoring first (event/ip_score tables must exist), then this crate's own.
+    sqlx::migrate!("../core-scoring/migrations")
+        .run(pool)
+        .await
+        .unwrap();
+    review::migrator().run(pool).await.unwrap();
+}
+
+fn ev(
+    ip: &str,
+    sensor: &str,
+    signal: SignalType,
+    protocol: Protocol,
+    authenticated: bool,
+    ts: &str,
+    metadata: serde_json::Value,
+) -> EventInput {
+    EventInput::from_signal(
+        ip.parse().unwrap(),
+        None,
+        sensor.into(),
+        signal,
+        protocol,
+        authenticated,
+        ts.parse().unwrap(),
+        metadata,
+        None,
+    )
+}
+
+/// Seeds an eligible + vendor-recommended `ip_score` for `ip`: a confirmed-real
+/// SSH honeypot login and an SSH brute-force corroboration (both tagged
+/// `protocol_label: "ssh"`, matching `sensor-ssh`'s real wire contract), plus
+/// a label-less catch-all probe (matching `sensor-catchall`'s real
+/// contract). Raw 85 / max_confidence 0.920 clears the Standard tier floor,
+/// 3 events across 3 categories clears the eligibility gates - same recipe
+/// as `queue_test.rs`'s `seed_recommended`, with real `protocol_label`
+/// metadata added so `submit::category_protocol_labels` has something to
+/// find.
+async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
+    // Recent, ordered event times (a few minutes ago) so the seeded IP passes the gatekeeper's
+    // freshness gate. Only recency and order matter here; no assertion references these timestamps.
+    let base = Utc::now() - Duration::minutes(5);
+    let t0 = base.to_rfc3339();
+    let t1 = (base + Duration::seconds(10)).to_rfc3339();
+    let t2 = (base + Duration::seconds(20)).to_rfc3339();
+    append_event(
+        pool,
+        ev(
+            ip,
+            "honeypot-sensor",
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            &t0,
+            serde_json::json!({"protocol_label": "ssh"}),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        pool,
+        ev(
+            ip,
+            "ssh-sensor",
+            SignalType::SshBruteForce,
+            Protocol::Tcp,
+            true,
+            &t1,
+            serde_json::json!({"protocol_label": "ssh"}),
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        pool,
+        ev(
+            ip,
+            "catchall-sensor",
+            SignalType::CatchallProbe,
+            Protocol::Udp,
+            false,
+            &t2,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// A permissive baseline gatekeeper config: enabled, generous cooldown/rate
+/// limit, no score floor or category restriction - matching
+/// `gatekeeper_test.rs`'s own `permissive_config`.
+fn permissive_config(vendor: &str) -> VendorConfig {
+    VendorConfig {
+        name: vendor.to_string(),
+        enabled: true,
+        cooldown_hours: 24,
+        rate_limit: 1000,
+        rate_window_hours: 24,
+        score_floor: None,
+        category_filter: None,
+    }
+}
+
+async fn count_submissions(pool: &PgPool, ip: &str, vendor: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vendor_submission WHERE source_ip = $1::inet AND vendor = $2",
+    )
+    .bind(ip)
+    .bind(vendor)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+struct SubmissionRow {
+    success: bool,
+    response_status: Option<i32>,
+    response_body: Option<String>,
+}
+
+/// Fetches the ONE row for `(ip, vendor)` - scoped by both, so this is
+/// unaffected by any other IP the shared database also routes through this
+/// vendor's own name.
+async fn fetch_submission(pool: &PgPool, ip: &str, vendor: &str) -> SubmissionRow {
+    let row = sqlx::query(
+        "SELECT success, response_status, response_body \
+         FROM vendor_submission WHERE source_ip = $1::inet AND vendor = $2",
+    )
+    .bind(ip)
+    .bind(vendor)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    SubmissionRow {
+        success: row.get("success"),
+        response_status: row.get("response_status"),
+        response_body: row.get("response_body"),
+    }
+}
+
+/// Seeds, populates, and approves `ip` in one call - every test needs this
+/// exact sequence before constructing a `SubmissionRunner`.
+async fn seed_and_approve(pool: &PgPool, ip: &str) {
+    seed_recommended_ssh(pool, ip).await;
+    let queue = ReviewQueue::new();
+    queue.populate(pool).await.unwrap();
+    queue
+        .approve(pool, ip.parse().unwrap(), None)
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------
+
+#[sqlx::test(migrations = false)]
+async fn run_once_submits_with_real_protocol_label_mapping(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.240";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+
+    let mock = MockVendor::new("dshield");
+    mock.script(
+        ip_addr,
+        vec![MockOutcome::Success {
+            status: 200,
+            body: "ok",
+        }],
+    );
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(pool.clone(), vendors, vec![permissive_config("dshield")]);
+
+    runner.run_once().await.unwrap();
+
+    let mine = mock.submissions_for(ip_addr);
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].source_ip, ip_addr);
+    // Honeypot and Auth both carry protocol_label "ssh" -> the DShield "ssh"
+    // tag (not the generic "intrusion" Auth would fall back to without a
+    // label); the label-less catch-all's Network category -> "scan". Proves
+    // `category_protocol_labels` + `categories_for_vendor`'s dispatch is
+    // actually wired end-to-end, not just reachable from unit tests.
+    assert_eq!(
+        mine[0].categories,
+        vec!["ssh".to_string(), "scan".to_string()]
+    );
+    assert!(!mine[0].comment.is_empty());
+
+    let row = fetch_submission(&pool, ip, "dshield").await;
+    assert!(row.success);
+    assert_eq!(row.response_status, Some(200));
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_holds_disabled_vendor_without_writing_a_row(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.241";
+    seed_and_approve(&pool, ip).await;
+
+    let mock = MockVendor::new("mockvendor-disabled");
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let config = VendorConfig {
+        enabled: false,
+        ..permissive_config("mockvendor-disabled")
+    };
+    let runner = SubmissionRunner::new(pool.clone(), vendors, vec![config]);
+
+    let result = runner.run_once().await.unwrap();
+
+    // Disabled holds EVERY ip unconditionally (including any contaminating
+    // one), so the raw, unfiltered call count is safe to assert here.
+    assert_eq!(mock.call_count(), 0, "a held vendor must never be called");
+    assert_eq!(count_submissions(&pool, ip, "mockvendor-disabled").await, 0);
+    // The hold must be the disabled vendor, not the reserved-address check that runs first: a
+    // reserved fixture address would pass the two asserts above for the wrong reason.
+    assert!(
+        result.held_by.disabled >= 1,
+        "held as disabled: {:?}",
+        result.held_by
+    );
+    assert_eq!(
+        result.held_by.reserved, 0,
+        "the fixture address must not be reserved"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_records_failed_submission(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.242";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+
+    let mock = MockVendor::new("mockvendor-failed");
+    mock.script(
+        ip_addr,
+        vec![MockOutcome::Permanent {
+            status: 422,
+            body: "invalid ip",
+        }],
+    );
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("mockvendor-failed")],
+    );
+
+    runner.run_once().await.unwrap();
+
+    let row = fetch_submission(&pool, ip, "mockvendor-failed").await;
+    assert!(!row.success);
+    assert_eq!(row.response_status, Some(422));
+    assert_eq!(row.response_body.as_deref(), Some("invalid ip"));
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_is_idempotent_across_a_failed_then_successful_retry(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.243";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+
+    // A transient failure never sets success = true, so neither the
+    // cooldown nor the rate-limit check (both filtered to success = TRUE)
+    // blocks the second attempt - it reaches the INSERT/adapter.submit
+    // dance again, exactly the "retried on the next poll" scenario the
+    // design spec describes.
+    let mock = MockVendor::new("mockvendor-idempotent");
+    mock.script(
+        ip_addr,
+        vec![
+            MockOutcome::Transient {
+                status: 503,
+                body: "down",
+            },
+            MockOutcome::Success {
+                status: 200,
+                body: "ok",
+            },
+        ],
+    );
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("mockvendor-idempotent")],
+    );
+
+    runner.run_once().await.unwrap();
+    runner.run_once().await.unwrap();
+
+    assert_eq!(
+        mock.submissions_for(ip_addr).len(),
+        2,
+        "this ip is genuinely retried, not skipped, while still failed"
+    );
+    assert_eq!(
+        count_submissions(&pool, ip, "mockvendor-idempotent").await,
+        1,
+        "the UNIQUE idempotency key must collapse both attempts into one row, never two"
+    );
+    let row = fetch_submission(&pool, ip, "mockvendor-idempotent").await;
+    assert!(
+        row.success,
+        "the row must reflect the LATEST attempt's outcome"
+    );
+    assert_eq!(row.response_status, Some(200));
+}
+
+/// The crash window: an earlier attempt today inserted its pending row, called the vendor, and
+/// died before `record_result` ran. Its row shows `success = false` with NO response recorded.
+/// The cooldown check filters on `success = TRUE`, so it cannot hold this; the runner must
+/// recognise the unrecorded outcome itself and not call the vendor again - the vendor may have
+/// accepted that report, and a second call would report the IP twice.
+#[sqlx::test(migrations = false)]
+async fn run_once_does_not_resubmit_when_an_earlier_attempt_left_no_recorded_outcome(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.248";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    let vendor = "mockvendor-crashwindow";
+    seed_and_approve(&pool, ip).await;
+
+    // Today's row exactly as `insert_pending` leaves it before the vendor call.
+    let key = format!("{ip}:{vendor}:{}", Utc::now().date_naive());
+    sqlx::query(
+        "INSERT INTO vendor_submission \
+         (source_ip, vendor, idempotency_key, categories, comment, success) \
+         VALUES ($1::inet, $2, $3, '{}', '', FALSE)",
+    )
+    .bind(ip)
+    .bind(vendor)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mock = MockVendor::new(vendor);
+    mock.script(
+        ip_addr,
+        vec![MockOutcome::Success {
+            status: 200,
+            body: "ok",
+        }],
+    );
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(pool.clone(), vendors, vec![permissive_config(vendor)]);
+    let result = runner.run_once().await.unwrap();
+
+    assert!(
+        mock.submissions_for(ip_addr).is_empty(),
+        "an attempt with an unrecorded outcome must not be re-sent to the vendor"
+    );
+    assert!(
+        result.unresolved >= 1,
+        "the skip must be counted as unresolved, not silently dropped: {result:?}"
+    );
+    assert_eq!(count_submissions(&pool, ip, vendor).await, 1);
+    let row = fetch_submission(&pool, ip, vendor).await;
+    assert!(
+        !row.success,
+        "nothing may rewrite the unknown outcome as a result"
+    );
+    assert_eq!(row.response_status, None);
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_repeat_call_after_success_is_held_by_cooldown_not_resubmitted(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.244";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+
+    let mock = MockVendor::new("mockvendor-cooldown");
+    mock.script(
+        ip_addr,
+        vec![MockOutcome::Success {
+            status: 200,
+            body: "ok",
+        }],
+    );
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("mockvendor-cooldown")],
+    );
+
+    runner.run_once().await.unwrap();
+    assert_eq!(count_submissions(&pool, ip, "mockvendor-cooldown").await, 1);
+
+    // Same day, cooldown_hours = 24 (permissive default): the gatekeeper's
+    // own cooldown check now finds this IP's successful submission from
+    // moments ago and holds the repeat, before this module would ever
+    // re-INSERT the same idempotency key.
+    runner.run_once().await.unwrap();
+
+    assert_eq!(
+        mock.submissions_for(ip_addr).len(),
+        1,
+        "cooldown must prevent a second real vendor call for this ip in normal operation"
+    );
+    assert_eq!(count_submissions(&pool, ip, "mockvendor-cooldown").await, 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_ignores_entries_that_are_not_approved(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.245";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    seed_recommended_ssh(&pool, ip).await;
+    // Populate only - left Pending, never approved.
+    ReviewQueue::new().populate(&pool).await.unwrap();
+
+    let mock = MockVendor::new("mockvendor-nonapproved");
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("mockvendor-nonapproved")],
+    );
+
+    // Not asserting on the returned SubmitResult: the shared database may
+    // carry unrelated Approved entries (see the module doc comment), so
+    // only THIS ip's own absence is the invariant under test here.
+    runner.run_once().await.unwrap();
+
+    assert!(
+        mock.submissions_for(ip_addr).is_empty(),
+        "the human-approval gate: a Pending entry must never be submitted"
+    );
+    assert_eq!(
+        count_submissions(&pool, ip, "mockvendor-nonapproved").await,
+        0
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_gates_each_configured_vendor_independently(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.246";
+    let ip_addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+
+    let passing = MockVendor::new("mockvendor-multi-pass");
+    passing.script(
+        ip_addr,
+        vec![MockOutcome::Success {
+            status: 200,
+            body: "ok",
+        }],
+    );
+    let disabled = MockVendor::new("mockvendor-multi-disabled");
+    let vendors: Vec<Box<dyn VendorAdapter>> =
+        vec![Box::new(passing.clone()), Box::new(disabled.clone())];
+    let configs = vec![
+        permissive_config("mockvendor-multi-pass"),
+        VendorConfig {
+            enabled: false,
+            ..permissive_config("mockvendor-multi-disabled")
+        },
+    ];
+    let runner = SubmissionRunner::new(pool.clone(), vendors, configs);
+
+    runner.run_once().await.unwrap();
+
+    assert_eq!(passing.submissions_for(ip_addr).len(), 1);
+    // Disabled holds unconditionally, so the raw count is safe here too.
+    assert_eq!(disabled.call_count(), 0);
+}
+
+// Live: "submitted=0 held=17202" every pass with the reason per (ip, vendor) at debug only, so
+// nothing said WHY nothing was submitted. The pass result now carries the held count by reason.
+#[sqlx::test(migrations = false)]
+async fn run_once_reports_held_pairs_by_reason(pool: PgPool) {
+    migrate(&pool).await;
+    seed_and_approve(&pool, "203.0.113.240").await;
+
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![
+        Box::new(MockVendor::new("mockvendor-held-off")),
+        Box::new(MockVendor::new("mockvendor-held-floor")),
+        Box::new(MockVendor::new("mockvendor-held-noconfig")),
+    ];
+    let configs = vec![
+        VendorConfig {
+            enabled: false,
+            ..permissive_config("mockvendor-held-off")
+        },
+        VendorConfig {
+            score_floor: Some(rust_decimal::Decimal::from(100_000)),
+            ..permissive_config("mockvendor-held-floor")
+        },
+    ];
+    let result = SubmissionRunner::new(pool.clone(), vendors, configs)
+        .run_once()
+        .await
+        .unwrap();
+
+    assert_eq!(result.submitted, 0);
+    assert_eq!(result.held, 3);
+    assert_eq!(result.held_by.disabled, 1);
+    assert_eq!(result.held_by.score_floor, 1);
+    assert_eq!(result.held_by.no_vendor_config, 1);
+    assert_eq!(
+        result.held_by.total(),
+        result.held,
+        "every hold has a reason"
+    );
+    assert_eq!(
+        result.held_by.to_string(),
+        "no_vendor_config=1 disabled=1 score_floor=1"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn run_once_holds_vendor_with_no_matching_gatekeeper_config(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.247";
+    seed_and_approve(&pool, ip).await;
+
+    let mock = MockVendor::new("mockvendor-unconfigured");
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    // No entry in gatekeeper_config matches this adapter's name, so it holds
+    // unconditionally for every ip - the raw call count is safe here too.
+    let runner = SubmissionRunner::new(pool.clone(), vendors, vec![]);
+
+    runner.run_once().await.unwrap();
+
+    assert_eq!(mock.call_count(), 0);
+    assert_eq!(
+        count_submissions(&pool, ip, "mockvendor-unconfigured").await,
+        0
+    );
+}
+
+/// The statements sqlx logs while the guard is held: sqlx emits each at DEBUG on the
+/// `sqlx::query` target with the SQL text in `db.statement`.
+#[derive(Clone, Default)]
+struct StatementLog(Arc<Mutex<Vec<String>>>);
+
+struct StatementText(Option<String>);
+
+impl tracing::field::Visit for StatementText {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "db.statement" {
+            self.0 = Some(value.to_string());
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "db.statement" {
+            self.0 = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatementLog {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() == "sqlx::query" {
+            let mut text = StatementText(None);
+            event.record(&mut text);
+            if let Some(sql) = text.0 {
+                self.0.lock().unwrap().push(sql);
+            }
+        }
+    }
+}
+
+impl StatementLog {
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::prelude::*;
+        let log = StatementLog::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(log.clone())
+            .with(tracing_subscriber::filter::LevelFilter::DEBUG);
+        (log, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|sql| sql.contains(needle))
+            .count()
+    }
+}
+
+/// A pass over many addresses that are all held by cooldown (the steady state: every approved
+/// address stays Approved) used to run one cooldown lookup per address and vendor, plus one
+/// protocol-label query per address that no held pair ever uses. 5,600 addresses and three vendors
+/// made 17,000 of the first on the live node, each timed by sqlx as a stall.
+#[sqlx::test(migrations = false)]
+async fn a_pass_over_held_addresses_reads_cooldowns_in_one_query(pool: PgPool) {
+    migrate(&pool).await;
+    const ADDRESSES: usize = 12;
+    for n in 0..ADDRESSES {
+        seed_and_approve(&pool, &format!("203.0.113.{}", 20 + n)).await;
+    }
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![
+        Box::new(MockVendor::new("dshield")),
+        Box::new(MockVendor::new("otx")),
+    ];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("dshield"), permissive_config("otx")],
+    );
+
+    // The first pass submits everything and so puts every pair into cooldown.
+    let first = runner.run_once().await.unwrap();
+    assert_eq!(first.submitted, ADDRESSES * 2);
+
+    let (log, guard) = StatementLog::capture();
+    let second = runner.run_once().await.unwrap();
+    drop(guard);
+
+    assert_eq!(second.held, ADDRESSES * 2);
+    assert_eq!(second.held_by.cooldown, ADDRESSES * 2);
+    assert_eq!(second.submitted, 0);
+    assert_eq!(
+        log.count("ORDER BY submitted_at DESC LIMIT 1"),
+        0,
+        "no per-pair cooldown lookup"
+    );
+    assert_eq!(
+        log.count("MAX(submitted_at)"),
+        1,
+        "one batched cooldown read for the whole pass"
+    );
+    assert_eq!(
+        log.count("enum_range"),
+        0,
+        "no protocol-label read for an address every vendor held"
+    );
+}

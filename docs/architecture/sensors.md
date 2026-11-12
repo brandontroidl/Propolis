@@ -1,0 +1,240 @@
+<!--
+title: Sensor architecture
+audience: developer
+status: current
+owner: maintainer
+applies-to: 0.4.0 (untagged; latest tag v0.1.0)
+last-verified: 2026-10-14
+-->
+
+# Sensor architecture
+
+Propolis captures attacker activity through **twelve sensor crates covering fifteen
+emulated protocols**, plus one protocol-agnostic passive listener. Every sensor is
+a thin protocol front-end built on one shared crate, `sensor-framework`, which owns
+the parts that must behave identically everywhere: the listener, connection bounds,
+event emission, capture hand-off, the quarantine spool, the fake shell, and the
+single fictional host persona.
+
+This page explains how a sensor is structured and how a connection travels from
+accept to emitted event. Exact per-protocol behavior (banners, verbs, response
+codes, caps) is owned by [`reference/sensor-behavior.md`](../reference/sensor-behavior.md);
+event fields and signal types by
+[`reference/events-and-signals.md`](../reference/events-and-signals.md); ports and
+binds by [`reference/ports-and-protocols.md`](../reference/ports-and-protocols.md).
+
+## The two invariants sensors exist to hold
+
+Every sensor crate is engineered so that two properties hold **by construction**,
+not by careful coding:
+
+- **Egress-free.** No attacker-facing sensor crate has an HTTP or network-fetch
+  client anywhere in its own dependency tree. Per-sensor tests ban
+  `reqwest/hyper/ureq/curl/isahc/surf/attohttpc`; the shell's `wget`/`curl` return
+  canned transcripts with zero network I/O
+  (`crates/sensor-framework/src/shell/mod.rs`). A sensor cannot fetch or serve
+  attacker-directed content because nothing capable of it is present. (The *platform*
+  as a whole has a few operator-gated, default-off egress paths for enrichment and
+  reporting; see [`security/outbound-controls.md`](../security/outbound-controls.md).
+  Those live in other crates, never in a sensor.)
+- **Never-execute.** No sensor imports a process-spawning facility. There is no code
+  path from an attacker-typed byte to a real shell, syscall, or interpreter. The fake
+  shell returns hand-written strings; a source-level test
+  (`never_exec_static_check` in `crates/sensor-ssh/tests/shell_test.rs`) asserts this
+  across every file in the shell and SSH crates. See
+  [`security/never-execute.md`](../security/never-execute.md).
+
+## The shared framework (`sensor-framework`)
+
+A sensor crate supplies protocol logic; the framework supplies everything else.
+
+### Listener and per-connection isolation
+
+`run_tcp_listener(addr, bounds, per_source_cap, handler)` binds one TCP address, runs an accept loop,
+and hands each accepted connection to the protocol handler with a raw `TcpStream`,
+the peer `SocketAddr`, and a fresh `Uuid::now_v7()` session id
+(`crates/sensor-framework/src/listener.rs#run_tcp_listener`). Each connection:
+
+- runs in its own `tokio::spawn`, so a panicking handler is caught by tokio's task
+  harness, logged, and never crashes the accept loop
+  (`crates/sensor-framework/src/listener.rs#run_tcp_listener`);
+- is bounded per source IP by `per_source_cap` (`Some(n)` enables it; sensors pass a
+  quarter of `max_concurrent`, floor 2; the gateway passes `None` because its trusted
+  shipper multiplexes many connections from one IP), checked before the global permit
+  so one source cannot exhaust `max_concurrent`
+  (`crates/sensor-framework/src/admission.rs#PerSourceLimiter`);
+- is bounded by `max_concurrent` via a `tokio::sync::Semaphore` - a connection over
+  the limit is refused immediately (socket closed, never queued)
+  (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`);
+- is time-bounded by running the handler future inside
+  `tokio::time::timeout(max_duration, fut)` (`crates/sensor-framework/src/listener.rs#run_tcp_listener`).
+
+`run_udp_listener` mirrors this for datagrams (a datagram over its source's cap is dropped), but **never hands the socket to the
+handler**, so a UDP sensor cannot answer a probe by construction
+(`crates/sensor-framework/src/listener.rs#run_udp_listener`). `normalize_dual_stack` maps IPv4-mapped IPv6 peers
+(`::ffff:a.b.c.d`) down to plain IPv4 before WAN resolution, so a plain-IPv4 WAN map
+matches a dual-stack listener (`crates/sensor-framework/src/listener.rs#normalize_dual_stack`).
+
+### Connection bounds
+
+`ConnectionBounds` (`crates/sensor-framework/src/bounds.rs#ConnectionBounds`) defines *shape only* - `read_timeout`, `idle_timeout`, `max_duration`, `max_captured_bytes`,
+`max_concurrent`. Concrete values are set per sensor and read from environment
+variables through the framework's typed readers (`crates/sensor-framework/src/env.rs#Env`),
+validated before anything binds; a present-but-zero or unparseable bound makes every
+sensor refuse to start ("zero never means unlimited"), and only a missing or blank
+variable takes its default. Exact defaults are owned by
+[`reference/environment-variables.md`](../reference/environment-variables.md).
+
+### Server-side TLS
+
+Seven of the twelve sensors terminate TLS in-process (http, redis, mqtt, smtp, ftp, cred, dns);
+ssh, telnet, adb, tftp and catchall do not. The framework owns the shared parts in
+`crates/sensor-framework/src/tls.rs`: a fail-closed loader for one certificate and key per sensor
+(`crates/sensor-framework/src/tls.rs#load_server_config`), an implicit-TLS listener that wraps
+the plain listener's bounds so the per-source cap, the global limit and the session cap apply
+unchanged (`crates/sensor-framework/src/tls.rs#run_tls_listener`), and a plaintext-to-TLS stream
+for in-protocol upgrades (`crates/sensor-framework/src/tls.rs#MaybeTlsStream`,
+`crates/sensor-framework/src/tls.rs#upgrade_buffered`). Handlers are generic over the stream (or take
+`MaybeTlsStream` where a session can upgrade), so the protocol code is the same over plaintext
+and TLS. No client certificate is ever requested.
+
+Three modes, chosen per protocol:
+
+- **Implicit** (http 443, redis 6380, mqtt 8883, smtp 465, ftp 990, dns 853): a second listener in the
+  same process, started only when its `*_TLS_BIND` variable is set.
+- **STARTTLS** (smtp `STARTTLS`, ftp `AUTH TLS`): the plain listener upgrades in place after the
+  command, and refuses plaintext pipelined behind it.
+- **In-band** (cred: PostgreSQL, MySQL, MSSQL; MongoDB sniffs the first bytes): TLS is
+  negotiated inside the protocol's own startup on the existing port; no TLS port is added.
+
+Every TLS surface is off until its variables are set. TLS events carry `"tls": true` in their
+metadata ([events and signals](../reference/events-and-signals.md#tls-metadata-keys)). The
+surfaces, variables, certificate handling and operator procedures are owned by
+[Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners).
+
+### WAN resolution
+
+`WanResolver` maps the local bound address a connection landed on to the operator's
+WAN IP, so an event records which vantage saw the attacker
+(`crates/sensor-framework/src/wan.rs#WanResolver::resolve`). An unmapped local address yields `None` → the event's `wan_ip` is
+null, a documented case rather than an error. No-NAT deployments carry an identity
+entry (local == WAN).
+
+### Persona, fake filesystem, fake shell
+
+One coherent fictional host - **Ubuntu 22.04.4 LTS "Jammy", hostname `server01` by
+default** - is resolved from `persona.rs` so no two sensors contradict each other
+(`crates/sensor-framework/src/persona.rs`). Banners, `uname` output, and `/etc/os-release` all derive from
+it.
+
+`fakefs.rs` is an in-memory static snapshot, fresh per session, with no real
+filesystem underneath - path traversal is structurally impossible
+(`crates/sensor-framework/src/fakefs.rs`). `shell/` is the interactive fake shell presented post-auth,
+shared by SSH, Telnet, and ADB. It emits one `honeypot_command_exec` per non-blank
+line (recording the raw line, sanitized and capped), decodes single-byte-XOR
+obfuscated probes, recognizes fetch verbs (emitting `honeypot_file_download` with the
+target URL, never fetching it), and answers a curated command set including a
+BusyBox applet dispatcher and a Gafgyt/BASHLITE echo handshake. The per-command
+behavior is owned by
+[`reference/sensor-behavior.md`](../reference/sensor-behavior.md).
+
+### Capture sanitization
+
+`sanitize_value(input, max_len)` is the single chokepoint every attacker string
+clears before entering an event (`crates/sensor-framework/src/sanitize.rs#sanitize_value`): it collapses CR/LF/tab runs to
+one space, strips ANSI/C0/C1 controls and bidi/zero-width characters, NFC-normalizes,
+and UTF-8-boundary-safe truncates to a byte cap - closing CR/LF/ANSI log injection.
+See [`security/input-handling.md`](../security/input-handling.md).
+
+## The capture path
+
+Only these sensors write captured file *bodies* to disk - **SSH, FTP, ADB, TFTP**,
+Telnet when its shell phase sees a binary payload, and MQTT when a PUBLISH payload looks
+binary (`crates/sensor-mqtt/src/handler.rs#on_publish`).
+Redis, HTTP, SMTP, cred, DNS, and catchall capture metadata only and never spool a
+body (confirmed by the absence of `QuarantineSpool`/`CaptureHandoff` in those crates).
+MQTT always records a PUBLISH as metadata (topic, QoS, length, a bounded preview and a SHA-256
+of the payload), spools the payload only when it passes the shared `looks_binary` gate, and
+never delivers, retains, or forwards the message
+(see [sensor behavior](../reference/sensor-behavior.md#sensor-mqtt)).
+TFTP and DNS are the two sensors that answer over UDP; both bound their replies so bytes sent
+never exceed bytes received, which is why neither uses the framework's receive-only UDP
+listener (see [sensor-tftp](../reference/sensor-behavior.md#sensor-tftp) and
+[sensor-dns](../reference/sensor-behavior.md#sensor-dns)).
+
+For the spooling sensors the path is deliberately **off the connection's reply
+path**, for covertness - response latency must not leak whether a capture happened:
+
+1. The handler reads enough to answer the protocol, builds a `CaptureJob`, and
+   `submit`s it. `submit` is backed by `mpsc::try_send` and **never blocks**; a full
+   queue drops the job, returns `CaptureDropped`, and increments a counter
+   (`crates/sensor-framework/src/handoff.rs#submit`). Queue size is 64 on every spooling sensor.
+2. A **single worker** drains the queue strictly sequentially (`start_worker` panics
+   on a second call), so the spool is never written concurrently
+   (`crates/sensor-framework/src/handoff.rs#start_worker`). It hashes the body, stores it, and appends the event via
+   `process_job`; a panicking event builder is isolated by `catch_unwind` and the
+   worker continues (`crates/sensor-framework/src/handoff.rs#process_job`).
+
+### Quarantine spool
+
+`QuarantineSpool` stores every captured body under its **SHA-256 as the filename**
+(never the attacker-supplied name → traversal impossible), with `0640` permissions
+and re-hash-on-read fail-closed (`sensor-framework/src/spool.rs#store`, `sensor-framework/src/spool.rs#read_verified`). It enforces a per-file
+size cap and a global byte budget by reserving under an accounting lock, dedups
+on existing hash, and recovers its used-byte count by scanning the directory on
+startup so a restart does not reset the ceiling. FTP/ADB use a 10 MB per-file cap and SSH
+a 16 MiB one (`crates/sensor-framework/src/spool.rs#SPOOL_MAX_FILE_BYTES`, the largest kept
+body, which the indicator scan reads), each with a 100 MB global budget. See
+[`security/malware-custody.md`](../security/malware-custody.md) and
+[`reference/filesystem-paths.md`](../reference/filesystem-paths.md).
+
+### Event emission
+
+`EventEmitter::append` serializes an event to one NDJSON line, opens the log with
+`O_APPEND` (atomic concurrent appends on local storage), and `write_all` + `flush`; a
+serialize or append failure never partially writes a line
+(`crates/sensor-framework/src/emit.rs#append`). The log directory must be local storage - NFS `O_APPEND` can race
+(`crates/sensor-framework/src/emit.rs#append`). These NDJSON files are what the intake tailer consumes; see
+[`event-and-sample-lifecycle.md`](event-and-sample-lifecycle.md).
+
+## The wire record
+
+Every sensor emits the same frozen record, `SensorEvent`
+(`crates/sensor-wire/src/lib.rs#SensorEvent`, `WIRE_VERSION = 1`). A sensor emits **raw
+facts only** - `source_ip`, `wan_ip`, `sensor`, `signal_type` (a plain string),
+`protocol`, `authenticated`, `observed_at`, `metadata`, an optional `sample`
+reference, an optional `session_id`, an optional `occurrence_id` (minted by
+`EventEmitter::append`), and on a shell command's event an optional `reply`
+(`crates/sensor-wire/src/lib.rs#ReplyRef`: what the shell printed, capped at 4 KiB, which intake
+moves into the `shell_output` table). Weight, confidence, and category are **not**
+on the wire; they are derived downstream so a sensor never computes a score. Field
+types and the signal vocabulary are owned by
+[`reference/events-and-signals.md`](../reference/events-and-signals.md).
+
+## The catch-all and multi-protocol sensors
+
+- **`sensor-catchall`** emulates no protocol and never writes a byte back
+  (`crates/sensor-catchall/src/handler.rs`). It binds every configured address
+  on **both TCP and UDP**, reads up to a small byte cap, and emits one
+  `catchall_probe` carrying a hex payload sample. Its bounds are deliberately tighter
+  than the interactive sensors.
+- **`sensor-cred`** is one binary with one listener per configured database/remote
+  protocol - **VNC, MySQL, MSSQL, PostgreSQL, MongoDB**. Each speaks just enough of
+  its handshake to elicit a credential attempt, drops the credential, and emits a
+  login attempt. This is why twelve crates cover fifteen protocols.
+
+## Never-serve-outbound
+
+No sensor fetches or serves attacker-directed content: FTP `RETR`→550 and
+`PORT/EPRT`→502, ADB sync `RECV`→FAIL, SSH `direct-tcpip` refused, catchall never
+responds, the two UDP sensors that reply send only a tiny TFTP error or ACK and a DNS
+REFUSED with no record, and shell `wget`/`curl` are canned
+(`sensor-wire`/handler evidence, cross-cutting). This invariant is part of the trust
+boundary; see
+[`security/attack-surfaces.md`](../security/attack-surfaces.md) and
+[`architecture/trust-boundaries-and-data-flows.md`](trust-boundaries-and-data-flows.md).
+
+## Adding a sensor
+
+The developer procedure for building a new sensor on this framework lives in
+[`development/adding-a-sensor.md`](../development/adding-a-sensor.md).

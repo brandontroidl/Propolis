@@ -1,0 +1,4 @@
+{% include "feed_entries_rows.html" %}
+{#- The rows land through the request's own `beforeend` swap into this table's body; this replaces
+    the table's own button out of band (each table on the Entries tab has its own). -#}
+<div class="load-more-row" id="more-{{ t.key }}" hx-swap-oob="true">{% include "feed_entries_load_more.html" %}</div>

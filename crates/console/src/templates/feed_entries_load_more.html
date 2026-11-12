@@ -1,0 +1,1 @@
+{% if t.cursor_lost %}<span class="dim">The feed was rebuilt since this page loaded: the last address shown is no longer in it. Reload to continue.</span>{% elif t.next_after %}<button hx-get="/feed/entries/{{ t.key }}?after={{ t.next_after }}" hx-target="#entries-{{ t.key }}" hx-swap="beforeend" class="load-more">Load more</button>{% endif %}

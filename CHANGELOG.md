@@ -4,6 +4,27 @@
 
 ### Upgrade note
 
+- **`upgrade.sh` can move a box onto a restarted history or a successor repository.** An
+  `origin/main` that does not descend from the box's commit was refused with advice to reset
+  the checkout by hand, which checks nothing. It is still refused by default, and the refusal
+  now says which shape it met (no shared history, a rewritten `main`, a `main` moved back).
+  `--adopt-history=<full commit id>` deploys it when `origin/main` is exactly the commit
+  named, including a move backwards, which the run announces. The clean tree, the recorded
+  origin and the signature check still apply; the run prints how many files differ; the
+  commit the box left is kept as `refs/propolis/before-adoption/<UTC time>`; and no refusal
+  prints the commit that was fetched, because the id has to reach you through a channel the
+  remote does not control. The argument needs a box whose own `upgrade.sh` already has it. To
+  move a running box to a successor repository: upgrade once on the old origin, change the
+  remote, then run with `--accept-origin --adopt-history=<id>`. A box that cannot take that
+  first upgrade, and a split deployment's collectors, follow by hand with commands that name
+  the id
+  ([steps](docs/operations/upgrade-rollback-and-dr.md#a-restarted-history-or-a-successor-repository)).
+- **The upgrade's pull is narrower and checks its own result.** It fetches the `main` branch
+  and nothing else, so tags and other branches of the remote no longer reach the box's clone.
+  After the checkout moves, it must be at the commit that was checked with no tracked file
+  differing from it, or nothing is built: an edit made while the run was fetching, or a file
+  git could not replace, used to go into the root-installed build. If a script of yours
+  relied on `upgrade.sh` fetching tags, fetch them yourself.
 - **The ledger's append-only control did not bind the daemon's own role, and now can.** The
   control is a revoke, and PostgreSQL does not apply a revoke to a table's owner. The daemon
   connects as the role that ran the migrations, so it owned `event` and could grant itself

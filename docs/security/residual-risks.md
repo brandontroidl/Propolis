@@ -123,7 +123,8 @@ address without a fronting proxy exposes operational metrics to the network. See
 
 `deploy/upgrade.sh` fetches the repository, builds it as the checkout's owner and installs the
 result as root. Its checks (a clean tree, the origin the last deploy recorded, fast-forward
-only, and an SSH signature when `/etc/propolis/upgrade-signers` exists) hold against the
+only unless the operator names the commit, and an SSH signature when
+`/etc/propolis/upgrade-signers` exists) hold against the
 remote and against operator mistakes; the checkout's owner account builds what root installs
 and is trusted by construction. What remains:
 
@@ -136,12 +137,30 @@ and is trusted by construction. What remains:
 - **With signing on, the signature proves the author, not the intent to release.** The remote
   may present any commit a listed key signed that descends from `HEAD`, including a signed
   branch never meant for `main`, and the box deploys it.
+- **Adopting a history trusts the commit the operator names.**
+  `--adopt-history=<commit>` deploys an `origin/main` that does not descend from what the box
+  runs, provided it is exactly the commit named: an unrelated history, a rewritten `main`, or
+  an earlier commit of the box's own history, which makes the argument the one way a remote's
+  rollback is accepted. Nothing in such a commit can prove it continues the same code, so the
+  proof is the id, and it is worth what the channel it came through is worth. An id read off
+  the remote being checked (this box's own fetch, or the hosting site's page for a repository
+  that may be hijacked) checks nothing. The script does not print the fetched id in any
+  refusal, which keeps it from inviting that mistake and does not prevent it: the id is one
+  `git rev-parse` away in the box's clone. The run prints how many files differ so the operator
+  sees what they accept; it cannot judge whether the difference is benign. With signing on,
+  the named commit must also carry a listed key's signature, and that is the control that
+  does not depend on where the id came from. See
+  [a restarted history](../operations/upgrade-rollback-and-dr.md#a-restarted-history-or-a-successor-repository).
 - **A freeze is not detected.** The remote may withhold new commits indefinitely; nothing on
   the box knows that `main` has moved elsewhere. The fleet pane's "behind" reading is from
   the last fetch, not a live query.
 - **The hand-run collector upgrade** in
   [split deployment](../operations/split-deployment.md#upgrading) runs the fetch, signature
-  check and fast-forward by hand and skips the dirty check and the origin pin.
+  check and fast-forward by hand; the dirty check and the origin pin are done by eye, and
+  nothing records the origin. The by-hand steps onto a restarted history, on a collector and
+  on a box whose `upgrade.sh` predates `--adopt-history`, make the same checks as the script
+  in one chained command, but they are typed by an operator, not enforced by a program: a
+  step left out is not noticed.
 
 The setup and the full list of what signing does and does not cover are in
 [upgrade, rollback and DR](../operations/upgrade-rollback-and-dr.md#signed-upgrades-recommended).

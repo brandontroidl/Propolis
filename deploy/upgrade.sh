@@ -9,9 +9,19 @@
 # sensor's spool dir) always exists before the unit that needs it restarts - no longer assumes
 # install.sh already provisioned it.
 #
-# Usage: sudo ./deploy/upgrade.sh [--accept-origin]
+# Usage: sudo ./deploy/upgrade.sh [--accept-origin] [--adopt-history=<commit>]
 #   --accept-origin   deploy from the origin URL the checkout has NOW although it differs from the
 #                     one the last deploy recorded; this run's deploy stamp records the new one.
+#   --adopt-history=<commit>
+#                     deploy origin/main although it does not descend from this checkout's commit
+#                     (the repository's history was restarted, the checkout now points at a
+#                     successor repository, main was rewritten, or main was moved back), provided
+#                     origin/main is exactly <commit>, given as a full commit id. Naming the
+#                     commit is the check: nothing in a history that does not contain this
+#                     checkout ties it to what this box runs, so the operator states which commit
+#                     they mean and anything else on origin/main is refused. The id is worth what
+#                     the channel it came through is worth: it has to reach the operator some way
+#                     that does not depend on the remote being checked.
 #
 # What gets built and installed as root is whatever the pull brings in, so the pull is held to the
 # checks in the pull-and-reexec block below: a clean tree, the origin the last deploy recorded, a
@@ -46,10 +56,27 @@ cd "$REPO_DIR"
 # pull happened rather than when the re-exec did. deploy_test.rs runs this block against stubs.
 # BEGIN pull-and-reexec
 ACCEPT_ORIGIN=0
+ADOPT_COMMIT=""
 for arg in "$@"; do
     case "$arg" in
         --accept-origin) ACCEPT_ORIGIN=1 ;;
-        *) echo "usage: $0 [--accept-origin]" >&2; exit 2 ;;
+        --adopt-history=*)
+            # Twice is a mistake to stop on, not to resolve by taking the last: the two may differ.
+            if [ -n "$ADOPT_COMMIT" ]; then
+                echo "error: --adopt-history was given more than once" >&2
+                exit 2
+            fi
+            ADOPT_COMMIT="${arg#--adopt-history=}"
+            ADOPT_COMMIT="${ADOPT_COMMIT,,}"
+            # The whole id and nothing git would have to resolve: an abbreviation names whichever
+            # commit happens to match it in the repository that was fetched, and a ref name names
+            # whatever the remote put there, which is the thing this argument exists to check.
+            if ! [[ "$ADOPT_COMMIT" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+                echo "error: --adopt-history takes the full commit id of origin/main (40 hexadecimal characters), not '${ADOPT_COMMIT:0:80}'" >&2
+                exit 2
+            fi
+            ;;
+        *) echo "usage: $0 [--accept-origin] [--adopt-history=<commit>]" >&2; exit 2 ;;
     esac
 done
 ROOT="${PROPOLIS_UPGRADE_ROOT:-}"
@@ -149,7 +176,17 @@ else
         fi
     fi
 
-    as_owner git fetch origin
+    # main and nothing else. Every other branch and every tag is a name the remote chooses, and
+    # this script has no use for any of them: a tag named like a commit id is looked up as a ref
+    # by some git commands that are handed the id, and a ref can be named to read as an argument
+    # in the list git prints. Tags a clone already holds stay, so nothing below relies on this.
+    # Quiet, because the summary line git prints ends in the abbreviated id of what it fetched,
+    # and a refused run does not hand that over in any form; errors still print, and a run that
+    # goes on shows the range in the merge's or the adoption's own output.
+    if ! as_owner git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'; then
+        refuse "the fetch from $ORIGIN_URL failed or brought no origin/main, so there is nothing to upgrade to" \
+            "git's own message is above; a remote without a main branch is the usual reason for a missing ref"
+    fi
 
     # Resolved once, so the commit every check below looks at is the commit that gets merged: a
     # fetch from elsewhere (the owner's editor, a cron job, a second operator) between the checks
@@ -160,8 +197,13 @@ else
             "the remote has no main branch, or the clone's fetch refspec does not include it"
     fi
 
+    # Until this run has accepted origin/main, nothing it prints says which commit was fetched:
+    # not a progress line, not a refusal. Where the operator is asked to name the commit
+    # (--adopt-history), the id has to come from somewhere other than the remote it is checked
+    # against, and output that hands it over invites pasting it back. This is a nudge, not a
+    # control: git's own fetch line shows an abbreviation, and one git command shows the rest.
     if [ -e "$SIGNERS_FILE" ]; then
-        echo "    verifying origin/main ($TARGET) against the signers in $SIGNERS_FILE"
+        echo "    verifying origin/main against the signers in $SIGNERS_FILE"
         # gpg.format picks the SIGNING format only; verification picks its backend from the
         # signature itself, so a PGP-signed commit would be handed to gpg with the owner's keyring,
         # which the signers file does not govern (any imported key, such as GitHub's web-flow key,
@@ -170,26 +212,149 @@ else
         if ! as_owner git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS_FILE" \
             -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
             verify-commit "$TARGET"; then
-            refuse "origin/main ($TARGET) is not SSH-signed by a key in $SIGNERS_FILE, so it will not be deployed" \
+            refuse "origin/main is not SSH-signed by a key in $SIGNERS_FILE, so it will not be deployed" \
                 "sign the commit with a listed SSH key, add the key to the file, or remove the file to deploy unsigned commits"
         fi
     fi
 
+    # A commit named with --adopt-history pins this run: origin/main must be that commit and no
+    # other, whether or not its history turns out to need adopting. Checked before the ancestry
+    # so the answer never depends on what the remote served.
+    if [ -n "$ADOPT_COMMIT" ] && [ "$TARGET" != "$ADOPT_COMMIT" ]; then
+        refuse "origin/main is not the commit --adopt-history names ($ADOPT_COMMIT)" \
+            "either main has moved since you looked it up, or $ORIGIN_URL is not the repository you meant" \
+            "look the commit up again at a source you trust and name that one, or drop the argument for an ordinary upgrade"
+    fi
+
+    # Where the operator finds the id. Not "the repository's page": for a hijacked hosting account
+    # that page is the remote. The pin is worth what the channel it came through is worth.
+    ADOPT_HINT="to deploy origin/main as it is, get the full commit id of its main branch through a channel that does not depend on this remote (the maintainer's announcement, a signed tag or release note, a clone made earlier on another machine) and run again with --adopt-history=<that commit id>"
+
+    OLD_HEAD="$(as_owner git rev-parse --verify HEAD)"
     # Only ever move forward onto what main has: a commit on this box that main lacks would be
     # merged into a root-installed build and would also never match the deploy stamp.
-    if ! as_owner git merge-base --is-ancestor HEAD "$TARGET"; then
-        refuse "this checkout is not an ancestor of origin/main ($TARGET), so the upgrade cannot fast-forward" \
-            "commits here that origin/main does not have:" \
-            "$(as_owner git log --oneline "$TARGET..HEAD")" \
-            "reset the checkout to origin/main (or merge the commits into main) and run again"
+    if as_owner git merge-base --is-ancestor HEAD "$TARGET"; then
+        if [ -n "$ADOPT_COMMIT" ]; then
+            echo "    --adopt-history: origin/main already descends from this checkout, so this is an ordinary upgrade to the commit you named"
+        fi
+        as_owner git merge --ff-only "$TARGET"
+    elif [ -z "$ADOPT_COMMIT" ]; then
+        if as_owner git merge-base --is-ancestor "$TARGET" HEAD; then
+            # origin/main is an earlier commit of this checkout's own history: deploying it would
+            # move the box backwards, which is what a remote that was rolled back looks like.
+            refuse "origin/main is behind this checkout: it is an earlier commit of the same history, and this checkout is not an ancestor of origin/main" \
+                "$(as_owner git rev-list --count "$TARGET..HEAD") commit(s) here are newer than origin/main, so deploying it would move this box backwards" \
+                "$ADOPT_HINT"
+        elif as_owner git merge-base HEAD "$TARGET" >/dev/null; then
+            refuse "this checkout is not an ancestor of origin/main, so the upgrade cannot fast-forward" \
+                "commits here that origin/main does not have:" \
+                "$(as_owner git log --oneline -n 20 "$TARGET..HEAD")" \
+                "if they were made on this box and should be kept, merge them into main and pull them back" \
+                "$ADOPT_HINT; the commits listed above are then left behind"
+        fi
+        # No common commit at all. Listing "the commits origin/main does not have" would print
+        # this checkout's whole history.
+        refuse "this checkout shares no history with origin/main, so the upgrade cannot fast-forward" \
+            "either the repository's history was restarted, or $ORIGIN_URL is a different repository" \
+            "$ADOPT_HINT"
+    else
+        # Before the checkout moves: a main without this script is not a tree it can deploy, and
+        # the lines after this block would be read from a file that is no longer there.
+        if ! as_owner git cat-file -e "$TARGET:deploy/upgrade.sh" 2>/dev/null; then
+            refuse "origin/main ($TARGET) has no deploy/upgrade.sh, so it is not a tree this script can deploy"
+        fi
+        echo "    --adopt-history: origin/main ($TARGET) does not contain this checkout's commit ($OLD_HEAD)"
+        if as_owner git merge-base --is-ancestor "$TARGET" HEAD; then
+            echo "    origin/main is BEHIND this checkout: adopting it moves this box backwards by $(as_owner git rev-list --count "$TARGET..HEAD") commit(s)"
+        elif MERGE_BASE="$(as_owner git merge-base HEAD "$TARGET")"; then
+            LEFT_BEHIND="$(as_owner git rev-list --count "$TARGET..HEAD")"
+            echo "    the two share history up to $MERGE_BASE; $LEFT_BEHIND commit(s) here are not in origin/main and are left behind:"
+            as_owner git log --oneline -n 20 "$TARGET..HEAD" | sed 's/^/      /'
+            if [ "$LEFT_BEHIND" -gt 20 ]; then
+                echo "      ... and $((LEFT_BEHIND - 20)) more"
+            fi
+        else
+            echo "    the two share no history"
+        fi
+        # What the operator is agreeing to, in the one figure that matters: how much of what is
+        # installed from here on differs from what this checkout held.
+        if as_owner git diff --quiet "$OLD_HEAD" "$TARGET"; then
+            echo "    every file is identical in both: adopting changes the history and no file"
+        else
+            # --no-renames: rename detection between two unrelated trees compares every pair of
+            # files and adds nothing to a count.
+            echo "    files differ between the two: $(as_owner git diff --no-renames --shortstat "$OLD_HEAD" "$TARGET" | sed 's/^ *//')"
+        fi
+
+        # The fetch took time, and the clean-tree check ran before it.
+        DIRTY="$(as_owner git status --porcelain --untracked-files=normal)"
+        if [ -n "$DIRTY" ]; then
+            refuse "the checkout changed while this run was fetching, and a root-installed build must not include local changes:" \
+                "$DIRTY" "commit, stash or discard them, then run the upgrade again"
+        fi
+
+        # The commit being left is on no branch once the checkout moves, and a history that was
+        # restarted cannot be fetched again: without a ref of its own git would expire it. Kept
+        # under a name no fetch writes to, so the way back does not depend on the reflog.
+        KEPT_REF="refs/propolis/before-adoption/$(date -u +%Y%m%dT%H%M%SZ)"
+        if ! as_owner git update-ref "$KEPT_REF" "$OLD_HEAD"; then
+            refuse "could not record this checkout's commit as $KEPT_REF, so the checkout was not moved"
+        fi
+
+        # A checkout, never a hard reset or a forced one: it refuses to overwrite a file edited
+        # since the check above, and with --no-overwrite-ignore a box-local ignored file (.env, a
+        # data directory) that the new tree has at the same path, where git's default is to
+        # replace it without a word. The branch is named by stripping refs/heads/ from HEAD's own
+        # target and the commit as <id>^{commit}: handed a short branch name or a bare id, git
+        # looks either up as a ref first, and a tag of that name then decides where the branch
+        # lands. Its exit status is not enough either (git reports a file it could not replace and
+        # still exits 0), so what counts is the check after it.
+        HEAD_REF="$(as_owner git symbolic-ref --quiet HEAD || true)"
+        MOVED=1
+        case "$HEAD_REF" in
+            refs/heads/?*)
+                as_owner git checkout --quiet --no-overwrite-ignore -B "${HEAD_REF#refs/heads/}" "$TARGET^{commit}" || MOVED=0 ;;
+            *)
+                as_owner git checkout --quiet --no-overwrite-ignore --detach "$TARGET^{commit}" || MOVED=0 ;;
+        esac
     fi
-    as_owner git merge --ff-only "$TARGET"
+
+    # The commit that was checked is the commit that is built, and nothing else is in the tree:
+    # HEAD is that commit and every tracked file matches it. This holds after a fast-forward as
+    # after an adoption, and it is the guard that does not depend on how git resolved a name or
+    # on its exit status. Tracked files only: an adopted tree may ignore different paths, and the
+    # box's own build output is not a change to what gets built.
+    NOW_HEAD="$(as_owner git rev-parse --verify HEAD)"
+    TREE_STATE="$(as_owner git status --porcelain --untracked-files=no)"
+    if [ "${MOVED:-1}" -eq 0 ] || [ "$NOW_HEAD" != "$TARGET" ] || [ -n "$TREE_STATE" ]; then
+        WHERE=("it is at $NOW_HEAD and it was at $OLD_HEAD${KEPT_REF:+ (kept as $KEPT_REF)}")
+        if [ -n "$TREE_STATE" ]; then
+            WHERE+=("tracked files that do not match the commit it is at:" "$TREE_STATE")
+        fi
+        refuse "the checkout could not be moved cleanly onto the commit that was checked" \
+            "${WHERE[@]}" \
+            "git's own message, if any, is above; fix what it names and run the upgrade again"
+    fi
+    if [ -n "${KEPT_REF:-}" ]; then
+        echo "    this checkout is now at $TARGET; the commit it left ($OLD_HEAD) is kept as $KEPT_REF"
+    fi
+
     SCRIPT_SUM_AFTER="$(sha256sum < "$SCRIPT_DIR/upgrade.sh")"
     if [ "$SCRIPT_SUM_BEFORE" != "$SCRIPT_SUM_AFTER" ]; then
         echo "==> deploy/upgrade.sh changed in the pull, re-executing the new version"
         export PROPOLIS_UPGRADE_REEXEC=1 PROPOLIS_UPGRADE_PULLED_AT="$PULLED_AT" \
             PROPOLIS_UPGRADE_ORIGIN_URL="$ORIGIN_URL"
-        exec "$BASH" "$SCRIPT_DIR/upgrade.sh" "$@"
+        # --adopt-history is not handed on: the pull it governs is over, the re-executed run
+        # skips this block, and an adopted tree whose script predates the argument would stop on
+        # it with a usage error after the checkout had already moved.
+        REEXEC_ARGS=()
+        for arg in "$@"; do
+            case "$arg" in
+                --adopt-history=*) ;;
+                *) REEXEC_ARGS+=("$arg") ;;
+            esac
+        done
+        exec "$BASH" "$SCRIPT_DIR/upgrade.sh" ${REEXEC_ARGS[@]+"${REEXEC_ARGS[@]}"}
     fi
 fi
 # END pull-and-reexec

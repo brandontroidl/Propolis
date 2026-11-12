@@ -123,7 +123,13 @@ installing the result as root (`deploy/upgrade.sh`), so the pull is the last lin
 above. The script refuses to build from a dirty checkout, from a remote other than the one the
 last deploy recorded in the deploy stamp (`deploy/deploy-stamp.sh#origin_url`;
 `--accept-origin` records a deliberate move), or from a commit `origin/main` does not have,
-and it only ever fast-forwards. With `/etc/propolis/upgrade-signers` on the box, the fetched
+and it fetches the `main` branch and nothing else. It only fast-forwards, with one exception
+the operator has to ask for by naming the commit: `--adopt-history=<full commit id>` deploys an
+`origin/main` that does not descend from the box's commit (a restarted history, a successor
+repository, a rewritten or moved-back `main`) when it is exactly that commit, and every other
+check still applies
+([a restarted history](../operations/upgrade-rollback-and-dr.md#a-restarted-history-or-a-successor-repository)).
+With `/etc/propolis/upgrade-signers` on the box, the fetched
 `origin/main` must also carry an SSH signature by a listed key; only SSH signatures are
 accepted (a PGP-signed commit, such as a GitHub web-interface merge, is refused whatever keys
 the box holds). That holds against a compromised remote or a mistaken push; it is off by
@@ -135,8 +141,8 @@ that owns the checkout, which builds what root installs and is trusted by constr
 remains with and without signing is stated in
 [residual risks](./residual-risks.md#deploying-from-the-repository). The hand-run collector
 upgrade in [split deployment](../operations/split-deployment.md#upgrading) runs the same
-fetch, signature check and fast-forward by hand; it does not run the dirty check or the origin
-pin.
+fetch, signature check and fast-forward by hand; the dirty check and the origin pin are done
+by eye there, and nothing records the origin.
 
 ## Related
 

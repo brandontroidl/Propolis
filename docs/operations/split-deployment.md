@@ -410,6 +410,50 @@ The shipper's frames carry a wire version with no negotiation
 (`crates/collector-wire/src/frame.rs#VERSION`). A release that changes it has to reach both hosts
 together, since a shipper on the other version stops at its first batch.
 
+#### Following a restarted history
+
+When the repository's history was restarted or the project moved to a successor repository,
+the control plane follows with `upgrade.sh --adopt-history=<commit>`
+([a restarted history](upgrade-rollback-and-dr.md#a-restarted-history-or-a-successor-repository)).
+A collector's `git merge --ff-only` above then fails, as it should: the new `main` does not
+descend from what the collector runs. Follow by hand after the control plane, with the same
+commit id; every command after the fetch names the id and none names the ref. As the owner of
+the checkout, from the top of it:
+
+```sh
+# Example - ID is the full commit id the control plane adopted, from a channel the remote does not control.
+ID=<full commit id of the new main>
+git remote get-url origin    # read it: the remote you mean (set-url first when moving)
+# One command: each step runs only if the one before it succeeded.
+[ -z "$(git status --porcelain --untracked-files=normal)" ] &&
+git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' &&
+[ "$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')" = "$ID" ] &&
+{ [ ! -e /etc/propolis/upgrade-signers ] ||
+  git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/propolis/upgrade-signers \
+      -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
+      verify-commit "$ID^{commit}"; } &&
+git diff --shortstat HEAD "$ID^{commit}" &&
+git update-ref "refs/propolis/before-adoption/$(date -u +%Y%m%dT%H%M%SZ)" HEAD &&
+git checkout --quiet --no-overwrite-ignore -B main "$ID^{commit}" &&
+[ -z "$(git status --porcelain --untracked-files=no)" ] &&
+[ "$(git rev-parse HEAD)" = "$ID" ] &&
+echo "OK: the checkout is on the commit named" ||
+echo "STOPPED: a step failed and nothing after it ran"
+```
+
+In order: the tree is clean; `main` and nothing else is fetched; `origin/main` is the commit
+named; with a signers file on the box, that commit carries a listed key's SSH signature; the
+number of files that differ is printed, which is what you are accepting; the commit being
+left is recorded, because it is on no branch afterwards and cannot be fetched again from a
+restarted history; the branch moves, without replacing ignored files; and the result is the
+named commit with no tracked file differing from it. A step that fails prints `STOPPED` and
+leaves the rest undone. `"$ID^{commit}"` rather than the bare id is deliberate: handed a bare
+id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of that
+name would decide where the branch lands.
+
+After `OK`, build as the same account with `cargo build --release --workspace --locked`, then
+install and restart as root exactly as above.
+
 ### Rotating certificates
 
 The certificates never expire, so rotation is a response to a leaked key. Create a new set as in

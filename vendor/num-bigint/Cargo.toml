@@ -13,8 +13,7 @@
 edition = "2021"
 rust-version = "1.60"
 name = "num-bigint"
-version = "0.4.8"
-authors = ["The Rust Project Developers"]
+version = "0.5.1"
 build = false
 exclude = [
     "/ci/*",
@@ -46,7 +45,8 @@ repository = "https://github.com/rust-num/num-bigint"
 features = [
     "std",
     "serde",
-    "rand",
+    "rand_0_10",
+    "rand_0_9",
     "quickcheck",
     "arbitrary",
 ]
@@ -59,7 +59,16 @@ rustdoc-args = [
 arbitrary = ["dep:arbitrary"]
 default = ["std"]
 quickcheck = ["dep:quickcheck"]
-rand = ["dep:rand"]
+rand_0_10 = [
+    "rand_core_0_10",
+    "dep:rand_0_10",
+]
+rand_0_9 = [
+    "rand_core_0_9",
+    "dep:rand_0_9",
+]
+rand_core_0_10 = ["dep:rand_core_0_10"]
+rand_core_0_9 = ["dep:rand_core_0_9"]
 serde = ["dep:serde"]
 std = [
     "num-integer/std",
@@ -105,6 +114,7 @@ path = "tests/roots.rs"
 [[bench]]
 name = "bigint"
 path = "benches/bigint.rs"
+required-features = ["rand_0_10"]
 
 [[bench]]
 name = "factorial"
@@ -113,10 +123,12 @@ path = "benches/factorial.rs"
 [[bench]]
 name = "gcd"
 path = "benches/gcd.rs"
+required-features = ["rand_0_10"]
 
 [[bench]]
 name = "roots"
 path = "benches/roots.rs"
+required-features = ["rand_0_10"]
 
 [[bench]]
 name = "shootout-pidigits"
@@ -143,10 +155,29 @@ version = "1"
 optional = true
 default-features = false
 
-[dependencies.rand]
-version = "0.8"
+[dependencies.rand_0_10]
+version = "0.10"
 optional = true
 default-features = false
+package = "rand"
+
+[dependencies.rand_0_9]
+version = "0.9"
+optional = true
+default-features = false
+package = "rand"
+
+[dependencies.rand_core_0_10]
+version = "0.10"
+optional = true
+default-features = false
+package = "rand_core"
+
+[dependencies.rand_core_0_9]
+version = "0.9"
+optional = true
+default-features = false
+package = "rand_core"
 
 [dependencies.serde]
 version = "1.0"

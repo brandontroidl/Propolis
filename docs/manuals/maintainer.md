@@ -127,7 +127,7 @@ Owned by [`security/supply-chain`](../security/supply-chain.md) (posture) and
 a maintainer enforces:
 
 - **Fully vendored dependencies.** All dependencies are vendored in-tree under
-  `vendor/` (514 top-level directories) and committed; `.cargo/config.toml`
+  `vendor/` (446 top-level directories) and committed; `.cargo/config.toml`
   redirects crates-io to that tree. A build reaches no network to resolve crates,
   and a dependency add/bump appears as a **reviewable diff**. Review the
   `Cargo.lock` diff and the `vendor/` changes together (guidance, not an automated

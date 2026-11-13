@@ -16,7 +16,7 @@ security posture.
 
 ## Fully vendored dependencies
 
-All dependencies are vendored in-tree under `vendor/` (514 top-level directories)
+All dependencies are vendored in-tree under `vendor/` (446 top-level directories)
 and committed to the repository. `.cargo/config.toml` redirects crates-io to that
 directory:
 

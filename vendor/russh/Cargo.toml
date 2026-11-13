@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 name = "russh"
-version = "0.62.4"
+version = "0.65.1"
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 build = false
 autolib = false
@@ -35,7 +35,6 @@ all-features = true
 
 [features]
 _bench = ["dep:criterion"]
-async-trait = ["dep:async-trait"]
 aws-lc-rs = ["dep:aws-lc-rs"]
 default = [
     "flate2",
@@ -44,7 +43,6 @@ default = [
 ]
 des = ["dep:des"]
 dsa = ["ssh-key/dsa"]
-legacy-ed25519-pkcs8-parser = ["yasna"]
 ring = ["dep:ring"]
 rsa = [
     "dep:rsa",
@@ -74,6 +72,10 @@ name = "echoserver"
 path = "examples/echoserver.rs"
 
 [[example]]
+name = "echoserver_certificates"
+path = "examples/echoserver_certificates.rs"
+
+[[example]]
 name = "ratatui_app"
 path = "examples/ratatui_app.rs"
 
@@ -94,16 +96,40 @@ name = "test"
 path = "examples/test.rs"
 
 [[test]]
+name = "auth_agent_req_channel_reply"
+path = "tests/auth_agent_req_channel_reply.rs"
+
+[[test]]
+name = "auth_partial_success"
+path = "tests/auth_partial_success.rs"
+
+[[test]]
+name = "auth_signer_failure"
+path = "tests/auth_signer_failure.rs"
+
+[[test]]
 name = "auth_state_reset"
 path = "tests/auth_state_reset.rs"
+
+[[test]]
+name = "test_agent_session_bind"
+path = "tests/test_agent_session_bind.rs"
 
 [[test]]
 name = "test_backpressure"
 path = "tests/test_backpressure.rs"
 
 [[test]]
+name = "test_contention"
+path = "tests/test_contention.rs"
+
+[[test]]
 name = "test_data_stream"
 path = "tests/test_data_stream.rs"
+
+[[test]]
+name = "test_keepalive_before_auth"
+path = "tests/test_keepalive_before_auth.rs"
 
 [[test]]
 name = "test_kex_shared_secret"
@@ -121,6 +147,14 @@ path = "tests/test_mlkem_kex.rs"
 name = "test_rekey_strict_kex"
 path = "tests/test_rekey_strict_kex.rs"
 
+[[test]]
+name = "test_server_cert"
+path = "tests/test_server_cert.rs"
+
+[[test]]
+name = "test_window_adjust"
+path = "tests/test_window_adjust.rs"
+
 [[bench]]
 name = "ciphers"
 path = "benches/ciphers.rs"
@@ -129,13 +163,14 @@ harness = false
 [dependencies.aes]
 version = "0.9"
 
-[dependencies.async-trait]
-version = "0.1.50"
-optional = true
-
 [dependencies.aws-lc-rs]
 version = "1.16.2"
+features = [
+    "alloc",
+    "aws-lc-sys",
+]
 optional = true
+default-features = false
 
 [dependencies.bitflags]
 version = "2.0"
@@ -213,7 +248,6 @@ version = "0.3"
 
 [dependencies.generic-array]
 version = "1.3.3"
-features = ["compat-0_14"]
 
 [dependencies.getrandom]
 version = "0.4"
@@ -247,13 +281,8 @@ version = "0.3"
 version = "0.2"
 
 [dependencies.num-bigint]
-version = "=0.5.0"
+version = "0.5"
 features = ["rand_0_10"]
-package = "internal-russh-num-bigint"
-
-[dependencies.num_bigint_0_4]
-version = "0.4.6"
-package = "num-bigint"
 
 [dependencies.p256]
 version = "0.14"
@@ -371,14 +400,6 @@ version = "1.17"
 
 [dependencies.universal-hash]
 version = "0.6.1"
-
-[dependencies.yasna]
-version = "0.6"
-features = [
-    "bit-vec",
-    "num-bigint",
-]
-optional = true
 
 [dependencies.zeroize]
 version = "1.7"

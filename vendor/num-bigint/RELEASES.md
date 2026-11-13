@@ -1,10 +1,26 @@
-# Release 0.4.8 (2026-07-04)
+# Release 0.5.1 (2026-07-04)
 
-- [Fixed a regression in the B-Z division algorithm.][349]
+- [Fixed a regression in the B-Z division algorithm.][348]
 
-[349]: https://github.com/rust-num/num-bigint/pull/349
+[348]: https://github.com/rust-num/num-bigint/pull/338
 
 **Contributors**: @cuviper
+
+# Release 0.5.0 (2026-07-02)
+
+- [Upgrade to `rand` v0.10 and/or v0.9, and split `rand_core`][338].
+  - The former `rand` feature is now split into multiple features, `rand_0_9`,
+    `rand_core_0_9`, `rand_0_10`, and `rand_core_0_10`, depending on the
+    version and feature set you need.
+  - The `RandBigInt` extension trait is now split into `BigRng09` and
+    `BigRng010` for each version.
+  - The `gen_*` methods are deprecated in favor of new `random_*` methods.
+  - This is also a [value-breaking] release, as `rand` defines it.
+
+[338]: https://github.com/rust-num/num-bigint/pull/338
+[value-breaking]: https://rust-random.github.io/book/crate-reprod.html#api-breaking-value-breaking-and-semver
+
+**Contributors**: @bionicles, @cuviper, @divergentdave
 
 # Release 0.4.7 (2026-07-02)
 

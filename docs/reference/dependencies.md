@@ -17,7 +17,7 @@ vendoring mechanics and the notable-dependency inventory.
 ## Vendored in-tree
 
 All dependencies are vendored under `vendor/` and committed to the repository
-(514 top-level dependency directories, `vendor/`). `vendor/` is **not**
+(446 top-level dependency directories, `vendor/`). `vendor/` is **not**
 gitignored; only `/target` is (`.gitignore:2`). `.cargo/config.toml` redirects
 crates.io to the vendored copy:
 

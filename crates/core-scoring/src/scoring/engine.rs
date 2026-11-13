@@ -53,7 +53,9 @@ const LIVE_FLOOR: Decimal = dec!(0.5);
 ///
 /// `decay_anchor` and `last_seen` never move backwards. An event dated before the stored anchor
 /// (a backlog read late, a collector whose clock is slow, a forged timestamp) is still counted
-/// and still adds its weight, but it is folded in at the anchor already reached. Taking its
+/// and is folded in at the anchor already reached, adding what its own age leaves of its weight
+/// (its weight decayed from its time to the anchor), which is what it would have added had it
+/// been read in order. Taking its
 /// time as the new anchor would make the next event, and every read, decay the whole accumulated
 /// score across the gap a second time, so one line dated years back would erase everything
 /// other sensors had gathered about the address; taking it as `last_seen` would drop a listed
@@ -159,11 +161,22 @@ pub fn apply_event(
             weight: dec!(0),
             max_confidence: dec!(0),
         });
-        entry.weight += Decimal::from(event.weight);
+        // What this event is worth at the anchor. An event that is not newer than the anchor is
+        // added as of its own time and decayed to the anchor, like everything already in the
+        // score. Read late (a backlog drained after an outage, one log read behind another) it
+        // then counts for what it would have counted read in order, where its full weight at the
+        // anchor would turn a session from days ago into a current one; and a back-dated line
+        // adds only what its claimed age leaves of it. For the newest event the gap is zero.
+        let worth = decay(
+            Decimal::from(event.weight),
+            (decay_anchor - now).num_seconds(),
+            half_life_seconds,
+        );
+        entry.weight += worth;
         if event.confidence > entry.max_confidence {
             entry.max_confidence = event.confidence;
         }
-        std::cmp::min(SCORE_CAP, decayed_raw + Decimal::from(event.weight))
+        std::cmp::min(SCORE_CAP, decayed_raw + worth)
     };
 
     // Step 4: sticky latch + counts (a deduped sighting still counts).
@@ -897,17 +910,19 @@ mod tests {
         assert!(s.has_confirmed_real);
     }
 
-    /// An event dated before what is already stored is still a sighting (it counts, and adds its
-    /// weight in full) but it moves neither `last_seen` nor the decay anchor back, and it does
-    /// not rewrite `first_seen` either.
+    /// An event dated before what is already stored is still a sighting (it counts, and adds what
+    /// its age leaves of its weight) but it moves neither `last_seen` nor the decay anchor back,
+    /// and it does not rewrite `first_seen` either.
     #[test]
-    fn an_older_event_counts_and_weighs_but_moves_neither_last_seen_nor_the_anchor_back() {
+    fn an_older_event_counts_and_weighs_by_its_age_but_moves_neither_last_seen_nor_the_anchor_back()
+    {
         let seen = ts("2026-11-01T12:00:00Z");
         let s1 = apply_event(None, &command_exec_at(seen), HALF_LIFE, false, 1, 1);
         assert_eq!(s1.raw_score, dec!(60));
 
-        // Three years back, another category (port_scan, weight 20) so the weight is visible.
-        let mut old = tcp_probe_event_at(seen - Duration::days(3 * 365));
+        // One half-life back, another category (port_scan, weight 20) so the weight is visible:
+        // read in order it would have decayed to half by the time of the event already stored.
+        let mut old = tcp_probe_event_at(seen - Duration::seconds(HALF_LIFE));
         old.source_ip = s1.source_ip;
         let s2 = apply_event(Some(s1.clone()), &old, HALF_LIFE, false, 1, 1);
         assert_eq!(s2.last_seen, seen);
@@ -917,8 +932,8 @@ mod tests {
         assert_eq!(s2.established_event_count, 2);
         assert_eq!(
             s2.raw_score,
-            dec!(80),
-            "nothing decayed, the weight is added"
+            dec!(70),
+            "what was stored has not decayed; the older event adds half its weight"
         );
         assert_eq!(s2.distinct_categories, 2);
         assert_eq!(
@@ -930,9 +945,54 @@ mod tests {
         let s3 = apply_event(Some(s2.clone()), &old, HALF_LIFE, true, 1, 1);
         assert_eq!(
             (s3.last_seen, s3.decay_anchor, s3.raw_score),
-            (seen, seen, dec!(80))
+            (seen, seen, dec!(70))
         );
         assert_eq!(s3.event_count, 3);
+    }
+
+    /// A whole session read late is worth what it would have been worth read in order. One log
+    /// read eleven days behind another (an outage, a drained backlog) used to add every event of
+    /// it at full weight as of the newest sighting, which made a session from last week a
+    /// current top-tier address. Folded in either order, the score is the same.
+    #[test]
+    fn a_session_read_late_scores_what_it_would_have_scored_read_in_order() {
+        let now = ts("2026-11-12T12:00:00Z");
+        let then = now - Duration::days(11);
+        let probe = tcp_probe_event_at(now);
+        let session: Vec<EventInput> = (0..4)
+            .map(|i| {
+                let mut e = command_exec_at(then + Duration::seconds(i * 120));
+                e.source_ip = probe.source_ip;
+                e
+            })
+            .collect();
+
+        let mut in_order: Option<IpScore> = None;
+        for e in session.iter().chain(std::iter::once(&probe)) {
+            in_order = Some(apply_event(in_order, e, HALF_LIFE, false, 1, 1));
+        }
+        let mut late: Option<IpScore> = None;
+        for e in std::iter::once(&probe).chain(session.iter()) {
+            late = Some(apply_event(late, e, HALF_LIFE, false, 1, 1));
+        }
+        let (in_order, late) = (in_order.unwrap(), late.unwrap());
+
+        assert_eq!(late.last_seen, now);
+        assert_eq!(late.decay_anchor, now);
+        assert!(
+            (late.raw_score - in_order.raw_score).abs() < dec!(0.001),
+            "late {} against in order {}",
+            late.raw_score,
+            in_order.raw_score
+        );
+        assert!(
+            late.raw_score < dec!(21),
+            "eleven days is forty-four half-lives: {}",
+            late.raw_score
+        );
+        assert_eq!(late.tier, in_order.tier);
+        assert_eq!(late.tier, None, "one probe today is not a listing");
+        assert_eq!(late.event_count, in_order.event_count);
     }
 
     /// Security regression (audit): one line dated years back must not erase an address's score.

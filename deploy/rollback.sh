@@ -168,12 +168,17 @@ env_value() {
 # tries to bring the services back rather than leave a honeypot dark.
 STOPPED=0
 STEP=""
-# The database's own name, the name it was renamed aside to, and whether the dump finished
+# The database's own name, the name it is renamed aside to, and whether the dump finished
 # restoring into the new database of that name. Between the rename and that point the name the
-# daemon connects to holds nothing, or half a ledger.
+# daemon connects to holds nothing, or half a ledger. ASIDE is set BEFORE the rename is asked for:
+# a signal is acted on the moment a step returns, which is before the line after it runs, so a
+# record made after the step can be missing for a step that happened. What was actually renamed
+# is asked of PostgreSQL when it matters (put_database_back).
 DB=""
 ASIDE=""
 RESTORED=0
+# What put_database_back found and did: unmoved, back, stuck or unknown.
+PUT_BACK=""
 # Set while propolis-migrate and its --check have been asked for and have not both succeeded.
 ROLES_UNCHECKED=0
 # Set when the kept release cannot re-apply the role split of a node that has one.
@@ -193,25 +198,41 @@ say() {
     return 0
 }
 
-# The restore did not finish, so the real database is the one renamed aside. Moves whatever now
-# holds its name out of the way and gives it the name back; nothing is dropped. Returns 1 when the
-# real database is not back under its name. Runs in the EXIT trap, so every step reports and none
-# may end the script.
+# The run ended between asking for the rename aside and recording a finished restore, so the name
+# the daemon connects to may hold nothing, an empty database or part of a ledger. Asks PostgreSQL
+# which it is and puts the real database back under its name; nothing is dropped. Sets PUT_BACK:
+#   unmoved  the rename aside never happened: the real database never left its name
+#   back     it had been renamed aside and has its name again
+#   stuck    it is still renamed aside and could not be given its name back
+#   unknown  PostgreSQL did not answer, so where it is cannot be said
+# Returns 0 for the first two. Runs in the EXIT trap, so every step reports and none may end the
+# script.
 put_database_back() {
-    local failed exists
+    local failed aside exists
+    aside="$(runuser -u postgres -- psql -X -A -t -v ON_ERROR_STOP=1 \
+        -c "SELECT count(*) FROM pg_database WHERE datname = '$ASIDE'" 2>/dev/null)" || aside=""
+    case "$aside" in
+        0) PUT_BACK=unmoved; return 0 ;;
+        1) ;;
+        *) PUT_BACK=unknown; return 1 ;;
+    esac
+    PUT_BACK=stuck
     failed="${DB}_failed_restore_$(date -u +%Y%m%d%H%M%S)"
     exists="$(runuser -u postgres -- psql -X -A -t -v ON_ERROR_STOP=1 \
         -c "SELECT count(*) FROM pg_database WHERE datname = '$DB'" 2>/dev/null)" || exists=""
     if [ "$exists" != 0 ]; then
         if runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
             -c "ALTER DATABASE \"$DB\" RENAME TO \"$failed\""; then
-            say "The incomplete database was renamed to $failed; drop it once you have looked at it."
+            # Not called incomplete: a run ended by a signal right after the restore returned has
+            # a finished one here, and is undone all the same.
+            say "The database the dump was being restored into was renamed to $failed; drop it once you have looked at it."
         else
-            say "The incomplete database $DB could not be renamed out of the way."
+            say "The database the dump was being restored into, $DB, could not be renamed out of the way."
         fi
     fi
     runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
-        -c "ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\""
+        -c "ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\"" || return 1
+    PUT_BACK=back
 }
 
 on_exit() {
@@ -226,16 +247,30 @@ on_exit() {
     trap '' HUP INT TERM PIPE
     say "error: the rollback failed while $STEP, after the services were stopped."
     if [ -n "$ASIDE" ] && [ "$RESTORED" -eq 0 ]; then
-        if put_database_back; then
-            say "The database from before the rollback is back under its own name, $DB; nothing was dropped."
+        put_database_back
+        case "$PUT_BACK" in
+            unmoved)
+                say "The database was not renamed: $DB is as it was before the rollback, and nothing was dropped."
+                ;;
+            back)
+                say "The database from before the rollback is back under its own name, $DB; nothing was dropped."
+                ;;
+            stuck)
+                # Started on this name the daemon would find no ledger, or part of one, and on a
+                # node with one database role would migrate and begin a new chain there while the
+                # real one sits aside.
+                daemon=0
+                say "The database from before the rollback could NOT be put back under its name: the real data is in database $ASIDE, and nothing was dropped."
+                say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. Once what stopped the rename (above) is out of the way, as the postgres user rename any database now named $DB aside, run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\", then go forward again with deploy/upgrade.sh."
+                ;;
+            *)
+                daemon=0
+                say "PostgreSQL did not answer, so this script cannot tell whether the database is still under its name, $DB, or was renamed to $ASIDE. Nothing was dropped."
+                say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. When PostgreSQL answers, list the databases as the postgres user (psql -l). If $ASIDE is there, rename any database now named $DB aside and run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\". Then go forward again with deploy/upgrade.sh."
+                ;;
+        esac
+        if [ "$daemon" -eq 1 ]; then
             say "The kept binaries are installed: propolis runs on that database if the upgrade changed no schema, and otherwise refuses it at startup and changes nothing. To go forward again, run deploy/upgrade.sh."
-        else
-            # Started on this name the daemon would find no ledger, or part of one, and on a node
-            # with one database role would migrate and begin a new chain there while the real one
-            # sits aside.
-            daemon=0
-            say "The database from before the rollback could NOT be put back under its name: the real data is in database $ASIDE, and nothing was dropped."
-            say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. Once what stopped the rename (above) is out of the way, as the postgres user rename any database now named $DB aside, run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\", then go forward again with deploy/upgrade.sh."
         fi
     elif [ -n "$ASIDE" ]; then
         say "The dump was restored into $DB; the database from before the rollback is kept as $ASIDE, and nothing was dropped."
@@ -431,7 +466,7 @@ restore() {
     [[ "$release" =~ $RELEASE_RE ]] || { echo "error: not a kept release name: $release" >&2; exit 2; }
     local dir="$STORE/$release"
     [ -d "$dir" ] || { echo "error: $dir does not exist (see $0 --list)" >&2; exit 1; }
-    local commit set dump="" db="" owner="" size="" role="" owner_url="" name_re='^[a-z_][a-z0-9_]*$'
+    local commit set dump="" db="" owner="" size="" role="" owner_url="" owner_said="" name_re='^[a-z_][a-z0-9_]*$'
     commit="$(field commit "$dir/manifest")"
     set="$(field backup_set "$dir/manifest")"
 
@@ -474,9 +509,18 @@ restore() {
             SPLIT=1
             ROLE="$role"
             owner_url="$(env_value PROPOLIS_MIGRATE_DATABASE_URL "$ROOT/etc/propolis/migrate.env")"
-            OWNER_ROLE="$(DATABASE_URL="$owner_url" "$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user' 2>/dev/null)" || OWNER_ROLE=""
+            # What psql said goes to a variable, not the screen, and is shown only in the refusal:
+            # a URL psql cannot be handed (pg-exec takes fewer settings than the daemon's own
+            # connection does) is a different thing to fix from a role that cannot log in.
+            owner_said=""
+            OWNER_ROLE="$(DATABASE_URL="$owner_url" "$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user' 2>/dev/null)" || {
+                OWNER_ROLE=""
+                owner_said="$(DATABASE_URL="$owner_url" "$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user' 2>&1 >/dev/null | head -n 3 | tr '\n' ' ')" || true
+            }
             [[ "$ROLE" =~ $name_re ]] && [[ "$OWNER_ROLE" =~ $name_re ]] && [ "$ROLE" != "$OWNER_ROLE" ] || {
-                echo "error: this node splits its database roles (migrate.env names an owner role), but the two roles could not be read as two different plain names: the daemon connects as '$ROLE' and the owner's URL as '$OWNER_ROLE'. The split cannot be put back after a restore unless the owner role can connect: check the URL in migrate.env (\`propolis-migrate --check\` shows the daemon's side), or restore by hand (docs/operations/backup-and-restore.md)" >&2
+                echo "error: this node splits its database roles (migrate.env names an owner role), but the two roles could not be read as two different plain names: the daemon connects as '$ROLE' and the owner's URL as '$OWNER_ROLE'." >&2
+                [ -z "$owner_said" ] || echo "Connecting with the owner's URL said: $owner_said" >&2
+                echo "The split cannot be put back after a restore unless this script can connect as the owner role: check the URL in migrate.env (\`propolis-migrate --check\` shows the daemon's side; this script reads the role through psql, which takes fewer URL settings than propolis-migrate does), or restore by hand (docs/operations/backup-and-restore.md)" >&2
                 exit 1
             }
             # The database belonging to the daemon's role is the split already undone, which is
@@ -527,9 +571,9 @@ restore() {
         local aside
         aside="${db}_before_rollback_$(date -u +%Y%m%d%H%M%S)"
         DB="$db"
+        ASIDE="$aside"
         runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
             -c "ALTER DATABASE \"$db\" RENAME TO \"$aside\""
-        ASIDE="$aside"
         STEP="creating the empty database"
         runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
             -c "CREATE DATABASE \"$db\" OWNER \"$owner\" TEMPLATE template0"

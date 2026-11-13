@@ -33,7 +33,9 @@ esac
 /// afterwards which database ended up under which name. Its `pg_restore --list` reads the head of
 /// the archive and stops, as the real one does; `STUB_RESTORE_FAIL` fails the restore itself,
 /// after the dump reached it, and `STUB_RESTORE_HOLD` names a file the restore waits for after
-/// writing `<file>.started`, so a test can act while the restore is running. Asked about the
+/// writing `<file>.started`, so a test can act while the restore is running; `STUB_PSQL_HOLD`
+/// does the same for the psql command containing that text, after the command has taken effect
+/// (`STUB_PSQL_HOLD_FILE` is the file). Asked about the
 /// restored database, its psql says who owns the `event` table (`STUB_EVENT_OWNER`) and whether
 /// the daemon's role is confined (`STUB_CONFINED`, the three booleans as psql prints them). A
 /// command run through `env` is run: that is how the superuser step reaches the propolis stub.
@@ -76,6 +78,10 @@ case "$1" in
             echo "${STUB_CONFINED-f|f|f}"
         elif [[ "$*" == *"pg_get_userbyid(c.relowner)"* ]]; then
             echo "${STUB_EVENT_OWNER-propolis_owner}"
+        fi
+        if [ -n "${STUB_PSQL_HOLD:-}" ] && [[ "$*" == *"$STUB_PSQL_HOLD"* ]]; then
+            : > "$STUB_PSQL_HOLD_FILE.started"
+            for _ in $(seq 1 600); do [ -e "$STUB_PSQL_HOLD_FILE" ] && break; sleep 0.05; done
         fi
         ;;
     env)
@@ -166,7 +172,10 @@ case "$1" in
             *current_database*) echo propolis ;;
             *current_user*)
                 [[ "$DATABASE_URL" =~ ^postgres://([a-z_]+) ]] || exit 1
-                if [ -n "${{STUB_OWNER_LOGIN_FAIL:-}}" ] && [ "${{BASH_REMATCH[1]}}" != propolis ]; then exit 1; fi
+                if [ -n "${{STUB_OWNER_LOGIN_FAIL:-}}" ] && [ "${{BASH_REMATCH[1]}}" != propolis ]; then
+                    echo "psql: error: FATAL:  password authentication failed for user \"${{BASH_REMATCH[1]}}\"" >&2
+                    exit 1
+                fi
                 echo "${{BASH_REMATCH[1]}}"
                 ;;
         esac
@@ -624,6 +633,12 @@ fn a_failed_rename_aside_leaves_the_database_where_it_was_and_starts_the_service
         stderr.contains("while renaming the current database aside"),
         "{stderr}"
     );
+    // The script asks PostgreSQL whether the database moved before it touches anything, and
+    // says what it found: the operator is not left to wonder which name holds the data.
+    assert!(
+        stderr.contains("The database was not renamed: propolis is as it was"),
+        "{stderr}"
+    );
     let log = fx.log();
     assert_eq!(
         log.matches("RENAME TO").count(),
@@ -634,6 +649,102 @@ fn a_failed_rename_aside_leaves_the_database_where_it_was_and_starts_the_service
     assert_eq!(
         fx.databases(),
         vec![("propolis".to_string(), LIVE.to_string())]
+    );
+}
+
+/// A signal is acted on the moment the step in progress returns, which is before the script's
+/// next line runs. For the rename aside that means the database HAS moved and nothing after the
+/// rename has run. The name it was moved to is recorded before the rename is asked for, and the
+/// trap asks PostgreSQL what is where, so the database is given its name back. Recorded after
+/// the step, as it was, the trap saw nothing to put back and started the daemon on a name with
+/// no database under it.
+#[test]
+fn a_signal_right_after_the_rename_aside_gives_the_database_its_name_back() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let hold = fx.root.join("rename-may-return");
+    let started = fx.root.join("rename-may-return.started");
+    let child = fx.spawn(
+        &["--with-database", "--yes"],
+        &[
+            ("STUB_PSQL_HOLD", "RENAME TO \"propolis_before_rollback_"),
+            ("STUB_PSQL_HOLD_FILE", hold.to_str().unwrap()),
+        ],
+        false,
+    );
+    wait_for(&started);
+    assert!(
+        !fx.pg.join("propolis").exists(),
+        "precondition: the rename has taken effect and psql has not returned yet"
+    );
+    signal("TERM", &child.id().to_string());
+    std::fs::write(&hold, b"").unwrap();
+    let out = child.wait_with_output().expect("rollback.sh ends");
+    assert_eq!(out.status.code(), Some(143), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("back under its own name, propolis"),
+        "{stderr}"
+    );
+    let log = fx.log();
+    assert!(!log.contains("CREATE DATABASE"), "{log}");
+    assert_in_order(
+        &log,
+        &[
+            "ALTER DATABASE \"propolis\" RENAME TO \"propolis_before_rollback_",
+            "ALTER DATABASE \"propolis_before_rollback_",
+            "systemctl start propolis.service",
+        ],
+    );
+    assert_eq!(
+        fx.databases(),
+        vec![("propolis".to_string(), LIVE.to_string())],
+        "the only database is the real one, under its own name"
+    );
+}
+
+/// The trap cannot ask PostgreSQL where the database is (the server went away, which is also a
+/// likely reason for the restore to have failed). It must not guess: the daemon is left stopped
+/// and the message names both places the data can be.
+#[test]
+fn when_postgresql_cannot_say_where_the_database_is_the_daemon_is_left_stopped() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[
+            ("STUB_RESTORE_FAIL", "1"),
+            ("STUB_RUNUSER_FAIL", "count(*) FROM pg_database"),
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("PostgreSQL did not answer")
+            && stderr.contains(
+                "still under its name, propolis, or was renamed to propolis_before_rollback_"
+            )
+            && stderr.contains("propolis.service is left stopped"),
+        "{stderr}"
+    );
+    let log = fx.log();
+    let after = &log[log.find("pg_restore --exit-on-error").unwrap()..];
+    assert!(
+        !after.contains("systemctl start propolis.service"),
+        "the daemon was started without knowing what its database name holds: {log}"
+    );
+    assert!(
+        after.contains("systemctl start sensor-ssh.service"),
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("runuser psql -X -v ON_ERROR_STOP=1 -c ALTER DATABASE")
+            .count(),
+        1,
+        "nothing is renamed on a guess: {log}"
     );
 }
 
@@ -1202,6 +1313,14 @@ fn on_a_split_node_an_owner_role_that_cannot_be_read_refuses_before_stopping_any
     assert!(
         stderr.contains("could not be read as two different plain names")
             && stderr.contains("migrate.env"),
+        "{stderr}"
+    );
+    // What the attempt said is shown, so a URL psql cannot be handed is told apart from a role
+    // that cannot log in.
+    assert!(
+        stderr.contains(
+            "Connecting with the owner's URL said: psql: error: FATAL:  password authentication failed"
+        ),
         "{stderr}"
     );
 

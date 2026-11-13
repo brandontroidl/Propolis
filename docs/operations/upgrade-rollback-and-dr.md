@@ -565,7 +565,10 @@ starts on the database it had. With the kept binaries it then either runs or ref
 schema at startup; go forward again with `deploy/upgrade.sh`. If the real database cannot be
 put back, the sensors, the gateway and the shipper are started and `propolis.service` is left
 stopped, so that it cannot begin a new ledger in an empty database, and the message names the
-database that holds the real data. Nothing is dropped in either case.
+database that holds the real data. The script does not go by its own record of what it had
+done: it asks PostgreSQL which names exist, so a database that was never renamed is left alone
+and said to be where it was, and if PostgreSQL cannot be asked the daemon is likewise left
+stopped and the message names both places the data can be. Nothing is dropped in any case.
 
 A signal ends the run the same way a failed step does (`deploy/rollback.sh#on_exit`). The
 restore is the long step and a rollback is usually run over SSH: if the session drops, the

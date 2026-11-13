@@ -2562,6 +2562,8 @@ impl UpgradeFixture {
              \tif [ \"$a\" = -c ]; then skip=1; continue; fi\n\
              \tsub=\"$a\"; break\ndone\n\
              echo \"$sub\" >> \"$GIT_LOG\"\n\
+             if [ -n \"${FAIL_ON_GIT:-}\" ] && [ \"$sub\" = \"$FAIL_ON_GIT\" ]; then\n\
+             \techo 'fatal: simulated failure' >&2\n\texit 128\nfi\n\
              if [ -n \"${EDIT_ON_GIT:-}\" ] && [ \"$sub\" = \"${EDIT_ON_GIT%%:*}\" ]; then\n\
              \tprintf 'edited late\\n' >> \"${EDIT_ON_GIT#*:}\"\nfi\n\
              exec \"$prog\" \"$@\"\n",
@@ -3908,9 +3910,92 @@ fn upgrade_reports_a_fast_forward_git_gave_up_on_as_a_refusal() {
         "a failed merge must end in the refusal, not in git's error alone: {stderr}"
     );
     assert!(
-        stderr.contains(&format!("it is at {head}")),
+        stderr.contains(&format!("it has not moved from {head}")),
         "the refusal says where the checkout is: {stderr}"
     );
+    assert!(
+        stderr.contains("git restore <file>"),
+        "and how to put back what the failed move wrote: {stderr}"
+    );
+}
+
+/// The list of files a move had to remove comes from git. When git cannot produce it, the check
+/// that depends on it has not been made, and that is a refusal: a check that passes because it
+/// could not run is how a stray file would reach the build after all.
+#[test]
+fn upgrade_refuses_when_it_cannot_list_what_the_move_removed() {
+    let fx = UpgradeFixture::new();
+    fx.push_change(false);
+    let tip = git(&fx.author, &["rev-parse", "HEAD"]);
+    // On an ordinary fast-forward the listing is the block's only `git diff`.
+    let run = fx.run(&[], &[("FAIL_ON_GIT", "diff")]);
+    assert!(!run.output.status.success(), "{}", run.stdout());
+    assert!(
+        continued_lines(&run).is_empty(),
+        "the run went on to the build without the check: {}",
+        run.stdout()
+    );
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("could not list the files this move had to remove")
+            && stderr.contains("nothing was built or installed"),
+        "{stderr}"
+    );
+    assert_eq!(fx.head(), tip, "the fast-forward itself had gone through");
+}
+
+/// A move that removes files is not refused for it. In particular not when the new commit puts a
+/// link where a directory was and the link's target holds a file of the same name: that file is
+/// found at the old path, through the link, and it is the new commit's own.
+#[test]
+fn upgrade_does_not_take_a_file_reached_through_a_new_link_for_one_left_behind() {
+    for adopt in [false, true] {
+        let fx = UpgradeFixture::new();
+        std::fs::create_dir_all(fx.author.join("conf")).unwrap();
+        std::fs::create_dir_all(fx.author.join("real")).unwrap();
+        std::fs::write(fx.author.join("conf/settings"), "old\n").unwrap();
+        std::fs::write(fx.author.join("conf/gone"), "old\n").unwrap();
+        std::fs::write(fx.author.join("real/settings"), "real\n").unwrap();
+        git(&fx.author, &["add", "-A"]);
+        git(&fx.author, &["commit", "-q", "-m", "a directory"]);
+        git(&fx.author, &["push", "-q", "origin", "main"]);
+        assert!(fx.run(&[], &[]).output.status.success());
+
+        if adopt {
+            git(&fx.author, &["checkout", "-q", "--orphan", "restarted"]);
+        }
+        std::fs::remove_dir_all(fx.author.join("conf")).unwrap();
+        std::os::unix::fs::symlink("real", fx.author.join("conf")).unwrap();
+        git(&fx.author, &["add", "-A"]);
+        git(
+            &fx.author,
+            &["commit", "-q", "-m", "the directory becomes a link"],
+        );
+        git(
+            &fx.author,
+            &["push", "-q", "--force", "origin", "HEAD:main"],
+        );
+        let tip = git(&fx.author, &["rev-parse", "HEAD"]);
+
+        let args: Vec<String> = if adopt {
+            vec![format!("--adopt-history={tip}")]
+        } else {
+            Vec::new()
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = fx.run(&args, &[]);
+        assert!(
+            run.output.status.success(),
+            "adopt={adopt}: {}",
+            run.stderr()
+        );
+        assert_eq!(fx.head(), tip);
+        assert!(
+            fx.repo.join("conf/settings").is_file() && !fx.repo.join("conf/gone").exists(),
+            "adopt={adopt}: the fixture is the case this test is about"
+        );
+        assert!(git(&fx.repo, &["status", "--porcelain"]).is_empty());
+    }
 }
 
 /// The clean-tree check runs again right before the checkout moves on an ordinary upgrade too,

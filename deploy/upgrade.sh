@@ -405,9 +405,11 @@ else
     TREE_STATE="$(as_owner git status --porcelain --untracked-files=no)"
     LEFT_OVER=""
     # NUL-separated, so no file name needs unquoting. The last record is a marker written only
-    # when git succeeded: without it the list cannot be trusted to be complete.
-    mapfile -d '' -t GONE < <(as_owner git diff --no-renames --name-only --diff-filter=D -z "$OLD_HEAD" "$TARGET" && printf 'listed\0')
-    if [ "${#GONE[@]}" -eq 0 ] || [ "${GONE[-1]}" != listed ]; then
+    # when git succeeded (a name git prints cannot start with that byte unquoted in practice,
+    # and it would have to be the last one): without it the list cannot be trusted to be
+    # complete, and a check that cannot be made is a refusal, not a pass.
+    mapfile -d '' -t GONE < <(as_owner git diff --no-renames --name-only --diff-filter=D -z "$OLD_HEAD" "$TARGET" && printf '\001listed\0')
+    if [ "${#GONE[@]}" -eq 0 ] || [ "${GONE[-1]}" != $'\001listed' ]; then
         MOVED=0
         LEFT_OVER="(could not list the files this move had to remove)"
     else
@@ -416,12 +418,29 @@ else
             # A regular file or a link. A directory here is the new commit's own: the path was a
             # file and is now a directory of tracked files.
             if [ -f "$REPO_DIR/$gone" ] || [ -L "$REPO_DIR/$gone" ]; then
-                LEFT_OVER+="${LEFT_OVER:+$'\n'}?? $gone"
+                # Unless it is reached through a link: the new commit put a link where a
+                # directory was, and the file found there belongs to the link's target.
+                through_link=0
+                parent="$gone"
+                while [[ "$parent" == */* ]]; do
+                    parent="${parent%/*}"
+                    if [ -L "$REPO_DIR/$parent" ]; then
+                        through_link=1
+                        break
+                    fi
+                done
+                if [ "$through_link" -eq 0 ]; then
+                    LEFT_OVER+="${LEFT_OVER:+$'\n'}?? $gone"
+                fi
             fi
         done
     fi
     if [ "$MOVED" -eq 0 ] || [ "$NOW_HEAD" != "$TARGET" ] || [ -n "$TREE_STATE" ] || [ -n "$LEFT_OVER" ]; then
-        WHERE=("it is at $NOW_HEAD and it was at $OLD_HEAD${KEPT_REF:+ (kept as $KEPT_REF)}")
+        if [ "$NOW_HEAD" = "$OLD_HEAD" ]; then
+            WHERE=("it has not moved from $OLD_HEAD")
+        else
+            WHERE=("it is at $NOW_HEAD and it was at $OLD_HEAD${KEPT_REF:+ (kept as $KEPT_REF)}")
+        fi
         if [ -n "$TREE_STATE" ]; then
             WHERE+=("tracked files that do not match the commit it is at:" "$TREE_STATE")
         fi
@@ -431,7 +450,8 @@ else
         refuse "the checkout could not be moved cleanly onto the commit that was checked" \
             "${WHERE[@]}" \
             "the files listed are an edit made while this run was working, or what a move git could not finish left behind" \
-            "git's own message, if any, is above; fix what it names, put the listed files right, and run the upgrade again"
+            "git's own message, if any, is above. Fix what it names; then, as the checkout's owner, put back a file you did not edit with: git restore <file>" \
+            "and remove a file listed with ??. Run the upgrade again when git status is clean: it carries on from the commit the checkout is on"
     fi
     if [ -n "${KEPT_REF:-}" ]; then
         echo "    this checkout is now at $TARGET; the commit it left ($OLD_HEAD) is kept as $KEPT_REF"

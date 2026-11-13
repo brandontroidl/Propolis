@@ -76,8 +76,9 @@ path. See [deployment models](deployment-models.md) and
 Whatever the pull brings in is built and installed as root, so `upgrade.sh` checks five things
 before it builds (`deploy/upgrade.sh#pull-and-reexec`). Each refusal says what it found and
 ends with "nothing was built or installed". The first four leave the checkout where it was. The
-fifth is made after the checkout has moved, so a refusal there leaves it on the new commit
-with the installed release still the old one; the message names both commits.
+fifth is made after the checkout has moved, so a refusal there normally leaves it on the new
+commit with the installed release still the old one; the message says where the checkout is
+and how to put right what it lists.
 
 1. **A clean tree.** `git status --porcelain --untracked-files=normal` must print nothing: an
    uncommitted edit on the box, tracked or untracked, would otherwise be built and installed
@@ -112,8 +113,10 @@ with the installed release still the old one; the message names both commits.
    commit removed. Git reports a file it could not replace or remove and still exits 0, a
    file it could not remove is untracked from then on, and cargo builds a stray `build.rs` or
    `src/bin/*.rs` without being asked: a root-installed build must hold the commit and nothing
-   else. When this check refuses, fix what the message lists and run the upgrade again; it
-   carries on from the commit the checkout is on. One window stays open: a new, untracked file
+   else. A fast-forward git gave up on part-way ends here too, with the checkout not moved
+   and some files already rewritten. When this check refuses, fix what git names, put the
+   listed files right (`git restore <file>` for one you did not edit, remove one marked `??`)
+   and run the upgrade again; it carries on from the commit the checkout is on. One window stays open: a new, untracked file
    created between the second clean-tree check and the move is not seen, because after the
    move only tracked files are compared (an adopted tree may ignore different paths).
 

@@ -372,7 +372,7 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
   ```sh
   git status --porcelain --untracked-files=normal   # must print nothing
   git remote get-url origin                         # must be the remote you expect
-  git fetch origin
+  git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
   # only with /etc/propolis/upgrade-signers on this box (see "Signed upgrades")
   git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/propolis/upgrade-signers \
       -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
@@ -381,7 +381,8 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
   cargo build --release --workspace --locked
   ```
 
-  The first two lines are the dirty check and the origin pin done by eye: this path writes no
+  The fetch is the script's: `main` and nothing else, so no tag or branch name the remote
+  chooses reaches the clone or the terminal. The first two lines are the dirty check and the origin pin done by eye: this path writes no
   deploy stamp, so the origin a collector's stamp records is the one `install.sh` saw and is
   never refreshed (see [what the pull trusts](upgrade-rollback-and-dr.md#what-the-pull-trusts)).
   Then, as root
@@ -412,44 +413,64 @@ together, since a shipper on the other version stops at its first batch.
 
 #### Following a restarted history
 
-When the repository's history was restarted or the project moved to a successor repository,
-the control plane follows with `upgrade.sh --adopt-history=<commit>`
+When the repository's history was restarted, the project moved to a successor repository, or
+`main` was rewritten or moved back, the control plane follows with
+`upgrade.sh --adopt-history=<commit>`
 ([a restarted history](upgrade-rollback-and-dr.md#a-restarted-history-or-a-successor-repository)).
-A collector's `git merge --ff-only` above then fails, as it should: the new `main` does not
-descend from what the collector runs. Follow by hand after the control plane, with the same
-commit id; every command after the fetch names the id and none names the ref. As the owner of
-the checkout, from the top of it:
+The collectors follow by hand after it, with the same commit id. How the ordinary collector
+procedure above behaves depends on the shape, and neither behaviour moves the collector:
+
+- A `main` that does not descend from what the collector runs makes `git merge --ff-only`
+  fail, as it should.
+- A `main` that was moved back makes it print `Already up to date.` and change nothing. The
+  collector then stays ahead of the control plane, which is the skew the order rule above
+  exists to avoid.
+
+In both cases use this instead, as the owner of the checkout, from the top of it. Every
+command after the fetch names the id and none names the ref:
 
 ```sh
 # Example - ID is the full commit id the control plane adopted, from a channel the remote does not control.
 ID=<full commit id of the new main>
 git remote get-url origin    # read it: the remote you mean (set-url first when moving)
 # One command: each step runs only if the one before it succeeded.
+[ "$(git symbolic-ref --quiet HEAD)" = refs/heads/main ] &&
 [ -z "$(git status --porcelain --untracked-files=normal)" ] &&
+OLD="$(git rev-parse --verify HEAD)" &&
 git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' &&
+[ "$(git rev-parse --verify 'FETCH_HEAD^{commit}')" = "$ID" ] &&
 [ "$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')" = "$ID" ] &&
 { [ ! -e /etc/propolis/upgrade-signers ] ||
   git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/propolis/upgrade-signers \
       -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
       verify-commit "$ID^{commit}"; } &&
-git diff --shortstat HEAD "$ID^{commit}" &&
-git update-ref "refs/propolis/before-adoption/$(date -u +%Y%m%dT%H%M%SZ)" HEAD &&
+git diff --shortstat "$OLD" "$ID^{commit}" &&
+git update-ref "refs/propolis/before-adoption/$(date -u +%Y%m%dT%H%M%SZ)" "$OLD" &&
 git checkout --quiet --no-overwrite-ignore -B main "$ID^{commit}" &&
 [ -z "$(git status --porcelain --untracked-files=no)" ] &&
 [ "$(git rev-parse HEAD)" = "$ID" ] &&
+git diff --no-renames --name-only --diff-filter=D -z "$OLD" "$ID^{commit}" |
+    xargs -0 -r sh -c 'for p; do if [ -f "$p" ] || [ -L "$p" ]; then echo "still on disk: $p"; exit 1; fi; done' sh &&
 echo "OK: the checkout is on the commit named" ||
 echo "STOPPED: a step failed and nothing after it ran"
 ```
 
-In order: the tree is clean; `main` and nothing else is fetched; `origin/main` is the commit
-named; with a signers file on the box, that commit carries a listed key's SSH signature; the
-number of files that differ is printed, which is what you are accepting; the commit being
-left is recorded, because it is on no branch afterwards and cannot be fetched again from a
-restarted history; the branch moves, without replacing ignored files; and the result is the
-named commit with no tracked file differing from it. A step that fails prints `STOPPED` and
-leaves the rest undone. `"$ID^{commit}"` rather than the bare id is deliberate: handed a bare
-id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of that
-name would decide where the branch lands.
+In order: the checkout is on `main`; the tree is clean; `main` and nothing else is fetched,
+and this fetch delivered it; `origin/main` is the commit named; with a signers file on the
+box, that commit carries a listed key's SSH signature; the number of files that differ is
+printed, which is what you are accepting; the commit being left is recorded, because it is on
+no branch afterwards and cannot be fetched again from a restarted history; the branch moves,
+without replacing ignored files; and the result is the named commit, with no tracked file
+differing from it and no file the new commit removed still on disk. A step that fails prints
+`STOPPED` and leaves the rest undone.
+
+Three things the block does on purpose. `"$ID^{commit}"` rather than the bare id: handed a
+bare id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of
+that name would decide where the branch lands. `ID` is set before anything is fetched:
+whatever a remote prints during a fetch is the thing being checked, never a source for the
+id. And it moves `main` only: on a checkout that is on another branch, put that branch's name
+in the first line and in the `-B` line; on a detached one, drop the first line and use
+`git checkout --quiet --no-overwrite-ignore --detach "$ID^{commit}"`.
 
 After `OK`, build as the same account with `cargo build --release --workspace --locked`, then
 install and restart as root exactly as above.

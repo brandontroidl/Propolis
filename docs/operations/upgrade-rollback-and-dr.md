@@ -73,9 +73,11 @@ path. See [deployment models](deployment-models.md) and
 
 ### What the pull trusts
 
-Whatever the pull brings in is built and installed as root, so `upgrade.sh` checks four things
+Whatever the pull brings in is built and installed as root, so `upgrade.sh` checks five things
 before it builds (`deploy/upgrade.sh#pull-and-reexec`). Each refusal says what it found and
-ends with "nothing was built or installed"; the checkout is left where it was.
+ends with "nothing was built or installed". The first four leave the checkout where it was. The
+fifth is made after the checkout has moved, so a refusal there leaves it on the new commit
+with the installed release still the old one; the message names both commits.
 
 1. **A clean tree.** `git status --porcelain --untracked-files=normal` must print nothing: an
    uncommitted edit on the box, tracked or untracked, would otherwise be built and installed
@@ -104,9 +106,16 @@ ends with "nothing was built or installed"; the checkout is left where it was.
    is an earlier commit of the box's own history. None of the three is deployed without the
    operator naming the commit:
    [a restarted history](#a-restarted-history-or-a-successor-repository), below.
-5. **The move itself.** After the fast-forward the checkout must be at the commit that was
-   checked, with no tracked file differing from it. Git can leave a file it could not replace
-   and still report success, and a root-installed build must hold the commit and nothing else.
+5. **The move itself.** The clean-tree check runs a second time right before the checkout
+   moves, because the fetch took time. After the move the checkout must be at the commit that
+   was checked, with no tracked file differing from it and no file left on disk that the new
+   commit removed. Git reports a file it could not replace or remove and still exits 0, a
+   file it could not remove is untracked from then on, and cargo builds a stray `build.rs` or
+   `src/bin/*.rs` without being asked: a root-installed build must hold the commit and nothing
+   else. When this check refuses, fix what the message lists and run the upgrade again; it
+   carries on from the commit the checkout is on. One window stays open: a new, untracked file
+   created between the second clean-tree check and the move is not seen, because after the
+   move only tracked files are compared (an adopted tree may ignore different paths).
 
 `origin/main` is resolved to one commit right after the fetch, and the signature check, the
 ancestry check and the merge all name that commit, so a fetch that lands in between (an
@@ -115,8 +124,10 @@ merged. The fetch asks for the `main` branch and nothing else
 (`deploy/upgrade.sh#--no-tags`): every other ref is a name the remote chooses, and a tag
 named like a commit id or a branch whose name reads as an argument has no business in the
 box's clone or on the operator's terminal. A remote without a `main` branch is refused as
-that, not as a signature or ancestry failure, and the `origin/main` the clone holds from an
-earlier fetch is not used in its place.
+that, not as a signature or ancestry failure. So is a fetch that exits 0 without delivering
+`main` (git only warns when a shallow, depth-limited remote's `main` is rejected): the
+`origin/main` the clone holds from an earlier fetch is never used in its place
+(`deploy/upgrade.sh#FETCH_HEAD`).
 
 The checks run only on the first pass: when the pull changed `upgrade.sh` itself, the
 re-executed copy carries on from the pull it already did.
@@ -165,7 +176,8 @@ What the argument does (`deploy/upgrade.sh#ADOPT_COMMIT`):
 - **It widens one check, the fast-forward, and only for that commit.** The named commit is
   deployed whichever of the three shapes it has, including a `main` that is an earlier commit
   of the box's own history: the argument is the one thing that moves a box backwards, and the
-  run says `BEHIND` in as many words before it does. The clean tree, the recorded origin and,
+  run says `BEHIND` in as many words before it does (see
+  [moving backwards](#moving-backwards-and-the-database) first). The clean tree, the recorded origin and,
   with a signers file, the SSH signature are checked first and as before. An unsigned commit
   is not adopted on a box that requires signatures
   (`crates/sensor-framework/tests/deploy_test.rs#upgrade_adopt_history_with_signers_refuses_an_unsigned_commit_and_adopts_a_signed_one`).
@@ -177,18 +189,22 @@ What the argument does (`deploy/upgrade.sh#ADOPT_COMMIT`):
   fetch. The move is a plain checkout, never forced and never a hard reset, so a file edited
   even later is left alone and the run stops; it also refuses to replace a file the box
   ignores (its own `.env`, a data directory) that the new tree happens to track. Afterwards
-  the checkout must be at the named commit with no tracked file differing from it, or nothing
-  is built
+  check 5 applies as on any upgrade: the named commit, no tracked file differing from it, no
+  removed file still on disk, or nothing is built
   (`crates/sensor-framework/tests/deploy_test.rs#upgrade_adopt_history_never_discards_or_builds_an_edit_made_during_the_run`).
 - **It keeps the commit the box left.** That commit is on no branch afterwards, and on a
   restarted history it cannot be fetched again, so the run records it as
   `refs/propolis/before-adoption/<UTC time>` and prints the name. The ref does not expire.
   `git checkout -B main refs/propolis/before-adoption/<UTC time>`, as the checkout's owner,
-  puts the checkout back on it; the installed release goes back with
-  [`rollback.sh`](#rollback), as after any upgrade.
+  puts the checkout back on it (name the checkout's own branch if it is not `main`, or use
+  `git checkout --detach` with the ref on a detached one); the installed release goes back
+  with [`rollback.sh`](#rollback), as after any upgrade.
 - **The rest of the run is the adopted tree's own `upgrade.sh`,** started without the
   argument: a tree from before the argument existed would stop on it after the checkout had
-  already moved. A `main` with no `deploy/upgrade.sh` at all is refused before anything moves.
+  already moved. The hand-over relies on that script skipping its own pull, so a `main` whose
+  `upgrade.sh` is from before the re-exec guard is refused before anything moves: it would
+  pull a second time by itself, with no pin. So is a `main` with no `deploy/upgrade.sh` at all
+  (`crates/sensor-framework/tests/deploy_test.rs#upgrade_adopt_history_refuses_a_script_from_before_the_reexec_guard`).
 
 **Where the commit id comes from.** The check is worth what the id's source is worth. It has
 to reach you through a channel the remote being checked does not control: the maintainer's
@@ -196,13 +212,44 @@ announcement, a signed tag or release note you can verify, a clone made earlier 
 machine. The repository's own web page is the remote; when the worry is a hijacked
 repository, it is not a second source.
 
-No refusal prints the commit that was fetched: not the three that ask for the argument, not
-the one that says the commit named is not `origin/main`, not the signature refusal
+Until a run has accepted `origin/main`, nothing it prints says which commit was fetched: not
+the three refusals that ask for the argument, not the one that says the commit named is not
+`origin/main`, not the signature refusal
 (`crates/sensor-framework/tests/deploy_test.rs#upgrade_prints_the_fetched_commit_in_no_refusal_whichever_shape_the_remote_picks`).
+The same goes for what the remote can make git print
+(`crates/sensor-framework/tests/deploy_test.rs#upgrade_shows_nothing_the_remote_says_in_a_refused_run`):
+text a server sends during a fetch is not shown when the fetch succeeded (a failed fetch
+shows it, because that is how an honest failure is diagnosed), and anything that reads as a
+commit id is taken out of git's own messages and of the commit subjects a refusal lists. A
+`Run: upgrade.sh --adopt-history=<id>` printed by the remote above the refusal that asks for
+an id is the obvious thing for a hostile one to send.
+
 That is a nudge, not a control. The id is in the box's clone and one `git rev-parse` reads it
 out; the script only declines to hand over a value that, pasted back, would check nothing.
 What stands between a hostile remote and a root install is the operator taking the id from
-somewhere else, and with signing on, the signature.
+somewhere else, and with signing on, the signature. Nothing a remote says during an upgrade
+is an instruction.
+
+#### Moving backwards, and the database
+
+Migrations only run forward ([below](#migrations-are-additive-and-run-at-startup)). A tree
+that lacks a migration this box's database has already run builds a daemon that refuses to
+start, exactly as after a [rollback](#rollback) of the binaries alone. That is what adopting
+a `main` moved back across a migration does, and what adopting a rewritten `main` or a
+successor's snapshot does when it lacks migrations the box has. The run warns before it
+moves, naming the migration files the adopted tree lacks
+(`crates/sensor-framework/tests/deploy_test.rs#upgrade_adopt_history_warns_when_the_adopted_tree_lacks_migrations_the_box_has`),
+and goes on, because git cannot see the database. Check before you run it:
+
+```
+# Example - as the checkout's owner; prints the migrations the commit you would adopt lacks.
+git diff --no-renames --name-only --diff-filter=D HEAD <full commit id> -- 'crates/*/migrations/*'
+```
+
+If it prints anything, the database has to go back too: `rollback.sh --with-database`
+restores the dump taken before the upgrade that ran those migrations, and the events recorded
+since stay in the renamed database, not the restored one. Or wait until `main` has passed the
+box again.
 
 **Moving a running box to a successor repository.** Three steps, in this order, because the
 box's own copy of `upgrade.sh` has to know the argument before it can be given it:
@@ -247,33 +294,47 @@ none names the ref. As the account that owns the checkout, from the top of it:
 ID=<full commit id of the new main>
 git remote get-url origin    # read it: the remote you mean (set-url first when moving)
 # One command: each step runs only if the one before it succeeded.
+[ "$(git symbolic-ref --quiet HEAD)" = refs/heads/main ] &&
 [ -z "$(git status --porcelain --untracked-files=normal)" ] &&
+OLD="$(git rev-parse --verify HEAD)" &&
 git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' &&
+[ "$(git rev-parse --verify 'FETCH_HEAD^{commit}')" = "$ID" ] &&
 [ "$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')" = "$ID" ] &&
 { [ ! -e /etc/propolis/upgrade-signers ] ||
   git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/etc/propolis/upgrade-signers \
       -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
       verify-commit "$ID^{commit}"; } &&
-git diff --shortstat HEAD "$ID^{commit}" &&
-git update-ref "refs/propolis/before-adoption/$(date -u +%Y%m%dT%H%M%SZ)" HEAD &&
+git diff --shortstat "$OLD" "$ID^{commit}" &&
+git update-ref "refs/propolis/before-adoption/$(date -u +%Y%m%dT%H%M%SZ)" "$OLD" &&
 git checkout --quiet --no-overwrite-ignore -B main "$ID^{commit}" &&
 [ -z "$(git status --porcelain --untracked-files=no)" ] &&
 [ "$(git rev-parse HEAD)" = "$ID" ] &&
+git diff --no-renames --name-only --diff-filter=D -z "$OLD" "$ID^{commit}" |
+    xargs -0 -r sh -c 'for p; do if [ -f "$p" ] || [ -L "$p" ]; then echo "still on disk: $p"; exit 1; fi; done' sh &&
 echo "OK: the checkout is on the commit named" ||
 echo "STOPPED: a step failed and nothing after it ran"
 ```
 
-In order: the tree is clean; `main` and nothing else is fetched; `origin/main` is the commit
-named; with a signers file on the box, that commit carries a listed key's SSH signature; the
-number of files that differ is printed, which is what you are accepting; the commit being
-left is recorded, because it is on no branch afterwards and cannot be fetched again from a
-restarted history; the branch moves, without replacing ignored files; and the result is the
-named commit with no tracked file differing from it. A step that fails prints `STOPPED` and
-leaves the rest undone. `"$ID^{commit}"` rather than the bare id is deliberate: handed a bare
-id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of that
-name would decide where the branch lands. With signing on, the signature is
-checked here, before the checkout: the next step runs the new tree's `upgrade.sh` as root,
-and a signature checked only by the code it is meant to vouch for is not a check.
+In order: the checkout is on `main`; the tree is clean; `main` and nothing else is fetched,
+and this fetch delivered it; `origin/main` is the commit named; with a signers file on the
+box, that commit carries a listed key's SSH signature; the number of files that differ is
+printed, which is what you are accepting; the commit being left is recorded, because it is on
+no branch afterwards and cannot be fetched again from a restarted history; the branch moves,
+without replacing ignored files; and the result is the named commit, with no tracked file
+differing from it and no file the new commit removed still on disk. A step that fails prints
+`STOPPED` and leaves the rest undone.
+
+Three things the block does on purpose. `"$ID^{commit}"` rather than the bare id: handed a
+bare id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of
+that name would decide where the branch lands. `ID` is set before anything is fetched:
+whatever a remote prints during a fetch is the thing being checked, never a source for the
+id. And it moves `main` only: on a checkout that is on another branch, put that branch's name
+in the first line and in the `-B` line; on a detached one, drop the first line and use
+`git checkout --quiet --no-overwrite-ignore --detach "$ID^{commit}"`. With signing on, the
+signature is checked here, before the checkout: the next step runs the new tree's
+`upgrade.sh` as root, and a signature checked only by the code it is meant to vouch for is
+not a check. The [database](#moving-backwards-and-the-database) caution applies to this path
+as to the script's.
 
 The checkout now carries an `upgrade.sh` that has the argument, so the deploy itself is the
 ordinary pinned run, as root (`--accept-origin` only when the remote changed):

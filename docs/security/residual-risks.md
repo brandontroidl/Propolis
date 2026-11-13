@@ -144,9 +144,12 @@ and is trusted by construction. What remains:
   rollback is accepted. Nothing in such a commit can prove it continues the same code, so the
   proof is the id, and it is worth what the channel it came through is worth. An id read off
   the remote being checked (this box's own fetch, or the hosting site's page for a repository
-  that may be hijacked) checks nothing. The script does not print the fetched id in any
-  refusal, which keeps it from inviting that mistake and does not prevent it: the id is one
-  `git rev-parse` away in the box's clone. The run prints how many files differ so the operator
+  that may be hijacked) checks nothing. Until a run has accepted `origin/main` the script
+  prints neither the fetched id nor what the remote sent during the fetch, which keeps it
+  from inviting that mistake and does not prevent it: the id is one `git rev-parse` away in
+  the box's clone, and a remote has other ways to reach an operator than the terminal. An
+  adopted tree that lacks migrations the database has run builds a daemon that will not
+  start; the run warns and goes on. The run prints how many files differ so the operator
   sees what they accept; it cannot judge whether the difference is benign. With signing on,
   the named commit must also carry a listed key's signature, and that is the control that
   does not depend on where the id came from. See

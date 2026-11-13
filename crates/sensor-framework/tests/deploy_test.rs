@@ -2988,6 +2988,14 @@ fn printed(run: &ReexecRun) -> String {
     format!("{}{}", run.stdout(), run.stderr())
 }
 
+/// Root writes and unlinks in a read-only directory without noticing its mode, so the tests that
+/// stand a read-only directory in for "a path the checkout's owner cannot change" skip as root.
+/// CI runs them as an ordinary account.
+fn running_as_root() -> bool {
+    let uid = Command::new("id").arg("-u").output().unwrap().stdout;
+    String::from_utf8_lossy(&uid).trim() == "0"
+}
+
 /// The fetched commit's id is in `text` in some form: whole, or as the abbreviation git prints in
 /// a fetch summary (`+ 1a2b3c4...5d6e7f8 main -> origin/main`), which one `git rev-parse` expands.
 fn names_commit(text: &str, commit: &str) -> bool {
@@ -3449,6 +3457,49 @@ fn upgrade_adopt_history_moves_a_box_backwards_only_when_named_and_says_so() {
     );
 }
 
+/// Migrations only run forward. A tree that lacks a migration the box's database has already run
+/// builds a daemon that refuses to start, and git cannot see the database, only that the files are
+/// gone. The run says so before it moves, by name, and says nothing when no migration is lost.
+#[test]
+fn upgrade_adopt_history_warns_when_the_adopted_tree_lacks_migrations_the_box_has() {
+    let fx = UpgradeFixture::new();
+    let first = fx.head();
+    let dir = fx.author.join("crates/core-scoring/migrations");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("0099_add_x.sql"), "ALTER TABLE x ADD y int;\n").unwrap();
+    git(&fx.author, &["add", "-A"]);
+    git(&fx.author, &["commit", "-q", "-m", "a migration"]);
+    git(&fx.author, &["push", "-q", "origin", "main"]);
+    assert!(fx.run(&[], &[]).output.status.success());
+    git(
+        &fx.author,
+        &["push", "-q", "--force", "origin", &format!("{first}:main")],
+    );
+
+    let run = fx.run(&[&format!("--adopt-history={first}")], &[]);
+    assert!(run.output.status.success(), "{}", run.stderr());
+    let stdout = run.stdout();
+    assert!(
+        stdout.contains("WARNING: origin/main lacks 1 database migration(s) this checkout has:")
+            && stdout.contains("crates/core-scoring/migrations/0099_add_x.sql")
+            && stdout.contains("propolis will not start until the database is"),
+        "{stdout}"
+    );
+    let warned = stdout.find("WARNING").unwrap();
+    let moved = stdout.find("this checkout is now at").unwrap();
+    assert!(
+        warned < moved,
+        "the warning comes before the move: {stdout}"
+    );
+
+    // Forward again, by name: the migration is added, not lost, and there is nothing to warn of.
+    let fx = UpgradeFixture::new();
+    let restarted = fx.restart_history(true);
+    let run = fx.run(&[&format!("--adopt-history={restarted}")], &[]);
+    assert!(run.output.status.success(), "{}", run.stderr());
+    assert!(!run.stdout().contains("WARNING"), "{}", run.stdout());
+}
+
 /// The documented way onto a successor repository is both arguments in one run: one accepts the
 /// origin, the other names the commit. Naming the commit does not stand in for accepting the
 /// origin, and the stamp records the new origin only once the run is accepted.
@@ -3689,10 +3740,7 @@ fn upgrade_adopt_history_does_not_replace_an_ignored_local_file() {
 #[test]
 fn upgrade_adopt_history_refuses_a_tree_git_could_only_half_move() {
     use std::os::unix::fs::PermissionsExt;
-    // Root replaces a file in a read-only directory without noticing the mode, so as root the
-    // fixture cannot produce the tree this test is about.
-    let uid = Command::new("id").arg("-u").output().unwrap().stdout;
-    if String::from_utf8_lossy(&uid).trim() == "0" {
+    if running_as_root() {
         eprintln!("skipped as root: a read-only directory does not stop root replacing a file");
         return;
     }
@@ -3741,6 +3789,341 @@ fn upgrade_adopt_history_refuses_a_tree_git_could_only_half_move() {
         std::fs::read_to_string(dir.join("lib.txt")).unwrap(),
         "old\n",
         "the fixture did not produce the half-moved tree this test is about"
+    );
+}
+
+/// The other half of a move git could not finish: a file the new commit no longer has, which git
+/// could not remove. Git warns, exits 0, and from then on the file is untracked, so a check of
+/// tracked files sees a clean tree while cargo would build the stray source without being asked.
+/// Refused on both paths, naming the file.
+#[test]
+fn upgrade_refuses_a_tree_that_still_holds_a_file_the_new_commit_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        eprintln!("skipped as root: a read-only directory does not stop root removing a file");
+        return;
+    }
+    for adopt in [false, true] {
+        let fx = UpgradeFixture::new();
+        std::fs::create_dir_all(fx.author.join("src/bin")).unwrap();
+        std::fs::write(fx.author.join("src/bin/dropped.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(fx.author.join("src/keep.txt"), "kept\n").unwrap();
+        git(&fx.author, &["add", "-A"]);
+        git(
+            &fx.author,
+            &["commit", "-q", "-m", "a file a later commit removes"],
+        );
+        git(&fx.author, &["push", "-q", "origin", "main"]);
+        assert!(fx.run(&[], &[]).output.status.success());
+        let head = fx.head();
+
+        if adopt {
+            git(&fx.author, &["checkout", "-q", "--orphan", "restarted"]);
+        }
+        std::fs::remove_file(fx.author.join("src/bin/dropped.rs")).unwrap();
+        git(&fx.author, &["add", "-A"]);
+        git(&fx.author, &["commit", "-q", "-m", "drops a file"]);
+        git(
+            &fx.author,
+            &["push", "-q", "--force", "origin", "HEAD:main"],
+        );
+        let tip = git(&fx.author, &["rev-parse", "HEAD"]);
+
+        let dir = fx.repo.join("src/bin");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let args: Vec<String> = if adopt {
+            vec![format!("--adopt-history={tip}")]
+        } else {
+            Vec::new()
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = fx.run(&args, &[]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            dir.join("dropped.rs").is_file(),
+            "adopt={adopt}: the fixture did not leave the file this test is about"
+        );
+        assert!(
+            !run.output.status.success(),
+            "adopt={adopt}: {}",
+            run.stdout()
+        );
+        assert!(
+            continued_lines(&run).is_empty(),
+            "adopt={adopt}: a tree with a stray source file reached the build: {}",
+            run.stdout()
+        );
+        let stderr = run.stderr();
+        assert!(
+            stderr.contains("could not be moved cleanly")
+                && stderr.contains("files that commit does not have, still on disk:")
+                && stderr.contains("?? src/bin/dropped.rs")
+                && stderr.contains("nothing was built or installed"),
+            "adopt={adopt}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("it is at {tip} and it was at {head}")),
+            "adopt={adopt}: the checkout did move, and the refusal says so: {stderr}"
+        );
+    }
+}
+
+/// A fast-forward git gives up on part-way has already rewritten some files. That used to end the
+/// run through `set -e`, on git's own error line: no statement that nothing was installed, none of
+/// where the checkout was, and the next run called the files git had written the operator's local
+/// changes. It goes through the same refusal as every other move that did not finish.
+#[test]
+fn upgrade_reports_a_fast_forward_git_gave_up_on_as_a_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        eprintln!("skipped as root: a read-only directory does not stop root replacing a file");
+        return;
+    }
+    let fx = UpgradeFixture::new();
+    std::fs::create_dir_all(fx.author.join("src")).unwrap();
+    std::fs::write(fx.author.join("src/lib.txt"), "old\n").unwrap();
+    git(&fx.author, &["add", "-A"]);
+    git(&fx.author, &["commit", "-q", "-m", "a tracked directory"]);
+    git(&fx.author, &["push", "-q", "origin", "main"]);
+    assert!(fx.run(&[], &[]).output.status.success());
+    let head = fx.head();
+
+    std::fs::write(fx.author.join("src/lib.txt"), "new\n").unwrap();
+    git(&fx.author, &["commit", "-q", "-a", "-m", "changes it"]);
+    git(&fx.author, &["push", "-q", "origin", "main"]);
+
+    let dir = fx.repo.join("src");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let run = fx.run(&[], &[]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(run.merged(), "{:?}", run.git_calls);
+    assert!(!run.output.status.success(), "{}", run.stdout());
+    assert!(continued_lines(&run).is_empty(), "{}", run.stdout());
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("could not be moved cleanly")
+            && stderr.contains("nothing was built or installed"),
+        "a failed merge must end in the refusal, not in git's error alone: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("it is at {head}")),
+        "the refusal says where the checkout is: {stderr}"
+    );
+}
+
+/// The clean-tree check runs again right before the checkout moves on an ordinary upgrade too,
+/// which is every routine one: a file that appeared while the fetch ran (a second operator, an
+/// editor, a cron job) is not built. Cargo picks up a new build.rs without being asked.
+#[test]
+fn upgrade_refuses_a_file_created_while_an_ordinary_fetch_ran() {
+    let fx = UpgradeFixture::new();
+    let head = fx.head();
+    fx.push_change(false);
+    let stray = fx.repo.join("build.rs");
+    let hook = format!("fetch:{}", stray.display());
+    let run = fx.run(&[], &[("EDIT_ON_GIT", &hook)]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("changed while this run was fetching") && stderr.contains("?? build.rs"),
+        "{stderr}"
+    );
+    assert!(!run.merged(), "{:?}", run.git_calls);
+}
+
+/// An adoption can land on a tree whose upgrade.sh is from before the re-exec guard, which no
+/// fast-forward can. Handed the rest of the run, such a script would pull a second time by itself:
+/// no pin, no signature check, whatever main is by then. Refused before anything moves.
+#[test]
+fn upgrade_adopt_history_refuses_a_script_from_before_the_reexec_guard() {
+    let fx = UpgradeFixture::new();
+    git(&fx.author, &["pull", "-q", "origin", "main"]);
+    git(&fx.author, &["checkout", "-q", "--orphan", "older"]);
+    write_executable(
+        &fx.author.join("deploy/upgrade.sh"),
+        "#!/usr/bin/env bash\ngit pull --ff-only\necho OLDER SCRIPT RAN\n",
+    );
+    git(&fx.author, &["add", "-A"]);
+    git(
+        &fx.author,
+        &["commit", "-q", "-m", "a script that pulls by itself"],
+    );
+    git(
+        &fx.author,
+        &["push", "-q", "--force", "origin", "HEAD:main"],
+    );
+    let older = git(&fx.author, &["rev-parse", "HEAD"]);
+    let head = fx.head();
+
+    let run = fx.run(&[&format!("--adopt-history={older}")], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("from before the re-exec guard"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        !run.stdout().contains("OLDER SCRIPT RAN"),
+        "{}",
+        run.stdout()
+    );
+    assert_eq!(
+        git(&fx.repo, &["for-each-ref", "refs/propolis/"]),
+        "",
+        "refused before anything was recorded or moved"
+    );
+}
+
+/// What a refused run prints holds nothing the remote chose to put there. A server can send any
+/// text during a fetch; a tag named like the commit it will serve, fetched into the clone by an
+/// earlier release's `git fetch`, makes git warn with that id in full; and the subject line of a
+/// commit this box took from the remote long ago is the remote's text too. Each of the three would
+/// otherwise put a paste-ready id directly above the refusal that asks the operator for one.
+#[test]
+fn upgrade_shows_nothing_the_remote_says_in_a_refused_run() {
+    // Text the server sends during the fetch. The hook is how a real server says it: git runs it
+    // in place of pack-objects on the serving side and carries its stderr to the client.
+    let fx = UpgradeFixture::new();
+    let restarted = fx.restart_history(true);
+    let head = fx.head();
+    let ran = fx.tmp.path().join("server-hook-ran");
+    let hook = fx.tmp.path().join("server-hook.sh");
+    write_executable(
+        &hook,
+        &format!(
+            "#!/bin/sh\necho 'NOTICE: this history was restarted. Run:' >&2\n\
+             echo '  sudo ./deploy/upgrade.sh --adopt-history={restarted}' >&2\n: > '{}'\nexec \"$@\"\n",
+            ran.display()
+        ),
+    );
+    let server_config = fx.tmp.path().join("server.gitconfig");
+    std::fs::write(
+        &server_config,
+        format!("[uploadpack]\n\tpackObjectsHook = {}\n", hook.display()),
+    )
+    .unwrap();
+    let run = fx.run(
+        &[],
+        &[("GIT_CONFIG_GLOBAL", server_config.to_str().unwrap())],
+    );
+    assert!(
+        ran.exists(),
+        "the serving side did not run the hook: {}",
+        run.stderr()
+    );
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(out.contains("shares no history with origin/main"), "{out}");
+    assert!(
+        !names_commit(&out, &restarted) && !out.contains("NOTICE"),
+        "the server's text reached the terminal: {out}"
+    );
+    assert!(
+        out.contains("the remote sent text during the fetch, which is not shown"),
+        "{out}"
+    );
+
+    // A tag named like the fetched commit, already in the clone. With and without signers.
+    for signers in [false, true] {
+        let fx = UpgradeFixture::new();
+        if signers {
+            let (_key, public) = fx.ssh_key("signer");
+            fx.write_signers(&[&public]);
+        }
+        let restarted = fx.restart_history(true);
+        let head = fx.head();
+        git(&fx.repo, &["tag", &restarted, "HEAD"]);
+        let run = fx.run(&[], &[]);
+        assert_refused_before_build(&fx, &run, &head);
+        let out = printed(&run);
+        assert!(
+            !names_commit(&out, &restarted) && !out.contains("is ambiguous"),
+            "signers={signers}: git's ambiguity warning printed the fetched id: {out}"
+        );
+    }
+
+    // A commit this box holds whose subject line names the commit the remote now serves.
+    let fx = UpgradeFixture::new();
+    fx.push_change(false);
+    let tip = git(&fx.author, &["rev-parse", "HEAD"]);
+    git(
+        &fx.repo,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("run upgrade.sh --adopt-history={tip}"),
+        ],
+    );
+    let head = fx.head();
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("commits here that origin/main does not have:")
+            && out.contains("run upgrade.sh --adopt-history=<a commit id, not shown>"),
+        "{out}"
+    );
+    assert!(!names_commit(&out, &tip), "{out}");
+}
+
+/// Git exits 0 from a fetch that updated nothing: a shallow remote's main is rejected with a
+/// warning and the clone keeps the origin/main an earlier fetch left. Carrying on would report an
+/// upgrade that did not happen and, with `--accept-origin`, record an origin nothing came from.
+#[test]
+fn upgrade_refuses_a_fetch_that_delivered_nothing_and_records_no_origin_for_it() {
+    let fx = UpgradeFixture::new();
+    assert!(fx.run(&[], &[]).output.status.success(), "first deploy");
+    let recorded = fx.origin_url();
+    let head = fx.head();
+
+    // Another repository, of which the box is given a depth-1 mirror.
+    let other = fx.tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    git(&other, &["config", "user.email", "test@example.com"]);
+    git(&other, &["config", "user.name", "test"]);
+    for n in ["one", "two", "three"] {
+        std::fs::write(other.join("README"), n).unwrap();
+        git(&other, &["add", "README"]);
+        git(&other, &["commit", "-q", "-m", n]);
+    }
+    let mirror = fx.tmp.path().join("mirror.git");
+    git(
+        fx.tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            "--depth",
+            "1",
+            &format!("file://{}", other.display()),
+            mirror.to_str().unwrap(),
+        ],
+    );
+    git(
+        &fx.repo,
+        &["remote", "set-url", "origin", mirror.to_str().unwrap()],
+    );
+
+    let run = fx.run(&["--accept-origin"], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let stderr = run.stderr();
+    // Which of the two refusals depends on git: 2.43 exits 0 with a warning, and a git that
+    // fails the fetch outright is refused one step earlier.
+    assert!(
+        stderr.contains("did not deliver the origin/main this clone holds")
+            || stderr.contains("failed or brought no origin/main"),
+        "{stderr}"
+    );
+    assert!(!run.merged(), "{:?}", run.git_calls);
+    let stamp = std::fs::read_to_string(fx.stamp_path()).unwrap();
+    assert!(
+        stamp.contains(&recorded) && !stamp.contains("mirror.git"),
+        "the stamp must still record the origin the installed release came from: {stamp}"
     );
 }
 

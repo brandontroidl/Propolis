@@ -84,8 +84,20 @@ STAMP_FILE="$ROOT/var/lib/propolis/deploy-stamp.json"
 SIGNERS_FILE="$ROOT/etc/propolis/upgrade-signers"
 REPO_OWNER="$(stat -c '%U' "$REPO_DIR")"
 # Every git command runs as the checkout's owner, like the build: the fetch needs the owner's
-# credentials, and git refuses root a directory someone else owns.
-as_owner() { sudo -u "$REPO_OWNER" "$@"; }
+# credentials, and git refuses root a directory someone else owns. Git is told not to warn about
+# ambiguous ref names: every command here names a full ref or a commit id, so the warning can only
+# fire for a ref that someone named like a commit id, and it prints that id in full.
+as_owner() {
+    if [ "$1" = git ]; then
+        shift
+        sudo -u "$REPO_OWNER" git -c core.warnAmbiguousRefs=false "$@"
+    else
+        sudo -u "$REPO_OWNER" "$@"
+    fi
+}
+# Anything that reads as a commit id is taken out of text this run did not write itself (what git
+# printed while it talked to the remote, a commit's subject line), wherever a refusal may follow.
+without_ids() { sed -E 's/[0-9a-fA-F]{40,}/<a commit id, not shown>/g'; }
 stamp_field() {
     [ -r "$STAMP_FILE" ] || return 0
     sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p" "$STAMP_FILE" | head -n 1 || true
@@ -180,12 +192,31 @@ else
     # this script has no use for any of them: a tag named like a commit id is looked up as a ref
     # by some git commands that are handed the id, and a ref can be named to read as an argument
     # in the list git prints. Tags a clone already holds stay, so nothing below relies on this.
-    # Quiet, because the summary line git prints ends in the abbreviated id of what it fetched,
-    # and a refused run does not hand that over in any form; errors still print, and a run that
-    # goes on shows the range in the merge's or the adoption's own output.
-    if ! as_owner git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'; then
+    #
+    # Until this run has accepted origin/main, nothing it prints says which commit was fetched:
+    # not a progress line, not a refusal. Where the operator is asked to name the commit
+    # (--adopt-history), the id has to reach them some way that does not depend on the remote it
+    # is checked against, and output that hands it over invites pasting it back. So the fetch is
+    # quiet (git's summary line ends in the abbreviated id), and what it does print is held back
+    # and shown without the part the remote wrote: a server can send any text it likes during a
+    # fetch, and a ready-made "run upgrade.sh --adopt-history=<id>" above the refusal that asks
+    # for the id is the obvious thing for a hostile one to send. A fetch that failed shows
+    # everything, because that text is how an honest failure is diagnosed, with anything that
+    # reads as a commit id taken out. This is a nudge, not a control: the id is in the clone,
+    # one git command away.
+    FETCH_FAILED=0
+    FETCH_SAID="$(as_owner git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' 2>&1)" || FETCH_FAILED=1
+    if [ "$FETCH_FAILED" -eq 1 ]; then
+        [ -z "$FETCH_SAID" ] || printf '%s\n' "$FETCH_SAID" | without_ids >&2
         refuse "the fetch from $ORIGIN_URL failed or brought no origin/main, so there is nothing to upgrade to" \
             "git's own message is above; a remote without a main branch is the usual reason for a missing ref"
+    fi
+    if [ -n "$FETCH_SAID" ]; then
+        FETCH_LOCAL="$(printf '%s\n' "$FETCH_SAID" | grep -v '^remote:' || true)"
+        [ -z "$FETCH_LOCAL" ] || printf '%s\n' "$FETCH_LOCAL" | without_ids >&2
+        if [ "$FETCH_LOCAL" != "$FETCH_SAID" ]; then
+            echo "    the remote sent text during the fetch, which is not shown: nothing a remote says is part of an upgrade" >&2
+        fi
     fi
 
     # Resolved once, so the commit every check below looks at is the commit that gets merged: a
@@ -196,12 +227,16 @@ else
         refuse "the fetch from $ORIGIN_URL brought no origin/main, so there is nothing to upgrade to" \
             "the remote has no main branch, or the clone's fetch refspec does not include it"
     fi
+    # And it has to be what THIS fetch brought. Git exits 0 from a fetch that updated nothing (a
+    # shallow remote's main is rejected with a warning), and origin/main is then whatever an
+    # earlier fetch left, possibly from another origin: deploying it would report an upgrade that
+    # did not happen and, with --accept-origin, record an origin nothing came from.
+    if [ "$(as_owner git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' || true)" != "$TARGET" ]; then
+        refuse "the fetch from $ORIGIN_URL did not deliver the origin/main this clone holds, so there is nothing new to check" \
+            "git's own message, if any, is above; a shallow (depth-limited) remote is refused this way, and so is a second fetch that ran at the same moment" \
+            "point the checkout at a full repository, or run the upgrade again"
+    fi
 
-    # Until this run has accepted origin/main, nothing it prints says which commit was fetched:
-    # not a progress line, not a refusal. Where the operator is asked to name the commit
-    # (--adopt-history), the id has to come from somewhere other than the remote it is checked
-    # against, and output that hands it over invites pasting it back. This is a nudge, not a
-    # control: git's own fetch line shows an abbreviation, and one git command shows the rest.
     if [ -e "$SIGNERS_FILE" ]; then
         echo "    verifying origin/main against the signers in $SIGNERS_FILE"
         # gpg.format picks the SIGNING format only; verification picks its backend from the
@@ -209,9 +244,14 @@ else
         # which the signers file does not govern (any imported key, such as GitHub's web-flow key,
         # would then pass). Both other backends are pointed at /bin/false so only an SSH signature
         # can verify, and the SSH backend is pinned so the owner's gitconfig cannot replace it.
-        if ! as_owner git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS_FILE" \
+        # What it prints is shown with commit ids taken out: on a malformed signature git quotes
+        # the commit's own signature header, which is text whoever wrote the commit chose.
+        VERIFIED=1
+        VERIFY_SAID="$(as_owner git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS_FILE" \
             -c gpg.ssh.program=ssh-keygen -c gpg.program=/bin/false -c gpg.x509.program=/bin/false \
-            verify-commit "$TARGET"; then
+            verify-commit "$TARGET" 2>&1)" || VERIFIED=0
+        [ -z "$VERIFY_SAID" ] || printf '%s\n' "$VERIFY_SAID" | without_ids >&2
+        if [ "$VERIFIED" -eq 0 ]; then
             refuse "origin/main is not SSH-signed by a key in $SIGNERS_FILE, so it will not be deployed" \
                 "sign the commit with a listed SSH key, add the key to the file, or remove the file to deploy unsigned commits"
         fi
@@ -231,13 +271,29 @@ else
     ADOPT_HINT="to deploy origin/main as it is, get the full commit id of its main branch through a channel that does not depend on this remote (the maintainer's announcement, a signed tag or release note, a clone made earlier on another machine) and run again with --adopt-history=<that commit id>"
 
     OLD_HEAD="$(as_owner git rev-parse --verify HEAD)"
+    MOVED=1
+    # The fetch took time, and the clean-tree check ran before it. Run again right before the
+    # checkout moves, on either path. What it cannot see is a file created after it and before
+    # the move, and that window is not closed here: the check after the move looks at tracked
+    # files only, because an adopted tree may ignore different paths.
+    still_clean() {
+        local dirty
+        dirty="$(as_owner git status --porcelain --untracked-files=normal)"
+        if [ -n "$dirty" ]; then
+            refuse "the checkout changed while this run was fetching, and a root-installed build must not include local changes:" \
+                "$dirty" "commit, stash or discard them, then run the upgrade again"
+        fi
+    }
     # Only ever move forward onto what main has: a commit on this box that main lacks would be
     # merged into a root-installed build and would also never match the deploy stamp.
     if as_owner git merge-base --is-ancestor HEAD "$TARGET"; then
         if [ -n "$ADOPT_COMMIT" ]; then
             echo "    --adopt-history: origin/main already descends from this checkout, so this is an ordinary upgrade to the commit you named"
         fi
-        as_owner git merge --ff-only "$TARGET"
+        still_clean
+        # A merge git gives up on part-way has already rewritten some files: its failure goes to
+        # the check after the move, which says where the checkout is, not out through `set -e`.
+        as_owner git merge --ff-only "$TARGET" || MOVED=0
     elif [ -z "$ADOPT_COMMIT" ]; then
         if as_owner git merge-base --is-ancestor "$TARGET" HEAD; then
             # origin/main is an earlier commit of this checkout's own history: deploying it would
@@ -248,7 +304,7 @@ else
         elif as_owner git merge-base HEAD "$TARGET" >/dev/null; then
             refuse "this checkout is not an ancestor of origin/main, so the upgrade cannot fast-forward" \
                 "commits here that origin/main does not have:" \
-                "$(as_owner git log --oneline -n 20 "$TARGET..HEAD")" \
+                "$(as_owner git log --oneline -n 20 "$TARGET..HEAD" | without_ids)" \
                 "if they were made on this box and should be kept, merge them into main and pull them back" \
                 "$ADOPT_HINT; the commits listed above are then left behind"
         fi
@@ -260,9 +316,19 @@ else
     else
         # Before the checkout moves: a main without this script is not a tree it can deploy, and
         # the lines after this block would be read from a file that is no longer there.
-        if ! as_owner git cat-file -e "$TARGET:deploy/upgrade.sh" 2>/dev/null; then
+        if ! ADOPTED_SCRIPT="$(as_owner git cat-file blob "$TARGET:deploy/upgrade.sh" 2>/dev/null)"; then
             refuse "origin/main ($TARGET) has no deploy/upgrade.sh, so it is not a tree this script can deploy"
         fi
+        # The rest of this run is handed to that script, on the understanding that it skips its
+        # own pull when the guard variable is set. A fast-forward only ever reaches a script that
+        # has the guard; an adoption can land on one from before it, which would pull again by
+        # itself, with no pin, and deploy whatever main is by then.
+        case "$ADOPTED_SCRIPT" in
+            *PROPOLIS_UPGRADE_REEXEC*) ;;
+            *) refuse "origin/main ($TARGET) carries a deploy/upgrade.sh from before the re-exec guard, so this run cannot hand over to it" \
+                "run from that checkout it would pull a second time by itself, with none of the checks made here" ;;
+        esac
+        unset ADOPTED_SCRIPT
         echo "    --adopt-history: origin/main ($TARGET) does not contain this checkout's commit ($OLD_HEAD)"
         if as_owner git merge-base --is-ancestor "$TARGET" HEAD; then
             echo "    origin/main is BEHIND this checkout: adopting it moves this box backwards by $(as_owner git rev-list --count "$TARGET..HEAD") commit(s)"
@@ -286,12 +352,21 @@ else
             echo "    files differ between the two: $(as_owner git diff --no-renames --shortstat "$OLD_HEAD" "$TARGET" | sed 's/^ *//')"
         fi
 
-        # The fetch took time, and the clean-tree check ran before it.
-        DIRTY="$(as_owner git status --porcelain --untracked-files=normal)"
-        if [ -n "$DIRTY" ]; then
-            refuse "the checkout changed while this run was fetching, and a root-installed build must not include local changes:" \
-                "$DIRTY" "commit, stash or discard them, then run the upgrade again"
+        # The one thing an adoption can break that a fast-forward cannot: migrations only run
+        # forward, so a daemon built from a tree that lacks a migration this database has already
+        # run refuses to start. Git cannot see the database; it can see that the files are gone.
+        mapfile -t LOST_MIGRATIONS < <(as_owner git diff --no-renames --name-only --diff-filter=D "$OLD_HEAD" "$TARGET" -- 'crates/*/migrations/*')
+        if [ "${#LOST_MIGRATIONS[@]}" -gt 0 ]; then
+            echo "    WARNING: origin/main lacks ${#LOST_MIGRATIONS[@]} database migration(s) this checkout has:"
+            printf '      %s\n' "${LOST_MIGRATIONS[@]:0:10}"
+            if [ "${#LOST_MIGRATIONS[@]}" -gt 10 ]; then
+                echo "      ... and $((${#LOST_MIGRATIONS[@]} - 10)) more"
+            fi
+            echo "    a database that has run them is refused by the daemon this builds: propolis will not start until the database is"
+            echo "    restored to a dump from before them (deploy/rollback.sh --with-database), which loses the events recorded since"
         fi
+
+        still_clean
 
         # The commit being left is on no branch once the checkout moves, and a history that was
         # restarted cannot be fetched again: without a ref of its own git would expire it. Kept
@@ -310,7 +385,6 @@ else
         # lands. Its exit status is not enough either (git reports a file it could not replace and
         # still exits 0), so what counts is the check after it.
         HEAD_REF="$(as_owner git symbolic-ref --quiet HEAD || true)"
-        MOVED=1
         case "$HEAD_REF" in
             refs/heads/?*)
                 as_owner git checkout --quiet --no-overwrite-ignore -B "${HEAD_REF#refs/heads/}" "$TARGET^{commit}" || MOVED=0 ;;
@@ -320,20 +394,44 @@ else
     fi
 
     # The commit that was checked is the commit that is built, and nothing else is in the tree:
-    # HEAD is that commit and every tracked file matches it. This holds after a fast-forward as
-    # after an adoption, and it is the guard that does not depend on how git resolved a name or
-    # on its exit status. Tracked files only: an adopted tree may ignore different paths, and the
-    # box's own build output is not a change to what gets built.
+    # HEAD is that commit, every tracked file matches it, and no file the old commit had and
+    # this one lacks is still on disk. This holds after a fast-forward as after an adoption, and
+    # it is the guard that does not depend on how git resolved a name or on its exit status: git
+    # reports a file it could not replace or remove and still exits 0, and a file it could not
+    # remove is untracked from then on (cargo builds a stray build.rs or src/bin/*.rs without
+    # being asked). Otherwise tracked files only: an adopted tree may ignore different paths, and
+    # the box's own build output is not a change to what gets built.
     NOW_HEAD="$(as_owner git rev-parse --verify HEAD)"
     TREE_STATE="$(as_owner git status --porcelain --untracked-files=no)"
-    if [ "${MOVED:-1}" -eq 0 ] || [ "$NOW_HEAD" != "$TARGET" ] || [ -n "$TREE_STATE" ]; then
+    LEFT_OVER=""
+    # NUL-separated, so no file name needs unquoting. The last record is a marker written only
+    # when git succeeded: without it the list cannot be trusted to be complete.
+    mapfile -d '' -t GONE < <(as_owner git diff --no-renames --name-only --diff-filter=D -z "$OLD_HEAD" "$TARGET" && printf 'listed\0')
+    if [ "${#GONE[@]}" -eq 0 ] || [ "${GONE[-1]}" != listed ]; then
+        MOVED=0
+        LEFT_OVER="(could not list the files this move had to remove)"
+    else
+        unset 'GONE[-1]'
+        for gone in ${GONE[@]+"${GONE[@]}"}; do
+            # A regular file or a link. A directory here is the new commit's own: the path was a
+            # file and is now a directory of tracked files.
+            if [ -f "$REPO_DIR/$gone" ] || [ -L "$REPO_DIR/$gone" ]; then
+                LEFT_OVER+="${LEFT_OVER:+$'\n'}?? $gone"
+            fi
+        done
+    fi
+    if [ "$MOVED" -eq 0 ] || [ "$NOW_HEAD" != "$TARGET" ] || [ -n "$TREE_STATE" ] || [ -n "$LEFT_OVER" ]; then
         WHERE=("it is at $NOW_HEAD and it was at $OLD_HEAD${KEPT_REF:+ (kept as $KEPT_REF)}")
         if [ -n "$TREE_STATE" ]; then
             WHERE+=("tracked files that do not match the commit it is at:" "$TREE_STATE")
         fi
+        if [ -n "$LEFT_OVER" ]; then
+            WHERE+=("files that commit does not have, still on disk:" "$LEFT_OVER")
+        fi
         refuse "the checkout could not be moved cleanly onto the commit that was checked" \
             "${WHERE[@]}" \
-            "git's own message, if any, is above; fix what it names and run the upgrade again"
+            "the files listed are an edit made while this run was working, or what a move git could not finish left behind" \
+            "git's own message, if any, is above; fix what it names, put the listed files right, and run the upgrade again"
     fi
     if [ -n "${KEPT_REF:-}" ]; then
         echo "    this checkout is now at $TARGET; the commit it left ($OLD_HEAD) is kept as $KEPT_REF"

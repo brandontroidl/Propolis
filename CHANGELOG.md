@@ -11,20 +11,27 @@
   `--adopt-history=<full commit id>` deploys it when `origin/main` is exactly the commit
   named, including a move backwards, which the run announces. The clean tree, the recorded
   origin and the signature check still apply; the run prints how many files differ; the
-  commit the box left is kept as `refs/propolis/before-adoption/<UTC time>`; and no refusal
-  prints the commit that was fetched, because the id has to reach you through a channel the
-  remote does not control. The argument needs a box whose own `upgrade.sh` already has it. To
+  commit the box left is kept as `refs/propolis/before-adoption/<UTC time>`; and until the
+  run has accepted `origin/main` it prints neither the commit that was fetched nor text the
+  remote sent, because the id has to reach you through a channel the remote does not control.
+  A tree that lacks database migrations the box has run is adopted with a warning: the
+  daemon it builds will not start until the database is restored to match. The argument needs a box whose own `upgrade.sh` already has it. To
   move a running box to a successor repository: upgrade once on the old origin, change the
   remote, then run with `--accept-origin --adopt-history=<id>`. A box that cannot take that
   first upgrade, and a split deployment's collectors, follow by hand with commands that name
   the id
   ([steps](docs/operations/upgrade-rollback-and-dr.md#a-restarted-history-or-a-successor-repository)).
 - **The upgrade's pull is narrower and checks its own result.** It fetches the `main` branch
-  and nothing else, so tags and other branches of the remote no longer reach the box's clone.
-  After the checkout moves, it must be at the commit that was checked with no tracked file
-  differing from it, or nothing is built: an edit made while the run was fetching, or a file
-  git could not replace, used to go into the root-installed build. If a script of yours
-  relied on `upgrade.sh` fetching tags, fetch them yourself.
+  and nothing else, so tags and other branches of the remote no longer reach the box's clone;
+  if a script of yours relied on `upgrade.sh` fetching tags, fetch them yourself. A fetch that
+  exits 0 without delivering `main` (a shallow mirror) is refused, where it used to deploy the
+  `origin/main` an earlier fetch had left. The clean-tree check runs again right before the
+  checkout moves, and after the move the checkout must be at the commit that was checked,
+  with no tracked file differing from it and no removed file still on disk, or nothing is
+  built: a file created or edited while the run was fetching, and a file git could not
+  replace or remove, used to go into the root-installed build. A refusal at that last check
+  leaves the checkout on the new commit with the old release installed; fix what it lists and
+  run the upgrade again.
 - **The ledger's append-only control did not bind the daemon's own role, and now can.** The
   control is a revoke, and PostgreSQL does not apply a revoke to a table's owner. The daemon
   connects as the role that ran the migrations, so it owned `event` and could grant itself

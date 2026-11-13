@@ -57,10 +57,12 @@ returns the prior state unchanged (clock-skew clamp; decay only shrinks)
 An event never moves time backwards. The new `decay_anchor` is the later of the event's
 `observed_at` and the stored anchor, the new `last_seen` the later of `observed_at` and the stored
 `last_seen`, and the decay runs from the old anchor to the new one. An event dated before the
-anchor (a backlog read late, a collector with a slow clock, a forged timestamp) is still counted
-and still adds its weight, at the anchor already reached; it used to become the anchor, so the
-next event or read decayed the whole score across the gap, and it used to become `last_seen`,
-which took a listed address out of every feed window. `first_seen` stays the time of the first
+anchor (a backlog read late, a collector with a slow clock, a forged timestamp) is still counted,
+and adds what its own age leaves of its weight: the weight decayed from `observed_at` to the
+anchor, as everything already in the score has been, so a stream folded late scores what it
+would have scored in order. It used to become the anchor, so the next event or read decayed the
+whole score across the gap, and it used to become `last_seen`, which took a listed address out
+of every feed window. `first_seen` stays the time of the first
 event folded. Replay folds the same events in ledger order through the same function, so it
 still equals the stored row for rows written since this rule; a row written before it from
 out-of-order events keeps the times it had, and nothing rebuilds it
@@ -205,6 +207,14 @@ of the IP's last event), so a tier cannot slide between builds
   retention windows, never the tier files, and an address that is also a tier candidate is
   listed once, as the tier candidate (`crates/feed/src/builder.rs#build`).
 
+Both sources read the row as its last event left it, and every event re-derives the stored
+tier from the score decayed to that event. So a later, weaker event can end a tier listing
+early: an approved address that has been quiet for some hours and is then named by one
+low-weight line stores no tier, and leaves the tier files and the retention windows until it
+earns a tier again (unless it also has the thousand established events of a volume candidate,
+which keep it in the retention windows). See
+[residual risks](../security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence).
+
 ### Volume review
 
 The count behind a volume listing is what sensor log lines declare, and one summary line can
@@ -215,8 +225,9 @@ stand for a thousand events, so a volume candidate waits for a decision in its o
 | Step | Rule | Source |
 |---|---|---|
 | Offered (pending) | not delisted, `established_event_count >= 1000`, `last_seen` within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist | `crates/review/src/volume.rs#populate` |
-| Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue`; decided rows are never removed | `crates/review/src/volume.rs#withdraw` |
-| Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor | `crates/review/src/volume.rs#approve` |
+| Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue` | `crates/review/src/volume.rs#withdraw` |
+| Lapsed | a pending or approved row whose address has not been seen for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`; 90 days where none is configured, and in the standalone `review daemon`); the row is removed and logged, and the address's next sighting is offered as a new candidate. A rejected row never lapses | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
+| Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor. The approval stands until it is reopened, the address is delisted, or it lapses: while it stands, any event for the address, of any kind and from any sensor, renews the listing | `crates/review/src/volume.rs#approve` |
 | Reject | not published on volume; the row stays, so the address is not offered again | `crates/review/src/volume.rs#reject` |
 | Reopen | back to pending; an approved address leaves the retention feeds at the next build | `crates/review/src/volume.rs#reopen` |
 
@@ -229,14 +240,23 @@ its `review_queue` row. The vendor submission runner reads `review_queue` only
 (`crates/review/src/submit.rs#run_once`), so a volume approval never causes a report.
 
 `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` is the opt-in that removes the approval. The
-builder then publishes every address with `s.recommended_for_blocklist = true AND
+builder then also publishes every address with `s.recommended_for_blocklist = true AND
 s.eligible = false`, with no operator decision: any address whose log lines add up to a
-thousand TCP events reaches the public retention feeds on that count alone. The builder then
-reads no decision at all: candidates are still offered on the volume tab, so what is being
-published can be seen, but approving or rejecting one changes nothing in the feed, and
-delisting is the way to take an address out. It is off by default, only the exact word
-`true` turns it on, and the daemon logs a warning at startup when it is set
-(`crates/propolis/src/config.rs#load_config`, `crates/feed/src/builder.rs#FeedConfig`).
+thousand TCP events, none of them authenticated, reaches the public retention feeds on that
+count alone. It still publishes everything the default does, so setting it never takes an
+approved address out. With it set the volume tab is not a view of what is published:
+
+- an address that never authenticated is published whatever is decided there, a rejected one
+  included, and delisting is the way to take it out;
+- one that went quiet more than a day before a scan saw it is published for as long as a
+  window holds it without ever being offered;
+- a candidate that has authenticated (`eligible = true`) is not covered by the automatic
+  condition and is published on volume only once approved, there or in the review queue.
+
+The feed page and the `all-*` files are what say which addresses are out. The opt-in is off
+by default, only the exact word `true` turns it on, and the daemon logs a warning at startup
+when it is set (`crates/propolis/src/config.rs#load_config`,
+`crates/feed/src/builder.rs#FeedConfig`, `crates/feed/src/builder.rs#volume_candidates_sql`).
 
 ### TTLs and windows
 

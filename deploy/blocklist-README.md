@@ -45,7 +45,9 @@ decision, use `tiers/`.
 ## Tiers
 
 Tier is decided by how the address scored **at the time it was last seen**, and does not change
-afterwards. An entry enters one tier's file and stays there until its window lapses.
+between sightings. An entry stays in its tier's file until its window lapses or the address is
+seen again: a new sighting scores it afresh, which can move it to the other file or, when the
+score has decayed and the new activity is slight, take it out until it earns a tier again.
 
 | Tier | Raw score | Confidence | Carried for |
 |---|---|---|---|

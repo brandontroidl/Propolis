@@ -14,14 +14,18 @@
   `volume_review`), so at the first feed build after the upgrade every volume listing leaves
   the retention feeds. Sources seen within the last day are offered at the next queue scan;
   one that went quiet more than a day ago is not offered and stays out unless it returns. An
-  address already approved in the review queue needs no second decision. The scan runs with
+  address already approved in the review queue needs no second decision. An approval is not
+  for one build: it stands while the address keeps being seen, by any kind of event, and
+  lapses once the address has gone unseen for the longest retention window (ninety days as
+  shipped), after which a later flood is offered again. A rejection does not lapse. The scan runs with
   the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is offered and none
   is published. The nav badge and "Waiting on you" count both queues;
   `propolis_review_queue_pending` is unchanged and `propolis_volume_review_pending` is new.
   Delist and delete also remove an address's volume decision. To keep the old behaviour set
-  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` (the exact word) before upgrading: volume-listed
-  addresses are then published with no human decision, decisions on the Volume tab gate
-  nothing, and the daemon logs a warning at each start
+  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` (the exact word) before upgrading: an address
+  listed on volume that never authenticated is then published with no human decision,
+  whatever is decided on the Volume tab, a candidate that has authenticated is still
+  published on volume only once approved, and the daemon logs a warning at each start
   ([rules](docs/reference/scoring-and-feed.md#volume-review)).
 - **A last-seen time ahead of the clock no longer extends a feed entry's validity.** The feed
   builder reads a stored `last_seen` later than the build time as the build time, so no entry
@@ -68,7 +72,8 @@
   behind, loses its lines and logs `line dated in the future refused` with how far ahead each
   was. Lines dated in the past are never refused for their age.
 - **An older event no longer moves an address's `last_seen` or decay anchor backwards.** An
-  out-of-order or back-dated line is still counted and still adds its weight, but it used to
+  out-of-order or back-dated line is still counted, and adds what its own age leaves of its
+  weight, so a backlog read late scores what it would have scored read in order. It used to
   become the anchor, so the next event or read decayed the whole score across the gap, and it
   used to become `last_seen`, which took a listed address out of every feed window. Existing
   `ip_score` rows are not rebuilt. A row whose times were moved back keeps them until that
@@ -77,17 +82,38 @@
   `SELECT source_ip, last_seen FROM ip_score WHERE last_seen > now() + interval '1 hour'`
   lists them, and delisting removes one from the feed. A projection replayed from the ledger
   (`rebuild_projection`) follows the new rule, so it can differ from a row an earlier version
-  stored from out-of-order events.
+  stored from out-of-order events. A line dated now is not covered by any of this: every
+  event re-derives the stored tier from the decayed score, so one weak line for an approved
+  address that has been quiet for some hours still takes it out of the tier files until it
+  earns a tier again
+  ([what remains](docs/security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
+- **An event whose metadata holds a floating-point number is refused.** The ledger's chain
+  hash is taken over an event as written and checked over the event as PostgreSQL returns it,
+  and JSONB does not return a float as written (no negative zero, no exponent, no trailing
+  `.0`), so one such line read as a broken chain from that row on, for good, and hid any
+  later tampering behind it. No shipped sensor writes a float into `metadata`. A line from
+  your own tooling that does is now rejected and counted like any other line that fails
+  validation: write the value as an integer or a string. A timestamp with second 60 (a leap
+  second) had the same effect and is now stored, and hashed, as the first second of the next
+  minute. Neither change touches rows already in the ledger: a chain a past line broke stays
+  broken at that row.
 - **`rollback.sh --with-database` keeps the database's owner, checks the backup before it stops
   anything, and puts the real database back when the restore fails.** The new database was
   created for the role `DATABASE_URL` connects as. On a node with
   [split database roles](docs/operations/database-roles.md) that is the daemon's role, so a
   database rollback made the daemon's role the database's owner and nothing reported it. It is
-  now created with the owner the current database has, and on such a node the script runs
-  `propolis-migrate` and `propolis-migrate --check` after the restore, before it starts
-  anything; either failing fails the rollback. **If you have run `rollback.sh --with-database`
-  on a node with split roles, run `propolis-migrate --check` now.** A node left that way
-  prints `ledger: NOT protected: role ... owns the database`: stop the daemon, repeat the
+  now created with the owner the current database has. On a node with split roles the script
+  also puts the split back after the restore, before it starts anything: a database that
+  belongs to the daemon's role is created for the owner role `migrate.env` names; a dump from
+  before the split (the only pre-upgrade dump a freshly split node has) gets the split's first
+  step, `propolis migrate --init-roles`, run on it as the `postgres` user; `propolis-migrate`
+  and `propolis-migrate --check` run; and the script then asks PostgreSQL itself whether the
+  daemon's role is confined, because the check is answered by the release rolled back to and
+  an older one does not look at the database's owner. Any of these failing fails the
+  rollback, and such a node now needs an owner role that can connect or the rollback refuses
+  before stopping anything. **If you have run `rollback.sh --with-database` on a node with
+  split roles, run `propolis-migrate --check` now.** A node left that way prints
+  `ledger: NOT protected: role ... owns the database`: stop the daemon, repeat the
   `propolis migrate --init-roles` step and run `propolis-migrate`
   ([steps](docs/operations/database-roles.md#splitting-the-roles-on-an-existing-node)).
   Before any service is stopped the script now checks the set against its `SHA256SUMS` (a set
@@ -98,7 +124,10 @@
   leaves the daemon started on an empty or half-restored database: the incomplete one is
   renamed to `<name>_failed_restore_<time>`, the renamed-aside one gets its name back and the
   services start on it. If it cannot be put back, `propolis.service` is left stopped and the
-  message names the database that holds the data. Nothing is dropped.
+  message names the database that holds the data. Nothing is dropped. The same holds when the
+  run is ended by a signal or a dropped SSH session, which used to skip all of it and leave
+  every service stopped on a half-restored database; what a failed run reports now also goes
+  to the journal (`journalctl -t propolis-rollback`).
 - **`propolis migrate --check`, the daemon's startup log and `config-check.sh` now report a
   daemon role that owns the database**, or may create objects in the ledger's schema, without
   owning the `event` table (`ledger: NOT protected: ...`; finding `ledger-database`, a

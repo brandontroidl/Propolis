@@ -229,7 +229,7 @@ review daemon                     # long-running: populate/withdraw queue + subm
 
 review volume list                        # every Pending volume candidate, oldest-surfaced first
 review volume decided                     # Approved and Rejected volume candidates, newest decision first
-review volume approve <ip> --notes "..."  # publish in the retention feeds; not reported to vendors
+review volume approve <ip> --notes "..."  # publish in the retention feeds until reopened, delisted or lapsed; not reported to vendors
 review volume reject  <ip> --notes "..."  # not published on volume, not offered again
 review volume reopen  <ip>                # back to Pending; undoes an approval or a rejection
 ```

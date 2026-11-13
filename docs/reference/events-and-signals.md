@@ -32,8 +32,8 @@ A frozen NDJSON record - one line per event, no embedded `\n` or `\r` (test
 | `signal_type` | String | plain string, **not** the enum - keeps sensor-wire free of a core-scoring dependency; intake validates it against the known set (`crates/sensor-wire/src/lib.rs#SensorEvent`) and against what its sensor can emit |
 | `protocol` | String | plain string, same rationale |
 | `authenticated` | bool | |
-| `observed_at` | DateTime\<Utc\> | RFC 3339 via chrono's default serde - **must** match `hashing.rs`; switching to `ts_microseconds` (integer timestamp) would break the hash chain (`crates/sensor-wire/src/lib.rs#SensorEvent`) |
-| `metadata` | serde_json::Value | free-form per-signal detail |
+| `observed_at` | DateTime\<Utc\> | RFC 3339 via chrono's default serde - **must** match `hashing.rs`; switching to `ts_microseconds` (integer timestamp) would break the hash chain (`crates/sensor-wire/src/lib.rs#SensorEvent`). Stored to the microsecond; a leap second (second 60) is stored as the first second of the next minute (`crates/core-scoring/src/repository/events.rs#normalize_in_place`) |
+| `metadata` | serde_json::Value | free-form per-signal detail: strings, booleans, integers, arrays and objects. A floating-point number anywhere in it gets the line rejected, because JSONB does not return one as written and the chain hash is checked over what is read back (`crates/core-scoring/src/domain/types.rs#has_float`) |
 | `sample` | Option\<SampleRef\> | side-channel file reference (see below) |
 | `session_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - omitted from JSON when None; older records without the key still deserialize (test `deserialize_without_session_id`, `crates/sensor-wire/src/lib.rs#deserialize_without_session_id`) |
 | `occurrence_id` | Option\<Uuid\> | `#[serde(default, skip_serializing_if = "Option::is_none")]` - UUIDv7 minted once per event at emit time (`EventEmitter::append`), stable across replays so intake can dedup exactly (`crates/sensor-wire/src/lib.rs#SensorEvent`) |

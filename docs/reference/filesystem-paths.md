@@ -66,9 +66,11 @@ for encrypted sets are read from `/etc/propolis/backup-recipients.txt`. See
 
 Where the [database roles are split](../operations/database-roles.md),
 `/etc/propolis/migrate.env` (0600 root:root, created by the operator) holds the schema owner's
-`PROPOLIS_MIGRATE_DATABASE_URL`. `/usr/local/sbin/propolis-migrate` (`deploy/migrate.sh`) is its
-only reader; no unit loads it and `deploy/propolis.service#InaccessiblePaths=-/etc/propolis/migrate.env`
-and the sensor units deny it.
+`PROPOLIS_MIGRATE_DATABASE_URL`. Two scripts read it, both as root:
+`/usr/local/sbin/propolis-migrate` (`deploy/migrate.sh`), and `deploy/rollback.sh --with-database`
+to learn the owner role's name before a restore. No unit loads it and
+`deploy/propolis.service#InaccessiblePaths=-/etc/propolis/migrate.env` and the sensor units deny
+it.
 
 Each upgrade keeps the release it replaces in `/var/lib/propolis/rollback/<UTC time>-<commit>`
 (0700 root; `deploy/rollback.sh#save`): its binaries, `propolis-*` helpers, unit files, deploy

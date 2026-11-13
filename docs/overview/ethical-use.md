@@ -44,10 +44,11 @@ its intent and its license.
 
 ## Outbound actions are operator-gated
 
-No vendor abuse report is filed and no IP enters a feed file without a per-case
-operator decision. The retention feeds additionally list sources that completed a
-thousand or more TCP connections, once you approve each one as a volume candidate; such
-a source is never reported to a vendor on volume alone. Publishing those sources with
+No vendor abuse report is filed and no IP enters a feed file without an operator's
+decision about that address. The retention feeds additionally list sources that completed
+a thousand or more TCP connections, once you approve each one as a volume candidate; such
+a source is never reported to a vendor on volume alone. An approval stands until you undo
+it, so review what you have approved when an address changes hands. Publishing those sources with
 no review is possible only by setting `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which
 makes you answerable for addresses no person looked at. Enabling any enrichment or
 reporting egress path

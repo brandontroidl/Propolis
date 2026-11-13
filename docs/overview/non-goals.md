@@ -36,11 +36,15 @@ features; see [Limitations](limitations.md) for residual risks within scope.
   and defaults off. See [`../security/outbound-controls.md`](../security/outbound-controls.md).
 
 - **No automatic reporting or listing.** No vendor abuse report is filed and no IP
-  enters any feed file without a per-case operator decision. That includes the volume
-  rule: a source with a thousand or more completed TCP connections and activity in the
-  last day is offered for the retention feeds and published only once approved, and is
-  never reported to a vendor on that basis. Automatic volume listing exists as an
-  explicit opt-in (`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`) and is off by default.
+  enters any feed file without an operator's decision about that address. That includes
+  the volume rule: a source with a thousand or more completed TCP connections and
+  activity in the last day is offered for the retention feeds and published only once
+  approved, and is never reported to a vendor on that basis. A decision stands until it
+  is undone: an address approved on its score is listed again whenever it earns a tier
+  again, and one approved on volume stays listed for as long as it keeps being seen (that
+  approval lapses once the address has been silent for the longest retention window).
+  Automatic volume listing exists as an explicit opt-in
+  (`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`) and is off by default.
 
 - **No bundled threat-intel data.** GeoLite2 databases are not shipped; enrichment
   degrades gracefully to "not configured" when absent. The feed is built from your

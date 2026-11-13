@@ -86,6 +86,12 @@ review entries, and the page heading says how the total splits.
    (`all-24h` to `all-90d`) from the next build; it is not reported to abuse vendors.
    **Reject** keeps it out, and the scan does not offer it again.
 
+An approval is not for one build. It stands until you return the candidate to pending,
+delist the address, or the address has gone unseen for the longest retention window
+(ninety days as shipped), at which point the row is removed and a later flood from the
+address is offered again. While it stands, any event that names the address keeps it in
+the retention feeds, a single UDP packet included. A rejection does not lapse.
+
 Decided candidates are listed under the pending ones. **Return to pending** undoes
 either decision; an approved address then leaves the retention feeds at the next
 build. An address you already approved in the review queue is not offered here: that
@@ -96,8 +102,12 @@ and `review volume approve|reject|reopen <ip>` acts on one. Rules and thresholds
 owned by [reference/scoring-and-feed.md](../reference/scoring-and-feed.md#volume-review).
 
 If you set `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, the tab still lists candidates but
-its decisions no longer decide anything: every candidate is published, a rejected one
-included, and delisting is the only way to take an address out.
+it is no longer a list of what is published. An address that never authenticated is
+published whatever you decide there, a rejected one included, and delisting is the only
+way to take it out; that includes an address that went quiet more than a day before the
+scan saw it, which is published without ever appearing on the tab. A candidate that has
+authenticated is still published on volume only once you approve it. The Feed page and
+the `all-*` files show what is actually out.
 
 After an upgrade to the first version with this queue, no volume listing is published
 until you approve it: addresses that were listed automatically drop out of the

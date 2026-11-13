@@ -53,11 +53,14 @@ another when displayed.
   six-hour half-life, the event's weight is added, and the result is capped at 100. A
   repeat of the same signal from the same IP within sixty seconds is recorded but adds
   no weight. Decay only ever shrinks a score; clock skew cannot inflate one. Time never
-  runs backwards either: an event dated before the stored one is counted and weighed,
-  but `last_seen` and the decay anchor stay where they were, so a back-dated line from a
-  compromised sensor or a slow clock can neither erase a score at the next event nor
-  take a listed address out of its feed window. A line dated more than an hour ahead
-  never reaches the ledger; intake refuses it.
+  runs backwards either: an event dated before the stored one is counted, and weighed
+  for what its own age leaves of its weight, but `last_seen` and the decay anchor stay
+  where they were, so a back-dated line from a compromised sensor or a slow clock can
+  neither erase a score at the next event nor move a listed address's last-seen time
+  out of its feed window. A line dated more than an hour ahead never reaches the
+  ledger; intake refuses it. A line dated now is another matter: every event re-derives
+  the stored tier from the decayed score, so a weak one can still end a tier listing
+  early ([residual risks](../security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
 - **Confirmed-real latch.** An event sets this flag when it arrived over TCP,
   authenticated against a honeypot sensor. It never unsets. UDP, ICMP and
   unauthenticated traffic cannot set it, which is what stops a spoofed source from
@@ -106,9 +109,12 @@ Volume candidates wait in a second queue, the `volume_review` table
   row yet, and has no Approved review-queue row. Reserved and allowlisted addresses are
   skipped.
 - Withdrawal removes a Pending row once its address has no score row, is delisted, has
-  fallen below the threshold, or has been approved in the review queue. Approved and
-  Rejected rows are never touched.
-- Approve publishes the address in the retention feeds. Reject keeps it out and it is
+  fallen below the threshold, or has been approved in the review queue.
+- A Pending or Approved row lapses, and is removed, once its address has not been seen
+  for the longest retention window: it is then in no feed file, and its next sighting is
+  offered as a new candidate. A Rejected row is never touched.
+- Approve publishes the address in the retention feeds, and while the approval stands
+  any later event for the address renews the listing. Reject keeps it out and it is
   not offered again. Reopen returns either to Pending.
 - The vendor submitter never reads this queue. A volume approval reports nothing.
 

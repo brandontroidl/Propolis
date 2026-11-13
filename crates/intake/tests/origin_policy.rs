@@ -421,3 +421,61 @@ async fn a_forged_event_summary_in_the_ssh_log_is_refused(pool: PgPool) {
         .unwrap();
     assert_eq!(score.established_event_count, 1000);
 }
+
+/// A line of a sensor's own kind passes the origin policy whatever else it carries, and two
+/// things it could carry used to break ledger chain verification for good: a timestamp with
+/// second 60, which PostgreSQL stores as the next minute while the hash was taken over the
+/// `:60` form, and a floating-point number in metadata, which JSONB does not hand back as
+/// written. Verification stops at the first row that fails, so one such line also hid any later
+/// tampering. Driven from raw text, because that is what a compromised sensor controls.
+#[sqlx::test(migrations = false)]
+async fn a_leap_second_is_ingested_and_a_float_is_refused_and_the_chain_stays_intact(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let raw = |ip: &str, observed_at: &str, metadata: &str| {
+        format!(
+            r#"{{"v":1,"source_ip":"{ip}","wan_ip":null,"sensor":"catchall","signal_type":"catchall_probe","protocol":"tcp","authenticated":false,"observed_at":"{observed_at}","metadata":{metadata},"sample":null}}"#
+        )
+    };
+    let now = Utc::now().to_rfc3339();
+    let lines = [
+        raw(ATTACKER, &now, r#"{"payload_len":0}"#),
+        // 2016-12-31T23:59:60Z was a real leap second.
+        raw(
+            "203.0.113.81",
+            "2016-12-31T23:59:60Z",
+            r#"{"payload_len":0}"#,
+        ),
+        raw(VICTIM, &now, r#"{"payload_len":-0.0}"#),
+        raw("203.0.113.82", &now, r#"{"payload_len":0,"ratio":0.5}"#),
+        raw("203.0.113.83", &now, r#"{"nested":[{"n":1e16}]}"#),
+        raw(
+            "203.0.113.84",
+            &now,
+            r#"{"payload_len":18446744073709551615}"#,
+        ),
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+    let result = runner(&pool, dir.path(), "catchall").run_batch().await;
+    assert_eq!(
+        (result.ingested, result.rejected, result.errors),
+        (3, 3, 0),
+        "the honest line, the leap second and the largest integer are ingested; the three \
+         lines with a float are rejected like any other line that fails validation"
+    );
+    for ip in [VICTIM, "203.0.113.82", "203.0.113.83"] {
+        assert_untouched(&pool, ip).await;
+    }
+    let stored: DateTime<Utc> =
+        sqlx::query_scalar("SELECT observed_at FROM event WHERE source_ip = '203.0.113.81'::inet")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.to_rfc3339(), "2017-01-01T00:00:00+00:00");
+    assert_eq!(
+        core_scoring::verify_chain(&pool).await.unwrap(),
+        core_scoring::ChainStatus::Intact
+    );
+}

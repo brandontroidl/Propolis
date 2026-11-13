@@ -4,9 +4,10 @@
 //!
 //! Ordering guarantee: because cursor persistence follows a confirmed ack, a crash mid-cycle
 //! re-reads and re-ships the unconfirmed batch on the next cycle; the gateway's idempotent
-//! `Duplicate` path absorbs a re-ship of an already-accepted seq. At-least-once end to end,
-//! converging on the ledger dedup window - matching the contract `log_tailer` and
-//! `gateway::verify::GatewaySink` already document on their own sides of this exact boundary.
+//! `Duplicate` path absorbs a re-ship of an already-accepted seq. At-least-once end to end
+//! (with the one exception under "Residual, not closed" below), converging on the ledger dedup
+//! window - matching the contract `log_tailer` and `gateway::verify::GatewaySink` already
+//! document on their own sides of this exact boundary.
 //!
 //! F1 guard: a `Duplicate` ack is only ever a safe crash-retry echo when the gateway reports
 //! `next_expected_seq == batch.seq + 1` (it has exactly this batch and nothing past our own
@@ -18,6 +19,16 @@
 //! opposite of at-least-once). `ship_cycle` stops with [`StopReason::ChainDiverged`] instead;
 //! see `crates/shipper/src/state.rs`'s `load_or_fresh` doc and `deploy/collector.env.example`
 //! for the operator-facing side of this contract.
+//!
+//! Residual, not closed: the retry after a lost ack sends a REBUILT batch, not the one that was
+//! sent. `next_batch` reads again from the same offset, so when the first batch was short and
+//! the sensor has written since, the rebuilt batch carries lines the gateway never received
+//! under the same seq. The gateway answers `Duplicate` by seq alone
+//! (`next_expected_seq == batch.seq + 1`), which is taken as this batch's echo, and the cursor
+//! is committed past those lines: they are lost, and the next batch fails `HashMismatch` because
+//! the stored `last_batch_hash` is the rebuilt batch's. Closing it means resending exactly what
+//! was sent: keep the in-flight batch's extent and hash on disk before the first send and
+//! rebuild to that extent, so a `Duplicate` is proof the gateway holds these records.
 //!
 //! Residual the guard cannot close: if an operator rebuilds a collector reusing an old CN
 //! WITHOUT resetting the gateway state, and the gateway's remembered `last_seq` happens to

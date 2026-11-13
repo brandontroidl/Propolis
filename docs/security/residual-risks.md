@@ -79,8 +79,26 @@ sensor can produce, and a line dated more than an hour ahead is refused. What re
   the control plane any line that fits some known sensor's row
   ([split deployment](../operations/split-deployment.md#known-limitations)).
 - **Timestamps within the bounds.** A line may be dated up to an hour ahead, and as far back as
-  its writer likes: a back-dated line cannot move `last_seen` or the decay anchor, but it is
-  stored with the time it claims and sorts there in the ledger and the console.
+  its writer likes: a back-dated line cannot move `last_seen` or the decay anchor and adds only
+  what its claimed age leaves of its weight, but it is stored with the time it claims and sorts
+  there in the ledger and the console.
+- **A line dated now can end a tier listing.** Every event, of any kind and from any sensor,
+  re-derives the stored tier from the score decayed to that event, and the feed publishes a
+  tier entry only while the stored row has a tier. Once an approved address has been quiet for
+  a few hours (the half-life is six), one low-weight line naming it stores no tier: a
+  `catchall_probe` from a compromised sensor-catchall, one UDP datagram with a spoofed source
+  sent to the DNS or TFTP listener by anyone, or the address itself connecting once. The
+  address is still Approved and was seen seconds ago, and it is in no tier file and no
+  retention window until it earns a tier again. An address that also has a thousand
+  established events stays in the retention windows as a volume listing. Nothing else stops
+  this; the back-dating and future-dating checks do not apply to a line dated now.
+- **An approved volume listing follows any sighting.** A volume approval stands until an
+  operator reopens it, the address is delisted, or the address has been unseen for the longest
+  retention window. While it stands, any event for the address renews its place in every
+  retention window, with no new decision: a forged line from any sensor, or one spoofed UDP
+  datagram. The same holds for an address approved in the review queue that has a thousand
+  established events, and that approval does not lapse. The lapse is noticed by the queue scan,
+  so a node that was down for the whole quiet period keeps the approval.
 - **What was stored before these checks.** Ledger rows and `ip_score` rows written by an earlier
   version keep the sensor names and timestamps they had. Nothing re-validates the ledger and
   nothing rebuilds a projection, so a row whose `last_seen` or `decay_anchor` was moved back by

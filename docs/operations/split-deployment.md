@@ -627,6 +627,16 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
   (`crates/shipper/src/client.rs#ship_cycle`).
 - Delivery is at least once, and a line delivered twice becomes a second event row; the dedup
   window only keeps it from adding score (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`).
+- One case is not at least once: a lost acknowledgement can cost lines. If the gateway stored a
+  batch and the shipper never saw the answer (a reset connection, the 60 s batch timeout, a
+  restart in between), the shipper reads the log again from the same place and builds that
+  sequence number afresh. When the first batch was not full and the sensor has written more
+  lines since, the new batch holds lines the gateway never received. The gateway answers
+  `Duplicate` on the sequence number alone, the shipper takes that as confirmation of the batch
+  it just built, and its cursor moves past the extra lines: they are not shipped and nothing is
+  logged for them. The batch after that is rejected with `reason=HashMismatch`, because the two
+  sides no longer agree on the last batch, and the shipper stops until the collector is resynced
+  (`crates/shipper/src/client.rs#ship_cycle`, `crates/gateway/src/verify.rs#GatewaySink`).
 - A line the control plane's database refuses is quarantined on the control plane, in
   `/var/lib/propolis/quarantine` (`PROPOLIS_QUARANTINE_DIR`), under the collector's label: the
   collector's own log is not touched, and the gateway has already acknowledged the line

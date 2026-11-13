@@ -164,7 +164,7 @@ same CSRF check (`crates/console/src/routes/queue.rs#volume_act`).
 
 | Action | Method + path | Effect | Response |
 |---|---|---|---|
-| Approve | `POST /volume/{ip}/approve` | `VolumeQueue::approve`: published in the retention feeds from the next build | HTMX `queue_volume_row.html` partial carrying the new state |
+| Approve | `POST /volume/{ip}/approve` | `VolumeQueue::approve`: published in the retention feeds from the next build, until reopened, delisted or lapsed | HTMX `queue_volume_row.html` partial carrying the new state |
 | Reject | `POST /volume/{ip}/reject` | `VolumeQueue::reject`: not published on volume, not offered again | the same partial |
 | Reopen | `POST /volume/{ip}/reopen` | `VolumeQueue::reopen`: back to pending, decision time cleared, note kept | HTMX `queue_volume_decided_row.html` acknowledgement linking back to the tab |
 

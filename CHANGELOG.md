@@ -17,9 +17,11 @@
   address already approved in the review queue needs no second decision. An approval is not
   for one build: it stands while the address keeps being seen, by any kind of event, and
   lapses once the address has gone unseen for the longest retention window (ninety days as
-  shipped), after which a later flood is offered again. A rejection does not lapse. The scan runs with
-  the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is offered and none
-  is published. The nav badge and "Waiting on you" count both queues;
+  shipped, never less than a day), after which a later flood is offered again. A rejection
+  does not lapse. The scan runs with
+  the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is offered, so
+  nothing new is published on volume; approvals already given are still published, and still
+  lapse. The nav badge and "Waiting on you" count both queues;
   `propolis_review_queue_pending` is unchanged and `propolis_volume_review_pending` is new.
   Delist and delete also remove an address's volume decision. To keep the old behaviour set
   `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` (the exact word) before upgrading: an address
@@ -73,7 +75,9 @@
   was. Lines dated in the past are never refused for their age.
 - **An older event no longer moves an address's `last_seen` or decay anchor backwards.** An
   out-of-order or back-dated line is still counted, and adds what its own age leaves of its
-  weight, so a backlog read late scores what it would have scored read in order. It used to
+  weight, so a backlog read late adds to the raw score what it would have added read in
+  order (it still earns no persistence days: a day earlier than the newest one already seen
+  is not counted, as before). It used to
   become the anchor, so the next event or read decayed the whole score across the gap, and it
   used to become `last_seen`, which took a listed address out of every feed window. Existing
   `ip_score` rows are not rebuilt. A row whose times were moved back keeps them until that
@@ -87,16 +91,21 @@
   address that has been quiet for some hours still takes it out of the tier files until it
   earns a tier again
   ([what remains](docs/security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
-- **An event whose metadata holds a floating-point number is refused.** The ledger's chain
-  hash is taken over an event as written and checked over the event as PostgreSQL returns it,
-  and JSONB does not return a float as written (no negative zero, no exponent, no trailing
-  `.0`), so one such line read as a broken chain from that row on, for good, and hid any
-  later tampering behind it. No shipped sensor writes a float into `metadata`. A line from
-  your own tooling that does is now rejected and counted like any other line that fails
-  validation: write the value as an integer or a string. A timestamp with second 60 (a leap
-  second) had the same effect and is now stored, and hashed, as the first second of the next
-  minute. Neither change touches rows already in the ledger: a chain a past line broke stays
-  broken at that row.
+- **An event whose metadata holds a number the database would not return as written is
+  refused.** The ledger's chain hash is taken over an event as written and checked over the
+  event as PostgreSQL returns it, and JSONB does not return every float as written: a negative
+  zero comes back as zero, a float of 1e16 or more comes back without its exponent or not
+  readable at all, and a fraction can come back one bit off. One such line read as a broken
+  chain from that row on, for good, and hid any later tampering behind it. Refused now: a
+  float with a fraction, a negative zero, and a float of 1e15 or more in size. Integers and
+  whole-number floats are unaffected, and that is all the shipped sensors write (the
+  `"window_secs": 600.0` of every flood, command and rate-limit summary is a whole-number
+  float and is ingested as before). A line from your own tooling with a fraction in
+  `metadata` is rejected and counted like any other line that fails validation: write the
+  value as an integer or a string. A timestamp with second 60 (a leap second) had the same
+  effect and is now stored, and hashed, as the first second of the next minute. Neither
+  change touches rows already in the ledger: a chain a past line broke stays broken at that
+  row.
 - **`rollback.sh --with-database` keeps the database's owner, checks the backup before it stops
   anything, and puts the real database back when the restore fails.** The new database was
   created for the role `DATABASE_URL` connects as. On a node with

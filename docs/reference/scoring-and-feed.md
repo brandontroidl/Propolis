@@ -59,8 +59,12 @@ An event never moves time backwards. The new `decay_anchor` is the later of the 
 `last_seen`, and the decay runs from the old anchor to the new one. An event dated before the
 anchor (a backlog read late, a collector with a slow clock, a forged timestamp) is still counted,
 and adds what its own age leaves of its weight: the weight decayed from `observed_at` to the
-anchor, as everything already in the score has been, so a stream folded late scores what it
-would have scored in order. It used to become the anchor, so the next event or read decayed the
+anchor, as everything already in the score has been, so a stream folded late adds to the raw
+score what it would have added in order. Two things still depend on the order events are read
+in. The cap of 100 is applied at each step, so the two orders can differ slightly where a
+score reaches it. And the [persistence bonus](#persistence-bonus) counts a day only when it is
+later than the newest day already seen, so a backlog read after newer events earns no active
+days and is gated lower than it would have been in order. It used to become the anchor, so the next event or read decayed the
 whole score across the gap, and it used to become `last_seen`, which took a listed address out
 of every feed window. `first_seen` stays the time of the first
 event folded. Replay folds the same events in ledger order through the same function, so it
@@ -101,7 +105,9 @@ persistence_points(active_days) = min(PERSIST_CAP, PERSIST_PER_DAY * max(0, acti
 ```
 
 `active_days` is an unbounded, non-decaying count of distinct UTC calendar days
-seen (`crates/core-scoring/src/scoring/engine.rs#apply_event`). The bonus is 0 up to and including 2 days, then
+seen, counted as events are read: a day adds one only when it is later than the newest day
+already counted, so an older day read late (a backlog) adds none
+(`crates/core-scoring/src/scoring/engine.rs#apply_event`). The bonus is 0 up to and including 2 days, then
 linear at 0.55/day, saturating at 60 points
 (`crates/core-scoring/src/scoring/persistence.rs#persistence_points`).
 
@@ -226,14 +232,17 @@ stand for a thousand events, so a volume candidate waits for a decision in its o
 |---|---|---|
 | Offered (pending) | not delisted, `established_event_count >= 1000`, `last_seen` within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist | `crates/review/src/volume.rs#populate` |
 | Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue` | `crates/review/src/volume.rs#withdraw` |
-| Lapsed | a pending or approved row whose address has not been seen for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`; 90 days where none is configured, and in the standalone `review daemon`); the row is removed and logged, and the address's next sighting is offered as a new candidate. A rejected row never lapses | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
+| Lapsed | a pending or approved row whose address has not been seen for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`; 90 days where none is configured, and in the standalone `review daemon`; never less than the 86400 s an address is still offered within); the row is removed and logged, and the address's next sighting is offered as a new candidate. A rejected row never lapses | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
 | Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor. The approval stands until it is reopened, the address is delisted, or it lapses: while it stands, any event for the address, of any kind and from any sensor, renews the listing | `crates/review/src/volume.rs#approve` |
 | Reject | not published on volume; the row stays, so the address is not offered again | `crates/review/src/volume.rs#reject` |
 | Reopen | back to pending; an approved address leaves the retention feeds at the next build | `crates/review/src/volume.rs#reopen` |
 
 The scan runs with the review queue's, every `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, and only
 when `PROPOLIS_REVIEW_ENABLED` is true (`crates/propolis/src/main.rs#run_queue_scan_loop`).
-With the review subsystem off no candidate is offered and none is published. Decisions are made
+With the review subsystem off no candidate is offered, so nothing new can be approved; an
+address approved earlier is still published, and the feed build runs the withdrawal and lapse
+itself before each build, so such an approval still ends
+(`crates/propolis/src/main.rs#run_feed_loop`). Decisions are made
 on the console's volume tab ([console routes](console-routes.md)) or with `review volume`
 ([commands](commands.md)). A delist or delete removes the address's `volume_review` row with
 its `review_queue` row. The vendor submission runner reads `review_queue` only

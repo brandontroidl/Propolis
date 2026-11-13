@@ -20,15 +20,19 @@
 //! see `crates/shipper/src/state.rs`'s `load_or_fresh` doc and `deploy/collector.env.example`
 //! for the operator-facing side of this contract.
 //!
-//! Residual, not closed: the retry after a lost ack sends a REBUILT batch, not the one that was
-//! sent. `next_batch` reads again from the same offset, so when the first batch was short and
-//! the sensor has written since, the rebuilt batch carries lines the gateway never received
-//! under the same seq. The gateway answers `Duplicate` by seq alone
-//! (`next_expected_seq == batch.seq + 1`), which is taken as this batch's echo, and the cursor
-//! is committed past those lines: they are lost, and the next batch fails `HashMismatch` because
-//! the stored `last_batch_hash` is the rebuilt batch's. Closing it means resending exactly what
-//! was sent: keep the in-flight batch's extent and hash on disk before the first send and
-//! rebuild to that extent, so a `Duplicate` is proof the gateway holds these records.
+//! Residual, not closed: after a lost ack nothing records which batch was in flight, so the
+//! next batch built under that seq is taken for it. The seq and hash chain belong to the
+//! collector, not to one log: when `send_batch` fails, this cycle rewinds its tailer and returns,
+//! and the next cycle (the same log read again from the same offset, now with more lines if the
+//! first batch was short, or, on a collector with several logs, the next tailer in
+//! `run_ship_loop`'s pass) builds seq S from whatever it reads. If the gateway did store the
+//! first batch it answers `Duplicate` by seq alone (`next_expected_seq == batch.seq + 1`), which
+//! is taken as this batch's echo, and that tailer's cursor is committed past lines the gateway
+//! never received: up to a whole batch of another log. The next batch then fails `HashMismatch`,
+//! because the stored `last_batch_hash` is the rebuilt batch's. Closing it means resending
+//! exactly what was sent: keep the in-flight batch's log, extent and hash on disk before the
+//! first send, and on the next pass rebuild that batch before any other tailer builds one, so a
+//! `Duplicate` is proof the gateway holds these records.
 //!
 //! Residual the guard cannot close: if an operator rebuilds a collector reusing an old CN
 //! WITHOUT resetting the gateway state, and the gateway's remembered `last_seq` happens to

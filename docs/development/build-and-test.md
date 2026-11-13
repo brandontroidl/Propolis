@@ -129,8 +129,8 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 5013 test functions** (2971 unit + 2042 integration).
-- **DB-backed (`sqlx::test`): 543** - console 267, review 134, core-scoring 50, intake 38, propolis 24, feed 21, fleet 9. These provision a fresh database per test.
+- **Total: 5018 test functions** (2971 unit + 2047 integration).
+- **DB-backed (`sqlx::test`): 546** - console 267, review 135, core-scoring 50, intake 38, propolis 26, feed 21, fleet 9. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -171,14 +171,14 @@ Per-crate breakdown:
 | intake | 30 | 57 | audit_regressions, batched_runner, converter_test, end_to_end, origin_policy, probe_filter, quarantine, sensor_stats, shell_reply |
 | log-format | 0 | 15 | format, no_stock_fmt, process |
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
-| propolis | 194 | 59 | capture_to_console, coverage, db_roles, docs_agreement, logging, migrate_cli, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console, volume_listing |
+| propolis | 194 | 61 | capture_to_console, coverage, db_roles, docs_agreement, logging, migrate_cli, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console, summary_intake, volume_listing |
 | provision-certs | 0 | 16 | provision |
-| review | 232 | 141 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test, volume_test |
+| review | 232 | 142 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test, volume_test |
 | sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
 | sensor-catchall | 11 | 10 | arrival, env_strict, integration |
 | sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1505 | 408 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1505 | 410 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
@@ -190,7 +190,7 @@ Per-crate breakdown:
 | sensor-wire | 33 | 0 | - |
 | shipper | 4 | 34 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **2971** | **2042** | |
+| **Total** | **2971** | **2047** | |
 
 ### Test styles by layer
 
@@ -200,7 +200,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (49 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (491 uses) - needed wherever a test needs more than
+  applies migrations manually (494 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

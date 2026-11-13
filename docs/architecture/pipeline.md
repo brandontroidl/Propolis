@@ -54,7 +54,8 @@ another when displayed.
   repeat of the same signal from the same IP within sixty seconds is recorded but adds
   no weight. Decay only ever shrinks a score; clock skew cannot inflate one. Time never
   runs backwards either: an event dated before the stored one is counted, and weighed
-  for what its own age leaves of its weight, but `last_seen` and the decay anchor stay
+  for what its own age leaves of its weight (it earns no persistence day, which only a
+  day later than the newest seen does), but `last_seen` and the decay anchor stay
   where they were, so a back-dated line from a compromised sensor or a slow clock can
   neither erase a score at the next event nor move a listed address's last-seen time
   out of its feed window. A line dated more than an hour ahead never reaches the

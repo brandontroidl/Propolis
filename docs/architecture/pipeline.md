@@ -54,8 +54,9 @@ another when displayed.
   repeat of the same signal from the same IP within sixty seconds is recorded but adds
   no weight. Decay only ever shrinks a score; clock skew cannot inflate one. Time never
   runs backwards either: an event dated before the stored one is counted, and weighed
-  for what its own age leaves of its weight (it earns no persistence day, which only a
-  day later than the newest seen does), but `last_seen` and the decay anchor stay
+  for what its own age leaves of its weight (a backlog read late is still not scored
+  exactly as it would be in order: [decay](../reference/scoring-and-feed.md#decay)), but
+  `last_seen` and the decay anchor stay
   where they were, so a back-dated line from a compromised sensor or a slow clock can
   neither erase a score at the next event nor move a listed address's last-seen time
   out of its feed window. A line dated more than an hour ahead never reaches the
@@ -112,7 +113,8 @@ Volume candidates wait in a second queue, the `volume_review` table
 - Withdrawal removes a Pending row once its address has no score row, is delisted, has
   fallen below the threshold, or has been approved in the review queue.
 - A Pending or Approved row lapses, and is removed, once its address has not been seen
-  for the longest retention window: it is then in no feed file, and its next sighting is
+  for the longest retention window, ninety days at the least: it is then in no feed file,
+  and its next sighting is
   offered as a new candidate. A Rejected row is never touched.
 - Approve publishes the address in the retention feeds, and while the approval stands
   any later event for the address renews the listing. Reject keeps it out and it is

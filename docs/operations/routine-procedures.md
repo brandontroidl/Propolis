@@ -88,7 +88,7 @@ review entries, and the page heading says how the total splits.
 
 An approval is not for one build. It stands until you return the candidate to pending,
 delist the address, or the address has gone unseen for the longest retention window
-(ninety days as shipped), at which point the row is removed and a later flood from the
+(never less than ninety days), at which point the row is removed and a later flood from the
 address is offered again. While it stands, any event that names the address keeps it in
 the retention feeds, a single UDP packet included. A rejection does not lapse.
 

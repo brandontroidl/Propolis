@@ -16,12 +16,14 @@
   one that went quiet more than a day ago is not offered and stays out unless it returns. An
   address already approved in the review queue needs no second decision. An approval is not
   for one build: it stands while the address keeps being seen, by any kind of event, and
-  lapses once the address has gone unseen for the longest retention window (ninety days as
-  shipped, never less than a day), after which a later flood is offered again. A rejection
-  does not lapse. The scan runs with
-  the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is offered, so
-  nothing new is published on volume; approvals already given are still published, and still
-  lapse. The nav badge and "Waiting on you" count both queues;
+  lapses once the address has gone unseen for the longest retention window, and never
+  sooner than ninety days, after which a later flood is offered again. A rejection does not
+  lapse. The lapse removes the row for every node that shares the database: nodes that
+  publish windows longer than ninety days need the same `PROPOLIS_FEED_WINDOWS`. The scan
+  runs with the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is
+  offered, so nothing new can be approved; approvals already given are still published, and
+  still lapse (and with `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` addresses that never
+  authenticated are still published with no approval at all). The nav badge and "Waiting on you" count both queues;
   `propolis_review_queue_pending` is unchanged and `propolis_volume_review_pending` is new.
   Delist and delete also remove an address's volume decision. To keep the old behaviour set
   `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` (the exact word) before upgrading: an address
@@ -75,9 +77,11 @@
   was. Lines dated in the past are never refused for their age.
 - **An older event no longer moves an address's `last_seen` or decay anchor backwards.** An
   out-of-order or back-dated line is still counted, and adds what its own age leaves of its
-  weight, so a backlog read late adds to the raw score what it would have added read in
-  order (it still earns no persistence days: a day earlier than the newest one already seen
-  is not counted, as before). It used to
+  weight. A score still depends on the order events are read in: a backlog of repeats read
+  after a newer event is not deduped against itself, and the cap is applied at each step, so
+  a backlog a few hours old can score tens of points higher than the same events in order
+  (never above 100; one days old has decayed to nothing), and it earns no persistence days
+  ([details](docs/reference/scoring-and-feed.md#decay)). It used to
   become the anchor, so the next event or read decayed the whole score across the gap, and it
   used to become `last_seen`, which took a listed address out of every feed window. Existing
   `ip_score` rows are not rebuilt. A row whose times were moved back keeps them until that
@@ -136,7 +140,10 @@
   message names the database that holds the data. Nothing is dropped. The same holds when the
   run is ended by a signal or a dropped SSH session, which used to skip all of it and leave
   every service stopped on a half-restored database; what a failed run reports now also goes
-  to the journal (`journalctl -t propolis-rollback`).
+  to the journal (`journalctl -t propolis-rollback`). Where the daemon is left stopped it is
+  also disabled, so that a reboot does not start it on the wrong database, and the message
+  gives the command that enables it again. A run that fails with the database in place now
+  starts the nightly backup's timer again; it used to stay off until the next boot.
 - **`propolis migrate --check`, the daemon's startup log and `config-check.sh` now report a
   daemon role that owns the database**, or may create objects in the ledger's schema, without
   owning the `event` table (`ledger: NOT protected: ...`; finding `ledger-database`, a

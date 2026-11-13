@@ -59,14 +59,28 @@ An event never moves time backwards. The new `decay_anchor` is the later of the 
 `last_seen`, and the decay runs from the old anchor to the new one. An event dated before the
 anchor (a backlog read late, a collector with a slow clock, a forged timestamp) is still counted,
 and adds what its own age leaves of its weight: the weight decayed from `observed_at` to the
-anchor, as everything already in the score has been, so a stream folded late adds to the raw
-score what it would have added in order. Two things still depend on the order events are read
-in. The cap of 100 is applied at each step, so the two orders can differ slightly where a
-score reaches it. And the [persistence bonus](#persistence-bonus) counts a day only when it is
-later than the newest day already seen, so a backlog read after newer events earns no active
-days and is gated lower than it would have been in order. It used to become the anchor, so the next event or read decayed the
-whole score across the gap, and it used to become `last_seen`, which took a listed address out
-of every feed window. `first_seen` stays the time of the first
+anchor, as everything already in the score has been. It used to become the anchor, so the next
+event or read decayed the whole score across the gap, and it used to become `last_seen`, which
+took a listed address out of every feed window.
+
+That does not make a score independent of the order events are read in. A backlog read after
+newer events for the same address can score differently from the same events in order, in
+three ways:
+
+- **Dedup.** A repeat is deduped against the newest event of its signal type already stored
+  (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`), not against its neighbours
+  in time. A burst of repeats read in order adds the weight of one; read after a newer event
+  of that type, none of its lines is within sixty seconds of the newest, so each adds its own
+  decayed weight.
+- **The cap.** It is applied at each step. In order, a burst that reaches 100 loses the excess
+  before it decays; read late, each line is decayed first and then added under the cap.
+- **Persistence.** The [bonus](#persistence-bonus) counts a day only when it is later than
+  the newest day already seen, so a backlog earns no active days.
+
+The first two score a late-read backlog higher than in order, by tens of points for a backlog
+a few hours old (ten connections twelve hours back plus one now: 100 read late, about 66 in
+order), never above 100, and by next to nothing for one days old, which has decayed away. The
+third scores it lower. `first_seen` stays the time of the first
 event folded. Replay folds the same events in ledger order through the same function, so it
 still equals the stored row for rows written since this rule; a row written before it from
 out-of-order events keeps the times it had, and nothing rebuilds it
@@ -232,7 +246,7 @@ stand for a thousand events, so a volume candidate waits for a decision in its o
 |---|---|---|
 | Offered (pending) | not delisted, `established_event_count >= 1000`, `last_seen` within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist | `crates/review/src/volume.rs#populate` |
 | Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue` | `crates/review/src/volume.rs#withdraw` |
-| Lapsed | a pending or approved row whose address has not been seen for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`; 90 days where none is configured, and in the standalone `review daemon`; never less than the 86400 s an address is still offered within); the row is removed and logged, and the address's next sighting is offered as a new candidate. A rejected row never lapses | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
+| Lapsed | a pending or approved row whose address has not been seen for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`), and never for less than 90 days, which is also what the standalone `review daemon` uses; the row is removed and logged, and the address's next sighting is offered as a new candidate. A rejected row never lapses. The row is deleted for every node that shares the database, by whichever node's scan gets there first: nodes that publish windows longer than 90 days must all be given the same `PROPOLIS_FEED_WINDOWS` | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
 | Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor. The approval stands until it is reopened, the address is delisted, or it lapses: while it stands, any event for the address, of any kind and from any sensor, renews the listing | `crates/review/src/volume.rs#approve` |
 | Reject | not published on volume; the row stays, so the address is not offered again | `crates/review/src/volume.rs#reject` |
 | Reopen | back to pending; an approved address leaves the retention feeds at the next build | `crates/review/src/volume.rs#reopen` |

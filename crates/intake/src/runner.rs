@@ -234,6 +234,22 @@ impl IntakeRunner {
         probe_sources: Arc<HashSet<IpAddr>>,
         probe_grace: Duration,
     ) -> Self {
+        // Said once per log, because the binding is by name and nothing else shows it: a log
+        // that was given a sensor's name by mistake (a collector's stream called "ssh", two
+        // entries with their paths swapped) loses every other sensor's lines, and a log whose
+        // name was meant to bind it and does not is only held to what each line claims.
+        match sensor_wire::origin::bound_sensor(&sensor_name) {
+            Some(sensor) => tracing::info!(
+                log = %sensor_name,
+                sensor,
+                "intake: this log is bound to one sensor; a line in it that names another is refused"
+            ),
+            None => tracing::info!(
+                log = %sensor_name,
+                "intake: this log's name is not a shipped sensor's, so it is not bound to one; it may \
+                 carry any known sensor's lines, each held to its own sensor's row"
+            ),
+        }
         Self {
             tailer,
             pool,

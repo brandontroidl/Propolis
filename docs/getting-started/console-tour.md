@@ -55,11 +55,21 @@ entry back in the pending queue on its own, so that tab carries its own Approve 
 Reject controls, plus **Return to pending** to hand the entry back to the working
 queue. Acting on a row there moves it to another tab and tells you which one.
 
+The **Volume tab** is a second queue: addresses that reached a thousand established TCP
+connections, whether or not they ever logged in. None of them is published while it
+waits. **Approve for retention feeds** publishes the address in the `all-*` retention
+feeds and nothing else; it is not reported to abuse vendors. **Reject** keeps it out.
+Decided candidates are listed below with **Return to pending**, which undoes either
+decision. The badge in the navigation counts both queues, and the page heading says how
+the total splits.
+
 Two per-address actions go further. **Delist** removes the address from the queue and
 keeps it out of the feed until you say otherwise - **Relist**, which replaces the
 Delist button once an address is delisted, is how you say otherwise. Relisting clears
 the hold and re-derives the ordinary gates, so the address rejoins the feed only if it
-still qualifies on its current score. **Delete** removes its score, queue and
+still qualifies on its current score. Delisting also discards the address's volume
+decision, so a relisted address that still floods is offered on the Volume tab again.
+**Delete** removes its score, queue, volume and
 submission rows so it starts from nothing; the event ledger is never touched, so the
 score can be rebuilt from it.
 

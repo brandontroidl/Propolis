@@ -1,0 +1,41 @@
+{% import "macros.html" as m %}
+{#- One volume candidate in the volume tab's pending list, and the same row once decided: a
+    decision swaps this row for itself (`hx-target="closest tr"`) with the state in place of the
+    controls, as the pending tab does. The context line below stays with it. -#}
+<tr id="volume-row-{{ row.ip }}"{% if row.context %} class="has-context"{% endif %}>
+  <td class="ip stack-lead">{{ m.ip_evidence_link(row.ip) }}</td>
+  <td class="count" data-label="TCP events">{{ row.established_now | count }}</td>
+  <td class="count" data-label="When offered">{{ row.established_at_surface | count }}</td>
+  <td class="count" data-label="All events">{{ row.event_count | count }}</td>
+  <td class="seen stack-end" data-label="Last seen">{{ row.last_seen }}</td>
+  <td class="stack-full">
+    {% if row.is_pending %}
+    <div class="actions">
+      <input type="hidden" name="csrf_token" value="{{ row.csrf_token }}">
+      <div class="buttons">
+        {#- The label says what this approval does. On the pending tab "Approve" also reports the
+            address to vendors; here it must not read as the same button. -#}
+        <button type="button" class="btn-approve" title="Publishes this address in the retention feeds; it is not reported to abuse vendors." hx-post="/volume/{{ row.ip }}/approve" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Approve for retention feeds</button>
+        <button type="button" class="btn-reject" title="Keeps this address out of the retention feeds; it is not offered again." hx-post="/volume/{{ row.ip }}/reject" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Reject</button>
+      </div>
+      <details class="qnote"{% if row.notes %} open{% endif %}>
+        <summary>Note</summary>
+        <textarea name="notes" placeholder="Notes (optional)" aria-label="Note for {{ row.ip }}">{{ row.notes }}</textarea>
+      </details>
+    </div>
+    {% else %}
+    <span class="state-pill state-{{ row.state }}">{{ row.state }}</span>
+    {% if row.state == "approved" %}<span class="dim note-sm">in the retention feeds from the next build; not reported to vendors</span>{% endif %}
+    {% if row.notes %}<div class="dim note-sm">{{ row.notes }}</div>{% endif %}
+    {% endif %}
+  </td>
+</tr>
+{% if row.context %}{% set c = row.context %}
+<tr class="queue-context" id="volume-context-{{ row.ip }}">
+  <td colspan="6" class="stack-full">
+    {% if c.notable %}<span class="ctx-what"><span class="ctx-verb">{% if c.notable.kind == "upload" %}uploaded{% elif c.notable.kind == "fetch" %}fetched{% else %}ran{% endif %}</span> <code class="mono ctx-code" title="{{ c.notable.full }}">{{ c.notable.text }}</code></span>{% endif %}
+    <span class="ctx-dim">{% for s in c.sensors %}<span class="ctx-chip">{{ s }}</span>{% endfor %}{% if c.sessions > 0 %}<span>{{ c.sessions | count }} session{% if c.sessions != 1 %}s{% endif %}</span>{% endif %}</span>
+    {% if c.signals %}<span class="sev-tags"{% if c.sampled %} title="counts from {{ c.sampled | count }} events"{% endif %}>{% for s in c.signals %}<span class="sev sev--{{ s.sev }}">{{ s.label }} {{ s.count | count }}</span>{% endfor %}</span>{% endif %}
+  </td>
+</tr>
+{% endif %}

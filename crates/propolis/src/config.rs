@@ -117,6 +117,11 @@ pub struct PropolisConfig {
     /// `(label, retention)` pairs driving the `all-{label}.*` feeds. The label is both the
     /// filename suffix and the source the duration is parsed from, so the two cannot drift.
     pub feed_windows: Vec<(String, Duration)>,
+    /// Publish volume-listed addresses in the retention feeds with no operator decision
+    /// (`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH`). Default off: a volume candidate waits in the volume
+    /// review queue and is published once approved. Only the exact word `true` turns it on, so a
+    /// mistyped value leaves approval required.
+    pub feed_volume_auto_publish: bool,
     // Console
     pub console_bind: SocketAddr,
     pub console_password: String,
@@ -584,6 +589,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
     let feed_windows = parse_window_list(
         &env::var("PROPOLIS_FEED_WINDOWS").unwrap_or_else(|_| DEFAULT_FEED_WINDOWS.to_string()),
     )?;
+    let feed_volume_auto_publish = parse_bool_flag("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH", false);
 
     let bind_raw =
         env::var("PROPOLIS_CONSOLE_BIND").unwrap_or_else(|_| DEFAULT_CONSOLE_BIND.to_string());
@@ -722,6 +728,7 @@ pub fn load_config() -> Result<PropolisConfig, ConfigError> {
         feed_delist,
         feed_asn_allowlist,
         feed_windows,
+        feed_volume_auto_publish,
         console_bind,
         console_password,
         console_session_secret,
@@ -911,6 +918,41 @@ mod tests {
             env::remove_var("PROPOLIS_FETCH_DAILY_CAP");
             env::remove_var("PROPOLIS_FETCH_OWN_IPS");
         }
+    }
+
+    /// Automatic publication of volume-listed addresses is the one setting that lets an address
+    /// reach a public feed with no operator decision, so it has to be asked for exactly. Unset,
+    /// empty, or anything that is not the word `true` leaves approval required: the flag parser
+    /// returns the default for a value it does not recognise, and the default here is off.
+    #[test]
+    fn volume_auto_publish_is_off_unless_set_to_exactly_true() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_required_env();
+        // SAFETY: ENV_LOCK held for this test's whole cycle.
+        unsafe { env::remove_var("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH") };
+        assert!(
+            !load_config().unwrap().feed_volume_auto_publish,
+            "unset: approval is required"
+        );
+
+        for mistyped in ["", "1", "yes", "on", "enabled", "ture", " true", "true "] {
+            unsafe { env::set_var("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH", mistyped) };
+            assert!(
+                !load_config().unwrap().feed_volume_auto_publish,
+                "{mistyped:?} must not turn automatic publication on"
+            );
+        }
+
+        for on in ["true", "TRUE", "True"] {
+            unsafe { env::set_var("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH", on) };
+            assert!(load_config().unwrap().feed_volume_auto_publish, "{on:?}");
+        }
+
+        unsafe { env::set_var("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH", "false") };
+        assert!(!load_config().unwrap().feed_volume_auto_publish);
+
+        unsafe { env::remove_var("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH") };
+        clear_required_env();
     }
 
     #[test]

@@ -4,6 +4,33 @@
 
 ### Upgrade note
 
+- **Volume-listed addresses are no longer published until an operator approves them.** An
+  address with a thousand or more established TCP events used to enter every retention feed
+  (`all-24h` to `all-90d`) with no decision, on a count taken from what sensor log lines
+  declare; one forged summary line could list any address. Such an address is now offered as a
+  pending volume candidate (console Review page, Volume tab, or `review volume list`) and is
+  published only once approved there. The approval publishes the address and is never
+  reported to a vendor. The queue starts empty (review migration `0009`, table
+  `volume_review`), so at the first feed build after the upgrade every volume listing leaves
+  the retention feeds. Sources seen within the last day are offered at the next queue scan;
+  one that went quiet more than a day ago is not offered and stays out unless it returns. An
+  address already approved in the review queue needs no second decision. The scan runs with
+  the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is offered and none
+  is published. The nav badge and "Waiting on you" count both queues;
+  `propolis_review_queue_pending` is unchanged and `propolis_volume_review_pending` is new.
+  Delist and delete also remove an address's volume decision. To keep the old behaviour set
+  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` (the exact word) before upgrading: volume-listed
+  addresses are then published with no human decision, decisions on the Volume tab gate
+  nothing, and the daemon logs a warning at each start
+  ([rules](docs/reference/scoring-and-feed.md#volume-review)).
+- **A last-seen time ahead of the clock no longer extends a feed entry's validity.** The feed
+  builder reads a stored `last_seen` later than the build time as the build time, so no entry
+  is published as valid for longer than its window from now. Such an entry is still listed
+  while its stored time is ahead of the clock.
+- **The published blocklist README no longer claims every entry was approved by a human.** It
+  now says that `retention/` can carry volume listings, which an operator can choose to
+  publish unreviewed, and that only `tiers/` always rests on an authenticated session and a
+  human decision. `blocklist-sync.sh` copies it on its next run.
 - **Intake no longer believes a sensor log line about where it came from.** Each sensor writes
   its own log as its own user, but intake copied `sensor`, `signal_type`, `protocol` and
   `authenticated` from the line, so a compromised low-interaction sensor could write another

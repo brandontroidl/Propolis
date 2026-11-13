@@ -820,6 +820,7 @@ async fn detail(
         uptime,
         version,
         degraded: base_degraded,
+        ..
     } = base_context(&state.db, state.startup_time, state.version).await;
     degraded.absorb(base_degraded);
     let degraded = degraded.names();

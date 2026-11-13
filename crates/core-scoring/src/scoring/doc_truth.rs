@@ -75,8 +75,9 @@ fn readme_score_half_life_is_six_hours() {
 // feed TIERS gate on this via `eligible`, so a spoofed source can earn neither.
 //
 // VOLUME EXCEPTION, and how it stays spoofing-safe: the volume-listed RETENTION path does NOT gate
-// on confirmed-real (see the feed builder's `eligible = false` query and its
-// `a_volume_flood_lands_in_retention_but_not_the_tier_files` test). But it counts only ESTABLISHED
+// on confirmed-real (see the feed builder's `volume_candidates_sql` and its
+// `a_volume_flood_lands_in_retention_but_not_the_tier_files` test). It gates on an operator's
+// approval instead, unless automatic publication was opted in to. And it counts only ESTABLISHED
 // (completed-TCP) connections, never spoofable UDP/ICMP - `sensor-catchall` DOES run a live UDP
 // listener, so this gating is load-bearing, not hypothetical. A spoofed UDP flood therefore cannot
 // volume-list an innocent third party; guarded by `engine`'s

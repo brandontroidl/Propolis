@@ -79,8 +79,8 @@ debug level.
 | - | `DbError` | a DB read failed - fail-closed, held |
 
 A vendor is also only reached for IPs that are `recommended_for_vendor` (eligible
-and tiered) - a bare volume-flood IP is blocklisted locally but never reported
-upstream. Thresholds and defaults:
+and tiered) - a bare volume-flood IP can be blocklisted locally, once approved as a
+volume candidate, but is never reported upstream. Thresholds and defaults:
 [Rate limits and budgets](../reference/rate-limits-and-budgets.md) and
 [Scoring and feed](../reference/scoring-and-feed.md).
 
@@ -131,7 +131,11 @@ is missing:
   and previous siblings live inside the writable parent). A dir without it can
   break the swap; keep the default shape.
 - **No eligible entries** - tier files require operator-approved, eligible,
-  tiered IPs; retention-window files also include volume-flood entries. An empty
+  tiered IPs; retention-window files also include volume-flood entries an operator
+  approved on the queue page's volume tab. A flooding address missing from `all-*`
+  is usually a pending volume candidate (`propolis_volume_review_pending` on
+  `/metrics`), or the review subsystem is off (`PROPOLIS_REVIEW_ENABLED=false`), in
+  which case no candidate is ever offered. An empty
   feed still publishes normally (a zero-entry tier renders), so an empty
   `manifest.json` with the daemon healthy means "nothing qualifies yet", not a
   failure.

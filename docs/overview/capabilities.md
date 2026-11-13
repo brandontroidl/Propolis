@@ -63,8 +63,12 @@ report to be filed.
 
 The retention feeds (`all-24h`, `all-7d` and so on) are different: they hold every
 approved entry seen within the window, and also any source that completed a thousand
-or more TCP connections in the last day. That volume rule needs no approval; it exists
-so a flood is blocked promptly. Volume alone never triggers a vendor report.
+or more TCP connections and that you approved as a volume candidate. The volume rule
+exists so a flood can be blocked even when it never logged in; it offers the source on
+the review page's volume tab, and approving it there publishes it without reporting
+it. Volume alone never triggers a vendor report. Setting
+`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` publishes volume candidates with no approval;
+it is off by default.
 
 The feed builder writes text, JSON, CSV, CIDR, ipset, nftables, pf, alias, hosts and
 RPZ formats to a local directory with a checksummed manifest, atomically, every fifteen

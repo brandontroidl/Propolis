@@ -53,6 +53,8 @@ counters, and the opt-in ntfy monitor are owned by
 Watch, at minimum:
 
 - `propolis_review_queue_pending` - so surfaced IPs do not accumulate undecided;
+- `propolis_volume_review_pending` - volume candidates waiting for a decision; none of them
+  is published until decided, so a sudden jump is addresses someone, or something, wants listed;
 - `propolis_feed_last_build_timestamp` - the primary signal the feed loop is still
   publishing;
 - the `dropped`/`spool-refused` journal WARNs - a rising count means the capture layer
@@ -67,9 +69,12 @@ This is the core daily task. The full procedure - working the queue, the four re
 states, and the two distinct feed-publish stages - is owned by
 [routine procedures](../operations/routine-procedures.md). The gates in brief:
 
-- Publication of any IP requires **all** of: an authenticated console session, the IP
-  seen more than once, above the score floor, and an explicit human approval. There is
-  no auto-publish path.
+- Publication of any IP requires an authenticated console session and an explicit human
+  approval. A score-based entry also needs the IP seen more than once and above the score
+  floor; a volume candidate (a thousand or more established TCP events) is approved on the
+  queue page's volume tab and published in the retention feeds only. There is no
+  auto-publish path unless you set `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which publishes
+  volume candidates unreviewed and is off by default.
 - **Stage 1** (in-process feed build) is automated by the daemon: it builds a snapshot
   from `ip_score` and writes it atomically to the feed directory each build interval; a
   failed build leaves the previous feed in place.

@@ -53,7 +53,7 @@ for the complete set and exact values.
 | Database | PgPool connection and size | `DATABASE_URL` (required), `PROPOLIS_DB_MAX_CONNECTIONS` |
 | Intake | which sensor logs to tail, cursor state, quarantine directory, poll cadence | `PROPOLIS_SENSOR_LOGS` (required), `PROPOLIS_CURSOR_DIR`, `PROPOLIS_QUARANTINE_DIR`, `PROPOLIS_POLL_INTERVAL_MS` |
 | Review | scoring/review loop cadence and vendor submitters | `PROPOLIS_REVIEW_ENABLED`, `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_VENDOR_<V>_*` |
-| Feed | blocklist output dir, build cadence, tiers/windows, allow/delist | `PROPOLIS_FEED_ENABLED`, `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`, `PROPOLIS_FEED_WINDOWS`, `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_FEED_DELIST` |
+| Feed | blocklist output dir, build cadence, tiers/windows, allow/delist | `PROPOLIS_FEED_ENABLED`, `PROPOLIS_FEED_OUTPUT_DIR`, `PROPOLIS_FEED_BUILD_INTERVAL_SECS`, `PROPOLIS_FEED_WINDOWS`, `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH`, `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_FEED_DELIST` |
 | Console | bind address, auth, session, enrichment | `PROPOLIS_CONSOLE_BIND`, `PROPOLIS_CONSOLE_PASSWORD` (required), `PROPOLIS_CONSOLE_SESSION_SECRET`, `PROPOLIS_GEOIP_DIR`, `PROPOLIS_CONSOLE_RDNS_ENABLED` |
 | VirusTotal | sample scanning (opt-in egress) | `PROPOLIS_VT_ENABLED`, `PROPOLIS_VT_KEY`, `PROPOLIS_VT_UPLOAD`, `PROPOLIS_VT_SCAN_INTERVAL_SECS` |
 | Malware fetcher | artifact retrieval (opt-in egress) | `PROPOLIS_FETCH_ENABLED` and the `PROPOLIS_FETCH_*` bounds |
@@ -85,6 +85,11 @@ Fail-closed pairings worth noting (all owned by the reference table):
   (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
   skipping it (`crates/propolis/src/config.rs#parse_window_list`).
+- `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` is off unless it is exactly `true`. Off, a volume-listed
+  address waits for approval on the console's volume tab before it is published; on, it is
+  published in the retention feeds with no operator decision. A mistyped value leaves it off
+  (`crates/propolis/src/config.rs#parse_bool_flag`), and the daemon logs a warning at startup
+  when it is on.
 - `PROPOLIS_FEED_ALLOWLIST_FILE` refuses to start on an unreadable file, a line that is not a
   CIDR, or an entry wider than /8 (IPv4) or /16 (IPv6); see
   [the allowlist file procedure](#keeping-declared-crawlers-out-of-the-feed)

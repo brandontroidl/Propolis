@@ -15,9 +15,13 @@ that score can put the IP in front of an operator, and the outcome is a blocklis
 and, optionally, a report to an abuse vendor. This page explains how those stages
 connect. The constants are in the [scoring and feed reference](../reference/scoring-and-feed.md).
 
-Two outward paths exist and they are gated differently. Score-based tier entries and
-vendor reports wait for an operator decision. Volume-based retention entries do not;
-a flood is listed on connection count alone. The details are in sections 2 and 4.
+Two outward paths exist, and both wait for an operator. Score-based tier entries and
+vendor reports are decided in the review queue. Volume-based retention entries, where a
+flood is listed on connection count alone, are decided in a second queue of their own,
+and that approval publishes the address without reporting it. An operator can opt in
+to publishing volume entries with no decision
+(`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`); it is off by default. The details are in
+sections 2 and 4.
 
 ```mermaid
 flowchart TD
@@ -25,7 +29,10 @@ flowchart TD
   S --> P[(ip_score<br/>flags: eligible / tier /<br/>recommended_for_vendor / _blocklist)]
   P --> RQ[Review queue<br/>populate recommended + eligible]
   RQ --> OP{Operator<br/>approve / reject / snooze}
-  P -->|volume listings| FB[Feed builder]
+  P -->|volume candidates| VQ[Volume queue]
+  VQ --> VO{Operator<br/>approve / reject}
+  VO -->|approved for retention feeds| FB[Feed builder]
+  P -.volume listings with the opt-in only.-> FB
   OP -->|approved| FB
   FB --> FP[Publisher<br/>atomic, re-validated]
   FP --> FO[(feed output dir)]
@@ -91,6 +98,23 @@ operator turns it into a decision:
 
 The queue reads stored flags, so it can lag the scoring engine by one scan interval.
 
+Volume candidates wait in a second queue, the `volume_review` table
+(`crates/review/src/volume.rs#VolumeQueue`), maintained by the same scan:
+
+- Population inserts, as **Pending**, every address that is not delisted, has a
+  thousand or more established TCP events, was last seen within a day, has no volume
+  row yet, and has no Approved review-queue row. Reserved and allowlisted addresses are
+  skipped.
+- Withdrawal removes a Pending row once its address has no score row, is delisted, has
+  fallen below the threshold, or has been approved in the review queue. Approved and
+  Rejected rows are never touched.
+- Approve publishes the address in the retention feeds. Reject keeps it out and it is
+  not offered again. Reopen returns either to Pending.
+- The vendor submitter never reads this queue. A volume approval reports nothing.
+
+The scan runs with the review subsystem. With `PROPOLIS_REVIEW_ENABLED=false` no
+volume candidate is offered, so none can be approved; the daemon says so at startup.
+
 ## 3. Enrichment
 
 Enrichment adds context to captured evidence. It never changes a score.
@@ -120,9 +144,16 @@ IP's last event, so an entry cannot slide between tiers between builds.
   review queue. Aggressive entries expire 24 hours after last sighting, Standard after
   48.
 - **Retention feeds.** The `all-24h`, `all-7d`, `all-30d`, `all-60d` and `all-90d`
-  files hold every approved entry seen within the window, and also every volume-listed
-  IP. Volume listings are the one automatic path into the feed: they need no approval,
-  and they never reach the tier files.
+  files hold every approved entry seen within the window, and also the volume-listed
+  addresses an operator approved: not delisted, a thousand or more established TCP
+  events, and Approved in the volume queue (an address already Approved in the review
+  queue needs no second decision). A volume listing never reaches the tier files, and
+  an address that qualifies both ways is listed once. With
+  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` the builder instead takes every volume-listed
+  address with no decision; that is an opt-in and off by default
+  (`crates/feed/src/builder.rs#volume_candidates_sql`).
+- **Clock.** A stored last-seen time later than the build's clock is read as the build
+  time, so an entry is never valid for longer than its window from now.
 - **Exclusions.** Reserved ranges, an operator CIDR allowlist, explicit delisting, and
   optional ASN suppression are applied at build time, using the same reserved-range
   list the vendor path uses. The same allowlist also keeps listed addresses out of the

@@ -1703,6 +1703,17 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
         pend(&pool, ip).await;
     }
     scored_ip(&pool, "198.51.100.9").await;
+    // The volume tab's two lists, each with a row: one candidate waiting, one of each decision.
+    sqlx::query(
+        "INSERT INTO volume_review \
+         (source_ip, state, established_events_at_surface, decided_at, notes) VALUES \
+         ('192.0.2.1', 'pending', 1000, NULL, NULL), \
+         ('192.0.2.2', 'approved', 1200, now(), 'flooding ssh'), \
+         ('192.0.2.3', 'rejected', 1500, now(), NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO fetch_attempt (url_hash, url, host, scheme, status, last_attempt) \
          VALUES ($1, 'http://198.51.100.70/w.sh', '198.51.100.70', 'http', 'dead', now())",
@@ -1729,6 +1740,7 @@ async fn every_page_keeps_the_panel_contract(pool: PgPool) {
         "/queue?tab=approved".to_string(),
         "/queue?tab=snoozed".to_string(),
         "/queue?tab=rejected".to_string(),
+        "/queue?tab=volume".to_string(),
         "/campaigns?kind=scan".to_string(),
         "/ips".to_string(),
         "/ip/192.0.2.1".to_string(),

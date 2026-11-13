@@ -13,6 +13,13 @@
 //! forgery `SessionStore`'s per-session CSRF token exists to stop. `routes::login`'s POST
 //! deliberately has no CSRF check - see that module's doc comment for why that is a considered
 //! omission, not a gap.
+//!
+//! The page's `volume` tab and `POST /volume/{ip}/approve|reject|reopen` are the same thing for
+//! the other queue, `volume_review`: addresses the connection-volume rule would list in the
+//! retention feeds, which are published only once approved here (`review::volume`). They are
+//! separate routes on a separate table because the two approvals differ: approving a pending
+//! review entry lets the submission runner report the address to vendors, approving a volume
+//! candidate publishes it and reports nothing. Same session gate, same CSRF check.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -26,6 +33,7 @@ use chrono::{DateTime, Utc};
 use core_scoring::{IpScore, ReviewState, begin_exclusive, read_score};
 use minijinja::context;
 use review::queue::ReviewQueue;
+use review::volume::{VolumeEntry, VolumeQueue};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
@@ -53,6 +61,11 @@ pub fn router() -> Router<AppState> {
         .route("/queue/{ip}/unsnooze", post(unsnooze))
         .route("/ip/{ip}/relist", post(relist))
         .route("/ip/{ip}/delete", post(delete_ip))
+        // Decisions on volume candidates. Under `/volume`, not `/queue`, so no client can reach
+        // one by mistyping the other: `/queue/{ip}/approve` approves for vendor reporting.
+        .route("/volume/{ip}/approve", post(volume_approve))
+        .route("/volume/{ip}/reject", post(volume_reject))
+        .route("/volume/{ip}/reopen", post(volume_reopen))
 }
 
 /// The three operator decisions a pending entry can receive. A dedicated enum (rather than
@@ -101,7 +114,8 @@ impl SortKey {
 /// Tab accepted via `?tab=`, matching this task's "pending/approved/rejected/snoozed" review
 /// queue history tabs. `Pending` is the default (unchanged page behavior for a bare `/queue`
 /// hit); the other three list historical decisions straight from `review_queue` since
-/// `ReviewQueue` exposes no per-state listing beyond `list_pending`/`list_approved`.
+/// `ReviewQueue` exposes no per-state listing beyond `list_pending`/`list_approved`. `Volume` is
+/// the other queue: the volume candidates waiting for a decision and the ones already decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Tab {
@@ -110,6 +124,7 @@ enum Tab {
     Approved,
     Rejected,
     Snoozed,
+    Volume,
 }
 
 impl Tab {
@@ -119,14 +134,16 @@ impl Tab {
             Tab::Approved => "approved",
             Tab::Rejected => "rejected",
             Tab::Snoozed => "snoozed",
+            Tab::Volume => "volume",
         }
     }
 
     /// The `review_queue.state` value this tab lists, or `None` for `Pending` (handled by the
-    /// existing `ReviewQueue::list_pending` path, which additionally sorts by the `?sort=` key).
+    /// existing `ReviewQueue::list_pending` path, which additionally sorts by the `?sort=` key)
+    /// and for `Volume`, which lists `volume_review` and no `review_queue` row at all.
     fn review_state(self) -> Option<ReviewState> {
         match self {
-            Tab::Pending => None,
+            Tab::Pending | Tab::Volume => None,
             Tab::Approved => Some(ReviewState::Approved),
             Tab::Rejected => Some(ReviewState::Rejected),
             Tab::Snoozed => Some(ReviewState::Snoozed),
@@ -218,6 +235,42 @@ struct Notable {
     /// Longer form for the `title` attribute, cut to [`CONTEXT_TITLE_CHARS`].
     full: String,
 }
+
+/// One volume candidate on the volume tab, pending or decided. The counts stay numbers so the
+/// template's `count` filter groups them like every other count on the page.
+#[derive(Debug, Serialize)]
+struct VolumeRowView {
+    ip: String,
+    state: &'static str,
+    is_pending: bool,
+    /// `ip_score.established_event_count` now: what the volume rule counts.
+    established_now: i32,
+    /// The same count when the scan offered the address.
+    established_at_surface: i32,
+    /// Every event, spoofable ones included, for comparison with the two above.
+    event_count: i32,
+    /// Exact, not relative: a last-seen stamp dated ahead of the clock is something the operator
+    /// should be able to see before approving.
+    last_seen: String,
+    decided_at: String,
+    notes: String,
+    csrf_token: String,
+    /// Sensors reached and top signal types, as on the pending tab. Only on a pending row.
+    context: Option<RowContext>,
+}
+
+/// The volume tab's two lists.
+#[derive(Debug, Serialize)]
+struct VolumeView {
+    pending: Vec<VolumeRowView>,
+    /// Approved and rejected candidates, most recently decided first, at most
+    /// [`VOLUME_DECIDED_SHOWN`].
+    decided: Vec<VolumeRowView>,
+}
+
+/// Decided volume candidates listed under the pending ones: a history browse, like the 100 rows
+/// each review-queue history tab shows.
+const VOLUME_DECIDED_SHOWN: usize = 100;
 
 /// A campaign with two or more pending members on the page, shown as one expandable row.
 #[derive(Debug, Serialize)]
@@ -408,20 +461,29 @@ async fn queue_page(
         .generate_csrf(&session.id)
         .unwrap_or_default();
 
-    let mut rows: Vec<QueueRowView> = match query.tab.review_state() {
-        None => pending_rows(&state.db, query.sort, &csrf_token).await?,
+    let mut rows: Vec<QueueRowView> = match (query.tab, query.tab.review_state()) {
+        // The volume tab lists the other queue and no review-queue row.
+        (Tab::Volume, _) => Vec::new(),
+        (_, None) => pending_rows(&state.db, query.sort, &csrf_token).await?,
         // The token goes to the history tabs too: the Snoozed tab carries real decision controls
         // (it is the only route back out of a snooze), and those POST like any other.
-        Some(review_state) => history_rows(&state.db, review_state, &csrf_token).await?,
+        (_, Some(review_state)) => history_rows(&state.db, review_state, &csrf_token).await?,
+    };
+    let volume = if query.tab == Tab::Volume {
+        Some(volume_view(&state.db, &csrf_token).await?)
+    } else {
+        None
     };
 
     // `pending_count` is the shared sitewide count from `base_context` (the same query the
     // nav/footer badge uses on every page) rather than `rows.len()`: the two are equal in normal
     // operation, but `pending_rows` below silently omits any entry missing its `ip_score`
     // projection, so sourcing the heading from the same canonical count keeps this page's own "N
-    // pending" consistent with what the rest of the console shows for the same number.
+    // pending" consistent with what the rest of the console shows for the same number. It counts
+    // both queues, so the heading also says how many of them are volume candidates.
     let BaseContext {
         pending_count,
+        volume_pending_count,
         uptime,
         version,
         mut degraded,
@@ -449,11 +511,14 @@ async fn queue_page(
         csrf_token,
         active_nav => "queue",
         pending_count,
+        volume_pending_count,
+        review_pending_count => pending_count - volume_pending_count,
         uptime,
         version,
         degraded => degraded.names(),
         rows,
         items,
+        volume,
         sort => query.sort.as_str(),
         tab => query.tab.as_str(),
     })?;
@@ -669,6 +734,75 @@ async fn history_rows(
     Ok(rows)
 }
 
+/// The volume tab: every pending volume candidate, oldest-surfaced first, each with its live
+/// projection and the pending tab's context line; then the latest decided ones.
+///
+/// A pending row whose address has no projection is omitted, as on the pending tab; the next
+/// queue scan withdraws it. Decided rows are shown from `volume_review` alone, so a decision
+/// stays visible, and reversible, whatever has happened to the address since.
+async fn volume_view(pool: &PgPool, csrf_token: &str) -> Result<VolumeView, AppError> {
+    let queue = VolumeQueue::new();
+
+    let mut pending = Vec::new();
+    for entry in queue.list_pending(pool).await? {
+        let ip = entry.source_ip;
+        let Some(score) = read_score(pool, ip).await? else {
+            tracing::warn!(
+                %ip,
+                "pending volume candidate has no ip_score projection; omitting from queue page"
+            );
+            continue;
+        };
+        let mut row = volume_row_view(&entry, Some(&score), csrf_token);
+        row.context = Some(row_context(pool, ip, score.event_count).await?);
+        pending.push(row);
+    }
+
+    // Each state is read newest-first and bounded, so the merge below holds the newest
+    // `VOLUME_DECIDED_SHOWN` decisions overall without reading the whole history.
+    let limit = Some(VOLUME_DECIDED_SHOWN as i64);
+    let mut decided = queue
+        .list_by_state(pool, ReviewState::Approved, limit)
+        .await?;
+    decided.extend(
+        queue
+            .list_by_state(pool, ReviewState::Rejected, limit)
+            .await?,
+    );
+    decided.sort_by_key(|e| std::cmp::Reverse(e.decided_at));
+    decided.truncate(VOLUME_DECIDED_SHOWN);
+
+    Ok(VolumeView {
+        pending,
+        decided: decided
+            .iter()
+            .map(|entry| volume_row_view(entry, None, csrf_token))
+            .collect(),
+    })
+}
+
+fn volume_row_view(
+    entry: &VolumeEntry,
+    score: Option<&IpScore>,
+    csrf_token: &str,
+) -> VolumeRowView {
+    VolumeRowView {
+        ip: entry.source_ip.to_string(),
+        state: review_state_label(entry.state),
+        is_pending: entry.state == ReviewState::Pending,
+        established_now: score.map_or(0, |s| s.established_event_count),
+        established_at_surface: entry.established_events_at_surface,
+        event_count: score.map_or(0, |s| s.event_count),
+        last_seen: score
+            .map(|s| format_timestamp(s.last_seen))
+            .unwrap_or_default(),
+        decided_at: entry.decided_at.map(format_timestamp).unwrap_or_default(),
+        notes: entry.notes.clone().unwrap_or_default(),
+        csrf_token: csrf_token.to_string(),
+        context: None,
+    }
+}
+
 /// "N/M vendors" for `ip`'s `vendor_submission` rows, or "-" when none exist yet (an approved IP
 /// the submission runner has not picked up yet).
 async fn submission_summary(pool: &PgPool, ip: IpAddr) -> Result<String, AppError> {
@@ -786,6 +920,98 @@ async fn act(
     Ok(Html(html).into_response())
 }
 
+/// The three things an operator can do to a volume candidate.
+#[derive(Debug, Clone, Copy)]
+enum VolumeAction {
+    Approve,
+    Reject,
+    Reopen,
+}
+
+/// `POST /volume/{ip}/approve` - publish a volume candidate in the retention feeds. It is not
+/// reported to abuse vendors: that is what `POST /queue/{ip}/approve` does, on the other queue.
+async fn volume_approve(
+    state: State<AppState>,
+    session: Extension<Session>,
+    path: Path<IpAddr>,
+    form: Form<ActionForm>,
+) -> Result<Response, AppError> {
+    volume_act(state, session, path, form, VolumeAction::Approve).await
+}
+
+/// `POST /volume/{ip}/reject` - keep a volume candidate out of the retention feeds. The row
+/// stays, so the scan does not offer the address again.
+async fn volume_reject(
+    state: State<AppState>,
+    session: Extension<Session>,
+    path: Path<IpAddr>,
+    form: Form<ActionForm>,
+) -> Result<Response, AppError> {
+    volume_act(state, session, path, form, VolumeAction::Reject).await
+}
+
+/// `POST /volume/{ip}/reopen` - return a decided volume candidate to pending. The way to undo an
+/// approval (the address leaves the retention feeds at the next build) or a rejection.
+async fn volume_reopen(
+    state: State<AppState>,
+    session: Extension<Session>,
+    path: Path<IpAddr>,
+    form: Form<ActionForm>,
+) -> Result<Response, AppError> {
+    volume_act(state, session, path, form, VolumeAction::Reopen).await
+}
+
+/// The volume decisions, built like [`act`]: CSRF first, then the one state change, then the row
+/// re-rendered for the HTMX swap.
+///
+/// A decision made in the pending list answers with that row carrying its new state. A reopen is
+/// made from the decided list, whose row no longer belongs there, so it answers with the
+/// acknowledgement that says where the candidate went.
+async fn volume_act(
+    State(state): State<AppState>,
+    Extension(session): Extension<Session>,
+    Path(ip): Path<IpAddr>,
+    Form(form): Form<ActionForm>,
+    action: VolumeAction,
+) -> Result<Response, AppError> {
+    if !state.sessions.validate_csrf(&session.id, &form.csrf_token) {
+        tracing::warn!(%ip, "volume queue action rejected: missing or invalid csrf token");
+        return Ok((StatusCode::FORBIDDEN, "invalid or missing csrf token").into_response());
+    }
+
+    let notes = form.notes.trim();
+    let notes = if notes.is_empty() { None } else { Some(notes) };
+
+    let queue = VolumeQueue::new();
+    match action {
+        VolumeAction::Approve => queue.approve(&state.db, ip, notes).await,
+        VolumeAction::Reject => queue.reject(&state.db, ip, notes).await,
+        VolumeAction::Reopen => queue.reopen(&state.db, ip).await,
+    }?;
+
+    let csrf_token = state
+        .sessions
+        .generate_csrf(&session.id)
+        .unwrap_or_default();
+    // Read back rather than assembled from the request, so the row shows what was stored.
+    let Some(entry) = queue.get(&state.db, ip).await? else {
+        // Decided a moment ago and gone already: a delist or delete landed in between.
+        return Err(review::ReviewError::VolumeNotFound(ip).into());
+    };
+    let (template, score) = match action {
+        VolumeAction::Reopen => ("queue_volume_decided_row.html", None),
+        VolumeAction::Approve | VolumeAction::Reject => {
+            let Some(score) = read_score(&state.db, ip).await? else {
+                return Err(AppError::missing_projection(ip));
+            };
+            ("queue_volume_row.html", Some(score))
+        }
+    };
+    let row = volume_row_view(&entry, score.as_ref(), &csrf_token);
+    let tmpl = state.templates.get_template(template)?;
+    Ok(Html(tmpl.render(context! { row })?).into_response())
+}
+
 /// Which row template answers a decision made from `from_tab`.
 ///
 /// The pending tab keeps its existing behaviour: the decided row is re-rendered in place with a
@@ -817,6 +1043,12 @@ async fn delist(
         .bind(ip.to_string())
         .execute(&mut *tx)
         .await?;
+    // The volume decision goes with it, approved or not: a delist takes the address out of every
+    // feed, and a relist must not bring an old volume approval back into force unasked.
+    sqlx::query("DELETE FROM volume_review WHERE source_ip = $1::inet")
+        .bind(ip.to_string())
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
         "UPDATE ip_score SET delisted = TRUE, eligible = FALSE, recommended_for_vendor = FALSE, \
@@ -844,7 +1076,9 @@ async fn delist(
 /// address, so a relisted address rejoins the feed on its current merit or not at all.
 ///
 /// It does NOT restore the review-queue entry `delist` deleted: that entry was a recommendation,
-/// and the population scan re-creates one on its next pass iff the address still qualifies. Same
+/// and the population scan re-creates one on its next pass iff the address still qualifies. The
+/// same holds for a volume candidate: `delist` deleted its `volume_review` row, decision
+/// included, and the volume scan offers the address again, pending, iff it still qualifies. Same
 /// CSRF gate as `delist`.
 async fn relist(
     State(state): State<AppState>,
@@ -895,8 +1129,8 @@ async fn relist(
 }
 
 /// `POST /ip/{ip}/delete` - purge an address's derived state (scoring projection, review-queue
-/// entry, and vendor-submission history), for a false positive or a test address an operator wants
-/// gone rather than merely delisted.
+/// entry, volume-review entry, and vendor-submission history), for a false positive or a test
+/// address an operator wants gone rather than merely delisted.
 ///
 /// The append-only, hash-chained `event` ledger is deliberately NOT touched: deleting a link would
 /// break `verify_chain` for the whole ledger, and the projection deleted here can always be rebuilt
@@ -919,6 +1153,12 @@ async fn delete_ip(
     // Under the append lock, so an append in flight cannot write the purged row back.
     let mut tx = begin_exclusive(&state.db).await?;
     sqlx::query("DELETE FROM review_queue WHERE source_ip = $1::inet")
+        .bind(&ip_str)
+        .execute(&mut *tx)
+        .await?;
+    // An approved volume row left behind would publish the address again the moment it sent
+    // another thousand connections, on a decision made about state this purge just discarded.
+    sqlx::query("DELETE FROM volume_review WHERE source_ip = $1::inet")
         .bind(&ip_str)
         .execute(&mut *tx)
         .await?;

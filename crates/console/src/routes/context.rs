@@ -4,19 +4,26 @@
 //! `routes::dashboard`/`queue`/`detail`/`feed` are its only callers.
 
 use chrono::Utc;
+use review::volume::VolumeQueue;
 use sqlx::PgPool;
 
 use crate::routes::degraded::Degraded;
 
 pub(crate) struct BaseContext {
+    /// Everything waiting on the operator: pending review-queue entries plus pending volume
+    /// candidates. The nav badge and the dashboard's "Waiting on you" show this one number, so
+    /// neither class can pile up behind a badge that reads zero.
     pub pending_count: i64,
+    /// The volume candidates within `pending_count`, so the queue page can say how the total
+    /// splits between its two classes.
+    pub volume_pending_count: i64,
     pub uptime: String,
     pub version: &'static str,
     /// The pending-count failure, if any, so a page can fold it into its own banner.
     pub degraded: Degraded,
 }
 
-/// Queries the current sitewide pending-review count and computes process uptime from
+/// Queries the current sitewide pending counts (both queues) and computes process uptime from
 /// `AppState::startup_time`. A failure on the count query falls back to 0 rather than
 /// propagating: this trio is supplementary nav/footer chrome shown on every page, not a page's own
 /// primary content (which already fails closed to a 503 via `AppError` on its own query errors), so
@@ -28,12 +35,17 @@ pub(crate) async fn base_context(
     version: &'static str,
 ) -> BaseContext {
     let mut degraded = Degraded::new();
-    let pending_count: i64 = degraded.soft(
+    let review_pending_count: i64 = degraded.soft(
         "pending review count",
         sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE state = 'pending'")
             .fetch_one(db)
             .await,
     );
+    let volume_pending_count: i64 = degraded.soft(
+        "pending volume candidate count",
+        VolumeQueue::new().pending_count(db).await,
+    );
+    let pending_count = review_pending_count + volume_pending_count;
 
     let elapsed = Utc::now() - startup_time;
     let hours = elapsed.num_hours();
@@ -46,6 +58,7 @@ pub(crate) async fn base_context(
 
     BaseContext {
         pending_count,
+        volume_pending_count,
         uptime,
         version,
         degraded,
@@ -85,6 +98,42 @@ mod tests {
         let ctx = super::base_context(&pool, chrono::Utc::now(), "0.1.0").await;
 
         assert_eq!(ctx.pending_count, 2);
+    }
+
+    async fn insert_volume(pool: &PgPool, ip: &str, state: &str) {
+        sqlx::query(
+            "INSERT INTO volume_review (source_ip, state, established_events_at_surface) \
+             VALUES ($1::inet, $2::review_state_enum, 1000)",
+        )
+        .bind(ip)
+        .bind(state)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The badge is the one place the operator learns something is waiting. A volume candidate
+    /// is not published until decided, so one that did not count here would sit unseen.
+    #[sqlx::test(migrations = false)]
+    async fn pending_count_adds_pending_volume_candidates_to_pending_reviews(pool: PgPool) {
+        migrate(&pool).await;
+        insert_pending(&pool, "203.0.113.1").await;
+        insert_pending(&pool, "203.0.113.2").await;
+        insert_volume(&pool, "203.0.113.3", "pending").await;
+        insert_volume(&pool, "203.0.113.4", "pending").await;
+        insert_volume(&pool, "203.0.113.5", "pending").await;
+        // Decided volume rows are not waiting on anyone.
+        insert_volume(&pool, "203.0.113.6", "approved").await;
+        insert_volume(&pool, "203.0.113.7", "rejected").await;
+
+        let ctx = super::base_context(&pool, chrono::Utc::now(), "0.1.0").await;
+
+        assert_eq!(ctx.volume_pending_count, 3);
+        assert_eq!(
+            ctx.pending_count, 5,
+            "two reviews and three volume candidates"
+        );
+        assert!(ctx.degraded.names().is_empty());
     }
 
     #[sqlx::test(migrations = false)]

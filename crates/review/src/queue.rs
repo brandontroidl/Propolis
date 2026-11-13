@@ -39,6 +39,10 @@ pub enum ReviewError {
     /// landing on a real, surfaced entry.
     #[error("no review queue entry for {0}")]
     NotFound(IpAddr),
+    /// The same caller error against the volume queue ([`crate::volume::VolumeQueue`]): a
+    /// decision on an address with no `volume_review` row.
+    #[error("no volume review entry for {0}")]
+    VolumeNotFound(IpAddr),
 }
 
 /// One `review_queue` row: a surfaced IP and the operator's decision so far.
@@ -314,8 +318,9 @@ impl ReviewQueue {
     }
 
     /// Split candidate addresses into (not reserved, reserved). Passes everything through when
-    /// the queue was built with [`Self::offering_reserved_addresses`].
-    fn partition_reserved(
+    /// the queue was built with [`Self::offering_reserved_addresses`]. Shared with the volume
+    /// queue, so both offer the operator the same set of addresses.
+    pub(crate) fn partition_reserved(
         &self,
         ips: Vec<String>,
     ) -> Result<(Vec<String>, Vec<String>), ReviewError> {
@@ -335,8 +340,9 @@ impl ReviewQueue {
     }
 
     /// Split stored/candidate addresses into (not allowlisted, allowlisted). An unparseable value
-    /// is corrupt state and fails the scan rather than being silently kept or dropped.
-    fn partition_allowlisted(
+    /// is corrupt state and fails the scan rather than being silently kept or dropped. Shared with
+    /// the volume queue.
+    pub(crate) fn partition_allowlisted(
         &self,
         ips: Vec<String>,
     ) -> Result<(Vec<String>, Vec<String>), ReviewError> {

@@ -27,6 +27,8 @@ const QUEUE_HTML: &str = include_str!("templates/queue.html");
 const QUEUE_ROW_HTML: &str = include_str!("templates/queue_row.html");
 const QUEUE_HISTORY_ROW_HTML: &str = include_str!("templates/queue_history_row.html");
 const QUEUE_MOVED_ROW_HTML: &str = include_str!("templates/queue_moved_row.html");
+const QUEUE_VOLUME_ROW_HTML: &str = include_str!("templates/queue_volume_row.html");
+const QUEUE_VOLUME_DECIDED_ROW_HTML: &str = include_str!("templates/queue_volume_decided_row.html");
 const LOGIN_HTML: &str = include_str!("templates/login.html");
 const DETAIL_HTML: &str = include_str!("templates/detail.html");
 const DRAWER_SHELL_HTML: &str = include_str!("templates/drawer_shell.html");
@@ -102,6 +104,15 @@ pub fn environment() -> Environment<'static> {
     // tab - see the template's own comment for why it cannot just be re-rendered in place.
     env.add_template("queue_moved_row.html", QUEUE_MOVED_ROW_HTML)
         .expect("queue_moved_row.html must be a valid template");
+    // The volume tab's two lists: candidates waiting for a decision, and decided ones with the
+    // one control that undoes a decision.
+    env.add_template("queue_volume_row.html", QUEUE_VOLUME_ROW_HTML)
+        .expect("queue_volume_row.html must be a valid template");
+    env.add_template(
+        "queue_volume_decided_row.html",
+        QUEUE_VOLUME_DECIDED_ROW_HTML,
+    )
+    .expect("queue_volume_decided_row.html must be a valid template");
     env.add_template("login.html", LOGIN_HTML)
         .expect("login.html must be a valid template");
     env.add_template("detail.html", DETAIL_HTML)

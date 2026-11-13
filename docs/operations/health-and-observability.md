@@ -94,7 +94,9 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
 (`crates/console/src/routes/metrics.rs#metrics`). Emitted series (`crates/console/src/routes/metrics.rs#metrics`):
 
 - Gauges: `propolis_ips_scored`, `propolis_ips_eligible`, `propolis_ips_recommended_vendor`,
-  `propolis_ips_recommended_blocklist`, `propolis_review_queue_pending`, and the stored shell
+  `propolis_ips_recommended_blocklist`, `propolis_review_queue_pending`,
+  `propolis_volume_review_pending` (pending volume candidates, counted apart from the review
+  queue), and the stored shell
   reply table's `propolis_shell_output_rows` (planner estimate) and `propolis_shell_output_bytes`
   (table plus indexes), read from the catalog so a scrape never reads the table
   ([retention](retention.md#stored-shell-replies)).

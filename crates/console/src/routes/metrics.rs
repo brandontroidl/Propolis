@@ -112,6 +112,17 @@ async fn metrics(
         "review_queue entries awaiting an operator decision.",
         review_queue_pending,
     );
+    // Its own gauge, not added to the one above: that one keeps meaning what dashboards and
+    // alerts built on it already read it as.
+    let volume_review_pending = review::volume::VolumeQueue::new()
+        .pending_count(&state.db)
+        .await?;
+    push_gauge(
+        &mut out,
+        "propolis_volume_review_pending",
+        "Volume candidates awaiting an operator decision before publication.",
+        volume_review_pending,
+    );
 
     // Planner estimate and on-disk size, not a count over the table: a scrape must not read it.
     // `reltuples` is -1 on a table never analysed, which reads as 0 rows here.

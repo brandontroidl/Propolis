@@ -63,6 +63,7 @@ async fn logs_page(
         uptime,
         version,
         degraded,
+        ..
     } = base_context(&state.db, state.startup_time, state.version).await;
 
     let tmpl = state.templates.get_template("logs.html")?;

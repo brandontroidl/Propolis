@@ -17,9 +17,12 @@
 use std::net::IpAddr;
 
 use chrono::{DateTime, Timelike, Utc};
-use core_scoring::{EventInput, FeedTier, Protocol, SignalType, append_event, read_score};
-use feed::{ExclusionEngine, FeedBuilder, FeedConfig};
+use core_scoring::{
+    EventInput, FeedTier, Protocol, SignalType, append_event, append_events, read_score,
+};
+use feed::{ExclusionEngine, FeedBuilder, FeedConfig, FeedSnapshot};
 use review::queue::ReviewQueue;
+use review::volume::VolumeQueue;
 use sqlx::PgPool;
 
 async fn migrate(pool: &PgPool) {
@@ -679,4 +682,442 @@ async fn the_build_reads_signal_types_by_probe_and_only_for_addresses_a_feed_can
             .any(|e| e.source_ip == "45.10.30.202".parse::<IpAddr>().unwrap()),
         "an address last seen ten days ago is not published"
     );
+}
+
+// --- volume-listed addresses ---
+//
+// A volume candidate is an address with a thousand or more established TCP events and no
+// confirmed-real session: the stored projection recommends it for the blocklist on that count
+// alone. The count is whatever the sensor's log lines declared, so by default the build publishes
+// such an address only once an operator has approved it.
+
+/// A flood from `ip`: a thousand unauthenticated TCP connections, the last one at `last_event`.
+/// They are a millisecond apart, so the 60 s dedup scores them as one sighting while the
+/// established-event count still reaches the volume threshold, which is the case the volume rule
+/// exists for. Unauthenticated, so the address never becomes eligible on these alone.
+async fn seed_flood(pool: &PgPool, ip: IpAddr, last_event: DateTime<Utc>) {
+    let events: Vec<EventInput> = (0..1000)
+        .map(|i| {
+            ev(
+                ip,
+                SignalType::HoneypotConnection,
+                Protocol::Tcp,
+                false,
+                last_event - chrono::Duration::milliseconds(999 - i),
+            )
+        })
+        .collect();
+    let outcome = append_events(pool, events).await;
+    assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+    assert_eq!(outcome.appended, 1000);
+}
+
+/// The retention windows a default deployment publishes that matter here: the shortest and a
+/// longer one, so "in the retention windows" is checked on more than one file.
+fn config_with_windows(volume_auto_publish: bool) -> FeedConfig {
+    FeedConfig {
+        windows: vec![
+            ("24h".into(), chrono::Duration::hours(24)),
+            ("7d".into(), chrono::Duration::days(7)),
+        ],
+        volume_auto_publish,
+        ..FeedConfig::default()
+    }
+}
+
+async fn build(pool: &PgPool, config: &FeedConfig) -> FeedSnapshot {
+    FeedBuilder::build(pool, &ExclusionEngine::new(Vec::new(), Vec::new()), config)
+        .await
+        .unwrap()
+}
+
+/// How many entries each retention window holds for `ip`.
+fn window_entries(snapshot: &FeedSnapshot, ip: IpAddr) -> Vec<usize> {
+    snapshot
+        .windows
+        .iter()
+        .map(|w| w.entries.iter().filter(|e| e.source_ip == ip).count())
+        .collect()
+}
+
+fn in_a_tier_file(snapshot: &FeedSnapshot, ip: IpAddr) -> bool {
+    snapshot
+        .aggressive
+        .iter()
+        .chain(snapshot.standard.iter())
+        .any(|e| e.source_ip == ip)
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_volume_candidate_is_published_only_once_an_operator_approves_it(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let undecided: IpAddr = "45.10.30.110".parse().unwrap();
+    let pending: IpAddr = "45.10.30.111".parse().unwrap();
+    let rejected: IpAddr = "45.10.30.112".parse().unwrap();
+    let approved: IpAddr = "45.10.30.113".parse().unwrap();
+
+    // The first address floods before the queue scan runs and never gets a row at all (a node
+    // with the review subsystem off, or a build that runs before the next scan).
+    seed_flood(&pool, undecided, now).await;
+    let score = read_score(&pool, undecided).await.unwrap().unwrap();
+    assert!(
+        score.recommended_for_blocklist && !score.eligible,
+        "precondition: the flood is listed on volume alone"
+    );
+    let config = config_with_windows(false);
+    let snapshot = build(&pool, &config).await;
+    assert_eq!(
+        window_entries(&snapshot, undecided),
+        [0, 0],
+        "a volume candidate with no decision must not be published"
+    );
+
+    for ip in [pending, rejected, approved] {
+        seed_flood(&pool, ip, now).await;
+    }
+    let queue = VolumeQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue.reject(&pool, rejected, None).await.unwrap();
+    queue.approve(&pool, approved, None).await.unwrap();
+
+    let snapshot = build(&pool, &config).await;
+    for (ip, what) in [
+        (undecided, "pending (surfaced by the scan above)"),
+        (pending, "pending"),
+        (rejected, "rejected"),
+    ] {
+        assert_eq!(
+            window_entries(&snapshot, ip),
+            [0, 0],
+            "{ip} is {what}: it must not be published"
+        );
+        assert!(!in_a_tier_file(&snapshot, ip));
+    }
+
+    assert_eq!(
+        window_entries(&snapshot, approved),
+        [1, 1],
+        "an approved volume candidate is published in every retention window it falls inside"
+    );
+    assert!(
+        !in_a_tier_file(&snapshot, approved),
+        "a volume listing never reaches the aggressive or standard file"
+    );
+    let entry = snapshot.windows[0]
+        .entries
+        .iter()
+        .find(|e| e.source_ip == approved)
+        .unwrap();
+    assert_eq!(entry.tier, None);
+    assert_eq!(entry.event_count, 1000);
+
+    // Reopening takes it back out: publication follows the row's current state, not a decision
+    // that was once made.
+    queue.reopen(&pool, approved).await.unwrap();
+    let snapshot = build(&pool, &config).await;
+    assert_eq!(window_entries(&snapshot, approved), [0, 0]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_address_approved_on_its_score_is_published_on_volume_without_a_second_decision(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.120".parse().unwrap();
+
+    // Two days ago the address earned a tier and the operator approved it. Its score has since
+    // decayed, and today it floods: the stored projection has no tier any more, so it is not a
+    // merit candidate, but it meets the volume condition and the operator's approval stands.
+    seed_qualifying(
+        &pool,
+        ip,
+        SignalType::HoneypotMalwareUpload,
+        now - chrono::Duration::days(2),
+    )
+    .await;
+    seed_flood(&pool, ip, now).await;
+    let score = read_score(&pool, ip).await.unwrap().unwrap();
+    assert_eq!(score.tier, None, "precondition: no tier, so no merit entry");
+    assert!(score.established_event_count >= 1000);
+    let volume_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM volume_review")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(volume_rows, 0, "precondition: no volume decision exists");
+
+    let snapshot = build(&pool, &config_with_windows(false)).await;
+
+    assert_eq!(window_entries(&snapshot, ip), [1, 1]);
+    assert!(!in_a_tier_file(&snapshot, ip));
+    let entry = snapshot.windows[1]
+        .entries
+        .iter()
+        .find(|e| e.source_ip == ip)
+        .unwrap();
+    assert_eq!(entry.tier, None, "published as a volume entry");
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_approved_address_below_the_volume_threshold_is_not_a_volume_entry(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.124".parse().unwrap();
+
+    // The same history as the address above, except that today brings one connection instead of
+    // a flood. The approval alone must not put it in the retention feeds: an approved address
+    // with no tier is published only when it meets the volume condition.
+    seed_qualifying(
+        &pool,
+        ip,
+        SignalType::HoneypotMalwareUpload,
+        now - chrono::Duration::days(2),
+    )
+    .await;
+    append_event(
+        &pool,
+        ev(
+            ip,
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            now,
+        ),
+    )
+    .await
+    .unwrap();
+    let score = read_score(&pool, ip).await.unwrap().unwrap();
+    assert_eq!(score.tier, None, "precondition: no tier, so no merit entry");
+    assert!(score.established_event_count < 1000);
+
+    let snapshot = build(&pool, &config_with_windows(false)).await;
+
+    assert_eq!(window_entries(&snapshot, ip), [0, 0]);
+    assert!(!in_a_tier_file(&snapshot, ip));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_review_queue_entry_that_is_not_approved_publishes_no_volume_listing(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.123".parse().unwrap();
+
+    // Eligible, offered in the review queue, and flooding. The volume statement accepts a
+    // review-queue approval in place of a volume one, so every other state of that row must
+    // leave the address unpublished.
+    append_event(
+        &pool,
+        ev(
+            ip,
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            now,
+        ),
+    )
+    .await
+    .unwrap();
+    append_event(
+        &pool,
+        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+    )
+    .await
+    .unwrap();
+    let queue = ReviewQueue::new();
+    assert_eq!(queue.populate(&pool).await.unwrap(), 1);
+    seed_flood(&pool, ip, now).await;
+
+    let config = config_with_windows(false);
+    assert_eq!(
+        window_entries(&build(&pool, &config).await, ip),
+        [0, 0],
+        "pending"
+    );
+    queue.reject(&pool, ip, None).await.unwrap();
+    assert_eq!(
+        window_entries(&build(&pool, &config).await, ip),
+        [0, 0],
+        "rejected"
+    );
+    queue.snooze(&pool, ip, None).await.unwrap();
+    assert_eq!(
+        window_entries(&build(&pool, &config).await, ip),
+        [0, 0],
+        "snoozed"
+    );
+
+    queue.approve(&pool, ip, None).await.unwrap();
+    assert_eq!(
+        window_entries(&build(&pool, &config).await, ip),
+        [1, 1],
+        "approved: the same setup is published once the operator says so"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_address_that_is_a_merit_and_a_volume_candidate_is_published_once(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.121".parse().unwrap();
+
+    // Approved on its score and still tiered, and flooding as well. Both statements select it.
+    seed_qualifying(&pool, ip, SignalType::HoneypotMalwareUpload, now).await;
+    seed_flood(&pool, ip, now).await;
+    let score = read_score(&pool, ip).await.unwrap().unwrap();
+    assert!(
+        score.eligible && score.tier.is_some() && score.established_event_count >= 1000,
+        "precondition: a merit candidate that also meets the volume condition"
+    );
+    // A volume approval on top, so both of the volume statement's approval legs match it too.
+    sqlx::query(
+        "INSERT INTO volume_review (source_ip, state, established_events_at_surface, decided_at) \
+         VALUES ($1::inet, 'approved', 1000, now())",
+    )
+    .bind(ip.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let snapshot = build(&pool, &config_with_windows(false)).await;
+
+    assert_eq!(
+        window_entries(&snapshot, ip),
+        [1, 1],
+        "one entry per window, not a merit entry and a volume entry"
+    );
+    let entry = snapshot.windows[0]
+        .entries
+        .iter()
+        .find(|e| e.source_ip == ip)
+        .unwrap();
+    assert!(
+        entry.tier.is_some(),
+        "the entry kept is the merit candidate, which carries the tier"
+    );
+    assert!(in_a_tier_file(&snapshot, ip));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_delisted_address_is_not_published_on_volume_even_with_an_approved_row(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.122".parse().unwrap();
+    seed_flood(&pool, ip, now).await;
+    let queue = VolumeQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue.approve(&pool, ip, None).await.unwrap();
+
+    let config = config_with_windows(false);
+    let baseline = build(&pool, &config).await;
+    assert_eq!(
+        window_entries(&baseline, ip),
+        [1, 1],
+        "negative control failed: the approved candidate is published before the delist"
+    );
+
+    // Only the latch is set, and the approved row is left in place: the console's delist removes
+    // the row as well, so this is the state the builder's own check has to cover (a row approved
+    // by a request that raced the delist, or restored from a dump).
+    sqlx::query("UPDATE ip_score SET delisted = TRUE WHERE source_ip = $1::inet")
+        .bind(ip.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let snapshot = build(&pool, &config).await;
+    assert_eq!(window_entries(&snapshot, ip), [0, 0]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn automatic_volume_publication_is_an_opt_in_that_needs_no_decision(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let flood: IpAddr = "45.10.30.130".parse().unwrap();
+    let eligible_flood: IpAddr = "45.10.30.131".parse().unwrap();
+
+    seed_flood(&pool, flood, now).await;
+    // Eligible (an authenticated session and a second event) and flooding, but never approved.
+    append_event(
+        &pool,
+        ev(
+            eligible_flood,
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            now,
+        ),
+    )
+    .await
+    .unwrap();
+    seed_flood(&pool, eligible_flood, now).await;
+    let score = read_score(&pool, eligible_flood).await.unwrap().unwrap();
+    assert!(score.eligible && score.established_event_count >= 1000);
+    let decisions: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM volume_review) + (SELECT count(*) FROM review_queue)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(decisions, 0, "precondition: no operator decision exists");
+
+    // The default first: with no decision, nothing is published.
+    let gated = build(&pool, &config_with_windows(false)).await;
+    assert_eq!(window_entries(&gated, flood), [0, 0]);
+    assert_eq!(window_entries(&gated, eligible_flood), [0, 0]);
+
+    let automatic = build(&pool, &config_with_windows(true)).await;
+    assert_eq!(
+        window_entries(&automatic, flood),
+        [1, 1],
+        "with the opt-in a volume-listed address is published with no row in either queue"
+    );
+    assert!(!in_a_tier_file(&automatic, flood));
+    assert_eq!(
+        window_entries(&automatic, eligible_flood),
+        [0, 0],
+        "an eligible address is a merit candidate and waits for approval, opt-in or not"
+    );
+    assert!(!in_a_tier_file(&automatic, eligible_flood));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_stored_last_seen_in_the_future_does_not_extend_validity_past_now_plus_the_window(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.140".parse().unwrap();
+    seed_flood(&pool, ip, now).await;
+    let queue = VolumeQueue::new();
+    queue.populate(&pool).await.unwrap();
+    queue.approve(&pool, ip, None).await.unwrap();
+    // What one log line dated ahead of the clock leaves behind: the projection takes `last_seen`
+    // from the event's own timestamp.
+    sqlx::query(
+        "UPDATE ip_score SET last_seen = now() + interval '300 days' WHERE source_ip = $1::inet",
+    )
+    .bind(ip.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let snapshot = build(&pool, &config_with_windows(false)).await;
+    let after_build = Utc::now();
+
+    for window in &snapshot.windows {
+        let entry = window
+            .entries
+            .iter()
+            .find(|e| e.source_ip == ip)
+            .unwrap_or_else(|| panic!("{}: the address is still published", window.label));
+        assert!(
+            entry.valid_until <= after_build + window.retention,
+            "{}: valid until {}, more than the window past now",
+            window.label,
+            entry.valid_until
+        );
+        assert!(entry.last_seen <= after_build, "{}", window.label);
+        assert_eq!(entry.valid_until - entry.valid_from, window.retention);
+    }
 }

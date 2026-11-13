@@ -1,0 +1,26 @@
+{% import "macros.html" as m %}
+{#- One decided volume candidate in the volume tab's second list. "Return to pending" is the only
+    control: it undoes either decision, and the candidate is then decided again from the list
+    above. Once reopened the row no longer belongs in this list, so the reopen answers with the
+    acknowledgement below instead of a row in these columns. -#}
+{% if row.is_pending %}
+<tr id="volume-decided-{{ row.ip }}">
+  <td colspan="6" class="dim stack-full"><span class="mono">{{ row.ip }}</span> is <span class="state-pill state-pending">pending</span> again and is not published &middot; <a href="/queue?tab=volume">reload the volume tab</a> to decide it</td>
+</tr>
+{% else %}
+<tr id="volume-decided-{{ row.ip }}">
+  <td class="ip stack-lead">{{ m.ip_evidence_link(row.ip) }}</td>
+  <td><span class="state-pill state-{{ row.state }}">{{ row.state }}</span></td>
+  <td class="count" data-label="TCP events when offered">{{ row.established_at_surface | count }}</td>
+  <td class="seen stack-end" data-label="Decided">{{ row.decided_at }}</td>
+  <td class="dim stack-full">{{ row.notes }}</td>
+  <td class="stack-full">
+    <div class="actions">
+      <input type="hidden" name="csrf_token" value="{{ row.csrf_token }}">
+      <div class="buttons">
+        <button type="button" class="btn-snooze" hx-post="/volume/{{ row.ip }}/reopen" hx-include="closest tr" hx-target="closest tr" hx-swap="outerHTML">Return to pending</button>
+      </div>
+    </div>
+  </td>
+</tr>
+{% endif %}

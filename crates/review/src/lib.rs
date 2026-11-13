@@ -18,6 +18,7 @@ pub mod submit;
 pub mod upload_filter;
 pub mod vendor;
 pub mod virustotal;
+pub mod volume;
 
 pub use cli::{Cli, CliError, Command};
 pub use gatekeeper::{CooldownBook, GateReason, GateResult, VendorConfig, check, check_with};
@@ -27,6 +28,7 @@ pub use vendor::{
     AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter, VendorError, VendorReport,
     VendorResponse, build_categories, build_dshield_categories, build_otx_categories,
 };
+pub use volume::{VolumeEntry, VolumeQueue};
 
 /// This crate's own migrator, tracked under a table name distinct from
 /// core-scoring's default `_sqlx_migrations`.

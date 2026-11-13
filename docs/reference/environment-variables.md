@@ -226,6 +226,7 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 | `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`crates/propolis/src/config.rs#parse_ip_list`); invalid → abort |
 | `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`crates/propolis/src/config.rs#parse_asn_list`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
 | `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`) | comma-sep `<count>h`/`<count>d` (`crates/propolis/src/config.rs#parse_window_list`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** `deploy/blocklist-sync.sh` publishes only labels of one to five digits with no leading zero (`24h`, not `024h` or `+24h`) and at most 16 windows, and refuses the whole build otherwise. |
+| `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag. Default: a volume-listed address (1000 or more established TCP events) is published in the retention feeds only after an operator approves it on the console's volume tab or with `review volume approve`. `true` publishes every volume-listed address with **no human decision**: the count comes from what sensor log lines declare, so one forged line can list any address. Only the word `true` enables it; `1`, `yes` or a typo leaves approval required. Copied to `crates/feed/src/builder.rs#FeedConfig`; see [volume candidates](scoring-and-feed.md#candidate-sources). |
 
 ### Console
 
@@ -497,7 +498,9 @@ defaults and the same strict-parse/fail-closed rules unless noted.
   `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS`, `PROPOLIS_FEED_STANDARD_TTL_HOURS`,
   `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_DELIST`,
   `PROPOLIS_FEED_ASN_ALLOWLIST`, `PROPOLIS_GEOIP_DIR`. **Does not read
-  `PROPOLIS_FEED_WINDOWS`** (no `all-{label}` retention feeds in standalone).
+  `PROPOLIS_FEED_WINDOWS`** (no `all-{label}` retention feeds in standalone), nor
+  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH`: a volume listing is published only in a retention
+  feed, so the standalone binary publishes none.
 - **`intake`** (`crates/intake/src/main.rs#load_config_from_env`): `DATABASE_URL` (req),
   `PROPOLIS_CURSOR_DIR`, `PROPOLIS_POLL_INTERVAL_MS`, `PROPOLIS_SENSOR_LOGS`
   (req, empty→abort).

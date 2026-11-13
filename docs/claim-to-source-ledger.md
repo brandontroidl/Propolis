@@ -262,7 +262,7 @@ Owner: [reference/scoring-and-feed.md](reference/scoring-and-feed.md),
 | Claim | Source | Status |
 |---|---|---|
 | Feed membership is decided by RETENTION windows against stored (last-event) fields, not a live-decayed score, so tier cannot slide between builds. | `crates/feed/src/builder.rs:110-128,135-153` | IMPLEMENTED |
-| Merit-tiered entries require operator approval (`q.state='approved'`); volume entries auto-publish into retention windows only, never the tier files. | `builder.rs:174-176,226-236,316-336` | IMPLEMENTED |
+| Merit-tiered entries require operator approval (`q.state='approved'`); volume entries require it too (an `approved` row in `volume_review` or `review_queue`) unless `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, and land in retention windows only, never the tier files. Row revised after the 2026-08-26 snapshot, when volume entries were published with no approval; it cites symbols, not that snapshot's lines. | `builder.rs` `merit_candidates_sql`, `volume_candidates_sql`; tests `a_volume_candidate_is_published_only_once_an_operator_approves_it`, `a_volume_flood_lands_in_retention_but_not_the_tier_files` | IMPLEMENTED |
 | Exported timestamps coarsened to the hour boundary (anti-deanonymization). | `builder.rs:372-384`; `export/mod.rs:39-41` | IMPLEMENTED |
 | One `is_reserved_ip` list guards BOTH outbound paths (feed publish + vendor submit); previously feed-only. | `crates/core-scoring/src/net.rs:1-9,57-59`; `crates/feed/src/exclusion.rs:24-27` | IMPLEMENTED |
 | ASN suppression is opt-in and empty by default; an empty allowlist short-circuits before any DB lookup; ASN ownership is RIR-registered, not per-IP spoofable. | `crates/core-scoring/src/allowlist.rs:10-14,217-222`; `crates/propolis/src/config.rs:498` | IMPLEMENTED |

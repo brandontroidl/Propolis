@@ -135,6 +135,16 @@ becoming script execution.
   across days, exact timestamps in the `title`), and below 640 px each entry stacks as a card,
   as every table of addresses does (all rules in `console.css`, no inline style). Group counts are rendered with the page and are not updated when a member is decided in
   place; the approve confirmation lists the live pending set.
+- **Volume tab** - the queue page's fifth tab lists the other queue, `volume_review`: the
+  addresses the connection-volume rule would list in the retention feeds, which are published
+  only once approved here (`routes/queue.rs#volume_view`). The pending list shows each address
+  with its established TCP events now and when it was offered, its total events, its last-seen
+  time as an exact timestamp, and the pending tab's context line (sensors reached, top signal
+  types); under it are the latest 100 decided candidates with the one control that undoes a
+  decision. Its routes are `/volume/{ip}/approve|reject|reopen`, apart from `/queue/{ip}/...`,
+  and its approve button is labelled for what it does: it publishes the address in the retention
+  feeds and is not reported to abuse vendors. The nav badge counts both queues, and the page
+  heading says how the total splits.
 - **HTMX fragment model** - several routes return partials rather than full pages:
   the dashboard and IP-detail charts, the IP-detail event timeline (keyset
   pagination), the queue-row partials after an action, and search "load more". A

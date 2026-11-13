@@ -66,7 +66,9 @@
 #     (default true), PROPOLIS_FEED_OUTPUT_DIR (default /var/lib/propolis/feed/current),
 #     PROPOLIS_FEED_BUILD_INTERVAL_SECS (default 900), PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS
 #     (default 24), PROPOLIS_FEED_STANDARD_TTL_HOURS (default 48), PROPOLIS_FEED_WINDOWS
-#     (default 24h,7d,30d,60d,90d - retention feeds published as all-{label}.*), PROPOLIS_FEED_ALLOWLIST
+#     (default 24h,7d,30d,60d,90d - retention feeds published as all-{label}.*),
+#     PROPOLIS_FEED_VOLUME_AUTO_PUBLISH (default false - true publishes volume-listed addresses
+#     in the retention feeds without the operator approval they otherwise wait for), PROPOLIS_FEED_ALLOWLIST
 #     (optional CIDR list), PROPOLIS_FEED_ALLOWLIST_FILE (optional path to a CIDR file, one per
 #     line, readable by the propolis user, not under /home; a bad line stops startup),
 #     PROPOLIS_FEED_DELIST (optional IP list), PROPOLIS_CONSOLE_BIND

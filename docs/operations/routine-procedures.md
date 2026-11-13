@@ -21,10 +21,16 @@ the score and categories at surface time; the review-queue table is owned by
 [reference/database.md](../reference/database.md), the eligibility and tier gates
 by [reference/scoring-and-feed.md](../reference/scoring-and-feed.md).
 
-Publication of any IP requires **all** of: an authenticated console session, the
-IP seen more than once, above the score floor, and an explicit human approval.
-There is no auto-publish path. Nothing leaves the node to a public feed or a
-vendor without an operator decision.
+Publication of any IP requires an authenticated console session and an explicit
+human approval. A score-based entry additionally needs the IP seen more than once
+and above the score floor. A volume candidate (a thousand or more established TCP
+events) is approved separately, on the queue page's volume tab; see
+[volume candidates](#volume-candidates) below. By default there is no auto-publish
+path: nothing leaves the node to a public feed or a vendor without an operator
+decision. The one exception is an opt-in you have to set yourself,
+`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which publishes volume candidates in the
+retention feeds with no decision; leave it unset unless you accept listing addresses
+nobody looked at.
 
 Work the queue from the console:
 
@@ -61,6 +67,41 @@ plus **Return to pending** for an entry you want back in the working queue.
 From the CLI: `review snoozed` lists what is waiting, and
 `review approve|reject|unsnooze <ip>` acts on it. `unsnooze` also undoes an
 approval or rejection made in error; it clears `decided_at` and keeps the notes.
+
+### Volume candidates
+
+An address that reaches a thousand established TCP events, and was seen in the last
+day, is offered on the queue page's **Volume** tab as a pending volume candidate. It
+is not published while it waits. The nav badge counts these together with pending
+review entries, and the page heading says how the total splits.
+
+1. Open the Volume tab. Each row shows the established TCP events now and when the
+   address was offered, its total events, its last-seen time, and the sensors and
+   signal types behind the count.
+2. Check that the count is believable. It is taken from what the sensors' logs
+   declared, and a single summary line can stand for a thousand events: an address
+   listed by one sensor, in one burst, with a last-seen time ahead of the clock,
+   deserves a look at its evidence drawer before a decision.
+3. **Approve for retention feeds** publishes this address in the retention feeds
+   (`all-24h` to `all-90d`) from the next build; it is not reported to abuse vendors.
+   **Reject** keeps it out, and the scan does not offer it again.
+
+Decided candidates are listed under the pending ones. **Return to pending** undoes
+either decision; an approved address then leaves the retention feeds at the next
+build. An address you already approved in the review queue is not offered here: that
+approval covers its volume listing as well.
+
+From the CLI: `review volume list` and `review volume decided` show the two lists,
+and `review volume approve|reject|reopen <ip>` acts on one. Rules and thresholds are
+owned by [reference/scoring-and-feed.md](../reference/scoring-and-feed.md#volume-review).
+
+If you set `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, the tab still lists candidates but
+its decisions no longer decide anything: every candidate is published, a rejected one
+included, and delisting is the only way to take an address out.
+
+After an upgrade to the first version with this queue, no volume listing is published
+until you approve it: addresses that were listed automatically drop out of the
+retention feeds at the next build and those still flooding appear on the Volume tab.
 
 ### Delisting and relisting
 

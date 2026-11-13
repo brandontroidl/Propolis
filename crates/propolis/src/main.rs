@@ -36,6 +36,7 @@ use review::fetcher::{self, FetchDeps, guard::SystemResolver, http::FetchLimits}
 use review::queue::ReviewQueue;
 use review::submit::SubmissionRunner;
 use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter};
+use review::volume::VolumeQueue;
 
 /// Path the malware fetcher writes captured samples to - the same `fetched` bucket
 /// `review::spool::all_body_dirs` hands the VT scan and the console samples view (sample retention
@@ -291,10 +292,12 @@ async fn run_intake_sensor(
     }
 }
 
-/// Queue-maintenance loop: populate newly-recommended IPs, withdraw lapsed entries. Mirrors
-/// `review/src/main.rs`'s `run_queue_scan_loop`.
+/// Queue-maintenance loop: populate newly-recommended IPs, withdraw lapsed entries, and do the
+/// same for the volume candidates that wait in their own queue. Mirrors `review/src/main.rs`'s
+/// `run_queue_scan_loop`.
 async fn run_queue_scan_loop(
     queue: ReviewQueue,
+    volume: VolumeQueue,
     pool: PgPool,
     interval: Duration,
     cancel: CancellationToken,
@@ -311,6 +314,14 @@ async fn run_queue_scan_loop(
         }
         if let Err(e) = queue.resolve_reserved(&pool).await {
             tracing::error!(error = %e, "review: queue reserved-address resolution failed");
+        }
+        // After the review queue's own scan, so an address approved there since the last pass is
+        // already Approved when the volume scan decides whether it needs a second decision.
+        if let Err(e) = volume.populate(&pool).await {
+            tracing::error!(error = %e, "review: volume queue populate failed");
+        }
+        if let Err(e) = volume.withdraw(&pool).await {
+            tracing::error!(error = %e, "review: volume queue withdraw failed");
         }
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
@@ -1326,13 +1337,15 @@ async fn main() {
                     let (adapters, gate_configs) = build_adapters(&vendors, client);
                     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
                         .with_allowlist(allowlist.clone());
-                    let queue = ReviewQueue::new().with_allowlist(allowlist);
+                    let queue = ReviewQueue::new().with_allowlist(allowlist.clone());
+                    let volume = VolumeQueue::new().with_allowlist(allowlist);
 
                     let queue_token = token.child_token();
                     let submit_token = token.child_token();
 
                     let queue_handle = tokio::spawn(run_queue_scan_loop(
                         queue,
+                        volume,
                         pool,
                         queue_interval,
                         queue_token,
@@ -1376,7 +1389,24 @@ async fn main() {
                     )
                 })
                 .collect(),
+            volume_auto_publish: config.feed_volume_auto_publish,
         };
+        if feed_config.volume_auto_publish {
+            // Said once at startup and at warn, because it is the one setting that lets an
+            // address reach a public feed with no operator decision.
+            tracing::warn!(
+                "feed: PROPOLIS_FEED_VOLUME_AUTO_PUBLISH is on; volume-listed addresses are \
+                 published in the retention feeds without operator approval"
+            );
+        } else if !config.review_enabled && !feed_config.windows.is_empty() {
+            // Approval is the default, and the scan that offers volume candidates for approval
+            // runs with the review subsystem. With that off nothing new is ever offered, so
+            // nothing new is ever published on volume: say so instead of leaving it to be found.
+            tracing::warn!(
+                "feed: the review subsystem is disabled, so volume candidates are not offered for \
+                 approval; the retention feeds publish only addresses that are already approved"
+            );
+        }
         let output_dir = config.feed_output_dir.clone();
         let build_interval = config.feed_build_interval;
 

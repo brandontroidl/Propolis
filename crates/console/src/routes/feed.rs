@@ -240,6 +240,7 @@ async fn feed_page(
         uptime,
         version,
         mut degraded,
+        ..
     } = base_context(&state.db, state.startup_time, state.version).await;
 
     // Only the entries tab reads the export files back; the status tab needs only the manifest.

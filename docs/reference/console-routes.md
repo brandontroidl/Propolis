@@ -64,11 +64,14 @@ login rate limiting) are owned by [authentication and authorization](../security
 |---|---|---|---|---|
 | GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts; Recent activity reads the newest 1,000 events and folds runs from one source, sensor and signal into 20 rows; the charts and the sensor split count from the [hourly roll-up](database.md#event-rollups) | `crates/console/src/routes/dashboard.rs#dashboard`, `crates/console/src/routes/dashboard.rs#fold_recent` |
 | GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed -> `24h`; every range but `1h` counts from the hourly roll-up, except in a time zone whose offset is not a whole number of hours, where it reads the ledger | `crates/console/src/routes/dashboard.rs#dashboard_chart_fragment` |
-| GET | `/queue` | `queue_page` | review queue; pending entries with two or more listed members in one campaign are one expandable group row under that campaign's "Approve all N" link (the existing two-step confirmation), everything else is a row; each row carries a context line built from at most 5,000 of its events; `?sort=` is score, event_count, first_seen or last_seen, applied to a group through its top member | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#group_pending`, `crates/console/src/routes/queue.rs#group_home`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
+| GET | `/queue` | `queue_page` | review queue; pending entries with two or more listed members in one campaign are one expandable group row under that campaign's "Approve all N" link (the existing two-step confirmation), everything else is a row; each row carries a context line built from at most 5,000 of its events; `?sort=` is score, event_count, first_seen or last_seen, applied to a group through its top member; `?tab=pending\|approved\|rejected\|snoozed\|volume`, where `volume` lists the pending [volume candidates](#volume-candidate-actions) (established TCP events now and when offered, all events, last seen, the same context line) and under them the latest 100 decided ones; the heading says how the pending count splits between the pending tab and the volume tab | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#group_pending`, `crates/console/src/routes/queue.rs#group_home`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/queue.rs#volume_view`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `crates/console/src/routes/queue.rs#approve` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `crates/console/src/routes/queue.rs#reject` |
 | POST | `/queue/{ip}/snooze` | `snooze` | CSRF required | `crates/console/src/routes/queue.rs#snooze` |
 | POST | `/queue/{ip}/unsnooze` | `unsnooze` | CSRF required | `routes/queue.rs` |
+| POST | `/volume/{ip}/approve` | `volume_approve` | CSRF required; publishes a volume candidate in the retention feeds, reports nothing | `crates/console/src/routes/queue.rs#volume_approve` |
+| POST | `/volume/{ip}/reject` | `volume_reject` | CSRF required | `crates/console/src/routes/queue.rs#volume_reject` |
+| POST | `/volume/{ip}/reopen` | `volume_reopen` | CSRF required; returns a decided volume candidate to pending | `crates/console/src/routes/queue.rs#volume_reopen` |
 | POST | `/ip/{ip}/delist` | `delist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/relist` | `relist` | CSRF required | `routes/queue.rs` |
 | POST | `/ip/{ip}/delete` | `delete_ip` | CSRF required | `routes/queue.rs` |
@@ -121,15 +124,15 @@ All under the protected group (`crates/console/src/routes/queue.rs#router`). Eac
 with a required `csrf_token` field and optional `notes` (`crates/console/src/routes/queue.rs#ActionForm`). CSRF is
 validated first; on failure the handler returns **`403 FORBIDDEN`** "invalid or missing
 csrf token" (`crates/console/src/routes/queue.rs#unsnooze` unsnooze, `crates/console/src/routes/queue.rs#act` act, `crates/console/src/routes/queue.rs#delist` delist, `crates/console/src/routes/queue.rs#relist` relist,
-`crates/console/src/routes/queue.rs#delete_ip` delete_ip).
+`crates/console/src/routes/queue.rs#delete_ip` delete_ip, `crates/console/src/routes/queue.rs#volume_act` the three volume actions).
 
 | Action | Method + path | Effect | Response |
 |---|---|---|---|
 | Approve | `POST /queue/{ip}/approve` | `ReviewQueue::approve` | HTMX `queue_row.html` partial |
 | Reject | `POST /queue/{ip}/reject` | `ReviewQueue::reject` | HTMX row partial |
 | Snooze | `POST /queue/{ip}/snooze` | `ReviewQueue::snooze` | HTMX row partial |
-| Delist | `POST /ip/{ip}/delist` | delete `review_queue` row; set `ip_score.delisted=TRUE, eligible=FALSE, recommended_for_vendor=FALSE, recommended_for_blocklist=FALSE` | `303` → `/ip/{ip}` |
-| Delete | `POST /ip/{ip}/delete` | purge `review_queue` + `vendor_submission` + `ip_score` rows | `303` → `/queue` |
+| Delist | `POST /ip/{ip}/delist` | delete `review_queue` and `volume_review` rows; set `ip_score.delisted=TRUE, eligible=FALSE, recommended_for_vendor=FALSE, recommended_for_blocklist=FALSE`; one transaction | `303` → `/ip/{ip}` |
+| Delete | `POST /ip/{ip}/delete` | purge `review_queue` + `volume_review` + `vendor_submission` + `ip_score` rows; one transaction | `303` → `/queue` |
 | Approve a campaign | `POST /campaigns/{id}/approve` | `ReviewQueue::approve` for each confirmed address that is still a pending member | page listing approved and skipped addresses |
 
 The campaign approval is the one bulk decision, and it is two steps by construction:
@@ -149,6 +152,27 @@ render the `queue_row.html` partial (`queue_moved_row.html` when the decision ca
 append-only hash-chained `event` ledger (`crates/console/src/routes/queue.rs#delete_ip`) - the projection can be
 rebuilt from the ledger. Table and column facts are owned by
 [database reference](database.md); scoring flags by [scoring and feed](scoring-and-feed.md).
+
+### Volume candidate actions
+
+A volume candidate is an address with a thousand or more established TCP events
+([rules](scoring-and-feed.md#volume-review)). It is listed on the queue page's `volume` tab
+and decided with its own three routes, on its own table (`volume_review`), because the
+approval is a different act from `POST /queue/{ip}/approve`: it publishes the address in the
+retention feeds and is not reported to abuse vendors. Same session gate, same `ActionForm`,
+same CSRF check (`crates/console/src/routes/queue.rs#volume_act`).
+
+| Action | Method + path | Effect | Response |
+|---|---|---|---|
+| Approve | `POST /volume/{ip}/approve` | `VolumeQueue::approve`: published in the retention feeds from the next build | HTMX `queue_volume_row.html` partial carrying the new state |
+| Reject | `POST /volume/{ip}/reject` | `VolumeQueue::reject`: not published on volume, not offered again | the same partial |
+| Reopen | `POST /volume/{ip}/reopen` | `VolumeQueue::reopen`: back to pending, decision time cleared, note kept | HTMX `queue_volume_decided_row.html` acknowledgement linking back to the tab |
+
+A decision on an address with no `volume_review` row fails (`503`) and changes nothing, so a
+volume route can never approve a review-queue entry. The nav badge and the dashboard's
+"Waiting on you" count pending review entries and pending volume candidates together
+(`crates/console/src/routes/context.rs#base_context`); `/metrics` reports them apart, as
+`propolis_review_queue_pending` and `propolis_volume_review_pending`.
 
 ## Feed downloads
 

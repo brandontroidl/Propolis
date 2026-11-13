@@ -2,7 +2,8 @@
 //! gatekeeper, and vendor submission daemon. Two modes selected by the CLI's
 //! subcommand (`review::cli`):
 //!
-//! - `review daemon` - runs forever: populates/withdraws the review queue on
+//! - `review daemon` - runs forever: populates/withdraws the review queue and
+//!   the volume queue (`review::volume`) on
 //!   `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, and polls
 //!   `SubmissionRunner::run_once` on `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS`,
 //!   each on its own tokio task (mirrors `intake/src/main.rs`'s
@@ -10,9 +11,10 @@
 //!   builds real adapters from FullVendorConfig + one shared reqwest::Client,
 //!   boxes them, and drives run_once() + populate()/withdraw() on a poll
 //!   loop").
-//! - Any other subcommand (`approve`/`reject`/`snooze`/`list`/`history`) -
-//!   runs one operator decision or query against `review_queue`/
-//!   `vendor_submission` via `review::cli::execute` and exits.
+//! - Any other subcommand (`approve`/`reject`/`snooze`/`list`/`history`,
+//!   and `volume` for the volume queue) - runs one operator decision or query
+//!   against `review_queue`/`volume_review`/`vendor_submission` via
+//!   `review::cli::execute` and exits.
 //!
 //! Configuration is environment variables, matching `intake`/
 //! `sensor-catchall`/`sensor-ssh`'s established convention: every value is
@@ -36,6 +38,7 @@ use review::cli::{self, Cli, Command};
 use review::queue::ReviewQueue;
 use review::submit::SubmissionRunner;
 use review::vendor::{AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter};
+use review::volume::VolumeQueue;
 
 const ENV_DATABASE_URL: &str = "DATABASE_URL";
 const ENV_QUEUE_SCAN_INTERVAL_SECS: &str = "PROPOLIS_QUEUE_SCAN_INTERVAL_SECS";
@@ -388,7 +391,12 @@ async fn shutdown_signal() {
 /// database error ... is logged and retried on the next poll cycle"); success
 /// counts are already logged by `ReviewQueue::populate`/`withdraw`
 /// themselves, so this loop only adds the error-path logging they don't do.
-async fn run_queue_scan_loop(queue: ReviewQueue, pool: PgPool, interval: Duration) {
+async fn run_queue_scan_loop(
+    queue: ReviewQueue,
+    volume: VolumeQueue,
+    pool: PgPool,
+    interval: Duration,
+) {
     loop {
         if let Err(e) = queue.populate(&pool).await {
             tracing::error!(error = %e, "review: queue populate failed");
@@ -398,6 +406,14 @@ async fn run_queue_scan_loop(queue: ReviewQueue, pool: PgPool, interval: Duratio
         }
         if let Err(e) = queue.resolve_reserved(&pool).await {
             tracing::error!(error = %e, "review: queue reserved-address resolution failed");
+        }
+        // After the review queue's own scan, so an address approved there since the last pass is
+        // already Approved when the volume scan decides whether it needs a second decision.
+        if let Err(e) = volume.populate(&pool).await {
+            tracing::error!(error = %e, "review: volume queue populate failed");
+        }
+        if let Err(e) = volume.withdraw(&pool).await {
+            tracing::error!(error = %e, "review: volume queue withdraw failed");
         }
         tokio::time::sleep(interval).await;
     }
@@ -457,8 +473,14 @@ async fn run_daemon(pool: PgPool, config: Config) {
     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
         .with_allowlist(config.allowlist.clone());
     let queue = ReviewQueue::new().with_allowlist(config.allowlist.clone());
+    let volume = VolumeQueue::new().with_allowlist(config.allowlist.clone());
 
-    let queue_handle = tokio::spawn(run_queue_scan_loop(queue, pool, config.queue_scan_interval));
+    let queue_handle = tokio::spawn(run_queue_scan_loop(
+        queue,
+        volume,
+        pool,
+        config.queue_scan_interval,
+    ));
     let submit_handle = tokio::spawn(run_submission_loop(runner, config.submit_poll_interval));
 
     shutdown_signal().await;

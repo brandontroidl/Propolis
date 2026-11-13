@@ -2,13 +2,20 @@
 //! `ip_score`, gated on operator approval in `review_queue`, re-derives their gate flags
 //! decayed to now, groups by tier, applies exclusions, and coarsens every timestamp to an
 //! hour boundary. See `internal/design/05-blocklist-feed.md` ("The feed builder").
+//!
+//! Volume-listed addresses (a thousand or more established TCP events) are a second source,
+//! published only in the retention windows. They too wait for an operator: the default build
+//! takes one only when it is approved in `volume_review` (or already approved in
+//! `review_queue`). [`FeedConfig::volume_auto_publish`] is the opt-in that publishes them with
+//! no decision.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use sqlx::{PgPool, Row};
 
-use core_scoring::{FeedTier, RepoError, off_worker};
+use core_scoring::{FeedTier, RepoError, VOLUME_LIST_THRESHOLD, off_worker};
 
 use crate::exclusion::ExclusionEngine;
 
@@ -33,7 +40,7 @@ pub enum FeedError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedEntry {
     pub source_ip: IpAddr,
-    /// `None` for a volume-listed flood published only in the retention windows; `Some` for a
+    /// `None` for a volume-listed address published only in the retention windows; `Some` for a
     /// score-tiered entry. Not serialized into the published files (each file's tier is its own
     /// name/label); used to route entries between the tier files and to re-validate.
     pub tier: Option<FeedTier>,
@@ -93,16 +100,23 @@ pub struct FeedConfig {
     /// Each holds every approved entry whose `last_seen` falls inside the window, regardless of
     /// tier, so the windows nest (30d contains everything in 7d). Empty disables them.
     pub windows: Vec<(String, Duration)>,
+    /// Publish volume-listed addresses in the retention feeds with no operator decision
+    /// (`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH`). Off by default: a volume listing rests on a count
+    /// of events that a sensor's own log line declares, so the default build publishes one only
+    /// after an operator approved it. See [`volume_candidates_sql`].
+    pub volume_auto_publish: bool,
 }
 
 impl Default for FeedConfig {
     /// The spec's ratified defaults: Aggressive 24h, Standard 48h. Retention windows default to
-    /// empty so an unconfigured deployment publishes exactly the two files it always has.
+    /// empty so an unconfigured deployment publishes exactly the two files it always has, and
+    /// volume listings default to waiting for approval.
     fn default() -> Self {
         Self {
             aggressive_ttl: Duration::hours(24),
             standard_ttl: Duration::hours(48),
             windows: Vec::new(),
+            volume_auto_publish: false,
         }
     }
 }
@@ -116,7 +130,7 @@ impl Default for FeedConfig {
 /// observation time means an IP enters one file and stays there for its window.
 struct Candidate {
     ip: IpAddr,
-    /// `None` for a volume-listed flood (no score-tier). Such a candidate is excluded from the
+    /// `None` for a volume-listed address (no score-tier). Such a candidate is excluded from the
     /// aggressive/standard tier files (which filter on `Some(tier)`) and appears only in the
     /// retention windows.
     tier: Option<FeedTier>,
@@ -137,7 +151,9 @@ impl FeedBuilder {
     ///
     /// 1. Selects approved candidates on the STORED `recommended_for_blocklist`/`eligible` flags,
     ///    reading `tier`, `first_seen`, `last_seen` and the evidence counts AS STORED - i.e. as of
-    ///    each IP's last event.
+    ///    each IP's last event. With retention windows configured it then adds the volume-listed
+    ///    addresses, approved ones only unless `config.volume_auto_publish` is set
+    ///    ([`volume_candidates_sql`]).
     /// 2. Applies `exclusions.is_excluded` (reserved ranges, operator allowlist, delist).
     /// 3. Keeps an entry while `last_seen` falls inside the relevant window: the tier's TTL for
     ///    `aggressive`/`standard`, or the window's own duration for each configured retention
@@ -220,24 +236,37 @@ impl FeedBuilder {
             Ok(())
         })?;
 
-        // Volume-listed floods: recommended for the blocklist on connection volume alone (no
-        // confirmed-real latch, so eligible = false, so tier = NULL and no operator approval). They
-        // are auto-published into the RETENTION windows only - never the score-tiered files - so a
-        // hyperactive flooder the dedup would otherwise erase still gets blocked. `eligible = false`
-        // AND `recommended_for_blocklist = true` uniquely identifies them (see core-scoring's
-        // derive_projection). Exclusions still apply, the same as for merit candidates.
+        // Volume-listed addresses: listed on connection volume alone (a thousand or more
+        // established TCP events), with no score tier. They go into the RETENTION windows only -
+        // never the score-tiered files - so a hyperactive flooder the dedup would otherwise erase
+        // can still be blocked. Which of them are read depends on `volume_auto_publish`: by
+        // default only those an operator approved, see `volume_candidates_sql`. Exclusions still
+        // apply, the same as for merit candidates.
         //
         // Only a retention window can publish one, so with none configured there is nothing to
         // read, and with some the longest bounds the candidates as above.
         let volume_rows = match config.windows.iter().map(|(_, retention)| *retention).max() {
             None => Vec::new(),
             Some(longest) => {
-                sqlx::query(sqlx::AssertSqlSafe(volume_candidates_sql()))
-                    .bind(Utc::now() - longest - Duration::minutes(1))
-                    .fetch_all(pool)
-                    .await?
+                let sql = volume_candidates_sql(config.volume_auto_publish);
+                let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(Utc::now() - longest - Duration::minutes(1));
+                // Only the approval-gated statement takes the threshold; the automatic one reads
+                // the stored flag the scoring engine derived from the same constant.
+                let query = if config.volume_auto_publish {
+                    query
+                } else {
+                    query.bind(i64::from(VOLUME_LIST_THRESHOLD))
+                };
+                query.fetch_all(pool).await?
             }
         };
+
+        // An approved address can meet the volume condition and be a merit candidate at once
+        // (the approval-gated statement does not require `eligible = false`). The merit candidate
+        // is already in every window its last event falls inside, tier and all, so its volume
+        // row is dropped rather than published as a second entry for the same address.
+        let merit_ips: HashSet<IpAddr> = candidates.iter().map(|c| c.ip).collect();
 
         off_worker(|| -> Result<(), FeedError> {
             for row in volume_rows {
@@ -253,6 +282,9 @@ impl FeedBuilder {
                     }
                 };
                 if exclusions.is_excluded(ip) {
+                    continue;
+                }
+                if merit_ips.contains(&ip) {
                     continue;
                 }
                 candidates.push(Candidate {
@@ -333,14 +365,39 @@ pub fn merit_candidates_sql() -> String {
     )
 }
 
-/// The volume-listed floods. `$1` is the oldest `last_seen` any retention window can still
-/// publish.
-pub fn volume_candidates_sql() -> String {
+/// The volume-listed addresses a retention window may publish. `$1` is the oldest `last_seen`
+/// any retention window can still publish.
+///
+/// By default (`auto_publish` false) an address is read only when an operator approved it: it is
+/// not delisted, its `established_event_count` is at least `$2` (bind
+/// `core_scoring::VOLUME_LIST_THRESHOLD`), and it has an Approved `volume_review` row or an
+/// Approved `review_queue` row. An address already approved on its score needs no second
+/// decision, which is also why this form does not require `eligible = false`: an approved volume
+/// listing must not vanish when the address later becomes eligible as well. It reads the count
+/// and the delist latch themselves rather than the stored `recommended_for_blocklist` flag, so
+/// the condition is the volume rule's and not whatever else set that flag.
+///
+/// With `auto_publish` the statement asks for no decision: it reads every address the stored
+/// projection lists on volume (`recommended_for_blocklist = true AND eligible = false`) and
+/// takes `$1` only. That is the opt-in `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` sets.
+pub fn volume_candidates_sql(auto_publish: bool) -> String {
+    if auto_publish {
+        return format!(
+            "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
+                    s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
+             FROM ip_score s \
+             WHERE s.recommended_for_blocklist = true AND s.eligible = false AND s.last_seen > $1"
+        );
+    }
     format!(
         "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
                 s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
          FROM ip_score s \
-         WHERE s.recommended_for_blocklist = true AND s.eligible = false AND s.last_seen > $1"
+         WHERE NOT s.delisted AND s.established_event_count >= $2 AND s.last_seen > $1 \
+           AND (EXISTS (SELECT 1 FROM volume_review v \
+                        WHERE v.source_ip = s.source_ip AND v.state = 'approved') \
+                OR EXISTS (SELECT 1 FROM review_queue q \
+                           WHERE q.source_ip = s.source_ip AND q.state = 'approved'))"
     )
 }
 
@@ -351,6 +408,12 @@ pub fn volume_candidates_sql() -> String {
 /// mean what it says: an entry is carried for a fixed period after the activity that justified it,
 /// and leaves when that period lapses. Anchoring on build time instead would restart every
 /// entry's clock on each build, so nothing would ever expire.
+///
+/// A stored `last_seen` later than `now` is read as `now`. `last_seen` is the timestamp the
+/// address's last event carried, which is whatever its log line said; taken as stored, a line
+/// dated a year ahead would keep the entry in every window for that year plus the window, and
+/// publish a `valid_until` to match. Read as `now`, the entry can never be valid past
+/// `now + ttl`.
 fn materialize(
     candidates: &[Candidate],
     now: DateTime<Utc>,
@@ -359,9 +422,11 @@ fn materialize(
 ) -> Vec<FeedEntry> {
     let mut out: Vec<FeedEntry> = candidates
         .iter()
-        .filter(|c| include(c) && now - c.last_seen < ttl)
-        .map(|c| {
-            let valid_from = coarsen_to_hour(c.last_seen);
+        .filter(|c| include(c))
+        .map(|c| (c, c.last_seen.min(now)))
+        .filter(|(_, last_seen)| now - *last_seen < ttl)
+        .map(|(c, last_seen)| {
+            let valid_from = coarsen_to_hour(last_seen);
             FeedEntry {
                 source_ip: c.ip,
                 tier: c.tier,
@@ -426,6 +491,15 @@ mod tests {
         assert_eq!(cfg.standard_ttl, Duration::hours(48));
     }
 
+    #[test]
+    fn feed_config_default_does_not_publish_volume_listings_without_approval() {
+        // Automatic publication is an opt-in. A config built with `..FeedConfig::default()` (the
+        // standalone binary, every test) must get the approval-gated statement.
+        assert!(!FeedConfig::default().volume_auto_publish);
+        assert!(volume_candidates_sql(false).contains("v.state = 'approved'"));
+        assert!(!volume_candidates_sql(true).contains("volume_review"));
+    }
+
     /// A candidate last seen `hours_ago`, with a deliberately non-default value in every field so
     /// a carry-forward that drops one is visible rather than passing on a matching default.
     fn candidate(last_octet: u8, tier: FeedTier, hours_ago: i64, now: DateTime<Utc>) -> Candidate {
@@ -477,6 +551,39 @@ mod tests {
             entry.valid_until - now,
             Duration::hours(3) + Duration::minutes(30)
         );
+    }
+
+    #[test]
+    fn a_last_seen_in_the_future_is_read_as_now_so_validity_never_outlasts_the_ttl() {
+        // `last_seen` is the timestamp the address's last log line carried. Taken as stored, a
+        // line dated a year ahead passes `now - last_seen < ttl` for that whole year and is
+        // published as valid until a year and a day from now.
+        let now = now_fixed();
+        let mut ahead = candidate(1, FeedTier::Aggressive, 0, now);
+        ahead.last_seen = now + Duration::days(365);
+        let on_time = candidate(2, FeedTier::Aggressive, 0, now);
+
+        let out = materialize(&[ahead, on_time], now, Duration::hours(24), |_| true);
+
+        assert_eq!(out.len(), 2, "a future last_seen is clamped, not dropped");
+        for entry in &out {
+            assert_eq!(entry.last_seen, coarsen_to_hour(now), "{}", entry.source_ip);
+            assert_eq!(
+                entry.valid_from,
+                coarsen_to_hour(now),
+                "{}",
+                entry.source_ip
+            );
+            assert!(
+                entry.valid_until <= now + Duration::hours(24),
+                "{} is published as valid until {}",
+                entry.source_ip,
+                entry.valid_until
+            );
+        }
+        // The two are the same entry apart from the address: the clamp treats the future-dated
+        // one exactly as an address last seen at build time.
+        assert_eq!(out[0].valid_until, out[1].valid_until);
     }
 
     #[test]
@@ -560,9 +667,10 @@ mod tests {
     #[test]
     fn a_volume_flood_lands_in_retention_but_not_the_tier_files() {
         let now = now_fixed();
-        // A volume-listed flood carries no score-tier (None). It must be excluded from the
-        // aggressive/standard files (which filter on Some(tier)) and appear only in the
-        // tier-agnostic retention windows.
+        // A volume-listed flood carries no score-tier (None). Once the build has taken it (by
+        // default only with an operator's approval, see `tests/builder_test.rs`) it must be
+        // excluded from the aggressive/standard files (which filter on Some(tier)) and appear
+        // only in the tier-agnostic retention windows.
         let mut flood = candidate(9, FeedTier::Aggressive, 1, now);
         flood.tier = None;
         let cands = [flood];

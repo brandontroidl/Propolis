@@ -177,8 +177,13 @@ out of the log reaches the threshold as before
 summaries (`overflow_summary: true`) stand for many addresses and count as one event with no
 weight and no confirmed-real latch (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
 Vendor reporting always gates on `recommended_for_vendor`
-(confirmed-real), so a bare flood is blocked locally but never reported upstream
+(confirmed-real), so a bare flood can be listed in the retention feeds, once an operator
+approves it, but is never reported upstream
 (`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
+
+The flag is a recommendation, not a publication. A volume-listed address is published only
+through the [volume candidates](#candidate-sources) path below, which by default needs an
+operator's approval.
 
 ## Feed membership and retention
 
@@ -192,10 +197,46 @@ of the IP's last event), so a tier cannot slide between builds
 - **Tier candidates** (aggressive / standard files) require operator approval:
   `s.recommended_for_blocklist = true AND s.eligible = true AND q.state = 'approved' AND s.tier IS NOT NULL`
   (`crates/feed/src/builder.rs#build`). See the [review queue](../architecture/pipeline.md).
-- **Volume candidates** are auto-published (no approval):
-  `s.recommended_for_blocklist = true AND s.eligible = false` (tier = none). They
-  land ONLY in retention windows, never the tier files
-  (`crates/feed/src/builder.rs#build`).
+- **Volume candidates** require operator approval by default:
+  `NOT s.delisted AND s.established_event_count >= 1000` and an `approved` row in
+  `volume_review` or in `review_queue` (tier = none)
+  (`crates/feed/src/builder.rs#volume_candidates_sql`; the threshold is bound from
+  `crates/core-scoring/src/scoring/constants.rs#VOLUME_LIST_THRESHOLD`). They land ONLY in
+  retention windows, never the tier files, and an address that is also a tier candidate is
+  listed once, as the tier candidate (`crates/feed/src/builder.rs#build`).
+
+### Volume review
+
+The count behind a volume listing is what sensor log lines declare, and one summary line can
+stand for a thousand events, so a volume candidate waits for a decision in its own queue,
+`volume_review` (`crates/review/src/volume.rs#VolumeQueue`; schema in
+[database.md](database.md)).
+
+| Step | Rule | Source |
+|---|---|---|
+| Offered (pending) | not delisted, `established_event_count >= 1000`, `last_seen` within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist | `crates/review/src/volume.rs#populate` |
+| Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue`; decided rows are never removed | `crates/review/src/volume.rs#withdraw` |
+| Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor | `crates/review/src/volume.rs#approve` |
+| Reject | not published on volume; the row stays, so the address is not offered again | `crates/review/src/volume.rs#reject` |
+| Reopen | back to pending; an approved address leaves the retention feeds at the next build | `crates/review/src/volume.rs#reopen` |
+
+The scan runs with the review queue's, every `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, and only
+when `PROPOLIS_REVIEW_ENABLED` is true (`crates/propolis/src/main.rs#run_queue_scan_loop`).
+With the review subsystem off no candidate is offered and none is published. Decisions are made
+on the console's volume tab ([console routes](console-routes.md)) or with `review volume`
+([commands](commands.md)). A delist or delete removes the address's `volume_review` row with
+its `review_queue` row. The vendor submission runner reads `review_queue` only
+(`crates/review/src/submit.rs#run_once`), so a volume approval never causes a report.
+
+`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` is the opt-in that removes the approval. The
+builder then publishes every address with `s.recommended_for_blocklist = true AND
+s.eligible = false`, with no operator decision: any address whose log lines add up to a
+thousand TCP events reaches the public retention feeds on that count alone. The builder then
+reads no decision at all: candidates are still offered on the volume tab, so what is being
+published can be seen, but approving or rejecting one changes nothing in the feed, and
+delisting is the way to take an address out. It is off by default, only the exact word
+`true` turns it on, and the daemon logs a warning at startup when it is set
+(`crates/propolis/src/config.rs#load_config`, `crates/feed/src/builder.rs#FeedConfig`).
 
 ### TTLs and windows
 
@@ -206,13 +247,16 @@ of the IP's last event), so a tier cannot slide between builds
 | Retention windows | `24h,7d,30d,60d,90d` | `PROPOLIS_FEED_WINDOWS` | `crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`, `crates/propolis/src/config.rs#load_config` |
 | Build interval | 15 min (900 s) | `PROPOLIS_FEED_BUILD_INTERVAL_SECS` | `crates/propolis/src/config.rs#DEFAULT_FEED_BUILD_INTERVAL_SECS` |
 | Feed enabled | true | `PROPOLIS_FEED_ENABLED` | `crates/propolis/src/config.rs#load_config` |
+| Publish volume listings without approval | false | `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` | `crates/propolis/src/config.rs#load_config` |
 | Output dir | `/var/lib/propolis/feed/current` | (config) | `crates/propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR` |
 
-Retention windows ignore tier and hold every approved entry (and volume floods)
-whose `last_seen` is inside the window, published as `all-{label}.*` and nested
+Retention windows ignore tier and hold every approved entry (and approved volume
+listings) whose `last_seen` is inside the window, published as `all-{label}.*` and nested
 by construction (`crates/feed/src/builder.rs#FeedConfig`, `crates/feed/src/builder.rs#build`). A candidate is kept iff
 `now - last_seen < ttl`; each entry's `valid_from = coarsen_to_hour(last_seen)`
-and `valid_until = valid_from + ttl` (`crates/feed/src/builder.rs#materialize`). Every exported
+and `valid_until = valid_from + ttl` (`crates/feed/src/builder.rs#materialize`). A stored
+`last_seen` later than `now` is read as `now` in all three, so an entry dated ahead of the
+clock is never valid past `now + ttl`. Every exported
 timestamp is coarsened to the hour boundary (anti-deanonymization)
 (`crates/feed/src/builder.rs#coarsen_to_hour`).
 

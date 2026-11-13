@@ -107,8 +107,8 @@ alone do not set it. The latch is sticky until an explicit delist. Combined with
 the eligibility rule (confirmed-real plus at least two recorded events), this
 means a listed IP is corroborated by traffic a spoofed source could not produce.
 An independent **volume path** can list a high-volume source on completed-TCP
-event counts alone, but it never triggers vendor reporting and never applies to
-spoofable UDP/ICMP floods. Details:
+event counts alone, once an operator approves it as a volume candidate; it never
+triggers vendor reporting and never applies to spoofable UDP/ICMP floods. Details:
 [`reference/scoring-and-feed`](../reference/scoring-and-feed.md#confirmed-real-gate).
 
 ## Samples and their verdicts
@@ -140,8 +140,10 @@ govern research use:
 - **Not for offensive use.** Repurposing captured data or credentials to act
   against third parties is outside both the intent and the license.
 - **Outbound actions are operator-gated.** No vendor abuse report is filed and no
-  IP enters the score-based tier files without a per-case operator decision; the
-  retention feeds also list high-volume TCP sources automatically. Enabling any
+  IP enters a feed file without a per-case operator decision; the retention feeds
+  also list high-volume TCP sources, each one approved as a volume candidate
+  unless the operator opted in to listing them automatically
+  (`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, off by default). Enabling any
   enrichment/reporting egress (VirusTotal, AbuseIPDB/DShield/OTX, ntfy, reverse
   DNS) is an operator decision with associated exposure. See
   [`security/outbound-controls`](../security/outbound-controls.md). When you file a

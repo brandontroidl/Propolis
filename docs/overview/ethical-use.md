@@ -44,10 +44,12 @@ its intent and its license.
 
 ## Outbound actions are operator-gated
 
-No vendor abuse report is filed and no IP enters the score-based tier files without
-a per-case operator decision. The retention feeds additionally list sources that
-completed a thousand or more TCP connections in the last day, without review; such a
-source is never reported to a vendor on volume alone. Enabling any enrichment or
+No vendor abuse report is filed and no IP enters a feed file without a per-case
+operator decision. The retention feeds additionally list sources that completed a
+thousand or more TCP connections, once you approve each one as a volume candidate; such
+a source is never reported to a vendor on volume alone. Publishing those sources with
+no review is possible only by setting `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which
+makes you answerable for addresses no person looked at. Enabling any enrichment or
 reporting egress path
 (VirusTotal, AbuseIPDB/DShield/OTX, ntfy alerts, reverse DNS) is an operator
 decision with associated exposure - see

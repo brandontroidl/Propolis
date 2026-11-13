@@ -34,7 +34,8 @@ Two kinds of retention apply:
   An entry is kept iff `now - last_seen < ttl`; `valid_until = coarsen_to_hour(last_seen) + ttl`
   (`crates/feed/src/builder.rs#materialize`).
 - **Retention windows** publish `all-{label}` feeds that ignore tier and hold every approved
-  entry (and auto-published volume floods) whose `last_seen` falls inside the window:
+  entry (and every approved volume listing; unapproved ones too only with
+  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`) whose `last_seen` falls inside the window:
   `PROPOLIS_FEED_WINDOWS`, default **`24h,7d,30d,60d,90d`**, nested by construction
   (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`, `crates/feed/src/builder.rs#FeedBuilder::build`). A malformed window entry is fail-closed.
 

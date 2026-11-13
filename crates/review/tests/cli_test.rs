@@ -20,10 +20,11 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use core_scoring::{EventInput, Protocol, SignalType, append_event, append_events};
 use sqlx::{PgPool, Row};
 
 use review::queue::ReviewQueue;
+use review::volume::VolumeQueue;
 
 /// The connection string for the subprocess: the caller's `DATABASE_URL` with `pool`'s own
 /// database substituted.
@@ -130,7 +131,9 @@ fn help_exits_zero_and_lists_every_subcommand() {
     let output = Command::new(review_bin()).arg("--help").output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for sub in ["daemon", "approve", "reject", "snooze", "list", "history"] {
+    for sub in [
+        "daemon", "approve", "reject", "snooze", "list", "history", "volume",
+    ] {
         assert!(
             stdout.contains(sub),
             "--help output must list the {sub} subcommand:\n{stdout}"
@@ -403,5 +406,199 @@ async fn daemon_populates_seeded_ip_into_pending_queue(pool: PgPool) {
         note,
         "auto-rejected: reserved address, never reported to a vendor (was approved, \
          operator note: looks real)"
+    );
+}
+
+// --- volume candidates ---
+
+/// A thousand unauthenticated TCP connections from `ip`, the last a few minutes ago: listed by
+/// the volume rule, and recent enough for the volume queue's scan to offer it.
+async fn seed_flood(pool: &PgPool, ip: &str) {
+    let last = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let connections: Vec<EventInput> = (0..1000)
+        .map(|i| {
+            EventInput::from_signal(
+                ip.parse().unwrap(),
+                None,
+                "ssh-sensor".into(),
+                SignalType::HoneypotConnection,
+                Protocol::Tcp,
+                false,
+                last - chrono::Duration::milliseconds(999 - i),
+                serde_json::json!({}),
+                None,
+            )
+        })
+        .collect();
+    assert!(append_events(pool, connections).await.failure.is_none());
+}
+
+async fn volume_state(pool: &PgPool, ip: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT state::text FROM volume_review WHERE source_ip = $1::inet")
+        .bind(ip)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+fn review(pool: &PgPool, args: &[&str]) -> std::process::Output {
+    Command::new(review_bin())
+        .args(args)
+        .env("DATABASE_URL", database_url(pool))
+        .output()
+        .unwrap()
+}
+
+/// The whole operator path for a volume candidate through the compiled binary: find it, approve
+/// it, find it again among the decided, take the approval back, reject it. None of it touches
+/// `review_queue`, which is what the submission daemon reports from.
+#[sqlx::test(migrations = false)]
+async fn volume_subcommands_list_and_decide_a_candidate(pool: PgPool) {
+    migrate(&pool).await;
+    let test_ip = "203.0.113.230";
+    seed_flood(&pool, test_ip).await;
+    assert_eq!(VolumeQueue::new().populate(&pool).await.unwrap(), 1);
+
+    let output = review(&pool, &["volume", "list"]);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(test_ip) && stdout.contains("pending") && stdout.contains("1000"),
+        "volume list must show the pending candidate and the count that listed it:\n{stdout}"
+    );
+    // The review queue's own listing is a different queue and must not show it.
+    let output = review(&pool, &["list"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(test_ip));
+
+    let output = review(
+        &pool,
+        &["volume", "approve", test_ip, "--notes", "flooding ssh"],
+    );
+    assert!(output.status.success(), "{:?}", output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("not reported to vendors"),
+        "the confirmation says what a volume approval does and does not do"
+    );
+    assert_eq!(
+        volume_state(&pool, test_ip).await.as_deref(),
+        Some("approved")
+    );
+    let notes: Option<String> =
+        sqlx::query_scalar("SELECT notes FROM volume_review WHERE source_ip = $1::inet")
+            .bind(test_ip)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(notes.as_deref(), Some("flooding ssh"));
+    assert!(
+        queue_state(&pool, test_ip).await.is_none(),
+        "a volume approval must not create a review_queue entry"
+    );
+
+    let output = review(&pool, &["volume", "decided"]);
+    assert!(output.status.success(), "{:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(test_ip) && stdout.contains("approved") && stdout.contains("flooding ssh"),
+        "volume decided must show the approved candidate with its note:\n{stdout}"
+    );
+    let output = review(&pool, &["volume", "list"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no pending volume candidates"));
+
+    let output = review(&pool, &["volume", "reopen", test_ip]);
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        volume_state(&pool, test_ip).await.as_deref(),
+        Some("pending")
+    );
+
+    let output = review(&pool, &["volume", "reject", test_ip]);
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        volume_state(&pool, test_ip).await.as_deref(),
+        Some("rejected")
+    );
+}
+
+/// `approve` and `volume approve` are different decisions on different queues. An address queued
+/// on its score has no volume row, so `volume approve` must fail on it and leave its review entry
+/// exactly as it was; and `approve` must fail on an address that is only a volume candidate.
+#[sqlx::test(migrations = false)]
+async fn a_volume_decision_and_a_review_decision_do_not_land_on_each_others_queue(pool: PgPool) {
+    migrate(&pool).await;
+    let scored = "203.0.113.231";
+    let flood = "203.0.113.232";
+    seed_recommended(&pool, scored).await;
+    ReviewQueue::new().populate(&pool).await.unwrap();
+    seed_flood(&pool, flood).await;
+    VolumeQueue::new().populate(&pool).await.unwrap();
+    assert_eq!(queue_state(&pool, scored).await.as_deref(), Some("pending"));
+    assert_eq!(volume_state(&pool, flood).await.as_deref(), Some("pending"));
+
+    let output = review(&pool, &["volume", "approve", scored]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(scored) && stderr.contains("volume"),
+        "stderr must name the address and the queue it was not found in:\n{stderr}"
+    );
+    assert_eq!(queue_state(&pool, scored).await.as_deref(), Some("pending"));
+    assert!(volume_state(&pool, scored).await.is_none());
+
+    let output = review(&pool, &["approve", flood]);
+    assert!(!output.status.success());
+    assert!(queue_state(&pool, flood).await.is_none());
+    assert_eq!(volume_state(&pool, flood).await.as_deref(), Some("pending"));
+}
+
+/// The daemon's queue scan also maintains the volume queue: a flooding address is offered as a
+/// pending volume candidate, and a pending row with nothing left to decide is taken back. The
+/// flood is not eligible, so the same scan must leave the review queue empty.
+#[sqlx::test(migrations = false)]
+async fn daemon_offers_a_flooding_address_as_a_pending_volume_candidate(pool: PgPool) {
+    migrate(&pool).await;
+    let flood = "203.0.113.233";
+    let lapsed = "203.0.113.234";
+    seed_flood(&pool, flood).await;
+    // A candidate offered by an earlier scan whose projection is gone since.
+    sqlx::query(
+        "INSERT INTO volume_review (source_ip, established_events_at_surface) \
+         VALUES ($1::inet, 1000)",
+    )
+    .bind(lapsed)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut child = Command::new(review_bin())
+        .arg("daemon")
+        .env("DATABASE_URL", database_url(&pool))
+        .env("PROPOLIS_QUEUE_SCAN_INTERVAL_SECS", "1")
+        .env("PROPOLIS_SUBMIT_POLL_INTERVAL_SECS", "1")
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = false;
+    while Instant::now() < deadline {
+        if volume_state(&pool, flood).await.as_deref() == Some("pending")
+            && volume_state(&pool, lapsed).await.is_none()
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        seen,
+        "daemon must offer the flood and withdraw the lapsed candidate within 5s"
+    );
+    assert!(
+        queue_state(&pool, flood).await.is_none(),
+        "a flood is never offered for vendor reporting"
     );
 }

@@ -27,10 +27,11 @@ use axum::response::Response;
 use console::auth::{self, PasswordStore, RateLimiter, SessionStore};
 use console::log_buffer::{LogEntry, LogField};
 use console::{AppState, routes};
-use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use core_scoring::{EventInput, Protocol, SignalType, append_event, append_events};
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use review::queue::ReviewQueue;
+use review::volume::VolumeQueue;
 use sqlx::{PgPool, Row};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -1144,6 +1145,14 @@ async fn delete_rolls_back_all_derived_state_when_the_final_delete_fails(pool: P
         .await
         .unwrap();
     sqlx::query(
+        "INSERT INTO volume_review (source_ip, state, established_events_at_surface) \
+         VALUES ($1::inet, 'approved', 1000)",
+    )
+    .bind("203.0.113.41")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "INSERT INTO vendor_submission \
          (source_ip, vendor, idempotency_key, categories, comment) \
          VALUES ($1::inet, 'test', 'delete-rollback-test', ARRAY['x'], 'test')",
@@ -1188,6 +1197,10 @@ async fn delete_rolls_back_all_derived_state_when_the_final_delete_fails(pool: P
         (
             "review_queue",
             "SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet",
+        ),
+        (
+            "volume_review",
+            "SELECT COUNT(*) FROM volume_review WHERE source_ip = $1::inet",
         ),
         (
             "vendor_submission",
@@ -1573,6 +1586,14 @@ async fn delist_rolls_back_queue_removal_when_projection_update_fails(pool: PgPo
         .await
         .unwrap();
     sqlx::query(
+        "INSERT INTO volume_review (source_ip, state, established_events_at_surface) \
+         VALUES ($1::inet, 'approved', 1000)",
+    )
+    .bind("203.0.113.210")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
         "CREATE FUNCTION reject_delist_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN RAISE EXCEPTION 'injected delist failure'; END $$",
     )
@@ -1614,6 +1635,11 @@ async fn delist_rolls_back_queue_removal_when_projection_update_fails(pool: PgPo
             .unwrap();
     assert_eq!(queued, 1, "queue removal must roll back with the update");
     assert!(!delisted, "the projection must retain its original latch");
+    assert_eq!(
+        volume_row(&pool, "203.0.113.210").await.map(|row| row.0),
+        Some("approved".into()),
+        "the volume decision is removed in the same transaction, so it rolls back too"
+    );
 }
 
 #[sqlx::test(migrations = false)]
@@ -2041,6 +2067,587 @@ async fn queue_history_tab_empty_state_names_the_tab(pool: PgPool) {
         body.contains(r#"<p class="empty-line">no rejected entries yet</p>"#),
         "expected a tab-specific empty-state message: {body}"
     );
+}
+
+// --- volume candidates ---
+//
+// The queue page's volume tab and `POST /volume/{ip}/approve|reject|reopen`. A volume candidate
+// is published in the retention feeds only once approved here, and that approval is a different
+// act from the pending tab's: it never reports the address to a vendor.
+
+/// A flood from `ip`: a thousand unauthenticated TCP connections to the SSH sensor a few minutes
+/// ago, which is what the volume rule lists and what the volume queue's scan offers.
+async fn seed_flood(pool: &PgPool, ip: &str) {
+    let last = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let connections: Vec<EventInput> = (0..1000)
+        .map(|i| {
+            ev(
+                ip,
+                "ssh",
+                SignalType::HoneypotConnection,
+                Protocol::Tcp,
+                false,
+                &(last - chrono::Duration::milliseconds(999 - i)).to_rfc3339(),
+            )
+        })
+        .collect();
+    assert!(append_events(pool, connections).await.failure.is_none());
+}
+
+/// Seeds a flood from `ip` and runs the volume scan, leaving one pending candidate. The fixtures
+/// are in the documentation ranges, so the scan is told to offer them.
+async fn seed_volume_candidate(pool: &PgPool, ip: &str) {
+    seed_flood(pool, ip).await;
+    VolumeQueue::new()
+        .offering_reserved_addresses()
+        .populate(pool)
+        .await
+        .unwrap();
+}
+
+async fn volume_row(pool: &PgPool, ip: &str) -> Option<(String, bool, Option<String>)> {
+    sqlx::query_as(
+        "SELECT state::text, decided_at IS NOT NULL, notes \
+         FROM volume_review WHERE source_ip = $1::inet",
+    )
+    .bind(ip)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+async fn review_queue_rows(pool: &PgPool, ip: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM review_queue WHERE source_ip = $1::inet")
+        .bind(ip)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = false)]
+async fn volume_tab_lists_pending_candidates_with_their_counts_and_context(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.150").await;
+    // More connections since it was offered, so "now" and "when offered" differ on the page.
+    let later: Vec<EventInput> = (0..234)
+        .map(|i| {
+            ev(
+                "203.0.113.150",
+                "ssh",
+                SignalType::HoneypotConnection,
+                Protocol::Tcp,
+                false,
+                &(chrono::Utc::now() - chrono::Duration::milliseconds(234 - i)).to_rfc3339(),
+            )
+        })
+        .collect();
+    assert!(append_events(&pool, later).await.failure.is_none());
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let app = test_app(state);
+    let response = app
+        .oneshot(get_request(
+            "/queue?tab=volume",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<a href="/queue?tab=volume" class="tab active">Volume</a>"#),
+        "the volume tab is in the tab bar and marked active: {body}"
+    );
+    let row = body
+        .split(r#"<tr id="volume-row-203.0.113.150""#)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the pending candidate is listed: {body}"));
+    let row = &row[..row.find(r#"<tr class="queue-context""#).unwrap()];
+    assert!(
+        row.contains(r#"data-label="TCP events">1,234<"#),
+        "established TCP events now: {row}"
+    );
+    assert!(
+        row.contains(r#"data-label="When offered">1,000<"#),
+        "established TCP events when the scan offered it: {row}"
+    );
+    assert!(
+        row.contains(r#"data-label="All events">1,234<"#),
+        "total events: {row}"
+    );
+    assert!(row.contains(r#"data-label="Last seen">20"#), "{row}");
+    assert!(
+        row.contains(r#"hx-post="/volume/203.0.113.150/approve""#)
+            && row.contains(r#"hx-post="/volume/203.0.113.150/reject""#),
+        "{row}"
+    );
+    assert!(
+        !body.contains("/queue/203.0.113.150/"),
+        "a volume candidate must never be offered the review queue's own decisions, which \
+         approve for vendor reporting: {body}"
+    );
+    // The page says what the approval does before the first button.
+    assert!(
+        body.contains(
+            "publishes this address in the retention feeds; it is not reported to abuse vendors."
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "Publishes this address in the retention feeds; it is not reported to abuse vendors."
+        ),
+        "and on the button itself: {body}"
+    );
+    // The pending tab's context line: the sensor it reached and its top signal type.
+    let context = body
+        .split(r#"id="volume-context-203.0.113.150""#)
+        .nth(1)
+        .unwrap();
+    let context = &context[..context.find("</tr>").unwrap()];
+    assert!(
+        context.contains(r#"<span class="ctx-chip">SSH</span>"#),
+        "{context}"
+    );
+    assert!(context.contains("1,234"), "{context}");
+
+    markup::assert_panels(&body);
+    assert_eq!(markup::stack_violations(&body), Vec::<String>::new());
+    assert_eq!(markup::vocabulary_violations(&body), Vec::<String>::new());
+    assert_eq!(markup::form_violations(&body), Vec::<String>::new());
+}
+
+#[sqlx::test(migrations = false)]
+async fn volume_tab_is_empty_until_an_address_is_offered(pool: PgPool) {
+    migrate(&pool).await;
+    // A pending review entry is not a volume candidate and must not appear on this tab.
+    seed_recommended(&pool, "203.0.113.151", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let response = test_app(state)
+        .oneshot(get_request(
+            "/queue?tab=volume",
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<p class="empty-line">no volume candidates waiting</p>"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"<p class="empty-line">no volume candidates decided yet</p>"#),
+        "{body}"
+    );
+    assert!(!body.contains("volume-row-203.0.113.151"), "{body}");
+    markup::assert_panels(&body);
+}
+
+#[sqlx::test(migrations = false)]
+async fn volume_approve_changes_state_and_approves_nothing_for_vendor_reporting(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.152").await;
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/volume/203.0.113.152/approve",
+            format!("csrf_token={csrf_token}&notes=flooding-ssh"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<span class="state-pill state-approved">approved</span>"#),
+        "the swapped row carries the new state: {body}"
+    );
+    assert!(body.contains("flooding-ssh"), "{body}");
+    assert!(
+        !body.contains("hx-post"),
+        "a decided row keeps no decision controls: {body}"
+    );
+    assert_eq!(
+        volume_row(&pool, "203.0.113.152").await,
+        Some(("approved".into(), true, Some("flooding-ssh".into())))
+    );
+    assert_eq!(
+        review_queue_rows(&pool, "203.0.113.152").await,
+        0,
+        "the submission runner reports approved review_queue rows; a volume approval must not \
+         create one"
+    );
+
+    // It is now in the decided list, with the one control that undoes the decision.
+    let page = body_text(
+        app.oneshot(get_request("/queue?tab=volume", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let decided = page
+        .split(r#"<tr id="volume-decided-203.0.113.152">"#)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the approved candidate is in the decided list: {page}"));
+    let decided = &decided[..decided.find("</tr>").unwrap()];
+    assert!(decided.contains("state-approved"), "{decided}");
+    assert!(decided.contains("flooding-ssh"), "{decided}");
+    assert!(
+        decided.contains(r#"hx-post="/volume/203.0.113.152/reopen""#),
+        "{decided}"
+    );
+    assert!(!page.contains("volume-row-203.0.113.152"), "{page}");
+    markup::assert_panels(&page);
+    assert_eq!(markup::vocabulary_violations(&page), Vec::<String>::new());
+}
+
+#[sqlx::test(migrations = false)]
+async fn volume_reject_changes_state(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.153").await;
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/volume/203.0.113.153/reject",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        body_text(response)
+            .await
+            .contains(r#"<span class="state-pill state-rejected">rejected</span>"#)
+    );
+    assert_eq!(
+        volume_row(&pool, "203.0.113.153").await,
+        Some(("rejected".into(), true, None))
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn volume_reopen_returns_a_decided_candidate_to_pending(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.154").await;
+    VolumeQueue::new()
+        .approve(
+            &pool,
+            "203.0.113.154".parse().unwrap(),
+            Some("approved once"),
+        )
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(form_request(
+            "/volume/203.0.113.154/reopen",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains(r#"<span class="state-pill state-pending">pending</span>"#)
+            && body.contains("is not published"),
+        "the acknowledgement says where the candidate went: {body}"
+    );
+    assert_eq!(
+        volume_row(&pool, "203.0.113.154").await,
+        Some(("pending".into(), false, Some("approved once".into()))),
+        "pending again, no decision time, note kept"
+    );
+
+    // Back in the list it can be decided from.
+    let page = body_text(
+        app.oneshot(get_request("/queue?tab=volume", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(page.contains("volume-row-203.0.113.154"), "{page}");
+    assert!(!page.contains("volume-decided-203.0.113.154"), "{page}");
+}
+
+/// Each volume decision is a state change an operator's own session could be tricked into
+/// sending, so each is refused without that session's CSRF token, and refused before anything is
+/// written.
+#[sqlx::test(migrations = false)]
+async fn a_volume_decision_without_the_csrf_token_returns_403_and_changes_nothing(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.155").await;
+    seed_volume_candidate(&pool, "203.0.113.156").await;
+    VolumeQueue::new()
+        .approve(&pool, "203.0.113.156".parse().unwrap(), None)
+        .await
+        .unwrap();
+    let approved_before = volume_row(&pool, "203.0.113.156").await;
+
+    let state = test_state(pool.clone());
+    let (_, cookie) = state.sessions.create();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    for (uri, body) in [
+        (
+            "/volume/203.0.113.155/approve",
+            "csrf_token=not-the-real-token",
+        ),
+        (
+            "/volume/203.0.113.155/reject",
+            "csrf_token=not-the-real-token",
+        ),
+        ("/volume/203.0.113.155/approve", "csrf_token="),
+        (
+            "/volume/203.0.113.156/reopen",
+            "csrf_token=not-the-real-token",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(form_request(uri, body.to_string(), Some(&cookie_header)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri} {body}");
+    }
+
+    assert_eq!(
+        volume_row(&pool, "203.0.113.155").await,
+        Some(("pending".into(), false, None)),
+        "a refused approve or reject must leave the candidate pending"
+    );
+    assert_eq!(
+        volume_row(&pool, "203.0.113.156").await,
+        approved_before,
+        "a refused reopen must leave the approval in place"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_volume_decision_without_a_session_is_sent_to_login_and_changes_nothing(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.157").await;
+
+    let state = test_state(pool.clone());
+    // A valid token for a real session, but the request carries no session cookie.
+    let (session_id, _) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let app = test_app(state);
+
+    for action in ["approve", "reject", "reopen"] {
+        let response = app
+            .clone()
+            .oneshot(form_request(
+                &format!("/volume/203.0.113.157/{action}"),
+                format!("csrf_token={csrf_token}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{action}");
+        assert_eq!(response.headers().get("location").unwrap(), "/login");
+    }
+    assert_eq!(
+        volume_row(&pool, "203.0.113.157").await,
+        Some(("pending".into(), false, None))
+    );
+}
+
+/// The two approvals are different acts on different tables. A volume decision posted for an
+/// address that is only in the review queue must fail and leave that entry alone: otherwise the
+/// volume route would be a second way to approve an address for vendor reporting.
+#[sqlx::test(migrations = false)]
+async fn a_volume_decision_never_lands_on_a_review_queue_entry(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.158", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let response = test_app(state)
+        .oneshot(form_request(
+            "/volume/203.0.113.158/approve",
+            format!("csrf_token={csrf_token}"),
+            Some(&format!("{}={cookie}", auth::SESSION_COOKIE)),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let state: core_scoring::ReviewState =
+        sqlx::query_scalar("SELECT state FROM review_queue WHERE source_ip = $1::inet")
+            .bind("203.0.113.158")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, core_scoring::ReviewState::Pending);
+    assert_eq!(volume_row(&pool, "203.0.113.158").await, None);
+}
+
+/// A delist takes the address out of every feed, so the volume decision goes with the review
+/// entry. Left behind, an approved row would not publish while the latch holds, but a later
+/// relist would bring the old approval back into force without anyone deciding it again.
+#[sqlx::test(migrations = false)]
+async fn delist_and_delete_remove_the_volume_decision(pool: PgPool) {
+    migrate(&pool).await;
+    seed_volume_candidate(&pool, "203.0.113.159").await;
+    seed_volume_candidate(&pool, "203.0.113.160").await;
+    seed_volume_candidate(&pool, "203.0.113.161").await;
+    for ip in ["203.0.113.159", "203.0.113.160"] {
+        VolumeQueue::new()
+            .approve(&pool, ip.parse().unwrap(), Some("was approved"))
+            .await
+            .unwrap();
+    }
+
+    let state = test_state(pool.clone());
+    let (session_id, cookie) = state.sessions.create();
+    let csrf_token = state.sessions.generate_csrf(&session_id).unwrap();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    for uri in ["/ip/203.0.113.159/delist", "/ip/203.0.113.160/delete"] {
+        let response = app
+            .clone()
+            .oneshot(form_request(
+                uri,
+                format!("csrf_token={csrf_token}"),
+                Some(&cookie_header),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{uri}");
+    }
+
+    assert_eq!(volume_row(&pool, "203.0.113.159").await, None, "delisted");
+    assert_eq!(volume_row(&pool, "203.0.113.160").await, None, "deleted");
+    assert_eq!(
+        volume_row(&pool, "203.0.113.161").await,
+        Some(("pending".into(), false, None)),
+        "another address's candidate is untouched"
+    );
+
+    // Relisting does not restore the approval: the address has to be offered and decided again.
+    let response = app
+        .oneshot(form_request(
+            "/ip/203.0.113.159/relist",
+            format!("csrf_token={csrf_token}"),
+            Some(&cookie_header),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(volume_row(&pool, "203.0.113.159").await, None);
+    VolumeQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        volume_row(&pool, "203.0.113.159").await,
+        Some(("pending".into(), false, None)),
+        "after a relist the scan offers it again, pending"
+    );
+}
+
+/// The nav badge and the dashboard's "Waiting on you" are where an operator learns work is
+/// waiting, so they count both queues; the queue page says how the total splits, so a badge of 3
+/// over a pending tab with one row is explained where it is read.
+#[sqlx::test(migrations = false)]
+async fn the_pending_badge_counts_reviews_and_volume_candidates_and_the_queue_page_splits_them(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.162", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    seed_volume_candidate(&pool, "203.0.113.163").await;
+    seed_volume_candidate(&pool, "203.0.113.164").await;
+    // A decided candidate waits on nobody.
+    seed_volume_candidate(&pool, "203.0.113.165").await;
+    VolumeQueue::new()
+        .reject(&pool, "203.0.113.165".parse().unwrap(), None)
+        .await
+        .unwrap();
+
+    let state = test_state(pool);
+    let (_, cookie) = state.sessions.create();
+    let cookie_header = format!("{}={cookie}", auth::SESSION_COOKIE);
+    let app = test_app(state);
+
+    let dashboard = body_text(
+        app.clone()
+            .oneshot(get_request("/", Some(&cookie_header)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        dashboard.contains(r#"<span class="badge">3</span>"#),
+        "one pending review and two pending volume candidates: {dashboard}"
+    );
+    assert!(
+        dashboard.contains(r#"<a href="/queue">3</a>"#),
+        "Waiting on you shows the same total: {dashboard}"
+    );
+
+    for uri in ["/queue", "/queue?tab=volume"] {
+        let page = body_text(
+            app.clone()
+                .oneshot(get_request(uri, Some(&cookie_header)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            page.contains(r#"<span class="badge">3</span>"#),
+            "{uri}: {page}"
+        );
+        assert!(
+            page.contains("(3 pending: 1 on the pending tab, 2 on the volume tab)"),
+            "{uri} must say how the total splits: {page}"
+        );
+    }
 }
 
 // --- login ---
@@ -4563,6 +5170,46 @@ async fn metrics_returns_prometheus_text_format(pool: PgPool) {
         "expected exactly one pending review entry: {body}"
     );
     assert!(body.contains("propolis_ips_recommended_vendor 1\n"));
+}
+
+/// Volume candidates have their own gauge. The review-queue gauge keeps counting review-queue
+/// entries only, so an alert or dashboard built on it reads what it always read.
+#[sqlx::test(migrations = false)]
+async fn metrics_count_pending_volume_candidates_apart_from_pending_reviews(pool: PgPool) {
+    migrate(&pool).await;
+    seed_recommended(&pool, "203.0.113.166", 60).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    seed_volume_candidate(&pool, "203.0.113.167").await;
+    seed_volume_candidate(&pool, "203.0.113.168").await;
+    seed_volume_candidate(&pool, "203.0.113.169").await;
+    VolumeQueue::new()
+        .approve(&pool, "203.0.113.169".parse().unwrap(), None)
+        .await
+        .unwrap();
+
+    let response = test_app(test_state(pool))
+        .oneshot(get_request("/metrics", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(
+        body.contains("# TYPE propolis_volume_review_pending gauge"),
+        "{body}"
+    );
+    assert!(
+        body.contains("propolis_volume_review_pending 2\n"),
+        "two pending candidates; the approved one is not waiting: {body}"
+    );
+    assert!(
+        body.contains("propolis_review_queue_pending 1\n"),
+        "the review-queue gauge does not count volume candidates: {body}"
+    );
 }
 
 /// The four address gauges come from one statement, so each must keep counting its own flag:

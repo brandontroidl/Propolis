@@ -2,18 +2,79 @@
 {% block title %}Review queue - Propolis{% endblock %}
 {% block content %}
 {% import "macros.html" as m %}
-<h1>Review queue <span class="dim">({{ pending_count | count }} pending)</span></h1>
+{#- The count is everything waiting on the operator, as the nav badge shows it, and it covers two
+    queues. The split is spelled out whenever anything is waiting, so a badge of 3 over an empty
+    pending tab is explained where it is read. -#}
+<h1>Review queue <span class="dim">({{ pending_count | count }} pending{% if pending_count > 0 %}: {{ review_pending_count | count }} on the pending tab, {{ volume_pending_count | count }} on the volume tab{% endif %})</span></h1>
 <div class="tab-bar">
   {% for tab_name in ["pending", "approved", "rejected", "snoozed"] %}
   <a href="/queue?tab={{ tab_name }}" class="tab {% if tab == tab_name %}active{% endif %}">{{ tab_name | capitalize }}</a>
   {% endfor %}
+  <a href="/queue?tab=volume" class="tab {% if tab == "volume" %}active{% endif %}">Volume</a>
 </div>
 {% if tab == "snoozed" %}
 <p class="table-note">Snoozed entries stay here until you decide them - nothing puts them back in the
 pending queue on its own. Decide one below, or return it to pending to deal with it alongside the
 rest.</p>
 {% endif %}
-{% if tab == "pending" and items %}
+{% if tab == "volume" %}
+{#- The other queue. Its approval is not the pending tab's approval, and the page has to say so
+    before the first button: this one publishes and reports nothing. The last sentence is there
+    because the console is not told how the feed builder is configured: with the opt-in set the
+    builder reads no decision at all, and a page that promised otherwise would be wrong exactly
+    when an operator relies on it. -#}
+<p class="table-note">A volume candidate is an address that reached a thousand established TCP
+events. It is published only if you approve it here. <strong>Approve</strong>
+publishes this address in the retention feeds; it is not reported to abuse vendors.
+<strong>Reject</strong> keeps it out, and it is not offered again. The count is what the sensors'
+logs declared, so look at what the address did before approving it. The exception: on a node
+started with <code>PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true</code> every candidate is published
+whatever is decided here, and delisting an address is the way to take it out.</p>
+<div class="panel queue-panel">
+  <div class="panel-head">Waiting for a decision <span class="dim">{{ volume.pending | length | count }}</span></div>
+  {% if volume.pending %}
+  <table class="table-compact stack">
+    <thead>
+      <tr>
+        <th>IP</th>
+        <th class="count">TCP events</th>
+        <th class="count">When offered</th>
+        <th class="count">All events</th>
+        <th>Last seen</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in volume.pending %}{% include "queue_volume_row.html" %}{% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">no volume candidates waiting</p>
+  {% endif %}
+</div>
+<div class="panel queue-panel">
+  <div class="panel-head">Decided <span class="dim">most recent first</span></div>
+  {% if volume.decided %}
+  <table class="table-compact stack">
+    <thead>
+      <tr>
+        <th>IP</th>
+        <th>Decision</th>
+        <th class="count">TCP events when offered</th>
+        <th>Decided</th>
+        <th>Notes</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in volume.decided %}{% include "queue_volume_decided_row.html" %}{% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-line">no volume candidates decided yet</p>
+  {% endif %}
+</div>
+{% elif tab == "pending" and items %}
 {#- Sorting lives here rather than in the column headers: Active covers two keys, and the headers
     are hidden on a narrow screen. -#}
 <nav class="sortbar" aria-label="Sort the pending entries">

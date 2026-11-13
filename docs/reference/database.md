@@ -565,6 +565,28 @@ in a SQL comment (`crates/review/migrations/0003_fetch_attempt.sql#pending|succe
 `transport_auth` is the exception on this table: its value set, and its pairing with
 `tls_verify_error`, are enforced by CHECK constraints (`0007`).
 
+### `volume_review` (`0009_volume_review.sql`)
+
+PK `source_ip INET`. One row per volume candidate: an address the connection-volume rule would
+list in the retention feeds, and the operator's decision on it. Separate from `review_queue`
+because the vendor submission runner reports every approved `review_queue` row, and an approval
+here publishes the address without reporting it
+([rules](scoring-and-feed.md#volume-review), `crates/review/src/volume.rs#VolumeQueue`).
+
+| column | type | default |
+|---|---|---|
+| `source_ip` | INET | PRIMARY KEY |
+| `state` | review_state_enum | NOT NULL DEFAULT `'pending'` |
+| `established_events_at_surface` | INTEGER | NOT NULL |
+| `surfaced_at` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` |
+| `decided_at` | TIMESTAMPTZ | nullable |
+| `notes` | TEXT | nullable |
+
+Only `pending`, `approved` and `rejected` are written; nothing sets `snoozed` here.
+`established_events_at_surface` is `ip_score.established_event_count` when the row was
+inserted. The feed builder publishes a volume listing only for an `approved` row (or an
+`approved` `review_queue` row) unless `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`.
+
 ## Server settings that make a stall attributable
 
 When the daemon stalls (unrelated trivial statements all finishing within a fraction of a
@@ -652,6 +674,7 @@ the watch stream and compare timestamps.
 | `0006` | `fetch_attempt.claim_expires` + partial index; `fetch_daily_usage` table |
 | `0007` | `fetch_attempt.transport_auth` (existing rows `'unknown'`) + `tls_verify_error`, with their CHECK constraints |
 | `0008` | `fetch_event_cursor` (one row, starts at 0: the first sync walks the existing ledger once) |
+| `0009` | `volume_review` (uses core-scoring's `review_state_enum`; starts empty, so no volume listing is published after this migration until an operator approves it) |
 
 **fleet** (`crates/fleet/migrations/`, tracked in `_sqlx_migrations_fleet`):
 

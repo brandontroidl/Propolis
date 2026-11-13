@@ -32,13 +32,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use core_scoring::{EventInput, Protocol, SignalType, append_event};
+use core_scoring::{EventInput, Protocol, SignalType, append_event, append_events};
 use sqlx::{PgPool, Row};
 
 use review::gatekeeper::VendorConfig;
 use review::queue::ReviewQueue;
 use review::submit::SubmissionRunner;
 use review::vendor::{VendorAdapter, VendorError, VendorReport, VendorResponse};
+use review::volume::VolumeQueue;
 
 // ---------------------------------------------------------------------
 // Mock vendor
@@ -586,6 +587,72 @@ async fn run_once_ignores_entries_that_are_not_approved(pool: PgPool) {
         count_submissions(&pool, ip, "mockvendor-nonapproved").await,
         0
     );
+}
+
+/// An approval in the volume queue publishes an address in the retention feeds. It is not an
+/// approval to report the address: the runner's input is `review_queue` alone. The flood here is
+/// everything the gatekeeper would otherwise pass (public, seen minutes ago, never reported), so
+/// only the runner never being handed it keeps it from the vendor.
+#[sqlx::test(migrations = false)]
+async fn run_once_never_submits_an_address_approved_only_as_a_volume_candidate(pool: PgPool) {
+    migrate(&pool).await;
+    let flood = "203.0.113.246";
+    let flood_addr: IpAddr = flood.parse().unwrap();
+    let last = Utc::now() - Duration::minutes(5);
+    let connections: Vec<EventInput> = (0..1000)
+        .map(|i| {
+            ev(
+                flood,
+                "ssh-sensor",
+                SignalType::HoneypotConnection,
+                Protocol::Tcp,
+                false,
+                &(last - Duration::milliseconds(999 - i)).to_rfc3339(),
+                serde_json::json!({"protocol_label": "ssh"}),
+            )
+        })
+        .collect();
+    assert!(append_events(&pool, connections).await.failure.is_none());
+    let volume = VolumeQueue::new();
+    assert_eq!(volume.populate(&pool).await.unwrap(), 1);
+    volume
+        .approve(&pool, flood_addr, Some("flooding ssh"))
+        .await
+        .unwrap();
+
+    // The control: an address approved in the review queue, which the same pass must report, so
+    // a runner that submitted nothing at all would not pass this test.
+    let reported = "203.0.113.247";
+    seed_and_approve(&pool, reported).await;
+
+    let mock = MockVendor::new("mockvendor-volume");
+    let vendors: Vec<Box<dyn VendorAdapter>> = vec![Box::new(mock.clone())];
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vendors,
+        vec![permissive_config("mockvendor-volume")],
+    );
+
+    let result = runner.run_once().await.unwrap();
+
+    assert_eq!(mock.submissions_for(reported.parse().unwrap()).len(), 1);
+    assert!(
+        mock.submissions_for(flood_addr).is_empty(),
+        "a volume approval must never reach a vendor"
+    );
+    assert_eq!(mock.call_count(), 1);
+    assert_eq!(result.submitted, 1);
+    assert_eq!(
+        count_submissions(&pool, flood, "mockvendor-volume").await,
+        0
+    );
+    let any_for_flood: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vendor_submission WHERE source_ip = $1::inet")
+            .bind(flood)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(any_for_flood, 0);
 }
 
 #[sqlx::test(migrations = false)]

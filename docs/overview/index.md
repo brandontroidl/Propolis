@@ -30,11 +30,14 @@ sets out the boundaries this depends on.
 ## What needs your approval, and what does not
 
 Score-based tier entries and every vendor report wait in the review queue for you to
-approve, reject or snooze them. One path is automatic: a source that has completed a
-thousand or more TCP connections and was seen in the last day is added to the
-retention feeds without review, so a flood is blocked even when it never tried a login.
-Such a source is never reported to a vendor on volume alone. The exact rule is in the
-[scoring and feed reference](../reference/scoring-and-feed.md).
+approve, reject or snooze them. A source that has completed a thousand or more TCP
+connections and was seen in the last day is offered separately, as a volume candidate,
+so a flood can be blocked even when it never tried a login. It is added to the
+retention feeds only when you approve it, and it is never reported to a vendor on
+volume alone. By default nothing is published without your decision. The one opt-in is
+`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which publishes volume candidates with no
+review. The exact rule is in the
+[scoring and feed reference](../reference/scoring-and-feed.md#volume-review).
 
 ## What it is not
 

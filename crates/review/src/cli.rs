@@ -8,6 +8,13 @@
 //! This is the whole operator surface until the web console (sub-project 6)
 //! lands.
 //!
+//! `volume` groups the same decisions for the other queue: the addresses
+//! the connection-volume rule would list in the retention feeds
+//! ([`crate::volume`]). They are separate subcommands, not a flag on
+//! `approve`, because the two approvals do different things: `approve`
+//! reports an address to vendors, `volume approve` publishes it and reports
+//! nothing.
+//!
 //! `daemon` is defined here as a [`Command`] variant (so `--help` documents it
 //! alongside the operator subcommands, and both share one argument parser),
 //! but [`execute`] never handles it: the daemon loop needs the constructed
@@ -22,6 +29,7 @@ use clap::{Parser, Subcommand};
 use sqlx::{PgPool, Row};
 
 use crate::queue::{ReviewError, ReviewQueue};
+use crate::volume::{VolumeEntry, VolumeQueue};
 
 /// Propolis review queue + vendor submission operator CLI.
 #[derive(Parser, Debug)]
@@ -75,6 +83,43 @@ pub enum Command {
     Snoozed,
     /// Show vendor submission history for an IP, most recent first.
     History { ip: IpAddr },
+    /// Decide volume candidates: addresses with a thousand or more
+    /// established TCP events, which are published in the retention feeds
+    /// only once approved here. A volume approval is never reported to a
+    /// vendor.
+    Volume {
+        #[command(subcommand)]
+        command: VolumeCommand,
+    },
+}
+
+/// The `volume` subcommands. `Reopen` is the way back from either decision,
+/// and `Decided` is the listing it is used from.
+#[derive(Subcommand, Debug, PartialEq)]
+pub enum VolumeCommand {
+    /// List every Pending volume candidate, oldest-surfaced first.
+    List,
+    /// List every Approved and Rejected volume candidate, most recently
+    /// decided first.
+    Decided,
+    /// Approve a volume candidate: it is published in the retention feeds
+    /// from the next feed build. It is not reported to abuse vendors.
+    Approve {
+        ip: IpAddr,
+        /// Optional note recording the reasoning behind this decision.
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Reject a volume candidate: not published on volume, and not offered
+    /// again by a later scan.
+    Reject {
+        ip: IpAddr,
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Return a decided volume candidate to pending. Undoes an approval (the
+    /// address leaves the retention feeds at the next build) or a rejection.
+    Reopen { ip: IpAddr },
 }
 
 /// Errors an operator command can fail with: either the review queue's own
@@ -125,8 +170,77 @@ pub async fn execute(pool: &PgPool, command: Command) -> Result<(), CliError> {
         Command::List => print_pending(pool, &queue).await?,
         Command::Snoozed => print_snoozed(pool, &queue).await?,
         Command::History { ip } => print_history(pool, ip).await?,
+        Command::Volume { command } => execute_volume(pool, command).await?,
     }
     Ok(())
+}
+
+async fn execute_volume(pool: &PgPool, command: VolumeCommand) -> Result<(), CliError> {
+    let queue = VolumeQueue::new();
+    match command {
+        VolumeCommand::List => {
+            let entries = queue.list_pending(pool).await?;
+            if entries.is_empty() {
+                println!("no pending volume candidates");
+                return Ok(());
+            }
+            print_volume_entries(&entries);
+            println!("\ndecide one with: review volume approve|reject <ip>");
+        }
+        VolumeCommand::Decided => {
+            let mut entries = queue
+                .list_by_state(pool, core_scoring::ReviewState::Approved, None)
+                .await?;
+            entries.extend(
+                queue
+                    .list_by_state(pool, core_scoring::ReviewState::Rejected, None)
+                    .await?,
+            );
+            if entries.is_empty() {
+                println!("no decided volume candidates");
+                return Ok(());
+            }
+            entries.sort_by_key(|e| std::cmp::Reverse(e.decided_at));
+            print_volume_entries(&entries);
+            println!("\nundo one with: review volume reopen <ip>");
+        }
+        VolumeCommand::Approve { ip, notes } => {
+            queue.approve(pool, ip, notes.as_deref()).await?;
+            println!("approved {ip} for the retention feeds (not reported to vendors)");
+        }
+        VolumeCommand::Reject { ip, notes } => {
+            queue.reject(pool, ip, notes.as_deref()).await?;
+            println!("rejected {ip} as a volume candidate");
+        }
+        VolumeCommand::Reopen { ip } => {
+            queue.reopen(pool, ip).await?;
+            println!("{ip} returned to pending as a volume candidate");
+        }
+    }
+    Ok(())
+}
+
+/// One line per volume candidate. `TCP_AT_SURFACE` is the established-event
+/// count that listed it; the console's volume tab shows the current count
+/// beside it.
+fn print_volume_entries(entries: &[VolumeEntry]) {
+    println!(
+        "{:<16}{:<10}{:>15}  {:<25}{:<25}NOTES",
+        "SOURCE_IP", "STATE", "TCP_AT_SURFACE", "SURFACED_AT", "DECIDED_AT"
+    );
+    for e in entries {
+        println!(
+            "{:<16}{:<10}{:>15}  {:<25}{:<25}{}",
+            e.source_ip.to_string(),
+            format!("{:?}", e.state).to_lowercase(),
+            e.established_events_at_surface,
+            e.surfaced_at.to_rfc3339(),
+            e.decided_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "-".to_string()),
+            e.notes.as_deref().unwrap_or_default(),
+        );
+    }
 }
 
 async fn print_pending(pool: &PgPool, queue: &ReviewQueue) -> Result<(), CliError> {
@@ -286,6 +400,62 @@ mod tests {
         assert!(Cli::try_parse_from(["review", "reject", "203.0.113.9"]).is_ok());
         assert!(Cli::try_parse_from(["review", "snooze", "203.0.113.9"]).is_ok());
         assert!(Cli::try_parse_from(["review", "history", "203.0.113.9"]).is_ok());
+    }
+
+    #[test]
+    fn cli_parses_the_volume_subcommands() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        assert_eq!(
+            parse(&["review", "volume", "list"]).unwrap(),
+            Command::Volume {
+                command: VolumeCommand::List
+            }
+        );
+        assert_eq!(
+            parse(&["review", "volume", "decided"]).unwrap(),
+            Command::Volume {
+                command: VolumeCommand::Decided
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "review",
+                "volume",
+                "approve",
+                "203.0.113.9",
+                "--notes",
+                "flood"
+            ])
+            .unwrap(),
+            Command::Volume {
+                command: VolumeCommand::Approve {
+                    ip: "203.0.113.9".parse().unwrap(),
+                    notes: Some("flood".to_string()),
+                }
+            }
+        );
+        assert_eq!(
+            parse(&["review", "volume", "reject", "203.0.113.9"]).unwrap(),
+            Command::Volume {
+                command: VolumeCommand::Reject {
+                    ip: "203.0.113.9".parse().unwrap(),
+                    notes: None,
+                }
+            }
+        );
+        assert_eq!(
+            parse(&["review", "volume", "reopen", "203.0.113.9"]).unwrap(),
+            Command::Volume {
+                command: VolumeCommand::Reopen {
+                    ip: "203.0.113.9".parse().unwrap(),
+                }
+            }
+        );
+        // A volume decision is never reachable as a flag or a bare `volume`: the operator has to
+        // name the queue and the action.
+        assert!(parse(&["review", "volume"]).is_err());
+        assert!(parse(&["review", "volume", "approve", "not-an-ip"]).is_err());
+        assert!(parse(&["review", "approve", "203.0.113.9", "--volume"]).is_err());
     }
 
     #[test]

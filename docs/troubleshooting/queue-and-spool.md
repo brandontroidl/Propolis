@@ -44,7 +44,8 @@ The console `/metrics` endpoint exposes process counters derived per scrape:
 - `propolis_events_ingested_total` and `propolis_events_rejected_total` come from
   in-process atomics (`metrics`, `crates/console/src/routes/metrics.rs#metrics`). A rising
   `rejected` total during load is where dropped/invalid events surface.
-- `propolis_review_queue_pending` gauges the review backlog.
+- `propolis_review_queue_pending` gauges the review backlog, and
+  `propolis_volume_review_pending` the volume candidates waiting on the volume tab.
 
 `/metrics` is unauthenticated but only because the console binds loopback by
 default. Scrape it locally:

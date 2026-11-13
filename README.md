@@ -6,9 +6,10 @@ VNC, MySQL, MSSQL, PostgreSQL, and MongoDB, plus a silent catch-all listener tha
 whatever other TCP and UDP ports you point it at.
 
 Events are stored in PostgreSQL, scored by source IP, and shown in a local operator
-console. Operator approval is required for vendor reports and score-based blocklist
-entries. A separate connection-volume rule can add high-volume TCP sources to retention
-feeds automatically. Captured payloads are stored for analysis but are never executed.
+console. Operator approval is required for vendor reports and for every blocklist
+entry. A separate connection-volume rule offers high-volume TCP sources for the retention
+feeds; they too are published only once approved, unless you opt in to publishing them
+automatically. Captured payloads are stored for analysis but are never executed.
 
 ## How it works
 
@@ -20,10 +21,13 @@ console on loopback.
 
 An IP only earns a feed tier or a vendor report after a completed TCP handshake has
 authenticated against a sensor. Spoofable UDP traffic and lone SYNs do not count toward
-that gate. The one automatic path is volume: a source with a thousand or more completed
-connections on record and activity in the last day is added to the retention feeds
-without review, so a flood is blocked even when no login was attempted. Score-based tiers
-and vendor reports still wait for a decision in the console.
+that gate. Volume is a second path: a source with a thousand or more completed
+connections on record and activity in the last day is offered as a volume candidate, so a
+flood can be blocked even when no login was attempted. It is added to the retention feeds
+once you approve it in the console, and a volume approval never files a vendor report.
+Nothing is published without a decision unless you set
+`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which publishes volume candidates unreviewed
+and is off by default.
 
 Captured files (SCP, SFTP, ADB pushes, FTP and TFTP uploads, downloaded droppers) go to a spool
 mounted `noexec`. The sensors themselves make no outbound connections. The daemon's

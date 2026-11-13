@@ -333,6 +333,9 @@ async fn main() {
         // this binary in production (see deploy/install.sh). This dev/test binary publishes the
         // two tiered feeds only.
         windows: Vec::new(),
+        // A volume entry is published only in a retention window, and this binary has none, so
+        // it publishes no volume entry either way. Left at the default: approval required.
+        volume_auto_publish: false,
     };
 
     tracing::info!(

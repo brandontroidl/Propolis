@@ -29,7 +29,7 @@ Schema is split across three migration sets, each listed migration by migration 
 
 - **`core-scoring`** owns `event`, `ip_score`, `ip_vantage`, `ip_sensor`,
   `sample_analysis`, and all five enum types.
-- **`review`** owns `review_queue`, `vendor_submission`, `fetch_attempt`,
+- **`review`** owns `review_queue`, `volume_review`, `vendor_submission`, `fetch_attempt`,
   `fetch_daily_usage`, and `fetch_event_cursor`. It depends on the `review_state_enum` created by
   core-scoring's first migration - a deliberate cross-crate schema dependency so the
   schema is complete.
@@ -224,6 +224,10 @@ to duplicate tier logic in SQL, keeping Rust the single source of truth.
 - `review_queue` (PK `source_ip`) - snapshots score and categories at the moment an
   IP is surfaced for operator review; carries the review `state`
   (pending/approved/rejected/snoozed) and decision timestamps.
+- `volume_review` (PK `source_ip`) - one row per volume candidate (an address with a
+  thousand or more established TCP events) and the operator's decision on it
+  (pending/approved/rejected). The retention feeds publish a volume listing only once its
+  row is approved; the vendor submitter never reads this table.
 - `vendor_submission` (PK `id`) - one row per abuse-report submission, with a
   **UNIQUE `idempotency_key`** that dedupes retries and the recorded vendor response.
 - `fetch_attempt` (PK `url_hash`) - the malware fetcher's record of each

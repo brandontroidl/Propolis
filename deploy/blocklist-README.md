@@ -20,18 +20,27 @@ manifest.json                                 build time, counts, digests, valid
 
 ## What makes an entry
 
-Every IP in this list did all four of these:
+Every IP under `tiers/` did all four of these:
 
 1. **Connected to a honeypot service** and completed an authenticated session - not a port
-   scan, not a bare TCP connect. Unauthenticated probes are recorded but never published.
+   scan, not a bare TCP connect.
 2. **Did it more than once.** Single-event IPs are excluded.
 3. **Scored above the publication floor** when it was last seen (see below).
-4. **Was approved by a human.** No IP reaches this list automatically. An operator reviews the
+4. **Was approved by a human.** No IP reaches `tiers/` automatically. An operator reviews the
    captured session - the commands run, the credentials tried, the files uploaded - and
    approves or rejects it individually.
 
 That last point is the main thing separating this from an automated feed. It is also why the
 list is small. It is meant to be high-confidence, not comprehensive.
+
+`retention/` carries those same addresses for longer, and can also carry **volume listings**:
+addresses that completed a thousand or more TCP connections to the honeypot, whether or not any
+of them authenticated. A volume listing has no tier and is never under `tiers/`. By default the
+operator approves each one before it is published. The software also lets an operator publish
+volume listings automatically, with no review, and nothing in these files says which was done.
+So treat an address that is in `retention/` and not in `tiers/` as a high-volume source, not as
+a reviewed attacker. If you need every entry to rest on an authenticated session and a human
+decision, use `tiers/`.
 
 ## Tiers
 
@@ -61,14 +70,15 @@ list.
 
 | File | Contains |
 |---|---|
-| `retention/all-24h.*` | every approved address active in the last 24 hours |
+| `retention/all-24h.*` | every tiered address, and every volume listing, active in the last 24 hours |
 | `retention/all-7d.*` | last 7 days |
 | `retention/all-30d.*` | last 30 days |
 | `retention/all-60d.*` | last 60 days |
 | `retention/all-90d.*` | last 90 days |
 
 These ignore tier and **nest**: `all-90d` is a superset of `all-30d`, which is a superset of
-`all-7d`. Pick exactly one; there is never a reason to merge two.
+`all-7d`. Pick exactly one; there is never a reason to merge two. They include the volume
+listings described under "What makes an entry"; the tier files do not.
 
 ## Formats
 

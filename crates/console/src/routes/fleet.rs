@@ -1189,6 +1189,7 @@ async fn fleet_page(
         uptime,
         version,
         degraded,
+        ..
     } = base_context(&state.db, state.startup_time, state.version).await;
     let view = build_view(&state, degraded).await;
     let csrf_token = state

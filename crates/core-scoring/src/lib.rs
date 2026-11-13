@@ -44,4 +44,7 @@ pub use repository::{
     coverage_events, read_score, rebuild_projection, verify_chain,
 };
 pub use scoring::breadth::effective_score;
+// The volume rule's two numbers, for the volume review queue (`review::volume`) and the feed
+// builder: both select volume candidates in SQL and bind these rather than restate them.
+pub use scoring::constants::{VOLUME_LIST_THRESHOLD, VOLUME_LIST_WINDOW_SECONDS};
 pub use scoring::persistence::persistence_points;

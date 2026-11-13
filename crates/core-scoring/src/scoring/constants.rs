@@ -46,8 +46,11 @@ pub const PERSIST_CAP: Decimal = dec!(60);
 /// score. An IP whose cumulative `event_count` crosses this threshold AND is still active within
 /// [`VOLUME_LIST_WINDOW_SECONDS`] is recommended for the blocklist on volume alone. Cumulative count
 /// is the volume proxy (the model has no windowed counter); the recency gate keeps a long-stopped
-/// flood from lingering. Vendor reporting still requires confirmed-real, so a bare flood is blocked
-/// locally but never reported upstream.
+/// flood from lingering. The recommendation is not a publication: the feed builder lists a
+/// volume-recommended address only once an operator approved it in the volume review queue
+/// (`review::volume`), unless the operator opted in to publishing such addresses automatically.
+/// Vendor reporting still requires confirmed-real, so a bare flood can be blocked locally but is
+/// never reported upstream.
 pub const VOLUME_LIST_THRESHOLD: u32 = 1000;
 pub const VOLUME_LIST_WINDOW_SECONDS: i64 = 86_400;
 

@@ -226,9 +226,23 @@ review approve <ip> --notes "..." # mark Approved
 review reject  <ip> --notes "..." # never reported, not re-surfaced by a later scan
 review snooze  <ip> --notes "..." # defer
 review daemon                     # long-running: populate/withdraw queue + submit approved entries
+
+review volume list                        # every Pending volume candidate, oldest-surfaced first
+review volume decided                     # Approved and Rejected volume candidates, newest decision first
+review volume approve <ip> --notes "..."  # publish in the retention feeds; not reported to vendors
+review volume reject  <ip> --notes "..."  # not published on volume, not offered again
+review volume reopen  <ip>                # back to Pending; undoes an approval or a rejection
 ```
 
-> **Egress warning.** `review approve <ip>` does not itself send anything, but
+`review volume` decides the other queue: addresses with a thousand or more established TCP
+events, which the retention feeds publish only once approved
+(`crates/review/src/cli.rs#VolumeCommand`; rules in
+[scoring-and-feed.md](scoring-and-feed.md#volume-review)). `review approve` and
+`review volume approve` are different decisions on different tables, and each fails on an
+address that is only in the other queue.
+
+> **Egress warning.** `review volume approve <ip>` publishes the address in the retention
+> feeds at the next feed build and reports it to nobody. `review approve <ip>` does not itself send anything, but
 > the submission daemon (`review daemon`, or the review subsystem inside
 > `propolis` when `review_enabled`) picks up Approved entries on its next poll
 > and submits them to the configured abuse vendors (AbuseIPDB / DShield / OTX).

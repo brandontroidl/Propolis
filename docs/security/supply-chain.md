@@ -90,7 +90,13 @@ rDNS FFI above.
 ## Dependency policy (`deny.toml`)
 
 The `dependency policy` CI job runs `cargo deny check` against `deny.toml` at the
-repository root, with a freshly fetched advisory database on every run:
+repository root, with a freshly fetched advisory database on every run. It runs on every push
+and pull request and, alone among the jobs, once a day (`.github/workflows/ci.yml#schedule:`):
+an advisory is published against a lockfile that has not changed, so a tree nobody pushes to
+would otherwise not hear of it until the next push. A failed daily run reaches the maintainer
+through GitHub's own workflow notifications; no job is given the right to open an issue.
+GitHub suspends a schedule after 60 days without repository activity, so a quiet repository
+needs a push or a run by hand from the Actions tab to keep it going. The policy:
 
 - **Advisories.** Vulnerable, unsound, unmaintained and yanked crates fail the job.
   An exception names the advisory, why it is accepted and a review date. The one

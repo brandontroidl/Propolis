@@ -41,6 +41,10 @@ way, a cheap failure cannot hide an expensive one.
 | **dependency policy** | `cargo deny check --all-features` against `deny.toml` (see [supply chain](../security/supply-chain.md#dependency-policy-denytoml)) | no |
 | **shellcheck** | `shellcheck -x deploy/*.sh scripts/**/*.sh`, the `koalaman/shellcheck` v0.11.0 image pinned by digest | no |
 
+Every job runs on each push and pull request, and when the workflow is started by hand.
+**dependency policy** also runs once a day by itself (`.github/workflows/ci.yml#schedule:`),
+because a new advisory needs no change to the repository to apply to it.
+
 The release job compiles the profile `deploy/upgrade.sh` ships. The other three
 compile the dev profile, so a release-only break (the vendored-crate checksum
 regression of 2026-08-22, which `cargo test` passed) reached the box with CI

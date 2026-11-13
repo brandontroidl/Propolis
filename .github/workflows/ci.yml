@@ -3,7 +3,9 @@ name: CI
 # Quality gate for the Propolis workspace: formatting, lint (clippy deny-warnings), the full
 # test suite against a real PostgreSQL, a release-profile build, and the dependency policy
 # (deny.toml: advisories, licences, sources). Runs on every push and pull request so nothing
-# merges un-gated. The toolchain is pinned via rust-toolchain.toml (matched rustc + clippy +
+# merges un-gated, and the dependency policy alone runs once a day as well: an advisory is
+# published against a lockfile that has not changed, so a tree nobody pushes to would otherwise
+# never hear of it. The toolchain is pinned via rust-toolchain.toml (matched rustc + clippy +
 # rustfmt).
 #
 # These are INDEPENDENT jobs, deliberately, not steps in one. As a single sequential
@@ -24,6 +26,14 @@ name: CI
 on:
   push:
   pull_request:
+  # Daily, for the dependency policy only (every other job is skipped on this event): the
+  # advisory database changes when the repository does not. A failed scheduled run notifies
+  # through GitHub's own workflow notifications; no job is given the right to open an issue.
+  # GitHub suspends a schedule after 60 days without repository activity and says so by email.
+  schedule:
+    - cron: "23 6 * * *"
+  # By hand, from the Actions tab: runs every job.
+  workflow_dispatch:
 
 # The token every job receives can only read the repository. No job writes to it, opens or
 # comments on anything, or publishes: checkout needs read, the cache and the step summary use the
@@ -32,8 +42,10 @@ on:
 permissions:
   contents: read
 
+# The event is part of the group so that the daily run on main and a push to main do not cancel
+# one another.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -42,6 +54,7 @@ env:
 jobs:
   fmt:
     name: fmt
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -59,6 +72,7 @@ jobs:
 
   clippy:
     name: clippy
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -80,6 +94,7 @@ jobs:
 
   tests:
     name: tests
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     services:
@@ -185,6 +200,7 @@ jobs:
 
   release:
     name: release build
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -214,7 +230,8 @@ jobs:
       # deny.toml at the repository root is the policy: advisories (vulnerable, unsound,
       # unmaintained, yanked), the licence allowlist, and crates.io as the only source. The advisory
       # database is fetched fresh each run, so a new advisory against a vendored crate turns this
-      # job red without any change to the repository - which is the point.
+      # job red without any change to the repository - which is the point, and why this job, alone,
+      # also runs on the daily schedule: without it nothing runs until someone pushes.
       - name: cargo deny check
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
         with:
@@ -224,6 +241,7 @@ jobs:
 
   shellcheck:
     name: shellcheck
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

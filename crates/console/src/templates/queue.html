@@ -26,8 +26,8 @@ rest.</p>
 <p class="table-note">A volume candidate is an address that reached a thousand established TCP
 events. It is published only if you approve it here. <strong>Approve</strong>
 publishes this address in the retention feeds; it is not reported to abuse vendors. The approval
-stands while the address keeps being seen, by any kind of event, and lapses once it has dropped
-out of every retention window. <strong>Reject</strong> keeps it out, and it is not offered again.
+stands while the address keeps being seen, by any kind of event, and lapses once the address
+has been silent for the longest retention window (ninety days at the least). <strong>Reject</strong> keeps it out, and it is not offered again.
 The count is what the sensors' logs declared, so look at what the address did before approving
 it. The exception: on a node started with <code>PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true</code>
 this tab is not a list of what is published. An address that never authenticated is published

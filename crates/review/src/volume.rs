@@ -43,9 +43,9 @@ pub struct VolumeEntry {
     pub notes: Option<String>,
 }
 
-/// How long an address may go unseen before a Pending or Approved row about it lapses, unless
-/// [`VolumeQueue::lapsing_after`] says otherwise: the longest retention window the feed ships
-/// with (`all-90d`).
+/// The shortest time an address may go unseen before a Pending or Approved row about it lapses:
+/// the longest retention window the feed ships with (`all-90d`). [`VolumeQueue::lapsing_after`]
+/// can lengthen it and never shortens it.
 pub const VOLUME_DECISION_LAPSE_DAYS: i64 = 90;
 
 /// The volume review queue: population/withdrawal scans, the operator's decisions and the
@@ -79,12 +79,15 @@ impl VolumeQueue {
     /// feed file, so an approval has nothing left to publish and the next sighting should be a
     /// new decision, not a listing nobody looked at.
     ///
-    /// Never less than [`VOLUME_LIST_WINDOW_SECONDS`], the day within which [`Self::populate`]
-    /// still offers an address. With a shorter limit (a node whose longest window is a few
-    /// hours) every scan would offer an address seen inside that day and remove the row again
-    /// in the same pass, once a scan interval, each time with a log line.
+    /// Never less than [`VOLUME_DECISION_LAPSE_DAYS`], whatever this node's own windows are.
+    /// The lapse is a delete on a table every node of a shared database reads, so a node that
+    /// publishes only short windows must not end an approval that another node, with the
+    /// windows a default install has, is still publishing; a removed approval does not come
+    /// back until the address floods again and is approved again. The bound also keeps the
+    /// lapse outside the day within which [`Self::populate`] still offers an address, where
+    /// every scan would insert a row and remove it again in the same pass.
     pub fn lapsing_after(mut self, silence: Duration) -> Self {
-        self.lapse_after = silence.max(Duration::seconds(VOLUME_LIST_WINDOW_SECONDS));
+        self.lapse_after = silence.max(Duration::days(VOLUME_DECISION_LAPSE_DAYS));
         self
     }
 
@@ -197,7 +200,8 @@ impl VolumeQueue {
     /// decision on its score covers the volume listing too).
     ///
     /// A Pending or an Approved row goes when its address has not been seen for
-    /// [`Self::lapsing_after`]'s duration. Short of that a candidate is NOT withdrawn for going
+    /// [`Self::lapsing_after`]'s duration: the longest retention window, and never less than
+    /// [`VOLUME_DECISION_LAPSE_DAYS`]. Short of that a candidate is NOT withdrawn for going
     /// quiet: the retention feeds carry an address for up to their longest window after its last
     /// event, so the decision still matters after the flood stops. Past it the address is in no
     /// feed file. An approval left standing there would publish the address again at its next
@@ -254,7 +258,7 @@ impl VolumeQueue {
                 ?state,
                 ?decided_at,
                 silent_days = self.lapse_after.num_days(),
-                "volume review: row lapsed, its address is out of every retention window"
+                "volume review: row lapsed, its address has not been seen for this long"
             );
         }
         removed += lapsed.len();

@@ -523,7 +523,8 @@ async fn last_seen_ago(pool: &PgPool, ip: &str, ago: Duration) {
 /// retention window it is in no feed file, and an approval left standing would publish it again
 /// at its next sighting with nobody deciding. So the approved row goes, a pending row with it,
 /// and the next flood is offered as a new candidate. A rejection stays: a rejected address is
-/// not offered again.
+/// not offered again. The node here publishes a window longer than the ninety days the queue
+/// uses by default.
 #[sqlx::test(migrations = false)]
 async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offered_anew(
     pool: PgPool,
@@ -536,7 +537,8 @@ async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offere
     for ip in [approved, pending, rejected, approved_inside] {
         seed_flood(&pool, ip).await;
     }
-    let queue = queue().lapsing_after(Duration::days(30));
+    let longest = Duration::days(120);
+    let queue = queue().lapsing_after(longest);
     assert_eq!(queue.populate(&pool).await.unwrap(), 4);
     for ip in [approved, approved_inside] {
         queue
@@ -551,7 +553,7 @@ async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offere
 
     // A minute short of the limit nothing lapses.
     for ip in [approved, pending, rejected] {
-        last_seen_ago(&pool, ip, Duration::days(30) - Duration::minutes(1)).await;
+        last_seen_ago(&pool, ip, longest - Duration::minutes(1)).await;
     }
     assert_eq!(queue.withdraw(&pool).await.unwrap(), 0);
     assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Approved));
@@ -560,7 +562,7 @@ async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offere
     // A minute past it the approval and the open candidate are gone; the rejection and the
     // approval of an address still being seen are not.
     for ip in [approved, pending, rejected] {
-        last_seen_ago(&pool, ip, Duration::days(30) + Duration::minutes(1)).await;
+        last_seen_ago(&pool, ip, longest + Duration::minutes(1)).await;
     }
     assert_eq!(queue.withdraw(&pool).await.unwrap(), 2);
     assert_eq!(state_of(&pool, approved).await, None);
@@ -611,30 +613,47 @@ async fn by_default_a_decision_lapses_after_ninety_days_unseen(pool: PgPool) {
     assert_eq!(state_of(&pool, outside).await, None);
 }
 
-/// A node whose longest retention window is shorter than the day within which `populate` still
-/// offers an address. Lapsing at the window would have every scan offer an address seen inside
-/// that day and remove the row again in the same pass. The limit is never less than that day.
+/// The lapse is a delete on a table every node of a shared database reads. A node that publishes
+/// only short windows must not end an approval another node is still publishing under the
+/// windows a default install has, and a removed approval does not come back until the address
+/// floods again. So a limit shorter than ninety days is raised to ninety, whatever this node
+/// publishes. (It also keeps the lapse outside the day within which `populate` still offers an
+/// address, where every scan would insert a row and remove it again.)
 #[sqlx::test(migrations = false)]
-async fn a_lapse_shorter_than_the_offer_window_is_raised_to_it(pool: PgPool) {
+async fn a_lapse_shorter_than_ninety_days_is_raised_to_ninety(pool: PgPool) {
     migrate(&pool).await;
-    let ip = "192.0.2.66";
-    seed_flood(&pool, ip).await;
-    let queue = queue().lapsing_after(Duration::hours(12));
-    assert_eq!(queue.populate(&pool).await.unwrap(), 1);
+    let approved = "192.0.2.66";
+    let pending = "192.0.2.67";
+    for ip in [approved, pending] {
+        seed_flood(&pool, ip).await;
+    }
+    // This node's longest window is seven days.
+    let queue = queue().lapsing_after(Duration::days(7));
+    assert_eq!(queue.populate(&pool).await.unwrap(), 2);
+    queue
+        .approve(&pool, approved.parse().unwrap(), None)
+        .await
+        .unwrap();
 
-    // Thirteen hours unseen: past the node's window, inside the offer window. The row stays, so
-    // the next scan has nothing to offer again.
-    last_seen_ago(&pool, ip, Duration::hours(13)).await;
-    for _ in 0..3 {
-        assert_eq!(queue.populate(&pool).await.unwrap(), 0);
-        assert_eq!(queue.withdraw(&pool).await.unwrap(), 0);
-        assert_eq!(state_of(&pool, ip).await, Some(ReviewState::Pending));
+    // Thirteen hours unseen, then thirty days: past this node's windows, inside ninety days.
+    // Both rows stay, and a row that stays is not offered again by the next scan.
+    for unseen in [Duration::hours(13), Duration::days(30), Duration::days(89)] {
+        for ip in [approved, pending] {
+            last_seen_ago(&pool, ip, unseen).await;
+        }
+        assert_eq!(queue.populate(&pool).await.unwrap(), 0, "{unseen}");
+        assert_eq!(queue.withdraw(&pool).await.unwrap(), 0, "{unseen}");
+        assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Approved));
+        assert_eq!(state_of(&pool, pending).await, Some(ReviewState::Pending));
     }
 
-    // Past the offer window it lapses, and is not offered again while it stays unseen.
-    last_seen_ago(&pool, ip, Duration::hours(25)).await;
-    assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
-    assert_eq!(state_of(&pool, ip).await, None);
+    // Past ninety days they lapse.
+    for ip in [approved, pending] {
+        last_seen_ago(&pool, ip, Duration::days(91)).await;
+    }
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 2);
+    assert_eq!(state_of(&pool, approved).await, None);
+    assert_eq!(state_of(&pool, pending).await, None);
     assert_eq!(queue.populate(&pool).await.unwrap(), 0);
 }
 

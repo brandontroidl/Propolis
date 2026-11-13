@@ -47,6 +47,14 @@ shared DB, and review/feed are designed to be idempotent so more than one node
 can run them against the same data
 (`docs/archive/2026-08-26/root/INSTALL.md#Multi-node deployment`).
 
+One setting has to match across such nodes. A lapsed volume approval is deleted from the shared
+database by whichever node's scan finds it, using that node's own longest retention window and
+never less than 90 days ([volume review](../reference/scoring-and-feed.md#volume-review)). Nodes
+whose windows all fit in 90 days cannot cut each other short. If any node publishes a window
+longer than that, give every node that runs the review subsystem or the feed the same
+`PROPOLIS_FEED_WINDOWS`, or the node with the shortest list ends approvals the others still
+publish.
+
 What is enforced in code and tested with two independent connection pools:
 
 - **Malware fetcher.** Each cycle claims its rows in one transaction, so no two

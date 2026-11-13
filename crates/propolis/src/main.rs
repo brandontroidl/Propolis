@@ -1319,8 +1319,9 @@ async fn main() {
     };
 
     // A volume decision lapses once its address has been unseen for the longest retention
-    // window this node publishes: past that it is in no feed file. With no window configured
-    // nothing is published on volume at all and the queue's own default stands.
+    // window this node publishes: past that it is in no feed file. The queue never lets that be
+    // less than its own ninety days (another node of the same database may publish longer
+    // windows than this one), and with no window configured that default stands.
     let volume_lapse = config
         .feed_windows
         .iter()

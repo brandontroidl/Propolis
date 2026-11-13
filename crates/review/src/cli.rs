@@ -105,7 +105,8 @@ pub enum VolumeCommand {
     /// Approve a volume candidate: it is published in the retention feeds
     /// from the next feed build. It is not reported to abuse vendors. The
     /// approval stands until it is reopened, the address is delisted, or the
-    /// address has gone unseen for the longest retention window.
+    /// address has gone unseen for the longest retention window (ninety
+    /// days at the least).
     Approve {
         ip: IpAddr,
         /// Optional note recording the reasoning behind this decision.

@@ -450,7 +450,7 @@ git checkout --quiet --no-overwrite-ignore -B main "$ID^{commit}" &&
 [ -z "$(git status --porcelain --untracked-files=no)" ] &&
 [ "$(git rev-parse HEAD)" = "$ID" ] &&
 git diff --no-renames --name-only --diff-filter=D -z "$OLD" "$ID^{commit}" |
-    xargs -0 -r sh -c 'for p; do if [ -f "$p" ] || [ -L "$p" ]; then echo "still on disk: $p"; exit 1; fi; done' sh &&
+    xargs -0 -r sh -c 'for p; do d="$p"; while [ "$d" != "${d%/*}" ]; do d="${d%/*}"; [ -L "$d" ] && continue 2; done; if [ -f "$p" ] || [ -L "$p" ]; then echo "still on disk: $p"; exit 1; fi; done' sh &&
 echo "OK: the checkout is on the commit named" ||
 echo "STOPPED: a step failed and nothing after it ran"
 ```
@@ -461,8 +461,9 @@ box, that commit carries a listed key's SSH signature; the number of files that 
 printed, which is what you are accepting; the commit being left is recorded, because it is on
 no branch afterwards and cannot be fetched again from a restarted history; the branch moves,
 without replacing ignored files; and the result is the named commit, with no tracked file
-differing from it and no file the new commit removed still on disk. A step that fails prints
-`STOPPED` and leaves the rest undone.
+differing from it and no file the new commit removed still on disk (a file reached through
+a link the new commit put where a directory was is the link target's, not a leftover). A step
+that fails prints `STOPPED` and leaves the rest undone.
 
 Three things the block does on purpose. `"$ID^{commit}"` rather than the bare id: handed a
 bare id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of

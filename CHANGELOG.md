@@ -12,10 +12,11 @@
   named, including a move backwards, which the run announces. The clean tree, the recorded
   origin and the signature check still apply; the run prints how many files differ; the
   commit the box left is kept as `refs/propolis/before-adoption/<UTC time>`; and until the
-  run has accepted `origin/main` it prints neither the commit that was fetched nor text the
-  remote sent, because the id has to reach you through a channel the remote does not control.
-  A tree that lacks database migrations the box has run is adopted with a warning: the
-  daemon it builds will not start until the database is restored to match. The argument needs a box whose own `upgrade.sh` already has it. To
+  run has accepted `origin/main` it prints neither the commit that was fetched nor anything a
+  fetch that worked printed, because the id has to reach you through a channel the remote does
+  not control. A tree that lacks database migrations the box has run is adopted with a
+  warning: the daemon it builds will not start unless the release and its database were
+  rolled back first (`rollback.sh --with-database <release>`), in that order. The argument needs a box whose own `upgrade.sh` already has it. To
   move a running box to a successor repository: upgrade once on the old origin, change the
   remote, then run with `--accept-origin --adopt-history=<id>`. A box that cannot take that
   first upgrade, and a split deployment's collectors, follow by hand with commands that name

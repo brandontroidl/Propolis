@@ -2458,9 +2458,14 @@ impl ReexecRun {
 
 /// Runs `git` in `dir`, asserting success and returning trimmed stdout.
 fn git(dir: &Path, args: &[&str]) -> String {
+    // No global or system config: a developer whose own config signs every commit, with their
+    // key and their signing program, would otherwise sign the commits a test means to leave
+    // unsigned and re-sign the ones it signs with a fixture key.
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .fenced_output()
         .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
     assert!(
@@ -2574,7 +2579,10 @@ impl UpgradeFixture {
             &stubs.join("git-remote-probe"),
             "#!/bin/sh\nwhile IFS= read -r cmd; do\n\tcase \"$cmd\" in\n\
              \t\tcapabilities) printf 'connect\\n\\n' ;;\n\
-             \t\t\"connect git-upload-pack\") printf '\\n'; exec git upload-pack \"$FIXTURE_ORIGIN\" ;;\n\
+             \t\t\"connect git-upload-pack\") printf '\\n'\n\
+             \t\t\t[ -z \"${PROBE_SAYS:-}\" ] || printf '%s\\n' \"$PROBE_SAYS\" >&2\n\
+             \t\t\t[ -z \"${PROBE_FAILS:-}\" ] || exit 1\n\
+             \t\t\texec git upload-pack \"$FIXTURE_ORIGIN\" ;;\n\
              \t\t\"\") exit 0 ;;\n\t\t*) exit 1 ;;\n\tesac\ndone\n",
         );
         Self {
@@ -2788,6 +2796,9 @@ impl UpgradeFixture {
             .env("DEPLOY_STAMP", DEPLOY_STAMP)
             .env("FIXTURE_ORIGIN", &self.origin)
             .env("PROPOLIS_UPGRADE_ROOT", &self.root)
+            // As in `git` above; a test that plays the serving side passes its own.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("PROPOLIS_UPGRADE_REEXEC")
             .env_remove("PROPOLIS_UPGRADE_PULLED_AT")
             .env_remove("PROPOLIS_UPGRADE_ORIGIN_URL");
@@ -2994,7 +3005,7 @@ fn printed(run: &ReexecRun) -> String {
 /// stand a read-only directory in for "a path the checkout's owner cannot change" skip as root.
 /// CI runs them as an ordinary account.
 fn running_as_root() -> bool {
-    let uid = Command::new("id").arg("-u").output().unwrap().stdout;
+    let uid = Command::new("id").arg("-u").fenced_output().unwrap().stdout;
     String::from_utf8_lossy(&uid).trim() == "0"
 }
 
@@ -3296,6 +3307,9 @@ fn upgrade_adopt_history_lands_on_the_named_commit_whatever_a_tag_is_called() {
     git(&fx.repo, &["fetch", "-q", "origin", "side"]);
     git(&fx.repo, &["tag", &restarted, &other]);
     git(&fx.repo, &["tag", "main", &other]);
+    // And one named like the tracking ref, so a move that named the ref and not the commit that
+    // was checked would land on the other commit too.
+    git(&fx.repo, &["tag", "origin/main", &other]);
 
     let run = fx.run(&[&format!("--adopt-history={restarted}")], &[]);
     assert!(run.output.status.success(), "{}", run.stderr());
@@ -3416,6 +3430,16 @@ fn upgrade_adopt_history_lists_the_commits_it_leaves_behind() {
     fx.push_change(false);
     let tip = git(&fx.author, &["rev-parse", "HEAD"]);
 
+    // Any other id moves nothing, and is not answered with the right one.
+    let run = fx.run(&[&format!("--adopt-history={head}")], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("origin/main is not the commit --adopt-history names")
+            && !names_commit(&out, &tip),
+        "{out}"
+    );
+
     let run = fx.run(&[&format!("--adopt-history={tip}")], &[]);
     assert!(run.output.status.success(), "{}", run.stderr());
     assert_eq!(fx.head(), tip);
@@ -3442,6 +3466,17 @@ fn upgrade_adopt_history_moves_a_box_backwards_only_when_named_and_says_so() {
     git(
         &fx.author,
         &["push", "-q", "--force", "origin", &format!("{first}:main")],
+    );
+
+    // Named means named: any other id, here the box's own commit, moves nothing. This is the
+    // shape the argument makes dangerous, so it is the one a wrong id has to be tried against.
+    let run = fx.run(&[&format!("--adopt-history={head}")], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("origin/main is not the commit --adopt-history names")
+            && !names_commit(&out, &first),
+        "{out}"
     );
 
     let run = fx.run(&[&format!("--adopt-history={first}")], &[]);
@@ -3484,7 +3519,8 @@ fn upgrade_adopt_history_warns_when_the_adopted_tree_lacks_migrations_the_box_ha
     assert!(
         stdout.contains("WARNING: origin/main lacks 1 database migration(s) this checkout has:")
             && stdout.contains("crates/core-scoring/migrations/0099_add_x.sql")
-            && stdout.contains("propolis will not start until the database is"),
+            && stdout.contains("rolled back first")
+            && stdout.contains("propolis will not start"),
         "{stdout}"
     );
     let warned = stdout.find("WARNING").unwrap();
@@ -3944,6 +3980,276 @@ fn upgrade_refuses_when_it_cannot_list_what_the_move_removed() {
     assert_eq!(fx.head(), tip, "the fast-forward itself had gone through");
 }
 
+/// With signing on, the commits that get as far as the ancestry and the pin are validly signed
+/// ones: an earlier signed release served again, a signed commit over a commit the box made, a
+/// signed restarted history under a wrong id. Those are what a hijacked remote can produce there,
+/// and each refusal still says nothing of which commit was fetched.
+#[test]
+fn upgrade_with_signers_prints_no_fetched_commit_once_the_signature_is_good() {
+    // An earlier signed release, served again.
+    let fx = UpgradeFixture::new();
+    let (key, public) = fx.ssh_key("signer");
+    fx.write_signers(&[&public]);
+    fx.push_signed(&key, "release one");
+    let one = git(&fx.author, &["rev-parse", "HEAD"]);
+    fx.push_signed(&key, "release two");
+    assert!(fx.run(&[], &[]).output.status.success());
+    let head = fx.head();
+    git(
+        &fx.author,
+        &["push", "-q", "--force", "origin", &format!("{one}:main")],
+    );
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(out.contains("origin/main is behind this checkout"), "{out}");
+    assert!(!names_commit(&out, &one), "{out}");
+
+    // A signed commit on main over a commit made on the box.
+    let fx = UpgradeFixture::new();
+    let (key, public) = fx.ssh_key("signer");
+    fx.write_signers(&[&public]);
+    git(
+        &fx.repo,
+        &["commit", "-q", "--allow-empty", "-m", "local only change"],
+    );
+    let head = fx.head();
+    fx.push_signed(&key, "signed upstream");
+    let tip = git(&fx.author, &["rev-parse", "HEAD"]);
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(out.contains("not an ancestor of origin/main"), "{out}");
+    assert!(!names_commit(&out, &tip), "{out}");
+
+    // A signed restarted history, and an operator who names another commit.
+    let fx = UpgradeFixture::new();
+    let (key, public) = fx.ssh_key("signer");
+    fx.write_signers(&[&public]);
+    fx.restart_history(true);
+    git(
+        &fx.author,
+        &[
+            "-c",
+            "gpg.format=ssh",
+            "-c",
+            &format!("user.signingkey={}", key.display()),
+            "commit",
+            "-q",
+            "--amend",
+            "--no-edit",
+            "-S",
+        ],
+    );
+    git(
+        &fx.author,
+        &["push", "-q", "--force", "origin", "HEAD:main"],
+    );
+    let signed = git(&fx.author, &["rev-parse", "HEAD"]);
+    let head = fx.head();
+    for args in [vec![], vec![format!("--adopt-history={head}")]] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = fx.run(&args, &[]);
+        assert_refused_before_build(&fx, &run, &head);
+        let out = printed(&run);
+        assert!(
+            out.contains("shares no history with origin/main")
+                || out.contains("origin/main is not the commit --adopt-history names"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("is not SSH-signed"),
+            "the signature was good: {out}"
+        );
+        assert!(!names_commit(&out, &signed), "{out}");
+    }
+}
+
+/// The check after the move, held for any account. The tests that stand a read-only directory in
+/// for "a file git could not remove or replace" cannot run as root; here a hook of the checkout's
+/// own does to the tree, right after git has moved it, what such a failure leaves: a removed file
+/// back on disk, and a replaced file with its old content.
+#[test]
+fn upgrade_refuses_what_is_in_the_tree_after_the_move_and_not_in_the_commit() {
+    // Each state on its own, so each half of the check is the one that has to refuse.
+    for (adopt, left_over) in [(false, true), (true, true), (false, false), (true, false)] {
+        let case = format!("adopt={adopt} left_over={left_over}");
+        let fx = UpgradeFixture::new();
+        std::fs::create_dir_all(fx.author.join("src/bin")).unwrap();
+        std::fs::write(fx.author.join("src/bin/dropped.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(fx.author.join("src/lib.txt"), "old\n").unwrap();
+        git(&fx.author, &["add", "-A"]);
+        git(&fx.author, &["commit", "-q", "-m", "two files"]);
+        git(&fx.author, &["push", "-q", "origin", "main"]);
+        assert!(fx.run(&[], &[]).output.status.success());
+        let head = fx.head();
+
+        if adopt {
+            git(&fx.author, &["checkout", "-q", "--orphan", "restarted"]);
+        }
+        std::fs::remove_file(fx.author.join("src/bin/dropped.rs")).unwrap();
+        std::fs::write(fx.author.join("src/lib.txt"), "new\n").unwrap();
+        git(&fx.author, &["add", "-A"]);
+        git(
+            &fx.author,
+            &["commit", "-q", "-m", "drops one, changes one"],
+        );
+        git(
+            &fx.author,
+            &["push", "-q", "--force", "origin", "HEAD:main"],
+        );
+        let tip = git(&fx.author, &["rev-parse", "HEAD"]);
+
+        let hook = if adopt { "post-checkout" } else { "post-merge" };
+        write_executable(
+            &fx.repo.join(".git/hooks").join(hook),
+            if left_over {
+                "#!/bin/sh\nmkdir -p src/bin\nprintf 'fn main() {}\\n' > src/bin/dropped.rs\n"
+            } else {
+                "#!/bin/sh\nprintf 'old\\n' > src/lib.txt\n"
+            },
+        );
+        let args: Vec<String> = if adopt {
+            vec![format!("--adopt-history={tip}")]
+        } else {
+            Vec::new()
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = fx.run(&args, &[]);
+
+        assert!(!run.output.status.success(), "{case}: {}", run.stdout());
+        assert!(
+            continued_lines(&run).is_empty(),
+            "{case}: the tree reached the build: {}",
+            run.stdout()
+        );
+        let stderr = run.stderr();
+        assert!(
+            stderr.contains("could not be moved cleanly")
+                && stderr.contains(&format!("it is at {tip} and it was at {head}"))
+                && stderr.contains("nothing was built or installed"),
+            "{case}: {stderr}"
+        );
+        if left_over {
+            assert!(
+                stderr.contains("files that commit does not have, still on disk:")
+                    && stderr.contains("?? src/bin/dropped.rs")
+                    && !stderr.contains("tracked files that do not match"),
+                "{case}: {stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains("tracked files that do not match the commit it is at:")
+                    && stderr.contains(" M src/lib.txt")
+                    && !stderr.contains("still on disk"),
+                "{case}: {stderr}"
+            );
+        }
+    }
+}
+
+/// A fast-forward that fails ends in the refusal for any account: the merge is made to exit
+/// non-zero, where the read-only-directory test needs an account a directory's mode can stop.
+#[test]
+fn upgrade_reports_a_failed_fast_forward_as_a_refusal_for_any_account() {
+    let fx = UpgradeFixture::new();
+    let head = fx.head();
+    fx.push_change(false);
+    let run = fx.run(&[], &[("FAIL_ON_GIT", "merge")]);
+    assert!(!run.output.status.success(), "{}", run.stdout());
+    assert!(continued_lines(&run).is_empty(), "{}", run.stdout());
+    let stderr = run.stderr();
+    assert!(
+        stderr.contains("could not be moved cleanly")
+            && stderr.contains(&format!("it has not moved from {head}"))
+            && stderr.contains("nothing was built or installed"),
+        "a failed merge must end in the refusal, not in git's error alone: {stderr}"
+    );
+    assert_eq!(fx.head(), head);
+}
+
+/// HEAD after the move is the commit that was checked, and that is compared, not inferred from
+/// git's exit status or from a clean tree: here a hook commits on top right after the move, so the
+/// tree is clean, git reported success, and the checkout is on a commit nothing verified.
+#[test]
+fn upgrade_refuses_a_checkout_that_ends_on_a_commit_other_than_the_one_checked() {
+    for adopt in [false, true] {
+        let fx = UpgradeFixture::new();
+        let head = fx.head();
+        let tip = if adopt {
+            fx.restart_history(true)
+        } else {
+            fx.push_change(false);
+            git(&fx.author, &["rev-parse", "HEAD"])
+        };
+        let hook = if adopt { "post-checkout" } else { "post-merge" };
+        write_executable(
+            &fx.repo.join(".git/hooks").join(hook),
+            "#!/bin/sh\nexec git commit -q --allow-empty -m 'made after the move'\n",
+        );
+        let args: Vec<String> = if adopt {
+            vec![format!("--adopt-history={tip}")]
+        } else {
+            Vec::new()
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = fx.run(&args, &[]);
+        let now = fx.head();
+        assert!(
+            now != tip && now != head && git(&fx.repo, &["status", "--porcelain"]).is_empty(),
+            "adopt={adopt}: the fixture is the case this test is about"
+        );
+        assert!(
+            !run.output.status.success(),
+            "adopt={adopt}: {}",
+            run.stdout()
+        );
+        assert!(
+            continued_lines(&run).is_empty(),
+            "adopt={adopt}: a commit nothing checked reached the build: {}",
+            run.stdout()
+        );
+        let stderr = run.stderr();
+        assert!(
+            stderr.contains("could not be moved cleanly")
+                && stderr.contains(&format!("it is at {now} and it was at {head}")),
+            "adopt={adopt}: {stderr}"
+        );
+    }
+}
+
+/// The commit an adoption leaves is recorded before anything moves, and a record that cannot be
+/// written stops the run there: on a restarted history that commit cannot be fetched again.
+#[test]
+fn upgrade_adopt_history_does_not_move_when_it_cannot_keep_the_commit_it_leaves() {
+    let fx = UpgradeFixture::new();
+    let restarted = fx.restart_history(true);
+    let head = fx.head();
+    // A ref where the directory of kept refs has to be: git cannot create a ref below a ref.
+    git(
+        &fx.repo,
+        &["update-ref", "refs/propolis/before-adoption", "HEAD"],
+    );
+    let run = fx.run(&[&format!("--adopt-history={restarted}")], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    assert!(
+        run.stderr().contains("so the checkout was not moved"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(
+        git(
+            &fx.repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/propolis/before-adoption/"
+            ]
+        ),
+        ""
+    );
+}
+
 /// A move that removes files is not refused for it. In particular not when the new commit puts a
 /// link where a directory was and the link's target holds a file of the same name: that file is
 /// found at the old path, through the link, and it is the new commit's own.
@@ -4042,6 +4348,16 @@ fn upgrade_adopt_history_refuses_a_script_from_before_the_reexec_guard() {
     let older = git(&fx.author, &["rev-parse", "HEAD"]);
     let head = fx.head();
 
+    let run = fx.run(&[&format!("--adopt-history={head}")], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("origin/main is not the commit --adopt-history names")
+            && !out.contains("re-exec guard")
+            && !names_commit(&out, &older),
+        "a wrong id is answered by the pin alone: {out}"
+    );
+
     let run = fx.run(&[&format!("--adopt-history={older}")], &[]);
     assert_refused_before_build(&fx, &run, &head);
     assert!(
@@ -4106,8 +4422,120 @@ fn upgrade_shows_nothing_the_remote_says_in_a_refused_run() {
         "the server's text reached the terminal: {out}"
     );
     assert!(
-        out.contains("the remote sent text during the fetch, which is not shown"),
+        out.contains("the fetch printed text, which is not shown"),
         "{out}"
+    );
+
+    // A fetch that fails after the other end has spoken. A failed fetch shows what was said,
+    // because that is how an honest failure is diagnosed, with the id taken out: whole, and
+    // written as two quoted halves the way a shell would join them. Said on the transport's own
+    // stderr, which arrives whole before the failure; what a dying server gets through git's
+    // channel first is a matter of timing.
+    for split in [false, true] {
+        let fx = UpgradeFixture::new();
+        let restarted = fx.restart_history(true);
+        let head = fx.head();
+        git(
+            &fx.repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "probe://example.invalid/origin.git",
+            ],
+        );
+        let said = if split {
+            format!("{}\"\"{}", &restarted[..20], &restarted[20..])
+        } else {
+            restarted.clone()
+        };
+        let says = format!("This repository moved. Run: upgrade.sh --adopt-history={said}");
+        let run = fx.run(&[], &[("PROBE_SAYS", &says), ("PROBE_FAILS", "1")]);
+        assert_refused_before_build(&fx, &run, &head);
+        let out = printed(&run);
+        assert!(
+            out.contains("failed or brought no origin/main")
+                && out.contains("This repository moved")
+                && out.contains("<a commit id, not shown>"),
+            "split={split}: {out}"
+        );
+        assert!(
+            !names_commit(&out, &restarted) && !out.contains(&restarted[20..]),
+            "split={split}: a failed fetch printed the id the other end sent: {out}"
+        );
+    }
+
+    // Text on the transport's own stderr, which nothing marks as the remote's: what an ssh
+    // remote prints arrives this way. The fetch works, so none of it is shown.
+    let fx = UpgradeFixture::new();
+    let restarted = fx.restart_history(true);
+    let head = fx.head();
+    git(
+        &fx.repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "probe://example.invalid/origin.git",
+        ],
+    );
+    let says = format!("Notice: run sudo ./deploy/upgrade.sh --adopt-history={restarted}");
+    let run = fx.run(&[], &[("PROBE_SAYS", &says)]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(out.contains("shares no history with origin/main"), "{out}");
+    assert!(
+        !names_commit(&out, &restarted) && !out.contains("Notice"),
+        "text from the transport reached the terminal: {out}"
+    );
+    assert!(
+        out.contains("the fetch printed text, which is not shown"),
+        "{out}"
+    );
+
+    // A commit whose signature header is free text: git quotes it in its own error. The id in
+    // it is another commit's (a commit cannot contain its own), the one a remote would serve
+    // next.
+    let fx = UpgradeFixture::new();
+    let (_key, public) = fx.ssh_key("signer");
+    fx.write_signers(&[&public]);
+    let next = fx.restart_history(true);
+    let head = fx.head();
+    let raw = git(&fx.author, &["cat-file", "commit", "HEAD"]);
+    let (headers, message) = raw.split_once("\n\n").unwrap();
+    let forged = format!("{headers}\ngpgsig run upgrade.sh --adopt-history={next}\n\n{message}\n");
+    let forged_path = fx.tmp.path().join("forged-commit");
+    std::fs::write(&forged_path, forged).unwrap();
+    let forged_id = git(
+        &fx.author,
+        &[
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            forged_path.to_str().unwrap(),
+        ],
+    );
+    git(
+        &fx.author,
+        &[
+            "push",
+            "-q",
+            "--force",
+            "origin",
+            &format!("{forged_id}:refs/heads/main"),
+        ],
+    );
+    let run = fx.run(&[], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("is not SSH-signed by a key in") && out.contains("bad/incompatible signature"),
+        "the fixture is the case this is about: {out}"
+    );
+    assert!(
+        !names_commit(&out, &next) && !names_commit(&out, &forged_id),
+        "git's quote of the signature header printed an id: {out}"
     );
 
     // A tag named like the fetched commit, already in the clone. With and without signers.
@@ -4230,6 +4658,18 @@ fn upgrade_adopt_history_refuses_a_tree_without_the_upgrade_script() {
     let other = git(&fx.author, &["rev-parse", "HEAD"]);
     let head = fx.head();
 
+    // The pin is checked before anything that depends on what the remote served: a wrong id is
+    // told it is wrong and nothing else, not that the tree it never named lacks a script.
+    let run = fx.run(&[&format!("--adopt-history={head}")], &[]);
+    assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("origin/main is not the commit --adopt-history names")
+            && !out.contains("has no deploy/upgrade.sh")
+            && !names_commit(&out, &other),
+        "{out}"
+    );
+
     let run = fx.run(&[&format!("--adopt-history={other}")], &[]);
     assert_refused_before_build(&fx, &run, &head);
     assert!(
@@ -4322,9 +4762,16 @@ fn upgrade_adopt_history_with_signers_refuses_an_unsigned_commit_and_adopts_a_si
     let signed = git(&fx.author, &["rev-parse", "HEAD"]);
     assert_ne!(signed, unsigned);
 
-    // The unsigned commit's id no longer names origin/main.
+    // The unsigned commit's id no longer names origin/main. The signature is good by now, and
+    // the refusal still does not say which commit carries it.
     let run = fx.run(&[&format!("--adopt-history={unsigned}")], &[]);
     assert_refused_before_build(&fx, &run, &head);
+    let out = printed(&run);
+    assert!(
+        out.contains("origin/main is not the commit --adopt-history names")
+            && !names_commit(&out, &signed),
+        "{out}"
+    );
 
     let run = fx.run(&[&format!("--adopt-history={signed}")], &[]);
     assert!(run.output.status.success(), "{}", run.stderr());

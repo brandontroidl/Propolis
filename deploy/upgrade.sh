@@ -97,7 +97,13 @@ as_owner() {
 }
 # Anything that reads as a commit id is taken out of text this run did not write itself (what git
 # printed while it talked to the remote, a commit's subject line), wherever a refusal may follow.
-without_ids() { sed -E 's/[0-9a-fA-F]{40,}/<a commit id, not shown>/g'; }
+# Control characters and the characters a shell joins words across go first, so an id written as
+# two quoted halves, or around an escape sequence, is still one run of hex digits when it is
+# looked for.
+without_ids() {
+    LC_ALL=C tr -d '\000-\010\013-\037\177\047\042\134\044\140\173\175' \
+        | sed -E 's/[0-9a-fA-F]{40,}/<a commit id, not shown>/g'
+}
 stamp_field() {
     [ -r "$STAMP_FILE" ] || return 0
     sed -n "s/.*\"$1\": \"\\([^\"]*\\)\".*/\\1/p" "$STAMP_FILE" | head -n 1 || true
@@ -197,26 +203,27 @@ else
     # not a progress line, not a refusal. Where the operator is asked to name the commit
     # (--adopt-history), the id has to reach them some way that does not depend on the remote it
     # is checked against, and output that hands it over invites pasting it back. So the fetch is
-    # quiet (git's summary line ends in the abbreviated id), and what it does print is held back
-    # and shown without the part the remote wrote: a server can send any text it likes during a
-    # fetch, and a ready-made "run upgrade.sh --adopt-history=<id>" above the refusal that asks
-    # for the id is the obvious thing for a hostile one to send. A fetch that failed shows
-    # everything, because that text is how an honest failure is diagnosed, with anything that
-    # reads as a commit id taken out. This is a nudge, not a control: the id is in the clone,
-    # one git command away.
+    # quiet (git's summary line ends in the abbreviated id), and what it does print is held
+    # back: a server can send any text it likes during a fetch, and a ready-made "run upgrade.sh
+    # --adopt-history=<id>" above the refusal that asks for the id is the obvious thing for a
+    # hostile one to send. Nothing marks that text reliably (git prefixes what comes over its
+    # own channel with "remote:", and passes on what an ssh transport prints as it is), so after
+    # a fetch that worked none of it is shown. A fetch that failed, or that delivered nothing,
+    # shows all of it in its refusal, because that text is how an honest failure is diagnosed,
+    # with anything that reads as a commit id taken out. This is a nudge, not a control: the id
+    # is in the clone, one git command away.
     FETCH_FAILED=0
     FETCH_SAID="$(as_owner git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' 2>&1)" || FETCH_FAILED=1
-    if [ "$FETCH_FAILED" -eq 1 ]; then
+    show_what_the_fetch_said() {
         [ -z "$FETCH_SAID" ] || printf '%s\n' "$FETCH_SAID" | without_ids >&2
+    }
+    if [ "$FETCH_FAILED" -eq 1 ]; then
+        show_what_the_fetch_said
         refuse "the fetch from $ORIGIN_URL failed or brought no origin/main, so there is nothing to upgrade to" \
             "git's own message is above; a remote without a main branch is the usual reason for a missing ref"
     fi
     if [ -n "$FETCH_SAID" ]; then
-        FETCH_LOCAL="$(printf '%s\n' "$FETCH_SAID" | grep -v '^remote:' || true)"
-        [ -z "$FETCH_LOCAL" ] || printf '%s\n' "$FETCH_LOCAL" | without_ids >&2
-        if [ "$FETCH_LOCAL" != "$FETCH_SAID" ]; then
-            echo "    the remote sent text during the fetch, which is not shown: nothing a remote says is part of an upgrade" >&2
-        fi
+        echo "    the fetch printed text, which is not shown: nothing a remote says is part of an upgrade" >&2
     fi
 
     # Resolved once, so the commit every check below looks at is the commit that gets merged: a
@@ -224,6 +231,7 @@ else
     # could otherwise move origin/main under them. A remote with no main branch is the usual
     # reason for a missing ref, and it must not be reported as a signature or ancestry failure.
     if ! TARGET="$(as_owner git rev-parse --verify --quiet 'refs/remotes/origin/main^{commit}')"; then
+        show_what_the_fetch_said
         refuse "the fetch from $ORIGIN_URL brought no origin/main, so there is nothing to upgrade to" \
             "the remote has no main branch, or the clone's fetch refspec does not include it"
     fi
@@ -232,8 +240,9 @@ else
     # earlier fetch left, possibly from another origin: deploying it would report an upgrade that
     # did not happen and, with --accept-origin, record an origin nothing came from.
     if [ "$(as_owner git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' || true)" != "$TARGET" ]; then
+        show_what_the_fetch_said
         refuse "the fetch from $ORIGIN_URL did not deliver the origin/main this clone holds, so there is nothing new to check" \
-            "git's own message, if any, is above; a shallow (depth-limited) remote is refused this way, and so is a second fetch that ran at the same moment" \
+            "what the fetch printed, if anything, is above; a shallow (depth-limited) remote is refused this way, and so is a second fetch that ran at the same moment" \
             "point the checkout at a full repository, or run the upgrade again"
     fi
 
@@ -362,8 +371,8 @@ else
             if [ "${#LOST_MIGRATIONS[@]}" -gt 10 ]; then
                 echo "      ... and $((${#LOST_MIGRATIONS[@]} - 10)) more"
             fi
-            echo "    a database that has run them is refused by the daemon this builds: propolis will not start until the database is"
-            echo "    restored to a dump from before them (deploy/rollback.sh --with-database), which loses the events recorded since"
+            echo "    a database that has run them is refused by the daemon this builds. Unless the release and its database were"
+            echo "    rolled back first (deploy/rollback.sh --list, then --with-database <a release from before them>), propolis will not start"
         fi
 
         still_clean

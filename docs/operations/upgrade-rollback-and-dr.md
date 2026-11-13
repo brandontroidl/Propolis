@@ -220,12 +220,14 @@ the three refusals that ask for the argument, not the one that says the commit n
 `origin/main`, not the signature refusal
 (`crates/sensor-framework/tests/deploy_test.rs#upgrade_prints_the_fetched_commit_in_no_refusal_whichever_shape_the_remote_picks`).
 The same goes for what the remote can make git print
-(`crates/sensor-framework/tests/deploy_test.rs#upgrade_shows_nothing_the_remote_says_in_a_refused_run`):
-text a server sends during a fetch is not shown when the fetch succeeded (a failed fetch
-shows it, because that is how an honest failure is diagnosed), and anything that reads as a
-commit id is taken out of git's own messages and of the commit subjects a refusal lists. A
-`Run: upgrade.sh --adopt-history=<id>` printed by the remote above the refusal that asks for
-an id is the obvious thing for a hostile one to send.
+(`crates/sensor-framework/tests/deploy_test.rs#upgrade_shows_nothing_the_remote_says_in_a_refused_run`).
+Nothing a fetch printed is shown when the fetch worked: a server can send any text during
+one, an ssh remote's text arrives with nothing to mark it as the remote's, and a
+`Run: upgrade.sh --adopt-history=<id>` above the refusal that asks for an id is the obvious
+thing for a hostile one to send. A fetch that failed, or delivered nothing, shows what was
+printed, because that is how an honest failure is diagnosed, with anything that reads as a
+commit id taken out; the same is taken out of git's signature messages and of the commit
+subjects a refusal lists.
 
 That is a nudge, not a control. The id is in the box's clone and one `git rev-parse` reads it
 out; the script only declines to hand over a value that, pasted back, would check nothing.
@@ -246,13 +248,24 @@ and goes on, because git cannot see the database. Check before you run it:
 
 ```
 # Example - as the checkout's owner; prints the migrations the commit you would adopt lacks.
+git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
 git diff --no-renames --name-only --diff-filter=D HEAD <full commit id> -- 'crates/*/migrations/*'
 ```
 
-If it prints anything, the database has to go back too: `rollback.sh --with-database`
-restores the dump taken before the upgrade that ran those migrations, and the events recorded
-since stay in the renamed database, not the restored one. Or wait until `main` has passed the
-box again.
+If it prints anything, the installed release and its database go back first, and the adoption
+second:
+
+1. `sudo ./deploy/rollback.sh --list`, then
+   `sudo ./deploy/rollback.sh --with-database <release>` with a release from before those
+   migrations. That puts back its binaries and the dump taken before the upgrade that ran
+   them; the events recorded since stay in the renamed database, not the restored one.
+2. `sudo ./deploy/upgrade.sh --adopt-history=<full commit id>`, so the checkout follows.
+
+The other way round leaves `propolis` stopped, and a bare `rollback.sh --with-database` at
+that point is no way out: it puts back the release the adoption just replaced, with the dump
+that run took, which is the newer database again. Only the newest three releases are kept; a
+release further back is a [restore by hand](backup-and-restore.md#restore-procedure). Or
+wait until `main` has passed the box again.
 
 **Moving a running box to a successor repository.** Three steps, in this order, because the
 box's own copy of `upgrade.sh` has to know the argument before it can be given it:
@@ -313,7 +326,7 @@ git checkout --quiet --no-overwrite-ignore -B main "$ID^{commit}" &&
 [ -z "$(git status --porcelain --untracked-files=no)" ] &&
 [ "$(git rev-parse HEAD)" = "$ID" ] &&
 git diff --no-renames --name-only --diff-filter=D -z "$OLD" "$ID^{commit}" |
-    xargs -0 -r sh -c 'for p; do if [ -f "$p" ] || [ -L "$p" ]; then echo "still on disk: $p"; exit 1; fi; done' sh &&
+    xargs -0 -r sh -c 'for p; do d="$p"; while [ "$d" != "${d%/*}" ]; do d="${d%/*}"; [ -L "$d" ] && continue 2; done; if [ -f "$p" ] || [ -L "$p" ]; then echo "still on disk: $p"; exit 1; fi; done' sh &&
 echo "OK: the checkout is on the commit named" ||
 echo "STOPPED: a step failed and nothing after it ran"
 ```
@@ -324,8 +337,9 @@ box, that commit carries a listed key's SSH signature; the number of files that 
 printed, which is what you are accepting; the commit being left is recorded, because it is on
 no branch afterwards and cannot be fetched again from a restarted history; the branch moves,
 without replacing ignored files; and the result is the named commit, with no tracked file
-differing from it and no file the new commit removed still on disk. A step that fails prints
-`STOPPED` and leaves the rest undone.
+differing from it and no file the new commit removed still on disk (a file reached through
+a link the new commit put where a directory was is the link target's, not a leftover). A step
+that fails prints `STOPPED` and leaves the rest undone.
 
 Three things the block does on purpose. `"$ID^{commit}"` rather than the bare id: handed a
 bare id as the start point, `git checkout -B` looks it up as a ref name first, and a tag of

@@ -403,8 +403,9 @@ async fn withdraw_removes_pending_rows_that_have_nothing_left_to_decide(pool: Pg
 }
 
 /// Nothing but the stated reasons withdraws a candidate. A flood that stopped is still carried by
-/// the retention feeds for up to their longest window, so the decision is still wanted; and a
-/// review-queue entry that is not Approved decides nothing about the volume listing.
+/// the retention feeds for up to their longest window (forty days is inside the ninety the queue
+/// allows by default), so the decision is still wanted; and a review-queue entry that is not
+/// Approved decides nothing about the volume listing.
 #[sqlx::test(migrations = false)]
 async fn withdraw_keeps_a_pending_row_for_a_quiet_or_differently_decided_address(pool: PgPool) {
     migrate(&pool).await;
@@ -506,6 +507,108 @@ async fn withdraw_never_removes_a_decided_row(pool: PgPool) {
             "{reason}"
         );
     }
+}
+
+/// Moves `ip`'s stored `last_seen` to `ago` before now, as if nothing had named it since.
+async fn last_seen_ago(pool: &PgPool, ip: &str, ago: Duration) {
+    sqlx::query("UPDATE ip_score SET last_seen = $2 WHERE source_ip = $1::inet")
+        .bind(ip)
+        .bind(Utc::now() - ago)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// An approval covers one listing. Once the address has been unseen for longer than the longest
+/// retention window it is in no feed file, and an approval left standing would publish it again
+/// at its next sighting with nobody deciding. So the approved row goes, a pending row with it,
+/// and the next flood is offered as a new candidate. A rejection stays: a rejected address is
+/// not offered again.
+#[sqlx::test(migrations = false)]
+async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offered_anew(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let approved = "192.0.2.60";
+    let pending = "192.0.2.61";
+    let rejected = "192.0.2.62";
+    let approved_inside = "192.0.2.63";
+    for ip in [approved, pending, rejected, approved_inside] {
+        seed_flood(&pool, ip).await;
+    }
+    let queue = queue().lapsing_after(Duration::days(30));
+    assert_eq!(queue.populate(&pool).await.unwrap(), 4);
+    for ip in [approved, approved_inside] {
+        queue
+            .approve(&pool, ip.parse().unwrap(), Some("flood"))
+            .await
+            .unwrap();
+    }
+    queue
+        .reject(&pool, rejected.parse().unwrap(), Some("ours"))
+        .await
+        .unwrap();
+
+    // A minute short of the limit nothing lapses.
+    for ip in [approved, pending, rejected] {
+        last_seen_ago(&pool, ip, Duration::days(30) - Duration::minutes(1)).await;
+    }
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 0);
+    assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Approved));
+    assert_eq!(state_of(&pool, pending).await, Some(ReviewState::Pending));
+
+    // A minute past it the approval and the open candidate are gone; the rejection and the
+    // approval of an address still being seen are not.
+    for ip in [approved, pending, rejected] {
+        last_seen_ago(&pool, ip, Duration::days(30) + Duration::minutes(1)).await;
+    }
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 2);
+    assert_eq!(state_of(&pool, approved).await, None);
+    assert_eq!(state_of(&pool, pending).await, None);
+    assert_eq!(state_of(&pool, rejected).await, Some(ReviewState::Rejected));
+    assert_eq!(
+        state_of(&pool, approved_inside).await,
+        Some(ReviewState::Approved)
+    );
+
+    // While the address stays unseen there is nothing to offer.
+    assert_eq!(queue.populate(&pool).await.unwrap(), 0);
+
+    // One more line names each of them, months later. The two whose rows lapsed are offered
+    // again and are Pending: the old approval does not speak for the new sighting. The rejected
+    // one is not offered.
+    for ip in [approved, pending, rejected] {
+        last_seen_ago(&pool, ip, Duration::minutes(1)).await;
+    }
+    assert_eq!(queue.populate(&pool).await.unwrap(), 2);
+    assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Pending));
+    assert_eq!(state_of(&pool, pending).await, Some(ReviewState::Pending));
+    assert_eq!(state_of(&pool, rejected).await, Some(ReviewState::Rejected));
+}
+
+/// Without `lapsing_after` the limit is the longest window the feed ships with, ninety days.
+#[sqlx::test(migrations = false)]
+async fn by_default_a_decision_lapses_after_ninety_days_unseen(pool: PgPool) {
+    migrate(&pool).await;
+    let inside = "192.0.2.64";
+    let outside = "192.0.2.65";
+    for ip in [inside, outside] {
+        seed_flood(&pool, ip).await;
+    }
+    let queue = queue();
+    assert_eq!(queue.populate(&pool).await.unwrap(), 2);
+    for ip in [inside, outside] {
+        queue
+            .approve(&pool, ip.parse().unwrap(), None)
+            .await
+            .unwrap();
+    }
+    last_seen_ago(&pool, inside, Duration::days(89)).await;
+    last_seen_ago(&pool, outside, Duration::days(91)).await;
+
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
+    assert_eq!(state_of(&pool, inside).await, Some(ReviewState::Approved));
+    assert_eq!(state_of(&pool, outside).await, None);
 }
 
 // --- decisions ---

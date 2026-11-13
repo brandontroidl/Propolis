@@ -19,17 +19,20 @@ rest.</p>
 {% endif %}
 {% if tab == "volume" %}
 {#- The other queue. Its approval is not the pending tab's approval, and the page has to say so
-    before the first button: this one publishes and reports nothing. The last sentence is there
-    because the console is not told how the feed builder is configured: with the opt-in set the
-    builder reads no decision at all, and a page that promised otherwise would be wrong exactly
-    when an operator relies on it. -#}
+    before the first button: this one publishes and reports nothing. The last sentences are
+    there because the console is not told how the feed builder is configured: with the opt-in
+    set the builder publishes an address that never authenticated without reading a decision,
+    and a page that promised otherwise would be wrong exactly when an operator relies on it. -#}
 <p class="table-note">A volume candidate is an address that reached a thousand established TCP
 events. It is published only if you approve it here. <strong>Approve</strong>
-publishes this address in the retention feeds; it is not reported to abuse vendors.
-<strong>Reject</strong> keeps it out, and it is not offered again. The count is what the sensors'
-logs declared, so look at what the address did before approving it. The exception: on a node
-started with <code>PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true</code> every candidate is published
-whatever is decided here, and delisting an address is the way to take it out.</p>
+publishes this address in the retention feeds; it is not reported to abuse vendors. The approval
+stands while the address keeps being seen, by any kind of event, and lapses once it has dropped
+out of every retention window. <strong>Reject</strong> keeps it out, and it is not offered again.
+The count is what the sensors' logs declared, so look at what the address did before approving
+it. The exception: on a node started with <code>PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true</code>
+this tab is not a list of what is published. An address that never authenticated is published
+whatever is decided here, even one that went quiet before it could be offered, and delisting it
+is the way to take it out; the <a href="/feed">Feed</a> page shows what is out.</p>
 <div class="panel queue-panel">
   <div class="panel-head">Waiting for a decision <span class="dim">{{ volume.pending | length | count }}</span></div>
   {% if volume.pending %}

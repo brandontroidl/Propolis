@@ -1081,6 +1081,60 @@ async fn automatic_volume_publication_is_an_opt_in_that_needs_no_decision(pool: 
     assert!(!in_a_tier_file(&automatic, eligible_flood));
 }
 
+/// The opt-in adds listings and takes none away. An approved candidate that has also
+/// authenticated is eligible, so the automatic condition (`eligible = false`) does not cover it;
+/// read alone, that condition dropped the approved address from every retention feed the moment
+/// the opt-in was set.
+#[sqlx::test(migrations = false)]
+async fn the_opt_in_publishes_everything_the_default_does_and_ignores_a_rejection(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let approved_eligible: IpAddr = "45.10.30.140".parse().unwrap();
+    let rejected_flood: IpAddr = "45.10.30.141".parse().unwrap();
+
+    append_event(
+        &pool,
+        ev(
+            approved_eligible,
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            now,
+        ),
+    )
+    .await
+    .unwrap();
+    seed_flood(&pool, approved_eligible, now).await;
+    seed_flood(&pool, rejected_flood, now).await;
+    let score = read_score(&pool, approved_eligible).await.unwrap().unwrap();
+    assert!(
+        score.eligible && score.established_event_count >= 1000,
+        "precondition: a volume candidate that is also eligible"
+    );
+
+    let queue = VolumeQueue::new();
+    assert_eq!(queue.populate(&pool).await.unwrap(), 2);
+    queue.approve(&pool, approved_eligible, None).await.unwrap();
+    queue.reject(&pool, rejected_flood, None).await.unwrap();
+
+    let gated = build(&pool, &config_with_windows(false)).await;
+    assert_eq!(window_entries(&gated, approved_eligible), [1, 1]);
+    assert_eq!(window_entries(&gated, rejected_flood), [0, 0]);
+
+    let automatic = build(&pool, &config_with_windows(true)).await;
+    assert_eq!(
+        window_entries(&automatic, approved_eligible),
+        [1, 1],
+        "setting the opt-in must not take an approved address out of the feeds"
+    );
+    assert_eq!(
+        window_entries(&automatic, rejected_flood),
+        [1, 1],
+        "with the opt-in a bare flood is published whatever was decided"
+    );
+    assert!(!in_a_tier_file(&automatic, approved_eligible));
+}
+
 #[sqlx::test(migrations = false)]
 async fn a_stored_last_seen_in_the_future_does_not_extend_validity_past_now_plus_the_window(
     pool: PgPool,

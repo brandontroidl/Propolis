@@ -1312,6 +1312,14 @@ async fn main() {
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
         let review_allowlist = operator_allowlist.clone();
+        // A volume decision lapses once its address has been unseen for the longest retention
+        // window this node publishes: past that it is in no feed file. With no window configured
+        // nothing is published on volume at all and the queue's own default stands.
+        let volume_lapse = config
+            .feed_windows
+            .iter()
+            .map(|(_, window)| chrono::Duration::seconds(window.as_secs() as i64))
+            .max();
 
         // Once per process, not per supervised restart of the review group.
         review::vendor::log_vendor_startup(&vendors);
@@ -1339,6 +1347,10 @@ async fn main() {
                         .with_allowlist(allowlist.clone());
                     let queue = ReviewQueue::new().with_allowlist(allowlist.clone());
                     let volume = VolumeQueue::new().with_allowlist(allowlist);
+                    let volume = match volume_lapse {
+                        Some(silence) => volume.lapsing_after(silence),
+                        None => volume,
+                    };
 
                     let queue_token = token.child_token();
                     let submit_token = token.child_token();

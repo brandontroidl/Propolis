@@ -249,21 +249,16 @@ impl FeedBuilder {
             None => Vec::new(),
             Some(longest) => {
                 let sql = volume_candidates_sql(config.volume_auto_publish);
-                let query = sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(Utc::now() - longest - Duration::minutes(1));
-                // Only the approval-gated statement takes the threshold; the automatic one reads
-                // the stored flag the scoring engine derived from the same constant.
-                let query = if config.volume_auto_publish {
-                    query
-                } else {
-                    query.bind(i64::from(VOLUME_LIST_THRESHOLD))
-                };
-                query.fetch_all(pool).await?
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(Utc::now() - longest - Duration::minutes(1))
+                    .bind(i64::from(VOLUME_LIST_THRESHOLD))
+                    .fetch_all(pool)
+                    .await?
             }
         };
 
         // An approved address can meet the volume condition and be a merit candidate at once
-        // (the approval-gated statement does not require `eligible = false`). The merit candidate
+        // (the approved leg of the statement does not require `eligible = false`). The merit candidate
         // is already in every window its last event falls inside, tier and all, so its volume
         // row is dropped rather than published as a second entry for the same address.
         let merit_ips: HashSet<IpAddr> = candidates.iter().map(|c| c.ip).collect();
@@ -366,38 +361,38 @@ pub fn merit_candidates_sql() -> String {
 }
 
 /// The volume-listed addresses a retention window may publish. `$1` is the oldest `last_seen`
-/// any retention window can still publish.
+/// any retention window can still publish and `$2` the volume threshold (bind
+/// `core_scoring::VOLUME_LIST_THRESHOLD`).
 ///
 /// By default (`auto_publish` false) an address is read only when an operator approved it: it is
-/// not delisted, its `established_event_count` is at least `$2` (bind
-/// `core_scoring::VOLUME_LIST_THRESHOLD`), and it has an Approved `volume_review` row or an
-/// Approved `review_queue` row. An address already approved on its score needs no second
-/// decision, which is also why this form does not require `eligible = false`: an approved volume
-/// listing must not vanish when the address later becomes eligible as well. It reads the count
-/// and the delist latch themselves rather than the stored `recommended_for_blocklist` flag, so
-/// the condition is the volume rule's and not whatever else set that flag.
+/// not delisted, its `established_event_count` is at least `$2`, and it has an Approved
+/// `volume_review` row or an Approved `review_queue` row. An address already approved on its
+/// score needs no second decision, which is also why this form does not require
+/// `eligible = false`: an approved volume listing must not vanish when the address later becomes
+/// eligible as well. It reads the count and the delist latch themselves rather than the stored
+/// `recommended_for_blocklist` flag, so the condition is the volume rule's and not whatever else
+/// set that flag.
 ///
-/// With `auto_publish` the statement asks for no decision: it reads every address the stored
-/// projection lists on volume (`recommended_for_blocklist = true AND eligible = false`) and
-/// takes `$1` only. That is the opt-in `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` sets.
+/// With `auto_publish` (the opt-in `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` sets) the statement also
+/// reads, with no decision asked, every address the stored projection lists on volume
+/// (`recommended_for_blocklist = true AND eligible = false`). It still reads everything the
+/// default form reads, so turning the opt-in on never takes an approved address out of a feed.
 pub fn volume_candidates_sql(auto_publish: bool) -> String {
-    if auto_publish {
-        return format!(
-            "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
-                    s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
-             FROM ip_score s \
-             WHERE s.recommended_for_blocklist = true AND s.eligible = false AND s.last_seen > $1"
-        );
-    }
+    let approved = "NOT s.delisted AND s.established_event_count >= $2 \
+           AND (EXISTS (SELECT 1 FROM volume_review v \
+                        WHERE v.source_ip = s.source_ip AND v.state = 'approved') \
+                OR EXISTS (SELECT 1 FROM review_queue q \
+                           WHERE q.source_ip = s.source_ip AND q.state = 'approved'))";
+    let listed = if auto_publish {
+        format!("((s.recommended_for_blocklist = true AND s.eligible = false) OR ({approved}))")
+    } else {
+        approved.to_owned()
+    };
     format!(
         "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
                 s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
          FROM ip_score s \
-         WHERE NOT s.delisted AND s.established_event_count >= $2 AND s.last_seen > $1 \
-           AND (EXISTS (SELECT 1 FROM volume_review v \
-                        WHERE v.source_ip = s.source_ip AND v.state = 'approved') \
-                OR EXISTS (SELECT 1 FROM review_queue q \
-                           WHERE q.source_ip = s.source_ip AND q.state = 'approved'))"
+         WHERE s.last_seen > $1 AND {listed}"
     )
 }
 

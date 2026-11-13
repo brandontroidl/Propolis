@@ -43,18 +43,44 @@ pub struct VolumeEntry {
     pub notes: Option<String>,
 }
 
+/// How long an address may go unseen before a Pending or Approved row about it lapses, unless
+/// [`VolumeQueue::lapsing_after`] says otherwise: the longest retention window the feed ships
+/// with (`all-90d`).
+pub const VOLUME_DECISION_LAPSE_DAYS: i64 = 90;
+
 /// The volume review queue: population/withdrawal scans, the operator's decisions and the
 /// listings. Stateless, like [`ReviewQueue`]: every method takes the pool it operates against.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct VolumeQueue {
     /// The reserved-address test and the operator allowlist. Held as a [`ReviewQueue`] so both
     /// queues filter candidates through the same two functions and cannot drift apart.
     filters: ReviewQueue,
+    /// How long an address may go unseen before [`Self::withdraw`] removes its Pending or
+    /// Approved row. See [`Self::lapsing_after`].
+    lapse_after: Duration,
+}
+
+impl Default for VolumeQueue {
+    fn default() -> Self {
+        Self {
+            filters: ReviewQueue::default(),
+            lapse_after: Duration::days(VOLUME_DECISION_LAPSE_DAYS),
+        }
+    }
 }
 
 impl VolumeQueue {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set how long an address may go unseen before its Pending or Approved row lapses. The
+    /// daemon passes the longest retention window it publishes: past that the address is in no
+    /// feed file, so an approval has nothing left to publish and the next sighting should be a
+    /// new decision, not a listing nobody looked at.
+    pub fn lapsing_after(mut self, silence: Duration) -> Self {
+        self.lapse_after = silence;
+        self
     }
 
     /// Replace the reserved-address test. For tests only; see
@@ -158,15 +184,29 @@ impl VolumeQueue {
         Ok(inserted)
     }
 
-    /// Remove every Pending row that no longer has anything to decide: its address has no
-    /// `ip_score` row, is delisted, has fallen below [`VOLUME_LIST_THRESHOLD`], or now has an
-    /// Approved `review_queue` row (the operator's decision on its score covers the volume
-    /// listing too). Approved and Rejected rows are never touched: a background scan does not
-    /// undo a decision. Returns the number of rows removed.
+    /// Remove every row that no longer has anything to decide or to publish. Returns the number
+    /// of rows removed.
     ///
-    /// A candidate is NOT withdrawn for going quiet. The retention feeds carry an address for up
-    /// to their longest window after its last event, so the decision still matters after the
-    /// flood stops.
+    /// A Pending row goes when its address has no `ip_score` row, is delisted, has fallen below
+    /// [`VOLUME_LIST_THRESHOLD`], or now has an Approved `review_queue` row (the operator's
+    /// decision on its score covers the volume listing too).
+    ///
+    /// A Pending or an Approved row goes when its address has not been seen for
+    /// [`Self::lapsing_after`]'s duration. Short of that a candidate is NOT withdrawn for going
+    /// quiet: the retention feeds carry an address for up to their longest window after its last
+    /// event, so the decision still matters after the flood stops. Past it the address is in no
+    /// feed file. An approval left standing there would publish the address again at its next
+    /// sighting, of any kind and however long after, with nobody deciding; with the row gone
+    /// that sighting is offered as a new candidate by [`Self::populate`]. So an approval covers
+    /// one listing: it holds while the address keeps being seen and ends when the listing does.
+    ///
+    /// Apart from that lapse an Approved row is never touched, and a Rejected row is never
+    /// touched at all: a background scan does not undo a decision, and a rejected address is
+    /// not offered again.
+    ///
+    /// The lapse is noticed by this scan, so it needs the scan to run while the address is
+    /// quiet. A node that was down for the whole of that time, and reads a new line for the
+    /// address before its first scan, still has the approval.
     pub async fn withdraw(&self, pool: &PgPool) -> Result<usize, ReviewError> {
         let result = sqlx::query(
             "DELETE FROM volume_review v \
@@ -183,16 +223,45 @@ impl VolumeQueue {
         .bind(ReviewState::Approved)
         .execute(pool)
         .await?;
-        let removed = result.rows_affected() as usize;
+        let mut removed = result.rows_affected() as usize;
         if removed > 0 {
             tracing::info!(removed, "volume review: withdrew pending volume candidates");
         }
+
+        let lapsed = sqlx::query(
+            "DELETE FROM volume_review v USING ip_score s \
+             WHERE s.source_ip = v.source_ip AND v.state IN ($1, $2) AND s.last_seen <= $3 \
+             RETURNING host(v.source_ip) AS source_ip, v.state, v.decided_at",
+        )
+        .bind(ReviewState::Pending)
+        .bind(ReviewState::Approved)
+        .bind(Utc::now() - self.lapse_after)
+        .fetch_all(pool)
+        .await?;
+        for row in &lapsed {
+            let source_ip: String = row.try_get("source_ip")?;
+            let state: ReviewState = row.try_get("state")?;
+            let decided_at: Option<DateTime<Utc>> = row.try_get("decided_at")?;
+            // One line per row and at info: this is the only record that an approval ended
+            // without an operator ending it.
+            tracing::info!(
+                ip = %source_ip,
+                ?state,
+                ?decided_at,
+                silent_days = self.lapse_after.num_days(),
+                "volume review: row lapsed, its address is out of every retention window"
+            );
+        }
+        removed += lapsed.len();
         Ok(removed)
     }
 
     /// Approve `ip`: the feed builder publishes it in the retention feeds from its next build,
-    /// for as long as it stays inside a window. It is not reported to any vendor: the submission
-    /// runner reads `review_queue` only. Sets `decided_at = now()` and records `notes`.
+    /// for as long as it stays inside a window, and any later event for the address, of any
+    /// kind, keeps it there. The approval ends when an operator reopens it or delists the
+    /// address, or when [`Self::withdraw`] finds the address unseen for the lapse duration. It
+    /// is not reported to any vendor: the submission runner reads `review_queue` only. Sets
+    /// `decided_at = now()` and records `notes`.
     pub async fn approve(
         &self,
         pool: &PgPool,

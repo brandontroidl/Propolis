@@ -28,7 +28,7 @@ pub use vendor::{
     AbuseIpDb, DShield, FullVendorConfig, OtxAdapter, VendorAdapter, VendorError, VendorReport,
     VendorResponse, build_categories, build_dshield_categories, build_otx_categories,
 };
-pub use volume::{VolumeEntry, VolumeQueue};
+pub use volume::{VOLUME_DECISION_LAPSE_DAYS, VolumeEntry, VolumeQueue};
 
 /// This crate's own migrator, tracked under a table name distinct from
 /// core-scoring's default `_sqlx_migrations`.

@@ -746,6 +746,15 @@ fn when_postgresql_cannot_say_where_the_database_is_the_daemon_is_left_stopped()
         1,
         "nothing is renamed on a guess: {log}"
     );
+    // PostgreSQL going away is the case most likely to be followed by a reboot.
+    assert!(
+        after.contains("systemctl disable propolis.service"),
+        "{log}"
+    );
+    assert!(
+        stderr.contains("systemctl enable --now propolis.service"),
+        "{stderr}"
+    );
 }
 
 /// The restore itself fails with the live database already renamed aside and a new one created.
@@ -824,7 +833,8 @@ fn when_the_database_cannot_be_put_back_the_daemon_is_left_stopped_and_the_real_
                 ("STUB_RUNUSER_FAIL", failing_rename),
                 (
                     "STUB_ENABLED",
-                    "propolis.service sensor-ssh.service gateway.service shipper.service",
+                    "propolis.service sensor-ssh.service gateway.service shipper.service \
+                     propolis-backup.timer",
                 ),
             ],
             None,
@@ -861,7 +871,73 @@ fn when_the_database_cannot_be_put_back_the_daemon_is_left_stopped_and_the_real_
             );
         }
         assert!(!log.contains("DROP"), "nothing is dropped: {log}");
+        // Stopped does not survive a reboot: the unit is enabled, and at the next boot it would
+        // take whatever holds the name for its database and read the sensor logs into it. So it
+        // is disabled as well, and the way back is said. The nightly backup stays off for the
+        // same reason: it would dump whatever holds the name.
+        assert!(
+            after.contains("systemctl disable propolis.service"),
+            "{failing_rename}: {log}"
+        );
+        assert!(
+            stderr.contains("propolis.service was also disabled")
+                && stderr.contains("systemctl enable --now propolis.service")
+                && stderr.contains("systemctl start propolis-backup.timer"),
+            "{failing_rename}: {stderr}"
+        );
+        assert!(
+            !after.contains("systemctl start propolis-backup.timer\n"),
+            "{failing_rename}: the backup timer was started with the daemon held back: {log}"
+        );
     }
+}
+
+/// The run stops the nightly backup's timer with the services, and only its last steps start it
+/// again. A run that fails with the database in place starts it again too: a node that has just
+/// had a failed rollback is where a current backup matters, and nothing else would show that
+/// the timer was off. Not for a kept release from before the backup helper, whose timer the
+/// rollback turns off on purpose.
+#[test]
+fn a_failed_run_starts_the_backup_timer_again_unless_the_kept_release_has_no_backup() {
+    let enabled = (
+        "STUB_ENABLED",
+        "propolis.service sensor-ssh.service propolis-backup.timer",
+    );
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_RESTORE_FAIL", "1"), enabled],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let log = fx.log();
+    assert_in_order(
+        &log,
+        &[
+            "systemctl stop propolis-backup.timer propolis-backup.service",
+            "pg_restore --exit-on-error",
+            "systemctl start propolis.service",
+            "systemctl start propolis-backup.timer\n",
+        ],
+    );
+    assert!(!log.contains("systemctl disable"), "{log}");
+
+    let fx = Fixture::new();
+    std::fs::remove_file(fx.root.join("usr/local/sbin/propolis-backup")).unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_RESTORE_FAIL", "1"), enabled],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let log = fx.log();
+    assert!(log.contains("systemctl start propolis.service"), "{log}");
+    assert!(
+        !log.contains("systemctl start propolis-backup.timer\n"),
+        "{log}"
+    );
 }
 
 /// Rolling back to a release from before the nightly backup turns its timer off: that release's

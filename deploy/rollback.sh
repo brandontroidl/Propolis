@@ -179,6 +179,9 @@ ASIDE=""
 RESTORED=0
 # What put_database_back found and did: unmoved, back, stuck or unknown.
 PUT_BACK=""
+# Cleared once the kept files are back when the kept release has no backup helper: its nightly
+# backup cannot run, so a failed run must not start the timer again.
+BACKUP_RUNS=1
 # Set while propolis-migrate and its --check have been asked for and have not both succeeded.
 ROLES_UNCHECKED=0
 # Set when the kept release cannot re-apply the role split of a node that has one.
@@ -261,16 +264,30 @@ on_exit() {
                 # real one sits aside.
                 daemon=0
                 say "The database from before the rollback could NOT be put back under its name: the real data is in database $ASIDE, and nothing was dropped."
-                say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. Once what stopped the rename (above) is out of the way, as the postgres user rename any database now named $DB aside, run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\", then go forward again with deploy/upgrade.sh."
+                say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. Once what stopped the rename (above) is out of the way, as the postgres user rename any database now named $DB aside and run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\"."
                 ;;
             *)
                 daemon=0
                 say "PostgreSQL did not answer, so this script cannot tell whether the database is still under its name, $DB, or was renamed to $ASIDE. Nothing was dropped."
-                say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. When PostgreSQL answers, list the databases as the postgres user (psql -l). If $ASIDE is there, rename any database now named $DB aside and run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\". Then go forward again with deploy/upgrade.sh."
+                say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. When PostgreSQL answers, list the databases as the postgres user (psql -l). If $ASIDE is there, rename any database now named $DB aside and run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\"."
                 ;;
         esac
         if [ "$daemon" -eq 1 ]; then
             say "The kept binaries are installed: propolis runs on that database if the upgrade changed no schema, and otherwise refuses it at startup and changes nothing. To go forward again, run deploy/upgrade.sh."
+        else
+            # Stopped is not enough. The unit is enabled, so the next boot would start it on
+            # whatever holds the name by then, and a reboot is a likely step when PostgreSQL is
+            # what went wrong. It would take that database for its own and read the sensor logs
+            # into it.
+            if unit_enabled propolis.service; then
+                if systemctl disable propolis.service 2>/dev/null; then
+                    say "propolis.service was also disabled, so that a reboot does not start it on the wrong database. Once the real database is back under its name: systemctl enable --now propolis.service, and start the nightly backup again with systemctl start propolis-backup.timer. Then go forward again with deploy/upgrade.sh."
+                else
+                    say "propolis.service could NOT be disabled and is still enabled: do not reboot this host, and do not start propolis.service, until the real database is back under its name. Then start it, start the nightly backup again with systemctl start propolis-backup.timer, and go forward again with deploy/upgrade.sh."
+                fi
+            else
+                say "Once the real database is back under its name, start propolis.service and the nightly backup (systemctl start propolis-backup.timer), then go forward again with deploy/upgrade.sh."
+            fi
         fi
     elif [ -n "$ASIDE" ]; then
         say "The dump was restored into $DB; the database from before the rollback is kept as $ASIDE, and nothing was dropped."
@@ -289,6 +306,14 @@ on_exit() {
         fi
         unit_enabled "$unit.service" && systemctl start "$unit.service" 2>/dev/null || true
     done
+    # The run stopped the nightly backup's timer and only its last steps start it again. A node
+    # that has just had a failed rollback is where a current backup matters, and a stopped timer
+    # is not something `systemctl --failed` shows. Not while the daemon is held back: a backup
+    # then would dump whatever holds the database's name.
+    if [ "$daemon" -eq 1 ] && [ "$BACKUP_RUNS" -eq 1 ] && unit_enabled propolis-backup.timer; then
+        systemctl start propolis-backup.timer 2>/dev/null \
+            || say "propolis-backup.timer could not be started again; start it with systemctl start propolis-backup.timer."
+    fi
     # Last, where it is read: on such a node this is why the daemon did not come back.
     if [ "$ROLES_BY_HAND" -eq 1 ]; then
         roles_caveat
@@ -563,6 +588,7 @@ restore() {
     for f in "$dir"/units/*; do install -m 0644 "$f" "$ROOT/etc/systemd/system/$(basename "$f")"; done
     shopt -u nullglob
     [ -f "$dir/deploy-stamp.json" ] && install -m 0644 "$dir/deploy-stamp.json" "$ROOT/var/lib/propolis/deploy-stamp.json"
+    [ -e "$dir/sbin/propolis-backup" ] || BACKUP_RUNS=0
     systemctl daemon-reload
 
     if [ "$with_db" -eq 1 ]; then

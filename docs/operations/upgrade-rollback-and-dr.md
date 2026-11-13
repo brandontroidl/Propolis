@@ -569,6 +569,11 @@ database that holds the real data. The script does not go by its own record of w
 done: it asks PostgreSQL which names exist, so a database that was never renamed is left alone
 and said to be where it was, and if PostgreSQL cannot be asked the daemon is likewise left
 stopped and the message names both places the data can be. Nothing is dropped in any case.
+Wherever the daemon is left stopped it is also disabled, because a stopped unit that is still
+enabled starts at the next boot, on whatever database holds the name by then; the message
+gives the `systemctl enable --now propolis.service` to run once the database is back. The
+nightly backup's timer, which the script stops while it works, is started again when a run
+fails with the database in place, and stays off while the daemon is held back.
 
 A signal ends the run the same way a failed step does (`deploy/rollback.sh#on_exit`). The
 restore is the long step and a rollback is usually run over SSH: if the session drops, the

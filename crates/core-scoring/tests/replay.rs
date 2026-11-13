@@ -667,13 +667,17 @@ async fn verify_chain_intact_with_rich_metadata(pool: PgPool) -> Result<(), Repo
 
 /// What any sensor can write in a line of its own kind must not be able to break verification.
 /// A timestamp with second 60 is hashed as the instant PostgreSQL stores for it (the next
-/// minute). Floating-point metadata does not come back from `JSONB` as given (no negative zero;
-/// a whole number without its point or exponent; the largest floats not readable at all), so an
-/// event that carries one is refused before it is hashed, on the single and the batch path.
-/// Each of these used to leave the chain reported `Broken` at that row for good, or the row
-/// unreadable, which also hid every later tampering.
+/// minute). Some floating-point metadata does not come back from `JSONB` as given (no negative
+/// zero; an exponent written out as digits; the largest floats not readable at all; a fraction
+/// that may be one bit off once parsed again), so an event that carries such a number is refused
+/// before it is hashed, on the single and the batch path. Each of these used to leave the chain
+/// reported `Broken` at that row for good, or the row unreadable, which also hid every later
+/// tampering.
+///
+/// A whole-number float is not one of them and must keep working: every flood, command and
+/// rate-limit summary the sensors write carries `"window_secs": 600.0`.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_float_in_metadata_is_refused_and_a_leap_second_is_stored_as_the_next_minute(
+async fn a_number_that_would_not_come_back_is_refused_and_a_leap_second_is_stored_as_the_next_minute(
     pool: PgPool,
 ) -> Result<(), RepoError> {
     let event = |at: &str| {
@@ -701,33 +705,79 @@ async fn a_float_in_metadata_is_refused_and_a_leap_second_is_stored_as_the_next_
     );
     assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
 
-    for float in [
+    for unstable in [
         r#"{"x": -0.0}"#,
+        r#"{"x": 1e15}"#,
         r#"{"x": 1e16}"#,
-        r#"{"x": 100.0}"#,
+        r#"{"x": -1e15}"#,
         r#"{"x": 0.5}"#,
+        r#"{"x": -2.25}"#,
+        r#"{"x": 0.30000000000000004}"#,
         r#"{"x": 1.7976931348623157e308}"#,
         r#"{"x": 18446744073709551616}"#,
-        r#"{"nested": {"list": [1, 2, 3.0]}}"#,
+        r#"{"nested": {"list": [1, 2, 3.5]}}"#,
     ] {
         let mut e = event("2026-07-17T00:01:00Z");
-        e.metadata = serde_json::from_str(float).unwrap();
+        e.metadata = serde_json::from_str(unstable).unwrap();
         assert!(
             matches!(
                 e.validate(),
-                Err(core_scoring::domain::types::ValidationError::NonIntegerNumber)
+                Err(core_scoring::domain::types::ValidationError::UnstableNumber)
             ),
-            "{float}"
+            "{unstable}"
         );
         assert!(
             matches!(
                 append_event(&pool, e.clone()).await,
                 Err(RepoError::Invalid(_))
             ),
-            "{float} reached the ledger"
+            "{unstable} reached the ledger"
         );
         let outcome = core_scoring::repository::append_events(&pool, vec![e]).await;
-        assert_eq!(outcome.appended, 0, "{float} reached the ledger in a batch");
+        assert_eq!(
+            outcome.appended, 0,
+            "{unstable} reached the ledger in a batch"
+        );
+    }
+
+    // Whole-number floats, as the sensors' summaries carry them, are stored and come back as
+    // written: the chain is intact with each of them in it, on the single and the batch path.
+    let whole = [
+        r#"{"window_secs": 600.0, "suppressed_count": 1500}"#,
+        r#"{"window_secs": 60.0}"#,
+        r#"{"window_secs": 10.0}"#,
+        r#"{"zero": 0.0, "negative": -5.0, "written_with_an_exponent": 1e2}"#,
+        r#"{"largest_accepted": 999999999999999.0, "smallest_accepted": -999999999999999.0}"#,
+        r#"{"nested": {"list": [1, 2, 3.0]}}"#,
+    ];
+    for (i, metadata) in whole.iter().enumerate() {
+        let mut e = event(&format!("2026-07-17T00:02:{i:02}Z"));
+        e.metadata = serde_json::from_str(metadata).unwrap();
+        assert_eq!(e.validate(), Ok(()), "{metadata}");
+        if i % 2 == 0 {
+            append_event(&pool, e.clone()).await?;
+        } else {
+            let outcome = core_scoring::repository::append_events(&pool, vec![e.clone()]).await;
+            assert!(
+                outcome.failure.is_none(),
+                "{metadata}: {:?}",
+                outcome.failure
+            );
+        }
+        assert_eq!(
+            verify_chain(&pool).await?,
+            ChainStatus::Intact,
+            "{metadata} broke the chain"
+        );
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM event ORDER BY id DESC LIMIT 1")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            serde_json::to_string(&stored).unwrap(),
+            serde_json::to_string(&e.metadata).unwrap(),
+            "{metadata} did not come back as it was written"
+        );
     }
 
     // Integers of every size the parser keeps exactly are fine, and so is a batch.
@@ -742,7 +792,7 @@ async fn a_float_in_metadata_is_refused_and_a_leap_second_is_stored_as_the_next_
     let events: i64 = sqlx::query_scalar("SELECT count(*) FROM event")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(events, 2);
+    assert_eq!(events, 2 + whole.len() as i64);
     Ok(())
 }
 

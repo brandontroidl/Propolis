@@ -72,29 +72,46 @@ impl EventInput {
         {
             return Err(ValidationError::SignalTypeMismatch);
         }
-        // Metadata is hashed as written and verified as read back from `JSONB`, and a
-        // floating-point number is the one thing `JSONB` does not hand back as given: it has no
-        // negative zero, it prints a whole number without its point or exponent, and the largest
-        // floats come back as a decimal this crate's JSON parser refuses to read at all. One
+        // Metadata is hashed as written and verified as read back from `JSONB`, and some
+        // floating-point numbers are the one thing `JSONB` does not hand back as given. One
         // such number in one line would leave the chain reported broken at that row for good,
-        // or the row unreadable. No shipped sensor writes one, so a line that carries one is
-        // refused here, at the gate every append goes through.
-        if has_float(&self.metadata) {
-            return Err(ValidationError::NonIntegerNumber);
+        // or the row unreadable, so a line that carries one is refused here, at the gate every
+        // append goes through.
+        if has_unstable_number(&self.metadata) {
+            return Err(ValidationError::UnstableNumber);
         }
         Ok(())
     }
 }
 
-/// Whether `value` holds a JSON number that is not an integer `serde_json` keeps exactly: one
-/// written with a fraction or an exponent, or an integer too large for 64 bits.
-fn has_float(value: &serde_json::Value) -> bool {
+/// Whether `value` holds a JSON number that would not come back from `JSONB` as it was written.
+fn has_unstable_number(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::Number(number) => number.is_f64(),
-        serde_json::Value::Array(items) => items.iter().any(has_float),
-        serde_json::Value::Object(map) => map.values().any(has_float),
+        serde_json::Value::Number(number) => {
+            number.is_f64() && !number.as_f64().is_some_and(float_survives_jsonb)
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_unstable_number),
+        serde_json::Value::Object(map) => map.values().any(has_unstable_number),
         _ => false,
     }
+}
+
+/// Whether the float `v` is written, stored and read back as the same text.
+///
+/// An integer is always safe and never reaches this function. A float is safe only when it is a
+/// whole number of modest size, the form the shipped sensors write (`"window_secs": 600.0` in
+/// every flood, command and rate-limit summary): `serde_json` prints it as `600.0`, `JSONB`
+/// keeps the digit after the point, and reading `600.0` back gives the same float exactly.
+/// Everything else is refused, each for a reason seen on a real server:
+///
+/// - negative zero comes back as `0.0`;
+/// - from 1e16 up `serde_json` writes an exponent (`1e16`) and `JSONB` returns the digits, and the
+///   largest floats come back as a decimal this crate's JSON parser refuses to read at all (the
+///   bound here is 1e15, below both and below 2^53, where whole floats stop being exact);
+/// - a fraction is returned digit for digit, but this crate's JSON parser is not built to round
+///   every decimal to the nearest float, so the value read back can differ in its last bit.
+fn float_survives_jsonb(v: f64) -> bool {
+    v.fract() == 0.0 && v.abs() < 1e15 && !(v == 0.0 && v.is_sign_negative())
 }
 
 #[derive(Debug, PartialEq)]
@@ -104,8 +121,9 @@ pub enum ValidationError {
     /// `category`/`weight`/`confidence` do not match `signal_weight(signal_type)` - a desynced
     /// event that could forge the confirmed-real latch or corrupt the ledger weight.
     SignalTypeMismatch,
-    /// `metadata` holds a floating-point number, which does not survive `JSONB` as it was hashed.
-    NonIntegerNumber,
+    /// `metadata` holds a number that would not come back from `JSONB` as it was hashed: a
+    /// float with a fraction, a negative zero, or one of 1e15 or more in size.
+    UnstableNumber,
 }
 
 /// Read model mirroring the `ip_score` table columns.

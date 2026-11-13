@@ -425,11 +425,15 @@ async fn a_forged_event_summary_in_the_ssh_log_is_refused(pool: PgPool) {
 /// A line of a sensor's own kind passes the origin policy whatever else it carries, and two
 /// things it could carry used to break ledger chain verification for good: a timestamp with
 /// second 60, which PostgreSQL stores as the next minute while the hash was taken over the
-/// `:60` form, and a floating-point number in metadata, which JSONB does not hand back as
-/// written. Verification stops at the first row that fails, so one such line also hid any later
-/// tampering. Driven from raw text, because that is what a compromised sensor controls.
+/// `:60` form, and a floating-point number in metadata that JSONB does not hand back as
+/// written (a negative zero, a fraction, an exponent). Verification stops at the first row that
+/// fails, so one such line also hid any later tampering. Driven from raw text, because that is
+/// what a compromised sensor controls. A whole-number float, the form real summaries carry
+/// (`"window_secs": 600.0`), is ingested like any other line.
 #[sqlx::test(migrations = false)]
-async fn a_leap_second_is_ingested_and_a_float_is_refused_and_the_chain_stays_intact(pool: PgPool) {
+async fn a_leap_second_is_ingested_and_an_unstable_number_is_refused_and_the_chain_stays_intact(
+    pool: PgPool,
+) {
     migrate(&pool).await;
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("events.jsonl");
@@ -455,15 +459,21 @@ async fn a_leap_second_is_ingested_and_a_float_is_refused_and_the_chain_stays_in
             &now,
             r#"{"payload_len":18446744073709551615}"#,
         ),
+        raw(
+            "203.0.113.85",
+            &now,
+            r#"{"payload_len":0,"window_secs":600.0}"#,
+        ),
     ];
     std::fs::write(&log, lines.join("\n") + "\n").unwrap();
 
     let result = runner(&pool, dir.path(), "catchall").run_batch().await;
     assert_eq!(
         (result.ingested, result.rejected, result.errors),
-        (3, 3, 0),
-        "the honest line, the leap second and the largest integer are ingested; the three \
-         lines with a float are rejected like any other line that fails validation"
+        (4, 3, 0),
+        "the honest line, the leap second, the largest integer and the whole-number float are \
+         ingested; the negative zero, the fraction and the exponent are rejected like any other \
+         line that fails validation"
     );
     for ip in [VICTIM, "203.0.113.82", "203.0.113.83"] {
         assert_untouched(&pool, ip).await;

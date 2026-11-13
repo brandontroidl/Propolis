@@ -224,11 +224,12 @@ const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
 ///     strings and integers round-trip unchanged, because sqlx re-parses stored `JSONB` into a
 ///     `BTreeMap`-backed `serde_json::Value` whose lexicographic key order already matches the
 ///     in-memory value's (this crate does not enable serde_json's `preserve_order`).
-///     Floating-point numbers do not round-trip (no negative zero, whole numbers printed without
-///     a point, the largest ones unreadable on the way back), so `EventInput::validate` refuses
-///     an event whose metadata holds one before it reaches this point. Verified by
-///     `verify_chain_intact_with_rich_metadata` and
-///     `a_float_in_metadata_is_refused_and_a_leap_second_is_stored_as_the_next_minute`.
+///     Not every floating-point number round-trips (no negative zero, an exponent written out
+///     as digits, the largest ones unreadable on the way back, a fraction that may come back one
+///     bit off), so `EventInput::validate` refuses an event whose metadata holds one that would
+///     not, before it reaches this point. A whole number below 1e15, which is what the sensors
+///     write, does. Verified by `verify_chain_intact_with_rich_metadata` and
+///     `a_number_that_would_not_come_back_is_refused_and_a_leap_second_is_stored_as_the_next_minute`.
 ///
 /// `canonical_bytes`/`chain_hash` stay unchanged (deterministic already); normalization belongs
 /// at the append boundary, and every append path (single, telemetry, batch) goes through here.

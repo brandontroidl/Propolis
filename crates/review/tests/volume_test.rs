@@ -611,6 +611,33 @@ async fn by_default_a_decision_lapses_after_ninety_days_unseen(pool: PgPool) {
     assert_eq!(state_of(&pool, outside).await, None);
 }
 
+/// A node whose longest retention window is shorter than the day within which `populate` still
+/// offers an address. Lapsing at the window would have every scan offer an address seen inside
+/// that day and remove the row again in the same pass. The limit is never less than that day.
+#[sqlx::test(migrations = false)]
+async fn a_lapse_shorter_than_the_offer_window_is_raised_to_it(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "192.0.2.66";
+    seed_flood(&pool, ip).await;
+    let queue = queue().lapsing_after(Duration::hours(12));
+    assert_eq!(queue.populate(&pool).await.unwrap(), 1);
+
+    // Thirteen hours unseen: past the node's window, inside the offer window. The row stays, so
+    // the next scan has nothing to offer again.
+    last_seen_ago(&pool, ip, Duration::hours(13)).await;
+    for _ in 0..3 {
+        assert_eq!(queue.populate(&pool).await.unwrap(), 0);
+        assert_eq!(queue.withdraw(&pool).await.unwrap(), 0);
+        assert_eq!(state_of(&pool, ip).await, Some(ReviewState::Pending));
+    }
+
+    // Past the offer window it lapses, and is not offered again while it stays unseen.
+    last_seen_ago(&pool, ip, Duration::hours(25)).await;
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
+    assert_eq!(state_of(&pool, ip).await, None);
+    assert_eq!(queue.populate(&pool).await.unwrap(), 0);
+}
+
 // --- decisions ---
 
 #[sqlx::test(migrations = false)]

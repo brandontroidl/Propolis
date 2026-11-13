@@ -78,8 +78,13 @@ impl VolumeQueue {
     /// daemon passes the longest retention window it publishes: past that the address is in no
     /// feed file, so an approval has nothing left to publish and the next sighting should be a
     /// new decision, not a listing nobody looked at.
+    ///
+    /// Never less than [`VOLUME_LIST_WINDOW_SECONDS`], the day within which [`Self::populate`]
+    /// still offers an address. With a shorter limit (a node whose longest window is a few
+    /// hours) every scan would offer an address seen inside that day and remove the row again
+    /// in the same pass, once a scan interval, each time with a log line.
     pub fn lapsing_after(mut self, silence: Duration) -> Self {
-        self.lapse_after = silence;
+        self.lapse_after = silence.max(Duration::seconds(VOLUME_LIST_WINDOW_SECONDS));
         self
     }
 

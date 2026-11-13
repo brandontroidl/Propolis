@@ -87,6 +87,16 @@ fn free_port() -> u16 {
 /// scans and feed builds. `auto_publish` is the value of `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH`, or
 /// `None` to leave it unset as a default install does.
 fn start_daemon(pool: &PgPool, root: &Path, auto_publish: Option<&str>) -> Daemon {
+    start_daemon_with(pool, root, auto_publish, &[])
+}
+
+/// [`start_daemon`] with more of the environment set, after everything it sets itself.
+fn start_daemon_with(
+    pool: &PgPool,
+    root: &Path,
+    auto_publish: Option<&str>,
+    more: &[(&str, &str)],
+) -> Daemon {
     let sensor_log = root.join("ssh.jsonl");
     std::fs::write(&sensor_log, "").unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_propolis"));
@@ -113,6 +123,7 @@ fn start_daemon(pool: &PgPool, root: &Path, auto_publish: Option<&str>) -> Daemo
     if let Some(value) = auto_publish {
         cmd.env("PROPOLIS_FEED_VOLUME_AUTO_PUBLISH", value);
     }
+    cmd.envs(more.iter().copied());
     Daemon(cmd.spawn().expect("spawn propolis"))
 }
 
@@ -259,4 +270,47 @@ async fn the_daemon_publishes_without_approval_only_when_the_opt_in_is_set(pool:
         Some("pending"),
         "and no decision was made: the candidate is still pending"
     );
+}
+
+/// The scan that ends a lapsed volume approval runs with the review subsystem. A node with that
+/// off and the feed on still publishes the approvals it already has, so something must still end
+/// them: an approval that outlived its listing would put the address back in every window at its
+/// next sighting, however long after. The feed build loop runs the scan there.
+#[sqlx::test(migrations = false)]
+async fn with_the_review_subsystem_off_the_feed_loop_still_ends_a_lapsed_approval(pool: PgPool) {
+    migrate(&pool).await;
+    seed_flood(&pool).await;
+    // Offered and approved while the review subsystem was still on.
+    let queue = VolumeQueue::new();
+    assert_eq!(queue.populate(&pool).await.unwrap(), 1);
+    queue
+        .approve(&pool, FLOOD.parse().unwrap(), None)
+        .await
+        .unwrap();
+    // Then the address went quiet for longer than the node's one window (24h).
+    sqlx::query(
+        "UPDATE ip_score SET last_seen = now() - interval '2 days' WHERE source_ip = $1::inet",
+    )
+    .bind(FLOOD)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let _daemon = start_daemon_with(
+        &pool,
+        root.path(),
+        None,
+        &[("PROPOLIS_REVIEW_ENABLED", "false")],
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while volume_state(&pool).await.is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "with the review subsystem off, the approval of an address out of every window was \
+             never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

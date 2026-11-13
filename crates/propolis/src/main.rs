@@ -410,10 +410,17 @@ fn publish_snapshot(
 }
 
 /// Feed build loop: build snapshot, publish atomically. Mirrors `feed/src/main.rs`'s loop.
+///
+/// `volume_lapse` is the volume review queue when nothing else scans it, which is when the review
+/// subsystem is off: its scan then runs here, before each build, so that a volume approval still
+/// ends once its address is out of every window. Without it the approvals already given would
+/// stand for ever on such a node, and an address approved long ago would be listed again at its
+/// next sighting.
 async fn run_feed_loop(
     pool: PgPool,
     exclusions: ExclusionEngine,
     feed_config: FeedConfig,
+    volume_lapse: Option<VolumeQueue>,
     output_dir: PathBuf,
     interval: Duration,
     cancel: CancellationToken,
@@ -457,6 +464,12 @@ async fn run_feed_loop(
     loop {
         if cancel.is_cancelled() {
             return;
+        }
+
+        if let Some(volume) = &volume_lapse
+            && let Err(e) = volume.withdraw(&pool).await
+        {
+            tracing::error!(error = %e, "feed: volume review lapse scan failed");
         }
 
         match FeedBuilder::build(&pool, &exclusions, &feed_config).await {
@@ -1305,6 +1318,22 @@ async fn main() {
         )
     };
 
+    // A volume decision lapses once its address has been unseen for the longest retention
+    // window this node publishes: past that it is in no feed file. With no window configured
+    // nothing is published on volume at all and the queue's own default stands.
+    let volume_lapse = config
+        .feed_windows
+        .iter()
+        .map(|(_, window)| chrono::Duration::seconds(window.as_secs() as i64))
+        .max();
+    let volume_queue = move |allowlist: Arc<core_scoring::OperatorAllowlist>| {
+        let queue = VolumeQueue::new().with_allowlist(allowlist);
+        match volume_lapse {
+            Some(silence) => queue.lapsing_after(silence),
+            None => queue,
+        }
+    };
+
     // 6. Spawn review subsystem (queue scan + submission) if enabled.
     if config.review_enabled {
         let pool_r = pool.clone();
@@ -1312,14 +1341,6 @@ async fn main() {
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
         let review_allowlist = operator_allowlist.clone();
-        // A volume decision lapses once its address has been unseen for the longest retention
-        // window this node publishes: past that it is in no feed file. With no window configured
-        // nothing is published on volume at all and the queue's own default stands.
-        let volume_lapse = config
-            .feed_windows
-            .iter()
-            .map(|(_, window)| chrono::Duration::seconds(window.as_secs() as i64))
-            .max();
 
         // Once per process, not per supervised restart of the review group.
         review::vendor::log_vendor_startup(&vendors);
@@ -1346,11 +1367,7 @@ async fn main() {
                     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
                         .with_allowlist(allowlist.clone());
                     let queue = ReviewQueue::new().with_allowlist(allowlist.clone());
-                    let volume = VolumeQueue::new().with_allowlist(allowlist);
-                    let volume = match volume_lapse {
-                        Some(silence) => volume.lapsing_after(silence),
-                        None => volume,
-                    };
+                    let volume = volume_queue(allowlist);
 
                     let queue_token = token.child_token();
                     let submit_token = token.child_token();
@@ -1419,6 +1436,10 @@ async fn main() {
                  approval; the retention feeds publish only addresses that are already approved"
             );
         }
+        // The queue scan that ends a lapsed volume approval runs with the review subsystem.
+        // With that off, the build loop runs it instead.
+        let feed_volume_lapse =
+            (!config.review_enabled).then(|| volume_queue(operator_allowlist.clone()));
         let output_dir = config.feed_output_dir.clone();
         let build_interval = config.feed_build_interval;
 
@@ -1430,12 +1451,14 @@ async fn main() {
                 let pool = pool_f.clone();
                 let exclusions = exclusions.clone();
                 let feed_config = feed_config.clone();
+                let volume_lapse = feed_volume_lapse.clone();
                 let output_dir = output_dir.clone();
                 async move {
                     run_feed_loop(
                         pool,
                         exclusions,
                         feed_config,
+                        volume_lapse,
                         output_dir,
                         build_interval,
                         token,

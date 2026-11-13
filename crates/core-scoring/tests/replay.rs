@@ -476,8 +476,9 @@ async fn replay_equals_incremental(pool: PgPool) -> Result<(), RepoError> {
 /// sensor or a collector with a broken clock would deliver it. In the stored row `last_seen` and
 /// `decay_anchor` never step backwards (the back-dated line used to become both, which dropped
 /// the address out of every feed window and made the next event decay its whole score away), the
-/// later event still finds the earlier weight, and a replay of the ledger, which folds the same
-/// events in the same ledger order, rebuilds exactly the stored row.
+/// later event still finds the earlier weight, an older line adds only what its own age leaves
+/// of its weight, and a replay of the ledger, which folds the same events in the same ledger
+/// order, rebuilds exactly the stored row.
 #[sqlx::test(migrations = "./migrations")]
 async fn replay_equals_incremental_when_events_arrive_out_of_order(
     pool: PgPool,
@@ -562,18 +563,24 @@ async fn replay_equals_incremental_when_events_arrive_out_of_order(
         assert_eq!(replayed, stored, "replay diverged after {latest}");
     }
 
-    // 20 + 15 + 40 accumulated at the 12:00 anchor, the two older lines included. One hour of
-    // a six-hour half-life later the newer event (weight 20) found about 66.8 of it left, not
-    // what four hours, or three years, of decay from a regressed anchor would leave; the last,
-    // older line then added its 3 with no further decay.
+    // At the 12:00 anchor: the port scan's 20; nothing measurable of the line dated three years
+    // back; and of the connection from 09:00 (weight 40) what half a half-life leaves, about
+    // 28.3. Each older line adds what its own age leaves of it, as it would have read in order.
     let before = before_the_newer_event.expect("three events were stored before the newer one");
-    assert_eq!(before.raw_score, dec!(75));
+    assert!(
+        before.raw_score > dec!(48.2) && before.raw_score < dec!(48.3),
+        "20 plus 40 decayed for three hours: {}",
+        before.raw_score
+    );
+    // One hour of a six-hour half-life later the newer event (weight 20) found about 43.0 of
+    // that left, not what four hours, or three years, of decay from a regressed anchor would
+    // leave; the last line, half an hour older than the anchor, then added about 2.8 of its 3.
     let stored = read_stored_score(&pool, ip).await?.unwrap();
     assert_eq!(stored.event_count, 5);
     assert_eq!(stored.established_event_count, 4);
     assert!(
-        stored.raw_score > dec!(89.8) && stored.raw_score < dec!(89.9),
-        "75 decayed for one hour, plus 20, plus 3: {}",
+        stored.raw_score > dec!(65.8) && stored.raw_score < dec!(65.9),
+        "48.28 decayed for one hour, plus 20, plus 3 decayed for half an hour: {}",
         stored.raw_score
     );
     Ok(())
@@ -655,6 +662,87 @@ async fn verify_chain_intact_with_rich_metadata(pool: PgPool) -> Result<(), Repo
     e.metadata = serde_json::json!({"z": 1, "a": {"n": 42, "s": "x"}, "list": [3, 2, 1]});
     append_event(&pool, e).await?;
     assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
+    Ok(())
+}
+
+/// What any sensor can write in a line of its own kind must not be able to break verification.
+/// A timestamp with second 60 is hashed as the instant PostgreSQL stores for it (the next
+/// minute). Floating-point metadata does not come back from `JSONB` as given (no negative zero;
+/// a whole number without its point or exponent; the largest floats not readable at all), so an
+/// event that carries one is refused before it is hashed, on the single and the batch path.
+/// Each of these used to leave the chain reported `Broken` at that row for good, or the row
+/// unreadable, which also hid every later tampering.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_float_in_metadata_is_refused_and_a_leap_second_is_stored_as_the_next_minute(
+    pool: PgPool,
+) -> Result<(), RepoError> {
+    let event = |at: &str| {
+        ev(
+            at,
+            SignalType::HoneypotCommandExec,
+            Some("198.51.100.1"),
+            "s1",
+            Protocol::Tcp,
+            true,
+        )
+    };
+    let mut leap = event("2026-07-17T00:00:00Z");
+    leap.observed_at = "2026-11-12T10:15:60Z".parse().unwrap();
+    append_event(&pool, leap).await?;
+    let stored: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT observed_at FROM event WHERE id = 1")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        stored,
+        "2026-11-12T10:16:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap()
+    );
+    assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
+
+    for float in [
+        r#"{"x": -0.0}"#,
+        r#"{"x": 1e16}"#,
+        r#"{"x": 100.0}"#,
+        r#"{"x": 0.5}"#,
+        r#"{"x": 1.7976931348623157e308}"#,
+        r#"{"x": 18446744073709551616}"#,
+        r#"{"nested": {"list": [1, 2, 3.0]}}"#,
+    ] {
+        let mut e = event("2026-07-17T00:01:00Z");
+        e.metadata = serde_json::from_str(float).unwrap();
+        assert!(
+            matches!(
+                e.validate(),
+                Err(core_scoring::domain::types::ValidationError::NonIntegerNumber)
+            ),
+            "{float}"
+        );
+        assert!(
+            matches!(
+                append_event(&pool, e.clone()).await,
+                Err(RepoError::Invalid(_))
+            ),
+            "{float} reached the ledger"
+        );
+        let outcome = core_scoring::repository::append_events(&pool, vec![e]).await;
+        assert_eq!(outcome.appended, 0, "{float} reached the ledger in a batch");
+    }
+
+    // Integers of every size the parser keeps exactly are fine, and so is a batch.
+    let mut batched = event("2026-07-17T00:05:00Z");
+    batched.metadata =
+        serde_json::json!({"max": u64::MAX, "min": i64::MIN, "zero": 0, "list": [1, -1]});
+    batched.observed_at = "2026-11-12T10:20:60.5Z".parse().unwrap();
+    let outcome = core_scoring::repository::append_events(&pool, vec![batched]).await;
+    assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+    assert_eq!(outcome.appended, 1);
+    assert_eq!(verify_chain(&pool).await?, ChainStatus::Intact);
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM event")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(events, 2);
     Ok(())
 }
 

@@ -210,19 +210,25 @@ const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
 /// falsely verify as `Broken`. The principle is "hash what you store":
 ///   - `observed_at` is `TIMESTAMPTZ` (microsecond precision) -> truncate the sub-µs nanoseconds
 ///     so the inserted value already carries no precision the column would drop (e.g. a raw
-///     `Utc::now()` carries nanoseconds).
+///     `Utc::now()` carries nanoseconds), and rebuild it from its microsecond count so that a
+///     leap second (`...T10:15:60Z`, which chrono keeps as second 59 with an extra second of
+///     nanoseconds and prints as `:60`) is the instant PostgreSQL stores for it (`10:16:00`).
+///     Any sensor can write such a timestamp, and hashed as written it broke verification at
+///     that row for good.
 ///   - `confidence` is `NUMERIC(4,3)` (scale 3) -> rescale to exactly 3 decimal places.
 ///     `round_dp(3)` only trims excess scale, it never pads (dec!(0.9).round_dp(3) stays "0.9"),
 ///     so a value-equal low-scale confidence would hash as "0.9" here but read back as "0.900"
 ///     from storage and false-break verify_chain. `rescale(3)` pads (and rounds if >3dp,
 ///     unreachable after validate()).
-///   - `metadata` is `JSONB` and is intentionally NOT rewritten here: the documented canonical
-///     metadata form (JSON integers, strings, and nested objects/arrays thereof) round-trips
-///     unchanged, because sqlx re-parses stored `JSONB` into a `BTreeMap`-backed
-///     `serde_json::Value` whose lexicographic key order already matches the in-memory value's
-///     (this crate does not enable serde_json's `preserve_order`). Floating-point JSON numbers
-///     are NOT guaranteed stable across the `JSONB` round-trip and are outside that canonical
-///     form. Verified by `verify_chain_intact_with_rich_metadata`.
+///   - `metadata` is `JSONB` and is intentionally NOT rewritten here: its objects, arrays,
+///     strings and integers round-trip unchanged, because sqlx re-parses stored `JSONB` into a
+///     `BTreeMap`-backed `serde_json::Value` whose lexicographic key order already matches the
+///     in-memory value's (this crate does not enable serde_json's `preserve_order`).
+///     Floating-point numbers do not round-trip (no negative zero, whole numbers printed without
+///     a point, the largest ones unreadable on the way back), so `EventInput::validate` refuses
+///     an event whose metadata holds one before it reaches this point. Verified by
+///     `verify_chain_intact_with_rich_metadata` and
+///     `a_float_in_metadata_is_refused_and_a_leap_second_is_stored_as_the_next_minute`.
 ///
 /// `canonical_bytes`/`chain_hash` stay unchanged (deterministic already); normalization belongs
 /// at the append boundary, and every append path (single, telemetry, batch) goes through here.
@@ -234,7 +240,9 @@ pub(super) fn normalize_event(mut event: EventInput) -> EventInput {
 /// [`normalize_event`] without moving the event, for a batch that owns a thousand of them.
 pub(super) fn normalize_in_place(event: &mut EventInput) {
     event.confidence.rescale(3);
-    event.observed_at = event.observed_at.trunc_subsecs(6);
+    let truncated = event.observed_at.trunc_subsecs(6);
+    event.observed_at =
+        chrono::DateTime::from_timestamp_micros(truncated.timestamp_micros()).unwrap_or(truncated);
 }
 
 impl RepoError {

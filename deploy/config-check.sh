@@ -1041,24 +1041,49 @@ run_events() {
 # Whether the role the daemon connects as can do more to the ledger than append to it. The
 # append-only control is a revoke, which does not bind the table's owner: a daemon connected as
 # the role that ran the migrations can grant itself UPDATE and DELETE back or disable the chain
-# trigger (docs/operations/database-roles.md). One row comes back: role|controls|privileges, where
-# controls is t when the role owns `event` or is a superuser and privileges lists what it holds
-# beyond SELECT and INSERT. Asked as the daemon's own role, read-only, through the same connection
-# path as the events query; skipped wherever that query could not run, which is already reported.
+# trigger (docs/operations/database-roles.md). A role that owns the database the table is in, or
+# may create objects in its schema, is confined by nothing on the table either: that is what a
+# database restored for the wrong owner leaves. One row comes back,
+# role|controls|privileges|owns_database|can_create: controls is t when the role owns `event` or
+# is a superuser, privileges lists what it holds beyond SELECT and INSERT, owns_database is t when
+# it owns the database and can_create when it may create in the schema `event` is in. Asked as the
+# daemon's own role, read-only, through the same connection path as the events query; skipped
+# wherever that query could not run, which is already reported.
 check_ledger_role() {
-    local out role="" controls="" privs=""
+    local out role="" controls="" privs="" owns_db="" can_create="" extra="" flag what=""
     if [ "$EV_STATE" != ok ]; then
         return 0
     fi
     out="$TMP_DIR/ledger-role.out"
-    ledger_psql "SELECT current_user, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) OR pg_has_role(current_user, c.relowner, 'USAGE'), concat_ws(' ', CASE WHEN has_table_privilege(c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN has_table_privilege(c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN has_table_privilege(c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN has_table_privilege(c.oid, 'TRIGGER') THEN 'TRIGGER' END) FROM pg_class c WHERE c.oid = to_regclass('event')" >"$out" 2>/dev/null || return 0
-    IFS='|' read -r role controls privs <"$out" || true
-    # Only capitals and spaces can be a privilege list; anything else is not this query's answer.
+    ledger_psql "SELECT current_user, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) OR pg_has_role(current_user, c.relowner, 'USAGE'), concat_ws(' ', CASE WHEN has_table_privilege(c.oid, 'UPDATE') THEN 'UPDATE' END, CASE WHEN has_table_privilege(c.oid, 'DELETE') THEN 'DELETE' END, CASE WHEN has_table_privilege(c.oid, 'TRUNCATE') THEN 'TRUNCATE' END, CASE WHEN has_table_privilege(c.oid, 'TRIGGER') THEN 'TRIGGER' END), (SELECT pg_has_role(current_user, d.datdba, 'USAGE') FROM pg_database d WHERE d.datname = current_database()), has_schema_privilege(c.relnamespace, 'CREATE') FROM pg_class c WHERE c.oid = to_regclass('event')" >"$out" 2>/dev/null || return 0
+    # The last name takes whatever is left of the line, so one more name than the query has
+    # columns keeps a column this function does not know out of the ones it reads.
+    IFS='|' read -r role controls privs owns_db can_create extra <"$out" || true
+    # Each column has a closed vocabulary: three booleans as psql prints them, and a list that can
+    # only be capitals and spaces. A row that is anything else (no row, fewer columns, more, other
+    # text) is not this query's answer, and nothing is claimed from it either way.
+    for flag in "$controls" "$owns_db" "$can_create"; do
+        case "$flag" in t | f) ;; *) return 0 ;; esac
+    done
     case "$privs" in *[!A-Z\ ]*) return 0 ;; esac
+    if [ -n "$extra" ]; then
+        return 0
+    fi
     if [ "$controls" = t ]; then
         finding warn "ledger" "ledger-owner" "the daemon connects to the database as role $role, which owns the event table (or is a superuser): the ledger's append-only revoke does not bind an owner, so this role can grant itself UPDATE and DELETE or disable the chain trigger" \
             "split the database roles so an owner role migrates and the daemon's role only appends: docs/operations/database-roles.md" manual
-    elif [ "$controls" = f ] && [ -n "$privs" ]; then
+        return 0
+    fi
+    if [ "$owns_db" = t ]; then
+        what="owns the database: it can put a schema of its own ahead of the ledger's in every session's search path, the owner role's migrations included"
+    elif [ "$can_create" = t ]; then
+        what="may create objects in the ledger's schema: it can plant functions and tables there for the owner role's migrations to call or adopt"
+    fi
+    if [ -n "$what" ]; then
+        finding warn "ledger" "ledger-database" "the daemon's database role $role does not own the event table but $what" \
+            "stop propolis, give the database and its schema back to the owner role (propolis migrate --init-roles) and run propolis-migrate: docs/operations/database-roles.md" manual
+    fi
+    if [ -n "$privs" ]; then
         finding warn "ledger" "ledger-grants" "the daemon's database role $role holds $privs on the event table; it needs only SELECT and INSERT" \
             "sudo propolis-migrate"
     fi

@@ -150,6 +150,46 @@ async fn with_one_role_it_migrates_and_says_the_ledger_is_not_protected(admin: P
     assert!(text(&out.stdout).contains("no separate runtime role"));
 }
 
+/// `--check` is what `deploy/rollback.sh` runs after restoring a database on a node with split
+/// roles, and what an operator runs after restoring one by hand. A database owned by the role the
+/// daemon connects as must fail it, although every grant on the tables is as the split left it,
+/// and the owner's migration run must not be what makes it pass.
+#[sqlx::test(migrations = false)]
+async fn the_check_fails_for_a_runtime_role_that_owns_the_database(admin: PgPool) {
+    let (owner, runtime) = roles(&admin).await;
+    let (owner_url, runtime_url) = (url_as(&admin, &owner), url_as(&admin, &runtime));
+    let both = [
+        ("PROPOLIS_MIGRATE_DATABASE_URL", owner_url.as_str()),
+        ("DATABASE_URL", runtime_url.as_str()),
+    ];
+    let out = migrate(&[], &both);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = migrate(&["--check"], &[("DATABASE_URL", &runtime_url)]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+
+    let db = admin.connect_options().get_database().unwrap().to_string();
+    raw(format!("ALTER DATABASE \"{db}\" OWNER TO {runtime}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let out = migrate(&["--check"], &[("DATABASE_URL", &runtime_url)]);
+        let stdout = text(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{stdout}");
+        assert!(stdout.contains("schema: current"), "{stdout}");
+        assert!(
+            stdout.contains(&format!(
+                "ledger: NOT protected: role {runtime} owns the database"
+            )),
+            "{stdout}"
+        );
+        // The second time round, after the owner has migrated and reset the grants again.
+        let out = migrate(&[], &both);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    }
+}
+
 #[test]
 fn it_refuses_unknown_arguments_and_a_missing_url_without_starting_anything() {
     let out = migrate(&["--force"], &[]);

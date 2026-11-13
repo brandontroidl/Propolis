@@ -161,6 +161,9 @@ pub struct RoleStatus {
     pub controls_ledger: bool,
     /// The role may create objects in the current schema.
     pub can_create: bool,
+    /// The role owns the database (directly or through membership), or is a superuser. A
+    /// database's owner can reconfigure and drop it whatever it holds on the tables inside.
+    pub owns_database: bool,
     /// The role holds `SELECT` and `INSERT` on `event`: what appending takes.
     pub can_append: bool,
     /// The ledger privileges, beyond `SELECT` and `INSERT`, the role holds on `event`.
@@ -190,6 +193,23 @@ impl RoleStatus {
                 self.role
             ));
         }
+        // Rights over what the ledger sits in, held by a role that does not own the table. A
+        // database recreated for the wrong owner leaves exactly this, with every grant on the
+        // tables as it should be.
+        if self.owns_database {
+            return Some(format!(
+                "role {} owns the database, so it can put a schema of its own ahead of the \
+                 ledger's in every session's search path, the owner role's migrations included",
+                self.role
+            ));
+        }
+        if self.can_create {
+            return Some(format!(
+                "role {} may create objects in the ledger's schema, so it can plant functions \
+                 and tables there for the owner role's migrations to call or adopt",
+                self.role
+            ));
+        }
         if !self.ledger_write_privileges.is_empty() {
             return Some(format!(
                 "role {} holds {} on the event table",
@@ -198,6 +218,13 @@ impl RoleStatus {
             ));
         }
         None
+    }
+
+    /// The exposure is one the owner role's `propolis migrate` does not undo: that run resets
+    /// grants on tables, and neither who owns the database nor a right to create in the schema
+    /// held through `PUBLIC` is one of those.
+    fn exposed_beyond_table_grants(&self) -> bool {
+        self.ledger_exists && !self.controls_ledger && (self.owns_database || self.can_create)
     }
 }
 
@@ -210,6 +237,8 @@ pub async fn role_status(pool: &PgPool) -> Result<RoleStatus, sqlx::Error> {
                   OR COALESCE(pg_has_role(current_user, e.relowner, 'USAGE'), false) \
                   AS controls_ledger, \
                 has_schema_privilege(current_user, current_schema(), 'CREATE') AS can_create, \
+                (SELECT pg_has_role(current_user, d.datdba, 'USAGE') FROM pg_database d \
+                  WHERE d.datname = current_database()) AS owns_database, \
                 COALESCE(has_table_privilege(current_user, e.oid, 'SELECT') \
                          AND has_table_privilege(current_user, e.oid, 'INSERT'), false) \
                   AS can_append, \
@@ -240,6 +269,7 @@ pub async fn role_status(pool: &PgPool) -> Result<RoleStatus, sqlx::Error> {
         ledger_exists: row.try_get("ledger_exists")?,
         controls_ledger: row.try_get("controls_ledger")?,
         can_create: row.try_get("can_create")?,
+        owns_database: row.try_get("owns_database")?,
         can_append: row.try_get("can_append")?,
         ledger_write_privileges,
     })
@@ -474,6 +504,12 @@ pub async fn prepare_schema(pool: &PgPool) -> Result<(), String> {
         ));
     }
     match status.exposure() {
+        Some(why) if status.exposed_beyond_table_grants() => tracing::warn!(
+            reason = %why,
+            "propolis: the ledger is not protected from this role; stop propolis and give the \
+             database and its schema back to the owner role with `propolis migrate --init-roles` \
+             (docs/operations/database-roles.md)"
+        ),
         Some(why) => tracing::warn!(
             reason = %why,
             "propolis: the ledger is not protected from this role; run `propolis migrate` as the \
@@ -651,9 +687,76 @@ async fn migrate_as(
 
 #[cfg(test)]
 mod tests {
-    use super::url_role;
+    use super::{RoleStatus, url_role};
+
+    /// A runtime role as the split leaves it: appends, owns nothing, creates nothing.
+    fn confined() -> RoleStatus {
+        RoleStatus {
+            role: "propolis".to_string(),
+            ledger_exists: true,
+            controls_ledger: false,
+            can_create: false,
+            owns_database: false,
+            can_append: true,
+            ledger_write_privileges: Vec::new(),
+        }
+    }
 
     // Everything that needs a database is in `tests/db_roles.rs`.
+    #[test]
+    fn each_way_a_role_is_not_confined_has_its_own_reason_and_the_ledgers_owner_only_one() {
+        assert_eq!(confined().exposure(), None);
+
+        let owns_database = RoleStatus {
+            owns_database: true,
+            can_create: true,
+            ..confined()
+        };
+        let why = owns_database.exposure().unwrap();
+        assert!(why.contains("owns the database"), "{why}");
+        assert!(owns_database.exposed_beyond_table_grants());
+
+        let may_create = RoleStatus {
+            can_create: true,
+            ..confined()
+        };
+        let why = may_create.exposure().unwrap();
+        assert!(why.contains("may create objects"), "{why}");
+        assert!(may_create.exposed_beyond_table_grants());
+
+        // A stray grant on the table is the one thing the owner's `propolis migrate` resets.
+        let granted = RoleStatus {
+            ledger_write_privileges: vec!["UPDATE"],
+            ..confined()
+        };
+        let why = granted.exposure().unwrap();
+        assert!(why.contains("holds UPDATE on the event table"), "{why}");
+        assert!(!granted.exposed_beyond_table_grants());
+
+        // The one role of an unsplit deployment owns everything; it is told about the ledger.
+        let single = RoleStatus {
+            controls_ledger: true,
+            owns_database: true,
+            can_create: true,
+            ledger_write_privileges: vec!["TRIGGER"],
+            ..confined()
+        };
+        let why = single.exposure().unwrap();
+        assert!(why.contains("owns the event table"), "{why}");
+        assert!(!why.contains("owns the database"), "{why}");
+        assert!(!single.exposed_beyond_table_grants());
+
+        // Before the first migration there is no ledger to be exposed.
+        let empty = RoleStatus {
+            ledger_exists: false,
+            owns_database: true,
+            can_create: true,
+            ..confined()
+        };
+        assert_eq!(empty.exposure(), None);
+        assert!(!empty.exposed_beyond_table_grants());
+    }
+
     #[test]
     fn the_runtime_role_is_read_from_the_url_only_when_the_url_names_one() {
         assert_eq!(

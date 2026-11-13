@@ -104,7 +104,8 @@ when the daemon starts again.
    ```
 
    `deploy/config-check.sh` reports the same thing among its findings: `ledger-owner` while the
-   daemon's role still owns the ledger, nothing once it does not
+   daemon's role still owns the ledger, `ledger-database` if it owns the database or may create
+   objects in the ledger's schema without owning the table, nothing once it does neither
    ([configuration check](service-lifecycle.md#configuration-check)).
 
    Expected output of the check:
@@ -114,6 +115,14 @@ when the daemon starts again.
    schema: current
    ledger: protected (this role can append and read, nothing else)
    ```
+
+   The check also fails, with `ledger: NOT protected`, for a role that does not own the `event`
+   table but owns the database, or may create objects in the ledger's schema
+   (`crates/propolis/src/db_roles.rs#exposure`). The owner of a database can put a schema of
+   its own ahead of the ledger's for every session, the owner role's migrations included,
+   whatever it holds on the tables. A database created for the daemon's role and then restored
+   into is in that state. Stop the daemon and repeat step 3, which gives the database and its
+   schema back to the owner role, then steps 6 and 7.
 
 ## A new node
 
@@ -212,7 +221,10 @@ schema older or newer than its binary it exits, naming each migration that diffe
 `pg_dump` records ownership and grants but not roles. Create **both** roles on the new server
 before restoring, and make the owner role the database's owner; the grants then come back with
 the dump ([restore procedure](backup-and-restore.md#restore-procedure)). Run
-`propolis-migrate --check` afterwards.
+`propolis-migrate --check` afterwards: it fails if the database was created for the daemon's
+role instead. `deploy/rollback.sh --with-database` does all of this itself: it creates the new
+database with the owner the current one has, then runs `propolis-migrate` and the check before
+it starts anything ([rollback](upgrade-rollback-and-dr.md#rollback)).
 
 ## Going back to one role
 

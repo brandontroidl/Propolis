@@ -224,8 +224,13 @@ event ledger (`deploy/config-check.sh#check_ledger_role`). A role that owns the 
 is a superuser, is a warning (`ledger-owner`): the ledger's append-only revoke does not bind an
 owner, and the step is to [split the database roles](database-roles.md). A role that does not own
 it but holds `UPDATE`, `DELETE`, `TRUNCATE` or `TRIGGER` on it is a warning (`ledger-grants`)
-whose fix is `sudo propolis-migrate`, which resets the grants. A role that can only read and
-append is not reported. The check is skipped wherever the EVENTS query is.
+whose fix is `sudo propolis-migrate`, which resets the grants. A role that does not own the
+table but owns the database, or may create objects in the ledger's schema, is a warning
+(`ledger-database`): nothing on the table confines a database's owner, and the step is to
+[move ownership to the owner role again](database-roles.md#splitting-the-roles-on-an-existing-node).
+A role that can only read and append, in a database and schema it does not control, is not
+reported. The check is skipped wherever the EVENTS query is, and claims nothing from an answer
+that is not the row it asked for.
 
 **The dangerous row.** A port that is open in the firewall and held, on a non-loopback
 address, by a process that is not the expected sensor is reported first, as `DANGEROUS`, for

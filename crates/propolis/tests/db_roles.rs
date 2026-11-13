@@ -163,6 +163,10 @@ async fn a_single_role_deployment_still_migrates_and_is_reported_as_unprotected(
     assert!(status.is_owner());
     let why = status.exposure().expect("an owner is never protected from");
     assert!(why.contains("owns the event table"), "{why}");
+    // The one role owns the database and may create in the schema as well. What it is told is
+    // still that it owns the ledger, which is the whole of it and the reason to split.
+    assert!(status.owns_database && status.can_create);
+    assert!(!why.contains("owns the database"), "{why}");
 }
 
 /// Migration 0004 leaves a single role owning a ledger it holds no UPDATE, DELETE or TRUNCATE on,
@@ -301,6 +305,123 @@ async fn a_grant_made_by_hand_is_reported_and_reset(admin: PgPool) {
     reconcile_runtime_grants(&owner, &role).await.unwrap();
     assert_eq!(role_status(&runtime).await.unwrap().exposure(), None);
     assert!(denied(&runtime, "DELETE FROM event").await);
+}
+
+/// What `deploy/rollback.sh --with-database` left on a node with split roles before it kept the
+/// database's owner: every table and every grant as the dump had them, and the database itself
+/// owned by the role the daemon connects as. Nothing about the event table shows it, so the check
+/// has to look at the database.
+#[sqlx::test(migrations = false)]
+async fn a_runtime_role_that_owns_the_database_is_reported_though_it_does_not_own_the_ledger(
+    admin: PgPool,
+) {
+    let (owner, runtime, role) = split(&admin).await;
+    assert_eq!(role_status(&runtime).await.unwrap().exposure(), None);
+    let owner_role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&owner)
+        .await
+        .unwrap();
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+
+    raw(format!("ALTER DATABASE \"{db}\" OWNER TO {role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let status = role_status(&runtime).await.unwrap();
+    assert!(status.owns_database);
+    // Everything the check looked at before still says the role is confined.
+    assert!(!status.controls_ledger && !status.is_owner());
+    assert!(status.ledger_write_privileges.is_empty());
+    assert!(denied(&runtime, "DELETE FROM event").await);
+    let why = status.exposure().expect("a database owner is reported");
+    assert!(
+        why.contains(&format!("role {role} owns the database")),
+        "{why}"
+    );
+    // Reported, not fatal: the daemon still starts, and says so.
+    prepare_schema(&runtime).await.unwrap();
+
+    // The owner role's migration run resets grants on tables. It does not give a database back.
+    reconcile_runtime_grants(&owner, &role).await.unwrap();
+    assert!(role_status(&runtime).await.unwrap().exposure().is_some());
+
+    // What the message says the role can do, the server lets it do. Last, because the setting
+    // reaches every connection opened to this database from here on.
+    raw("CREATE SCHEMA pt_front".to_string())
+        .execute(&runtime)
+        .await
+        .expect("a database's owner may create a schema in it");
+    raw(format!(
+        "ALTER DATABASE \"{db}\" SET search_path = pt_front, public"
+    ))
+    .execute(&runtime)
+    .await
+    .expect("a database's owner may set the search path its sessions start with");
+
+    // Handing the database back is what clears it.
+    raw(format!(
+        "ALTER DATABASE \"{db}\" RESET search_path; \
+         DROP SCHEMA pt_front; \
+         ALTER DATABASE \"{db}\" OWNER TO {owner_role}"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+    let fresh = connect_as(&admin, &role).await;
+    assert_eq!(role_status(&fresh).await.unwrap().exposure(), None);
+}
+
+/// A right to create in the ledger's schema is the other thing the event table's own grants do
+/// not show. Granted to the role itself, the owner's grant reset takes it away again; held
+/// through PUBLIC, it does not, and the role stays reported until PUBLIC loses it.
+#[sqlx::test(migrations = false)]
+async fn a_runtime_role_that_may_create_in_the_ledgers_schema_is_reported(admin: PgPool) {
+    let (owner, runtime, role) = split(&admin).await;
+
+    raw(format!("GRANT CREATE ON SCHEMA public TO {role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let status = role_status(&runtime).await.unwrap();
+    assert!(status.can_create && !status.owns_database && !status.controls_ledger);
+    let why = status
+        .exposure()
+        .expect("a role that may create is reported");
+    assert!(
+        why.contains(&format!(
+            "role {role} may create objects in the ledger's schema"
+        )),
+        "{why}"
+    );
+    raw("CREATE TABLE scratch (n int); DROP TABLE scratch".to_string())
+        .execute(&runtime)
+        .await
+        .expect("the server lets the role create in the schema");
+    // Reported, not fatal.
+    prepare_schema(&runtime).await.unwrap();
+    reconcile_runtime_grants(&owner, &role).await.unwrap();
+    assert_eq!(role_status(&runtime).await.unwrap().exposure(), None);
+
+    raw("GRANT CREATE ON SCHEMA public TO PUBLIC".to_string())
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(role_status(&runtime).await.unwrap().exposure().is_some());
+    reconcile_runtime_grants(&owner, &role).await.unwrap();
+    let why = role_status(&runtime)
+        .await
+        .unwrap()
+        .exposure()
+        .expect("the reset does not reach PUBLIC");
+    assert!(why.contains("may create objects"), "{why}");
+    raw("REVOKE CREATE ON SCHEMA public FROM PUBLIC".to_string())
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(role_status(&runtime).await.unwrap().exposure(), None);
 }
 
 #[sqlx::test(migrations = false)]

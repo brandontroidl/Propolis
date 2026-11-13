@@ -2324,12 +2324,18 @@ type Scenario = (&'static str, fn(&Fx));
 fn fix_scenarios() -> Vec<Scenario> {
     vec![
         ("the daemon's database role owns the ledger", |fx| {
-            fx.write("state/psql_role_out", "propolis|t|\n");
+            fx.write("state/psql_role_out", "propolis|t||t|t\n");
         }),
         (
             "the daemon's database role holds extra ledger privileges",
             |fx| {
-                fx.write("state/psql_role_out", "propolis|f|UPDATE DELETE\n");
+                fx.write("state/psql_role_out", "propolis|f|UPDATE DELETE|f|f\n");
+            },
+        ),
+        (
+            "the daemon's database role owns the database but not the ledger",
+            |fx| {
+                fx.write("state/psql_role_out", "propolis|f||t|t\n");
             },
         ),
         ("env files all empty", |fx| {
@@ -3700,22 +3706,27 @@ fn an_env_file_readable_by_other_accounts_is_a_failure_with_the_chmod_that_close
 
 // ---- the daemon's database role and the ledger -------------------------------------------------
 
-fn ledger_finding(fx: &Fx) -> Option<serde_json::Value> {
+fn ledger_findings(fx: &Fx) -> Vec<serde_json::Value> {
     fx.json()["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|f| f["id"].as_str().is_some_and(|id| id.starts_with("ledger-")))
+        .filter(|f| f["id"].as_str().is_some_and(|id| id.starts_with("ledger-")))
         .cloned()
+        .collect()
 }
 
-/// The answer a role-split node gives (`role|controls|privileges`): nothing to report, and the
-/// verdict is what it was without the check.
+fn ledger_finding(fx: &Fx) -> Option<serde_json::Value> {
+    ledger_findings(fx).into_iter().next()
+}
+
+/// The answer a role-split node gives (`role|controls|privileges|owns_database|can_create`):
+/// nothing to report, and the verdict is what it was without the check.
 #[test]
 fn a_daemon_role_that_can_only_append_to_the_ledger_is_not_a_finding() {
     let fx = Fx::new();
     let before = fx.run(&[]).code;
-    fx.write("state/psql_role_out", "propolis|f|\n");
+    fx.write("state/psql_role_out", "propolis|f||f|f\n");
     assert_eq!(ledger_finding(&fx), None);
     assert_eq!(fx.run(&[]).code, before);
     assert!(
@@ -3725,11 +3736,12 @@ fn a_daemon_role_that_can_only_append_to_the_ledger_is_not_a_finding() {
 }
 
 /// A revoke does not bind a table's owner. A daemon connected as the role that owns `event` is
-/// told so, with the page that fixes it as a manual step: there is no command to paste.
+/// told so, with the page that fixes it as a manual step: there is no command to paste. On a node
+/// with one role that role owns the database too, and it is still this finding and no other.
 #[test]
 fn a_daemon_role_that_owns_the_ledger_is_a_warning_with_a_manual_step() {
     let fx = Fx::new();
-    fx.write("state/psql_role_out", "propolis|t|\n");
+    fx.write("state/psql_role_out", "propolis|t||t|t\n");
     let finding = ledger_finding(&fx).expect("an owning role is reported");
     assert_eq!(finding["id"], "ledger-owner");
     assert_eq!(finding["level"], "warn");
@@ -3742,6 +3754,11 @@ fn a_daemon_role_that_owns_the_ledger_is_a_warning_with_a_manual_step() {
             .unwrap()
             .contains("docs/operations/database-roles.md"),
         "{finding}"
+    );
+    assert_eq!(
+        ledger_findings(&fx).len(),
+        1,
+        "a single-role node gets the finding it always got, once"
     );
     let r = fx.run(&[]);
     assert_eq!(r.code, 1, "{}", r.out);
@@ -3759,7 +3776,7 @@ fn a_daemon_role_that_owns_the_ledger_is_a_warning_with_a_manual_step() {
 #[test]
 fn a_daemon_role_holding_extra_ledger_privileges_is_told_to_reset_its_grants() {
     let fx = Fx::new();
-    fx.write("state/psql_role_out", "propolis|f|UPDATE TRIGGER\n");
+    fx.write("state/psql_role_out", "propolis|f|UPDATE TRIGGER|f|f\n");
     let finding = ledger_finding(&fx).expect("the extra privileges are reported");
     assert_eq!(finding["id"], "ledger-grants");
     assert_eq!(finding["level"], "warn");
@@ -3771,6 +3788,63 @@ fn a_daemon_role_holding_extra_ledger_privileges_is_told_to_reset_its_grants() {
         "{finding}"
     );
     assert_eq!(finding["fix"], "sudo propolis-migrate");
+}
+
+/// What a database restored for the wrong owner leaves: the tables and every grant on them as
+/// they should be, and the database itself owned by the role the daemon connects as. Nothing
+/// about the event table shows it. It is a warning with a manual step, because handing a
+/// database back takes a superuser.
+#[test]
+fn a_daemon_role_that_owns_the_database_but_not_the_ledger_is_a_warning_with_a_manual_step() {
+    let fx = Fx::new();
+    fx.write("state/psql_role_out", "propolis|f||t|t\n");
+    let finding = ledger_finding(&fx).expect("a role that owns the database is reported");
+    assert_eq!(finding["id"], "ledger-database");
+    assert_eq!(finding["level"], "warn");
+    let message = finding["message"].as_str().unwrap();
+    assert!(
+        message.contains("role propolis does not own the event table but owns the database"),
+        "{message}"
+    );
+    assert_eq!(finding["fix_kind"], "manual");
+    assert!(
+        finding["fix"]
+            .as_str()
+            .unwrap()
+            .contains("docs/operations/database-roles.md"),
+        "{finding}"
+    );
+    assert_eq!(fx.run(&[]).code, 1);
+}
+
+/// A right to create in the schema the ledger is in, without owning the database: the same
+/// finding, saying which of the two it is.
+#[test]
+fn a_daemon_role_that_may_create_in_the_ledgers_schema_is_the_same_warning() {
+    let fx = Fx::new();
+    fx.write("state/psql_role_out", "propolis|f||f|t\n");
+    let finding = ledger_finding(&fx).expect("a role that may create in the schema is reported");
+    assert_eq!(finding["id"], "ledger-database");
+    let message = finding["message"].as_str().unwrap();
+    assert!(
+        message.contains("may create objects in the ledger's schema"),
+        "{message}"
+    );
+    assert!(!message.contains("owns the database"), "{message}");
+}
+
+/// Stray table privileges and a database the role owns are two findings with two different
+/// steps, and one does not hide the other.
+#[test]
+fn extra_ledger_privileges_and_an_owned_database_are_both_reported() {
+    let fx = Fx::new();
+    fx.write("state/psql_role_out", "propolis|f|DELETE|t|f\n");
+    let mut ids: Vec<String> = ledger_findings(&fx)
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["ledger-database", "ledger-grants"]);
 }
 
 /// The check is optional like the events query it rides behind: where the database cannot be
@@ -3785,24 +3859,39 @@ fn the_ledger_role_check_claims_nothing_when_it_cannot_be_answered() {
     // The role query itself fails.
     let fx = Fx::new();
     fx.write("state/psql_role_rc", "2");
-    fx.write("state/psql_role_out", "propolis|t|\n");
+    fx.write("state/psql_role_out", "propolis|t||t|t\n");
     assert_eq!(ledger_finding(&fx), None);
 
-    // An answer that is not a privilege list is not trusted, and never reaches the report.
-    let fx = Fx::new();
-    fx.write("state/psql_role_out", "propolis|t|$(touch /tmp/x); DROP\n");
-    assert_eq!(ledger_finding(&fx), None);
+    // A row of another shape is not this query's answer, whichever column is off: a privilege
+    // list that is not one, the three columns an older script asked for, a column this script
+    // does not know (which must not be read as part of the one before it), a boolean that is
+    // neither, and one the server left empty. None is trusted, and none reaches the report.
+    for row in [
+        "propolis|t|$(touch /tmp/x); DROP|t|t",
+        "propolis|t|",
+        "propolis|f|UPDATE",
+        "propolis|f||t|t|t",
+        "propolis|f||t|f|owner",
+        "propolis|f||yes|f",
+        "propolis|f|||t",
+        "propolis|f||t|",
+        "propolis||UPDATE|f|f",
+    ] {
+        let fx = Fx::new();
+        fx.write("state/psql_role_out", &format!("{row}\n"));
+        assert_eq!(ledger_finding(&fx), None, "{row}");
+    }
 
     // The events query could not run: the role query is not attempted.
     let fx = Fx::new();
     fx.write("state/psql_rc", "2");
-    fx.write("state/psql_role_out", "propolis|t|\n");
+    fx.write("state/psql_role_out", "propolis|t||t|t\n");
     assert_eq!(ledger_finding(&fx), None);
     assert!(!fx.p("state/psql_role.log").exists());
 
     // --no-events skips every ledger query.
     let fx = Fx::new();
-    fx.write("state/psql_role_out", "propolis|t|\n");
+    fx.write("state/psql_role_out", "propolis|t||t|t\n");
     let r = fx.run(&["--no-events"]);
     assert!(
         !r.has("ledger-owner") && !r.has("owns the event table"),
@@ -3817,11 +3906,15 @@ fn the_ledger_role_check_claims_nothing_when_it_cannot_be_answered() {
 #[test]
 fn the_ledger_role_query_is_read_only_and_keeps_the_password_off_the_command_line() {
     let fx = Fx::new();
-    fx.write("state/psql_role_out", "propolis|f|\n");
+    fx.write("state/psql_role_out", "propolis|f||f|f\n");
     fx.run(&[]);
     let log = fx.read("state/psql_role.log");
     let argv = log.lines().find(|l| l.starts_with("ARGV:")).unwrap();
     assert!(argv.contains("has_table_privilege"), "{argv}");
+    assert!(
+        argv.contains("datdba") && argv.contains("has_schema_privilege"),
+        "the database's owner and the schema are not asked about: {argv}"
+    );
     assert!(!argv.contains("postgres://"), "{argv}");
     let password = log
         .lines()

@@ -4,6 +4,32 @@
 
 ### Upgrade note
 
+- **`rollback.sh --with-database` keeps the database's owner, checks the backup before it stops
+  anything, and puts the real database back when the restore fails.** The new database was
+  created for the role `DATABASE_URL` connects as. On a node with
+  [split database roles](docs/operations/database-roles.md) that is the daemon's role, so a
+  database rollback made the daemon's role the database's owner and nothing reported it. It is
+  now created with the owner the current database has, and on such a node the script runs
+  `propolis-migrate` and `propolis-migrate --check` after the restore, before it starts
+  anything; either failing fails the rollback. **If you have run `rollback.sh --with-database`
+  on a node with split roles, run `propolis-migrate --check` now.** A node left that way
+  prints `ledger: NOT protected: role ... owns the database`: stop the daemon, repeat the
+  `propolis migrate --init-roles` step and run `propolis-migrate`
+  ([steps](docs/operations/database-roles.md#splitting-the-roles-on-an-existing-node)).
+  Before any service is stopped the script now checks the set against its `SHA256SUMS` (a set
+  from before backups wrote one is restored with a note), that the dump decrypts with the
+  identity and `pg_restore --list` reads it, and that the volume holding PostgreSQL's data has
+  at least the database's current size free; each is a refusal with the node still running,
+  except free space that cannot be measured, which is a note. A restore that fails no longer
+  leaves the daemon started on an empty or half-restored database: the incomplete one is
+  renamed to `<name>_failed_restore_<time>`, the renamed-aside one gets its name back and the
+  services start on it. If it cannot be put back, `propolis.service` is left stopped and the
+  message names the database that holds the data. Nothing is dropped.
+- **`propolis migrate --check`, the daemon's startup log and `config-check.sh` now report a
+  daemon role that owns the database**, or may create objects in the ledger's schema, without
+  owning the `event` table (`ledger: NOT protected: ...`; finding `ledger-database`, a
+  warning). A node whose roles are split correctly is unaffected. On a node in that state a
+  `--check` and a config check that exited 0 now exit 1.
 - **`upgrade.sh` can move a box onto a restarted history or a successor repository.** An
   `origin/main` that does not descend from the box's commit was refused with advice to reset
   the checkout by hand, which checks nothing. It is still refused by default, and the refusal

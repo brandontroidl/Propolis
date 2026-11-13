@@ -492,16 +492,25 @@ forward and no down-migration exists, so the older daemon refuses the newer data
 startup, and the script says so when it sees a migration error in the journal. Run it with
 `--with-database` to also restore the release's pre-upgrade dump. It never drops anything: the
 current database is renamed to `<name>_before_rollback_<time>`, a new empty one is created
-owned by the same role, and the dump is restored into it by the
-[documented procedure](backup-and-restore.md#restore-procedure). Events recorded since the
+with the owner the current one has (not the role `DATABASE_URL` connects as, which is a
+different role where the [database roles are split](database-roles.md)), and the dump is
+restored into it by the [documented procedure](backup-and-restore.md#restore-procedure).
+Events recorded since the
 upgrade are in the renamed database, not the restored one; drop it yourself once you no longer
 need them. The restored ledger no longer holds the chain heads later backups recorded, so run one
 backup with `PROPOLIS_BACKUP_ACCEPT_LEDGER_RESET=1` afterwards
-([why](backup-and-restore.md#when-the-ledger-does-not-match-a-backup)). Rolling back to a release
+([why](backup-and-restore.md#when-the-ledger-does-not-match-a-backup)). On a node with split
+roles the script puts the split back and checks it after the restore: it runs `propolis-migrate`
+and then `propolis-migrate --check` before it starts any service
+(`deploy/rollback.sh#restore_role_split`). If either of them fails the rollback fails, saying
+that the split is not confirmed on the restored database; the services are started all the same,
+and the daemon reports what the check found when it starts. Rolling back to a release
 from before `propolis migrate` on a node with split roles also needs
-[ownership handed back](database-roles.md#going-back-to-one-role). This needs PostgreSQL on the same host (the script runs `psql` and `pg_restore` as
-the `postgres` user); restore a remote database by hand with that page. An encrypted dump needs
-the age identity that decrypts it: pass `--identity <file>`, or keep a box-local key at
+[ownership handed back](database-roles.md#going-back-to-one-role); the script cannot do that for
+you, says so, and goes on. This needs PostgreSQL on the same host (the script runs `psql` and
+`pg_restore` as the `postgres` user); restore a remote database by hand with that page. An
+encrypted dump needs the age identity that decrypts it: pass `--identity <file>`, or keep a
+box-local key at
 `/etc/propolis/backup-identity.txt` (root, 0600) whose public half is also in
 `backup-recipients.txt`.
 
@@ -509,15 +518,33 @@ The kept release records only the pre-upgrade set that upgrade wrote. An upgrade
 `PROPOLIS_UPGRADE_SKIP_BACKUP=1`, or before `DATABASE_URL` was set, records none, so
 `--with-database` refuses it rather than restore an older set from before an earlier upgrade.
 
+Before it stops anything, `--with-database` checks the set it is about to restore
+(`deploy/rollback.sh#verify_set`): the files against the set's `SHA256SUMS`, that the dump
+decrypts with the identity, and that `pg_restore --list` can read it. A set from before backups
+wrote `SHA256SUMS` is restored with a note that it could not be verified. It also compares the
+current database's size with the space free on the volume that holds PostgreSQL's data
+directory, because the restore loads a second copy while the current database is kept aside; if
+either figure cannot be read it says the check was not made and goes on.
+
 Every refusal (no kept release, a release with no backup, a missing identity, no local
-PostgreSQL, no `DATABASE_URL`, a database or role name that is not a plain identifier, an
-unconfirmed prompt) happens before any service is stopped. The script also stops
-`propolis-backup.timer` while it works, so a nightly dump cannot hold the database open
-during the rename. If a step fails after the services are stopped, it says which step, names
-the renamed-aside database if there is one, and starts the services again; check
-`systemctl --failed` afterwards. Rolling back to a release from before the nightly backup
-disables `propolis-backup.timer` until the next upgrade, because that release's binary has no
-`pg-exec`.
+PostgreSQL, no `DATABASE_URL`, a database or owner name that is not a plain identifier, an
+owner that cannot be read, a set that does not match its `SHA256SUMS` or whose `SHA256SUMS`
+does not list the dump, a dump the identity does not decrypt or `pg_restore --list` cannot
+read, less free space than the current database's size, an unconfirmed prompt) happens before
+any service is stopped. The script also stops `propolis-backup.timer` while it works, so a
+nightly dump cannot hold the database open during the rename. If a step fails after the
+services are stopped, it says which step and starts the services again; check
+`systemctl --failed` afterwards. When the failure comes after the database was renamed aside
+and before the dump is fully restored, the script first puts the
+real database back (`deploy/rollback.sh#put_database_back`): the incomplete one is renamed to
+`<name>_failed_restore_<time>` and the renamed-aside one gets its name back, so the daemon
+starts on the database it had. With the kept binaries it then either runs or refuses a newer
+schema at startup; go forward again with `deploy/upgrade.sh`. If the real database cannot be
+put back, the sensors, the gateway and the shipper are started and `propolis.service` is left
+stopped, so that it cannot begin a new ledger in an empty database, and the message names the
+database that holds the real data. Nothing is dropped in either case. Rolling back to a release
+from before the nightly backup disables `propolis-backup.timer` until the next upgrade, because
+that release's binary has no `pg-exec`.
 
 ## Disaster recovery
 

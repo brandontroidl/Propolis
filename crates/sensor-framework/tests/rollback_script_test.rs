@@ -1,15 +1,17 @@
 //! Runs `deploy/rollback.sh` against a scratch filesystem root (`PROPOLIS_ROLLBACK_ROOT`) with stub
-//! `systemctl`, `runuser`, `journalctl`, `id`, `age`, `df`, `propolis` and `propolis-migrate`
-//! programs, and asserts what `--save` keeps, that a rollback puts exactly those files back and
+//! `systemctl`, `runuser`, `journalctl`, `id`, `age`, `df`, `logger`, `propolis` and
+//! `propolis-migrate` programs, and asserts what `--save` keeps, that a rollback puts exactly those files back and
 //! restarts in order, that a database rollback renames the current database aside rather than
 //! dropping it and gives the new one the same owner, that the backup set is verified and every
 //! refusal happens before a service is stopped, that a node with split database roles has the
-//! split put back and checked before anything starts, and that a restore that fails leaves the
-//! node on its real database or with the daemon stopped. The real `sha256sum` runs as shipped.
+//! split put back and checked before anything starts, and that a restore that fails, or a run
+//! ended by a signal, leaves the node on its real database or with the daemon stopped. The real
+//! `sha256sum` runs as shipped.
 
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
 
 /// Writing an executable and spawning a child never overlap (ETXTBSY); see deploy_test.rs's fence.
@@ -30,7 +32,11 @@ esac
 /// `$STUB_PG`, so a rename or a create fails where the real one would and a test can read
 /// afterwards which database ended up under which name. Its `pg_restore --list` reads the head of
 /// the archive and stops, as the real one does; `STUB_RESTORE_FAIL` fails the restore itself,
-/// after the dump reached it.
+/// after the dump reached it, and `STUB_RESTORE_HOLD` names a file the restore waits for after
+/// writing `<file>.started`, so a test can act while the restore is running. Asked about the
+/// restored database, its psql says who owns the `event` table (`STUB_EVENT_OWNER`) and whether
+/// the daemon's role is confined (`STUB_CONFINED`, the three booleans as psql prints them). A
+/// command run through `env` is run: that is how the superuser step reaches the propolis stub.
 const RUNUSER_STUB: &str = r#"#!/usr/bin/env bash
 shift 3
 printf 'runuser %s\n' "$*" >> "$STUB_LOG"
@@ -46,6 +52,10 @@ case "$1" in
             exit 1
         fi
         printf 'restored %s bytes\n' "$(wc -c)" >> "$STUB_LOG"
+        if [ -n "${STUB_RESTORE_HOLD:-}" ]; then
+            : > "$STUB_RESTORE_HOLD.started"
+            for _ in $(seq 1 600); do [ -e "$STUB_RESTORE_HOLD" ] && break; sleep 0.05; done
+        fi
         [ -z "${STUB_RESTORE_FAIL:-}" ] || exit 1
         if [[ "$*" =~ --dbname=([a-z0-9_]+) ]]; then echo "restored from the dump" > "$STUB_PG/${BASH_REMATCH[1]}"; fi
         ;;
@@ -60,9 +70,24 @@ case "$1" in
             if [ -e "$STUB_PG/${BASH_REMATCH[1]}" ]; then echo 1; else echo 0; fi
         elif [[ "$*" == *data_directory* ]]; then
             echo "${STUB_DATA_DIRECTORY-/var/lib/postgresql/16/main}"
+        elif [[ "$*" == *unix_socket_directories* ]]; then
+            echo "${STUB_SOCKET_DIRECTORIES-/var/run/postgresql, /tmp}|5433"
+        elif [[ "$*" == *has_schema_privilege* ]]; then
+            echo "${STUB_CONFINED-f|f|f}"
+        elif [[ "$*" == *"pg_get_userbyid(c.relowner)"* ]]; then
+            echo "${STUB_EVENT_OWNER-propolis_owner}"
         fi
         ;;
+    env)
+        shift
+        exec env "$@"
+        ;;
 esac
+"#;
+
+/// `logger -t TAG -p PRIORITY -- TEXT`: what a failed run sends to the journal.
+const LOGGER_STUB: &str = r#"#!/usr/bin/env bash
+printf 'logger %s\n' "$*" >> "$STUB_LOG"
 "#;
 
 const JOURNALCTL_STUB: &str = r#"#!/usr/bin/env bash
@@ -105,10 +130,11 @@ printf 'propolis-migrate runs %s\n' "$("$PROPOLIS_BIN" --version)" >> "$STUB_LOG
 "#;
 
 /// The propolis binary of release `commit`. Its `pg-exec psql` answers as the database the daemon
-/// connects to: named `propolis`, connected to as role `propolis`, owned by `STUB_DB_OWNER`
-/// (`propolis` unless a test says the roles are split) and `STUB_DB_SIZE` bytes large. Its
-/// `migrate` logs itself, and carries the usage text the deploy scripts look for to tell a
-/// release that has the subcommand.
+/// connects to: named `propolis`, connected to as the role `DATABASE_URL` names (`propolis` in
+/// propolis.env, `propolis_owner` in migrate.env; `STUB_OWNER_LOGIN_FAIL` makes the latter fail
+/// to connect), owned by `STUB_DB_OWNER` (`propolis` unless a test says the roles are split) and
+/// `STUB_DB_SIZE` bytes large. Its `migrate` logs itself, and carries the usage text the deploy
+/// scripts look for to tell a release that has the subcommand.
 fn propolis_stub(commit: &str) -> String {
     propolis_stub_with(
         commit,
@@ -138,7 +164,11 @@ case "$1" in
             *pg_database_size*) echo "${{STUB_DB_SIZE-1048576}}" ;;
             *datdba*) echo "${{STUB_DB_OWNER-propolis}}" ;;
             *current_database*) echo propolis ;;
-            *current_user*) echo propolis ;;
+            *current_user*)
+                [[ "$DATABASE_URL" =~ ^postgres://([a-z_]+) ]] || exit 1
+                if [ -n "${{STUB_OWNER_LOGIN_FAIL:-}}" ] && [ "${{BASH_REMATCH[1]}}" != propolis ]; then exit 1; fi
+                echo "${{BASH_REMATCH[1]}}"
+                ;;
         esac
         ;;
 {more_subcommands}esac
@@ -218,6 +248,13 @@ impl Fixture {
         // Installed by every upgrade and never part of a kept release, so a rollback finds the
         // newer release's copy.
         write_exec(&root.join("usr/local/sbin/propolis-migrate"), MIGRATE_STUB);
+        // The owner role's URL. The stub above is what says whether the node is split
+        // (`STUB_SPLIT_ROLES`); rollback.sh reads this file only on a node that is.
+        std::fs::write(
+            root.join("etc/propolis/migrate.env"),
+            "PROPOLIS_MIGRATE_DATABASE_URL=postgres://propolis_owner:pw@localhost/propolis\n",
+        )
+        .unwrap();
         for (name, body) in [
             ("systemctl", SYSTEMCTL_STUB),
             ("runuser", RUNUSER_STUB),
@@ -225,6 +262,7 @@ impl Fixture {
             ("id", ID_STUB),
             ("age", AGE_STUB),
             ("df", DF_STUB),
+            ("logger", LOGGER_STUB),
         ] {
             write_exec(&bin.join(name), body);
         }
@@ -293,6 +331,22 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>) -> Output {
+        let mut child = self.spawn(args, env, stdin.is_some());
+        if let Some(text) = stdin {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+        }
+        child.wait_with_output().expect("rollback.sh finishes")
+    }
+
+    /// Starts rollback.sh in a process group of its own, so a test can signal the script and
+    /// everything it runs the way a terminal that goes away does.
+    fn spawn(&self, args: &[&str], env: &[(&str, &str)], stdin: bool) -> Child {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/rollback.sh");
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
         let mut command = Command::new("bash");
@@ -306,27 +360,12 @@ impl Fixture {
             .env("STUB_PG", &self.pg)
             .env("STUB_ENABLED", "propolis.service sensor-ssh.service")
             .envs(env.iter().copied())
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = {
-            let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
-            command.spawn().expect("bash runs")
-        };
-        if let Some(text) = stdin {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(text.as_bytes())
-                .unwrap();
-        }
-        child.wait_with_output().expect("rollback.sh finishes")
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        command.spawn().expect("bash runs")
     }
 
     fn store(&self) -> PathBuf {
@@ -1093,6 +1132,7 @@ fn on_a_split_node_the_roles_are_reapplied_and_checked_before_any_service_starts
         &log,
         &[
             "propolis-migrate --check\n",
+            "has_schema_privilege('propolis', c.relnamespace, 'CREATE')",
             "systemctl start propolis.service",
         ],
     );
@@ -1101,6 +1141,338 @@ fn on_a_split_node_the_roles_are_reapplied_and_checked_before_any_service_starts
             .count(),
         2,
         "both ran the binary that was rolled back to: {log}"
+    );
+    assert!(
+        log.contains("CREATE DATABASE \"propolis\" OWNER \"propolis_owner\" TEMPLATE template0"),
+        "{log}"
+    );
+    // The dump is from after the split (the owner role owns its tables), so nothing is moved.
+    assert!(!log.contains("--init-roles"), "{log}");
+}
+
+/// A split node whose database belongs to the daemon's role: what this script left behind when
+/// it created the restored database for the role `DATABASE_URL` connects as. Recreating it for
+/// that role again would keep the split undone, and a kept release from before
+/// `propolis migrate --check` looked at the database's owner calls that protected. The restored
+/// database is created for the owner role migrate.env names.
+#[test]
+fn on_a_split_node_a_database_the_daemons_role_owns_is_recreated_for_the_owner_role() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_SPLIT_ROLES", "1"), ("STUB_DB_OWNER", "propolis")],
+        None,
+    );
+    assert_ok(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("the role split is undone on this node")
+            && stdout.contains("created for the owner role, 'propolis_owner'"),
+        "{stdout}"
+    );
+    let log = fx.log();
+    assert!(
+        log.contains("CREATE DATABASE \"propolis\" OWNER \"propolis_owner\" TEMPLATE template0"),
+        "{log}"
+    );
+    assert!(!log.contains("OWNER \"propolis\""), "{log}");
+    // Said before anything is stopped, so the operator reads it at the confirmation.
+    let said = stdout.find("the role split is undone").unwrap();
+    assert!(
+        said < stdout.find("==> stopping services").unwrap(),
+        "{stdout}"
+    );
+}
+
+/// The roles are read while everything still runs. An owner URL that does not connect, or one
+/// that names the daemon's own role, means the split cannot be put back after the restore, and
+/// that is a refusal, not something to find out with the services stopped.
+#[test]
+fn on_a_split_node_an_owner_role_that_cannot_be_read_refuses_before_stopping_anything() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_SPLIT_ROLES", "1"), ("STUB_OWNER_LOGIN_FAIL", "1")],
+        None,
+    );
+    let stderr = assert_refused_before_stopping(&fx, &out);
+    assert!(
+        stderr.contains("could not be read as two different plain names")
+            && stderr.contains("migrate.env"),
+        "{stderr}"
+    );
+
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    std::fs::write(
+        fx.root.join("etc/propolis/migrate.env"),
+        "PROPOLIS_MIGRATE_DATABASE_URL=postgres://propolis:pw@localhost/propolis\n",
+    )
+    .unwrap();
+    let out = fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_SPLIT_ROLES", "1")],
+        None,
+    );
+    let stderr = assert_refused_before_stopping(&fx, &out);
+    assert!(stderr.contains("two different plain names"), "{stderr}");
+
+    // The owner's URL holds a password. It reaches the binary in its environment only.
+    assert!(!fx.log().contains("pw@"), "{}", fx.log());
+    assert!(!stderr.contains("pw@"), "{stderr}");
+}
+
+/// A dump taken before the node split its roles has every table owned by the daemon's role.
+/// The owner role cannot migrate that and the daemon, which no longer owns the database, cannot
+/// either, so without help the rollback ends with a daemon that will not start. The split's own
+/// first step is run first, as the postgres superuser over the server's socket, with the binary
+/// that was rolled back to.
+#[test]
+fn a_dump_from_before_the_role_split_has_its_tables_handed_to_the_owner_role_first() {
+    let split = [
+        ("STUB_SPLIT_ROLES", "1"),
+        ("STUB_DB_OWNER", "propolis_owner"),
+        ("STUB_EVENT_OWNER", "propolis"),
+    ];
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let out = fx.run(&["--with-database", "--yes"], &split, None);
+    assert_ok(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("the dump is from before the roles were split"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_in_order(
+        &fx.log(),
+        &[
+            "restored 15 bytes",
+            "runuser env PROPOLIS_ADMIN_DATABASE_URL=postgres://postgres@%2Fvar%2Frun%2Fpostgresql:5433/propolis ",
+            "propolis migrate --init-roles --owner propolis_owner --runtime propolis (abc000000001)",
+            "propolis-migrate\n",
+            "propolis-migrate --check\n",
+            "has_schema_privilege",
+            "systemctl start propolis.service",
+        ],
+    );
+
+    // The step failing fails the rollback before the owner role's run, and the way out is said.
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let mut failing = split.to_vec();
+    failing.push(("STUB_RUNUSER_FAIL", "--init-roles"));
+    let out = fx.run(&["--with-database", "--yes"], &failing, None);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("while moving the restored tables to the owner role")
+            && stderr.contains("role split is NOT confirmed")
+            && stderr.contains("refuse to start"),
+        "{stderr}"
+    );
+    assert!(!fx.log().contains("propolis-migrate\n"), "{}", fx.log());
+
+    // A socket directory that cannot be read is said, not guessed.
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let mut no_socket = split.to_vec();
+    no_socket.push(("STUB_SOCKET_DIRECTORIES", ""));
+    let out = fx.run(&["--with-database", "--yes"], &no_socket, None);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("socket directory and port could not be read"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!fx.log().contains("runuser env"), "{}", fx.log());
+}
+
+/// `propolis-migrate --check` is answered by the kept release's binary, and a release from
+/// before that binary looked at the database's owner prints "protected" for a daemon role that
+/// owns the database. So the script asks PostgreSQL itself, after that check and before any
+/// service starts, and anything but three times "no" fails the rollback.
+#[test]
+fn a_daemon_role_that_is_not_confined_fails_the_rollback_whatever_the_kept_binary_says() {
+    for answer in ["f|t|t", "f|f|t", "t|f|f", "", "f|f|f|f"] {
+        let fx = Fixture::new();
+        assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+        let out = fx.run(
+            &["--with-database", "--yes"],
+            &[
+                ("STUB_SPLIT_ROLES", "1"),
+                ("STUB_DB_OWNER", "propolis_owner"),
+                ("STUB_CONFINED", answer),
+            ],
+            None,
+        );
+        assert_eq!(out.status.code(), Some(1), "{answer:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("the daemon's role propolis is not confined")
+                && stderr.contains(&format!("answered '{answer}'"))
+                && stderr.contains("role split is NOT confirmed"),
+            "{answer:?}: {stderr}"
+        );
+        let log = fx.log();
+        // The kept binary's check ran and passed; the rollback fails all the same.
+        assert_in_order(
+            &log,
+            &["propolis-migrate --check\n", "has_schema_privilege"],
+        );
+        assert!(
+            fx.databases().contains(&(
+                "propolis".to_string(),
+                "restored from the dump\n".to_string()
+            )),
+            "{answer:?}"
+        );
+    }
+}
+
+/// Waits for `path` to exist: the restore stub writes it once the dump has reached it.
+fn wait_for(path: &Path) {
+    for _ in 0..600 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("{} never appeared", path.display());
+}
+
+fn signal(name: &str, target: &str) {
+    let status = Command::new("kill")
+        .args([&format!("-{name}"), "--", target])
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "kill -{name} {target}");
+}
+
+/// The restore is the long step, and a rollback is usually run over SSH. A run ended there by a
+/// signal used to skip the put-back altogether: bash enters the EXIT trap with the status of the
+/// last command that finished, which is 0, and the trap took that for success. Every service
+/// was left stopped with a half-restored database under the daemon's name, and nothing said so.
+///
+/// Sent to the script alone, a signal is acted on once the step in progress ends. Here the
+/// script's output has gone away as well, which is what a dropped session does to it: reporting
+/// to it fails, and that must not end the trap before the database is back. The report still
+/// reaches the journal.
+#[test]
+fn a_run_ended_by_a_signal_during_the_restore_puts_the_real_database_back() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let hold = fx.root.join("restore-may-finish");
+    let started = fx.root.join("restore-may-finish.started");
+    let mut child = fx.spawn(
+        &["--with-database", "--yes"],
+        &[("STUB_RESTORE_HOLD", hold.to_str().unwrap())],
+        false,
+    );
+    wait_for(&started);
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    signal("TERM", &child.id().to_string());
+    std::fs::write(&hold, b"").unwrap();
+    let status = child.wait().expect("rollback.sh ends");
+    assert_eq!(status.code(), Some(143), "{status:?}");
+
+    let log = fx.log();
+    assert_in_order(
+        &log,
+        &[
+            "pg_restore --exit-on-error --dbname=propolis",
+            "logger -t propolis-rollback -p daemon.err -- error: the rollback failed while restoring the dump",
+            "ALTER DATABASE \"propolis\" RENAME TO \"propolis_failed_restore_",
+            "ALTER DATABASE \"propolis_before_rollback_",
+            "logger -t propolis-rollback -p daemon.err -- The database from before the rollback is back under its own name, propolis",
+            "systemctl start sensor-ssh.service",
+            "systemctl start propolis.service",
+        ],
+    );
+    let databases = fx.databases();
+    assert_eq!(databases.len(), 2, "{databases:?}");
+    assert_eq!(
+        databases[0],
+        ("propolis".to_string(), LIVE.to_string()),
+        "the daemon's database is the one from before the rollback"
+    );
+    assert!(
+        databases[1].0.starts_with("propolis_failed_restore_"),
+        "{databases:?}"
+    );
+}
+
+/// A terminal that goes away signals everything the script is running too, so the restore
+/// itself dies part-way. The same end state: the real database under its name, the part-restored
+/// one aside, the services started.
+#[test]
+fn a_hangup_that_kills_the_restore_too_puts_the_real_database_back() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let hold = fx.root.join("restore-may-finish");
+    let started = fx.root.join("restore-may-finish.started");
+    let child = fx.spawn(
+        &["--with-database", "--yes"],
+        &[("STUB_RESTORE_HOLD", hold.to_str().unwrap())],
+        false,
+    );
+    wait_for(&started);
+    signal("HUP", &format!("-{}", child.id()));
+    let out = child.wait_with_output().expect("rollback.sh ends");
+    assert_eq!(out.status.code(), Some(129), "{:?}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("while restoring the dump"), "{stderr}");
+    assert!(
+        stderr.contains("back under its own name, propolis"),
+        "{stderr}"
+    );
+
+    let log = fx.log();
+    assert!(log.contains("systemctl start propolis.service"), "{log}");
+    let databases = fx.databases();
+    assert_eq!(databases.len(), 2, "{databases:?}");
+    assert_eq!(databases[0], ("propolis".to_string(), LIVE.to_string()));
+    assert!(
+        databases[1].0.starts_with("propolis_failed_restore_")
+            && databases[1].1 == "created empty\n",
+        "the restore never finished: {databases:?}"
+    );
+}
+
+/// A signal before anything was stopped ends the run and changes nothing.
+#[test]
+fn a_signal_before_the_services_are_stopped_changes_nothing() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    // No --yes: the run waits at the confirmation, with everything still running.
+    let child = fx.spawn(&["--with-database"], &[], true);
+    for _ in 0..600 {
+        if fx.log().contains("pg_restore --list") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    signal("TERM", &child.id().to_string());
+    let out = child.wait_with_output().expect("rollback.sh ends");
+    assert_eq!(out.status.code(), Some(143), "{:?}", out.status);
+    let log = fx.log();
+    assert!(!log.contains("systemctl stop"), "{log}");
+    assert!(
+        !log.contains("logger"),
+        "nothing failed, nothing is reported: {log}"
+    );
+    assert_eq!(
+        fx.databases(),
+        vec![("propolis".to_string(), LIVE.to_string())]
     );
 }
 
@@ -1117,7 +1489,11 @@ fn a_role_split_that_cannot_be_reapplied_or_does_not_check_out_fails_the_rollbac
         assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
         let out = fx.run(
             &["--with-database", "--yes"],
-            &[("STUB_SPLIT_ROLES", "1"), ("STUB_MIGRATE_FAIL", failing)],
+            &[
+                ("STUB_SPLIT_ROLES", "1"),
+                ("STUB_DB_OWNER", "propolis_owner"),
+                ("STUB_MIGRATE_FAIL", failing),
+            ],
             None,
         );
         assert_eq!(out.status.code(), Some(1), "{failing}");
@@ -1126,6 +1502,16 @@ fn a_role_split_that_cannot_be_reapplied_or_does_not_check_out_fails_the_rollbac
         assert!(
             stderr.contains("role split is NOT confirmed"),
             "{failing}: {stderr}"
+        );
+        // The way out starts with the step that cannot fail on who owns what, so following it
+        // does not lead back to the same error.
+        assert!(
+            stderr.contains("`propolis migrate --init-roles`"),
+            "{failing}: {stderr}"
+        );
+        assert!(
+            !fx.log().contains("has_schema_privilege"),
+            "{failing}: the last check is not reached"
         );
         let log = fx.log();
         assert_eq!(
@@ -1175,7 +1561,11 @@ fn the_installed_migrate_script_runs_migrate_and_the_check_with_the_rolled_back_
     std::fs::set_permissions(&migrate_env, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     fx.upgrade();
-    assert_ok(&fx.run(&["--with-database", "--yes"], &[], None));
+    assert_ok(&fx.run(
+        &["--with-database", "--yes"],
+        &[("STUB_DB_OWNER", "propolis_owner")],
+        None,
+    ));
     assert_in_order(
         &fx.log(),
         &[
@@ -1188,6 +1578,7 @@ fn the_installed_migrate_script_runs_migrate_and_the_check_with_the_rolled_back_
 
     let fx = Fixture::new();
     install_real_helper(&fx);
+    std::fs::remove_file(fx.root.join("etc/propolis/migrate.env")).unwrap();
     assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     assert_ok(&fx.run(&["--with-database", "--yes"], &[], None));
     assert!(!fx.log().contains("propolis migrate"), "{}", fx.log());

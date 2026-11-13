@@ -10,7 +10,8 @@
 # credential must be somewhere the daemon cannot read it:
 #   /etc/propolis/migrate.env   root:root 0600, one line: PROPOLIS_MIGRATE_DATABASE_URL=postgres://...
 # No unit loads it; propolis.service and every sensor unit deny it by mount. This script, run as
-# root, is the only reader. The role the daemon connects as comes from DATABASE_URL in
+# root, reads it; so does rollback.sh --with-database, also as root, to learn the owner role's
+# name before a restore. The role the daemon connects as comes from DATABASE_URL in
 # propolis.env, so the two files cannot name different runtime roles.
 #
 # Neither URL reaches a command line: both are handed to `propolis migrate` in its environment.

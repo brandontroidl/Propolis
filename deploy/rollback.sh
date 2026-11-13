@@ -26,11 +26,15 @@
 #
 # The backup set is checked while everything still runs: its SHA256SUMS, that the dump decrypts and
 # pg_restore can list it, and that the volume has room for a second copy of the database. Where
-# the database roles are split (docs/operations/database-roles.md) the split is put back with
-# propolis-migrate and checked with propolis-migrate --check after the restore, before any service
-# starts. If the restore fails, the incomplete database is renamed to
-# <name>_failed_restore_<time> and the renamed-aside one gets its name back; if that cannot be
-# done, propolis.service is left stopped, because the name it connects to holds no ledger.
+# the database roles are split (docs/operations/database-roles.md) the split is put back after the
+# restore, before any service starts: a database the daemon's role had come to own is created for
+# the owner role, a dump from before the split has its tables handed to the owner role
+# (propolis migrate --init-roles), propolis-migrate and propolis-migrate --check run, and the
+# script then asks the database itself whether the daemon's role is confined in it. If the restore
+# fails, or the run is ended by a signal or a dropped terminal, the incomplete database is renamed
+# to <name>_failed_restore_<time> and the renamed-aside one gets its name back; if that cannot be
+# done, propolis.service is left stopped, because the name it connects to holds no ledger. What a
+# failed run reports goes to the journal as well (tag propolis-rollback).
 #
 # PROPOLIS_ROLLBACK_ROOT reads and writes every path under that directory instead of / (tests).
 # PROPOLIS_ROLLBACK_WAIT_SECS is how long to wait for propolis.service to stay up (default 30).
@@ -151,8 +155,9 @@ list() {
 
 unit_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
 
+# env_value KEY [FILE]: the value systemd would load for KEY from FILE (propolis.env unless given).
 env_value() {
-    local file="$ROOT/etc/propolis/propolis.env" v
+    local file="${2:-$ROOT/etc/propolis/propolis.env}" v
     [ -r "$file" ] || return 0
     v="$(sed -n "s/^$1=//p" "$file" | tail -n 1)"
     v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
@@ -173,6 +178,20 @@ RESTORED=0
 ROLES_UNCHECKED=0
 # Set when the kept release cannot re-apply the role split of a node that has one.
 ROLES_BY_HAND=0
+# A node that splits its database roles: the role the daemon connects as and the role that owns
+# the schema, both read before anything is stopped.
+SPLIT=0
+ROLE=""
+OWNER_ROLE=""
+
+# say TEXT: one line of a failed run's report, to stderr and to the journal. A rollback is often
+# run over SSH and a session that drops is one of the ways it ends: the terminal is gone, a write
+# to it fails, and what the operator finds on reconnecting is the journal. Never fails.
+say() {
+    echo "$1" >&2 2>/dev/null
+    logger -t propolis-rollback -p daemon.err -- "$1" 2>/dev/null
+    return 0
+}
 
 # The restore did not finish, so the real database is the one renamed aside. Moves whatever now
 # holds its name out of the way and gives it the name back; nothing is dropped. Returns 1 when the
@@ -186,9 +205,9 @@ put_database_back() {
     if [ "$exists" != 0 ]; then
         if runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
             -c "ALTER DATABASE \"$DB\" RENAME TO \"$failed\""; then
-            echo "The incomplete database was renamed to $failed; drop it once you have looked at it." >&2
+            say "The incomplete database was renamed to $failed; drop it once you have looked at it."
         else
-            echo "The incomplete database $DB could not be renamed out of the way." >&2
+            say "The incomplete database $DB could not be renamed out of the way."
         fi
     fi
     runuser -u postgres -- psql -X -v ON_ERROR_STOP=1 \
@@ -196,31 +215,38 @@ put_database_back() {
 }
 
 on_exit() {
-    local code=$? daemon=1
-    [ "$code" -ne 0 ] && [ "$STOPPED" -eq 1 ] || return 0
-    echo "error: the rollback failed while $STEP, after the services were stopped." >&2
+    local daemon=1
+    # Keyed on what was done, not on the exit status: ended by a signal, bash runs this with the
+    # status of the last command that finished, which is usually 0.
+    [ "$STOPPED" -eq 1 ] || return 0
+    # From here to the last line nothing may end the script: not a step that fails, not a write
+    # to a terminal that has gone away, not a second signal. The commands it runs inherit the
+    # ignored signals, so the rename that puts the database back survives a hangup too.
+    set +e
+    trap '' HUP INT TERM PIPE
+    say "error: the rollback failed while $STEP, after the services were stopped."
     if [ -n "$ASIDE" ] && [ "$RESTORED" -eq 0 ]; then
         if put_database_back; then
-            echo "The database from before the rollback is back under its own name, $DB; nothing was dropped." >&2
-            echo "The kept binaries are installed: propolis runs on that database if the upgrade changed no schema, and otherwise refuses it at startup and changes nothing. To go forward again, run deploy/upgrade.sh." >&2
+            say "The database from before the rollback is back under its own name, $DB; nothing was dropped."
+            say "The kept binaries are installed: propolis runs on that database if the upgrade changed no schema, and otherwise refuses it at startup and changes nothing. To go forward again, run deploy/upgrade.sh."
         else
             # Started on this name the daemon would find no ledger, or part of one, and on a node
             # with one database role would migrate and begin a new chain there while the real one
             # sits aside.
             daemon=0
-            echo "The database from before the rollback could NOT be put back under its name: the real data is in database $ASIDE, and nothing was dropped." >&2
-            echo "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. Once what stopped the rename (above) is out of the way, as the postgres user rename any database now named $DB aside, run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\", then go forward again with deploy/upgrade.sh." >&2
+            say "The database from before the rollback could NOT be put back under its name: the real data is in database $ASIDE, and nothing was dropped."
+            say "propolis.service is left stopped, so that it cannot start a new ledger in an empty database; the sensors keep logging and nothing they record is lost. Once what stopped the rename (above) is out of the way, as the postgres user rename any database now named $DB aside, run ALTER DATABASE \"$ASIDE\" RENAME TO \"$DB\", then go forward again with deploy/upgrade.sh."
         fi
     elif [ -n "$ASIDE" ]; then
-        echo "The dump was restored into $DB; the database from before the rollback is kept as $ASIDE, and nothing was dropped." >&2
+        say "The dump was restored into $DB; the database from before the rollback is kept as $ASIDE, and nothing was dropped."
     fi
     if [ "$ROLES_UNCHECKED" -eq 1 ]; then
-        echo "The database role split is NOT confirmed on the restored database: until \`propolis-migrate && propolis-migrate --check\` succeeds, treat the ledger as not protected from the daemon's role. Where the database turns out to belong to the daemon's role (it keeps the owner it had), the step that moves ownership gives it back first: docs/operations/database-roles.md." >&2
+        say "The database role split is NOT confirmed on the restored database: treat the ledger as not protected from the daemon's role, and expect propolis.service to refuse to start if the owner role's migration did not run. To put the split back: stop propolis, repeat the step that moves ownership (\`propolis migrate --init-roles\`, docs/operations/database-roles.md step 3; it is safe to repeat, and it is what a dump from before the split needs), then run \`propolis-migrate\` and \`propolis-migrate --check\`."
     fi
     if [ "$daemon" -eq 1 ]; then
-        echo "Trying to start the services again; check \`systemctl --failed\`." >&2
+        say "Trying to start the services again; check \`systemctl --failed\`."
     else
-        echo "Starting the sensors, the gateway and the shipper, not propolis.service; check \`systemctl --failed\`." >&2
+        say "Starting the sensors, the gateway and the shipper, not propolis.service; check \`systemctl --failed\`."
     fi
     for unit in "${SENSORS[@]}" gateway propolis shipper; do
         if [ "$unit" = propolis ] && [ "$daemon" -eq 0 ]; then
@@ -235,6 +261,13 @@ on_exit() {
     return 0
 }
 trap on_exit EXIT
+# A signal ends the run the way a failed step does, through the EXIT trap, with a status that says
+# so. Bash runs these once the command it is waiting for has ended: a hangup from a dropped
+# terminal reaches that command too and ends it, and a signal sent to this script alone is acted
+# on when the step in progress finishes.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # verify_set SETDIR DUMP IDENTITY: refuses unless the set is what the backup wrote and its dump can
 # be read. Run while every service is still up: found at the restore step instead, a damaged set
@@ -310,23 +343,31 @@ check_free_space() {
 # `propolis migrate`: that release cannot put the split back, and its daemon cannot run under it.
 # Said when it is found and again as the last thing the run prints, whichever way the run ends.
 roles_caveat() {
-    cat >&2 <<EOF
-WARNING: this node splits its database roles and the kept release is from before \`propolis migrate\`.
-    The split was NOT re-applied or checked. That release's daemon migrates as the role it connects
-    as, which owns nothing in the database, so ownership has to be handed back by hand before it
-    can start: docs/operations/database-roles.md, "Going back to one role".
-EOF
+    say "WARNING: this node splits its database roles and the kept release is from before \`propolis migrate\`."
+    say "    The split was NOT re-applied or checked. That release's daemon migrates as the role it connects"
+    say "    as, which owns nothing in the database, so ownership has to be handed back by hand before it"
+    say "    can start: docs/operations/database-roles.md, \"Going back to one role\"."
 }
 
 # After the restore, on a node that splits its database roles (migrate.env names an owner role):
 # the dump brings table ownership and grants back, but not everything the split rests on, and
-# nothing has yet asked the restored database whether the daemon's role is confined in it. The
-# owner role's migration run sets that role's grants again and --check asks, as that role, whether
-# the ledger is protected from it. Both run before any service starts and either failing fails
-# the rollback.
+# nothing has yet asked the restored database whether the daemon's role is confined in it. Every
+# step runs before any service starts and any of them failing fails the rollback.
+#
+# - A dump taken before the node split its roles has every table owned by the daemon's role. The
+#   owner role cannot migrate that, and the daemon cannot either any more, because it does not own
+#   the new database. The split's own first step (`propolis migrate --init-roles`, as the postgres
+#   superuser) hands those tables to the owner role; it is one transaction and safe to repeat.
+# - The owner role's migration run then sets the daemon role's grants again.
+# - `propolis-migrate --check` asks, as the daemon's role, whether the schema is current.
+# - Last, the script asks PostgreSQL itself whether that role controls the ledger table, owns the
+#   database or may create in the ledger's schema. The check above is made by the kept release's
+#   binary, and a release from before that binary learned to look at the database's owner calls a
+#   database owned by the daemon's role protected.
 restore_role_split() {
     local helper="$ROOT/usr/local/sbin/propolis-migrate" bin="$ROOT/usr/local/bin/propolis"
-    PROPOLIS_MIGRATE_ROOT="$ROOT" "$helper" --configured 2>/dev/null || return 0
+    local event_owner socket sockdir port confined
+    [ "$SPLIT" -eq 1 ] || return 0
     # The same test propolis-migrate makes: a binary from before the subcommand would take
     # `migrate` for nothing and start the daemon, as root.
     if ! grep -q -a -F 'usage: propolis migrate' "$bin"; then
@@ -336,10 +377,37 @@ restore_role_split() {
     fi
     echo "==> putting the database role split back and checking it"
     ROLES_UNCHECKED=1
+    STEP="reading who owns the restored ledger"
+    event_owner="$(runuser -u postgres -- psql -X -A -t -v ON_ERROR_STOP=1 -d "$DB" \
+        -c "SELECT pg_get_userbyid(c.relowner) FROM pg_class c WHERE c.oid = to_regclass('event')")"
+    if [ "$event_owner" = "$ROLE" ]; then
+        echo "    the dump is from before the roles were split (role $ROLE owns its tables): moving them to $OWNER_ROLE, as the split's first step does"
+        STEP="moving the restored tables to the owner role (propolis migrate --init-roles)"
+        # The superuser connects the way psql just did: over the server's own socket, which the
+        # server names. The first directory it listens in and its port make the URL.
+        socket="$(runuser -u postgres -- psql -X -A -t -v ON_ERROR_STOP=1 \
+            -c "SELECT current_setting('unix_socket_directories'), current_setting('port')")"
+        sockdir="${socket%%|*}"
+        sockdir="${sockdir%%,*}"
+        port="${socket##*|}"
+        [[ "$sockdir" =~ ^/[A-Za-z0-9_./-]+$ ]] && [[ "$port" =~ ^[0-9]{1,5}$ ]] || {
+            echo "error: PostgreSQL's socket directory and port could not be read ('$socket'), so the step that moves ownership cannot be run from here" >&2
+            exit 1
+        }
+        runuser -u postgres -- env "PROPOLIS_ADMIN_DATABASE_URL=postgres://postgres@${sockdir//\//%2F}:$port/$DB" \
+            "$bin" migrate --init-roles --owner "$OWNER_ROLE" --runtime "$ROLE"
+    fi
     STEP="re-applying the database role split (propolis-migrate)"
     PROPOLIS_MIGRATE_ROOT="$ROOT" PROPOLIS_BIN="$bin" "$helper"
     STEP="checking the database role split (propolis-migrate --check)"
     PROPOLIS_MIGRATE_ROOT="$ROOT" PROPOLIS_BIN="$bin" "$helper" --check
+    STEP="checking that the daemon's role is confined in the restored database"
+    confined="$(runuser -u postgres -- psql -X -A -t -v ON_ERROR_STOP=1 -d "$DB" \
+        -c "SELECT (SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = '$ROLE') OR pg_has_role('$ROLE', c.relowner, 'USAGE'), (SELECT pg_has_role('$ROLE', d.datdba, 'USAGE') FROM pg_database d WHERE d.datname = current_database()), has_schema_privilege('$ROLE', c.relnamespace, 'CREATE') FROM pg_class c WHERE c.oid = to_regclass('event')")"
+    if [ "$confined" != "f|f|f" ]; then
+        echo "error: in the restored database the daemon's role $ROLE is not confined. Asked whether it controls the ledger table, owns the database, or may create in the ledger's schema, PostgreSQL answered '$confined' (each should be f), whatever the kept release's own check printed above." >&2
+        exit 1
+    fi
     ROLES_UNCHECKED=0
 }
 
@@ -363,7 +431,7 @@ restore() {
     [[ "$release" =~ $RELEASE_RE ]] || { echo "error: not a kept release name: $release" >&2; exit 2; }
     local dir="$STORE/$release"
     [ -d "$dir" ] || { echo "error: $dir does not exist (see $0 --list)" >&2; exit 1; }
-    local commit set dump="" db="" owner="" size=""
+    local commit set dump="" db="" owner="" size="" role="" owner_url="" name_re='^[a-z_][a-z0-9_]*$'
     commit="$(field commit "$dir/manifest")"
     set="$(field backup_set "$dir/manifest")"
 
@@ -393,10 +461,33 @@ restore() {
         # split undone, and nothing in a dump puts a database's owner back.
         owner="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()')" || owner=""
         size="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT pg_database_size(current_database())' 2>/dev/null)" || size=""
+        role="$("$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user' 2>/dev/null)" || role=""
         unset DATABASE_URL
         [ -n "$owner" ] || { echo "error: could not read which role owns database '$db', so the restored one cannot be given the same owner; restore by hand" >&2; exit 1; }
-        [[ "$db" =~ ^[a-z_][a-z0-9_]*$ ]] && [[ "$owner" =~ ^[a-z_][a-z0-9_]*$ ]] || {
+        [[ "$db" =~ $name_re ]] && [[ "$owner" =~ $name_re ]] || {
             echo "error: database '$db' or its owner '$owner' is not a plain name; restore by hand" >&2; exit 1; }
+        # A node that splits its database roles. Putting the split back after the restore needs
+        # both role names and an owner role that can connect, so both are read now, while a
+        # wrong answer can still refuse with everything running. The owner's URL goes to the
+        # binary in its environment, as propolis-migrate passes it, never on a command line.
+        if PROPOLIS_MIGRATE_ROOT="$ROOT" "$ROOT/usr/local/sbin/propolis-migrate" --configured 2>/dev/null; then
+            SPLIT=1
+            ROLE="$role"
+            owner_url="$(env_value PROPOLIS_MIGRATE_DATABASE_URL "$ROOT/etc/propolis/migrate.env")"
+            OWNER_ROLE="$(DATABASE_URL="$owner_url" "$ROOT/usr/local/bin/propolis" pg-exec psql -X -A -t -c 'SELECT current_user' 2>/dev/null)" || OWNER_ROLE=""
+            [[ "$ROLE" =~ $name_re ]] && [[ "$OWNER_ROLE" =~ $name_re ]] && [ "$ROLE" != "$OWNER_ROLE" ] || {
+                echo "error: this node splits its database roles (migrate.env names an owner role), but the two roles could not be read as two different plain names: the daemon connects as '$ROLE' and the owner's URL as '$OWNER_ROLE'. The split cannot be put back after a restore unless the owner role can connect: check the URL in migrate.env (\`propolis-migrate --check\` shows the daemon's side), or restore by hand (docs/operations/backup-and-restore.md)" >&2
+                exit 1
+            }
+            # The database belonging to the daemon's role is the split already undone, which is
+            # what this script did on such a node before it kept the owner. Recreating it for
+            # that role would keep it undone, and a kept release from before `propolis migrate
+            # --check` looked at the database's owner would call the result protected.
+            if [ "$owner" = "$ROLE" ] && grep -q -a -F 'usage: propolis migrate' "$dir/bin/propolis" 2>/dev/null; then
+                echo "    database '$db' belongs to '$ROLE', the role the daemon connects as: the role split is undone on this node. The restored database is created for the owner role, '$OWNER_ROLE', instead."
+                owner="$OWNER_ROLE"
+            fi
+        fi
         echo "==> checking the pre-upgrade backup $set and the room to restore it (nothing is stopped yet)"
         check_free_space "$db" "$size"
         verify_set "$setdir" "$dump" "$identity"

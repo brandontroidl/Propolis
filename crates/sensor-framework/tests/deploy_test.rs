@@ -1736,8 +1736,9 @@ fn secret_paths_under_etc_propolis() -> HashSet<String> {
     paths
 }
 
-/// The file holding the schema owner's database URL, as `deploy/migrate.sh` (its only reader)
-/// names it. No unit loads it, so no `EnvironmentFile=` line leads to it.
+/// The file holding the schema owner's database URL, as `deploy/migrate.sh` names it (root's
+/// two scripts read it: that one and `rollback.sh --with-database`). No unit loads it, so no
+/// `EnvironmentFile=` line leads to it.
 fn migrate_env_path() -> String {
     let script = deploy_file("migrate.sh");
     let path = script

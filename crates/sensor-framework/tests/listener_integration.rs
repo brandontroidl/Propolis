@@ -410,12 +410,14 @@ async fn per_source_slot_is_released_when_the_connection_ends() {
     handle.abort();
 }
 
+/// A probe as the catchall sensor writes one: the emitter asserts that every event is within its
+/// sensor's row of the origin policy, and catchall is the sensor that probes over tcp and udp.
 fn probe_event(protocol: &str) -> sensor_wire::SensorEvent {
     sensor_wire::SensorEvent {
         v: sensor_wire::WIRE_VERSION,
         source_ip: "203.0.113.7".parse().unwrap(),
         wan_ip: None,
-        sensor: "probe".into(),
+        sensor: "catchall".into(),
         signal_type: sensor_wire::SIGNAL_CATCHALL_PROBE.into(),
         protocol: protocol.into(),
         authenticated: false,

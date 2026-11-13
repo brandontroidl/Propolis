@@ -102,7 +102,7 @@ impl Args {
 fn usage() -> ! {
     eprintln!(
         "usage: soak run --dir <out dir> [--database-url URL] [--rate LINES_PER_S] [--duration SECS]\n\
-         \x20      [--mix ssh=0.08,http=0.06,cred=0.03,adb=0.02] [--prefill-bytes 1G] [--sample-secs N]\n\
+         \x20      [--mix ssh=0.08,http=0.06,postgresql=0.03,adb=0.02] [--prefill-bytes 1G] [--sample-secs N]\n\
          \x20      [--rotate-secs N] [--rotate-min-bytes 100M] [--rotation copytruncate|rename|alternate]\n\
          \x20      [--fault kill@60,cursor-loss@90,poison@120] [--verify-every-secs N] [--keep-logs 1]\n\
          \x20      and the threshold flags named in docs/development/intake-soak.md\n\
@@ -180,7 +180,7 @@ fn parse_mix(text: Option<&str>) -> Vec<(String, f64)> {
         ("telnet", 1.0),
         ("ssh", 0.08),
         ("http", 0.06),
-        ("cred", 0.03),
+        ("postgresql", 0.03),
         ("adb", 0.02),
     ]
     .iter()
@@ -203,6 +203,13 @@ fn parse_mix(text: Option<&str>) -> Vec<(String, f64)> {
         mix.retain(|(n, _)| n != name);
         if share > 0.0 {
             mix.push((name.to_string(), share));
+        }
+    }
+    // Each log is named after its sensor and intake holds it to that sensor's row of the origin
+    // policy, so a stream intake would refuse is a mistake in the mix, not load.
+    for (name, _) in &mix {
+        if let Some(why) = traffic::mix_refusal(name) {
+            die(&format!("--mix {name}: {why}"));
         }
     }
     mix

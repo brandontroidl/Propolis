@@ -83,7 +83,9 @@ default-off** egress.
    off the response path (see [malware custody](../security/malware-custody.md)); the
    record carries only a SHA-256 reference.
 4. **Intake.** The intake binary tails each sensor log on its own task against a shared
-   `PgPool`, validates the wire record's `signal_type`/`protocol` against the known
+   `PgPool`, refuses a line dated more than an hour ahead of its clock or claiming more
+   than the log it was read from can be believed on (the origin policy, below), validates
+   the wire record's `signal_type`/`protocol` against the known
    set, derives weight/confidence/category (the sensor never computes them), and calls
    `append_events`, a batch per transaction. Appends are serialized by a Postgres advisory
    lock and the DB-layer chain trigger rejects any bad linkage fail-closed. See
@@ -93,6 +95,23 @@ Note the transport: **sensors never talk to intake directly.** The only channel 
 the local NDJSON file on local storage - a one-directional trust boundary. A
 compromised sensor can write lines to its own log, but it cannot reach the database,
 another sensor, or the network.
+
+What it writes there is believed only as far as the file proves it. Each sensor runs as
+its own user and owns its own log, so the file a line was read from identifies the sensor;
+the line's own `sensor`, `signal_type`, `protocol`, `authenticated` and `observed_at` are
+claims. Intake holds each line to the **origin policy** for its log
+(`crates/sensor-wire/src/origin.rs#check`, table in
+[events and signals](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)):
+a log bound to a sensor carries that sensor's name only, with only the signal types and
+protocols that sensor emits, authenticated only if that sensor ever authenticates, and a
+counted summary only from the sensors that write them. So a compromised `sensor-catchall`
+cannot write `ssh`'s authenticated upload, confirm another sensor's reachability probe,
+list an address with one summary line, or date a line into the future to pin a listing;
+and a line it dates into the past cannot move an address's `last_seen` or decay anchor
+back. It **can** still forge events of its own kind under its own name, for any address
+it likes: see [residual risks](../security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence).
+In a split deployment the same check runs in the shipper, on the collector, where the
+logs are still one per sensor ([split deployment](../operations/split-deployment.md)).
 
 ## Outbound data flow (egress posture)
 

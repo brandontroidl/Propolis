@@ -472,6 +472,113 @@ async fn replay_equals_incremental(pool: PgPool) -> Result<(), RepoError> {
     Ok(())
 }
 
+/// A stream that arrives out of order, one line of it dated three years back, as a compromised
+/// sensor or a collector with a broken clock would deliver it. In the stored row `last_seen` and
+/// `decay_anchor` never step backwards (the back-dated line used to become both, which dropped
+/// the address out of every feed window and made the next event decay its whole score away), the
+/// later event still finds the earlier weight, and a replay of the ledger, which folds the same
+/// events in the same ledger order, rebuilds exactly the stored row.
+#[sqlx::test(migrations = "./migrations")]
+async fn replay_equals_incremental_when_events_arrive_out_of_order(
+    pool: PgPool,
+) -> Result<(), RepoError> {
+    let ip = IP.parse().unwrap();
+    let at = |ts: &str| ts.parse::<chrono::DateTime<Utc>>().unwrap();
+    // (event, the latest observed_at appended so far)
+    let stream = [
+        (
+            ev(
+                "2026-07-17T12:00:00Z",
+                SignalType::PortScan,
+                Some("198.51.100.1"),
+                "s1",
+                Protocol::Tcp,
+                false,
+            ),
+            "2026-07-17T12:00:00Z",
+        ),
+        (
+            ev(
+                "2023-07-17T12:00:00Z",
+                SignalType::SuricataSev2,
+                Some("198.51.100.1"),
+                "s2",
+                Protocol::Tcp,
+                false,
+            ),
+            "2026-07-17T12:00:00Z",
+        ),
+        (
+            ev(
+                "2026-07-17T09:00:00Z",
+                SignalType::HoneypotConnection,
+                Some("203.0.113.200"),
+                "s3",
+                Protocol::Tcp,
+                true,
+            ),
+            "2026-07-17T12:00:00Z",
+        ),
+        (
+            ev(
+                "2026-07-17T13:00:00Z",
+                SignalType::SshBruteForce,
+                Some("198.51.100.1"),
+                "s1",
+                Protocol::Tcp,
+                false,
+            ),
+            "2026-07-17T13:00:00Z",
+        ),
+        (
+            ev(
+                "2026-07-17T12:30:00Z",
+                SignalType::BlockedConnection,
+                None,
+                "s2",
+                Protocol::Udp,
+                false,
+            ),
+            "2026-07-17T13:00:00Z",
+        ),
+    ];
+
+    let mut before_the_newer_event = None;
+    for (event, latest) in stream {
+        let newer = event.observed_at == at("2026-07-17T13:00:00Z");
+        if newer {
+            before_the_newer_event = read_stored_score(&pool, ip).await?;
+        }
+        append_event(&pool, event).await?;
+        let stored = read_stored_score(&pool, ip)
+            .await?
+            .expect("projection row exists");
+        assert_eq!(stored.last_seen, at(latest));
+        assert_eq!(stored.decay_anchor, at(latest));
+        assert_eq!(stored.first_seen, at("2026-07-17T12:00:00Z"));
+        let replayed = rebuild_projection(&pool, ip)
+            .await?
+            .expect("appended stream yields a projection");
+        assert_eq!(replayed, stored, "replay diverged after {latest}");
+    }
+
+    // 20 + 15 + 40 accumulated at the 12:00 anchor, the two older lines included. One hour of
+    // a six-hour half-life later the newer event (weight 20) found about 66.8 of it left, not
+    // what four hours, or three years, of decay from a regressed anchor would leave; the last,
+    // older line then added its 3 with no further decay.
+    let before = before_the_newer_event.expect("three events were stored before the newer one");
+    assert_eq!(before.raw_score, dec!(75));
+    let stored = read_stored_score(&pool, ip).await?.unwrap();
+    assert_eq!(stored.event_count, 5);
+    assert_eq!(stored.established_event_count, 4);
+    assert!(
+        stored.raw_score > dec!(89.8) && stored.raw_score < dec!(89.9),
+        "75 decayed for one hour, plus 20, plus 3: {}",
+        stored.raw_score
+    );
+    Ok(())
+}
+
 /// An untampered ledger verifies as `Intact` (guards against `verify_chain`
 /// trivially returning `Broken`, and exercises the full hash round-trip through
 /// storage: any field whose stored representation diverged from what was hashed

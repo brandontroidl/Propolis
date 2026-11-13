@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sensor_wire::SensorEvent;
+use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent, origin};
 use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 
@@ -89,7 +89,21 @@ impl EventEmitter {
     /// With a gate attached, an event over its source's budget is not written: it is counted into
     /// a summary and `append` returns `Ok` with an id that names no line. Only connection, login
     /// and plain command events are ever gated, and none of their callers use the id.
+    ///
+    /// In debug builds it also asserts that the event is one its own sensor's row of the origin
+    /// policy allows (`sensor_wire::origin::conforms`). Intake and the shipper refuse a line
+    /// outside that table, so a sensor that gains an event without its row would have real
+    /// evidence dropped in production; here every sensor's tests fail first. Release builds do
+    /// not check: a sensor never refuses to write what it saw.
     pub async fn append(&self, event: &SensorEvent) -> std::io::Result<uuid::Uuid> {
+        // Before the gates, so an event that is folded into a summary is held to the table too.
+        // A sensor's own stats line is not evidence and has no row.
+        debug_assert!(
+            event.signal_type == SIGNAL_SENSOR_STATS || origin::conforms(event).is_ok(),
+            "an event outside the origin policy reached the emitter (add it to its sensor's row \
+             in sensor_wire::origin::SENSORS, or intake will refuse it): {:?}",
+            origin::conforms(event).err()
+        );
         if self.suppressed(event) {
             return Ok(event.occurrence_id.unwrap_or_else(uuid::Uuid::now_v7));
         }

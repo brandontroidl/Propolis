@@ -54,6 +54,20 @@ returns the prior state unchanged (clock-skew clamp; decay only shrinks)
 `max_confidence` per category is a running MAX and does not decay
 (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
 
+An event never moves time backwards. The new `decay_anchor` is the later of the event's
+`observed_at` and the stored anchor, the new `last_seen` the later of `observed_at` and the stored
+`last_seen`, and the decay runs from the old anchor to the new one. An event dated before the
+anchor (a backlog read late, a collector with a slow clock, a forged timestamp) is still counted
+and still adds its weight, at the anchor already reached; it used to become the anchor, so the
+next event or read decayed the whole score across the gap, and it used to become `last_seen`,
+which took a listed address out of every feed window. `first_seen` stays the time of the first
+event folded. Replay folds the same events in ledger order through the same function, so it
+still equals the stored row for rows written since this rule; a row written before it from
+out-of-order events keeps the times it had, and nothing rebuilds it
+(`crates/core-scoring/src/scoring/engine.rs#apply_event`). The other direction is closed at
+intake, which refuses a line dated more than an hour ahead
+([events and signals](events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)).
+
 ### Breadth multiplier
 
 ```

@@ -4,6 +4,53 @@
 
 ### Upgrade note
 
+- **Intake no longer believes a sensor log line about where it came from.** Each sensor writes
+  its own log as its own user, but intake copied `sensor`, `signal_type`, `protocol` and
+  `authenticated` from the line, so a compromised low-interaction sensor could write another
+  sensor's authenticated upload, confirm another sensor's reachability probe, or carry an
+  address past the volume threshold with one `event_summary` line. A line is now held to the
+  log it was read from. The name in a `PROPOLIS_SENSOR_LOGS` entry binds the log to a sensor
+  when it is that sensor's name or one of `cred-vnc`, `cred-mysql`, `cred-mssql`, `cred-pg`,
+  `cred-mongo`; in a bound log intake refuses a line that names another sensor, a signal type
+  or protocol that sensor does not emit, `authenticated: true` from a sensor that never
+  authenticates (adb, http, tftp, dns, catchall), or `event_summary: true` from anything but
+  sensor-cred. The shipped names keep working. Check yours: a sensor's name on another
+  sensor's log, or on a control plane's per-collector spool entry, gets the other lines
+  refused; any other name leaves the log unbound, where any known sensor's lines are accepted
+  and each is still held to its own sensor's row. On every log, a line under a sensor name no
+  shipped sensor writes, or with a signal type no sensor emits (`suricata_*`, `waf_*`,
+  `port_scan`, `syn_flood`, `blocked_connection`, `ssh_brute_force`, `remote_auth_failure`),
+  is refused: lines fed to intake from your own tooling under such names stop being ingested.
+  A refused line is logged at WARN (`line refused by the origin policy`, with the reason),
+  counted in `propolis_events_rejected_total`, not quarantined and not read again
+  ([rules and table](docs/reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)).
+- **The shipper drops what a sensor's log may not carry.** The same policy runs on the
+  collector, by the name in `PROPOLIS_SHIPPER_SENSOR_LOGS`, before the logs are merged into
+  the collector's one stream. Name each log after the sensor that writes it; sensor-cred's
+  files are `cred-vnc`, `cred-mysql`, `cred-mssql`, `cred-pg`, `cred-mongo`. The split
+  deployment page used to give `cred-postgresql` as an example: that name is not bound,
+  rename it to `cred-pg`. A dropped line is logged in the shipper's journal with a per-cycle
+  count and never reaches the control plane. The wire format is unchanged and either side can
+  be upgraded first. A collector compromised as a whole is still trusted for every sensor it
+  could run.
+- **A line dated more than an hour ahead of the daemon's clock is refused.** It would have
+  held its address's score undecayed and its listing in every feed window until the clock
+  caught up. This covers `sensor_stats` and probe lines too. The line is dropped, not kept:
+  check time synchronisation on every collector and on the control plane before upgrading. A
+  host more than an hour ahead of the control plane, or a control plane more than an hour
+  behind, loses its lines and logs `line dated in the future refused` with how far ahead each
+  was. Lines dated in the past are never refused for their age.
+- **An older event no longer moves an address's `last_seen` or decay anchor backwards.** An
+  out-of-order or back-dated line is still counted and still adds its weight, but it used to
+  become the anchor, so the next event or read decayed the whole score across the gap, and it
+  used to become `last_seen`, which took a listed address out of every feed window. Existing
+  `ip_score` rows are not rebuilt. A row whose times were moved back keeps them until that
+  address's next event. A row already dated in the future is no longer pulled back by the
+  next event and stays until the clock passes it:
+  `SELECT source_ip, last_seen FROM ip_score WHERE last_seen > now() + interval '1 hour'`
+  lists them, and delisting removes one from the feed. A projection replayed from the ledger
+  (`rebuild_projection`) follows the new rule, so it can differ from a row an earlier version
+  stored from out-of-order events.
 - **`rollback.sh --with-database` keeps the database's owner, checks the backup before it stops
   anything, and puts the real database back when the restore fails.** The new database was
   created for the role `DATABASE_URL` connects as. On a node with

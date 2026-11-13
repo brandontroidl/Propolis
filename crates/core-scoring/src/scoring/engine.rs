@@ -1,8 +1,10 @@
 //! Pure projection accumulate step: the load-bearing state transition of the
 //! scoring system. `apply_event` folds one `EventInput` into the prior
 //! `IpScore` projection, decaying the stored raw score and each category's
-//! accumulated weight to the event's `observed_at`, adding this event's
-//! contribution (unless deduped), and recomputing every derived flag.
+//! accumulated weight to the event's `observed_at` (or leaving them at the
+//! stored anchor when the event is older than it: time never runs backwards
+//! here), adding this event's contribution (unless deduped), and recomputing
+//! every derived flag.
 //!
 //! It is a pure function: no DB, no clock, no I/O. The repository layer
 //! (Task 12) supplies the un-projected stored `raw_score` and the breadth
@@ -47,7 +49,16 @@ pub struct CategoryStat {
 const LIVE_FLOOR: Decimal = dec!(0.5);
 
 /// Fold `event` into `prev`, returning the new projection anchored at
-/// `event.observed_at`.
+/// `event.observed_at`, or at the previous anchor when that is later.
+///
+/// `decay_anchor` and `last_seen` never move backwards. An event dated before the stored anchor
+/// (a backlog read late, a collector whose clock is slow, a forged timestamp) is still counted
+/// and still adds its weight, but it is folded in at the anchor already reached. Taking its
+/// time as the new anchor would make the next event, and every read, decay the whole accumulated
+/// score across the gap a second time, so one line dated years back would erase everything
+/// other sensors had gathered about the address; taking it as `last_seen` would drop a listed
+/// address out of every feed window. Replay folds the same events in the same order through
+/// this function, so the rule holds for a rebuilt projection exactly as for the stored one.
 ///
 /// `deduped` = this sighting is a duplicate within the dedup window: it decays
 /// prior state to now and still records the sighting (`event_count += 1`, can
@@ -65,11 +76,13 @@ pub fn apply_event(
 ) -> IpScore {
     let now = event.observed_at;
 
-    // Step 1-2: seed or decay prior state to `now`.
+    // Step 1-2: seed or decay prior state to the new anchor.
     let (
         decayed_raw,
         mut breakdown,
         first_seen,
+        last_seen,
+        decay_anchor,
         prev_event_count,
         prev_established_event_count,
         prev_has_confirmed_real,
@@ -81,6 +94,8 @@ pub fn apply_event(
             dec!(0),
             BTreeMap::<Category, CategoryStat>::new(),
             now,
+            now,
+            now,
             0i32,
             0i32,
             false,
@@ -89,7 +104,12 @@ pub fn apply_event(
             None::<NaiveDate>,
         ),
         Some(p) => {
-            let elapsed = (now - p.decay_anchor).num_seconds();
+            // The later of the event's time and what is stored, for each: see the function doc.
+            // The decay runs from the previous anchor to the new one, so it is zero for an event
+            // that is not newer and exactly the real gap for one that is.
+            let decay_anchor = std::cmp::max(now, p.decay_anchor);
+            let last_seen = std::cmp::max(now, p.last_seen);
+            let elapsed = (decay_anchor - p.decay_anchor).num_seconds();
             let decayed_raw = decay(p.raw_score, elapsed, half_life_seconds);
             let mut map: BTreeMap<Category, CategoryStat> =
                 serde_json::from_value(p.category_breakdown)
@@ -101,6 +121,8 @@ pub fn apply_event(
                 decayed_raw,
                 map,
                 p.first_seen,
+                last_seen,
+                decay_anchor,
                 p.event_count,
                 p.established_event_count,
                 p.has_confirmed_real,
@@ -162,8 +184,8 @@ pub fn apply_event(
         prev_established_event_count
     };
 
-    // Steps 5-6: derive facts + assemble. Both decay_anchor and last_seen are `now`
-    // (the event's observed_at) because an event WAS seen at this instant.
+    // Steps 5-6: derive facts + assemble. `last_seen` and `decay_anchor` are the event's
+    // observed_at (an event WAS seen at this instant) unless the stored ones are later.
     derive_projection(
         event.source_ip,
         new_raw,
@@ -176,8 +198,8 @@ pub fn apply_event(
         active_days,
         last_active_day,
         first_seen,
-        now,
-        now,
+        last_seen,
+        decay_anchor,
         delisted,
     )
 }
@@ -875,7 +897,129 @@ mod tests {
         assert!(s.has_confirmed_real);
     }
 
+    /// An event dated before what is already stored is still a sighting (it counts, and adds its
+    /// weight in full) but it moves neither `last_seen` nor the decay anchor back, and it does
+    /// not rewrite `first_seen` either.
+    #[test]
+    fn an_older_event_counts_and_weighs_but_moves_neither_last_seen_nor_the_anchor_back() {
+        let seen = ts("2026-11-01T12:00:00Z");
+        let s1 = apply_event(None, &command_exec_at(seen), HALF_LIFE, false, 1, 1);
+        assert_eq!(s1.raw_score, dec!(60));
+
+        // Three years back, another category (port_scan, weight 20) so the weight is visible.
+        let mut old = tcp_probe_event_at(seen - Duration::days(3 * 365));
+        old.source_ip = s1.source_ip;
+        let s2 = apply_event(Some(s1.clone()), &old, HALF_LIFE, false, 1, 1);
+        assert_eq!(s2.last_seen, seen);
+        assert_eq!(s2.decay_anchor, seen);
+        assert_eq!(s2.first_seen, seen, "first_seen is the first event folded");
+        assert_eq!(s2.event_count, 2);
+        assert_eq!(s2.established_event_count, 2);
+        assert_eq!(
+            s2.raw_score,
+            dec!(80),
+            "nothing decayed, the weight is added"
+        );
+        assert_eq!(s2.distinct_categories, 2);
+        assert_eq!(
+            s2.active_days, 1,
+            "an older day does not open a new active day"
+        );
+
+        // A duplicate sighting from the past changes the counters and nothing else.
+        let s3 = apply_event(Some(s2.clone()), &old, HALF_LIFE, true, 1, 1);
+        assert_eq!(
+            (s3.last_seen, s3.decay_anchor, s3.raw_score),
+            (seen, seen, dec!(80))
+        );
+        assert_eq!(s3.event_count, 3);
+    }
+
+    /// Security regression (audit): one line dated years back must not erase an address's score.
+    /// It used to become the decay anchor, so the next real event (and every read) decayed the
+    /// whole accumulation across those years, to nothing. The next event must decay from the
+    /// true anchor: one hour on, the earlier weight is still there.
+    #[test]
+    fn a_back_dated_line_does_not_wipe_the_score_at_the_next_event_or_read() {
+        let seen = ts("2026-11-01T12:00:00Z");
+        let s1 = apply_event(None, &command_exec_at(seen), HALF_LIFE, false, 1, 1);
+        let back_dated = command_exec_at(seen - Duration::days(3 * 365));
+        let s2 = apply_event(Some(s1), &back_dated, HALF_LIFE, true, 1, 1);
+        assert_eq!(s2.raw_score, dec!(60));
+
+        let hour_later = seen + Duration::hours(1);
+        let kept = decay(dec!(60), 3600, HALF_LIFE);
+        assert!(kept > dec!(53), "one hour of a six-hour half-life: {kept}");
+
+        // The read path projects from the stored anchor.
+        let read = project_to_now(s2.clone(), hour_later, HALF_LIFE);
+        assert_eq!(read.raw_score, kept);
+        assert_eq!(read.last_seen, seen);
+
+        // The next event decays from the true anchor, then becomes the anchor itself.
+        let mut next = tcp_probe_event_at(hour_later);
+        next.source_ip = s2.source_ip;
+        let s3 = apply_event(Some(s2), &next, HALF_LIFE, false, 1, 1);
+        assert_eq!(s3.raw_score, kept + dec!(20));
+        assert_eq!(s3.decay_anchor, hour_later);
+        assert_eq!(s3.last_seen, hour_later);
+        assert_eq!(s3.event_count, 3);
+    }
+
+    /// A volume listing is published while `last_seen` is inside a feed window, so a back-dated
+    /// line must not be able to take a listed address out of it.
+    #[test]
+    fn a_back_dated_line_does_not_move_a_volume_listed_address_out_of_its_window() {
+        let threshold = crate::scoring::constants::VOLUME_LIST_THRESHOLD as i64;
+        let base = ts("2026-08-21T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for i in 0..threshold {
+            let e = tcp_probe_event_at(base + Duration::seconds(i));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, i > 0, 1, 1));
+        }
+        let listed = acc.unwrap();
+        assert!(listed.recommended_for_blocklist);
+        let newest = base + Duration::seconds(threshold - 1);
+        assert_eq!(listed.last_seen, newest);
+
+        let back_dated = tcp_probe_event_at(base - Duration::days(400));
+        let after = apply_event(Some(listed), &back_dated, HALF_LIFE, false, 1, 1);
+        assert_eq!(after.last_seen, newest);
+        assert_eq!(after.decay_anchor, newest);
+        assert!(after.recommended_for_blocklist);
+    }
+
     proptest! {
+        /// Whatever order events are folded in, `last_seen` and the anchor end at the latest
+        /// time among them and never step back on the way; `first_seen` stays the first folded.
+        #[test]
+        fn last_seen_and_the_anchor_are_the_latest_time_folded_in_any_order(
+            offsets in prop::collection::vec(-2_000_000i64..2_000_000i64, 1..24usize),
+            deduped in prop::collection::vec(any::<bool>(), 24),
+        ) {
+            let base = ts("2026-06-01T00:00:00Z");
+            let mut acc: Option<IpScore> = None;
+            let mut latest: Option<DateTime<Utc>> = None;
+            for (offset, deduped) in offsets.iter().zip(deduped) {
+                let when = base + Duration::seconds(*offset);
+                latest = Some(latest.map_or(when, |l| l.max(when)));
+                let next = apply_event(acc.clone(), &command_exec_at(when), HALF_LIFE, deduped, 1, 1);
+                if let Some(prev) = &acc {
+                    prop_assert!(next.last_seen >= prev.last_seen);
+                    prop_assert!(next.decay_anchor >= prev.decay_anchor);
+                    prop_assert!(next.raw_score >= decay(
+                        prev.raw_score,
+                        (next.decay_anchor - prev.decay_anchor).num_seconds(),
+                        HALF_LIFE,
+                    ));
+                }
+                prop_assert_eq!(Some(next.last_seen), latest);
+                prop_assert_eq!(Some(next.decay_anchor), latest);
+                prop_assert_eq!(next.first_seen, base + Duration::seconds(offsets[0]));
+                acc = Some(next);
+            }
+        }
+
         #[test]
         fn breadth_never_flips_eligibility_without_confirmed_real(
             seq in event_seq_no_confirmed_real()

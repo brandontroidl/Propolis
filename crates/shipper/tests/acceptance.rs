@@ -32,6 +32,9 @@ use tokio_rustls::rustls::ClientConfig;
 const GATEWAY_DNS: &str = "gateway.local";
 const COLLECTOR_ID: &str = "collector-acceptance";
 const STATE_KEY: &str = "collector-acceptance-sensor1";
+/// The label of the one sensor log shipped here, as `PROPOLIS_SHIPPER_SENSOR_LOGS` would name it.
+/// The shipper holds every line to the origin policy for it, so the events below are all ssh's.
+const LOG: &str = "ssh";
 
 struct Certs {
     ca: Vec<u8>,
@@ -110,12 +113,12 @@ fn build_events() -> Vec<SensorEvent> {
             v: WIRE_VERSION,
             source_ip: "203.0.113.9".parse().unwrap(),
             wan_ip: None,
-            sensor: "telnet".into(),
+            sensor: "ssh".into(),
             signal_type: SIGNAL_HONEYPOT_LOGIN_ATTEMPT.into(),
             protocol: PROTO_TCP.into(),
             authenticated: false,
             observed_at: "2026-08-27T10:15:03Z".parse().unwrap(),
-            metadata: serde_json::json!({ "protocol_label": "telnet", "username": "admin" }),
+            metadata: serde_json::json!({ "protocol_label": "ssh", "username": "admin" }),
             sample: None,
             session_id: None,
             occurrence_id: None,
@@ -182,6 +185,7 @@ async fn real_sensor_events_survive_shipping_byte_exact_and_reconstitute_for_int
     let report = ship_cycle(
         &mut stream,
         &mut tailer,
+        LOG,
         shipper_state_dir.path(),
         STATE_KEY,
         16,

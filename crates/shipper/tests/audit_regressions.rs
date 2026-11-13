@@ -100,6 +100,7 @@ async fn audit_retry_exhaustion_must_not_skip_unacknowledged_records() {
     let first = ship_cycle(
         &mut stream,
         &mut tailer,
+        "ssh",
         &state,
         COLLECTOR_ID,
         1,
@@ -114,6 +115,7 @@ async fn audit_retry_exhaustion_must_not_skip_unacknowledged_records() {
     ship_cycle(
         &mut stream,
         &mut tailer,
+        "ssh",
         &state,
         COLLECTOR_ID,
         1,

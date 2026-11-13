@@ -103,6 +103,7 @@ async fn ships_two_lines_byte_exact_and_a_re_run_after_confirmation_ships_nothin
     let report = ship_cycle(
         &mut stream,
         &mut tailer,
+        "ssh",
         shipper_state_dir.path(),
         STATE_KEY,
         16,
@@ -127,6 +128,7 @@ async fn ships_two_lines_byte_exact_and_a_re_run_after_confirmation_ships_nothin
     let report2 = ship_cycle(
         &mut stream2,
         &mut tailer2,
+        "ssh",
         shipper_state_dir.path(),
         STATE_KEY,
         16,
@@ -238,6 +240,7 @@ async fn two_sensor_logs_ship_through_one_shared_multiplexed_chain_with_no_dupli
     let ssh_report = ship_cycle(
         &mut stream,
         &mut ssh_tailer,
+        "ssh",
         shipper_state_dir.path(),
         COLLECTOR_ID,
         16,
@@ -263,6 +266,7 @@ async fn two_sensor_logs_ship_through_one_shared_multiplexed_chain_with_no_dupli
     let telnet_report = ship_cycle(
         &mut stream2,
         &mut telnet_tailer,
+        "telnet",
         shipper_state_dir.path(),
         COLLECTOR_ID,
         16,
@@ -363,6 +367,7 @@ async fn a_rebuilt_collector_reusing_an_identity_with_reset_shipper_state_diverg
     let original_report = ship_cycle(
         &mut stream,
         &mut original_tailer,
+        "ssh",
         original_shipper_state_dir.path(),
         COLLECTOR_ID,
         1, // one record per batch, forcing 3 separate confirmed batches (seq 1, 2, 3)
@@ -399,6 +404,7 @@ async fn a_rebuilt_collector_reusing_an_identity_with_reset_shipper_state_diverg
     let rebuilt_report = ship_cycle(
         &mut stream2,
         &mut rebuilt_tailer,
+        "ssh",
         rebuilt_shipper_state_dir.path(),
         COLLECTOR_ID,
         16,
@@ -443,4 +449,102 @@ async fn a_rebuilt_collector_reusing_an_identity_with_reset_shipper_state_diverg
         vec!["{\"new\":1}".to_string()],
         "the tailer cursor must not have advanced past the diverged, unshipped line"
     );
+}
+
+/// The origin policy across the real wire: the catchall log on a collector holds one honest line
+/// and lines that claim to be another sensor's authenticated evidence. The gateway's spool for
+/// this collector, the one stream the control plane's intake reads, must hold the honest line
+/// only, and the cycle must say how many lines it left behind.
+#[tokio::test]
+async fn a_line_refused_for_its_log_never_reaches_the_gateway_spool_and_the_cycle_counts_it() {
+    let cert_dir = tempfile::tempdir().expect("cert tempdir");
+    let certs = mint_certs(cert_dir.path());
+    let gateway_state_dir = tempfile::tempdir().expect("gateway state tempdir");
+    let spool_dir = tempfile::tempdir().expect("spool tempdir");
+    let bound_addr = start_gateway(
+        &certs,
+        gateway_state_dir.path().to_path_buf(),
+        spool_dir.path().to_path_buf(),
+    )
+    .await;
+
+    let line = |sensor: &str, signal_type: &str, authenticated: bool| {
+        serde_json::json!({
+            "v": 1,
+            "source_ip": "203.0.113.80",
+            "wan_ip": null,
+            "sensor": sensor,
+            "signal_type": signal_type,
+            "protocol": "tcp",
+            "authenticated": authenticated,
+            "observed_at": "2026-11-13T10:00:00Z",
+            "metadata": { "protocol_label": sensor },
+            "sample": null,
+        })
+        .to_string()
+    };
+    let honest = line("catchall", "catchall_probe", false);
+    let forged_upload = line("ssh", "honeypot_malware_upload", true);
+    let forged_login = line("catchall", "honeypot_login_attempt", true);
+
+    let sensor_dir = tempfile::tempdir().expect("sensor tempdir");
+    let log_path = sensor_dir.path().join("events.jsonl");
+    std::fs::write(
+        &log_path,
+        format!("{forged_upload}\n{honest}\n{forged_login}\n"),
+    )
+    .expect("write sensor log");
+    let cursor_dir = sensor_dir.path().join("cursors");
+    let shipper_state_dir = tempfile::tempdir().expect("shipper state tempdir");
+    let mut tailer = LogTailer::new(log_path.clone(), cursor_dir.clone());
+    let mut stream = ShipperClient::connect(bound_addr, client_tls(&certs), GATEWAY_DNS)
+        .await
+        .expect("connect");
+    // One record per read, so the first and the last read each hold nothing but a refused line:
+    // the cycle has to carry on past a read that yields no batch, not stop at it.
+    let report = ship_cycle(
+        &mut stream,
+        &mut tailer,
+        "catchall",
+        shipper_state_dir.path(),
+        COLLECTOR_ID,
+        1,
+        retry_policy(),
+    )
+    .await
+    .expect("ship cycle");
+    assert_eq!(report.batches_shipped, 1);
+    assert_eq!(report.refused, 2);
+    assert!(report.stopped.is_none());
+
+    let spool_path = spool_dir.path().join(COLLECTOR_ID).join("events.jsonl");
+    let spooled = std::fs::read_to_string(&spool_path).expect("read spool");
+    assert_eq!(spooled, format!("{honest}\n"));
+
+    // The refused lines are behind the persisted cursor, the trailing one included: a restarted
+    // shipper does not read them again.
+    let mut restarted = LogTailer::new(log_path.clone(), cursor_dir.clone());
+    assert!(restarted.read_batch(16).is_empty());
+
+    // The same forged upload from the ssh log is ssh's own evidence and ships.
+    let ssh_log = sensor_dir.path().join("ssh-events.jsonl");
+    std::fs::write(&ssh_log, format!("{forged_upload}\n")).expect("write ssh log");
+    let mut ssh_tailer = LogTailer::new(ssh_log, cursor_dir);
+    let mut stream = ShipperClient::connect(bound_addr, client_tls(&certs), GATEWAY_DNS)
+        .await
+        .expect("reconnect");
+    let report = ship_cycle(
+        &mut stream,
+        &mut ssh_tailer,
+        "ssh",
+        shipper_state_dir.path(),
+        COLLECTOR_ID,
+        16,
+        retry_policy(),
+    )
+    .await
+    .expect("ship ssh log");
+    assert_eq!((report.batches_shipped, report.refused), (1, 0));
+    let spooled = std::fs::read_to_string(&spool_path).expect("read spool again");
+    assert_eq!(spooled, format!("{honest}\n{forged_upload}\n"));
 }

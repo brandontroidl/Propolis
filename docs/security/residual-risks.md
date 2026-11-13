@@ -56,6 +56,39 @@ resilience requires operator-provided off-host backups (tested by restoring) and
 where warranted, independent infrastructure. See
 [../operations/backup-and-restore.md](../operations/backup-and-restore.md).
 
+## A compromised sensor can forge its own kind of evidence
+
+Intake believes a sensor log line only as far as the file it came from proves it
+([origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)):
+a log speaks for its own sensor, within the signal types, protocols and authentication that
+sensor can produce, and a line dated more than an hour ahead is refused. What remains:
+
+- **A sensor's own kind of event, under its own name, for any address.** A compromised
+  `sensor-ssh` can write authenticated ssh uploads, and a compromised sensor-cred protocol can
+  write login summaries worth up to a million events each, for an address that never connected.
+  The policy narrows what a low-interaction sensor (catchall, tftp, dns, http, adb) can claim;
+  it does not make a sensor's testimony about its own protocol verifiable. One forged summary,
+  or a thousand forged TCP lines, still takes an address that never connected past the volume
+  threshold.
+- **A log that is not bound.** Only a `PROPOLIS_SENSOR_LOGS` name that is a sensor's name or one
+  of the five shipped `cred-*` labels binds a log. Under any other name the log may carry any
+  known sensor's lines, each held to its own row only, so the writer of that log can speak for
+  every sensor.
+- **A compromised collector, as a whole.** In a split deployment the per-log check runs in the
+  shipper on the collector. Root on the collector, or its shipper or certificate key, can send
+  the control plane any line that fits some known sensor's row
+  ([split deployment](../operations/split-deployment.md#known-limitations)).
+- **Timestamps within the bounds.** A line may be dated up to an hour ahead, and as far back as
+  its writer likes: a back-dated line cannot move `last_seen` or the decay anchor, but it is
+  stored with the time it claims and sorts there in the ledger and the console.
+- **What was stored before these checks.** Ledger rows and `ip_score` rows written by an earlier
+  version keep the sensor names and timestamps they had. Nothing re-validates the ledger and
+  nothing rebuilds a projection, so a row whose `last_seen` or `decay_anchor` was moved back by
+  an out-of-order event stays as it is until that address's next event, and one that is dated
+  in the future stays so until the clock passes it (the next event no longer pulls it back).
+  `SELECT source_ip, last_seen FROM ip_score WHERE last_seen > now() + interval '1 hour'` finds
+  the latter; delisting the address in the console takes it out of the feed.
+
 ## Egress paths, once enabled, are real egress
 
 Five outbound paths exist, all opt-in and defaulting OFF. When an operator enables

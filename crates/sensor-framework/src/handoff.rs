@@ -1255,12 +1255,14 @@ mod tests {
         }
     }
 
+    /// An upload as the ssh sensor writes one. The emitter asserts that every event is within
+    /// its sensor's row of the origin policy, so the fixture names a sensor that uploads.
     fn test_event(sample: Option<SampleRef>) -> SensorEvent {
         SensorEvent {
             v: WIRE_VERSION,
             source_ip: "203.0.113.7".parse().unwrap(),
             wan_ip: None,
-            sensor: "test".into(),
+            sensor: "ssh".into(),
             signal_type: SIGNAL_HONEYPOT_MALWARE_UPLOAD.into(),
             protocol: PROTO_TCP.into(),
             authenticated: true,

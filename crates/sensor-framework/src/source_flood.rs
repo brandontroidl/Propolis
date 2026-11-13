@@ -58,8 +58,9 @@ use crate::emit::EventEmitter;
 use crate::rate_limit::{DEFAULT_SUMMARY_CAPACITY, SourceKey};
 use crate::sanitize_value;
 
-/// The metadata key that marks a connection or login summary event.
-pub const EVENT_SUMMARY_KEY: &str = "event_summary";
+/// The metadata key that marks a connection or login summary event. It is the origin policy's
+/// own constant, so the key this module writes is the key intake holds a summary's sensor to.
+pub const EVENT_SUMMARY_KEY: &str = sensor_wire::origin::EVENT_SUMMARY_KEY;
 /// The metadata key set to `true` on the overflow and per-network summaries only. They are
 /// attributed to one address but stand for many, so scoring must count one event, not the
 /// `suppressed_count`, and must neither weight it nor latch confirmed-real from it.

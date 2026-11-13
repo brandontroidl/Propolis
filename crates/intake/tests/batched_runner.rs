@@ -14,12 +14,15 @@ use sqlx::PgPool;
 
 const PROBE_GRACE: Duration = Duration::from_secs(600);
 
+/// One line of the ssh sensor's log: the runner below reads it under the label `ssh`, so every
+/// line must be one the origin policy lets that log carry, and ssh is a sensor that emits every
+/// signal these tests mix (telemetry included).
 fn line(n: usize, signal: &str, metadata: serde_json::Value) -> String {
     let event = SensorEvent {
         v: WIRE_VERSION,
         source_ip: format!("192.0.2.{}", 10 + n % 3).parse().unwrap(),
         wan_ip: Some("198.51.100.4".parse().unwrap()),
-        sensor: "telnet".into(),
+        sensor: "ssh".into(),
         signal_type: signal.into(),
         protocol: PROTO_TCP.into(),
         authenticated: true,
@@ -40,7 +43,7 @@ fn runner(pool: &PgPool, dir: &std::path::Path) -> IntakeRunner {
     IntakeRunner::new(
         LogTailer::new(dir.join("events.jsonl"), dir.join("cursors")),
         pool.clone(),
-        "telnet".into(),
+        "ssh".into(),
         Arc::new(HashSet::<IpAddr>::new()),
         PROBE_GRACE,
     )
@@ -166,7 +169,7 @@ async fn a_line_the_database_refuses_stops_the_batch_and_the_prefix_is_not_repla
     }
     let why = runner.wedged().unwrap();
     assert!(
-        why.contains("22P05") && why.contains("telnet"),
+        why.contains("22P05") && why.contains("ssh"),
         "the report names the sensor and the SQLSTATE: {why}"
     );
     let counted: i32 = sqlx::query_scalar("SELECT event_count FROM ip_score ORDER BY source_ip")

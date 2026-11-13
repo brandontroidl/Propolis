@@ -12,6 +12,7 @@ path = "src/main.rs"
 log-tailer = { path = "../log-tailer" }
 collector-wire = { path = "../collector-wire" }
 sensor-framework = { path = "../sensor-framework" }
+sensor-wire = { path = "../sensor-wire" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
@@ -22,6 +23,5 @@ log-format = { path = "../log-format" }
 [dev-dependencies]
 gateway = { path = "../gateway" }
 provision-certs = { path = "../provision-certs" }
-sensor-wire = { path = "../sensor-wire" }
 uuid = { version = "1", features = ["v7", "serde"] }
 tempfile = "3.27.0"

@@ -45,11 +45,20 @@ another when displayed.
 - **Decay and accumulate.** The stored score is decayed to the event's time with a
   six-hour half-life, the event's weight is added, and the result is capped at 100. A
   repeat of the same signal from the same IP within sixty seconds is recorded but adds
-  no weight. Decay only ever shrinks a score; clock skew cannot inflate one.
+  no weight. Decay only ever shrinks a score; clock skew cannot inflate one. Time never
+  runs backwards either: an event dated before the stored one is counted and weighed,
+  but `last_seen` and the decay anchor stay where they were, so a back-dated line from a
+  compromised sensor or a slow clock can neither erase a score at the next event nor
+  take a listed address out of its feed window. A line dated more than an hour ahead
+  never reaches the ledger; intake refuses it.
 - **Confirmed-real latch.** An event sets this flag when it arrived over TCP,
   authenticated against a honeypot sensor. It never unsets. UDP, ICMP and
   unauthenticated traffic cannot set it, which is what stops a spoofed source from
-  earning merit on someone else's packets.
+  earning merit on someone else's packets. The protocol and the authentication are what
+  the sensor's log line says, so intake accepts them only from a log whose sensor can
+  produce them ([origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)):
+  a sensor that never authenticates, or that only sees UDP, cannot set the latch or add
+  to the completed-TCP count by saying so.
 - **Breadth.** Activity seen from more than one of your WAN addresses raises the
   effective score, by 0.15 per extra address up to 1.6 times. Only addresses that saw
   an authenticated TCP handshake count, and addresses in the same /24 (or /64 for IPv6)

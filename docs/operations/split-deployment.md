@@ -35,6 +35,12 @@ sensor-*  ->  /var/log/propolis/<sensor>/...
 - The **shipper** tails the sensor logs it is given, batches up to 15 lines, and sends each batch
   with a sequence number and the hash of the batch before it
   (`crates/shipper/src/batcher.rs#Batcher::next_batch`, `crates/shipper/src/batcher.rs#MAX_RECORDS_FRAME_SAFE`).
+  It is the last place that knows which sensor's log a line came from, so it applies the
+  [origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)
+  there: a line that parses as an event and claims another sensor's name, or a signal type,
+  protocol, authentication or summary its sensor cannot produce, is dropped with a WARN and not
+  shipped (`crates/shipper/src/batcher.rs#admit`). A line that does not parse, and a sensor's own
+  `sensor_stats` line, are shipped unchanged.
 - The **gateway** accepts a connection only with a client certificate signed by its CA, takes the
   collector id from that certificate's CommonName rather than from anything the collector sends,
   checks each batch's hash and its place in the chain, and appends the lines byte for byte to one
@@ -42,7 +48,12 @@ sensor-*  ->  /var/log/propolis/<sensor>/...
   (`crates/collector-wire/src/tls.rs#server_config`, `crates/gateway/src/server.rs#handle_connection`,
   `crates/gateway/src/verify.rs#GatewaySink::accept`, `crates/gateway/src/spool.rs#SpoolWriter::write_records`).
 - **Intake** on the control plane tails that spool file the way it tails a sensor log on a single
-  host. Every line keeps its own `sensor` field, so one entry per collector is enough.
+  host. Every line keeps its own `sensor` field, so one entry per collector is enough. The entry's
+  name must not be a sensor's name or one of the shipped `cred-*` labels: such a name binds the
+  log to that one sensor and every other sensor's lines in the stream would be refused. Under any
+  other name (the collector id is the convention) the stream may carry every known sensor, and
+  intake still holds each line to its own sensor's row of the policy and refuses a line dated more
+  than an hour ahead of the control plane's clock.
 - Each end keeps its position in the chain on disk, as `last_seq` and `last_batch_hash` in a file
   named after the collector id (`crates/gateway/src/state.rs#CollectorState`,
   `crates/shipper/src/state.rs#ConfirmedState`). Equal `last_seq` values mean the two ends agree
@@ -181,7 +192,9 @@ still holding the previous run's files can no longer connect.
    ```
 
 5. In `/etc/propolis/propolis.env`, point intake at the collector's spool file, one `name:path`
-   entry per collector:
+   entry per collector. Use the collector id as the name, never a sensor's name (`ssh`, `vnc`,
+   `cred-pg` and so on): a sensor's name binds the stream to that one sensor and intake would
+   refuse every other sensor's lines in it:
 
    ```sh
    PROPOLIS_SENSOR_LOGS=collector-01:/var/spool/propolis/gateway/collector-01/events.jsonl
@@ -263,15 +276,21 @@ files expect it to match the shipper's. Then:
    - `PROPOLIS_COLLECTOR_ID` must equal the certificate's CommonName, or the shipper refuses to
      start (`crates/shipper/src/config.rs#validate_collector_id`).
    - `PROPOLIS_SHIPPER_SENSOR_LOGS` lists every log to ship as `name:path`, with the path each
-     sensor actually writes; the name only labels log lines. By default that is
-     `/var/log/propolis/<sensor>/events.jsonl`, except for `sensor-catchall` (set above) and
-     `sensor-cred`, which writes one file per protocol it binds: `vnc.jsonl`, `mysql.jsonl`,
-     `mssql.jsonl`, `postgresql.jsonl` (from `PROPOLIS_CRED_PG_BIND`) and `mongodb.jsonl` (from
-     `PROPOLIS_CRED_MONGO_BIND`) under `/var/log/propolis/cred/`, each needing its own entry, for
-     example `cred-postgresql:/var/log/propolis/cred/postgresql.jsonl`
-     (`crates/sensor-cred/src/main.rs#main`). A path the shipper cannot open, including a
-     misspelled one, ships nothing and reports nothing, and the unit can read only under
-     `/var/log/propolis`.
+     sensor actually writes. The name labels log lines and binds the log to a sensor: name each
+     log after the sensor that writes it (`ssh`, `telnet`, `catchall`, and so on), and the shipper
+     ships only that sensor's lines from it. A name that is not a sensor's leaves the log
+     unbound (any known sensor's lines are shipped from it), and the name of a different sensor
+     gets every line dropped, so a swapped name and path shows as
+     `shipper: dropping a line the origin policy refuses for this log` in the journal. By default
+     the path is `/var/log/propolis/<sensor>/events.jsonl`, except for `sensor-catchall` (set
+     above) and `sensor-cred`, which writes one file per protocol it binds: `vnc.jsonl`,
+     `mysql.jsonl`, `mssql.jsonl`, `postgresql.jsonl` (from `PROPOLIS_CRED_PG_BIND`) and
+     `mongodb.jsonl` (from `PROPOLIS_CRED_MONGO_BIND`) under `/var/log/propolis/cred/`, each
+     needing its own entry under its own name: `cred-vnc`, `cred-mysql`, `cred-mssql`, `cred-pg`,
+     `cred-mongo`, for example `cred-pg:/var/log/propolis/cred/postgresql.jsonl`
+     (`crates/sensor-cred/src/main.rs#main`, `crates/sensor-wire/src/origin.rs#bound_sensor`). A
+     path the shipper cannot open, including a misspelled one, ships nothing and reports nothing,
+     and the unit can read only under `/var/log/propolis`.
 
    Every shipper variable is in the
    [environment variable reference](../reference/environment-variables.md#shipper).
@@ -619,6 +638,15 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
 - The ledger does not record which collector an event came from, and the fleet pane matches probe
   lines and event age by sensor name, so two collectors running the same sensor cannot be told
   apart there (`crates/fleet/src/store.rs#confirm_sensor`, `crates/console/src/routes/fleet.rs`).
+- The origin policy separates the sensors of a collector from each other, not the collector from
+  the control plane. The shipper runs on the collector and the batch it sends carries no record
+  of which log a line came from, so a collector that is compromised as a whole (its shipper, its
+  certificate key, or root on the host) is still trusted for every sensor it could run: it can
+  send any line that fits some known sensor's row. The control plane refuses only what no sensor
+  could write, a line under an unknown sensor name, and a line dated more than an hour ahead.
+- A line the shipper drops is logged and counted in the shipper's journal
+  (`shipper: this cycle dropped lines the origin policy refuses for this log`) and nowhere else:
+  it never reaches the control plane, so `propolis_events_rejected_total` does not see it.
 - `gateway` and `shipper` have no `--version`, and the deploy stamp records only `propolis` and
   `console` (`deploy/deploy-stamp.sh`), so their installed build is not visible.
 - `propolis`, `console` and the sensors default to `info` when `RUST_LOG` is unset; every other

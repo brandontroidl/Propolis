@@ -15,7 +15,7 @@ use crate::quarantine::{Quarantine, QuarantinedLine};
 use chrono::{DateTime, Utc};
 use core_scoring::{EventInput, append_events};
 use log_tailer::LogTailer;
-use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent, SensorStats};
+use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent, SensorStats, origin};
 use sqlx::PgPool;
 
 /// Outcome of one [`IntakeRunner::run_batch`] call.
@@ -24,7 +24,9 @@ pub struct RunBatchResult {
     /// Lines that parsed, converted, and were appended to the ledger.
     pub ingested: usize,
     /// Lines that failed NDJSON parsing or `convert` (unknown signal type/protocol, unsupported
-    /// wire version, domain validation) - permanently unprocessable, so they are dropped rather
+    /// wire version, domain validation), that are dated further ahead of this clock than
+    /// [`MAX_FUTURE_SKEW`], or that the origin policy refuses for the log they were read from
+    /// (`sensor_wire::origin::check`) - permanently unprocessable, so they are dropped rather
     /// than retried.
     pub rejected: usize,
     /// Lines dropped because they came from a configured reachability-probe source, each recorded
@@ -175,10 +177,29 @@ pub fn next_batch_size(
         .max(MIN_BATCH_LINES)
 }
 
-/// How many distinct `event.sensor` names one log's runner remembers. A log carries one sensor's
-/// events, so a handful is generous; the bound only stops a misbehaving sensor writing a fresh
-/// name per line from growing the set without limit.
+/// How many distinct `event.sensor` names one log's runner remembers. A log bound to a sensor
+/// carries that sensor's events only (the origin policy refuses any other name), so a handful is
+/// generous; the bound keeps the set small for a log that is not bound, such as a collector's
+/// stream.
 const MAX_REPORTED_SENSORS: usize = 8;
+
+/// How far ahead of this daemon's clock a line's `observed_at` may be before the line is refused.
+///
+/// A line dated in the future pins what it touches: its address's score does not decay and its
+/// listing does not leave a feed window until the clock catches up, and it reads as the freshest
+/// event in every view ordered by time. Any bound closes the indefinite pin. This one is wide on
+/// purpose: a refused line is gone (the cursor passes it), and an honest collector whose clock
+/// has drifted by minutes must not lose its evidence. A line dated in the past is never refused
+/// here: a backlog can be days old, and scoring does not let an old line move time backwards
+/// (`core_scoring`'s `apply_event`).
+pub const MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::hours(1);
+
+/// How far `observed_at` is ahead of `now`, when that is more than [`MAX_FUTURE_SKEW`] and the
+/// line is therefore refused; `None` for a line that may be ingested.
+pub fn ahead_of_clock(observed_at: DateTime<Utc>, now: DateTime<Utc>) -> Option<chrono::Duration> {
+    let ahead = observed_at.signed_duration_since(now);
+    (ahead > MAX_FUTURE_SKEW).then_some(ahead)
+}
 
 /// What `run_batch` keeps of a converted line until the append says how far it got.
 struct Pending {
@@ -313,6 +334,14 @@ impl IntakeRunner {
     /// skipped: both are permanent failures, so retrying them next poll would just re-reject them
     /// forever while blocking every line behind them.
     ///
+    /// So is a line that says something about itself this log cannot be believed on, checked as
+    /// soon as it parses and before anything is done with it: an `observed_at` more than
+    /// [`MAX_FUTURE_SKEW`] ahead of this clock (every kind of line), and for every line but a
+    /// `sensor_stats` one (which has its own exact check against the label) a sensor name, signal
+    /// type, protocol, authentication or summary marker outside what the origin policy allows the
+    /// log it was read from (`sensor_wire::origin::check`). A probe line is held to the policy
+    /// too, so a log can only confirm a sensor it is allowed to speak for.
+    ///
     /// Every convertible line is appended in ONE transaction (`core_scoring::append_events`),
     /// which holds the ledger's append lock once for the batch. A database error from it is
     /// treated differently from a rejected line: it may be transient (a dropped connection, lock
@@ -358,6 +387,8 @@ impl IntakeRunner {
         let mut replies: Vec<(usize, String, String)> = Vec::new();
         let mut stats_lines: Vec<(usize, SensorStats, DateTime<Utc>)> = Vec::new();
         let mut bytes_read = 0usize;
+        // One reading of the clock for the batch: every line is judged against the same instant.
+        let now = Utc::now();
 
         for (index, line) in lines.iter().enumerate() {
             bytes_read += line.len();
@@ -373,6 +404,22 @@ impl IntakeRunner {
                     continue;
                 }
             };
+
+            // Before anything else is done with the line, stats and probe lines included: a
+            // timestamp from the future would otherwise reach a score, a `sensor_stats` row or a
+            // probe confirmation and read there as the newest thing known.
+            if let Some(ahead) = ahead_of_clock(event.observed_at, now) {
+                tracing::warn!(
+                    sensor = %self.sensor_name,
+                    observed_at = %event.observed_at.to_rfc3339(),
+                    ahead_secs = ahead.num_seconds(),
+                    max_ahead_secs = MAX_FUTURE_SKEW.num_seconds(),
+                    "line dated in the future refused, dropping line: check the clock of the \
+                     host that wrote it, and this host's"
+                );
+                rejected_at.push(index);
+                continue;
+            }
 
             // A sensor's own health counters are not evidence. They are taken out here, BEFORE
             // conversion, so they cannot reach the ledger, a score, the feed, a campaign or a
@@ -403,6 +450,21 @@ impl IntakeRunner {
                         rejected_at.push(index);
                     }
                 }
+                continue;
+            }
+
+            // The file proves which sensor wrote the line; the line's own fields prove nothing.
+            // Held to the origin policy here, before the probe branch uses its sensor name and
+            // before conversion copies its sensor, signal type, protocol and authentication into
+            // the ledger. A `sensor_stats` line never reaches this: it was compared with the
+            // label exactly, above.
+            if let Err(e) = origin::check(&self.sensor_name, &event) {
+                tracing::warn!(
+                    sensor = %self.sensor_name,
+                    error = %e,
+                    "line refused by the origin policy, dropping line"
+                );
+                rejected_at.push(index);
                 continue;
             }
 
@@ -860,6 +922,40 @@ mod tests {
         assert!(
             moved(0, 0, 0, 1, 1),
             "a quarantined line moved the position past it"
+        );
+    }
+
+    #[test]
+    fn a_line_is_refused_only_when_dated_more_than_the_skew_ahead() {
+        let now: DateTime<Utc> = "2026-11-13T12:00:00Z".parse().unwrap();
+        assert_eq!(MAX_FUTURE_SKEW, chrono::Duration::hours(1));
+        assert_eq!(ahead_of_clock(now, now), None);
+        assert_eq!(
+            ahead_of_clock(now - chrono::Duration::days(11), now),
+            None,
+            "a backlog is never refused for its age"
+        );
+        assert_eq!(
+            ahead_of_clock("1970-01-01T00:00:00Z".parse().unwrap(), now),
+            None
+        );
+        assert_eq!(
+            ahead_of_clock(now + chrono::Duration::minutes(59), now),
+            None,
+            "ordinary clock drift on a collector"
+        );
+        assert_eq!(
+            ahead_of_clock(now + MAX_FUTURE_SKEW, now),
+            None,
+            "the bound itself is allowed"
+        );
+        let just_over = MAX_FUTURE_SKEW + chrono::Duration::microseconds(1);
+        assert_eq!(ahead_of_clock(now + just_over, now), Some(just_over));
+        let years = chrono::Duration::days(5 * 365);
+        assert_eq!(
+            ahead_of_clock(now + years, now),
+            Some(years),
+            "the refusal carries how far ahead the line is, for the warning"
         );
     }
 

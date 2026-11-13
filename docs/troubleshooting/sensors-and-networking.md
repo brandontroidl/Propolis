@@ -41,7 +41,13 @@ Work outward from the process:
    the unified daemon (or standalone `intake`) is consuming that sensor's
    `events.jsonl` via `PROPOLIS_SENSOR_LOGS` (a `name:path` list). A sensor can
    be capturing to its log while the daemon ignores it because the path is not in
-   `PROPOLIS_SENSOR_LOGS`. Verify the mapping matches each sensor's `LOG_PATH`.
+   `PROPOLIS_SENSOR_LOGS`. Verify the mapping matches each sensor's `LOG_PATH`, name included:
+   the name binds the log to a sensor, so a sensor's name on another sensor's log (a swapped
+   pair) gets every line refused. That shows as `propolis_events_rejected_total` rising and
+   `line refused by the origin policy, dropping line` in the daemon's journal, with the reason.
+   `line dated in the future refused` there means the writing host's clock, or this one's, is
+   more than an hour off
+   ([origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)).
 4. **Can traffic reach the port?** From another host, test the port is open
    through the firewall. Sensors need inbound on their configured ports.
 

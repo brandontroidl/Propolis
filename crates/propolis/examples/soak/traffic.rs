@@ -68,12 +68,15 @@ pub struct SensorMix {
     pub signals: &'static [(&'static str, u32)],
 }
 
+/// Each sensor's mix holds only signals that sensor emits. Intake binds every log to the sensor
+/// it is named after and refuses a line outside that sensor's row of the origin policy
+/// (`sensor_wire::origin`), so a line a real sensor could not write would be rejected, not
+/// ingested. The telemetry signal (`honeypot_session_end`) therefore rides on ssh, which emits it.
 pub fn mix_for(sensor: &str) -> SensorMix {
     const TELNET: &[(&str, u32)] = &[
         ("honeypot_command_exec", 45),
         ("honeypot_login_attempt", 40),
-        ("honeypot_connection", 13),
-        ("honeypot_session_end", 2),
+        ("honeypot_connection", 15),
     ];
     const SSH: &[(&str, u32)] = &[
         ("honeypot_login_attempt", 60),
@@ -81,28 +84,43 @@ pub fn mix_for(sensor: &str) -> SensorMix {
         ("honeypot_command_exec", 18),
         ("honeypot_session_end", 2),
     ];
-    const HTTP: &[(&str, u32)] = &[
-        ("honeypot_connection", 75),
-        ("honeypot_login_attempt", 10),
-        ("honeypot_command_exec", 13),
-        ("honeypot_session_end", 2),
-    ];
+    const HTTP: &[(&str, u32)] = &[("honeypot_connection", 75), ("honeypot_command_exec", 25)];
     const CRED: &[(&str, u32)] = &[("honeypot_login_attempt", 95), ("honeypot_connection", 5)];
     const ADB: &[(&str, u32)] = &[
         ("honeypot_connection", 30),
         ("honeypot_command_exec", 55),
-        ("honeypot_file_download", 10),
-        ("honeypot_session_end", 5),
+        ("honeypot_file_download", 15),
     ];
     SensorMix {
         signals: match sensor {
             "ssh" => SSH,
             "http" => HTTP,
-            "cred" => CRED,
+            "postgresql" => CRED,
             "adb" => ADB,
             _ => TELNET,
         },
     }
+}
+
+/// Why intake would refuse the lines generated for a log named `sensor`, if it would: the name
+/// is not a sensor's, or that sensor does not emit, over tcp, a signal of its mix or the
+/// `honeypot_command_exec` every stream's near-maximum and poison lines are written as.
+pub fn mix_refusal(sensor: &str) -> Option<String> {
+    let Some(row) = sensor_wire::origin::row(sensor) else {
+        return Some(format!("{sensor} is not a sensor intake knows"));
+    };
+    if !row.protocols.contains(&sensor_wire::PROTO_TCP) {
+        return Some(format!(
+            "{sensor} does not use tcp, which every generated line carries"
+        ));
+    }
+    mix_for(sensor)
+        .signals
+        .iter()
+        .map(|(signal, _)| *signal)
+        .chain(["honeypot_command_exec"])
+        .find(|signal| !row.signals.contains(signal))
+        .map(|signal| format!("{sensor} does not emit {signal}, which this harness writes for it"))
 }
 
 fn pick_signal(rng: &mut Rng, mix: &SensorMix) -> &'static str {
@@ -349,7 +367,9 @@ pub fn build_line(
         _ => meta = metadata(rng, sensor, signal, run, seq),
     }
     let telnet_like = sensor == "telnet";
-    let authenticated = signal != "honeypot_connection";
+    // Only a sensor that authenticates may say so: intake refuses the claim from any other.
+    let authenticated = signal != "honeypot_connection"
+        && sensor_wire::origin::row(sensor).is_some_and(|row| row.authenticates);
     let wan = if rng.below(2) == 0 {
         "192.0.2.250"
     } else {
@@ -632,5 +652,34 @@ pub fn run_rotator(cfg: RotateCfg, logs: Vec<Arc<WriterShared>>, stop: Arc<Atomi
             }
         }
         count += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The harness stands for the sensors, and every generated line is expected in the ledger
+    /// unless it is a designed absence. A line intake's origin policy refuses for the log it was
+    /// written to would be a rejection the accounting cannot explain.
+    #[test]
+    fn every_default_stream_writes_only_lines_intake_accepts_for_its_log() {
+        let mut rng = Rng::new(7);
+        for sensor in ["telnet", "ssh", "http", "postgresql", "adb"] {
+            assert_eq!(mix_refusal(sensor), None);
+            for (seq, kind) in (0..400).map(|seq| (seq, LineKind::Normal)).chain([
+                (400, LineKind::NearMax),
+                (401, LineKind::Poison),
+                (402, LineKind::Overlength),
+            ]) {
+                let line = build_line(&mut rng, sensor, "run", seq, kind, Utc::now());
+                let event: sensor_wire::SensorEvent = serde_json::from_str(&line).unwrap();
+                let checked = sensor_wire::origin::check(sensor, &event);
+                assert_eq!(checked, Ok(()), "{sensor} {kind:?} {}", event.signal_type);
+            }
+        }
+        for not_writable in ["cred", "vnc", "dns", "tftp", "catchall", "collector-01"] {
+            assert!(mix_refusal(not_writable).is_some(), "{not_writable}");
+        }
     }
 }

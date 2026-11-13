@@ -41,7 +41,10 @@ flowchart TD
    `protocol` are plain strings on the wire so `sensor-wire` carries no scoring
    dependency; the record contains no `\n`/`\r` (NDJSON invariant). Field detail is
    owned by [`reference/events-and-signals.md`](../reference/events-and-signals.md).
-3. **Intake.** The intake tailer consumes each NDJSON record and validates its
+3. **Intake.** The intake tailer consumes each NDJSON record, refuses one dated more than
+   an hour ahead of its clock or outside what the log it was read from may claim (the
+   [origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)),
+   and validates its
    `signal_type`/`protocol` against the known set. `EventInput::from_signal` derives
    `weight`, `confidence`, and `category` from the single-source-of-truth weight
    table (`crates/core-scoring/src/domain/weights.rs#signal_weight`) so a sensor never

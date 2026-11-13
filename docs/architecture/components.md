@@ -19,7 +19,7 @@ owner of the component inventory and the inter-crate dependency graph.
 
 | Crate | Kind | Binary | Purpose |
 |---|---|---|---|
-| `sensor-wire` | library (leaf) | none | Frozen sensor->intake NDJSON wire format (`WIRE_VERSION = 1`); the single source of truth imported by every sensor and by intake. |
+| `sensor-wire` | library (leaf) | none | Frozen sensor->intake NDJSON wire format (`WIRE_VERSION = 1`); the single source of truth imported by every sensor and by intake. Also the origin policy: what each sensor is able to write and which log is bound to which sensor, applied by intake and the shipper. |
 | `core-scoring` | library | none | Event ledger and scoring engine: append events, chain-hashing, `ip_score`, blocklist eligibility; owns the core migrations. Also owns the operator allowlist shared by the feed and the review stage (`allowlist.rs`), so it depends on `geoip`. |
 | `geoip` | library (leaf) | none | Offline MaxMind GeoLite2 City + ASN enrichment (local file reads only, egress-free); both DBs optional. |
 | `sensor-framework` | library | none | Shared sensor harness: TCP/UDP listener lifecycle, WAN attribution, sanitize, event emit, quarantine spool, capture hand-off, fake shell/fs, persona, bounds. Also provides per-sensor server-side TLS (`crates/sensor-framework/src/tls.rs`): a fail-closed cert/key loader, an implicit-TLS listener and a plaintext-to-TLS stream for STARTTLS-style upgrades. Seven sensors use it (http, redis, mqtt, smtp, ftp, cred, dns); see [Networking and TLS](../operations/networking-tls.md#sensor-tls-attacker-facing-listeners). |
@@ -44,7 +44,7 @@ owner of the component inventory and the inter-crate dependency graph.
 | `log-tailer` | library (leaf) | none | File tailing with a durable, rotation-aware cursor and the over-length line discard; extracted from `intake` so the shipper can tail sensor logs without the control-plane database stack. Also owns the one `name:path` sensor-log list parser, and a cursorless mode (`LogTailer::without_cursor`) that persists nothing, for the live watcher. |
 | `log-format` | library (leaf) | none | The one `tracing` output format every binary installs (`log_format::init`, or `log_format::layer` for the two that build their own registry): colour only on a terminal, and under systemd a `<N>` priority prefix per line so journald records the real level. Pulls in only `tracing` and `tracing-subscriber`, which is why the control-plane crates that do not link `sensor-framework` can share it. See [logging](../operations/health-and-observability.md#logging-and-journal-priorities). |
 | `collector-wire` | library (leaf) | none | Collector-to-gateway wire protocol: sequenced, hash-chained batch frames, acks, and the mutual-TLS configs both ends build from one pinned CA. |
-| `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
+| `shipper` | lib + bin | `shipper` | Collector side of the split deployment: tails a sensor log through `log-tailer`, drops a line the origin policy (`sensor-wire`) refuses for that log, assembles the next sequenced batch, ships it to the gateway over mutual TLS, and advances its durable state only after a confirmed ack. |
 | `gateway` | lib + bin | `gateway` | Control-plane side of the split deployment: a client-certificate-required TLS accept loop that verifies each collector's sequence and hash chain and appends accepted records to a per-collector spool in sensor NDJSON shape, which intake tails unchanged. |
 | `watch` | lib + bin | `propolis-watch` | Read-only live view for the operator: streams every sensor event log named in `PROPOLIS_SENSOR_LOGS` (and, with `--journal`, the units' journal) as JSON Lines on stdout through `log-tailer`'s cursorless mode, with a heartbeat naming each log's status. Writes no file, opens no socket, holds no database handle; meant to run as an SSH forced command. See [live watch](../operations/live-watch.md). |
 | `provision-certs` | lib + bin | `provision-certs` | Mints a private CA, the gateway server certificate and one collector client certificate per run, isolated so its certificate library never enters the daemon dependency trees. With `--sensor-tls <out-dir> <sensor>...` it instead mints one self-signed TLS pair per sensor (kept if both files already exist), driven by `deploy/provision-tls.sh`. |
@@ -133,6 +133,7 @@ graph TD
   propolis --> review
   propolis --> fw
   propolis --> logfmt
+  shipper --> wire
   shipper --> cwire
   shipper --> tailer
   shipper --> fw

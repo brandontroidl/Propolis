@@ -173,7 +173,7 @@ variable in this section plus the universal ones above.
 
 | Variable | Req | Default | Notes |
 |---|---|---|---|
-| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, split on the first colon of each entry (`crates/log-tailer/src/sensor_logs.rs#parse_sensor_logs`, the one parser the daemon, standalone `intake`, `shipper`'s `SENSOR_LOGS` and `propolis-watch` share). Empty list, or an entry missing name/path → **abort**. At least one pair required. |
+| `PROPOLIS_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, split on the first colon of each entry (`crates/log-tailer/src/sensor_logs.rs#parse_sensor_logs`, the one parser the daemon, standalone `intake`, `shipper`'s `SENSOR_LOGS` and `propolis-watch` share). Empty list, or an entry missing name/path → **abort**. At least one pair required. The name is not stored on events. It labels the log in intake's own log lines and alerts, and it binds the log to a sensor when it is a sensor's name or one of the shipped `cred-vnc`, `cred-mysql`, `cred-mssql`, `cred-pg`, `cred-mongo`: intake then refuses every line in that log that names another sensor (`crates/sensor-wire/src/origin.rs#bound_sensor`; [origin policy](events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)). Any other name leaves the log unbound. |
 | `PROPOLIS_CURSOR_DIR` | no | `/var/lib/propolis/cursors` (`crates/propolis/src/config.rs#DEFAULT_CURSOR_DIR`) | any path; no validation |
 | `PROPOLIS_QUARANTINE_DIR` | no | `/var/lib/propolis/quarantine` (`crates/propolis/src/config.rs#DEFAULT_QUARANTINE_DIR`; standalone `intake`: `crates/intake/src/main.rs#DEFAULT_QUARANTINE_DIR`) | any path; blank = default. One `<sensor-label>.jsonl` per log holds each line the database refused on three polls in a row; created `0750` if missing (the default's parent is root-owned, so `deploy/provision.sh` creates it). Fixed caps of 64 MiB and 10,000 records, never cleaned; see [quarantined intake lines](../operations/health-and-observability.md#quarantined-intake-lines) |
 | `PROPOLIS_POLL_INTERVAL_MS` | no | `1000` (`crates/propolis/src/config.rs#DEFAULT_POLL_INTERVAL_MS`) | positive u64 ms; zero/unparseable → abort. Three intervals, if longer than ten minutes, become the `intake-lagging` age threshold (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#age_threshold`) |
@@ -457,20 +457,23 @@ additionally cross-checked against the client certificate's CommonName at startu
 | `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` | **yes** | - | PEM path, this collector's client certificate; absent → abort |
 | `PROPOLIS_SHIPPER_CLIENT_KEY_PATH` | **yes** | - | PEM path, private key for the client cert above; absent → abort |
 | `PROPOLIS_COLLECTOR_ID` (deprecated alias `PROPOLIS_SHIPPER_COLLECTOR_ID`, still read) | **yes** | - | this collector's identity; **must equal** the CommonName baked into `PROPOLIS_SHIPPER_CLIENT_CERT_PATH` or the shipper refuses to start (`validate_collector_id`, `ConfigError::CollectorIdMismatch`). Same variable the four body-capturing sensors read (see "Outbox manifest" below) - set the same value on every unit of this collector. Today the sensors only stamp it on their outbox manifest rows, which nothing reads yet; the planned provenance join on `(collector_id, occurrence_id)` depends on it matching. |
-| `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required |
+| `PROPOLIS_SHIPPER_SENSOR_LOGS` | **yes** | - | comma-separated `name:path` pairs, same grammar as `PROPOLIS_SENSOR_LOGS`; empty or a malformed entry → abort; at least one pair required. The name binds the log to a sensor exactly as it does for `PROPOLIS_SENSOR_LOGS`, and the shipper drops a line the origin policy refuses for it (`crates/shipper/src/batcher.rs#admit`) |
 | `PROPOLIS_SHIPPER_CURSOR_DIR` | no | `/var/lib/propolis/shipper/cursors` | one cursor file per log, named by the SHA-256 of the log's path (`crates/log-tailer/src/cursor.rs#DurableCursor::cursor_file_path`) |
 | `PROPOLIS_SHIPPER_STATE_DIR` | no | `/var/lib/propolis/shipper/state` | this collector's position in its batch chain, `<dir>/<collector_id>.json` (`crates/shipper/src/state.rs#ConfirmedState`) |
 | `PROPOLIS_SHIPPER_POLL_INTERVAL_MS` | no | `1000` | positive u64 ms; zero/unparseable → abort |
 | `PROPOLIS_SHIPPER_MAX_RECORDS_PER_BATCH` | no | `15` (`batcher::MAX_RECORDS_FRAME_SAFE`) | positive u64 → usize; zero/unparseable → abort; a value above 15 is lowered to 15 (`crates/shipper/src/batcher.rs#Batcher::next_batch`) |
 | `PROPOLIS_SHIPPER_RETRY_BACKOFF_MS` | no | `2000` | positive u64 ms; zero/unparseable → abort. The wait before resending a batch the gateway answered with Retry, at most 5 times in a row (`crates/shipper/src/main.rs#MAX_CONSECUTIVE_RETRIES`); a failed connection is retried on the next poll instead |
 
-`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` only labels log lines: it is not sent to the gateway, and each
-log's cursor is keyed by its path. Every sensor log on a collector ships through one seq/hash chain
+`PROPOLIS_SHIPPER_SENSOR_LOGS`'s `name` is not sent to the gateway, and each
+log's cursor is keyed by its path. It labels the shipper's log lines and selects the origin policy
+applied to the log before its lines are shipped: name each log after the sensor that writes it.
+Every sensor log on a collector ships through one seq/hash chain
 keyed by `PROPOLIS_COLLECTOR_ID`
 (via the gateway's verified client-certificate CommonName), not by the per-log name.
 
 On the control-plane side, intake's `PROPOLIS_SENSOR_LOGS` is re-pointed at the gateway's
-per-collector spool (one `name:path` entry per collector, not per sensor) - see
+per-collector spool (one `name:path` entry per collector, not per sensor, under a name that is not
+a sensor's, so the stream stays unbound) - see
 [split deployment](../operations/split-deployment.md), [filesystem paths](filesystem-paths.md#split-deployment-gateway-and-shipper)
 and `deploy/control-plane.env.example`.
 

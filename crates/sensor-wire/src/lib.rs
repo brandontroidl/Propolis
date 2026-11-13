@@ -8,6 +8,8 @@ use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
 
+pub mod origin;
+
 pub const VERSION_MARKER: &str = "sensor-wire";
 pub const WIRE_VERSION: u32 = 1;
 

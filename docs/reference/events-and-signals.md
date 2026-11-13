@@ -28,8 +28,8 @@ A frozen NDJSON record - one line per event, no embedded `\n` or `\r` (test
 | `v` | u32 | wire version (`WIRE_VERSION`, currently 1) |
 | `source_ip` | IpAddr | attacker source |
 | `wan_ip` | Option\<IpAddr\> | serializes as `"wan_ip":null` when None (test `null_wan_ip_serializes`, `crates/sensor-wire/src/lib.rs#null_wan_ip_serializes`) |
-| `sensor` | String | sensor name |
-| `signal_type` | String | plain string, **not** the enum - keeps sensor-wire free of a core-scoring dependency; intake validates it against the known set (`crates/sensor-wire/src/lib.rs#SensorEvent`) |
+| `sensor` | String | sensor name; a claim, not proof: intake holds it to the log the line was read from ([origin policy](#what-a-log-line-may-claim-the-origin-policy)) |
+| `signal_type` | String | plain string, **not** the enum - keeps sensor-wire free of a core-scoring dependency; intake validates it against the known set (`crates/sensor-wire/src/lib.rs#SensorEvent`) and against what its sensor can emit |
 | `protocol` | String | plain string, same rationale |
 | `authenticated` | bool | |
 | `observed_at` | DateTime\<Utc\> | RFC 3339 via chrono's default serde - **must** match `hashing.rs`; switching to `ts_microseconds` (integer timestamp) would break the hash chain (`crates/sensor-wire/src/lib.rs#SensorEvent`) |
@@ -344,6 +344,11 @@ authenticated. Its `source_ip` is the address the events came from (the first on
 overflow and network summaries), its `wan_ip` and `sensor` are the first folded event's, its
 protocol is `tcp` and its `session_id` is fresh.
 
+Only the five sensor-cred sensors write these summaries, and only from them is one accepted: a
+line marked `event_summary: true` under any other sensor's name is refused by intake and by the
+shipper ([origin policy](#what-a-log-line-may-claim-the-origin-policy)), because one such line
+is counted as up to a million events.
+
 | key | type | meaning |
 |---|---|---|
 | `event_summary` | boolean | always `true`; marks the event as a summary |
@@ -447,6 +452,76 @@ SampleRef), `capture_reason`, and `url` on `honeypot_file_download`. It groups c
 skipped by every rule. The [ATT&CK tag rules](attack-tagging.md) read the same keys, plus the
 event's `sensor` and `signal_type`; the `command_decoded` text replaces `command` when present.
 
+## What a log line may claim: the origin policy
+
+Each sensor runs as its own user and writes its own log, so the operating system proves which
+sensor wrote a file. The line's own `sensor`, `signal_type`, `protocol`, `authenticated` and
+`observed_at` prove nothing: they are whatever the writing process put there. Intake therefore
+checks every line that parses, before anything else is done with it, against the log it was read
+from. A line that fails is logged at WARN with the reason and counted as rejected
+(`propolis_events_rejected_total`), exactly like a line the converter rejects: it is not
+quarantined, the cursor passes it and it is not read again
+(`crates/intake/src/runner.rs#run_batch`).
+
+**A timestamp from the future.** A line whose `observed_at` is more than one hour ahead of the
+daemon's clock is refused, whatever kind of line it is, `sensor_stats` and probe lines included
+(`crates/intake/src/runner.rs#MAX_FUTURE_SKEW`, `crates/intake/src/runner.rs#ahead_of_clock`).
+A future-dated event would hold its address's score undecayed and its listing inside every feed
+window until the clock caught up. The warning gives how far ahead the line is; the cause is
+almost always the clock of the host that wrote it, or of this one. The bound is an hour and not
+less because a refused line is gone, and an honest collector whose clock drifted by minutes must
+not lose evidence. A line dated in the past is never refused for its age (a backlog can be days
+old); scoring instead never lets an older event move `last_seen` or the decay anchor backwards
+([scoring](scoring-and-feed.md#decay)).
+
+**The origin of the line** (`crates/sensor-wire/src/origin.rs#check`). The label of the log is the
+name in its `PROPOLIS_SENSOR_LOGS` entry. A label that equals a sensor name in the table below is
+bound to that sensor, and the five sensor-cred labels of the shipped configuration are bound to
+their protocols: `cred-vnc` to `vnc`, `cred-mysql` to `mysql`, `cred-mssql` to `mssql`, `cred-pg`
+to `postgresql`, `cred-mongo` to `mongodb` (`crates/sensor-wire/src/origin.rs#bound_sensor`). The
+match is exact. Any other label (a collector id on a control plane, a label of your own) is not
+bound. Four rules apply to every line except a `sensor_stats` line, which keeps its own exact
+comparison with the label:
+
+1. The line's `sensor` must be one of the names in the table, on every log.
+2. On a bound log, the line's `sensor` must be the sensor the log is bound to.
+3. The line's `signal_type` and `protocol` must be among those of its sensor's row, and
+   `authenticated` may be `true` only if that sensor ever authenticates.
+4. A line marked `event_summary: true` must come from a sensor that writes summaries.
+
+A probe-source line is held to the same rules before its sensor name is used, so a log can only
+confirm the reachability of a sensor it is allowed to speak for. A log that is not bound may
+carry any known sensor's lines, each held to its own sensor's row (rules 1, 3 and 4): that is
+what a control plane's per-collector stream is, and there the per-log binding is applied earlier,
+by the shipper on the collector ([split deployment](../operations/split-deployment.md)).
+
+| `sensor` | signal types | protocol | may authenticate | may summarize |
+|---|---|---|---|---|
+| `ssh` | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_file_download`, `honeypot_malware_upload`, `honeypot_session_end` | tcp | yes | no |
+| `telnet` | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_file_download`, `honeypot_malware_upload`, `catchall_probe` | tcp | yes | no |
+| `adb` | `honeypot_connection`, `honeypot_command_exec`, `honeypot_file_download`, `honeypot_malware_upload` | tcp | no | no |
+| `redis` | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec` | tcp | yes | no |
+| `http` | `honeypot_connection`, `honeypot_command_exec` | tcp | no | no |
+| `ftp` | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_malware_upload` | tcp | yes | no |
+| `smtp` | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec` | tcp | yes | no |
+| `tftp` | `honeypot_connection`, `honeypot_malware_upload` | udp | no | no |
+| `mqtt` | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec`, `honeypot_malware_upload`, `honeypot_session_end` | tcp | yes | no |
+| `dns` | `honeypot_connection`, `honeypot_command_exec` | udp, tcp | no | no |
+| `catchall` | `catchall_probe` | tcp, udp | no | no |
+| `vnc`, `mysql`, `mssql`, `mongodb` (sensor-cred) | `honeypot_connection`, `honeypot_login_attempt` | tcp | yes | yes |
+| `postgresql` (sensor-cred) | `honeypot_connection`, `honeypot_login_attempt`, `honeypot_command_exec` | tcp | yes | yes |
+
+The table is `crates/sensor-wire/src/origin.rs#SENSORS`. It lists what each sensor's code can
+emit, so it has to change in the same commit as a sensor that gains an event: a row that is too
+narrow drops real evidence. The sensors hold it to themselves. The one function every sensor
+writes through asserts, in debug builds, that the event is within its own sensor's row
+(`crates/sensor-framework/src/emit.rs#append`, `crates/sensor-wire/src/origin.rs#conforms`), so a
+sensor's test suite fails before intake could refuse what it writes. Release builds do not
+check: a sensor never declines to record what it saw.
+
+What the policy cannot refuse is a sensor forging events of its own kind under its own name
+([residual risks](../security/residual-risks.md)).
+
 ## Signal types
 
 17 signal types (`signal_type_enum`, mirrored by Rust `SignalType`). Sixteen of them
@@ -457,7 +532,7 @@ definition and its DB type are owned by
 
 The `meaning` column below is **[inferred]** from each identifier and its weight -
 only `weight`, `confidence`, and `category` are directly evidenced in code. Which
-sensor actually emits a given signal is not asserted here.
+sensor emits which signal is the table [above](#what-a-log-line-may-claim-the-origin-policy).
 
 ## Signal weight table
 

@@ -3,6 +3,9 @@ use collector_wire::hash::ZERO_HASH;
 use log_tailer::LogTailer;
 use shipper::batcher::{Batcher, MAX_RECORDS_FRAME_SAFE};
 
+/// The label of the log every test here reads, as `PROPOLIS_SHIPPER_SENSOR_LOGS` would name it.
+const LOG: &str = "ssh";
+
 #[test]
 fn builds_the_first_batch_from_whole_tailed_lines_then_drains_to_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -10,7 +13,8 @@ fn builds_the_first_batch_from_whole_tailed_lines_then_drains_to_none() {
     std::fs::write(&log_path, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
     let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
 
-    let batch1 = Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100)
+    let batch1 = Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, 100)
+        .batch
         .expect("three whole lines are available");
     assert_eq!(batch1.seq, 1);
     assert_eq!(batch1.prev_batch_hash, ZERO_HASH);
@@ -21,7 +25,11 @@ fn builds_the_first_batch_from_whole_tailed_lines_then_drains_to_none() {
 
     // The tailer is drained: a second call must return None, not an empty-records batch
     // (`Batch::new` panics on empty records, so `None` is the only sane empty signal).
-    assert!(Batcher::next_batch(&mut tailer, batch1.seq, batch1.batch_hash, 100).is_none());
+    assert!(
+        Batcher::next_batch(&mut tailer, LOG, batch1.seq, batch1.batch_hash, 100)
+            .batch
+            .is_none()
+    );
 
     // A new line arrives; the next batch chains onto batch1's hash and increments seq.
     let mut f = std::fs::OpenOptions::new()
@@ -32,7 +40,8 @@ fn builds_the_first_batch_from_whole_tailed_lines_then_drains_to_none() {
     f.write_all(b"{\"d\":4}\n").unwrap();
     drop(f);
 
-    let batch2 = Batcher::next_batch(&mut tailer, batch1.seq, batch1.batch_hash, 100)
+    let batch2 = Batcher::next_batch(&mut tailer, LOG, batch1.seq, batch1.batch_hash, 100)
+        .batch
         .expect("one more whole line is available");
     assert_eq!(batch2.seq, 2);
     assert_eq!(batch2.prev_batch_hash, batch1.batch_hash);
@@ -46,11 +55,15 @@ fn caps_the_batch_at_max_records() {
     std::fs::write(&log_path, "1\n2\n3\n4\n5\n").unwrap();
     let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
 
-    let batch = Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 2).unwrap();
+    let batch = Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, 2)
+        .batch
+        .unwrap();
     assert_eq!(batch.records.len(), 2);
     assert_eq!(batch.records, vec![b"1".to_vec(), b"2".to_vec()]);
 
-    let batch2 = Batcher::next_batch(&mut tailer, batch.seq, batch.batch_hash, 2).unwrap();
+    let batch2 = Batcher::next_batch(&mut tailer, LOG, batch.seq, batch.batch_hash, 2)
+        .batch
+        .unwrap();
     assert_eq!(batch2.records, vec![b"3".to_vec(), b"4".to_vec()]);
 }
 
@@ -60,7 +73,11 @@ fn an_empty_log_yields_no_batch() {
     let log_path = dir.path().join("events.jsonl");
     std::fs::write(&log_path, "").unwrap();
     let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
-    assert!(Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100).is_none());
+    assert!(
+        Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, 100)
+            .batch
+            .is_none()
+    );
 }
 
 #[test]
@@ -122,7 +139,8 @@ fn an_over_length_lossy_expanded_record_is_dropped_and_does_not_block_the_next_r
     std::fs::write(&log_path, &content).unwrap();
 
     let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
-    let batch = Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100)
+    let batch = Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, 100)
+        .batch
         .expect("the normal second line still yields a batch");
 
     assert_eq!(
@@ -134,7 +152,11 @@ fn an_over_length_lossy_expanded_record_is_dropped_and_does_not_block_the_next_r
 
     // Both raw lines were consumed from the tailer (the oversized one dropped, not left
     // unconsumed to be re-read forever) - a third call finds nothing left.
-    assert!(Batcher::next_batch(&mut tailer, batch.seq, batch.batch_hash, 100).is_none());
+    assert!(
+        Batcher::next_batch(&mut tailer, LOG, batch.seq, batch.batch_hash, 100)
+            .batch
+            .is_none()
+    );
 }
 
 /// When EVERY line a read produces is over-length, `next_batch` must return `None` (not build a
@@ -151,7 +173,9 @@ fn a_read_where_every_line_is_over_length_yields_none_not_a_stall() {
 
     let mut tailer = LogTailer::new(log_path.clone(), dir.path().join("cursors"));
     assert!(
-        Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100).is_none(),
+        Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, 100)
+            .batch
+            .is_none(),
         "a read producing only over-length records must yield None, not panic or an empty batch"
     );
 
@@ -166,7 +190,8 @@ fn a_read_where_every_line_is_over_length_yields_none_not_a_stall() {
     f.write_all(b"{\"b\":2}\n").unwrap();
     drop(f);
 
-    let batch = Batcher::next_batch(&mut tailer, 0, ZERO_HASH, 100)
+    let batch = Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, 100)
+        .batch
         .expect("the newly appended normal line yields a batch");
     assert_eq!(batch.records, vec![b"{\"b\":2}".to_vec()]);
 }
@@ -185,8 +210,9 @@ fn next_batch_never_exceeds_the_frame_safe_ceiling_even_when_asked_for_more() {
     let mut tailer = LogTailer::new(log_path, dir.path().join("cursors"));
 
     let requested = MAX_RECORDS_FRAME_SAFE + 50; // deliberately far over the ceiling
-    let batch =
-        Batcher::next_batch(&mut tailer, 0, ZERO_HASH, requested).expect("lines are available");
+    let batch = Batcher::next_batch(&mut tailer, LOG, 0, ZERO_HASH, requested)
+        .batch
+        .expect("lines are available");
     assert_eq!(batch.records.len(), MAX_RECORDS_FRAME_SAFE);
     for (i, record) in batch.records.iter().enumerate() {
         assert_eq!(record, &i.to_string().into_bytes());
@@ -194,13 +220,193 @@ fn next_batch_never_exceeds_the_frame_safe_ceiling_even_when_asked_for_more() {
 
     // The 5 lines beyond the ceiling were never read (clamped at the tailer read, not dropped
     // after), so they are still there for the next batch.
-    let batch2 = Batcher::next_batch(&mut tailer, batch.seq, batch.batch_hash, requested)
+    let batch2 = Batcher::next_batch(&mut tailer, LOG, batch.seq, batch.batch_hash, requested)
+        .batch
         .expect("the remaining 5 lines are available");
     assert_eq!(batch2.records.len(), 5);
     for (i, record) in batch2.records.iter().enumerate() {
         assert_eq!(
             record,
             &(MAX_RECORDS_FRAME_SAFE + i).to_string().into_bytes()
+        );
+    }
+}
+
+fn event(sensor: &str, signal_type: &str, source_ip: &str) -> sensor_wire::SensorEvent {
+    sensor_wire::SensorEvent {
+        v: sensor_wire::WIRE_VERSION,
+        source_ip: source_ip.parse().unwrap(),
+        wan_ip: None,
+        sensor: sensor.into(),
+        signal_type: signal_type.into(),
+        protocol: sensor_wire::PROTO_TCP.into(),
+        authenticated: false,
+        observed_at: "2026-11-13T10:00:00Z".parse().unwrap(),
+        metadata: serde_json::json!({ "protocol_label": sensor }),
+        sample: None,
+        session_id: None,
+        occurrence_id: None,
+        reply: None,
+    }
+}
+
+/// Writes `lines` as a log and returns a tailer at its start.
+fn log_of(dir: &std::path::Path, lines: &[String]) -> LogTailer {
+    std::fs::create_dir_all(dir).unwrap();
+    let log_path = dir.join("events.jsonl");
+    let content: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&log_path, content).unwrap();
+    LogTailer::new(log_path, dir.join("cursors"))
+}
+
+fn json(event: &sensor_wire::SensorEvent) -> String {
+    serde_json::to_string(event).unwrap()
+}
+
+/// The shipper is the last place a collector's logs are still one per sensor: the gateway spools
+/// them all into one stream. A line in the catchall log that claims to be ssh's authenticated
+/// upload, or that claims more than catchall can observe, must not leave the collector, and the
+/// honest lines around it must.
+#[test]
+fn a_line_the_origin_policy_refuses_for_its_log_is_not_shipped_and_the_rest_of_the_batch_is() {
+    use sensor_wire::{SIGNAL_CATCHALL_PROBE, SIGNAL_HONEYPOT_MALWARE_UPLOAD};
+    let dir = tempfile::tempdir().unwrap();
+    let honest = json(&event("catchall", SIGNAL_CATCHALL_PROBE, "203.0.113.55"));
+    let mut forged = event("ssh", SIGNAL_HONEYPOT_MALWARE_UPLOAD, "203.0.113.80");
+    forged.authenticated = true;
+    let mut authenticated = event("catchall", SIGNAL_CATCHALL_PROBE, "203.0.113.80");
+    authenticated.authenticated = true;
+    let upload = event("catchall", SIGNAL_HONEYPOT_MALWARE_UPLOAD, "203.0.113.80");
+    let mut summary = event("catchall", SIGNAL_CATCHALL_PROBE, "203.0.113.80");
+    summary.metadata["event_summary"] = true.into();
+    let unknown = event("backdoor", SIGNAL_CATCHALL_PROBE, "203.0.113.80");
+    let last = json(&event("catchall", SIGNAL_CATCHALL_PROBE, "203.0.113.56"));
+    let mut tailer = log_of(
+        dir.path(),
+        &[
+            honest.clone(),
+            json(&forged),
+            json(&authenticated),
+            json(&upload),
+            json(&summary),
+            json(&unknown),
+            last.clone(),
+        ],
+    );
+
+    let next = Batcher::next_batch(&mut tailer, "catchall", 0, ZERO_HASH, 100);
+    assert_eq!(next.refused, 5);
+    let batch = next.batch.expect("the honest lines still make a batch");
+    assert_eq!(
+        batch.records,
+        vec![honest.into_bytes(), last.into_bytes()],
+        "exactly the honest lines, byte for byte and in order"
+    );
+    assert_eq!(batch.seq, 1);
+
+    // The refused lines were consumed with the rest: nothing is left to read or to re-ship.
+    let after = Batcher::next_batch(&mut tailer, "catchall", batch.seq, batch.batch_hash, 100);
+    assert_eq!((after.batch, after.refused), (None, 0));
+}
+
+/// The same lines are evidence when they come from the log of the sensor that writes them, and
+/// a log that is not bound to a sensor (a label the shipped configuration does not use) carries
+/// any known sensor's lines.
+#[test]
+fn the_policy_is_applied_for_the_label_of_the_log_the_line_was_read_from() {
+    use sensor_wire::{SIGNAL_HONEYPOT_CONNECTION, SIGNAL_HONEYPOT_MALWARE_UPLOAD};
+    let mut upload = event("ssh", SIGNAL_HONEYPOT_MALWARE_UPLOAD, "203.0.113.80");
+    upload.authenticated = true;
+    let lines = [
+        json(&upload),
+        json(&event("vnc", SIGNAL_HONEYPOT_CONNECTION, "203.0.113.81")),
+    ];
+    for (label, shipped, refused) in [
+        ("ssh", vec![&lines[0]], 1),
+        ("cred-vnc", vec![&lines[1]], 1),
+        ("telnet", vec![], 2),
+        ("my-sensors", vec![&lines[0], &lines[1]], 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tailer = log_of(dir.path(), &lines);
+        let next = Batcher::next_batch(&mut tailer, label, 0, ZERO_HASH, 100);
+        assert_eq!(next.refused, refused, "{label}");
+        let records = next.batch.map(|batch| batch.records).unwrap_or_default();
+        let expected: Vec<Vec<u8>> = shipped.iter().map(|l| l.as_bytes().to_vec()).collect();
+        assert_eq!(records, expected, "{label}");
+    }
+}
+
+/// When the policy refuses every line of a read there is no batch to build, the count is still
+/// reported, and the tailer has moved on: the next read returns what follows.
+#[test]
+fn a_read_where_every_line_is_refused_yields_no_batch_and_reports_the_count() {
+    use sensor_wire::{SIGNAL_CATCHALL_PROBE, SIGNAL_HONEYPOT_LOGIN_ATTEMPT};
+    let dir = tempfile::tempdir().unwrap();
+    let forged = json(&event("ssh", SIGNAL_HONEYPOT_LOGIN_ATTEMPT, "203.0.113.80"));
+    let mut tailer = log_of(dir.path(), &[forged.clone(), forged.clone(), forged]);
+
+    let next = Batcher::next_batch(&mut tailer, "catchall", 0, ZERO_HASH, 100);
+    assert_eq!((next.batch, next.refused), (None, 3));
+
+    let honest = json(&event("catchall", SIGNAL_CATCHALL_PROBE, "203.0.113.55"));
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join("events.jsonl"))
+        .unwrap();
+    use std::io::Write;
+    writeln!(f, "{honest}").unwrap();
+    drop(f);
+    let next = Batcher::next_batch(&mut tailer, "catchall", 0, ZERO_HASH, 100);
+    assert_eq!(next.refused, 0);
+    assert_eq!(next.batch.unwrap().records, vec![honest.into_bytes()]);
+}
+
+/// The shipper judges only what it can read as a sensor event. A line that does not parse is
+/// shipped exactly as it is: the control plane rejects and counts it, and dropping it here would
+/// hide a malfunctioning sensor from that count.
+#[test]
+fn a_line_that_does_not_parse_as_a_sensor_event_is_shipped_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let lines = [
+        "not json at all".to_string(),
+        "{\"v\":1,\"source_ip\":\"203.0.113.80\",\"sensor\":\"ssh\"".to_string(),
+        "{\"sensor\":\"ssh\",\"signal_type\":\"honeypot_malware_upload\"}".to_string(),
+        "[]".to_string(),
+    ];
+    let mut tailer = log_of(dir.path(), &lines);
+    let next = Batcher::next_batch(&mut tailer, "catchall", 0, ZERO_HASH, 100);
+    assert_eq!(next.refused, 0);
+    let expected: Vec<Vec<u8>> = lines.iter().map(|l| l.as_bytes().to_vec()).collect();
+    assert_eq!(next.batch.unwrap().records, expected);
+}
+
+/// A sensor's own stats line has no row in the origin policy. It is shipped as it is, whichever
+/// log it sits in; the control plane's intake validates it and never lets it reach the ledger.
+#[test]
+fn a_sensor_stats_line_is_shipped_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = sensor_wire::SensorStats {
+        sensor: "ssh".into(),
+        uptime_secs: 61,
+        is_final: false,
+        dropped: 0,
+        spool_refused: 0,
+        truncated: 0,
+        refused: 0,
+        budget_current: 0,
+        budget_high_water: 0,
+        budget_refused: 0,
+    };
+    let line = json(&stats.to_event("2026-11-13T10:00:00Z".parse().unwrap()));
+    for label in ["ssh", "catchall", "collector-01"] {
+        let mut tailer = log_of(&dir.path().join(label), std::slice::from_ref(&line));
+        let next = Batcher::next_batch(&mut tailer, label, 0, ZERO_HASH, 100);
+        assert_eq!(next.refused, 0, "{label}");
+        assert_eq!(
+            next.batch.unwrap().records,
+            vec![line.clone().into_bytes()],
+            "{label}"
         );
     }
 }

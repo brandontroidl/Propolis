@@ -194,12 +194,19 @@ pub struct CycleReport {
     /// Task 12's outer loop uses to decide whether to sleep `POLL_INTERVAL_MS` before the next
     /// cycle.
     pub batches_shipped: u64,
+    /// How many lines this cycle read and did not ship because the origin policy refused them
+    /// for this log (see `Batcher::next_batch`). A batch that is rewound and read again counts
+    /// its refused lines again.
+    pub refused: u64,
     pub stopped: Option<StopReason>,
 }
 
 /// Runs one ship cycle to completion: loads the confirmed state for `key`, then repeatedly
 /// builds the next batch from `tailer` and ships it over `stream` until `Batcher::next_batch`
-/// returns `None` (nothing left to ship) or the cycle stops early (see [`StopReason`]).
+/// returns no batch (nothing left to ship) or the cycle stops early (see [`StopReason`]).
+/// `label` is the `PROPOLIS_SHIPPER_SENSOR_LOGS` name of the log `tailer` reads: the batcher
+/// holds each line to the origin policy for it, and a read whose lines were all refused is
+/// passed (cursor persisted) without ending the cycle.
 ///
 /// Per batch: `Accepted`, and a `Duplicate` that is exactly this batch's own crash-retry echo
 /// (`ack.next_expected_seq == batch.seq + 1`), advance the confirmed state, persist it, THEN
@@ -218,6 +225,7 @@ pub struct CycleReport {
 pub async fn ship_cycle(
     stream: &mut ShipperStream,
     tailer: &mut LogTailer,
+    label: &str,
     state_dir: &Path,
     key: &str,
     max_records: usize,
@@ -226,12 +234,28 @@ pub async fn ship_cycle(
     let mut confirmed = ConfirmedState::load_or_fresh(state_dir, key);
     let mut report = CycleReport::default();
 
-    while let Some(batch) = Batcher::next_batch(
-        tailer,
-        confirmed.last_seq,
-        confirmed.last_batch_hash,
-        max_records,
-    ) {
+    loop {
+        let next = Batcher::next_batch(
+            tailer,
+            label,
+            confirmed.last_seq,
+            confirmed.last_batch_hash,
+            max_records,
+        );
+        report.refused += next.refused;
+        let Some(batch) = next.batch else {
+            if next.refused == 0 {
+                break;
+            }
+            // Every line of this read was refused by the origin policy. Like a line intake
+            // rejects, they are passed for good: every batch before them in this cycle was
+            // confirmed, so nothing unshipped sits behind the cursor, and a log that carried
+            // nothing else would otherwise be read from the same place after every restart.
+            // More lines may follow, so the cycle carries on.
+            tailer.commit_batch();
+            tailer.persist_cursor()?;
+            continue;
+        };
         let frame = encode_frame(&batch);
         let mut consecutive_retries: u32 = 0;
 

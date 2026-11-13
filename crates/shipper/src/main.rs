@@ -208,6 +208,7 @@ async fn run_ship_loop(
             let report = match ship_cycle(
                 &mut stream,
                 tailer,
+                sensor_name,
                 &state_dir,
                 &collector_id,
                 max_records,
@@ -228,6 +229,17 @@ async fn run_ship_loop(
 
             if report.batches_shipped > 0 {
                 any_shipped = true;
+            }
+            // Each refused line was already logged with its reason; this is the cycle's total,
+            // so a log that keeps carrying lines it has no business carrying stands out.
+            if report.refused > 0 {
+                tracing::warn!(
+                    sensor = %sensor_name,
+                    refused = report.refused,
+                    batches_shipped = report.batches_shipped,
+                    "shipper: this cycle dropped lines the origin policy refuses for this log; \
+                     they were not shipped"
+                );
             }
 
             match report.stopped {

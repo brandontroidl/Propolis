@@ -46,14 +46,22 @@ loss and duplication are counted from the source side rather than from the ledge
 All sources are RFC 5737 addresses, plus `2001:db8::/32` for the long tail; the WAN addresses are
 RFC 5737 too. Telnet carries 40% of its lines from five hot sources (shares 50, 27, 13, 7 and 3
 percent), 20% from 500 warm sources and 40% from a long tail of 300000, the tiers the intake
-performance work measured. Its signal mix is 45% command, 40% login, 13% connection and 2%
-session end. Command text is what bot loops send: short probes, download-and-run chains, and echo
+performance work measured. Its signal mix is 45% command, 40% login and 15% connection. Command
+text is what bot loops send: short probes, download-and-run chains, and echo
 loaders that carry a binary as `\xNN` escapes, which are the long lines (up to about 64 KB). Lines
 average about 0.9 KB.
 
-The other sensors run at a fraction of the telnet rate. The defaults (ssh 0.08, http 0.06, cred
-0.03, adb 0.02) are an assumption, not a measured ratio: set them from the live journal with
+The other sensors run at a fraction of the telnet rate. The defaults (ssh 0.08, http 0.06,
+postgresql 0.03, adb 0.02) are an assumption, not a measured ratio: set them from the live journal with
 `--mix`.
+
+Each log is named after its sensor, as in the shipped configuration, so intake binds it to that
+sensor and holds every line to the
+[origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy).
+The generator therefore writes only what the named sensor emits (the telemetry signal,
+`honeypot_session_end`, is 2% of the ssh stream; http and adb lines are never authenticated), and
+`--mix` refuses a name that is not a sensor's or whose mix that sensor could not have written
+(`crates/propolis/examples/soak/traffic.rs#mix_refusal`).
 
 Designed absences, each tracked by sequence number so the accounting expects them:
 
@@ -120,7 +128,7 @@ sensor's batch time.
 | `--dir` | required | output directory |
 | `--database-url` | `DATABASE_URL` | scratch database |
 | `--rate` | 750 | telnet lines per second |
-| `--mix` | `ssh=0.08,http=0.06,cred=0.03,adb=0.02` | other sensors, as fractions of `--rate`; `name=0` removes one |
+| `--mix` | `ssh=0.08,http=0.06,postgresql=0.03,adb=0.02` | other sensors, as fractions of `--rate`; `name=0` removes one; a name must be a sensor's |
 | `--duration` | 600 | seconds of live load |
 | `--prefill-bytes` | 0 | backdated backlog written first (`K`, `M`, `G` suffixes) |
 | `--sample-secs` | 10 | sampling interval |

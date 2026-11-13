@@ -1,8 +1,16 @@
 //! Assembles the next sequenced, hash-chained [`Batch`] from whole lines read off a
 //! [`LogTailer`]. Pure with respect to the network: this module only reads the tailer and builds
 //! frames in memory, it never ships anything.
+//!
+//! It is also the last place a line's origin is known. Each sensor on a collector writes its own
+//! log as its own user, and the batches built here from all of them become one stream at the
+//! gateway, where nothing says which log a record came from. So a line is held to the origin
+//! policy for the log it was read from (`sensor_wire::origin::check`) before it is batched, and a
+//! line the policy refuses is not shipped.
 use collector_wire::frame::{Batch, MAX_FRAME_LEN, MAX_RECORD_LEN};
 use log_tailer::LogTailer;
+use sensor_wire::origin::{self, OriginError};
+use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent};
 
 /// Largest record count for which a batch is GUARANTEED to encode within [`MAX_FRAME_LEN`], no
 /// matter how large the individual records are (up to their own [`MAX_RECORD_LEN`] cap).
@@ -34,15 +42,44 @@ const _: () = assert!(
 /// 16) can never produce an oversized frame either.
 pub const DEFAULT_MAX_RECORDS: usize = MAX_RECORDS_FRAME_SAFE;
 
+/// What one [`Batcher::next_batch`] call made of the lines it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextBatch {
+    /// The next batch, or `None` when the tailer had nothing new to offer or none of the lines
+    /// it read may be shipped (an empty batch cannot be built: `Batch::new` requires at least one
+    /// record).
+    pub batch: Option<Batch>,
+    /// Lines read and left out because the origin policy refused them for this log.
+    pub refused: u64,
+}
+
+/// Whether a line read from the log labelled `label` may be shipped.
+///
+/// Only a line that parses as a sensor event is judged. Anything else is shipped as it is: the
+/// control plane rejects and counts a line it cannot parse, as it does on a single node, and
+/// dropping it here would hide it from that count. A sensor's own `sensor_stats` line has no row
+/// in the policy and is shipped as it is too; intake validates those on their own path.
+fn admit(label: &str, line: &str) -> Result<(), OriginError> {
+    let Ok(event) = serde_json::from_str::<SensorEvent>(line) else {
+        return Ok(());
+    };
+    if event.signal_type == SIGNAL_SENSOR_STATS {
+        return Ok(());
+    }
+    origin::check(label, &event)
+}
+
 /// Builds a [`Batch`] out of up to `max_records` whole lines tailed from a sensor log.
 pub struct Batcher;
 
 impl Batcher {
-    /// Reads up to `max_records` complete lines from `tailer` and, if any were available, wraps
-    /// them in the next batch: `seq = last_seq + 1`, `prev_batch_hash = last_hash`.
+    /// Reads up to `max_records` complete lines from `tailer`, the log labelled `label` in
+    /// `PROPOLIS_SHIPPER_SENSOR_LOGS`, and, if any may be shipped, wraps them in the next batch:
+    /// `seq = last_seq + 1`, `prev_batch_hash = last_hash`.
     ///
-    /// Returns `None` when the tailer has nothing new to offer (an empty batch cannot be built:
-    /// `Batch::new` requires at least one record).
+    /// A line that parses as a sensor event and fails the origin policy for `label` is dropped
+    /// with a warning and counted in [`NextBatch::refused`]: a sensor's log may only carry what
+    /// that sensor is able to write, under its own name.
     ///
     /// Does NOT call `tailer.persist_cursor()`. `read_batch` already advances the tailer's
     /// in-memory cursor for the lines it returns, but persisting that cursor is deliberately
@@ -51,10 +88,11 @@ impl Batcher {
     /// and re-ships it rather than silently dropping it.
     pub fn next_batch(
         tailer: &mut LogTailer,
+        label: &str,
         last_seq: u64,
         last_hash: [u8; 32],
         max_records: usize,
-    ) -> Option<Batch> {
+    ) -> NextBatch {
         // Clamp at the read, not after: reading MAX_RECORDS_FRAME_SAFE+1 lines and then
         // dropping the last one would still advance the tailer's cursor past it (`read_batch`
         // consumes what it returns), permanently losing that line. Clamping the count passed
@@ -63,8 +101,12 @@ impl Batcher {
         // larger than the frame-safe ceiling (see `DEFAULT_MAX_RECORDS`'s doc comment).
         let n = max_records.min(MAX_RECORDS_FRAME_SAFE);
         let lines = tailer.read_batch(n);
+        let mut refused = 0u64;
         if lines.is_empty() {
-            return None;
+            return NextBatch {
+                batch: None,
+                refused,
+            };
         }
 
         // log-tailer bounds a raw tailed LINE to MAX_LINE_BYTES (== MAX_RECORD_LEN), but it
@@ -94,18 +136,36 @@ impl Batcher {
                     );
                     return None;
                 }
+                // Dropped the same way, and for good: the gateway spools every log of this
+                // collector into one stream, so past this point nothing can tell that the line
+                // came from a log that had no business carrying it.
+                if let Err(e) = admit(label, &line) {
+                    tracing::warn!(
+                        sensor = %label,
+                        error = %e,
+                        "shipper: dropping a line the origin policy refuses for this log"
+                    );
+                    refused += 1;
+                    return None;
+                }
                 Some(line.into_bytes())
             })
             .collect();
 
         if records.is_empty() {
-            // Every line this read produced was over-length and skipped: nothing to ship this
-            // round, but the tailer's cursor already advanced past them (read_batch consumes
-            // what it returns), so the next call reads whatever follows rather than re-reading
-            // these forever.
-            return None;
+            // Every line this read produced was over-length or refused, and skipped: nothing to
+            // ship this round, but the tailer's cursor already advanced past them (read_batch
+            // consumes what it returns), so the next call reads whatever follows rather than
+            // re-reading these forever.
+            return NextBatch {
+                batch: None,
+                refused,
+            };
         }
 
-        Some(Batch::new(last_seq + 1, last_hash, records))
+        NextBatch {
+            batch: Some(Batch::new(last_seq + 1, last_hash, records)),
+            refused,
+        }
     }
 }

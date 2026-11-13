@@ -114,7 +114,7 @@ impl Point {
             / 1e6;
         let wedged = self.sensors.values().filter(|s| s.wedged.is_some()).count();
         format!(
-            "t={:>5.0}s eps={:>7.0} written={:>7.0}/s lag[telnet={} ssh={} http={} cred={} adb={}]s behind={:.1}MB \
+            "t={:>5.0}s eps={:>7.0} written={:>7.0}/s lag[telnet={} ssh={} http={} postgresql={} adb={}]s behind={:.1}MB \
              rss={}MB cpu={}% lockwait[p95={:.0} max={:.0}]ms ledger={:.0}MB pass={}({}s ago) wedged={} restarts={}{}",
             self.t,
             self.ingest_eps,
@@ -122,7 +122,7 @@ impl Point {
             lag("telnet"),
             lag("ssh"),
             lag("http"),
-            lag("cred"),
+            lag("postgresql"),
             lag("adb"),
             behind_mb,
             self.rss_kb

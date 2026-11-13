@@ -491,8 +491,17 @@ mod tests {
         // Automatic publication is an opt-in. A config built with `..FeedConfig::default()` (the
         // standalone binary, every test) must get the approval-gated statement.
         assert!(!FeedConfig::default().volume_auto_publish);
-        assert!(volume_candidates_sql(false).contains("v.state = 'approved'"));
-        assert!(!volume_candidates_sql(true).contains("volume_review"));
+        let gated = volume_candidates_sql(false);
+        assert!(gated.contains("v.state = 'approved'"));
+        assert!(
+            !gated.contains("recommended_for_blocklist"),
+            "the default statement reads no address without a decision: {gated}"
+        );
+        // The opt-in adds the automatic condition and keeps the approved one, so setting it
+        // never takes an approved address out.
+        let automatic = volume_candidates_sql(true);
+        assert!(automatic.contains("s.recommended_for_blocklist = true AND s.eligible = false"));
+        assert!(automatic.contains("v.state = 'approved'"));
     }
 
     /// A candidate last seen `hours_ago`, with a deliberately non-default value in every field so

@@ -12,7 +12,10 @@
 #   rollback.sh --list           lists the kept releases, newest first.
 #   rollback.sh [--with-database] [--identity FILE] [--yes] [RELEASE]
 #                                stops the services, puts RELEASE (default: the newest) back,
-#                                reloads systemd and starts them again.
+#                                reloads systemd and starts them again. The kept alert library
+#                                goes back only when it serves every script that sources it and
+#                                is in place afterwards (check_alert_lib); otherwise the current
+#                                one stays.
 #
 # Binaries alone are enough when the upgrade changed no schema. When it ran new migrations, the
 # older daemon refuses the newer database at startup (sqlx reports a migration it does not know),
@@ -47,7 +50,18 @@ STORE="$ROOT/var/lib/propolis/rollback"
 KEEP=3
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4,40}$'
 SET_RE='^[0-9]{8}T[0-9]{6}Z-pre-upgrade$'
-SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert)
+SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert propolis-alert-lib)
+# The shared library of the shell alerting code, and the installed scripts that may source it,
+# each as <copy in a kept release>:<installed path under ROOT>. A script that sources it states
+# the library version it needs on a `# needs-alert-lib: <n>` line (none or no line: 0); the
+# library states its own on a `PA_LIB_VERSION=<n>` line.
+ALERT_LIB=propolis-alert-lib
+ALERT_LIB_CONSUMERS=(
+    sbin/propolis-alert:usr/local/sbin/propolis-alert
+    sbin/propolis-witness:usr/local/sbin/propolis-witness
+    sbin/propolis-status:usr/local/sbin/propolis-status
+    lib/config-check.sh:usr/local/lib/propolis/config-check.sh
+)
 SENSORS=(sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred)
 
 usage() {
@@ -79,6 +93,57 @@ installed_sha() {
 }
 
 field() { sed -n "s/^$1=//p" "$2" | head -n 1; }
+
+# number_line FILE SED_PREFIX: the integer on the first line of FILE that is SED_PREFIX followed by
+# digits, or 0 when the file or the line is missing. Never fails. Blanks around the digits and a
+# CRLF ending are allowed: read as 0, a hand-edited line would let an older library back in.
+number_line() {
+    local n=""
+    [ -f "$1" ] && n="$(sed -n "s/^$2[[:space:]]*\([0-9]\{1,9\}\)[[:space:]]*$/\1/p" "$1" 2>/dev/null | head -n 1)" || n=""
+    printf '%s' "$(( 10#${n:-0} ))"
+}
+
+# The library version rule. A rollback must never pair a script that sources the library with an
+# older library that lacks a function it calls. Functions are only ever added to the library, so a
+# newer library serves an older script, and keeping the current library is always safe. For each
+# consumer, the copy in place after the rollback is the kept one when the kept release holds it
+# (the restore loops put it back) and the current one otherwise. The kept library is restored
+# only when its version is at least the largest that any of those copies needs; otherwise its
+# name joins RESTORE_SKIP, which the restore loops leave out, and the run says why.
+RESTORE_SKIP=()
+check_alert_lib() {
+    local dir="$1" pair kept current copy need lib_version
+    local most=0 who=""
+    [ -f "$dir/sbin/$ALERT_LIB" ] || return 0
+    for pair in "${ALERT_LIB_CONSUMERS[@]}"; do
+        kept="${pair%%:*}"
+        current="${pair#*:}"
+        if [ -f "$dir/$kept" ]; then
+            copy="$dir/$kept"
+        else
+            copy="$ROOT/$current"
+        fi
+        need="$(number_line "$copy" '# needs-alert-lib: ')"
+        if [ "$need" -gt "$most" ]; then
+            most="$need"
+            who="${current##*/}"
+        fi
+    done
+    lib_version="$(number_line "$dir/sbin/$ALERT_LIB" 'PA_LIB_VERSION=')"
+    if [ "$lib_version" -lt "$most" ]; then
+        echo "    kept the current alert library: the kept one is version $lib_version, and $who needs $most"
+        RESTORE_SKIP+=("$ALERT_LIB")
+    fi
+}
+
+# skipped NAME: whether a rule above keeps the current copy of NAME.
+skipped() {
+    local name
+    for name in ${RESTORE_SKIP[@]+"${RESTORE_SKIP[@]}"}; do
+        [ "$name" = "$1" ] && return 0
+    done
+    return 1
+}
 
 save() {
     require_root
@@ -582,9 +647,20 @@ restore() {
 
     echo "==> putting the kept binaries, helpers and units back"
     STEP="putting the kept files back"
+    check_alert_lib "$dir"
+    local name
     shopt -s nullglob
     for f in "$dir"/bin/*; do install -m 0755 "$f" "$ROOT/usr/local/bin/$(basename "$f")"; done
-    for f in "$dir"/sbin/*; do install -m 0755 "$f" "$ROOT/usr/local/sbin/$(basename "$f")"; done
+    for f in "$dir"/sbin/*; do
+        name="$(basename "$f")"
+        skipped "$name" && continue
+        # The library is sourced, never run: 0644, as the deploy scripts install it.
+        if [ "$name" = "$ALERT_LIB" ]; then
+            install -m 0644 "$f" "$ROOT/usr/local/sbin/$name"
+        else
+            install -m 0755 "$f" "$ROOT/usr/local/sbin/$name"
+        fi
+    done
     for f in "$dir"/units/*; do install -m 0644 "$f" "$ROOT/etc/systemd/system/$(basename "$f")"; done
     shopt -u nullglob
     [ -f "$dir/deploy-stamp.json" ] && install -m 0644 "$dir/deploy-stamp.json" "$ROOT/var/lib/propolis/deploy-stamp.json"

@@ -152,11 +152,14 @@ existing units. Observable required directives (`deploy/sensor-ssh.service`):
   and `NoExecPaths=/` with `ExecPaths=/usr/local/bin/sensor-<name> /usr/lib -/usr/lib64` (the
   binary and its libraries are the only executable content; a sensor execs nothing; `/usr/lib64`
   is optional because arm64 hosts have none).
-- `InaccessiblePaths=` naming, `-`-prefixed, every other unit's env file, `watch.env` and
-  `/etc/propolis/certs` (copy the list from `deploy/sensor-ssh.service` and drop your own
-  `<name>.env`), and add `-/etc/propolis/<name>.env` to every other sensor unit's list: the
-  test derives the set from every unit's `EnvironmentFile=` and holds each sensor unit to it
-  exactly, so both halves fail until done.
+- `InaccessiblePaths=` naming, `-`-prefixed, every other unit's env file, `watch.env`,
+  `migrate.env`, `alert.env` and `/etc/propolis/certs` (copy the list from
+  `deploy/sensor-ssh.service` and drop your own `<name>.env`), and add
+  `-/etc/propolis/<name>.env` to every other sensor unit's list: the test derives the set from
+  every unit's `EnvironmentFile=`, plus the env files no unit loads, taken from the files that
+  name them (`deploy/migrate.sh#MIGRATE_ENV`, `deploy/alert-lib.sh#PA_ALERT_ENV_NAME`,
+  `crates/watch/src/config.rs#WATCH_ENV_PATH`; nothing reads `alert.env` yet), and holds each
+  sensor unit to it exactly, so both halves fail until done.
 - Resource caps: `MemoryMax=512M`, `TasksMax=`, `LimitNOFILE=`, `CPUQuota=`.
 
 > **`SystemCallFilter` is a placeholder, not a shipped hardened filter.** The units

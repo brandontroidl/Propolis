@@ -367,6 +367,19 @@
     user.name ...` and `user.email ...`
   ([formats](deploy/blocklist-README.md#formats),
   [publishing](docs/operations/routine-procedures.md)).
+- **Provisioning now prepares hosts for the root alerting code; nothing an operator is sent
+  changes.** `deploy/provision.sh` (run by `install.sh` and `upgrade.sh`) creates
+  `/var/lib/propolis/witness` (0750 root:propolis) with an empty root-only `state.lock`, created
+  only when missing and never replaced, and installs and applies
+  `/etc/tmpfiles.d/propolis.conf`, so `/run/propolis-witness` (0750 root:propolis) and
+  `/run/motd.d` exist now and after every boot. A failure of that tmpfiles step prints a
+  warning and does not stop an install or an upgrade. Both deploy scripts install the shared library
+  of the shell alerting code as `/usr/local/sbin/propolis-alert-lib` (0644); nothing sources it
+  yet. Every sensor unit also denies itself `/etc/propolis/alert.env` by mount, a name reserved
+  for the root alert senders; nothing reads it yet and no unit loads it. A rollback keeps the
+  library with the other helpers and restores it only when it serves every script left in place
+  ([rollback](docs/operations/upgrade-rollback-and-dr.md#rollback),
+  [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories)).
 
 ### Added
 

@@ -1000,6 +1000,300 @@ fn a_rollback_puts_exactly_the_kept_files_back_and_restarts_in_order() {
     );
 }
 
+/// `deploy/alert-lib.sh` as shipped, with its version line set to `version`, so the fixture
+/// carries the line in the exact form the rollback script reads.
+fn alert_lib_at(version: u32) -> String {
+    let lib = read(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/alert-lib.sh"
+    )));
+    let lines: Vec<String> = lib
+        .lines()
+        .map(|l| {
+            if l.starts_with("PA_LIB_VERSION=") {
+                format!("PA_LIB_VERSION={version}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    assert_eq!(
+        lib.lines()
+            .filter(|l| l.starts_with("PA_LIB_VERSION="))
+            .count(),
+        1,
+        "deploy/alert-lib.sh must carry one PA_LIB_VERSION= line"
+    );
+    lines.join("\n") + "\n"
+}
+
+/// A consumer of the library (the failure hook, the status command) that needs `version`.
+fn consumer_needing(version: u32) -> String {
+    format!("#!/usr/bin/env bash\n# needs-alert-lib: {version}\necho consumer\n")
+}
+
+fn installed_lib_version(fx: &Fixture) -> String {
+    read(&fx.root.join("usr/local/sbin/propolis-alert-lib"))
+        .lines()
+        .find(|l| l.starts_with("PA_LIB_VERSION="))
+        .unwrap_or("none")
+        .to_string()
+}
+
+#[test]
+fn save_keeps_the_alert_library_with_the_other_helpers() {
+    let fx = Fixture::new();
+    std::fs::write(
+        fx.root.join("usr/local/sbin/propolis-alert-lib"),
+        alert_lib_at(1),
+    )
+    .unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let kept = fx.store().join(&fx.releases()[0]);
+    assert!(
+        read(&kept.join("sbin/propolis-alert-lib")).contains("PA_LIB_VERSION=1\n"),
+        "the library is kept with the helpers"
+    );
+}
+
+/// The library version rule, the direction that keeps the current library: a consumer that the
+/// rollback leaves in place needs more than the kept library has, so restoring it would leave
+/// that consumer calling functions that are not there.
+#[test]
+fn a_kept_library_older_than_a_consumer_that_stays_keeps_the_current_library_and_says_so() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(1)).unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
+    // Not one of the helpers a kept release holds, so the newer copy stays after the rollback.
+    write_exec(&sbin.join("propolis-status"), &consumer_needing(2));
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "kept the current alert library: the kept one is version 1, and propolis-status needs 2"
+        ),
+        "{stdout}"
+    );
+    // The rest of the release still goes back.
+    assert!(read(&fx.root.join("etc/systemd/system/propolis.service")).contains("ExecStart=old"));
+}
+
+/// The kept copy of a consumer is the one that counts when the rollback restores it: here the
+/// kept hook needs more than the kept library has, though the current hook would not.
+#[test]
+fn a_kept_consumer_that_needs_more_than_the_kept_library_keeps_the_current_library() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
+    write_exec(&sbin.join("propolis-alert"), &consumer_needing(3));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(3)).unwrap();
+    write_exec(&sbin.join("propolis-alert"), &consumer_needing(1));
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=3");
+    assert!(read(&sbin.join("propolis-alert")).contains("needs-alert-lib: 3"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "kept the current alert library: the kept one is version 2, and propolis-alert needs 3"
+        ),
+        "{stdout}"
+    );
+}
+
+/// The other direction: every consumer in place after the rollback (the kept hook, which goes
+/// back, and the current status command, which stays) is served by the kept library, so it goes
+/// back too, readable and not executable, as the deploy scripts install it.
+#[test]
+fn a_kept_library_that_every_consumer_in_place_accepts_is_restored() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
+    write_exec(&sbin.join("propolis-alert"), &consumer_needing(2));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(3)).unwrap();
+    write_exec(&sbin.join("propolis-alert"), &consumer_needing(3));
+    write_exec(&sbin.join("propolis-status"), &consumer_needing(1));
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    let mode = std::fs::metadata(sbin.join("propolis-alert-lib"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o644, "the library goes back 0644, got {mode:o}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("kept the current alert library"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// A release kept before the library was installed holds none, and the one in place stays. A
+/// consumer that stays and needs a version must not make the run report a kept library at
+/// version 0, which does not exist.
+#[test]
+fn a_kept_release_without_the_library_leaves_the_current_one_in_place() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
+    write_exec(&sbin.join("propolis-status"), &consumer_needing(1));
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("kept the current alert library"),
+        "nothing to keep or say when the kept release has no library"
+    );
+}
+
+/// `deploy/alert-lib.sh` as shipped with its version line replaced by `line` verbatim, for the
+/// spellings `alert_lib_at` cannot produce.
+fn alert_lib_with_version_line(line: &str) -> String {
+    alert_lib_at(0).replace("PA_LIB_VERSION=0\n", &format!("{line}\n"))
+}
+
+/// Keeps a library at `kept` in a release, upgrades to one at `current`, puts `consumer` at
+/// `installed` (a path under the root), rolls back, and returns what the run printed.
+fn roll_back_with_consumer(
+    fx: &Fixture,
+    kept: &str,
+    current: u32,
+    installed: &str,
+    consumer: &str,
+) -> String {
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), kept).unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(current)).unwrap();
+    write_exec(&fx.root.join(installed), consumer);
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Every consumer rollback weighs counts, the witness among them.
+#[test]
+fn a_current_witness_that_needs_more_than_the_kept_library_keeps_the_current_library() {
+    let fx = Fixture::new();
+    let stdout = roll_back_with_consumer(
+        &fx,
+        &alert_lib_at(1),
+        2,
+        "usr/local/sbin/propolis-witness",
+        &consumer_needing(2),
+    );
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    assert!(
+        stdout.contains(
+            "kept the current alert library: the kept one is version 1, and propolis-witness needs 2"
+        ),
+        "{stdout}"
+    );
+}
+
+/// The installed config-check, under `/usr/local/lib/propolis`, counts too.
+#[test]
+fn a_current_config_check_that_needs_more_than_the_kept_library_keeps_the_current_library() {
+    let fx = Fixture::new();
+    let stdout = roll_back_with_consumer(
+        &fx,
+        &alert_lib_at(1),
+        2,
+        "usr/local/lib/propolis/config-check.sh",
+        &consumer_needing(2),
+    );
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    assert!(
+        stdout.contains(
+            "kept the current alert library: the kept one is version 1, and config-check.sh needs 2"
+        ),
+        "{stdout}"
+    );
+}
+
+/// A version with a leading zero is read in base 10, not taken for octal by bash.
+#[test]
+fn a_library_version_with_a_leading_zero_is_read_as_decimal() {
+    let fx = Fixture::new();
+    let stdout = roll_back_with_consumer(
+        &fx,
+        &alert_lib_with_version_line("PA_LIB_VERSION=08"),
+        10,
+        "usr/local/sbin/propolis-status",
+        &consumer_needing(9),
+    );
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=10");
+    assert!(
+        stdout.contains(
+            "kept the current alert library: the kept one is version 8, and propolis-status needs 9"
+        ),
+        "{stdout}"
+    );
+}
+
+/// Of two needs lines the first is the one read. The deploy tests refuse a second line in a
+/// shipped script; this pins what rollback does with a copy that has one anyway.
+#[test]
+fn of_two_needs_lines_the_first_is_the_one_read() {
+    let fx = Fixture::new();
+    let stdout = roll_back_with_consumer(
+        &fx,
+        &alert_lib_at(2),
+        3,
+        "usr/local/sbin/propolis-status",
+        "#!/usr/bin/env bash\n# needs-alert-lib: 1\n# needs-alert-lib: 5\necho consumer\n",
+    );
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=2");
+    assert!(
+        !stdout.contains("kept the current alert library"),
+        "{stdout}"
+    );
+}
+
+/// A needs line with blanks around the number, or a CRLF ending, still counts. Read as needing
+/// nothing, it would let an older library go back under the script.
+#[test]
+fn a_needs_line_with_stray_blanks_or_a_crlf_ending_still_counts() {
+    for consumer in [
+        "#!/usr/bin/env bash\n# needs-alert-lib: 2 \necho consumer\n",
+        "#!/usr/bin/env bash\n# needs-alert-lib:  2\necho consumer\n",
+        "#!/usr/bin/env bash\r\n# needs-alert-lib: 2\r\necho consumer\r\n",
+    ] {
+        let fx = Fixture::new();
+        let stdout = roll_back_with_consumer(
+            &fx,
+            &alert_lib_at(1),
+            2,
+            "usr/local/sbin/propolis-status",
+            consumer,
+        );
+        assert_eq!(
+            installed_lib_version(&fx),
+            "PA_LIB_VERSION=2",
+            "{consumer:?}"
+        );
+        assert!(
+            stdout.contains(
+                "kept the current alert library: the kept one is version 1, and propolis-status needs 2"
+            ),
+            "{consumer:?}: {stdout}"
+        );
+    }
+}
+
 /// The new database gets the owner the current one has. On a node that splits its database roles
 /// that is the owner role, not the role `DATABASE_URL` connects as: created for the connecting
 /// role, the daemon's role would own the database and the split would be undone without a word.

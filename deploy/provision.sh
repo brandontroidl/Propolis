@@ -15,7 +15,8 @@
 #
 # This script does NOT start, enable, restart, or stop any service, and does NOT touch binaries.
 # It creates the service env files empty and keeps them 0600 (env-files.sh) and derives
-# watch.env (watch-env.sh); it never writes a value into an operator's env file.
+# watch.env (watch-env.sh); it never writes a value into an operator's env file. It installs
+# and applies the tmpfiles entry for the /run directories (propolis-tmpfiles.conf).
 #
 # Usage: sudo ./provision.sh          (provisions for real)
 #        DRY_RUN=1 ./provision.sh     (prints every action without touching the system; no
@@ -24,6 +25,7 @@
 set -euo pipefail
 
 DRY_RUN="${DRY_RUN:-0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '==> %s\n' "$*"; }
 
@@ -177,6 +179,10 @@ ensure_dir /var/lib/propolis/backup-status 0755 root             root
 # used to sit beside the feed, in the daemon's own directory, where a link the daemon planted made
 # the cron write through it; here only the sync account writes, and the daemon can still stat it.
 ensure_dir /var/lib/propolis/blocklist-status 0755 propolis-blocklist propolis-blocklist
+# State of the root alerting code; only root writes it. Group propolis may enter and read the
+# directory, never write it, so the daemon cannot rename, replace or plant anything in it, and
+# every file inside is 0600 root:root. Its parent above is root-owned for the same reason.
+ensure_dir /var/lib/propolis/witness      0750 root              propolis
 # propolis-blocklist's home (known_hosts, the deploy key), outside /var/lib/propolis.
 ensure_dir /var/lib/propolis-blocklist    0750 propolis-blocklist propolis-blocklist
 # The backup sets themselves. Group propolis-backup-pull may enter and list it; each plaintext set
@@ -197,6 +203,53 @@ ensure_dir /var/lib/propolis-backup-pull/.ssh 0755 root          root
 # (deploy/watch-authorized-keys.example).
 ensure_dir /var/lib/propolis-watch        0750 root              propolis-watch
 ensure_dir /var/lib/propolis-watch/.ssh   0755 root              root
+
+# The one lock every root writer of the witness directory takes, by flock on a read-only
+# descriptor. Created empty when missing and never replaced: a new inode while a writer holds the
+# old one would let a second writer in. One left with another owner or mode by an earlier build is
+# corrected in place, which keeps the inode. Root-only, because any account that can open the
+# file can hold the lock and stall every root writer. A link or anything other than a regular
+# file is reported and left alone, never followed. The state files themselves are not created
+# here: the first root writer creates each one, 0600. A function so the tests can run each case.
+ensure_witness_lock() {
+    local lock="$1" parent="${1%/*}"
+    # A dry run by an account outside group propolis cannot search the 0750 directory, so every
+    # test below would call the lock missing even where it exists.
+    if [ "$DRY_RUN" -eq 1 ] && [ -d "$parent" ] && [ ! -x "$parent" ]; then
+        log "cannot see whether $lock exists without root; a real run creates it only when missing"
+        return 0
+    fi
+    if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+        run install -m 0600 -o root -g root /dev/null "$lock"
+    elif [ -L "$lock" ] || [ ! -f "$lock" ]; then
+        log "warning: $lock is not a regular file; left alone. Remove it, then run this script again"
+    else
+        log "$lock already exists; kept"
+        if [ "$(stat -c '%U:%G %a' -- "$lock")" != "root:root 600" ]; then
+            run chown root:root "$lock"
+            run chmod 0600 "$lock"
+        fi
+    fi
+}
+WITNESS_LOCK=/var/lib/propolis/witness/state.lock
+ensure_witness_lock "$WITNESS_LOCK"
+
+# /run starts empty at every boot, so its directories come from a tmpfiles entry systemd applies
+# at boot; applied here as well, so an install or upgrade does not wait for a reboot. After the
+# users, since it names group propolis. See the entry's own header for the two directories.
+#
+# A failure here is reported and does not end the script. upgrade.sh runs this script after it
+# has installed the new binaries and before it installs the units, so stopping here would leave
+# a host half upgraded for two directories no service needs in order to start.
+apply_tmpfiles_entry() {
+    local conf="$1" dest="$2"
+    log "installing and applying the tmpfiles entry for /run"
+    if run install -m 0644 "$conf" "$dest" && run systemd-tmpfiles --create "$dest"; then
+        return 0
+    fi
+    log "warning: the tmpfiles entry for /run was not applied, so /run/propolis-witness and /run/motd.d may be missing. Nothing needs them to start. Fix the cause shown above, then run this script again"
+}
+apply_tmpfiles_entry "$SCRIPT_DIR/propolis-tmpfiles.conf" /etc/tmpfiles.d/propolis.conf
 
 # ---- 3. spool directories (mount points only - see printed fstab guidance in install.sh) ----
 

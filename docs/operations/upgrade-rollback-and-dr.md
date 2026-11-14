@@ -42,14 +42,19 @@ The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin] [--adopt-hi
    retention that cannot fit before an upgrade meets it.
 3. Installs the built binaries (`propolis`, the 12 sensors, `gateway`, `shipper`)
    to `/usr/local/bin/` with `install -m 0755`.
-4. Runs `deploy/provision.sh` (idempotent users + directories), then
+4. Runs `deploy/provision.sh` (idempotent users + directories, the root alerting state
+   directory `/var/lib/propolis/witness` with its empty `state.lock`, and the tmpfiles entry
+   for `/run/propolis-witness` and `/run/motd.d`, see
+   [filesystem paths](../reference/filesystem-paths.md#alerting-state-and-runtime-directories)), then
    `deploy/provision-tls.sh`, which mints a self-signed TLS pair for each
    TLS-capable sensor that lacks one and leaves any existing pair, including an
    operator-supplied real certificate, untouched (`deploy/upgrade.sh#provision-tls.sh`;
    run by hand with `sudo deploy/provision-tls.sh`, `DRY_RUN=1` to preview, see
    [networking-tls.md](networking-tls.md#sensor-tls-attacker-facing-listeners)).
    It then reinstalls the production unit files and `logrotate-sensors.conf` (the same set `install.sh`
-   installs; `gateway.service`/`shipper.service` only where already enabled), then
+   installs; `gateway.service`/`shipper.service` only where already enabled) and the
+   `propolis-*` helpers in `/usr/local/sbin`, among them the shared library of the shell
+   alerting code, `propolis-alert-lib` (0644: it is sourced, never run), then
    runs `systemctl daemon-reload` so the restarts below pick up the new unit
    definitions.
 5. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
@@ -486,6 +491,21 @@ it. It shows what it is about to do and asks you to type the release name (`--ye
 that). Then it stops the enabled services, puts the kept binaries, helpers, unit files and
 deploy stamp back, reloads systemd, starts the services again and waits for
 `propolis.service` to stay up.
+
+**The alert library goes back only when it fits.** The kept helpers include
+`/usr/local/sbin/propolis-alert-lib`, the shared library of the shell alerting code. A script
+that sources it states the library version it needs on a `# needs-alert-lib: <n>` line, and the
+library states its own on its `PA_LIB_VERSION=<n>` line. Before it puts files back, the script
+works out which copy of each such script will be in place afterwards (the kept one when the kept
+release holds it, the current one otherwise) and restores the kept library only when its version
+is at least the largest any of them needs (`deploy/rollback.sh#check_alert_lib`). Otherwise it
+keeps the current library, which serves older scripts too because functions are only ever added
+to it, and prints `kept the current alert library: the kept one is version <k>, and <script>
+needs <n>`. Blanks around the number and a CRLF ending do not hide a line
+(`deploy/rollback.sh#number_line`), so a hand-edited copy is still weighed; a missing line counts
+as 0. A kept release from before the library was installed holds none, and the current one
+stays. No installed script carries the `# needs-alert-lib` line yet, so today the kept library
+always goes back. The restored library is installed 0644, as the deploy scripts install it.
 
 **When the upgrade changed the schema**, the binaries alone are not enough. Migrations only run
 forward and no down-migration exists, so the older daemon refuses the newer database at

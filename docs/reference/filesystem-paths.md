@@ -73,9 +73,42 @@ to learn the owner role's name before a restore. No unit loads it and
 it.
 
 Each upgrade keeps the release it replaces in `/var/lib/propolis/rollback/<UTC time>-<commit>`
-(0700 root; `deploy/rollback.sh#save`): its binaries, `propolis-*` helpers, unit files, deploy
+(0700 root; `deploy/rollback.sh#save`): its binaries, `propolis-*` helpers (among them the alert
+library `propolis-alert-lib`, which a rollback restores only when it fits the scripts left in
+place, `deploy/rollback.sh#check_alert_lib`), unit files, deploy
 stamp, and a `manifest` naming the commit and the pre-upgrade backup set. The newest 3 are
 kept. See [rollback](../operations/upgrade-rollback-and-dr.md#rollback).
+
+## Alerting state and runtime directories
+
+Provisioned for the root shell alerting code. Nothing writes state into these directories yet
+and no script sources the library: the persistent directory holds only the empty lock, and the
+runtime one is empty.
+
+| Path | Mode | Owner | Created by |
+|---|---|---|---|
+| `/var/lib/propolis/witness/` | 0750 | root:propolis | `deploy/provision.sh#ensure_dir /var/lib/propolis/witness` |
+| `/var/lib/propolis/witness/state.lock` | 0600, empty | root:root | `deploy/provision.sh#WITNESS_LOCK`, only when missing |
+| `/run/propolis-witness/` | 0750 | root:propolis | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
+| `/run/motd.d/` | 0755 | root:root | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
+| `/etc/tmpfiles.d/propolis.conf` | 0644 | root:root | `deploy/provision.sh#propolis-tmpfiles.conf`, from `deploy/propolis-tmpfiles.conf` |
+| `/usr/local/sbin/propolis-alert-lib` | 0644 | root:root | `deploy/install.sh#alert-lib.sh` and `deploy/upgrade.sh#alert-lib.sh`, from `deploy/alert-lib.sh` |
+
+- Only root writes in `/var/lib/propolis/witness` and `/run/propolis-witness`. Group `propolis`
+  may enter and read them and never write them, and their parents, `/var/lib/propolis` and
+  `/run`, are root-owned, so the daemon can neither plant nor replace anything there.
+- The lock is root-only because any account that can open it can hold it and stall every root
+  writer. `provision.sh` creates it only when it is missing and never replaces it (a new file
+  while a writer holds the old one would let a second writer in); one left with another owner
+  or mode is corrected in place, and a link or other non-regular file in its place is reported
+  and left alone.
+- `/run` is empty after every boot, so the two `/run` directories come from the tmpfiles entry,
+  which systemd applies at boot and `provision.sh` applies on every install and upgrade
+  (`systemd-tmpfiles --create`). They do not come from a unit's `RuntimeDirectory=`, which
+  systemd removes when that unit stops. If installing or applying the entry fails,
+  `provision.sh` prints a warning and goes on (`deploy/provision.sh#apply_tmpfiles_entry`): no
+  service needs either directory in order to start, and stopping there would leave an upgrade
+  half done. Fix the cause it shows, then run `sudo ./deploy/provision.sh` again.
 
 ## Spool / quarantine (uploaded-artifact capture)
 
@@ -185,9 +218,12 @@ itself) and `/var/log/propolis`.
   `deploy/propolis.service#EnvironmentFile=/etc/propolis/propolis.env`). `install.sh` writes no value into them
   (`deploy/install.sh#OPERATOR-owned /etc/propolis/*.env file`): provisioning (`deploy/env-files.sh`)
   creates each missing one empty and closes any that is open, and the operator populates them.
-  Each sensor unit makes every env file it does not load, plus `watch.env` and `certs/`,
-  inaccessible by mount (`InaccessiblePaths=`, `-`-prefixed so an absent file does not fail
-  the unit); the unit's own file is read by systemd before the namespace exists.
+  Each sensor unit makes every env file it does not load, plus `watch.env`, `migrate.env`,
+  `alert.env` and `certs/`, inaccessible by mount (`InaccessiblePaths=`, `-`-prefixed so an
+  absent file does not fail the unit); the unit's own file is read by systemd before the
+  namespace exists. `alert.env` is reserved for the root shell alert senders, named by
+  `deploy/alert-lib.sh#PA_ALERT_ENV_NAME`; nothing reads it yet, no unit loads it and nothing
+  creates it, so the sensors are denied it before it holds anything.
 - **Derived, secret-free env files** written by deploy scripts, never by hand:
   `/etc/propolis/fleet-listeners.env` (`deploy/fleet-listeners.sh`) and
   `/etc/propolis/watch.env`, root:propolis-watch 0640, holding only the `PROPOLIS_SENSOR_LOGS` line

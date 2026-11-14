@@ -2,11 +2,11 @@
 # shellcheck disable=SC2034 # the PA_* variables are this library's output, read by its callers
 #
 # The shared library of the shell alerting code, to be sourced by the failure hook's record step,
-# the witness, the status command and config-check, and installed as
-# /usr/local/sbin/propolis-alert-lib. Sourced, never executed. It sets no shell options and no
-# trap (a trap set here would replace the caller's), and defines functions and PA_* variables
-# only. Every function returns a status and works under the caller's `set -u` and `set -e`
-# without relying on either.
+# the witness, the status command and config-check. deploy/install.sh and deploy/upgrade.sh
+# install it as /usr/local/sbin/propolis-alert-lib, 0644. Sourced, never executed. It sets no
+# shell options and no trap (a trap set here would replace the caller's), and defines functions
+# and PA_* variables only. Every function returns a status and works under the caller's `set -u`
+# and `set -e` without relying on either.
 #
 # WHY ONE LIBRARY. Four programs read the same env files, state files, lock and ids. Four copies
 # of the env reader or of the state-file format would drift, and a drift here is silent: one
@@ -34,12 +34,11 @@
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" >&2; exit 64; fi
 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
-# change meaning, so a newer library serves an older consumer. Nothing reads the number yet: the
-# rollback script will compare it with what each consumer needs before it restores an older
-# library.
+# change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
+# the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
 PA_LIB_VERSION=1
-# The optional env file of the shell senders; the deploy tests will derive the sensors' denied set
-# from this name.
+# The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
+# this name.
 PA_ALERT_ENV_NAME=alert.env
 
 # Writers trim incidents to 192 KiB; readers accept up to 1 MiB, so a file a writer produced is

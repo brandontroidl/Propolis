@@ -865,11 +865,15 @@ fn every_unit_readwrite_dir_is_provisioned() {
 /// The `/var/spool/propolis/*` and `/var/lib/propolis/*` entries in `unit`'s `ReadWritePaths=`
 /// lines - the spool/state directories a sensor must be able to write, and the exact class of
 /// directory the telnet outage was missing. `/var/log/propolis/*` log directories are provisioned
-/// by the same routine but excluded here; they are not what this regression test targets.
+/// by the same routine but excluded here; they are not what this regression test targets. One
+/// leading `-` is stripped first: systemd skips a `-` grant whose directory is missing instead of
+/// failing the unit, which hides the missing directory instead of making it safe, so such a grant
+/// is held to provisioning like any other.
 fn spool_state_read_write_dirs(unit: &str) -> Vec<String> {
     unit.lines()
         .filter(|l| l.starts_with("ReadWritePaths="))
         .flat_map(|l| l.trim_start_matches("ReadWritePaths=").split_whitespace())
+        .map(|p| p.strip_prefix('-').unwrap_or(p))
         .filter(|p| {
             p.starts_with("/var/spool/propolis/")
                 || p.starts_with("/var/lib/propolis/")
@@ -900,6 +904,594 @@ fn provisioned_dirs() -> HashSet<String> {
             tokens.next().map(str::to_string)
         })
         .collect()
+}
+
+/// A `-` grant is the form every root alerting unit uses for its state directories, so the parser
+/// that feeds `every_unit_readwrite_dir_is_provisioned` must see through the prefix, or those
+/// grants would pass that test unchecked.
+#[test]
+fn a_read_write_grant_with_the_dash_prefix_is_still_held_to_provisioning() {
+    let unit = "ReadWritePaths=-/var/lib/propolis/witness -/run/propolis-witness /var/spool/propolis/ssh\n";
+    assert_eq!(
+        spool_state_read_write_dirs(unit),
+        vec![
+            "/var/lib/propolis/witness".to_string(),
+            "/var/spool/propolis/ssh".to_string()
+        ]
+    );
+}
+
+/// The `d` lines of `deploy/propolis-tmpfiles.conf`, by path.
+fn tmpfiles_dirs() -> HashSet<String> {
+    deploy_file("propolis-tmpfiles.conf")
+        .lines()
+        .filter_map(|l| {
+            let mut fields = l.split_whitespace();
+            if fields.next()? != "d" {
+                return None;
+            }
+            fields.next().map(str::to_string)
+        })
+        .collect()
+}
+
+/// `/run` is empty after every boot, so a `/run` directory a unit is granted must come back
+/// before that unit runs. Only tmpfiles brings one back for several units at once: a oneshot's
+/// own `RuntimeDirectory=` is removed when that unit stops, under any other unit using it. The
+/// failure hook's `/run/propolis-alert` is the one exception, created by its own unit's
+/// `RuntimeDirectory=` and kept by `RuntimeDirectoryPreserve=`.
+#[test]
+fn every_unit_run_dir_is_in_tmpfiles() {
+    let created = tmpfiles_dirs();
+    let mut checked_any = false;
+    for name in service_units() {
+        if !name.starts_with("propolis-") {
+            continue;
+        }
+        checked_any = true;
+        let missing = run_dirs_missing_from_tmpfiles(&deploy_file(&name), &created);
+        assert!(
+            missing.is_empty(),
+            "deploy/{name} grants {missing:?}, which deploy/propolis-tmpfiles.conf does not \
+             create: after a reboot the unit would find them missing"
+        );
+    }
+    assert!(checked_any, "no deploy/propolis-*.service units walked");
+}
+
+/// The `/run` directories `unit_text` grants in `ReadWritePaths=`, with or without the `-`
+/// prefix, that `created` does not hold. `/run/propolis-alert` is left out: its own unit creates
+/// and keeps it.
+fn run_dirs_missing_from_tmpfiles(unit_text: &str, created: &HashSet<String>) -> Vec<String> {
+    uncommented(unit_text)
+        .lines()
+        .filter_map(|l| l.strip_prefix("ReadWritePaths="))
+        .flat_map(str::split_whitespace)
+        .map(|token| token.strip_prefix('-').unwrap_or(token))
+        .filter(|path| path.starts_with("/run/") && *path != "/run/propolis-alert")
+        .filter(|path| !created.contains(*path))
+        .map(str::to_string)
+        .collect()
+}
+
+/// No unit grants a `/run` directory yet, so the walk above checks nothing today; this holds the
+/// walker itself to what it must find once one does.
+#[test]
+fn a_run_grant_missing_from_tmpfiles_is_found_with_or_without_the_dash_prefix() {
+    let created: HashSet<String> = ["/run/propolis-witness", "/run/motd.d"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let unit = "[Service]\n# ReadWritePaths=/run/commented\nReadWritePaths=-/run/propolis-witness -/run/other /run/propolis-alert /var/lib/propolis\n";
+    assert_eq!(
+        run_dirs_missing_from_tmpfiles(unit, &created),
+        vec!["/run/other".to_string()]
+    );
+}
+
+/// The tmpfiles entry holds exactly the two runtime directories the root alerting code needs: the
+/// witness's, which the daemon's group may enter but not write, and `/run/motd.d`, which a stock
+/// Debian host may lack and which `ProtectSystem=strict` keeps a unit from creating.
+#[test]
+fn the_tmpfiles_entry_creates_exactly_the_witness_run_directory_and_the_motd_directory() {
+    let lines: Vec<String> = uncommented(&deploy_file("propolis-tmpfiles.conf"))
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "d /run/propolis-witness 0750 root propolis -".to_string(),
+            "d /run/motd.d 0755 root root -".to_string(),
+        ]
+    );
+}
+
+/// The witness's state directory and its lock exist before anything writes them, the lock is
+/// created only when missing and never replaced (a new inode under a held lock would let two
+/// writers in at once), and the tmpfiles entry is installed and applied. Every step goes through
+/// `run`, so a dry run shows it and changes nothing. No state file is written here: the first
+/// root writer creates each one.
+#[test]
+fn provision_creates_the_witness_directory_and_its_lock_and_applies_the_tmpfiles_entry() {
+    let provision = deploy_file("provision.sh");
+    let lines: Vec<&str> = provision.lines().map(str::trim).collect();
+    let at = |what: &str, pred: &dyn Fn(&str) -> bool| {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("provision.sh has no {what}"))
+    };
+    let users = at("last user", &|l| l == "ensure_user propolis-cred");
+    let var_lib = at("/var/lib/propolis", &|l| {
+        l.starts_with("ensure_dir /var/lib/propolis ")
+    });
+    let witness = at("witness directory", &|l| {
+        l.split_whitespace().collect::<Vec<_>>()
+            == [
+                "ensure_dir",
+                "/var/lib/propolis/witness",
+                "0750",
+                "root",
+                "propolis",
+            ]
+    });
+    let lock = at("lock install", &|l| {
+        l == "run install -m 0600 -o root -g root /dev/null \"$lock\""
+    });
+    let lock_fn = at("ensure_witness_lock", &|l| l == "ensure_witness_lock() {");
+    let lock_call = at("lock call", &|l| {
+        l == "ensure_witness_lock \"$WITNESS_LOCK\""
+    });
+    assert!(lock_fn < lock && lock < lock_call);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("ensure_witness_lock "))
+            .count(),
+        1,
+        "provision.sh must make the lock exactly once"
+    );
+    // Install, then apply, both through `run`, in the one function the script calls once.
+    let tmpfiles_fn = at("apply_tmpfiles_entry", &|l| l == "apply_tmpfiles_entry() {");
+    let tmpfiles_steps = at("tmpfiles install and create", &|l| {
+        l == "if run install -m 0644 \"$conf\" \"$dest\" && run systemd-tmpfiles --create \"$dest\"; then"
+    });
+    let tmpfiles_call = at("tmpfiles call", &|l| {
+        l == "apply_tmpfiles_entry \"$SCRIPT_DIR/propolis-tmpfiles.conf\" /etc/tmpfiles.d/propolis.conf"
+    });
+    assert!(users < var_lib && var_lib < witness && witness < lock_call);
+    assert!(users < tmpfiles_fn && tmpfiles_fn < tmpfiles_steps && tmpfiles_steps < tmpfiles_call);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("apply_tmpfiles_entry "))
+            .count(),
+        1,
+        "provision.sh must apply the tmpfiles entry exactly once"
+    );
+    assert!(
+        lines.contains(&"WITNESS_LOCK=/var/lib/propolis/witness/state.lock"),
+        "provision.sh must name the lock in WITNESS_LOCK"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\"")),
+        "provision.sh must find its own directory for the tmpfiles source"
+    );
+    // The lock is created behind a test for its existence, and an existing one is only ever
+    // re-owned and re-moded in place.
+    let lock_lines: Vec<&&str> = lines
+        .iter()
+        .filter(|l| (l.contains("$WITNESS_LOCK") || l.contains("$lock")) && !l.starts_with('#'))
+        .collect();
+    assert!(
+        lines[..lock]
+            .iter()
+            .rev()
+            .take(3)
+            .any(|l| l.contains("[ ! -e \"$lock\" ]")),
+        "the lock install must sit behind a test that the lock is missing"
+    );
+    for l in &lock_lines {
+        assert!(
+            !l.contains("rm ") && !l.contains("mv ") && !l.contains("> "),
+            "provision.sh must never replace or truncate the lock: {l}"
+        );
+        if l.starts_with("chown") || l.starts_with("chmod") {
+            panic!("a change to the lock must go through run: {l}");
+        }
+    }
+    assert!(
+        lock_lines
+            .iter()
+            .any(|l| **l == "run chown root:root \"$lock\"")
+    );
+    assert!(lock_lines.iter().any(|l| **l == "run chmod 0600 \"$lock\""));
+    for name in [
+        "incidents",
+        "send-ledger",
+        "readcheck",
+        "meta",
+        "observe",
+        "testpage",
+        "id-salt",
+    ] {
+        assert!(
+            !provision.contains(&format!("witness/{name}")),
+            "provision.sh must not create the state file {name}: the first root writer does"
+        );
+    }
+}
+
+/// The dry run prints the witness directory, the lock (or that the one already there is kept),
+/// and both tmpfiles steps.
+#[test]
+fn install_dry_run_prints_the_witness_directory_the_lock_and_the_tmpfiles_steps() {
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "[dry-run] install -d -m 0750 -o root -g propolis /var/lib/propolis/witness\n",
+        "propolis-tmpfiles.conf /etc/tmpfiles.d/propolis.conf\n",
+        "[dry-run] systemd-tmpfiles --create /etc/tmpfiles.d/propolis.conf\n",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "dry-run output missing {expected:?}:\n{stdout}"
+        );
+    }
+    // What the dry run says about the lock follows from this host, so the branch it reported is
+    // the one it should have: kept where the lock is, created where it is not, and neither
+    // claimed where the directory cannot be searched.
+    let expected = match Path::new("/var/lib/propolis/witness/state.lock").symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            "==> cannot see whether /var/lib/propolis/witness/state.lock exists without root"
+        }
+        Ok(m) if m.is_file() => "==> /var/lib/propolis/witness/state.lock already exists; kept\n",
+        Ok(_) => {
+            "==> warning: /var/lib/propolis/witness/state.lock is not a regular file; left alone"
+        }
+        Err(_) => {
+            "[dry-run] install -m 0600 -o root -g root /dev/null /var/lib/propolis/witness/state.lock\n"
+        }
+    };
+    assert!(
+        stdout.contains(expected),
+        "dry-run output does not say {expected:?} about the witness lock:\n{stdout}"
+    );
+}
+
+/// Runs `deploy/provision.sh#ensure_witness_lock` on `lock` under `DRY_RUN=1`, with only `log`,
+/// `run` and that function loaded from provision.sh, so no other step runs. `stat_answer`, when
+/// given, is what a stub `stat` on PATH prints for the owner and mode, since a fixture cannot be
+/// owned by root where the tests do not run as root. `as_other` runs the shell as uid 65534
+/// (through setpriv when the tests run as root), the view of an account outside group propolis.
+fn run_ensure_witness_lock(
+    dir: &Path,
+    lock: &Path,
+    stat_answer: Option<&str>,
+    as_other: bool,
+) -> Output {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A copy inside the fixture, which another account can read whatever the checkout's modes.
+    let provision = dir.join("provision.sh");
+    std::fs::write(&provision, deploy_file("provision.sh")).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&provision, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let stubs = dir.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    std::fs::set_permissions(&stubs, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = std::env::var("PATH").unwrap_or_default();
+    if let Some(answer) = stat_answer {
+        std::fs::write(stubs.join("stat.out"), format!("{answer}\n")).unwrap();
+        write_executable(
+            &stubs.join("stat"),
+            &format!("#!/bin/sh\ncat '{}'\n", stubs.join("stat.out").display()),
+        );
+        path = format!("{}:{path}", stubs.display());
+    }
+    let script = "set -euo pipefail\n\
+        DRY_RUN=1\n\
+        eval \"$(sed -n -e '/^log() /p' -e '/^run() {$/,/^}$/p' -e '/^ensure_witness_lock() {$/,/^}$/p' \"$1\")\"\n\
+        declare -F log run ensure_witness_lock > /dev/null\n\
+        ensure_witness_lock \"$2\"\n";
+    let root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
+    let mut command = if as_other && root {
+        let mut c = Command::new("setpriv");
+        c.args(["--reuid=65534", "--regid=65534", "--clear-groups", "bash"]);
+        c
+    } else {
+        Command::new("bash")
+    };
+    command
+        .args(["-c", script, "bash"])
+        .arg(&provision)
+        .arg(lock)
+        .env("PATH", path)
+        .current_dir(dir)
+        .fenced_output()
+        .expect("failed to run ensure_witness_lock from deploy/provision.sh")
+}
+
+fn ensure_witness_lock_stdout(out: &Output) -> String {
+    assert!(
+        out.status.success(),
+        "ensure_witness_lock failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The entry `run_apply_tmpfiles_entry` installs.
+const TMPFILES_FIXTURE: &str = "d /run/example 0755 root root -\n";
+
+/// Runs `deploy/provision.sh#apply_tmpfiles_entry` with only `log`, `run` and that function
+/// loaded from provision.sh, under `set -euo pipefail` as the script runs, and prints one more
+/// line after it. `dest` is where the entry is installed. A stub `systemd-tmpfiles` on PATH
+/// records its arguments and exits with `tmpfiles_rc`. Returns the output and what the stub
+/// recorded.
+fn run_apply_tmpfiles_entry(
+    dir: &Path,
+    dest: &Path,
+    tmpfiles_rc: i32,
+    dry_run: bool,
+) -> (Output, String) {
+    let provision = dir.join("provision.sh");
+    std::fs::write(&provision, deploy_file("provision.sh")).unwrap();
+    let conf = dir.join("entry.conf");
+    std::fs::write(&conf, TMPFILES_FIXTURE).unwrap();
+    let stubs = dir.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    let calls = dir.join("tmpfiles.calls");
+    std::fs::write(&calls, b"").unwrap();
+    write_executable(
+        &stubs.join("systemd-tmpfiles"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexit {tmpfiles_rc}\n",
+            calls.display()
+        ),
+    );
+    let script = "set -euo pipefail\n\
+        DRY_RUN=\"$4\"\n\
+        eval \"$(sed -n -e '/^log() /p' -e '/^run() {$/,/^}$/p' -e '/^apply_tmpfiles_entry() {$/,/^}$/p' \"$1\")\"\n\
+        declare -F log run apply_tmpfiles_entry > /dev/null\n\
+        apply_tmpfiles_entry \"$2\" \"$3\"\n\
+        echo 'after: the script went on'\n";
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .args(["-c", script, "bash"])
+        .arg(&provision)
+        .arg(&conf)
+        .arg(dest)
+        .arg(if dry_run { "1" } else { "0" })
+        .env("PATH", path)
+        .current_dir(dir)
+        .fenced_output()
+        .expect("failed to run apply_tmpfiles_entry from deploy/provision.sh");
+    (out, std::fs::read_to_string(&calls).unwrap())
+}
+
+/// A tmpfiles step that fails is reported and provisioning goes on. upgrade.sh runs provision.sh
+/// after it has installed the binaries and before it installs the units, so a failure that
+/// ended the script would leave a host half upgraded, for two /run directories no service needs
+/// in order to start.
+#[test]
+fn a_failing_tmpfiles_step_is_reported_and_does_not_stop_provisioning() {
+    use std::os::unix::fs::PermissionsExt;
+    let warning = "==> warning: the tmpfiles entry for /run was not applied";
+
+    // systemd-tmpfiles fails: the entry is installed, the failure is reported, the script goes on.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("propolis.conf");
+    let (out, calls) = run_apply_tmpfiles_entry(dir.path(), &dest, 73, false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(calls, format!("--create {}\n", dest.display()));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), TMPFILES_FIXTURE);
+    assert_eq!(
+        std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    assert!(stdout.contains(warning), "{stdout}");
+    assert!(stdout.contains("then run this script again"), "{stdout}");
+    assert!(stdout.ends_with("after: the script went on\n"), "{stdout}");
+
+    // The install itself fails (no such directory): the same report, and nothing is applied.
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("missing/propolis.conf");
+    let (out, calls) = run_apply_tmpfiles_entry(dir.path(), &dest, 0, false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(calls, "", "an entry that was not installed is not applied");
+    assert!(stdout.contains(warning), "{stdout}");
+    assert!(stdout.ends_with("after: the script went on\n"), "{stdout}");
+}
+
+/// A tmpfiles step that works installs the entry 0644, applies that file and reports nothing
+/// more; a dry run prints both commands and does neither.
+#[test]
+fn a_tmpfiles_step_that_works_warns_about_nothing_and_a_dry_run_only_prints_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("propolis.conf");
+    let (out, calls) = run_apply_tmpfiles_entry(dir.path(), &dest, 0, false);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert_eq!(calls, format!("--create {}\n", dest.display()));
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), TMPFILES_FIXTURE);
+    assert!(!stdout.contains("warning"), "{stdout}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("propolis.conf");
+    let (out, calls) = run_apply_tmpfiles_entry(dir.path(), &dest, 73, true);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert_eq!(calls, "", "a dry run applies nothing");
+    assert!(!dest.exists(), "a dry run installs nothing");
+    for printed in [
+        format!(
+            "[dry-run] install -m 0644 {} {}\n",
+            dir.path().join("entry.conf").display(),
+            dest.display()
+        ),
+        format!("[dry-run] systemd-tmpfiles --create {}\n", dest.display()),
+    ] {
+        assert!(
+            stdout.contains(&printed),
+            "missing {printed:?} in:\n{stdout}"
+        );
+    }
+    assert!(!stdout.contains("warning"), "{stdout}");
+}
+
+/// A missing lock is created, root-only and empty.
+#[test]
+fn a_missing_witness_lock_is_created_root_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("state.lock");
+    let stdout =
+        ensure_witness_lock_stdout(&run_ensure_witness_lock(dir.path(), &lock, None, false));
+    assert_eq!(
+        stdout,
+        format!(
+            "[dry-run] install -m 0600 -o root -g root /dev/null {}\n",
+            lock.display()
+        )
+    );
+}
+
+/// A lock already root-only is kept as it is, with nothing run.
+#[test]
+fn a_root_only_witness_lock_is_kept_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("state.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let stdout = ensure_witness_lock_stdout(&run_ensure_witness_lock(
+        dir.path(),
+        &lock,
+        Some("root:root 600"),
+        false,
+    ));
+    assert_eq!(
+        stdout,
+        format!("==> {} already exists; kept\n", lock.display())
+    );
+}
+
+/// A lock an earlier build left readable by group propolis is corrected in place, which keeps its
+/// inode, so a writer holding it is not joined by a second one on a new file.
+#[test]
+fn a_witness_lock_with_another_owner_or_mode_is_corrected_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("state.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let stdout = ensure_witness_lock_stdout(&run_ensure_witness_lock(
+        dir.path(),
+        &lock,
+        Some("root:propolis 644"),
+        false,
+    ));
+    assert_eq!(
+        stdout,
+        format!(
+            "==> {0} already exists; kept\n[dry-run] chown root:root {0}\n[dry-run] chmod 0600 {0}\n",
+            lock.display()
+        )
+    );
+}
+
+/// Anything in the lock's place that is not a regular file is reported and never followed,
+/// replaced or changed: a link could point root's chown and chmod at any file on the host.
+#[test]
+fn a_witness_lock_that_is_a_link_a_directory_or_a_fifo_is_reported_and_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    std::fs::write(&target, b"").unwrap();
+    set_mode(&target, 0o644);
+    let dangling = dir.path().join("dangling.lock");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+    let link = dir.path().join("link.lock");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let directory = dir.path().join("dir.lock");
+    std::fs::create_dir(&directory).unwrap();
+    let fifo = dir.path().join("fifo.lock");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .fenced_status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "mkfifo failed");
+    for lock in [&dangling, &link, &directory, &fifo] {
+        // The stub would have the fix-up run if this were taken for a lock.
+        let stdout = ensure_witness_lock_stdout(&run_ensure_witness_lock(
+            dir.path(),
+            lock,
+            Some("root:propolis 644"),
+            false,
+        ));
+        assert_eq!(
+            stdout,
+            format!(
+                "==> warning: {} is not a regular file; left alone. Remove it, then run this script again\n",
+                lock.display()
+            ),
+            "for {}",
+            lock.display()
+        );
+    }
+    assert_eq!(mode_of(&target), 0o644, "the link's target was changed");
+}
+
+/// An account that cannot search the witness directory sees no lock whether or not there is
+/// one, so its dry run says it cannot tell instead of claiming the lock would be created.
+#[test]
+fn a_dry_run_that_cannot_search_the_witness_directory_says_so_instead_of_claiming_an_install() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let witness = dir.path().join("witness");
+    std::fs::create_dir(&witness).unwrap();
+    std::fs::write(witness.join("state.lock"), b"").unwrap();
+    set_mode(&witness, 0o000);
+    let lock = witness.join("state.lock");
+    let other = run_ensure_witness_lock(dir.path(), &lock, None, true);
+    // Root searches any directory, so its own dry run goes on to the lock itself.
+    let as_root = (std::fs::metadata("/proc/self").unwrap().uid() == 0)
+        .then(|| run_ensure_witness_lock(dir.path(), &lock, Some("root:root 600"), false));
+    set_mode(&witness, 0o755);
+    let stdout = ensure_witness_lock_stdout(&other);
+    assert_eq!(
+        stdout,
+        format!(
+            "==> cannot see whether {} exists without root; a real run creates it only when missing\n",
+            lock.display()
+        )
+    );
+    if let Some(out) = as_root {
+        assert_eq!(
+            ensure_witness_lock_stdout(&out),
+            format!("==> {} already exists; kept\n", lock.display())
+        );
+    }
 }
 
 /// The deploy stamp is what lets the console tell a stale BINARY from a stale CHECKOUT: each
@@ -1727,6 +2319,7 @@ fn secret_paths_under_etc_propolis() -> HashSet<String> {
         .expect("crates/watch/src/config.rs has no `pub const WATCH_ENV_PATH: &str = \"...\";`");
     paths.insert(watch_env.to_string());
     paths.insert(migrate_env_path());
+    paths.insert(alert_env_path());
     assert!(
         paths.len() >= 20,
         "only {} secret paths derived from deploy/ and crates/watch: the derivation is broken: \
@@ -1748,6 +2341,23 @@ fn migrate_env_path() -> String {
         .expect("deploy/migrate.sh has no `MIGRATE_ENV=\"$ROOT/...\"` line");
     assert!(path.starts_with("/etc/propolis/"), "{path}");
     path.to_string()
+}
+
+/// The optional env file of the root shell senders, which holds the alert target and its token.
+/// No unit loads it, so no `EnvironmentFile=` line leads to it; the name comes from the shared
+/// library's own `PA_ALERT_ENV_NAME=` line, so a rename there fails the sensors' denied set here.
+fn alert_env_path() -> String {
+    let name = deploy_file("alert-lib.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix("PA_ALERT_ENV_NAME="))
+        .expect("deploy/alert-lib.sh has no `PA_ALERT_ENV_NAME=` line at column 0")
+        .trim()
+        .to_string();
+    assert!(
+        !name.is_empty() && !name.contains(['/', '"', '\'', '$', ' ']),
+        "PA_ALERT_ENV_NAME is not a plain file name: {name:?}"
+    );
+    format!("/etc/propolis/{name}")
 }
 
 /// The daemon connects as a role that cannot change the ledger; the role that can is named in a
@@ -5940,6 +6550,261 @@ fn every_installed_unit_alerts_on_failure_and_the_alert_unit_does_not_loop() {
         .fenced_status()
         .expect("bash -n runs");
     assert!(status.success(), "deploy/alert.sh is not valid bash");
+}
+
+/// The shared library is installed beside the hook, readable and not executable: it is sourced,
+/// and its own guard refuses a direct run. The dry run shows it.
+#[test]
+fn install_and_upgrade_install_the_alert_library_readable_and_not_executable() {
+    for (script_name, expected) in [
+        (
+            "install.sh",
+            "run install -m 0644 \"$SCRIPT_DIR/alert-lib.sh\" /usr/local/sbin/propolis-alert-lib",
+        ),
+        (
+            "upgrade.sh",
+            "install -m 0644 \"$SCRIPT_DIR/alert-lib.sh\" /usr/local/sbin/propolis-alert-lib",
+        ),
+    ] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let installs: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("/usr/local/sbin/propolis-alert-lib"))
+            .collect();
+        assert_eq!(
+            installs,
+            vec![&expected],
+            "{script_name} must install the library once, 0644"
+        );
+        let hook = lines
+            .iter()
+            .position(|l| l.contains("alert.sh") && l.ends_with("/usr/local/sbin/propolis-alert"))
+            .unwrap_or_else(|| panic!("{script_name} does not install the hook"));
+        let lib = lines.iter().position(|l| *l == expected).unwrap();
+        assert!(
+            hook < lib,
+            "{script_name}: install the library beside the hook"
+        );
+    }
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("alert-lib.sh /usr/local/sbin/propolis-alert-lib\n")
+            && stdout.contains("[dry-run] install -m 0644 "),
+        "dry-run output does not show the library install:\n{stdout}"
+    );
+}
+
+/// One to nine ASCII digits and nothing else, the number `deploy/rollback.sh#number_line`
+/// captures.
+fn plain_count(s: &str) -> Option<u32> {
+    if s.is_empty() || s.len() > 9 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// The library's version from its one `PA_LIB_VERSION=<n>` line, held to the exact form
+/// `deploy/rollback.sh#check_alert_lib` asks `number_line` for. Split on `\n`, not `lines()`,
+/// which drops the trailing CR of a CRLF line that `sed` would see.
+fn alert_lib_version(text: &str) -> Result<u32, String> {
+    if text.contains('\r') {
+        return Err("the file carries a carriage return".to_string());
+    }
+    let found: Vec<&str> = text
+        .split('\n')
+        .filter(|l| l.trim_start().starts_with("PA_LIB_VERSION"))
+        .collect();
+    match found.as_slice() {
+        [line] => line
+            .strip_prefix("PA_LIB_VERSION=")
+            .and_then(plain_count)
+            .ok_or_else(|| format!("{line:?} is not `PA_LIB_VERSION=<n>`")),
+        _ => Err(format!(
+            "{} PA_LIB_VERSION lines, not one: {found:?}",
+            found.len()
+        )),
+    }
+}
+
+/// What is wrong with how deploy script `name` states the library version it needs, against a
+/// library at `version`; empty when nothing is. A line meant as a needs line in any other spelling
+/// than the one rollback reads would count as needing nothing, and a rollback would then put an
+/// older library back under the script, so every near miss is reported.
+fn needs_line_problems(name: &str, text: &str, version: u32) -> Vec<String> {
+    let mut problems = Vec::new();
+    let needs: Vec<&str> = text
+        .split('\n')
+        .filter(|l| {
+            l.trim_start()
+                .trim_start_matches('#')
+                .trim_start()
+                .starts_with("needs-alert-lib")
+        })
+        .collect();
+    let sources = text
+        .split('\n')
+        .any(|l| l.trim() == "# shellcheck source=deploy/alert-lib.sh");
+    if sources && needs.len() != 1 {
+        problems.push(format!(
+            "deploy/{name} sources the library and must state once the version it needs, on a \
+             `# needs-alert-lib: <n>` line; it has {}",
+            needs.len()
+        ));
+    } else if needs.len() > 1 {
+        problems.push(format!(
+            "deploy/{name} states the version it needs {} times",
+            needs.len()
+        ));
+    }
+    if !needs.is_empty() && text.contains('\r') {
+        problems.push(format!("deploy/{name} carries a carriage return"));
+    }
+    for line in needs {
+        match line
+            .strip_prefix("# needs-alert-lib: ")
+            .and_then(plain_count)
+        {
+            None => problems.push(format!(
+                "deploy/{name}: {line:?} is not exactly `# needs-alert-lib: <n>`"
+            )),
+            Some(n) if n > version => problems.push(format!(
+                "deploy/{name} needs library version {n}, and deploy/alert-lib.sh is {version}"
+            )),
+            Some(_) => {}
+        }
+    }
+    problems
+}
+
+/// The library states its version on one line, and every script that sources it states the
+/// version it needs on one line, in the forms `deploy/rollback.sh` reads before it restores an
+/// older library. In one tree no consumer may need more than the library beside it has.
+#[test]
+fn the_alert_library_carries_one_version_line_and_no_consumer_needs_more_than_it_has() {
+    let version = alert_lib_version(&deploy_file("alert-lib.sh"))
+        .unwrap_or_else(|e| panic!("deploy/alert-lib.sh: {e}"));
+    let rollback = uncommented(&deploy_file("rollback.sh"));
+    for call in [
+        "need=\"$(number_line \"$copy\" '# needs-alert-lib: ')\"",
+        "lib_version=\"$(number_line \"$dir/sbin/$ALERT_LIB\" 'PA_LIB_VERSION=')\"",
+    ] {
+        assert!(
+            rollback.lines().any(|l| l.trim() == call),
+            "deploy/rollback.sh no longer reads the version with {call:?}"
+        );
+    }
+    let deploy = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy"));
+    let mut problems = Vec::new();
+    for entry in std::fs::read_dir(&deploy).expect("failed to read deploy/") {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if path.extension().is_none_or(|x| x != "sh") || name == "alert-lib.sh" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        problems.extend(needs_line_problems(&name, &text, version));
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// The checks above, on lines rollback would misread. Each near miss would be read as needing
+/// nothing.
+#[test]
+fn a_needs_line_in_any_form_but_the_one_rollback_reads_is_reported() {
+    for bad in [
+        "# needs-alert-lib: 3 \n",
+        "# needs-alert-lib:  3\n",
+        "# needs-alert-lib: 3\r\n",
+        "# needs-alert-lib:3\n",
+        "#needs-alert-lib: 3\n",
+        "  # needs-alert-lib: 3\n",
+        "# needs-alert-lib: \n",
+        "# needs-alert-lib: 1234567890\n",
+        "# needs-alert-lib: 1\n# needs-alert-lib: 1\n",
+    ] {
+        let text = format!("#!/usr/bin/env bash\n{bad}echo x\n");
+        assert!(
+            !needs_line_problems("x.sh", &text, 5).is_empty(),
+            "{bad:?} passed"
+        );
+    }
+    let good = "#!/usr/bin/env bash\n# needs-alert-lib: 3\necho x\n";
+    assert_eq!(needs_line_problems("x.sh", good, 5), Vec::<String>::new());
+}
+
+/// A script that sources the library must say what it needs, and may not need more than the
+/// library beside it has.
+#[test]
+fn a_script_that_sources_the_library_must_need_one_version_no_newer_than_the_library() {
+    let directive = "# shellcheck source=deploy/alert-lib.sh\n";
+    let with = |needs: &str| format!("#!/usr/bin/env bash\n{needs}{directive}. lib\n");
+    assert!(!needs_line_problems("x.sh", &with(""), 2).is_empty());
+    assert!(!needs_line_problems("x.sh", &with("# needs-alert-lib: 3\n"), 2).is_empty());
+    assert!(
+        !needs_line_problems(
+            "x.sh",
+            &with("# needs-alert-lib: 1\n# needs-alert-lib: 2\n"),
+            2
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        needs_line_problems("x.sh", &with("# needs-alert-lib: 2\n"), 2),
+        Vec::<String>::new()
+    );
+}
+
+/// The library's own line, held to the same exact form.
+#[test]
+fn the_library_version_line_is_read_only_in_the_form_rollback_reads() {
+    assert_eq!(alert_lib_version("x\nPA_LIB_VERSION=3\ny\n"), Ok(3));
+    for bad in [
+        "PA_LIB_VERSION=3 \n",
+        "PA_LIB_VERSION= 3\n",
+        "PA_LIB_VERSION=3\r\n",
+        "PA_LIB_VERSION=\"3\"\n",
+        "readonly PA_LIB_VERSION=3\n",
+        "  PA_LIB_VERSION=3\n",
+        "PA_LIB_VERSION=3\nPA_LIB_VERSION=4\n",
+        "no version here\n",
+        "PA_LIB_VERSION=3\n# a stray CR\r\n",
+    ] {
+        assert!(alert_lib_version(bad).is_err(), "{bad:?} passed");
+    }
+}
+
+/// The consumers rollback weighs are exactly the four scripts that source the library, each
+/// with the path a kept release holds it under and the path it is installed at.
+#[test]
+fn rollback_weighs_exactly_the_four_consumers_of_the_alert_library() {
+    let rollback = deploy_file("rollback.sh");
+    let start = rollback
+        .find("\nALERT_LIB_CONSUMERS=(\n")
+        .expect("deploy/rollback.sh has no `ALERT_LIB_CONSUMERS=(` line at column 0");
+    let body = &rollback[start + "\nALERT_LIB_CONSUMERS=(\n".len()..];
+    let body = &body[..body
+        .find("\n)\n")
+        .expect("ALERT_LIB_CONSUMERS=( is not closed by `)` at column 0")];
+    let body = uncommented(body);
+    let pairs: Vec<&str> = body.split_whitespace().collect();
+    assert_eq!(
+        pairs,
+        vec![
+            "sbin/propolis-alert:usr/local/sbin/propolis-alert",
+            "sbin/propolis-witness:usr/local/sbin/propolis-witness",
+            "sbin/propolis-status:usr/local/sbin/propolis-status",
+            "lib/config-check.sh:usr/local/lib/propolis/config-check.sh",
+        ]
+    );
 }
 
 /// The dry run shows the backup script, its units, and the enable.

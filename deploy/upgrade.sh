@@ -590,6 +590,8 @@ done
 install -m 0755 "$SCRIPT_DIR/migrate.sh" /usr/local/sbin/propolis-migrate
 # Every Propolis unit names this in OnFailure=; installed with them, nothing to enable.
 install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
+# The shared library of the shell alerting code, sourced and never run, so 0644.
+install -m 0644 "$SCRIPT_DIR/alert-lib.sh" /usr/local/sbin/propolis-alert-lib
 # The public-feed push runs from the operator's cron as propolis-blocklist out of a root-owned copy
 # the account cannot edit; refreshed here so the copy never goes stale behind the checkout.
 install -d -o root -g root -m 0755 /usr/local/lib/propolis

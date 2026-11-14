@@ -15,9 +15,10 @@
   the retention feeds. Sources seen within the last day are offered at the next queue scan;
   one that went quiet more than a day ago is not offered and stays out unless it returns. An
   address already approved in the review queue needs no second decision. An approval is not
-  for one build: it stands while the address keeps being seen, by any kind of event, and
-  lapses once the address has gone unseen for the longest retention window, and never
-  sooner than ninety days, after which a later flood is offered again. A rejection does not
+  for one build: it stands while the address keeps making established (completed-TCP)
+  connections, and a datagram naming it does not renew it. It lapses once the address has
+  made no established connection for the longest retention window, and never sooner than
+  ninety days, after which a later flood is offered again. A rejection does not
   lapse. The lapse removes the row for every node that shares the database: nodes that
   publish windows longer than ninety days need the same `PROPOLIS_FEED_WINDOWS`. The scan
   runs with the review subsystem: with `PROPOLIS_REVIEW_ENABLED=false` no candidate is
@@ -31,10 +32,11 @@
   whatever is decided on the Volume tab, a candidate that has authenticated is still
   published on volume only once approved, and the daemon logs a warning at each start
   ([rules](docs/reference/scoring-and-feed.md#volume-review)).
-- **A last-seen time ahead of the clock no longer extends a feed entry's validity.** The feed
-  builder reads a stored `last_seen` later than the build time as the build time, so no entry
-  is published as valid for longer than its window from now. Such an entry is still listed
-  while its stored time is ahead of the clock.
+- **A listing time ahead of the clock no longer extends a feed entry's validity.** The feed
+  builder reads a listing time (since the change to earned-tier clocks below, the time the entry
+  last earned its place) later than the build time as the build time, so no entry is published
+  as valid for longer than its window from now. Such an entry is still listed while its stored
+  time is ahead of the clock.
 - **The published blocklist README no longer claims every entry was approved by a human.** It
   now says that `retention/` can carry volume listings, which an operator can choose to
   publish unreviewed, and that only `tiers/` always rests on an authenticated session and a
@@ -90,11 +92,10 @@
   `SELECT source_ip, last_seen FROM ip_score WHERE last_seen > now() + interval '1 hour'`
   lists them, and delisting removes one from the feed. A projection replayed from the ledger
   (`rebuild_projection`) follows the new rule, so it can differ from a row an earlier version
-  stored from out-of-order events. A line dated now is not covered by any of this: every
-  event re-derives the stored tier from the decayed score, so one weak line for an approved
-  address that has been quiet for some hours still takes it out of the tier files until it
-  earns a tier again
-  ([what remains](docs/security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
+  stored from out-of-order events. A line dated now no longer ends a listing either: a
+  listing now runs from the last time the address earned its tier, which a later weak event
+  neither clears nor advances (see the upgrade note on established sightings below, and
+  [what remains](docs/security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
 - **An event whose metadata holds a number the database would not return as written is
   refused.** The ledger's chain hash is taken over an event as written and checked over the
   event as PostgreSQL returns it, and JSONB does not return every float as written: a negative
@@ -231,8 +232,9 @@
   set it can page once if that push is more than the stale threshold away. Run the sync by hand
   after upgrading to avoid it. The old marker file is no longer read and can be deleted.
 - **The first start on this version is slower on a large ledger** - core-scoring migrations `0021`
-  to `0026` build indexes on `event`, `ip_score` and `attack_tag` and fill the new hourly
-  roll-up table from the ledger, holding a lock that blocks writes to `event` (reads proceed)
+  to `0027` build indexes on `event`, `ip_score` and `attack_tag`, fill the new hourly
+  roll-up table from the ledger, and (`0027`) scan the event table once to backfill
+  `ip_score.established_last_seen` and build the partial index `event_dedup_tcp_idx`, holding a lock that blocks writes to `event` (reads proceed)
   while they run, before intake starts. On a ledger of 7.5M events plan on up to a few minutes
   of extra start-up `[estimated from 1,500,000 events: about 6 s per index build and a few
   seconds for the roll-ups]`; later starts are unaffected. See
@@ -248,7 +250,81 @@
   `PROPOLIS_CATCHALL_UDP_BURST_GLOBAL`; zero is refused, so the budget cannot be turned off
   ([limits](docs/reference/rate-limits-and-budgets.md#udp-event-budget-sensor-catchall)).
 
+- **A datagram no longer scores, and a listing or a vendor report now runs on the last time the
+  address earned its tier.** An event over a completed TCP connection is established; any other
+  (UDP or ICMP: in the shipped sensors DNS over UDP, TFTP and the catch-all's UDP listener)
+  carries a source address the sender chose. Such an event is still stored, counted and shown,
+  but it now moves only `event_count`, `last_seen` and the sensor count: no weight, no active
+  day, no latch, no flag and no listing clock. A TFTP upload no longer scores; DNS over TCP and
+  DoT are TCP and unaffected. Eligibility needs two established events, not two of any kind,
+  and the 60 s dedup measures a repeat only against the newest established event of its type.
+  The feed lists an approved, not-delisted address in a tier file for that tier's TTL after it
+  last earned the tier (24 h aggressive, 48 h standard; the two files never hold the same
+  address) and in a retention window while the later earned time is inside it; a volume
+  listing runs on the last established connection. The published `valid_from`, `valid_until`
+  and `last_seen` follow that time. A later weak event neither removes nor extends an entry,
+  and a Pending review candidate is no longer withdrawn by one. The vendor gate now holds an
+  address that is delisted (`held_by` gains `delisted`), or that has not earned a tier within
+  48 h, or has earned nothing since the vendor last accepted a report about it: one burst of
+  activity is one report per vendor. `PROPOLIS_FEED_DELIST` now also holds an address out of
+  review and vendor reporting. What to expect and do:
+  - **Stop every node that shares one database, and upgrade them together.** Core-scoring
+    migration `0027` adds `ip_score.established_last_seen`, `aggressive_earned_at` and
+    `standard_earned_at`; an old binary keeps writing rows without them, and refuses to start
+    against the migrated database. Rolling back needs `rollback.sh --with-database`.
+  - **If you run the standalone `feed` and `review` services, copy `PROPOLIS_FEED_DELIST` from
+    `feed.env` into `review.env`.** The standalone `review` binary now reads it; without it an
+    address you delisted is still offered for review and reported. The unified daemon passes
+    its own value through.
+  - **Expect a shorter feed and review queue at the first build and scan.** The migration
+    backfills `established_last_seen` exactly from the ledger's TCP rows. Rows that were
+    eligible only because a non-TCP event was their second event lose `eligible` and
+    `recommended_*`, so they leave the Pending list at the next scan and the feeds at the next
+    build. The earned times are seeded from the last established sighting for rows whose
+    stored tier is set and that are eligible, recommended and not delisted, so an address that
+    only datagrams have named for the last two days stops being listed and reported at the
+    upgrade.
+  - **For about a day after the upgrade a tier can be earned partly on old datagram weight.** A
+    stored score may still hold weight datagrams added before the upgrade; it decays with the
+    usual six-hour half-life. Nothing rebuilds stored projections.
+  - **Expect fewer vendor reports.** An approved address that used to be re-reported every
+    cooldown for as long as anything kept naming it is now reported once per burst, and is
+    counted in `held_by` as `stale` in between
+  ([rules](docs/reference/scoring-and-feed.md#established-and-forgeable-events),
+  [gate](docs/reference/rate-limits-and-budgets.md#vendor-submission-gatekeeper)).
+
+- **The firewall and DNS feed files changed shape, and the hosts file is gone.** Anyone who
+  applies your published feed has a one-time change to make; the published README's "Changed in
+  this layout" section tells them what.
+  - `.nft` no longer defines a variable (`$propolis_aggressive`). It maintains two named sets,
+    `propolis_<feed>_v4` and `propolis_<feed>_v6`, in the table `inet propolis`, and is applied
+    with `nft -f` on every refresh.
+  - `.ipset` now uses the sets `propolis_<feed>_v4` and `propolis_<feed>_v6` (the old single set
+    was `propolis_<feed>`), and is applied with `ipset -exist restore` on every refresh.
+  - `.rpz` is now a complete zone and lists IPv6 addresses too. The earlier file did not load in
+    a resolver at all, so nothing can have depended on it.
+  - `.hosts` is no longer written: it blocked nothing. The console's download list and
+    `deploy/blocklist-sync.sh` no longer know the format.
+  - The first push after the upgrade removes every `*.hosts` file from the public repository, and
+    from then on any file a build no longer has. `upgrade.sh` installs the new
+    `blocklist-sync.sh` with the daemon; a script and a daemon from different versions refuse
+    every build ("is not what the publisher writes"), because the script now reads each file
+    back and holds it to its format. A publishing run that lands before the daemon's first
+    build after the upgrade refuses the old build once (it still holds `.hosts` files); the
+    next run publishes.
+  - Commits to the public repository are now made as the identity set in that checkout, or a
+    fixed neutral one if none is set, and are dated to the build hour in UTC. If you relied on
+    the account's global git identity, set it in the checkout: `git -C <checkout> config
+    user.name ...` and `user.email ...`
+  ([formats](deploy/blocklist-README.md#formats),
+  [publishing](docs/operations/routine-procedures.md)).
+
 ### Added
+
+- **`deploy/blocklist-sync.sh --check [FEED_DIR]`** - runs every check the publishing script makes
+  on a build (names, file types and sizes, and now the contents of every file) and stops, with
+  no checkout, commit or push. Exit 0 means the build would be published as it stands
+  (`deploy/blocklist-sync.sh#CHECK_ONLY`).
 
 - **`propolis-watch --journal` follows the PostgreSQL server too** - the fixed `journalctl`
   vector gained `-u postgresql*` (Debian's `postgresql@<version>-<cluster>`, the vendor
@@ -541,6 +617,12 @@
 
 ### Changed
 
+- **The console shows when an address earned its tiers and when it last connected** - the
+  address page adds "Earned aggressive tier", "Earned standard tier", "Established events" and
+  "Last connection" beside "Last seen", and the Review page's volume tab shows the last
+  connection, the clock a volume listing and its approval's lapse run on, instead of the last
+  sighting of any kind. The feed page's retention panel says entries are held by when a tier
+  was last earned.
 - **No real address in the review tests** - the gatekeeper and the review queue hold every
   reserved address first, so the Disabled, ScoreFloor, Cooldown and RateLimit holds and the
   daemon's queue populate pass could only be exercised with a real, allocated address, which the
@@ -684,6 +766,96 @@
 
 ### Fixed
 
+- **The nftables, ipset and RPZ feed files now work when a consumer applies them, and again when
+  they refresh** - all three broke in ordinary use, and no test opened any of them. An empty
+  feed's `.nft` was `define x = {}`, a syntax error that stopped the consumer's whole ruleset
+  from loading; a feed with an IPv6 entry failed where the define was used with `ip saddr`; and
+  a define cannot be refreshed. The `.ipset` file began with a bare `create`, so the second load
+  failed at its first line and nothing was ever removed from the set, its `maxelem` changed from
+  build to build, and it added IPv6 addresses to a `family inet` set, which stops the load at
+  that line. The `.rpz` file had no SOA or NS record and its trigger names lacked the
+  prefix-length label, so a resolver refused the zone and then every name in it, and IPv6
+  entries were dropped without a word. Now `.nft` declares a named set per family in `inet
+  propolis`, empties both and adds the feed, in one transaction
+  (`crates/feed/src/export/firewall.rs#export_nftables`); `.ipset` fills a scratch set per family
+  and swaps it into place, with constant parameters
+  (`crates/feed/src/export/firewall.rs#export_ipset`); `.rpz` is a whole zone with `32.` and
+  `128.` trigger names for both families
+  (`crates/feed/src/export/firewall.rs#export_rpz`). An IPv4-mapped IPv6 address is listed as
+  the IPv4 address it is. Each output was applied with the tool itself: nftables 1.0.9, ipset
+  7.19 with iptables rules using the sets, and BIND 9.18 as a response policy zone.
+- **The `.hosts` feed file is no longer published** - it mapped `d.c.b.a.in-addr.arpa` names to
+  `0.0.0.0`, which blocks no traffic to or from an address, and was described as a DNS sinkhole.
+- **The published repository no longer keeps files a build has dropped** -
+  `deploy/blocklist-sync.sh` moved each new file over the old one, so a retention window the
+  operator removed, or a format no longer written, stayed in the public repository at its last
+  contents for good, still fetched by consumers. `tiers/` and `retention/` are now replaced
+  whole on every run; other files in the checkout are left alone.
+- **A public feed commit no longer carries the node's host name, account or time zone** - the
+  script let git make up the author from the account and the machine's host name and date the
+  commit to the second in local time. It now commits as the identity set in the checkout, or a
+  fixed neutral one, dated to the build hour in UTC, and ignores any identity in the
+  environment.
+- **The publishing script now refuses a feed file that holds anything but the feed** - it checked
+  each file's name, type and size and never what was in it, while consumers apply the `.nft`
+  and `.ipset` files to their firewalls as root. A daemon that parses hostile input all day
+  could have published firewall commands, or anything it could read, under a feed's name. Every
+  copy is now read back and must be, line for line, what the publisher writes for that format:
+  its fixed header, the feed's own set and table names, addresses of the right family, and
+  hour-boundary timestamps (`deploy/blocklist-sync.sh#check_content`). `manifest.json` is held to
+  its shape and to the retention windows actually present. A test publishes real builds through
+  the same check, so the two cannot drift apart unnoticed.
+
+- **An approved address is no longer reported to every vendor again each cooldown for as long as
+  anything names it** - the gatekeeper's freshness check ran on `last_seen`, which any sighting
+  moves, a forged UDP datagram included, and it never looked at eligibility, tier or delisting.
+  So an approved address was re-reported every 24 h for as long as any event kept `last_seen`
+  within 48 h. `Stale` is now measured on the last time the address earned a tier
+  (`IpScore::tier_earned_at`), and after the cooldown a new report needs the tier to have been
+  earned again since the last report the vendor accepted; a delisted address is held as the new
+  `Delisted` reason (`crates/review/src/gatekeeper.rs#check_with`). One burst of activity is now
+  one report per vendor
+  ([gate](docs/reference/rate-limits-and-budgets.md#vendor-submission-gatekeeper)).
+- **A forged datagram no longer adds score weight, counts as the second sighting, or makes a real
+  connection a duplicate** - a UDP or ICMP event carries whatever source its sender wrote, yet it
+  added its signal weight, a category and an active day to the address it named, re-derived that
+  address's flags, counted toward the two events eligibility asks for, and could be the newest
+  event a later real connection of the same type was deduped against, so that connection added
+  nothing. Such an event now changes only `event_count`, `last_seen` and the sensor count
+  (`crates/core-scoring/src/scoring/engine.rs#record_sighting`), eligibility counts established
+  events (`crates/core-scoring/src/scoring/eligibility.rs#eligible`), and the dedup read asks
+  for the newest established event of the type
+  (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`, the batch path and replay)
+  ([rules](docs/reference/scoring-and-feed.md#established-and-forgeable-events)).
+- **A weak later event no longer ends a listing early or withdraws a pending candidate** - the
+  feed published a tier entry only while the stored row had a tier, and every event re-derived
+  that tier from the decayed score, so one low-weight line for an approved address that had been
+  quiet for some hours took it out of the tier files and the retention windows; the review
+  queue's withdrawal read the stored `recommended_for_vendor` the same way and removed a Pending
+  candidate before the operator saw it. The scoring fold now records when an established event
+  left the address eligible and holding each tier, and the feed lists an entry for the tier's TTL
+  after that (`crates/feed/src/builder.rs#merit_candidates_sql`,
+  `crates/feed/src/builder.rs#Candidate`); the queue offers and keeps an address that has earned a
+  tier (`crates/review/src/queue.rs#OFFERED_SQL`).
+- **A datagram no longer keeps a volume listing or a volume approval alive** - volume recency and
+  the volume approval's lapse ran on `last_seen`, so a stopped TCP flood stayed listed and its
+  approval stood for as long as datagrams under its address kept arriving. Both now run on
+  `established_last_seen`, the last completed TCP connection
+  (`crates/feed/src/builder.rs#volume_candidates_sql`,
+  `crates/review/src/volume.rs#VolumeQueue::withdraw`,
+  `crates/core-scoring/src/scoring/tier.rs#recommended_by_volume`).
+- **`PROPOLIS_FEED_DELIST` now reaches review and vendor reporting** - the operator's delist took
+  an address out of the feed only: it was still offered for review, and an approval given
+  earlier kept reporting it to every vendor. An address on it is now not offered for review or as
+  a volume candidate, a Pending entry for it is withdrawn, and an Approved one is held from every
+  vendor (`crates/review/src/submit.rs#SubmissionRunner::with_delist`). The standalone `review`
+  binary reads the variable itself (`crates/review/src/main.rs#ENV_DELIST`).
+- **A vendor report is no longer dated or labelled by a later datagram** - the attack time sent
+  to vendors was `last_seen`, and the protocol label that picks a vendor's category codes was
+  read from the newest event of each category of any protocol, so one forged DNS datagram could
+  re-date a report and turn an SSH report into a generic one. The time is now the last
+  established sighting (`crates/review/src/submit.rs#build_report`) and the label is read from
+  established events only (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`).
 - **One sender can no longer fill the catch-all's log over UDP** - the catch-all wrote one
   `catchall_probe` event for every UDP datagram it received, with no rate budget, and a UDP
   source address is whatever the sender wrote. A single host sending at line rate therefore

@@ -179,17 +179,26 @@ A per-cycle counter would reset each cycle and never enforce a per-day cap.
 
 Ordered, fail-closed per-vendor check sequence run at submission time, after
 operator approval; short-circuits on the first hold
-(`crates/review/src/gatekeeper.rs#check`).
+(`crates/review/src/gatekeeper.rs#check`, `crates/review/src/gatekeeper.rs#check_with`).
 
 | # | Check | Rule | Default |
 |---|---|---|---|
 | 1 | Reserved | `is_reserved_ip(ip)` (first, not overridable) | always on |
-| 2 | Disabled | `!config.enabled` | vendor off unless enabled + non-empty key |
-| 3 | Stale | last activity older than freshness window | 48 h *(hard-coded, vendor-agnostic)* (`crates/review/src/gatekeeper.rs#FRESHNESS_WINDOW_HOURS`) |
-| 4 | Cooldown | prior SUCCESSFUL submit for this (ip, vendor) within `cooldown_hours` | 24 h |
-| 5 | RateLimit | vendor-WIDE successful submits within `rate_window_hours` `>= rate_limit` | 100 per 1 h |
-| 6 | ScoreFloor | `current_score.raw_score < floor` | `None` (no extra floor) |
-| 7 | CategoryFilter | no breakdown key matches configured filter | `None` (any category) |
+| 2 | Delisted | `current_score.delisted` (the delist latch) | always on |
+| 3 | Disabled | `!config.enabled` | vendor off unless enabled + non-empty key |
+| 4 | Stale | no tier earned within the freshness window, or ever, measured on `IpScore::tier_earned_at` (the last time an established event left the address eligible and tiered), not on `last_seen` | 48 h *(hard-coded, vendor-agnostic)* (`crates/review/src/gatekeeper.rs#FRESHNESS_WINDOW_HOURS`) |
+| 5 | Cooldown | prior SUCCESSFUL submit for this (ip, vendor) within `cooldown_hours` | 24 h |
+| 6 | Stale | nothing new: the tier was last earned at or before this vendor's last successful submit | always on |
+| 7 | RateLimit | vendor-WIDE successful submits within `rate_window_hours` `>= rate_limit` | 100 per 1 h |
+| 8 | ScoreFloor | `current_score.raw_score < floor` | `None` (no extra floor) |
+| 9 | CategoryFilter | no breakdown key matches configured filter | `None` (any category) |
+
+After the cooldown, a new report needs the tier to have been earned again since the last
+report this vendor accepted, so one burst of activity is one report per vendor rather than one
+per cooldown for as long as anything keeps naming the address. An earned time ahead of the
+clock is read as now. An address on the operator delist (`PROPOLIS_FEED_DELIST`) is held by the
+submission runner before the gate runs and counted as `delisted` with the latch
+(`crates/review/src/submit.rs#SubmissionRunner::with_delist`).
 
 Runtime defaults for both the `review` binary and `propolis`:
 `cooldown_hours = 24`, `rate_limit = 100`, `rate_window_hours = 1`
@@ -197,7 +206,7 @@ Runtime defaults for both the `review` binary and `propolis`:
 `crates/propolis/src/config.rs#DEFAULT_COOLDOWN_HOURS`/`crates/propolis/src/config.rs#DEFAULT_RATE_LIMIT`/`crates/propolis/src/config.rs#DEFAULT_RATE_WINDOW_HOURS`).
 `score_floor` and `category_filter` are `None` in the shipped config loaders
 (`crates/review/src/main.rs#load_vendor_config`, `crates/propolis/src/config.rs#load_vendor_config`). A database error on the cooldown or rate-limit query holds
-the submission (`DbError`), fail-closed (`crates/review/src/gatekeeper.rs#check_cooldown`/`crates/review/src/gatekeeper.rs#check_rate_limit`). Per-vendor
+the submission (`DbError`), fail-closed (`crates/review/src/gatekeeper.rs#latest_success`/`crates/review/src/gatekeeper.rs#check_rate_limit`). Per-vendor
 overrides:
 `PROPOLIS_VENDOR_<NAME>_{ENABLED,COOLDOWN_HOURS,RATE_LIMIT,RATE_WINDOW_HOURS,KEY,URL}`
 (plus `PROPOLIS_VENDOR_DSHIELD_USER`) - see
@@ -348,8 +357,9 @@ Operational spool and queue sizing (disk headroom, backpressure) is covered in
 
 ## Score-model dedup window
 
-A repeat `(source_ip, signal_type)` within 60 s records the event but adds no
-weight (`DEDUP_WINDOW_SECONDS`, fixed). This is a scoring constant owned by
+A repeat `(source_ip, signal_type)` within 60 s of the newest established event of that type
+records the event but adds no weight (`DEDUP_WINDOW_SECONDS`, fixed). A forgeable (UDP or ICMP)
+event adds no weight at all, so only established events accrue score. This is a scoring constant owned by
 [scoring-and-feed.md](scoring-and-feed.md#constants),
 noted here because it bounds how fast a single source can accrue score.
 

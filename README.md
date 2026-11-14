@@ -21,8 +21,9 @@ console on loopback.
 
 An IP only earns a feed tier or a vendor report after a completed TCP handshake has
 authenticated against a sensor. Spoofable UDP traffic and lone SYNs do not count toward
-that gate. Volume is a second path: a source with a thousand or more completed
-connections on record and activity in the last day is offered as a volume candidate, so a
+that gate, and UDP traffic adds nothing to the score at all: it is recorded and counted,
+and that is all. Volume is a second path: a source with a thousand or more completed
+connections on record and one in the last day is offered as a volume candidate, so a
 flood can be blocked even when no login was attempted. It is added to the retention feeds
 once you approve it in the console, and a volume approval never files a vendor report.
 Nothing is published without a decision unless you set

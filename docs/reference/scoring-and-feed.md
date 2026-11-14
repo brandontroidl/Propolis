@@ -24,7 +24,28 @@ by [events-and-signals.md](events-and-signals.md).
 A source IP's score is a decaying, capped accumulation of signal weights.
 `apply_event` is a pure fold: it decays prior state to the new event's
 `observed_at`, adds the event's weight (unless deduped), and recomputes all
-derived flags (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
+derived flags (`crates/core-scoring/src/scoring/engine.rs#apply_event`). It does all of
+that only for an established event.
+
+### Established and forgeable events
+
+An event is established when it came over a completed TCP connection
+(`crates/core-scoring/src/scoring/engine.rs#is_established`): a sender cannot finish the
+handshake from an address it does not hold. Any other event (UDP or ICMP; in the shipped sensors
+that means DNS over UDP, TFTP, and the catch-all's UDP listener) carries a source address the
+sender chose. Such a forgeable sighting is stored in the ledger, counted and shown, but on the
+`ip_score` row it changes only `event_count`, `last_seen` (and `first_seen` when it opens the row)
+and `distinct_sensor_count` (`crates/core-scoring/src/scoring/engine.rs#record_sighting`). It
+adds no weight, no category and no active day, takes no decay step and re-derives nothing. It
+cannot set the confirmed-real latch, cannot change `eligible`, `tier`, `recommended_for_vendor`
+or `recommended_for_blocklist`, and moves none of the clocks a listing or a vendor report runs
+on (`established_last_seen`, `aggressive_earned_at`, `standard_earned_at`).
+
+A row that only forgeable sightings have touched has a score of 0, `active_days` 0 and no tier.
+The first established event starts that row over, keeping only the count and the dates of the
+sightings (`crates/core-scoring/src/scoring/engine.rs#apply_event`), so a history scores the
+same with its forgeable sightings removed. So a TFTP upload, which arrives over UDP, no longer
+scores. DNS over TCP and DNS over TLS are TCP and are unaffected.
 
 ### Constants
 
@@ -33,7 +54,7 @@ Defined in `crates/core-scoring/src/scoring/constants.rs`.
 | Constant | Value | Meaning |
 |---|---|---|
 | `HALF_LIFE_SECONDS` | 21600 (6 h) | Decay half-life for raw score and per-category weight (`crates/core-scoring/src/scoring/constants.rs#HALF_LIFE_SECONDS`) |
-| `DEDUP_WINDOW_SECONDS` | 60 | A repeat `(source_ip, signal_type)` within 60 s records the event but adds no weight (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`) |
+| `DEDUP_WINDOW_SECONDS` | 60 | A repeat `(source_ip, signal_type)` within 60 s of the newest established event of that type records the event but adds no weight (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`) |
 | `SCORE_CAP` | 100 | Clamp ceiling for raw and effective score (`crates/core-scoring/src/scoring/constants.rs#SCORE_CAP`) |
 | `BREADTH_PER_WAN` | 0.15 | Breadth-factor increment per extra distinct WAN vantage (`crates/core-scoring/src/scoring/constants.rs#BREADTH_PER_WAN`) |
 | `BREADTH_CAP` | 0.60 | Max breadth bonus; factor saturates at 1.60 (`crates/core-scoring/src/scoring/constants.rs#BREADTH_CAP`) |
@@ -67,11 +88,14 @@ That does not make a score independent of the order events are read in. A backlo
 newer events for the same address can score differently from the same events in order, in
 three ways:
 
-- **Dedup.** A repeat is deduped against the newest event of its signal type already stored
-  (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`), not against its neighbours
-  in time. A burst of repeats read in order adds the weight of one; read after a newer event
-  of that type, none of its lines is within sixty seconds of the newest, so each adds its own
-  decayed weight.
+- **Dedup.** A repeat is deduped against the newest established event of its signal type
+  already stored (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`,
+  `crates/core-scoring/src/repository/batch.rs#DEDUP_PRIORS_SQL`, and the same rule in replay),
+  not against its neighbours in time. A datagram is never the event a repeat is measured
+  against, so it cannot make a real connection a no-weight duplicate; the partial index
+  `event_dedup_tcp_idx` (migration `0027_established_sightings.sql`) serves the read. A burst
+  of repeats read in order adds the weight of one; read after a newer event of that type, none
+  of its lines is within sixty seconds of the newest, so each adds its own decayed weight.
 - **The cap.** It is applied at each step. In order, a burst that reaches 100 loses the excess
   before it decays; read late, each line is decayed first and then added under the cap.
 - **Persistence.** The [bonus](#persistence-bonus) counts a day only when it is later than
@@ -119,7 +143,7 @@ persistence_points(active_days) = min(PERSIST_CAP, PERSIST_PER_DAY * max(0, acti
 ```
 
 `active_days` is an unbounded, non-decaying count of distinct UTC calendar days
-seen, counted as events are read: a day adds one only when it is later than the newest day
+with an established event, counted as events are read (a forgeable sighting adds no day): a day adds one only when it is later than the newest day
 already counted, so an older day read late (a backlog) adds none
 (`crates/core-scoring/src/scoring/engine.rs#apply_event`). The bonus is 0 up to and including 2 days, then
 linear at 0.55/day, saturating at 60 points
@@ -158,11 +182,13 @@ effective score: `tier(gated_raw, max_confidence)` (`crates/core-scoring/src/sco
 ## Eligibility latch
 
 ```
-eligible(has_confirmed_real, event_count, _distinct_categories, delisted)
-    = !delisted && has_confirmed_real && event_count >= 2
+eligible(has_confirmed_real, established_event_count, _distinct_categories, delisted)
+    = !delisted && has_confirmed_real && established_event_count >= 2
 ```
 
-(`crates/core-scoring/src/scoring/eligibility.rs#eligible`). The
+(`crates/core-scoring/src/scoring/eligibility.rs#eligible`). Both sightings must be
+established events: a forged datagram cannot be the second sighting of an address that
+authenticated once. The
 `distinct_categories` argument is ignored (leading underscore): the older
 two-category gate was dropped 2026-08-19 (migration `0006_relax_eligibility.sql`).
 Eligibility takes no score input, so a decayed score can never revoke it; it is
@@ -185,12 +211,13 @@ Derived in `derive_projection`, the single source of truth shared by
 |---|---|---|
 | `recommended_for_vendor` | `eligible && tier.is_some()` | `crates/core-scoring/src/scoring/tier.rs#recommended_for_vendor` |
 | `recommended_for_blocklist` | `eligible && effective_score >= 50` **OR** the volume path below | `crates/core-scoring/src/scoring/tier.rs#recommended_for_blocklist`, `crates/core-scoring/src/scoring/engine.rs#derive_projection` |
-| `recommended_by_volume` | `!delisted && established_event_count >= 1000 && seconds_since_last_seen <= 86400` | `crates/core-scoring/src/scoring/tier.rs#recommended_by_volume` |
+| `recommended_by_volume` | `!delisted && established_event_count >= 1000 && seconds_since_established <= 86400`, where `seconds_since_established` is measured from the last established sighting and an address with none is never listed on volume | `crates/core-scoring/src/scoring/tier.rs#recommended_by_volume` |
 
 The volume path is independent of confirmed-real and score. It counts ONLY
 `established_event_count` (completed-TCP events: `prev + (protocol == Tcp)`,
-`crates/core-scoring/src/scoring/engine.rs#apply_event`), so a spoofed UDP/ICMP flood cannot
-volume-list an innocent third party. A cred sensor's connection or login summary
+`crates/core-scoring/src/scoring/engine.rs#apply_event`) and measures recency from the last
+established sighting, so a spoofed UDP/ICMP flood can neither volume-list an innocent third party
+nor keep a stopped TCP flood listed. A cred sensor's connection or login summary
 (`event_summary: true`) counts as the `suppressed_count` events it replaces, in both
 `event_count` and `established_event_count`, so a flooder whose events a per-source budget kept
 out of the log reaches the threshold as before
@@ -198,41 +225,73 @@ out of the log reaches the threshold as before
 [keys](events-and-signals.md#connection-and-login-summary-keys)). The overflow and per-network
 summaries (`overflow_summary: true`) stand for many addresses and count as one event with no
 weight and no confirmed-real latch (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
-Vendor reporting always gates on `recommended_for_vendor`
-(confirmed-real), so a bare flood can be listed in the retention feeds, once an operator
-approves it, but is never reported upstream
-(`crates/core-scoring/src/scoring/engine.rs#derive_projection`).
+A bare flood can be listed in the retention feeds, once an operator approves it, but is never
+reported upstream: the review queue offers only an address that is eligible (confirmed-real)
+and has earned a tier (`crates/review/src/queue.rs#OFFERED_SQL`), a volume approval lives in
+its own table, which the submission runner never reads, and the vendor gate holds an address
+that has not earned a tier within its freshness window
+(`crates/review/src/gatekeeper.rs#check_with`;
+[gatekeeper](rate-limits-and-budgets.md#vendor-submission-gatekeeper)).
 
 The flag is a recommendation, not a publication. A volume-listed address is published only
 through the [volume candidates](#candidate-sources) path below, which by default needs an
 operator's approval.
 
+### Earned tiers and listing clocks
+
+The stored `tier`, `eligible` and `recommended_*` columns are whatever the last established
+event left. They are still stored and shown, but they no longer decide publication or
+reporting. Three columns on `ip_score` (migration `0027_established_sightings.sql`, fields on
+`crates/core-scoring/src/domain/types.rs#IpScore`) carry the clocks that do:
+
+| Column | Meaning | Read by |
+|---|---|---|
+| `established_last_seen` | the latest `observed_at` of an established event; NULL if there is none | volume recency, the volume approval's lapse, the attack time sent to vendors |
+| `aggressive_earned_at` | the last time an established event that added its weight left the address eligible and holding the aggressive tier | the aggressive file, the retention windows, the vendor gate |
+| `standard_earned_at` | the same for the standard tier | the standard file, the retention windows, the vendor gate |
+
+An earned time is set to the decay anchor after the event, and only by an event that added its
+weight: a repeat inside the dedup window and an overflow summary earn nothing
+(`crates/core-scoring/src/scoring/engine.rs#apply_event`). An event that leaves the address below
+the tier neither clears nor advances it, so a listing runs its full TTL from the last time it was
+earned: a later weak event cannot end it early, and only earning the tier again extends it.
+`IpScore::tier_earned_at` is the later of the two
+(`crates/core-scoring/src/domain/types.rs#IpScore::tier_earned_at`). Delisting does not clear
+the earned times, so relisting resumes a listing that still has time to run; every consumer
+checks the `delisted` latch itself.
+
 ## Feed membership and retention
 
 Owned by the feed builder (`crates/feed/src/builder.rs`). Membership is decided
-by RETENTION windows, not a live-decayed score. All fields are read as stored (as
-of the IP's last event), so a tier cannot slide between builds
-(`crates/feed/src/builder.rs#Candidate`, `crates/feed/src/builder.rs#build`).
+by RETENTION windows, not a live-decayed score. All fields are read as stored, never
+re-derived against the clock, so a tier cannot slide between builds, and what decides a listing
+is when the address last earned it ([earned tiers](#earned-tiers-and-listing-clocks);
+`crates/feed/src/builder.rs#Candidate`, `crates/feed/src/builder.rs#build`).
 
 ### Candidate sources
 
-- **Tier candidates** (aggressive / standard files) require operator approval:
-  `s.recommended_for_blocklist = true AND s.eligible = true AND q.state = 'approved' AND s.tier IS NOT NULL`
-  (`crates/feed/src/builder.rs#build`). See the [review queue](../architecture/pipeline.md).
+- **Tier candidates** (aggressive / standard files and the retention windows) require operator
+  approval and an earned tier:
+  `q.state = 'approved' AND NOT s.delisted AND GREATEST(s.aggressive_earned_at, s.standard_earned_at) > $1`,
+  where `$1` is the oldest earned time the longest feed can still publish
+  (`crates/feed/src/builder.rs#merit_candidates_sql`). See the
+  [review queue](../architecture/pipeline.md).
 - **Volume candidates** require operator approval by default:
   `NOT s.delisted AND s.established_event_count >= 1000` and an `approved` row in
-  `volume_review` or in `review_queue` (tier = none)
-  (`crates/feed/src/builder.rs#volume_candidates_sql`; the threshold is bound from
-  `crates/core-scoring/src/scoring/constants.rs#VOLUME_LIST_THRESHOLD`). They land ONLY in
-  retention windows, never the tier files, and an address that is also a tier candidate is
-  listed once, as the tier candidate (`crates/feed/src/builder.rs#build`).
+  `volume_review` or in `review_queue`, with recency taken from `s.established_last_seen > $1`,
+  never from `last_seen` (`crates/feed/src/builder.rs#volume_candidates_sql`; the threshold is
+  bound from `crates/core-scoring/src/scoring/constants.rs#VOLUME_LIST_THRESHOLD`). They land
+  ONLY in retention windows, never the tier files.
 
-Both sources read the row as its last event left it, and every event re-derives the stored
-tier from the score decayed to that event. So a later, weaker event can end a tier listing
-early: an approved address that has been quiet for some hours and is then named by one
-low-weight line stores no tier, and leaves the tier files and the retention windows until it
-earns a tier again (unless it also has the thousand established events of a volume candidate,
-which keep it in the retention windows). See
+An address that is both a tier candidate and a volume candidate is published once, and a
+window holds it while either clock (the later earned time or the last established sighting) is
+inside it (`crates/feed/src/builder.rs#build`, `crates/feed/src/builder.rs#Candidate::window_listing`).
+
+Neither source reads the stored `tier`, `eligible` or `recommended_*` columns, which are whatever
+the last established event left. An entry stays listed for its full TTL after the last time the
+address earned the tier: a later weak event neither removes nor extends it, and a datagram
+naming the address changes nothing. An approved address that has not earned a tier within a
+window is in that window only if it is also a volume candidate. See
 [residual risks](../security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence).
 
 ### Volume review
@@ -244,10 +303,10 @@ stand for a thousand events, so a volume candidate waits for a decision in its o
 
 | Step | Rule | Source |
 |---|---|---|
-| Offered (pending) | not delisted, `established_event_count >= 1000`, `last_seen` within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist | `crates/review/src/volume.rs#populate` |
+| Offered (pending) | not delisted, `established_event_count >= 1000`, `established_last_seen` (the last established sighting) within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist or the operator delist (`PROPOLIS_FEED_DELIST`) | `crates/review/src/volume.rs#populate` |
 | Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue` | `crates/review/src/volume.rs#withdraw` |
-| Lapsed | a pending or approved row whose address has not been seen for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`), and never for less than 90 days, which is also what the standalone `review daemon` uses; the row is removed and logged, and the address's next sighting is offered as a new candidate. A rejected row never lapses. The row is deleted for every node that shares the database, by whichever node's scan gets there first: nodes that publish windows longer than 90 days must all be given the same `PROPOLIS_FEED_WINDOWS` | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
-| Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor. The approval stands until it is reopened, the address is delisted, or it lapses: while it stands, any event for the address, of any kind and from any sensor, renews the listing | `crates/review/src/volume.rs#approve` |
+| Lapsed | a pending or approved row whose address has made no established connection for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`), and never for less than 90 days, which is also what the standalone `review daemon` uses; a row whose address has no established sighting at all lapses at once. The row is removed and logged, and the address's next flood is offered as a new candidate. A rejected row never lapses. The row is deleted for every node that shares the database, by whichever node's scan gets there first: nodes that publish windows longer than 90 days must all be given the same `PROPOLIS_FEED_WINDOWS` | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
+| Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor. The approval stands until it is reopened, the address is delisted, or it lapses: while it stands, any established (completed-TCP) connection from the address, from any sensor, renews the listing; a datagram naming it does not | `crates/review/src/volume.rs#approve` |
 | Reject | not published on volume; the row stays, so the address is not offered again | `crates/review/src/volume.rs#reject` |
 | Reopen | back to pending; an approved address leaves the retention feeds at the next build | `crates/review/src/volume.rs#reopen` |
 
@@ -293,13 +352,27 @@ when it is set (`crates/propolis/src/config.rs#load_config`,
 | Publish volume listings without approval | false | `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` | `crates/propolis/src/config.rs#load_config` |
 | Output dir | `/var/lib/propolis/feed/current` | (config) | `crates/propolis/src/config.rs#DEFAULT_FEED_OUTPUT_DIR` |
 
-Retention windows ignore tier and hold every approved entry (and approved volume
-listings) whose `last_seen` is inside the window, published as `all-{label}.*` and nested
-by construction (`crates/feed/src/builder.rs#FeedConfig`, `crates/feed/src/builder.rs#build`). A candidate is kept iff
-`now - last_seen < ttl`; each entry's `valid_from = coarsen_to_hour(last_seen)`
-and `valid_until = valid_from + ttl` (`crates/feed/src/builder.rs#materialize`). A stored
-`last_seen` later than `now` is read as `now` in all three, so an entry dated ahead of the
-clock is never valid past `now + ttl`. Every exported
+Each entry runs from its listing time, the time the address last earned its place in that
+file:
+
+- **Aggressive file:** `aggressive_earned_at`, kept while `now - aggressive_earned_at` is under
+  the aggressive TTL.
+- **Standard file:** `standard_earned_at`, kept while `now - standard_earned_at` is under the
+  standard TTL, and only while the address is not in the aggressive file. The two files never
+  hold the same address, so one that earned both runs out its aggressive TTL and is then carried
+  in the standard file for what is left of the standard one
+  (`crates/feed/src/builder.rs#Candidate::standard_listing`).
+- **Retention windows** ignore tier and hold every approved entry while the later of its two
+  earned times is inside the window, and an approved volume listing while its
+  `established_last_seen` is (`crates/feed/src/builder.rs#Candidate::window_listing`). They are
+  published as `all-{label}.*` and nested by construction (`crates/feed/src/builder.rs#FeedConfig`,
+  `crates/feed/src/builder.rs#build`).
+
+A candidate is kept iff `now - listing_time < ttl`; each entry's
+`valid_from = coarsen_to_hour(listing_time)`, `valid_until = valid_from + ttl`, and the
+published `last_seen` field is the same coarsened listing time
+(`crates/feed/src/builder.rs#materialize`). A listing time later than `now` is read as `now`, so
+an entry dated ahead of the clock is never valid past `now + ttl`. Every exported
 timestamp is coarsened to the hour boundary (anti-deanonymization)
 (`crates/feed/src/builder.rs#coarsen_to_hour`).
 
@@ -331,6 +404,15 @@ is_reserved(ip) || allowlist_cidr_contains(ip) || delist_contains(ip) || asn_all
   (`crates/core-scoring/src/allowlist.rs#contains`), because the review stage applies it too:
   `ExclusionEngine` delegates to it for the feed, and the review queue and submission runner use
   the same value for vendor reporting (see [Declared crawlers](#declared-crawlers)).
+- The delist (`PROPOLIS_FEED_DELIST`) reaches the review side too: an address on it is not
+  offered for review, a Pending entry for it is withdrawn (logged with the reason `delisted`),
+  it is not offered as a volume candidate, and an Approved one is held from every vendor
+  (`crates/review/src/queue.rs#ReviewQueue::with_delist`,
+  `crates/review/src/volume.rs#VolumeQueue::with_delist`,
+  `crates/review/src/submit.rs#SubmissionRunner::with_delist`). The unified daemon passes its
+  own value through; the standalone `review` binary reads the variable itself
+  (`crates/review/src/main.rs#ENV_DELIST`), so a node that runs the standalone `feed` and
+  `review` services must give `review.env` the same value as `feed.env`.
 
 The publisher re-validates every entry against exclusions at publish time; the
 FIRST violation rejects the WHOLE build, unlike the builder which drops

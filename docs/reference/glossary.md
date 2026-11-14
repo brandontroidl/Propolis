@@ -71,7 +71,8 @@ TCP handshake from an address the sender actually controls. It gates
 
 Whether an IP may be published to the blocklist feed. An IP is eligible only
 when it is not delisted, has the confirmed-real latch, and has at least two
-recorded events (`crates/core-scoring/src/scoring/eligibility.rs#eligible`). Raw
+established (completed-TCP) events (`crates/core-scoring/src/scoring/eligibility.rs#eligible`).
+A UDP or ICMP event does not count toward the two. Raw
 score alone never makes an IP eligible. Thresholds are owned by
 [`scoring-and-feed.md`](scoring-and-feed.md).
 

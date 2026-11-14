@@ -101,7 +101,8 @@ still emitted, so the ledger keeps its source, topic, size and hash: it has no `
 row has no `sample_sha256`, so the Samples list, the IP page's malware panel and the campaign
 indexer (which links a sample and tags an upload only on `sample_sha256`) do not show or link it; the
 IP timeline and the review queue read `sha256`, `size` and `orig_name` instead and show it as
-`name (hash..., size, not stored: spool full)`. Scoring counts it like any upload. Whether the
+`name (hash..., size, not stored: spool full)`. Scoring counts it like any upload (and, like
+any upload over UDP, a TFTP one adds no weight). Whether the
 indexer should key on `sha256` when `stored` is false is undecided.
 FTP drains at most a further 10 MB past its cap before closing the data
 connection, so a `wire_size` of 20 MB on an FTP row is a floor, not the total.
@@ -403,7 +404,9 @@ seen from the network in the window, its `wan_ip` is that of the bind address, a
 | `distinct_sources`, `distinct_sources_capped` | integer, boolean | distinct source addresses among them, at most 32 |
 
 The line is not marked `event_summary`, so scoring counts it as one sighting however many
-datagrams it stands for: none of them proved where it came from. The DNS and TFTP
+datagrams it stands for: none of them proved where it came from. Being UDP, it is a forgeable
+sighting: it adds to `event_count` and moves `last_seen`, and nothing else
+([established and forgeable events](scoring-and-feed.md#established-and-forgeable-events)). The DNS and TFTP
 `rate_limited` summaries carry the same keys except `rate_limited`, plus `protocol_label`,
 `transport` and `query_status: "rate_limited"`
 (`crates/sensor-framework/src/rate_limit.rs#flood_summary_metadata`).
@@ -467,7 +470,8 @@ same whichever produced it.
 `chaos_fingerprint_probe`, recorded in the `probe_signals` metadata array
 (`crates/sensor-dns/src/events.rs#probe_signals`). They are never `signal_type` values and carry
 no weight of their own: a UDP query is a `honeypot_connection` and a TCP or DoT query a
-`honeypot_command_exec`, whatever its probe signals. The rules are in
+`honeypot_command_exec`, whatever its probe signals. The UDP query is a forgeable sighting, so
+its weight is never added; the TCP and DoT query is established and scores. The rules are in
 [sensor-behavior.md](sensor-behavior.md#sensor-dns).
 
 ### Metadata the campaign indexer reads
@@ -573,7 +577,7 @@ is stored as `NUMERIC(4,3)` in `event`.
 
 | signal_type | weight | confidence | category | meaning [inferred] |
 |---|---|---|---|---|
-| `honeypot_connection` | 40 | 0.900 | honeypot | TCP connection established to a honeypot service, or a UDP probe (tftp request, dns query) |
+| `honeypot_connection` | 40 | 0.900 | honeypot | TCP connection established to a honeypot service, or a UDP probe (tftp request, dns query), which is counted but adds no weight |
 | `honeypot_login_attempt` | 50 | 0.920 | honeypot | credential submitted to a fake service |
 | `honeypot_command_exec` | 60 | 0.950 | honeypot | command run in the fake shell, or a protocol command (smtp DATA, the STARTTLS and AUTH TLS refusals, MQTT SUBSCRIBE and PUBLISH) |
 | `honeypot_malware_upload` | 80 | 0.980 | honeypot | file uploaded to a honeypot (highest weight/confidence) |
@@ -590,6 +594,13 @@ is stored as `NUMERIC(4,3)` in `event`.
 | `catchall_probe` | 15 | 0.400 | network | probe hit the catch-all listener |
 | `remote_auth_failure` | 12 | 0.400 | auth | remote auth failure (corroborating sensor) |
 | `honeypot_session_end` | 0 | 0.000 | honeypot | **telemetry**: how one interaction ended |
+
+A weight is added to a score only by an established event, one over a completed TCP
+connection. A UDP or ICMP event of any signal type carries a source its sender chose: it is
+stored with the weight above, counted and shown, but it adds nothing to the score, the
+categories or the active days
+(`crates/core-scoring/src/scoring/engine.rs#record_sighting`;
+[scoring](scoring-and-feed.md#established-and-forgeable-events)).
 
 ### Telemetry signals never score
 

@@ -165,7 +165,8 @@ async fn spoof_without_confirmed_real_stays_unreportable(pool: PgPool) -> Result
 /// STANDARD floor (raw >= 75) on its own. A second, small `suricata_sev3`
 /// event (weight 5, confidence 0.300, category Ids) supplies the second
 /// distinct category and second event `eligible` requires, without pushing
-/// raw (85) up to the AGGRESSIVE floor (raw >= 90).
+/// raw (85) up to the AGGRESSIVE floor (raw >= 90). Both are over TCP: only an established
+/// event counts toward eligibility or adds weight.
 #[sqlx::test(migrations = "./migrations")]
 async fn confirmed_real_plus_second_category_is_eligible_and_tiered(
     pool: PgPool,
@@ -193,7 +194,7 @@ async fn confirmed_real_plus_second_category_is_eligible_and_tiered(
             None,
             "ids-sensor",
             SignalType::SuricataSev3,
-            Protocol::Udp,
+            Protocol::Tcp,
             false,
             "2026-07-17T00:01:00Z", // close in time: no decay-driven category fade
         ),

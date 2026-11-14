@@ -223,7 +223,7 @@ Default base URLs (`crates/review/src/vendor/*.rs`):
 | `PROPOLIS_FEED_STANDARD_TTL_HOURS` | no | `48` (`crates/propolis/src/config.rs#DEFAULT_STANDARD_TTL_HOURS`) | positive u64; zero → abort |
 | `PROPOLIS_FEED_ALLOWLIST` | no | `""` | comma-sep CIDR list (`crates/propolis/src/config.rs#parse_cidr_list`); **bare IP without prefix is rejected**; invalid entry → abort |
 | `PROPOLIS_FEED_ALLOWLIST_FILE` | no | unset | path to a local text file of CIDRs, one per line, `#` comments (`crates/core-scoring/src/allowlist.rs#load_allowlist_file`), merged into `PROPOLIS_FEED_ALLOWLIST`. Read once at startup; the same list keeps these addresses out of the review queue and vendor submission, so an edit needs a restart. Each of these aborts startup: unreadable file, over 1 MiB or 50,000 entries, not UTF-8, any bad line, a bare address, an entry wider than /8 (IPv4) or /16 (IPv6). See [declared crawlers](scoring-and-feed.md#declared-crawlers). |
-| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`crates/propolis/src/config.rs#parse_ip_list`); invalid → abort |
+| `PROPOLIS_FEED_DELIST` | no | `""` | comma-sep IP list (`crates/propolis/src/config.rs#parse_ip_list`); invalid → abort. An address on it is published in no feed, is not offered for review or as a volume candidate, has a Pending review entry withdrawn, and is held from every vendor even when Approved (`crates/review/src/submit.rs#SubmissionRunner::with_delist`). Read once at startup. The standalone `review` binary reads it too: where the standalone `feed` and `review` services run, give `review.env` the same value as `feed.env` |
 | `PROPOLIS_FEED_ASN_ALLOWLIST` | no | `""` | comma-sep AS numbers, optional `AS`/`as` prefix (`crates/propolis/src/config.rs#parse_asn_list`); invalid → abort. Inert unless the GeoIP ASN DB loads (see [interactions](#interactions)). |
 | `PROPOLIS_FEED_WINDOWS` | no | `24h,7d,30d,60d,90d` (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`) | comma-sep `<count>h`/`<count>d` (`crates/propolis/src/config.rs#parse_window_list`). Only `h`/`d` units; count must be a positive int; **any malformed entry → abort** (fails closed, not skipped). Empty string → no retention feeds. **Unified daemon only.** `deploy/blocklist-sync.sh` publishes only labels of one to five digits with no leading zero (`24h`, not `024h` or `+24h`) and at most 16 windows, and refuses the whole build otherwise. |
 | `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` | no | `false` (`crates/propolis/src/config.rs#load_config`) | bool_flag. Default: a volume-listed address (1000 or more established TCP events) is published in the retention feeds only after an operator approves it on the console's volume tab or with `review volume approve`. `true` publishes every volume-listed address with **no human decision**: the count comes from what sensor log lines declare, so one forged line can list any address. Only the word `true` enables it; `1`, `yes` or a typo leaves approval required. Copied to `crates/feed/src/builder.rs#FeedConfig`; see [volume candidates](scoring-and-feed.md#candidate-sources). |
@@ -515,8 +515,14 @@ defaults and the same strict-parse/fail-closed rules unless noted.
   `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS`, `PROPOLIS_SUBMIT_POLL_INTERVAL_SECS`, and
   the full `PROPOLIS_VENDOR_*` set (`_KEY`/`_URL`/`_ENABLED`/`_COOLDOWN_HOURS`/
   `_RATE_LIMIT`/`_RATE_WINDOW_HOURS` for abuseipdb/dshield/otx plus
-  `PROPOLIS_VENDOR_DSHIELD_USER`), same defaults as unified. **Does not read the
-  VT or FETCH variables.**
+  `PROPOLIS_VENDOR_DSHIELD_USER`), same defaults as unified. It also reads the operator
+  lists the feed reads, so one list governs both the published feed and vendor reporting:
+  `PROPOLIS_FEED_ALLOWLIST`, `PROPOLIS_FEED_ALLOWLIST_FILE`, `PROPOLIS_FEED_ASN_ALLOWLIST`
+  (with `PROPOLIS_GEOIP_DIR` for the ASN lookup) and `PROPOLIS_FEED_DELIST`
+  (`crates/review/src/main.rs#ENV_DELIST`). An address on the delist is not offered for review
+  and not reported to any vendor; a malformed entry refuses startup, as in the feed. The binary
+  does not see `feed.env`, so where the standalone services run, put the same
+  `PROPOLIS_FEED_DELIST` value in `review.env`. **Does not read the VT or FETCH variables.**
 
 ---
 

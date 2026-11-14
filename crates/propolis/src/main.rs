@@ -1327,8 +1327,15 @@ async fn main() {
         .iter()
         .map(|(_, window)| chrono::Duration::seconds(window.as_secs() as i64))
         .max();
-    let volume_queue = move |allowlist: Arc<core_scoring::OperatorAllowlist>| {
-        let queue = VolumeQueue::new().with_allowlist(allowlist);
+    // The operator's delist reaches the feed's exclusions below. It also has to reach the review
+    // side: an address the operator took out of the feed must not be offered for review or
+    // reported to a vendor either.
+    let feed_delist: Arc<HashSet<IpAddr>> = Arc::new(config.feed_delist.iter().copied().collect());
+    let volume_queue = move |allowlist: Arc<core_scoring::OperatorAllowlist>,
+                             delist: Arc<HashSet<IpAddr>>| {
+        let queue = VolumeQueue::new()
+            .with_allowlist(allowlist)
+            .with_delist(delist);
         match volume_lapse {
             Some(silence) => queue.lapsing_after(silence),
             None => queue,
@@ -1342,6 +1349,7 @@ async fn main() {
         let submit_interval = config.submit_poll_interval;
         let vendors = config.vendors.clone();
         let review_allowlist = operator_allowlist.clone();
+        let review_delist = feed_delist.clone();
 
         // Once per process, not per supervised restart of the review group.
         review::vendor::log_vendor_startup(&vendors);
@@ -1354,6 +1362,7 @@ async fn main() {
                 let pool = pool_r.clone();
                 let vendors = vendors.clone();
                 let allowlist = review_allowlist.clone();
+                let delist = review_delist.clone();
                 async move {
                     let client = match review::vendor::http_client(
                         review::vendor::ClientTimeouts::VENDOR,
@@ -1366,9 +1375,12 @@ async fn main() {
                     };
                     let (adapters, gate_configs) = build_adapters(&vendors, client);
                     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
-                        .with_allowlist(allowlist.clone());
-                    let queue = ReviewQueue::new().with_allowlist(allowlist.clone());
-                    let volume = volume_queue(allowlist);
+                        .with_allowlist(allowlist.clone())
+                        .with_delist(delist.clone());
+                    let queue = ReviewQueue::new()
+                        .with_allowlist(allowlist.clone())
+                        .with_delist(delist.clone());
+                    let volume = volume_queue(allowlist, delist);
 
                     let queue_token = token.child_token();
                     let submit_token = token.child_token();
@@ -1439,8 +1451,8 @@ async fn main() {
         }
         // The queue scan that ends a lapsed volume approval runs with the review subsystem.
         // With that off, the build loop runs it instead.
-        let feed_volume_lapse =
-            (!config.review_enabled).then(|| volume_queue(operator_allowlist.clone()));
+        let feed_volume_lapse = (!config.review_enabled)
+            .then(|| volume_queue(operator_allowlist.clone(), feed_delist.clone()));
         let output_dir = config.feed_output_dir.clone();
         let build_interval = config.feed_build_interval;
 

@@ -526,3 +526,168 @@ async fn migration_0014_backfills_the_sets_from_the_ledger(pool: PgPool) -> Resu
     );
     Ok(())
 }
+
+/// Migration 0027 applied to rows an earlier version wrote. It must take `established_last_seen`
+/// from the ledger's TCP rows (never from `last_seen`, which a datagram may have moved), seed the
+/// earned times from it for the rows the feed lists, and withdraw eligibility that rested on a
+/// datagram being the second event.
+#[sqlx::test(migrations = false)]
+async fn migration_0027_backfills_from_established_sightings_only(
+    pool: PgPool,
+) -> Result<(), RepoError> {
+    let migrator = sqlx::migrate!("./migrations");
+    migrator
+        .run_to(26, &pool)
+        .await
+        .map_err(sqlx::Error::from)?;
+
+    let t0: DateTime<Utc> = "2026-09-01T00:00:00Z".parse().expect("literal");
+    let at = |minutes: i64| t0 + Duration::minutes(minutes);
+    use SignalType::*;
+    // (source, signal, tcp, minutes after t0)
+    let ledger: [(&str, SignalType, bool, i64); 11] = [
+        // Listed aggressive. Its last connection is at 10; a datagram names it at 600 and a
+        // session-end telemetry row (TCP, never folded) is written at 700.
+        ("192.0.2.50", HoneypotMalwareUpload, true, 0),
+        ("192.0.2.50", HoneypotCommandExec, true, 10),
+        ("192.0.2.50", HoneypotConnection, false, 600),
+        ("192.0.2.50", HoneypotSessionEnd, true, 700),
+        // Listed standard, last connection at 30.
+        ("192.0.2.51", HoneypotMalwareUpload, true, 20),
+        ("192.0.2.51", HoneypotLoginAttempt, true, 30),
+        // One connection, then a datagram: eligible under the old rule only.
+        ("192.0.2.52", HoneypotMalwareUpload, true, 40),
+        ("192.0.2.52", HoneypotConnection, false, 50),
+        // Delisted, with a tier still stored.
+        ("192.0.2.53", HoneypotMalwareUpload, true, 60),
+        ("192.0.2.53", HoneypotCommandExec, true, 70),
+        // Only ever named by a datagram.
+        ("192.0.2.54", HoneypotConnection, false, 80),
+    ];
+    let mut tx = pool.begin().await?;
+    for &(ip, signal, tcp, minutes) in &ledger {
+        let e = event(ip, None, "s", signal, tcp, tcp, at(minutes));
+        insert_chained(&mut tx, &e).await?;
+    }
+    tx.commit().await?;
+
+    // The rows as the old fold left them: (source, tier, eligible, recommended, delisted,
+    // established events, last_seen and anchor in minutes).
+    type StoredRow = (
+        &'static str,
+        Option<&'static str>,
+        bool,
+        bool,
+        bool,
+        i32,
+        i64,
+    );
+    let stored: [StoredRow; 5] = [
+        ("192.0.2.50", Some("aggressive"), true, true, false, 2, 600),
+        ("192.0.2.51", Some("standard"), true, true, false, 2, 30),
+        ("192.0.2.52", Some("standard"), true, true, false, 1, 50),
+        ("192.0.2.53", Some("aggressive"), false, false, true, 2, 70),
+        ("192.0.2.54", None, false, false, false, 0, 80),
+    ];
+    for &(ip, tier, eligible, recommended, delisted, established, seen) in &stored {
+        sqlx::query(
+            "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
+                 distinct_categories, first_seen, last_seen, eligible, recommended_for_vendor, \
+                 recommended_for_blocklist, tier, delisted, established_event_count) \
+             VALUES ($1::inet, 90, $2, 0.98, 3, 1, $2, $2, $3, $4, $4, $5::feed_tier_enum, $6, $7)",
+        )
+        .bind(ip)
+        .bind(at(seen))
+        .bind(eligible)
+        .bind(recommended)
+        .bind(tier)
+        .bind(delisted)
+        .bind(established)
+        .execute(&pool)
+        .await?;
+    }
+
+    migrator.run(&pool).await.map_err(sqlx::Error::from)?;
+
+    type Backfilled = (
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+        bool,
+        bool,
+        bool,
+    );
+    let mut got: BTreeMap<String, Backfilled> = BTreeMap::new();
+    for row in sqlx::query(
+        "SELECT host(source_ip) AS ip, established_last_seen, aggressive_earned_at, \
+                standard_earned_at, eligible, recommended_for_vendor, recommended_for_blocklist \
+         FROM ip_score",
+    )
+    .fetch_all(&pool)
+    .await?
+    {
+        got.insert(
+            row.try_get("ip")?,
+            (
+                row.try_get("established_last_seen")?,
+                row.try_get("aggressive_earned_at")?,
+                row.try_get("standard_earned_at")?,
+                row.try_get("eligible")?,
+                row.try_get("recommended_for_vendor")?,
+                row.try_get("recommended_for_blocklist")?,
+            ),
+        );
+    }
+    let want: BTreeMap<String, Backfilled> = [
+        // The datagram at 600 and the telemetry at 700 move nothing: earned at the connection.
+        (
+            "192.0.2.50",
+            (Some(at(10)), Some(at(10)), None, true, true, true),
+        ),
+        (
+            "192.0.2.51",
+            (Some(at(30)), None, Some(at(30)), true, true, true),
+        ),
+        // No longer eligible, so nothing earned and nothing recommended.
+        (
+            "192.0.2.52",
+            (Some(at(40)), None, None, false, false, false),
+        ),
+        (
+            "192.0.2.53",
+            (Some(at(70)), None, None, false, false, false),
+        ),
+        ("192.0.2.54", (None, None, None, false, false, false)),
+    ]
+    .into_iter()
+    .map(|(ip, row)| (ip.to_string(), row))
+    .collect();
+    assert_eq!(got, want);
+
+    // The dedup read's index exists and holds only established rows.
+    let predicate: String = sqlx::query_scalar(
+        "SELECT pg_get_expr(indpred, indrelid) FROM pg_index \
+         WHERE indexrelid = 'event_dedup_tcp_idx'::regclass",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(predicate.contains("tcp"), "{predicate}");
+
+    // A backfilled row carries on: the next connection folds onto it and replays to the same
+    // clocks the fold would have kept.
+    let next = append_event(
+        &pool,
+        event(
+            "192.0.2.51",
+            None,
+            "s",
+            HoneypotCommandExec,
+            true,
+            true,
+            at(45),
+        ),
+    )
+    .await?;
+    assert_eq!(next.established_last_seen, Some(at(45)));
+    Ok(())
+}

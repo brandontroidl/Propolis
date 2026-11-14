@@ -290,7 +290,8 @@ async fn with_the_review_subsystem_off_the_feed_loop_still_ends_a_lapsed_approva
     // Then the address went quiet for longer than any window, and longer than the ninety days
     // an approval is kept at the least.
     sqlx::query(
-        "UPDATE ip_score SET last_seen = now() - interval '91 days' WHERE source_ip = $1::inet",
+        "UPDATE ip_score SET established_last_seen = now() - interval '91 days' \
+         WHERE source_ip = $1::inet",
     )
     .bind(FLOOD)
     .execute(&pool)

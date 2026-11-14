@@ -38,11 +38,12 @@ features; see [Limitations](limitations.md) for residual risks within scope.
 - **No automatic reporting or listing.** No vendor abuse report is filed and no IP
   enters any feed file without an operator's decision about that address. That includes
   the volume rule: a source with a thousand or more completed TCP connections and
-  activity in the last day is offered for the retention feeds and published only once
-  approved, and is never reported to a vendor on that basis. A decision stands until it
-  is undone: an address approved on its score is listed again whenever it earns a tier
-  again, and one approved on volume stays listed for as long as it keeps being seen (that
-  approval lapses once the address has been silent for the longest retention window).
+  a completed connection in the last day is offered for the retention feeds and
+  published only once approved, and is never reported to a vendor on that basis. A
+  decision stands until it is undone: an address approved on its score is listed again
+  whenever it earns a tier again, and one approved on volume stays listed for as long as
+  it keeps making completed TCP connections (a datagram naming it does not renew it; the
+  approval lapses once the address has made none for the longest retention window).
   Automatic volume listing exists as an explicit opt-in
   (`PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`) and is off by default.
 

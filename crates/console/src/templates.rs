@@ -713,7 +713,7 @@ mod tests {
             has_confirmed_real => false, event_count => 0, distinct_categories => 0,
             distinct_wan_count => 0, distinct_sensor_count => 0, active_days => 0,
             persistence_bonus => "0", max_confidence => "0.000",
-            first_seen => "-", last_seen => "-",
+            first_seen => "-", last_seen => "-", established_event_count => 0,
             timeline_counts => minijinja::context! {
                 events => 0, commands => 0, sessions => 0, ungrouped => 0,
             },

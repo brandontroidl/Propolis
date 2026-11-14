@@ -41,7 +41,9 @@ real zero.
 
 ## Review
 
-Addresses that have reached a tier and are waiting for a decision. Under each pending
+Addresses that have earned a tier and are waiting for a decision. A pending entry stays
+until you decide it, the address is delisted, or your allowlist or delist covers it: a later
+weak event does not take it away. Under each pending
 row a context line says what the address did: the sensors it reached, how many sessions,
 its three most frequent signals, and its first upload or download, or failing that its
 first command after the `enable` / `system` / `shell` / `sh` preamble Mirai-family
@@ -56,8 +58,9 @@ Reject controls, plus **Return to pending** to hand the entry back to the workin
 queue. Acting on a row there moves it to another tab and tells you which one.
 
 The **Volume tab** is a second queue: addresses that reached a thousand established TCP
-connections, whether or not they ever logged in. None of them is published while it
-waits. **Approve for retention feeds** publishes the address in the `all-*` retention
+connections, whether or not they ever logged in. Its time column is the last connection,
+the clock a volume listing runs on, not the last sighting of any kind. None of them is
+published while it waits. **Approve for retention feeds** publishes the address in the `all-*` retention
 feeds and nothing else; it is not reported to abuse vendors. **Reject** keeps it out.
 Decided candidates are listed below with **Return to pending**, which undoes either
 decision. The badge in the navigation counts both queues, and the page heading says how
@@ -66,8 +69,10 @@ the total splits.
 Two per-address actions go further. **Delist** removes the address from the queue and
 keeps it out of the feed until you say otherwise - **Relist**, which replaces the
 Delist button once an address is delisted, is how you say otherwise. Relisting clears
-the hold and re-derives the ordinary gates, so the address rejoins the feed only if it
-still qualifies on its current score. Delisting also discards the address's volume
+the hold and re-derives the ordinary gates. Delisting deleted the address's queue entry,
+so a relisted address is offered for review again if it has earned a tier, and once
+approved it is listed for whatever is left of its tier's TTL from the last time it earned
+it. Delisting also discards the address's volume
 decision, so a relisted address that still floods is offered on the Volume tab again.
 **Delete** removes its score, queue, volume and
 submission rows so it starts from nothing; the event ledger is never touched, so the
@@ -83,14 +88,17 @@ addresses the total is the database's estimate and says so.
 
 The **score** column is the live score: decayed since the address's last event and
 weighted for how many of your WAN addresses it hit. The **tier** was set when the address
-was last scored, from its raw score and its strongest signal's confidence, so a standard
+last made a completed TCP connection (UDP traffic does not rescore it), from its raw score and its strongest signal's confidence, so a standard
 address can show 100.0 while an aggressive one shows 99.9. A note above the table states
 the thresholds; their owner is [scoring and feed](../reference/scoring-and-feed.md#tier).
 
 ## Address detail
 
-One address: score and tier, the gates it has passed, the activity chart, and the
-evidence timeline grouped into sessions where the sensor recorded one. Consecutive
+One address: score and tier, the gates it has passed, when it last earned each tier
+("Earned aggressive tier", "Earned standard tier", the times the feed and vendor reporting run
+on), how many of its events were completed TCP connections ("Established events", the only
+ones that score), and "Last connection" beside "Last seen" (a UDP datagram moves only the
+second, since its source can be forged), the activity chart, and the evidence timeline grouped into sessions where the sensor recorded one. Consecutive
 sessions that ran the same commands (a loader retrying under a new username) fold into
 one card marked `x3 identical sessions` with the usernames tried, each session still
 inside it, and an echo loader's chunk writes to one file are one row, `40 echo chunks
@@ -121,7 +129,7 @@ The **Status** tab reads the published manifest: entry counts per tier and per
 retention window, when it was built, and what the exclusions removed. The **Entries**
 tab lists the addresses in the published files, read from those files rather than the
 database, so it cannot disagree with what was published. Every feed is downloadable in
-ten formats, from plain text to nftables, pf and RPZ.
+nine formats, from plain text to nftables, pf and RPZ.
 
 ## Samples
 

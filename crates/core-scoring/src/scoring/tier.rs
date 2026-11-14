@@ -30,15 +30,17 @@ pub fn recommended_for_blocklist(eligible: bool, effective_score: Decimal) -> bo
 /// latch, no score threshold. A flood of unsolicited connections is itself hostile on a honeypot,
 /// and the 60s same-signal dedup otherwise collapses such a flood to one scored event so it never
 /// clears the merit path. Gated on recent activity so a long-stopped flood ages out, and on
-/// `!delisted` like every other blocklist path.
+/// `!delisted` like every other blocklist path. Both the count and the recency are of ESTABLISHED
+/// events: `seconds_since_established` is `None` for an address no completed TCP connection has
+/// come from, which is never listed on volume.
 pub fn recommended_by_volume(
     delisted: bool,
-    event_count: u32,
-    seconds_since_last_seen: i64,
+    established_event_count: u32,
+    seconds_since_established: Option<i64>,
 ) -> bool {
     !delisted
-        && event_count >= VOLUME_LIST_THRESHOLD
-        && seconds_since_last_seen <= VOLUME_LIST_WINDOW_SECONDS
+        && established_event_count >= VOLUME_LIST_THRESHOLD
+        && seconds_since_established.is_some_and(|secs| secs <= VOLUME_LIST_WINDOW_SECONDS)
 }
 
 #[cfg(test)]
@@ -84,17 +86,19 @@ mod tests {
     #[test]
     fn volume_lists_a_recent_flood_but_not_a_stale_small_or_delisted_one() {
         // A recent high-volume flood is listed on volume alone (no confirmed-real, no score).
-        assert!(recommended_by_volume(false, 1000, 3600));
-        assert!(recommended_by_volume(false, 50_000, 0));
+        assert!(recommended_by_volume(false, 1000, Some(3600)));
+        assert!(recommended_by_volume(false, 50_000, Some(0)));
         // Below the threshold: not listed.
-        assert!(!recommended_by_volume(false, 999, 60));
-        // Over threshold but last seen more than the window ago: aged out.
+        assert!(!recommended_by_volume(false, 999, Some(60)));
+        // Over threshold but last established more than the window ago: aged out.
         assert!(!recommended_by_volume(
             false,
             50_000,
-            VOLUME_LIST_WINDOW_SECONDS + 1
+            Some(VOLUME_LIST_WINDOW_SECONDS + 1)
         ));
         // Delisted overrides volume.
-        assert!(!recommended_by_volume(true, 50_000, 60));
+        assert!(!recommended_by_volume(true, 50_000, Some(60)));
+        // No established sighting at all: whatever the count claims, nothing proved the source.
+        assert!(!recommended_by_volume(false, 50_000, None));
     }
 }

@@ -150,18 +150,22 @@ than running without deadlines.
 ### Gating (the gatekeeper)
 
 Before any submission, `gatekeeper::check` runs an ordered, fail-closed sequence
-that short-circuits on the first hold (`crates/review/src/gatekeeper.rs#check`): **Reserved**
-(reserved-range IP, first and not overridable) -> **Disabled** -> **Stale**
-(last activity older than the 48 h freshness window) -> **Cooldown** ->
-**RateLimit** -> **ScoreFloor** -> **CategoryFilter**. Exact values and the full
+that short-circuits on the first hold (`crates/review/src/gatekeeper.rs#check`,
+`crates/review/src/gatekeeper.rs#check_with`): **Reserved** (reserved-range IP, first and not
+overridable) -> **Delisted** -> **Disabled** -> **Stale** (no tier earned within the 48 h
+freshness window, or ever; measured on the last time the address earned a tier, not on
+`last_seen`) -> **Cooldown** -> **Stale** again (nothing earned since this vendor last accepted
+a report about the address) -> **RateLimit** -> **ScoreFloor** -> **CategoryFilter**. One burst
+of activity is therefore one report per vendor. Exact values and the full
 sequence are owned by
 [rate-limits-and-budgets.md](rate-limits-and-budgets.md#vendor-submission-gatekeeper).
 
 An address on the operator allowlist (`PROPOLIS_FEED_ALLOWLIST`, its file, and
-`PROPOLIS_FEED_ASN_ALLOWLIST`) never reaches this sequence: the review queue does not
-surface it, and `SubmissionRunner::run_once` refuses it before any vendor call even if it was
-queued and approved before the list covered it
-(`crates/review/src/submit.rs#run_once`; see
+`PROPOLIS_FEED_ASN_ALLOWLIST`) or the operator delist (`PROPOLIS_FEED_DELIST`) never reaches
+this sequence: the review queue does not surface it, and `SubmissionRunner::run_once` refuses
+it before any vendor call even if it was queued and approved before the list covered it
+(`crates/review/src/submit.rs#run_once`,
+`crates/review/src/submit.rs#SubmissionRunner::with_delist`; see
 [Declared crawlers](scoring-and-feed.md#declared-crawlers)).
 
 ### What is never sent
@@ -179,7 +183,13 @@ could carry a WAN vantage address - confirmed by reading all three
 
 The report comment is
 `"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,
-and `evidence_window = (first_seen, last_seen)` (`crates/review/src/submit.rs#build_report`).
+and `evidence_window = (first_seen, established_last_seen)` (`crates/review/src/submit.rs#build_report`).
+The end of the window, the attack time a vendor is told, is the address's last established
+(completed-TCP) sighting, never `last_seen`, which a datagram under a forged source moves; `last_seen`
+stands in only for a row with no established sighting, which the gate never passes. `first_seen` is
+the row's first sighting of any kind. The protocol label that picks each vendor's category codes is
+read from established events only (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`), so a forged
+DNS datagram cannot turn a report of an SSH session into a generic one.
 
 ## Ops-alert ntfy
 

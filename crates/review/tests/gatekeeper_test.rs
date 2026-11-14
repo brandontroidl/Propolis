@@ -49,10 +49,10 @@ fn permissive_config(vendor: &str) -> VendorConfig {
     }
 }
 
-/// An in-memory `IpScore` the gatekeeper can check without any DB round trip:
-/// `check` only reads `raw_score` and `category_breakdown` from it. Other
-/// fields are filled with plausible values that are never inspected by the
-/// gate.
+/// An in-memory `IpScore` the gatekeeper can check without any DB round trip: `check` reads
+/// `raw_score`, `category_breakdown`, `delisted` and the earned times from it. This one earned
+/// the standard tier just now. Other fields are filled with plausible values that are never
+/// inspected by the gate.
 fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
     let now = Utc::now();
     let mut breakdown = serde_json::Map::new();
@@ -83,6 +83,9 @@ fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
         recommended_for_blocklist: false,
         tier: None,
         delisted: false,
+        established_last_seen: Some(now),
+        aggressive_earned_at: None,
+        standard_earned_at: Some(now),
     }
 }
 
@@ -108,31 +111,95 @@ async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: 
 }
 
 #[sqlx::test(migrations = false)]
-async fn stale_last_seen_is_held(pool: PgPool) {
+async fn a_tier_earned_outside_the_freshness_window_is_held_however_recently_it_was_seen(
+    pool: PgPool,
+) {
     migrate(&pool).await;
     let ip: IpAddr = "45.10.31.243".parse().unwrap();
     let config = permissive_config("stale-vendor");
-    // Active three days ago: older than the freshness window, so it must not be submitted (a
-    // days-old attack is not current honeypot activity, and vendors reject the stale timestamp).
+    // It earned its tier three days ago: older than the freshness window, so it must not be
+    // submitted (a days-old attack is not current honeypot activity, and vendors reject the stale
+    // timestamp). It was SEEN a moment ago, which is all one forged datagram takes, and that
+    // must not make it reportable: this is the check that used to read `last_seen`.
     let mut score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
-    score.last_seen = Utc::now() - Duration::days(3);
+    score.standard_earned_at = Some(Utc::now() - Duration::days(3));
+    score.established_last_seen = Some(Utc::now() - Duration::days(3));
+    score.last_seen = Utc::now();
+
+    let result = check(&pool, ip, &config, &score).await;
+    assert_eq!(result, GateResult::Held(GateReason::Stale));
+
+    // Either tier's clock counts: earning aggressive an hour ago makes it current again.
+    score.aggressive_earned_at = Some(Utc::now() - Duration::hours(1));
+    assert_eq!(check(&pool, ip, &config, &score).await, GateResult::Pass);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_recently_earned_tier_passes_the_freshness_gate(pool: PgPool) {
+    migrate(&pool).await;
+    let vendor = "fresh-vendor";
+    let ip: IpAddr = "45.10.31.244".parse().unwrap();
+    let config = permissive_config(vendor);
+    // Earned 47 hours ago: inside the freshness window, so every other check applies.
+    let mut score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
+    score.standard_earned_at = Some(Utc::now() - Duration::hours(47));
+
+    let result = check(&pool, ip, &config, &score).await;
+    assert_eq!(result, GateResult::Pass);
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_address_that_never_earned_a_tier_is_held(pool: PgPool) {
+    migrate(&pool).await;
+    let ip: IpAddr = "45.10.31.245".parse().unwrap();
+    let config = permissive_config("never-earned-vendor");
+    // Approved, seen now, high stored score, and no record of ever having earned a tier.
+    let mut score = fake_score(ip, Decimal::from(95), &["Honeypot"]);
+    score.standard_earned_at = None;
 
     let result = check(&pool, ip, &config, &score).await;
     assert_eq!(result, GateResult::Held(GateReason::Stale));
 }
 
 #[sqlx::test(migrations = false)]
-async fn recent_last_seen_passes_the_freshness_gate(pool: PgPool) {
+async fn a_delisted_address_is_held_whatever_it_earned(pool: PgPool) {
     migrate(&pool).await;
-    let vendor = "fresh-vendor";
-    let ip: IpAddr = "45.10.31.244".parse().unwrap();
-    let config = permissive_config(vendor);
-    // Active one hour ago: comfortably inside the freshness window, so every other check applies.
-    let mut score = fake_score(ip, Decimal::from(80), &["Honeypot"]);
-    score.last_seen = Utc::now() - Duration::hours(1);
+    let ip: IpAddr = "45.10.31.246".parse().unwrap();
+    let config = permissive_config("delisted-vendor");
+    // Delisting leaves the earned times in place, so the latch itself has to hold the report.
+    let mut score = fake_score(ip, Decimal::from(95), &["Honeypot"]);
+    score.delisted = true;
 
     let result = check(&pool, ip, &config, &score).await;
-    assert_eq!(result, GateResult::Pass);
+    assert_eq!(result, GateResult::Held(GateReason::Delisted));
+}
+
+#[sqlx::test(migrations = false)]
+async fn nothing_earned_since_the_last_report_is_not_reported_again(pool: PgPool) {
+    migrate(&pool).await;
+    let vendor = "one-burst-vendor";
+    let ip = "45.10.31.247";
+    let addr: IpAddr = ip.parse().unwrap();
+    let config = permissive_config(vendor);
+    // One burst of activity 40 hours ago, reported 30 hours ago. The 24 hour cooldown is over
+    // and the tier is still inside the 48 hour window, which used to mean a second report of
+    // the same sighting.
+    insert_submission(&pool, ip, vendor, Utc::now() - Duration::hours(30)).await;
+    let mut score = fake_score(addr, Decimal::from(80), &["Honeypot"]);
+    score.standard_earned_at = Some(Utc::now() - Duration::hours(40));
+    assert_eq!(
+        check(&pool, addr, &config, &score).await,
+        GateResult::Held(GateReason::Stale)
+    );
+
+    // The address comes back and earns its tier again after that report: that is news.
+    score.standard_earned_at = Some(Utc::now() - Duration::hours(2));
+    assert_eq!(check(&pool, addr, &config, &score).await, GateResult::Pass);
+
+    // A vendor that was never sent the first burst still gets it.
+    let other = permissive_config("never-told-vendor");
+    score.standard_earned_at = Some(Utc::now() - Duration::hours(40));
+    assert_eq!(check(&pool, addr, &other, &score).await, GateResult::Pass);
 }
 
 #[sqlx::test(migrations = false)]

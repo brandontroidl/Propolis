@@ -64,7 +64,7 @@ login rate limiting) are owned by [authentication and authorization](../security
 |---|---|---|---|---|
 | GET | `/` | `dashboard` | 6 stat cards, 2 Chart.js charts; Recent activity reads the newest 1,000 events and folds runs from one source, sensor and signal into 20 rows; the charts and the sensor split count from the [hourly roll-up](database.md#event-rollups) | `crates/console/src/routes/dashboard.rs#dashboard`, `crates/console/src/routes/dashboard.rs#fold_recent` |
 | GET | `/dashboard/chart` | `dashboard_chart_fragment` | HTMX; `?range=1h\|24h\|7d\|30d`, malformed -> `24h`; every range but `1h` counts from the hourly roll-up, except in a time zone whose offset is not a whole number of hours, where it reads the ledger | `crates/console/src/routes/dashboard.rs#dashboard_chart_fragment` |
-| GET | `/queue` | `queue_page` | review queue; pending entries with two or more listed members in one campaign are one expandable group row under that campaign's "Approve all N" link (the existing two-step confirmation), everything else is a row; each row carries a context line built from at most 5,000 of its events; `?sort=` is score, event_count, first_seen or last_seen, applied to a group through its top member; `?tab=pending\|approved\|rejected\|snoozed\|volume`, where `volume` lists the pending [volume candidates](#volume-candidate-actions) (established TCP events now and when offered, all events, last seen, the same context line) and under them the latest 100 decided ones; the heading says how the pending count splits between the pending tab and the volume tab | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#group_pending`, `crates/console/src/routes/queue.rs#group_home`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/queue.rs#volume_view`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
+| GET | `/queue` | `queue_page` | review queue; pending entries with two or more listed members in one campaign are one expandable group row under that campaign's "Approve all N" link (the existing two-step confirmation), everything else is a row; each row carries a context line built from at most 5,000 of its events; `?sort=` is score, event_count, first_seen or last_seen, applied to a group through its top member; `?tab=pending\|approved\|rejected\|snoozed\|volume`, where `volume` lists the pending [volume candidates](#volume-candidate-actions) (established TCP events now and when offered, all events, last connection (`established_last_seen`, the clock a volume listing runs on), the same context line) and under them the latest 100 decided ones; the heading says how the pending count splits between the pending tab and the volume tab | `crates/console/src/routes/queue.rs#queue_page`, `crates/console/src/routes/queue.rs#group_pending`, `crates/console/src/routes/queue.rs#group_home`, `crates/console/src/routes/queue.rs#row_context`, `crates/console/src/routes/queue.rs#volume_view`, `crates/console/src/routes/campaigns.rs#campaigns_by_ip` |
 | POST | `/queue/{ip}/approve` | `approve` | CSRF required | `crates/console/src/routes/queue.rs#approve` |
 | POST | `/queue/{ip}/reject` | `reject` | CSRF required | `crates/console/src/routes/queue.rs#reject` |
 | POST | `/queue/{ip}/snooze` | `snooze` | CSRF required | `crates/console/src/routes/queue.rs#snooze` |
@@ -131,7 +131,7 @@ csrf token" (`crates/console/src/routes/queue.rs#unsnooze` unsnooze, `crates/con
 | Approve | `POST /queue/{ip}/approve` | `ReviewQueue::approve` | HTMX `queue_row.html` partial |
 | Reject | `POST /queue/{ip}/reject` | `ReviewQueue::reject` | HTMX row partial |
 | Snooze | `POST /queue/{ip}/snooze` | `ReviewQueue::snooze` | HTMX row partial |
-| Delist | `POST /ip/{ip}/delist` | delete `review_queue` and `volume_review` rows; set `ip_score.delisted=TRUE, eligible=FALSE, recommended_for_vendor=FALSE, recommended_for_blocklist=FALSE`; one transaction | `303` → `/ip/{ip}` |
+| Delist | `POST /ip/{ip}/delist` | delete `review_queue` and `volume_review` rows; set `ip_score.delisted=TRUE, eligible=FALSE, recommended_for_vendor=FALSE, recommended_for_blocklist=FALSE`, leaving the earned-tier times in place; one transaction | `303` → `/ip/{ip}` |
 | Delete | `POST /ip/{ip}/delete` | purge `review_queue` + `volume_review` + `vendor_submission` + `ip_score` rows; one transaction | `303` → `/queue` |
 | Approve a campaign | `POST /campaigns/{id}/approve` | `ReviewQueue::approve` for each confirmed address that is still a pending member | page listing approved and skipped addresses |
 
@@ -184,7 +184,7 @@ disk. Both path segments are validated **before** touching the filesystem.
   is a **shape check** that admits no `.`, `/`, or `\`, so no accepted value can traverse
   out of the feed directory.
 - `format` is matched against a fixed set → (extension, content-type)
-  (`crates/console/src/routes/feed.rs#download_feed`). **10 formats:**
+  (`crates/console/src/routes/feed.rs#download_feed`). **9 formats:**
 
   | Format | Extension | Content-Type |
   |---|---|---|
@@ -196,7 +196,6 @@ disk. Both path segments are validated **before** touching the filesystem.
   | `nft` | `.nft` | `text/plain` |
   | `pf` | `.pf` | `text/plain` |
   | `alias` | `.alias` | `text/plain` |
-  | `hosts` | `.hosts` | `text/plain` |
   | `rpz` | `.rpz` | `text/plain` |
 
 - The path is built as `{tier}.{extension}` under the feed directory

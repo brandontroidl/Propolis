@@ -168,7 +168,7 @@ fn retention_windows_are_written_as_all_label_files_and_listed_in_the_manifest()
 
     // Every format the tiers get, the windows get too.
     for ext in [
-        "txt", "json", "csv", "cidr", "ipset", "nft", "pf", "alias", "hosts", "rpz",
+        "txt", "json", "csv", "cidr", "ipset", "nft", "pf", "alias", "rpz",
     ] {
         assert!(
             output_dir.join(format!("all-7d.{ext}")).exists(),

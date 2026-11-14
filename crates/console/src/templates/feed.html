@@ -23,7 +23,6 @@
     <option value="nft">nftables</option>
     <option value="pf">pf</option>
     <option value="alias">pfSense</option>
-    <option value="hosts">hosts</option>
     <option value="rpz">RPZ</option>
   </select>
   <a class="dl-go" data-feed="{{ feed }}" href="/feed/download/{{ feed }}/txt" download>Download</a>
@@ -96,7 +95,7 @@
   </div>
   {% if windows %}
   <div class="panel">
-    <div class="panel-head">Retention feeds <span class="dim">by last seen: approved entries of any tier, and volume listings</span></div>
+    <div class="panel-head">Retention feeds <span class="dim">by when a tier was last earned: approved entries of any tier, and volume listings by last connection</span></div>
     <table class="table-compact">
       <thead><tr><th>Window</th><th>Entries</th><th>Valid until</th><th>File</th></tr></thead>
       <tbody>

@@ -869,6 +869,13 @@ async fn detail(
             max_confidence => format!("{:.3}", score.max_confidence),
             first_seen => format_timestamp(score.first_seen),
             last_seen => format_timestamp(score.last_seen),
+            // What a listing runs on. `last_seen` moves on any sighting, a datagram under a forged
+            // source included; these three only move on a completed connection, and the two earned
+            // times only when that connection left the address eligible and holding the tier.
+            established_event_count => score.established_event_count,
+            last_connection => score.established_last_seen.map(format_timestamp),
+            aggressive_earned => score.aggressive_earned_at.map(format_timestamp),
+            standard_earned => score.standard_earned_at.map(format_timestamp),
             session_folds,
             ungrouped,
             timeline_counts,

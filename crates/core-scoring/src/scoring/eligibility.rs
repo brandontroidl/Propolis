@@ -1,10 +1,10 @@
 pub fn eligible(
     has_confirmed_real: bool,
-    event_count: u32,
+    established_event_count: u32,
     _distinct_categories: u32,
     delisted: bool,
 ) -> bool {
-    !delisted && has_confirmed_real && event_count >= 2
+    !delisted && has_confirmed_real && established_event_count >= 2
 }
 
 #[cfg(test)]

@@ -133,6 +133,14 @@ the source's last sighting, which grows while intake is behind. The plan is held
 `crates/core-scoring/src/repository/events.rs#dedup_read_plan_uses_the_dedup_index_on_an_incident_shaped_ledger`
 and `crates/core-scoring/src/repository/events.rs#dedup_read_plan_generic_form_uses_the_dedup_index`.
 
+Since `0027` that read asks for the newest ESTABLISHED (`protocol = 'tcp'`) event of the signal
+type, so a datagram cannot make a real connection a duplicate. The partial index
+`event_dedup_tcp_idx (source_ip, signal_type, observed_at) WHERE protocol = 'tcp'`
+(`crates/core-scoring/migrations/0027_established_sightings.sql#event_dedup_tcp_idx`) holds only the rows that read can return, so a
+source that sent datagrams for days and then connects costs one backward step, not a walk past
+every datagram while the append lock is held. The batch path's
+`crates/core-scoring/src/repository/batch.rs#DEDUP_PRIORS_SQL` and replay apply the same rule.
+
 The `metadata` column is documented "sanitized at capture" (`crates/core-scoring/migrations/0002_event.sql#metadata`); the
 sanitizer path itself lives outside the schema. The DB does **not** enforce the
 `signal_type` -> `category` coupling; a mismatched `category` on a direct SQL INSERT
@@ -224,7 +232,7 @@ missing `prev_hash` is rejected before the row lands.
 
 ## Table: `ip_score` (per-IP aggregate)
 
-Base `0003_ip_score.sql`; extended by `0008`, `0010`, `0011`. PK `source_ip`. Rust
+Base `0003_ip_score.sql`; extended by `0008`, `0010`, `0011`, `0027`. PK `source_ip`. Rust
 read model `IpScore` (`crates/core-scoring/src/domain/types.rs#IpScore`). The formulas that produce these values are
 owned by [scoring-and-feed.md](scoring-and-feed.md); this table is the persisted
 result.
@@ -251,6 +259,9 @@ result.
 | `active_days` | INTEGER | NOT NULL DEFAULT 1 | `crates/core-scoring/migrations/0010_active_days.sql#active_days` |
 | `last_active_day` | DATE | nullable | `crates/core-scoring/migrations/0010_active_days.sql#last_active_day` |
 | `established_event_count` | INTEGER | NOT NULL DEFAULT 0 | `crates/core-scoring/migrations/0011_established_event_count.sql#established_event_count` |
+| `established_last_seen` | TIMESTAMPTZ | nullable | `crates/core-scoring/migrations/0027_established_sightings.sql#established_last_seen` |
+| `aggressive_earned_at` | TIMESTAMPTZ | nullable | `crates/core-scoring/migrations/0027_established_sightings.sql#aggressive_earned_at` |
+| `standard_earned_at` | TIMESTAMPTZ | nullable | `crates/core-scoring/migrations/0027_established_sightings.sql#standard_earned_at` |
 
 One index beyond the `source_ip` PRIMARY KEY: `ip_score_order_idx`, on
 `(ip_score_order_key(raw_score, distinct_wan_count, decay_anchor) DESC, source_ip DESC)`
@@ -267,7 +278,7 @@ row measured over 100,000 updates.
 (`crates/core-scoring/src/domain/enums.rs#is_confirmed_real`).
 
 `active_days` (`0010`): an unbounded, non-decaying count of distinct UTC calendar days
-the IP was seen. It feeds a persistence bonus at the tier gate so a slow attacker that
+on which the IP made an established (completed-TCP) event; a forgeable sighting adds no day. It feeds a persistence bonus at the tier gate so a slow attacker that
 the 6-hour decay would otherwise erase still earns a tier. `last_active_day` records
 the last UTC day counted, telling the next event whether it opens a new day. The
 migration backfills `active_days` from the distinct-UTC-date count in the `event`
@@ -277,6 +288,33 @@ ledger (`crates/core-scoring/migrations/0010_active_days.sql#UPDATE ip_score s S
 events. The by-volume recommendation gates on this instead of raw `event_count`, so a
 spoofed UDP/ICMP flood cannot publish an innocent third party. Backfill = `count(*)
 WHERE protocol='tcp'` per `source_ip` (`crates/core-scoring/migrations/0011_established_event_count.sql#WHERE protocol = 'tcp'`); no-TCP rows keep 0.
+Eligibility asks for two of these, not two events of any kind.
+
+`established_last_seen`, `aggressive_earned_at`, `standard_earned_at` (`0027`): the clocks a
+forgeable sighting cannot move. A UDP or ICMP event changes only `event_count`, `last_seen` (and
+`first_seen` when it opens the row) and `distinct_sensor_count` on this row
+([scoring](scoring-and-feed.md#established-and-forgeable-events)).
+
+- `established_last_seen` is the latest `observed_at` of an established event, NULL for an
+  address only datagrams have named. Volume recency, the volume approval's lapse and the attack
+  time sent to vendors run on it.
+- `aggressive_earned_at` and `standard_earned_at` are the last time an established event that
+  added its weight (not a deduped repeat, not an overflow summary) left the address eligible and
+  holding that tier; the value is the decay anchor after the event. An event that leaves the
+  address below the tier neither clears nor advances them, and delisting does not clear them, so
+  every reader checks `delisted` itself. The feed's tier files and retention windows, the review
+  queue's offer and the vendor gate's freshness check run on them
+  ([earned tiers](scoring-and-feed.md#earned-tiers-and-listing-clocks)).
+
+The stored `eligible`, `tier` and `recommended_*` columns are whatever the last established
+event left. They are still written and shown, but nothing that publishes or reports reads them.
+
+The `0027` backfill takes `established_last_seen` exactly from the ledger's TCP rows (telemetry
+excluded); clears `eligible` and both `recommended_*` flags on rows with fewer than two
+established events; and seeds each earned time from `established_last_seen` for rows whose
+stored tier is that tier and that are eligible, recommended for the blocklist and not delisted
+(`crates/core-scoring/migrations/0027_established_sightings.sql#UPDATE ip_score`). It does not re-derive tiers, which live once, in
+Rust.
 
 `0006_relax_eligibility.sql` is a **data-only** backfill (no schema change). It relaxed
 the eligibility gate from `(has_confirmed_real AND event_count>=2 AND
@@ -661,6 +699,7 @@ the watch stream and compare timestamps.
 | `0024` | index `attack_tag_source_idx (source_ip)`, which serves the address page's technique read |
 | `0025` | the [event roll-up](#event-rollups): function `event_hour`, tables `event_hour_listener` and `event_rollup_cursor`, backfilled from the ledger under a `SHARE` lock on `event` |
 | `0026` | index `event_signal_observed_idx (signal_type, observed_at)`, which serves the search page's signal-type menu and filter without reading the ledger; built inside the migration transaction like `0013` |
+| `0027` | `ip_score.established_last_seen`, `aggressive_earned_at` and `standard_earned_at` (nullable `TIMESTAMPTZ`); backfills `established_last_seen` from the ledger's TCP rows, clears `eligible` and `recommended_*` on rows with fewer than two established events, seeds the earned times for rows the feed lists today; partial index `event_dedup_tcp_idx (source_ip, signal_type, observed_at) WHERE protocol = 'tcp'` for the dedup read, built inside the migration transaction like `0013` |
 
 **review** (`crates/review/migrations/`):
 

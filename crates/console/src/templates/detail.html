@@ -52,9 +52,12 @@
   <table class="table-compact">
     <tbody>
       <tr><td>Recommended for vendor report</td><td>{{ m.yes_no(recommended_for_vendor) }}</td></tr>
-      <tr><td>Recommended for blocklist (live score)</td><td>{{ m.yes_no(recommended_for_blocklist) }}{% if not recommended_for_blocklist %} <span class="dim">- may still be published via a retention window (by last seen), which does not use the live score</span>{% endif %}</td></tr>
+      <tr><td>Recommended for blocklist (live score)</td><td>{{ m.yes_no(recommended_for_blocklist) }}{% if not recommended_for_blocklist %} <span class="dim">- may still be published: a listing runs from when the tier was last earned, not from the live score</span>{% endif %}</td></tr>
+      <tr><td>Earned aggressive tier</td><td class="seen">{% if aggressive_earned %}{{ aggressive_earned }} <span class="dim">once approved, in the aggressive file for its TTL from then</span>{% else %}<span class="faint">never</span>{% endif %}</td></tr>
+      <tr><td>Earned standard tier</td><td class="seen">{% if standard_earned %}{{ standard_earned }} <span class="dim">once approved, in the standard file for its TTL from then</span>{% else %}<span class="faint">never</span>{% endif %}</td></tr>
       <tr><td>Confirmed-real latch</td><td>{{ m.yes_no(has_confirmed_real) }}</td></tr>
-      <tr><td>Event count</td><td class="mono">{{ event_count | count }}</td></tr>
+      <tr><td>Event count</td><td class="mono">{{ event_count | count }} <span class="dim">every sighting, datagrams included</span></td></tr>
+      <tr><td>Established events</td><td class="mono">{{ established_event_count | count }} <span class="dim">completed TCP connections: the only ones that score</span></td></tr>
       <tr><td>Distinct categories (live)</td><td class="mono">{{ distinct_categories | count }}</td></tr>
       <tr><td>Distinct WAN vantages</td><td class="mono">{{ distinct_wan_count | count }}</td></tr>
       <tr><td>Distinct sensors</td><td class="mono">{{ distinct_sensor_count | count }}</td></tr>
@@ -62,7 +65,8 @@
       <tr><td>Persistence bonus</td><td class="mono">+{{ persistence_bonus }}</td></tr>
       <tr><td>Max confidence (live)</td><td class="mono">{{ max_confidence }}</td></tr>
       <tr><td>First seen</td><td class="seen">{{ first_seen }}</td></tr>
-      <tr><td>Last seen</td><td class="seen">{{ last_seen }}</td></tr>
+      <tr><td>Last seen</td><td class="seen">{{ last_seen }} <span class="dim">any sighting</span></td></tr>
+      <tr><td>Last connection</td><td class="seen">{% if last_connection %}{{ last_connection }}{% else %}<span class="faint">none</span> <span class="dim">only ever named by datagrams, whose source can be forged</span>{% endif %}</td></tr>
     </tbody>
   </table>
 </div>

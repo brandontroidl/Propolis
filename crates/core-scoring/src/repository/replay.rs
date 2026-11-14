@@ -35,7 +35,7 @@ use crate::domain::types::{EventInput, IpScore};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
-use crate::scoring::engine::apply_event;
+use crate::scoring::engine::{apply_event, is_established};
 
 use super::events::RepoError;
 
@@ -148,14 +148,19 @@ pub async fn rebuild_projection(pool: &PgPool, ip: IpAddr) -> Result<Option<IpSc
     for k in 0..events.len() {
         let event = &events[k];
 
-        // deduped_k: among already-processed events (0..k) with the SAME
+        // deduped_k: among already-processed ESTABLISHED events (0..k) with the SAME
         // signal_type, the most recent observed_at; deduped iff within window.
-        // Mirrors `MAX(observed_at) WHERE signal_type = $ AND id < new_id`.
-        let prior_observed = events[..k]
-            .iter()
-            .filter(|e| e.signal_type == event.signal_type)
-            .map(|e| e.observed_at)
-            .max();
+        // Mirrors `MAX(observed_at) WHERE signal_type = $ AND protocol = 'tcp' AND id < new_id`,
+        // which the append path asks only for an established event.
+        let prior_observed = if is_established(event) {
+            events[..k]
+                .iter()
+                .filter(|e| e.signal_type == event.signal_type && is_established(e))
+                .map(|e| e.observed_at)
+                .max()
+        } else {
+            None
+        };
         // Symmetric window, mirroring the append path (events.rs) exactly so
         // replay == incremental: dedup only within DEDUP_WINDOW_SECONDS in either
         // time direction, never treating a negative (out-of-order) elapsed as a dup.

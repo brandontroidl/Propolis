@@ -12,9 +12,91 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const FORMATS: [&str; 10] = [
-    "txt", "json", "csv", "cidr", "ipset", "nft", "pf", "alias", "hosts", "rpz",
+const FORMATS: [&str; 9] = [
+    "txt", "json", "csv", "cidr", "ipset", "nft", "pf", "alias", "rpz",
 ];
+/// The build hour every fixture file states.
+const BUILD_TIME: &str = "2026-10-14T00:00:00Z";
+/// The fixture's two listed addresses, one of each family, from the documentation ranges.
+const V4: &str = "192.0.2.1";
+const V6: &str = "2001:db8::7";
+
+/// `feed.ext` as the publisher writes it for a feed listing [`V4`] and [`V6`]. The script reads
+/// every file back and refuses anything else, so the fixture has to be the real thing. It is
+/// written out here rather than produced by the feed crate, which this crate does not depend on;
+/// `crates/feed/tests/sync_check_test.rs` is what holds the script to the publisher's real
+/// output.
+fn feed_file(feed: &str, ext: &str) -> String {
+    let t = BUILD_TIME;
+    let titled = format!("{}{}", feed[..1].to_uppercase(), &feed[1..]);
+    match ext {
+        "txt" => format!(
+            "# Propolis blocklist - {titled} tier\n# Generated: {t}\n# Valid until: {t}\n\
+             # Entries: 2\n{V4}\n{V6}\n"
+        ),
+        "json" => {
+            let entry = |ip: &str| {
+                format!(
+                    r#"{{"ip":"{ip}","first_seen":"{t}","last_seen":"{t}","categories":1,"events":3,"signals":["port_scan"]}}"#
+                )
+            };
+            format!(
+                r#"{{"meta":{{"generator":"propolis","tier":"{feed}","generated":"{t}","valid_until":"{t}","count":2}},"entries":[{},{}]}}"#,
+                entry(V4),
+                entry(V6)
+            )
+        }
+        "csv" => format!(
+            "ip,first_seen,last_seen,categories,events,signals\n\
+             {V4},{t},{t},1,3,port_scan\n{V6},{t},{t},1,3,port_scan\n"
+        ),
+        "cidr" => format!("{V4}/32\n{V6}/128\n"),
+        "ipset" => {
+            let family = |suffix: &str, family: &str, ip: &str| {
+                let live = format!("propolis_{feed}_{suffix}");
+                let params = format!("hash:ip family {family} hashsize 4096 maxelem 1048576");
+                format!(
+                    "create {live} {params}\ncreate {live}-new {params}\nflush {live}-new\n\
+                     add {live}-new {ip}\nswap {live}-new {live}\ndestroy {live}-new\n"
+                )
+            };
+            format!("{}{}", family("v4", "inet", V4), family("v6", "inet6", V6))
+        }
+        "nft" => format!(
+            "table inet propolis {{\n\tset propolis_{feed}_v4 {{\n\t\ttype ipv4_addr\n\t}}\n\
+             \tset propolis_{feed}_v6 {{\n\t\ttype ipv6_addr\n\t}}\n}}\n\
+             flush set inet propolis propolis_{feed}_v4\n\
+             flush set inet propolis propolis_{feed}_v6\n\
+             add element inet propolis propolis_{feed}_v4 {{\n\t{V4}\n}}\n\
+             add element inet propolis propolis_{feed}_v6 {{\n\t{V6}\n}}\n"
+        ),
+        "pf" => format!("# Propolis blocklist - {feed} tier\n# Generated: {t}\n{V4}\n{V6}\n"),
+        "alias" => format!("{V4}\n{V6}\n"),
+        "rpz" => format!(
+            "; Propolis RPZ - {feed} tier\n; Generated: {t}\n$TTL 300\n\
+             @ IN SOA localhost. hostmaster.localhost. 2026101400 3600 600 86400 300\n\
+             @ IN NS localhost.\n32.1.2.0.192.rpz-ip CNAME .\n128.7.zz.db8.2001.rpz-ip CNAME .\n"
+        ),
+        other => panic!("no fixture content for .{other}"),
+    }
+}
+
+/// `manifest.json` as the publisher writes it, for the two tiers and the given window labels.
+fn manifest(windows: &[&str]) -> String {
+    let t = BUILD_TIME;
+    let sha = "0".repeat(64);
+    let feed = format!(r#"{{"count":2,"sha256":"{sha}","valid_until":"{t}"}}"#);
+    let windows: Vec<String> = windows
+        .iter()
+        .map(|label| {
+            format!(r#"{{"label":"{label}","count":2,"sha256":"{sha}","valid_until":"{t}"}}"#)
+        })
+        .collect();
+    format!(
+        r#"{{"build_time":"{t}","tiers":{{"aggressive":{feed},"standard":{feed}}},"windows":[{}],"exclusions":{{"allowlist_count":0,"delist_count":0,"asn_allowlist_count":0,"asn_db_loaded":false}}}}"#,
+        windows.join(",")
+    )
+}
 const FEEDS: [&str; 3] = ["aggressive", "standard", "all-7d"];
 const SECRET: &str = "FAKE-ROOT-ONLY-KEY-MATERIAL";
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -32,19 +114,9 @@ impl Fixture {
         };
         std::fs::create_dir_all(fx.feed()).unwrap();
         for feed in FEEDS {
-            for ext in FORMATS {
-                std::fs::write(
-                    fx.feed().join(format!("{feed}.{ext}")),
-                    format!("# {feed}.{ext}\n192.0.2.1\n"),
-                )
-                .unwrap();
-            }
+            fx.write_feed(feed);
         }
-        std::fs::write(
-            fx.feed().join("manifest.json"),
-            r#"{"build_time":"2026-10-14T00:00:00Z","tiers":{}}"#,
-        )
-        .unwrap();
+        std::fs::write(fx.feed().join("manifest.json"), manifest(&["7d"])).unwrap();
         std::fs::create_dir_all(fx.status()).unwrap();
         std::fs::set_permissions(fx.status(), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::create_dir_all(fx.root().join("secret")).unwrap();
@@ -59,6 +131,17 @@ impl Fixture {
             &fx.repo(),
         );
         fx
+    }
+
+    /// Writes every format of `feed` into the build.
+    fn write_feed(&self, feed: &str) {
+        for ext in FORMATS {
+            std::fs::write(
+                self.feed().join(format!("{feed}.{ext}")),
+                feed_file(feed, ext),
+            )
+            .unwrap();
+        }
     }
 
     fn root(&self) -> &Path {
@@ -256,10 +339,17 @@ fn a_normal_build_is_published_in_the_split_layout_and_the_push_is_recorded() {
         assert!(pushed.contains(&path), "{path} missing: {pushed:?}");
     }
     assert!(pushed.contains(&"manifest.json".to_string()));
-    assert_eq!(
-        fx.pushed_file("tiers/aggressive.txt"),
-        "# aggressive.txt\n192.0.2.1\n"
-    );
+    for (path, feed, ext) in [
+        ("tiers/aggressive.txt", "aggressive", "txt"),
+        ("tiers/standard.nft", "standard", "nft"),
+        ("retention/all-7d.json", "all-7d", "json"),
+    ] {
+        assert_eq!(
+            fx.pushed_file(path),
+            feed_file(feed, ext),
+            "{path} is pushed byte for byte"
+        );
+    }
     let log = fx.git(&["log", "--format=%s"], &fx.origin());
     assert_eq!(log.trim(), "feed: 2026-10-14T00:00:00Z");
 
@@ -376,13 +466,15 @@ fn a_feed_directory_that_is_a_symlink_is_refused() {
 }
 
 /// Writes `feed/current/<n>h` retention files so the build carries `count` windows beyond the
-/// fixture's own `all-7d`.
+/// fixture's own `all-7d`, and lists them in the manifest as the publisher does.
 fn add_windows(fx: &Fixture, count: usize) {
+    let mut labels = vec!["7d".to_string()];
     for n in 1..=count {
-        for ext in FORMATS {
-            std::fs::write(fx.feed().join(format!("all-{n}h.{ext}")), "192.0.2.1\n").unwrap();
-        }
+        fx.write_feed(&format!("all-{n}h"));
+        labels.push(format!("{n}h"));
     }
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    std::fs::write(fx.feed().join("manifest.json"), manifest(&labels)).unwrap();
 }
 
 /// The script holds the number of retention windows a run will copy to a fixed bound.
@@ -691,15 +783,14 @@ fn an_oversized_file_is_refused() {
     let out = fx.run();
     fx.assert_refused_and_nothing_published(&out, "oversized");
 
-    // Exactly at the cap is accepted.
+    // Exactly at the cap is accepted. The file has to be real content now that every file is
+    // read back, so it is an alias list of exactly 32 MiB: 3,050,392 eleven-byte lines and ten
+    // twelve-byte ones.
     let fx = Fixture::new();
-    let big = std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(fx.feed().join("all-7d.json"))
-        .unwrap();
-    big.set_len(MAX_FILE_BYTES).unwrap();
-    drop(big);
+    let mut list = "192.0.2.10\n".repeat(3_050_392);
+    list.push_str(&"192.0.2.100\n".repeat(10));
+    assert_eq!(list.len() as u64, MAX_FILE_BYTES);
+    std::fs::write(fx.feed().join("all-7d.alias"), list).unwrap();
     assert_ok(&fx.run());
 }
 
@@ -857,4 +948,228 @@ fn a_host_without_perl_is_told_so_and_publishes_nothing() {
         !stderr.contains("could not be opened as the file that was checked"),
         "a missing perl must not read as an inode swap: {stderr}"
     );
+}
+
+/// The published tree is the build, no more. Moving the new files over the old ones left every
+/// file the build no longer had in the public repository for good: a retention window the
+/// operator removed, a format the publisher dropped. Each stayed at its last contents, still
+/// fetched by consumers with nothing to say it had stopped changing.
+#[test]
+fn files_the_build_no_longer_has_are_removed_from_the_published_tree() {
+    let fx = Fixture::new();
+    add_windows(&fx, 1); // all-7d and all-1h
+    assert_ok(&fx.run());
+    assert!(
+        fx.pushed_paths()
+            .contains(&"retention/all-1h.txt".to_string())
+    );
+
+    // What an earlier version left behind: a format that is no longer written, and an old window.
+    // And two things that are the operator's, not the feed's.
+    let repo = fx.repo();
+    std::fs::write(repo.join("tiers/aggressive.hosts"), "0.0.0.0 stale\n").unwrap();
+    std::fs::write(repo.join("retention/all-30d.txt"), "192.0.2.9\n").unwrap();
+    std::fs::write(repo.join("LICENSE"), "the operator's own file\n").unwrap();
+    std::fs::create_dir_all(repo.join(".github")).unwrap();
+    std::fs::write(repo.join(".github/FUNDING.yml"), "github: someone\n").unwrap();
+    fx.git(&["add", "-A"], &repo);
+    fx.git(
+        &["commit", "-q", "-m", "state from an earlier version"],
+        &repo,
+    );
+    fx.git(&["push", "-q", "origin", "HEAD"], &repo);
+    assert!(
+        fx.pushed_paths()
+            .contains(&"tiers/aggressive.hosts".to_string())
+    );
+
+    // The operator drops the one-hour window. The next build has only all-7d.
+    for ext in FORMATS {
+        std::fs::remove_file(fx.feed().join(format!("all-1h.{ext}"))).unwrap();
+    }
+    std::fs::write(fx.feed().join("manifest.json"), manifest(&["7d"])).unwrap();
+    assert_ok(&fx.run());
+
+    let pushed = fx.pushed_paths();
+    let mut expected: Vec<String> = vec![
+        ".github/FUNDING.yml".into(),
+        "LICENSE".into(),
+        "README.md".into(),
+        "manifest.json".into(),
+    ];
+    for ext in FORMATS {
+        expected.push(format!("retention/all-7d.{ext}"));
+        expected.push(format!("tiers/aggressive.{ext}"));
+        expected.push(format!("tiers/standard.{ext}"));
+    }
+    expected.sort();
+    assert_eq!(
+        pushed, expected,
+        "exactly this build, plus what is the operator's"
+    );
+}
+
+/// With no retention window at all the build has no `all-*` file, and the published tree has no
+/// `retention/` left over from when it had.
+#[test]
+fn a_build_with_no_retention_window_publishes_no_retention_files() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run());
+    for ext in FORMATS {
+        std::fs::remove_file(fx.feed().join(format!("all-7d.{ext}"))).unwrap();
+    }
+    std::fs::write(fx.feed().join("manifest.json"), manifest(&[])).unwrap();
+    assert_ok(&fx.run());
+    let pushed = fx.pushed_paths();
+    assert!(
+        !pushed.iter().any(|p| p.starts_with("retention/")),
+        "{pushed:?}"
+    );
+    assert!(pushed.contains(&"tiers/aggressive.txt".to_string()));
+}
+
+/// The author, committer and dates of the newest commit on the remote.
+fn commit_identity(fx: &Fixture) -> String {
+    fx.git(
+        &["log", "-1", "--format=%an|%ae|%cn|%ce|%aI|%cI"],
+        &fx.origin(),
+    )
+    .trim()
+    .to_string()
+}
+
+/// The commit is public. Left to itself git signs it with a name and address made up from the
+/// account and the machine's host name and dates it to the second in the node's time zone: the
+/// host name of a honeypot, where it is, and when its cron job runs.
+#[test]
+fn the_commit_carries_a_fixed_identity_and_the_build_hour_and_nothing_of_the_host() {
+    let fx = Fixture::new();
+    // No identity in the checkout, and one in the environment that must not be used either.
+    fx.git(&["config", "--unset", "user.name"], &fx.repo());
+    fx.git(&["config", "--unset", "user.email"], &fx.repo());
+    let out = fx.run_with(&[
+        ("EMAIL", "root@honeypot-7.internal.example"),
+        ("GIT_AUTHOR_NAME", "Operator Fullname"),
+        ("GIT_AUTHOR_EMAIL", "operator@personal.example"),
+        ("GIT_COMMITTER_NAME", "Operator Fullname"),
+        ("GIT_COMMITTER_EMAIL", "operator@personal.example"),
+        ("GIT_AUTHOR_DATE", "2031-01-01T12:34:56+09:00"),
+        ("TZ", "Asia/Tokyo"),
+    ]);
+    assert_ok(&out);
+    let neutral = "propolis-blocklist|propolis-blocklist@users.noreply.invalid";
+    assert_eq!(
+        commit_identity(&fx),
+        format!("{neutral}|{neutral}|2026-10-14T00:00:00+00:00|2026-10-14T00:00:00+00:00"),
+        "a fixed author, and the build hour in UTC"
+    );
+}
+
+/// An identity the operator set in the checkout is theirs to choose and is used as it is. The
+/// date is still the build hour.
+#[test]
+fn an_identity_set_in_the_checkout_is_used() {
+    let fx = Fixture::new();
+    let out = fx.run_with(&[("TZ", "America/New_York")]);
+    assert_ok(&out);
+    let set = "sync test|sync@example.invalid";
+    assert_eq!(
+        commit_identity(&fx),
+        format!("{set}|{set}|2026-10-14T00:00:00+00:00|2026-10-14T00:00:00+00:00")
+    );
+}
+
+/// Consumers apply these files to their firewalls as root. A file that is not, line for line,
+/// what the publisher writes for its format is refused, and nothing of the build is published.
+/// (`crates/feed/tests/sync_check_test.rs` covers every format against real builds; this is the
+/// whole run refusing.)
+#[test]
+fn a_file_that_is_not_what_the_publisher_writes_is_refused_and_nothing_is_published() {
+    for (file, addition, why) in [
+        (
+            "aggressive.nft",
+            "add rule inet filter input accept\n".to_string(),
+            "a firewall command",
+        ),
+        (
+            "standard.ipset",
+            "destroy\n".to_string(),
+            "an ipset command",
+        ),
+        (
+            "all-7d.txt",
+            format!("{SECRET}\n"),
+            "a line that is not an address",
+        ),
+    ] {
+        let fx = Fixture::new();
+        let path = fx.feed().join(file);
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&addition);
+        std::fs::write(&path, content).unwrap();
+        let out = fx.run();
+        fx.assert_refused_and_nothing_published(&out, why);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(file), "{why}: {stderr}");
+        assert!(
+            stderr.contains("is not what the publisher writes"),
+            "{why}: {stderr}"
+        );
+    }
+
+    // The manifest is held to its shape too, and to the files beside it.
+    let fx = Fixture::new();
+    std::fs::write(fx.feed().join("manifest.json"), manifest(&["7d", "30d"])).unwrap();
+    let out = fx.run();
+    fx.assert_refused_and_nothing_published(&out, "a window with no files");
+    let fx = Fixture::new();
+    std::fs::write(
+        fx.feed().join("manifest.json"),
+        r#"{"build_time":"2026-10-14T00:00:00Z","tiers":{}}"#,
+    )
+    .unwrap();
+    let out = fx.run();
+    fx.assert_refused_and_nothing_published(&out, "a manifest of another shape");
+}
+
+/// `--check` runs every check and stops: no checkout, no commit, no push, no marker.
+#[test]
+fn check_mode_validates_a_build_and_touches_nothing() {
+    let fx = Fixture::new();
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/blocklist-sync.sh"
+    );
+    let run = |feed: &Path| {
+        Command::new("bash")
+            .arg(script)
+            .arg("--check")
+            .arg(feed)
+            .env("HOME", fx.root())
+            .env(
+                "PROPOLIS_BLOCKLIST_REPO",
+                fx.root().join("no-such-checkout"),
+            )
+            .env("PROPOLIS_BLOCKLIST_STATUS_DIR", fx.status())
+            .output()
+            .expect("bash runs")
+    };
+    let out = run(&fx.feed());
+    assert_ok(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("passes every check"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(fx.pushed_paths().is_empty(), "nothing is pushed");
+    assert!(!fx.status().join("last-pushed").exists());
+    assert!(
+        fx.git(&["status", "--porcelain"], &fx.repo()).is_empty(),
+        "the checkout is untouched"
+    );
+
+    std::fs::write(fx.feed().join("aggressive.pf"), "pass in all\n").unwrap();
+    let out = run(&fx.feed());
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("aggressive.pf"));
 }

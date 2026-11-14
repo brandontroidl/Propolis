@@ -57,9 +57,16 @@ fn is_coarsened(dt: DateTime<Utc>) -> bool {
     dt.minute() == 0 && dt.second() == 0 && dt.nanosecond() == 0
 }
 
+/// `dt` as the database stores it: to the microsecond.
+fn micros(dt: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::SubsecRound;
+    dt.trunc_subsecs(6)
+}
+
 /// Seeds a qualifying entry: an authenticated-TCP honeypot event (confirmed-real) plus a
-/// corroborating `CatchallProbe` in a different category, both at `now` (negligible decay by the
-/// time the build reads it back). `honeypot_weight` decides the tier: HoneypotMalwareUpload (80,
+/// corroborating `CatchallProbe` in a different category, both over TCP (only an established
+/// event scores or counts toward eligibility) and both at `now` (negligible decay by the time the
+/// build reads it back). `honeypot_weight` decides the tier: HoneypotMalwareUpload (80,
 /// conf 0.980) plus CatchallProbe (15) gives raw 95 / conf 0.980 -> Aggressive.
 /// HoneypotFileDownload (70, conf 0.960) plus CatchallProbe (15) gives raw 85 / conf 0.960 ->
 /// Standard (raw < 90).
@@ -74,7 +81,7 @@ async fn seed_qualifying(
         .unwrap();
     append_event(
         pool,
-        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+        ev(ip, SignalType::CatchallProbe, Protocol::Tcp, false, now),
     )
     .await
     .unwrap();
@@ -208,7 +215,7 @@ async fn recommended_but_tier_none_is_excluded_fail_closed(pool: PgPool) {
     .unwrap();
     append_event(
         &pool,
-        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+        ev(ip, SignalType::CatchallProbe, Protocol::Tcp, false, now),
     )
     .await
     .unwrap();
@@ -276,7 +283,7 @@ async fn seed_claiming_crawler(pool: &PgPool, ip: IpAddr, now: DateTime<Utc>) {
     append_event(pool, claimed).await.unwrap();
     append_event(
         pool,
-        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+        ev(ip, SignalType::CatchallProbe, Protocol::Tcp, false, now),
     )
     .await
     .unwrap();
@@ -417,7 +424,7 @@ async fn eligible_ip_without_approval_is_excluded_from_feed(pool: PgPool) {
     .unwrap();
     append_event(
         &pool,
-        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+        ev(ip, SignalType::CatchallProbe, Protocol::Tcp, false, now),
     )
     .await
     .unwrap();
@@ -600,9 +607,11 @@ async fn seed_heavy_approved(pool: &PgPool, ip: &str, events: i32, last_seen_ago
     sqlx::query(
         "INSERT INTO ip_score (source_ip, raw_score, decay_anchor, max_confidence, event_count, \
              distinct_categories, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
-             first_seen, last_seen, eligible, recommended_for_blocklist, tier) \
+             first_seen, last_seen, eligible, recommended_for_blocklist, tier, \
+             established_last_seen, aggressive_earned_at) \
          VALUES ($1::inet, 95, now(), 0.9, $2, 2, true, 1, 1, now() - interval '30 days', \
-                 now() - $3::interval, true, true, 'aggressive')",
+                 now() - $3::interval, true, true, 'aggressive', now() - $3::interval, \
+                 now() - $3::interval)",
     )
     .bind(ip)
     .bind(events)
@@ -634,8 +643,8 @@ async fn the_build_reads_signal_types_by_probe_and_only_for_addresses_a_feed_can
         .execute(&pool)
         .await
         .unwrap();
-    // 3,000 events and seen an hour ago: published. 2,000 events and last seen ten days ago: past
-    // the longest default TTL (48 h), so never published.
+    // 3,000 events and its tier earned an hour ago: published. 2,000 events and its tier last
+    // earned ten days ago: past the longest default TTL (48 h), so never published.
     seed_heavy_approved(&pool, "45.10.30.201", 3000, "1 hour").await;
     seed_heavy_approved(&pool, "45.10.30.202", 2000, "10 days").await;
     sqlx::query("ANALYZE event").execute(&pool).await.unwrap();
@@ -680,7 +689,7 @@ async fn the_build_reads_signal_types_by_probe_and_only_for_addresses_a_feed_can
             .aggressive
             .iter()
             .any(|e| e.source_ip == "45.10.30.202".parse::<IpAddr>().unwrap()),
-        "an address last seen ten days ago is not published"
+        "an address that last earned its tier ten days ago is not published"
     );
 }
 
@@ -827,19 +836,15 @@ async fn an_address_approved_on_its_score_is_published_on_volume_without_a_secon
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.120".parse().unwrap();
 
-    // Two days ago the address earned a tier and the operator approved it. Its score has since
-    // decayed, and today it floods: the stored projection has no tier any more, so it is not a
-    // merit candidate, but it meets the volume condition and the operator's approval stands.
-    seed_qualifying(
-        &pool,
-        ip,
-        SignalType::HoneypotMalwareUpload,
-        now - chrono::Duration::days(2),
-    )
-    .await;
+    // Two days ago the address earned the aggressive tier and the operator approved it. Its
+    // score has since decayed, and today it floods: the flood adds no tier, but it meets the
+    // volume condition and the operator's approval stands.
+    let earned = now - chrono::Duration::days(2);
+    seed_qualifying(&pool, ip, SignalType::HoneypotMalwareUpload, earned).await;
     seed_flood(&pool, ip, now).await;
     let score = read_score(&pool, ip).await.unwrap().unwrap();
-    assert_eq!(score.tier, None, "precondition: no tier, so no merit entry");
+    assert_eq!(score.tier, None, "precondition: the flood left no tier");
+    assert_eq!(score.aggressive_earned_at, Some(micros(earned)));
     assert!(score.established_event_count >= 1000);
     let volume_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM volume_review")
         .fetch_one(&pool)
@@ -850,31 +855,38 @@ async fn an_address_approved_on_its_score_is_published_on_volume_without_a_secon
     let snapshot = build(&pool, &config_with_windows(false)).await;
 
     assert_eq!(window_entries(&snapshot, ip), [1, 1]);
-    assert!(!in_a_tier_file(&snapshot, ip));
-    let entry = snapshot.windows[1]
-        .entries
-        .iter()
-        .find(|e| e.source_ip == ip)
-        .unwrap();
-    assert_eq!(entry.tier, None, "published as a volume entry");
+    assert!(
+        !in_a_tier_file(&snapshot, ip),
+        "the aggressive TTL ran out a day ago, and a flood earns no tier"
+    );
+    let entry_in = |window: usize| {
+        snapshot.windows[window]
+            .entries
+            .iter()
+            .find(|e| e.source_ip == ip)
+            .unwrap()
+    };
+    // The day window holds it on volume alone: the tier was earned outside it.
+    assert_eq!(entry_in(0).tier, None, "published as a volume entry");
+    // The week window reaches back to the tier, and runs from the later of the two clocks.
+    assert_eq!(entry_in(1).tier, Some(FeedTier::Aggressive));
+    assert_eq!(entry_in(1).valid_from, entry_in(0).valid_from);
+    assert!(entry_in(1).valid_from > earned + chrono::Duration::days(1));
 }
 
 #[sqlx::test(migrations = false)]
-async fn an_approved_address_below_the_volume_threshold_is_not_a_volume_entry(pool: PgPool) {
+async fn a_weak_event_neither_removes_a_listing_nor_extends_it(pool: PgPool) {
     migrate(&pool).await;
     let now = Utc::now();
     let ip: IpAddr = "45.10.30.124".parse().unwrap();
 
     // The same history as the address above, except that today brings one connection instead of
-    // a flood. The approval alone must not put it in the retention feeds: an approved address
-    // with no tier is published only when it meets the volume condition.
-    seed_qualifying(
-        &pool,
-        ip,
-        SignalType::HoneypotMalwareUpload,
-        now - chrono::Duration::days(2),
-    )
-    .await;
+    // a flood. The score had decayed, so the connection leaves the stored row with no tier. That
+    // must not take the address out of the window its tier still has time in, and must not put
+    // it in the one that has lapsed: it is listed for a fixed time after it EARNED the tier, and
+    // one unauthenticated connection earns nothing.
+    let earned = now - chrono::Duration::days(2);
+    seed_qualifying(&pool, ip, SignalType::HoneypotMalwareUpload, earned).await;
     append_event(
         &pool,
         ev(
@@ -888,13 +900,44 @@ async fn an_approved_address_below_the_volume_threshold_is_not_a_volume_entry(po
     .await
     .unwrap();
     let score = read_score(&pool, ip).await.unwrap().unwrap();
-    assert_eq!(score.tier, None, "precondition: no tier, so no merit entry");
+    assert_eq!(score.tier, None, "precondition: the stored row has no tier");
     assert!(score.established_event_count < 1000);
 
     let snapshot = build(&pool, &config_with_windows(false)).await;
 
-    assert_eq!(window_entries(&snapshot, ip), [0, 0]);
-    assert!(!in_a_tier_file(&snapshot, ip));
+    assert_eq!(
+        window_entries(&snapshot, ip),
+        [0, 1],
+        "out of the day window (not extended), still in the week window (not removed)"
+    );
+    assert!(!in_a_tier_file(&snapshot, ip), "the 24 h TTL has run out");
+    let entry = snapshot.windows[1]
+        .entries
+        .iter()
+        .find(|e| e.source_ip == ip)
+        .unwrap();
+    assert_eq!(entry.tier, Some(FeedTier::Aggressive));
+    assert_eq!(
+        entry.valid_from,
+        feed::builder::coarsen_to_hour(earned),
+        "its validity runs from when the tier was earned, not from today's connection"
+    );
+
+    // A datagram naming it changes nothing either.
+    append_event(
+        &pool,
+        ev(
+            ip,
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            now,
+        ),
+    )
+    .await
+    .unwrap();
+    let again = build(&pool, &config_with_windows(false)).await;
+    assert_eq!(window_entries(&again, ip), [0, 1]);
 }
 
 #[sqlx::test(migrations = false)]
@@ -920,7 +963,7 @@ async fn a_review_queue_entry_that_is_not_approved_publishes_no_volume_listing(p
     .unwrap();
     append_event(
         &pool,
-        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+        ev(ip, SignalType::CatchallProbe, Protocol::Tcp, false, now),
     )
     .await
     .unwrap();
@@ -1136,22 +1179,34 @@ async fn the_opt_in_publishes_everything_the_default_does_and_ignores_a_rejectio
 }
 
 #[sqlx::test(migrations = false)]
-async fn a_stored_last_seen_in_the_future_does_not_extend_validity_past_now_plus_the_window(
+async fn a_stored_time_in_the_future_does_not_extend_validity_past_now_plus_the_window(
     pool: PgPool,
 ) {
     migrate(&pool).await;
     let now = Utc::now();
-    let ip: IpAddr = "45.10.30.140".parse().unwrap();
-    seed_flood(&pool, ip, now).await;
+    let flooder: IpAddr = "45.10.30.140".parse().unwrap();
+    seed_flood(&pool, flooder, now).await;
     let queue = VolumeQueue::new();
     queue.populate(&pool).await.unwrap();
-    queue.approve(&pool, ip, None).await.unwrap();
-    // What one log line dated ahead of the clock leaves behind: the projection takes `last_seen`
-    // from the event's own timestamp.
+    queue.approve(&pool, flooder, None).await.unwrap();
+    let tiered: IpAddr = "45.10.30.141".parse().unwrap();
+    seed_qualifying(&pool, tiered, SignalType::HoneypotMalwareUpload, now).await;
+    // What one log line dated ahead of the clock leaves behind: the projection takes the times a
+    // listing runs from out of events' own timestamps. Each feed has its own: the last
+    // established sighting for a volume listing, the earned time for a tier.
     sqlx::query(
-        "UPDATE ip_score SET last_seen = now() + interval '300 days' WHERE source_ip = $1::inet",
+        "UPDATE ip_score SET established_last_seen = now() + interval '300 days' \
+         WHERE source_ip = $1::inet",
     )
-    .bind(ip.to_string())
+    .bind(flooder.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ip_score SET aggressive_earned_at = now() + interval '300 days' \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(tiered.to_string())
     .execute(&pool)
     .await
     .unwrap();
@@ -1159,19 +1214,95 @@ async fn a_stored_last_seen_in_the_future_does_not_extend_validity_past_now_plus
     let snapshot = build(&pool, &config_with_windows(false)).await;
     let after_build = Utc::now();
 
-    for window in &snapshot.windows {
-        let entry = window
-            .entries
-            .iter()
-            .find(|e| e.source_ip == ip)
-            .unwrap_or_else(|| panic!("{}: the address is still published", window.label));
-        assert!(
-            entry.valid_until <= after_build + window.retention,
-            "{}: valid until {}, more than the window past now",
-            window.label,
-            entry.valid_until
-        );
-        assert!(entry.last_seen <= after_build, "{}", window.label);
-        assert_eq!(entry.valid_until - entry.valid_from, window.retention);
+    for ip in [flooder, tiered] {
+        for window in &snapshot.windows {
+            let entry = window
+                .entries
+                .iter()
+                .find(|e| e.source_ip == ip)
+                .unwrap_or_else(|| panic!("{}: {ip} is still published", window.label));
+            assert!(
+                entry.valid_until <= after_build + window.retention,
+                "{}: {ip} valid until {}, more than the window past now",
+                window.label,
+                entry.valid_until
+            );
+            assert!(entry.last_seen <= after_build, "{}", window.label);
+            assert_eq!(entry.valid_until - entry.valid_from, window.retention);
+        }
     }
+    let in_file = snapshot
+        .aggressive
+        .iter()
+        .find(|e| e.source_ip == tiered)
+        .expect("the tiered address is in the aggressive file");
+    assert!(in_file.valid_until <= after_build + chrono::Duration::hours(24));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_datagram_naming_a_listed_address_does_not_keep_it_listed(pool: PgPool) {
+    migrate(&pool).await;
+    let now = Utc::now();
+    let datagram_now = |ip: IpAddr| {
+        ev(
+            ip,
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            now,
+        )
+    };
+
+    // Earned aggressive 25 hours ago: its 24 hour TTL has run out. One forged packet a day
+    // under its address used to keep it in the file for as long as the packets kept coming.
+    let lapsed: IpAddr = "45.10.30.150".parse().unwrap();
+    let earned = now - chrono::Duration::hours(25);
+    seed_qualifying(&pool, lapsed, SignalType::HoneypotMalwareUpload, earned).await;
+    append_event(&pool, datagram_now(lapsed)).await.unwrap();
+
+    // Earned 23 hours ago: still listed, and the datagram does not move its expiry.
+    let live: IpAddr = "45.10.30.151".parse().unwrap();
+    let live_earned = now - chrono::Duration::hours(23);
+    seed_qualifying(&pool, live, SignalType::HoneypotMalwareUpload, live_earned).await;
+    append_event(&pool, datagram_now(live)).await.unwrap();
+
+    // A flood that stopped 25 hours ago, approved on volume, named by a datagram now.
+    let flooder: IpAddr = "45.10.30.152".parse().unwrap();
+    seed_flood(&pool, flooder, now - chrono::Duration::hours(25)).await;
+    sqlx::query(
+        "INSERT INTO volume_review (source_ip, state, established_events_at_surface) \
+         VALUES ($1::inet, 'approved', 1000)",
+    )
+    .bind(flooder.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    append_event(&pool, datagram_now(flooder)).await.unwrap();
+
+    let snapshot = build(&pool, &config_with_windows(false)).await;
+
+    assert!(
+        !in_a_tier_file(&snapshot, lapsed),
+        "its TTL ran out an hour ago"
+    );
+    assert_eq!(
+        window_entries(&snapshot, lapsed),
+        [0, 1],
+        "out of the day window, in the week window on the tier it earned"
+    );
+    let entry = snapshot
+        .aggressive
+        .iter()
+        .find(|e| e.source_ip == live)
+        .expect("23 hours after earning it, the address is in the aggressive file");
+    assert_eq!(
+        entry.valid_from,
+        feed::builder::coarsen_to_hour(live_earned),
+        "the datagram did not restart its clock"
+    );
+    assert_eq!(
+        window_entries(&snapshot, flooder),
+        [0, 1],
+        "a flood that stopped 25 hours ago is out of the day window whatever names it since"
+    );
 }

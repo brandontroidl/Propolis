@@ -52,7 +52,7 @@ use crate::domain::types::{EventInput, IpScore};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
-use crate::scoring::engine::apply_event;
+use crate::scoring::engine::{apply_event, is_established};
 
 use super::append_gate;
 use super::events::{APPEND_LOCK_KEY, RepoError, normalize_in_place, score_from_row};
@@ -152,17 +152,25 @@ async fn append_atomic(pool: &PgPool, events: &[EventInput]) -> Result<(), RepoE
 
     // Fold in order.
     for event in &scored {
-        let key = (event.source_ip, event.signal_type);
-        let prior = newest.get(&key).copied().flatten();
-        // Symmetric window, as in `append_event`: either time direction counts as a duplicate.
-        let deduped = match prior {
-            Some(prior) => (event.observed_at - prior).num_seconds().abs() <= DEDUP_WINDOW_SECONDS,
-            None => false,
+        // As in `append_event`: only an established event is deduplicated, and only against
+        // established events, so only one becomes a prior for the events after it.
+        let deduped = if is_established(event) {
+            let key = (event.source_ip, event.signal_type);
+            let prior = newest.get(&key).copied().flatten();
+            newest.insert(
+                key,
+                Some(prior.map_or(event.observed_at, |p| p.max(event.observed_at))),
+            );
+            // Symmetric window: either time direction counts as a duplicate.
+            match prior {
+                Some(prior) => {
+                    (event.observed_at - prior).num_seconds().abs() <= DEDUP_WINDOW_SECONDS
+                }
+                None => false,
+            }
+        } else {
+            false
         };
-        newest.insert(
-            key,
-            Some(prior.map_or(event.observed_at, |p| p.max(event.observed_at))),
-        );
 
         let state = sources
             .get_mut(&event.source_ip)
@@ -310,11 +318,12 @@ async fn load_sources(
 
 /// The dedup read of `append_event` for every distinct (source, signal) of the batch: the newest
 /// observation already in the ledger. One correlated `MAX` per key keeps each lookup a single
-/// backward step on `event_dedup_idx` whatever the source's history or the intake lag, the
+/// backward step on `event_dedup_tcp_idx` whatever the source's history or the intake lag, the
 /// property `dedup_read_plan_*` guards for the single path; `batch_dedup_read_plan_*` holds this
-/// statement to it too.
+/// statement to it too. Established events only, as there, on `event_dedup_tcp_idx`.
 pub(super) const DEDUP_PRIORS_SQL: &str = "SELECT host(k.ip) AS source_ip, k.st AS signal_type, \
-            (SELECT MAX(e.observed_at) FROM event e WHERE e.source_ip = k.ip AND e.signal_type = k.st) AS prior \
+            (SELECT MAX(e.observed_at) FROM event e WHERE e.source_ip = k.ip AND e.signal_type = k.st \
+                AND e.protocol = 'tcp') AS prior \
      FROM unnest($1::text[]::inet[], $2::signal_type_enum[]) AS k(ip, st)";
 
 async fn load_dedup_priors(
@@ -323,7 +332,8 @@ async fn load_dedup_priors(
 ) -> Result<HashMap<(IpAddr, SignalType), Option<DateTime<Utc>>>, RepoError> {
     let mut distinct: Vec<(IpAddr, SignalType)> = Vec::new();
     let mut seen: HashSet<(IpAddr, SignalType)> = HashSet::new();
-    for e in scored {
+    // Only an established event asks whether it repeats one (see `append_event`).
+    for e in scored.iter().filter(|e| is_established(e)) {
         if seen.insert((e.source_ip, e.signal_type)) {
             distinct.push((e.source_ip, e.signal_type));
         }
@@ -466,21 +476,25 @@ async fn write_sources(
          (source_ip, raw_score, decay_anchor, max_confidence, event_count, distinct_categories, \
           category_breakdown, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
           first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, \
-          tier, delisted, active_days, last_active_day, established_event_count) \
+          tier, delisted, active_days, last_active_day, established_event_count, \
+          established_last_seen, aggressive_earned_at, standard_earned_at) \
          SELECT source_ip::inet, raw_score, decay_anchor, max_confidence, event_count, \
                 distinct_categories, category_breakdown, has_confirmed_real, distinct_wan_count, \
                 distinct_sensor_count, first_seen, last_seen, eligible, recommended_for_vendor, \
                 recommended_for_blocklist, tier, delisted, active_days, last_active_day, \
-                established_event_count \
+                established_event_count, established_last_seen, aggressive_earned_at, \
+                standard_earned_at \
          FROM unnest($1::text[], $2::numeric[], $3::timestamptz[], $4::numeric[], $5::int4[], \
                      $6::int4[], $7::jsonb[], $8::bool[], $9::int4[], $10::int4[], \
                      $11::timestamptz[], $12::timestamptz[], $13::bool[], $14::bool[], $15::bool[], \
-                     $16::feed_tier_enum[], $17::bool[], $18::int4[], $19::date[], $20::int4[]) \
+                     $16::feed_tier_enum[], $17::bool[], $18::int4[], $19::date[], $20::int4[], \
+                     $21::timestamptz[], $22::timestamptz[], $23::timestamptz[]) \
               AS t(source_ip, raw_score, decay_anchor, max_confidence, event_count, \
                    distinct_categories, category_breakdown, has_confirmed_real, distinct_wan_count, \
                    distinct_sensor_count, first_seen, last_seen, eligible, recommended_for_vendor, \
                    recommended_for_blocklist, tier, delisted, active_days, last_active_day, \
-                   established_event_count) \
+                   established_event_count, established_last_seen, aggressive_earned_at, \
+                   standard_earned_at) \
          ON CONFLICT (source_ip) DO UPDATE SET \
            raw_score = EXCLUDED.raw_score, \
            decay_anchor = EXCLUDED.decay_anchor, \
@@ -499,7 +513,10 @@ async fn write_sources(
            tier = EXCLUDED.tier, \
            active_days = EXCLUDED.active_days, \
            last_active_day = EXCLUDED.last_active_day, \
-           established_event_count = EXCLUDED.established_event_count",
+           established_event_count = EXCLUDED.established_event_count, \
+           established_last_seen = EXCLUDED.established_last_seen, \
+           aggressive_earned_at = EXCLUDED.aggressive_earned_at, \
+           standard_earned_at = EXCLUDED.standard_earned_at",
     )
     .bind(scores.iter().map(|s| s.source_ip.to_string()).collect::<Vec<_>>())
     .bind(column!(raw_score))
@@ -521,6 +538,9 @@ async fn write_sources(
     .bind(column!(active_days))
     .bind(scores.iter().map(|s| s.last_active_day).collect::<Vec<NaiveDate>>())
     .bind(column!(established_event_count))
+    .bind(column!(established_last_seen))
+    .bind(column!(aggressive_earned_at))
+    .bind(column!(standard_earned_at))
     .execute(&mut **tx)
     .await?;
     Ok(())

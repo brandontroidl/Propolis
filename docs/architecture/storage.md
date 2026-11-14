@@ -187,9 +187,10 @@ non-test source.
 `ip_score` is a **per-IP projection** of the ledger: an aggregate keyed on
 `source_ip`, advanced by the same transaction that appends the event. It holds the
 running score inputs (raw score, decay anchor, max confidence, event and category
-counts, distinct WAN/sensor counts, first/last seen) and the derived feed flags
-(`eligible`, `recommended_for_vendor`, `recommended_for_blocklist`, `tier`,
-`delisted`). Because it is a projection, it can be **rebuilt from the ledger** - which
+counts, distinct WAN/sensor counts, first/last seen, last established sighting) and the
+derived feed flags (`eligible`, `recommended_for_vendor`, `recommended_for_blocklist`, `tier`,
+`delisted`), plus the times the address last earned each tier, which the feed, the review queue
+and the vendor gate run on. Because it is a projection, it can be **rebuilt from the ledger** - which
 is exactly why the console's `delete_ip` action purges the `ip_score` and review rows
 but deliberately never touches the `event` ledger.
 
@@ -202,12 +203,16 @@ tables, so a replay checks them ([breadth sets](../reference/database.md#breadth
 Two projection columns are worth calling out for their integrity intent (values and
 formulas owned by [reference/scoring-and-feed.md](../reference/scoring-and-feed.md)):
 
-- `active_days` - an unbounded, non-decaying count of distinct UTC calendar days an
-  IP was seen, so a slow attacker the time-decay would otherwise erase can still earn
-  a tier.
+- `active_days` - an unbounded, non-decaying count of distinct UTC calendar days on
+  which an IP made an established (completed-TCP) event, so a slow attacker the
+  time-decay would otherwise erase can still earn a tier.
 - `established_event_count` - counts only non-spoofable completed-TCP-connection
   events, so a spoofed UDP/ICMP flood cannot get an innocent third party published to
-  the feed.
+  the feed. Eligibility asks for two of them.
+- `established_last_seen`, `aggressive_earned_at`, `standard_earned_at` - the clocks a
+  UDP or ICMP event cannot move: the last established sighting, and the last time an
+  established event earned each tier. Listings, volume recency and the vendor gate run on
+  them rather than on `last_seen`.
 
 `sample_analysis` is a per-sample verdict table (detected/total engine hits, keyed by
 SHA-256) linking a captured sample to its VirusTotal-style result. Two negative values are

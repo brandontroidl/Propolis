@@ -2,8 +2,9 @@
 //! at submission time, after operator approval. See
 //! `internal/design/04-review-gatekeeper-reporting.md` ("The gatekeeper").
 //!
-//! The sequence is fixed - vendor enabled, cooldown, rate limit, score floor,
-//! category filter - and short-circuits on the first held check. Every check
+//! The sequence is fixed - reserved address, delisted, vendor enabled, freshness, cooldown,
+//! nothing new since the last report, rate limit, score floor, category filter - and
+//! short-circuits on the first held check. Every check
 //! is fail-closed: a check this function cannot evaluate (a database error on
 //! the cooldown/rate-limit queries) holds the submission with
 //! [`GateReason::DbError`] rather than propagating an error a caller might
@@ -20,11 +21,17 @@ use core_scoring::IpScore;
 
 use crate::reserved::is_reserved_ip;
 
-/// Do not report an IP whose most recent activity is older than this. Abuse feeds want RECENT
+/// Do not report an IP that last EARNED a tier longer ago than this. Abuse feeds want RECENT
 /// attacker activity, so re-reporting a days-old attack is both wrong and (for DShield) rejected.
-/// 48h covers the daily-cooldown resubmission of a still-recent IP while excluding attackers that
+/// 48h covers the daily-cooldown resubmission of a still-active IP while excluding attackers that
 /// have gone quiet for days. Vendor-agnostic on purpose - reporting stale activity is wrong for any
 /// of them - so it is a constant, not per-vendor config.
+///
+/// The clock is [`IpScore::tier_earned_at`]: the last time an established (completed-TCP) event
+/// left the address eligible and holding a tier. It is not `last_seen`, which any sighting
+/// moves, a datagram under a forged source included. On `last_seen` an approved address was
+/// reported again every cooldown for as long as anything at all kept naming it, with no check
+/// that it still merited a report.
 const FRESHNESS_WINDOW_HOURS: i64 = 48;
 
 /// Per-vendor gate configuration: the fields the check sequence reads.
@@ -68,11 +75,16 @@ pub enum GateReason {
     /// documentation, multicast, IPv6 ULA...) and must never be reported to a third party,
     /// regardless of score, approval, or configuration. Not operator-overridable.
     Reserved,
+    /// The address carries the operator's delist latch. It is published nowhere and reported to
+    /// no one until it is relisted.
+    Delisted,
     Disabled,
-    /// The IP's most recent activity is older than [`FRESHNESS_WINDOW_HOURS`]. Reporting a days-old
-    /// attack as current honeypot activity is wrong, and some vendors reject a stale timestamp
-    /// outright - which, because a failed submission never enters cooldown, would otherwise retry on
-    /// every poll forever. Held here so a stale IP is never submitted in the first place.
+    /// There is nothing current to report. Either the address has not earned a tier within
+    /// [`FRESHNESS_WINDOW_HOURS`] (or ever): reporting a days-old attack as current honeypot
+    /// activity is wrong, and some vendors reject a stale timestamp outright - which, because a
+    /// failed submission never enters cooldown, would otherwise retry on every poll forever. Or
+    /// it has earned nothing since this vendor last accepted a report about it: the same
+    /// sighting is not reported twice.
     Stale,
     Cooldown,
     RateLimit,
@@ -188,20 +200,42 @@ pub async fn check_with(
         return GateResult::Held(GateReason::Reserved);
     }
 
+    // Delisting leaves the earned times in place (relisting resumes a listing that still has
+    // time to run), so the latch is checked here and not inferred from them.
+    if current_score.delisted {
+        return GateResult::Held(GateReason::Delisted);
+    }
+
     if !config.enabled {
         return GateResult::Held(GateReason::Disabled);
     }
 
-    // Never submit an IP whose most recent activity predates the freshness window: a days-old attack
+    // Never submit an IP that has not earned a tier inside the freshness window: a days-old attack
     // is not current honeypot activity, and a stale timestamp is rejected by some vendors (DShield
     // 500s on it) - which, since a failed submission never enters cooldown, would then retry every
-    // poll indefinitely. Cheap in-memory check on the caller-supplied decayed projection.
-    if Utc::now() - current_score.last_seen > Duration::hours(FRESHNESS_WINDOW_HOURS) {
+    // poll indefinitely. Cheap in-memory check on the caller-supplied projection. A time ahead of
+    // the clock (an event's own timestamp, up to intake's skew allowance) is read as now, as the
+    // feed builder reads it, so it cannot widen the window.
+    let now = Utc::now();
+    let Some(earned) = current_score.tier_earned_at().map(|at| at.min(now)) else {
+        return GateResult::Held(GateReason::Stale);
+    };
+    if now - earned > Duration::hours(FRESHNESS_WINDOW_HOURS) {
         return GateResult::Held(GateReason::Stale);
     }
 
-    if let Err(reason) = check_cooldown(pool, ip, config, book).await {
-        return GateResult::Held(reason);
+    let last_success = match latest_success(pool, ip, config, book).await {
+        Ok(last_success) => last_success,
+        Err(reason) => return GateResult::Held(reason),
+    };
+    if last_success.is_some_and(|last| now - last < Duration::hours(config.cooldown_hours as i64)) {
+        return GateResult::Held(GateReason::Cooldown);
+    }
+    // The cooldown is over. Report again only if the address has earned its tier again since the
+    // last report this vendor accepted: one burst of activity is one report, not one per
+    // cooldown for as long as the freshness window stays open.
+    if last_success.is_some_and(|last| earned <= last) {
+        return GateResult::Held(GateReason::Stale);
     }
 
     if let Err(reason) = check_rate_limit(pool, config).await {
@@ -226,36 +260,28 @@ pub async fn check_with(
     GateResult::Pass
 }
 
-/// Held with [`GateReason::Cooldown`] if this (ip, vendor) pair has a
-/// successful submission within `config.cooldown_hours`; held with
-/// [`GateReason::DbError`] if the query itself fails.
-async fn check_cooldown(
+/// When this vendor last accepted a report about `ip`, from `book` when it covers the pair and
+/// from the database otherwise. [`GateReason::DbError`] if the query itself fails, so the caller
+/// holds rather than treating an unanswered question as "never reported".
+async fn latest_success(
     pool: &PgPool,
     ip: IpAddr,
     config: &VendorConfig,
     book: Option<&CooldownBook>,
-) -> Result<(), GateReason> {
-    let most_recent: Option<DateTime<Utc>> =
-        match book.and_then(|b| b.latest_success(ip, &config.name)) {
-            Some(latest) => latest,
-            None => sqlx::query_scalar(
-                "SELECT submitted_at FROM vendor_submission \
-                 WHERE source_ip = $1::inet AND vendor = $2 AND success = TRUE \
-                 ORDER BY submitted_at DESC LIMIT 1",
-            )
-            .bind(ip.to_string())
-            .bind(&config.name)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| GateReason::DbError(e.to_string()))?,
-        };
-
-    if most_recent
-        .is_some_and(|last| Utc::now() - last < Duration::hours(config.cooldown_hours as i64))
-    {
-        return Err(GateReason::Cooldown);
+) -> Result<Option<DateTime<Utc>>, GateReason> {
+    match book.and_then(|b| b.latest_success(ip, &config.name)) {
+        Some(latest) => Ok(latest),
+        None => sqlx::query_scalar(
+            "SELECT submitted_at FROM vendor_submission \
+             WHERE source_ip = $1::inet AND vendor = $2 AND success = TRUE \
+             ORDER BY submitted_at DESC LIMIT 1",
+        )
+        .bind(ip.to_string())
+        .bind(&config.name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| GateReason::DbError(e.to_string())),
     }
-    Ok(())
 }
 
 /// Held with [`GateReason::RateLimit`] if the total successful submissions to

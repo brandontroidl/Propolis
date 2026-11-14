@@ -108,7 +108,7 @@
 //! DB errors." A skipped IP's `review_queue` row stays Approved, so a later
 //! `run_once` call reconsiders it exactly as if this pass had never run.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -175,6 +175,9 @@ pub struct SubmitResult {
 pub struct HeldBreakdown {
     /// The address is on the operator allowlist.
     pub allowlisted: usize,
+    /// The address is delisted: on the operator's delist (`PROPOLIS_FEED_DELIST`) or carrying
+    /// the console's delist latch.
+    pub delisted: usize,
     /// The vendor adapter has no gatekeeper configuration.
     pub no_vendor_config: usize,
     pub reserved: usize,
@@ -191,6 +194,7 @@ impl HeldBreakdown {
     fn record(&mut self, reason: &GateReason) {
         let slot = match reason {
             GateReason::Reserved => &mut self.reserved,
+            GateReason::Delisted => &mut self.delisted,
             GateReason::Disabled => &mut self.disabled,
             GateReason::Stale => &mut self.stale,
             GateReason::Cooldown => &mut self.cooldown,
@@ -205,6 +209,7 @@ impl HeldBreakdown {
     pub fn total(&self) -> usize {
         let Self {
             allowlisted,
+            delisted,
             no_vendor_config,
             reserved,
             disabled,
@@ -216,6 +221,7 @@ impl HeldBreakdown {
             db_error,
         } = *self;
         allowlisted
+            + delisted
             + no_vendor_config
             + reserved
             + disabled
@@ -233,6 +239,7 @@ impl std::fmt::Display for HeldBreakdown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let parts = [
             ("allowlisted", self.allowlisted),
+            ("delisted", self.delisted),
             ("no_vendor_config", self.no_vendor_config),
             ("reserved", self.reserved),
             ("disabled", self.disabled),
@@ -266,6 +273,8 @@ pub struct SubmissionRunner {
     vendors: Vec<Box<dyn VendorAdapter>>,
     gatekeeper_config: Vec<VendorConfig>,
     allowlist: Arc<OperatorAllowlist>,
+    /// The operator's delist (`PROPOLIS_FEED_DELIST`). See [`Self::with_delist`].
+    delist: Arc<HashSet<IpAddr>>,
 }
 
 impl SubmissionRunner {
@@ -279,6 +288,7 @@ impl SubmissionRunner {
             vendors,
             gatekeeper_config,
             allowlist: Arc::default(),
+            delist: Arc::default(),
         }
     }
 
@@ -292,6 +302,20 @@ impl SubmissionRunner {
         self
     }
 
+    /// Refuse to submit any address on the operator's delist (`PROPOLIS_FEED_DELIST`), whatever
+    /// its queue state. The feed stops publishing such an address at once; without this an
+    /// approval given before the address was listed there kept reporting it to every vendor.
+    /// The default runner has an empty delist.
+    pub fn with_delist(mut self, delist: Arc<HashSet<IpAddr>>) -> Self {
+        self.delist = delist;
+        self
+    }
+
+    /// Whether `ip` is held before any vendor is considered: the operator has excluded it.
+    fn excluded(&self, ip: IpAddr) -> bool {
+        self.allowlist.contains(ip) || self.delist.contains(&ip)
+    }
+
     /// The cooldown lookups of the whole pass in one query: every approved address that is not on
     /// the allowlist, for every configured vendor. A pass used to look each pair up on its own
     /// (17,000 `SELECT ... LIMIT 1` for 5,600 addresses and three vendors). A failed load is
@@ -301,7 +325,7 @@ impl SubmissionRunner {
         let ips: Vec<IpAddr> = approved
             .iter()
             .map(|e| e.source_ip)
-            .filter(|ip| !self.allowlist.contains(*ip))
+            .filter(|ip| !self.excluded(*ip))
             .collect();
         let vendors: Vec<&str> = self.vendors.iter().map(|v| v.name()).collect();
         match CooldownBook::load(&self.pool, &ips, &vendors).await {
@@ -334,6 +358,17 @@ impl SubmissionRunner {
                 );
                 result.held += self.vendors.len();
                 result.held_by.allowlisted += self.vendors.len();
+                continue;
+            }
+
+            if self.delist.contains(&ip) {
+                // Steady state for as long as the entry stays Approved, as above.
+                tracing::debug!(
+                    %ip,
+                    "approved entry is on the operator delist; not submitting to any vendor"
+                );
+                result.held += self.vendors.len();
+                result.held_by.delisted += self.vendors.len();
                 continue;
             }
 
@@ -393,6 +428,7 @@ impl SubmissionRunner {
                             | GateReason::ScoreFloor
                             | GateReason::CategoryFilter
                             | GateReason::Disabled
+                            | GateReason::Delisted
                             | GateReason::Stale => {
                                 tracing::debug!(%ip, vendor = %name, ?reason, "submission held");
                             }
@@ -516,14 +552,18 @@ const PROTOCOL_LABELS_SQL: &str = "\
     CROSS JOIN LATERAL ( \
         SELECT e.source_ip, e.category AS cat, e.metadata->>'protocol_label' AS protocol_label \
         FROM event e \
-        WHERE (e.source_ip, e.category) >= ($1::inet, c.category) \
+        WHERE (e.source_ip, e.category) >= ($1::inet, c.category) AND e.protocol = 'tcp' \
         ORDER BY e.source_ip, e.category, e.observed_at DESC LIMIT 1 \
     ) l \
     WHERE l.source_ip = $1::inet AND l.cat = c.category";
 
-/// For each `Category` this source IP's ledger has ever recorded an event
+/// For each `Category` this source IP's ledger has ever recorded an ESTABLISHED event
 /// under, the `protocol_label` (if any) of the MOST RECENTLY observed such
 /// event. See the module doc comment's "Where `protocol_label` comes from".
+///
+/// Established events only (`protocol = 'tcp'`): the label decides which category codes a
+/// vendor is sent, and a datagram under a forged source (a DNS query, label `dns`) must not be
+/// able to turn a report of an SSH session into a generic one.
 async fn category_protocol_labels(
     pool: &PgPool,
     ip: IpAddr,
@@ -600,11 +640,18 @@ fn build_report(
         current_score.raw_score.round_dp(1),
     );
 
+    // The end of the window is what a vendor is told the attack time was. It is the address's
+    // last established sighting, never `last_seen`, which a datagram under a forged source moves.
+    // An address the gate passed always has one; `last_seen` stands in only for a row that
+    // somehow has none.
+    let last_established = current_score
+        .established_last_seen
+        .unwrap_or(current_score.last_seen);
     Ok(VendorReport {
         source_ip: ip,
         categories,
         comment,
-        evidence_window: (current_score.first_seen, current_score.last_seen),
+        evidence_window: (current_score.first_seen, last_established),
     })
 }
 
@@ -727,6 +774,7 @@ mod tests {
             GateReason::Cooldown,
             GateReason::Disabled,
             GateReason::Reserved,
+            GateReason::Delisted,
             GateReason::Stale,
             GateReason::RateLimit,
             GateReason::ScoreFloor,
@@ -736,13 +784,15 @@ mod tests {
             held.record(&reason);
         }
         held.allowlisted += 4;
+        // The runner counts an address on the operator's delist here too, once per vendor.
+        held.delisted += 2;
         held.no_vendor_config += 1;
         assert_eq!(
             held.to_string(),
-            "allowlisted=4 no_vendor_config=1 reserved=1 disabled=2 stale=1 cooldown=1 \
-             rate_limit=1 score_floor=1 category_filter=1 db_error=1"
+            "allowlisted=4 delisted=3 no_vendor_config=1 reserved=1 disabled=2 stale=1 \
+             cooldown=1 rate_limit=1 score_floor=1 category_filter=1 db_error=1"
         );
-        assert_eq!(held.total(), 14);
+        assert_eq!(held.total(), 17);
     }
 
     #[test]

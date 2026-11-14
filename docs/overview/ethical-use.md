@@ -48,8 +48,9 @@ No vendor abuse report is filed and no IP enters a feed file without an operator
 decision about that address. The retention feeds additionally list sources that completed
 a thousand or more TCP connections, once you approve each one as a volume candidate; such
 a source is never reported to a vendor on volume alone. An approval of a scored entry
-stands until you undo it, and a volume approval stands while the address keeps being seen
-and lapses once it has been silent for the longest retention window, so review what you
+stands until you undo it, and a volume approval stands while the address keeps making
+completed TCP connections (a datagram naming it does not renew it) and lapses once it has
+made none for the longest retention window, so review what you
 have approved when an address changes hands. Publishing those sources with
 no review is possible only by setting `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which
 makes you answerable for addresses no person looked at. Enabling any enrichment or

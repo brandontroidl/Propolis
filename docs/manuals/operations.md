@@ -70,8 +70,8 @@ states, and the two distinct feed-publish stages - is owned by
 [routine procedures](../operations/routine-procedures.md). The gates in brief:
 
 - Publication of any IP requires an authenticated console session and an explicit human
-  approval. A score-based entry also needs the IP seen more than once and above the score
-  floor; a volume candidate (a thousand or more established TCP events) is approved on the
+  approval. A score-based entry also needs at least two completed TCP connections from the
+  IP and a tier earned within the tier's time to live (UDP traffic never counts); a volume candidate (a thousand or more established TCP events) is approved on the
   queue page's volume tab and published in the retention feeds only. There is no
   auto-publish path unless you set `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`, which publishes
   volume candidates unreviewed and is off by default.

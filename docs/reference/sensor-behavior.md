@@ -1357,7 +1357,9 @@ nothing (`crates/sensor-tftp/src/main.rs#load_config`).
   on the first short block (complete), a peer ERROR, the body cap (ERROR 3), the idle
   timeout, the packet cap, or `max_duration`; whatever arrived is captured either way,
   with `complete: false` unless the final short block was received
-  (`crates/sensor-tftp/src/handler.rs#UploadCapture`).
+  (`crates/sensor-tftp/src/handler.rs#UploadCapture`). Every TFTP event, the upload
+  included, arrives over UDP, so it is stored and counted but adds nothing to its source's
+  score ([established and forgeable events](scoring-and-feed.md#established-and-forgeable-events)).
 - **Anti-amplification.** Every send goes through one `send_to`, behind a byte budget
   that refuses any packet which would take bytes sent past bytes received from the
   peer, the request datagram included (`crates/sensor-tftp/src/guarded.rs#ByteBudget`).

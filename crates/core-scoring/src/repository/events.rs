@@ -60,7 +60,7 @@ use crate::domain::types::{EventInput, IpScore, ValidationError};
 use crate::hashing::chain_hash;
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 use crate::scoring::constants::{DEDUP_WINDOW_SECONDS, HALF_LIFE_SECONDS};
-use crate::scoring::engine::{CategoryStat, apply_event, project_to_now};
+use crate::scoring::engine::{CategoryStat, apply_event, is_established, project_to_now};
 
 use super::append_gate;
 
@@ -109,7 +109,8 @@ macro_rules! stored_score_columns {
          event_count, established_event_count, distinct_categories, category_breakdown, \
          has_confirmed_real, distinct_wan_count, distinct_sensor_count, first_seen, last_seen, \
          eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
-         active_days, last_active_day"
+         active_days, last_active_day, established_last_seen, aggressive_earned_at, \
+         standard_earned_at"
     };
 }
 pub(crate) use stored_score_columns;
@@ -188,20 +189,25 @@ impl From<ValidationError> for RepoError {
 pub(super) const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 
 /// The dedup read: the newest prior observation of this source and signal. Runs inside the append
-/// lock on every scored event, so its plan decides intake throughput. Migration 0013's
-/// `event_dedup_idx` answers it in one backward step. The alternative the planner also weighs is
+/// lock on every established event, so its plan decides intake throughput. Migration 0027's
+/// `event_dedup_tcp_idx` answers it in one backward step. The alternative the planner also weighs is
 /// walking `event_observed_at_idx` down from the ledger head until the source turns up, which
 /// costs one row per event newer than the source's last sighting, so it grows with intake lag.
 ///
 /// The address is wrapped in a scalar subquery so the planner cannot see it. Given the literal
 /// value, it looks the address up in the column statistics, and a bot loop holding a large share
 /// of the ledger is estimated to turn up within a few rows of the head: the walk then costs about
-/// the same as the index on paper, and it was still chosen with `event_dedup_idx` present on a
+/// the same as the index on paper, and it was still chosen with the dedup index present on a
 /// ledger shaped like the incident. Hidden, the address is costed as an average source, for which
 /// the walk is never competitive. `dedup_read_plan_*` in this module's tests holds the plan to the
 /// index.
+///
+/// Only ESTABLISHED events are priors (`protocol = 'tcp'`, the engine's `is_established`): a
+/// datagram under a forged address must not be able to make that address's next real connection
+/// a no-weight duplicate. The predicate is the partial index's own, so `event_dedup_tcp_idx`
+/// (migration 0027) answers the read without visiting a single datagram's row.
 const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
-     WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND id < $3";
+     WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND protocol = 'tcp' AND id < $3";
 
 /// Normalize the storage-lossy fields to their STORED precision BEFORE both hashing and
 /// inserting, so the bytes we hash are byte-identical to the bytes storage returns on read.
@@ -329,14 +335,19 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     // panicking inside the engine's `.expect()`.
     let stored = read_stored_ip_score(&mut *tx, event.source_ip).await?;
 
-    // 2e. Dedup on (source_ip, signal_type): the most recent prior observation,
-    // excluding the row we just inserted (id < new_id).
-    let prior_observed: Option<DateTime<Utc>> = sqlx::query_scalar(DEDUP_PRIOR_SQL)
-        .bind(event.source_ip.to_string())
-        .bind(event.signal_type)
-        .bind(new_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    // 2e. Dedup on (source_ip, signal_type): the most recent prior established observation,
+    // excluding the row we just inserted (id < new_id). A forgeable sighting adds no weight
+    // whether or not it repeats one, so it asks nothing.
+    let prior_observed: Option<DateTime<Utc>> = if is_established(&event) {
+        sqlx::query_scalar(DEDUP_PRIOR_SQL)
+            .bind(event.source_ip.to_string())
+            .bind(event.signal_type)
+            .bind(new_id)
+            .fetch_one(&mut *tx)
+            .await?
+    } else {
+        None
+    };
     // Symmetric window: dedup only a same-signal observation within DEDUP_WINDOW_SECONDS in
     // EITHER time direction. A one-sided `elapsed <= WINDOW` treats any negative elapsed
     // (an out-of-order/earlier-timestamped event from a buffered or clock-skewed sensor) as a
@@ -358,8 +369,10 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
          (source_ip, raw_score, decay_anchor, max_confidence, event_count, distinct_categories, \
           category_breakdown, has_confirmed_real, distinct_wan_count, distinct_sensor_count, \
           first_seen, last_seen, eligible, recommended_for_vendor, recommended_for_blocklist, tier, delisted, \
-          active_days, last_active_day, established_event_count) \
-         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
+          active_days, last_active_day, established_event_count, established_last_seen, \
+          aggressive_earned_at, standard_earned_at) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, \
+                 $21, $22, $23) \
          ON CONFLICT (source_ip) DO UPDATE SET \
            raw_score = EXCLUDED.raw_score, \
            decay_anchor = EXCLUDED.decay_anchor, \
@@ -378,7 +391,10 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
            tier = EXCLUDED.tier, \
            active_days = EXCLUDED.active_days, \
            last_active_day = EXCLUDED.last_active_day, \
-           established_event_count = EXCLUDED.established_event_count",
+           established_event_count = EXCLUDED.established_event_count, \
+           established_last_seen = EXCLUDED.established_last_seen, \
+           aggressive_earned_at = EXCLUDED.aggressive_earned_at, \
+           standard_earned_at = EXCLUDED.standard_earned_at",
     )
     .bind(new_score.source_ip.to_string())
     .bind(new_score.raw_score)
@@ -400,6 +416,9 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
     .bind(new_score.active_days)
     .bind(new_score.last_active_day)
     .bind(new_score.established_event_count)
+    .bind(new_score.established_last_seen)
+    .bind(new_score.aggressive_earned_at)
+    .bind(new_score.standard_earned_at)
     .execute(&mut *tx)
     .await?;
 
@@ -637,6 +656,9 @@ pub(super) fn score_from_row(row: &sqlx::postgres::PgRow) -> Result<IpScore, Rep
         recommended_for_blocklist: row.try_get("recommended_for_blocklist")?,
         tier: row.try_get("tier")?,
         delisted: row.try_get("delisted")?,
+        established_last_seen: row.try_get("established_last_seen")?,
+        aggressive_earned_at: row.try_get("aggressive_earned_at")?,
+        standard_earned_at: row.try_get("standard_earned_at")?,
     })
 }
 
@@ -745,8 +767,8 @@ mod tests {
 
         let custom = custom_plan_indexes(&pool, DEDUP_PRIOR_SQL, next_id).await?;
         assert!(
-            custom.iter().any(|n| n == "event_dedup_idx"),
-            "the dedup read must use event_dedup_idx, plan read {custom:?}"
+            custom.iter().any(|n| n == "event_dedup_tcp_idx"),
+            "the dedup read must use event_dedup_tcp_idx, plan read {custom:?}"
         );
         assert!(
             !custom.iter().any(|n| n == "event_observed_at_idx"),
@@ -754,7 +776,7 @@ mod tests {
         );
 
         let mut tx = pool.begin().await?;
-        sqlx::query("DROP INDEX event_dedup_idx")
+        sqlx::query("DROP INDEX event_dedup_idx, event_dedup_tcp_idx")
             .execute(&mut *tx)
             .await?;
         let incident = custom_plan_indexes(&mut *tx, INCIDENT_DEDUP_SQL, next_id).await?;
@@ -767,7 +789,7 @@ mod tests {
         Ok(())
     }
 
-    /// The batched dedup read answers every (source, signal) key from `event_dedup_idx` on the
+    /// The batched dedup read answers every (source, signal) key from `event_dedup_tcp_idx` on the
     /// same incident-shaped ledger, for the hot source and a cold one, never by walking
     /// `event_observed_at_idx`. The ledger is the one the guard above proves provokes that walk.
     #[sqlx::test(migrations = "./migrations")]
@@ -783,8 +805,8 @@ mod tests {
         let mut names = Vec::new();
         index_names(&plan, &mut names);
         assert!(
-            names.iter().any(|n| n == "event_dedup_idx"),
-            "the batched dedup read must use event_dedup_idx, plan read {names:?}"
+            names.iter().any(|n| n == "event_dedup_tcp_idx"),
+            "the batched dedup read must use event_dedup_tcp_idx, plan read {names:?}"
         );
         assert!(
             !names.iter().any(|n| n == "event_observed_at_idx"),
@@ -807,8 +829,8 @@ mod tests {
         let mut names = Vec::new();
         index_names(&plan, &mut names);
         assert!(
-            names.iter().any(|n| n == "event_dedup_idx"),
-            "the generic dedup plan must use event_dedup_idx, plan read {names:?}"
+            names.iter().any(|n| n == "event_dedup_tcp_idx"),
+            "the generic dedup plan must use event_dedup_tcp_idx, plan read {names:?}"
         );
         assert!(
             !names.iter().any(|n| n == "event_observed_at_idx"),

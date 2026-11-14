@@ -48,6 +48,8 @@ per-IP score that decays with a six-hour half-life. Two things shape it:
 - An IP only becomes eligible for a tier or a vendor report after a completed TCP
   handshake has authenticated against a sensor. UDP traffic and bare SYNs cannot do
   that, so a spoofed source cannot be pushed into the feed by someone else's packets.
+  UDP and ICMP events are recorded and counted but add nothing to the score at all, and
+  cannot keep an address listed or reported.
 - Activity across more than one of your addresses, and across more than one protocol,
   weighs more than repeated hits on a single port.
 
@@ -61,16 +63,21 @@ in the console or with the `review` command. Approval is what lets it into the
 `aggressive` or `standard` feed files and, if a vendor is configured, what allows a
 report to be filed.
 
+An entry stays in a tier file for that tier's time to live after the last time the
+address earned the tier, and a vendor gets one report per burst of activity, not one
+per day for as long as anything names the address.
+
 The retention feeds (`all-24h`, `all-7d` and so on) are different: they hold every
-approved entry seen within the window, and also any source that completed a thousand
-or more TCP connections and that you approved as a volume candidate. The volume rule
+approved entry that earned a tier within the window, and also any source that completed
+a thousand or more TCP connections, made one within the window, and that you approved as
+a volume candidate. The volume rule
 exists so a flood can be blocked even when it never logged in; it offers the source on
 the review page's volume tab, and approving it there publishes it without reporting
 it. Volume alone never triggers a vendor report. Setting
 `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` publishes volume candidates with no approval;
 it is off by default.
 
-The feed builder writes text, JSON, CSV, CIDR, ipset, nftables, pf, alias, hosts and
+The feed builder writes text, JSON, CSV, CIDR, ipset, nftables, pf, alias and
 RPZ formats to a local directory with a checksummed manifest, atomically, every fifteen
 minutes by default. Getting those files to a firewall or a public repository is your
 step; a sync script is provided but not scheduled for you.

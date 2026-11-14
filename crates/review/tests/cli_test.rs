@@ -101,7 +101,7 @@ async fn seed_recommended(pool: &PgPool, ip: &str) {
             ip,
             "catchall-sensor",
             SignalType::CatchallProbe,
-            Protocol::Udp,
+            Protocol::Tcp,
             false,
         ),
     )

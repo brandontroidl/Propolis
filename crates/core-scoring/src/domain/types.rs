@@ -157,6 +157,25 @@ pub struct IpScore {
     pub recommended_for_blocklist: bool,
     pub tier: Option<FeedTier>,
     pub delisted: bool,
+    /// The latest `observed_at` of an established event (a completed TCP connection), or `None`
+    /// for an address only forgeable datagrams have named. `last_seen` moves on any sighting;
+    /// this is the one a sender cannot move for someone else, so volume listing and the volume
+    /// approval's lapse run on it.
+    pub established_last_seen: Option<DateTime<Utc>>,
+    /// The last time an established event left the address eligible and holding the aggressive
+    /// tier. The feed lists an approved address in the aggressive file for that tier's TTL after
+    /// this time. An event that leaves the address below the tier neither clears nor advances it.
+    pub aggressive_earned_at: Option<DateTime<Utc>>,
+    /// The same for the standard tier.
+    pub standard_earned_at: Option<DateTime<Utc>>,
+}
+
+impl IpScore {
+    /// The last time the address earned either tier: the clock the retention windows and the
+    /// vendor gate's freshness check run on.
+    pub fn tier_earned_at(&self) -> Option<DateTime<Utc>> {
+        self.aggressive_earned_at.max(self.standard_earned_at)
+    }
 }
 
 #[cfg(test)]

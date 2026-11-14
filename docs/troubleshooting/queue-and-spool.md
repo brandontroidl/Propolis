@@ -122,12 +122,21 @@ The review queue is populated/withdrawn by the `review` loop on
 `PROPOLIS_QUEUE_SCAN_INTERVAL_SECS` (default 60s), so expect up to one scan
 interval of lag.
 
-- **Nothing surfaces** - `populate` only inserts `ip_score` rows where
-  `recommended_for_vendor = TRUE AND eligible = TRUE`
-  (`crates/review/src/queue.rs#populate`). If a source never becomes eligible
-  (eligibility needs a confirmed-real honeypot event and `event_count >= 2`),
-  it never enters the queue. Eligibility and tier rules are owned by
+- **Nothing surfaces** - `populate` only inserts `ip_score` rows that are
+  eligible, not delisted and have earned a tier at some time
+  (`eligible = TRUE AND NOT delisted` and `aggressive_earned_at` or
+  `standard_earned_at` set; `crates/review/src/queue.rs#OFFERED_SQL`,
+  `crates/review/src/queue.rs#populate`). If a source never becomes eligible
+  (eligibility needs a confirmed-real honeypot event and
+  `established_event_count >= 2`: two completed-TCP events, so UDP traffic never
+  counts), or never earns a tier on an established event, it never enters the
+  queue. An address on the operator allowlist or delist (`PROPOLIS_FEED_DELIST`)
+  is skipped too. Eligibility and tier rules are owned by
   [Scoring and feed](../reference/scoring-and-feed.md).
+- **A Pending entry disappears** - each scan withdraws a Pending entry only when
+  the address is delisted, its score row is gone, or the operator allowlist or
+  delist now covers it, logged with the reason (`crates/review/src/queue.rs#withdraw`).
+  A later event that leaves the address below its tier does not withdraw it.
 - **A reserved address never surfaces, and one already queued is rejected** - an
   address in a reserved range (RFC 1918, loopback, link-local, documentation,
   and the rest of `core_scoring::is_reserved_ip`) is skipped by `populate`,

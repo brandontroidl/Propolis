@@ -19,23 +19,29 @@ planning](./capacity-planning.md)).
 ## Feed retention windows and tier TTLs
 
 Blocklist-feed membership is decided by **retention windows and tier TTLs, not by a
-live-decayed score**. Every field is read as stored (as of the IP's last event) and never
-re-derived against the wall clock, so an entry cannot slide between builds
+live-decayed score**. Every field is read as stored and never re-derived against the wall
+clock, so an entry cannot slide between builds, and an entry runs from the last time the address
+earned its place
 (`crates/feed/src/builder.rs#FeedBuilder::build`). The feed loop rebuilds every
 `PROPOLIS_FEED_BUILD_INTERVAL_SECS` (default **900 s** / 15 min) and publishes atomically; a
 failed build leaves the previous feed in place (`run_feed_loop`, `crates/propolis/src/main.rs#run_feed_loop`).
 
 Two kinds of retention apply:
 
-- **Tier TTLs** bound how long a merit-tiered entry stays in the per-tier files after its last
-  sighting:
+- **Tier TTLs** bound how long a merit-tiered entry stays in the per-tier files after the last
+  time an established (completed-TCP) event earned it that tier (`aggressive_earned_at`,
+  `standard_earned_at`):
   - `PROPOLIS_FEED_AGGRESSIVE_TTL_HOURS` - default **24 h** (`crates/propolis/src/config.rs#DEFAULT_AGGRESSIVE_TTL_HOURS`);
   - `PROPOLIS_FEED_STANDARD_TTL_HOURS` - default **48 h** (`crates/propolis/src/config.rs#DEFAULT_STANDARD_TTL_HOURS`).
-  An entry is kept iff `now - last_seen < ttl`; `valid_until = coarsen_to_hour(last_seen) + ttl`
-  (`crates/feed/src/builder.rs#materialize`).
+  An entry is kept iff `now - earned_at < ttl`; `valid_until = coarsen_to_hour(earned_at) + ttl`
+  (`crates/feed/src/builder.rs#materialize`). The two files never hold the same address: one that
+  earned both runs out its aggressive TTL and is then carried in the standard file for what is
+  left of the standard one. A later weak event neither removes nor extends an entry, and a UDP
+  datagram naming the address changes nothing.
 - **Retention windows** publish `all-{label}` feeds that ignore tier and hold every approved
   entry (and every approved volume listing; unapproved ones too only with
-  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`) whose `last_seen` falls inside the window:
+  `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`) while the later of its earned times, or for a volume
+  listing its last established connection (`established_last_seen`), falls inside the window:
   `PROPOLIS_FEED_WINDOWS`, default **`24h,7d,30d,60d,90d`**, nested by construction
   (`crates/propolis/src/config.rs#DEFAULT_FEED_WINDOWS`, `crates/feed/src/builder.rs#FeedBuilder::build`). A malformed window entry is fail-closed.
 
@@ -152,8 +158,8 @@ Consequences for an operator:
 
 - plan database storage for sustained ingest; if you need bounded event history, run your own
   periodic pruning job against the `event` table (there is no shipped one);
-- delisting an IP (`PROPOLIS_FEED_DELIST`) removes it from feed output but does not delete its
-  events or score row;
+- delisting an IP (`PROPOLIS_FEED_DELIST`) removes it from feed output, keeps it out of review
+  and vendor reporting, but does not delete its events or score row;
 - the hash-chained event ledger means deletions break chain continuity, so prune with that
   trade-off in mind. See [storage](../architecture/storage.md) and [database
   reference](../reference/database.md);

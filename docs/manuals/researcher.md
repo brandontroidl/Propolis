@@ -104,8 +104,12 @@ An IP earns a feed tier or a vendor report only after it latches
 (`protocol == Tcp && authenticated && category == Honeypot`). UDP/ICMP,
 unauthenticated, or non-honeypot traffic never latches it. Weight and confidence
 alone do not set it. The latch is sticky until an explicit delist. Combined with
-the eligibility rule (confirmed-real plus at least two recorded events), this
-means a listed IP is corroborated by traffic a spoofed source could not produce.
+the eligibility rule (confirmed-real plus at least two established, completed-TCP
+events), this means a listed IP is corroborated by traffic a spoofed source could
+not produce. A UDP or ICMP event is stored and counted but adds nothing to the score,
+and a listing runs from the last time an established event earned the tier, so a
+datagram under a forged source can neither list an address, nor keep one listed,
+nor end a listing.
 An independent **volume path** can list a high-volume source on completed-TCP
 event counts alone, once an operator approves it as a volume candidate; it never
 triggers vendor reporting and never applies to spoofable UDP/ICMP floods. Details:

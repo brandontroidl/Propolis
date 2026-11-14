@@ -22,7 +22,7 @@ sets out the boundaries this depends on.
 - **Evidence.** Login attempts, shell commands, uploaded files and downloaded droppers,
   stored in an append-only ledger and viewable per source IP in the console.
 - **A blocklist.** Two score-based tiers, `aggressive` and `standard`, plus retention
-  feeds that list everything seen within a window. You sync the files to your own
+  feeds that list every approved address active within a window. You sync the files to your own
   firewall; nothing is pushed anywhere unless you set that up.
 - **Vendor reports.** Optional submissions to AbuseIPDB, DShield and OTX, off until
   configured.

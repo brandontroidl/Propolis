@@ -48,7 +48,7 @@ async fn seed_recommended(pool: &PgPool, ip: &str) {
     let events = [
         (SignalType::HoneypotLoginAttempt, Protocol::Tcp, true, 0),
         (SignalType::SshBruteForce, Protocol::Tcp, true, 10),
-        (SignalType::CatchallProbe, Protocol::Udp, false, 20),
+        (SignalType::CatchallProbe, Protocol::Tcp, false, 20),
     ];
     for (signal, protocol, authenticated, offset) in events {
         let ts = (base + Duration::seconds(offset)).to_rfc3339();

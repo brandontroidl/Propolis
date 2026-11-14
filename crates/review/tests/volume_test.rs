@@ -419,7 +419,8 @@ async fn withdraw_keeps_a_pending_row_for_a_quiet_or_differently_decided_address
     assert_eq!(queue.populate(&pool).await.unwrap(), 3);
 
     sqlx::query(
-        "UPDATE ip_score SET last_seen = now() - interval '40 days' WHERE source_ip = $1::inet",
+        "UPDATE ip_score SET established_last_seen = now() - interval '40 days' \
+         WHERE source_ip = $1::inet",
     )
     .bind(quiet)
     .execute(&pool)
@@ -509,14 +510,19 @@ async fn withdraw_never_removes_a_decided_row(pool: PgPool) {
     }
 }
 
-/// Moves `ip`'s stored `last_seen` to `ago` before now, as if nothing had named it since.
-async fn last_seen_ago(pool: &PgPool, ip: &str, ago: Duration) {
-    sqlx::query("UPDATE ip_score SET last_seen = $2 WHERE source_ip = $1::inet")
-        .bind(ip)
-        .bind(Utc::now() - ago)
-        .execute(pool)
-        .await
-        .unwrap();
+/// Moves `ip`'s last established connection to `ago` before now, as if it had not connected
+/// since. `last_seen` is set to now, which is what one datagram naming the address leaves: the
+/// lapse and the offer must run on the connection and ignore that.
+async fn last_connection_ago(pool: &PgPool, ip: &str, ago: Duration) {
+    sqlx::query(
+        "UPDATE ip_score SET established_last_seen = $2, last_seen = now() \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(ip)
+    .bind(Utc::now() - ago)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 /// An approval covers one listing. Once the address has been unseen for longer than the longest
@@ -553,7 +559,7 @@ async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offere
 
     // A minute short of the limit nothing lapses.
     for ip in [approved, pending, rejected] {
-        last_seen_ago(&pool, ip, longest - Duration::minutes(1)).await;
+        last_connection_ago(&pool, ip, longest - Duration::minutes(1)).await;
     }
     assert_eq!(queue.withdraw(&pool).await.unwrap(), 0);
     assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Approved));
@@ -562,7 +568,7 @@ async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offere
     // A minute past it the approval and the open candidate are gone; the rejection and the
     // approval of an address still being seen are not.
     for ip in [approved, pending, rejected] {
-        last_seen_ago(&pool, ip, longest + Duration::minutes(1)).await;
+        last_connection_ago(&pool, ip, longest + Duration::minutes(1)).await;
     }
     assert_eq!(queue.withdraw(&pool).await.unwrap(), 2);
     assert_eq!(state_of(&pool, approved).await, None);
@@ -576,11 +582,11 @@ async fn a_decision_lapses_once_its_address_is_out_of_every_window_and_is_offere
     // While the address stays unseen there is nothing to offer.
     assert_eq!(queue.populate(&pool).await.unwrap(), 0);
 
-    // One more line names each of them, months later. The two whose rows lapsed are offered
-    // again and are Pending: the old approval does not speak for the new sighting. The rejected
-    // one is not offered.
+    // Each of them connects again, months later. The two whose rows lapsed are offered again
+    // and are Pending: the old approval does not speak for the new flood. The rejected one is
+    // not offered.
     for ip in [approved, pending, rejected] {
-        last_seen_ago(&pool, ip, Duration::minutes(1)).await;
+        last_connection_ago(&pool, ip, Duration::minutes(1)).await;
     }
     assert_eq!(queue.populate(&pool).await.unwrap(), 2);
     assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Pending));
@@ -605,8 +611,8 @@ async fn by_default_a_decision_lapses_after_ninety_days_unseen(pool: PgPool) {
             .await
             .unwrap();
     }
-    last_seen_ago(&pool, inside, Duration::days(89)).await;
-    last_seen_ago(&pool, outside, Duration::days(91)).await;
+    last_connection_ago(&pool, inside, Duration::days(89)).await;
+    last_connection_ago(&pool, outside, Duration::days(91)).await;
 
     assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
     assert_eq!(state_of(&pool, inside).await, Some(ReviewState::Approved));
@@ -639,7 +645,7 @@ async fn a_lapse_shorter_than_ninety_days_is_raised_to_ninety(pool: PgPool) {
     // Both rows stay, and a row that stays is not offered again by the next scan.
     for unseen in [Duration::hours(13), Duration::days(30), Duration::days(89)] {
         for ip in [approved, pending] {
-            last_seen_ago(&pool, ip, unseen).await;
+            last_connection_ago(&pool, ip, unseen).await;
         }
         assert_eq!(queue.populate(&pool).await.unwrap(), 0, "{unseen}");
         assert_eq!(queue.withdraw(&pool).await.unwrap(), 0, "{unseen}");
@@ -649,7 +655,7 @@ async fn a_lapse_shorter_than_ninety_days_is_raised_to_ninety(pool: PgPool) {
 
     // Past ninety days they lapse.
     for ip in [approved, pending] {
-        last_seen_ago(&pool, ip, Duration::days(91)).await;
+        last_connection_ago(&pool, ip, Duration::days(91)).await;
     }
     assert_eq!(queue.withdraw(&pool).await.unwrap(), 2);
     assert_eq!(state_of(&pool, approved).await, None);
@@ -856,7 +862,7 @@ async fn an_eligible_flooding_address_is_offered_until_its_score_entry_is_approv
     for (signal, protocol, authenticated) in [
         (SignalType::HoneypotLoginAttempt, Protocol::Tcp, true),
         (SignalType::SshBruteForce, Protocol::Tcp, true),
-        (SignalType::CatchallProbe, Protocol::Udp, false),
+        (SignalType::CatchallProbe, Protocol::Tcp, false),
     ] {
         append_event(&pool, ev(ip, signal, protocol, authenticated, when))
             .await
@@ -881,4 +887,75 @@ async fn an_eligible_flooding_address_is_offered_until_its_score_entry_is_approv
         0,
         "and it is not offered again while that approval stands"
     );
+}
+
+/// A datagram's source address is whatever the sender wrote. One naming a flooder long after its
+/// flood stopped must not get the address offered for review, and must not keep an approval alive
+/// past its lapse: both run on the last completed connection.
+#[sqlx::test(migrations = false)]
+async fn a_datagram_neither_offers_a_stopped_flood_nor_keeps_its_approval_alive(pool: PgPool) {
+    migrate(&pool).await;
+    let stopped = "192.0.2.90";
+    let approved = "192.0.2.91";
+    let queue = queue();
+    let datagram_now = |ip: &str| {
+        ev(
+            ip,
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            Utc::now(),
+        )
+    };
+
+    // A flood that stopped two days ago was never offered, and a datagram names it now.
+    seed_connections(&pool, stopped, 1000, Utc::now() - Duration::days(2)).await;
+    core_scoring::append_event(&pool, datagram_now(stopped))
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.populate(&pool).await.unwrap(),
+        0,
+        "seen a moment ago, but its last connection was two days ago"
+    );
+    assert_eq!(state_of(&pool, stopped).await, None);
+
+    // An approved flood whose last connection is 91 days old, named by a datagram now.
+    seed_connections(&pool, approved, 1000, Utc::now() - Duration::days(91)).await;
+    sqlx::query(
+        "INSERT INTO volume_review (source_ip, state, established_events_at_surface) \
+         VALUES ($1::inet, 'approved', 1000)",
+    )
+    .bind(approved)
+    .execute(&pool)
+    .await
+    .unwrap();
+    core_scoring::append_event(&pool, datagram_now(approved))
+        .await
+        .unwrap();
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
+    assert_eq!(
+        state_of(&pool, approved).await,
+        None,
+        "the datagram did not renew the approval"
+    );
+}
+
+/// The operator's delist (`PROPOLIS_FEED_DELIST`) keeps an address out of every feed whatever is
+/// decided, so offering it here would only invite an approval that can never take effect.
+#[sqlx::test(migrations = false)]
+async fn an_address_on_the_operator_delist_is_not_offered(pool: PgPool) {
+    migrate(&pool).await;
+    let delisted = "192.0.2.92";
+    let other = "192.0.2.93";
+    for ip in [delisted, other] {
+        seed_flood(&pool, ip).await;
+    }
+    let delist: std::collections::HashSet<std::net::IpAddr> =
+        [delisted.parse().unwrap()].into_iter().collect();
+    let queue = queue().with_delist(std::sync::Arc::new(delist));
+
+    assert_eq!(queue.populate(&pool).await.unwrap(), 1);
+    assert_eq!(state_of(&pool, delisted).await, None);
+    assert_eq!(state_of(&pool, other).await, Some(ReviewState::Pending));
 }

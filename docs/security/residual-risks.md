@@ -82,23 +82,33 @@ sensor can produce, and a line dated more than an hour ahead is refused. What re
   its writer likes: a back-dated line cannot move `last_seen` or the decay anchor and adds only
   what its claimed age leaves of its weight, but it is stored with the time it claims and sorts
   there in the ledger and the console.
-- **A line dated now can end a tier listing.** Every event, of any kind and from any sensor,
-  re-derives the stored tier from the score decayed to that event, and the feed publishes a
-  tier entry only while the stored row has a tier. Once an approved address has been quiet for
-  a few hours (the half-life is six), one low-weight line naming it stores no tier: a
-  `catchall_probe` from a compromised sensor-catchall, one UDP datagram with a spoofed source
-  sent to the DNS or TFTP listener by anyone, or the address itself connecting once. The
-  address is still Approved and was seen seconds ago, and it is in no tier file and no
-  retention window until it earns a tier again. An address that also has a thousand
-  established events stays in the retention windows as a volume listing. Nothing else stops
-  this; the back-dating and future-dating checks do not apply to a line dated now.
-- **An approved volume listing follows any sighting.** A volume approval stands until an
-  operator reopens it, the address is delisted, or the address has been unseen for the longest
-  retention window. While it stands, any event for the address renews its place in every
-  retention window, with no new decision: a forged line from any sensor, or one spoofed UDP
-  datagram. The same holds for an address approved in the review queue that has a thousand
-  established events, and that approval does not lapse. The lapse is noticed by the queue scan,
-  so a node that was down for the whole quiet period keeps the approval.
+- **Forged established evidence.** A forgeable sighting (UDP or ICMP, whose source is whatever
+  the sender wrote) is counted and dated but adds no weight, no active day and no latch, and
+  moves no clock a listing or a report runs on
+  ([established and forgeable events](../reference/scoring-and-feed.md#established-and-forgeable-events)).
+  That closes two risks this page used to list: a line dated now can no longer end a tier
+  listing (a listing runs its full TTL from the last time the address earned the tier, and a
+  later weak event neither clears nor advances that time), and an approved volume listing no
+  longer follows any sighting (its recency and its approval's lapse run on the last completed
+  TCP connection, which a datagram cannot move). What remains is a sensor that can write TCP
+  events: a compromised or malicious one can still forge established evidence for any address,
+  under its own name and within its own protocols, as the first bullet says, and that evidence
+  earns tiers, renews listings and dates reports like real traffic.
+- **The first day after the upgrade to established sightings.** A tier stored before migration
+  `0027_established_sightings.sql` may rest in part on weight that datagrams added under the old
+  rule. That residue decays with the usual six-hour half-life, so for about a day after the
+  upgrade a tier can be earned partly on it.
+- **A volume approval relists on any later connection.** The volume count is lifetime. A volume
+  approval stands until an operator reopens it, the address is delisted, or the address has made
+  no established connection for the longest retention window; while it stands, any later
+  established connection from the address puts it back in every retention window that holds
+  that connection, with no new decision. The same holds for an address approved in the review
+  queue that has a thousand established events, and that approval does not lapse. The lapse is
+  noticed by the queue scan, so a node that was down for the whole quiet period keeps the
+  approval.
+- **A report's `first_seen` is a sighting of any kind.** The attack time sent to a vendor is the
+  address's last established sighting, but the `first_seen` quoted in the vendor comment is the
+  row's first sighting of any kind, which a datagram under a forged source may have set.
 - **What was stored before these checks.** Ledger rows and `ip_score` rows written by an earlier
   version keep the sensor names and timestamps they had. Nothing re-validates the ledger and
   nothing rebuilds a projection, so a row whose `last_seen` or `decay_anchor` was moved back by

@@ -87,10 +87,11 @@ review entries, and the page heading says how the total splits.
    **Reject** keeps it out, and the scan does not offer it again.
 
 An approval is not for one build. It stands until you return the candidate to pending,
-delist the address, or the address has gone unseen for the longest retention window
-(never less than ninety days), at which point the row is removed and a later flood from the
-address is offered again. While it stands, any event that names the address keeps it in
-the retention feeds, a single UDP packet included. A rejection does not lapse.
+delist the address, or the address has made no completed TCP connection for the longest
+retention window (never less than ninety days), at which point the row is removed and a later
+flood from the address is offered again. While it stands, any later completed TCP connection
+from the address keeps it in the retention feeds; a UDP packet naming it does not. A rejection
+does not lapse.
 
 Decided candidates are listed under the pending ones. **Return to pending** undoes
 either decision; an approved address then leaves the retention feeds at the next
@@ -118,8 +119,11 @@ retention feeds at the next build and those still flooding appear on the Volume 
 **Delist** keeps an address out of the feed and the queue regardless of score.
 **Relist** (the address's detail page, on a delisted address) removes that hold.
 Relisting does not force the address back into the feed: it clears the latch and
-re-derives the ordinary gates from the current projection, so an address whose
-score has since decayed stays out on its own merits.
+re-derives the ordinary gates from the current projection. Delisting deleted the
+queue entry, so the address must be offered and approved again; it is then listed
+only while the last time it earned a tier is inside the tier's TTL or a retention
+window. Delisting does not clear the earned times, so a listing that still has time
+to run resumes.
 
 ## Publishing the feed
 
@@ -211,12 +215,33 @@ writes:
 
 - the feed directory itself is a symbolic link;
 - an entry is not `manifest.json` or `aggressive`, `standard` or `all-<n>h|d`
-  with one of the publisher's ten formats, a feed is missing one of those
+  with one of the publisher's nine formats, a feed is missing one of those
   formats, or there are more than 16 retention windows;
 - a file is not a regular file with exactly one link (a symlink, a hard link, a
   FIFO, a device), is over 32 MiB, or the build is over 256 MiB in all;
 - a file is replaced between its check and its copy: each one is opened without
-  following a link and without blocking, and checked again after it is read.
+  following a link and without blocking, and checked again after it is read;
+- a file holds anything but what the publisher writes for its format. Every copy is
+  read back and held, line for line, to that format: its fixed header, addresses,
+  and hour-boundary timestamps, with the set and table names the feed's own name
+  gives (`deploy/blocklist-sync.sh#check_content`). Consumers apply the `.nft` and
+  `.ipset` files to their firewalls as root, so one extra line there would be a
+  command run on every consumer, and any file could carry data out of the node;
+- `manifest.json` is not the publisher's, or the retention windows it lists are not
+  exactly the `all-*` feeds present.
+
+`deploy/blocklist-sync.sh --check [FEED_DIR]` runs all of these checks and stops:
+nothing is committed or pushed and no checkout is needed. Use it to see whether the
+current build would be published.
+
+What it pushes is the build and nothing else. `tiers/` and `retention/` in the
+checkout are replaced whole on every run, so a retention window you removed, or a
+format a newer version no longer writes, leaves the public repository at the next
+push; other files in the checkout (a licence, the README) are left alone. The commit
+is made as the identity set in that checkout (`git config user.name` and
+`user.email` there) or, if none is set, as a fixed neutral one, and is dated to the
+build hour in UTC. Nothing is taken from the account, the host name or the node's
+time zone, so the public history says no more about the node than the feed does.
 
 It always attempts a push (to ship any commit stranded by a prior failed run) and
 exits non-zero with a diagnostic if the push fails. After a successful push it

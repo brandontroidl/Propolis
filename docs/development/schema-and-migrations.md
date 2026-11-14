@@ -63,6 +63,11 @@ change: `0006_relax_eligibility.sql` (recomputes eligibility flags - the one mig
 that embeds a scoring formula in SQL) and the `0010`/`0011` backfills for `active_days`
 and `established_event_count`. `0010` explicitly refuses to duplicate tier logic in SQL
 (`0010:14-16`) - scoring stays in Rust. Keep new scoring logic out of migrations.
+`0027_established_sightings.sql` follows the same rule: it takes `established_last_seen` from
+the ledger, applies the one-comparison eligibility rule (two established events) to the stored
+flags, and seeds the earned-tier times from the stored tier, but re-derives no tier. It reads the
+`event` heap once for the backfill and once more to build the partial index
+`event_dedup_tcp_idx`, both inside its transaction.
 `0014_breadth_sets.sql` creates two projection tables and fills them from the ledger in the
 same file; it derives sets of observed values (which WANs and sensors each source was seen
 on), not scores, and the counting over those sets stays in Rust.

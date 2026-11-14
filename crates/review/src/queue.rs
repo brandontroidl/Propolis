@@ -10,6 +10,7 @@
 //! next append. See `internal/design/04-review-gatekeeper-reporting.md`
 //! ("Population" / "Withdrawal").
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -61,6 +62,18 @@ pub struct QueueEntry {
     pub notes: Option<String>,
 }
 
+/// Which `ip_score` rows the queue offers for review, as a condition on that table: the address
+/// is eligible, not delisted, and has earned a tier at some time (`aggressive_earned_at` or
+/// `standard_earned_at`, which only an established event that left it eligible and tiered sets).
+/// [`ReviewQueue::populate`] inserts the rows that satisfy it and [`ReviewQueue::withdraw`]
+/// removes the Pending ones that no longer do, so the two can never disagree.
+///
+/// It is not the stored `recommended_for_vendor` flag. That flag is whatever the address's LAST
+/// event left, so one later low-weight connection cleared it and withdrew a candidate whose
+/// listing still had a day to run, before the operator had seen it.
+pub const OFFERED_SQL: &str = "eligible = TRUE AND NOT delisted \
+     AND (aggressive_earned_at IS NOT NULL OR standard_earned_at IS NOT NULL)";
+
 /// The review queue: population/withdrawal scans plus the three operator
 /// decisions and the pending listing. Stateless - every method takes the
 /// pool it operates against, so callers can share one instance or build a
@@ -68,6 +81,9 @@ pub struct QueueEntry {
 #[derive(Debug, Clone)]
 pub struct ReviewQueue {
     allowlist: Arc<OperatorAllowlist>,
+    /// The operator's delist (`PROPOLIS_FEED_DELIST`): addresses the feed never publishes. See
+    /// [`Self::with_delist`].
+    delist: Arc<HashSet<IpAddr>>,
     /// Which addresses are never offered and are resolved when found queued.
     /// [`crate::reserved::is_reserved_ip`] in every default queue (exactly
     /// [`core_scoring::is_reserved_ip`] in any build without the test-only `test-public-ranges`
@@ -80,6 +96,7 @@ impl Default for ReviewQueue {
     fn default() -> Self {
         Self {
             allowlist: Arc::default(),
+            delist: Arc::default(),
             is_reserved: is_reserved_ip,
         }
     }
@@ -124,11 +141,19 @@ impl ReviewQueue {
         self
     }
 
-    /// Surface every IP that is currently `eligible` and
-    /// `recommended_for_vendor` on the `ip_score` projection and not already
-    /// in the queue in ANY state (a previously Rejected or Snoozed IP is not
-    /// re-surfaced; see [`Self::reject`]/[`Self::snooze`]). Returns the
-    /// number of newly-inserted Pending entries.
+    /// Honour the operator's delist (`PROPOLIS_FEED_DELIST`): an address on it is never surfaced
+    /// and a Pending one is withdrawn, exactly as for the allowlist. The feed excludes these
+    /// addresses whatever is decided and the submission runner holds them, so offering one only
+    /// invites an approval that can never take effect. The default queue has an empty delist.
+    pub fn with_delist(mut self, delist: Arc<HashSet<IpAddr>>) -> Self {
+        self.delist = delist;
+        self
+    }
+
+    /// Surface every IP that is `eligible`, not delisted and has EARNED a tier on the `ip_score`
+    /// projection ([`OFFERED_SQL`]) and is not already in the queue in ANY state (a previously
+    /// Rejected or Snoozed IP is not re-surfaced; see [`Self::reject`]/[`Self::snooze`]).
+    /// Returns the number of newly-inserted Pending entries.
     ///
     /// An address on the operator allowlist is skipped (and counted in the log
     /// line), so a declared crawler is never offered to the operator for
@@ -147,17 +172,22 @@ impl ReviewQueue {
     /// defer it - but it means the Snoozed listing is the ONLY route back, so any interface that
     /// can snooze must also be able to act on what it snoozed.
     pub async fn populate(&self, pool: &PgPool) -> Result<usize, ReviewError> {
-        let candidates: Vec<String> = sqlx::query_scalar(
+        let candidates: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT host(source_ip) FROM ip_score \
-             WHERE recommended_for_vendor = TRUE \
-               AND eligible = TRUE \
-               AND NOT delisted \
-               AND source_ip NOT IN (SELECT source_ip FROM review_queue)",
-        )
+             WHERE {OFFERED_SQL} \
+               AND source_ip NOT IN (SELECT source_ip FROM review_queue)"
+        )))
         .fetch_all(pool)
         .await?;
         let (candidates, reserved) = self.partition_reserved(candidates)?;
-        let (allowed, allowlisted) = self.partition_allowlisted(candidates)?;
+        let (candidates, allowlisted) = self.partition_allowlisted(candidates)?;
+        let (allowed, delisted) = self.partition_delisted(candidates)?;
+        if !delisted.is_empty() {
+            tracing::debug!(
+                skipped = delisted.len(),
+                "review queue: skipped delisted addresses (operator delist)"
+            );
+        }
         // Steady state for as long as the address stays recommended, so debug, not info.
         if !reserved.is_empty() {
             tracing::debug!(
@@ -171,17 +201,15 @@ impl ReviewQueue {
                 "review queue: skipped allowlisted addresses (operator allowlist)"
             );
         }
-        let result = sqlx::query(
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO review_queue (source_ip, score_at_surface, categories_at_surface) \
              SELECT source_ip, raw_score, category_breakdown \
              FROM ip_score \
-             WHERE recommended_for_vendor = TRUE \
-               AND eligible = TRUE \
-               AND NOT delisted \
+             WHERE {OFFERED_SQL} \
                AND source_ip = ANY($1::text[]::inet[]) \
                AND source_ip NOT IN (SELECT source_ip FROM review_queue) \
-             ON CONFLICT (source_ip) DO NOTHING",
-        )
+             ON CONFLICT (source_ip) DO NOTHING"
+        )))
         .bind(allowed)
         .execute(pool)
         .await?;
@@ -192,11 +220,13 @@ impl ReviewQueue {
         Ok(inserted)
     }
 
-    /// Remove every Pending entry whose IP is no longer both `eligible` and
-    /// `recommended_for_vendor` on the current `ip_score` projection.
-    /// Approved, Rejected, and Snoozed entries are never touched by this scan;
-    /// only a still-open (Pending) decision is withdrawn when its trigger
-    /// lapses. Returns the number of rows removed.
+    /// Remove every Pending entry whose IP [`Self::populate`] would no longer offer
+    /// ([`OFFERED_SQL`]): it was delisted, or its score row is gone. Approved, Rejected, and
+    /// Snoozed entries are never touched by this scan. Returns the number of rows removed.
+    ///
+    /// A later event that leaves the address below its tier does NOT withdraw it. The address
+    /// earned the tier, its listing runs on from that, and a candidate that vanished whenever a
+    /// weak event arrived before the operator looked could never be approved.
     ///
     /// A Pending entry for an address on the operator allowlist is withdrawn
     /// too, whatever its score, and each is logged with the reason
@@ -208,14 +238,11 @@ impl ReviewQueue {
     /// operator never made. Approved, Rejected and Snoozed rows are left alone
     /// here; the submission runner refuses an allowlisted Approved entry.
     pub async fn withdraw(&self, pool: &PgPool) -> Result<usize, ReviewError> {
-        let result = sqlx::query(
+        let result = sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM review_queue \
              WHERE state = $1 \
-               AND source_ip NOT IN ( \
-                 SELECT source_ip FROM ip_score \
-                 WHERE recommended_for_vendor = TRUE AND eligible = TRUE \
-               )",
-        )
+               AND source_ip NOT IN (SELECT source_ip FROM ip_score WHERE {OFFERED_SQL})"
+        )))
         .bind(ReviewState::Pending)
         .execute(pool)
         .await?;
@@ -223,19 +250,34 @@ impl ReviewQueue {
         if removed > 0 {
             tracing::info!(removed, "review queue: withdrew lapsed pending entries");
         }
-        if !self.allowlist.is_empty() {
-            removed += self.withdraw_allowlisted(pool).await?;
+        if !self.allowlist.is_empty() || !self.delist.is_empty() {
+            removed += self.withdraw_excluded(pool).await?;
         }
         Ok(removed)
     }
 
-    async fn withdraw_allowlisted(&self, pool: &PgPool) -> Result<usize, ReviewError> {
+    /// Withdraw the Pending entries the operator's allowlist or delist now covers.
+    async fn withdraw_excluded(&self, pool: &PgPool) -> Result<usize, ReviewError> {
         let pending: Vec<String> =
             sqlx::query_scalar("SELECT host(source_ip) FROM review_queue WHERE state = $1")
                 .bind(ReviewState::Pending)
                 .fetch_all(pool)
                 .await?;
-        let (_, allowlisted) = self.partition_allowlisted(pending)?;
+        let (rest, allowlisted) = self.partition_allowlisted(pending)?;
+        let (_, delisted) = self.partition_delisted(rest)?;
+        let mut removed = self
+            .withdraw_pending(pool, &allowlisted, "allowlisted")
+            .await?;
+        removed += self.withdraw_pending(pool, &delisted, "delisted").await?;
+        Ok(removed)
+    }
+
+    async fn withdraw_pending(
+        &self,
+        pool: &PgPool,
+        allowlisted: &[String],
+        reason: &'static str,
+    ) -> Result<usize, ReviewError> {
         if allowlisted.is_empty() {
             return Ok(0);
         }
@@ -247,12 +289,12 @@ impl ReviewQueue {
              RETURNING host(source_ip)",
         )
         .bind(ReviewState::Pending)
-        .bind(&allowlisted)
+        .bind(allowlisted)
         .fetch_all(pool)
         .await?;
         for row in &result {
             let ip: String = row.try_get(0)?;
-            tracing::info!(%ip, reason = "allowlisted", "review queue: withdrew pending entry");
+            tracing::info!(%ip, reason, "review queue: withdrew pending entry");
         }
         Ok(result.len())
     }
@@ -359,6 +401,27 @@ impl ReviewQueue {
             }
         }
         Ok((kept, allowlisted))
+    }
+
+    /// Split stored/candidate addresses into (not on the delist, on the delist). Shared with the
+    /// volume queue.
+    pub(crate) fn partition_delisted(
+        &self,
+        ips: Vec<String>,
+    ) -> Result<(Vec<String>, Vec<String>), ReviewError> {
+        let mut kept = Vec::new();
+        let mut delisted = Vec::new();
+        for text in ips {
+            let ip: IpAddr = text
+                .parse()
+                .map_err(|e| ReviewError::Corrupt(format!("stored source_ip {text}: {e}")))?;
+            if self.delist.contains(&ip) {
+                delisted.push(text);
+            } else {
+                kept.push(text);
+            }
+        }
+        Ok((kept, delisted))
     }
 
     /// Approve `ip`: the submission daemon (a later task) picks up Approved

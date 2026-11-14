@@ -56,13 +56,16 @@ disabled vendor is held by the gatekeeper, not skipped at construction. A vendor
 `_ENABLED=true` with an empty `_KEY` is force-disabled fail-closed with a warning
 (`load_vendor_config`, `crates/propolis/src/config.rs#load_vendor_config`). If nothing is being reported, walk the
 gatekeeper's ordered checks - it short-circuits on the first hold
-(`check`, `crates/review/src/gatekeeper.rs#check`).
+(`check`, `crates/review/src/gatekeeper.rs#check`,
+`crates/review/src/gatekeeper.rs#check_with`).
 
 You do not have to guess which check holds: each submission pass logs one INFO line,
 `review: submission pass complete`, whose `held` count is split in `held_by` by reason
 (`reserved`, `disabled`, `stale`, `cooldown`, `rate_limit`, `score_floor`,
 `category_filter`, `db_error`, plus `allowlisted` for an address on the operator
-allowlist and `no_vendor_config` for an adapter with no gate configuration). At
+allowlist, `delisted` for one on the operator delist (`PROPOLIS_FEED_DELIST`) or carrying the
+console's delist latch, and `no_vendor_config` for an adapter with no gate configuration;
+`crates/review/src/submit.rs#HeldBreakdown`). `delisted` is printed after `allowlisted`. At
 startup a vendor that is off logs one warning naming the variable to set, and a second
 warning if no vendor is enabled at all. The per-address, per-vendor reason stays at
 debug level.
@@ -70,17 +73,25 @@ debug level.
 | Order | Hold reason | Meaning |
 |---|---|---|
 | 1 | `Reserved` | target IP is in a reserved/private range - never reportable |
-| 2 | `Disabled` | vendor not enabled (or empty key forced it off) |
-| 3 | `Stale` | last-seen older than the 48h freshness window |
-| 4 | `Cooldown` | a prior successful report to this vendor for this IP within `cooldown_hours` (default 24) |
-| 5 | `RateLimit` | vendor-wide successful reports within `rate_window_hours` reached `rate_limit` (default 100/1h) |
-| 6 | `ScoreFloor` | below `score_floor` (default none) |
-| 7 | `CategoryFilter` | category filter set and no match (default none) |
+| 2 | `Delisted` | the address carries the delist latch - reported to no one until relisted |
+| 3 | `Disabled` | vendor not enabled (or empty key forced it off) |
+| 4 | `Stale` | the address has not earned a tier within the 48h freshness window, or ever (measured on the last time it earned a tier, not on `last_seen`) |
+| 5 | `Cooldown` | a prior successful report to this vendor for this IP within `cooldown_hours` (default 24) |
+| 6 | `Stale` | the cooldown is over but the address has earned nothing since this vendor last accepted a report about it |
+| 7 | `RateLimit` | vendor-wide successful reports within `rate_window_hours` reached `rate_limit` (default 100/1h) |
+| 8 | `ScoreFloor` | below `score_floor` (default none) |
+| 9 | `CategoryFilter` | category filter set and no match (default none) |
 | - | `DbError` | a DB read failed - fail-closed, held |
 
-A vendor is also only reached for IPs that are `recommended_for_vendor` (eligible
-and tiered) - a bare volume-flood IP can be blocklisted locally, once approved as a
-volume candidate, but is never reported upstream. Thresholds and defaults:
+A vendor is only reached for an IP approved in the review queue, which offers only an
+address that is eligible (confirmed-real) and has earned a tier, and the gate then holds it
+as `Stale` unless it earned a tier within the last 48 hours and since this vendor's last
+successful report. So one burst of activity produces one report per vendor, and an
+approved address that has been named since only by datagrams, or by weak connections that
+left it below its tier, is not reported again. A bare volume-flood IP can be blocklisted
+locally, once approved as a volume candidate, but is never reported upstream: the
+submission runner reads the review queue only. A `stale` count that keeps growing for
+approved addresses is this rule working, not a fault. Thresholds and defaults:
 [Rate limits and budgets](../reference/rate-limits-and-budgets.md) and
 [Scoring and feed](../reference/scoring-and-feed.md).
 
@@ -130,9 +141,12 @@ is missing:
 - **Output dir suffix** - the atomic swap needs the trailing `/current` (staging
   and previous siblings live inside the writable parent). A dir without it can
   break the swap; keep the default shape.
-- **No eligible entries** - tier files require operator-approved, eligible,
-  tiered IPs; retention-window files also include volume-flood entries an operator
-  approved on the queue page's volume tab. A flooding address missing from `all-*`
+- **No eligible entries** - tier files require operator-approved IPs that earned that
+  tier within its TTL (24 h aggressive, 48 h standard); retention-window files hold
+  approved IPs that earned a tier within the window, and also volume-flood entries an
+  operator approved on the queue page's volume tab whose last completed TCP connection is
+  within the window. An approved address named since only by datagrams drops out when its
+  TTL runs out. A flooding address missing from `all-*`
   is usually a pending volume candidate (`propolis_volume_review_pending` on
   `/metrics`), or the review subsystem is off (`PROPOLIS_REVIEW_ENABLED=false`), in
   which case no candidate is ever offered. An empty
@@ -170,10 +184,15 @@ installed, so a push that has never succeeded is reported rather than read as
 - The script is fail-closed: it aborts if the source has no `manifest.json`, the
   target is not a git checkout, or the feed directory holds anything the
   publisher does not write (an unexpected name, a missing format, a link, a FIFO,
-  a file over 32 MiB). Each refusal names the file and ends "refusing to push";
-  one that names a link or an unexpected file in the feed directory means
-  something other than the publisher wrote there, so investigate the daemon
-  before clearing it.
+  a file over 32 MiB, or a file whose contents are not, line for line, what the
+  publisher writes for that format). Each refusal names the file and ends
+  "refusing to push"; one that names a link, an unexpected file or a line that "is
+  not what the publisher writes" means something other than the publisher wrote
+  there, so investigate the daemon before clearing it. Run
+  `deploy/blocklist-sync.sh --check` to repeat the checks without pushing. A refusal
+  right after an upgrade that names every file of one format means the installed
+  script and the daemon are from different versions: re-run the upgrade so both are
+  replaced.
 - `feed-push-stale` firing while pushes succeed: the log says "could not update
   push marker". `/var/lib/propolis/blocklist-status` must exist (re-run
   `deploy/provision.sh`), be owned by `propolis-blocklist` (a root cron drops to

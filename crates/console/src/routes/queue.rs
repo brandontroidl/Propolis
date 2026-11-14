@@ -793,8 +793,12 @@ fn volume_row_view(
         established_now: score.map_or(0, |s| s.established_event_count),
         established_at_surface: entry.established_events_at_surface,
         event_count: score.map_or(0, |s| s.event_count),
+        // The last completed connection, which is the clock a volume listing and its approval's
+        // lapse run on. Not `last_seen`: that moves on any datagram naming the address, and an
+        // operator shown it would read a stopped flood as a live one.
         last_seen: score
-            .map(|s| format_timestamp(s.last_seen))
+            .and_then(|s| s.established_last_seen)
+            .map(format_timestamp)
             .unwrap_or_default(),
         decided_at: entry.decided_at.map(format_timestamp).unwrap_or_default(),
         notes: entry.notes.clone().unwrap_or_default(),
@@ -1073,10 +1077,16 @@ async fn delist(
 /// directly, and setting them back to TRUE here would claim gates this address may no longer pass
 /// (its score decays while delisted, and the category weights with it). Clearing the latch first
 /// and reading the projection back gives the same answer `core_scoring` would give for any other
-/// address, so a relisted address rejoins the feed on its current merit or not at all.
+/// address.
+///
+/// The times the address earned its tiers (`aggressive_earned_at`, `standard_earned_at`) are not
+/// touched by `delist` or by this: delisting holds a listing, it does not erase what was earned.
+/// So a relisted address resumes what is left of its listing once it is approved again, and one
+/// whose listing ran out while it was delisted stays out until it earns a tier again.
 ///
 /// It does NOT restore the review-queue entry `delist` deleted: that entry was a recommendation,
-/// and the population scan re-creates one on its next pass iff the address still qualifies. The
+/// and the population scan re-creates one on its next pass iff the address still qualifies (it
+/// is eligible again and has earned a tier). The
 /// same holds for a volume candidate: `delist` deleted its `volume_review` row, decision
 /// included, and the volume scan offers the address again, pending, iff it still qualifies. Same
 /// CSRF gate as `delist`.

@@ -85,7 +85,7 @@ async fn seed_recommended(pool: &PgPool, ip: &str) {
             ip,
             "catchall-sensor",
             SignalType::CatchallProbe,
-            Protocol::Udp,
+            Protocol::Tcp,
             false,
             "2026-07-17T00:00:20Z",
         ),
@@ -451,12 +451,12 @@ async fn unsnoozing_an_entry_that_does_not_exist_fails_closed(pool: PgPool) {
     );
 }
 
-/// An entry returned to pending is a live recommendation again, so a `withdraw` scan must be able
-/// to retire it when its trigger lapses - exactly as it would for any other pending entry. The
-/// scan skips decided rows, so this proves `unsnooze` really restored Pending rather than leaving
-/// a row that merely displays as pending.
+/// An entry returned to pending is an open candidate again, so a `withdraw` scan must be able to
+/// retire it when its address stops being offered - exactly as it would for any other pending
+/// entry. The scan skips decided rows, so this proves `unsnooze` really restored Pending rather
+/// than leaving a row that merely displays as pending.
 #[sqlx::test(migrations = false)]
-async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(pool: PgPool) {
+async fn an_unsnoozed_entry_is_withdrawn_again_when_its_address_stops_being_offered(pool: PgPool) {
     migrate(&pool).await;
     let test_ip = "192.0.2.221";
     seed_recommended(&pool, test_ip).await;
@@ -472,7 +472,7 @@ async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(po
         .await
         .unwrap();
 
-    sqlx::query("UPDATE ip_score SET recommended_for_vendor = FALSE WHERE source_ip = $1::inet")
+    sqlx::query("UPDATE ip_score SET delisted = TRUE WHERE source_ip = $1::inet")
         .bind(test_ip)
         .execute(&pool)
         .await
@@ -483,6 +483,94 @@ async fn an_unsnoozed_entry_is_withdrawn_again_when_its_recommendation_lapses(po
         row_count(&pool, test_ip).await,
         0,
         "an unsnoozed entry must be an ordinary pending entry, withdrawable like any other"
+    );
+}
+
+/// A candidate is offered because its address EARNED a tier, and stays offered when a later event
+/// leaves the stored row below the tier. It used to be withdrawn then (the scan read the stored
+/// `recommended_for_vendor`, which is whatever the last event left), so one low-weight connection
+/// hours after an attack took the attacker out of the queue before anyone had looked, while its
+/// listing still had a day to run.
+#[sqlx::test(migrations = false)]
+async fn a_later_weak_event_does_not_withdraw_a_candidate_that_earned_its_tier(pool: PgPool) {
+    migrate(&pool).await;
+    let test_ip = "192.0.2.222";
+    seed_recommended(&pool, test_ip).await;
+    let queue = ReviewQueue::new().offering_reserved_addresses();
+    queue.populate(&pool).await.unwrap();
+    assert_eq!(row_count(&pool, test_ip).await, 1);
+
+    // What a weak event leaves: no stored tier, not recommended. The earned time stands.
+    sqlx::query(
+        "UPDATE ip_score SET tier = NULL, recommended_for_vendor = FALSE, \
+                recommended_for_blocklist = FALSE WHERE source_ip = $1::inet",
+    )
+    .bind(test_ip)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 0);
+    assert_eq!(row_count(&pool, test_ip).await, 1, "still offered");
+
+    // An address that has not earned a tier is not offered, whatever its stored flags say: the
+    // reverse of the above, so the scan is shown to read the earned times and nothing else.
+    sqlx::query(
+        "UPDATE ip_score SET tier = 'standard', recommended_for_vendor = TRUE, \
+                aggressive_earned_at = NULL, standard_earned_at = NULL \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(test_ip)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
+    assert_eq!(queue.populate(&pool).await.unwrap(), 0);
+    assert_eq!(row_count(&pool, test_ip).await, 0);
+}
+
+/// The operator's delist (`PROPOLIS_FEED_DELIST`) reached only the feed: an address on it was
+/// still offered for review, and an approval given earlier kept reporting it.
+#[sqlx::test(migrations = false)]
+async fn an_address_on_the_operator_delist_is_not_offered_and_a_pending_one_is_withdrawn(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let delisted = "192.0.2.223";
+    let other = "192.0.2.224";
+    seed_recommended(&pool, delisted).await;
+    seed_recommended(&pool, other).await;
+    let delist: std::sync::Arc<std::collections::HashSet<IpAddr>> =
+        std::sync::Arc::new([delisted.parse().unwrap()].into_iter().collect());
+
+    // Queued before the operator listed it: withdrawn at the next scan.
+    let before = ReviewQueue::new().offering_reserved_addresses();
+    assert_eq!(before.populate(&pool).await.unwrap(), 2);
+    let queue = ReviewQueue::new()
+        .offering_reserved_addresses()
+        .with_delist(delist);
+    assert_eq!(queue.withdraw(&pool).await.unwrap(), 1);
+    assert_eq!(row_count(&pool, delisted).await, 0);
+    assert_eq!(row_count(&pool, other).await, 1);
+
+    // And never offered again while it is on the list.
+    assert_eq!(queue.populate(&pool).await.unwrap(), 0);
+    assert_eq!(row_count(&pool, delisted).await, 0);
+
+    // A decision the operator already made is not undone by the scan.
+    queue
+        .approve(&pool, other.parse().unwrap(), None)
+        .await
+        .unwrap();
+    let listing_both = ReviewQueue::new()
+        .offering_reserved_addresses()
+        .with_delist(std::sync::Arc::new(
+            [other.parse().unwrap()].into_iter().collect(),
+        ));
+    assert_eq!(listing_both.withdraw(&pool).await.unwrap(), 0);
+    assert_eq!(
+        row_count(&pool, other).await,
+        1,
+        "an Approved row stays; the runner holds it"
     );
 }
 

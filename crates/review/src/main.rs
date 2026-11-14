@@ -24,7 +24,9 @@
 //! list; `internal/design/04-review-gatekeeper-reporting.md`'s
 //! "Configuration" is the spec this mirrors.
 
+use std::collections::HashSet;
 use std::env;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +48,7 @@ const ENV_SUBMIT_POLL_INTERVAL_SECS: &str = "PROPOLIS_SUBMIT_POLL_INTERVAL_SECS"
 const ENV_ALLOWLIST: &str = "PROPOLIS_FEED_ALLOWLIST";
 const ENV_ALLOWLIST_FILE: &str = "PROPOLIS_FEED_ALLOWLIST_FILE";
 const ENV_ASN_ALLOWLIST: &str = "PROPOLIS_FEED_ASN_ALLOWLIST";
+const ENV_DELIST: &str = "PROPOLIS_FEED_DELIST";
 const ENV_GEOIP_DIR: &str = "PROPOLIS_GEOIP_DIR";
 
 const DEFAULT_QUEUE_SCAN_INTERVAL_SECS: u64 = 60;
@@ -61,6 +64,10 @@ struct Config {
     submit_poll_interval: Duration,
     vendors: Vec<FullVendorConfig>,
     allowlist: Arc<OperatorAllowlist>,
+    /// The operator's delist, from the variable the feed reads (`PROPOLIS_FEED_DELIST`): an
+    /// address on it is not offered for review and not reported to any vendor, as it is not
+    /// published.
+    delist: Arc<HashSet<IpAddr>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -265,7 +272,24 @@ fn load_config_from_env() -> Result<Config, ConfigError> {
         submit_poll_interval: Duration::from_secs(submit_poll_interval_secs),
         vendors: vec![abuseipdb, dshield, otx],
         allowlist: Arc::new(load_allowlist_from_env()?),
+        delist: Arc::new(load_delist_from_env()?),
     })
+}
+
+/// The operator's delist, from the same variable the feed reads (`PROPOLIS_FEED_DELIST`), so an
+/// address taken out of the published feed is also held from review and from vendor reporting.
+/// A malformed entry refuses startup, exactly as in the feed. Read once; edits need a restart.
+fn load_delist_from_env() -> Result<HashSet<IpAddr>, ConfigError> {
+    parse_delist(&env::var(ENV_DELIST).unwrap_or_default())
+}
+
+fn parse_delist(raw: &str) -> Result<HashSet<IpAddr>, ConfigError> {
+    allowlist::parse_ip_csv(raw)
+        .map(|ips| ips.into_iter().collect())
+        .map_err(|value| ConfigError::InvalidAllowlist {
+            field: ENV_DELIST,
+            reason: format!("{value:?} is not a valid IP address"),
+        })
 }
 
 /// The operator allowlist, from the same variables the feed reads
@@ -471,9 +495,14 @@ async fn run_daemon(pool: PgPool, config: Config) {
     };
     let (adapters, gate_configs) = build_adapters(&config.vendors, client);
     let runner = SubmissionRunner::new(pool.clone(), adapters, gate_configs)
-        .with_allowlist(config.allowlist.clone());
-    let queue = ReviewQueue::new().with_allowlist(config.allowlist.clone());
-    let volume = VolumeQueue::new().with_allowlist(config.allowlist.clone());
+        .with_allowlist(config.allowlist.clone())
+        .with_delist(config.delist.clone());
+    let queue = ReviewQueue::new()
+        .with_allowlist(config.allowlist.clone())
+        .with_delist(config.delist.clone());
+    let volume = VolumeQueue::new()
+        .with_allowlist(config.allowlist.clone())
+        .with_delist(config.delist.clone());
 
     let queue_handle = tokio::spawn(run_queue_scan_loop(
         queue,

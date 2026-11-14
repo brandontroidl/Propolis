@@ -7,7 +7,7 @@
   <td class="count" data-label="TCP events">{{ row.established_now | count }}</td>
   <td class="count" data-label="When offered">{{ row.established_at_surface | count }}</td>
   <td class="count" data-label="All events">{{ row.event_count | count }}</td>
-  <td class="seen stack-end" data-label="Last seen">{{ row.last_seen }}</td>
+  <td class="seen stack-end" data-label="Last connection">{{ row.last_seen }}</td>
   <td class="stack-full">
     {% if row.is_pending %}
     <div class="actions">

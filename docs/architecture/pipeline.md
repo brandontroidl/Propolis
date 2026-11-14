@@ -27,7 +27,7 @@ sections 2 and 4.
 flowchart TD
   E[(event ledger)] --> S[Scoring engine<br/>decay + accumulate + gates]
   S --> P[(ip_score<br/>flags: eligible / tier /<br/>recommended_for_vendor / _blocklist)]
-  P --> RQ[Review queue<br/>populate recommended + eligible]
+  P --> RQ[Review queue<br/>populate eligible + earned a tier]
   RQ --> OP{Operator<br/>approve / reject / snooze}
   P -->|volume candidates| VQ[Volume queue]
   VQ --> VO{Operator<br/>approve / reject}
@@ -49,10 +49,18 @@ row. One function, `derive_projection`, computes every derived flag, and both th
 write path and the read path call it, so a flag cannot mean one thing when stored and
 another when displayed.
 
+Only an established event, one over a completed TCP connection, does any of what follows.
+A UDP or ICMP event (DNS over UDP, TFTP, the catch-all's UDP listener) carries a source
+address its sender chose, so it is stored, counted and shown, and on the score row it moves
+only `event_count`, `last_seen` and the sensor count: no weight, no active day, no latch, no
+flag and no listing clock
+([established and forgeable events](../reference/scoring-and-feed.md#established-and-forgeable-events)).
+
 - **Decay and accumulate.** The stored score is decayed to the event's time with a
   six-hour half-life, the event's weight is added, and the result is capped at 100. A
-  repeat of the same signal from the same IP within sixty seconds is recorded but adds
-  no weight. Decay only ever shrinks a score; clock skew cannot inflate one. Time never
+  repeat of the same signal from the same IP within sixty seconds of its newest
+  established event of that signal is recorded but adds no weight; a datagram is never
+  what a repeat is measured against. Decay only ever shrinks a score; clock skew cannot inflate one. Time never
   runs backwards either: an event dated before the stored one is counted, and weighed
   for what its own age leaves of its weight (a backlog read late is still not scored
   exactly as it would be in order: [decay](../reference/scoring-and-feed.md#decay)), but
@@ -60,9 +68,10 @@ another when displayed.
   where they were, so a back-dated line from a compromised sensor or a slow clock can
   neither erase a score at the next event nor move a listed address's last-seen time
   out of its feed window. A line dated more than an hour ahead never reaches the
-  ledger; intake refuses it. A line dated now is another matter: every event re-derives
-  the stored tier from the decayed score, so a weak one can still end a tier listing
-  early ([residual risks](../security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
+  ledger; intake refuses it. A line dated now cannot end a listing either: a listing
+  runs from the last time the address earned its tier, which a later weak event neither
+  clears nor advances (see Tier below, and
+  [residual risks](../security/residual-risks.md#a-compromised-sensor-can-forge-its-own-kind-of-evidence)).
 - **Confirmed-real latch.** An event sets this flag when it arrived over TCP,
   authenticated against a honeypot sensor. It never unsets. UDP, ICMP and
   unauthenticated traffic cannot set it, which is what stops a spoofed source from
@@ -79,24 +88,31 @@ another when displayed.
   the score used for gate decisions, so a slow attacker the decay would otherwise erase
   can still reach a tier. The bonus is never written back into the stored score.
 - **Tier.** Aggressive needs a gate score of 90 and confidence of 0.95; Standard needs
-  75 and 0.70. Confidence is the highest signal confidence seen, decayed.
+  75 and 0.70. Confidence is the highest signal confidence seen, decayed. When an
+  established event that added its weight leaves the address eligible and holding a
+  tier, the time is recorded as `aggressive_earned_at` or `standard_earned_at`. These
+  earned times, not the stored tier (which is whatever the last established event left),
+  are what the review queue, the feed and the vendor gate run on.
 - **Eligibility and recommendations.** An IP is eligible once it is confirmed-real,
-  has at least two events, and has not been delisted. `recommended_for_vendor` is
+  has at least two established events, and has not been delisted. `recommended_for_vendor` is
   eligibility plus a tier. `recommended_for_blocklist` is eligibility plus an effective
   score of 50, or the volume rule: a thousand or more completed TCP connections on
-  record and activity within the last day. Only completed-TCP events count toward
-  volume, so a spoofed flood cannot volume-list a third party, and volume never sets
-  `recommended_for_vendor`.
+  record and a completed TCP connection within the last day. Only completed-TCP events
+  count toward volume or its recency, so a spoofed flood cannot volume-list a third party,
+  and volume never sets `recommended_for_vendor`.
 
 ## 2. The review gate
 
 A tier recommendation is a proposal. The review queue in `crates/review` is where an
 operator turns it into a decision:
 
-- Population inserts every IP that is both recommended for a vendor and eligible, with
-  a snapshot of its score and categories at that moment, as **Pending**.
-- Withdrawal removes Pending rows that no longer qualify. Approved, Rejected and
-  Snoozed rows are never touched, so a rejected IP is not surfaced again.
+- Population inserts every IP that is eligible, not delisted and has earned a tier at
+  some time, with a snapshot of its score and categories at that moment, as **Pending**
+  (`crates/review/src/queue.rs#OFFERED_SQL`).
+- Withdrawal removes a Pending row only when that stops holding (the address was
+  delisted, or its score row is gone) or the operator's allowlist or delist covers it. A
+  later event that leaves the address below its tier does not withdraw it. Approved,
+  Rejected and Snoozed rows are never touched, so a rejected IP is not surfaced again.
 - Approve, reject and snooze record the decision, the time and any notes. A decision
   on an unknown IP is an error, not a silent no-op.
 - The vendor submitter drains approved rows oldest first.
@@ -107,17 +123,18 @@ Volume candidates wait in a second queue, the `volume_review` table
 (`crates/review/src/volume.rs#VolumeQueue`), maintained by the same scan:
 
 - Population inserts, as **Pending**, every address that is not delisted, has a
-  thousand or more established TCP events, was last seen within a day, has no volume
-  row yet, and has no Approved review-queue row. Reserved and allowlisted addresses are
-  skipped.
+  thousand or more established TCP events, made its last established connection within
+  a day, has no volume row yet, and has no Approved review-queue row. Reserved,
+  allowlisted and operator-delisted addresses are skipped.
 - Withdrawal removes a Pending row once its address has no score row, is delisted, has
   fallen below the threshold, or has been approved in the review queue.
-- A Pending or Approved row lapses, and is removed, once its address has not been seen
-  for the longest retention window, ninety days at the least: it is then in no feed file,
-  and its next sighting is
-  offered as a new candidate. A Rejected row is never touched.
+- A Pending or Approved row lapses, and is removed, once its address has made no
+  established connection for the longest retention window, ninety days at the least: it
+  is then in no feed file, and its next flood is offered as a new candidate. A row whose
+  address has no established sighting lapses at once. A Rejected row is never touched.
 - Approve publishes the address in the retention feeds, and while the approval stands
-  any later event for the address renews the listing. Reject keeps it out and it is
+  any later established (completed-TCP) connection from the address renews the listing;
+  a datagram naming it does not. Reject keeps it out and it is
   not offered again. Reopen returns either to Pending.
 - The vendor submitter never reads this queue. A volume approval reports nothing.
 
@@ -145,32 +162,39 @@ Keys, budgets and wiring are in [integrations](../reference/integrations.md) and
 
 ## 4. Feed generation
 
-The feed builder in `crates/feed` decides membership from stored values as of each
-IP's last event, so an entry cannot slide between tiers between builds.
+The feed builder in `crates/feed` decides membership from stored values, never
+re-derived against the clock, so an entry cannot slide between tiers between builds.
+What decides a listing is when the address last earned it.
 
 - **Tier files.** An IP appears in the `aggressive` or `standard` file when it is
-  recommended for the blocklist, eligible, has that tier, and is approved in the
-  review queue. Aggressive entries expire 24 hours after last sighting, Standard after
-  48.
+  approved in the review queue, not delisted, and earned that tier within the tier's
+  TTL: 24 hours after it last earned Aggressive, 48 after it last earned Standard. The
+  two files never hold the same address: one that earned both runs out its aggressive
+  TTL and is then carried in the standard file for what is left of the standard one. A
+  later weak event neither removes nor extends an entry, and a datagram changes nothing.
 - **Retention feeds.** The `all-24h`, `all-7d`, `all-30d`, `all-60d` and `all-90d`
-  files hold every approved entry seen within the window, and also the volume-listed
-  addresses an operator approved: not delisted, a thousand or more established TCP
-  events, and Approved in the volume queue (an address already Approved in the review
-  queue needs no second decision). A volume listing never reaches the tier files, and
-  an address that qualifies both ways is listed once. With
+  files hold every approved entry that earned a tier within the window, and also the
+  volume-listed addresses an operator approved: not delisted, a thousand or more
+  established TCP events, a completed TCP connection within the window, and Approved in
+  the volume queue (an address already Approved in the review queue needs no second
+  decision). A volume listing never reaches the tier files, and an address that
+  qualifies both ways is listed once and stays in a window while either clock is inside
+  it. With
   `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true` the builder instead takes every volume-listed
   address with no decision; that is an opt-in and off by default
   (`crates/feed/src/builder.rs#volume_candidates_sql`).
-- **Clock.** A stored last-seen time later than the build's clock is read as the build
+- **Clock.** An entry's `valid_from`, `valid_until` and published `last_seen` all run
+  from its listing time (when it last earned the tier, or its last connection for a
+  volume listing). A listing time later than the build's clock is read as the build
   time, so an entry is never valid for longer than its window from now.
 - **Exclusions.** Reserved ranges, an operator CIDR allowlist, explicit delisting, and
   optional ASN suppression are applied at build time, using the same reserved-range
-  list the vendor path uses. The same allowlist also keeps listed addresses out of the
-  review queue and vendor submission (section 5).
+  list the vendor path uses. The same allowlist and delist also keep listed addresses
+  out of the review queue and vendor submission (section 5).
 - **Timestamps.** Every exported time is rounded to the hour so the feed does not reveal
   exactly when your sensors saw something.
 - **Atomic publish.** Every format (`.txt`, `.json`, `.csv`, `.cidr`, `.ipset`, `.nft`,
-  `.pf`, `.alias`, `.hosts`, `.rpz`) and a manifest are written to a staging directory
+  `.pf`, `.alias`, `.rpz`) and a manifest are written to a staging directory
   on the same filesystem, fsynced, re-checked against the exclusions, and swapped into
   place with two renames: the live directory is moved aside, then staging takes its
   place. An error at any point leaves the previous feed untouched - if the second rename
@@ -195,14 +219,16 @@ review queue, and the report must pass the gatekeeper.
 
 - **Vendors.** AbuseIPDB, DShield and OTX. A vendor configured with an empty key is
   disabled rather than tried. DShield's wire contract is marked provisional in the code.
-- **Operator allowlist.** An address on the operator allowlist is never added to the
-  review queue, a Pending entry for one is withdrawn, and the runner refuses one before
-  any vendor call even if it was approved before the list covered it. The list is read
-  once at startup.
+- **Operator allowlist and delist.** An address on the operator allowlist or the
+  operator delist (`PROPOLIS_FEED_DELIST`) is never added to the review queue, a Pending
+  entry for one is withdrawn, and the runner refuses one before any vendor call even if
+  it was approved before the list covered it. The lists are read once at startup.
 - **Gatekeeper.** An ordered sequence of checks that stops at the first hold: reserved
-  address, vendor disabled, last seen more than 48 hours ago, a successful report to
-  this vendor within the cooldown, the vendor-wide rate limit, the score floor, and the
-  category filter. A database error during a check holds the report. A pass reads every
+  address, delisted, vendor disabled, stale (no tier earned within 48 hours, or ever), a
+  successful report to this vendor within the cooldown, stale again (nothing earned since
+  this vendor's last successful report), the vendor-wide rate limit, the score floor, and
+  the category filter (`crates/review/src/gatekeeper.rs#check_with`). So one burst of
+  activity is one report per vendor, not one per cooldown. A database error during a check holds the report. A pass reads every
   pair's latest successful report in one query up front
   (`crates/review/src/gatekeeper.rs#CooldownBook`) instead of one lookup per address and
   vendor; the decisions are the same, and if that read fails the checks query pair by pair.
@@ -212,8 +238,11 @@ review queue, and the report must pass the gatekeeper.
   the call and the record, so the report is not re-sent; it is counted as unresolved
   instead.
 - **What a report contains.** The source IP, category codes, a comment and the evidence
-  window. No WAN address, score, confidence or sample body is included, and passwords
-  were dropped at the sensor.
+  window. The attack time a vendor is told is the address's last established sighting,
+  and the protocol label that picks category codes is read from established events only,
+  so a forged datagram can neither re-date a report nor change its categories. No WAN
+  address, score, confidence or sample body is included, and passwords were dropped at
+  the sensor.
 
 Enabling a vendor sends attacker IP addresses to a third party. Read
 [ethical use](../overview/ethical-use.md) before turning one on.

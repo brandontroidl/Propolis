@@ -6,6 +6,11 @@
 //! here), adding this event's contribution (unless deduped), and recomputing
 //! every derived flag.
 //!
+//! That is the fold for an ESTABLISHED event: one from a completed TCP connection, whose
+//! source address the handshake proved. A datagram's source address is whatever the sender
+//! wrote, so an event that is not established is only recorded ([`record_sighting`]): it is
+//! counted and dated, and changes nothing a score, a tier or a listing is derived from.
+//!
 //! It is a pure function: no DB, no clock, no I/O. The repository layer
 //! (Task 12) supplies the un-projected stored `raw_score` and the breadth
 //! counts; the engine never re-projects a read-projected value (double-decay
@@ -18,7 +23,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::domain::enums::{Category, Protocol, SignalType, is_confirmed_real};
+use crate::domain::enums::{Category, FeedTier, Protocol, SignalType, is_confirmed_real};
 use crate::domain::types::{EventInput, IpScore};
 use crate::scoring::breadth::effective_score;
 use crate::scoring::constants::{
@@ -68,6 +73,9 @@ const LIVE_FLOOR: Decimal = dec!(0.5);
 /// `distinct_sensor_count` are computed by the repository from its vantage and
 /// sensor tracking and threaded through verbatim; the engine does not recompute
 /// breadth.
+///
+/// An event that is not established ([`is_established`]) takes none of these steps: see
+/// [`record_sighting`].
 pub fn apply_event(
     prev: Option<IpScore>,
     event: &EventInput,
@@ -76,7 +84,22 @@ pub fn apply_event(
     distinct_wan_count: i32,
     distinct_sensor_count: i32,
 ) -> IpScore {
+    if !is_established(event) {
+        return record_sighting(prev, event, distinct_wan_count, distinct_sensor_count);
+    }
     let now = event.observed_at;
+
+    // A row no established event has reached holds nothing a score may build on: it was opened
+    // by a forgeable sighting (or, before this rule, scored by them). This event starts it as it
+    // would a new row, keeping only the record of those sightings, so a datagram can neither add
+    // to what the connection scores nor, by dating the row's anchor, take from it.
+    let (sightings, prev) = match prev {
+        Some(p) if p.established_event_count == 0 => (
+            Some((p.event_count, p.first_seen, p.last_seen, p.delisted)),
+            None,
+        ),
+        other => (None, other),
+    };
 
     // Step 1-2: seed or decay prior state to the new anchor.
     let (
@@ -91,20 +114,30 @@ pub fn apply_event(
         delisted,
         prev_active_days,
         prev_last_active_day,
+        prev_established_last_seen,
+        prev_aggressive_earned_at,
+        prev_standard_earned_at,
     ) = match prev {
-        None => (
-            dec!(0),
-            BTreeMap::<Category, CategoryStat>::new(),
-            now,
-            now,
-            now,
-            0i32,
-            0i32,
-            false,
-            false,
-            0i32,
-            None::<NaiveDate>,
-        ),
+        None => {
+            let (event_count, first_seen, last_seen, delisted) =
+                sightings.unwrap_or((0, now, now, false));
+            (
+                dec!(0),
+                BTreeMap::<Category, CategoryStat>::new(),
+                first_seen,
+                std::cmp::max(now, last_seen),
+                now,
+                event_count,
+                0i32,
+                false,
+                delisted,
+                0i32,
+                None::<NaiveDate>,
+                None::<DateTime<Utc>>,
+                None::<DateTime<Utc>>,
+                None::<DateTime<Utc>>,
+            )
+        }
         Some(p) => {
             // The later of the event's time and what is stored, for each: see the function doc.
             // The decay runs from the previous anchor to the new one, so it is zero for an event
@@ -131,6 +164,9 @@ pub fn apply_event(
                 p.delisted,
                 p.active_days,
                 Some(p.last_active_day),
+                p.established_last_seen,
+                p.aggressive_earned_at,
+                p.standard_earned_at,
             )
         }
     };
@@ -189,17 +225,15 @@ pub fn apply_event(
     let event_count = prev_event_count.saturating_add(represented);
     // Non-spoofable count: only a completed TCP connection proves the source address is genuine (a
     // spoofed source cannot finish the handshake). UDP/ICMP datagrams carry a forgeable sender, so
-    // they never count toward volume-based blocklisting - otherwise a spoofed flood could list an
-    // innocent third party (see `recommended_by_volume` in `derive_projection`).
-    let established_event_count = if event.protocol == Protocol::Tcp {
-        prev_established_event_count.saturating_add(represented)
-    } else {
-        prev_established_event_count
-    };
+    // they never reach this point and never count toward eligibility or volume-based blocklisting
+    // - otherwise a spoofed flood could list an innocent third party (see `recommended_by_volume`
+    // in `derive_projection`).
+    let established_event_count = prev_established_event_count.saturating_add(represented);
+    let established_last_seen = Some(prev_established_last_seen.map_or(now, |seen| seen.max(now)));
 
     // Steps 5-6: derive facts + assemble. `last_seen` and `decay_anchor` are the event's
     // observed_at (an event WAS seen at this instant) unless the stored ones are later.
-    derive_projection(
+    let mut next = derive_projection(
         event.source_ip,
         new_raw,
         breakdown,
@@ -214,7 +248,88 @@ pub fn apply_event(
         last_seen,
         decay_anchor,
         delisted,
-    )
+        established_last_seen,
+        prev_aggressive_earned_at,
+        prev_standard_earned_at,
+    );
+
+    // Step 7: the listing clocks. An established event that adds its weight and leaves the
+    // address eligible and holding a tier has earned that tier as of the anchor it was derived
+    // at. One that leaves it below the tier changes neither clock, so a listing runs its full TTL
+    // from the last time it was earned: a weak event cannot end it early, and nothing but earning
+    // the tier again can extend it. An event that adds nothing earns nothing either: a repeat
+    // inside the dedup window, or an overflow summary, which proves nothing about the address it
+    // names.
+    if !deduped && !unattributed && next.recommended_for_vendor {
+        match next.tier {
+            Some(FeedTier::Aggressive) => next.aggressive_earned_at = Some(next.decay_anchor),
+            Some(FeedTier::Standard) => next.standard_earned_at = Some(next.decay_anchor),
+            None => {}
+        }
+    }
+    next
+}
+
+/// Whether the event's source address is proven: it came over a completed TCP connection, which
+/// a sender cannot finish from an address it does not hold. A UDP or ICMP datagram carries
+/// whatever source its sender wrote.
+pub(crate) fn is_established(event: &EventInput) -> bool {
+    event.protocol == Protocol::Tcp
+}
+
+/// Record a forgeable sighting: the event is counted (`event_count`), dated (`last_seen`, and
+/// `first_seen` when it opens the row) and its sensor noted (`distinct_sensor_count`). Nothing
+/// else moves. The score, its anchor, the category breakdown, the confirmed-real latch, the
+/// active days, every derived flag and the listing clocks are returned exactly as stored, with
+/// no decay step and no re-derivation: anyone can send a datagram under any address, so it must
+/// not be able to raise that address's score, change its tier, end its listing, or keep it
+/// listed or reported.
+///
+/// A row such a sighting opens holds a zero score, no active day and no tier. Its `decay_anchor`
+/// and `last_active_day` are placeholders: the first established event starts the row over
+/// ([`apply_event`]), so a history scores the same with its forgeable sightings removed.
+fn record_sighting(
+    prev: Option<IpScore>,
+    event: &EventInput,
+    distinct_wan_count: i32,
+    distinct_sensor_count: i32,
+) -> IpScore {
+    let now = event.observed_at;
+    let represented = represented_events(event);
+    match prev {
+        Some(mut score) => {
+            score.event_count = score.event_count.saturating_add(represented);
+            score.last_seen = std::cmp::max(now, score.last_seen);
+            score.distinct_sensor_count = distinct_sensor_count;
+            score
+        }
+        None => IpScore {
+            source_ip: event.source_ip,
+            raw_score: dec!(0),
+            decay_anchor: now,
+            max_confidence: dec!(0),
+            event_count: represented,
+            established_event_count: 0,
+            distinct_categories: 0,
+            category_breakdown: serde_json::to_value(BTreeMap::<Category, CategoryStat>::new())
+                .expect("an empty CategoryStat map serializes to JSON"),
+            has_confirmed_real: false,
+            distinct_wan_count,
+            distinct_sensor_count,
+            active_days: 0,
+            last_active_day: now.date_naive(),
+            first_seen: now,
+            last_seen: now,
+            eligible: false,
+            recommended_for_vendor: false,
+            recommended_for_blocklist: false,
+            tier: None,
+            delisted: false,
+            established_last_seen: None,
+            aggressive_earned_at: None,
+            standard_earned_at: None,
+        },
+    }
 }
 
 /// Whether `event` is a sensor's overflow or per-network summary: it stands for many addresses but
@@ -265,6 +380,9 @@ fn derive_projection(
     last_seen: DateTime<Utc>,
     decay_anchor: DateTime<Utc>,
     delisted: bool,
+    established_last_seen: Option<DateTime<Utc>>,
+    aggressive_earned_at: Option<DateTime<Utc>>,
+    standard_earned_at: Option<DateTime<Utc>>,
 ) -> IpScore {
     let distinct_categories = breakdown.values().filter(|s| s.weight > LIVE_FLOOR).count() as i32;
     // Live-decayed confidence: a category whose weight has decayed to/below the floor no longer
@@ -276,9 +394,11 @@ fn derive_projection(
         .max()
         .unwrap_or(dec!(0));
 
+    // Established events only: a forged datagram must not be the second sighting of an address
+    // that authenticated once.
     let is_eligible = eligible(
         has_confirmed_real,
-        event_count as u32,
+        established_event_count as u32,
         distinct_categories as u32,
         delisted,
     );
@@ -300,12 +420,15 @@ fn derive_projection(
     // spoofed datagram flood cannot volume-list an innocent third party. Vendor reporting still
     // gates on confirmed-real (rec_vendor above), so a bare flood is blocked locally but not
     // reported upstream.
-    let seconds_since_last_seen = (decay_anchor - last_seen).num_seconds();
+    // Recency is measured from the last ESTABLISHED sighting for the same reason: `last_seen`
+    // moves on any datagram naming the address.
+    let seconds_since_established =
+        established_last_seen.map(|seen| (decay_anchor - seen).num_seconds());
     let rec_blocklist = recommended_for_blocklist(is_eligible, effective)
         || recommended_by_volume(
             delisted,
             established_event_count as u32,
-            seconds_since_last_seen,
+            seconds_since_established,
         );
 
     // The map is well-formed Decimals, so serialization cannot fail.
@@ -333,6 +456,9 @@ fn derive_projection(
         recommended_for_blocklist: rec_blocklist,
         tier: feed_tier,
         delisted,
+        established_last_seen,
+        aggressive_earned_at,
+        standard_earned_at,
     }
 }
 
@@ -369,6 +495,9 @@ pub(crate) fn project_to_now(
         stored.last_seen,
         now,
         stored.delisted,
+        stored.established_last_seen,
+        stored.aggressive_earned_at,
+        stored.standard_earned_at,
     )
 }
 
@@ -511,13 +640,494 @@ mod tests {
         let start = ts("2026-01-01T00:00:00Z");
         let mut acc: Option<IpScore> = None;
         for d in 0..90 {
-            let e = udp_probe_event_at(start + Duration::days(d));
+            let e = tcp_probe_event_at(start + Duration::days(d));
             acc = Some(apply_event(acc, &e, HALF_LIFE, false, 1, 1));
         }
         let s = acc.unwrap();
         assert_eq!(s.active_days, 90);
         assert_eq!(s.tier, None);
         assert!(!s.recommended_for_vendor);
+    }
+
+    // ---- Forgeable sightings and the listing clocks ----------------------------------------
+
+    const ATTACKER: &str = "203.0.113.7";
+
+    fn event_at(
+        signal: SignalType,
+        protocol: Protocol,
+        authenticated: bool,
+        when: DateTime<Utc>,
+    ) -> EventInput {
+        EventInput::from_signal(
+            ATTACKER.parse().unwrap(),
+            None,
+            "sensor-a".into(),
+            signal,
+            protocol,
+            authenticated,
+            when,
+            serde_json::json!({}),
+            None,
+        )
+    }
+
+    /// An authenticated upload (80) and a command (60) a minute apart: capped at 100 with
+    /// confidence 0.98, two established events, confirmed real. Aggressive, earned at `t + 1 min`.
+    fn aggressive_at(t: DateTime<Utc>) -> IpScore {
+        let upload = event_at(SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, t);
+        let command = event_at(
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            t + Duration::minutes(1),
+        );
+        let s = apply_event(None, &upload, HALF_LIFE, false, 1, 1);
+        let s = apply_event(Some(s), &command, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.tier, Some(FeedTier::Aggressive));
+        assert!(s.eligible && s.recommended_for_vendor);
+        s
+    }
+
+    fn datagram_at(when: DateTime<Utc>) -> EventInput {
+        // What one forged packet at the DNS or TFTP listener produces: weight 40, conf 0.90.
+        event_at(SignalType::HoneypotConnection, Protocol::Udp, false, when)
+    }
+
+    #[test]
+    fn a_forgeable_sighting_is_counted_and_dated_and_changes_nothing_else() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let listed = aggressive_at(t);
+        // Twelve hours on the score has decayed to a quarter. Re-derived here, the row would lose
+        // its tier; given the datagram's 40 points it would be worth 65.
+        let later = t + Duration::hours(12);
+        let after = apply_event(
+            Some(listed.clone()),
+            &datagram_at(later),
+            HALF_LIFE,
+            false,
+            1,
+            3,
+        );
+
+        let expected = IpScore {
+            event_count: listed.event_count + 1,
+            last_seen: later,
+            distinct_sensor_count: 3,
+            ..listed.clone()
+        };
+        assert_eq!(after, expected);
+        assert_eq!(
+            after.raw_score, listed.raw_score,
+            "no decay step, no weight"
+        );
+        assert_eq!(after.decay_anchor, listed.decay_anchor);
+        assert_eq!(
+            after.tier,
+            Some(FeedTier::Aggressive),
+            "the stored tier is not re-derived"
+        );
+        assert_eq!(after.established_last_seen, listed.established_last_seen);
+        assert_eq!(after.aggressive_earned_at, listed.aggressive_earned_at);
+
+        // ICMP is no more a proof of source than UDP.
+        let icmp = event_at(SignalType::PortScan, Protocol::Icmp, false, later);
+        let after_icmp = apply_event(Some(listed.clone()), &icmp, HALF_LIFE, false, 1, 3);
+        assert_eq!(after_icmp, expected);
+    }
+
+    #[test]
+    fn a_row_opened_by_a_forgeable_sighting_holds_no_score_no_day_and_no_tier() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let s = apply_event(None, &datagram_at(t), HALF_LIFE, false, 0, 1);
+        assert_eq!(s.event_count, 1);
+        assert_eq!((s.first_seen, s.last_seen), (t, t));
+        assert_eq!(s.raw_score, dec!(0));
+        assert_eq!(s.category_breakdown, serde_json::json!({}));
+        assert_eq!(s.distinct_categories, 0);
+        assert_eq!(s.max_confidence, dec!(0));
+        assert_eq!(s.established_event_count, 0);
+        assert_eq!(s.active_days, 0);
+        assert_eq!(s.tier, None);
+        assert!(!s.has_confirmed_real && !s.eligible);
+        assert!(!s.recommended_for_vendor && !s.recommended_for_blocklist);
+        assert_eq!(s.established_last_seen, None);
+        assert_eq!(s.tier_earned_at(), None);
+
+        // A thousand more change only the count and the date.
+        let mut acc = s.clone();
+        for i in 1..=1000 {
+            let e = datagram_at(t + Duration::seconds(i * 61));
+            acc = apply_event(Some(acc), &e, HALF_LIFE, false, 0, 1);
+        }
+        let expected = IpScore {
+            event_count: 1001,
+            last_seen: t + Duration::seconds(61_000),
+            ..s
+        };
+        assert_eq!(acc, expected);
+        // And a read projected to now derives nothing from them either.
+        let read = project_to_now(acc, t + Duration::days(1), HALF_LIFE);
+        assert!(!read.recommended_for_blocklist && read.tier.is_none());
+    }
+
+    #[test]
+    fn datagrams_on_ninety_days_add_no_active_day() {
+        // Persistence points are added to the score the tiers gate on, so a day only a forged
+        // datagram marks must not count.
+        let start = ts("2026-01-01T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for d in 0..90 {
+            let e = datagram_at(start + Duration::days(d));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, false, 0, 1));
+        }
+        let s = acc.unwrap();
+        assert_eq!(s.active_days, 0);
+        // The first connection then opens day one, on its own date.
+        let first = event_at(
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            start + Duration::days(90),
+        );
+        let s = apply_event(Some(s), &first, HALF_LIFE, false, 0, 1);
+        assert_eq!(s.active_days, 1);
+        assert_eq!(s.last_active_day, (start + Duration::days(90)).date_naive());
+    }
+
+    #[test]
+    fn a_datagram_is_not_the_second_sighting_eligibility_asks_for() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let upload = event_at(SignalType::HoneypotMalwareUpload, Protocol::Tcp, true, t);
+        let s = apply_event(None, &upload, HALF_LIFE, false, 1, 1);
+        assert!(s.has_confirmed_real);
+        assert!(!s.eligible, "one established event is one sighting");
+
+        let s = apply_event(
+            Some(s),
+            &datagram_at(t + Duration::minutes(5)),
+            HALF_LIFE,
+            false,
+            1,
+            1,
+        );
+        assert_eq!(s.event_count, 2);
+        assert!(!s.eligible, "a forged datagram must not make it two");
+        assert!(!s.recommended_for_vendor);
+        assert_eq!(s.tier_earned_at(), None);
+
+        let command = event_at(
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            t + Duration::minutes(6),
+        );
+        let s = apply_event(Some(s), &command, HALF_LIFE, false, 1, 1);
+        assert!(s.eligible, "a second connection does");
+        assert_eq!(s.aggressive_earned_at, Some(t + Duration::minutes(6)));
+    }
+
+    #[test]
+    fn a_weak_event_neither_ends_nor_extends_what_was_earned() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let listed = aggressive_at(t);
+        let earned = t + Duration::minutes(1);
+        assert_eq!(listed.aggressive_earned_at, Some(earned));
+        assert_eq!(listed.standard_earned_at, None);
+
+        // Twelve hours later one real, low-weight probe: 25 left of the score, plus 20.
+        let weak = event_at(
+            SignalType::PortScan,
+            Protocol::Tcp,
+            false,
+            t + Duration::hours(12),
+        );
+        let after = apply_event(Some(listed), &weak, HALF_LIFE, false, 1, 1);
+        assert_eq!(after.tier, None, "the stored tier is what this event left");
+        assert!(!after.recommended_for_vendor);
+        assert_eq!(
+            after.aggressive_earned_at,
+            Some(earned),
+            "the listing clock is neither cleared nor advanced"
+        );
+        assert_eq!(after.established_last_seen, Some(t + Duration::hours(12)));
+    }
+
+    #[test]
+    fn earning_a_tier_again_advances_its_clock_and_each_tier_keeps_its_own() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let listed = aggressive_at(t);
+
+        // Four hours later: 63 left, plus a probe's 20 is 83. Standard, not aggressive.
+        let at_standard = t + Duration::hours(4);
+        let probe = event_at(SignalType::PortScan, Protocol::Tcp, false, at_standard);
+        let s = apply_event(Some(listed), &probe, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.tier, Some(FeedTier::Standard));
+        assert_eq!(s.aggressive_earned_at, Some(t + Duration::minutes(1)));
+        assert_eq!(s.standard_earned_at, Some(at_standard));
+        assert_eq!(s.tier_earned_at(), Some(at_standard));
+
+        // An upload five minutes on takes it back over 90: aggressive is earned again, and the
+        // standard clock stays where it was.
+        let at_aggressive = at_standard + Duration::minutes(5);
+        let upload = event_at(
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            at_aggressive,
+        );
+        let s = apply_event(Some(s), &upload, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.tier, Some(FeedTier::Aggressive));
+        assert_eq!(s.aggressive_earned_at, Some(at_aggressive));
+        assert_eq!(s.standard_earned_at, Some(at_standard));
+    }
+
+    #[test]
+    fn a_repeat_inside_the_dedup_window_adds_nothing_and_earns_nothing() {
+        // The score still clears the tier when the repeat arrives, but the repeat added nothing
+        // to it: a listing is extended by evidence, not by a sample of what is already counted.
+        let t = ts("2026-09-01T00:00:00Z");
+        let listed = aggressive_at(t);
+        let again = event_at(
+            SignalType::HoneypotCommandExec,
+            Protocol::Tcp,
+            true,
+            t + Duration::minutes(2),
+        );
+        let s = apply_event(Some(listed), &again, HALF_LIFE, true, 1, 1);
+        assert_eq!(s.tier, Some(FeedTier::Aggressive));
+        assert_eq!(s.aggressive_earned_at, Some(t + Duration::minutes(1)));
+        assert_eq!(s.established_last_seen, Some(t + Duration::minutes(2)));
+    }
+
+    #[test]
+    fn a_row_scored_only_by_datagrams_starts_over_at_its_first_connection() {
+        // A row as an earlier version left it: scored, dated and given active days by datagrams
+        // alone. None of that may be what a connection builds on.
+        let t = ts("2026-09-01T00:00:00Z");
+        let legacy = IpScore {
+            raw_score: dec!(95),
+            category_breakdown: serde_json::json!({
+                "honeypot": { "weight": "95", "max_confidence": "0.900" },
+            }),
+            max_confidence: dec!(0.900),
+            distinct_categories: 1,
+            decay_anchor: t,
+            event_count: 400,
+            active_days: 9,
+            last_active_day: t.date_naive(),
+            first_seen: t - Duration::days(9),
+            last_seen: t,
+            tier: Some(FeedTier::Standard),
+            ..apply_event(None, &datagram_at(t), HALF_LIFE, false, 0, 1)
+        };
+        assert_eq!(legacy.established_event_count, 0);
+
+        let login = event_at(
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            t + Duration::minutes(5),
+        );
+        let after = apply_event(Some(legacy), &login, HALF_LIFE, false, 1, 1);
+        let alone = apply_event(None, &login, HALF_LIFE, false, 1, 1);
+        let expected = IpScore {
+            event_count: 401,
+            first_seen: t - Duration::days(9),
+            ..alone
+        };
+        assert_eq!(after, expected);
+        assert_eq!(
+            after.raw_score,
+            dec!(50),
+            "the login's own weight and nothing under it"
+        );
+        assert_eq!(after.active_days, 1);
+        assert_eq!(after.tier, None);
+    }
+
+    #[test]
+    fn an_overflow_summary_earns_nothing() {
+        // It names the first address it folded and proves nothing about that address, so it must
+        // not renew a listing however high the stored score still is.
+        let t = ts("2026-09-01T00:00:00Z");
+        let listed = aggressive_at(t);
+        let overflow = EventInput::from_signal(
+            ATTACKER.parse().unwrap(),
+            None,
+            "vnc".into(),
+            SignalType::HoneypotConnection,
+            Protocol::Tcp,
+            false,
+            t + Duration::minutes(10),
+            serde_json::json!({
+                "event_summary": true, "overflow_summary": true, "suppressed_count": 5000,
+            }),
+            None,
+        );
+        let s = apply_event(Some(listed), &overflow, HALF_LIFE, false, 1, 1);
+        assert_eq!(
+            s.tier,
+            Some(FeedTier::Aggressive),
+            "the score is still there"
+        );
+        assert_eq!(s.aggressive_earned_at, Some(t + Duration::minutes(1)));
+    }
+
+    #[test]
+    fn a_delisted_address_earns_nothing() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let mut delisted = aggressive_at(t);
+        delisted.delisted = true;
+        delisted.aggressive_earned_at = None;
+        let upload = event_at(
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            t + Duration::minutes(30),
+        );
+        let s = apply_event(Some(delisted), &upload, HALF_LIFE, false, 1, 1);
+        assert!(!s.eligible);
+        assert_eq!(s.tier_earned_at(), None);
+    }
+
+    #[test]
+    fn a_late_event_earns_as_of_the_anchor_and_never_moves_a_clock_back() {
+        let t = ts("2026-09-01T00:00:00Z");
+        let listed = aggressive_at(t);
+        let earned = t + Duration::minutes(1);
+        // A line from an hour before the anchor, read late. The row is derived at the anchor, so
+        // that is when the tier is held.
+        let late = event_at(
+            SignalType::HoneypotLoginAttempt,
+            Protocol::Tcp,
+            true,
+            t - Duration::hours(1),
+        );
+        let s = apply_event(Some(listed), &late, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.decay_anchor, earned);
+        assert_eq!(s.aggressive_earned_at, Some(earned));
+        assert_eq!(s.established_last_seen, Some(earned), "a running maximum");
+    }
+
+    #[test]
+    fn a_datagram_cannot_make_an_earlier_connection_count_as_late() {
+        // The datagram is read first and opens the row; the connection, from ten hours before
+        // it, is read after. Anchored at the datagram the connection would be worth a third of
+        // its weight. It must score as if the datagram had never been sent.
+        let t = ts("2026-09-01T00:00:00Z");
+        let command = event_at(SignalType::HoneypotCommandExec, Protocol::Tcp, true, t);
+        let alone = apply_event(None, &command, HALF_LIFE, false, 1, 1);
+
+        let opened = apply_event(
+            None,
+            &datagram_at(t + Duration::hours(10)),
+            HALF_LIFE,
+            false,
+            1,
+            1,
+        );
+        let after = apply_event(Some(opened), &command, HALF_LIFE, false, 1, 1);
+        assert_eq!(after.raw_score, dec!(60));
+        assert_eq!(after.decay_anchor, t);
+        let expected = IpScore {
+            event_count: 2,
+            first_seen: t + Duration::hours(10),
+            last_seen: t + Duration::hours(10),
+            ..alone
+        };
+        assert_eq!(after, expected);
+    }
+
+    #[test]
+    fn volume_recency_is_measured_from_the_last_connection_not_the_last_datagram() {
+        let threshold = crate::scoring::constants::VOLUME_LIST_THRESHOLD as i64;
+        let base = ts("2026-08-21T00:00:00Z");
+        let mut acc: Option<IpScore> = None;
+        for i in 0..threshold {
+            let e = tcp_probe_event_at(base + Duration::seconds(i));
+            acc = Some(apply_event(acc, &e, HALF_LIFE, i > 0, 1, 1));
+        }
+        let flood = acc.unwrap();
+        let stopped = base + Duration::seconds(threshold - 1);
+        assert_eq!(flood.established_last_seen, Some(stopped));
+        assert!(flood.recommended_for_blocklist);
+
+        // Thirty hours after the flood stopped, a datagram names the address.
+        let named = stopped + Duration::hours(30);
+        let s = apply_event(
+            Some(flood),
+            &udp_probe_event_at(named),
+            HALF_LIFE,
+            false,
+            1,
+            1,
+        );
+        assert_eq!(s.last_seen, named);
+        assert_eq!(s.established_last_seen, Some(stopped));
+        let read = project_to_now(s, named + Duration::minutes(1), HALF_LIFE);
+        assert!(
+            !read.recommended_for_blocklist,
+            "a flood that stopped more than a day ago is not kept listed by a datagram"
+        );
+    }
+
+    proptest! {
+        /// The rule in one property: take any history, remove every forgeable sighting, and the
+        /// address scores exactly the same. Only the record of having been named differs.
+        #[test]
+        fn a_history_scores_the_same_with_its_forgeable_sightings_removed(
+            steps in prop::collection::vec(
+                (0usize..6, any::<bool>(), 0i64..200_000, any::<bool>()),
+                1..40,
+            )
+        ) {
+            const SIGNALS: [SignalType; 6] = [
+                SignalType::HoneypotMalwareUpload,
+                SignalType::HoneypotCommandExec,
+                SignalType::HoneypotLoginAttempt,
+                SignalType::HoneypotConnection,
+                SignalType::CatchallProbe,
+                SignalType::PortScan,
+            ];
+            let base = ts("2026-09-01T00:00:00Z");
+            // Times are drawn independently of position, so the history is read out of order.
+            let events: Vec<EventInput> = steps
+                .iter()
+                .map(|&(signal, forgeable, at, authenticated)| {
+                    let protocol = if forgeable { Protocol::Udp } else { Protocol::Tcp };
+                    event_at(SIGNALS[signal], protocol, authenticated, base + Duration::seconds(at))
+                })
+                .collect();
+            let fold = |events: &[&EventInput]| {
+                events.iter().fold(None, |acc: Option<IpScore>, e| {
+                    Some(apply_event(acc, e, HALF_LIFE, false, 1, 1))
+                })
+            };
+            let all: Vec<&EventInput> = events.iter().collect();
+            let established: Vec<&EventInput> =
+                events.iter().filter(|e| is_established(e)).collect();
+            let with = fold(&all).expect("at least one event");
+            match fold(&established) {
+                Some(without) => {
+                    let expected = IpScore {
+                        event_count: with.event_count,
+                        first_seen: with.first_seen,
+                        last_seen: with.last_seen,
+                        ..without
+                    };
+                    prop_assert_eq!(with, expected);
+                }
+                None => {
+                    prop_assert_eq!(with.raw_score, dec!(0));
+                    prop_assert_eq!(with.active_days, 0);
+                    prop_assert!(with.tier.is_none() && !with.eligible);
+                    prop_assert!(!with.recommended_for_blocklist);
+                    prop_assert_eq!(with.established_last_seen, None);
+                    prop_assert_eq!(with.tier_earned_at(), None);
+                }
+            }
+        }
     }
 
     fn udp_probe_event_at(when: DateTime<Utc>) -> EventInput {

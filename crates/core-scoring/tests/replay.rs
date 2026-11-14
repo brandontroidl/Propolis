@@ -72,7 +72,7 @@ async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Resul
         SignalType::SuricataSev1,
         None,
         "s1",
-        Protocol::Udp,
+        Protocol::Tcp,
         false,
     );
     append_event(&pool, later).await?;
@@ -81,7 +81,7 @@ async fn out_of_order_event_outside_window_is_not_deduped(pool: PgPool) -> Resul
         SignalType::SuricataSev1,
         None,
         "s1",
-        Protocol::Udp,
+        Protocol::Tcp,
         false,
     );
     let s = append_event(&pool, earlier).await?;
@@ -133,7 +133,7 @@ async fn read_score_rederives_stale_flags_after_decay(pool: PgPool) -> Result<()
         SignalType::SuricataSev1,
         None,
         "s2",
-        Protocol::Udp,
+        Protocol::Tcp,
         false,
     );
     let stored = append_event(&pool, e1).await?;
@@ -574,14 +574,19 @@ async fn replay_equals_incremental_when_events_arrive_out_of_order(
     );
     // One hour of a six-hour half-life later the newer event (weight 20) found about 43.0 of
     // that left, not what four hours, or three years, of decay from a regressed anchor would
-    // leave; the last line, half an hour older than the anchor, then added about 2.8 of its 3.
+    // leave. The last line is a datagram: it is counted, and adds none of its 3.
     let stored = read_stored_score(&pool, ip).await?.unwrap();
     assert_eq!(stored.event_count, 5);
     assert_eq!(stored.established_event_count, 4);
     assert!(
-        stored.raw_score > dec!(65.8) && stored.raw_score < dec!(65.9),
-        "48.28 decayed for one hour, plus 20, plus 3 decayed for half an hour: {}",
+        stored.raw_score > dec!(62.9) && stored.raw_score < dec!(63.1),
+        "48.28 decayed for one hour, plus 20, and nothing for the datagram: {}",
         stored.raw_score
+    );
+    assert_eq!(
+        stored.established_last_seen,
+        Some(at("2026-07-17T13:00:00Z")),
+        "the datagram is not an established sighting"
     );
     Ok(())
 }

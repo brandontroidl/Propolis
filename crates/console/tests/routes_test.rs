@@ -230,7 +230,7 @@ async fn seed_recommended(pool: &PgPool, ip: &str, seconds_ago: i64) {
             ip,
             "catchall-sensor",
             SignalType::CatchallProbe,
-            Protocol::Udp,
+            Protocol::Tcp,
             false,
             &(start + chrono::Duration::seconds(20)).to_rfc3339(),
         ),
@@ -277,7 +277,7 @@ async fn dashboard_authenticated_returns_stats(pool: PgPool) {
     migrate(&pool).await;
     seed_recommended(&pool, "203.0.113.10", 60).await;
     seed_recommended(&pool, "203.0.113.11", 60).await;
-    // A single event never clears eligibility (`event_count >= 2` is required), so this IP gets an
+    // A single event never clears eligibility (two established events are required), so this IP gets an
     // `ip_score` row but is never surfaced into `review_queue`. That deliberately splits
     // total_scored_ips (3) from pending_reviews (2) so the two stats cannot coincidentally match
     // and mask one being wired to the wrong query.
@@ -1458,6 +1458,17 @@ async fn relist_clears_the_latch_and_rederives_the_gates(pool: PgPool) {
         before,
         "precondition: a seeded recommended address is eligible"
     );
+    let earned_sql = "SELECT GREATEST(aggressive_earned_at, standard_earned_at) FROM ip_score \
+                      WHERE source_ip = $1::inet";
+    let earned_before: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(earned_sql)
+        .bind("203.0.113.209")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        earned_before.is_some(),
+        "precondition: the address earned a tier"
+    );
 
     app.clone()
         .oneshot(form_request(
@@ -1503,6 +1514,18 @@ async fn relist_clears_the_latch_and_rederives_the_gates(pool: PgPool) {
         row.get::<bool, _>("recommended_for_vendor"),
         "the recommendation delist cleared must be re-derived, not left false"
     );
+
+    // Delisting holds a listing; it does not erase when the tier was earned. A relist therefore
+    // resumes what is left of the listing: the address is offered for review again at once (the
+    // delist removed its queue row), and an approval publishes it for the rest of its TTL.
+    let earned_after: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(earned_sql)
+        .bind("203.0.113.209")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(earned_after, earned_before);
+    let queue = ReviewQueue::new().offering_reserved_addresses();
+    assert_eq!(queue.populate(&pool).await.unwrap(), 1, "offered again");
 }
 
 /// An append in flight reads an address's projection and writes it back at commit, so a console
@@ -2177,7 +2200,10 @@ async fn volume_tab_lists_pending_candidates_with_their_counts_and_context(pool:
         row.contains(r#"data-label="All events">1,234<"#),
         "total events: {row}"
     );
-    assert!(row.contains(r#"data-label="Last seen">20"#), "{row}");
+    assert!(
+        row.contains(r#"data-label="Last connection">20"#),
+        "the clock a volume listing runs on, not the last sighting of any kind: {row}"
+    );
     assert!(
         row.contains(r#"hx-post="/volume/203.0.113.150/approve""#)
             && row.contains(r#"hx-post="/volume/203.0.113.150/reject""#),

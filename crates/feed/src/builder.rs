@@ -1,7 +1,7 @@
-//! The feed builder: reads approved, eligible, recommended-for-blocklist IP scores from
-//! `ip_score`, gated on operator approval in `review_queue`, re-derives their gate flags
-//! decayed to now, groups by tier, applies exclusions, and coarsens every timestamp to an
-//! hour boundary. See `internal/design/05-blocklist-feed.md` ("The feed builder").
+//! The feed builder: reads from `ip_score` the addresses that have earned a tier, gated on
+//! operator approval in `review_queue`, files each by when it last earned its tier (never by a
+//! score decayed to now), applies exclusions, and coarsens every timestamp to an hour boundary.
+//! See `internal/design/05-blocklist-feed.md` ("The feed builder").
 //!
 //! Volume-listed addresses (a thousand or more established TCP events) are a second source,
 //! published only in the retention windows. They too wait for an operator: the default build
@@ -9,7 +9,7 @@
 //! `review_queue`). [`FeedConfig::volume_auto_publish`] is the opt-in that publishes them with
 //! no decision.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -123,22 +123,81 @@ impl Default for FeedConfig {
 
 /// One approved IP as stored, before it is materialised into per-feed [`FeedEntry`] values.
 ///
-/// Every field is read AS STORED - the values as of the IP's last event - never re-derived
-/// against the current wall clock. That is the whole point: a re-derived tier slides across the
-/// 90/75 thresholds as the score decays, so the same IP is filed as aggressive on one render and
-/// standard on the next, and no two views taken minutes apart agree. Freezing the tier at
-/// observation time means an IP enters one file and stays there for its window.
+/// Every field is read AS STORED, never re-derived against the current wall clock. That is the
+/// whole point: a re-derived tier slides across the 90/75 thresholds as the score decays, so the
+/// same IP is filed as aggressive on one render and standard on the next, and no two views taken
+/// minutes apart agree.
+///
+/// What decides a listing is when the address last EARNED it, which the scoring fold records
+/// (`core_scoring::IpScore::aggressive_earned_at` and `standard_earned_at`: the last time an
+/// established event left the address eligible and holding that tier). An entry stays in a tier
+/// file for that tier's TTL after that time and in a retention window for the window's length
+/// after the later of the two. A later event that leaves the address below the tier moves
+/// neither time, so it cannot take the entry out early; a datagram naming the address moves
+/// nothing at all, so it cannot keep the entry in.
 struct Candidate {
     ip: IpAddr,
-    /// `None` for a volume-listed address (no score-tier). Such a candidate is excluded from the
-    /// aggressive/standard tier files (which filter on `Some(tier)`) and appears only in the
-    /// retention windows.
-    tier: Option<FeedTier>,
+    /// When the address last earned the aggressive tier. `None` if it never has, and for a
+    /// candidate listed on volume alone.
+    aggressive_earned_at: Option<DateTime<Utc>>,
+    /// The same for the standard tier.
+    standard_earned_at: Option<DateTime<Utc>>,
+    /// The address's last established sighting, for a candidate the volume rule lists (alone, or
+    /// as well as on its score). It carries the entry in the retention windows only.
+    volume_seen: Option<DateTime<Utc>>,
     first_seen: DateTime<Utc>,
-    last_seen: DateTime<Utc>,
     event_count: i32,
     distinct_categories: i32,
     categories: Vec<String>,
+}
+
+/// The time a feed's entry runs from, and the tier it is published with.
+type Listing = (DateTime<Utc>, Option<FeedTier>);
+
+/// Whether a listing that runs from `at` is still inside `ttl`. A time ahead of the clock is read
+/// as now, as [`materialize`] reads it.
+fn is_live(at: Option<DateTime<Utc>>, now: DateTime<Utc>, ttl: Duration) -> bool {
+    at.is_some_and(|at| now - at.min(now) < ttl)
+}
+
+impl Candidate {
+    /// The aggressive file: the address earned the aggressive tier.
+    fn aggressive_listing(&self) -> Option<Listing> {
+        self.aggressive_earned_at
+            .map(|at| (at, Some(FeedTier::Aggressive)))
+    }
+
+    /// The standard file: the address earned the standard tier and is not in the aggressive
+    /// file now. The two files never hold the same address, so one that earned both stays in
+    /// the aggressive file for its full TTL and is then carried here for what is left of the
+    /// standard one.
+    fn standard_listing(&self, now: DateTime<Utc>, aggressive_ttl: Duration) -> Option<Listing> {
+        if is_live(self.aggressive_earned_at, now, aggressive_ttl) {
+            return None;
+        }
+        self.standard_earned_at
+            .map(|at| (at, Some(FeedTier::Standard)))
+    }
+
+    /// A retention window of length `retention`: the latest of the times the address earned a
+    /// tier and, for a volume listing, its last established sighting. The entry names the tier
+    /// last earned if that is itself inside the window, and no tier when only the volume rule
+    /// holds it there.
+    fn window_listing(&self, now: DateTime<Utc>, retention: Duration) -> Option<Listing> {
+        let earned = match (self.aggressive_earned_at, self.standard_earned_at) {
+            (Some(aggressive), Some(standard)) if standard > aggressive => {
+                Some((standard, FeedTier::Standard))
+            }
+            (Some(aggressive), _) => Some((aggressive, FeedTier::Aggressive)),
+            (None, Some(standard)) => Some((standard, FeedTier::Standard)),
+            (None, None) => None,
+        };
+        let tier = earned
+            .filter(|&(at, _)| is_live(Some(at), now, retention))
+            .map(|(_, tier)| tier);
+        let clock = earned.map(|(at, _)| at).max(self.volume_seen)?;
+        Some((clock, tier))
+    }
 }
 
 /// Stateless namespace for the build step (mirrors the design's `FeedBuilder::build`).
@@ -149,16 +208,16 @@ impl FeedBuilder {
     ///
     /// Membership is decided by RETENTION, not by a live-decayed score:
     ///
-    /// 1. Selects approved candidates on the STORED `recommended_for_blocklist`/`eligible` flags,
-    ///    reading `tier`, `first_seen`, `last_seen` and the evidence counts AS STORED - i.e. as of
-    ///    each IP's last event. With retention windows configured it then adds the volume-listed
-    ///    addresses, approved ones only unless `config.volume_auto_publish` is set
-    ///    ([`volume_candidates_sql`]).
+    /// 1. Selects approved, not-delisted candidates that have earned a tier, reading the two
+    ///    earned times, `first_seen` and the evidence counts AS STORED ([`Candidate`]). With
+    ///    retention windows configured it then adds the volume-listed addresses, approved ones
+    ///    only unless `config.volume_auto_publish` is set ([`volume_candidates_sql`]).
     /// 2. Applies `exclusions.is_excluded` (reserved ranges, operator allowlist, delist).
-    /// 3. Keeps an entry while `last_seen` falls inside the relevant window: the tier's TTL for
-    ///    `aggressive`/`standard`, or the window's own duration for each configured retention
-    ///    feed. `valid_from`/`valid_until` are anchored on `last_seen`, so the published validity
-    ///    window is the truth about when the entry expires.
+    /// 3. Keeps an entry while the time it runs from falls inside the relevant window: the
+    ///    tier's TTL after the tier was last earned for `aggressive`/`standard`, or the window's
+    ///    own duration for each configured retention feed. `valid_from`/`valid_until` are
+    ///    anchored on that time, so the published validity window is the truth about when the
+    ///    entry expires.
     ///
     /// This deliberately does NOT re-derive scores against the current wall clock. Doing so made
     /// tier membership a function of when a page happened to render: an IP sliding from 90.0 to
@@ -175,9 +234,9 @@ impl FeedBuilder {
     ) -> Result<FeedSnapshot, FeedError> {
         let build_time = coarsen_to_hour(Utc::now());
 
-        // An entry leaves every feed once its last event is older than the longest window it can
-        // appear in, so a candidate past the longest one cannot be published and its signal types
-        // are not worth reading. `materialize` applies the exact per-feed cutoffs; this is only the
+        // An entry leaves every feed once the time it runs from is older than the longest window
+        // it can appear in, so a candidate past the longest one cannot be published and its signal
+        // types are not worth reading. `materialize` applies the exact per-feed cutoffs; this is only the
         // superset those can never exceed (a minute of margin for the clock moving between this
         // read and `materialize`'s).
         let merit_horizon = [config.aggressive_ttl, config.standard_ttl]
@@ -216,18 +275,12 @@ impl FeedBuilder {
                     continue;
                 }
 
-                // `tier IS NOT NULL` in the query above already excluded the untiered rows, so this
-                // only fails on a value the enum cannot represent - fail closed rather than guess.
-                let Some(tier): Option<FeedTier> = row.try_get("tier")? else {
-                    tracing::warn!(%ip, "feed builder: stored tier unreadable, excluding fail-closed");
-                    continue;
-                };
-
                 candidates.push(Candidate {
                     ip,
-                    tier: Some(tier),
+                    aggressive_earned_at: row.try_get("aggressive_earned_at")?,
+                    standard_earned_at: row.try_get("standard_earned_at")?,
+                    volume_seen: None,
                     first_seen: row.try_get("first_seen")?,
-                    last_seen: row.try_get("last_seen")?,
                     event_count: row.try_get("event_count")?,
                     distinct_categories: row.try_get("distinct_categories")?,
                     categories: row.try_get("categories")?,
@@ -258,10 +311,15 @@ impl FeedBuilder {
         };
 
         // An approved address can meet the volume condition and be a merit candidate at once
-        // (the approved leg of the statement does not require `eligible = false`). The merit candidate
-        // is already in every window its last event falls inside, tier and all, so its volume
-        // row is dropped rather than published as a second entry for the same address.
-        let merit_ips: HashSet<IpAddr> = candidates.iter().map(|c| c.ip).collect();
+        // (the approved leg of the statement does not require `eligible = false`). It is
+        // published once: its volume row is not a second entry but a second clock on the merit
+        // candidate. The two differ (the tier was earned days ago, the flood is an hour old), and
+        // a window holds the entry while either is inside it.
+        let merit_at: HashMap<IpAddr, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(at, c)| (c.ip, at))
+            .collect();
 
         off_worker(|| -> Result<(), FeedError> {
             for row in volume_rows {
@@ -279,14 +337,17 @@ impl FeedBuilder {
                 if exclusions.is_excluded(ip) {
                     continue;
                 }
-                if merit_ips.contains(&ip) {
+                let volume_seen: Option<DateTime<Utc>> = row.try_get("established_last_seen")?;
+                if let Some(&at) = merit_at.get(&ip) {
+                    candidates[at].volume_seen = volume_seen;
                     continue;
                 }
                 candidates.push(Candidate {
                     ip,
-                    tier: None,
+                    aggressive_earned_at: None,
+                    standard_earned_at: None,
+                    volume_seen,
                     first_seen: row.try_get("first_seen")?,
-                    last_seen: row.try_get("last_seen")?,
                     event_count: row.try_get("event_count")?,
                     distinct_categories: row.try_get("distinct_categories")?,
                     categories: row.try_get("categories")?,
@@ -297,10 +358,10 @@ impl FeedBuilder {
 
         let now = Utc::now();
         let aggressive = materialize(&candidates, now, config.aggressive_ttl, |c| {
-            c.tier == Some(FeedTier::Aggressive)
+            c.aggressive_listing()
         });
         let standard = materialize(&candidates, now, config.standard_ttl, |c| {
-            c.tier == Some(FeedTier::Standard)
+            c.standard_listing(now, config.aggressive_ttl)
         });
         let windows: Vec<WindowFeed> = config
             .windows
@@ -308,7 +369,9 @@ impl FeedBuilder {
             .map(|(label, retention)| WindowFeed {
                 label: label.clone(),
                 retention: *retention,
-                entries: materialize(&candidates, now, *retention, |_| true),
+                entries: materialize(&candidates, now, *retention, |c| {
+                    c.window_listing(now, *retention)
+                }),
             })
             .collect();
 
@@ -347,22 +410,29 @@ const CATEGORIES_SQL: &str = "ARRAY(SELECT t.v::text \
              SELECT 1 FROM event e WHERE e.source_ip = s.source_ip AND e.signal_type = t.v LIMIT 1 \
          ) x ORDER BY 1)";
 
-/// The approved, eligible, tiered candidates, read as stored. `$1` is the oldest `last_seen` any
-/// feed can still publish (see [`FeedBuilder::build`]).
+/// The approved candidates that have earned a tier, read as stored. `$1` is the oldest earned
+/// time any feed can still publish (see [`FeedBuilder::build`]).
+///
+/// The earned times are set only by an established event that left the address eligible and
+/// tiered, so they stand in for the stored `eligible`, `recommended_for_blocklist` and `tier` this
+/// statement used to read: those are whatever the address's LAST event left, and a later weak
+/// event clearing them must not end a listing that still has time to run. The delist latch is
+/// read directly, since delisting leaves the earned times in place.
 pub fn merit_candidates_sql() -> String {
     format!(
-        "SELECT host(s.source_ip) AS source_ip, s.tier, s.first_seen, s.last_seen, \
-                s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
+        "SELECT host(s.source_ip) AS source_ip, s.aggressive_earned_at, s.standard_earned_at, \
+                s.first_seen, s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
          FROM ip_score s \
          INNER JOIN review_queue q ON q.source_ip = s.source_ip \
-         WHERE s.recommended_for_blocklist = true AND s.eligible = true \
-           AND q.state = 'approved' AND s.tier IS NOT NULL AND s.last_seen > $1"
+         WHERE q.state = 'approved' AND NOT s.delisted \
+           AND GREATEST(s.aggressive_earned_at, s.standard_earned_at) > $1"
     )
 }
 
-/// The volume-listed addresses a retention window may publish. `$1` is the oldest `last_seen`
-/// any retention window can still publish and `$2` the volume threshold (bind
-/// `core_scoring::VOLUME_LIST_THRESHOLD`).
+/// The volume-listed addresses a retention window may publish. `$1` is the oldest established
+/// sighting any retention window can still publish and `$2` the volume threshold (bind
+/// `core_scoring::VOLUME_LIST_THRESHOLD`). Recency is `established_last_seen`, the last completed
+/// TCP connection, never `last_seen`: a datagram naming the address must not keep it listed.
 ///
 /// By default (`auto_publish` false) an address is read only when an operator approved it: it is
 /// not delisted, its `established_event_count` is at least `$2`, and it has an Approved
@@ -389,42 +459,43 @@ pub fn volume_candidates_sql(auto_publish: bool) -> String {
         approved.to_owned()
     };
     format!(
-        "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.last_seen, \
+        "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.established_last_seen, \
                 s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
          FROM ip_score s \
-         WHERE s.last_seen > $1 AND {listed}"
+         WHERE s.established_last_seen > $1 AND {listed}"
     )
 }
 
-/// Select the candidates that `include` accepts and whose last event falls inside `ttl`, and
-/// materialise them as [`FeedEntry`] values whose validity window is anchored on that last event.
+/// Select the candidates `listing` places in this feed and whose listing time falls inside
+/// `ttl`, and materialise them as [`FeedEntry`] values whose validity window is anchored on that
+/// time. `listing` gives, for a candidate, the time its entry in this feed runs from and the tier
+/// it is published with, or `None` when the candidate does not belong in the feed.
 ///
-/// Anchoring on `last_seen` rather than on build time is what makes the published `valid_until`
-/// mean what it says: an entry is carried for a fixed period after the activity that justified it,
-/// and leaves when that period lapses. Anchoring on build time instead would restart every
-/// entry's clock on each build, so nothing would ever expire.
+/// Anchoring on the time the listing was earned rather than on build time is what makes the
+/// published `valid_until` mean what it says: an entry is carried for a fixed period after the
+/// activity that justified it, and leaves when that period lapses. Anchoring on build time
+/// instead would restart every entry's clock on each build, so nothing would ever expire. The
+/// published `last_seen` is the same time: the last activity that earned the entry its place.
 ///
-/// A stored `last_seen` later than `now` is read as `now`. `last_seen` is the timestamp the
-/// address's last event carried, which is whatever its log line said; taken as stored, a line
-/// dated a year ahead would keep the entry in every window for that year plus the window, and
-/// publish a `valid_until` to match. Read as `now`, the entry can never be valid past
-/// `now + ttl`.
+/// A listing time later than `now` is read as `now`. It is the timestamp an event carried, which
+/// is whatever its log line said; taken as stored, a line dated a year ahead would keep the entry
+/// in every window for that year plus the window, and publish a `valid_until` to match. Read as
+/// `now`, the entry can never be valid past `now + ttl`.
 fn materialize(
     candidates: &[Candidate],
     now: DateTime<Utc>,
     ttl: Duration,
-    include: impl Fn(&Candidate) -> bool,
+    listing: impl Fn(&Candidate) -> Option<Listing>,
 ) -> Vec<FeedEntry> {
     let mut out: Vec<FeedEntry> = candidates
         .iter()
-        .filter(|c| include(c))
-        .map(|c| (c, c.last_seen.min(now)))
-        .filter(|(_, last_seen)| now - *last_seen < ttl)
-        .map(|(c, last_seen)| {
-            let valid_from = coarsen_to_hour(last_seen);
+        .filter_map(|c| listing(c).map(|(at, tier)| (c, at.min(now), tier)))
+        .filter(|(_, at, _)| now - *at < ttl)
+        .map(|(c, at, tier)| {
+            let valid_from = coarsen_to_hour(at);
             FeedEntry {
                 source_ip: c.ip,
-                tier: c.tier,
+                tier,
                 first_seen: coarsen_to_hour(c.first_seen),
                 last_seen: valid_from,
                 event_count: c.event_count,
@@ -494,6 +565,10 @@ mod tests {
         let gated = volume_candidates_sql(false);
         assert!(gated.contains("v.state = 'approved'"));
         assert!(
+            gated.contains("s.established_last_seen > $1") && !gated.contains("s.last_seen"),
+            "recency is the last connection, never the last sighting: {gated}"
+        );
+        assert!(
             !gated.contains("recommended_for_blocklist"),
             "the default statement reads no address without a decision: {gated}"
         );
@@ -504,14 +579,21 @@ mod tests {
         assert!(automatic.contains("v.state = 'approved'"));
     }
 
-    /// A candidate last seen `hours_ago`, with a deliberately non-default value in every field so
-    /// a carry-forward that drops one is visible rather than passing on a matching default.
+    /// A candidate that last earned `tier` `hours_ago`, with a deliberately non-default value in
+    /// every field so a carry-forward that drops one is visible rather than passing on a
+    /// matching default.
     fn candidate(last_octet: u8, tier: FeedTier, hours_ago: i64, now: DateTime<Utc>) -> Candidate {
+        let earned = Some(now - Duration::hours(hours_ago));
+        let (aggressive_earned_at, standard_earned_at) = match tier {
+            FeedTier::Aggressive => (earned, None),
+            FeedTier::Standard => (None, earned),
+        };
         Candidate {
             ip: format!("198.51.100.{last_octet}").parse().unwrap(),
-            tier: Some(tier),
+            aggressive_earned_at,
+            standard_earned_at,
+            volume_seen: None,
             first_seen: now - Duration::hours(hours_ago + 500),
-            last_seen: now - Duration::hours(hours_ago),
             event_count: 37,
             distinct_categories: 3,
             categories: vec!["ssh_brute_force".into(), "honeypot_command_exec".into()],
@@ -522,8 +604,29 @@ mod tests {
         "2026-08-19T12:30:00Z".parse().unwrap()
     }
 
+    const AGGRESSIVE_TTL: Duration = Duration::hours(24);
+    const STANDARD_TTL: Duration = Duration::hours(48);
+
+    fn aggressive_file(cands: &[Candidate], now: DateTime<Utc>) -> Vec<FeedEntry> {
+        materialize(cands, now, AGGRESSIVE_TTL, |c| c.aggressive_listing())
+    }
+
+    fn standard_file(cands: &[Candidate], now: DateTime<Utc>) -> Vec<FeedEntry> {
+        materialize(cands, now, STANDARD_TTL, |c| {
+            c.standard_listing(now, AGGRESSIVE_TTL)
+        })
+    }
+
+    fn window(cands: &[Candidate], now: DateTime<Utc>, retention: Duration) -> Vec<FeedEntry> {
+        materialize(cands, now, retention, |c| c.window_listing(now, retention))
+    }
+
+    fn ips(entries: &[FeedEntry]) -> Vec<String> {
+        entries.iter().map(|e| e.source_ip.to_string()).collect()
+    }
+
     #[test]
-    fn an_entry_leaves_the_feed_once_its_ttl_lapses_since_last_activity() {
+    fn an_entry_leaves_the_feed_once_its_ttl_lapses_since_it_was_earned() {
         let now = now_fixed();
         let cands = [
             candidate(1, FeedTier::Aggressive, 2, now),
@@ -531,24 +634,24 @@ mod tests {
             candidate(3, FeedTier::Aggressive, 25, now),
         ];
 
-        let out = materialize(&cands, now, Duration::hours(24), |_| true);
+        let out = aggressive_file(&cands, now);
 
-        let kept: Vec<String> = out.iter().map(|e| e.source_ip.to_string()).collect();
-        assert_eq!(kept, ["198.51.100.1", "198.51.100.2"]);
+        assert_eq!(ips(&out), ["198.51.100.1", "198.51.100.2"]);
     }
 
     #[test]
-    fn validity_is_anchored_on_last_activity_not_on_build_time() {
+    fn validity_is_anchored_on_when_the_listing_was_earned_not_on_build_time() {
         // The defect this guards: anchoring on build time restarts every entry's clock on each
         // build, so an address seen once and never again is republished with a fresh 24h validity
-        // forever. Anchoring on last_seen means the published valid_until is the truth.
+        // forever. Anchoring on the earned time means the published valid_until is the truth.
         let now = now_fixed();
         let cands = [candidate(1, FeedTier::Aggressive, 20, now)];
 
-        let out = materialize(&cands, now, Duration::hours(24), |_| true);
+        let out = aggressive_file(&cands, now);
 
         let entry = &out[0];
         assert_eq!(entry.valid_from, coarsen_to_hour(now - Duration::hours(20)));
+        assert_eq!(entry.last_seen, entry.valid_from);
         assert_eq!(entry.valid_until, entry.valid_from + Duration::hours(24));
         // Four hours of validity left, not a fresh twenty-four.
         assert_eq!(
@@ -558,18 +661,19 @@ mod tests {
     }
 
     #[test]
-    fn a_last_seen_in_the_future_is_read_as_now_so_validity_never_outlasts_the_ttl() {
-        // `last_seen` is the timestamp the address's last log line carried. Taken as stored, a
-        // line dated a year ahead passes `now - last_seen < ttl` for that whole year and is
-        // published as valid until a year and a day from now.
+    fn a_listing_time_in_the_future_is_read_as_now_so_validity_never_outlasts_the_ttl() {
+        // The earned time is the timestamp an event carried. Taken as stored, a line dated a year
+        // ahead passes `now - at < ttl` for that whole year and is published as valid until a
+        // year and a day from now. The same holds for a volume listing's last sighting.
         let now = now_fixed();
         let mut ahead = candidate(1, FeedTier::Aggressive, 0, now);
-        ahead.last_seen = now + Duration::days(365);
+        ahead.aggressive_earned_at = Some(now + Duration::days(365));
         let on_time = candidate(2, FeedTier::Aggressive, 0, now);
+        let cands = [ahead, on_time];
 
-        let out = materialize(&[ahead, on_time], now, Duration::hours(24), |_| true);
+        let out = aggressive_file(&cands, now);
 
-        assert_eq!(out.len(), 2, "a future last_seen is clamped, not dropped");
+        assert_eq!(out.len(), 2, "a future time is clamped, not dropped");
         for entry in &out {
             assert_eq!(entry.last_seen, coarsen_to_hour(now), "{}", entry.source_ip);
             assert_eq!(
@@ -586,62 +690,92 @@ mod tests {
             );
         }
         // The two are the same entry apart from the address: the clamp treats the future-dated
-        // one exactly as an address last seen at build time.
+        // one exactly as an address that earned its tier at build time.
         assert_eq!(out[0].valid_until, out[1].valid_until);
+
+        let mut flood = candidate(3, FeedTier::Standard, 0, now);
+        flood.standard_earned_at = None;
+        flood.volume_seen = Some(now + Duration::days(365));
+        let day = window(&[flood], now, Duration::days(1));
+        assert_eq!(day.len(), 1);
+        assert!(day[0].valid_until <= now + Duration::days(1));
     }
 
     #[test]
-    fn tier_is_taken_as_stored_so_membership_cannot_slide_between_builds() {
-        // Both candidates carry identical evidence; only the stored tier differs. If the builder
-        // re-derived tier from a decaying score, these would not stay in separate files.
+    fn each_tier_file_holds_what_earned_that_tier_and_the_two_never_overlap() {
         let now = now_fixed();
         let cands = [
             candidate(1, FeedTier::Aggressive, 1, now),
             candidate(2, FeedTier::Standard, 1, now),
         ];
 
-        let aggressive = materialize(&cands, now, Duration::hours(24), |c| {
-            c.tier == Some(FeedTier::Aggressive)
-        });
-        let standard = materialize(&cands, now, Duration::hours(48), |c| {
-            c.tier == Some(FeedTier::Standard)
-        });
+        let aggressive = aggressive_file(&cands, now);
+        let standard = standard_file(&cands, now);
 
-        assert_eq!(aggressive.len(), 1);
-        assert_eq!(aggressive[0].source_ip.to_string(), "198.51.100.1");
-        assert_eq!(standard.len(), 1);
-        assert_eq!(standard[0].source_ip.to_string(), "198.51.100.2");
+        assert_eq!(ips(&aggressive), ["198.51.100.1"]);
+        assert_eq!(aggressive[0].tier, Some(FeedTier::Aggressive));
+        assert_eq!(ips(&standard), ["198.51.100.2"]);
+        assert_eq!(standard[0].tier, Some(FeedTier::Standard));
+    }
+
+    #[test]
+    fn an_address_that_earned_both_tiers_runs_out_the_aggressive_ttl_and_then_the_standard_one() {
+        // Aggressive 20 hours ago; 15 hours ago a weaker event left it standard. It must not
+        // leave the aggressive file for that: the file is for 24 hours after the tier was last
+        // earned. When that lapses it is carried in the standard file for what is left of the
+        // 48 hours the standard tier earned it.
+        let earned_at = now_fixed();
+        let mut both = candidate(1, FeedTier::Aggressive, 20, earned_at);
+        both.standard_earned_at = Some(earned_at - Duration::hours(15));
+        let cands = [both];
+
+        let now = earned_at;
+        assert_eq!(ips(&aggressive_file(&cands, now)), ["198.51.100.1"]);
+        assert!(
+            standard_file(&cands, now).is_empty(),
+            "never in both files at once"
+        );
+
+        // Five hours on: 25 hours since aggressive, 20 since standard.
+        let later = earned_at + Duration::hours(5);
+        assert!(aggressive_file(&cands, later).is_empty());
+        let standard = standard_file(&cands, later);
+        assert_eq!(ips(&standard), ["198.51.100.1"]);
+        assert_eq!(
+            standard[0].valid_from,
+            coarsen_to_hour(earned_at - Duration::hours(15)),
+            "its standard listing runs from when standard was earned"
+        );
+
+        // 34 hours on: 49 since standard. Out of both.
+        let gone = earned_at + Duration::hours(34);
+        assert!(aggressive_file(&cands, gone).is_empty());
+        assert!(standard_file(&cands, gone).is_empty());
     }
 
     // Executable documentation-truth check for README.md "## Scoring", bullet "Score decay and
     // retention": "Feed membership ... is decided by retention windows (24h aggressive, 48h
     // standard), not by the live score - a quiet attacker is retained for its window rather than
     // dropping out the moment its score falls. This is a retention feed, not a decay-out feed."
-    // `materialize` takes NO score argument at all: an entry is kept iff its last activity is within
-    // the retention window. So a quiet-but-recent attacker (whose live score would have decayed) is
-    // retained, and an entry leaves only when the window lapses - never because a score fell. If
-    // membership ever starts consulting a live/decayed score, this test's score-free premise breaks
-    // and the README claim must be revisited.
+    // `materialize` takes NO score argument at all: an entry is kept iff the time it earned its
+    // listing is within the retention window. So a quiet-but-recent attacker (whose live score
+    // would have decayed) is retained, and an entry leaves only when the window lapses - never
+    // because a score fell. If membership ever starts consulting a live/decayed score, this test's
+    // score-free premise breaks and the README claim must be revisited.
     #[test]
     fn readme_feed_membership_is_retention_based_not_score_based() {
         let now = now_fixed();
-        // Quiet-but-recent: last seen 23h ago (no recent activity, a live score would have decayed
+        // Quiet-but-recent: earned 23h ago (no recent activity, a live score would have decayed
         // over ~4 half-lives), still inside the 24h aggressive window.
         let quiet_but_recent = candidate(1, FeedTier::Aggressive, 23, now);
-        // Same evidence, last seen 25h ago: outside the window.
+        // Same evidence, earned 25h ago: outside the window.
         let aged_out = candidate(2, FeedTier::Aggressive, 25, now);
 
-        let out = materialize(
-            &[quiet_but_recent, aged_out],
-            now,
-            Duration::hours(24),
-            |_| true,
-        );
-        let kept: Vec<String> = out.iter().map(|e| e.source_ip.to_string()).collect();
+        let out = aggressive_file(&[quiet_but_recent, aged_out], now);
 
         // Retained purely because it is within the retention window - no score consulted. The 25h
         // one leaves only because the window lapsed, not because any score fell below a floor.
-        assert_eq!(kept, ["198.51.100.1"]);
+        assert_eq!(ips(&out), ["198.51.100.1"]);
     }
 
     #[test]
@@ -653,9 +787,9 @@ mod tests {
             candidate(3, FeedTier::Standard, 1_000, now),
         ];
 
-        let day = materialize(&cands, now, Duration::days(1), |_| true);
-        let week = materialize(&cands, now, Duration::days(7), |_| true);
-        let month = materialize(&cands, now, Duration::days(90), |_| true);
+        let day = window(&cands, now, Duration::days(1));
+        let week = window(&cands, now, Duration::days(7));
+        let month = window(&cands, now, Duration::days(90));
 
         assert_eq!(day.len(), 1);
         assert_eq!(week.len(), 2);
@@ -666,26 +800,43 @@ mod tests {
                 assert!(month.iter().any(|m| m.source_ip == entry.source_ip));
             }
         }
+        assert_eq!(day[0].tier, Some(FeedTier::Aggressive));
+        assert_eq!(week[1].tier, Some(FeedTier::Standard));
+    }
+
+    #[test]
+    fn a_window_runs_from_the_later_of_the_two_earned_times() {
+        let now = now_fixed();
+        // Aggressive 10 days ago, standard 3 days ago.
+        let mut both = candidate(1, FeedTier::Aggressive, 240, now);
+        both.standard_earned_at = Some(now - Duration::hours(72));
+        let week = window(&[both], now, Duration::days(7));
+        assert_eq!(week.len(), 1);
+        assert_eq!(
+            week[0].valid_from,
+            coarsen_to_hour(now - Duration::hours(72))
+        );
+        assert_eq!(
+            week[0].tier,
+            Some(FeedTier::Standard),
+            "the tier last earned"
+        );
     }
 
     #[test]
     fn a_volume_flood_lands_in_retention_but_not_the_tier_files() {
         let now = now_fixed();
-        // A volume-listed flood carries no score-tier (None). Once the build has taken it (by
-        // default only with an operator's approval, see `tests/builder_test.rs`) it must be
-        // excluded from the aggressive/standard files (which filter on Some(tier)) and appear
-        // only in the tier-agnostic retention windows.
+        // A volume-listed flood has earned no tier. Once the build has taken it (by default only
+        // with an operator's approval, see `tests/builder_test.rs`) it must be excluded from the
+        // aggressive/standard files and appear only in the tier-agnostic retention windows.
         let mut flood = candidate(9, FeedTier::Aggressive, 1, now);
-        flood.tier = None;
+        flood.aggressive_earned_at = None;
+        flood.volume_seen = Some(now - Duration::hours(1));
         let cands = [flood];
 
-        let aggressive = materialize(&cands, now, Duration::hours(24), |c| {
-            c.tier == Some(FeedTier::Aggressive)
-        });
-        let standard = materialize(&cands, now, Duration::hours(48), |c| {
-            c.tier == Some(FeedTier::Standard)
-        });
-        let retention = materialize(&cands, now, Duration::days(1), |_| true);
+        let aggressive = aggressive_file(&cands, now);
+        let standard = standard_file(&cands, now);
+        let retention = window(&cands, now, Duration::days(1));
 
         assert!(
             aggressive.is_empty(),
@@ -694,6 +845,37 @@ mod tests {
         assert!(standard.is_empty(), "volume flood must not be in standard");
         assert_eq!(retention.len(), 1, "volume flood must be in retention");
         assert_eq!(retention[0].tier, None);
+    }
+
+    #[test]
+    fn an_address_listed_on_its_score_and_on_volume_is_in_each_window_either_clock_reaches() {
+        // It earned standard ten days ago and has been flooding since; its last connection was
+        // an hour ago. The volume rule puts it in the day and week windows, the score in the
+        // month. Carried on the older clock alone it would be missing from the short windows
+        // while it is flooding now.
+        let now = now_fixed();
+        let mut both = candidate(1, FeedTier::Standard, 240, now);
+        both.volume_seen = Some(now - Duration::hours(1));
+        let cands = [both];
+
+        let day = window(&cands, now, Duration::days(1));
+        let month = window(&cands, now, Duration::days(30));
+        assert_eq!(day.len(), 1, "the flood is an hour old");
+        assert_eq!(
+            day[0].tier, None,
+            "the day window holds it on volume, not on a tier"
+        );
+        assert_eq!(day[0].valid_from, coarsen_to_hour(now - Duration::hours(1)));
+        assert_eq!(month.len(), 1);
+        assert_eq!(month[0].tier, Some(FeedTier::Standard));
+        assert_eq!(
+            month[0].valid_from,
+            coarsen_to_hour(now - Duration::hours(1)),
+            "one entry, on the later clock"
+        );
+        // The volume clock never files it in a tier file.
+        assert!(aggressive_file(&cands, now).is_empty());
+        assert!(standard_file(&cands, now).is_empty());
     }
 
     // README "Score decay and retention": "retention windows (24h aggressive, 48h standard)". The
@@ -706,28 +888,20 @@ mod tests {
         let now = now_fixed();
         let cands = [
             candidate(1, FeedTier::Aggressive, 23, now), // within the 24h aggressive window
-            candidate(2, FeedTier::Standard, 47, now), // outside 24h, within the 48h standard window
-            candidate(3, FeedTier::Standard, 49, now), // outside both windows
+            candidate(2, FeedTier::Aggressive, 25, now), // outside it
+            candidate(3, FeedTier::Standard, 47, now),   // within the 48h standard window
+            candidate(4, FeedTier::Standard, 49, now),   // outside it
         ];
 
-        let aggressive = materialize(&cands, now, Duration::hours(24), |_| true);
-        let standard = materialize(&cands, now, Duration::hours(48), |_| true);
-
-        let agg: Vec<String> = aggressive.iter().map(|e| e.source_ip.to_string()).collect();
-        let std: Vec<String> = standard.iter().map(|e| e.source_ip.to_string()).collect();
-
         assert_eq!(
-            agg,
+            ips(&aggressive_file(&cands, now)),
             ["198.51.100.1"],
             "24h window keeps only the 23h-old entry"
         );
-        assert!(
-            std.contains(&"198.51.100.1".to_string()) && std.contains(&"198.51.100.2".to_string()),
-            "48h window keeps the 23h and 47h entries"
-        );
-        assert!(
-            !std.contains(&"198.51.100.3".to_string()),
-            "the 49h entry has aged out of the 48h standard window"
+        assert_eq!(
+            ips(&standard_file(&cands, now)),
+            ["198.51.100.3"],
+            "48h window keeps the 47h entry and not the 49h one"
         );
     }
 
@@ -736,12 +910,7 @@ mod tests {
         // The stored evidence is what an operator judges an entry by; a carry-forward that
         // zeroed it would still produce a well-formed feed.
         let now = now_fixed();
-        let out = materialize(
-            &[candidate(1, FeedTier::Aggressive, 1, now)],
-            now,
-            Duration::hours(24),
-            |_| true,
-        );
+        let out = aggressive_file(&[candidate(1, FeedTier::Aggressive, 1, now)], now);
         assert_eq!(out[0].event_count, 37);
         assert_eq!(out[0].distinct_categories, 3);
         assert_eq!(
@@ -763,8 +932,10 @@ mod tests {
             candidate(4, FeedTier::Aggressive, 1, now),
             candidate(200, FeedTier::Aggressive, 1, now),
         ];
-        let out = materialize(&cands, now, Duration::hours(24), |_| true);
-        let ips: Vec<String> = out.iter().map(|e| e.source_ip.to_string()).collect();
-        assert_eq!(ips, ["198.51.100.4", "198.51.100.30", "198.51.100.200"]);
+        let out = aggressive_file(&cands, now);
+        assert_eq!(
+            ips(&out),
+            ["198.51.100.4", "198.51.100.30", "198.51.100.200"]
+        );
     }
 }

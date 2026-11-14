@@ -123,6 +123,16 @@ pub fn parse_cidr_csv(raw: &str) -> Result<Vec<IpNet>, String> {
         .collect()
 }
 
+/// Parse a comma-separated list of single addresses (`PROPOLIS_FEED_DELIST`). Blank or absent
+/// yields an empty list. `Err` carries the first offending entry.
+pub fn parse_ip_csv(raw: &str) -> Result<Vec<IpAddr>, String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<IpAddr>().map_err(|_| s.to_string()))
+        .collect()
+}
+
 /// Parse a comma-separated AS-number list (`PROPOLIS_FEED_ASN_ALLOWLIST`): bare numbers, with or
 /// without an `AS`/`as` prefix. Blank or absent yields an empty set (ASN suppression off). `Err`
 /// carries the first offending entry.

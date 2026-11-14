@@ -310,10 +310,6 @@ fn write_tier(
         crate::export::export_pfsense_alias(name, entries).as_bytes(),
     )?;
     write_file_synced(
-        &staging.join(format!("{name}.hosts")),
-        crate::export::export_hosts(entries).as_bytes(),
-    )?;
-    write_file_synced(
         &staging.join(format!("{name}.rpz")),
         crate::export::export_rpz(name, generated, entries).as_bytes(),
     )?;

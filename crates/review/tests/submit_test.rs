@@ -189,8 +189,13 @@ fn ev(
 /// find.
 async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
     // Recent, ordered event times (a few minutes ago) so the seeded IP passes the gatekeeper's
-    // freshness gate. Only recency and order matter here; no assertion references these timestamps.
-    let base = Utc::now() - Duration::minutes(5);
+    // freshness gate.
+    seed_recommended_ssh_at(pool, ip, Utc::now() - Duration::minutes(5)).await;
+}
+
+/// [`seed_recommended_ssh`] with the first event at `base` and the last twenty seconds later,
+/// which is then the address's last established sighting and the time it earned its tier.
+async fn seed_recommended_ssh_at(pool: &PgPool, ip: &str, base: chrono::DateTime<Utc>) {
     let t0 = base.to_rfc3339();
     let t1 = (base + Duration::seconds(10)).to_rfc3339();
     let t2 = (base + Duration::seconds(20)).to_rfc3339();
@@ -228,7 +233,7 @@ async fn seed_recommended_ssh(pool: &PgPool, ip: &str) {
             ip,
             "catchall-sensor",
             SignalType::CatchallProbe,
-            Protocol::Udp,
+            Protocol::Tcp,
             false,
             &t2,
             serde_json::json!({}),
@@ -789,14 +794,34 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StatementLog {
     }
 }
 
+/// Holds the capture open. Dropping it ends the capture.
+struct CaptureGuard {
+    _default: tracing::subscriber::DefaultGuard,
+    _second: tracing::Dispatch,
+}
+
 impl StatementLog {
-    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+    /// Captures on this thread until the guard is dropped.
+    ///
+    /// The guard also keeps a second, do-nothing dispatcher alive. While exactly one dispatcher
+    /// exists in the process, `tracing` decides whether a callsite is enabled by asking the
+    /// default dispatcher of whichever thread happens to register or rebuild it. Tests run on
+    /// parallel threads and only this one has the capturing subscriber, so another test's thread
+    /// could mark sqlx's statement callsite as never enabled and this capture then saw no
+    /// statement at all (about one run in ten). With two dispatchers registered `tracing` asks
+    /// each of them instead, whatever thread it is on.
+    fn capture() -> (Self, CaptureGuard) {
         use tracing_subscriber::prelude::*;
         let log = StatementLog::default();
         let subscriber = tracing_subscriber::registry()
             .with(log.clone())
             .with(tracing_subscriber::filter::LevelFilter::DEBUG);
-        (log, tracing::subscriber::set_default(subscriber))
+        let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let guard = CaptureGuard {
+            _default: tracing::subscriber::set_default(subscriber),
+            _second: second,
+        };
+        (log, guard)
     }
 
     fn count(&self, needle: &str) -> usize {
@@ -856,4 +881,235 @@ async fn a_pass_over_held_addresses_reads_cooldowns_in_one_query(pool: PgPool) {
         0,
         "no protocol-label read for an address every vendor held"
     );
+}
+
+// ---------------------------------------------------------------------
+// What may be reported, and what a report says
+// ---------------------------------------------------------------------
+
+/// Moves everything this node knows about `ip` back by `by`: the times on its score row and its
+/// vendor submissions, whose day-scoped idempotency key is rewritten so that "today" is free
+/// again. What a test then does happens `by` later than what it did before.
+async fn age(pool: &PgPool, ip: &str, by: Duration) {
+    let secs = by.num_seconds() as f64;
+    sqlx::query(
+        "UPDATE ip_score SET \
+             decay_anchor = decay_anchor - make_interval(secs => $2), \
+             first_seen = first_seen - make_interval(secs => $2), \
+             last_seen = last_seen - make_interval(secs => $2), \
+             established_last_seen = established_last_seen - make_interval(secs => $2), \
+             aggressive_earned_at = aggressive_earned_at - make_interval(secs => $2), \
+             standard_earned_at = standard_earned_at - make_interval(secs => $2) \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(ip)
+    .bind(secs)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE vendor_submission SET \
+             submitted_at = submitted_at - make_interval(secs => $2), \
+             idempotency_key = idempotency_key || ':aged' \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(ip)
+    .bind(secs)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// What one forged packet at the DNS listener leaves in the ledger: a `honeypot_connection` over
+/// UDP, in the Honeypot category, labelled `dns`.
+fn dns_datagram(ip: &str) -> EventInput {
+    ev(
+        ip,
+        "dns",
+        SignalType::HoneypotConnection,
+        Protocol::Udp,
+        false,
+        &Utc::now().to_rfc3339(),
+        serde_json::json!({"protocol_label": "dns"}),
+    )
+}
+
+/// An approved address was reported again every cooldown for as long as anything kept its
+/// `last_seen` inside 48 hours, and one datagram a day under its address was enough: the gate
+/// never asked whether the address still merited a report. It now reports what the address
+/// EARNED, once.
+#[sqlx::test(migrations = false)]
+async fn an_address_kept_fresh_only_by_datagrams_is_reported_once_not_every_cooldown(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.60";
+    let addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+    let vendor = MockVendor::new("abuseipdb");
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vec![Box::new(vendor.clone())],
+        vec![permissive_config("abuseipdb")],
+    );
+
+    assert_eq!(runner.run_once().await.unwrap().submitted, 1);
+
+    // Twenty-five hours on: the cooldown is over, and a datagram names the address now.
+    age(&pool, ip, Duration::hours(25)).await;
+    append_event(&pool, dns_datagram(ip)).await.unwrap();
+    let score = core_scoring::read_score(&pool, addr)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        Utc::now() - score.last_seen < Duration::minutes(1),
+        "precondition: the datagram made the address look seen just now"
+    );
+
+    let second = runner.run_once().await.unwrap();
+    assert_eq!(
+        second.submitted, 0,
+        "nothing new was earned since the report"
+    );
+    assert_eq!(second.held_by.stale, 1);
+    assert_eq!(vendor.submissions_for(addr).len(), 1);
+
+    // Another day of datagrams changes nothing, and past 48 hours nothing would be fresh anyway.
+    age(&pool, ip, Duration::hours(25)).await;
+    append_event(&pool, dns_datagram(ip)).await.unwrap();
+    assert_eq!(runner.run_once().await.unwrap().submitted, 0);
+
+    // The address comes back and earns its tier again: that is reported.
+    seed_recommended_ssh_at(&pool, ip, Utc::now() - Duration::minutes(2)).await;
+    let third = runner.run_once().await.unwrap();
+    assert_eq!(third.submitted, 1, "{:?}", third.held_by);
+    assert_eq!(vendor.submissions_for(addr).len(), 2);
+}
+
+/// Approved late: the address earned its tier more than 48 hours ago and has only been named by
+/// datagrams since. Nothing is reported, however fresh `last_seen` looks.
+#[sqlx::test(migrations = false)]
+async fn a_tier_earned_days_ago_is_not_reported_because_a_datagram_named_the_address_today(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let ip = "203.0.113.61";
+    seed_and_approve(&pool, ip).await;
+    age(&pool, ip, Duration::hours(49)).await;
+    append_event(&pool, dns_datagram(ip)).await.unwrap();
+
+    let vendor = MockVendor::new("abuseipdb");
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vec![Box::new(vendor.clone())],
+        vec![permissive_config("abuseipdb")],
+    );
+    let pass = runner.run_once().await.unwrap();
+    assert_eq!(pass.submitted, 0);
+    assert_eq!(pass.held_by.stale, 1);
+    assert_eq!(vendor.call_count(), 0);
+}
+
+/// The report itself is built from what connections showed. A datagram under the address must
+/// change neither the attack time a vendor is given nor the category codes: one forged DNS query
+/// used to turn a report of an SSH session into a generic one, dated by the forged packet.
+#[sqlx::test(migrations = false)]
+async fn a_report_gives_the_last_connection_and_its_labels_whatever_datagrams_followed(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let named = "203.0.113.62";
+    let control = "203.0.113.63";
+    let base = Utc::now() - Duration::minutes(5);
+    for ip in [named, control] {
+        seed_recommended_ssh_at(&pool, ip, base).await;
+    }
+    let queue = ReviewQueue::new();
+    queue.populate(&pool).await.unwrap();
+    for ip in [named, control] {
+        queue
+            .approve(&pool, ip.parse().unwrap(), None)
+            .await
+            .unwrap();
+    }
+    append_event(&pool, dns_datagram(named)).await.unwrap();
+
+    let vendor = MockVendor::new("abuseipdb");
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vec![Box::new(vendor.clone())],
+        vec![permissive_config("abuseipdb")],
+    );
+    assert_eq!(runner.run_once().await.unwrap().submitted, 2);
+
+    let report = &vendor.submissions_for(named.parse().unwrap())[0];
+    let expected = &vendor.submissions_for(control.parse().unwrap())[0];
+    let last_connection = base + Duration::seconds(20);
+    assert!(
+        (report.evidence_window.1 - last_connection)
+            .num_milliseconds()
+            .abs()
+            < 1,
+        "attack time {} is the last connection, not the datagram a few minutes later",
+        report.evidence_window.1
+    );
+    assert_eq!(report.evidence_window.1, expected.evidence_window.1);
+    assert_eq!(
+        report.categories, expected.categories,
+        "the datagram's `dns` label must not replace what the SSH session showed"
+    );
+}
+
+/// `PROPOLIS_FEED_DELIST` took an address out of the published feed and nothing else: an approval
+/// given before the operator listed it kept reporting it to every vendor.
+#[sqlx::test(migrations = false)]
+async fn an_approved_address_on_the_operator_delist_is_held_from_every_vendor(pool: PgPool) {
+    migrate(&pool).await;
+    let delisted = "203.0.113.64";
+    let other = "203.0.113.65";
+    for ip in [delisted, other] {
+        seed_and_approve(&pool, ip).await;
+    }
+    let (first, second) = (MockVendor::new("abuseipdb"), MockVendor::new("otx"));
+    let delist: std::collections::HashSet<IpAddr> =
+        [delisted.parse().unwrap()].into_iter().collect();
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vec![Box::new(first.clone()), Box::new(second.clone())],
+        vec![permissive_config("abuseipdb"), permissive_config("otx")],
+    )
+    .with_delist(Arc::new(delist));
+
+    let pass = runner.run_once().await.unwrap();
+    assert_eq!(pass.submitted, 2, "the other address goes to both vendors");
+    assert_eq!(pass.held, 2);
+    assert_eq!(pass.held_by.delisted, 2, "one per vendor");
+    for vendor in [&first, &second] {
+        assert!(vendor.submissions_for(delisted.parse().unwrap()).is_empty());
+    }
+    assert_eq!(count_submissions(&pool, delisted, "abuseipdb").await, 0);
+}
+
+/// The console's delist latch on the score row holds a report too. Delisting normally deletes
+/// the approval; a row that still has one (another node's write, a restore) must not be
+/// reported on the strength of a tier it earned before it was delisted.
+#[sqlx::test(migrations = false)]
+async fn an_approved_address_carrying_the_delist_latch_is_held(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.66";
+    seed_and_approve(&pool, ip).await;
+    sqlx::query("UPDATE ip_score SET delisted = TRUE WHERE source_ip = $1::inet")
+        .bind(ip)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let vendor = MockVendor::new("abuseipdb");
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vec![Box::new(vendor.clone())],
+        vec![permissive_config("abuseipdb")],
+    );
+    let pass = runner.run_once().await.unwrap();
+    assert_eq!(pass.submitted, 0);
+    assert_eq!(pass.held_by.delisted, 1);
+    assert_eq!(vendor.call_count(), 0);
 }

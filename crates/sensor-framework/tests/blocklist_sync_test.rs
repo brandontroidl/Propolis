@@ -1028,15 +1028,25 @@ fn a_build_with_no_retention_window_publishes_no_retention_files() {
     assert!(pushed.contains(&"tiers/aggressive.txt".to_string()));
 }
 
-/// The author, committer and dates of the newest commit on the remote.
+/// The author, committer and dates of the newest commit on the remote. A date is read as git
+/// stores it, seconds since the epoch and the zone offset (`--date=raw`): how git prints a date
+/// as text differs between versions (`%aI` writes UTC as `+00:00` in some and as `Z` in others).
 fn commit_identity(fx: &Fixture) -> String {
     fx.git(
-        &["log", "-1", "--format=%an|%ae|%cn|%ce|%aI|%cI"],
+        &[
+            "log",
+            "-1",
+            "--date=raw",
+            "--format=%an|%ae|%cn|%ce|%ad|%cd",
+        ],
         &fx.origin(),
     )
     .trim()
     .to_string()
 }
+
+/// [`BUILD_TIME`], 2026-10-14T00:00:00Z, as `commit_identity` reads a date: that hour, in UTC.
+const BUILD_HOUR_RAW: &str = "1791936000 +0000";
 
 /// The commit is public. Left to itself git signs it with a name and address made up from the
 /// account and the machine's host name and dates it to the second in the node's time zone: the
@@ -1060,7 +1070,7 @@ fn the_commit_carries_a_fixed_identity_and_the_build_hour_and_nothing_of_the_hos
     let neutral = "propolis-blocklist|propolis-blocklist@users.noreply.invalid";
     assert_eq!(
         commit_identity(&fx),
-        format!("{neutral}|{neutral}|2026-10-14T00:00:00+00:00|2026-10-14T00:00:00+00:00"),
+        format!("{neutral}|{neutral}|{BUILD_HOUR_RAW}|{BUILD_HOUR_RAW}"),
         "a fixed author, and the build hour in UTC"
     );
 }
@@ -1075,7 +1085,7 @@ fn an_identity_set_in_the_checkout_is_used() {
     let set = "sync test|sync@example.invalid";
     assert_eq!(
         commit_identity(&fx),
-        format!("{set}|{set}|2026-10-14T00:00:00+00:00|2026-10-14T00:00:00+00:00")
+        format!("{set}|{set}|{BUILD_HOUR_RAW}|{BUILD_HOUR_RAW}")
     );
 }
 

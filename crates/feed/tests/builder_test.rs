@@ -491,7 +491,7 @@ async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered(
     .unwrap();
     append_event(
         &pool,
-        ev(ip, SignalType::CatchallProbe, Protocol::Udp, false, now),
+        ev(ip, SignalType::CatchallProbe, Protocol::Tcp, false, now),
     )
     .await
     .unwrap();
@@ -523,6 +523,54 @@ async fn entries_carry_the_distinct_signal_types_the_address_actually_triggered(
         ],
         "expected the deduplicated, sorted wire vocabulary"
     );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_datagram_adds_neither_a_signal_type_nor_an_event_to_a_published_entry(pool: PgPool) {
+    // A UDP source address is whatever the sender wrote. Anyone can send a listed address's
+    // "DNS queries" to a node, and what the feed says about that address must not change: not
+    // the activity types a consumer filters on, and not the number of events said to back it.
+    migrate(&pool).await;
+    let now = Utc::now();
+    let ip: IpAddr = "45.10.30.78".parse().unwrap();
+    seed_qualifying(&pool, ip, SignalType::HoneypotMalwareUpload, now).await;
+    for signal in [
+        SignalType::HoneypotConnection,
+        SignalType::HoneypotConnection,
+        SignalType::HoneypotCommandExec,
+    ] {
+        append_event(&pool, ev(ip, signal, Protocol::Udp, false, now))
+            .await
+            .unwrap();
+    }
+    let stored: (i32, i32) = sqlx::query_as(
+        "SELECT event_count, established_event_count FROM ip_score WHERE source_ip = $1::inet",
+    )
+    .bind(ip.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, (5, 2), "the datagrams are recorded as sightings");
+
+    let snapshot = build(&pool, &config_with_windows(false)).await;
+    let listed: Vec<_> = snapshot
+        .aggressive
+        .iter()
+        .chain(snapshot.windows.iter().flat_map(|w| w.entries.iter()))
+        .filter(|e| e.source_ip == ip)
+        .collect();
+    assert_eq!(listed.len(), 3, "the tier file and both retention windows");
+    for entry in listed {
+        assert_eq!(
+            entry.categories,
+            ["catchall_probe", "honeypot_malware_upload"],
+            "only what the address did over a connection it completed"
+        );
+        assert_eq!(
+            entry.event_count, 2,
+            "the two connections, not the datagrams"
+        );
+    }
 }
 
 #[sqlx::test(migrations = false)]
@@ -647,6 +695,34 @@ async fn the_build_reads_signal_types_by_probe_and_only_for_addresses_a_feed_can
     // earned ten days ago: past the longest default TTL (48 h), so never published.
     seed_heavy_approved(&pool, "45.10.30.201", 3000, "1 hour").await;
     seed_heavy_approved(&pool, "45.10.30.202", 2000, "10 days").await;
+    // 3,000 datagrams naming the live address, of a signal type it has no connection of. The
+    // probe for that type must find nothing without stepping through them: read from an index
+    // that also holds datagrams it would fetch every one to test its protocol.
+    sqlx::query(
+        "INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
+                            weight, confidence, observed_at, hash) \
+         SELECT '45.10.30.201'::inet, 'feed-test-sensor', 'catchall_probe', 'udp', false, \
+                'network', 1, 0.5, now() - g * interval '1 second', \
+                sha256(convert_to('datagram' || g::text, 'UTF8')) \
+         FROM generate_series(1, 3000) g",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // The rest of a ledger: many addresses with a few events each, so the statistics say what
+    // they say on a real node, that one address is a small part of the table.
+    sqlx::query(
+        "INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, category, \
+                            weight, confidence, observed_at, hash) \
+         SELECT ('10.' || (g % 250) || '.' || (g / 250 % 250) || '.7')::inet, 'feed-test-sensor', \
+                'port_scan', (ARRAY['tcp', 'udp'])[1 + g % 2]::protocol_enum, false, 'network', \
+                1, 0.5, now() - g * interval '1 second', \
+                sha256(convert_to('other' || g::text, 'UTF8')) \
+         FROM generate_series(1, 20000) g",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("ANALYZE event").execute(&pool).await.unwrap();
 
     let cutoff = Utc::now() - chrono::Duration::hours(48) - chrono::Duration::minutes(1);
@@ -659,6 +735,13 @@ async fn the_build_reads_signal_types_by_probe_and_only_for_addresses_a_feed_can
     .fetch_all(&mut *conn)
     .await
     .unwrap();
+    assert!(
+        plan.iter().any(|l| l.contains("event_dedup_tcp_idx"))
+            && !plan.iter().any(|l| l.contains("event_dedup_idx")),
+        "the probes must read the index of established events, which holds no datagram to step \
+         over\n{}",
+        plan.join("\n")
+    );
     let read = event_rows_read(&plan);
     assert!(
         read < 4.0,

@@ -2,7 +2,7 @@
 <tr id="row-{{ row.ip }}"{% if row.context %} class="has-context"{% endif %}>
   <td class="ip stack-lead">{{ m.ip_evidence_link(row.ip) }}</td>
   <td class="score">{{ row.score }}</td>
-  <td>{{ m.tier_pill(row.tier) }}</td>
+  <td{% if row.tier_title %} title="{{ row.tier_title }}"{% endif %}>{{ m.tier_pill(row.tier) }}</td>
   <td class="count" data-label="Events">{{ row.event_count | count }}</td>
   <td class="active-cell stack-end"{% if row.active_title %} title="{{ row.active_title }}"{% endif %}>{{ row.active }}</td>
   <td class="stack-full">

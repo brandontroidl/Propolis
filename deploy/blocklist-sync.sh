@@ -262,8 +262,11 @@ copy_feed_file() {
 #
 # The grammars are the exporters', restated: a test publishes real builds and runs them through
 # `--check`, so a change to an exporter that this does not follow fails that test
-# (crates/feed/tests/sync_check_test.rs). An address is anything inet_pton accepts in lower-case
-# canonical characters; a timestamp is an hour boundary, which is all the feed ever states.
+# (crates/feed/tests/sync_check_test.rs). An address is one inet_pton accepts AND that is spelt
+# the one way the publisher spells it (v6text below); a number has no leading zero; a timestamp
+# is an hour boundary, which is all the feed ever states. Text that only means the same as what
+# the publisher writes is refused too: "count":01 is not JSON, a resolver ignores an RPZ trigger
+# that is not in canonical form, and either would break every consumer for as long as it stood.
 #
 # Only core perl: Socket is in perl-base, a JSON module is not, so the one-line JSON is walked
 # with anchored matches.
@@ -284,20 +287,71 @@ $data = "" unless defined $data;
 if ($ext eq "nft") { bad("holds a byte that is not plain text") if $data =~ /[^\x09\x0a\x20-\x7e]/ }
 else { bad("holds a byte that is not plain text") if $data =~ /[^\x0a\x20-\x7e]/ }
 
-my $TS = qr/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z/;
+my $TS = qr/[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):00:00Z/;
 my $OCTET = qr/(?:0|[1-9][0-9]{0,2})/;
+# A count (at most nine digits) and a 32-bit counter (at most ten), as a number is printed.
+my $N = qr/(?:0|[1-9][0-9]{0,8})/;
+my $N32 = qr/(?:0|[1-9][0-9]{0,9})/;
 sub v4 { my $s = shift; $s =~ /\A$OCTET(?:\.$OCTET){3}\z/ && defined inet_pton(AF_INET, $s) }
-sub v6 { my $s = shift; $s =~ /\A[0-9a-f:.]{2,45}\z/ && $s =~ /:/ && defined inet_pton(AF_INET6, $s) }
+# The eight 16-bit groups of an IPv6 address, or nothing if the text is not one.
+sub groups {
+  my $s = shift;
+  return unless $s =~ /\A[0-9a-f:.]{2,45}\z/ && $s =~ /:/;
+  my $packed = inet_pton(AF_INET6, $s);
+  return unless defined $packed;
+  return unpack("n8", $packed);
+}
+# The run of zero groups that is written short: the longest of two or more, the first of equals.
+sub zero_run {
+  my ($at, $len, $start, $n) = (0, 0, 0, 0);
+  for my $k (0 .. 7) {
+    if ($_[$k] == 0) { $start = $k if $n == 0; $n++; ($at, $len) = ($start, $n) if $n > $len }
+    else { $n = 0 }
+  }
+  return $len >= 2 ? ($at, $len) : ();
+}
+sub mapped { !grep({ $_ != 0 } @_[0 .. 4]) && $_[5] == 0xffff }
+# An IPv6 address as the publisher prints it: RFC 5952, and an IPv4-mapped one with its last 32
+# bits as a dotted quad.
+sub v6text {
+  return sprintf("::ffff:%d.%d.%d.%d", $_[6] >> 8, $_[6] & 255, $_[7] >> 8, $_[7] & 255) if mapped(@_);
+  my @h = map { sprintf("%x", $_) } @_;
+  my ($at, $len) = zero_run(@_);
+  return join(":", @h) unless defined $at;
+  return join(":", @h[0 .. $at - 1]) . "::" . join(":", @h[$at + $len .. 7]);
+}
+sub v6 { my @g = groups($_[0]); @g == 8 && v6text(@g) eq $_[0] }
 sub ip { v4($_[0]) || v6($_[0]) }
+# An address in a list or a set a firewall loads. The publisher writes an IPv4-mapped address
+# there as the IPv4 address it maps, so the mapped form is never one of its lines.
+sub v6_listed { my @g = groups($_[0]); @g == 8 && !mapped(@g) && v6text(@g) eq $_[0] }
+sub listed { v4($_[0]) || v6_listed($_[0]) }
+# The RPZ trigger owner the publisher writes for an IPv6 address: its groups in reverse, the
+# zero run as the one label zz. A resolver ignores any other spelling of the same address.
+sub rpz6 {
+  my @h = map { sprintf("%x", $_) } @_;
+  my ($at, $len) = zero_run(@_);
+  splice(@h, $at, $len, "zz") if defined $at;
+  return "128." . join(".", reverse @h);
+}
+sub rpz6_owner {
+  my $owner = shift;
+  $owner =~ /\A128((?:\.(?:[0-9a-f]{1,4}|zz)){1,8})\z/ or return 0;
+  my @labels = reverse grep { length } split(/\./, $1);
+  my $short = grep { $_ eq "zz" } @labels;
+  return 0 if $short > 1 || (!$short && @labels != 8);
+  my @g = map { $_ eq "zz" ? ((0) x (9 - @labels)) : hex($_) } @labels;
+  return @g == 8 && !mapped(@g) && rpz6(@g) eq $owner;
+}
 
 if ($ext eq "json") {
   my $sig = qr/"[a-z0-9_]+"/;
-  $data =~ /\A\{"meta":\{"generator":"propolis","tier":"\Q$name\E","generated":"$TS","valid_until":"$TS","count":([0-9]{1,9})\},"entries":\[/gc
+  $data =~ /\A\{"meta":\{"generator":"propolis","tier":"\Q$name\E","generated":"$TS","valid_until":"$TS","count":($N)\},"entries":\[/gc
     or bad("does not start with the feed\x27s own meta block");
   my ($count, $seen) = ($1, 0);
   unless ($data =~ /\G\]\}\z/gc) {
     while (1) {
-      $data =~ /\G\{"ip":"([0-9a-f:.]{2,45})","first_seen":"$TS","last_seen":"$TS","categories":[0-9]{1,10},"events":[0-9]{1,10},"signals":\[(?:$sig(?:,$sig)*)?\]\}/gc
+      $data =~ /\G\{"ip":"([0-9a-f:.]{2,45})","first_seen":"$TS","last_seen":"$TS","categories":$N32,"events":$N32,"signals":\[(?:$sig(?:,$sig)*)?\]\}/gc
         or bad("entry " . ($seen + 1) . " is not an entry the publisher writes");
       ip($1) or bad("entry " . ($seen + 1) . " does not name an address");
       $seen++;
@@ -310,9 +364,9 @@ if ($ext eq "json") {
 }
 if ($ext eq "manifest") {
   my $H = qr/[0-9a-f]{64}/;
-  my $T = qr/\{"count":[0-9]{1,9},"sha256":"$H","valid_until":"$TS"\}/;
-  my $W = qr/\{"label":"[1-9][0-9]{0,4}[hd]","count":[0-9]{1,9},"sha256":"$H","valid_until":"$TS"\}/;
-  $data =~ /\A\{"build_time":"($TS)","tiers":\{"aggressive":$T,"standard":$T\},"windows":\[((?:$W(?:,$W)*)?)\],"exclusions":\{"allowlist_count":[0-9]{1,9},"delist_count":[0-9]{1,9},"asn_allowlist_count":[0-9]{1,9},"asn_db_loaded":(?:true|false)\}\}\z/
+  my $T = qr/\{"count":$N,"sha256":"$H","valid_until":"$TS"\}/;
+  my $W = qr/\{"label":"[1-9][0-9]{0,4}[hd]","count":$N,"sha256":"$H","valid_until":"$TS"\}/;
+  $data =~ /\A\{"build_time":"($TS)","tiers":\{"aggressive":$T,"standard":$T\},"windows":\[((?:$W(?:,$W)*)?)\],"exclusions":\{"allowlist_count":$N,"delist_count":$N,"asn_allowlist_count":$N,"asn_db_loaded":(?:true|false)\}\}\z/
     or bad("is not a manifest the publisher writes");
   my ($build_time, $windows) = ($1, $2);
   print "build_time $build_time\n";
@@ -333,23 +387,23 @@ if ($ext eq "txt") {
   want("# Propolis blocklist - " . ucfirst($name) . " tier", "title line");
   want_re(qr/\A# Generated: $TS\z/, "Generated line");
   want_re(qr/\A# Valid until: $TS\z/, "Valid until line");
-  ($l[$i] // "") =~ /\A# Entries: ([0-9]{1,9})\z/ or bad("line 4 is not the Entries line");
+  ($l[$i] // "") =~ /\A# Entries: ($N)\z/ or bad("line 4 is not the Entries line");
   my $n = $1; $i++;
   @l - $i == $n or bad("says $n entries and lists " . (@l - $i));
-  rest_are(\&ip, "an address");
+  rest_are(\&listed, "an address as the publisher lists it");
 } elsif ($ext eq "csv") {
   want("ip,first_seen,last_seen,categories,events,signals", "header row");
-  rest_are(sub { $_[0] =~ /\A([0-9a-f:.]{2,45}),$TS,$TS,[0-9]{1,10},[0-9]{1,10},(?:[a-z0-9_]+(?:;[a-z0-9_]+)*)?\z/ && ip($1) }, "a row the publisher writes");
+  rest_are(sub { $_[0] =~ /\A([0-9a-f:.]{2,45}),$TS,$TS,$N32,$N32,(?:[a-z0-9_]+(?:;[a-z0-9_]+)*)?\z/ && ip($1) }, "a row the publisher writes");
 } elsif ($ext eq "cidr") {
-  rest_are(sub { ($_[0] =~ /\A(.+)\/32\z/ && v4($1)) || ($_[0] =~ /\A(.+)\/128\z/ && v6($1)) }, "a host route");
+  rest_are(sub { ($_[0] =~ /\A(.+)\/32\z/ && v4($1)) || ($_[0] =~ /\A(.+)\/128\z/ && v6_listed($1)) }, "a host route as the publisher lists it");
 } elsif ($ext eq "alias") {
-  rest_are(\&ip, "an address");
+  rest_are(\&listed, "an address as the publisher lists it");
 } elsif ($ext eq "pf") {
   want("# Propolis blocklist - $name tier", "title line");
   want_re(qr/\A# Generated: $TS\z/, "Generated line");
-  rest_are(\&ip, "an address");
+  rest_are(\&listed, "an address as the publisher lists it");
 } elsif ($ext eq "ipset") {
-  for my $f (["v4", "inet", \&v4], ["v6", "inet6", \&v6]) {
+  for my $f (["v4", "inet", \&v4], ["v6", "inet6", \&v6_listed]) {
     my ($suffix, $family, $ok) = @$f;
     my $live = "propolis_${name}_$suffix";
     my $params = "hash:ip family $family hashsize 4096 maxelem 1048576";
@@ -370,7 +424,7 @@ if ($ext eq "txt") {
     "table inet propolis {", "\tset $s4 {", "\t\ttype ipv4_addr", "\t}",
     "\tset $s6 {", "\t\ttype ipv6_addr", "\t}", "}",
     "flush set inet propolis $s4", "flush set inet propolis $s6");
-  for my $f ([$s4, \&v4], [$s6, \&v6]) {
+  for my $f ([$s4, \&v4], [$s6, \&v6_listed]) {
     my ($set, $ok) = @$f;
     next unless defined $l[$i] && $l[$i] eq "add element inet propolis $set {";
     $i++;
@@ -387,15 +441,18 @@ if ($ext eq "txt") {
   $i == @l or bad("line " . ($i + 1) . " is past the end of what the publisher writes");
 } elsif ($ext eq "rpz") {
   want("; Propolis RPZ - $name tier", "title line");
+  # The serial is the build hour the Generated line states, as YYYYMMDDHH. Any ten digits would
+  # admit a serial no resolver loads (it has to fit 32 bits).
+  my $serial = ($l[$i] // "") =~ /\A; Generated: ([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):/ ? "$1$2$3$4" : "";
   want_re(qr/\A; Generated: $TS\z/, "Generated line");
   want("\$TTL 300", "TTL line");
-  want_re(qr/\A\@ IN SOA localhost\. hostmaster\.localhost\. [0-9]{10} 3600 600 86400 300\z/, "SOA record");
+  want("\@ IN SOA localhost. hostmaster.localhost. $serial 3600 600 86400 300", "SOA record with the build hour as its serial");
   want("\@ IN NS localhost.", "NS record");
   rest_are(sub {
     my $t = $_[0];
     return 1 if $t =~ /\A32\.($OCTET)\.($OCTET)\.($OCTET)\.($OCTET)\.rpz-ip CNAME \.\z/ && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256;
-    return $t =~ /\A128(?:\.(?:[0-9a-f]{1,4}|zz)){1,8}\.rpz-ip CNAME \.\z/;
-  }, "an address trigger");
+    return $t =~ /\A(128\.[0-9a-fz.]+)\.rpz-ip CNAME \.\z/ && rpz6_owner($1);
+  }, "an address trigger as the publisher writes it");
 } else {
   bad("has no content rule; add one before publishing a new format");
 }

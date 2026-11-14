@@ -18,6 +18,9 @@ use super::format_timestamp;
 /// 203.0.113.7
 /// ```
 ///
+/// The list is `super::listed_addresses`: an IPv4-mapped IPv6 address is written as the IPv4
+/// address it maps, once, and `Entries` counts the lines that follow it.
+///
 /// `tier_name` is a bare, caller-supplied label ("aggressive"/"standard", matching the JSON
 /// exporter's `meta.tier` and the publisher's per-tier file names); only this function's header
 /// line capitalizes it for human readability. `generated` and `valid_until` are explicit
@@ -28,15 +31,16 @@ pub fn export_plaintext(
     valid_until: DateTime<Utc>,
     entries: &[FeedEntry],
 ) -> String {
+    let addresses = super::listed_addresses(entries);
     let mut out = format!(
         "# Propolis blocklist - {} tier\n# Generated: {}\n# Valid until: {}\n# Entries: {}\n",
         titlecase(tier_name),
         format_timestamp(generated),
         format_timestamp(valid_until),
-        entries.len(),
+        addresses.len(),
     );
-    for entry in entries {
-        out.push_str(&entry.source_ip.to_string());
+    for ip in addresses {
+        out.push_str(&ip.to_string());
         out.push('\n');
     }
     out

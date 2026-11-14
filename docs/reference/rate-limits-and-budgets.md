@@ -188,16 +188,22 @@ operator approval; short-circuits on the first hold
 | 3 | Disabled | `!config.enabled` | vendor off unless enabled + non-empty key |
 | 4 | Stale | no tier earned within the freshness window, or ever, measured on `IpScore::tier_earned_at` (the last time an established event left the address eligible and tiered), not on `last_seen` | 48 h *(hard-coded, vendor-agnostic)* (`crates/review/src/gatekeeper.rs#FRESHNESS_WINDOW_HOURS`) |
 | 5 | Cooldown | prior SUCCESSFUL submit for this (ip, vendor) within `cooldown_hours` | 24 h |
-| 6 | Stale | nothing new: the tier was last earned at or before this vendor's last successful submit | always on |
+| 6 | Stale | nothing new: the stored earned time is at or before the earned time this vendor's last successful submit was sent for (`vendor_submission.earned_at`; a row from before review migration 0010 has none and is compared with its `submitted_at`) | always on |
 | 7 | RateLimit | vendor-WIDE successful submits within `rate_window_hours` `>= rate_limit` | 100 per 1 h |
 | 8 | ScoreFloor | `current_score.raw_score < floor` | `None` (no extra floor) |
 | 9 | CategoryFilter | no breakdown key matches configured filter | `None` (any category) |
 
-After the cooldown, a new report needs the tier to have been earned again since the last
-report this vendor accepted, so one burst of activity is one report per vendor rather than one
-per cooldown for as long as anything keeps naming the address. An earned time ahead of the
-clock is read as now. An address on the operator delist (`PROPOLIS_FEED_DELIST`) is held by the
-submission runner before the gate runs and counted as `delisted` with the latch
+After the cooldown, a new report needs the tier to have been earned again after the earned
+time the last accepted report covered. Activity that stops is reported once per vendor;
+activity that goes on after a report is reported once more when the cooldown ends, if it is
+still inside the freshness window, rather than once per cooldown for as long as anything keeps
+naming the address. While the cooldown runs the pass summary counts the address under
+`cooldown`, after it under `stale` until the tier is earned again. Both sides of that
+comparison are earned times, an event's own timestamp, so a sensor clock that runs a little
+fast or slow cannot make one burst look new or hide a real return; comparing with the time the
+report was sent, the node's clock, could. An earned time ahead of the clock is read as now. An
+address on the operator delist (`PROPOLIS_FEED_DELIST`) is held by the submission runner
+before the gate runs and counted as `delisted` with the latch
 (`crates/review/src/submit.rs#SubmissionRunner::with_delist`).
 
 Runtime defaults for both the `review` binary and `propolis`:

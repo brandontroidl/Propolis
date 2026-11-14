@@ -260,10 +260,19 @@ pub fn apply_event(
     // the tier again can extend it. An event that adds nothing earns nothing either: a repeat
     // inside the dedup window, or an overflow summary, which proves nothing about the address it
     // names.
+    //
+    // A clock never moves back. The anchor does not move back either, but a row can carry a
+    // clock ahead of its anchor: before the anchor was a running maximum it was the time of the
+    // last event read, and migration 0027 seeds the clocks from the latest established sighting,
+    // which on a row whose events were read out of order is later than that. Earning the tier
+    // at such an anchor keeps the later clock.
     if !deduped && !unattributed && next.recommended_for_vendor {
+        let held = Some(next.decay_anchor);
         match next.tier {
-            Some(FeedTier::Aggressive) => next.aggressive_earned_at = Some(next.decay_anchor),
-            Some(FeedTier::Standard) => next.standard_earned_at = Some(next.decay_anchor),
+            Some(FeedTier::Aggressive) => {
+                next.aggressive_earned_at = next.aggressive_earned_at.max(held);
+            }
+            Some(FeedTier::Standard) => next.standard_earned_at = next.standard_earned_at.max(held),
             None => {}
         }
     }
@@ -992,22 +1001,62 @@ mod tests {
     }
 
     #[test]
-    fn a_late_event_earns_as_of_the_anchor_and_never_moves_a_clock_back() {
+    fn a_late_event_earns_as_of_the_anchor_and_not_of_its_own_time() {
         let t = ts("2026-09-01T00:00:00Z");
         let listed = aggressive_at(t);
-        let earned = t + Duration::minutes(1);
-        // A line from an hour before the anchor, read late. The row is derived at the anchor, so
-        // that is when the tier is held.
+        // Twelve hours on, a weak probe: 25 left of the score plus 20, no tier. It moves the
+        // anchor and leaves the clock where the tier was last earned.
+        let anchor = t + Duration::hours(12);
+        let weak = event_at(SignalType::PortScan, Protocol::Tcp, false, anchor);
+        let s = apply_event(Some(listed), &weak, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.tier, None);
+        assert_eq!(s.aggressive_earned_at, Some(t + Duration::minutes(1)));
+
+        // An upload from an hour before the anchor, read late: worth 71 at the anchor, which
+        // takes the score back over 90. The row is derived at the anchor, so that is when the
+        // tier is held: not the line's own time, and not the time it was earned before.
         let late = event_at(
-            SignalType::HoneypotLoginAttempt,
+            SignalType::HoneypotMalwareUpload,
             Protocol::Tcp,
             true,
-            t - Duration::hours(1),
+            anchor - Duration::hours(1),
         );
-        let s = apply_event(Some(listed), &late, HALF_LIFE, false, 1, 1);
-        assert_eq!(s.decay_anchor, earned);
-        assert_eq!(s.aggressive_earned_at, Some(earned));
-        assert_eq!(s.established_last_seen, Some(earned), "a running maximum");
+        let s = apply_event(Some(s), &late, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.tier, Some(FeedTier::Aggressive));
+        assert_eq!(s.decay_anchor, anchor);
+        assert_eq!(s.aggressive_earned_at, Some(anchor));
+        assert_eq!(s.established_last_seen, Some(anchor), "a running maximum");
+    }
+
+    #[test]
+    fn a_clock_ahead_of_the_anchor_is_not_moved_back() {
+        // What migration 0027 leaves on a row an earlier version read out of order: the anchor
+        // is the time of the last event read, the clock the latest established sighting.
+        let t = ts("2026-09-01T00:00:00Z");
+        let mut listed = aggressive_at(t);
+        let seeded = t + Duration::minutes(10);
+        listed.established_last_seen = Some(seeded);
+        listed.aggressive_earned_at = Some(seeded);
+        assert_eq!(listed.decay_anchor, t + Duration::minutes(1));
+
+        // A lagging sensor's upload from between the two earns the tier at its own time, which
+        // is now the anchor and is still behind the clock.
+        let between = t + Duration::minutes(2);
+        let upload = event_at(
+            SignalType::HoneypotMalwareUpload,
+            Protocol::Tcp,
+            true,
+            between,
+        );
+        let s = apply_event(Some(listed), &upload, HALF_LIFE, false, 1, 1);
+        assert_eq!(s.tier, Some(FeedTier::Aggressive));
+        assert!(s.recommended_for_vendor);
+        assert_eq!(s.decay_anchor, between);
+        assert_eq!(
+            s.aggressive_earned_at,
+            Some(seeded),
+            "earning the tier again cannot shorten the listing it already has"
+        );
     }
 
     #[test]

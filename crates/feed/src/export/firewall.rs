@@ -20,7 +20,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 
 use crate::FeedEntry;
 
-use super::format_timestamp;
+use super::{format_timestamp, listed_addresses};
 
 /// The entries split by family, each sorted and without repeats.
 ///
@@ -154,24 +154,27 @@ fn nft_elements<A: std::fmt::Display>(
 /// A pf table file: one address per line, both families in the one table, `#` comments. Loaded
 /// with `table <name> persist file "FILE"` and refreshed with `pfctl -t <name> -T replace -f
 /// FILE`, which removes what the file no longer lists. An empty feed is the two header lines.
+/// An IPv4-mapped IPv6 address is written as the IPv4 address it maps, which is the one pf can
+/// match (see `listed_addresses`).
 pub fn export_pf(tier_name: &str, generated: DateTime<Utc>, entries: &[FeedEntry]) -> String {
     let mut out = format!(
         "# Propolis blocklist - {} tier\n# Generated: {}\n",
         tier_name,
         format_timestamp(generated),
     );
-    for entry in entries {
-        out.push_str(&entry.source_ip.to_string());
+    for ip in listed_addresses(entries) {
+        out.push_str(&ip.to_string());
         out.push('\n');
     }
     out
 }
 
-/// A pfSense / OPNsense URL Table alias source: bare addresses, one per line, both families.
+/// A pfSense / OPNsense URL Table alias source: bare addresses, one per line, both families,
+/// IPv4-mapped IPv6 addresses as IPv4 like the pf table.
 pub fn export_pfsense_alias(_tier_name: &str, entries: &[FeedEntry]) -> String {
     let mut out = String::new();
-    for entry in entries {
-        out.push_str(&entry.source_ip.to_string());
+    for ip in listed_addresses(entries) {
+        out.push_str(&ip.to_string());
         out.push('\n');
     }
     out
@@ -187,8 +190,11 @@ pub fn export_pfsense_alias(_tier_name: &str, entries: &[FeedEntry]) -> String {
 /// The file is a complete zone: an SOA and an NS record, without which a resolver will not load
 /// it, then the triggers. Owner names are relative, so the zone's name is whatever the consumer
 /// gives it. An empty feed is the SOA and NS alone, a valid empty zone. The serial is the build
-/// hour as `YYYYMMDDHH`: it rises with every hourly build and reveals nothing finer than the hour
-/// the other formats already state.
+/// hour as `YYYYMMDDHH`, which reveals nothing finer than the hour the other formats already
+/// state. Builds run more often than hourly, so two builds with different contents can carry the
+/// same serial: a resolver has to reload the zone from the file (`rndc reload`), and one that
+/// decides by serial alone (a secondary, a zone transfer) follows only at the next hour. A serial
+/// that counted builds would say when within the hour each one ran.
 pub fn export_rpz(tier_name: &str, generated: DateTime<Utc>, entries: &[FeedEntry]) -> String {
     let (v4, v6) = families(entries);
     let hour = crate::coarsen_to_hour(generated);

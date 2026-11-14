@@ -1789,6 +1789,85 @@ async fn queue_sort_by_first_seen_orders_oldest_first(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_queue_row_rests_on_the_last_connection_and_the_tier_that_was_earned(pool: PgPool) {
+    migrate(&pool).await;
+    // Both earned a tier on the same recipe; the first made its last connection an hour ago
+    // and the second ten minutes ago.
+    let (older, newer) = ("203.0.113.44", "203.0.113.45");
+    seed_recommended(&pool, older, 3600).await;
+    seed_recommended(&pool, newer, 600).await;
+    ReviewQueue::new()
+        .offering_reserved_addresses()
+        .populate(&pool)
+        .await
+        .unwrap();
+    // A datagram names the older one a second ago: its sender chose that address. And its
+    // score has fallen below every tier, as it does by decay or after one later low-weight
+    // connection: the page derives the live tier from the score, and that is now none.
+    append_event(
+        &pool,
+        ev(
+            older,
+            "dns-sensor",
+            SignalType::HoneypotConnection,
+            Protocol::Udp,
+            false,
+            &(chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+        ),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ip_score SET raw_score = 10, tier = NULL WHERE source_ip = $1::inet")
+        .bind(older)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (last_seen, last_connection, aggressive): (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT last_seen, established_last_seen, aggressive_earned_at IS NOT NULL \
+         FROM ip_score WHERE source_ip = $1::inet",
+    )
+    .bind(older)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        last_seen - last_connection > chrono::Duration::minutes(50),
+        "precondition: the datagram moved last_seen and not the last connection"
+    );
+
+    let state = test_state(pool);
+    let (_, body) = get_page(state, "/queue?sort=last_seen").await;
+    let at = |ip: &str| {
+        body.find(&format!(r#"<tr id="row-{ip}""#))
+            .unwrap_or_else(|| panic!("{ip} is listed: {body}"))
+    };
+    assert!(
+        at(newer) < at(older),
+        "most recent connection first: a datagram does not lift a candidate up the list"
+    );
+    let row = &body[at(older)..];
+    let row = &row[..row.find("</tr>").unwrap()];
+    let pill = if aggressive {
+        r#"<span class="tier tier-aggressive">Aggressive</span>"#
+    } else {
+        r#"<span class="tier tier-standard">Standard</span>"#
+    };
+    assert!(
+        row.contains(pill) && row.contains(r#"title="earned "#),
+        "the tier it earned and when, not the tier its score holds now: {row}"
+    );
+    let last = format!("last {}", last_connection.format("%Y-%m-%d %H:%M"));
+    assert!(
+        row.contains(&last),
+        "active until the last connection ({last}), not the datagram: {row}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn queue_page_empty_state_is_contextual(pool: PgPool) {
     migrate(&pool).await;
     let state = test_state(pool);

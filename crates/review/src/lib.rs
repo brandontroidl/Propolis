@@ -21,7 +21,9 @@ pub mod virustotal;
 pub mod volume;
 
 pub use cli::{Cli, CliError, Command};
-pub use gatekeeper::{CooldownBook, GateReason, GateResult, VendorConfig, check, check_with};
+pub use gatekeeper::{
+    CooldownBook, GateReason, GateResult, LastReport, VendorConfig, check, check_with,
+};
 pub use queue::{QueueEntry, ReviewError, ReviewQueue};
 pub use submit::{HeldBreakdown, SubmissionRunner, SubmitError, SubmitResult};
 pub use vendor::{

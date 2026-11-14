@@ -77,7 +77,7 @@ debug level.
 | 3 | `Disabled` | vendor not enabled (or empty key forced it off) |
 | 4 | `Stale` | the address has not earned a tier within the 48h freshness window, or ever (measured on the last time it earned a tier, not on `last_seen`) |
 | 5 | `Cooldown` | a prior successful report to this vendor for this IP within `cooldown_hours` (default 24) |
-| 6 | `Stale` | the cooldown is over but the address has earned nothing since this vendor last accepted a report about it |
+| 6 | `Stale` | the cooldown is over but the address has not earned a tier after the earned time the last report this vendor accepted was sent for |
 | 7 | `RateLimit` | vendor-wide successful reports within `rate_window_hours` reached `rate_limit` (default 100/1h) |
 | 8 | `ScoreFloor` | below `score_floor` (default none) |
 | 9 | `CategoryFilter` | category filter set and no match (default none) |
@@ -85,8 +85,10 @@ debug level.
 
 A vendor is only reached for an IP approved in the review queue, which offers only an
 address that is eligible (confirmed-real) and has earned a tier, and the gate then holds it
-as `Stale` unless it earned a tier within the last 48 hours and since this vendor's last
-successful report. So one burst of activity produces one report per vendor, and an
+as `Stale` unless it earned a tier within the last 48 hours and after the earned time this
+vendor's last successful report covered. So activity that stops produces one report per
+vendor, activity that goes on after a report produces one more when the cooldown ends (while
+the pass counts it under `cooldown`, then under `stale` until it earns a tier again), and an
 approved address that has been named since only by datagrams, or by weak connections that
 left it below its tier, is not reported again. A bare volume-flood IP can be blocklisted
 locally, once approved as a volume candidate, but is never reported upstream: the
@@ -188,11 +190,15 @@ installed, so a push that has never succeeded is reported rather than read as
   publisher writes for that format). Each refusal names the file and ends
   "refusing to push"; one that names a link, an unexpected file or a line that "is
   not what the publisher writes" means something other than the publisher wrote
-  there, so investigate the daemon before clearing it. Run
-  `deploy/blocklist-sync.sh --check` to repeat the checks without pushing. A refusal
-  right after an upgrade that names every file of one format means the installed
-  script and the daemon are from different versions: re-run the upgrade so both are
-  replaced.
+  there, so investigate the daemon before clearing it. The exception is a `.hosts`
+  file right after an upgrade, which the old daemon wrote:
+  `blocklist-sync: unexpected entry aggressive.hosts in <feed dir> - refusing to push`
+  happens once if the sync runs between `upgrade.sh` installing the new script and
+  the upgraded daemon's first build, and clears by itself at that build. The reverse,
+  `blocklist-sync: <feed>.hosts missing from <feed dir> - malformed feed output -
+  refusing to push` (the feed it names varies), means the installed script is older
+  than the daemon: re-run the upgrade so both are replaced. Run
+  `deploy/blocklist-sync.sh --check` to repeat the checks without pushing.
 - `feed-push-stale` firing while pushes succeed: the log says "could not update
   push marker". `/var/lib/propolis/blocklist-status` must exist (re-run
   `deploy/provision.sh`), be owned by `propolis-blocklist` (a root cron drops to

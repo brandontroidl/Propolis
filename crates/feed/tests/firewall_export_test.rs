@@ -265,6 +265,44 @@ fn pf_and_the_alias_list_every_address_of_both_families_one_per_line() {
     assert_eq!(export_pf("standard", generated(), &[]).lines().count(), 2);
 }
 
+#[test]
+fn every_address_list_writes_a_mapped_address_as_the_ipv4_address_it_is_and_once() {
+    // `::ffff:45.10.30.7` is the IPv4 host 45.10.30.7 as a dual-stack socket saw it. Given the
+    // mapped form, pf and pfSense hold an IPv6 table entry that no IPv4 packet matches, and the
+    // host the entry was listed for is not blocked. It is written as IPv4, in feed order, and
+    // once where the plain form is listed too.
+    let list = mixed();
+    assert_eq!(
+        export_pf("aggressive", generated(), &list),
+        "# Propolis blocklist - aggressive tier\n\
+         # Generated: 2026-07-29T14:00:00Z\n\
+         45.10.30.7\n\
+         45.10.30.90\n\
+         2003:aaaa:bbbb::7\n\
+         45.10.31.1\n"
+    );
+    assert_eq!(
+        export_pfsense_alias("aggressive", &list),
+        "45.10.30.7\n45.10.30.90\n2003:aaaa:bbbb::7\n45.10.31.1\n"
+    );
+    assert_eq!(
+        feed::export::export_cidr(&list),
+        "45.10.30.7/32\n45.10.30.90/32\n2003:aaaa:bbbb::7/128\n45.10.31.1/32\n"
+    );
+    assert_eq!(
+        feed::export::export_plaintext("aggressive", generated(), generated(), &list),
+        "# Propolis blocklist - Aggressive tier\n\
+         # Generated: 2026-07-29T14:00:00Z\n\
+         # Valid until: 2026-07-29T14:00:00Z\n\
+         # Entries: 4\n\
+         45.10.30.7\n\
+         45.10.30.90\n\
+         2003:aaaa:bbbb::7\n\
+         45.10.31.1\n",
+        "the count is of the lines that follow it"
+    );
+}
+
 // ---------- across the formats ----------
 
 #[test]

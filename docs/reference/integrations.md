@@ -154,10 +154,11 @@ that short-circuits on the first hold (`crates/review/src/gatekeeper.rs#check`,
 `crates/review/src/gatekeeper.rs#check_with`): **Reserved** (reserved-range IP, first and not
 overridable) -> **Delisted** -> **Disabled** -> **Stale** (no tier earned within the 48 h
 freshness window, or ever; measured on the last time the address earned a tier, not on
-`last_seen`) -> **Cooldown** -> **Stale** again (nothing earned since this vendor last accepted
-a report about the address) -> **RateLimit** -> **ScoreFloor** -> **CategoryFilter**. One burst
-of activity is therefore one report per vendor. Exact values and the full
-sequence are owned by
+`last_seen`) -> **Cooldown** -> **Stale** again (no tier earned after the earned time the last
+report this vendor accepted was sent for) -> **RateLimit** -> **ScoreFloor** ->
+**CategoryFilter**. Activity that stops is therefore reported once per vendor; activity that goes
+on after a report is reported once more when the cooldown ends, if it is still inside the
+freshness window. Exact values and the full sequence are owned by
 [rate-limits-and-budgets.md](rate-limits-and-budgets.md#vendor-submission-gatekeeper).
 
 An address on the operator allowlist (`PROPOLIS_FEED_ALLOWLIST`, its file, and
@@ -184,7 +185,9 @@ could carry a WAN vantage address - confirmed by reading all three
 The report comment is
 `"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,
 and `evidence_window = (first_seen, established_last_seen)` (`crates/review/src/submit.rs#build_report`).
-The end of the window, the attack time a vendor is told, is the address's last established
+`N` is `established_event_count`, the address's completed TCP connections: the stored
+`event_count` also counts every datagram that named the address, and the comment is public on
+OTX. The end of the window, the attack time a vendor is told, is the address's last established
 (completed-TCP) sighting, never `last_seen`, which a datagram under a forged source moves; `last_seen`
 stands in only for a row with no established sighting, which the gate never passes. `first_seen` is
 the row's first sighting of any kind. The protocol label that picks each vendor's category codes is

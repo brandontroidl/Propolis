@@ -225,10 +225,12 @@ review queue, and the report must pass the gatekeeper.
   it was approved before the list covered it. The lists are read once at startup.
 - **Gatekeeper.** An ordered sequence of checks that stops at the first hold: reserved
   address, delisted, vendor disabled, stale (no tier earned within 48 hours, or ever), a
-  successful report to this vendor within the cooldown, stale again (nothing earned since
-  this vendor's last successful report), the vendor-wide rate limit, the score floor, and
-  the category filter (`crates/review/src/gatekeeper.rs#check_with`). So one burst of
-  activity is one report per vendor, not one per cooldown. A database error during a check holds the report. A pass reads every
+  successful report to this vendor within the cooldown, stale again (no tier earned after
+  the earned time this vendor's last successful report was sent for, which the report's
+  `vendor_submission.earned_at` records), the vendor-wide rate limit, the score floor, and
+  the category filter (`crates/review/src/gatekeeper.rs#check_with`). So activity that
+  stops is reported once per vendor, and activity that goes on after a report once more
+  when the cooldown ends, not once per cooldown. A database error during a check holds the report. A pass reads every
   pair's latest successful report in one query up front
   (`crates/review/src/gatekeeper.rs#CooldownBook`) instead of one lookup per address and
   vendor; the decisions are the same, and if that read fails the checks query pair by pair.
@@ -240,7 +242,8 @@ review queue, and the report must pass the gatekeeper.
 - **What a report contains.** The source IP, category codes, a comment and the evidence
   window. The attack time a vendor is told is the address's last established sighting,
   and the protocol label that picks category codes is read from established events only,
-  so a forged datagram can neither re-date a report nor change its categories. No WAN
+  so a forged datagram can neither re-date a report nor change its categories. The event
+  count in the comment is the count of completed TCP connections. No WAN
   address, score, confidence or sample body is included, and passwords were dropped at
   the sensor.
 

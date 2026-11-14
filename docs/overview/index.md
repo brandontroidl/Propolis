@@ -31,7 +31,7 @@ sets out the boundaries this depends on.
 
 Score-based tier entries and every vendor report wait in the review queue for you to
 approve, reject or snooze them. A source that has completed a thousand or more TCP
-connections and was seen in the last day is offered separately, as a volume candidate,
+connections, the last of them in the last day, is offered separately, as a volume candidate,
 so a flood can be blocked even when it never tried a login. It is added to the
 retention feeds only when you approve it, and it is never reported to a vendor on
 volume alone. By default nothing is published without your decision. The one opt-in is

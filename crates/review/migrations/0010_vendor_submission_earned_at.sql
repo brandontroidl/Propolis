@@ -1,0 +1,14 @@
+-- What an accepted report covered.
+--
+-- The vendor gate sends a second report about an address only if the address has earned its
+-- tier again since the last report the vendor accepted. It asked that by comparing the earned
+-- time (`ip_score.aggressive_earned_at` / `standard_earned_at`, which is an event's own
+-- timestamp: the sensor's clock) with `submitted_at` (this node's clock). A sensor whose clock
+-- runs a little ahead dates a burst after the report that was sent about it, so the same burst
+-- went out again after every cooldown for as long as the freshness window stayed open; one
+-- whose clock runs behind hid a real return.
+--
+-- `earned_at` is the earned time the accepted report was sent for, as stored at that moment, so
+-- the gate compares the column with itself. NULL on a row that was not accepted and on every row
+-- written before this migration; for those the gate still compares with `submitted_at`.
+ALTER TABLE vendor_submission ADD COLUMN earned_at TIMESTAMPTZ;

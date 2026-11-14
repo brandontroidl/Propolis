@@ -959,3 +959,43 @@ async fn an_address_on_the_operator_delist_is_not_offered(pool: PgPool) {
     assert_eq!(state_of(&pool, delisted).await, None);
     assert_eq!(state_of(&pool, other).await, Some(ReviewState::Pending));
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_pending_candidate_the_operator_then_excludes_is_withdrawn(pool: PgPool) {
+    // Offered first, excluded afterwards: added to PROPOLIS_FEED_DELIST, or to the allowlist.
+    // The feed publishes neither, so the row left on the Volume tab was an approval that could
+    // never take effect. A decision already made is not undone by the scan.
+    migrate(&pool).await;
+    let delisted = "192.0.2.94";
+    let allowlisted = "192.0.2.95";
+    let approved = "192.0.2.96";
+    let untouched = "192.0.2.97";
+    for ip in [delisted, allowlisted, approved, untouched] {
+        seed_flood(&pool, ip).await;
+    }
+    assert_eq!(queue().populate(&pool).await.unwrap(), 4);
+    queue()
+        .approve(&pool, approved.parse().unwrap(), None)
+        .await
+        .unwrap();
+
+    let delist: std::collections::HashSet<std::net::IpAddr> =
+        [delisted.parse().unwrap(), approved.parse().unwrap()]
+            .into_iter()
+            .collect();
+    let allowlist = Arc::new(OperatorAllowlist::new(vec![
+        "192.0.2.95/32".parse().unwrap(),
+    ]));
+    let excluding = queue()
+        .with_delist(std::sync::Arc::new(delist))
+        .with_allowlist(allowlist);
+    assert_eq!(excluding.withdraw(&pool).await.unwrap(), 2);
+    assert_eq!(state_of(&pool, delisted).await, None);
+    assert_eq!(state_of(&pool, allowlisted).await, None);
+    assert_eq!(state_of(&pool, approved).await, Some(ReviewState::Approved));
+    assert_eq!(state_of(&pool, untouched).await, Some(ReviewState::Pending));
+
+    // And it is not offered again while the exclusion stands.
+    assert_eq!(excluding.populate(&pool).await.unwrap(), 0);
+    assert_eq!(state_of(&pool, delisted).await, None);
+}

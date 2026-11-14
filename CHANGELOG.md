@@ -234,7 +234,8 @@
 - **The first start on this version is slower on a large ledger** - core-scoring migrations `0021`
   to `0027` build indexes on `event`, `ip_score` and `attack_tag`, fill the new hourly
   roll-up table from the ledger, and (`0027`) scan the event table once to backfill
-  `ip_score.established_last_seen` and build the partial index `event_dedup_tcp_idx`, holding a lock that blocks writes to `event` (reads proceed)
+  `ip_score.established_last_seen` and once more for each of the partial indexes
+  `event_dedup_tcp_idx` and `event_source_category_tcp_idx`, holding a lock that blocks writes to `event` (reads proceed)
   while they run, before intake starts. On a ledger of 7.5M events plan on up to a few minutes
   of extra start-up `[estimated from 1,500,000 events: about 6 s per index build and a few
   seconds for the roll-ups]`; later starts are unaffected. See
@@ -265,9 +266,10 @@
   and `last_seen` follow that time. A later weak event neither removes nor extends an entry,
   and a Pending review candidate is no longer withdrawn by one. The vendor gate now holds an
   address that is delisted (`held_by` gains `delisted`), or that has not earned a tier within
-  48 h, or has earned nothing since the vendor last accepted a report about it: one burst of
-  activity is one report per vendor. `PROPOLIS_FEED_DELIST` now also holds an address out of
-  review and vendor reporting. What to expect and do:
+  48 h, or has not earned a tier again since the earned time covered by the last report the
+  vendor accepted: activity that stops is reported once, and activity that goes on after a
+  report is reported once more when the cooldown ends. `PROPOLIS_FEED_DELIST` now also holds
+  an address out of review and vendor reporting. What to expect and do:
   - **Stop every node that shares one database, and upgrade them together.** Core-scoring
     migration `0027` adds `ip_score.established_last_seen`, `aggressive_earned_at` and
     `standard_earned_at`; an old binary keeps writing rows without them, and refuses to start
@@ -276,6 +278,10 @@
     `feed.env` into `review.env`.** The standalone `review` binary now reads it; without it an
     address you delisted is still offered for review and reported. The unified daemon passes
     its own value through.
+  - **Give every node that shares one database the same `PROPOLIS_FEED_DELIST`.** The review
+    queue and vendor reporting are shared tables, but each process reads the list itself: a
+    node without an entry offers the address for review again at each scan after another node
+    withdrew it, and its submission runner reports an Approved address the other node holds.
   - **Expect a shorter feed and review queue at the first build and scan.** The migration
     backfills `established_last_seen` exactly from the ledger's TCP rows. Rows that were
     eligible only because a non-TCP event was their second event lose `eligible` and
@@ -288,8 +294,11 @@
     stored score may still hold weight datagrams added before the upgrade; it decays with the
     usual six-hour half-life. Nothing rebuilds stored projections.
   - **Expect fewer vendor reports.** An approved address that used to be re-reported every
-    cooldown for as long as anything kept naming it is now reported once per burst, and is
-    counted in `held_by` as `stale` in between
+    cooldown for as long as anything kept naming it is now reported again only if it has
+    earned a tier since the earned time the last accepted report covered, and while that is
+    inside the 48 h freshness window. While the cooldown runs it is counted in `held_by` as
+    `cooldown`, after it as `stale` until it earns a tier again. Review migration `0010` adds
+    `vendor_submission.earned_at` for this, one `ADD COLUMN` that takes no time
   ([rules](docs/reference/scoring-and-feed.md#established-and-forgeable-events),
   [gate](docs/reference/rate-limits-and-budgets.md#vendor-submission-gatekeeper)).
 
@@ -308,10 +317,13 @@
   - The first push after the upgrade removes every `*.hosts` file from the public repository, and
     from then on any file a build no longer has. `upgrade.sh` installs the new
     `blocklist-sync.sh` with the daemon; a script and a daemon from different versions refuse
-    every build ("is not what the publisher writes"), because the script now reads each file
-    back and holds it to its format. A publishing run that lands before the daemon's first
-    build after the upgrade refuses the old build once (it still holds `.hosts` files); the
-    next run publishes.
+    every build, because the format list no longer has `hosts`. A publishing run that lands
+    between `upgrade.sh` installing the script and the upgraded daemon's first build refuses
+    the old build once with `blocklist-sync: unexpected entry aggressive.hosts in <feed dir> -
+    refusing to push`, and clears by itself at the daemon's next build. An old script left
+    in place refuses every build of the new daemon with `blocklist-sync: <feed>.hosts missing
+    from <feed dir> - malformed feed output - refusing to push` (which feed it names varies):
+    re-run the upgrade so both are replaced.
   - Commits to the public repository are now made as the identity set in that checkout, or a
     fixed neutral one if none is set, and are dated to the build hour in UTC. If you relied on
     the account's global git identity, set it in the checkout: `git -C <checkout> config
@@ -782,8 +794,12 @@
   (`crates/feed/src/export/firewall.rs#export_ipset`); `.rpz` is a whole zone with `32.` and
   `128.` trigger names for both families
   (`crates/feed/src/export/firewall.rs#export_rpz`). An IPv4-mapped IPv6 address is listed as
-  the IPv4 address it is. Each output was applied with the tool itself: nftables 1.0.9, ipset
-  7.19 with iptables rules using the sets, and BIND 9.18 as a response policy zone.
+  the IPv4 address it is, now in `.pf`, `.alias`, `.cidr` and `.txt` too, once even if the plain
+  form is listed as well (`crates/feed/src/export/mod.rs#listed_addresses`; `.txt`'s `Entries`
+  counts the lines that follow): a pf or pfSense consumer held an IPv6 table entry that no IPv4
+  packet matches and did not block the host. `.json` and `.csv` keep each entry under the
+  address it was recorded with. Each output was applied with the tool itself: nftables 1.0.9,
+  ipset 7.19 with iptables rules using the sets, and BIND 9.18 as a response policy zone.
 - **The `.hosts` feed file is no longer published** - it mapped `d.c.b.a.in-addr.arpa` names to
   `0.0.0.0`, which blocks no traffic to or from an address, and was described as a DNS sinkhole.
 - **The published repository no longer keeps files a build has dropped** -
@@ -803,8 +819,14 @@
   copy is now read back and must be, line for line, what the publisher writes for that format:
   its fixed header, the feed's own set and table names, addresses of the right family, and
   hour-boundary timestamps (`deploy/blocklist-sync.sh#check_content`). `manifest.json` is held to
-  its shape and to the retention windows actually present. A test publishes real builds through
-  the same check, so the two cannot drift apart unnoticed.
+  its shape and to the retention windows actually present. The check also refuses text that only
+  means the same as what the publisher writes (`deploy/blocklist-sync.sh#CHECK_CONTENT_PL`): a
+  number with a leading zero (`"count":01` is not JSON), a timestamp without a real month, day
+  and hour, an RPZ serial other than the build hour the file's `Generated` line states, an IPv6
+  address or RPZ trigger name not spelt exactly as the publisher spells it, and an IPv4-mapped
+  address in any list or firewall file. None of that was a firewall command, but each would
+  have broken every consumer's parser, resolver or set for as long as it stood. A test
+  publishes real builds through the same check, so the two cannot drift apart unnoticed.
 
 - **An approved address is no longer reported to every vendor again each cooldown for as long as
   anything names it** - the gatekeeper's freshness check ran on `last_seen`, which any sighting
@@ -812,10 +834,21 @@
   So an approved address was re-reported every 24 h for as long as any event kept `last_seen`
   within 48 h. `Stale` is now measured on the last time the address earned a tier
   (`IpScore::tier_earned_at`), and after the cooldown a new report needs the tier to have been
-  earned again since the last report the vendor accepted; a delisted address is held as the new
-  `Delisted` reason (`crates/review/src/gatekeeper.rs#check_with`). One burst of activity is now
-  one report per vendor
+  earned again after the earned time the last accepted report covered; a delisted address is
+  held as the new `Delisted` reason (`crates/review/src/gatekeeper.rs#check_with`). Activity
+  that stops is now reported once per vendor, and activity that goes on after a report once
+  more when the cooldown ends
   ([gate](docs/reference/rate-limits-and-budgets.md#vendor-submission-gatekeeper)).
+- **A sensor clock running a little fast no longer gets one burst reported after every
+  cooldown** - the gate asked whether the address had earned its tier again since the last
+  accepted report by comparing the earned time, an event's own timestamp (the sensor's clock),
+  with `submitted_at` (the node's clock). A sensor a little ahead dated a burst after the report
+  sent about it, so the same burst went out again after every cooldown while the freshness
+  window stayed open; one running behind hid a real return. An accepted report now records the
+  earned time it was sent for in `vendor_submission.earned_at` (review migration `0010`,
+  `crates/review/src/submit.rs#record_result`), and the gate compares the stored earned time
+  with that (`crates/review/src/gatekeeper.rs#check_with`). Rows written before the migration
+  have no `earned_at` and are still compared with `submitted_at`.
 - **A forged datagram no longer adds score weight, counts as the second sighting, or makes a real
   connection a duplicate** - a UDP or ICMP event carries whatever source its sender wrote, yet it
   added its signal weight, a category and an active day to the address it named, re-derived that
@@ -826,7 +859,16 @@
   events (`crates/core-scoring/src/scoring/eligibility.rs#eligible`), and the dedup read asks
   for the newest established event of the type
   (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`, the batch path and replay)
-  ([rules](docs/reference/scoring-and-feed.md#established-and-forgeable-events)).
+  ([rules](docs/reference/scoring-and-feed.md#established-and-forgeable-events)). An earned
+  clock never moves back, including on a row an earlier version left with its clock ahead of
+  its anchor (`crates/core-scoring/src/scoring/engine.rs#apply_event`).
+- **A forged datagram no longer changes what a published entry says** - in the feed's JSON and
+  CSV, `signals` came from events of any protocol and `events` from `event_count`, so one forged
+  UDP datagram naming a listed address added a signal type of the sender's choosing to its
+  entry and raised its count. Both now come from established events only
+  (`crates/feed/src/builder.rs#CATEGORIES_SQL`, `crates/feed/src/builder.rs#merit_candidates_sql`,
+  `crates/feed/src/builder.rs#volume_candidates_sql`). `first_seen` is still the first sighting
+  of any kind.
 - **A weak later event no longer ends a listing early or withdraws a pending candidate** - the
   feed published a tier entry only while the stored row had a tier, and every event re-derived
   that tier from the decayed score, so one low-weight line for an approved address that had been
@@ -844,6 +886,20 @@
   (`crates/feed/src/builder.rs#volume_candidates_sql`,
   `crates/review/src/volume.rs#VolumeQueue::withdraw`,
   `crates/core-scoring/src/scoring/tier.rs#recommended_by_volume`).
+- **A volume candidate the operator allowlist or delist covers no longer stays on the Volume
+  tab** - a Pending candidate whose address came under the allowlist or `PROPOLIS_FEED_DELIST`
+  after it was offered stayed listed, where approving it could never publish anything. The scan
+  now withdraws it; decided rows are untouched
+  (`crates/review/src/volume.rs#VolumeQueue::withdraw`).
+- **A datagram no longer makes a review candidate look freshly active** - the review queue's
+  Tier cell showed the tier the address's score held at that moment, which decay or one later
+  low-weight connection takes away, and the Active cell and the "last seen" sort ran on `last_seen`, which a datagram
+  naming the address moves, so anyone could lift a candidate to the top of that sort. The Tier
+  cell now shows the tier the address last earned, with "earned <time>" as its hover text
+  (`crates/console/src/routes/queue.rs#earned_tier`); the Active cell runs from the first
+  sighting to the last completed connection, and the sort orders by that connection
+  (`crates/console/src/routes/queue.rs#last_connection`,
+  `crates/console/src/routes/queue.rs#sort_pending`).
 - **`PROPOLIS_FEED_DELIST` now reaches review and vendor reporting** - the operator's delist took
   an address out of the feed only: it was still offered for review, and an approval given
   earlier kept reporting it to every vendor. An address on it is now not offered for review or as
@@ -855,7 +911,11 @@
   read from the newest event of each category of any protocol, so one forged DNS datagram could
   re-date a report and turn an SSH report into a generic one. The time is now the last
   established sighting (`crates/review/src/submit.rs#build_report`) and the label is read from
-  established events only (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`).
+  established events only (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`), through the new
+  partial index `event_source_category_tcp_idx` (migration `0027`): read from the index of every
+  event, the lookup stepped over every datagram at or after the address (138 ms against 0.08 ms
+  for an address with 200,000 datagrams behind it). The event count in the comment, public on
+  OTX, is now the established event count.
 - **One sender can no longer fill the catch-all's log over UDP** - the catch-all wrote one
   `catchall_probe` event for every UDP datagram it received, with no rate budget, and a UDP
   source address is whatever the sender wrote. A single host sending at line rate therefore

@@ -124,7 +124,34 @@ pub async fn check(
 pub struct CooldownBook {
     covered_ips: HashSet<IpAddr>,
     covered_vendors: HashSet<String>,
-    latest: HashMap<(IpAddr, String), DateTime<Utc>>,
+    latest: HashMap<(IpAddr, String), LastReport>,
+}
+
+/// The reports a vendor has accepted about an address, as far as the gate needs them: when the
+/// newest was sent, and how much of the address's activity they covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastReport {
+    /// When the newest accepted report was sent, by this node's clock. The cooldown runs on it.
+    pub submitted_at: DateTime<Utc>,
+    /// The latest earned time (`IpScore::tier_earned_at`) an accepted report was sent for, as it
+    /// was stored then. `None` when every accepted report predates the column
+    /// (`vendor_submission.earned_at`, migration 0010).
+    pub earned_at: Option<DateTime<Utc>>,
+}
+
+/// Both queries that read a pair's accepted reports select these two columns, so the book and
+/// the per-pair lookup cannot come to describe a pair differently.
+const LAST_REPORT_COLUMNS: &str = "MAX(submitted_at) AS latest, MAX(earned_at) AS earned";
+
+fn last_report(row: &sqlx::postgres::PgRow) -> Result<Option<LastReport>, sqlx::Error> {
+    let latest: Option<DateTime<Utc>> = row.try_get("latest")?;
+    Ok(match latest {
+        Some(submitted_at) => Some(LastReport {
+            submitted_at,
+            earned_at: row.try_get("earned")?,
+        }),
+        None => None,
+    })
 }
 
 impl CooldownBook {
@@ -144,12 +171,12 @@ impl CooldownBook {
         }
         let ip_texts: Vec<String> = ips.iter().map(ToString::to_string).collect();
         let vendor_names: Vec<&str> = vendors.to_vec();
-        let rows = sqlx::query(
-            "SELECT host(source_ip) AS source_ip, vendor, MAX(submitted_at) AS latest \
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT host(source_ip) AS source_ip, vendor, {LAST_REPORT_COLUMNS} \
              FROM vendor_submission \
              WHERE success = TRUE AND vendor = ANY($2) AND source_ip = ANY($1::text[]::inet[]) \
-             GROUP BY source_ip, vendor",
-        )
+             GROUP BY source_ip, vendor"
+        )))
         .bind(&ip_texts)
         .bind(&vendor_names)
         .fetch_all(pool)
@@ -163,15 +190,16 @@ impl CooldownBook {
                 book.covered_ips.clear();
                 return Ok(book);
             };
-            book.latest
-                .insert((ip, row.try_get("vendor")?), row.try_get("latest")?);
+            if let Some(report) = last_report(&row)? {
+                book.latest.insert((ip, row.try_get("vendor")?), report);
+            }
         }
         Ok(book)
     }
 
     /// `Some(latest)` when the book covers the pair (`latest` is `None` for a pair with no
     /// successful submission), `None` when it does not and the database must be asked.
-    pub fn latest_success(&self, ip: IpAddr, vendor: &str) -> Option<Option<DateTime<Utc>>> {
+    pub fn latest_success(&self, ip: IpAddr, vendor: &str) -> Option<Option<LastReport>> {
         if !self.covered_ips.contains(&ip) || !self.covered_vendors.contains(vendor) {
             return None;
         }
@@ -228,13 +256,24 @@ pub async fn check_with(
         Ok(last_success) => last_success,
         Err(reason) => return GateResult::Held(reason),
     };
-    if last_success.is_some_and(|last| now - last < Duration::hours(config.cooldown_hours as i64)) {
+    let cooldown = Duration::hours(config.cooldown_hours as i64);
+    if last_success.is_some_and(|last| now - last.submitted_at < cooldown) {
         return GateResult::Held(GateReason::Cooldown);
     }
     // The cooldown is over. Report again only if the address has earned its tier again since the
     // last report this vendor accepted: one burst of activity is one report, not one per
     // cooldown for as long as the freshness window stays open.
-    if last_success.is_some_and(|last| earned <= last) {
+    //
+    // "Since" is asked of the earned time itself: the stored one against the one the accepted
+    // report was sent for. Both are the same column, so both are the sensor's clock. Against
+    // the time the report was sent (this node's clock) a sensor running a little fast puts the
+    // very burst that was reported after its own report, and it went out again after every
+    // cooldown; one running slow hid a real return. Only a report from before the earned time
+    // was recorded is still compared with the time it was sent.
+    if last_success.is_some_and(|last| match last.earned_at {
+        Some(covered) => current_score.tier_earned_at() <= Some(covered),
+        None => earned <= last.submitted_at,
+    }) {
         return GateResult::Held(GateReason::Stale);
     }
 
@@ -260,26 +299,26 @@ pub async fn check_with(
     GateResult::Pass
 }
 
-/// When this vendor last accepted a report about `ip`, from `book` when it covers the pair and
-/// from the database otherwise. [`GateReason::DbError`] if the query itself fails, so the caller
-/// holds rather than treating an unanswered question as "never reported".
+/// What this vendor has accepted about `ip`, from `book` when it covers the pair and from the
+/// database otherwise. [`GateReason::DbError`] if the query itself fails, so the caller holds
+/// rather than treating an unanswered question as "never reported".
 async fn latest_success(
     pool: &PgPool,
     ip: IpAddr,
     config: &VendorConfig,
     book: Option<&CooldownBook>,
-) -> Result<Option<DateTime<Utc>>, GateReason> {
+) -> Result<Option<LastReport>, GateReason> {
     match book.and_then(|b| b.latest_success(ip, &config.name)) {
         Some(latest) => Ok(latest),
-        None => sqlx::query_scalar(
-            "SELECT submitted_at FROM vendor_submission \
-             WHERE source_ip = $1::inet AND vendor = $2 AND success = TRUE \
-             ORDER BY submitted_at DESC LIMIT 1",
-        )
+        None => sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {LAST_REPORT_COLUMNS} FROM vendor_submission \
+             WHERE source_ip = $1::inet AND vendor = $2 AND success = TRUE"
+        )))
         .bind(ip.to_string())
         .bind(&config.name)
-        .fetch_optional(pool)
+        .fetch_one(pool)
         .await
+        .and_then(|row| last_report(&row))
         .map_err(|e| GateReason::DbError(e.to_string())),
     }
 }

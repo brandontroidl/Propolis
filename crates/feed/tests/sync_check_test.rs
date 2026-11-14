@@ -148,6 +148,69 @@ fn an_empty_build_with_no_windows_passes_every_check() {
 
 /// Publishes the full build, applies `tamper` to one file, and requires `--check` to refuse and
 /// to name that file.
+#[test]
+fn addresses_of_every_shape_are_spelt_the_way_the_check_expects() {
+    // The check rebuilds each IPv6 address and each RPZ trigger name from the address it reads
+    // and refuses a line spelt any other way, so its spelling has to be the exporters' for every
+    // address there is: which run of zero groups is written short, and when none is. The fixed
+    // shapes are the edges; the rest vary which groups are zero.
+    let mut addresses: Vec<String> = [
+        "2003::",
+        "2003::1",
+        "2003:0:0:1::1",
+        "2003:0:0:1:0:0:1:1",
+        "2003:1:0:0:1:0:0:1",
+        "2003:0:1:0:1:0:1:0",
+        "2003:1:2:3:4:5:6:7",
+        "2003:1:2:3:4:5::",
+        "2003:a0b::ff",
+        "2003:0:0:ffff:0:0:0:1",
+        "45.10.30.7",
+        "::ffff:45.10.31.1",
+    ]
+    .iter()
+    .map(|ip| ip.to_string())
+    .collect();
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..400 {
+        let mut groups = [0x2003u16, 0, 0, 0, 0, 0, 0, 0];
+        for group in groups.iter_mut().skip(1) {
+            let r = next();
+            *group = match r % 4 {
+                0 | 1 => 0,
+                2 => (r >> 8) as u16 & 0xff,
+                _ => (r >> 8) as u16,
+            };
+        }
+        addresses.push(std::net::Ipv6Addr::from(groups).to_string());
+    }
+    let mut entries: Vec<FeedEntry> = addresses
+        .iter()
+        .map(|ip| entry(ip, Some(FeedTier::Aggressive), &["port_scan"]))
+        .collect();
+    entries.sort_by_key(|e| e.source_ip);
+    entries.dedup_by_key(|e| e.source_ip);
+    assert!(entries.len() > 300, "{} distinct addresses", entries.len());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("current");
+    let snapshot = FeedSnapshot {
+        build_time: build_time(),
+        aggressive: entries,
+        standard: Vec::new(),
+        windows: Vec::new(),
+    };
+    publish(&snapshot, &dir);
+    let out = check(&dir);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
 fn refused(file: &str, tamper: impl FnOnce(String) -> String) {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("current");
@@ -263,6 +326,61 @@ fn a_data_file_with_a_field_the_publisher_does_not_write_is_refused() {
     });
     refused("all-7d.json", |s| {
         s.replace(r#""tier":"all-7d""#, r#""tier":"aggressive""#)
+    });
+}
+
+#[test]
+fn text_that_only_means_what_the_publisher_writes_is_refused() {
+    // None of these is a command, and each would break every consumer for as long as it was
+    // published: a number no JSON parser accepts, a zone serial no resolver loads, a trigger
+    // name a resolver ignores, an address a packet filter can never match.
+    refused("aggressive.json", |s| {
+        s.replace(r#""count":4}"#, r#""count":04}"#)
+    });
+    refused("aggressive.json", |s| {
+        s.replace(r#""events":1234,"#, r#""events":01234,"#)
+    });
+    refused("aggressive.txt", |s| {
+        s.replace("# Entries: 4", "# Entries: 04")
+    });
+    refused("aggressive.rpz", |s| {
+        s.replace(" 2026072914 3600 ", " 9999999999 3600 ")
+    });
+    refused("aggressive.rpz", |s| {
+        s.replace(" 2026072914 3600 ", " 2026072915 3600 ")
+    });
+    refused("aggressive.rpz", |s| {
+        s.replace("128.7.zz.bbbb.aaaa.2003", "128.7.0.0.0.0.0.bbbb.aaaa.2003")
+    });
+    refused("aggressive.rpz", |s| {
+        s.replace("128.7.zz.bbbb.aaaa.2003", "128.7.zz.0.bbbb.aaaa.2003")
+    });
+    refused("aggressive.rpz", |s| {
+        s.replace("128.7.zz.bbbb.aaaa.2003", "128.0007.zz.bbbb.aaaa.2003")
+    });
+    refused("aggressive.pf", |s| {
+        s.replace("45.10.31.1\n", "::ffff:45.10.31.1\n")
+    });
+    refused("aggressive.alias", |s| {
+        s.replace("45.10.31.1\n", "::ffff:45.10.31.1\n")
+    });
+    refused("aggressive.cidr", |s| {
+        s.replace("45.10.31.1/32", "::ffff:45.10.31.1/128")
+    });
+    refused("aggressive.nft", |s| {
+        s.replace("\t2003:aaaa:bbbb::7\n", "\t2003:aaaa:bbbb:0::7\n")
+    });
+    refused("aggressive.ipset", |s| {
+        s.replace(
+            "add propolis_aggressive_v6-new 2003:aaaa:bbbb::7",
+            "add propolis_aggressive_v6-new 2003:aaaa:bbbb:0:0:0:0:7",
+        )
+    });
+    refused("aggressive.txt", |s| {
+        s.replace("2026-07-29T14:00:00Z", "2026-13-29T14:00:00Z")
+    });
+    refused("aggressive.pf", |s| {
+        s.replace("2026-07-29T14:00:00Z", "2026-07-29T24:00:00Z")
     });
 }
 

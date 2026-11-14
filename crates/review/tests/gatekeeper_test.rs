@@ -23,7 +23,9 @@ use core_scoring::IpScore;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use review::gatekeeper::{CooldownBook, GateReason, GateResult, VendorConfig, check, check_with};
+use review::gatekeeper::{
+    CooldownBook, GateReason, GateResult, LastReport, VendorConfig, check, check_with,
+};
 
 async fn migrate(pool: &PgPool) {
     // Core-scoring first (review_state_enum, etc. must exist), then this crate's own.
@@ -89,15 +91,36 @@ fn fake_score(ip: IpAddr, raw_score: Decimal, categories: &[&str]) -> IpScore {
     }
 }
 
+/// `at` as a `timestamptz` column holds it: to the microsecond. The earned time on a score row
+/// and the one recorded with a report are both read back from the database, so they compare
+/// equal there; a test that builds them in memory has to give them the same precision.
+fn stored(at: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::SubsecRound;
+    at.trunc_subsecs(6)
+}
+
+/// An accepted report as an earlier version stored it: no record of what it covered.
 async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: DateTime<Utc>) {
+    insert_report(pool, ip, vendor, submitted_at, None).await;
+}
+
+/// An accepted report sent at `submitted_at` for the earned time `covered`.
+async fn insert_report(
+    pool: &PgPool,
+    ip: &str,
+    vendor: &str,
+    submitted_at: DateTime<Utc>,
+    covered: Option<DateTime<Utc>>,
+) {
     let key = format!(
         "{ip}:{vendor}:{}",
         submitted_at.timestamp_nanos_opt().unwrap()
     );
     sqlx::query(
         "INSERT INTO vendor_submission \
-         (source_ip, vendor, idempotency_key, categories, comment, submitted_at, success) \
-         VALUES ($1::inet, $2, $3, $4, $5, $6, TRUE)",
+         (source_ip, vendor, idempotency_key, categories, comment, submitted_at, success, \
+          earned_at) \
+         VALUES ($1::inet, $2, $3, $4, $5, $6, TRUE, $7)",
     )
     .bind(ip)
     .bind(vendor)
@@ -105,6 +128,7 @@ async fn insert_submission(pool: &PgPool, ip: &str, vendor: &str, submitted_at: 
     .bind(vec!["test".to_string()])
     .bind("test submission")
     .bind(submitted_at)
+    .bind(covered)
     .execute(pool)
     .await
     .unwrap();
@@ -200,6 +224,75 @@ async fn nothing_earned_since_the_last_report_is_not_reported_again(pool: PgPool
     let other = permissive_config("never-told-vendor");
     score.standard_earned_at = Some(Utc::now() - Duration::hours(40));
     assert_eq!(check(&pool, addr, &other, &score).await, GateResult::Pass);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_burst_dated_ahead_of_its_own_report_is_reported_once(pool: PgPool) {
+    migrate(&pool).await;
+    let vendor = "fast-clock-vendor";
+    let ip = "45.10.31.248";
+    let addr: IpAddr = ip.parse().unwrap();
+    let config = permissive_config(vendor);
+    // A sensor whose clock runs half an hour fast. The tier was earned 25 hours ago and the
+    // report went out two minutes later, but the event, and so the earned time, is dated
+    // half an hour after the moment it happened: 28 minutes AFTER the report about it. Asked
+    // whether anything was earned since the report was sent, the same burst was news again
+    // after every cooldown.
+    let happened = stored(Utc::now() - Duration::hours(25));
+    let dated = happened + Duration::minutes(30);
+    insert_report(
+        &pool,
+        ip,
+        vendor,
+        happened + Duration::minutes(2),
+        Some(dated),
+    )
+    .await;
+    let mut score = fake_score(addr, Decimal::from(80), &["Honeypot"]);
+    score.standard_earned_at = Some(dated);
+    assert_eq!(
+        check(&pool, addr, &config, &score).await,
+        GateResult::Held(GateReason::Stale),
+        "the cooldown is over and the earned time is after the report, but it is the earned \
+         time that report was sent for"
+    );
+    let book = CooldownBook::load(&pool, &[addr], &[vendor]).await.unwrap();
+    assert_eq!(
+        check_with(&pool, addr, &config, &score, Some(&book)).await,
+        GateResult::Held(GateReason::Stale)
+    );
+
+    // Earning the tier again moves the earned time past what was reported.
+    score.standard_earned_at = Some(dated + Duration::hours(3));
+    assert_eq!(check(&pool, addr, &config, &score).await, GateResult::Pass);
+    assert_eq!(
+        check_with(&pool, addr, &config, &score, Some(&book)).await,
+        GateResult::Pass
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_return_dated_before_the_last_report_is_still_news(pool: PgPool) {
+    migrate(&pool).await;
+    let vendor = "slow-clock-vendor";
+    let ip = "45.10.31.249";
+    let addr: IpAddr = ip.parse().unwrap();
+    let config = permissive_config(vendor);
+    // A sensor whose clock runs ten minutes slow. A burst was reported 25 hours ago; the
+    // address came back five minutes after that report, which the sensor dated five minutes
+    // BEFORE it. Compared with the time the report was sent, the return was never reported.
+    let reported = stored(Utc::now() - Duration::hours(25));
+    insert_report(
+        &pool,
+        ip,
+        vendor,
+        reported,
+        Some(reported - Duration::minutes(10)),
+    )
+    .await;
+    let mut score = fake_score(addr, Decimal::from(80), &["Honeypot"]);
+    score.standard_earned_at = Some(reported - Duration::minutes(5));
+    assert_eq!(check(&pool, addr, &config, &score).await, GateResult::Pass);
 }
 
 #[sqlx::test(migrations = false)]
@@ -577,7 +670,14 @@ async fn the_book_finds_each_pair_whatever_the_address_family(pool: PgPool) {
         .fetch_optional(&pool)
         .await
         .unwrap();
-        assert!(per_pair.is_some(), "{ip} was seeded");
-        assert_eq!(book.latest_success(*ip, "vend-a"), Some(per_pair), "{ip}");
+        let submitted_at = per_pair.unwrap_or_else(|| panic!("{ip} was seeded"));
+        assert_eq!(
+            book.latest_success(*ip, "vend-a"),
+            Some(Some(LastReport {
+                submitted_at,
+                earned_at: None,
+            })),
+            "{ip}"
+        );
     }
 }

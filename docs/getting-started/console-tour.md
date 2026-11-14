@@ -43,7 +43,10 @@ real zero.
 
 Addresses that have earned a tier and are waiting for a decision. A pending entry stays
 until you decide it, the address is delisted, or your allowlist or delist covers it: a later
-weak event does not take it away. Under each pending
+weak event does not take it away. A row's Tier is the tier the address last earned (hover
+for when), not the tier its score holds now, and its Active span runs from the first sighting to
+the last completed TCP connection, which is also what "last seen" sorts by, so a datagram
+naming the address does not make it look freshly active. Under each pending
 row a context line says what the address did: the sensors it reached, how many sessions,
 its three most frequent signals, and its first upload or download, or failing that its
 first command after the `enable` / `system` / `shell` / `sh` preamble Mirai-family
@@ -62,7 +65,8 @@ connections, whether or not they ever logged in. Its time column is the last con
 the clock a volume listing runs on, not the last sighting of any kind. None of them is
 published while it waits. **Approve for retention feeds** publishes the address in the `all-*` retention
 feeds and nothing else; it is not reported to abuse vendors. **Reject** keeps it out.
-Decided candidates are listed below with **Return to pending**, which undoes either
+A pending candidate that your allowlist or delist comes to cover is withdrawn at the next
+scan. Decided candidates are listed below with **Return to pending**, which undoes either
 decision. The badge in the navigation counts both queues, and the page heading says how
 the total splits.
 

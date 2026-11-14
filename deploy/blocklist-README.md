@@ -106,18 +106,21 @@ Substitute `tiers/standard`, `retention/all-30d`, or any other feed path for `ti
 Every firewall file can be applied again and again: applying a newer copy leaves the set holding
 exactly what that copy lists, so an address that has left the feed leaves your firewall too. An
 empty feed is a valid file that empties the set. IPv4 and IPv6 addresses are kept in separate sets
-where the tool requires it. In those files an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is
-listed as the IPv4 address it is.
+where the tool requires it. In every format except `.json` and `.csv`, an IPv4-mapped IPv6
+address (`::ffff:a.b.c.d`) is listed as the IPv4 address it is (`a.b.c.d`, and `a.b.c.d/32` in
+`.cidr`), once even if the plain form is listed too. `.json` and `.csv` keep each entry under the
+address it was recorded with.
 
 `manifest.json` carries the build timestamp, per-feed entry counts, SHA-256 digests, and validity
 windows.
 
 ### Per-entry fields
 
-The `.json` and `.csv` formats carry, per address: `first_seen`, `last_seen` (the hour the address
-last earned its place in that file, which is also its `valid_from`), `events` (how many
-observations back it), `categories` (how many distinct sensor classes saw it), and `signals` - the
-distinct activity types it triggered:
+The `.json` and `.csv` formats carry, per address: `first_seen` (its first sighting of any kind),
+`last_seen` (the hour the address last earned its place in that file, which is also its
+`valid_from`), `events` (how many completed TCP connections back it), `categories` (how many
+distinct sensor classes saw it), and `signals` - the distinct activity types it triggered over
+connections it completed:
 
 ```
 ssh_brute_force        honeypot_command_exec    honeypot_malware_upload
@@ -200,6 +203,10 @@ options { response-policy { zone "rpz.propolis"; }; };
 ```
 
 After fetching a newer copy, `rndc reload rpz.propolis`. The zone's serial is the build hour.
+Builds run more often than hourly (every 15 minutes by default), so two copies with different
+contents can carry the same serial: reload the zone from the file, as above. A secondary, or
+anything else that decides by serial alone, follows only at the next hour. The serial is not
+made finer because that would publish when within the hour each build ran.
 
 ### Changed in this layout
 
@@ -207,10 +214,15 @@ If you used an earlier copy of these files:
 
 - **nftables**: the file used to define a variable, `$propolis_aggressive`. It now maintains the
   named sets above. Replace `include` and `$propolis_aggressive` with the commands in the nftables
-  section.
+  section. Do it before the host next loads its configuration from nothing (at boot): a
+  configuration that still includes the file and uses `$propolis_aggressive` then fails to load,
+  which leaves the host with no ruleset. (A reload of a running ruleset fails as a whole and
+  leaves the running rules in place.)
 - **ipset**: the set `propolis_aggressive` is now `propolis_aggressive_v4`, with
   `propolis_aggressive_v6` beside it. Point your iptables rule at the new name, add the ip6tables
   rule, load with `-exist`, and destroy the old set once (`ipset destroy propolis_aggressive`).
+  If you do nothing, the old set stops being updated and keeps blocking the entries it last held
+  until you point your rule at the new sets and destroy it.
 - **RPZ**: the earlier file had no SOA or NS record and its trigger names lacked the prefix
   length, so resolvers did not load it. The current file needs no editing.
 - **hosts**: `aggressive.hosts` is no longer published. A hosts file maps names to addresses and

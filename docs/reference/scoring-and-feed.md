@@ -252,7 +252,10 @@ reporting. Three columns on `ip_score` (migration `0027_established_sightings.sq
 
 An earned time is set to the decay anchor after the event, and only by an event that added its
 weight: a repeat inside the dedup window and an overflow summary earn nothing
-(`crates/core-scoring/src/scoring/engine.rs#apply_event`). An event that leaves the address below
+(`crates/core-scoring/src/scoring/engine.rs#apply_event`). It never moves back: on a row an
+earlier version left with an earned time ahead of its anchor (migration `0027` seeds the clocks
+from the latest established sighting, which on a row read out of order is later than the
+anchor), earning the tier again keeps the later time. An event that leaves the address below
 the tier neither clears nor advances it, so a listing runs its full TTL from the last time it was
 earned: a later weak event cannot end it early, and only earning the tier again extends it.
 `IpScore::tier_earned_at` is the later of the two
@@ -287,6 +290,12 @@ An address that is both a tier candidate and a volume candidate is published onc
 window holds it while either clock (the later earned time or the last established sighting) is
 inside it (`crates/feed/src/builder.rs#build`, `crates/feed/src/builder.rs#Candidate::window_listing`).
 
+What an entry says about the address rests on completed connections too: its published
+`events` is `established_event_count`, and its `signals` are the signal types of its established
+events only (`crates/feed/src/builder.rs#CATEGORIES_SQL`, served by `event_dedup_tcp_idx`), so a
+forged datagram naming a listed address can neither add a signal type to its entry nor raise
+its count. Its `first_seen` is still the first sighting of any kind.
+
 Neither source reads the stored `tier`, `eligible` or `recommended_*` columns, which are whatever
 the last established event left. An entry stays listed for its full TTL after the last time the
 address earned the tier: a later weak event neither removes nor extends it, and a datagram
@@ -304,7 +313,7 @@ stand for a thousand events, so a volume candidate waits for a decision in its o
 | Step | Rule | Source |
 |---|---|---|
 | Offered (pending) | not delisted, `established_event_count >= 1000`, `established_last_seen` (the last established sighting) within 86400 s of now, no `volume_review` row in any state, no `approved` `review_queue` row, not reserved, not on the operator allowlist or the operator delist (`PROPOLIS_FEED_DELIST`) | `crates/review/src/volume.rs#populate` |
-| Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, or is now `approved` in `review_queue` | `crates/review/src/volume.rs#withdraw` |
+| Withdrawn | a pending row whose address has no `ip_score` row, is delisted, is below the threshold, is now `approved` in `review_queue`, or has come under the operator allowlist or `PROPOLIS_FEED_DELIST` since it was offered (approving it could never publish anything). Decided rows are left alone | `crates/review/src/volume.rs#withdraw` |
 | Lapsed | a pending or approved row whose address has made no established connection for the longest configured retention window (`PROPOLIS_FEED_WINDOWS`), and never for less than 90 days, which is also what the standalone `review daemon` uses; a row whose address has no established sighting at all lapses at once. The row is removed and logged, and the address's next flood is offered as a new candidate. A rejected row never lapses. The row is deleted for every node that shares the database, by whichever node's scan gets there first: nodes that publish windows longer than 90 days must all be given the same `PROPOLIS_FEED_WINDOWS` | `crates/review/src/volume.rs#withdraw`, `crates/review/src/volume.rs#lapsing_after`, `crates/review/src/volume.rs#VOLUME_DECISION_LAPSE_DAYS` |
 | Approve | publishes the address in the retention feeds from the next build; it is not reported to any vendor. The approval stands until it is reopened, the address is delisted, or it lapses: while it stands, any established (completed-TCP) connection from the address, from any sensor, renews the listing; a datagram naming it does not | `crates/review/src/volume.rs#approve` |
 | Reject | not published on volume; the row stays, so the address is not offered again | `crates/review/src/volume.rs#reject` |

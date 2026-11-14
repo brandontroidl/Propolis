@@ -64,8 +64,9 @@ in the console or with the `review` command. Approval is what lets it into the
 report to be filed.
 
 An entry stays in a tier file for that tier's time to live after the last time the
-address earned the tier, and a vendor gets one report per burst of activity, not one
-per day for as long as anything names the address.
+address earned the tier. A vendor gets one report about activity that stops, and one more
+when the cooldown ends if the address kept earning its tier after the first, not one per day
+for as long as anything names the address.
 
 The retention feeds (`all-24h`, `all-7d` and so on) are different: they hold every
 approved entry that earned a tier within the window, and also any source that completed

@@ -31,7 +31,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use core_scoring::{EventInput, Protocol, SignalType, append_event, append_events};
 use sqlx::{PgPool, Row};
 
@@ -910,6 +910,7 @@ async fn age(pool: &PgPool, ip: &str, by: Duration) {
     sqlx::query(
         "UPDATE vendor_submission SET \
              submitted_at = submitted_at - make_interval(secs => $2), \
+             earned_at = earned_at - make_interval(secs => $2), \
              idempotency_key = idempotency_key || ':aged' \
          WHERE source_ip = $1::inet",
     )
@@ -985,6 +986,63 @@ async fn an_address_kept_fresh_only_by_datagrams_is_reported_once_not_every_cool
     assert_eq!(vendor.submissions_for(addr).len(), 2);
 }
 
+/// A sensor whose clock runs ahead dates a burst after the report this node sends about it. Asked
+/// whether anything was earned since the report was SENT, that same burst was news again after
+/// every cooldown. An accepted report records the earned time it was sent for, and the gate
+/// asks whether the address has earned anything since THAT.
+#[sqlx::test(migrations = false)]
+async fn a_burst_a_fast_sensor_clock_dated_after_its_report_is_reported_once(pool: PgPool) {
+    migrate(&pool).await;
+    let ip = "203.0.113.66";
+    let addr: IpAddr = ip.parse().unwrap();
+    seed_and_approve(&pool, ip).await;
+    // The sensor that saw it is half an hour fast: the tier is dated half an hour from now.
+    sqlx::query(
+        "UPDATE ip_score SET \
+             aggressive_earned_at = aggressive_earned_at + interval '30 minutes', \
+             standard_earned_at = standard_earned_at + interval '30 minutes' \
+         WHERE source_ip = $1::inet",
+    )
+    .bind(ip)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let vendor = MockVendor::new("abuseipdb");
+    let runner = SubmissionRunner::new(
+        pool.clone(),
+        vec![Box::new(vendor.clone())],
+        vec![permissive_config("abuseipdb")],
+    );
+    assert_eq!(runner.run_once().await.unwrap().submitted, 1);
+
+    let (covered, earned, ahead): (Option<DateTime<Utc>>, DateTime<Utc>, bool) = sqlx::query_as(
+        "SELECT v.earned_at, GREATEST(s.aggressive_earned_at, s.standard_earned_at), \
+                GREATEST(s.aggressive_earned_at, s.standard_earned_at) > v.submitted_at \
+         FROM vendor_submission v JOIN ip_score s ON s.source_ip = v.source_ip \
+         WHERE v.source_ip = $1::inet AND v.success",
+    )
+    .bind(ip)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        covered,
+        Some(earned),
+        "the accepted report records what it covered"
+    );
+    assert!(
+        ahead,
+        "precondition: the tier is dated after its own report"
+    );
+
+    // Twenty-five hours on the cooldown is over and the tier is inside the freshness window.
+    age(&pool, ip, Duration::hours(25)).await;
+    let second = runner.run_once().await.unwrap();
+    assert_eq!(second.submitted, 0, "{:?}", second.held_by);
+    assert_eq!(second.held_by.stale, 1);
+    assert_eq!(vendor.submissions_for(addr).len(), 1);
+}
+
 /// Approved late: the address earned its tier more than 48 hours ago and has only been named by
 /// datagrams since. Nothing is reported, however fresh `last_seen` looks.
 #[sqlx::test(migrations = false)]
@@ -1057,6 +1115,15 @@ async fn a_report_gives_the_last_connection_and_its_labels_whatever_datagrams_fo
         report.categories, expected.categories,
         "the datagram's `dns` label must not replace what the SSH session showed"
     );
+    // Nor the number of events the comment gives a vendor (public, on OTX): the three
+    // connections, not the datagram as well.
+    for sent in [report, expected] {
+        assert!(
+            sent.comment.contains(" - 3 event(s) across "),
+            "{}",
+            sent.comment
+        );
+    }
 }
 
 /// `PROPOLIS_FEED_DELIST` took an address out of the published feed and nothing else: an approval

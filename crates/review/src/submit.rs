@@ -112,7 +112,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{PgPool, Row};
 
 use core_scoring::{Category, IpScore, OperatorAllowlist, read_score};
@@ -503,7 +503,12 @@ impl SubmissionRunner {
                     }
                 };
 
-                if let Err(e) = record_result(&self.pool, &key, status, &body, success).await {
+                // What an accepted report covered: the gate holds the next one until the
+                // address has earned its tier again after this.
+                let covered = success.then(|| current_score.tier_earned_at()).flatten();
+                if let Err(e) =
+                    record_result(&self.pool, &key, status, &body, success, covered).await
+                {
                     tracing::error!(
                         %ip, vendor = %name, error = %e,
                         "failed to record submission result"
@@ -532,20 +537,26 @@ fn idempotency_key(ip: IpAddr, vendor: &str, date: NaiveDate) -> String {
     format!("{ip}:{vendor}:{date}")
 }
 
-/// One index probe per category (`event_source_category_observed_idx`, core-scoring migration
-/// 0020) instead of `SELECT DISTINCT ON (category) ... ORDER BY category, observed_at DESC`, which
+/// One index probe per category (`event_source_category_tcp_idx`, core-scoring migration 0027)
+/// instead of `SELECT DISTINCT ON (category) ... ORDER BY category, observed_at DESC`, which
 /// reads and sorts every event the address ever produced: 1.55 s for one heavy address on the live
 /// node. The categories come from the enum itself, so a new `Category` variant needs no change
-/// here; a category with no event for this address yields no row, as before.
+/// here; a category with no established event for this address yields no row.
 ///
 /// The probe is a row comparison `(source_ip, category) >= (addr, c.category)` ordered by the
-/// index's own columns, with the equality re-checked on the one row it returns. Only the composite
-/// index can supply that order, so the planner has no alternative: written as `source_ip = $1 AND
-/// category = c.category ORDER BY observed_at DESC`, a custom plan for a heavy address (one the
-/// statistics list as common) chose a backward walk of `event_observed_at_idx` filtering as it
-/// went, which reads the whole index for every category the address has no event in (454-532 ms on
-/// a 400,000-event test ledger, no faster than the old form). A category the address lacks makes
-/// the probe land on the next address's row, which the outer `WHERE` discards.
+/// index's own columns, with the equality re-checked on the one row it returns. Only an index on
+/// those columns can supply that order, so the planner has no alternative: written as `source_ip
+/// = $1 AND category = c.category ORDER BY observed_at DESC`, a custom plan for a heavy address
+/// (one the statistics list as common) chose a backward walk of `event_observed_at_idx` filtering
+/// as it went, which reads the whole index for every category the address has no event in
+/// (454-532 ms on a 400,000-event test ledger, no faster than the old form). A category the
+/// address lacks makes the probe land on the next address's row, which the outer `WHERE`
+/// discards.
+///
+/// The index holds established rows only, as the probe asks for. Read from the index of every
+/// event (`event_source_category_observed_idx`, migration 0020) the same probe steps over each
+/// datagram at or after the address until it meets a TCP row: 138 ms against 0.08 ms for an
+/// address with 200,000 datagrams behind it, and anyone can send an address's datagrams.
 const PROTOCOL_LABELS_SQL: &str = "\
     SELECT c.category, l.protocol_label \
     FROM unnest(enum_range(NULL::category_enum)) AS c(category) \
@@ -631,7 +642,9 @@ fn build_report(
 
     let comment = format!(
         "propolis: {ip} - {} event(s) across {} categor{} since {}, current score {}",
-        current_score.event_count,
+        // Completed connections only. `event_count` also counts every datagram that named the
+        // address, and anyone can send those.
+        current_score.established_event_count,
         breakdown.len(),
         if breakdown.len() == 1 { "y" } else { "ies" },
         current_score.first_seen.to_rfc3339(),
@@ -716,22 +729,27 @@ async fn insert_pending(
     })
 }
 
-/// Record the HTTP call's outcome against the row `key` identifies.
+/// Record the HTTP call's outcome against the row `key` identifies. `covered` is the earned time
+/// an accepted report was sent for (`None` for a report that was not accepted): what
+/// `gatekeeper::check_with` asks "anything since?" of.
 async fn record_result(
     pool: &PgPool,
     key: &str,
     response_status: Option<i32>,
     response_body: &str,
     success: bool,
+    covered: Option<DateTime<Utc>>,
 ) -> Result<(), SubmitError> {
     sqlx::query(
-        "UPDATE vendor_submission SET response_status = $1, response_body = $2, success = $3 \
+        "UPDATE vendor_submission \
+         SET response_status = $1, response_body = $2, success = $3, earned_at = $5 \
          WHERE idempotency_key = $4",
     )
     .bind(response_status)
     .bind(response_body)
     .bind(success)
     .bind(key)
+    .bind(covered)
     .execute(pool)
     .await?;
     Ok(())
@@ -931,6 +949,12 @@ mod tests {
                     'tcp', true, 'honeypot', 1, 1, now() - make_interval(secs => g), \
                     decode(repeat('00', 32), 'hex') \
              FROM generate_series(1, 10000) g; \
+             INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, \
+                                category, weight, confidence, observed_at, hash) \
+             SELECT (ARRAY['198.51.100.7', '203.0.113.' || (g % 250)])[1 + g % 2]::inet, 's', \
+                    'honeypot_connection', 'udp', false, 'waf', 1, 1, \
+                    now() - make_interval(secs => g), decode(repeat('00', 32), 'hex') \
+             FROM generate_series(1, 20000) g; \
              ANALYZE event",
         )
         .execute(&pool)
@@ -959,9 +983,13 @@ mod tests {
                 !plan.contains("event_observed_at_idx"),
                 "the lookup must not walk the observed_at index ({ip}):\n{plan}"
             );
+            // Half the ledger's datagrams name the heavy address, in a category it has no
+            // connection in, and the rest name addresses that sort after it. Read from the index
+            // of every event the probe would step over them all.
             assert!(
-                plan.contains("event_source_category_observed_idx"),
-                "the lookup must probe the composite index ({ip}):\n{plan}"
+                plan.contains("event_source_category_tcp_idx")
+                    && !plan.contains("event_source_category_observed_idx"),
+                "the lookup must probe the index of established events ({ip}):\n{plan}"
             );
             assert!(
                 plan.contains("Limit"),
@@ -975,7 +1003,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(labels.len(), 3, "honeypot, network, ids only: {labels:?}");
-        assert!(!labels.contains_key(&Category::Waf));
+        assert!(
+            !labels.contains_key(&Category::Waf),
+            "ten thousand datagrams do not make a category"
+        );
         assert!(!labels.contains_key(&Category::Auth));
     }
 }

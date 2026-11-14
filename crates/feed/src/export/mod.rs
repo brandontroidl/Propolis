@@ -22,7 +22,32 @@ pub use firewall::{export_ipset, export_nftables, export_pf, export_pfsense_alia
 pub use json::export_json;
 pub use plaintext::export_plaintext;
 
+use std::collections::HashSet;
+use std::net::IpAddr;
+
 use chrono::{DateTime, SecondsFormat, Utc};
+
+use crate::FeedEntry;
+
+/// The addresses of `entries` as an address list has to carry them: in feed order, each once,
+/// and an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as the IPv4 address it maps.
+///
+/// A mapped address names an IPv4 peer as a dual-stack socket saw it. The packets to match are
+/// IPv4 packets, so a filter given the mapped form holds an IPv6 entry that nothing ever
+/// matches, and the host it was listed for is not blocked. Every format that is only a list of
+/// addresses goes through this (plain text, CIDR, pf, the pfSense alias); the typed sets
+/// (ipset, nftables, RPZ) make the same mapping in `firewall::families`. Mapped, an address can
+/// meet itself listed in its plain form, so repeats are dropped. The per-entry formats (JSON,
+/// CSV) keep each entry under the address it was recorded with, since each carries that entry's
+/// own counts and times.
+pub(crate) fn listed_addresses(entries: &[FeedEntry]) -> Vec<IpAddr> {
+    let mut seen = HashSet::with_capacity(entries.len());
+    entries
+        .iter()
+        .map(|entry| entry.source_ip.to_canonical())
+        .filter(|ip| seen.insert(*ip))
+        .collect()
+}
 
 /// Render a timestamp exactly as every export format needs it: RFC 3339, whole seconds, and a
 /// literal `Z` for UTC rather than `+00:00` - e.g. `2026-07-29T14:00:00Z`, matching the design's

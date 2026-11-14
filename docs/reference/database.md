@@ -140,6 +140,17 @@ type, so a datagram cannot make a real connection a duplicate. The partial index
 source that sent datagrams for days and then connects costs one backward step, not a walk past
 every datagram while the append lock is held. The batch path's
 `crates/core-scoring/src/repository/batch.rs#DEDUP_PRIORS_SQL` and replay apply the same rule.
+The feed's signal list (`crates/feed/src/builder.rs#CATEGORIES_SQL`) asks the same index for an
+established event of each signal type.
+
+The submission runner's label lookup (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`) reads
+the newest established event of each category, from the partial index
+`event_source_category_tcp_idx (source_ip, category, observed_at DESC) WHERE protocol = 'tcp'`
+(`crates/core-scoring/migrations/0027_established_sightings.sql#event_source_category_tcp_idx`).
+Read from `event_source_category_observed_idx`, the index of every event, the same probe steps
+over every datagram at or after the address before it reaches a TCP row: 138 ms against 0.08 ms
+for an address with 200,000 datagrams behind it, a cost anyone could raise by sending
+datagrams.
 
 The `metadata` column is documented "sanitized at capture" (`crates/core-scoring/migrations/0002_event.sql#metadata`); the
 sanitizer path itself lives outside the schema. The DB does **not** enforce the
@@ -545,8 +556,18 @@ PK `id BIGSERIAL`. The `UNIQUE idempotency_key` dedupes retries.
 | `response_status` | INTEGER | nullable |
 | `response_body` | TEXT | nullable |
 | `success` | BOOLEAN | NOT NULL DEFAULT FALSE |
+| `earned_at` | TIMESTAMPTZ | nullable (`0010`) |
 
 Index: `idx_vendor_submission_ip_vendor (source_ip, vendor, submitted_at DESC)`.
+
+`earned_at` (`0010_vendor_submission_earned_at.sql`) is the address's earned time
+(`IpScore::tier_earned_at`, the later of its two tier clocks) as stored when an accepted report
+was sent: what that report covered. The vendor gate holds the next report to that vendor until
+the stored earned time is later than it (`crates/review/src/gatekeeper.rs#check_with`). Both are
+event timestamps, the sensor's clock; `submitted_at` is the node's clock, and comparing across the
+two let a sensor running a little fast get one burst reported after every cooldown. NULL on a row
+that was not accepted and on every row written before `0010`; for those the gate compares with
+`submitted_at`.
 
 ### `fetch_attempt` (`0003_fetch_attempt.sql`)
 
@@ -699,7 +720,7 @@ the watch stream and compare timestamps.
 | `0024` | index `attack_tag_source_idx (source_ip)`, which serves the address page's technique read |
 | `0025` | the [event roll-up](#event-rollups): function `event_hour`, tables `event_hour_listener` and `event_rollup_cursor`, backfilled from the ledger under a `SHARE` lock on `event` |
 | `0026` | index `event_signal_observed_idx (signal_type, observed_at)`, which serves the search page's signal-type menu and filter without reading the ledger; built inside the migration transaction like `0013` |
-| `0027` | `ip_score.established_last_seen`, `aggressive_earned_at` and `standard_earned_at` (nullable `TIMESTAMPTZ`); backfills `established_last_seen` from the ledger's TCP rows, clears `eligible` and `recommended_*` on rows with fewer than two established events, seeds the earned times for rows the feed lists today; partial index `event_dedup_tcp_idx (source_ip, signal_type, observed_at) WHERE protocol = 'tcp'` for the dedup read, built inside the migration transaction like `0013` |
+| `0027` | `ip_score.established_last_seen`, `aggressive_earned_at` and `standard_earned_at` (nullable `TIMESTAMPTZ`); backfills `established_last_seen` from the ledger's TCP rows, clears `eligible` and `recommended_*` on rows with fewer than two established events, seeds the earned times for rows the feed lists today; partial indexes `event_dedup_tcp_idx (source_ip, signal_type, observed_at) WHERE protocol = 'tcp'` for the dedup read and the feed's signal list, and `event_source_category_tcp_idx (source_ip, category, observed_at DESC) WHERE protocol = 'tcp'` for the vendor report's label lookup, both built inside the migration transaction like `0013` |
 
 **review** (`crates/review/migrations/`):
 
@@ -714,6 +735,7 @@ the watch stream and compare timestamps.
 | `0007` | `fetch_attempt.transport_auth` (existing rows `'unknown'`) + `tls_verify_error`, with their CHECK constraints |
 | `0008` | `fetch_event_cursor` (one row, starts at 0: the first sync walks the existing ledger once) |
 | `0009` | `volume_review` (uses core-scoring's `review_state_enum`; starts empty, so no volume listing is published after this migration until an operator approves it) |
+| `0010` | `vendor_submission.earned_at` (nullable `TIMESTAMPTZ`, one `ADD COLUMN`, no backfill): the earned time an accepted report covered, which the vendor gate compares with |
 
 **fleet** (`crates/fleet/migrations/`, tracked in `_sqlx_migrations_fleet`):
 

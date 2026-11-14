@@ -146,6 +146,8 @@ struct Candidate {
     /// as well as on its score). It carries the entry in the retention windows only.
     volume_seen: Option<DateTime<Utc>>,
     first_seen: DateTime<Utc>,
+    /// Established events only (`established_event_count`): the stored `event_count` also counts
+    /// every datagram that named the address, which anyone can send.
     event_count: i32,
     distinct_categories: i32,
     categories: Vec<String>,
@@ -391,12 +393,17 @@ impl FeedBuilder {
     }
 }
 
-/// The distinct signal types an address triggered, as the wire vocabulary, sorted by name: one
-/// index probe per member of the closed `signal_type_enum` (`event_dedup_idx` starts with the
-/// source address and then the signal type, so each probe is a single descent), keeping the
-/// members the address has at least one event of. The cost is the number of signal types (17),
-/// not the number of events the address produced: `SELECT DISTINCT signal_type FROM event WHERE
-/// source_ip = ...` read every one of them, 4.3 s for 5,566 addresses on the live node.
+/// The distinct signal types an address triggered over a completed TCP connection, as the wire
+/// vocabulary, sorted by name: one index probe per member of the closed `signal_type_enum`
+/// (`event_dedup_tcp_idx` holds the established rows only and starts with the source address
+/// and then the signal type, so each probe is a single descent), keeping the members the address
+/// has at least one such event of. The cost is the number of signal types (17), not the number
+/// of events the address produced: `SELECT DISTINCT signal_type FROM event WHERE source_ip =
+/// ...` read every one of them, 4.3 s for 5,566 addresses on the live node.
+///
+/// Established events only, like everything else an entry says: a datagram's source address is
+/// whatever its sender wrote, so one forged packet at a UDP listener would otherwise add a
+/// signal type of the sender's choosing to a third party's published entry.
 ///
 /// The `LIMIT 1` inside a `LATERAL` keeps the planner from turning the probes back into a join
 /// that reads the address's whole history, which `WHERE EXISTS (...)` does. It reads the enum's
@@ -407,7 +414,9 @@ impl FeedBuilder {
 const CATEGORIES_SQL: &str = "ARRAY(SELECT t.v::text \
          FROM unnest(enum_range(NULL::signal_type_enum)) AS t(v) \
          CROSS JOIN LATERAL ( \
-             SELECT 1 FROM event e WHERE e.source_ip = s.source_ip AND e.signal_type = t.v LIMIT 1 \
+             SELECT 1 FROM event e \
+             WHERE e.source_ip = s.source_ip AND e.signal_type = t.v AND e.protocol = 'tcp' \
+             ORDER BY e.observed_at DESC LIMIT 1 \
          ) x ORDER BY 1)";
 
 /// The approved candidates that have earned a tier, read as stored. `$1` is the oldest earned
@@ -421,7 +430,8 @@ const CATEGORIES_SQL: &str = "ARRAY(SELECT t.v::text \
 pub fn merit_candidates_sql() -> String {
     format!(
         "SELECT host(s.source_ip) AS source_ip, s.aggressive_earned_at, s.standard_earned_at, \
-                s.first_seen, s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
+                s.first_seen, s.established_event_count AS event_count, s.distinct_categories, \
+                {CATEGORIES_SQL} AS categories \
          FROM ip_score s \
          INNER JOIN review_queue q ON q.source_ip = s.source_ip \
          WHERE q.state = 'approved' AND NOT s.delisted \
@@ -460,7 +470,8 @@ pub fn volume_candidates_sql(auto_publish: bool) -> String {
     };
     format!(
         "SELECT host(s.source_ip) AS source_ip, s.first_seen, s.established_last_seen, \
-                s.event_count, s.distinct_categories, {CATEGORIES_SQL} AS categories \
+                s.established_event_count AS event_count, s.distinct_categories, \
+                {CATEGORIES_SQL} AS categories \
          FROM ip_score s \
          WHERE s.established_last_seen > $1 AND {listed}"
     )

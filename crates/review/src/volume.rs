@@ -214,7 +214,10 @@ impl VolumeQueue {
     ///
     /// A Pending row goes when its address has no `ip_score` row, is delisted, has fallen below
     /// [`VOLUME_LIST_THRESHOLD`], or now has an Approved `review_queue` row (the operator's
-    /// decision on its score covers the volume listing too).
+    /// decision on its score covers the volume listing too). It also goes when the operator's
+    /// allowlist or delist (`PROPOLIS_FEED_DELIST`) has come to cover the address since it was
+    /// offered: [`Self::populate`] would not offer it now, and the feed publishes neither, so
+    /// what is left on the page is an approval that could never take effect.
     ///
     /// A Pending or an Approved row goes when its address has made no established connection
     /// for [`Self::lapsing_after`]'s duration: the longest retention window, and never less than
@@ -257,6 +260,7 @@ impl VolumeQueue {
         if removed > 0 {
             tracing::info!(removed, "volume review: withdrew pending volume candidates");
         }
+        removed += self.withdraw_excluded(pool).await?;
 
         let lapsed = sqlx::query(
             "DELETE FROM volume_review v USING ip_score s \
@@ -284,6 +288,41 @@ impl VolumeQueue {
             );
         }
         removed += lapsed.len();
+        Ok(removed)
+    }
+
+    /// Withdraw the Pending rows the operator's allowlist or delist now covers, as
+    /// `ReviewQueue::withdraw` does for the review queue.
+    async fn withdraw_excluded(&self, pool: &PgPool) -> Result<usize, ReviewError> {
+        let pending: Vec<String> =
+            sqlx::query_scalar("SELECT host(source_ip) FROM volume_review WHERE state = $1")
+                .bind(ReviewState::Pending)
+                .fetch_all(pool)
+                .await?;
+        let (rest, allowlisted) = self.filters.partition_allowlisted(pending)?;
+        let (_, delisted) = self.filters.partition_delisted(rest)?;
+        let mut removed = 0;
+        for (excluded, reason) in [(allowlisted, "allowlisted"), (delisted, "delisted")] {
+            if excluded.is_empty() {
+                continue;
+            }
+            // `state` is checked again in the DELETE: an operator may have decided the row since
+            // the SELECT, and a background scan never undoes a decision.
+            let rows = sqlx::query(
+                "DELETE FROM volume_review \
+                 WHERE state = $1 AND source_ip = ANY($2::text[]::inet[]) \
+                 RETURNING host(source_ip)",
+            )
+            .bind(ReviewState::Pending)
+            .bind(&excluded)
+            .fetch_all(pool)
+            .await?;
+            for row in &rows {
+                let ip: String = row.try_get(0)?;
+                tracing::info!(%ip, reason, "volume review: withdrew pending volume candidate");
+            }
+            removed += rows.len();
+        }
         Ok(removed)
     }
 

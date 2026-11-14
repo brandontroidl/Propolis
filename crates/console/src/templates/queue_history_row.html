@@ -2,7 +2,7 @@
 <tr id="row-{{ row.ip }}">
   <td class="ip stack-lead">{{ m.ip_evidence_link(row.ip) }}</td>
   <td class="score">{{ row.score }}</td>
-  <td>
+  <td{% if row.tier_title %} title="{{ row.tier_title }}"{% endif %}>
     {{ m.tier_pill(row.tier) }}
   </td>
   <td class="count" data-label="Events">{{ row.event_count | count }}</td>

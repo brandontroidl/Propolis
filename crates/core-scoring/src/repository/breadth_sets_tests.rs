@@ -12,7 +12,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 use sqlx::{PgPool, Row};
 
-use crate::domain::enums::{Protocol, SignalType};
+use crate::domain::enums::{FeedTier, Protocol, SignalType};
 use crate::domain::types::{EventInput, IpScore};
 use crate::scoring::breadth::{WanVantage, distinct_wan_count};
 
@@ -558,7 +558,8 @@ async fn migration_0027_backfills_from_established_sightings_only(
         // One connection, then a datagram: eligible under the old rule only.
         ("192.0.2.52", HoneypotMalwareUpload, true, 40),
         ("192.0.2.52", HoneypotConnection, false, 50),
-        // Delisted, with a tier still stored.
+        // Delisted, with a tier and both flags still stored (what a delist that raced an append
+        // leaves): only the latch says it must not be seeded.
         ("192.0.2.53", HoneypotMalwareUpload, true, 60),
         ("192.0.2.53", HoneypotCommandExec, true, 70),
         // Only ever named by a datagram.
@@ -586,7 +587,7 @@ async fn migration_0027_backfills_from_established_sightings_only(
         ("192.0.2.50", Some("aggressive"), true, true, false, 2, 600),
         ("192.0.2.51", Some("standard"), true, true, false, 2, 30),
         ("192.0.2.52", Some("standard"), true, true, false, 1, 50),
-        ("192.0.2.53", Some("aggressive"), false, false, true, 2, 70),
+        ("192.0.2.53", Some("aggressive"), true, true, true, 2, 70),
         ("192.0.2.54", None, false, false, false, 0, 80),
     ];
     for &(ip, tier, eligible, recommended, delisted, established, seen) in &stored {
@@ -653,10 +654,8 @@ async fn migration_0027_backfills_from_established_sightings_only(
             "192.0.2.52",
             (Some(at(40)), None, None, false, false, false),
         ),
-        (
-            "192.0.2.53",
-            (Some(at(70)), None, None, false, false, false),
-        ),
+        // Delisted: nothing earned, whatever the stored flags say.
+        ("192.0.2.53", (Some(at(70)), None, None, true, true, true)),
         ("192.0.2.54", (None, None, None, false, false, false)),
     ]
     .into_iter()
@@ -672,9 +671,17 @@ async fn migration_0027_backfills_from_established_sightings_only(
     .fetch_one(&pool)
     .await?;
     assert!(predicate.contains("tcp"), "{predicate}");
+    // So does the index the vendor report's label lookup reads.
+    let predicate: String = sqlx::query_scalar(
+        "SELECT pg_get_expr(indpred, indrelid) FROM pg_index \
+         WHERE indexrelid = 'event_source_category_tcp_idx'::regclass",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(predicate.contains("tcp"), "{predicate}");
 
-    // A backfilled row carries on: the next connection folds onto it and replays to the same
-    // clocks the fold would have kept.
+    // A backfilled row carries on: the next connection folds onto it, earns the tier it reaches
+    // on that tier's own clock, and leaves the seeded one where the migration put it.
     let next = append_event(
         &pool,
         event(
@@ -689,5 +696,8 @@ async fn migration_0027_backfills_from_established_sightings_only(
     )
     .await?;
     assert_eq!(next.established_last_seen, Some(at(45)));
+    assert_eq!(next.tier, Some(FeedTier::Aggressive));
+    assert_eq!(next.aggressive_earned_at, Some(at(45)));
+    assert_eq!(next.standard_earned_at, Some(at(30)));
     Ok(())
 }

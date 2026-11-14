@@ -70,17 +70,18 @@ approval or rejection made in error; it clears `decided_at` and keeps the notes.
 
 ### Volume candidates
 
-An address that reaches a thousand established TCP events, and was seen in the last
-day, is offered on the queue page's **Volume** tab as a pending volume candidate. It
+An address that reaches a thousand established TCP events, and made a completed TCP
+connection in the last day, is offered on the queue page's **Volume** tab as a pending
+volume candidate. It
 is not published while it waits. The nav badge counts these together with pending
 review entries, and the page heading says how the total splits.
 
 1. Open the Volume tab. Each row shows the established TCP events now and when the
-   address was offered, its total events, its last-seen time, and the sensors and
+   address was offered, its total events, its last connection time, and the sensors and
    signal types behind the count.
 2. Check that the count is believable. It is taken from what the sensors' logs
    declared, and a single summary line can stand for a thousand events: an address
-   listed by one sensor, in one burst, with a last-seen time ahead of the clock,
+   listed by one sensor, in one burst, with a last connection time ahead of the clock,
    deserves a look at its evidence drawer before a decision.
 3. **Approve for retention feeds** publishes this address in the retention feeds
    (`all-24h` to `all-90d`) from the next build; it is not reported to abuse vendors.
@@ -96,7 +97,9 @@ does not lapse.
 Decided candidates are listed under the pending ones. **Return to pending** undoes
 either decision; an approved address then leaves the retention feeds at the next
 build. An address you already approved in the review queue is not offered here: that
-approval covers its volume listing as well.
+approval covers its volume listing as well. A pending candidate is also withdrawn at the
+next scan once the operator allowlist or `PROPOLIS_FEED_DELIST` covers its address, since
+approving it could never publish anything; a decided one is left as it is.
 
 From the CLI: `review volume list` and `review volume decided` show the two lists,
 and `review volume approve|reject|reopen <ip>` acts on one. Rules and thresholds are
@@ -226,7 +229,17 @@ writes:
   and hour-boundary timestamps, with the set and table names the feed's own name
   gives (`deploy/blocklist-sync.sh#check_content`). Consumers apply the `.nft` and
   `.ipset` files to their firewalls as root, so one extra line there would be a
-  command run on every consumer, and any file could carry data out of the node;
+  command run on every consumer, and any file could carry data out of the node.
+  Text that only means the same is refused too
+  (`deploy/blocklist-sync.sh#CHECK_CONTENT_PL`): a number with a leading zero
+  (`"count":01` is not JSON), a timestamp without a real month, day and hour, an
+  RPZ serial other than the build hour the file's `Generated` line states, an IPv6
+  address or RPZ trigger name not spelt exactly as the publisher spells it
+  (`deploy/blocklist-sync.sh#v6text`, `deploy/blocklist-sync.sh#rpz6_owner`), and
+  an IPv4-mapped address in any list or firewall file
+  (`deploy/blocklist-sync.sh#listed`). None of these is a firewall command, but
+  each would break every consumer's parser, resolver or set for as long as it
+  stood;
 - `manifest.json` is not the publisher's, or the retention windows it lists are not
   exactly the `all-*` feeds present.
 

@@ -22,7 +22,8 @@
 //! of using `run_udp_listener` (`sensor-dns`, `sensor-tftp`), which wrap their per-datagram tasks
 //! and, for `sensor-dns`, its rate-limit summary task. An event emitted outside any scope simply
 //! carries no `local_port`, which the console renders as "port not recorded" rather than
-//! attributing it to a guess.
+//! attributing it to a guess. The catch-all's UDP summaries are deliberately among them: one
+//! summary covers every port on its bind address, and names the port in each sample instead.
 
 use std::future::Future;
 

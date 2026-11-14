@@ -16,11 +16,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use sensor_catchall::handler;
+use sensor_catchall::flood::{self, UdpBudget, UdpFlood};
+use sensor_catchall::{handler, start_udp_listener};
 use sensor_framework::listener::normalize_dual_stack;
 use sensor_framework::{
-    ConnectionBounds, Env, EnvError, EventEmitter, WanResolver, run_tcp_listener, run_udp_listener,
-    shutdown_signal,
+    ConnectionBounds, Env, EnvError, EventEmitter, Rate, RateLimitConfig, WanResolver,
+    run_tcp_listener, shutdown_signal,
 };
 use tokio::task::JoinHandle;
 
@@ -39,6 +40,10 @@ const ENV_IDLE_TIMEOUT_MS: &str = "PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS";
 const ENV_MAX_DURATION_SECS: &str = "PROPOLIS_CATCHALL_MAX_DURATION_SECS";
 const ENV_MAX_CAPTURED_BYTES: &str = "PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES";
 const ENV_MAX_CONCURRENT: &str = "PROPOLIS_CATCHALL_MAX_CONCURRENT";
+const ENV_UDP_RATE_PER_SOURCE: &str = "PROPOLIS_CATCHALL_UDP_RATE_PER_SOURCE";
+const ENV_UDP_BURST_PER_SOURCE: &str = "PROPOLIS_CATCHALL_UDP_BURST_PER_SOURCE";
+const ENV_UDP_RATE_GLOBAL: &str = "PROPOLIS_CATCHALL_UDP_RATE_GLOBAL";
+const ENV_UDP_BURST_GLOBAL: &str = "PROPOLIS_CATCHALL_UDP_BURST_GLOBAL";
 
 /// Reads `name`, falling back to the pre-rename bare spelling (`PROPOLIS_CATCHALL_X` -> `CATCHALL_X`)
 /// so a config written against the old names still starts the sensor. A legacy hit is warned about
@@ -58,6 +63,12 @@ const DEFAULT_IDLE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_MAX_DURATION_SECS: u64 = 30;
 const DEFAULT_MAX_CAPTURED_BYTES: u64 = 4_096;
 const DEFAULT_MAX_CONCURRENT: u32 = 256;
+// UDP datagrams recorded one by one, per source network (IPv4 /24, IPv6 /56) and in total. See
+// `sensor_catchall::flood` for what happens to the rest and why these values.
+const DEFAULT_UDP_RATE_PER_SOURCE: u32 = flood::DEFAULT_RATE_PER_SOURCE_PER_SECOND;
+const DEFAULT_UDP_BURST_PER_SOURCE: u32 = flood::DEFAULT_BURST_PER_SOURCE;
+const DEFAULT_UDP_RATE_GLOBAL: u32 = flood::DEFAULT_RATE_GLOBAL_PER_SECOND;
+const DEFAULT_UDP_BURST_GLOBAL: u32 = flood::DEFAULT_BURST_GLOBAL;
 
 /// Catch-all process configuration: every TCP/UDP address to bind, the local-to-WAN IP table, the
 /// per-connection bounds, and the event log path. Unlike `sensor_framework::SensorConfig`, this
@@ -70,6 +81,9 @@ struct Config {
     wan_map: HashMap<IpAddr, IpAddr>,
     bounds: ConnectionBounds,
     log_path: PathBuf,
+    /// The UDP budget: how many datagrams get an event of their own. Both rates are positive by
+    /// type, so the budget cannot be configured away.
+    udp_budget: RateLimitConfig,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,7 +140,16 @@ fn parse_bind_addrs(raw: &str) -> Result<Vec<SocketAddr>, ConfigError> {
 /// zero-valued bound is rejected here rather than silently substituted with a default that could
 /// disable the bound it names.
 fn load_config(env: &Env) -> Result<Config, ConfigError> {
+    let udp_per_source = Rate::new(
+        env.positive_u32(ENV_UDP_RATE_PER_SOURCE, DEFAULT_UDP_RATE_PER_SOURCE)?,
+        env.positive_u32(ENV_UDP_BURST_PER_SOURCE, DEFAULT_UDP_BURST_PER_SOURCE)?,
+    );
+    let udp_global = Rate::new(
+        env.positive_u32(ENV_UDP_RATE_GLOBAL, DEFAULT_UDP_RATE_GLOBAL)?,
+        env.positive_u32(ENV_UDP_BURST_GLOBAL, DEFAULT_UDP_BURST_GLOBAL)?,
+    );
     Ok(Config {
+        udp_budget: flood::budget_config(udp_per_source, udp_global),
         bind_addrs: parse_bind_addrs(&env.string(ENV_BIND_ADDRS)?.unwrap_or_default())?,
         wan_map: env.wan_map(ENV_WAN_MAP)?,
         log_path: env.path(ENV_LOG_PATH, DEFAULT_LOG_PATH)?,
@@ -163,6 +186,12 @@ async fn main() {
     // on failure, never propagated to stop the loop over the rest of the configured addresses.
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
+    // One UDP allowance for the whole process, and one set of flood summaries per bind address
+    // (not per port): a sender sweeping every port draws on a single budget and is summarized
+    // once. See `sensor_catchall::flood`.
+    let udp_budget = Arc::new(UdpBudget::new(config.udp_budget));
+    let mut udp_floods: HashMap<IpAddr, Arc<UdpFlood>> = HashMap::new();
+
     for addr in &config.bind_addrs {
         let bounds = config.bounds.clone();
         let tcp_emitter = emitter.clone();
@@ -197,19 +226,16 @@ async fn main() {
         }
 
         let local_ip = normalize_dual_stack(*addr).ip();
-        let udp_emitter = emitter.clone();
-        let udp_wan_resolver = wan_resolver.clone();
-        match run_udp_listener(
+        let udp_flood = udp_floods
+            .entry(local_ip)
+            .or_insert_with(|| Arc::new(UdpFlood::new(udp_budget.clone(), local_ip)))
+            .clone();
+        match start_udp_listener(
             *addr,
             config.bounds.clone(),
-            per_source_cap,
-            move |data, peer| {
-                let emitter = udp_emitter.clone();
-                let wan_resolver = udp_wan_resolver.clone();
-                async move {
-                    handler::handle_udp(data, peer, local_ip, &wan_resolver, &emitter).await;
-                }
-            },
+            udp_flood,
+            wan_resolver.clone(),
+            emitter.clone(),
         )
         .await
         {
@@ -231,10 +257,25 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let summary_handles: Vec<JoinHandle<()>> = udp_floods
+        .values()
+        .map(|udp_flood| {
+            tokio::spawn(flood::run_summaries(
+                udp_flood.clone(),
+                wan_resolver.clone(),
+                emitter.clone(),
+            ))
+        })
+        .collect();
+
     shutdown_signal().await;
     tracing::info!("catchall: shutdown signal received; stopping listeners");
-    for handle in handles {
+    for handle in handles.into_iter().chain(summary_handles) {
         handle.abort();
+    }
+    // What the budget withheld in the window still open is written now, not lost with the process.
+    for udp_flood in udp_floods.values() {
+        udp_flood.flush(&wan_resolver, &emitter).await;
     }
 }
 
@@ -286,6 +327,30 @@ mod tests {
         assert_eq!(c.bounds.max_duration, Duration::from_secs(30));
         assert_eq!(c.bounds.max_captured_bytes, 4_096);
         assert_eq!(c.bounds.max_concurrent, 256);
+        assert_eq!(
+            c.udp_budget,
+            flood::budget_config(rate(1, 20), rate(20, 100)),
+            "one datagram a second per source network, twenty a second in total"
+        );
+        assert_eq!(c.udp_budget.summary_capacity.get(), flood::SUMMARY_CAPACITY);
+    }
+
+    fn rate(per_second: u32, burst: u32) -> Rate {
+        let nz = |n| std::num::NonZeroU32::new(n).unwrap();
+        Rate::new(nz(per_second), nz(burst))
+    }
+
+    #[test]
+    fn the_udp_budget_is_read_from_its_four_variables() {
+        let c = load_config(&Env::from_table(&[
+            BINDS,
+            (ENV_UDP_RATE_PER_SOURCE, "3"),
+            (ENV_UDP_BURST_PER_SOURCE, "9"),
+            (ENV_UDP_RATE_GLOBAL, "40"),
+            (ENV_UDP_BURST_GLOBAL, "70"),
+        ]))
+        .unwrap();
+        assert_eq!(c.udp_budget, flood::budget_config(rate(3, 9), rate(40, 70)));
     }
 
     #[test]
@@ -296,6 +361,10 @@ mod tests {
             ENV_MAX_DURATION_SECS,
             ENV_MAX_CAPTURED_BYTES,
             ENV_MAX_CONCURRENT,
+            ENV_UDP_RATE_PER_SOURCE,
+            ENV_UDP_BURST_PER_SOURCE,
+            ENV_UDP_RATE_GLOBAL,
+            ENV_UDP_BURST_GLOBAL,
         ] {
             for bad in ["0", "-1", "ten"] {
                 match load_config(&Env::from_table(&[BINDS, (var, bad)])) {

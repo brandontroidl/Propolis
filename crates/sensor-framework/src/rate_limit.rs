@@ -518,12 +518,48 @@ impl FloodLedger {
     }
 }
 
+/// The fields every flood summary carries, whichever sensor writes it: the network
+/// (`source_prefix`, `"overflow"` for networks that arrived while the summary table was full),
+/// what was withheld (`suppressed_count`, `suppressed_bytes`), which budget refused it, the
+/// window, a few samples, and how many distinct addresses were seen. `first_seen` and `last_seen`
+/// are wall-clock times reconstructed from the monotonic instants at emission.
+pub fn flood_summary_metadata(
+    s: &FloodSummary,
+    window: Duration,
+    now: Instant,
+    now_utc: DateTime<Utc>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let wall = |at: Instant| {
+        let ago = chrono::Duration::from_std(now.saturating_duration_since(at)).unwrap_or_default();
+        (now_utc - ago).to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
+    let source_prefix = match s.key {
+        Some(key) => key.to_string(),
+        None => "overflow".to_string(),
+    };
+    let fields = json!({
+        "source_prefix": source_prefix,
+        "suppressed_count": s.count,
+        "suppressed_bytes": s.bytes,
+        "per_source_limited": s.source_limited,
+        "global_limited": s.global_limited,
+        "first_seen": wall(s.first_seen),
+        "last_seen": wall(s.last_seen),
+        "window_secs": window.as_secs_f64(),
+        "samples": s.samples,
+        "distinct_sources": s.distinct_sources as u64,
+        "distinct_sources_capped": s.distinct_sources_capped,
+    });
+    match fields {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
 /// One source network's UDP datagrams that got no reply and no event of their own over one
 /// window because the reply rate limit refused them, as the `honeypot_connection` over `udp` a
-/// single datagram would be. `source_ip` is the first address seen from the network in the window
-/// and `source_prefix` names the network (`"overflow"` for networks that arrived while the summary
-/// table was full). `first_seen` and `last_seen` are wall-clock times reconstructed from the
-/// monotonic instants at emission.
+/// single datagram would be. `source_ip` is the first address seen from the network in the
+/// window; the rest is [`flood_summary_metadata`] plus the protocol the sensor speaks.
 pub fn rate_limited_event(
     sensor: &str,
     protocol_label: &str,
@@ -533,14 +569,10 @@ pub fn rate_limited_event(
     now: Instant,
     now_utc: DateTime<Utc>,
 ) -> SensorEvent {
-    let wall = |at: Instant| {
-        let ago = chrono::Duration::from_std(now.saturating_duration_since(at)).unwrap_or_default();
-        (now_utc - ago).to_rfc3339_opts(SecondsFormat::Millis, true)
-    };
-    let source_prefix = match s.key {
-        Some(key) => key.to_string(),
-        None => "overflow".to_string(),
-    };
+    let mut metadata = flood_summary_metadata(s, window, now, now_utc);
+    metadata.insert("protocol_label".into(), protocol_label.into());
+    metadata.insert("transport".into(), "udp".into());
+    metadata.insert("query_status".into(), "rate_limited".into());
     SensorEvent {
         v: WIRE_VERSION,
         source_ip: s.first_source,
@@ -550,22 +582,7 @@ pub fn rate_limited_event(
         protocol: PROTO_UDP.into(),
         authenticated: false,
         observed_at: now_utc,
-        metadata: json!({
-            "protocol_label": protocol_label,
-            "transport": "udp",
-            "query_status": "rate_limited",
-            "source_prefix": source_prefix,
-            "suppressed_count": s.count,
-            "suppressed_bytes": s.bytes,
-            "per_source_limited": s.source_limited,
-            "global_limited": s.global_limited,
-            "first_seen": wall(s.first_seen),
-            "last_seen": wall(s.last_seen),
-            "window_secs": window.as_secs_f64(),
-            "samples": s.samples,
-            "distinct_sources": s.distinct_sources as u64,
-            "distinct_sources_capped": s.distinct_sources_capped,
-        }),
+        metadata: serde_json::Value::Object(metadata),
         sample: None,
         session_id: Some(Uuid::now_v7()),
         occurrence_id: None,

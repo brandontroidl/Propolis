@@ -1940,9 +1940,29 @@ a byte back** (`crates/sensor-catchall/src/handler.rs#handle_tcp`).
   and `observed_len`, authenticated=false, no `protocol_label` (`crates/sensor-catchall/src/handler.rs#MAX_HEX_SAMPLE_BYTES`, `crates/sensor-catchall/src/handler.rs#build_event`). TCP
   uses protocol `tcp`; UDP uses `udp` with a session id minted per datagram. No
   spool.
+- **UDP event budget** (`crates/sensor-catchall/src/flood.rs#UdpFlood::admit`): a UDP source
+  address is whatever the sender wrote, so one event per datagram would let a single sender
+  fill the log under any addresses it chose. Each datagram draws on a token bucket for its
+  source network (IPv4 /24, IPv6 /56; 1 per second, burst 20) and one for the whole process
+  (20 per second, burst 100), shared by every UDP listener so that sweeping many ports does not
+  multiply the allowance. Within both, the datagram is recorded as above. Over either, it gets
+  no event of its own and is counted into its source network's summary: one `catchall_probe`
+  over `udp` per network per 10 s (`crates/sensor-catchall/src/flood.rs#summary_event`), with
+  `metadata.rate_limited: true`, `source_prefix` (the network, or `overflow` for networks past
+  the 64 a bind address summarizes per window), `suppressed_count`, `suppressed_bytes`,
+  `per_source_limited`, `global_limited`, `first_seen`, `last_seen`, `window_secs`,
+  `distinct_sources`, `distinct_sources_capped`, and up to 8 `samples`, each
+  `port <port> len <bytes> hex <first 32 bytes>`. `source_ip` is the first address seen from
+  the network in the window. A summary covers every port on its bind address, so it carries no
+  `local_port`, `payload_hex` or `observed_len`. It is not an event summary in scoring's sense:
+  it counts as one sighting however many datagrams it stands for. Summaries still accumulating
+  are written at shutdown. The four rates are
+  [environment variables](environment-variables.md); the limits are tabled in
+  [rate-limits-and-budgets.md](rate-limits-and-budgets.md#udp-event-budget-sensor-catchall).
+  TCP probes are not budgeted this way.
 - **UDP WAN caveat:** `wan_ip` attribution under a wildcard UDP bind is a documented
-  limitation (no `local_addr()` on UDP receive; `local_ip` is caller-supplied,
-  `crates/sensor-catchall/src/handler.rs#handle_udp`).
+  limitation (no `local_addr()` on UDP receive; the local address is the bind address the
+  listener was started with, `crates/sensor-catchall/src/lib.rs#start_udp_listener`).
 - **Emits:** `catchall_probe` only.
 
 ### sensor-cred (VNC / MySQL / MSSQL / PostgreSQL / MongoDB)
@@ -2131,7 +2151,7 @@ all covered by the one path every handler writes through.
 
 - **Session id:** `Uuid::now_v7()` minted per accepted TCP connection by the
   listener, per datagram for catchall UDP and DNS UDP, per transfer for TFTP, and per summary
-  for a DNS or TFTP `rate_limited` event; carried on every event.
+  for a DNS or TFTP `rate_limited` event or a catch-all UDP summary; carried on every event.
 - **Password discipline:** every login-capturing sensor reads the password only to
   advance the protocol and drops it - never stored, logged, or placed in any event
   field (SSH `crates/sensor-ssh/src/auth.rs`, telnet `crates/sensor-telnet/src/handler.rs#handle_connection`, FTP `crates/sensor-ftp/src/handler.rs#handle_connection`, redis

@@ -2,7 +2,8 @@
 //!
 //! A flood, a repeated command and a UDP burst are each folded by the sensor into one summary
 //! line (`sensor_framework::source_summary_event`, `command_summary_event`,
-//! `rate_limited_event`). Those lines are how a flood's volume reaches scoring. Each end has its
+//! `rate_limited_event`, and the catch-all's `sensor_catchall::flood::summary_event`). Those
+//! lines are how a flood's volume reaches scoring. Each end has its
 //! own tests against hand-written lines, which is how a validation rule that refused every one of
 //! them (their `window_secs` is a float) passed the whole suite. So this drives the builders'
 //! real output through `IntakeRunner` under the names the shipped units give the logs and checks
@@ -31,6 +32,7 @@ use tokio::time::Instant;
 const FLOODER: &str = "203.0.113.90";
 const SHELL: &str = "203.0.113.91";
 const RESOLVER_ABUSER: &str = "203.0.113.92";
+const DATAGRAM_FLOODER: &str = "203.0.113.93";
 
 async fn migrate(pool: &PgPool) {
     sqlx::migrate!("../core-scoring/migrations")
@@ -190,6 +192,58 @@ async fn the_summaries_the_sensors_write_are_ingested_counted_and_leave_the_chai
     assert_eq!(
         serde_json::to_string(&stored_metadata(&pool, RESOLVER_ABUSER).await).unwrap(),
         serde_json::to_string(&burst.metadata).unwrap()
+    );
+
+    // A UDP flood at the catch-all, as its budget folds it. Not built by hand: the budget
+    // refuses real datagrams and the sensor's own emitter writes the line that is ingested.
+    let catchall_line = {
+        use sensor_catchall::flood::{UdpBudget, UdpFlood, budget_config};
+        use sensor_framework::{EventEmitter, Rate, WanResolver};
+        let one = std::num::NonZeroU32::MIN;
+        let budget = budget_config(Rate::new(one, one), Rate::new(one, one));
+        let flood = UdpFlood::new(
+            Arc::new(UdpBudget::new(budget)),
+            "192.0.2.1".parse().unwrap(),
+        );
+        let peer = format!("{DATAGRAM_FLOODER}:4000").parse().unwrap();
+        assert!(
+            flood.admit(peer, Some(1900), b"M-SEARCH"),
+            "the burst of one"
+        );
+        for _ in 0..999 {
+            assert!(!flood.admit(peer, Some(1900), b"M-SEARCH"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("events.jsonl");
+        flood
+            .flush(
+                &WanResolver::new(Default::default()),
+                &EventEmitter::new(log.clone()),
+            )
+            .await;
+        let written = std::fs::read_to_string(&log).unwrap();
+        let mut lines = written.lines();
+        let line: SensorEvent = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(lines.next(), None, "one network, one summary");
+        line
+    };
+    assert_eq!(catchall_line.metadata["suppressed_count"], 999);
+    assert_eq!(
+        ingest(&pool, "catchall", std::slice::from_ref(&catchall_line)).await,
+        (1, 0, 0)
+    );
+    let score = read_score(&pool, DATAGRAM_FLOODER.parse::<IpAddr>().unwrap())
+        .await
+        .unwrap()
+        .expect("the address the datagrams named has a score row");
+    assert_eq!(
+        (score.event_count, score.established_event_count),
+        (1, 0),
+        "a UDP summary is one sighting, not the 999 datagrams it stands for, and proves no source"
+    );
+    assert_eq!(
+        serde_json::to_string(&stored_metadata(&pool, DATAGRAM_FLOODER).await).unwrap(),
+        serde_json::to_string(&catchall_line.metadata).unwrap()
     );
 
     assert_eq!(verify_chain(&pool).await.unwrap(), ChainStatus::Intact);

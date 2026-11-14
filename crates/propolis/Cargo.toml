@@ -49,6 +49,8 @@ serde_json = "1.0.151"
 sensor-telnet = { path = "../sensor-telnet" }
 # The same boundary for the other shell sensor, whose capture metadata the console also reads.
 sensor-ssh = { path = "../sensor-ssh" }
+# The catch-all's UDP budget, so its summary line reaches intake as the sensor wrote it.
+sensor-catchall = { path = "../sensor-catchall" }
 # An SSH client for that test, so the session is driven over the real transport rather than by
 # calling the handler directly. Already vendored at this version for sensor-ssh's own tests.
 russh = "0.65.1"

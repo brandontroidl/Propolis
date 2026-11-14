@@ -716,7 +716,20 @@ The `<P>` rows above, instantiated per sensor (each name is read literally by th
   `PROPOLIS_REDIS_TLS_KEY` (see "Redis TLS" below).
 - catchall: `PROPOLIS_CATCHALL_READ_TIMEOUT_MS`, `PROPOLIS_CATCHALL_IDLE_TIMEOUT_MS`,
   `PROPOLIS_CATCHALL_MAX_DURATION_SECS`, `PROPOLIS_CATCHALL_MAX_CAPTURED_BYTES`,
-  `PROPOLIS_CATCHALL_MAX_CONCURRENT`.
+  `PROPOLIS_CATCHALL_MAX_CONCURRENT`. Four more variables set the UDP event budget
+  (`crates/sensor-catchall/src/flood.rs#UdpBudget`), each a positive `u32` where zero or a
+  non-number aborts startup (the budget can never be configured off):
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `PROPOLIS_CATCHALL_UDP_RATE_PER_SOURCE` | `1` (`sensor-catchall/src/flood.rs#DEFAULT_RATE_PER_SOURCE_PER_SECOND`) | UDP datagrams recorded one by one per second per source network (the IPv4 /24 or IPv6 /56). |
+  | `PROPOLIS_CATCHALL_UDP_BURST_PER_SOURCE` | `20` (`sensor-catchall/src/flood.rs#DEFAULT_BURST_PER_SOURCE`) | How many a quiet source network may send at once before the per-second rate applies. |
+  | `PROPOLIS_CATCHALL_UDP_RATE_GLOBAL` | `20` (`sensor-catchall/src/flood.rs#DEFAULT_RATE_GLOBAL_PER_SECOND`) | UDP datagrams recorded one by one per second across every source and every listener of the process. |
+  | `PROPOLIS_CATCHALL_UDP_BURST_GLOBAL` | `100` (`sensor-catchall/src/flood.rs#DEFAULT_BURST_GLOBAL`) | The global burst. |
+
+  The budget applies to UDP only. A datagram over either budget gets no event of its own; it
+  is counted in one `catchall_probe` summary event per source network per 10 s (see
+  [sensor-behavior](sensor-behavior.md#sensor-catchall)).
 - smtp: `PROPOLIS_SMTP_READ_TIMEOUT_MS`, `PROPOLIS_SMTP_IDLE_TIMEOUT_MS`,
   `PROPOLIS_SMTP_MAX_DURATION_SECS`, `PROPOLIS_SMTP_MAX_CAPTURED_BYTES`,
   `PROPOLIS_SMTP_MAX_CONCURRENT`, `PROPOLIS_SMTP_LOG_PATH`, `PROPOLIS_SMTP_WAN_MAP`

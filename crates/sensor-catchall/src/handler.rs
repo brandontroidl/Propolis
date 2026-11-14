@@ -12,10 +12,14 @@ use std::net::{IpAddr, SocketAddr};
 
 use chrono::Utc;
 use sensor_framework::listener::normalize_dual_stack;
-use sensor_framework::{ConnectionBounds, EventEmitter, Uuid, WanResolver, to_hex_bounded};
+use sensor_framework::{
+    ConnectionBounds, EventEmitter, Uuid, WanResolver, arrival, to_hex_bounded,
+};
 use sensor_wire::{PROTO_TCP, PROTO_UDP, SIGNAL_CATCHALL_PROBE, SensorEvent, WIRE_VERSION};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+
+use crate::flood::UdpFlood;
 
 /// Ceiling on how many captured bytes are hex-encoded into `metadata.payload_hex`, independent of
 /// `bounds.max_captured_bytes` (which bounds how much is actually *read* off the wire - this second
@@ -96,23 +100,33 @@ async fn read_bounded(stream: &mut TcpStream, bounds: &ConnectionBounds) -> Vec<
 /// `run_udp_listener` never gives a handler any way to reach the socket at all, so a UDP catch-all
 /// cannot answer a probe even by mistake.
 ///
-/// `local_ip` is supplied by the caller rather than discovered here: `run_udp_listener`'s handler
-/// signature carries only the datagram bytes and the sender's address, never the local address the
-/// datagram arrived on - there is no `local_addr()` equivalent for a UDP receive the way there is
-/// for an accepted TCP connection (see `sensor_catchall::start_test_udp_listener`'s doc for the
-/// full reasoning and its narrower limitation under a wildcard bind).
+/// The datagram first draws on the UDP budget (`crate::flood`). Within it, the datagram gets one
+/// `catchall_probe` event. Over it, the datagram is counted into its source network's summary
+/// and nothing is written here: a source address on a datagram is whatever the sender wrote, so
+/// one event per datagram would let a single sender fill the log under any addresses it chose.
+///
+/// The local address comes from `flood` rather than being discovered here: `run_udp_listener`'s
+/// handler signature carries only the datagram bytes and the sender's address, never the local
+/// address the datagram arrived on - there is no `local_addr()` equivalent for a UDP receive the
+/// way there is for an accepted TCP connection (see `sensor_catchall::start_udp_listener`'s doc
+/// for the full reasoning and its narrower limitation under a wildcard bind).
 pub async fn handle_udp(
     data: Vec<u8>,
     peer: SocketAddr,
-    local_ip: IpAddr,
+    flood: &UdpFlood,
     wan_resolver: &WanResolver,
     emitter: &EventEmitter,
 ) {
+    // The listener's port, for a summary sample: a summary spans every port on its address.
+    let local_port = arrival::current().map(|a| a.local_port);
+    if !flood.admit(peer, local_port, &data) {
+        return;
+    }
     // UDP has no persistent connection to mint a session id for at accept time (see
     // `run_udp_listener`'s module doc), so one is minted fresh per datagram here - each datagram
     // is its own independent observation.
     let session_id = Uuid::now_v7();
-    let wan_ip = wan_resolver.resolve(local_ip);
+    let wan_ip = wan_resolver.resolve(flood.local_ip());
     let event = build_event(peer.ip(), wan_ip, PROTO_UDP, &data, session_id);
     if let Err(e) = emitter.append(&event).await {
         tracing::error!(%peer, error = %e, "catchall: failed to append udp event");

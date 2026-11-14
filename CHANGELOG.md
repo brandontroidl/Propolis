@@ -237,6 +237,16 @@
   of extra start-up `[estimated from 1,500,000 events: about 6 s per index build and a few
   seconds for the roll-ups]`; later starts are unaffected. See
   [schema and migrations](docs/development/schema-and-migrations.md#index-builds).
+- **The catch-all no longer writes one event for every UDP datagram.** It records UDP
+  datagrams one by one only within a budget: one a second per source network (IPv4 /24, IPv6
+  /56) with a burst of 20, and 20 a second with a burst of 100 across the whole sensor. The
+  rest are counted in one summary event per network per 10 s. Ordinary scanning is far inside
+  the budget and is recorded as before; a host that was being flooded over UDP will show fewer
+  catch-all events and some summaries (`metadata.rate_limited: true`) in their place. Nothing
+  needs configuring. The four rates are `PROPOLIS_CATCHALL_UDP_RATE_PER_SOURCE`,
+  `PROPOLIS_CATCHALL_UDP_BURST_PER_SOURCE`, `PROPOLIS_CATCHALL_UDP_RATE_GLOBAL` and
+  `PROPOLIS_CATCHALL_UDP_BURST_GLOBAL`; zero is refused, so the budget cannot be turned off
+  ([limits](docs/reference/rate-limits-and-budgets.md#udp-event-budget-sensor-catchall)).
 
 ### Added
 
@@ -673,6 +683,22 @@
   with no sideways scroll.
 
 ### Fixed
+
+- **One sender can no longer fill the catch-all's log over UDP** - the catch-all wrote one
+  `catchall_probe` event for every UDP datagram it received, with no rate budget, and a UDP
+  source address is whatever the sender wrote. A single host sending at line rate therefore
+  wrote one log line per packet under as many forged addresses as it chose, and the log, the
+  shipper and the ledger filled at the sender's rate, each line a scored sighting of an address
+  that may never have sent anything. Every datagram now draws on a token bucket for its source
+  network and one for the whole process, shared by every UDP listener so that sweeping ports
+  does not multiply the allowance (`crates/sensor-catchall/src/flood.rs#UdpFlood::admit`). Over
+  either, the datagram is counted into its network's summary instead of being written: one
+  `catchall_probe` summary per network per 10 s, at most 64 networks and one overflow per bind
+  address per window, with counts, byte totals and eight samples that name the port each
+  arrived on. The worst case is now 20 events a second plus 65 summaries per 10 s per bind
+  address, however fast the sender is and however many networks it claims. The summary counts
+  as one sighting in scoring. TCP probes are unchanged
+  ([behaviour](docs/reference/sensor-behavior.md#sensor-catchall)).
 
 - **A full session-memory pool no longer starves every new SSH shell while one session holds far
   over its share** - a shell or exec was refused whenever the pool had under 512 KiB left, but

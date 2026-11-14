@@ -381,6 +381,33 @@ more than one: `suppressed_count` on a command summary or a UDP rate-limit summa
 for the analyst. A raw count of rows in the `event` table, as the console's event search and the
 metrics endpoint's per-signal counts read it, counts a summary once.
 
+#### Catch-all UDP summary keys
+
+A UDP datagram the catch-all receives over its event budget is not written; it is counted into
+one summary per source network per 10 s window, a `catchall_probe` over `udp` marked
+`rate_limited: true` (`crates/sensor-catchall/src/flood.rs#summary_event`; when and why in
+[sensor-behavior](sensor-behavior.md#sensor-catchall)). Its `source_ip` is the first address
+seen from the network in the window, its `wan_ip` is that of the bind address, and its
+`session_id` is fresh. It has none of the keys of a single probe (`payload_hex`,
+`observed_len`) and no `local_port`: a summary covers every port on its bind address.
+
+| key | type | meaning |
+|---|---|---|
+| `rate_limited` | boolean | always `true`; marks the event as a summary of withheld datagrams |
+| `source_prefix` | string | the source network in CIDR form (`198.51.100.0/24`, `2001:db8:0:ff00::/56`), or `overflow` for networks that arrived while the window's summary table was full |
+| `suppressed_count`, `suppressed_bytes` | integer | datagrams withheld, and their payload bytes |
+| `per_source_limited`, `global_limited` | integer | how many of them the source network's budget refused, and how many the process-wide budget refused |
+| `first_seen`, `last_seen` | string | RFC 3339 times of the first and last withheld datagram |
+| `window_secs` | number | the window length, 10 |
+| `samples` | array of strings | up to 8 withheld datagrams, each `port <port> len <bytes> hex <first 32 bytes>` |
+| `distinct_sources`, `distinct_sources_capped` | integer, boolean | distinct source addresses among them, at most 32 |
+
+The line is not marked `event_summary`, so scoring counts it as one sighting however many
+datagrams it stands for: none of them proved where it came from. The DNS and TFTP
+`rate_limited` summaries carry the same keys except `rate_limited`, plus `protocol_label`,
+`transport` and `query_status: "rate_limited"`
+(`crates/sensor-framework/src/rate_limit.rs#flood_summary_metadata`).
+
 ### Arrival metadata key
 
 Every event a sensor emits carries the local port of the listener its connection or datagram
@@ -394,7 +421,9 @@ a JSON integer survives the `JSONB` round trip the hash chain re-reads (see
 
 The transport is `protocol` (`tcp` or `udp`), not a metadata key. The pair (`protocol`,
 `local_port`) names one listener: the catch-all's TCP and UDP listeners on the same port number
-are told apart only by `protocol`. Events written before this key existed have no `local_port`;
+are told apart only by `protocol`. Events written before this key existed have no `local_port`,
+and neither does a [catch-all UDP summary](#catch-all-udp-summary-keys), which covers every port
+on its bind address;
 how the fleet pane attributes them is in
 [health and observability](../operations/health-and-observability.md#fleet-pane-listener-activity).
 Every sensor crate's `tests/arrival.rs` drives its real listeners and checks the key, and

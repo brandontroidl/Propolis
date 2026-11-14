@@ -77,6 +77,31 @@ are not charged. A zero or non-numeric rate aborts startup; no value turns the l
 over TCP and DoT is not rate limited (its per-connection bounds are in
 [sensor-behavior.md](sensor-behavior.md#sensor-dns)).
 
+## UDP event budget (sensor-catchall)
+
+The catch-all answers nothing, so there is no reply to bound; what a forged source address can
+abuse is the log. Every datagram used to be one event, at whatever rate and under whatever
+addresses the sender chose. The same token buckets now decide which datagrams are recorded one
+by one (`crates/sensor-catchall/src/flood.rs#UdpFlood`, checked in
+`crates/sensor-catchall/src/handler.rs#handle_udp`). Behavior and the summary event are owned by
+[sensor-behavior.md](sensor-behavior.md#sensor-catchall).
+
+| Item | Value | Source |
+|---|---|---|
+| Per source network | 1 per s, burst 20 | `PROPOLIS_CATCHALL_UDP_RATE_PER_SOURCE`, `PROPOLIS_CATCHALL_UDP_BURST_PER_SOURCE` |
+| Global | 20 per s, burst 100, shared by every UDP listener of the process | `PROPOLIS_CATCHALL_UDP_RATE_GLOBAL`, `PROPOLIS_CATCHALL_UDP_BURST_GLOBAL` |
+| Source network | IPv4 /24 (IPv4-mapped IPv6 included), IPv6 /56 *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#SourceKey` |
+| Over budget | no per-datagram event; counted in a summary | `crates/sensor-framework/src/rate_limit.rs#FloodLedger` |
+| Summary window | one summary event per network per 10 s *(hard-coded)* | `crates/sensor-framework/src/rate_limit.rs#DEFAULT_SUMMARY_WINDOW` |
+| Summaries held | 64 networks per bind address, then one overflow summary; 8 samples and 32 distinct sources each *(hard-coded)* | `crates/sensor-catchall/src/flood.rs#SUMMARY_CAPACITY`, `crates/sensor-framework/src/rate_limit.rs#MAX_SUMMARY_SAMPLES`, `crates/sensor-framework/src/rate_limit.rs#MAX_SUMMARY_SOURCES` |
+| Shutdown flush | pending summaries written before exit | `crates/sensor-catchall/src/flood.rs#UdpFlood::flush` |
+
+The worst case is therefore fixed by the sensor, not the sender: 20 events a second for the
+whole process, plus at most 65 summary lines per 10 s for each address it binds, however many
+ports are bound and however many source networks a flood claims. A zero or non-numeric rate
+aborts startup; no value turns the budget off. TCP probes are not budgeted here: the handshake
+proves the source, and the listener caps how many connections one source holds at once.
+
 ## Shell command-event budget (ssh, telnet, adb)
 
 Bounds how many `honeypot_command_exec` events one source network writes, not what the shell

@@ -2579,6 +2579,7 @@ dependencies = [
  "reqwest",
  "review",
  "russh",
+ "sensor-catchall",
  "sensor-framework",
  "sensor-ssh",
  "sensor-telnet",

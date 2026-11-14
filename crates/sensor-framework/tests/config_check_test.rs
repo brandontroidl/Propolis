@@ -449,7 +449,20 @@ cat "$d/psql_out"
     }
 
     fn run_with(&self, args: &[&str], env: &[(&str, &str)]) -> Run {
-        let mut cmd = Command::new(BASH);
+        self.run_under(&[], args, env)
+    }
+
+    /// The same run with the script started through `wrapper` (a privilege drop), so a check that
+    /// depends on what the account can read is exercised even when the tests run as root.
+    fn run_under(&self, wrapper: &[&str], args: &[&str], env: &[(&str, &str)]) -> Run {
+        let mut cmd = match wrapper.split_first() {
+            Some((first, rest)) => {
+                let mut c = Command::new(first);
+                c.args(rest).arg(BASH);
+                c
+            }
+            None => Command::new(BASH),
+        };
         cmd.arg(SCRIPT)
             .args(args)
             .arg("--env-dir")
@@ -491,7 +504,9 @@ cat "$d/psql_out"
             .env("PROPOLIS_CC_WATCH_ACCOUNT", &*self.watch_account.borrow())
             .env("PROPOLIS_CC_BACKUP_STATUS", self.p("state/backup-status"))
             .env("PROPOLIS_CC_BACKUP_DIR", self.p("state/backups"))
-            .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"));
+            .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"))
+            // Absent until a test creates it, so a run never looks at this host's own spool.
+            .env("PROPOLIS_CC_GATEWAY_SPOOL_DIR", self.p("spool/gateway"));
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -536,6 +551,46 @@ cat "$d/psql_out"
     fn logs(&self) -> String {
         self.p("logs").display().to_string()
     }
+
+    /// The gateway spool directory every run looks in (PROPOLIS_CC_GATEWAY_SPOOL_DIR).
+    fn spool_dir(&self) -> String {
+        self.p("spool/gateway").display().to_string()
+    }
+
+    /// One collector's spool file as the gateway writes it, `<spool>/<id>/events.jsonl`; returns
+    /// its path.
+    fn spool(&self, id: &str, bytes: usize, mtime: u64) -> String {
+        let rel = format!("spool/gateway/{id}/events.jsonl");
+        self.log(&rel, bytes, mtime);
+        self.p(&rel).display().to_string()
+    }
+
+    /// Appends `entries` (already `label:path,...`) to PROPOLIS_SENSOR_LOGS in propolis.env.
+    fn add_intake_entries(&self, entries: &str) {
+        let text: Vec<String> = self
+            .read("etc/propolis.env")
+            .lines()
+            .map(|l| {
+                if l.starts_with("PROPOLIS_SENSOR_LOGS=") {
+                    format!("{l},{entries}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        self.write("etc/propolis.env", &(text.join("\n") + "\n"));
+    }
+}
+
+/// The findings whose id starts with `spool-`, the gateway spool checks.
+fn spool_findings(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"].as_str().unwrap().starts_with("spool-"))
+        .cloned()
+        .collect()
 }
 
 fn is_root() -> bool {
@@ -586,6 +641,10 @@ fn an_all_green_host_reports_every_listener_ok_and_exits_zero() {
 #[test]
 fn it_writes_nothing_outside_its_own_temp_directory() {
     let fx = Fx::new();
+    // A gateway spool too, one collector listed and one not, so its check is held to the same rule.
+    let listed = fx.spool("collector-01", 200, NOW - 60);
+    fx.spool("collector-02", 200, NOW - 60);
+    fx.add_intake_entries(&format!("collector-01:{listed}"));
     let snapshot = |fx: &Fx| -> BTreeMap<PathBuf, (u64, u64)> {
         let mut m = BTreeMap::new();
         let mut stack = vec![fx.p("")];
@@ -2571,6 +2630,21 @@ fn fix_scenarios() -> Vec<Scenario> {
         ("cursor missing for a log with content", |fx| {
             fx.write("state/cursors/unrelated.json", "{}");
         }),
+        ("a collector spool the daemon does not list", |fx| {
+            fx.spool("collector-09", 300, NOW - 7200);
+        }),
+        (
+            "spool entries under a sensor's name and under a name that is not the collector id",
+            |fx| {
+                let a = fx.spool("collector-01", 300, NOW - 60);
+                let b = fx.spool("collector-02", 300, NOW - 60);
+                fx.add_intake_entries(&format!("telnet:{a},edge-box:{b}"));
+            },
+        ),
+        ("a spool entry under a daemon subsystem's name", |fx| {
+            let a = fx.spool("collector-01", 300, NOW - 60);
+            fx.add_intake_entries(&format!("console:{a}"));
+        }),
         ("cursor directory the rotation unit cannot see", |fx| {
             fx.set_env_line(
                 "etc/propolis.env",
@@ -3549,6 +3623,906 @@ fn each_intake_log_with_content_needs_a_cursor_file_and_a_visible_cursor_directo
             .to_string()
             .contains("does not read that file")
     );
+}
+
+// ---- gateway spool -------------------------------------------------------------------------
+
+#[test]
+fn a_host_without_a_gateway_spool_gets_no_spool_finding_and_no_spool_row() {
+    let fx = Fx::new();
+    // A gateway.env alone (a control plane being set up) is not a spool either.
+    fx.write("etc/gateway.env", "PROPOLIS_GATEWAY_BIND=0.0.0.0:9443\n");
+    let r = fx.run(&["--json"]);
+    let v = r.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(
+        global_state(&v, "gateway-spool"),
+        "absent",
+        "{}",
+        v["global"]
+    );
+    assert_eq!(r.code, 0, "{}", r.out);
+    let table = fx.run(&[]);
+    assert!(!table.has("gateway-spool"), "{}", table.out);
+    assert!(!table.has("spool"), "no noise about a spool: {}", table.out);
+}
+
+#[test]
+fn a_collector_spool_missing_from_the_daemons_list_is_a_failure_that_names_the_collector() {
+    let fx = Fx::new();
+    let path = fx.spool("collector-07", 4096, NOW - 3 * 86_400);
+    let r = fx.run(&["--json"]);
+    assert_eq!(r.code, 2, "{}", r.out);
+    let v = r.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert_eq!(f["id"], "spool-unlisted");
+    assert_eq!(f["level"], "fail");
+    assert_eq!(f["fix_kind"], "manual");
+    let msg = f["message"].as_str().unwrap();
+    for needle in [
+        "collector-07",
+        "accepting and acknowledging",
+        "not ingesting",
+        path.as_str(),
+        "4K",
+        "3d",
+    ] {
+        assert!(msg.contains(needle), "{needle:?} not in: {msg}");
+    }
+    let fix = f["fix"].as_str().unwrap();
+    assert!(
+        fix.contains(&format!(",collector-07:{path} ")),
+        "the exact entry, labelled with the collector id: {fix}"
+    );
+    assert!(
+        fix.contains("sudo systemctl restart propolis.service"),
+        "{fix}"
+    );
+    assert_eq!(global_state(&v, "gateway-spool"), "fail");
+    let table = fx.run(&[]);
+    assert!(
+        table.has("        do:  append ,collector-07:"),
+        "{}",
+        table.out
+    );
+}
+
+#[test]
+fn a_spool_listed_under_its_collector_id_gets_neither_spool_finding() {
+    let fx = Fx::new();
+    let a = fx.spool("collector-01", 200, NOW - 60);
+    fx.spool("collector-02", 200, NOW - 60);
+    // The second is listed by a path that is the same file written differently.
+    let b = format!("{}//collector-02/./events.jsonl", fx.spool_dir());
+    fx.add_intake_entries(&format!("collector-01:{a},collector-02:{b}"));
+    let v = fx.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+}
+
+#[test]
+fn the_spool_directory_is_read_from_gateway_env_as_the_unit_reads_it() {
+    let fx = Fx::new();
+    let other = fx.p("srv/gateway-spool");
+    fx.write(
+        "etc/gateway.env",
+        &format!(
+            "PROPOLIS_GATEWAY_BIND=0.0.0.0:9443\nPROPOLIS_GATEWAY_SPOOL_DIR={}\n",
+            other.display()
+        ),
+    );
+    fx.log("srv/gateway-spool/collector-05/events.jsonl", 10, NOW - 60);
+    // The unit's default holds a collector too; gateway.env moved the spool away from it.
+    fx.spool("collector-99", 10, NOW - 60);
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let msg = found[0]["message"].as_str().unwrap();
+    assert!(msg.contains("collector-05"), "{msg}");
+    assert!(!v["findings"].to_string().contains("collector-99"));
+}
+
+#[test]
+fn a_spool_entry_under_a_sensors_name_fails_and_under_another_name_warns() {
+    let fx = Fx::new();
+    let a = fx.spool("collector-01", 200, NOW - 60);
+    let b = fx.spool("collector-02", 200, NOW - 60);
+    let c = fx.spool("collector-03", 200, NOW - 60);
+    fx.add_intake_entries(&format!("telnet:{a},edge-box:{b},cred-mongo:{c}"));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    let by =
+        |id: &str| -> Vec<&serde_json::Value> { found.iter().filter(|f| f["id"] == id).collect() };
+    let bound = by("spool-label-sensor");
+    assert_eq!(bound.len(), 2, "{found:?}");
+    for f in &bound {
+        assert_eq!(f["level"], "fail");
+        assert_eq!(f["fix_kind"], "manual");
+        let msg = f["message"].as_str().unwrap();
+        assert!(msg.contains("refused"), "{msg}");
+    }
+    let telnet = bound
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("'telnet'"))
+        .expect("the telnet-labelled entry");
+    assert!(
+        telnet["message"].as_str().unwrap().contains("collector-01"),
+        "{telnet}"
+    );
+    assert!(
+        telnet["fix"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("collector-01:{a}")),
+        "{telnet}"
+    );
+    let cred = bound
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("'cred-mongo'"))
+        .expect("a cred-* label binds as well");
+    assert!(
+        cred["message"].as_str().unwrap().contains("mongodb"),
+        "names the sensor it binds to: {cred}"
+    );
+    let other = by("spool-label-other");
+    assert_eq!(other.len(), 1, "{found:?}");
+    assert_eq!(other[0]["level"], "warn");
+    let msg = other[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("'edge-box'") && msg.contains("collector-02"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("ingested") && msg.contains("alerts"),
+        "says what the wrong name does and does not do: {msg}"
+    );
+    assert!(
+        msg.contains("/metrics as collector=\"edge-box\""),
+        "the capture counters carry the label too: {msg}"
+    );
+    assert!(by("spool-unlisted").is_empty(), "every spool is listed");
+    assert_eq!(global_state(&v, "gateway-spool"), "fail");
+}
+
+#[test]
+fn an_unreadable_gateway_spool_is_a_limited_check_never_a_pass() {
+    let fx = Fx::new();
+    fx.spool("collector-07", 200, NOW - 60);
+    let spool = fx.p("spool/gateway");
+    // Root reads through any mode, so as root the run drops to nobody instead; the fixture's
+    // own directories are opened for traversal and the spool stays root's at 0700.
+    let wrapper: Vec<&str> = if is_root() {
+        std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        vec![
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+        ]
+    } else {
+        std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o000)).unwrap();
+        vec![]
+    };
+    let r = fx.run_under(&wrapper, &["--json"], &[("PROPOLIS_CC_EUID", "1000")]);
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let v = r.json();
+    assert_eq!(
+        global_state(&v, "gateway-spool"),
+        "unknown",
+        "{}",
+        v["global"]
+    );
+    assert!(
+        v["limited"].as_array().unwrap().iter().any(|l| {
+            let l = l.as_str().unwrap();
+            l.contains("gateway spool") && l.contains("not checked")
+        }),
+        "{}",
+        v["limited"]
+    );
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_ne!(r.code, 0);
+}
+
+#[test]
+fn hostile_collector_directory_names_are_cleaned_capped_and_never_executed() {
+    let fx = Fx::new();
+    let subst = "$(touch $STUB_STATE.pwned)";
+    let backtick = "`touch $STUB_STATE.pwned2`; x";
+    let escape = "esc\u{1b}[31mred";
+    let long = "a".repeat(200);
+    for name in [subst, backtick, escape, long.as_str()] {
+        fx.spool(name, 10, NOW - 60);
+    }
+    let r = fx.run(&["--json"]);
+    let v = r.json();
+    let table = fx.run(&[]);
+    assert!(!fx.p("state.pwned").exists() && !fx.p("state.pwned2").exists());
+    assert!(r.out.is_ascii() && table.out.is_ascii(), "{}", table.out);
+    assert!(!r.out.contains('\u{1b}') && !table.out.contains('\u{1b}'));
+
+    let found = spool_findings(&v);
+    let unlisted: Vec<&serde_json::Value> = found
+        .iter()
+        .filter(|f| f["id"] == "spool-unlisted")
+        .collect();
+    // A name with a control character is one the gateway never creates: it is not a collector.
+    assert_eq!(unlisted.len(), 3, "{found:?}");
+    assert!(!v["findings"].to_string().contains("[31mred"), "{found:?}");
+    assert!(
+        v["global"].to_string().contains("ignored"),
+        "the odd entry is counted, not trusted: {}",
+        v["global"]
+    );
+    for f in &unlisted {
+        let fix = f["fix"].as_str().unwrap();
+        assert_eq!(f["fix_kind"], "manual");
+        assert!(
+            !fix.contains("touch") && !fix.contains(&long),
+            "no directory name that is not a plain id reaches a step: {fix}"
+        );
+        assert_fix_contract(&fx, "hostile spool name", "spool-unlisted", "manual", fix);
+    }
+    let msgs = v["findings"].to_string();
+    assert!(
+        msgs.contains("$(touch $STUB_STATE.pwned)"),
+        "named, cleaned: {msgs}"
+    );
+    assert!(!msgs.contains(&long), "a long name is capped: {msgs}");
+    assert!(msgs.contains(&format!("{}...", "a".repeat(64))), "{msgs}");
+    assert!(
+        !v["global"].to_string().contains(&long),
+        "the row prints the cut name too: {}",
+        v["global"]
+    );
+}
+
+/// The row text of the global check `id`.
+fn global_text(v: &serde_json::Value, id: &str) -> String {
+    v["global"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == id)
+        .map(|g| g["text"].as_str().unwrap_or_default().to_string())
+        .unwrap_or_default()
+}
+
+/// Writes intake's cursor for the log at `path` the way `log-tailer` names it (the SHA-256 of the
+/// resolved path) into the fixture's cursor directory, at `offset` and with the file's own inode
+/// unless `inode` is given.
+fn spool_cursor(fx: &Fx, path: &str, offset: u64, inode: Option<u64>) {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    let resolved = std::fs::canonicalize(path).unwrap();
+    let hash: String = Sha256::digest(resolved.to_str().unwrap().as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let ino = inode.unwrap_or_else(|| std::fs::metadata(path).unwrap().ino());
+    let fp = vec!["0"; 32].join(",");
+    fx.write(
+        &format!("state/cursors/{hash}.json"),
+        &format!("{{\"inode\":{ino},\"offset\":{offset},\"fingerprint\":[{fp}]}}"),
+    );
+}
+
+#[test]
+fn a_spool_read_to_its_end_and_no_longer_listed_is_named_in_the_row_and_raises_no_finding() {
+    let fx = Fx::new();
+    // A collector rebuilt under a new id: the old id's spool stays, read in full.
+    let old = fx.spool("collector-01", 500, NOW - 86_400);
+    let new = fx.spool("collector-02", 200, NOW - 60);
+    fx.add_intake_entries(&format!("collector-02:{new}"));
+    spool_cursor(&fx, &old, 500, None);
+    let v = fx.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+    let text = global_text(&v, "gateway-spool");
+    assert!(
+        text.contains("1 read to the end and no longer listed: collector-01"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_unlisted_spool_with_bytes_past_its_cursor_fails_and_says_how_much_was_written_since() {
+    let fx = Fx::new();
+    let old = fx.spool("collector-01", 4096, NOW - 60);
+    spool_cursor(&fx, &old, 1024, None);
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["id"], "spool-unlisted");
+    let msg = found[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("3K written to it since are not ingested"),
+        "{msg}"
+    );
+    assert!(!msg.contains("never read"), "{msg}");
+    assert_eq!(global_state(&v, "gateway-spool"), "fail");
+}
+
+#[test]
+fn an_unlisted_spool_with_no_cursor_fails_and_says_it_was_not_read_or_the_cursors_are_elsewhere() {
+    let fx = Fx::new();
+    fx.spool("collector-01", 300, NOW - 60);
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let msg = found[0]["message"].as_str().unwrap();
+    // The check looks in one directory; a daemon that keeps its cursors in another has read the
+    // file, so the message must not say flatly that it never did.
+    assert!(
+        msg.contains("Intake has no cursor for this file in")
+            && msg.contains("it has not read it, or keeps its cursors elsewhere"),
+        "{msg}"
+    );
+    assert!(!msg.contains("never read"), "{msg}");
+}
+
+/// A spool read to its end is taken for a retired collector's only once it has gone unwritten
+/// for ten minutes. A collector whose entry was removed by mistake looks the same until its next
+/// batch arrives, and a capturing sensor writes at least a stats line every minute.
+#[test]
+fn a_spool_read_to_its_end_but_written_minutes_ago_fails_because_its_collector_may_be_shipping() {
+    for (age, retired) in [(60, false), (599, false), (600, true), (86_400, true)] {
+        let fx = Fx::new();
+        let old = fx.spool("collector-01", 500, NOW - age);
+        spool_cursor(&fx, &old, 500, None);
+        let v = fx.json();
+        let found = spool_findings(&v);
+        let text = global_text(&v, "gateway-spool");
+        if retired {
+            assert!(found.is_empty(), "written {age} s ago: {found:?}");
+            assert_eq!(global_state(&v, "gateway-spool"), "ok", "{age}");
+            assert!(
+                text.contains("1 read to the end and no longer listed: collector-01 (last written"),
+                "written {age} s ago: {text}"
+            );
+        } else {
+            assert_eq!(found.len(), 1, "written {age} s ago: {found:?}");
+            assert_eq!(found[0]["id"], "spool-unlisted");
+            let msg = found[0]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("read the file to its end")
+                    && msg.contains("the collector may still be shipping")
+                    && msg.contains("clears once the file has gone unwritten"),
+                "written {age} s ago: {msg}"
+            );
+            assert_eq!(global_state(&v, "gateway-spool"), "fail", "{age}");
+            assert!(!text.contains("no longer listed"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn an_unlisted_spool_whose_cursor_is_for_another_inode_fails_and_says_what_could_not_be_told() {
+    let fx = Fx::new();
+    let old = fx.spool("collector-01", 300, NOW - 60);
+    // At the file's size, but for a file that has since been replaced.
+    spool_cursor(&fx, &old, 300, Some(1));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let msg = found[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("could not be determined") && msg.contains("is for inode 1"),
+        "{msg}"
+    );
+    assert_eq!(global_state(&v, "gateway-spool"), "fail");
+}
+
+#[test]
+fn a_collector_whose_id_is_a_sensors_name_listed_under_that_id_fails_and_needs_a_new_id() {
+    let fx = Fx::new();
+    let p = fx.spool("mysql", 200, NOW - 60);
+    fx.add_intake_entries(&format!("mysql:{p}"));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert_eq!(f["id"], "spool-label-sensor");
+    assert_eq!(f["level"], "fail");
+    let msg = f["message"].as_str().unwrap();
+    assert!(msg.contains("'mysql'") && msg.contains("refused"), "{msg}");
+    let fix = f["fix"].as_str().unwrap();
+    assert!(fix.contains("new id"), "{fix}");
+    assert!(!fix.contains("change the entry to"), "{fix}");
+    assert_eq!(global_state(&v, "gateway-spool"), "fail");
+    assert!(
+        global_text(&v, "gateway-spool").contains("1 listed under an id that is a sensor's"),
+        "{}",
+        v["global"]
+    );
+}
+
+#[test]
+fn a_daemon_subsystem_name_is_never_suggested_and_is_flagged_when_used_as_a_label() {
+    let fx = Fx::new();
+    fx.spool("console", 200, NOW - 60);
+    let own = fx.spool("campaigns", 200, NOW - 60);
+    let other = fx.spool("collector-03", 200, NOW - 60);
+    fx.add_intake_entries(&format!("campaigns:{own},review:{other}"));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    let by =
+        |id: &str| -> Vec<&serde_json::Value> { found.iter().filter(|f| f["id"] == id).collect() };
+
+    let unlisted = by("spool-unlisted");
+    assert_eq!(unlisted.len(), 1, "{found:?}");
+    let fix = unlisted[0]["fix"].as_str().unwrap();
+    assert!(!fix.contains(",console:"), "{fix}");
+    assert!(fix.contains("new id"), "{fix}");
+    assert!(
+        unlisted[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("one the daemon gives one of its own subsystems"),
+        "{}",
+        unlisted[0]
+    );
+
+    let subsys = by("spool-label-subsystem");
+    assert_eq!(subsys.len(), 2, "{found:?}");
+    for f in &subsys {
+        assert_eq!(f["level"], "warn");
+        assert!(
+            f["message"].as_str().unwrap().contains("sensor-down"),
+            "{f}"
+        );
+    }
+    let campaigns = subsys
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("'campaigns'"))
+        .expect("the entry listed under its own id");
+    assert!(
+        campaigns["fix"].as_str().unwrap().contains("new id"),
+        "{campaigns}"
+    );
+    let review = subsys
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("'review'"))
+        .expect("the entry under a subsystem's name");
+    assert!(
+        review["fix"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("change the entry to collector-03:{other}")),
+        "{review}"
+    );
+    assert!(by("spool-label-other").is_empty(), "{found:?}");
+}
+
+#[test]
+fn the_spool_directory_in_gateway_env_is_trimmed_and_unquoted_as_systemd_reads_it() {
+    let fx = Fx::new();
+    let other = fx.p("srv/gateway-spool");
+    fx.write(
+        "etc/gateway.env",
+        &format!(
+            "PROPOLIS_GATEWAY_BIND=0.0.0.0:9443\nPROPOLIS_GATEWAY_SPOOL_DIR= \"{}\" \n",
+            other.display()
+        ),
+    );
+    fx.log("srv/gateway-spool/collector-05/events.jsonl", 10, NOW - 60);
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["id"], "spool-unlisted");
+    assert!(
+        found[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{}/collector-05/events.jsonl", other.display())),
+        "{}",
+        found[0]
+    );
+}
+
+#[test]
+fn a_spool_directory_gateway_env_names_that_does_not_exist_is_unknown_and_named() {
+    let fx = Fx::new();
+    let missing = fx.p("srv/no-such-spool");
+    fx.write(
+        "etc/gateway.env",
+        &format!("PROPOLIS_GATEWAY_SPOOL_DIR={}\n", missing.display()),
+    );
+    // The default location holds a spool, but the gateway does not write there.
+    fx.spool("collector-99", 10, NOW - 60);
+    let v = fx.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(
+        global_state(&v, "gateway-spool"),
+        "unknown",
+        "{}",
+        v["global"]
+    );
+    assert!(
+        global_text(&v, "gateway-spool").contains(&missing.display().to_string()),
+        "{}",
+        v["global"]
+    );
+}
+
+#[test]
+fn a_listed_spool_path_with_a_trailing_slash_does_not_count_and_the_entry_is_named() {
+    let fx = Fx::new();
+    let p = fx.spool("collector-01", 200, NOW - 60);
+    fx.add_intake_entries(&format!("collector-01:{p}/"));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert_eq!(f["id"], "spool-unlisted");
+    let msg = f["message"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!("'collector-01:{p}/' ends in '/'")),
+        "{msg}"
+    );
+    let fix = f["fix"].as_str().unwrap();
+    assert!(fix.contains("remove the trailing '/'"), "{fix}");
+    assert_eq!(global_state(&v, "gateway-spool"), "fail");
+}
+
+#[test]
+fn an_unreadable_gateway_env_is_a_limited_check_whether_or_not_a_spool_exists() {
+    for with_spool in [false, true] {
+        let fx = Fx::new();
+        if with_spool {
+            fx.spool("collector-07", 200, NOW - 60);
+        }
+        fx.write("etc/gateway.env", "PROPOLIS_GATEWAY_BIND=0.0.0.0:9443\n");
+        let genv = fx.p("etc/gateway.env");
+        let wrapper: Vec<&str> = if is_root() {
+            std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&genv, std::fs::Permissions::from_mode(0o600)).unwrap();
+            vec![
+                "/usr/bin/setpriv",
+                "--reuid=65534",
+                "--regid=65534",
+                "--clear-groups",
+            ]
+        } else {
+            std::fs::set_permissions(&genv, std::fs::Permissions::from_mode(0o000)).unwrap();
+            vec![]
+        };
+        let r = fx.run_under(&wrapper, &["--json"], &[("PROPOLIS_CC_EUID", "1000")]);
+        std::fs::set_permissions(&genv, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let v = r.json();
+        assert_eq!(
+            global_state(&v, "gateway-spool"),
+            "unknown",
+            "spool {with_spool}: {}",
+            v["global"]
+        );
+        assert!(
+            v["limited"].as_array().unwrap().iter().any(|l| {
+                let l = l.as_str().unwrap();
+                l.starts_with("gateway spool not checked") && l.contains("gateway.env")
+            }),
+            "spool {with_spool}: {}",
+            v["limited"]
+        );
+        assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    }
+}
+
+#[test]
+fn an_unreadable_propolis_env_alone_is_the_limit_the_spool_check_names() {
+    let fx = Fx::new();
+    fx.spool("collector-07", 200, NOW - 60);
+    let penv = fx.p("etc/propolis.env");
+    let wrapper: Vec<&str> = if is_root() {
+        std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o600)).unwrap();
+        vec![
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+        ]
+    } else {
+        std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o000)).unwrap();
+        vec![]
+    };
+    let r = fx.run_under(&wrapper, &["--json"], &[("PROPOLIS_CC_EUID", "1000")]);
+    std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let v = r.json();
+    assert_eq!(
+        global_state(&v, "gateway-spool"),
+        "unknown",
+        "{}",
+        v["global"]
+    );
+    let spool_limits: Vec<&str> = v["limited"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .filter(|l| l.starts_with("gateway spool"))
+        .collect();
+    assert_eq!(spool_limits.len(), 1, "{spool_limits:?}");
+    assert!(
+        spool_limits[0].contains(&format!("{} is not readable", penv.display())),
+        "{spool_limits:?}"
+    );
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+}
+
+#[test]
+fn an_unreadable_collector_directory_is_a_limited_check_and_no_unlisted_finding() {
+    let fx = Fx::new();
+    fx.spool("collector-07", 200, NOW - 60);
+    let dir = fx.p("spool/gateway/collector-07");
+    let penv = fx.p("etc/propolis.env");
+    let wrapper: Vec<&str> = if is_root() {
+        // As nobody, propolis.env has to be readable for the spool check to get this far.
+        std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        vec![
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+        ]
+    } else {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        vec![]
+    };
+    let r = fx.run_under(&wrapper, &["--json"], &[("PROPOLIS_CC_EUID", "1000")]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let v = r.json();
+    assert_eq!(
+        global_state(&v, "gateway-spool"),
+        "unknown",
+        "{}",
+        v["global"]
+    );
+    assert!(
+        v["limited"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().contains("collector directories under")),
+        "{}",
+        v["limited"]
+    );
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+}
+
+#[test]
+fn a_symlink_and_a_backslash_name_in_the_spool_are_ignored_and_counted() {
+    let fx = Fx::new();
+    let p = fx.spool("collector-01", 10, NOW - 60);
+    fx.add_intake_entries(&format!("collector-01:{p}"));
+    std::os::unix::fs::symlink(
+        fx.p("spool/gateway/collector-01"),
+        fx.p("spool/gateway/link"),
+    )
+    .unwrap();
+    fx.spool("b\\x", 10, NOW - 60);
+    let v = fx.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert!(
+        global_text(&v, "gateway-spool")
+            .contains("2 entries that are not collector directories ignored"),
+        "{}",
+        v["global"]
+    );
+}
+
+#[test]
+fn a_spool_listed_by_its_real_path_through_a_symlinked_spool_directory_is_listed() {
+    let fx = Fx::new();
+    let p = fx.spool("collector-01", 10, NOW - 60);
+    fx.add_intake_entries(&format!("collector-01:{p}"));
+    let link = fx.p("spool-link");
+    std::os::unix::fs::symlink(fx.p("spool/gateway"), &link).unwrap();
+    let v = fx
+        .run_with(
+            &["--json"],
+            &[("PROPOLIS_CC_GATEWAY_SPOOL_DIR", link.to_str().unwrap())],
+        )
+        .json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+}
+
+#[test]
+fn an_empty_collector_directory_is_counted_and_raises_no_finding() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.p("spool/gateway/collector-08")).unwrap();
+    let v = fx.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+    assert!(
+        global_text(&v, "gateway-spool").starts_with("1 collectors in"),
+        "{}",
+        v["global"]
+    );
+}
+
+#[test]
+fn past_twenty_unlisted_spools_the_rest_are_counted_in_the_row_only() {
+    let fx = Fx::new();
+    for i in 0..25 {
+        fx.spool(&format!("collector-{i:02}"), 10, NOW - 60);
+    }
+    let v = fx.json();
+    let unlisted = spool_findings(&v)
+        .iter()
+        .filter(|f| f["id"] == "spool-unlisted")
+        .count();
+    assert_eq!(unlisted, 20);
+    assert!(
+        global_text(&v, "gateway-spool").ends_with("and 20 more"),
+        "{}",
+        v["global"]
+    );
+}
+
+#[test]
+fn an_unlisted_spool_under_a_sensors_name_gets_the_new_id_step_and_no_entry() {
+    let fx = Fx::new();
+    fx.spool("ssh", 10, NOW - 60);
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let fix = found[0]["fix"].as_str().unwrap();
+    assert!(!fix.contains(",ssh:"), "{fix}");
+    assert!(fix.contains("new id"), "{fix}");
+    assert!(
+        found[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("its name is a sensor's name"),
+        "{}",
+        found[0]
+    );
+}
+
+#[test]
+fn a_collector_whose_intake_list_is_in_shipper_env_still_has_its_spools_checked() {
+    let fx = Fx::new();
+    let p = fx.spool("collector-01", 10, NOW - 60);
+    fx.set_env_line("etc/propolis.env", "PROPOLIS_SENSOR_LOGS=", None);
+    fx.write(
+        "etc/shipper.env",
+        &format!("PROPOLIS_SHIPPER_SENSOR_LOGS=collector-01:{p}\n"),
+    );
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["id"], "spool-unlisted");
+}
+
+#[test]
+fn a_spool_directory_under_a_sensors_name_listed_under_another_label_is_not_told_to_take_that_name()
+{
+    let fx = Fx::new();
+    let p = fx.spool("ssh", 10, NOW - 60);
+    fx.add_intake_entries(&format!("x:{p}"));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["id"], "spool-label-other");
+    let fix = found[0]["fix"].as_str().unwrap();
+    assert!(!fix.contains("change the entry to"), "{fix}");
+    assert!(fix.contains("new id"), "{fix}");
+}
+
+/// Which labels bind a log to one sensor is the origin policy's decision
+/// (`sensor_wire::origin::bound_sensor`); the spool check's copy must name the same set.
+#[test]
+fn the_labels_the_spool_check_treats_as_sensor_names_are_the_origin_policys() {
+    let origin = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../sensor-wire/src/origin.rs"
+    ))
+    .unwrap();
+    let table = &origin[..origin.find("#[cfg(test)]").unwrap()];
+    let mut want = std::collections::BTreeSet::new();
+    for l in table.lines().map(str::trim) {
+        if let Some(rest) = l.strip_prefix("sensor: \"") {
+            want.insert(rest.split('"').next().unwrap().to_string());
+        }
+        if let Some(rest) = l.strip_prefix("(\"cred-") {
+            want.insert(format!("cred-{}", rest.split('"').next().unwrap()));
+        }
+    }
+    assert!(want.len() >= 21, "the scan of origin.rs broke: {want:?}");
+    let script = std::fs::read_to_string(SCRIPT).unwrap();
+    let have: std::collections::BTreeSet<String> = script
+        .lines()
+        .find_map(|l| l.strip_prefix("SPOOL_BOUND_LABELS=\""))
+        .expect("config-check.sh has no SPOOL_BOUND_LABELS line")
+        .trim_end_matches('"')
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(have, want);
+
+    // And each cred-* label binds to the sensor CRED_LABELS pairs it with, which the finding names.
+    let cred: Vec<(String, String)> = table
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("(\"cred-"))
+        .map(|rest| {
+            let parts: Vec<&str> = rest.split('"').collect();
+            (format!("cred-{}", parts[0]), parts[2].to_string())
+        })
+        .collect();
+    assert_eq!(cred.len(), 5, "the scan of CRED_LABELS broke: {cred:?}");
+    let fx = Fx::new();
+    let entries: Vec<String> = cred
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| {
+            let p = fx.spool(&format!("collector-{i:02}"), 10, NOW - 60);
+            format!("{label}:{p}")
+        })
+        .collect();
+    fx.add_intake_entries(&entries.join(","));
+    let v = fx.json();
+    let found = spool_findings(&v);
+    for (label, sensor) in &cred {
+        let f = found
+            .iter()
+            .find(|f| {
+                f["id"] == "spool-label-sensor"
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("'{label}'"))
+            })
+            .unwrap_or_else(|| panic!("no spool-label-sensor for {label}: {found:?}"));
+        assert!(
+            f["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("binds the log to {sensor} alone")),
+            "{label}: {f}"
+        );
+    }
+}
+
+/// The daemon's subsystem names are `condition.rs`'s decision (`DAEMON_SUBSYSTEMS`); the spool
+/// check's copy, which it never suggests and flags as a label, must name the same set.
+#[test]
+fn the_names_the_spool_check_treats_as_daemon_subsystems_are_the_daemons() {
+    let condition = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../propolis/src/ops_alert/condition.rs"
+    ))
+    .unwrap();
+    let start = condition
+        .find("pub const DAEMON_SUBSYSTEMS")
+        .expect("condition.rs has no DAEMON_SUBSYSTEMS");
+    let body = &condition[start..];
+    let body = &body[body.find("= &[").unwrap()..body.find("];").unwrap()];
+    let want: std::collections::BTreeSet<String> = body
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    assert!(want.len() >= 9, "the scan of condition.rs broke: {want:?}");
+    let script = std::fs::read_to_string(SCRIPT).unwrap();
+    let have: std::collections::BTreeSet<String> = script
+        .lines()
+        .find_map(|l| l.strip_prefix("SPOOL_SUBSYSTEM_NAMES=\""))
+        .expect("config-check.sh has no SPOOL_SUBSYSTEM_NAMES line")
+        .trim_end_matches('"')
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(have, want);
 }
 
 /// On a fresh box provisioning creates every service env file EMPTY. That must read as "nothing

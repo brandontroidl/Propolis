@@ -646,6 +646,32 @@ Only `pending`, `approved` and `rejected` are written; nothing sets `snoozed` he
 inserted. The feed builder publishes a volume listing only for an `approved` row (or an
 `approved` `review_queue` row) unless `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH=true`.
 
+## fleet crate tables
+
+### `sensor_stats` (`fleet/migrations/0002_sensor_stats.sql`)
+
+PK `sensor TEXT`, `CHECK (sensor <> '' AND length(sensor) <= 64)`. One row per reporting
+sensor: the latest `sensor_stats` line it wrote (capture hand-off counters, capture-memory
+budget, uptime, `final`), replaced by each newer line and never by an older one
+(`crates/fleet/src/stats.rs#upsert`). Intake is the only writer, `/metrics` the only reader
+([health and observability](../operations/health-and-observability.md#sensor-stats)).
+
+The key is the bare sensor name (`ssh`) for a line read from a log bound to that sensor, which is
+every row on a single host under the shipped labels. For a line read from a log bound to no
+sensor (on a control plane, a collector's spool) it is the log's label and the sensor,
+`<label>/<sensor>` (`collector-01/ssh`), so the same sensor on two collectors, and on the control
+plane itself, is three rows, as long as no spool's `PROPOLIS_SENSOR_LOGS` entry is named after a
+sensor or a `cred-*` label: such an entry binds the spool to that sensor, whose rows are then
+stored under the bare name, the control plane's own (`config-check` fails it as
+`spool-label-sensor`). A label longer than 31 bytes, which would not fit 64 characters beside `/`
+and the longest sensor name the key takes (32 bytes), is cut to at most its first 14 bytes, on
+a character boundary, and followed
+by `~` and a 16-digit hash of the whole label (`crates/fleet/src/stats.rs#collector_key`). The
+decision and the cut depend on the label alone, so every sensor of one collector has the same
+label part. A sensor name never contains `/`, so the reader splits a key at its last `/`
+(`crates/fleet/src/stats.rs#split_key`). Nothing deletes a row; removing a gone collector's rows
+is a hand step ([sensor stats](../operations/health-and-observability.md#sensor-stats)).
+
 ## Server settings that make a stall attributable
 
 When the daemon stalls (unrelated trivial statements all finishing within a fraction of a
@@ -743,6 +769,6 @@ the watch stream and compare timestamps.
 | migration | adds |
 |---|---|
 | `0001` | `listener_probe` + `(sensor, attempted_at DESC)` index |
-| `0002` | `sensor_stats`: the latest `sensor_stats` line per sensor (capture counters and budget), outside the ledger |
+| `0002` | `sensor_stats`: the latest `sensor_stats` line per sensor, or per collector and sensor on a control plane (capture counters and budget), outside the ledger |
 
 Migration workflow and conventions: [../development/schema-and-migrations.md](../development/schema-and-migrations.md).

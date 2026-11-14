@@ -39,8 +39,10 @@ sensor-*  ->  /var/log/propolis/<sensor>/...
   [origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)
   there: a line that parses as an event and claims another sensor's name, or a signal type,
   protocol, authentication or summary its sensor cannot produce, is dropped with a WARN and not
-  shipped (`crates/shipper/src/batcher.rs#admit`). A line that does not parse, and a sensor's own
-  `sensor_stats` line, are shipped unchanged.
+  shipped (`crates/shipper/src/batcher.rs#admit`). A sensor's own `sensor_stats` line is held to
+  its log the same way: it is dropped unless it is well formed, names a known sensor and, in a log
+  bound to a sensor, names that sensor, because past the shipper nothing can tell the telnet log's
+  stats line from the ssh log's. A line that does not parse is shipped unchanged.
 - The **gateway** accepts a connection only with a client certificate signed by its CA, takes the
   collector id from that certificate's CommonName rather than from anything the collector sends,
   checks each batch's hash and its place in the chain, and appends the lines byte for byte to one
@@ -50,10 +52,19 @@ sensor-*  ->  /var/log/propolis/<sensor>/...
 - **Intake** on the control plane tails that spool file the way it tails a sensor log on a single
   host. Every line keeps its own `sensor` field, so one entry per collector is enough. The entry's
   name must not be a sensor's name or one of the shipped `cred-*` labels: such a name binds the
-  log to that one sensor and every other sensor's lines in the stream would be refused. Under any
+  log to that one sensor, every other sensor's lines in the stream would be refused, and that
+  sensor's `sensor_stats` line would be stored under the bare sensor name, the control plane's
+  own row (`config-check` fails such an entry as `spool-label-sensor`). Under any
   other name (the collector id is the convention) the stream may carry every known sensor, and
   intake still holds each line to its own sensor's row of the policy and refuses a line dated more
-  than an hour ahead of the control plane's clock.
+  than an hour ahead of the control plane's clock. The `sensor_stats` line each capturing sensor
+  writes every minute is stored for that collector and sensor together, under the entry's name
+  (`crates/intake/src/runner.rs#stats_key`), so the control plane's `/metrics` publishes each
+  collector's capture counters with two labels, for example
+  `propolis_sensor_capture_queue_dropped_total{collector="collector-01",sensor="ssh"}`, beside
+  the control plane's own sensors, which keep the one label `sensor`. A collector that stops
+  reporting shows `propolis_sensor_stats_stale` 1 for its own series only
+  ([sensor stats](health-and-observability.md#sensor-stats)).
 - Each end keeps its position in the chain on disk, as `last_seq` and `last_batch_hash` in a file
   named after the collector id (`crates/gateway/src/state.rs#CollectorState`,
   `crates/shipper/src/state.rs#ConfirmedState`). Equal `last_seq` values mean the two ends agree
@@ -204,6 +215,15 @@ still holding the previous run's files can no longer connect.
    in the `sensor-down` and `intake-stalled` alerts; do not reuse a name the daemon gives one of
    its own subsystems (`crates/propolis/src/ops_alert/condition.rs#DAEMON_SUBSYSTEMS`). The file
    does not exist until the first batch arrives, and intake waits for it.
+
+   Every collector needs its own entry, including one added later or given a new id when it is
+   rebuilt: the gateway accepts and acknowledges a collector's batches whether or not intake reads
+   its spool, so without the entry its evidence piles up unread and nothing else reports it.
+   `sudo ./deploy/config-check.sh` reports a collector spool that no entry lists
+   (`spool-unlisted`) and an entry whose name is not the collector id. Intake reads a newly listed
+   spool from its start, so an entry added late still ingests what the file holds. The old id's
+   spool, once intake has read it to its end, is moved out of the spool directory, as
+   [Rebuilding a collector](#rebuilding-a-collector) describes.
 
 6. Install and start the gateway, then restart `propolis` so it picks up the new group and log
    list. From the top of the checkout:
@@ -426,6 +446,16 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
 
   Then restart each enabled sensor unit, and `shipper.service` last.
 
+  Until a collector's shipper is upgraded, its sensors' `sensor_stats` counters on the control
+  plane are only as trustworthy as its least trusted sensor. The control plane reads the whole
+  spool under one label and stores a stats line under whatever known sensor it names; only the
+  shipper can see which log a line came from, and a shipper from before this release ships every
+  stats line from every log, so a compromised telnet sensor on that collector could keep
+  `propolis_sensor_stats_stale{collector="<id>",sensor="ssh"}` at 0 after ssh died
+  ([which log may report which sensor](health-and-observability.md#sensor-stats)). Such a
+  shipper holds no line to the log it came from, evidence lines included; the control plane
+  still holds each evidence line to its own sensor's row of the policy.
+
 The shipper's frames carry a wire version with no negotiation
 (`crates/collector-wire/src/frame.rs#VERSION`). A release that changes it has to reach both hosts
 together, since a shipper on the other version stops at its first batch.
@@ -519,7 +549,32 @@ two ways out:
   `gateway.crt` and `gateway.key` on the control plane (step 3.2) and restart `gateway.service`,
   replace the old `PROPOLIS_SENSOR_LOGS` entry with the new id's spool path and restart
   `propolis.service`, then set `PROPOLIS_COLLECTOR_ID` to the new id in the capturing sensors'
-  env files (step 4) and set up the collector from step 4.2 with the new id.
+  env files (step 4) and set up the collector from step 4.2 with the new id. The old id's
+  `sensor_stats` rows stay behind: `/metrics` goes on publishing them beside the new id's, for
+  example `propolis_sensor_stats_stale{collector="collector-01",sensor="ssh"} 1`, with an age
+  that only grows, and an alert on `stale == 1` keeps firing. Delete them by hand once the old
+  spool is retired (below), not before: while intake is still reading the old spool it stores
+  that collector's last stats lines again.
+
+  The old id's spool directory stays under the gateway spool as well. Once intake has read it in
+  full (its cursor, found as under [Disk space](#disk-space), shows an `offset` equal to the file's
+  size, and `sudo ./deploy/config-check.sh` counts it in the `gateway-spool` row as read to the end
+  and no longer listed, which it does once the file has not been written for ten minutes), move it
+  out of the spool directory. Keep it under `/var/spool/propolis`,
+  which the [documented archive](backup-and-restore.md) holds:
+
+  ```sh
+  sudo install -d -m 0750 -o propolis-gateway -g propolis-gateway /var/spool/propolis/gateway-retired
+  sudo mv /var/spool/propolis/gateway/collector-01 /var/spool/propolis/gateway-retired/
+  ```
+
+  If `config-check` instead fails the old id with `spool-unlisted` and says bytes were written
+  after intake stopped reading it, put its entry back beside the new one and restart
+  `propolis.service`; intake resumes from its saved position. Remove the entry again once the
+  cursor reaches the end. Then delete the old id's `sensor_stats` rows, by its `collector` label
+  as `/metrics` prints it, with the statement under
+  [sensor stats](health-and-observability.md#sensor-stats); it deletes no other collector's rows.
+  A collector retired for good is handled the same way.
 - Or reset the chain on both sides, so both restart at 1 together:
   1. stop `shipper.service` on the collector, then `gateway.service` on the control plane;
   2. delete `/var/lib/propolis/gateway/<collector id>.json` on the control plane and
@@ -533,8 +588,10 @@ two ways out:
 Resetting only one side always ends in a stop: a gateway with no state rejects the shipper's next
 batch as a sequence gap, and a shipper with no state diverges as above. One case stops a batch
 late. If the gateway had accepted exactly one batch from the collector (`last_seq` 1) when the
-shipper's state was lost, the shipper's first batch is taken as a resend of that one and dropped
-without an error, and its lines are lost; the next batch then fails the gateway's hash check and
+shipper's state was lost, the shipper's first batch is taken as a resend of that one and dropped,
+and its lines are lost. The shipper logs nothing for it; the gateway logs
+`gateway: batch reuses the last accepted seq with different content` (see
+[Troubleshooting](#troubleshooting)). The next batch then fails the gateway's hash check and
 the shipper stops with `shipper: gateway rejected a batch` (`reason=HashMismatch`). Resetting both
 sides whenever a collector's state is lost avoids it.
 
@@ -598,6 +655,7 @@ With `RUST_LOG=info`. Each message is quoted from its start, as the binaries pri
 | Gateway logs `tls handshake failed; dropping connection` with `BadSignature`; once it has events the shipper logs `shipper: ship cycle IO error; will retry next pass` with `DecryptError` on every pass | the collector's certificate and key come from a different `provision-certs` run than the gateway's `ca.crt`, while the collector's own `ca.crt` matches the gateway (it got the new `ca.crt` but kept its old certificate and key) | Install one run's files on both hosts and restart both units |
 | `shipper: ship cycle IO error; will retry next pass` about every two minutes, only while a backlog drains | the gateway closes every connection after `PROPOLIS_GATEWAY_MAX_DURATION_SECS` (120 s) | Expected; nothing is lost |
 | `shipper: this collector's chain has diverged from the gateway's` | a rebuilt collector, or lost shipper state | [Rebuild or reset](#rebuilding-a-collector) |
+| Gateway logs `gateway: batch reuses the last accepted seq with different content; acknowledged as Duplicate without storing it` (ERROR) | the shipper never saw the gateway's answer for a batch the gateway stored (a reset connection, the 60 s batch timeout, a restart), then built a different batch under the same number: more lines from the same log, the next log in the pass, or a lost or restored shipper state file. Nothing from this batch of `records` lines was stored, and the shipper has moved past all of them. When it read the same log again, the batch begins with the lines of the earlier batch under that seq, which are stored, so only the lines after those are missing; from another log, or after a lost or restored state file, all of them are. The gateway cannot tell which. `suppressed_batches` and `suppressed_records` count the further such batches since the previous line, which is logged at most once a minute per `collector_id` | On that collector, read the shipper journal just before the line for a connection error, timeout or restart, and check whether its state under `/var/lib/propolis/shipper` was deleted or restored. The shipper's next batch is rejected with `reason=HashMismatch`: reset the chain on both sides, see [Known limitations](#known-limitations). The shipper keeps its read positions, so it then sends the lines after the missing ones but never the missing ones. Once it has caught up, copy `/var/spool/propolis/gateway/<collector id>/events.jsonl` to the collector and list each sensor log's lines the spool does not hold, for example `grep -Fxv -f events.jsonl /var/log/propolis/ssh/events.jsonl`, and the same for its `.1`. Those are the missing lines, apart from any the shipper dropped with a warning (`shipper: dropping a line the origin policy refuses for this log`) and any older than a spool file emptied to reclaim space. They stay in the sensor log until it rotates past them |
 | `shipper: gateway rejected a batch` with `reason=SeqGap` or `reason=HashMismatch` | the gateway's state was lost or restored from an older backup, or the shipper's state was lost when the gateway had accepted exactly one batch | Reset the chain on both sides |
 | `shipper: gateway rejected a batch` with `reason=Oversize` | a blank line in a sensor log: the gateway refuses an empty record | Not cleared by a reset or restart; see [Known limitations](#known-limitations) |
 | Spool file grows, nothing is ingested | the running `propolis` does not have the `propolis-gateway` group, or `PROPOLIS_SENSOR_LOGS` names another path | Step 5.3's checks; steps 3.4 to 3.6 |
@@ -635,7 +693,11 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
   collector with more than one sensor, the next log in the pass. The gateway answers `Duplicate`
   on the sequence number alone, the shipper takes that as confirmation of the batch it just
   built, and that log's cursor moves past lines the gateway never received: up to a whole batch
-  (15 lines) of another log. They are not shipped and nothing is logged for them. The batch
+  (15 lines) of another log. They are not shipped. The gateway cannot take them, since its answer
+  must stay the same, but when the new batch's content differs from the one it stored it logs an
+  ERROR for it and counts it (`crates/gateway/src/verify.rs#GatewaySink::reused_seq_counts`; see
+  [Troubleshooting](#troubleshooting)). It keeps only the last accepted batch's hash, so a reused
+  older number cannot be told from a resend and stays silent. The batch
   after that is rejected with `reason=HashMismatch`, because the two sides no longer agree on
   the last batch, and the shipper stops until the collector is resynced
   (`crates/shipper/src/client.rs#ship_cycle`, `crates/shipper/src/main.rs#run_ship_loop`,
@@ -651,8 +713,9 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
 - The ledger does not record which collector an event came from, and the fleet pane matches probe
   lines and event age by sensor name, so two collectors running the same sensor cannot be told
   apart there (`crates/fleet/src/store.rs#confirm_sensor`, `crates/console/src/routes/fleet.rs`).
-- The origin policy separates the sensors of a collector from each other, not the collector from
-  the control plane. The shipper runs on the collector and the batch it sends carries no record
+- The origin policy separates the sensors of a collector from each other, `sensor_stats` lines
+  included, only once the collector runs a shipper from this release (see
+  [Upgrading](#upgrading)), and never the collector from the control plane. The shipper runs on the collector and the batch it sends carries no record
   of which log a line came from, so a collector that is compromised as a whole (its shipper, its
   certificate key, or root on the host) is still trusted for every sensor it could run: it can
   send any line that fits some known sensor's row. The control plane refuses only what no sensor

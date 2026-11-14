@@ -381,13 +381,9 @@ fn a_line_that_does_not_parse_as_a_sensor_event_is_shipped_unchanged() {
     assert_eq!(next.batch.unwrap().records, expected);
 }
 
-/// A sensor's own stats line has no row in the origin policy. It is shipped as it is, whichever
-/// log it sits in; the control plane's intake validates it and never lets it reach the ledger.
-#[test]
-fn a_sensor_stats_line_is_shipped_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
+fn stats_line(sensor: &str) -> String {
     let stats = sensor_wire::SensorStats {
-        sensor: "ssh".into(),
+        sensor: sensor.into(),
         uptime_secs: 61,
         is_final: false,
         dropped: 0,
@@ -398,15 +394,97 @@ fn a_sensor_stats_line_is_shipped_unchanged() {
         budget_high_water: 0,
         budget_refused: 0,
     };
-    let line = json(&stats.to_event("2026-11-13T10:00:00Z".parse().unwrap()));
-    for label in ["ssh", "catchall", "collector-01"] {
-        let mut tailer = log_of(&dir.path().join(label), std::slice::from_ref(&line));
+    json(&stats.to_event("2026-11-13T10:00:00Z".parse().unwrap()))
+}
+
+/// A sensor's own stats line, in the log bound to that sensor, is shipped byte for byte: the
+/// control plane stores it for this collector and that sensor.
+#[test]
+fn a_bound_logs_own_sensor_stats_line_is_shipped_unchanged() {
+    for (label, sensor) in [("ssh", "ssh"), ("cred-pg", "postgresql")] {
+        let dir = tempfile::tempdir().unwrap();
+        let line = stats_line(sensor);
+        let mut tailer = log_of(dir.path(), std::slice::from_ref(&line));
         let next = Batcher::next_batch(&mut tailer, label, 0, ZERO_HASH, 100);
         assert_eq!(next.refused, 0, "{label}");
         assert_eq!(
             next.batch.unwrap().records,
-            vec![line.clone().into_bytes()],
+            vec![line.into_bytes()],
             "{label}"
         );
     }
+}
+
+/// The gateway spools every log of a collector into one stream and the control plane reads that
+/// stream under one unbound label, so past this point a stats line naming ssh is ssh's row
+/// whichever log it came from. A telnet log that writes ssh's counters is refused here, counted
+/// like any other refused line, and read past, so the honest line after it still ships.
+#[test]
+fn a_sensor_stats_line_naming_a_sibling_sensor_is_refused_and_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let honest = stats_line("telnet");
+    let mut tailer = log_of(dir.path(), &[stats_line("ssh"), honest.clone()]);
+
+    let next = Batcher::next_batch(&mut tailer, "telnet", 0, ZERO_HASH, 100);
+    assert_eq!(next.refused, 1);
+    assert_eq!(next.batch.unwrap().records, vec![honest.into_bytes()]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut tailer = log_of(dir.path(), &[stats_line("ssh")]);
+    let next = Batcher::next_batch(&mut tailer, "telnet", 0, ZERO_HASH, 100);
+    assert_eq!((next.batch, next.refused), (None, 1));
+    let after = Batcher::next_batch(&mut tailer, "telnet", 0, ZERO_HASH, 100);
+    assert_eq!(
+        (after.batch, after.refused),
+        (None, 0),
+        "read past, not re-read"
+    );
+}
+
+/// A stats line naming a sensor no shipped sensor writes would make the control plane refuse it
+/// anyway; it is refused here from every log, bound or not.
+#[test]
+fn a_sensor_stats_line_naming_an_unknown_sensor_is_refused_from_every_log() {
+    for label in ["ssh", "collector-01", "my-sensors"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tailer = log_of(dir.path(), &[stats_line("nosuchsensor")]);
+        let next = Batcher::next_batch(&mut tailer, label, 0, ZERO_HASH, 100);
+        assert_eq!((next.batch, next.refused), (None, 1), "{label}");
+    }
+}
+
+/// A stats line that is not a well-formed stats line (here, from a real source address instead
+/// of the sentinel) cannot be checked against the log's sensor, and is refused.
+#[test]
+fn a_malformed_sensor_stats_line_is_refused() {
+    let mut event: sensor_wire::SensorEvent = serde_json::from_str(&stats_line("ssh")).unwrap();
+    event.source_ip = "203.0.113.80".parse().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut tailer = log_of(dir.path(), &[json(&event)]);
+    let next = Batcher::next_batch(&mut tailer, "ssh", 0, ZERO_HASH, 100);
+    assert_eq!((next.batch, next.refused), (None, 1));
+}
+
+/// The shipper accepts a log label that is bound to no sensor (one the shipped configuration
+/// does not use). Such a log is not one sensor's, so, as for evidence lines, it may carry the
+/// stats of any known sensor.
+#[test]
+fn an_unbound_logs_stats_lines_for_every_known_sensor_are_shipped() {
+    let lines: Vec<String> = sensor_wire::origin::SENSORS
+        .iter()
+        .map(|row| stats_line(row.sensor))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut tailer = log_of(dir.path(), &lines);
+    let mut shipped = Vec::new();
+    let mut last = (0, ZERO_HASH);
+    loop {
+        let next = Batcher::next_batch(&mut tailer, "my-sensors", last.0, last.1, 100);
+        assert_eq!(next.refused, 0);
+        let Some(batch) = next.batch else { break };
+        last = (batch.seq, batch.batch_hash);
+        shipped.extend(batch.records);
+    }
+    let expected: Vec<Vec<u8>> = lines.into_iter().map(String::into_bytes).collect();
+    assert_eq!(shipped, expected);
 }

@@ -4,6 +4,33 @@
 
 ### Upgrade note
 
+- **Collectors need this release's shipper before their capture counters can be trusted sensor
+  by sensor.** A control plane now stores the `sensor_stats` lines its collectors send (Added,
+  below). The rule that one sensor's log may report only that sensor is enforced where the logs
+  are still separate, on the collector, by its shipper (`crates/shipper/src/batcher.rs#admit`):
+  a stats line that is malformed, names a sensor this system does not know, or names another
+  sensor than the one its log is bound to is dropped there with the shipper's usual refusal
+  warning, and no longer reaches the control plane's rejected count. A collector still running
+  an older shipper sends every stats line on, so until it is upgraded a compromised sensor on it
+  can write a sibling sensor's counters on that collector. Evidence lines are held to their log
+  by every release's shipper and are not affected
+  ([split deployment](docs/operations/split-deployment.md)).
+- **`config-check` can fail on a control plane it passed before.** Its new `gateway-spool` row
+  fails when a collector's spool is not in `PROPOLIS_SENSOR_LOGS`, or is listed under a sensor's
+  name (Added, below). Both were silent evidence loss before; the check only reports them.
+  `deploy/upgrade.sh` runs the check in report-only mode, so a finding cannot fail an upgrade.
+- **The example alert target is empty.** `deploy/propolis.env.example` no longer sets
+  `PROPOLIS_OPS_NTFY_URL=https://ntfy.sh`. A file already in `/etc/propolis` is not touched. A
+  new copy with `PROPOLIS_OPS_ENABLED=true` and both the URL and the topic left empty starts and
+  alerts to the journal only (`journalctl -p err`), and `config-check` says so (`ops-no-push`);
+  with one of the two set and not the other the daemon still refuses to start
+  (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). On a server where the topic's
+  read access is not restricted to you, anyone who knows the topic name can read every alert,
+  and a token does not change that: it says who publishes, not who may read.
+- **The failure hook now retries an alert nobody received.** One new optional setting for
+  `propolis-alert@.service`, `PROPOLIS_ALERT_RETRY_SECS` (default 120): how long the hook waits
+  after an undelivered alert before the next failure of that unit posts again (Changed, below).
+
 - **Volume-listed addresses are no longer published until an operator approves them.** An
   address with a thousand or more established TCP events used to enter every retention feed
   (`all-24h` to `all-90d`) with no decision, on a count taken from what sensor log lines
@@ -333,6 +360,45 @@
 
 ### Added
 
+- **A control plane's `/metrics` carries each collector's capture counters** - intake stored a
+  `sensor_stats` line only when it named the label of the log it came from. A collector's spool
+  is labelled with the collector id, so every stats line from every collector was refused, with
+  one warning per sensor per minute, and a collector that was dropping captures looked the same
+  as a healthy one. Intake now stores a line that names a known sensor from a log bound to no
+  sensor (`crates/intake/src/runner.rs#stats_key`), under the label and the sensor together
+  (`crates/fleet/src/stats.rs#collector_key`), so two collectors' rows for one sensor, and the
+  control plane's own, are three rows and none overwrites another. `/metrics` publishes such a
+  row with two labels, `collector` and `sensor`; a row from a sensor's own log keeps the single
+  `sensor` label, so a single box's output is unchanged. A label longer than 31 bytes is
+  shortened to its first bytes, `~` and a hash of the whole label, the same for every sensor of
+  that collector. No schema change. Nothing deletes a row: a collector that is removed or
+  rebuilt under a new id leaves series that read stale until its rows are deleted by hand
+  ([sensor stats](docs/operations/health-and-observability.md#sensor-stats)).
+- **`config-check` reports a collector spool the daemon does not read** - the gateway accepts
+  and acknowledges a collector's batches into its spool whether or not the daemon reads that
+  spool, so a collector added, renamed or rebuilt without a matching `PROPOLIS_SENSOR_LOGS`
+  entry had its evidence acknowledged and never ingested, and nothing said so. On a host with a
+  gateway spool the new `gateway-spool` row (`deploy/config-check.sh#check_gateway_spool`) fails
+  with `spool-unlisted` for each such collector, says from intake's cursor whether the file was
+  never read or how much was written after reading stopped, and gives the entry to add. A spool
+  read to its end and not written for ten minutes, such as a retired collector's, is only
+  counted in the row. An entry that reads a spool under a sensor's name or a `cred-*` label
+  fails with `spool-label-sensor` (intake binds the log to that sensor and refuses every other
+  sensor's lines); one under a daemon subsystem's name (`spool-label-subsystem`) or any other
+  name that is not the collector id (`spool-label-other`) is a warning. A host with no spool
+  directory gets no row ([configuration check](docs/operations/service-lifecycle.md)).
+- **The gateway says when a collector re-sends a batch number with different content** - a
+  collector that loses an acknowledgement and then rebuilds the batch from a log that changed
+  in between sends different lines under a number the gateway already accepted. The gateway
+  answered `Duplicate`, the collector moved on, and any line that was not in the first batch
+  was never ingested, with no record anywhere. The gateway now logs, at ERROR and at most once
+  a minute per collector, `gateway: batch reuses the last accepted seq with different content;
+  acknowledged as Duplicate without storing it`, with the collector, the seq, the number of
+  records and how many such batches were held back since the last line
+  (`crates/gateway/src/verify.rs#note_reused_seq`). The acknowledgement and the wire are
+  unchanged. Only the last accepted number can be judged, because that is the one hash the
+  gateway keeps; an identical replay stays silent
+  ([split deployment](docs/operations/split-deployment.md#troubleshooting)).
 - **`deploy/blocklist-sync.sh --check [FEED_DIR]`** - runs every check the publishing script makes
   on a build (names, file types and sizes, and now the contents of every file) and stops, with
   no checkout, commit or push. Exit 0 means the build would be published as it stands
@@ -493,10 +559,13 @@
   per sensor in a new `sensor_stats` table (`fleet` migration `0002`, additive), so it never
   reaches the ledger, a score, the feed, a campaign or a vendor submission. Intake refuses, as a
   rejected line with a WARN, a `sensor_stats` line from any other source, with other than the
-  fixed field set, with a value over 2^53, or naming a sensor other than the log's label. The
-  console publishes the values on `/metrics` as `propolis_sensor_capture_*` series labelled by
-  sensor, with `propolis_sensor_stats_age_seconds`, `_stale` (past 180 s) and `_final`, so a dead
-  sensor reads as stale, not as zeros. No new setting.
+  fixed field set, with a value over 2^53, or naming a sensor this system does not know. A log
+  whose `PROPOLIS_SENSOR_LOGS` name is a sensor's name or a `cred-*` label may report only that
+  sensor; a log under any other name, which on a control plane is a collector's spool, may report
+  any known sensor, kept per name and sensor (the collector entry below). The console publishes
+  the values on `/metrics` as `propolis_sensor_capture_*` series labelled by sensor, and by
+  collector for a row from such a log, with `propolis_sensor_stats_age_seconds`, `_stale` (past
+  180 s) and `_final`, so a dead sensor reads as stale, not as zeros. No new setting.
 - **The evidence timeline shows what the fetcher did with each download** - a
   `honeypot_file_download` event now carries a line under its URL: `fetched` with the sample
   hash linked to its page, `refused` (the SSRF guard or hop limit) or `failed` with the recorded
@@ -629,6 +698,26 @@
 
 ### Changed
 
+- **The failure hook's cooldown is armed only by an alert that was delivered** - the hook
+  (`deploy/alert.sh`) wrote its per-unit cooldown stamp before it posted, so one failed post
+  (ntfy down, a revoked token, no network) silenced that unit's alerts for the next half hour
+  although nobody had been told. The cooldown now starts when the post succeeds, or, with no
+  push target configured, when the alert is written to the journal as before. After an
+  undelivered alert the next failure of the unit posts again once `PROPOLIS_ALERT_RETRY_SECS`
+  (default 120) has passed; in between, each failure writes one short journal line saying since
+  when the alert is undelivered, and the full text goes to the journal at most once per
+  cooldown, so a crash loop on a host that cannot reach ntfy neither hammers ntfy nor floods
+  the journal. The alert that gets through says how many earlier failures went undelivered and
+  since when (`deploy/alert.sh#undelivered`).
+- **The troubleshooting pages start with what not to touch** - while ingestion is stopped the
+  unread evidence is still in the sensor logs and gateway spools. The intake-backlog and
+  database pages now open with a step 0: do not truncate, delete, rotate by hand or restart
+  until you know which stage stopped and whether the file you are about to touch has been
+  read, with the checks that exist today and what each can and cannot tell you (a zero
+  `propolis_intake_bytes_behind` proves nothing for a loop that gave up, and a log with no
+  series is not read at all). Each destructive command has its condition directly in front of
+  it, and the retention page says which check applies on a collector, where the reader is the
+  shipper ([intake backlog](docs/troubleshooting/intake-backlog.md)).
 - **The console shows when an address earned its tiers and when it last connected** - the
   address page adds "Earned aggressive tier", "Earned standard tier", "Established events" and
   "Last connection" beside "Last seen", and the Review page's volume tab shows the last
@@ -778,6 +867,15 @@
 
 ### Fixed
 
+- **A clock stepped back, a slow ntfy server or a missing `curl` no longer silences the failure
+  hook** - three ways `deploy/alert.sh` went quiet. A cooldown stamp dated after now, as after
+  a clock step, made the stamp's age negative, which read as recent, so the unit's alerts were
+  dropped for as long as the step; a negative age now counts as expired. The post had no bound
+  on its total time, so a server answering with a long `Retry-After` kept `curl` waiting until
+  systemd killed the hook at its start timeout with nothing written; the post is now bounded
+  well inside that timeout and a failed post always reaches the journal. And a host without
+  `curl` logged "could not post to ntfy"; it now says `curl` is not installed, and the alert
+  counts as undelivered instead of delivered.
 - **The nftables, ipset and RPZ feed files now work when a consumer applies them, and again when
   they refresh** - all three broke in ordinary use, and no test opened any of them. An empty
   feed's `.nft` was `define x = {}`, a syntax error that stopped the consumer's whole ruleset

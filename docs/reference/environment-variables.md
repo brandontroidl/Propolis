@@ -390,9 +390,9 @@ u32.
 | Variable | Req | Default | Min/bounds | Notes |
 |---|---|---|---|---|
 | `PROPOLIS_OPS_ENABLED` | no | `false` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | opt-in; a deployment predating ops-alert still starts |
-| `PROPOLIS_OPS_NTFY_URL` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) |
+| `PROPOLIS_OPS_NTFY_URL` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). Use your own ntfy server or one that restricts the topic's read access to you. Where it is not restricted (an unreserved topic on a public server, or a self-hosted server left at its default open access), anyone who knows the topic name can read every alert, token or not. |
 | `PROPOLIS_OPS_NTFY_TOPIC` | no | `""` (unset reads as empty, `crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | enabled and set with the other unset -> abort (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`); enabled and both unset -> alerts go to the local log sink (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). The `propolis-ops` value seen in tests is not a runtime default. |
-| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | optional bearer token |
+| `PROPOLIS_OPS_NTFY_TOKEN` | no | none (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | - | optional bearer token; it says who publishes and does not by itself make the topic private |
 | `PROPOLIS_OPS_POLL_INTERVAL_SECS` | no | `30` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
 | `PROPOLIS_OPS_REPAGE_COOLDOWN_SECS` | no | `5400` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |
 | `PROPOLIS_OPS_STALL_FOR_SECS` | no | `600` (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`) | min 1 | |

@@ -14,6 +14,26 @@ database via `DATABASE_URL` and runs its migrations at startup. Schema, tables,
 enums, and migration list are owned by
 [Database reference](../reference/database.md); this page covers symptoms.
 
+## Step 0: change nothing until you know what stopped
+
+> **Warning - held evidence.** While intake cannot write to the database, the events it has not
+> appended wait in the sensor logs under `/var/log/propolis/` (on a control plane, also in the
+> gateway spool under `/var/spool/propolis/gateway/`), and intake resumes from its saved cursor
+> once the database is back. Do not truncate, delete or rotate a log by hand, and do not restart
+> anything, until you know which stage stopped and whether intake has read the file you are
+> about to touch. Truncating or deleting unread lines loses them for good, and a restart of
+> `propolis` clears the `gave_up` list `/ready` reports.
+
+Find out first, with what is running: `curl -s localhost:8080/ready` (below) returns
+`{"status":"unavailable"}` while the database is down, or names the subsystems that gave up
+once it answers; `journalctl -u propolis --since '1 hour ago'` shows the error intake and the
+pool last logged. `/metrics` queries the database before it writes any series, so while the
+database is down it answers with an error page and cannot tell you how far intake has read: no
+`propolis_intake_bytes_behind` line means unknown, never caught up. Leave the logs untouched
+until the database is back and that reading returns. What it means, and when truncating a log
+is safe, is in
+[intake backlog](intake-backlog.md#step-0-change-nothing-until-you-know-what-stopped).
+
 ## Connection failures at startup
 
 Phase 2 of daemon startup connects the pool; on failure it logs

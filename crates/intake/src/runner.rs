@@ -216,6 +216,52 @@ fn hash_line(line: &str) -> u64 {
     hasher.finish()
 }
 
+/// Why [`stats_key`] refused a `sensor_stats` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatsRefusal {
+    /// The line names a sensor that is not in the origin table.
+    UnknownSensor,
+    /// The log is bound to a sensor and the line names another one.
+    OtherSensor,
+}
+
+/// The `sensor_stats` key a stats line naming `claimed`, read from the log labelled `label`, is
+/// stored under, or why it is refused.
+///
+/// - `claimed` must be a sensor this system knows (`origin::row`). That is also what bounds the
+///   rows one log can create: one per known sensor, whatever its lines say.
+/// - A log bound to a sensor (`origin::bound_sensor`: a single box's own logs) speaks for that
+///   sensor only, and its row is keyed by the bare sensor name, as it always has been.
+/// - A log bound to no sensor is, on a control node, one collector's spool, labelled with the
+///   collector id (or, on any node, a log under a label of the operator's own). It may report
+///   any known sensor, and its rows are keyed by the label AND the sensor
+///   (`fleet::stats::collector_key`), so two collectors running the same sensor, and the control
+///   node's own, do not share a row as long as no spool is labelled with a sensor name or a
+///   `cred-*` label (`config-check` reports that as `spool-label-sensor`).
+///
+/// Who enforces what, for a collector's rows:
+/// - Which collector: the gateway appends a batch to the spool of the collector named in the
+///   client certificate the batch arrived on, the label is the operator's `PROPOLIS_SENSOR_LOGS`
+///   name for that spool, and nothing in the line moves either. So a collector writes only
+///   under its own label.
+/// - Which sensor of that collector: not here. The spool merges every log of the collector, so
+///   this check cannot tell which log a line came from. The collector's shipper holds each stats
+///   line to the log it read it from before it ships it (`shipper::batcher`'s `admit`): the
+///   telnet log may not report ssh. A collector still running a shipper from before that check
+///   is not held to it, so each of its sensors' rows is only as trustworthy as the least
+///   trusted sensor on that collector until its shipper is upgraded, and a collector that is
+///   compromised as a whole can write any of its known sensors' rows.
+fn stats_key(label: &str, claimed: &str) -> Result<String, StatsRefusal> {
+    let row = origin::row(claimed).ok_or(StatsRefusal::UnknownSensor)?;
+    match origin::bound_sensor(label) {
+        Some(bound) if bound == row.sensor => Ok(row.sensor.to_string()),
+        Some(_) => Err(StatsRefusal::OtherSensor),
+        // `None` only for a name too long or with a `/`, which no table row is (the test
+        // `every_known_sensor_has_a_collector_key_under_the_longest_label` holds it).
+        None => fleet::stats::collector_key(label, row.sensor).ok_or(StatsRefusal::UnknownSensor),
+    }
+}
+
 impl IntakeRunner {
     /// `probe_sources` are the control plane's own egress addresses, from
     /// `PROPOLIS_FLEET_PROBE_SOURCE_IPS`. An EMPTY set means no probe is configured on this node
@@ -353,9 +399,9 @@ impl IntakeRunner {
     /// So is a line that says something about itself this log cannot be believed on, checked as
     /// soon as it parses and before anything is done with it: an `observed_at` more than
     /// [`MAX_FUTURE_SKEW`] ahead of this clock (every kind of line), and for every line but a
-    /// `sensor_stats` one (which has its own exact check against the label) a sensor name, signal
-    /// type, protocol, authentication or summary marker outside what the origin policy allows the
-    /// log it was read from (`sensor_wire::origin::check`). A probe line is held to the policy
+    /// `sensor_stats` one (which has its own check against the label, `stats_key`) a sensor
+    /// name, signal type, protocol, authentication or summary marker outside what the origin
+    /// policy allows the log it was read from (`sensor_wire::origin::check`). A probe line is held to the policy
     /// too, so a log can only confirm a sensor it is allowed to speak for.
     ///
     /// Every convertible line is appended in ONE transaction (`core_scoring::append_events`),
@@ -401,7 +447,7 @@ impl IntakeRunner {
         let mut probes: Vec<(usize, String)> = Vec::new();
         // (index into `pending`, digest, text) of each reply in the batch, stored before the append.
         let mut replies: Vec<(usize, String, String)> = Vec::new();
-        let mut stats_lines: Vec<(usize, SensorStats, DateTime<Utc>)> = Vec::new();
+        let mut stats_lines: Vec<(usize, String, SensorStats, DateTime<Utc>)> = Vec::new();
         let mut bytes_read = 0usize;
         // One reading of the clock for the batch: every line is judged against the same instant.
         let now = Utc::now();
@@ -440,23 +486,37 @@ impl IntakeRunner {
             // A sensor's own health counters are not evidence. They are taken out here, BEFORE
             // conversion, so they cannot reach the ledger, a score, the feed, a campaign or a
             // vendor submission, and are stored in `sensor_stats` after the append (below). The
-            // intercept keys on the signal type alone; the sentinel source, the fixed field set,
-            // the bounds and the log's own sensor label are then ALL required
-            // (`SensorStats::from_event`), and a line that fails any of them is refused, never
-            // stored and never handed on to `convert`.
+            // intercept keys on the signal type alone; the sentinel source, the fixed field set
+            // and the bounds (`SensorStats::from_event`) and then the log's right to speak for the
+            // sensor named (`stats_key`) are ALL required, and a line that fails any of them is
+            // refused, never stored and never handed on to `convert`.
+            //
+            // Not `origin::check`: stats is no sensor's evidence signal, so no row in the origin
+            // table lists it and `check` refuses every stats line from every log (its test
+            // `a_signal_no_sensor_emits_is_refused_from_every_sensor` proves it). `stats_key`
+            // applies the two parts of the policy that do concern a stats line: the sensor must
+            // be one this system knows, and a log bound to a sensor speaks for that sensor only.
             if event.signal_type == SIGNAL_SENSOR_STATS {
                 match SensorStats::from_event(&event) {
-                    Ok(stats) if stats.sensor == self.sensor_name => {
-                        stats_lines.push((index, stats, event.observed_at));
-                    }
-                    Ok(stats) => {
-                        tracing::warn!(
-                            sensor = %self.sensor_name,
-                            claimed = %stats.sensor,
-                            "sensor_stats line names a different sensor than this log's label, refused"
-                        );
-                        rejected_at.push(index);
-                    }
+                    Ok(stats) => match stats_key(&self.sensor_name, &stats.sensor) {
+                        Ok(key) => stats_lines.push((index, key, stats, event.observed_at)),
+                        Err(StatsRefusal::OtherSensor) => {
+                            tracing::warn!(
+                                sensor = %self.sensor_name,
+                                claimed = %stats.sensor,
+                                "sensor_stats line names a different sensor than this log's label, refused"
+                            );
+                            rejected_at.push(index);
+                        }
+                        Err(StatsRefusal::UnknownSensor) => {
+                            tracing::warn!(
+                                sensor = %self.sensor_name,
+                                claimed = %stats.sensor,
+                                "sensor_stats line names a sensor this system does not know, refused"
+                            );
+                            rejected_at.push(index);
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             sensor = %self.sensor_name,
@@ -472,8 +532,8 @@ impl IntakeRunner {
             // The file proves which sensor wrote the line; the line's own fields prove nothing.
             // Held to the origin policy here, before the probe branch uses its sensor name and
             // before conversion copies its sensor, signal type, protocol and authentication into
-            // the ledger. A `sensor_stats` line never reaches this: it was compared with the
-            // label exactly, above.
+            // the ledger. A `sensor_stats` line never reaches this: it was held to the label on
+            // its own path, above (`stats_key`).
             if let Err(e) = origin::check(&self.sensor_name, &event) {
                 tracing::warn!(
                     sensor = %self.sensor_name,
@@ -612,9 +672,9 @@ impl IntakeRunner {
             result.probe_confirmations += 1;
         }
 
-        for (_, stats, observed_at) in stats_lines.iter().filter(|(i, _, _)| *i < reached) {
+        for (_, key, stats, observed_at) in stats_lines.iter().filter(|(i, _, _, _)| *i < reached) {
             let row = fleet::stats::SensorStatsRow {
-                sensor: stats.sensor.clone(),
+                sensor: key.clone(),
                 reported_at: *observed_at,
                 received_at: Utc::now(),
                 uptime_secs: stats.uptime_secs as i64,
@@ -833,6 +893,50 @@ mod tests {
             MIN_BATCH_LINES
         );
         assert_eq!(next_batch_size(1000, 0, 0, false), MIN_BATCH_LINES);
+    }
+
+    #[test]
+    fn every_known_sensor_has_a_collector_key_under_the_longest_label() {
+        let label = "c".repeat(64);
+        for row in origin::SENSORS {
+            let key = stats_key(&label, row.sensor).unwrap();
+            assert!(key.len() <= fleet::stats::MAX_KEY_LEN, "{key}");
+            assert_eq!(fleet::stats::split_key(&key).1, row.sensor);
+            // The reader tells a local row from a collector's by the slash alone.
+            assert!(!row.sensor.contains('/'), "{}", row.sensor);
+        }
+    }
+
+    /// `/metrics` publishes the label part of a key as the `collector` label, so the rows one
+    /// collector's spool writes, one per known sensor, must all carry the same label part.
+    #[test]
+    fn every_known_sensor_of_one_collector_is_stored_under_one_label_part() {
+        for len in 1..=80 {
+            let label = "c".repeat(len);
+            let parts: HashSet<String> = origin::SENSORS
+                .iter()
+                .map(|row| {
+                    let key = stats_key(&label, row.sensor).unwrap();
+                    fleet::stats::split_key(&key).0.unwrap().to_string()
+                })
+                .collect();
+            assert_eq!(parts.len(), 1, "label of {len}: {parts:?}");
+        }
+    }
+
+    #[test]
+    fn a_bound_log_keys_its_own_sensors_stats_by_the_bare_name_and_refuses_any_other() {
+        assert_eq!(stats_key("ssh", "ssh").as_deref(), Ok("ssh"));
+        assert_eq!(
+            stats_key("cred-pg", "postgresql").as_deref(),
+            Ok("postgresql")
+        );
+        assert_eq!(stats_key("ssh", "telnet"), Err(StatsRefusal::OtherSensor));
+        assert_eq!(stats_key("ssh", "nosuch"), Err(StatsRefusal::UnknownSensor));
+        assert_eq!(
+            stats_key("collector-a", "nosuch"),
+            Err(StatsRefusal::UnknownSensor)
+        );
     }
 
     fn lazy_runner() -> IntakeRunner {

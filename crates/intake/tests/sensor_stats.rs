@@ -240,6 +240,186 @@ async fn one_logs_stats_cannot_write_another_sensors_row(pool: PgPool) {
     assert_eq!(stored(&pool).await.len(), 1);
 }
 
+#[sqlx::test(migrations = false)]
+async fn a_stats_line_in_a_collector_spool_is_stored_under_the_collector_and_the_sensor(
+    pool: PgPool,
+) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    write_line(
+        &dir.path().join("events.jsonl"),
+        &stats("ssh", 9).to_event("2026-10-09T00:00:00Z".parse().unwrap()),
+    );
+    let before = ledger_counts(&pool).await;
+    let result = runner(&pool, dir.path(), "collector-a").run_batch().await;
+
+    assert_eq!(result.stats_updates, 1);
+    assert_eq!((result.rejected, result.ingested, result.errors), (0, 0, 0));
+    assert_eq!(ledger_counts(&pool).await, before);
+    let rows = stored(&pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].sensor.as_str(), rows[0].dropped),
+        ("collector-a/ssh", 9)
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_same_sensor_on_two_collectors_and_on_the_control_node_is_three_rows(pool: PgPool) {
+    migrate(&pool).await;
+    // Each line is newer than the one before, so a shared key would leave only the last.
+    let lines = [
+        ("ssh", 1, "2026-10-09T00:00:00Z"),
+        ("collector-a", 2, "2026-10-09T00:01:00Z"),
+        ("collector-b", 3, "2026-10-09T00:02:00Z"),
+    ];
+    for (label, dropped, when) in lines {
+        let dir = tempfile::tempdir().unwrap();
+        write_line(
+            &dir.path().join("events.jsonl"),
+            &stats("ssh", dropped).to_event(when.parse().unwrap()),
+        );
+        let result = runner(&pool, dir.path(), label).run_batch().await;
+        assert_eq!((result.rejected, result.stats_updates), (0, 1), "{label}");
+    }
+
+    let rows: Vec<(String, i64)> = stored(&pool)
+        .await
+        .into_iter()
+        .map(|r| (r.sensor, r.dropped))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("collector-a/ssh".to_string(), 2),
+            ("collector-b/ssh".to_string(), 3),
+            ("ssh".to_string(), 1),
+        ],
+        "no row overwrote another"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_collector_label_cannot_write_a_row_for_a_sensor_this_system_does_not_know(pool: PgPool) {
+    migrate(&pool).await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("events.jsonl");
+    let when = "2026-10-09T00:00:00Z".parse().unwrap();
+    write_line(&log, &stats("nosuchsensor", 1).to_event(when));
+    // A slash in the claimed name would otherwise move the split between collector and sensor.
+    write_line(&log, &stats("evil/ssh", 1).to_event(when));
+    let result = runner(&pool, dir.path(), "collector-a").run_batch().await;
+
+    assert_eq!((result.rejected, result.stats_updates), (2, 0));
+    assert!(stored(&pool).await.is_empty());
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_64_character_collector_label_is_stored_under_a_key_the_column_accepts(pool: PgPool) {
+    migrate(&pool).await;
+    let label = "c".repeat(64);
+    let dir = tempfile::tempdir().unwrap();
+    write_line(
+        &dir.path().join("events.jsonl"),
+        &stats("postgresql", 1).to_event("2026-10-09T00:00:00Z".parse().unwrap()),
+    );
+    let result = runner(&pool, dir.path(), &label).run_batch().await;
+
+    assert_eq!((result.rejected, result.stats_updates), (0, 1));
+    let rows = stored(&pool).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the insert was refused by the column's bound"
+    );
+    assert!(rows[0].sensor.chars().count() <= 64, "{}", rows[0].sensor);
+    assert!(
+        rows[0].sensor.ends_with("/postgresql"),
+        "{}",
+        rows[0].sensor
+    );
+}
+
+/// Every event logged while it is the thread's default subscriber, as `name=value` pairs. The
+/// `sqlx::test` runtime is single-threaded, so the runner's warnings land here.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Captured {
+    /// The logged events whose text contains `needle`.
+    fn with(&self, needle: &str) -> Vec<String> {
+        let events = self.0.lock().unwrap();
+        events
+            .iter()
+            .filter(|e| e.contains(needle))
+            .cloned()
+            .collect()
+    }
+}
+
+impl tracing::Subscriber for Captured {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(fields.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The operator reads why a stats line was refused from the WARN alone, and health-and-observability
+/// quotes both texts, so each refusal must log its own text, against the line that caused it.
+#[sqlx::test(migrations = false)]
+async fn each_stats_refusal_logs_its_own_reason_against_the_line_it_refused(pool: PgPool) {
+    migrate(&pool).await;
+    let captured = Captured::default();
+    let _guard = tracing::subscriber::set_default(captured.clone());
+    let when = "2026-10-09T00:00:00Z".parse().unwrap();
+
+    let bound = tempfile::tempdir().unwrap();
+    write_line(
+        &bound.path().join("events.jsonl"),
+        &stats("telnet", 1).to_event(when),
+    );
+    let result = runner(&pool, bound.path(), "ssh").run_batch().await;
+    assert_eq!(result.rejected, 1);
+
+    let spool = tempfile::tempdir().unwrap();
+    write_line(
+        &spool.path().join("events.jsonl"),
+        &stats("nosuchsensor", 1).to_event(when),
+    );
+    let result = runner(&pool, spool.path(), "collector-a").run_batch().await;
+    assert_eq!(result.rejected, 1);
+
+    let other = captured.with("names a different sensor than this log's label");
+    assert_eq!(other.len(), 1, "{other:?}");
+    assert!(
+        other[0].contains("sensor=ssh ") && other[0].contains("claimed=telnet "),
+        "{other:?}"
+    );
+    let unknown = captured.with("names a sensor this system does not know");
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert!(
+        unknown[0].contains("sensor=collector-a ") && unknown[0].contains("claimed=nosuchsensor "),
+        "{unknown:?}"
+    );
+}
+
 #[test]
 fn the_converter_would_refuse_a_stats_line_even_if_the_intercept_failed() {
     let event = stats("ssh", 1).to_event("2026-10-09T00:00:00Z".parse().unwrap());

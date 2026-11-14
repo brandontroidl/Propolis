@@ -320,6 +320,8 @@ Routine checks:
 - Watch the feed last-build timestamp to confirm Stage 1 is still building.
 - If enabled, the optional operational self-alerting subsystem pages via ntfy on
   degradation (stall, capacity, backlog, feed staleness, vendor failure rate,
-  chain-verify). It is **off by default** and, when enabled, requires its ntfy
-  URL and topic or it refuses to start (a monitor that cannot page must not run).
+  chain-verify). It is **off by default**. Enabled with the ntfy URL and topic
+  both empty, it starts and writes alerts to the journal at error priority only
+  (`journalctl -p err`); with one set and not the other the daemon refuses to
+  start (a half-set target looks configured but would page nothing).
   See [health and observability](health-and-observability.md).

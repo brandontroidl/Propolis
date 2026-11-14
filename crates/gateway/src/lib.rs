@@ -10,4 +10,4 @@ pub mod verify;
 pub use server::{BatchSink, serve};
 pub use spool::SpoolWriter;
 pub use state::CollectorState;
-pub use verify::{GatewaySink, SpoolWrite};
+pub use verify::{GatewaySink, ReusedSeqCounts, SpoolWrite};

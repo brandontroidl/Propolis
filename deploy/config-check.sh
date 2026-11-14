@@ -22,8 +22,9 @@
 # the newest event the ledger holds for the sensor. Host-wide: the log rotation timer and its state
 # file, the binaries upgrade.sh installs against the deploy stamp, the watcher's env file, enabled
 # sensor units with no bind configured, unreadable env files, and an env file whose mode lets
-# another account read it; and whether the daemon's database role can do more to the event
-# ledger than append to it.
+# another account read it; whether the daemon's database role can do more to the event
+# ledger than append to it; and, on a control plane with a gateway spool, each collector's spool
+# against PROPOLIS_SENSOR_LOGS (one the gateway acknowledges and the daemon never reads).
 #
 # NEVER MUTATES. It writes nothing outside a private temp directory it removes, restarts nothing,
 # and changes no firewall rule. Every external tool is optional: a missing one makes its check
@@ -49,7 +50,8 @@
 # PROPOLIS_CC_EUID, PROPOLIS_CC_BIN_DIR, PROPOLIS_CC_REPO_DIR, PROPOLIS_CC_BUILD_DIR,
 # PROPOLIS_CC_STAMP, PROPOLIS_CC_LOGROTATE_STATE, PROPOLIS_CC_LOGROTATE_POLICY,
 # PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME, PROPOLIS_CC_WATCH_ACCOUNT,
-# PROPOLIS_CC_BACKUP_DIR. PROPOLIS_CC_LOG_STALE_HOURS (default 24)
+# PROPOLIS_CC_BACKUP_DIR, PROPOLIS_CC_GATEWAY_SPOOL_DIR (the spool directory when gateway.env sets
+# none). PROPOLIS_CC_LOG_STALE_HOURS (default 24)
 # is the age past which a log on a running sensor is reported as quiet.
 #
 # The output is plain ASCII: every value read from an env file is passed through `clean` first, so
@@ -1907,6 +1909,369 @@ check_intake_list() {
     fi
 }
 
+# ---- gateway spool -------------------------------------------------------------------------
+
+# The labels intake binds to one sensor (crates/sensor-wire/src/origin.rs bound_sensor: the name of
+# every SENSORS row, and CRED_LABELS). config_check_test.rs holds this list to that file.
+SPOOL_BOUND_LABELS="ssh telnet adb redis http ftp smtp tftp mqtt dns catchall vnc mysql mssql postgresql mongodb cred-vnc cred-mysql cred-mssql cred-pg cred-mongo"
+# The names the daemon gives its own subsystems (crates/propolis/src/ops_alert/condition.rs
+# DAEMON_SUBSYSTEMS). A tailer under one of them shares that subsystem's name in the supervisor,
+# and the sensor-down alert never watches it. config_check_test.rs holds this list to that file.
+SPOOL_SUBSYSTEM_NAMES="review feed virustotal fetcher console ops-monitor sample-retention listener-probe campaigns"
+# Where gateway.service spools when gateway.env leaves PROPOLIS_GATEWAY_SPOOL_DIR unset.
+GATEWAY_SPOOL_DEFAULT="${PROPOLIS_CC_GATEWAY_SPOOL_DIR:-/var/spool/propolis/gateway}"
+# The most unlisted collectors given a finding each; the rest are counted in the row.
+SPOOL_MAX_REPORTED=20
+# How long an unlisted spool must have gone unwritten before "read to its end" is taken to mean
+# its collector is gone. A capturing sensor writes a stats line every minute, so a collector that
+# is still shipping writes its spool far more often than this; a spool written more recently may
+# belong to a collector whose entry was removed by mistake, which is the case this check is for.
+SPOOL_QUIET_SECS=600
+
+# A spool directory name fit to print: cleaned, and cut at 64 characters, the most a certificate
+# CommonName may hold (RFC 5280 ub-common-name), so nothing longer is a collector id anyway.
+spool_name() {
+    local s
+    s="$(clean "$1")"
+    if [ "${#s}" -gt 64 ]; then
+        s="${s:0:64}..."
+    fi
+    printf '%s' "$s"
+}
+
+# spool_id_of PATH DIR RESOLVED_DIR: the collector id when PATH is DIR/<id>/events.jsonl, else
+# nothing. The path is tried as written and canonicalized, so `//`, `./` or a symlinked spool
+# directory still match the directory the gateway writes into. A path ending in `/` names no file
+# (the daemon's open of `events.jsonl/` fails with ENOTDIR) and readlink -m would drop the slash,
+# so such a path lists nothing.
+spool_id_of() {
+    local path="$1" p base rest
+    case "$path" in /*) ;; *) return 0 ;; esac
+    case "$path" in */) return 0 ;; esac
+    for p in "$(readlink -m -- "$path" 2>/dev/null || true)" "$path"; do
+        for base in "$3" "$2"; do
+            [ -n "$p" ] && [ -n "$base" ] || continue
+            rest="${p#"${base%/}"/}"
+            [ "$rest" != "$p" ] || continue
+            case "$rest" in
+                */*/*) ;;
+                ?*/events.jsonl)
+                    printf '%s' "${rest%/events.jsonl}"
+                    return 0
+                    ;;
+            esac
+        done
+    done
+}
+
+# spool_bound LABEL: the sensor a log under LABEL is bound to, or nothing for an unbound label.
+spool_bound() {
+    local w
+    for w in $SPOOL_BOUND_LABELS; do
+        if [ "$w" = "$1" ]; then
+            case "$w" in
+                cred-pg) printf 'postgresql' ;;
+                cred-mongo) printf 'mongodb' ;;
+                cred-*) printf '%s' "${w#cred-}" ;;
+                *) printf '%s' "$w" ;;
+            esac
+            return 0
+        fi
+    done
+}
+
+# spool_subsystem NAME: succeeds when NAME is one of the daemon's own subsystem names.
+spool_subsystem() {
+    local w
+    for w in $SPOOL_SUBSYSTEM_NAMES; do
+        [ "$w" != "$1" ] || return 0
+    done
+    return 1
+}
+
+# env_file_value NAME FILE: the last assignment of NAME in FILE as systemd's EnvironmentFile=
+# hands it to the unit: surrounding whitespace trimmed and one pair of surrounding quotes removed.
+# read_env_var_in keeps trailing whitespace, so `DIR=/srv/spool ` would be read as another path.
+env_file_value() {
+    local line v
+    line="$(grep -hE "^[[:space:]]*$1=" -- "$2" 2>/dev/null | tail -n 1)" || line=""
+    [ -n "$line" ] || return 0
+    v="$(trim "${line#*=}")"
+    if [ "${#v}" -ge 2 ]; then
+        case "$v" in
+            \"*\" | \'*\') v="${v:1:${#v}-2}" ;;
+        esac
+    fi
+    printf '%s' "$v"
+}
+
+# spool_read_state FILE CURSOR_DIR: how far intake read FILE, from the cursor the daemon keeps for
+# it. The cursor is named by the SHA-256 of the file's resolved path, not by its label
+# (crates/log-tailer/src/cursor.rs DurableCursor::cursor_file_path), so it outlives the entry that
+# listed the file. Prints one of: `end` (read to its current size), `unread N` (N bytes written
+# after the cursor), `none` (no cursor in that directory: not read, or the daemon keeps its
+# cursors elsewhere), or `unknown REASON`.
+spool_read_state() {
+    local file="$1" cdir="$2" st inode size cur json c_inode c_offset
+    st="$(stat -L -c '%i %s' -- "$file" 2>/dev/null)" || st=""
+    inode="${st%% *}"
+    size="${st##* }"
+    if ! [[ "$inode" =~ ^[0-9]+$ ]] || ! [[ "$size" =~ ^[0-9]+$ ]]; then
+        printf 'unknown %s could not be read with stat' "$file"
+        return 0
+    fi
+    if [ ! -d "$cdir" ]; then
+        printf 'none'
+        return 0
+    fi
+    if [ ! -x "$cdir" ]; then
+        printf 'unknown the cursor directory %s is not readable as this user' "$cdir"
+        return 0
+    fi
+    cur="$cdir/$(printf '%s' "$(readlink -f -- "$file" 2>/dev/null || printf '%s' "$file")" | sha256sum | cut -d' ' -f1).json"
+    if [ ! -e "$cur" ]; then
+        printf 'none'
+        return 0
+    fi
+    if ! json="$(cat -- "$cur" 2>/dev/null)"; then
+        printf 'unknown its cursor %s is not readable as this user' "$cur"
+        return 0
+    fi
+    c_inode="$(printf '%s' "$json" | sed -n 's/.*"inode":\([0-9][0-9]*\).*/\1/p')"
+    c_offset="$(printf '%s' "$json" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')"
+    if [ -z "$c_inode" ] || [ -z "$c_offset" ]; then
+        printf 'unknown its cursor %s has no inode and offset' "$cur"
+    elif [ "$c_inode" != "$inode" ]; then
+        printf 'unknown its cursor %s is for inode %s, and the file is now inode %s' "$cur" "$c_inode" "$inode"
+    elif [ "$c_offset" -gt "$size" ]; then
+        printf 'unknown its cursor %s is at byte %s, past the file'"'"'s %s bytes, so the file was emptied after intake read it' "$cur" "$c_offset" "$size"
+    elif [ "$c_offset" -eq "$size" ]; then
+        printf 'end'
+    else
+        printf 'unread %s' "$((size - c_offset))"
+    fi
+}
+
+# On a control plane the gateway accepts, acknowledges and spools every batch a collector ships,
+# and the daemon ingests a spool only if PROPOLIS_SENSOR_LOGS lists it. A collector added, renamed
+# or rebuilt without that entry has its evidence acknowledged and never ingested, and nothing else
+# says so. Only a host with a gateway spool directory is checked; everywhere else this is silent.
+check_gateway_spool() {
+    local LC_ALL=C
+    local genv="$ENV_DIR/gateway.env" penv="$ENV_DIR/propolis.env" configured="" sdir sdir_r
+    if [ -e "$genv" ] && [ ! -r "$genv" ]; then
+        global gateway-spool unknown "$genv not readable, so the spool directory is unknown"
+        limit "gateway spool not checked: $genv is not readable as this user, so where the gateway spools is unknown; run as root"
+        return 0
+    fi
+    if [ -r "$genv" ]; then
+        configured="$(env_file_value PROPOLIS_GATEWAY_SPOOL_DIR "$genv")"
+    fi
+    sdir="${configured:-$GATEWAY_SPOOL_DEFAULT}"
+    if [ -n "$configured" ] && [ ! -d "$sdir" ]; then
+        # gateway.env names a spool, so this is a control plane: say the spool was not checked
+        # rather than look like a host that has none.
+        global gateway-spool unknown "PROPOLIS_GATEWAY_SPOOL_DIR in $genv is $(clean "$sdir"), which is not a directory: no collector has delivered a batch yet, or the path is wrong; collector spools were not checked"
+        return 0
+    fi
+    # No spool directory: a single host or a collector, with nothing here to check.
+    [ -d "$sdir" ] || return 0
+    if [ ! -r "$sdir" ] || [ ! -x "$sdir" ]; then
+        global gateway-spool unknown "$sdir not readable as this user"
+        limit "gateway spool not checked: $sdir is not readable as this user, so a collector whose spool PROPOLIS_SENSOR_LOGS does not list would go unseen; run as root"
+        return 0
+    fi
+    if [ -e "$penv" ] && [ ! -r "$penv" ]; then
+        global gateway-spool unknown "$penv not readable"
+        limit "gateway spool not checked: $penv is not readable as this user, so the spool cannot be compared with PROPOLIS_SENSOR_LOGS; run as root"
+        return 0
+    fi
+    sdir_r="$(readlink -m -- "$sdir" 2>/dev/null)" || sdir_r="$sdir"
+
+    local i id lp label lab sid bound relabel worst=ok n=0 ignored=0 unreadable=0 mislabelled=0
+    local d name file st mtime size detail why subsys badname=0 ownid entry rs read lead
+    local -a unlisted=() retired=()
+    local -A listed=() trailing=()
+    local restart newid cdir
+    restart="sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")"
+    newid="give this collector a new id (docs/operations/split-deployment.md, Rebuilding a collector) and list $sdir/<new id>/events.jsonl under that id in PROPOLIS_SENSOR_LOGS in $penv, then run: $restart"
+    # The daemon's cursor directory, the one check_cursors reads: a spool no entry lists any more
+    # still has its cursor there, which tells whether intake read it to its end.
+    cdir="${PROPOLIS_CC_CURSOR_DIR:-}"
+    if [ -z "$cdir" ]; then
+        [ ! -r "$penv" ] || cdir="$(read_env_var_in PROPOLIS_CURSOR_DIR "$penv")"
+        cdir="${cdir:-/var/lib/propolis/cursors}"
+    fi
+    # Only the daemon's own list counts: a shipper.env list is a collector's, not this host's intake.
+    if [ "$INTAKE_VAR" = PROPOLIS_SENSOR_LOGS ]; then
+        for ((i = 0; i < ${#IN_PATH[@]}; i++)); do
+            lp="${IN_PATH[$i]}"
+            id="$(spool_id_of "$lp" "$sdir" "$sdir_r")"
+            if [ -z "$id" ]; then
+                # A spool path written with a trailing '/' lists nothing; remember the entry so
+                # the spool's finding can say what is wrong with it.
+                case "$lp" in
+                    */)
+                        id="$(spool_id_of "${lp%"${lp##*[!/]}"}" "$sdir" "$sdir_r")"
+                        [ -z "$id" ] || trailing["$id"]="$(clean "${IN_LABEL[$i]}:$lp")"
+                        ;;
+                esac
+                continue
+            fi
+            listed["$id"]=1
+            label="${IN_LABEL[$i]}"
+            bound="$(spool_bound "$label")"
+            subsys=0
+            if spool_subsystem "$label"; then subsys=1; fi
+            # The collector id as the label is the convention, unless the id itself is a name
+            # intake or the daemon treats specially: then relabelling cannot help, only a new id.
+            ownid=0
+            if [ "$label" = "$id" ]; then
+                [ -n "$bound" ] || [ "$subsys" -eq 1 ] || continue
+                ownid=1
+                badname=$((badname + 1))
+            else
+                mislabelled=$((mislabelled + 1))
+            fi
+            lab="$(spool_name "$label")"
+            sid="$(spool_name "$id")"
+            if [ "$ownid" -eq 1 ] || [ -n "$(spool_bound "$id")" ] || spool_subsystem "$id"; then
+                relabel="$newid"
+            elif [[ "$id" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+                relabel="in $INTAKE_FILE change the entry to $id:$lp (intake keeps its read position by path, so the new label does not read the spool again), then run: $restart"
+            else
+                relabel="in $INTAKE_FILE label the entry with the collector id, the spool directory's name, then run: $restart"
+            fi
+            if [ -n "$bound" ]; then
+                worst=fail
+                finding fail "gateway-spool" "spool-label-sensor:$lp" \
+                    "PROPOLIS_SENSOR_LOGS entry '$lab:$lp' reads collector $sid's spool under the label '$lab', which names a sensor: intake binds the log to $bound alone, so every line in this collector's stream from any other sensor is refused and skipped, and lines already refused are not read again$(if [ "$ownid" -eq 1 ]; then printf '. The label is the collector id, as it should be, so the id itself is the problem: any other label would break the rule that a spool is labelled with its collector id, which also keys the collector'"'"'s capture counters'; fi)" \
+                    "$relabel" manual
+            elif [ "$subsys" -eq 1 ]; then
+                if [ "$worst" = ok ]; then worst=warn; fi
+                finding warn "gateway-spool" "spool-label-subsystem:$lp" \
+                    "PROPOLIS_SENSOR_LOGS entry '$lab:$lp' reads collector $sid's spool under '$lab', the name of one of the daemon's own subsystems: its events are ingested, but the daemon supervises this tailer under the same name as that subsystem, so the sensor-down alert never watches it and a stop of either can be reported as the other" \
+                    "$relabel" manual
+            else
+                if [ "$worst" = ok ]; then worst=warn; fi
+                finding warn "gateway-spool" "spool-label-other:$lp" \
+                    "PROPOLIS_SENSOR_LOGS entry '$lab:$lp' reads collector $sid's spool under the label '$lab' instead of its id: its events are still ingested (a label that is not a sensor's name binds the log to no one sensor), but intake's log lines and the sensor-down and intake-stalled alerts for this spool carry '$lab', and the collector's capture counters are stored under '$lab' and published on /metrics as collector=\"$lab\", so they name the wrong collector or none" \
+                    "$relabel" manual
+            fi
+        done
+    fi
+
+    for d in "$sdir"/* "$sdir"/.[!.]* "$sdir"/..?*; do
+        name="${d##*/}"
+        # The gateway makes a collector directory only under a name that is a safe path component
+        # (crates/gateway/src/state.rs is_safe_path_component): no control character, no
+        # backslash, and it makes no symlinks. Anything else was not made by it and is no id.
+        if [ -L "$d" ] || [ ! -d "$d" ]; then
+            [ -L "$d" ] && ignored=$((ignored + 1))
+            continue
+        fi
+        if [[ "$name" == *\\* ]] || [[ "$name" =~ [[:cntrl:]] ]]; then
+            ignored=$((ignored + 1))
+            continue
+        fi
+        n=$((n + 1))
+        [ -z "${listed["$name"]+x}" ] || continue
+        if [ ! -x "$d" ]; then
+            unreadable=$((unreadable + 1))
+            continue
+        fi
+        file="$d/events.jsonl"
+        # A directory with no events file yet holds no evidence to lose.
+        [ -f "$file" ] || continue
+        sid="$(spool_name "$name")"
+        entry="${trailing["$name"]:-}"
+        rs="$(spool_read_state "$file" "$cdir")"
+        st="$(stat -c '%Y %s' -- "$file" 2>/dev/null)" || st=""
+        mtime="${st%% *}"
+        size="${st##* }"
+        quiet=""
+        if [[ "$mtime" =~ ^[0-9]+$ ]]; then quiet=$((NOW - mtime)); fi
+        # Read to its end, no longer listed and not written for a while: a collector retired or
+        # rebuilt under a new id, whose spool stays until it is moved away. Nothing is lost, so
+        # it is only counted. One written a moment ago is not taken for retired: its collector
+        # may still be shipping, and its next batch would be acknowledged and never ingested.
+        if [ -z "$entry" ] && [ "$rs" = end ] && [ -n "$quiet" ] && [ "$quiet" -ge "$SPOOL_QUIET_SECS" ]; then
+            retired+=("$sid (last written $(human_age "$quiet") ago)")
+            continue
+        fi
+        unlisted+=("$sid")
+        worst=fail
+        [ "${#unlisted[@]}" -le "$SPOOL_MAX_REPORTED" ] || continue
+        detail=""
+        if [ -n "$quiet" ] && [[ "$size" =~ ^[0-9]+$ ]]; then
+            detail=" ($(human_bytes "$size"), last written $(human_age "$quiet") ago)"
+        fi
+        why=""
+        if ! [[ "$name" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+            why="its name is not a plain collector id (letters, digits, '.', '_' and '-', at most 64), so no entry is suggested"
+        elif [ -n "$(spool_bound "$name")" ]; then
+            why="its name is a sensor's name, which as a label would bind the spool to that one sensor, so no entry is suggested"
+        elif spool_subsystem "$name"; then
+            why="its name is one the daemon gives one of its own subsystems, which as a label would hide the spool from the sensor-down alert, so no entry is suggested"
+        fi
+        lead="the gateway is accepting and acknowledging collector $sid's evidence into $sdir/$sid/events.jsonl$detail, but no PROPOLIS_SENSOR_LOGS entry in $penv points at that file, so the daemon is not ingesting it and the collector counts it as delivered."
+        case "$rs" in
+            none) read=" Intake has no cursor for this file in $cdir: it has not read it, or keeps its cursors elsewhere." ;;
+            end)
+                if [ -n "$entry" ]; then
+                    read=" Intake's cursor shows it read the file to its end before the entry changed, so only what arrives from now on is missed."
+                else
+                    read=" Intake's cursor shows it read the file to its end, but the file was written within the last $(human_age "$SPOOL_QUIET_SECS"), so the collector may still be shipping and what it sends from now on is not ingested. If the collector was retired or rebuilt under a new id, this finding clears once the file has gone unwritten that long."
+                fi
+                ;;
+            unread\ *)
+                read=" Intake read this file before it stopped being listed, and $(human_bytes "${rs#unread }") written to it since are not ingested."
+                lead="the gateway accepted and acknowledged collector $sid's evidence into $sdir/$sid/events.jsonl$detail, but no PROPOLIS_SENSOR_LOGS entry in $penv points at that file now, so the daemon is not ingesting what was written after it stopped reading and the collector counts it as delivered."
+                ;;
+            *) read=" Whether intake read it before it stopped being listed could not be determined: ${rs#unknown }." ;;
+        esac
+        if [ -n "$entry" ]; then
+            read="$read The entry '$entry' ends in '/', which names a directory, so the daemon's open of it fails with 'Not a directory' and it reads nothing."
+        fi
+        finding fail "gateway-spool" "spool-unlisted:$name" \
+            "$lead$read Intake reads a newly listed log from its start (from its saved read position if the path was listed before), so what the file holds is ingested once it is listed${why:+; $why}" \
+            "$(if [ -n "$entry" ]; then
+                printf "in %s remove the trailing '/' from the entry %s, then run: %s" "$penv" "$entry" "$restart"
+            elif [ -z "$why" ]; then
+                printf 'append ,%s:%s to PROPOLIS_SENSOR_LOGS in %s, then run: %s' "$name" "$file" "$penv" "$restart"
+            else
+                printf '%s' "$newid"
+            fi)" manual
+    done
+
+    if [ "$unreadable" -gt 0 ]; then
+        if [ "$worst" = ok ]; then worst=unknown; fi
+        limit "gateway spool: $unreadable collector directories under $sdir are not readable as this user and were not checked; run as root"
+    fi
+    local text="$n collectors in $sdir" shown="" k
+    if [ "${#unlisted[@]}" -gt 0 ]; then
+        for ((k = 0; k < ${#unlisted[@]} && k < 5; k++)); do shown="${shown:+$shown, }${unlisted[$k]}"; done
+        if [ "${#unlisted[@]}" -gt 5 ]; then shown="$shown and $((${#unlisted[@]} - 5)) more"; fi
+        text="$text, not in PROPOLIS_SENSOR_LOGS: $shown"
+    fi
+    if [ "${#retired[@]}" -gt 0 ]; then
+        shown=""
+        for ((k = 0; k < ${#retired[@]} && k < 3; k++)); do shown="${shown:+$shown, }${retired[$k]}"; done
+        if [ "${#retired[@]}" -gt 3 ]; then shown="$shown and $((${#retired[@]} - 3)) more"; fi
+        text="$text, ${#retired[@]} read to the end and no longer listed: $shown"
+    fi
+    if [ "$mislabelled" -gt 0 ]; then
+        text="$text, $mislabelled listed under a label that is not the collector id"
+    fi
+    if [ "$badname" -gt 0 ]; then
+        text="$text, $badname listed under an id that is a sensor's or a daemon subsystem's name"
+    fi
+    if [ "$ignored" -gt 0 ]; then
+        text="$text, $ignored entries that are not collector directories ignored"
+    fi
+    global gateway-spool "$worst" "$text"
+}
+
 # Whether the watcher's own account can read $1, from the file's owner, group and mode. The
 # check's own `-r` test answers for root in practice, and a watch.env at 0600 root:root passes
 # it while propolis-watch cannot read the file (live, 2026-10-14).
@@ -2110,6 +2475,7 @@ check_alerting
 check_clock
 check_binaries
 check_intake_list
+check_gateway_spool
 check_cursors
 check_unconfigured_units
 check_watcher

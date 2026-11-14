@@ -87,8 +87,9 @@
 #     own_ips set, e.g. a DNAT'd WAN IP no local interface carries).
 #     Operational self-alerting (pages ntfy when the daemon itself degrades; opt-in, off by default
 #     so an upgrade of a node that predates it still starts): PROPOLIS_OPS_ENABLED (default false),
-#     PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC (both REQUIRED when enabled - fail-closed, the
-#     daemon refuses to start without them; use a topic SEPARATE from the Guardian's),
+#     PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC (both empty: alerts go to the journal only;
+#     one set without the other: fail-closed, the daemon refuses to start; use a topic SEPARATE
+#     from the Guardian's),
 #     PROPOLIS_OPS_NTFY_TOKEN (optional, for an access-protected topic),
 #     PROPOLIS_OPS_POLL_INTERVAL_SECS (default 30), PROPOLIS_OPS_REPAGE_COOLDOWN_SECS (default 5400),
 #     PROPOLIS_OPS_STALL_FOR_SECS (default 600), PROPOLIS_OPS_CAPACITY_FREE_PCT (default 15),

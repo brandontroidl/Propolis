@@ -1,8 +1,10 @@
 //! Every sensor binary that drains a capture hand-off at shutdown also starts its `sensor_stats`
 //! line, under its own name. The set is derived from the source tree, not from a list someone
 //! keeps: a new capturing sensor that forgets `start_stats` fails here, and so does a rename that
-//! leaves the name behind. The name must equal the crate's label because intake refuses a stats
-//! line whose sensor differs from the log's label.
+//! leaves the name behind. The name must equal the crate's label because a sensor's log is
+//! labelled with that name, which binds it to that sensor: on a single host intake, and on a
+//! collector the shipper, refuse a stats line in a bound log whose sensor differs from the log's
+//! label.
 
 use std::path::Path;
 

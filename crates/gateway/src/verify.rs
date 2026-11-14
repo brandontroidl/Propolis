@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use collector_wire::ack::{Ack, AckReason, AckStatus};
 use collector_wire::frame::Batch;
@@ -31,14 +33,153 @@ pub struct GatewaySink<S: SpoolWrite> {
     state_dir: PathBuf,
     spool: S,
     states: Mutex<HashMap<String, CollectorState>>,
+    clock: Box<dyn Fn() -> Instant + Send + Sync>,
+    reused_batches: AtomicU64,
+    reused_records: AtomicU64,
+    reuse_log: Mutex<ReuseLogLimiter>,
+}
+
+/// The shortest gap between two reused-seq ERROR lines for one collector. A compromised or
+/// looping collector can resend at will, and one line per batch would flood the journal.
+pub const REUSED_SEQ_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many collectors the reused-seq limiter remembers at once. Ids come from certificates the
+/// CA issued, so this is far above any real deployment, but the map is bounded regardless.
+pub const REUSED_SEQ_TRACKED_COLLECTORS: usize = 1024;
+
+/// What one collector's reused-seq lines have held back since the last one was logged.
+struct ReuseLogEntry {
+    last_logged: Instant,
+    suppressed_batches: u64,
+    suppressed_records: u64,
+}
+
+/// Per-collector rate limit for the reused-seq line: at most one per
+/// [`REUSED_SEQ_LOG_INTERVAL`], and the next one carries what was held back in between.
+struct ReuseLogLimiter {
+    entries: HashMap<String, ReuseLogEntry>,
+}
+
+impl ReuseLogLimiter {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Records one reused-seq batch of `records` records at `now`. Returns the suppressed
+    /// (batches, records) to report when this one should be logged, or `None` when it falls
+    /// inside the collector's window and is only added to the held-back totals.
+    fn note(&mut self, collector_id: &str, records: u64, now: Instant) -> Option<(u64, u64)> {
+        if let Some(entry) = self.entries.get_mut(collector_id) {
+            if now.saturating_duration_since(entry.last_logged) < REUSED_SEQ_LOG_INTERVAL {
+                entry.suppressed_batches += 1;
+                entry.suppressed_records += records;
+                return None;
+            }
+            let suppressed = (entry.suppressed_batches, entry.suppressed_records);
+            *entry = ReuseLogEntry {
+                last_logged: now,
+                suppressed_batches: 0,
+                suppressed_records: 0,
+            };
+            return Some(suppressed);
+        }
+        if self.entries.len() >= REUSED_SEQ_TRACKED_COLLECTORS {
+            // Forget the collector logged longest ago. Its held-back totals are lost from the
+            // next line only; the sink's counters still hold them.
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_logged)
+                .map(|(id, _)| id.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            collector_id.to_string(),
+            ReuseLogEntry {
+                last_logged: now,
+                suppressed_batches: 0,
+                suppressed_records: 0,
+            },
+        );
+        Some((0, 0))
+    }
+}
+
+/// How many batches arrived under the last accepted seq of their collector with content that
+/// differs from the batch accepted under it, and how many records they carried. Every one of
+/// those batches was acknowledged `Duplicate` and nothing was stored from it. `records` is
+/// their size, not what is missing: a batch the shipper rebuilt by reading the same log again
+/// from the same offset begins with the lines of the earlier batch under that seq, which are
+/// stored, and only its lines after those never arrived. A batch built from another log, or
+/// from a cursor that had moved on, has none of its lines stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReusedSeqCounts {
+    pub batches: u64,
+    pub records: u64,
 }
 
 impl<S: SpoolWrite> GatewaySink<S> {
     pub fn new(state_dir: PathBuf, spool: S) -> Self {
+        Self::with_clock(state_dir, spool, Instant::now)
+    }
+
+    /// `new` with the clock the reused-seq log limiter reads, so a test can step time instead
+    /// of sleeping through the limiter's window.
+    pub fn with_clock(
+        state_dir: PathBuf,
+        spool: S,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+    ) -> Self {
         Self {
             state_dir,
             spool,
             states: Mutex::new(HashMap::new()),
+            clock: Box::new(clock),
+            reused_batches: AtomicU64::new(0),
+            reused_records: AtomicU64::new(0),
+            reuse_log: Mutex::new(ReuseLogLimiter::new()),
+        }
+    }
+
+    /// Counts a batch that reused the collector's last accepted seq with different content and
+    /// logs it, rate-limited per collector. The message says only that this batch was not
+    /// stored: the gateway cannot tell how many of its lines it already holds from the earlier
+    /// batch under this seq (see [`ReusedSeqCounts`]). `collector_id` reaches here only after a
+    /// batch was stored under it, which `CollectorState::store` refuses for an unsafe id, and it
+    /// goes out as a field, never inside the message. No record content is logged.
+    fn note_reused_seq(&self, collector_id: &str, batch: &Batch) {
+        let records = batch.records.len() as u64;
+        self.reused_batches.fetch_add(1, Ordering::Relaxed);
+        self.reused_records.fetch_add(records, Ordering::Relaxed);
+        let now = (self.clock)();
+        let decision = self
+            .reuse_log
+            .lock()
+            .expect("reused-seq log limiter lock poisoned")
+            .note(collector_id, records, now);
+        if let Some((suppressed_batches, suppressed_records)) = decision {
+            tracing::error!(
+                %collector_id,
+                seq = batch.seq,
+                records,
+                suppressed_batches,
+                suppressed_records,
+                "gateway: batch reuses the last accepted seq with different content; \
+                 acknowledged as Duplicate without storing it"
+            );
+        }
+    }
+
+    /// Totals since this sink was built. The gateway has no metrics endpoint; this is what
+    /// tests (and anything embedding the sink) read.
+    pub fn reused_seq_counts(&self) -> ReusedSeqCounts {
+        ReusedSeqCounts {
+            batches: self.reused_batches.load(Ordering::Relaxed),
+            records: self.reused_records.load(Ordering::Relaxed),
         }
     }
 }
@@ -66,6 +207,18 @@ impl<S: SpoolWrite> BatchSink for GatewaySink<S> {
         // 2. An already-accepted (or lower) seq is an idempotent replay: re-ack without
         // writing the spool.
         if batch.seq <= current.last_seq {
+            // The shipper takes this ack as "delivered" and moves its cursor on, so a batch
+            // rebuilt under a used number after a lost ack is dropped here for good. Only
+            // seq == last_seq can be told apart from a true replay: the gateway keeps one hash,
+            // the last accepted batch's, so an older seq has nothing to compare against.
+            // last_seq 0 means nothing was ever accepted, so there is no stored batch either.
+            // The ack stays exactly what a replay gets; this only makes the loss visible.
+            if current.last_seq > 0
+                && batch.seq == current.last_seq
+                && batch.batch_hash != current.last_batch_hash
+            {
+                self.note_reused_seq(collector_id, batch);
+            }
             return Ack {
                 status: AckStatus::Duplicate,
                 reason: AckReason::None,
@@ -123,5 +276,29 @@ impl<S: SpoolWrite> BatchSink for GatewaySink<S> {
             reason: AckReason::None,
             next_expected_seq: batch.seq + 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reused_seq_limiter_never_tracks_more_than_its_bound_and_forgets_the_oldest_first() {
+        let mut limiter = ReuseLogLimiter::new();
+        let start = Instant::now();
+        let extra = 10;
+        for i in 0..REUSED_SEQ_TRACKED_COLLECTORS + extra {
+            let at = start + Duration::from_millis(i as u64);
+            assert_eq!(limiter.note(&format!("c{i}"), 1, at), Some((0, 0)));
+            assert!(limiter.entries.len() <= REUSED_SEQ_TRACKED_COLLECTORS);
+        }
+        assert_eq!(limiter.entries.len(), REUSED_SEQ_TRACKED_COLLECTORS);
+        for i in 0..extra {
+            assert!(!limiter.entries.contains_key(&format!("c{i}")));
+        }
+        // The newest is still remembered, so its next batch inside the window stays quiet.
+        let newest = format!("c{}", REUSED_SEQ_TRACKED_COLLECTORS + extra - 1);
+        assert_eq!(limiter.note(&newest, 1, start), None);
     }
 }

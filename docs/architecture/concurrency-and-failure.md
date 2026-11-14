@@ -225,7 +225,7 @@ before each rotation keeps this from happening in normal operation
 | Console `/ready` | `SELECT 1` fails (DB unavailable) | `503 {"status":"unavailable"}` | **Fail-closed** |
 | Console startup | No `PROPOLIS_CONSOLE_PASSWORD` | Refuses to start (`MissingPassword`) | **Fail-closed** |
 | Console login | `ConnectInfo` peer unavailable | Login extraction fails closed | **Fail-closed** |
-| Ops-alert | Enabled but URL/topic missing | Refuses to start: "a monitor that cannot page must not start silently" | **Fail-closed** |
+| Ops-alert | Enabled with only one of URL and topic set | Refuses to start (`ConfigError::Missing` names the empty one): a half-set target looks configured but would page nothing. With both empty it starts and alerts go to the journal only | **Fail-closed** |
 | Fetcher | `own_ips` empty | Refuses to run (cannot compute self-target guard) | **Fail-closed** |
 
 ### Where the system deliberately fails open

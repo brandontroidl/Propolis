@@ -129,8 +129,8 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 5103 test functions** (3001 unit + 2102 integration).
-- **DB-backed (`sqlx::test`): 569** - console 268, review 152, core-scoring 53, intake 38, propolis 26, feed 23, fleet 9. These provision a fresh database per test.
+- **Total: 5182 test functions** (3020 unit + 2162 integration).
+- **DB-backed (`sqlx::test`): 574** - console 268, review 152, core-scoring 53, intake 43, propolis 26, feed 23, fleet 9. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -162,23 +162,23 @@ Per-crate breakdown:
 | Crate | Unit | Integration | Integration files |
 |---|---|---|---|
 | collector-wire | 9 | 0 | - |
-| console | 192 | 291 | auth_test, campaigns_test, ledger_count_test, ledger_scan_test, render_off_worker, rollup_pages_test, rollup_test, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, search_signal_type_test, server_test, timeline_test |
+| console | 193 | 291 | auth_test, campaigns_test, ledger_count_test, ledger_scan_test, render_off_worker, rollup_pages_test, rollup_test, routes_test, samples_load_more_test, samples_transport_test, samples_truncated_test, search_signal_type_test, server_test, timeline_test |
 | core-scoring | 111 | 46 | append_gate, batch_equivalence, coverage, end_to_end, migrations, replay, repository, smoke, telemetry |
 | feed | 43 | 102 | builder_test, exclusion_test, export_test, firewall_export_test, publisher_test, sync_check_test |
-| fleet | 26 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
-| gateway | 11 | 15 | handshake, logging, spool, verify |
+| fleet | 37 | 35 | deploy_inventory_test, probe_test, stats_test, store_test |
+| gateway | 12 | 22 | handshake, logging, spool, verify |
 | geoip | 4 | 0 | - |
-| intake | 30 | 57 | audit_regressions, batched_runner, converter_test, end_to_end, origin_policy, probe_filter, quarantine, sensor_stats, shell_reply |
+| intake | 33 | 62 | audit_regressions, batched_runner, converter_test, end_to_end, origin_policy, probe_filter, quarantine, sensor_stats, shell_reply |
 | log-format | 0 | 15 | format, no_stock_fmt, process |
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
-| propolis | 194 | 61 | capture_to_console, coverage, db_roles, docs_agreement, logging, migrate_cli, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console, summary_intake, volume_listing |
+| propolis | 197 | 61 | capture_to_console, coverage, db_roles, docs_agreement, logging, migrate_cli, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console, summary_intake, volume_listing |
 | provision-certs | 0 | 16 | provision |
 | review | 233 | 158 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test, volume_test |
 | sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
 | sensor-catchall | 18 | 13 | arrival, env_strict, integration, udp_budget |
 | sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1505 | 417 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1505 | 461 | alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
@@ -188,9 +188,9 @@ Per-crate breakdown:
 | sensor-telnet | 53 | 68 | arrival, echo_loader, env_strict, infected_hold, integration, probe_payload, session_memory_limit, shell_cost, shell_cpu, shutdown_tracking |
 | sensor-tftp | 37 | 45 | arrival, env_strict, integration, logging, shutdown |
 | sensor-wire | 33 | 0 | - |
-| shipper | 4 | 34 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
+| shipper | 4 | 38 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **3001** | **2102** | |
+| **Total** | **3020** | **2162** | |
 
 ### Test styles by layer
 
@@ -200,7 +200,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (51 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (515 uses) - needed wherever a test needs more than
+  applies migrations manually (520 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

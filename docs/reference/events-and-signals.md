@@ -65,8 +65,17 @@ Sensor-emittable constants are provided so literals are not hand-typed:
   sensor in the `sensor_stats` table (`fleet` migration `0002`); it is never in the ledger, so it
   is never scored, fed, clustered into a campaign or submitted to a vendor. Intake refuses (counts
   as rejected, WARN) a line whose source is not `0.0.0.0`, whose metadata is not exactly the fixed
-  field set, whose values pass 2^53, or whose sensor name is not the label of the log it was read
-  from. The `propolis-watch` feed prints it like any other line.
+  field set, whose values pass 2^53, whose sensor is not in the
+  [origin policy](#what-a-log-line-may-claim-the-origin-policy) table, or that names another
+  sensor than the one its log is bound to. A log bound to no sensor (a collector's spool, or a
+  log under a label of your own) may report any known sensor; its rows are keyed on the log's
+  label and the sensor (`crates/intake/src/runner.rs#stats_key`), which keeps them apart from
+  every other log's as long as no spool's entry is named after a sensor or a `cred-*` label
+  (`config-check` fails that as `spool-label-sensor`). Intake cannot tell which of a collector's
+  logs a line in its spool came from, so on a collector the shipper applies the same rules to
+  each stats line in its own sensor's log before shipping it
+  (`crates/shipper/src/batcher.rs#admit`). The `propolis-watch` feed prints it like any other
+  line.
 - Protocol (`crates/sensor-wire/src/lib.rs#PROTO_TCP`, `crates/sensor-wire/src/lib.rs#PROTO_UDP`, `crates/sensor-wire/src/lib.rs#PROTO_ICMP`): `tcp`, `udp`, `icmp`.
 
 ### SampleRef
@@ -513,8 +522,10 @@ bound to that sensor, and the five sensor-cred labels of the shipped configurati
 their protocols: `cred-vnc` to `vnc`, `cred-mysql` to `mysql`, `cred-mssql` to `mssql`, `cred-pg`
 to `postgresql`, `cred-mongo` to `mongodb` (`crates/sensor-wire/src/origin.rs#bound_sensor`). The
 match is exact. Any other label (a collector id on a control plane, a label of your own) is not
-bound. Four rules apply to every line except a `sensor_stats` line, which keeps its own exact
-comparison with the label:
+bound. Four rules apply to every line except a `sensor_stats` line, which no sensor's row lists
+and which `check` would therefore refuse from every log; intake, and on a collector the shipper,
+hold it to rules 1 and 2 alone, on its own path (`crates/intake/src/runner.rs#stats_key`,
+`crates/shipper/src/batcher.rs#admit`; see `sensor_stats` above):
 
 1. The line's `sensor` must be one of the names in the table, on every log.
 2. On a bound log, the line's `sensor` must be the sensor the log is bound to.

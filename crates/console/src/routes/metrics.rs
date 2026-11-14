@@ -472,7 +472,8 @@ fn push_intake_lag(out: &mut String, mut logs: Vec<crate::intake_lag::IntakeLag>
     }
 }
 
-/// Each capturing sensor's latest `sensor_stats` line, labelled by sensor, with how old that line
+/// Each capturing sensor's latest `sensor_stats` line, labelled by sensor (and by collector for a
+/// collector's sensor, see [`stats_labels`]), with how old that line
 /// is. The values are the last ones reported and stay put when a sensor goes quiet; what changes
 /// is `propolis_sensor_stats_age_seconds` (and `_stale`), so a dead sensor reads as stale rather
 /// than as zeros. A sensor that never reported has no series at all.
@@ -539,13 +540,7 @@ fn push_sensor_stats(
         writeln!(out, "# HELP {name} {help}").unwrap();
         writeln!(out, "# TYPE {name} {kind}").unwrap();
         for row in rows {
-            writeln!(
-                out,
-                "{name}{{sensor=\"{}\"}} {}",
-                escape_label(&row.sensor),
-                value(row)
-            )
-            .unwrap();
+            writeln!(out, "{name}{{{}}} {}", stats_labels(row), value(row)).unwrap();
         }
     }
     type Derived = fn(&fleet::stats::SensorStatsRow, chrono::DateTime<chrono::Utc>) -> i64;
@@ -570,14 +565,25 @@ fn push_sensor_stats(
         writeln!(out, "# HELP {name} {help}").unwrap();
         writeln!(out, "# TYPE {name} gauge").unwrap();
         for row in rows {
-            writeln!(
-                out,
-                "{name}{{sensor=\"{}\"}} {}",
-                escape_label(&row.sensor),
-                value(row, now)
-            )
-            .unwrap();
+            writeln!(out, "{name}{{{}}} {}", stats_labels(row), value(row, now)).unwrap();
         }
+    }
+}
+
+/// The labels of one `sensor_stats` row's series: `sensor` alone for a sensor on this node, as a
+/// single box has always published it, and `collector` then `sensor` for a row intake stored from
+/// a collector's spool (`fleet::stats::collector_key`). Two labels rather than the stored key as
+/// one, so a query can select a sensor across collectors, or a collector across sensors. Both
+/// values are escaped: the collector part is the spool's label, and a shortened one carries the
+/// `~` and hash the key builder added.
+fn stats_labels(row: &fleet::stats::SensorStatsRow) -> String {
+    match fleet::stats::split_key(&row.sensor) {
+        (None, sensor) => format!("sensor=\"{}\"", escape_label(sensor)),
+        (Some(collector), sensor) => format!(
+            "collector=\"{}\",sensor=\"{}\"",
+            escape_label(collector),
+            escape_label(sensor)
+        ),
     }
 }
 
@@ -695,6 +701,36 @@ mod tests {
         }
         assert!(out.contains("# TYPE propolis_sensor_capture_queue_dropped_total counter"));
         assert!(out.contains("# TYPE propolis_sensor_capture_budget_bytes gauge"));
+    }
+
+    #[test]
+    fn a_collectors_sensor_stats_carry_the_collector_and_the_sensor_as_two_labels() {
+        let now: chrono::DateTime<chrono::Utc> = "2026-10-09T12:10:00Z".parse().unwrap();
+        let rows = [
+            stats_row("collector-a/ssh", "2026-10-09T12:09:30Z", false),
+            stats_row("ssh", "2026-10-09T12:09:50Z", false),
+            // A label is escaped as a sensor name is.
+            stats_row("site\"x\ny/ssh", "2026-10-09T12:09:30Z", false),
+            // And the sensor part of a collector's key is escaped too: the reader cannot rely on
+            // every stored key having come from the origin table.
+            stats_row("collector-a/s\"x", "2026-10-09T12:09:30Z", false),
+        ];
+        let mut out = String::new();
+        push_sensor_stats(&mut out, &rows, now);
+        for line in [
+            "propolis_sensor_capture_queue_dropped_total{collector=\"collector-a\",sensor=\"ssh\"} 11",
+            "propolis_sensor_stats_age_seconds{collector=\"collector-a\",sensor=\"ssh\"} 30",
+            "propolis_sensor_stats_age_seconds{sensor=\"ssh\"} 10",
+            "propolis_sensor_stats_age_seconds{collector=\"site\\\"x\\ny\",sensor=\"ssh\"} 30",
+            "propolis_sensor_stats_age_seconds{collector=\"collector-a\",sensor=\"s\\\"x\"} 30",
+        ] {
+            assert!(
+                out.lines().any(|l| l == line),
+                "missing `{line}` in:\n{out}"
+            );
+        }
+        let series = out.lines().filter(|l| !l.starts_with('#')).count();
+        assert_eq!(series, 4 * 11, "one series per row per metric:\n{out}");
     }
 
     #[test]

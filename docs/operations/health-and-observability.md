@@ -131,9 +131,13 @@ scrape; there are no pre-aggregated counters, so a scrape reflects current state
     (`crates/propolis/src/ops_alert/conditions/intake_lag.rs#oldest_unread_age`).
 
   There is no append-latency histogram: the metrics endpoint emits gauges and counters only.
-- Sensor capture health, one series per capturing sensor, labelled `sensor`, from the latest
-  `sensor_stats` line each wrote (see [Sensor stats](#sensor-stats); absent for a sensor that
-  never reported, never a zero; `crates/console/src/routes/metrics.rs#push_sensor_stats`):
+- Sensor capture health, one series per capturing sensor, labelled `sensor` (and, for a row read
+  from a log whose `PROPOLIS_SENSOR_LOGS` name is bound to no sensor, which on a control plane
+  means a collector's spool in a [split deployment](./split-deployment.md), also `collector`, set
+  to that name; a name longer than 31 bytes is shortened to at most 14 bytes, `~` and a hash,
+  the same for all of that log's sensors, `crates/fleet/src/stats.rs#collector_key`), from the
+  latest `sensor_stats` line each wrote (see [Sensor stats](#sensor-stats); absent for a sensor
+  that never reported, never a zero; `crates/console/src/routes/metrics.rs#push_sensor_stats`):
   counters `propolis_sensor_capture_queue_dropped_total`,
   `propolis_sensor_capture_spool_refused_total`, `propolis_sensor_capture_truncated_total`,
   `propolis_sensor_capture_refused_total`, `propolis_sensor_capture_budget_refused_total`;
@@ -162,7 +166,11 @@ reference](../reference/scoring-and-feed.md).
 Each capturing sensor (ssh, telnet, adb, ftp, mqtt, tftp) appends a `sensor_stats` line to its
 own event log every 60 s and a last one, with `final` true, when it shuts down. The line carries
 the capture hand-off counters and the capture-memory budget that used to be readable only inside
-the process; intake stores the latest per sensor, and `/metrics` publishes them (above).
+the process; intake stores the latest per sensor, and `/metrics` publishes them (above). On a
+[split deployment](./split-deployment.md) the control plane keeps one row per collector and
+sensor, so the same sensor on two collectors is two sets of series, each with its own age:
+`propolis_sensor_stats_stale{collector="collector-01",sensor="ssh"}` says whether that one sensor
+is still reporting, whatever the others do.
 
 - **Staleness, not zeros.** A sensor that stops writing keeps its last values and its age grows;
   `propolis_sensor_stats_stale` turns 1 after 180 s (three missed lines). `propolis_sensor_stats_final`
@@ -171,12 +179,64 @@ the process; intake stores the latest per sensor, and `/metrics` publishes them 
 - **Not evidence.** The line is not in the ledger and not an event: its `source_ip` is the sentinel
   `0.0.0.0`, intake stores it in the `sensor_stats` table instead of converting it, and nothing
   that scores, feeds or reports reads that table.
-- **Refused lines.** A `sensor_stats` line from any other source, with extra or missing fields,
-  with a value past 2^53, or naming a sensor other than the log's `PROPOLIS_SENSOR_LOGS` label is
-  counted as a rejected line with a WARN `malformed sensor_stats line, refused` (or `names a
-  different sensor than this log's label`) and is not stored. The label rule means a sensor whose
-  log label differs from its event name (the cred sensors, which have no capture hand-off and
-  write no stats) would have its stats refused.
+- **Which log may report which sensor.** The line must name a sensor this system knows (the
+  [origin policy](../reference/events-and-signals.md#what-a-log-line-may-claim-the-origin-policy)
+  table). A log whose `PROPOLIS_SENSOR_LOGS` label is bound to a sensor (a single host's own
+  logs) reports that sensor only, and its row is keyed by the sensor name. A log whose label is
+  bound to no sensor (a collector's spool on a control plane, named after the collector, or a log
+  under a label of your own) may report any known sensor, and its rows are keyed by the label and
+  the sensor together (`crates/intake/src/runner.rs#stats_key`,
+  `crates/fleet/src/stats.rs#collector_key`). Each rule is enforced in one place:
+  - *Which collector.* The gateway appends a batch to the spool of the collector named in its
+    client certificate, and intake keys the rows by that spool's label, so a collector writes
+    only under its own label, at most one row per known sensor. Its rows stay apart from another
+    collector's and from the control plane's own only while no spool's entry is named after a
+    sensor or a `cred-*` label: such an entry binds the spool, its own sensor's rows are stored
+    under the bare name, over the control plane's row, and `config-check` fails it as
+    `spool-label-sensor` ([split deployment](./split-deployment.md#how-it-fits-together) names
+    the entry after the collector id).
+  - *Which sensor of a collector.* The control plane cannot tell, because the spool merges all of
+    a collector's logs. The collector's shipper checks it, in each sensor's own log before it
+    ships: a stats line that is malformed, names an unknown sensor or, in a bound log, names
+    another sensor is dropped there, with the shipper's WARN `shipper: dropping a line the origin
+    policy refuses for this log` (`crates/shipper/src/batcher.rs#admit`). A collector still
+    running a shipper from before this check does not do it, so any sensor on that collector can
+    write any other's row, and its counters are only as trustworthy as its least trusted sensor
+    until its shipper is upgraded ([upgrading](./split-deployment.md#upgrading)). A collector
+    compromised as a whole can write any of its rows either way.
+- **Refused lines.** On a host whose intake reads the sensor's own log, a `sensor_stats` line
+  from any other source, with extra or missing fields, or with a value past 2^53 is counted as a
+  rejected line with a WARN `malformed sensor_stats line, refused`. On a collector the shipper
+  drops such a line first, so it shows in the shipper's journal there and not in the control
+  plane's count. One naming a sensor this system does not know logs `names a sensor this system
+  does not know`, and one in a bound log naming another sensor logs `names a different sensor
+  than this log's label`. None of them is stored.
+- **A collector that is gone keeps its series.** Nothing deletes a `sensor_stats` row: several
+  nodes can share one database, and no node knows every other node's labels. A collector that was
+  removed, or [rebuilt under a new id](./split-deployment.md#rebuilding-a-collector), leaves its
+  rows, and `/metrics` keeps publishing them, each with `propolis_sensor_stats_stale` 1 and an age
+  that only grows, for example
+  `propolis_sensor_stats_stale{collector="collector-01",sensor="ssh"} 1` beside the new id's
+  series, so an alert on `stale == 1` keeps firing. Once intake has read the collector's spool to
+  its end, its `PROPOLIS_SENSOR_LOGS` entry is gone for good and `propolis.service` is restarted
+  (reading the rest of the spool would store its last stats lines again), delete its rows by hand with the daemon's
+  `DATABASE_URL` from `/etc/propolis/propolis.env` (its runtime role may delete from this table,
+  `crates/propolis/src/db_roles.rs#reconcile_runtime_grants`; the owner role may too). Set
+  `collector` to the `collector` label exactly as `/metrics` prints it, which for a shortened
+  id includes its `~` and hash; the statement matches the part of each key before its last `/`,
+  so it deletes no other collector's rows and none of the control plane's own:
+
+  ```sh
+  # Example - collector-01 is the collector label of the series to remove.
+  psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -v collector='collector-01' <<'SQL'
+  DELETE FROM sensor_stats
+   WHERE substring(sensor FROM '^(.*)/[^/]*$') = :'collector'
+   RETURNING sensor;
+  SQL
+  ```
+
+  It prints each key it deleted. Run it for a collector that still ships and its rows come
+  back with its next line, a minute later.
 - **Nothing to configure.** The interval is a constant
   (`crates/sensor-framework/src/handoff.rs#STATS_INTERVAL`).
 
@@ -341,7 +401,7 @@ worker's queue to another thread for the duration.
 
 ## Ops-alert monitor (opt-in)
 
-The daemon can run an internal monitor that pages via [ntfy](https://ntfy.sh) when the system
+The daemon can run an internal monitor that pages via [ntfy](https://docs.ntfy.sh/) when the system
 degrades. It is **off by default** and is one of the platform's operator-gated egress paths
 (see [outbound controls](../security/outbound-controls.md)). It is distinct from the Guardian
 host-compromise monitor and should use a separate topic
@@ -466,7 +526,13 @@ variables](../reference/environment-variables.md); the monitor watches (defaults
   (`crates/propolis/src/ops_alert/conditions/backup.rs#BackupStale`);
 - re-page suppression `REPAGE_COOLDOWN_SECS` (5400 s); poll `POLL_INTERVAL_SECS` (30 s).
 
-`PROPOLIS_OPS_NTFY_TOKEN` is an optional bearer token for a protected topic. See
+`PROPOLIS_OPS_NTFY_TOKEN` is an optional bearer token for a protected topic. Point
+`PROPOLIS_OPS_NTFY_URL` at your own ntfy server or one where the topic's read access is
+restricted to you. Where it is not (an unreserved topic on a public server, or a self-hosted
+server left at its default open access), anyone who knows the topic name can read every alert,
+which says when this host's pipeline is down. A token says who publishes; it does not stop others reading unless the server restricts the
+topic, so it alone does not make a topic private. The shipped `deploy/propolis.env.example`
+leaves the URL empty for that reason. See
 [integrations](../reference/integrations.md) and [troubleshooting: integrations and
 feed](../troubleshooting/integrations-and-feed.md).
 
@@ -530,9 +596,19 @@ Two pieces cover that:
   the backup and log rotation) names `OnFailure=propolis-alert@%n.service`. When a unit enters
   the failed state, systemd runs `/usr/local/sbin/propolis-alert` (`deploy/alert.sh`), which
   posts "`<unit>` failed on `<host>`" with the unit's last journal lines to the same ntfy topic,
-  read from `propolis.env`, or writes it to the journal at err priority when there is none or the
-  post fails. A unit with `Restart=` passes through the failed state on every crash, so the hook
-  sends at most one alert per unit per 30 minutes. It does not need `PROPOLIS_OPS_ENABLED`.
+  read from `propolis.env`, or writes it to the journal at err priority when there is none, in
+  which case the journal line is the alert. A unit with `Restart=` passes through the failed
+  state on every crash, so once an alert for a unit has been delivered the hook sends no other
+  for that unit for 30 minutes (`PROPOLIS_ALERT_COOLDOWN_SECS`, 1800). An alert that was not
+  delivered (the post failed, or curl is not installed, which the journal line then says) does
+  not arm that cooldown: the next failure of the unit posts again once a short retry hold has
+  passed (`PROPOLIS_ALERT_RETRY_SECS`, 120), so a crash loop cannot hammer ntfy. While it stays
+  undelivered, the full alert goes to the journal at most once per cooldown, and each failure in
+  between writes one short err line saying since when the unit's alert is undelivered; the alert
+  that finally gets through also says how many earlier failures went undelivered and since when. A
+  stamp dated after the current time, as a clock stepped back leaves it, counts as expired. Both
+  variables are read from the hook unit's environment (an `Environment=` drop-in for
+  `propolis-alert@.service`), not from `propolis.env`. It does not need `PROPOLIS_OPS_ENABLED`.
 - **The heartbeat.** Set `PROPOLIS_OPS_HEARTBEAT_URL` to a dead-man's switch check: a service
   that alerts you when it stops hearing from you, such as a healthchecks.io check or one you run
   elsewhere. The monitor requests the URL after every complete evaluation round, at most every

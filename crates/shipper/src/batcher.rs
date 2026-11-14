@@ -9,8 +9,8 @@
 //! line the policy refuses is not shipped.
 use collector_wire::frame::{Batch, MAX_FRAME_LEN, MAX_RECORD_LEN};
 use log_tailer::LogTailer;
-use sensor_wire::origin::{self, OriginError};
-use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent};
+use sensor_wire::origin::{self, OriginError, Violation};
+use sensor_wire::{SIGNAL_SENSOR_STATS, SensorEvent, SensorStats, StatsRejected};
 
 /// Largest record count for which a batch is GUARANTEED to encode within [`MAX_FRAME_LEN`], no
 /// matter how large the individual records are (up to their own [`MAX_RECORD_LEN`] cap).
@@ -53,20 +53,66 @@ pub struct NextBatch {
     pub refused: u64,
 }
 
+/// Why [`admit`] refused a line.
+#[derive(Debug)]
+enum Refusal {
+    /// The line broke the origin policy for its log.
+    Origin(OriginError),
+    /// The line is a `sensor_stats` line that is not well formed, so it names no sensor this
+    /// check could hold to the log.
+    Stats(StatsRejected),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Origin(e) => e.fmt(f),
+            Self::Stats(e) => write!(f, "malformed sensor_stats line: {e}"),
+        }
+    }
+}
+
 /// Whether a line read from the log labelled `label` may be shipped.
 ///
 /// Only a line that parses as a sensor event is judged. Anything else is shipped as it is: the
 /// control plane rejects and counts a line it cannot parse, as it does on a single node, and
-/// dropping it here would hide it from that count. A sensor's own `sensor_stats` line has no row
-/// in the policy and is shipped as it is too; intake validates those on their own path.
-fn admit(label: &str, line: &str) -> Result<(), OriginError> {
+/// dropping it here would hide it from that count.
+///
+/// A sensor's own `sensor_stats` line has no row in the policy (`origin::check` would refuse it
+/// from every log), but the control plane reads this collector's whole stream under one label
+/// that is bound to no sensor, and so stores a stats line under whatever sensor it names. Here is
+/// the last place that can stop the telnet log writing ssh's counters, so a stats line is held to
+/// the two rules of the policy that concern it: it must name a sensor the table knows, and, on a
+/// log bound to a sensor, that sensor. A stats line that is not well formed names nothing that
+/// can be checked and is refused too; the control plane would refuse it as well.
+fn admit(label: &str, line: &str) -> Result<(), Refusal> {
     let Ok(event) = serde_json::from_str::<SensorEvent>(line) else {
         return Ok(());
     };
     if event.signal_type == SIGNAL_SENSOR_STATS {
+        let stats = SensorStats::from_event(&event).map_err(Refusal::Stats)?;
+        let refused = |violation| {
+            Refusal::Origin(OriginError {
+                label: label.to_string(),
+                violation,
+            })
+        };
+        let Some(row) = origin::row(&stats.sensor) else {
+            return Err(refused(Violation::UnknownSensor {
+                sensor: stats.sensor,
+            }));
+        };
+        if let Some(bound) = origin::bound_sensor(label)
+            && bound != row.sensor
+        {
+            return Err(refused(Violation::OtherSensor {
+                sensor: row.sensor.to_string(),
+                bound,
+            }));
+        }
         return Ok(());
     }
-    origin::check(label, &event)
+    origin::check(label, &event).map_err(Refusal::Origin)
 }
 
 /// Builds a [`Batch`] out of up to `max_records` whole lines tailed from a sensor log.
@@ -79,7 +125,8 @@ impl Batcher {
     ///
     /// A line that parses as a sensor event and fails the origin policy for `label` is dropped
     /// with a warning and counted in [`NextBatch::refused`]: a sensor's log may only carry what
-    /// that sensor is able to write, under its own name.
+    /// that sensor is able to write, under its own name. A `sensor_stats` line is held to the
+    /// same log the same way (see [`admit`]).
     ///
     /// Does NOT call `tailer.persist_cursor()`. `read_batch` already advances the tailer's
     /// in-memory cursor for the lines it returns, but persisting that cursor is deliberately

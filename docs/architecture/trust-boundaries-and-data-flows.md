@@ -136,7 +136,7 @@ flag defaults. In summary:
 | 2 | Abuse-vendor submitters (AbuseIPDB / DShield / OTX) | `review` | `PROPOLIS_VENDOR_<NAME>_ENABLED`; fail-closed with no key | outbound to vendor APIs |
 | 3 | Malware fetcher (attacker-supplied URL) | `review::fetcher` | `PROPOLIS_FETCH_ENABLED` | outbound to attacker host, SSRF-guarded |
 | 4 | Forward-confirmed reverse DNS | `console` | `PROPOLIS_CONSOLE_RDNS_ENABLED` | one PTR query via system resolver |
-| 5 | Ops-alert ntfy POST | `propolis` daemon | ops-alert `enabled`; URL+topic then REQUIRED | outbound to operator's ntfy server |
+| 5 | Ops-alert ntfy POST | `propolis` daemon | ops-alert `enabled` with URL and topic set (both empty: journal only, no POST; one alone: refuses to start) | outbound to operator's ntfy server |
 
 Two of these carry extra structural controls worth stating here:
 

@@ -82,7 +82,10 @@ Fail-closed pairings worth noting (all owned by the reference table):
   `PROPOLIS_OPS_NTFY_TOPIC` set fails closed (a half-configured target looks
   configured but would page nothing); with neither set, alerts fall back to the
   local log sink instead of aborting startup
-  (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`).
+  (`crates/propolis/src/ops_alert/config.rs#parse_ops_alert`). Point the URL at your own ntfy
+  server or one where the topic's read access is restricted to you. Where it is not (an
+  unreserved topic on a public server, or a self-hosted server left at its default open access),
+  anyone who knows the topic name can read every alert, and a token alone does not change that ([ops-alert monitor](health-and-observability.md#ops-alert-monitor-opt-in)).
 - `PROPOLIS_FEED_WINDOWS` fails closed on any malformed entry rather than
   skipping it (`crates/propolis/src/config.rs#parse_window_list`).
 - `PROPOLIS_FEED_VOLUME_AUTO_PUBLISH` is off unless it is exactly `true`. Off, a volume-listed

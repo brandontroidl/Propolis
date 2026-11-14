@@ -259,6 +259,44 @@ file, `0640` for `watch.env`, `0644` for the generated `fleet-listeners.env`; st
 with the `chmod` that closes it; and, where `propolis-watch` is installed, `watch.env` against
 `propolis.env` and the watcher's authorized key.
 
+**Gateway spool.** On a control plane the `gateway-spool` HOST row compares each collector's
+directory under the gateway spool (`PROPOLIS_GATEWAY_SPOOL_DIR` from `gateway.env`, else
+`/var/spool/propolis/gateway`) with `PROPOLIS_SENSOR_LOGS` in `propolis.env`
+(`deploy/config-check.sh#check_gateway_spool`). The directory is read from `gateway.env` the way
+systemd reads it, with surrounding whitespace and quotes removed. A collector whose `events.jsonl`
+no entry points at is a failure (`spool-unlisted`): the gateway accepts and acknowledges its
+batches and the daemon never ingests them. The finding says, from intake's cursor for that file
+(`deploy/config-check.sh#spool_read_state`), whether there is no cursor where it looks (intake has
+not read the file, or keeps its cursors elsewhere), or it was read once and how much was written
+after it stopped, or what about the cursor could not be judged. An entry whose
+path ends in `/` lists nothing, since the daemon cannot open it, and the finding names that entry.
+The step is the exact `<collector id>:<path>` entry to append; intake reads a newly listed log from
+its start, so what the file already holds is ingested once it is listed. A spool that no entry
+lists but whose cursor shows it read to its current size, and that has not been written for ten
+minutes, such as a collector rebuilt under a new id or retired, raises no finding: the row counts
+it as read to the end and no longer listed and names the first few, and it stays there until its
+directory is moved out of the spool. One written more recently still fails, because its collector
+may be shipping and its next batch would not be ingested
+([split deployment](split-deployment.md#rebuilding-a-collector)). An entry that reads a spool
+under a sensor's name or a `cred-*` label is a failure (`spool-label-sensor`): intake binds the
+log to that one sensor and refuses every other sensor's lines in the stream. That includes a
+collector whose id is itself such a name, listed under its id; its step is to give the collector a
+new id. An entry under one of the daemon's own subsystem names
+(`crates/propolis/src/ops_alert/condition.rs#DAEMON_SUBSYSTEMS`) is a warning
+(`spool-label-subsystem`): its events are ingested, but the tailer shares the subsystem's name and
+the `sensor-down` alert never watches it. An entry under any other name that is not the collector
+id is a warning (`spool-label-other`): its events are ingested, but intake's log lines and the
+`sensor-down` and `intake-stalled` alerts carry the wrong name, and so do the collector's capture
+counters, which intake stores under the entry's name and `/metrics` publishes as
+`collector="<name>"`. No step ever suggests a sensor's or a subsystem's name as a label. A host
+with no spool directory and no `PROPOLIS_GATEWAY_SPOOL_DIR` in `gateway.env` gets no row and no
+finding; when `gateway.env` names a directory that does not exist, the row is unknown and names
+it. A `gateway.env` this user cannot read is listed under `LIMITED CHECKS` whether or not a spool
+exists, and so is a spool directory, a collector directory or a `propolis.env` it cannot read.
+Directory names are printed cleaned and cut at 64 characters; a name with a control character or a
+backslash, which the gateway never creates, and a symlink are counted and ignored, and a step names
+an entry only for a plain id.
+
 Every finding carries the next step, in one of two labelled forms, and the explanation lives in
 the finding text above it, never in the step itself:
 

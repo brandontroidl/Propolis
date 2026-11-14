@@ -89,8 +89,11 @@ is ticked.
 ## Operations
 
 - [ ] Alerting is configured, or you have decided to do without it. With
-      `PROPOLIS_OPS_ENABLED=true` the ntfy URL and topic are required and the daemon
-      refuses to start without them. See
+      `PROPOLIS_OPS_ENABLED=true` and the ntfy URL and topic both empty, as shipped, the
+      daemon starts and alerts go to the journal only; with one set and not the other it
+      refuses to start. A clean start therefore does not show that alerts reach you:
+      confirm that `sudo ./deploy/config-check.sh` does not report `ops-no-push` (the
+      alerting line reads `journal only`). See
       [health and observability](../operations/health-and-observability.md).
 - [ ] You have read [routine procedures](../operations/routine-procedures.md) and know
       how to [tear the node down](safe-teardown.md).

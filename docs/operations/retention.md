@@ -332,7 +332,32 @@ When the guard refuses a log (the journal says `refusing to rotate`) or `sensor-
 names one, archive it and truncate it by hand. This is the recovery used on the production box
 after the October 2026 incident. The archive is compressed as it is written, so it needs a small
 fraction of the log's size, not a full copy; put it on another filesystem if the log volume is
-short on space.
+short on space. Before any of it, find out how far the log's reader has read it, because the
+`truncate` discards every line the reader has not read. Do not truncate a log whose reader has
+not finished it unless you have decided to give up those lines.
+
+- **On a host that runs the daemon** (single box or control plane), the reader is intake: use
+  the checks in [step
+  0](../troubleshooting/intake-backlog.md#step-0-change-nothing-until-you-know-what-stopped) of
+  the intake backlog page. `propolis_intake_bytes_behind` for that sensor on `/metrics` at zero
+  means intake has read all of it only while `/ready` names no `gave_up` loop for that log; no
+  series, or no answer from `/metrics`, means unknown, never caught up.
+- **On a split-deployment collector**, the reader is the shipper, which has no console and no
+  `/metrics`. `journalctl -u shipper` shows whether it is sending (`failed to connect to
+  gateway`, `ship cycle IO error` and `stopping the ship loop` mean it is not). Its cursor
+  for the log, which it saves only after the gateway confirms a batch, says how far it has
+  sent: the cursor's `inode` must be the log's inode and its `offset` the log's size.
+
+  ```
+  LOG=/var/log/propolis/telnet/events.jsonl
+  CDIR=/var/lib/propolis/shipper/cursors   # PROPOLIS_SHIPPER_CURSOR_DIR in shipper.env, if set
+  sudo cat "$CDIR/$(printf '%s' "$(readlink -f -- "$LOG")" | sha256sum | cut -d' ' -f1).json"; echo
+  sudo stat -c 'inode %i size %s' "$LOG"
+  ```
+
+  No cursor file (`sudo ./deploy/config-check.sh` reports it as `cursor-missing`) means the
+  shipper has not sent this log, or keeps its cursors elsewhere. An `events.jsonl.1` beside the
+  log that the cursor's inode names is still being sent.
 
 ```
 LOG=/var/log/propolis/telnet/events.jsonl

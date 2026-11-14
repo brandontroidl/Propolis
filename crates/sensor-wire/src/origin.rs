@@ -19,8 +19,13 @@
 //! ([`conforms`]), so every sensor's test suite runs against the table.
 //!
 //! `sensor_stats` lines are a sensor's own health counters, not evidence, and are not part of
-//! the table: intake validates them and compares them with the log's label on their own path
-//! (see [`crate::SensorStats::from_event`]).
+//! the table (so [`check`] refuses them from every log). The same two readers hold them, on
+//! their own path, to the two rules that concern them: the line must be well formed
+//! ([`crate::SensorStats::from_event`]) and name a sensor in the table ([`row`]), and on a bound
+//! log it must name the bound sensor ([`bound_sensor`]). Intake does it in
+//! `crates/intake/src/runner.rs` (`stats_key`), where an unbound log's line is then stored per
+//! label and sensor; the shipper does it in `crates/shipper/src/batcher.rs` (`admit`), the last
+//! place a collector's stats line is still in its own sensor's log.
 
 use crate::{
     PROTO_TCP, PROTO_UDP, SIGNAL_CATCHALL_PROBE, SIGNAL_HONEYPOT_COMMAND_EXEC,

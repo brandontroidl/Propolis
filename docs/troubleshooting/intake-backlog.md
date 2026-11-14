@@ -18,6 +18,63 @@ intake reads its line, so while intake is behind, the column shows how far intak
 not when the sensor last saw traffic. The same backlog usually slows every other sensor too,
 because all appends share one lock (see [why it happens](#why-it-happens)).
 
+## Step 0: change nothing until you know what stopped
+
+> **Warning - held evidence.** Until intake reads them, the waiting events exist only in the
+> sensor logs under `/var/log/propolis/` (on a control plane, also in the gateway spool under
+> `/var/spool/propolis/gateway/`). Do not truncate, delete or rotate a log by hand, and do not
+> restart anything, until you know which stage stopped and whether intake has read the file you
+> are about to touch. Truncating or deleting unread lines loses them for good. A restart of
+> `propolis` clears the `gave_up` list `/ready` reports, and the behind badge reads
+> `age unknown` until intake appends again.
+
+Find out first, with the daemon still running:
+
+- **Is the daemon serving and are its subsystems alive?**
+  `curl -s localhost:8080/ready` returns `{"status":"ok"}`; `{"status":"unavailable"}` with no
+  `gave_up` list when the database does not answer; or names the subsystems that gave up
+  ([database troubleshooting](database.md#ready-returns-503)).
+- **How far has intake read each log?** `propolis_intake_bytes_behind{sensor}` on `/metrics`
+  counts the unread bytes of a log after its intake loop's latest poll, rotated-out files still
+  being drained included. The fleet pane (`/fleet`) shows the same as the `behind:` badge.
+
+  ```
+  curl -s localhost:8080/ready; echo
+  curl -s -H "Authorization: Bearer $PROPOLIS_CONSOLE_METRICS_TOKEN" localhost:8080/metrics \
+    | grep '^propolis_intake_bytes_behind'
+  ```
+
+  Set `PROPOLIS_CONSOLE_METRICS_TOKEN` in your shell to its value in
+  `/etc/propolis/propolis.env`; when that file does not set it, `/metrics` takes no token and
+  ignores the header. `/metrics` answers only while the database does: with the database down,
+  or a wrong token (`unauthorized`), the `grep` prints nothing. Empty output means unknown, never
+  caught up.
+
+  Zero means intake has read everything that log holds only when `/ready` returns
+  `{"status":"ok"}`, or its `gave_up` list does not name that log (each intake loop is
+  supervised under the log's `PROPOLIS_SENSOR_LOGS` label). A loop that gave up stopped
+  polling, and its series keeps the last value it had, zero included. A log with no series is
+  not tailed by this daemon (it is not in `PROPOLIS_SENSOR_LOGS`), or its loop has not finished a
+  poll since the daemon started: treat all of it as unread.
+
+- **Which stage stopped?** `journalctl -u propolis --since '1 hour ago'` for intake; on a split
+  deployment also `journalctl -u gateway` on the control plane and `journalctl -u shipper` on
+  the collector ([split deployment](../operations/split-deployment.md#troubleshooting)).
+- **Has intake saved a position in the log?** `sudo ./deploy/config-check.sh` reports a log
+  with no cursor file where the rotation guard looks (`cursor-missing`; the finding names the
+  directory). Either intake has not read the log, or it keeps its cursors somewhere else. To
+  tell the two apart, look for the log in `journalctl -u propolis.service -b --no-pager`
+  (`intake: tailer started` for that sensor, then any error it logged) and for its
+  `propolis_intake_bytes_behind` series above. A series that falls between scrapes, or reads
+  zero for a log that is not empty while `/ready` is ok, means intake is reading the log and
+  saving its cursor elsewhere; no series, or an error for that sensor, means intake has not read
+  it. An empty log shows zero and has no cursor anywhere until intake reads its first batch.
+
+If the daemon is not running, nothing reports how far it read: leave the logs as they are, since
+intake resumes from its saved cursor when it starts. A split-deployment collector runs the
+shipper, not intake, and has no `/metrics`: check how far the shipper has sent a log as
+[retention](../operations/retention.md#a-log-too-large-to-rotate) describes.
+
 ## What the console and the alerts show
 
 - The listener row carries a badge under **Last event**, `behind: 6.6 GB / 11 d`: the unread
@@ -113,9 +170,11 @@ That cuts the rate a loop writes; it does not drain a backlog that already exist
 ## Recovering a backlog too large to drain
 
 If intake cannot catch up in a time you can accept, archive the backlog and truncate the log so
-intake starts over at its end, by hand: archive it with `gzip`, check the archive, then
-`truncate -s 0` the log
-([retention](../operations/retention.md#a-log-too-large-to-rotate) has the commands).
+intake starts over at its end, by hand. Do it only once [step 0](#step-0-change-nothing-until-you-know-what-stopped)
+has shown intake running and reading this log, slowly: behind an intake that has stopped, the
+lines would all have been read once it runs again. Then archive the log with `gzip`, check the
+archive, and only once `gzip -t` has passed `truncate -s 0` the log, by the commands in
+[retention](../operations/retention.md#a-log-too-large-to-rotate) rather than from memory.
 
 Forcing the shipped rotation policy (`logrotate --force`) no longer does this. Rotation moves the
 unread part into `events.jsonl.1`, which the tailer reads before the new file, so nothing is

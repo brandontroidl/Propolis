@@ -10,9 +10,10 @@ use crate::config::ConfigError;
 
 /// Every value is range-checked with a safe default; a zero or blank never disables a guard.
 /// `enabled` defaults to false: ops-alerting is opt-in, so an existing deployment that predates it
-/// keeps starting (and logs that it is off - visible, not silent). Once the operator sets
-/// `PROPOLIS_OPS_ENABLED=true`, `ntfy_url` and `ntfy_topic` become REQUIRED (fail-closed: a monitor
-/// that cannot page must not start silently). Thresholds are tunable operational values.
+/// keeps starting (and logs that it is off - visible, not silent). With `PROPOLIS_OPS_ENABLED=true`
+/// and `ntfy_url` and `ntfy_topic` both empty, alerts go to the journal only
+/// (`dispatch::LogPoster`); one set without the other refuses to start (fail-closed: a half-set
+/// target looks configured but would page nothing). Thresholds are tunable operational values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpsAlertConfig {
     pub enabled: bool,
@@ -346,5 +347,71 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    fn deploy_example(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The `KEY=VALUE` lines of an env file, comments skipped, the way systemd's
+    /// `EnvironmentFile=` reads them: a line `KEY=` sets `KEY` to the empty string.
+    fn env_lines(text: &str) -> HashMap<String, String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches('"').to_string()))
+            .collect()
+    }
+
+    // The docs say what an operator gets by copying the shipped example and turning alerting on:
+    // a daemon that starts with alerts in the journal only. A URL shipped filled in with the topic
+    // empty would instead refuse to start, so the example is held to the empty default here.
+    #[test]
+    fn the_shipped_example_with_alerting_turned_on_starts_with_alerts_in_the_journal_only() {
+        let mut env = env_lines(&deploy_example("propolis.env.example"));
+        assert!(
+            env.contains_key("PROPOLIS_OPS_NTFY_URL")
+                && env.contains_key("PROPOLIS_OPS_NTFY_TOPIC"),
+            "the example ships both ntfy lines uncommented, ready to fill in"
+        );
+        env.insert("PROPOLIS_OPS_ENABLED".into(), "true".into());
+        let cfg = parse_ops_alert(&|k: &str| env.get(k).cloned())
+            .expect("the shipped example with only PROPOLIS_OPS_ENABLED=true must start");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.ntfy_url, "", "an empty url is what selects the journal");
+        assert_eq!(cfg.ntfy_topic, "");
+    }
+
+    #[test]
+    fn the_shipped_example_with_only_a_url_filled_in_refuses_to_start_for_want_of_a_topic() {
+        let mut env = env_lines(&deploy_example("propolis.env.example"));
+        env.insert("PROPOLIS_OPS_ENABLED".into(), "true".into());
+        env.insert(
+            "PROPOLIS_OPS_NTFY_URL".into(),
+            "https://ntfy.example/".into(),
+        );
+        let err = parse_ops_alert(&|k: &str| env.get(k).cloned()).unwrap_err();
+        assert_eq!(err, ConfigError::Missing("PROPOLIS_OPS_NTFY_TOPIC"));
+    }
+
+    #[test]
+    fn the_control_plane_example_ships_its_commented_ntfy_url_and_topic_empty() {
+        let text = deploy_example("control-plane.env.example");
+        for key in ["PROPOLIS_OPS_NTFY_URL", "PROPOLIS_OPS_NTFY_TOPIC"] {
+            let values: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix('#'))
+                .filter_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))
+                .collect();
+            assert!(!values.is_empty(), "control-plane.env.example names {key}");
+            assert!(
+                values.iter().all(|v| v.trim().is_empty()),
+                "control-plane.env.example ships {key} with a value: {values:?}"
+            );
+        }
     }
 }

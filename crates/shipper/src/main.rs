@@ -25,8 +25,11 @@ use std::time::Duration;
 use collector_wire::tls::client_config;
 use log_tailer::LogTailer;
 use sensor_framework::shutdown_signal;
-use shipper::client::{RetryPolicy, ShipperClient, StopReason, ship_cycle};
+use shipper::client::{
+    CycleReport, RetryPolicy, ShipperClient, StopReason, settle_orphaned, ship_cycle,
+};
 use shipper::config::{load_config_from_env, validate_collector_id};
+use shipper::pending::PendingBatch;
 use tokio_rustls::rustls::ClientConfig;
 
 /// How many consecutive gateway `Retry` acks for the same batch `ship_cycle` tolerates before
@@ -150,8 +153,9 @@ async fn main() {
                 Ok(()) => {
                     tracing::error!(
                         "shipper: ship loop terminated on a permanent stop condition (gateway \
-                         rejection or chain divergence); exiting non-zero so this is visible as \
-                         a failed unit rather than a silently idle process"
+                         rejection, chain divergence or an unprovable duplicate); exiting \
+                         non-zero so this is visible as a failed unit rather than a silently \
+                         idle process"
                     );
                 }
                 Err(e) => {
@@ -167,9 +171,9 @@ async fn main() {
     }
 }
 
-/// Runs the single multiplexed ship loop until a gateway `Reject` or a `ChainDiverged` breaks the
-/// shared chain (see the module doc) - the only two ways this function returns on its own; `main`
-/// treats either as a permanent stop (F3) and exits non-zero. Each pass iterates `tailers` in
+/// Runs the single multiplexed ship loop until a gateway `Reject`, a `ChainDiverged` or an
+/// `UnprovenDuplicate` breaks the shared chain (see the module doc) - the only ways this function
+/// returns on its own; `main` treats each as a permanent stop (F3) and exits non-zero. Each pass iterates `tailers` in
 /// order, dials the gateway once per tailer,
 /// and runs Task 11's `ship_cycle` against the SHARED `collector_id` confirmed-state key; if the
 /// whole pass shipped nothing from any log, sleeps `poll_interval` before the next pass. A
@@ -188,8 +192,86 @@ async fn run_ship_loop(
     retry: RetryPolicy,
     poll_interval: Duration,
 ) {
+    for stray in PendingBatch::foreign_records(&state_dir, &collector_id) {
+        tracing::warn!(
+            path = %stray.display(),
+            "shipper: a record of a batch in flight for another collector id is in the state \
+             directory; it is not read or sent. Its lines are behind their logs' read positions \
+             and ship under this collector id; delete the file once that chain is retired"
+        );
+    }
+
     loop {
         let mut any_shipped = false;
+
+        // A batch in flight from a log no tailer reads would hold the shared chain for ever,
+        // since only its own log's cycle settles a record.
+        if let Ok(Some((label, path))) = PendingBatch::owner(&state_dir, &collector_id)
+            && !tailers
+                .iter()
+                .any(|(name, tailer)| *name == label && tailer.log_path() == path)
+        {
+            tracing::warn!(
+                sensor = %label,
+                path = %path.display(),
+                "shipper: the batch in flight was read from a log that is no longer configured; \
+                 sending it again to settle its sequence number, with no read position to move"
+            );
+            match ShipperClient::connect(gateway_addr, tls.clone(), &gateway_dns).await {
+                Ok(mut stream) => {
+                    match settle_orphaned(&mut stream, &state_dir, &collector_id, retry).await {
+                        Ok(CycleReport {
+                            stopped: Some(reason @ StopReason::Rejected { .. }),
+                            ..
+                        }) => {
+                            // The record stays, as in the Rejected arm of the ship loop below:
+                            // a gateway whose chain state was lost or unreadable rejects a batch
+                            // it may hold, and this log is no longer read, so a reset here would
+                            // give up the only copy of these lines the shipper can still send.
+                            tracing::error!(
+                                sensor = %label,
+                                ?reason,
+                                "shipper: gateway rejected the batch in flight from a log no \
+                                 longer configured; stopping the ship loop. The record of that \
+                                 batch (<collector id>.pending) is kept, because a gateway whose \
+                                 chain state was lost or unreadable rejects a batch it may hold: \
+                                 once its state is put back and gateway.service restarted, that \
+                                 batch is sent again and confirmed. Otherwise reset the chain on \
+                                 both sides, which deletes it"
+                            );
+                            return;
+                        }
+                        Ok(CycleReport {
+                            stopped:
+                                Some(
+                                    reason @ (StopReason::ChainDiverged { .. }
+                                    | StopReason::UnprovenDuplicate { .. }),
+                                ),
+                            ..
+                        }) => {
+                            tracing::error!(
+                                sensor = %label,
+                                ?reason,
+                                "shipper: the batch in flight from a log no longer configured \
+                                 cannot be settled; stopping the ship loop for an operator to \
+                                 reset the chain"
+                            );
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(
+                            sensor = %label,
+                            error = %e,
+                            "shipper: ship cycle IO error; will retry next pass"
+                        ),
+                    }
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "shipper: failed to connect to gateway; will retry next pass"
+                ),
+            }
+        }
 
         for (sensor_name, tailer) in tailers.iter_mut() {
             let mut stream =
@@ -256,12 +338,18 @@ async fn run_ship_loop(
                     // longer agrees with what the gateway will accept next. Retrying would just
                     // repeat the same rejection, and every other tailer shares this exact chain,
                     // so there is nothing left for this loop to safely do but stop and let an
-                    // operator resolve it.
+                    // operator resolve it. The record of the batch in flight stays: a gateway
+                    // that lost or could not read its chain state rejects a batch it may hold,
+                    // and only that exact batch may be sent once its state is back.
                     tracing::error!(
                         sensor = %sensor_name,
                         ?reason,
                         "shipper: gateway rejected a batch; the shared seq/hash chain is \
-                         broken, stopping the ship loop"
+                         broken, stopping the ship loop. The record of the batch in flight \
+                         (<collector id>.pending) is kept, because a gateway whose chain state \
+                         was lost or unreadable rejects a batch it may hold: once its state is \
+                         put back and gateway.service restarted, that batch is sent again and \
+                         confirmed. Otherwise reset the chain on both sides, which deletes it"
                     );
                     return;
                 }
@@ -280,6 +368,17 @@ async fn run_ship_loop(
                         gateway_next_expected,
                         "shipper: this collector's chain has diverged from the gateway's; \
                          stopping the ship loop for an operator to resync"
+                    );
+                    return;
+                }
+                Some(StopReason::UnprovenDuplicate { seq }) => {
+                    // Confirming would risk skipping lines and resending cannot settle it, so
+                    // the same permanent stop: the operator resets the chain on both sides.
+                    tracing::error!(
+                        sensor = %sensor_name,
+                        seq,
+                        "shipper: cannot prove which batch the gateway holds under this sequence \
+                         number; stopping the ship loop for an operator to reset the chain"
                     );
                     return;
                 }

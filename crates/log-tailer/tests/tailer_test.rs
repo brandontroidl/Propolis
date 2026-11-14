@@ -785,3 +785,42 @@ fn uncommitted_line_offsets_follow_the_file_each_line_came_from() {
     assert_eq!(tailer.uncommitted_line(5).unwrap().offset, 0, "new-000");
     assert_eq!(tailer.uncommitted_line(8).unwrap().offset, 3 * width);
 }
+
+/// `cursor_to_persist` names the position before it is written, `saved_cursor` reads back what
+/// `persist_cursor` wrote, and a restarted tailer starts from exactly that. An uncommitted read
+/// moves the first and not the second.
+#[test]
+fn the_saved_cursor_reads_back_what_persist_cursor_wrote_and_a_restart_starts_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let cursors = dir.path().join("cursors");
+    std::fs::write(&log_path, "a\nb\nc\n").unwrap();
+    let mut tailer = LogTailer::new(log_path.clone(), cursors.clone());
+    assert_eq!(tailer.saved_cursor().unwrap(), None, "nothing saved yet");
+
+    assert_eq!(tailer.read_batch(1), vec!["a"]);
+    tailer.commit_batch();
+    let expected = tailer.cursor_to_persist();
+    tailer.persist_cursor().unwrap();
+    assert_eq!(tailer.saved_cursor().unwrap(), Some(expected));
+
+    assert_eq!(tailer.read_batch(1), vec!["b"]);
+    assert_ne!(tailer.cursor_to_persist(), expected);
+    assert_eq!(tailer.saved_cursor().unwrap(), Some(expected));
+
+    let restarted = LogTailer::new(log_path, cursors);
+    assert_eq!(restarted.cursor_to_persist(), expected);
+    assert_eq!(restarted.saved_cursor().unwrap(), Some(expected));
+}
+
+#[test]
+fn a_tailer_without_a_cursor_has_no_saved_cursor_to_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    std::fs::write(&log_path, "a\n").unwrap();
+    let tailer = LogTailer::without_cursor(log_path, log_tailer::StartAt::Beginning);
+    assert_eq!(
+        tailer.saved_cursor().unwrap_err().kind(),
+        std::io::ErrorKind::Unsupported
+    );
+}

@@ -51,6 +51,9 @@ pub struct NextBatch {
     pub batch: Option<Batch>,
     /// Lines read and left out because the origin policy refused them for this log.
     pub refused: u64,
+    /// Every line the tailer handed out for this call, refused and over-length ones included:
+    /// how far reading the same place again must go to cover exactly what this batch consumed.
+    pub lines_read: usize,
 }
 
 /// Why [`admit`] refused a line.
@@ -148,11 +151,13 @@ impl Batcher {
         // larger than the frame-safe ceiling (see `DEFAULT_MAX_RECORDS`'s doc comment).
         let n = max_records.min(MAX_RECORDS_FRAME_SAFE);
         let lines = tailer.read_batch(n);
+        let lines_read = lines.len();
         let mut refused = 0u64;
         if lines.is_empty() {
             return NextBatch {
                 batch: None,
                 refused,
+                lines_read,
             };
         }
 
@@ -207,12 +212,14 @@ impl Batcher {
             return NextBatch {
                 batch: None,
                 refused,
+                lines_read,
             };
         }
 
         NextBatch {
             batch: Some(Batch::new(last_seq + 1, last_hash, records)),
             refused,
+            lines_read,
         }
     }
 }

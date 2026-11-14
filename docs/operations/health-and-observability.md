@@ -618,9 +618,23 @@ Two pieces cover that:
   `https://` and is never logged. Like ntfy, this is outbound egress you opt into.
 
 `deploy/config-check.sh` reports, under `alerting`, a monitor that is off, alerts that go only to
-the journal, no heartbeat and a missing failure hook, under `backup` and `clock` the backup
-state and whether the clock is NTP-synchronized, and under `env-files` an env file whose mode
-lets another account read it.
+the journal (`ops-no-push`), no heartbeat and a missing failure hook. It counts a push target only
+when both `PROPOLIS_OPS_NTFY_URL` and `PROPOLIS_OPS_NTFY_TOPIC` are set, since the daemon and the
+failure hook both need the two. With the monitor on and only one of them set it fails the check
+as `ops-push-half`, naming the empty one, because the daemon will not start with that file; with
+the monitor off and only one set, the failure hook writes its alerts to the journal, and the check
+reports that as `ops-no-push`. It reads the two values the way each reader gets them: for the
+daemon as systemd hands them over, with unquoted surrounding whitespace trimmed, so a value of
+only spaces counts as empty; for the failure hook as `deploy/alert.sh` reads the file, from lines
+that start with the name, with quotes removed and nothing trimmed, so a value set on an indented
+line reaches the daemon but not the hook, which the check also reports as `ops-no-push` and
+names the indentation only when the line is indented. Where the two readers disagree the other
+way, the hook posting with a value the daemon does not get (unquoted spaces, say), then with the
+monitor off the row reads `ntfy for the failure hook only` and the check reports that as
+`ops-no-push` too; with the monitor on and the daemon left with only one of the two values, it
+is `ops-push-half` as above. Under `backup` and `clock` it reports the backup state and whether
+the clock is NTP-synchronized, and under `env-files` an env file whose mode lets another account
+read it.
 
 ### Quarantined intake lines
 

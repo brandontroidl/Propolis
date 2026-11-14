@@ -173,7 +173,7 @@ itself) and `/var/log/propolis`.
 | gateway spool, one `<collector_id>/events.jsonl` per collector, tailed by intake | `PROPOLIS_GATEWAY_SPOOL_DIR` | `/var/spool/propolis/gateway` (`crates/gateway/src/config.rs#DEFAULT_SPOOL_DIR`) | control plane |
 | gateway chain state, `<collector_id>.json` | `PROPOLIS_GATEWAY_STATE_DIR` | `/var/lib/propolis/gateway` (`crates/gateway/src/config.rs#DEFAULT_STATE_DIR`) | control plane |
 | shipper read positions, one file per log | `PROPOLIS_SHIPPER_CURSOR_DIR` | `/var/lib/propolis/shipper/cursors` (`crates/shipper/src/config.rs#DEFAULT_CURSOR_DIR`) | collector |
-| shipper chain state, `<collector_id>.json` | `PROPOLIS_SHIPPER_STATE_DIR` | `/var/lib/propolis/shipper/state` (`crates/shipper/src/config.rs#DEFAULT_STATE_DIR`) | collector |
+| shipper chain state, `<collector_id>.json`; the batch in flight, `<collector_id>.pending`, present only from before a batch is first sent until its acknowledgement is recorded (at most one frame, under 16 MiB); an unreadable record set aside, `<collector_id>.pending.damaged` | `PROPOLIS_SHIPPER_STATE_DIR` | `/var/lib/propolis/shipper/state` (`crates/shipper/src/config.rs#DEFAULT_STATE_DIR`) | collector |
 | mTLS certificates and keys | the `*_CERT_PATH` and `*_KEY_PATH` variables | no default; `/etc/propolis/certs` by convention, read-only to both units (`deploy/gateway.service#ReadOnlyPaths=/etc/propolis/certs`) | both |
 
 ## Config

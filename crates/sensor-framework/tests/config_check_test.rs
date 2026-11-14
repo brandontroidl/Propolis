@@ -2714,6 +2714,13 @@ fn fix_scenarios() -> Vec<Scenario> {
                 fx.write("state/ntp_unsynced", "");
             },
         ),
+        ("alerting on with an ntfy URL and no topic", |fx| {
+            fx.set_env_line(
+                "etc/propolis.env",
+                "PROPOLIS_OPS_NTFY_TOPIC=",
+                Some("PROPOLIS_OPS_NTFY_TOPIC="),
+            );
+        }),
     ]
 }
 
@@ -3625,6 +3632,461 @@ fn each_intake_log_with_content_needs_a_cursor_file_and_a_visible_cursor_directo
     );
 }
 
+/// On a collector the sensor logs are read by the shipper, which keeps its cursors in its own
+/// directory (crates/shipper/src/config.rs DEFAULT_CURSOR_DIR, or PROPOLIS_SHIPPER_CURSOR_DIR) and
+/// saves a log's first one when a ship cycle starts reading the log (crates/shipper/src/client.rs
+/// ship_cycle), which needs a connection to the gateway and no other log's batch in flight, not
+/// an accepted batch. The finding must send the operator to that unit and that directory, not to
+/// an intake this host does not run, and must give the reasons that hold.
+#[test]
+fn a_missing_cursor_on_a_collector_names_the_shipper_its_unit_and_its_cursor_directory() {
+    use sha2::{Digest, Sha256};
+    let fx = Fx::new();
+    let logs = fx.logs();
+    let list = format!(
+        "PROPOLIS_SHIPPER_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,mqtt:{logs}/mqtt/events.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl"
+    );
+    fx.set_env_line("etc/propolis.env", "PROPOLIS_SENSOR_LOGS=", None);
+    let shipper_dir = fx.p("state/shipper-cursors");
+    fx.write(
+        "etc/shipper.env",
+        &format!(
+            "{list}\nPROPOLIS_SHIPPER_CURSOR_DIR={}\n",
+            shipper_dir.display()
+        ),
+    );
+    fx.write("state/shipper-cursors/unrelated.json", "{}");
+    // A leftover intake cursor directory holding a cursor for every log must not count: on a
+    // collector only the shipper's cursors say how far a log was read.
+    let intake_dir = fx.p("state/intake-cursors");
+    fx.set_env_line(
+        "etc/propolis.env",
+        "PROPOLIS_CURSOR_DIR=",
+        Some(&format!("PROPOLIS_CURSOR_DIR={}", intake_dir.display())),
+    );
+    for rel in [
+        "logs/ssh/events.jsonl",
+        "logs/mqtt/events.jsonl",
+        "logs/dns/events.jsonl",
+        "logs/tftp/events.jsonl",
+        "logs/cred/postgresql.jsonl",
+    ] {
+        let resolved = std::fs::canonicalize(fx.p(rel)).unwrap();
+        let hash: String = Sha256::digest(resolved.to_str().unwrap().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        fx.write(&format!("state/intake-cursors/{hash}.json"), "{}");
+    }
+    // No test override, so the directory is the one the script itself derives.
+    let v = fx
+        .run_with(&["--json"], &[("PROPOLIS_CC_CURSOR_DIR", "")])
+        .json();
+    assert_eq!(global_state(&v, "cursors"), "warn", "{}", v["global"]);
+    let missing: Vec<&serde_json::Value> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "cursor-missing")
+        .collect();
+    assert_eq!(missing.len(), 5, "{}", v["findings"]);
+    let ssh = missing
+        .iter()
+        .find(|f| {
+            f["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{logs}/ssh/events.jsonl"))
+        })
+        .unwrap_or_else(|| panic!("no finding for the ssh log: {missing:?}"));
+    let msg = ssh["message"].as_str().unwrap();
+    let fix = ssh["fix"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!("in {}", shipper_dir.display())),
+        "the shipper's cursor directory: {msg}"
+    );
+    assert!(msg.contains("the shipper"), "{msg}");
+    assert!(msg.contains("shipper.service"), "{msg}");
+    assert!(
+        msg.contains("when a ship cycle starts reading the log")
+            && msg.contains("cannot reach the gateway")
+            && msg.contains("another log's batch is in flight"),
+        "{msg}"
+    );
+    // The cursor is saved before any batch is sent, so neither an accepted batch nor a log the
+    // shipper cannot read decides whether it exists.
+    assert!(!msg.contains("accepts a batch"), "{msg}");
+    assert!(!msg.contains("cannot read the log"), "{msg}");
+    assert!(!msg.contains("intake"), "no intake on a collector: {msg}");
+    assert!(
+        fix.contains("journalctl -u shipper.service"),
+        "the shipper's journal: {fix}"
+    );
+    // The shipper's errors carry the log's label as sensor=, which is how its journal is read.
+    assert!(fix.contains("sensor=ssh"), "{fix}");
+    assert!(!fix.contains("propolis.service"), "{fix}");
+    assert_eq!(ssh["fix_kind"], "manual");
+}
+
+/// The daemon and the failure hook both push only with PROPOLIS_OPS_NTFY_URL and
+/// PROPOLIS_OPS_NTFY_TOPIC set (crates/propolis/src/ops_alert/config.rs parse_ops_alert,
+/// deploy/alert.sh). Every combination of the monitor switch and the two values is told as it is.
+#[test]
+fn alerting_is_reported_truthfully_for_every_combination_of_the_switch_the_url_and_the_topic() {
+    struct Row {
+        enabled: bool,
+        url: bool,
+        topic: bool,
+        state: &'static str,
+        ids: &'static [&'static str],
+        pushes: bool,
+        missing: Option<&'static str>,
+        // A topic line written as it stands in the file, in place of the plain one.
+        topic_line: Option<&'static str>,
+        // Text the alerting row must contain, for rows where the two readers disagree.
+        row_has: Option<&'static str>,
+        // Text the push finding's message must, and must not, contain.
+        says: &'static [&'static str],
+        never_says: &'static [&'static str],
+    }
+    let rows = [
+        Row {
+            enabled: true,
+            url: true,
+            topic: true,
+            state: "ok",
+            ids: &[],
+            pushes: true,
+            missing: None,
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: true,
+            url: true,
+            topic: false,
+            state: "fail",
+            ids: &["ops-push-half"],
+            pushes: false,
+            missing: Some("PROPOLIS_OPS_NTFY_TOPIC"),
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: true,
+            url: false,
+            topic: true,
+            state: "fail",
+            ids: &["ops-push-half"],
+            pushes: false,
+            missing: Some("PROPOLIS_OPS_NTFY_URL"),
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: true,
+            url: false,
+            topic: false,
+            state: "warn",
+            ids: &["ops-no-push"],
+            pushes: false,
+            missing: None,
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: false,
+            url: true,
+            topic: true,
+            state: "warn",
+            ids: &["ops-monitor-off"],
+            pushes: true,
+            missing: None,
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: false,
+            url: true,
+            topic: false,
+            state: "warn",
+            ids: &["ops-monitor-off", "ops-no-push"],
+            pushes: false,
+            missing: Some("PROPOLIS_OPS_NTFY_TOPIC"),
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: false,
+            url: false,
+            topic: true,
+            state: "warn",
+            ids: &["ops-monitor-off", "ops-no-push"],
+            pushes: false,
+            missing: Some("PROPOLIS_OPS_NTFY_URL"),
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        Row {
+            enabled: false,
+            url: false,
+            topic: false,
+            state: "warn",
+            ids: &["ops-monitor-off", "ops-no-push"],
+            pushes: false,
+            missing: None,
+            topic_line: None,
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        // Unquoted spaces only: systemd trims them, so the daemon sees no topic and refuses to
+        // start, however set the line looks.
+        Row {
+            enabled: true,
+            url: true,
+            topic: false,
+            state: "fail",
+            ids: &["ops-push-half"],
+            pushes: false,
+            missing: Some("PROPOLIS_OPS_NTFY_TOPIC"),
+            topic_line: Some("PROPOLIS_OPS_NTFY_TOPIC=   "),
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        // An indented line: the unit gets the topic, but deploy/alert.sh reads only lines that
+        // start with the name, so the failure hook has no push target.
+        Row {
+            enabled: false,
+            url: true,
+            topic: true,
+            state: "warn",
+            ids: &["ops-monitor-off", "ops-no-push"],
+            pushes: false,
+            missing: None,
+            topic_line: Some("  PROPOLIS_OPS_NTFY_TOPIC=propolis-ops"),
+            row_has: Some("journal only"),
+            says: &[],
+            never_says: &[],
+        },
+        // The same with the monitor on: the daemon pushes its own alerts, the hook does not.
+        Row {
+            enabled: true,
+            url: true,
+            topic: true,
+            state: "warn",
+            ids: &["ops-no-push"],
+            pushes: false,
+            missing: None,
+            topic_line: Some("  PROPOLIS_OPS_NTFY_TOPIC=propolis-ops"),
+            row_has: Some("ntfy for the daemon only, failure hook journal only"),
+            says: &["pushes its own alerts"],
+            never_says: &[],
+        },
+        // A quoted space: systemd keeps it and deploy/alert.sh strips only the quotes, so both
+        // readers see a topic and both push. Nothing is indented and nothing is missing.
+        Row {
+            enabled: true,
+            url: true,
+            topic: true,
+            state: "ok",
+            ids: &[],
+            pushes: true,
+            missing: None,
+            topic_line: Some("PROPOLIS_OPS_NTFY_TOPIC=' '"),
+            row_has: None,
+            says: &[],
+            never_says: &[],
+        },
+        // An unindented line the hook reads as empty: systemd removes the pair of double quotes
+        // and keeps the single quote, deploy/alert.sh removes one quote of each kind from each end
+        // and is left with nothing. The check must not blame indentation that is not there.
+        Row {
+            enabled: false,
+            url: true,
+            topic: true,
+            state: "warn",
+            ids: &["ops-monitor-off", "ops-no-push"],
+            pushes: false,
+            missing: None,
+            topic_line: Some("PROPOLIS_OPS_NTFY_TOPIC=\"'\""),
+            row_has: Some("journal only"),
+            says: &[
+                "PROPOLIS_OPS_NTFY_TOPIC",
+                "failure hook",
+                "does not see",
+                "journal",
+            ],
+            never_says: &["indented"],
+        },
+        // A value the hook sees and the daemon does not: systemd trims the unquoted spaces to
+        // nothing, deploy/alert.sh keeps them and posts. The hook is not journal-only.
+        Row {
+            enabled: false,
+            url: true,
+            topic: false,
+            state: "warn",
+            ids: &["ops-monitor-off", "ops-no-push"],
+            pushes: false,
+            missing: None,
+            topic_line: Some("PROPOLIS_OPS_NTFY_TOPIC=   "),
+            row_has: Some("ntfy for the failure hook only"),
+            says: &[
+                "PROPOLIS_OPS_NTFY_TOPIC",
+                "failure hook",
+                "posts",
+                "refuse to start",
+            ],
+            never_says: &["journal", "indented"],
+        },
+    ];
+    for row in rows {
+        let what = format!(
+            "enabled={} url={} topic={} topic_line={:?}",
+            row.enabled, row.url, row.topic, row.topic_line
+        );
+        let fx = Fx::new();
+        fx.set_env_line(
+            "etc/propolis.env",
+            "PROPOLIS_OPS_ENABLED=",
+            Some(&format!("PROPOLIS_OPS_ENABLED={}", row.enabled)),
+        );
+        if !row.url {
+            fx.set_env_line(
+                "etc/propolis.env",
+                "PROPOLIS_OPS_NTFY_URL=",
+                Some("PROPOLIS_OPS_NTFY_URL="),
+            );
+        }
+        if !row.topic {
+            fx.set_env_line(
+                "etc/propolis.env",
+                "PROPOLIS_OPS_NTFY_TOPIC=",
+                Some("PROPOLIS_OPS_NTFY_TOPIC="),
+            );
+        }
+        if let Some(line) = row.topic_line {
+            fx.set_env_line("etc/propolis.env", "PROPOLIS_OPS_NTFY_TOPIC=", Some(line));
+        }
+        let v = fx.json();
+        assert_eq!(
+            global_state(&v, "alerting"),
+            row.state,
+            "{what}: {}",
+            v["global"]
+        );
+        let ops: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["scope"] == "alerting")
+            .collect();
+        let ids: Vec<&str> = ops.iter().map(|f| f["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, row.ids, "{what}: {}", v["findings"]);
+        let text = global_text(&v, "alerting");
+        assert_eq!(
+            text.split(", ").any(|p| p == "ntfy"),
+            row.pushes,
+            "{what}: the alerting row says ntfy only when both values are set: {text}"
+        );
+        if let Some(part) = row.row_has {
+            assert!(text.contains(part), "{what}: {text}");
+        } else if !row.pushes {
+            assert!(!text.contains("ntfy"), "{what}: {text}");
+        }
+        let push_finding = ops
+            .iter()
+            .find(|f| f["id"] == "ops-push-half" || f["id"] == "ops-no-push");
+        assert!(
+            push_finding.is_some() || (row.says.is_empty() && row.never_says.is_empty()),
+            "{what}: no push finding to check: {}",
+            v["findings"]
+        );
+        if let Some(f) = push_finding {
+            let msg = f["message"].as_str().unwrap();
+            let fix = f["fix"].as_str().unwrap();
+            for s in row.says {
+                assert!(msg.contains(s), "{what}: says {s:?}: {msg}");
+            }
+            for s in row.never_says {
+                assert!(!msg.contains(s), "{what}: never says {s:?}: {msg}");
+            }
+            let indented = row.topic_line.is_some_and(|l| l.starts_with(' '));
+            // Indentation is named only where the file really has it.
+            assert!(
+                indented || !(msg.contains("indented") || fix.contains("whitespace before")),
+                "{what}: {msg} / {fix}"
+            );
+            if indented {
+                // The target is set; only where it is written keeps the hook from it.
+                assert!(
+                    msg.contains("PROPOLIS_OPS_NTFY_TOPIC")
+                        && msg.contains("indented")
+                        && msg.contains("failure hook")
+                        && msg.contains("journal"),
+                    "{what}: {msg}"
+                );
+                assert!(
+                    fix.contains("remove the whitespace before PROPOLIS_OPS_NTFY_TOPIC="),
+                    "{what}: {fix}"
+                );
+            } else {
+                assert!(
+                    fix.contains("read access is restricted to you")
+                        && fix.contains("anyone who knows the topic name can read the alerts"),
+                    "{what}: {fix}"
+                );
+            }
+            if row.enabled
+                && let Some(var) = row.missing
+            {
+                // The other way out: empty the one that is set, for journal-only alerts.
+                let set = if var == "PROPOLIS_OPS_NTFY_TOPIC" {
+                    "PROPOLIS_OPS_NTFY_URL"
+                } else {
+                    "PROPOLIS_OPS_NTFY_TOPIC"
+                };
+                assert!(fix.contains(&format!("empty {set}")), "{what}: {fix}");
+            }
+            if let Some(var) = row.missing {
+                assert!(
+                    msg.contains(&format!("{var} is empty")),
+                    "{what}: the message names the missing variable: {msg}"
+                );
+                assert!(fix.contains(&format!("set {var}")), "{what}: {fix}");
+            }
+            if row.enabled && row.missing.is_some() {
+                assert_eq!(f["level"], "fail", "{what}");
+                assert!(
+                    msg.contains("the daemon will not start with this file"),
+                    "{what}: {msg}"
+                );
+            }
+            if !row.enabled && row.missing.is_some() {
+                assert!(
+                    msg.contains("failure hook") && msg.contains("journal"),
+                    "{what}: {msg}"
+                );
+            }
+        }
+    }
+}
+
 // ---- gateway spool -------------------------------------------------------------------------
 
 #[test]
@@ -4332,6 +4794,15 @@ fn a_spool_listed_by_its_real_path_through_a_symlinked_spool_directory_is_listed
         .json();
     assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
     assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+    // The intake-list check resolves the spool directory the same way, so the real path is a
+    // collector's spool there too and not an entry no sensor writes.
+    let named: Vec<&serde_json::Value> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["scope"] == "intake-list" && f["message"].as_str().unwrap().contains(&p))
+        .collect();
+    assert!(named.is_empty(), "{named:?}");
 }
 
 #[test]
@@ -4400,6 +4871,188 @@ fn a_collector_whose_intake_list_is_in_shipper_env_still_has_its_spools_checked(
     let found = spool_findings(&v);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0]["id"], "spool-unlisted");
+}
+
+/// A host running sensors and a gateway lists each collector's spool beside its own sensor logs.
+/// Those entries are judged by the gateway-spool row; the older check that knows only local
+/// sensors must not call them orphans, nor call a collector that has not delivered yet a typo.
+/// The row names such a collector instead, since a listed id with no spool may be misspelled.
+#[test]
+fn a_listed_collector_spool_on_a_sensor_host_is_no_orphan_while_a_real_orphan_still_is() {
+    let fx = Fx::new();
+    let logs = fx.logs();
+    let a = fx.spool("collector-01", 200, NOW - 60);
+    // Listed ahead of its first batch: the spool directory exists, its own does not yet.
+    let b = format!("{}/collector-02/events.jsonl", fx.spool_dir());
+    fx.log("logs/retired/events.jsonl", 10, NOW - 60);
+    let orphan = format!("{logs}/retired/events.jsonl");
+    fx.add_intake_entries(&format!(
+        "collector-01:{a},collector-02:{b},retired:{orphan}"
+    ));
+    let v = fx.json();
+    let intake: Vec<&serde_json::Value> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["scope"] == "intake-list")
+        .collect();
+    for f in &intake {
+        let msg = f["message"].as_str().unwrap();
+        assert!(
+            !msg.contains(&a) && !msg.contains(&b),
+            "a listed collector spool is not an intake-list finding: {msg}"
+        );
+    }
+    assert_eq!(intake.len(), 1, "{intake:?}");
+    assert_eq!(intake[0]["id"], "intake-orphan");
+    assert!(
+        intake[0]["message"].as_str().unwrap().contains(&format!(
+            "'retired:{orphan}' matches no configured sensor's log path"
+        )),
+        "{}",
+        intake[0]
+    );
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+    // Named in the row, so a misspelled id does not go unseen, but no finding: a collector
+    // listed ahead of its first batch is the documented way to add one.
+    let text = global_text(&v, "gateway-spool");
+    assert!(
+        text.contains("listed but nothing delivered yet: collector-02"),
+        "{text}"
+    );
+    assert!(!text.contains("collector-01"), "{text}");
+}
+
+/// Undelivered listed ids in the gateway-spool row are cleaned like every other name and cut
+/// to a few, so a long or hostile list cannot flood or garble the row.
+#[test]
+fn listed_collectors_that_have_delivered_nothing_are_named_cleaned_and_capped_in_the_spool_row() {
+    let fx = Fx::new();
+    let dir = fx.spool_dir();
+    let a = fx.spool("collector-01", 200, NOW - 60);
+    let long = "l".repeat(70);
+    let ids = ["c-a", long.as_str(), "esc\u{1b}[31m", "c-d", "c-e"];
+    let entries: Vec<String> = ids
+        .iter()
+        .map(|id| format!("{id}:{dir}/{id}/events.jsonl"))
+        .collect();
+    fx.add_intake_entries(&format!("collector-01:{a},{}", entries.join(",")));
+    let r = fx.run(&["--json"]);
+    assert!(!r.out.contains('\u{1b}'), "{}", r.out);
+    let v = r.json();
+    assert!(spool_findings(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+    let text = global_text(&v, "gateway-spool");
+    // Cut at 64 characters like every spool name, the most a certificate CommonName holds.
+    let cut = format!("{}...", "l".repeat(64));
+    assert!(
+        text.contains(&format!(
+            "listed but nothing delivered yet: c-a, {cut}, esc?[31m and 2 more"
+        )),
+        "{text}"
+    );
+}
+
+/// The findings of any scope whose message contains `needle`.
+fn findings_naming<'a>(v: &'a serde_json::Value, needle: &str) -> Vec<&'a serde_json::Value> {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["message"].as_str().unwrap().contains(needle))
+        .collect()
+}
+
+/// With no spool directory and no gateway.env naming one, the gateway-spool row is absent, so an
+/// entry that only looks like a spool path must still be judged by the intake-list check.
+#[test]
+fn an_entry_under_the_spool_path_on_a_host_with_no_spool_is_still_an_intake_list_finding() {
+    let fx = Fx::new();
+    assert!(!fx.p("spool/gateway").exists());
+    let entry = format!("{}/c1/events.jsonl", fx.spool_dir());
+    fx.add_intake_entries(&format!("c1:{entry}"));
+    let v = fx.json();
+    let named = findings_naming(&v, &entry);
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert_eq!(named[0]["scope"], "intake-list", "{}", named[0]);
+    let id = named[0]["id"].as_str().unwrap();
+    assert!(id == "intake-orphan" || id == "intake-nodir", "{id}");
+    assert_eq!(
+        global_state(&v, "gateway-spool"),
+        "absent",
+        "{}",
+        v["global"]
+    );
+}
+
+/// A spool entry written with a trailing '/' lists nothing; the spool-unlisted finding already
+/// says so and how to fix it, so the intake-list check must not report it a second time.
+#[test]
+fn a_trailing_slash_spool_entry_on_a_sensor_host_is_reported_as_spool_unlisted_only() {
+    let fx = Fx::new();
+    let a = fx.spool("collector-01", 200, NOW - 60);
+    let entry = format!("{a}/");
+    fx.add_intake_entries(&format!("collector-01:{entry}"));
+    let v = fx.json();
+    let named = findings_naming(&v, &format!("collector-01:{entry}"));
+    assert_eq!(named.len(), 1, "{named:?}");
+    assert_eq!(named[0]["id"], "spool-unlisted", "{}", named[0]);
+    assert!(
+        named[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ends in '/'"),
+        "{}",
+        named[0]
+    );
+}
+
+/// gateway.env moves the spool, and the intake-list check finds it there with the same reading
+/// the unit gets: surrounding whitespace trimmed and one pair of quotes removed.
+#[test]
+fn a_spool_entry_under_the_directory_gateway_env_names_is_no_intake_list_finding() {
+    let fx = Fx::new();
+    let other = fx.p("srv/gateway-spool");
+    fx.write(
+        "etc/gateway.env",
+        &format!(
+            "PROPOLIS_GATEWAY_BIND=0.0.0.0:9443\nPROPOLIS_GATEWAY_SPOOL_DIR=\"{}\" \n",
+            other.display()
+        ),
+    );
+    fx.log("srv/gateway-spool/collector-05/events.jsonl", 10, NOW - 60);
+    let entry = format!("{}/collector-05/events.jsonl", other.display());
+    fx.add_intake_entries(&format!("collector-05:{entry}"));
+    let v = fx.json();
+    let named = findings_naming(&v, &entry);
+    assert!(
+        named.iter().all(|f| f["scope"] != "intake-list"),
+        "{named:?}"
+    );
+    assert_eq!(global_state(&v, "gateway-spool"), "ok", "{}", v["global"]);
+}
+
+/// On a collector the list in shipper.env is the shipper's, which no gateway spool feeds: an entry
+/// under the spool path there is no collector's spool and stays an orphan.
+#[test]
+fn an_entry_under_the_spool_path_in_a_collectors_list_is_still_an_orphan() {
+    let fx = Fx::new();
+    let logs = fx.logs();
+    let p = fx.spool("collector-01", 10, NOW - 60);
+    fx.set_env_line("etc/propolis.env", "PROPOLIS_SENSOR_LOGS=", None);
+    fx.write(
+        "etc/shipper.env",
+        &format!(
+            "PROPOLIS_SHIPPER_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,mqtt:{logs}/mqtt/events.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl,collector-01:{p}\n"
+        ),
+    );
+    let v = fx.json();
+    let orphan: Vec<&serde_json::Value> = findings_naming(&v, &format!("collector-01:{p}"))
+        .into_iter()
+        .filter(|f| f["id"] == "intake-orphan")
+        .collect();
+    assert_eq!(orphan.len(), 1, "{}", v["findings"]);
 }
 
 #[test]

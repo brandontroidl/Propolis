@@ -92,8 +92,9 @@ is ticked.
       `PROPOLIS_OPS_ENABLED=true` and the ntfy URL and topic both empty, as shipped, the
       daemon starts and alerts go to the journal only; with one set and not the other it
       refuses to start. A clean start therefore does not show that alerts reach you:
-      confirm that `sudo ./deploy/config-check.sh` does not report `ops-no-push` (the
-      alerting line reads `journal only`). See
+      confirm that `sudo ./deploy/config-check.sh` reports neither `ops-no-push` (the
+      alerting line reads `journal only`) nor `ops-push-half` (one of the two is set
+      without the other, and the daemon will not start). See
       [health and observability](../operations/health-and-observability.md).
 - [ ] You have read [routine procedures](../operations/routine-procedures.md) and know
       how to [tear the node down](safe-teardown.md).

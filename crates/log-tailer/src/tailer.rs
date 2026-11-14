@@ -560,6 +560,18 @@ impl LogTailer {
     /// a position in the new file would never go back for it; loaded as saved here, the restart
     /// sees the truncation again and resumes the drain from `<log>.1`.
     pub fn persist_cursor(&self) -> io::Result<()> {
+        let state = self.cursor_to_persist();
+        match &self.cursor {
+            Some(cursor) => cursor.save(&state),
+            None => Err(no_cursor()),
+        }
+    }
+
+    /// The state [`Self::persist_cursor`] would save if called now, uncommitted reads included,
+    /// and the one a tailer restarted from that save starts with. Compared with
+    /// [`Self::saved_cursor`], it tells a caller whether the saved position is the one it is
+    /// about to read from, without writing anything.
+    pub fn cursor_to_persist(&self) -> CursorState {
         let resumable = self.pending_drains.front().and_then(|(file, offset)| {
             let front = file.metadata().ok()?.ino();
             let (_, fingerprint, len) = self.resumes.iter().find(|(ino, ..)| *ino == front)?;
@@ -570,13 +582,18 @@ impl LogTailer {
                 fingerprint_len: Some(*len),
             })
         });
-        let state = resumable.unwrap_or(self.state);
+        resumable.unwrap_or(self.state)
+    }
+
+    /// The position saved on disk for this log, as a restarted tailer would load it: `Ok(None)`
+    /// when nothing usable is saved (the restart then starts the file from 0). A caller that must
+    /// know whether a restart would read a stretch of the log again compares this with what it
+    /// recorded before the read. A [`Self::without_cursor`] tailer has nothing saved and returns
+    /// `ErrorKind::Unsupported`.
+    pub fn saved_cursor(&self) -> io::Result<Option<CursorState>> {
         match &self.cursor {
-            Some(cursor) => cursor.save(&state),
-            None => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "this tailer was built without a cursor and persists nothing",
-            )),
+            Some(cursor) => cursor.load(),
+            None => Err(no_cursor()),
         }
     }
 
@@ -763,6 +780,13 @@ impl LogTailer {
                 .map(|m| m.len() > self.last_known_size)
                 .unwrap_or(false)
     }
+}
+
+fn no_cursor() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this tailer was built without a cursor and persists nothing",
+    )
 }
 
 /// One rotated generation to read, oldest first.

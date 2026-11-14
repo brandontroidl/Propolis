@@ -42,9 +42,13 @@ fn bounds() -> ConnectionBounds {
     }
 }
 
+/// The lines the sensor has finished writing. These tests read the log while the sensor is
+/// still appending to it, and a read can land part-way through a line: whatever follows the last
+/// newline is not a line yet, and is left for the next read.
 fn events(log: &Path) -> Vec<SensorEvent> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let written = text.rfind('\n').map_or("", |end| &text[..=end]);
+    written
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
@@ -91,9 +95,15 @@ async fn pace(sent: usize) {
     }
 }
 
-/// How many summary windows `sending` can have touched.
-fn windows(sending: Duration) -> usize {
-    (sending.as_millis() / WINDOW.as_millis()) as usize + 1
+/// The most summaries one source network can have had in `elapsed`. A summary is written no
+/// sooner than a whole window after its first datagram, and the network's next one starts after
+/// that, so any stretch one window long holds the start of at most one.
+///
+/// `elapsed` has to run from before the first datagram was sent until after the last one was
+/// counted. The listener counts a datagram some time after the sender sent it, so a time taken
+/// when the sending stopped is too short whenever the two fall either side of a window's end.
+fn windows(elapsed: Duration) -> usize {
+    (elapsed.as_millis() / WINDOW.as_millis()) as usize + 1
 }
 
 #[tokio::test]
@@ -118,20 +128,20 @@ async fn a_flood_from_one_source_writes_its_burst_and_a_summary_not_a_line_per_d
         client.send_to(b"flood-payload", addr).await.unwrap();
         pace(i).await;
     }
-    let sending = started.elapsed();
     let (own, summaries) = settle(&log, SENT as u64).await;
+    let elapsed = started.elapsed();
 
-    // One token a second on top of the burst, for as long as the sending took.
-    let allowed = BURST + sending.as_secs() as usize + 1;
+    // One token a second on top of the burst, until the last datagram was counted.
+    let allowed = BURST + elapsed.as_secs() as usize + 1;
     assert!(
         (BURST..=allowed).contains(&own.len()),
-        "{} events of their own from {SENT} datagrams in {sending:?}; the budget allows {BURST} \
+        "{} events of their own from {SENT} datagrams in {elapsed:?}; the budget allows {BURST} \
          to {allowed}",
         own.len()
     );
     assert!(
-        (1..=windows(sending)).contains(&summaries.len()),
-        "{} summaries for one source network over {sending:?}",
+        (1..=windows(elapsed)).contains(&summaries.len()),
+        "{} summaries for one source network over {elapsed:?}",
         summaries.len()
     );
     for event in &own {
@@ -199,19 +209,21 @@ async fn a_flood_under_many_source_networks_stays_within_the_global_budget_and_s
             pace(sent).await;
         }
     }
-    let sending = started.elapsed();
     let (own, summaries) = settle(&log, sent as u64).await;
+    let elapsed = started.elapsed();
 
-    let allowed = GLOBAL_BURST + GLOBAL_RATE * (sending.as_secs() as usize + 1);
+    let allowed = GLOBAL_BURST + GLOBAL_RATE * (elapsed.as_secs() as usize + 1);
     assert!(
         (GLOBAL_BURST..=allowed).contains(&own.len()),
-        "{} events of their own from {sent} datagrams under {NETWORKS} networks in {sending:?}; \
+        "{} events of their own from {sent} datagrams under {NETWORKS} networks in {elapsed:?}; \
          the global budget allows {GLOBAL_BURST} to {allowed}",
         own.len()
     );
+    // The table and the overflow bound how many summaries are open at once, and each stays open
+    // a whole window, so that many is also the most that can start in one.
     assert!(
-        summaries.len() <= (TABLE + 1) * windows(sending),
-        "{} summaries over {sending:?}; the table holds {TABLE} networks and one overflow per \
+        summaries.len() <= (TABLE + 1) * windows(elapsed),
+        "{} summaries over {elapsed:?}; the table holds {TABLE} networks and one overflow per \
          window",
         summaries.len()
     );

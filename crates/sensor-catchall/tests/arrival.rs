@@ -13,9 +13,13 @@ use sensor_wire::SensorEvent;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 
+/// The lines the sensor has finished writing. The log is read while the sensor is still
+/// appending to it, and a read can land part-way through a line: whatever follows the last
+/// newline is not a line yet, and is left for the next read.
 fn events(log: &Path) -> Vec<SensorEvent> {
-    std::fs::read_to_string(log)
-        .unwrap_or_default()
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let written = text.rfind('\n').map_or("", |end| &text[..=end]);
+    written
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()

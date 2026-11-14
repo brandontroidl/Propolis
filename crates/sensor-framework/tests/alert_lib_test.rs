@@ -1783,9 +1783,10 @@ fn pa_trusted_exec_fails_on_a_group_writable_parent_and_names_it() {
 
     // Ownership. Under a test root that root's owner stands for root. For another user the
     // foreign directory is one outside the root that root owns; for root it is one handed to
-    // another account.
-    std::os::unix::fs::symlink("/usr/bin", fx.p("chain/sys")).unwrap();
-    let (rc, why) = check("chain/sys/env");
+    // another account. The file outside the root is /etc/passwd, a regular file on every host:
+    // /usr/bin/env is a link to a multi-call binary on some distributions.
+    std::os::unix::fs::symlink("/etc", fx.p("chain/sys")).unwrap();
+    let (rc, why) = check("chain/sys/passwd");
     if is_root() {
         assert_eq!((rc.as_str(), why.as_str()), ("0", ""));
         std::os::unix::fs::chown(fx.p("usr/local"), Some(65534), None).unwrap();
@@ -1798,7 +1799,7 @@ fn pa_trusted_exec_fails_on_a_group_writable_parent_and_names_it() {
     } else {
         assert_eq!(rc, "1");
         assert!(
-            why.starts_with("/usr: not owned by root (root:root "),
+            why.starts_with("/etc: not owned by root (root:root "),
             "{why}"
         );
     }
@@ -1825,7 +1826,9 @@ fn pa_trusted_exec_walks_to_the_real_root_when_no_test_root_is_given() {
         assert_eq!(r.code, 0, "the walk ends at /: {}", r.err);
         (r.get("rc"), r.get("why"))
     };
-    assert_eq!(check("/usr/bin/env"), ("0".to_string(), String::new()));
+    // A file root owns under directories root owns, and a regular file on every host (a program
+    // such as /usr/bin/env is a link on some distributions, and a link is refused).
+    assert_eq!(check("/etc/passwd"), ("0".to_string(), String::new()));
     // The walk goes down from /, so /tmp is the first directory that fails, for root and for any
     // other user alike.
     let (rc, why) = check("\"$D/tool\"");

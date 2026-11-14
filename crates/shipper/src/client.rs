@@ -5,7 +5,7 @@
 //! Ordering guarantee: because cursor persistence follows a confirmed ack, a crash mid-cycle
 //! re-reads and re-ships the unconfirmed batch on the next cycle; the gateway's idempotent
 //! `Duplicate` path absorbs a re-ship of an already-accepted seq. At-least-once end to end
-//! (with the one exception under "Residual, not closed" below), converging on the ledger dedup
+//! (with the one exception under "Residual the guard cannot close" below), converging on the ledger dedup
 //! window - matching the contract `log_tailer` and `gateway::verify::GatewaySink` already
 //! document on their own sides of this exact boundary.
 //!
@@ -20,19 +20,16 @@
 //! see `crates/shipper/src/state.rs`'s `load_or_fresh` doc and `deploy/collector.env.example`
 //! for the operator-facing side of this contract.
 //!
-//! Residual, not closed: after a lost ack nothing records which batch was in flight, so the
-//! next batch built under that seq is taken for it. The seq and hash chain belong to the
-//! collector, not to one log: when `send_batch` fails, this cycle rewinds its tailer and returns,
-//! and the next cycle (the same log read again from the same offset, now with more lines if the
-//! first batch was short, or, on a collector with several logs, the next tailer in
-//! `run_ship_loop`'s pass) builds seq S from whatever it reads. If the gateway did store the
-//! first batch it answers `Duplicate` by seq alone (`next_expected_seq == batch.seq + 1`), which
-//! is taken as this batch's echo, and that tailer's cursor is committed past lines the gateway
-//! never received: up to a whole batch of another log. The next batch then fails `HashMismatch`,
-//! because the stored `last_batch_hash` is the rebuilt batch's. Closing it means resending
-//! exactly what was sent: keep the in-flight batch's log, extent and hash on disk before the
-//! first send, and on the next pass rebuild that batch before any other tailer builds one, so a
-//! `Duplicate` is proof the gateway holds these records.
+//! One batch per seq: the gateway answers `Duplicate` by seq alone, so a batch REBUILT under a
+//! seq whose ack was lost (the same log with more lines, or another log, since the seq and hash
+//! chain belong to the collector) would be taken as confirmed while the gateway holds the first
+//! one, and its tailer's cursor would move past lines the gateway never stored. So before a
+//! batch is first sent, `crate::pending::PendingBatch` keeps it durably, frame and all, and until
+//! that batch is confirmed nothing else is built or sent under the chain: every pass, for every
+//! log, starts by resending the stored frame (a cycle for another log sends nothing), across
+//! reconnects and restarts. On confirmation the owning tailer moves past exactly the lines that
+//! batch consumed: read again from the saved position the batch was read from and checked
+//! against the stored batch hash and the position the first read ended at (see `ship_cycle`).
 //!
 //! Residual the guard cannot close: if an operator rebuilds a collector reusing an old CN
 //! WITHOUT resetting the gateway state, and the gateway's remembered `last_seq` happens to
@@ -59,6 +56,7 @@ use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use crate::batcher::Batcher;
+use crate::pending::{Loaded, PendingBatch, Standing};
 use crate::state::ConfirmedState;
 
 /// TCP connect plus TLS handshake. Generous for a WAN link with packet loss, short next to "never".
@@ -199,6 +197,12 @@ pub enum StopReason {
         our_seq: u64,
         gateway_next_expected: u64,
     },
+    /// The record of an earlier batch in flight was unreadable (set aside as
+    /// `<key>.pending.damaged`), and the gateway answered `Duplicate` for this seq: it holds a
+    /// batch under it, which may be the lost one rather than this one. Taking that as
+    /// confirmation could move a cursor past lines the gateway never stored, so nothing is
+    /// advanced and the lines stay in the log. An operator resets the chain on both sides.
+    UnprovenDuplicate { seq: u64 },
 }
 
 /// What one `ship_cycle` call accomplished.
@@ -237,6 +241,36 @@ pub struct CycleReport {
 /// unpersisted is not enough on its own: `run_ship_loop` reuses this tailer for the next pass,
 /// so an un-rewound read means the next pass starts past records the gateway never took, and
 /// the first batch it does get accepted persists a cursor beyond them.
+///
+/// The batch in flight (see the module doc and `crate::pending`): before its first send each
+/// batch is recorded durably, and a record that cannot be written stops the cycle with an error
+/// and nothing sent. A cycle that finds a record settles it before building anything: for
+/// another log's batch it returns at once with nothing sent; for this log's it resends the
+/// stored frame and, once the gateway confirms it, stores the confirmed state, then moves this
+/// tailer past exactly the lines the batch consumed by reading them again from the saved read
+/// position the batch was read from and checking that they make the stored batch and end where
+/// the first read ended. If the saved position has moved on (it was already persisted past the
+/// batch) the cursor is left alone; if the lines read there no longer make the batch or end
+/// elsewhere (the log was rotated away, truncated or replaced, or the batch came from a rotated
+/// file a restart no longer drains) the cursor is left where it was too, so lines are sent twice
+/// rather than skipped.
+/// Only then is the record dropped. A confirmed batch persists the cursor before committing the
+/// read, so a failed persist rewinds instead of leaving memory ahead of disk.
+///
+/// What each stop does with the record: every one keeps it. `Retry` exhaustion, a dead
+/// connection and `ChainDiverged` leave the gateway possibly holding the batch, and so does a
+/// `Reject`: the answer is not final, since a gateway that lost or could not read its state for
+/// this collector answers from a fresh chain and rejects a frame it holds in its spool. Once its
+/// state is put back, the same frame is confirmed; a batch rebuilt under the seq would instead be
+/// confirmed by the `Duplicate` for the one held, and its lines lost. The stop stays permanent
+/// until an operator acts, and the reset on both sides deletes the record (a record it leaves
+/// behind does not block the new chain, see below). A record that does not fit the confirmed
+/// state (left from before a chain reset or a rollback) is dropped with a warning and the cursor
+/// left where it is; a confirmed state file that exists and cannot be read fails the pass
+/// instead, record kept, since a fresh chain would make every record look like that. An
+/// unreadable record is set aside as `<key>.pending.damaged`; until a batch is `Accepted` after
+/// that, a `Duplicate` for the next seq stops the cycle with [`StopReason::UnprovenDuplicate`]
+/// instead of confirming anything.
 pub async fn ship_cycle(
     stream: &mut ShipperStream,
     tailer: &mut LogTailer,
@@ -246,10 +280,70 @@ pub async fn ship_cycle(
     max_records: usize,
     retry: RetryPolicy,
 ) -> io::Result<CycleReport> {
-    let mut confirmed = ConfirmedState::load_or_fresh(state_dir, key);
     let mut report = CycleReport::default();
 
+    let loaded = PendingBatch::load(state_dir, key)?;
+    let mut confirmed = confirmed_state_for(&loaded, state_dir, key)?;
+    if let Loaded::Unreadable(why) = &loaded {
+        tracing::error!(
+            key,
+            reason = %why,
+            "shipper: the record of the batch in flight cannot be read; setting it aside as \
+             <collector id>.pending.damaged in the state directory. The next batch is built from \
+             the saved read positions, and if the gateway already holds a batch under its \
+             sequence number the shipper stops instead of taking that as confirmation"
+        );
+        PendingBatch::set_aside_unreadable(state_dir, key)?;
+    }
+    let mut unproven = PendingBatch::unreadable_set_aside(state_dir, key);
+    if let Loaded::Found(pending) = loaded {
+        if !pending.is_for(label, tailer.log_path()) {
+            // Another log's batch is in flight. Nothing may go out under the chain until it is
+            // settled, and only that log's own cycle can move its cursor.
+            tracing::debug!(
+                key,
+                sensor = label,
+                in_flight_from = %pending.label,
+                seq = pending.seq,
+                "shipper: another log's batch is in flight; this log waits for it"
+            );
+            return Ok(report);
+        }
+        let ctx = Settle {
+            state_dir,
+            key,
+            retry,
+            unproven,
+        };
+        match settle(
+            stream,
+            Some((tailer, label)),
+            false,
+            &pending,
+            &mut confirmed,
+            ctx,
+        )
+        .await?
+        {
+            Settled::Confirmed => {
+                report.batches_shipped += 1;
+                unproven = false;
+            }
+            Settled::Stale => {}
+            Settled::Stopped(reason) => {
+                report.stopped = Some(reason);
+                return Ok(report);
+            }
+        }
+    }
+
     loop {
+        // The record names the saved position the batch is read from, so that position must be
+        // the one this read starts at. It already is unless an earlier persist failed.
+        let start = tailer.cursor_to_persist();
+        if tailer.saved_cursor()? != Some(start) {
+            tailer.persist_cursor()?;
+        }
         let next = Batcher::next_batch(
             tailer,
             label,
@@ -271,114 +365,371 @@ pub async fn ship_cycle(
             tailer.persist_cursor()?;
             continue;
         };
-        let frame = encode_frame(&batch);
-        let mut consecutive_retries: u32 = 0;
-
-        loop {
-            let ack = match ShipperClient::send_batch(stream, &frame).await {
-                Ok(ack) => ack,
-                Err(e) => {
-                    // The connection died mid-batch. `next_batch` has already advanced the
-                    // tailer over these records, and the caller keeps the same tailer for the
-                    // next pass, so without a rewind this batch is skipped on reconnect and the
-                    // first later accepted batch persists a cursor past it.
-                    tailer.rewind_batch();
-                    return Err(e);
-                }
-            };
-            match ack.status {
-                AckStatus::Accepted => {
-                    confirmed = ConfirmedState {
-                        last_seq: batch.seq,
-                        last_batch_hash: batch.batch_hash,
-                    };
-                    // Only now is the batch durably on the control plane: the reads can be
-                    // committed, then the confirmed-seq state persisted, then the tailer cursor
-                    // - in that order. Advancing the cursor before a confirmed ack would lose
-                    // unconfirmed lines on a crash.
-                    tailer.commit_batch();
-                    confirmed.store(state_dir, key)?;
-                    tailer.persist_cursor()?;
-                    report.batches_shipped += 1;
-                    break;
-                }
-                AckStatus::Duplicate if ack.next_expected_seq == batch.seq + 1 => {
-                    // The gateway's chain for this collector id has exactly this batch as its
-                    // last confirmed seq and nothing beyond it: a benign crash-retry echo (this
-                    // exact batch was accepted on a prior attempt whose ack this shipper never
-                    // saw). Safe to confirm and advance, same as Accepted.
-                    confirmed = ConfirmedState {
-                        last_seq: batch.seq,
-                        last_batch_hash: batch.batch_hash,
-                    };
-                    tailer.commit_batch();
-                    confirmed.store(state_dir, key)?;
-                    tailer.persist_cursor()?;
-                    report.batches_shipped += 1;
-                    break;
-                }
-                AckStatus::Duplicate => {
-                    // ack.next_expected_seq > batch.seq + 1 (a Duplicate can never report less):
-                    // the gateway is ahead of this collector's local chain by more than this
-                    // batch. Not a crash retry - state divergence. Advancing confirmed or the
-                    // tailer cursor here would silently drop every record from batch.seq onward,
-                    // since the gateway will keep echoing Duplicate for seqs it already has.
-                    tracing::error!(
-                        key,
-                        our_seq = batch.seq,
-                        gateway_next_expected = ack.next_expected_seq,
-                        "shipper: this collector's local chain has diverged from the gateway's \
-                         (likely a rebuilt collector reusing an identity, or a lost/restored \
-                         shipper state); stopping ship cycle WITHOUT advancing confirmed state \
-                         or the tailer cursor - an operator must resync by resetting the \
-                         gateway's per-collector state for this collector id, or by \
-                         re-provisioning this collector with a FRESH collector id (CN)"
-                    );
-                    tailer.rewind_batch();
-                    report.stopped = Some(StopReason::ChainDiverged {
-                        our_seq: batch.seq,
-                        gateway_next_expected: ack.next_expected_seq,
-                    });
-                    return Ok(report);
-                }
-                AckStatus::Retry => {
-                    consecutive_retries += 1;
-                    if consecutive_retries > retry.max_consecutive_retries {
-                        tracing::error!(
-                            key,
-                            seq = batch.seq,
-                            attempts = consecutive_retries,
-                            "gateway kept returning Retry past the consecutive-retry bound; \
-                             stopping ship cycle"
-                        );
-                        tailer.rewind_batch();
-                        report.stopped = Some(StopReason::RetriesExhausted);
-                        return Ok(report);
-                    }
-                    tracing::warn!(
-                        key,
-                        seq = batch.seq,
-                        attempt = consecutive_retries,
-                        reason = ?ack.reason,
-                        "gateway asked for retry; backing off and resending the same batch"
-                    );
-                    tokio::time::sleep(retry.backoff).await;
-                    // Loop again without rebuilding the batch: the SAME frame is resent.
-                }
-                AckStatus::Reject => {
-                    tracing::error!(
-                        key,
-                        seq = batch.seq,
-                        reason = ?ack.reason,
-                        "gateway rejected batch; stopping ship cycle without advancing state"
-                    );
-                    tailer.rewind_batch();
-                    report.stopped = Some(StopReason::Rejected { reason: ack.reason });
-                    return Ok(report);
-                }
+        let pending = PendingBatch {
+            label: label.to_string(),
+            log_path: tailer.log_path().to_path_buf(),
+            seq: batch.seq,
+            prev_batch_hash: batch.prev_batch_hash,
+            batch_hash: batch.batch_hash,
+            lines_read: next.lines_read,
+            cursor_before: Some(start),
+            cursor_after: Some(tailer.cursor_to_persist()),
+            frame: encode_frame(&batch),
+        };
+        if let Err(e) = pending.store(state_dir, key) {
+            // Without the record a lost ack would let another batch go out under this seq, so
+            // this one does not go out at all. Its lines stay in the log for the next pass.
+            tailer.rewind_batch();
+            tracing::error!(
+                key,
+                sensor = label,
+                seq = batch.seq,
+                error = %e,
+                "shipper: cannot record the batch about to be sent in the state directory; not \
+                 sending it. Its lines stay in the log and are tried again next pass; check that \
+                 the state directory's filesystem is writable and not full"
+            );
+            return Err(e);
+        }
+        let ctx = Settle {
+            state_dir,
+            key,
+            retry,
+            unproven,
+        };
+        match settle(
+            stream,
+            Some((tailer, label)),
+            true,
+            &pending,
+            &mut confirmed,
+            ctx,
+        )
+        .await?
+        {
+            Settled::Confirmed => {
+                report.batches_shipped += 1;
+                unproven = false;
+            }
+            Settled::Stale => {}
+            Settled::Stopped(reason) => {
+                report.stopped = Some(reason);
+                return Ok(report);
             }
         }
     }
 
     Ok(report)
+}
+
+/// Settles a batch in flight whose log is no longer one this shipper tails (its entry left
+/// `PROPOLIS_SHIPPER_SENSOR_LOGS`, or was renamed): resends the stored frame so the seq is
+/// settled by the batch the gateway may hold, then drops the record. There is no cursor to move;
+/// a log that comes back is read from its saved position, so its lines are sent again rather
+/// than skipped. `CycleReport::batches_shipped` is 1 when the batch was confirmed.
+pub async fn settle_orphaned(
+    stream: &mut ShipperStream,
+    state_dir: &Path,
+    key: &str,
+    retry: RetryPolicy,
+) -> io::Result<CycleReport> {
+    let mut report = CycleReport::default();
+    let loaded = PendingBatch::load(state_dir, key)?;
+    let mut confirmed = confirmed_state_for(&loaded, state_dir, key)?;
+    let Loaded::Found(pending) = loaded else {
+        return Ok(report);
+    };
+    let ctx = Settle {
+        state_dir,
+        key,
+        retry,
+        unproven: PendingBatch::unreadable_set_aside(state_dir, key),
+    };
+    match settle(stream, None, false, &pending, &mut confirmed, ctx).await? {
+        Settled::Confirmed => report.batches_shipped = 1,
+        Settled::Stale => {}
+        Settled::Stopped(reason) => report.stopped = Some(reason),
+    }
+    Ok(report)
+}
+
+/// The confirmed state a pass works against. With a batch in flight, a state file that exists
+/// and cannot be read is an error for this pass rather than a fresh chain: against a fresh chain
+/// the record would stand stale and be dropped, and the batch rebuilt under its seq would then be
+/// confirmed by the gateway's `Duplicate` for the first one. A missing or unparseable file still
+/// counts as fresh, as it always has (a record of seq 2 or later is then stale, and the batch
+/// built for seq 1 meets `ChainDiverged` if the gateway is ahead).
+fn confirmed_state_for(loaded: &Loaded, state_dir: &Path, key: &str) -> io::Result<ConfirmedState> {
+    Ok(match loaded {
+        Loaded::Found(_) => {
+            ConfirmedState::load(state_dir, key)?.unwrap_or_else(ConfirmedState::fresh)
+        }
+        Loaded::Nothing | Loaded::Unreadable(_) => ConfirmedState::load_or_fresh(state_dir, key),
+    })
+}
+
+/// What became of a recorded batch on one attempt.
+enum Settled {
+    /// The gateway holds it, the confirmed state says so and the record is gone.
+    Confirmed,
+    /// The record fitted no position of the chain and was dropped.
+    Stale,
+    Stopped(StopReason),
+}
+
+/// The parts of one settle attempt that do not change during it.
+#[derive(Clone, Copy)]
+struct Settle<'a> {
+    state_dir: &'a Path,
+    key: &'a str,
+    retry: RetryPolicy,
+    /// An unreadable record was set aside and nothing has been accepted since: a `Duplicate`
+    /// cannot prove the gateway holds this batch.
+    unproven: bool,
+}
+
+/// Takes the recorded batch `pending` to a confirmed state, or to a stop. `owner` is the log the
+/// batch was read from and its label, `None` when no tailer reads that log any more; `held` says
+/// the owner still holds the batch's read uncommitted (a batch built in this cycle), so it is
+/// committed or rewound rather than read again.
+async fn settle(
+    stream: &mut ShipperStream,
+    mut owner: Option<(&mut LogTailer, &str)>,
+    held: bool,
+    pending: &PendingBatch,
+    confirmed: &mut ConfirmedState,
+    ctx: Settle<'_>,
+) -> io::Result<Settled> {
+    let Settle { state_dir, key, .. } = ctx;
+    let rewind = |owner: &mut Option<(&mut LogTailer, &str)>| {
+        if held && let Some((tailer, _)) = owner {
+            tailer.rewind_batch();
+        }
+    };
+    match pending.standing(confirmed) {
+        Standing::Stale => {
+            tracing::warn!(
+                key,
+                seq = pending.seq,
+                confirmed_seq = confirmed.last_seq,
+                "shipper: dropping a record of a batch in flight that does not follow the \
+                 confirmed state (left from before a chain reset or a rollback); read positions \
+                 are left where they are, so its lines are sent again if they are still in the log"
+            );
+            PendingBatch::remove(state_dir, key)?;
+            return Ok(Settled::Stale);
+        }
+        Standing::Confirmed => {}
+        Standing::Unconfirmed => {
+            let outcome = match send_until_answered(stream, pending, ctx).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // The connection died mid-batch. A held read is rewound, or the caller's
+                    // next pass on this tailer would start past lines the gateway may not hold.
+                    // The record stays: the next pass resends this frame.
+                    rewind(&mut owner);
+                    return Err(e);
+                }
+            };
+            if let Some(reason) = outcome {
+                // Every stop keeps the record, a `Reject` included: a gateway that lost or could
+                // not read its state for this collector answers from a fresh chain and rejects a
+                // frame it holds in its spool. Once its state is put back, only this exact frame
+                // may go out under the seq; a batch rebuilt in its place would be confirmed by
+                // the `Duplicate` for this one. The reset on both sides deletes the record.
+                rewind(&mut owner);
+                return Ok(Settled::Stopped(reason));
+            }
+            let now = ConfirmedState {
+                last_seq: pending.seq,
+                last_batch_hash: pending.batch_hash,
+            };
+            // The confirmed state first: until it is stored, the record is what says this seq is
+            // taken, and a failure here leaves it to be resent and confirmed again.
+            if let Err(e) = now.store(state_dir, key) {
+                rewind(&mut owner);
+                return Err(e);
+            }
+            *confirmed = now;
+        }
+    }
+
+    if let Some((tailer, label)) = owner {
+        if held {
+            // Persist before committing, so a failed persist can still rewind and memory never
+            // runs ahead of the saved position the next record will name.
+            if let Err(e) = tailer.persist_cursor() {
+                tailer.rewind_batch();
+                return Err(e);
+            }
+            tailer.commit_batch();
+        } else {
+            move_past_settled(tailer, label, pending, key)?;
+        }
+    }
+    PendingBatch::remove(state_dir, key)?;
+    if ctx.unproven {
+        // A batch was confirmed under the seq after the unreadable record's, so the gateway's
+        // chain and this one agree again and the set-aside record is no longer needed.
+        PendingBatch::clear_unreadable(state_dir, key)?;
+        tracing::info!(
+            key,
+            seq = pending.seq,
+            "shipper: the chain is confirmed past the unreadable record; deleted \
+             <collector id>.pending.damaged"
+        );
+    }
+    Ok(Settled::Confirmed)
+}
+
+/// Moves `tailer` past the lines of a confirmed batch it no longer holds in memory: after a
+/// reconnect it was rewound to the batch's start, and after a restart it starts from the saved
+/// position. Either way, if that saved position is still the one the batch was read from, the
+/// same number of lines is read again and must make the same batch (same records, so the same
+/// hash) and end at the position the first read ended at before the cursor is moved; a log that
+/// has grown since does not matter, as only `lines_read` lines are read.
+///
+/// The end position is what tells a batch drained from a rename-rotated file apart from lines in
+/// the new file that repeat it: the saved position names the new file at its start before and
+/// after every drained batch but the first, and after a restart the drain is gone, so reading
+/// again takes the new file's lines and moves along it, where the drain left the position where
+/// it was. Without that check those new lines would be committed unsent.
+fn move_past_settled(
+    tailer: &mut LogTailer,
+    label: &str,
+    pending: &PendingBatch,
+    key: &str,
+) -> io::Result<()> {
+    if tailer.saved_cursor()? != pending.cursor_before {
+        // Saved past the batch after it was confirmed, before the record was dropped.
+        return Ok(());
+    }
+    let again = Batcher::next_batch(
+        tailer,
+        label,
+        pending.seq.saturating_sub(1),
+        pending.prev_batch_hash,
+        pending.lines_read,
+    );
+    // Only the file and offset: the tailer widens a short fingerprint as a small file grows,
+    // without moving the position, so the rest may differ for the same stretch of the same file.
+    let ended_where_it_did = match (tailer.cursor_to_persist(), pending.cursor_after) {
+        (now, Some(then)) => now.inode == then.inode && now.offset == then.offset,
+        (_, None) => false,
+    };
+    if again.batch.map(|b| b.batch_hash) != Some(pending.batch_hash) || !ended_where_it_did {
+        tailer.rewind_batch();
+        tracing::warn!(
+            key,
+            sensor = label,
+            seq = pending.seq,
+            "shipper: the gateway holds the batch that was in flight, but this log no longer has \
+             its lines where they were read (rotated away, truncated or replaced in between); the \
+             read position is left where it was, so any of those lines still in the log are sent \
+             again"
+        );
+        return Ok(());
+    }
+    if let Err(e) = tailer.persist_cursor() {
+        tailer.rewind_batch();
+        return Err(e);
+    }
+    tailer.commit_batch();
+    Ok(())
+}
+
+/// Sends the recorded frame until the gateway answers it for good: `None` when it is confirmed
+/// (`Accepted`, or the `Duplicate` echo of this exact seq), the stop otherwise. `Retry` resends
+/// the same bytes after `retry.backoff`, at most `retry.max_consecutive_retries` times.
+async fn send_until_answered(
+    stream: &mut ShipperStream,
+    pending: &PendingBatch,
+    ctx: Settle<'_>,
+) -> io::Result<Option<StopReason>> {
+    let Settle {
+        key,
+        retry,
+        unproven,
+        ..
+    } = ctx;
+    let seq = pending.seq;
+    let mut consecutive_retries: u32 = 0;
+    loop {
+        let ack = ShipperClient::send_batch(stream, &pending.frame).await?;
+        match ack.status {
+            AckStatus::Accepted => return Ok(None),
+            AckStatus::Duplicate if ack.next_expected_seq == seq + 1 && unproven => {
+                tracing::error!(
+                    key,
+                    seq,
+                    "shipper: the gateway already holds a batch under this sequence number, and \
+                     since the record of the batch in flight was unreadable it may not be this \
+                     one; stopping without moving any read position, so no line is skipped. \
+                     Reset the chain on both sides to continue"
+                );
+                return Ok(Some(StopReason::UnprovenDuplicate { seq }));
+            }
+            AckStatus::Duplicate if ack.next_expected_seq == seq + 1 => {
+                // The gateway's chain for this collector id ends with this seq, and the only
+                // frame ever sent under it is this one (the record guarantees that), so this is
+                // the echo of an earlier attempt whose ack was lost. Same as Accepted.
+                return Ok(None);
+            }
+            AckStatus::Duplicate => {
+                // ack.next_expected_seq > seq + 1 (a Duplicate can never report less): the
+                // gateway is ahead of this collector's local chain by more than this batch. Not
+                // a crash retry - state divergence. Advancing confirmed or the tailer cursor here
+                // would silently drop every record from seq onward, since the gateway will keep
+                // echoing Duplicate for seqs it already has.
+                tracing::error!(
+                    key,
+                    our_seq = seq,
+                    gateway_next_expected = ack.next_expected_seq,
+                    "shipper: this collector's local chain has diverged from the gateway's \
+                     (likely a rebuilt collector reusing an identity, or a lost/restored \
+                     shipper state); stopping ship cycle WITHOUT advancing confirmed state \
+                     or the tailer cursor - an operator must resync by resetting the \
+                     gateway's per-collector state for this collector id, or by \
+                     re-provisioning this collector with a FRESH collector id (CN)"
+                );
+                return Ok(Some(StopReason::ChainDiverged {
+                    our_seq: seq,
+                    gateway_next_expected: ack.next_expected_seq,
+                }));
+            }
+            AckStatus::Retry => {
+                consecutive_retries += 1;
+                if consecutive_retries > retry.max_consecutive_retries {
+                    tracing::error!(
+                        key,
+                        seq,
+                        attempts = consecutive_retries,
+                        "gateway kept returning Retry past the consecutive-retry bound; \
+                         stopping ship cycle"
+                    );
+                    return Ok(Some(StopReason::RetriesExhausted));
+                }
+                tracing::warn!(
+                    key,
+                    seq,
+                    attempt = consecutive_retries,
+                    reason = ?ack.reason,
+                    "gateway asked for retry; backing off and resending the same batch"
+                );
+                tokio::time::sleep(retry.backoff).await;
+            }
+            AckStatus::Reject => {
+                tracing::error!(
+                    key,
+                    seq,
+                    reason = ?ack.reason,
+                    "gateway rejected batch; stopping ship cycle without advancing state. The \
+                     record of the batch in flight is kept, since a gateway whose chain state \
+                     was lost or unreadable rejects a batch it may hold; the reset on both sides \
+                     clears it"
+                );
+                return Ok(Some(StopReason::Rejected { reason: ack.reason }));
+            }
+        }
+    }
 }

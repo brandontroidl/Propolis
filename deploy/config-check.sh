@@ -1588,16 +1588,55 @@ check_backup() {
 # default), a push target for it, the dead-man's switch that covers a dead host, and the
 # OnFailure= hook that covers a dead daemon.
 check_alerting() {
-    local file="$ENV_DIR/propolis.env" enabled url heartbeat worst=ok parts=()
+    local file="$ENV_DIR/propolis.env" enabled url topic heartbeat worst=ok parts=() on=0
+    local have missing private hook_url hook_topic hook_push=0 hidden="" indented=1 extra="" v dv hv
     if [ ! -r "$file" ]; then
         global alerting unknown "$file is not readable"
         return
     fi
     enabled="$(read_env_var_in PROPOLIS_OPS_ENABLED "$file")"
-    url="$(read_env_var_in PROPOLIS_OPS_NTFY_URL "$file")"
+    # The daemon gets the two values from systemd, which trims unquoted whitespace, and treats an
+    # empty value as unset; `TOPIC=   ` looks set and is not.
+    url="$(env_file_value PROPOLIS_OPS_NTFY_URL "$file")"
+    topic="$(env_file_value PROPOLIS_OPS_NTFY_TOPIC "$file")"
+    # The failure hook reads the file itself (deploy/alert.sh env_value), only from lines that
+    # start with the name, strips quotes without trimming, and pushes when both raw values are
+    # non-empty. It is judged on exactly that, untrimmed, or a quoted space would be taken for
+    # a missing value the hook in fact posts with.
+    hook_url="$(alert_hook_value PROPOLIS_OPS_NTFY_URL "$file")"
+    hook_topic="$(alert_hook_value PROPOLIS_OPS_NTFY_TOPIC "$file")"
+    if [ -n "$hook_url" ] && [ -n "$hook_topic" ]; then
+        hook_push=1
+    fi
+    for v in PROPOLIS_OPS_NTFY_URL PROPOLIS_OPS_NTFY_TOPIC; do
+        if [ "$v" = PROPOLIS_OPS_NTFY_URL ]; then
+            dv="$url" hv="$hook_url"
+        else
+            dv="$topic" hv="$hook_topic"
+        fi
+        if [ -n "$url" ] && [ -n "$topic" ] && [ "$hook_push" -eq 0 ] && [ -z "$hv" ]; then
+            # The daemon has a push target and the hook lacks this half of it. Indentation is
+            # named as the cause only when the file holds the name on an indented line and on
+            # no line the hook reads; any other cause gets the plain statement.
+            hidden="${hidden:+$hidden and }$v"
+            if grep -qE "^$v=" -- "$file" 2>/dev/null || ! grep -qE "^[[:space:]]+$v=" -- "$file" 2>/dev/null; then
+                indented=0
+            fi
+        elif [ "$hook_push" -eq 1 ] && [ -z "$dv" ]; then
+            # The hook posts with a value the daemon does not get (unquoted whitespace systemd
+            # trims away, or a later indented line that only systemd reads).
+            extra="${extra:+$extra and }$v"
+        fi
+    done
     heartbeat="$(read_env_var_in PROPOLIS_OPS_HEARTBEAT_URL "$file")"
+    # The clause deploy/propolis.env.example gives beside the two lines: an open topic leaks the
+    # alerts, which say when this host's pipeline is down.
+    private="on a server where the topic's read access is restricted to you (where it is not, anyone who knows the topic name can read the alerts)"
     case "$(printf '%s' "$enabled" | tr '[:upper:]' '[:lower:]')" in
-        true | 1 | yes | on) parts+=("monitor on") ;;
+        true | 1 | yes | on)
+            on=1
+            parts+=("monitor on")
+            ;;
         *)
             worst=warn
             parts+=("monitor off")
@@ -1605,13 +1644,61 @@ check_alerting() {
                 "set PROPOLIS_OPS_ENABLED=true in $file, then run: sudo systemctl restart propolis" manual
             ;;
     esac
-    if [ -n "$url" ]; then
+    # Both the daemon (parse_ops_alert) and the failure hook (deploy/alert.sh) push only with the
+    # URL and the topic both set. With one of the two, the daemon refuses to start once the monitor
+    # is on, and the hook, which needs no monitor, falls back to the journal.
+    have=""
+    missing=""
+    if [ -n "$url" ] && [ -z "$topic" ]; then
+        have=PROPOLIS_OPS_NTFY_URL
+        missing=PROPOLIS_OPS_NTFY_TOPIC
+    elif [ -z "$url" ] && [ -n "$topic" ]; then
+        have=PROPOLIS_OPS_NTFY_TOPIC
+        missing=PROPOLIS_OPS_NTFY_URL
+    fi
+    if [ "$hook_push" -eq 1 ] && [ -n "$url" ] && [ -n "$topic" ]; then
         parts+=("ntfy")
+    elif [ -n "$missing" ] && [ "$on" -eq 1 ]; then
+        worst=fail
+        parts+=("push target half set, daemon will not start")
+        finding fail "alerting" "ops-push-half" "PROPOLIS_OPS_ENABLED turns the monitor on and $have is set in $file, but $missing is empty: the daemon will not start with this file, because it refuses a push target with only one of the two set" \
+            "set $missing in $file, $private, or empty $have to alert to the journal only, then run: sudo systemctl restart propolis" manual
     else
         if [ "$worst" = ok ]; then worst=warn; fi
-        parts+=("journal only")
-        finding warn "alerting" "ops-no-push" "no PROPOLIS_OPS_NTFY_URL in $file: alerts are written to the journal, where nobody sees them unless they look" \
-            "set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC in $file, then run: sudo systemctl restart propolis" manual
+        if [ -n "$extra" ]; then
+            parts+=("ntfy for the failure hook only")
+        elif [ -n "$hidden" ] && [ "$on" -eq 1 ]; then
+            parts+=("ntfy for the daemon only, failure hook journal only")
+        else
+            parts+=("journal only")
+        fi
+        finding warn "alerting" "ops-no-push" "$(if [ -n "$hidden" ]; then
+            if [ "$indented" -eq 1 ]; then
+                printf 'the value of %s in %s is on an indented line, and the failure hook (deploy/alert.sh) reads only lines that start with the name' "$hidden" "$file"
+            else
+                printf 'the failure hook (deploy/alert.sh) does not see the value of %s in %s that the daemon gets from systemd (the hook reads the last line that starts with the name and removes up to one double and one single quote from each end of the value, without trimming it)' "$hidden" "$file"
+            fi
+            printf ': when a unit fails, its alert is written to the journal, where nobody sees it unless they look'
+            if [ "$on" -eq 1 ]; then printf ' (the daemon gets the value from systemd and pushes its own alerts)'; fi
+        elif [ -n "$extra" ]; then
+            printf 'the failure hook (deploy/alert.sh) reads a value for %s in %s and posts its alerts with it when a unit fails, but the daemon, which gets the file from systemd, sees none (systemd trims unquoted whitespace, and takes the last assignment even from a line that does not start with the name)' "$extra" "$file"
+            if [ -n "$missing" ]; then printf ': with the monitor turned on, the daemon would refuse to start with this file, because it gets only one of the two'; fi
+        elif [ -n "$missing" ]; then
+            printf '%s is set in %s, but %s is empty: the failure hook pushes only with both, so its alerts are written to the journal, where nobody sees them unless they look' "$have" "$file" "$missing"
+        else
+            printf 'no PROPOLIS_OPS_NTFY_URL in %s: alerts are written to the journal, where nobody sees them unless they look' "$file"
+        fi)" \
+            "$(if [ -n "$hidden" ] && [ "$indented" -eq 1 ]; then
+                printf 'remove the whitespace before %s= in %s (the failure hook reads the file each time it runs)' "${hidden// and /= and }" "$file"
+            elif [ -n "$hidden" ]; then
+                printf 'write %s in %s on one line that starts with the name, with the value right after the =, %s (the failure hook reads the file each time it runs)' "$hidden" "$file" "$private"
+            elif [ -n "$extra" ]; then
+                printf 'write %s in %s on one line that starts with the name, with the value right after the = (or nothing after it, for alerts to the journal only), %s, then run: sudo systemctl restart propolis' "$extra" "$file" "$private"
+            elif [ -n "$missing" ]; then
+                printf 'set %s in %s, %s, then run: sudo systemctl restart propolis' "$missing" "$file" "$private"
+            else
+                printf 'set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC in %s, %s, then run: sudo systemctl restart propolis' "$file" "$private"
+            fi)" manual
     fi
     if [ -n "$heartbeat" ]; then
         parts+=("heartbeat")
@@ -1658,12 +1745,25 @@ check_clock() {
 check_cursors() {
     [ "$INTAKE_STATE" = present ] || return 0
     local default_dir var override cdir configured hash lp i checked=0 missing=() worst=ok text
+    local reader why look ship=0
     if [ "$INTAKE_VAR" = PROPOLIS_SHIPPER_SENSOR_LOGS ]; then
+        ship=1
+        reader="the shipper (shipper.service)"
+        # A collector: the shipper reads the sensor logs (crates/shipper/src/config.rs). Opening a
+        # log saves nothing; a log's first cursor is saved when a ship cycle for it starts reading
+        # (crates/shipper/src/client.rs ship_cycle, before any batch is sent), and a cycle runs
+        # only after a connection to the gateway and returns at once while another log's batch is
+        # in flight. Whether the log can be read or a batch accepted does not decide it. It logs
+        # no line per log it opens, but every connect or cycle error carries the log's label as
+        # sensor=.
         var=PROPOLIS_SHIPPER_CURSOR_DIR
         default_dir=/var/lib/propolis/shipper/cursors
+        why="the shipper saves a log's first cursor when a ship cycle starts reading the log, before it sends anything, so this means no cycle has started for it yet: the shipper is not running, cannot reach the gateway, another log's batch is in flight and this log waits for it, the shipper cannot read or write its state directory or cannot write its cursor directory, or its ship loop has stopped; or it keeps its cursors elsewhere"
     else
+        reader=intake
         var=PROPOLIS_CURSOR_DIR
         default_dir=/var/lib/propolis/cursors
+        why="intake saves a cursor after its first batch, so this means intake has not read the log, or keeps its cursors elsewhere"
     fi
     configured="$(read_env_var_in "$var" "$INTAKE_FILE")"
     cdir="${PROPOLIS_CC_CURSOR_DIR:-${configured:-$default_dir}}"
@@ -1689,9 +1789,14 @@ check_cursors() {
             if [ ! -e "$cdir/$hash.json" ]; then
                 missing+=("${IN_LABEL[$i]}")
                 worst=warn
+                if [ "$ship" -eq 1 ]; then
+                    look="check that shipper.service is running and shipping this log; its errors name the log as sensor=${IN_LABEL[$i]}: journalctl -u shipper.service -n 30 --no-pager"
+                else
+                    look="check that intake is running and reading this log: journalctl -u propolis.service -n 30 --no-pager"
+                fi
                 finding warn "logrotate" "cursor-missing:$lp" \
-                    "no cursor file for $lp in $cdir: the rotation guard cannot see how far intake has read it and rotates it without the unread-input check (intake saves a cursor after its first batch, so this means intake has not read the log, or keeps its cursors elsewhere)" \
-                    "check that intake is running and reading this log: journalctl -u propolis.service -n 30 --no-pager" manual
+                    "no cursor file for $lp in $cdir: the rotation guard cannot see how far $reader has read it and rotates it without the unread-input check ($why)" \
+                    "$look" manual
             fi
         done
     fi
@@ -1809,7 +1914,7 @@ check_binaries() {
 }
 
 check_intake_list() {
-    local i j worst=ok text="" lp k
+    local i j worst=ok text="" lp k gsdir="" gsdir_r="" gs_configured=""
     case "$INTAKE_STATE" in
         unreadable)
             global intake-list unknown "propolis.env / shipper.env not readable"
@@ -1864,6 +1969,23 @@ check_intake_list() {
                 for ((k = 0; k < ROW_COUNT; k++)); do
                     if [ "${R_LOGPATH[$k]}" = "$lp" ]; then known=1; fi
                 done
+                # A collector's spool on a host that also runs the gateway: the gateway-spool row
+                # judges it, and no local sensor writes it, so it is neither an orphan nor a typo.
+                # Only where check_gateway_spool gives a row, that is where gateway.env names a
+                # spool or the directory exists; elsewhere nothing would report the entry at all.
+                # The trailing '/' is stripped as check_gateway_spool strips it, whose
+                # spool-unlisted finding then names the slash.
+                if [ "$known" -eq 0 ] && [ "$INTAKE_VAR" = PROPOLIS_SENSOR_LOGS ]; then
+                    if [ -z "$gsdir" ]; then
+                        [ ! -r "$ENV_DIR/gateway.env" ] || gs_configured="$(env_file_value PROPOLIS_GATEWAY_SPOOL_DIR "$ENV_DIR/gateway.env")"
+                        gsdir="${gs_configured:-$GATEWAY_SPOOL_DEFAULT}"
+                        gsdir_r="$(readlink -m -- "$gsdir" 2>/dev/null)" || gsdir_r="$gsdir"
+                    fi
+                    if { [ -n "$gs_configured" ] || [ -d "$gsdir" ]; } \
+                        && [ -n "$(spool_id_of "${lp%"${lp##*[!/]}"}" "$gsdir" "$gsdir_r")" ]; then
+                        known=1
+                    fi
+                fi
                 if [ "$known" -eq 0 ] && [ "$ROW_COUNT" -gt 0 ] && [ "${#UNREADABLE_ENV[@]}" -eq 0 ]; then
                     if [ ! -e "$lp" ] && [ ! -d "$(dirname -- "$lp")" ] && [ -x "$(dirname -- "$(dirname -- "$lp")")" ]; then
                         worst=fail
@@ -2005,6 +2127,20 @@ env_file_value() {
     printf '%s' "$v"
 }
 
+# alert_hook_value NAME FILE: NAME as the failure hook reads it (deploy/alert.sh env_value): the
+# last line that starts with NAME= (an indented one is not seen), with a leading and a trailing
+# quote removed and no whitespace trimmed. Kept identical to the hook so the check sees what it sees.
+alert_hook_value() {
+    local v
+    [ -r "$2" ] || return 0
+    v="$(sed -n "s/^$1=//p" -- "$2" 2>/dev/null | tail -n 1)" || v=""
+    v="${v%\"}"
+    v="${v#\"}"
+    v="${v%\'}"
+    v="${v#\'}"
+    printf '%s' "$v"
+}
+
 # spool_read_state FILE CURSOR_DIR: how far intake read FILE, from the cursor the daemon keeps for
 # it. The cursor is named by the SHA-256 of the file's resolved path, not by its label
 # (crates/log-tailer/src/cursor.rs DurableCursor::cursor_file_path), so it outlives the entry that
@@ -2090,7 +2226,7 @@ check_gateway_spool() {
 
     local i id lp label lab sid bound relabel worst=ok n=0 ignored=0 unreadable=0 mislabelled=0
     local d name file st mtime size detail why subsys badname=0 ownid entry rs read lead
-    local -a unlisted=() retired=()
+    local -a unlisted=() retired=() order=() waiting=()
     local -A listed=() trailing=()
     local restart newid cdir
     restart="sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")"
@@ -2118,6 +2254,7 @@ check_gateway_spool() {
                 esac
                 continue
             fi
+            [ -n "${listed["$id"]+x}" ] || order+=("$id")
             listed["$id"]=1
             label="${IN_LABEL[$i]}"
             bound="$(spool_bound "$label")"
@@ -2268,6 +2405,18 @@ check_gateway_spool() {
     fi
     if [ "$ignored" -gt 0 ]; then
         text="$text, $ignored entries that are not collector directories ignored"
+    fi
+    # A listed id with no directory yet is the documented way to add a collector ahead of its
+    # first batch, so it is no finding; but a misspelled id looks exactly the same and its real
+    # spool would then be reported unlisted, so the row names these ids for the operator to compare.
+    for id in "${order[@]}"; do
+        [ -e "$sdir/$id" ] || [ -L "$sdir/$id" ] || waiting+=("$(spool_name "$id")")
+    done
+    if [ "${#waiting[@]}" -gt 0 ]; then
+        shown=""
+        for ((k = 0; k < ${#waiting[@]} && k < 3; k++)); do shown="${shown:+$shown, }${waiting[$k]}"; done
+        if [ "${#waiting[@]}" -gt 3 ]; then shown="$shown and $((${#waiting[@]} - 3)) more"; fi
+        text="$text, listed but nothing delivered yet: $shown"
     fi
     global gateway-spool "$worst" "$text"
 }

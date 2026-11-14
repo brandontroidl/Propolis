@@ -68,7 +68,15 @@ Find out first, with the daemon still running:
   `propolis_intake_bytes_behind` series above. A series that falls between scrapes, or reads
   zero for a log that is not empty while `/ready` is ok, means intake is reading the log and
   saving its cursor elsewhere; no series, or an error for that sensor, means intake has not read
-  it. An empty log shows zero and has no cursor anywhere until intake reads its first batch.
+  it. An empty log shows zero and has no cursor anywhere until intake reads its first batch. On
+  a split-deployment collector the same finding names the shipper, `shipper.service` and the
+  shipper's cursor directory instead, since the shipper reads the logs there. It saves a log's
+  first cursor when a ship cycle starts reading the log, before it sends anything, so a missing
+  cursor means no cycle has started for that log: the shipper is not running, cannot reach the
+  gateway, is waiting for another log's batch in flight to be confirmed, cannot read or write its
+  state directory or cannot write its cursor directory, or has stopped its ship loop; or it keeps
+  its cursors somewhere else. Its errors in `journalctl -u shipper.service` name the log as
+  `sensor=<label>`.
 
 If the daemon is not running, nothing reports how far it read: leave the logs as they are, since
 intake resumes from its saved cursor when it starts. A split-deployment collector runs the

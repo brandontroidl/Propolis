@@ -53,10 +53,16 @@ impl ConfirmedState {
         Ok(serde_json::from_slice(&bytes).ok())
     }
 
-    /// `load` folded to `fresh()` on any missing/unreadable/corrupt state - the caller-facing
-    /// convenience `ship_cycle` uses at the top of every cycle. `fresh()` is only correct for a
-    /// genuinely NEW collector identity (this key has never shipped anything the gateway could
-    /// have confirmed). It is NOT generally safe to assume re-shipping from seq 1 is absorbed by
+    /// `load` folded to `fresh()` on any missing/unreadable/corrupt state. `ship_cycle` and
+    /// `settle_orphaned` use it only when no batch is in flight (no `<key>.pending` record, or
+    /// one that was unreadable and set aside): there a fresh chain stands for a new identity or
+    /// a lost state, handled as described below. With a record of a batch in flight they call
+    /// `load` instead and fail the pass on a read error: judged against a fresh chain the record
+    /// would look stale and be dropped, and a batch rebuilt under its seq would then be confirmed
+    /// by the gateway's `Duplicate` for the first one (`client.rs`, `confirmed_state_for`).
+    ///
+    /// `fresh()` is only correct for a genuinely NEW collector identity (this key has never
+    /// shipped anything the gateway could have confirmed). It is NOT generally safe to assume re-shipping from seq 1 is absorbed by
     /// the gateway's `Duplicate` path: the tailer's cursor does not rewind, so a fresh state
     /// shipping seq 1 again carries whatever NEW records the tailer is currently positioned at -
     /// if this collector id's gateway state is already ahead (a rebuilt/re-provisioned collector
@@ -108,7 +114,7 @@ fn safe_state_file_path(dir: &Path, key: &str) -> io::Result<PathBuf> {
     Ok(dir.join(format!("{key}.json")))
 }
 
-fn is_safe_path_component(id: &str) -> bool {
+pub(crate) fn is_safe_path_component(id: &str) -> bool {
     !id.is_empty()
         && id != "."
         && id != ".."

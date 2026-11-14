@@ -4,6 +4,16 @@
 
 ### Upgrade note
 
+- **The shipper keeps a record of the batch it is sending.** A new file,
+  `<collector id>.pending`, appears in the shipper's state directory while a batch waits for the
+  gateway's answer, and `<collector id>.pending.damaged` if such a record cannot be read. The
+  chain reset in [split deployment](docs/operations/split-deployment.md#rebuilding-a-collector)
+  now deletes both. A rejected batch keeps its record until that reset. The protection (Fixed,
+  below) starts with the first batch the new shipper sends: an earlier shipper stopped for the
+  upgrade with an answer outstanding left no record, so upgrade a collector while its gateway is
+  reachable and afterwards check the gateway journal for `batch reuses the last accepted seq`.
+  The wire format is unchanged, so shippers and gateways of either release work together.
+
 - **Collectors need this release's shipper before their capture counters can be trusted sensor
   by sensor.** A control plane now stores the `sensor_stats` lines its collectors send (Added,
   below). The rule that one sensor's log may report only that sensor is enforced where the logs
@@ -867,6 +877,30 @@
 
 ### Fixed
 
+- **A lost acknowledgement no longer costs a collector's lines** - when the gateway stored a
+  batch and the shipper never saw the answer (a reset connection, the 60 s batch timeout, a
+  restart in between), the shipper built the next batch under the same number from whatever its
+  logs held then: the same log with more lines, or another log. The gateway answers `Duplicate`
+  on the number alone, the shipper took that as confirmation, and up to a batch of lines never
+  reached the gateway. The shipper now writes each batch, as sent, to `<collector id>.pending`
+  before its first send, and until the answer is recorded every pass resends that exact batch
+  and no other log sends anything, across reconnects and restarts. Once confirmed, the log's
+  read position moves past exactly the lines that batch took. Where that position cannot be
+  placed (the log was rotated away, truncated or replaced meanwhile) the lines are sent twice,
+  never skipped. A record that cannot be written stops the send and keeps the lines in the log.
+  One more synced write per batch; no change to the wire or the gateway
+  (`crates/shipper/src/pending.rs#PendingBatch`, `crates/shipper/src/client.rs#ship_cycle`).
+- **`config-check` tells the truth about a half-set alert target, a collector's cursors and a
+  listed collector spool** - the alerting row read only `PROPOLIS_OPS_NTFY_URL`, so a URL with no
+  topic showed as a working ntfy target although the daemon refuses to start with it and the
+  failure hook falls back to the journal. It now reads both values as the daemon and as the hook
+  read them: monitor on with one of the two set is a failure (`ops-push-half`), and a target the
+  hook cannot use is reported as journal only (`ops-no-push`). On a collector, a missing cursor
+  now names the shipper, `shipper.service` and its cursor directory, with the reasons that apply
+  there. On a host that runs sensors and a gateway, a collector spool listed in
+  `PROPOLIS_SENSOR_LOGS` is no longer reported as an entry that matches no sensor, and the
+  `gateway-spool` row names collectors that are listed but have delivered nothing yet
+  (`deploy/config-check.sh#check_alerting`, `deploy/config-check.sh#check_cursors`).
 - **A clock stepped back, a slow ntfy server or a missing `curl` no longer silences the failure
   hook** - three ways `deploy/alert.sh` went quiet. A cooldown stamp dated after now, as after
   a clock step, made the stamp's age negative, which read as recent, so the unit's alerts were

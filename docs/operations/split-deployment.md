@@ -220,7 +220,14 @@ still holding the previous run's files can no longer connect.
    rebuilt: the gateway accepts and acknowledges a collector's batches whether or not intake reads
    its spool, so without the entry its evidence piles up unread and nothing else reports it.
    `sudo ./deploy/config-check.sh` reports a collector spool that no entry lists
-   (`spool-unlisted`) and an entry whose name is not the collector id. Intake reads a newly listed
+   (`spool-unlisted`) and an entry whose name is not the collector id. On a control plane that
+   also runs sensors, an entry that points into the gateway spool directory is judged by that
+   `gateway-spool` row alone: it is not reported as an entry that matches no configured sensor
+   (`intake-orphan`), which any other entry no local sensor writes still is. An entry whose
+   collector directory does not exist yet raises no finding and leaves the row's state as it is;
+   the row names its id after `listed but nothing delivered yet:` (the first three, then how many
+   more), since a collector listed ahead of its first batch and a misspelled id look the same
+   there. Compare those ids with the collectors' certificate names. Intake reads a newly listed
    spool from its start, so an entry added late still ingests what the file holds. The old id's
    spool, once intake has read it to its end, is moved out of the spool directory, as
    [Rebuilding a collector](#rebuilding-a-collector) describes.
@@ -349,7 +356,9 @@ kernel's TCP connect timeout, because the shipper sets none.
      goes up ([health and observability](health-and-observability.md)).
 4. The two ends agree on the chain: `sudo cat /var/lib/propolis/gateway/collector-01.json` on the
    control plane and `sudo cat /var/lib/propolis/shipper/state/collector-01.json` on the collector
-   show the same `last_seq`.
+   show the same `last_seq`. While a batch is in flight, `collector-01.pending` sits beside the
+   shipper's file and the gateway's `last_seq` may already be one higher; the file is deleted once
+   the shipper has recorded the gateway's answer.
 5. The shipper has sent everything from a log when the `offset` in that log's cursor file equals
    the log's size. The cursor file is named after the SHA-256 of the log's path
    (`crates/log-tailer/src/cursor.rs#DurableCursor::cursor_file_path`):
@@ -577,13 +586,19 @@ two ways out:
   A collector retired for good is handled the same way.
 - Or reset the chain on both sides, so both restart at 1 together:
   1. stop `shipper.service` on the collector, then `gateway.service` on the control plane;
-  2. delete `/var/lib/propolis/gateway/<collector id>.json` on the control plane and
-     `/var/lib/propolis/shipper/state/<collector id>.json` on the collector;
+  2. delete `/var/lib/propolis/gateway/<collector id>.json` on the control plane and, on the
+     collector, `/var/lib/propolis/shipper/state/<collector id>.json` together with
+     `<collector id>.pending` and `<collector id>.pending.damaged` beside it if they are there;
   3. start `gateway.service`, then `shipper.service`.
 
   The gateway holds chain state in memory, so deleting its file while it runs changes nothing. The
   shipper's read positions are separate files and stay as they were, so nothing already sent is
-  sent again, and new lines go on appending to the same spool file.
+  sent again, apart from a batch that was in flight (`<collector id>.pending`), whose lines are
+  sent again because its log's read position had not moved past them. New lines go on appending
+  to the same spool file. A `<collector id>.pending` left behind does not block the new chain: a
+  batch that was in flight as the old chain's first batch is simply sent as the new chain's first,
+  and any other is dropped with `shipper: dropping a record of a batch in flight that does not
+  follow the confirmed state`.
 
 Resetting only one side always ends in a stop: a gateway with no state rejects the shipper's next
 batch as a sequence gap, and a shipper with no state diverges as above. One case stops a batch
@@ -655,8 +670,8 @@ With `RUST_LOG=info`. Each message is quoted from its start, as the binaries pri
 | Gateway logs `tls handshake failed; dropping connection` with `BadSignature`; once it has events the shipper logs `shipper: ship cycle IO error; will retry next pass` with `DecryptError` on every pass | the collector's certificate and key come from a different `provision-certs` run than the gateway's `ca.crt`, while the collector's own `ca.crt` matches the gateway (it got the new `ca.crt` but kept its old certificate and key) | Install one run's files on both hosts and restart both units |
 | `shipper: ship cycle IO error; will retry next pass` about every two minutes, only while a backlog drains | the gateway closes every connection after `PROPOLIS_GATEWAY_MAX_DURATION_SECS` (120 s) | Expected; nothing is lost |
 | `shipper: this collector's chain has diverged from the gateway's` | a rebuilt collector, or lost shipper state | [Rebuild or reset](#rebuilding-a-collector) |
-| Gateway logs `gateway: batch reuses the last accepted seq with different content; acknowledged as Duplicate without storing it` (ERROR) | the shipper never saw the gateway's answer for a batch the gateway stored (a reset connection, the 60 s batch timeout, a restart), then built a different batch under the same number: more lines from the same log, the next log in the pass, or a lost or restored shipper state file. Nothing from this batch of `records` lines was stored, and the shipper has moved past all of them. When it read the same log again, the batch begins with the lines of the earlier batch under that seq, which are stored, so only the lines after those are missing; from another log, or after a lost or restored state file, all of them are. The gateway cannot tell which. `suppressed_batches` and `suppressed_records` count the further such batches since the previous line, which is logged at most once a minute per `collector_id` | On that collector, read the shipper journal just before the line for a connection error, timeout or restart, and check whether its state under `/var/lib/propolis/shipper` was deleted or restored. The shipper's next batch is rejected with `reason=HashMismatch`: reset the chain on both sides, see [Known limitations](#known-limitations). The shipper keeps its read positions, so it then sends the lines after the missing ones but never the missing ones. Once it has caught up, copy `/var/spool/propolis/gateway/<collector id>/events.jsonl` to the collector and list each sensor log's lines the spool does not hold, for example `grep -Fxv -f events.jsonl /var/log/propolis/ssh/events.jsonl`, and the same for its `.1`. Those are the missing lines, apart from any the shipper dropped with a warning (`shipper: dropping a line the origin policy refuses for this log`) and any older than a spool file emptied to reclaim space. They stay in the sensor log until it rotates past them |
-| `shipper: gateway rejected a batch` with `reason=SeqGap` or `reason=HashMismatch` | the gateway's state was lost or restored from an older backup, or the shipper's state was lost when the gateway had accepted exactly one batch | Reset the chain on both sides |
+| Gateway logs `gateway: batch reuses the last accepted seq with different content; acknowledged as Duplicate without storing it` (ERROR) | the shipper sent a different batch under a number the gateway had already stored a batch under. A shipper from this release resends a batch whose answer it never saw byte for byte (see [Known limitations](#known-limitations)), so from it this means one of three things. Its chain state was lost, restored or reset without the gateway's: `<collector id>.json` under `/var/lib/propolis/shipper/state` deleted or replaced while the gateway kept its own. Or the record of the batch in flight was unreadable; then the shipper stops with `shipper: the gateway already holds a batch under this sequence number` instead of moving past anything, and a chain reset on both sides is all it needs. Or it is the first start of this release after an upgrade from an earlier one that stopped with an answer outstanding: the earlier release left no record, so the new one built that number again from the read positions. A shipper from an earlier release also does it after a lost answer (a reset connection, the 60 s batch timeout, a restart), by building the next batch under the same number: more lines from the same log, or the next log in the pass. Nothing from this batch of `records` lines was stored, and the shipper has moved past all of them. When it read the same log again, the batch begins with the lines of the earlier batch under that seq, which are stored, so only the lines after those are missing; from another log, or after a lost or restored state file, all of them are. The gateway cannot tell which. `suppressed_batches` and `suppressed_records` count the further such batches since the previous line, which is logged at most once a minute per `collector_id` | On that collector, read the shipper journal first. If it shows `shipper: the gateway already holds a batch under this sequence number`, the shipper stopped before moving any read position and nothing is missing: reset the chain on both sides ([Rebuilding a collector](#rebuilding-a-collector)) and it sends those lines again. Otherwise, check the shipper's version, whether its state under `/var/lib/propolis/shipper` was deleted or restored, and whether the line came at the first start after an upgrade from an earlier release (the shipper journal shows the start just before it); for an earlier release still running, also look just before the line for a connection error, timeout or restart, and upgrade it. In these cases (lost or restored shipper state, the first start after an upgrade, or an earlier release) the shipper's next batch is rejected with `reason=HashMismatch`: reset the chain on both sides, see [Known limitations](#known-limitations). The shipper keeps its read positions, so it then sends the lines after the missing ones but never the missing ones. Once it has caught up, copy `/var/spool/propolis/gateway/<collector id>/events.jsonl` to the collector and list each sensor log's lines the spool does not hold, for example `grep -Fxv -f events.jsonl /var/log/propolis/ssh/events.jsonl`, and the same for its `.1`. Those are the missing lines, apart from any the shipper dropped with a warning (`shipper: dropping a line the origin policy refuses for this log`) and any older than a spool file emptied to reclaim space. They stay in the sensor log until it rotates past them |
+| `shipper: gateway rejected a batch` with `reason=SeqGap` or `reason=HashMismatch` | the gateway's state was lost, could not be read (a gateway that cannot read `/var/lib/propolis/gateway/<collector id>.json` answers as if it had never seen the collector, and logs nothing for it) or was restored from an older backup; or the shipper's state was lost when the gateway had accepted exactly one batch; or, with `HashMismatch`, the batch after one the gateway logged as `batch reuses the last accepted seq` | The shipper keeps the record of the batch it was sending (`<collector id>.pending`), since the gateway may hold that batch, and stops for good. If the gateway's file is there but could not be read (its owner or mode, a failing disk), fix that and restart `gateway.service`: the shipper, restarted by systemd, sends that same batch again and it is confirmed, with nothing lost. Otherwise reset the chain on both sides ([Rebuilding a collector](#rebuilding-a-collector)), which deletes the record; after a `batch reuses the last accepted seq` line, also follow that row |
 | `shipper: gateway rejected a batch` with `reason=Oversize` | a blank line in a sensor log: the gateway refuses an empty record | Not cleared by a reset or restart; see [Known limitations](#known-limitations) |
 | Spool file grows, nothing is ingested | the running `propolis` does not have the `propolis-gateway` group, or `PROPOLIS_SENSOR_LOGS` names another path | Step 5.3's checks; steps 3.4 to 3.6 |
 | One sensor's events never arrive | the shipper cannot read that log, or its path in `PROPOLIS_SHIPPER_SENSOR_LOGS` is not the file the sensor writes | Step 4.1; the paths in step 4.3 |
@@ -667,8 +682,10 @@ With `RUST_LOG=info`. Each message is quoted from its start, as the binaries pri
 Each of these is a defect or an unbuilt part of the split, not a setup mistake.
 
 - A blank line in a sensor log stops the shipper for good. The gateway refuses the batch holding
-  it as oversize, the shipper stops, and after any restart it reads the same batch again, so the
-  lines before and after it are not shipped either (`crates/collector-wire/src/frame.rs#decode_frame`,
+  it as oversize and the shipper stops. The refused batch is kept in `<collector id>.pending` and
+  sent again as stored after every restart, and a batch built again from the log after a reset
+  would hold the blank line too, so neither a restart nor a reset clears the stop, and the lines
+  before and after it are not shipped either (`crates/collector-wire/src/frame.rs#decode_frame`,
   `crates/shipper/src/batcher.rs#Batcher::next_batch`). The sensors do not write blank lines
   themselves; one appears only if something else writes to the log.
 - `PROPOLIS_GATEWAY_READ_TIMEOUT_MS` and `PROPOLIS_GATEWAY_IDLE_TIMEOUT_MS` are validated but not
@@ -677,31 +694,85 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
 - The shipper bounds the dial (TCP connect plus handshake, 20 s) and each batch (write plus ack,
   60 s). A gateway that accepts a connection but never completes the handshake or never answers a
   batch costs one such wait and then a logged error (`shipper: failed to connect to gateway` or
-  `shipper: ship cycle IO error`); the batch is re-read and resent on the next pass
+  `shipper: ship cycle IO error`); the same batch is resent on the next pass
   (`crates/shipper/src/client.rs#ShipperClient::connect`, `crates/shipper/src/client.rs#ShipperClient::send_batch`).
-- If the shipper cannot write its state after the gateway accepted a batch (a full or read-only
-  disk), every batch it builds while the write keeps failing is taken as a resend and dropped, and
-  the first batch after the write succeeds again is rejected, which stops it
-  (`crates/shipper/src/client.rs#ship_cycle`).
+- If the shipper cannot write to its state directory (a full or read-only disk), it ships nothing
+  until it can: a batch is not sent before its record is written, which logs `shipper: cannot
+  record the batch about to be sent in the state directory` on every pass, and a batch the
+  gateway confirmed is sent again on each pass until the shipper has recorded that, which logs
+  `shipper: ship cycle IO error`. The same holds while a batch is in flight and
+  `<collector id>.json` exists but cannot be read: the pass stops with `shipper: ship cycle IO
+  error` and the record is kept. The cursor directory (`PROPOLIS_SHIPPER_CURSOR_DIR`,
+  `/var/lib/propolis/shipper/cursors` by default, a separate path) is needed the same way: a
+  confirmed batch keeps its record until its log's read position is saved past it, so if that
+  save fails, every pass logs `shipper: ship cycle IO error` and every log on the collector stops
+  shipping, not only the one whose cursor cannot be written. In every case the lines stay in the
+  sensor logs, so nothing is lost unless the logs rotate past lines it has not sent; once the disk
+  is fixed, shipping resumes on the next pass with no restart (`crates/shipper/src/client.rs#ship_cycle`).
 - Delivery is at least once, and a line delivered twice becomes a second event row; the dedup
   window only keeps it from adding score (`crates/core-scoring/src/scoring/constants.rs#DEDUP_WINDOW_SECONDS`).
-- One case is not at least once: a lost acknowledgement can cost lines. If the gateway stored a
-  batch and the shipper never saw the answer (a reset connection, the 60 s batch timeout, a
-  restart in between), nothing records which batch was in flight. The sequence number is shared
-  by every log on the collector, so whatever batch the shipper builds next takes that number:
-  the same log read again, now with more lines if the first batch was not full, or, on a
-  collector with more than one sensor, the next log in the pass. The gateway answers `Duplicate`
-  on the sequence number alone, the shipper takes that as confirmation of the batch it just
-  built, and that log's cursor moves past lines the gateway never received: up to a whole batch
-  (15 lines) of another log. They are not shipped. The gateway cannot take them, since its answer
-  must stay the same, but when the new batch's content differs from the one it stored it logs an
-  ERROR for it and counts it (`crates/gateway/src/verify.rs#GatewaySink::reused_seq_counts`; see
-  [Troubleshooting](#troubleshooting)). It keeps only the last accepted batch's hash, so a reused
-  older number cannot be told from a resend and stays silent. The batch
-  after that is rejected with `reason=HashMismatch`, because the two sides no longer agree on
-  the last batch, and the shipper stops until the collector is resynced
-  (`crates/shipper/src/client.rs#ship_cycle`, `crates/shipper/src/main.rs#run_ship_loop`,
-  `crates/gateway/src/verify.rs#GatewaySink`).
+- A lost acknowledgement (a reset connection, the 60 s batch timeout, a restart between the send
+  and the answer) does not cost lines. The gateway answers `Duplicate` on the sequence number
+  alone, and the number is shared by every log on the collector, so the shipper never sends two
+  different batches under one number: before a batch is first sent it writes it, as sent, with
+  the log it was read from, how many lines it took and the read positions it was read from and
+  ended at, to
+  `<collector id>.pending` in its state directory (`crates/shipper/src/pending.rs#PendingBatch`).
+  Until the gateway's answer is recorded, every pass resends that batch first and no other log
+  sends anything, across reconnects and restarts. Once it is confirmed, that log's read position
+  moves past exactly the lines the batch took, even though the log has grown since, and the file
+  is deleted (`crates/shipper/src/client.rs#ship_cycle`, `crates/shipper/src/main.rs#run_ship_loop`).
+  It costs one more synced write per batch, and the file holds one batch (a few KiB for ordinary
+  lines, under 16 MiB at most). What can still happen:
+  - A batch's lines are sent twice, never skipped, if its log's read position cannot be placed
+    after them. When the log was rotated away, truncated or replaced while the batch was in
+    flight, or the batch was read from a renamed log that a restarted shipper no longer reads,
+    the shipper logs `shipper: the gateway holds the batch that was in flight, but this
+    log no longer has its lines where they were read` and leaves the read position where it was.
+    When power is lost just after a batch was confirmed, the saved read position can be undone
+    while the record's deletion is not, and the batch is then read again as a new one.
+  - An unreadable record (damaged, or written by a newer release before a rollback) is moved to
+    `<collector id>.pending.damaged` with an ERROR, and shipping goes on. Until a batch is
+    accepted, a `Duplicate` answer for the next number cannot show which batch the gateway holds,
+    so the shipper stops with `shipper: the gateway already holds a batch under this sequence
+    number` and exits non-zero rather than move past lines the gateway may not have. Reset the
+    chain on both sides ([Rebuilding a collector](#rebuilding-a-collector)). An accepted batch
+    deletes the `.damaged` file instead.
+  - A record for a log no longer in `PROPOLIS_SHIPPER_SENSOR_LOGS` (removed or renamed) is resent
+    to settle its number, with `shipper: the batch in flight was read from a log that is no longer
+    configured`; that log's read position is not moved, so its lines are sent again if it comes
+    back. A record that does not follow the shipper's chain state (left behind by a reset that did
+    not delete it, or by a rollback to an earlier release and back) is dropped with `shipper:
+    dropping a record of a batch in flight that does not follow the confirmed state`, and records
+    of another collector id are reported at start and never read.
+  - A rejected batch keeps its record, and the shipper stops for good with `shipper: gateway
+    rejected a batch`. A gateway that lost or could not read its state for the collector rejects
+    a batch it may hold, and a batch rebuilt under that number once its state is back would be
+    confirmed in its place. Fixing the gateway's state file and restarting `gateway.service` lets
+    the same batch be confirmed; otherwise the reset on both sides deletes the record
+    ([Rebuilding a collector](#rebuilding-a-collector)).
+  - A lost or restored `<collector id>.json` is not covered: see the case of `last_seq` 1 under
+    [Rebuilding a collector](#rebuilding-a-collector). The gateway logs an ERROR whenever a batch
+    under its last accepted number differs from the one it stored, and counts it
+    (`crates/gateway/src/verify.rs#GatewaySink::reused_seq_counts`; see
+    [Troubleshooting](#troubleshooting)). It keeps only the last accepted batch's hash, so a reused
+    older number cannot be told from a resend and stays silent.
+
+  A shipper from an earlier release does none of this: after a lost acknowledgement it builds the
+  next batch under the same number from whatever its logs hold, the gateway's `Duplicate` is taken
+  as confirmation, up to a whole batch (15 lines) never reaches the gateway, and the batch after
+  that is rejected with `reason=HashMismatch`. The wire format is unchanged, so a shipper and a
+  gateway from either release work together. The protection starts with the first batch the new
+  release sends: an earlier shipper stopped for the upgrade with an answer outstanding left no
+  record, so the new one builds that number again from the read positions and can lose lines once,
+  as before. Upgrade a collector while its gateway is reachable, and afterwards check the gateway
+  journal for `batch reuses the last accepted seq`. From this release on, that line has three
+  causes, the same ones [Troubleshooting](#troubleshooting) lists with what to do for each: a
+  shipper chain state lost, restored or reset without the gateway's (lines are missing: reset both
+  sides, then recover them with `grep`); an unreadable record of the batch in flight (the shipper
+  stops with `shipper: the gateway already holds a batch under this sequence number` and nothing
+  is missing: reset both sides); and this first start after an upgrade with an answer outstanding
+  (lines are missing: reset both sides, then recover them with `grep`).
 - A line the control plane's database refuses is quarantined on the control plane, in
   `/var/lib/propolis/quarantine` (`PROPOLIS_QUARANTINE_DIR`), under the collector's label: the
   collector's own log is not touched, and the gateway has already acknowledged the line

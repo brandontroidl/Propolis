@@ -146,7 +146,7 @@ established event of each signal type.
 The submission runner's label lookup (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`) reads
 the newest established event of each category, from the partial index
 `event_source_category_tcp_idx (source_ip, category, observed_at DESC) WHERE protocol = 'tcp'`
-(`crates/core-scoring/migrations/0027_established_sightings.sql#event_source_category_tcp_idx`).
+(`crates/core-scoring/migrations/0028_event_source_category_tcp_index.sql#event_source_category_tcp_idx`).
 Read from `event_source_category_observed_idx`, the index of every event, the same probe steps
 over every datagram at or after the address before it reaches a TCP row: 138 ms against 0.08 ms
 for an address with 200,000 datagrams behind it, a cost anyone could raise by sending
@@ -720,7 +720,8 @@ the watch stream and compare timestamps.
 | `0024` | index `attack_tag_source_idx (source_ip)`, which serves the address page's technique read |
 | `0025` | the [event roll-up](#event-rollups): function `event_hour`, tables `event_hour_listener` and `event_rollup_cursor`, backfilled from the ledger under a `SHARE` lock on `event` |
 | `0026` | index `event_signal_observed_idx (signal_type, observed_at)`, which serves the search page's signal-type menu and filter without reading the ledger; built inside the migration transaction like `0013` |
-| `0027` | `ip_score.established_last_seen`, `aggressive_earned_at` and `standard_earned_at` (nullable `TIMESTAMPTZ`); backfills `established_last_seen` from the ledger's TCP rows, clears `eligible` and `recommended_*` on rows with fewer than two established events, seeds the earned times for rows the feed lists today; partial indexes `event_dedup_tcp_idx (source_ip, signal_type, observed_at) WHERE protocol = 'tcp'` for the dedup read and the feed's signal list, and `event_source_category_tcp_idx (source_ip, category, observed_at DESC) WHERE protocol = 'tcp'` for the vendor report's label lookup, both built inside the migration transaction like `0013` |
+| `0027` | `ip_score.established_last_seen`, `aggressive_earned_at` and `standard_earned_at` (nullable `TIMESTAMPTZ`); backfills `established_last_seen` from the ledger's TCP rows, clears `eligible` and `recommended_*` on rows with fewer than two established events, seeds the earned times for rows the feed lists today; partial index `event_dedup_tcp_idx (source_ip, signal_type, observed_at) WHERE protocol = 'tcp'` for the dedup read and the feed's signal list, built inside the migration transaction like `0013` |
+| `0028` | partial index `event_source_category_tcp_idx (source_ip, category, observed_at DESC) WHERE protocol = 'tcp'` for the vendor report's label lookup, built inside the migration transaction like `0013` |
 
 **review** (`crates/review/migrations/`):
 

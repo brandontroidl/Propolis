@@ -129,8 +129,8 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 5102 test functions** (3000 unit + 2102 integration).
-- **DB-backed (`sqlx::test`): 568** - console 268, review 151, core-scoring 53, intake 38, propolis 26, feed 23, fleet 9. These provision a fresh database per test.
+- **Total: 5103 test functions** (3001 unit + 2102 integration).
+- **DB-backed (`sqlx::test`): 569** - console 268, review 152, core-scoring 53, intake 38, propolis 26, feed 23, fleet 9. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
   default suite stays offline-deterministic; run it manually with
@@ -173,7 +173,7 @@ Per-crate breakdown:
 | log-tailer | 7 | 88 | copytruncate_drain_test, cursor_test, cursorless_test, tailer_test |
 | propolis | 194 | 61 | capture_to_console, coverage, db_roles, docs_agreement, logging, migrate_cli, production_features, restore_rehearsal, retention_deploy, shadow_diff, shell_explain, smoke_test, ssh_capture_to_console, summary_intake, volume_listing |
 | provision-certs | 0 | 16 | provision |
-| review | 232 | 158 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test, volume_test |
+| review | 233 | 158 | allowlist_test, attack_test, campaign_replica_test, campaign_test, cli_test, fetcher_proxy_test, fetcher_schema_test, fetcher_trust_store_test, gatekeeper_test, queue_test, submit_test, vendor_test, virustotal_upload_filter_test, volume_test |
 | sensor-adb | 54 | 48 | arrival, env_strict, integration, session_memory_limit, shell_cost, shutdown_tracking |
 | sensor-catchall | 18 | 13 | arrival, env_strict, integration, udp_budget |
 | sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
@@ -190,7 +190,7 @@ Per-crate breakdown:
 | sensor-wire | 33 | 0 | - |
 | shipper | 4 | 34 | acceptance, audit_regressions, batcher, config, end_to_end, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **3000** | **2102** | |
+| **Total** | **3001** | **2102** | |
 
 ### Test styles by layer
 
@@ -200,7 +200,7 @@ Per-crate breakdown:
 - **DB crates** use `sqlx::test`. Migrations are applied one of two ways:
   `#[sqlx::test(migrations = "./migrations")]` auto-applies that crate's own set
   (51 uses); `#[sqlx::test(migrations = false)]` provisions an empty DB and the test
-  applies migrations manually (514 uses) - needed wherever a test needs more than
+  applies migrations manually (515 uses) - needed wherever a test needs more than
   one migration history in one database, a history that keeps its own
   bookkeeping table (review, fleet), or a history applied only part of the way
   (`crates/core-scoring/src/repository/breadth_sets_tests.rs#migration_0014_backfills_the_sets_from_the_ledger`

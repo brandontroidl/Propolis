@@ -243,7 +243,7 @@ review queue, and the report must pass the gatekeeper.
   window. The attack time a vendor is told is the address's last established sighting,
   and the protocol label that picks category codes is read from established events only,
   so a forged datagram can neither re-date a report nor change its categories. The event
-  count in the comment is the count of completed TCP connections. No WAN
+  count in the comment counts events over completed TCP connections only. No WAN
   address, score, confidence or sample body is included, and passwords were dropped at
   the sensor.
 

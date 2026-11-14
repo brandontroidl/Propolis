@@ -232,10 +232,10 @@
   set it can page once if that push is more than the stale threshold away. Run the sync by hand
   after upgrading to avoid it. The old marker file is no longer read and can be deleted.
 - **The first start on this version is slower on a large ledger** - core-scoring migrations `0021`
-  to `0027` build indexes on `event`, `ip_score` and `attack_tag`, fill the new hourly
-  roll-up table from the ledger, and (`0027`) scan the event table once to backfill
-  `ip_score.established_last_seen` and once more for each of the partial indexes
-  `event_dedup_tcp_idx` and `event_source_category_tcp_idx`, holding a lock that blocks writes to `event` (reads proceed)
+  to `0028` build indexes on `event`, `ip_score` and `attack_tag`, fill the new hourly
+  roll-up table from the ledger, and scan the event table once to backfill
+  `ip_score.established_last_seen` (`0027`) and once more for each of the partial indexes
+  `event_dedup_tcp_idx` (`0027`) and `event_source_category_tcp_idx` (`0028`), holding a lock that blocks writes to `event` (reads proceed)
   while they run, before intake starts. On a ledger of 7.5M events plan on up to a few minutes
   of extra start-up `[estimated from 1,500,000 events: about 6 s per index build and a few
   seconds for the roll-ups]`; later starts are unaffected. See
@@ -849,6 +849,11 @@
   `crates/review/src/submit.rs#record_result`), and the gate compares the stored earned time
   with that (`crates/review/src/gatekeeper.rs#check_with`). Rows written before the migration
   have no `earned_at` and are still compared with `submitted_at`.
+- **A second node's failed retry no longer undoes an accepted vendor report** - two nodes on one
+  database can both retry a failure recorded earlier the same day. If one was accepted and the
+  other failed and recorded its outcome last, the row went back to a failure, and the gate,
+  which reads accepted reports only, sent the report again. A row that records an accepted
+  report is now left as it is (`crates/review/src/submit.rs#record_result`).
 - **A forged datagram no longer adds score weight, counts as the second sighting, or makes a real
   connection a duplicate** - a UDP or ICMP event carries whatever source its sender wrote, yet it
   added its signal weight, a category and an active day to the address it named, re-derived that
@@ -857,7 +862,8 @@
   nothing. Such an event now changes only `event_count`, `last_seen` and the sensor count
   (`crates/core-scoring/src/scoring/engine.rs#record_sighting`), eligibility counts established
   events (`crates/core-scoring/src/scoring/eligibility.rs#eligible`), and the dedup read asks
-  for the newest established event of the type
+  for the newest established event of the type, as one backward step on the partial index
+  whatever the source's history
   (`crates/core-scoring/src/repository/events.rs#DEDUP_PRIOR_SQL`, the batch path and replay)
   ([rules](docs/reference/scoring-and-feed.md#established-and-forgeable-events)). An earned
   clock never moves back, including on a row an earlier version left with its clock ahead of
@@ -895,8 +901,9 @@
   Tier cell showed the tier the address's score held at that moment, which decay or one later
   low-weight connection takes away, and the Active cell and the "last seen" sort ran on `last_seen`, which a datagram
   naming the address moves, so anyone could lift a candidate to the top of that sort. The Tier
-  cell now shows the tier the address last earned, with "earned <time>" as its hover text
-  (`crates/console/src/routes/queue.rs#earned_tier`); the Active cell runs from the first
+  cell now shows the tier the address last earned, with the time it earned each tier as its
+  hover text (`crates/console/src/routes/queue.rs#earned_tier`,
+  `crates/console/src/routes/queue.rs#earned_title`); the Active cell runs from the first
   sighting to the last completed connection, and the sort orders by that connection
   (`crates/console/src/routes/queue.rs#last_connection`,
   `crates/console/src/routes/queue.rs#sort_pending`).
@@ -912,7 +919,7 @@
   re-date a report and turn an SSH report into a generic one. The time is now the last
   established sighting (`crates/review/src/submit.rs#build_report`) and the label is read from
   established events only (`crates/review/src/submit.rs#PROTOCOL_LABELS_SQL`), through the new
-  partial index `event_source_category_tcp_idx` (migration `0027`): read from the index of every
+  partial index `event_source_category_tcp_idx` (migration `0028`): read from the index of every
   event, the lookup stepped over every datagram at or after the address (138 ms against 0.08 ms
   for an address with 200,000 datagrams behind it). The event count in the comment, public on
   OTX, is now the established event count.

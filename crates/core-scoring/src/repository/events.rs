@@ -206,8 +206,16 @@ pub(super) const APPEND_LOCK_KEY: i64 = 7_265_646_772_697_400_001;
 /// datagram under a forged address must not be able to make that address's next real connection
 /// a no-weight duplicate. The predicate is the partial index's own, so `event_dedup_tcp_idx`
 /// (migration 0027) answers the read without visiting a single datagram's row.
-const DEDUP_PRIOR_SQL: &str = "SELECT MAX(observed_at) FROM event \
-     WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND protocol = 'tcp' AND id < $3";
+///
+/// It is written as the newest row in the index's own order (`ORDER BY observed_at DESC LIMIT
+/// 1`), not as `MAX(observed_at)`. On the index of every event the planner turned that aggregate
+/// into one backward step by itself; on the partial index it did not, and read every established
+/// row the source had of the signal type to take their maximum: 13 ms for 50,000 rows, on every
+/// append, under the append lock. Asked for the row, it reads one or two (the row just inserted
+/// is the first it meets and fails `id < $3`). `dedup_read_plan_*` counts the rows read.
+const DEDUP_PRIOR_SQL: &str = "SELECT observed_at FROM event \
+     WHERE source_ip = (SELECT $1::inet) AND signal_type = $2 AND protocol = 'tcp' AND id < $3 \
+     ORDER BY observed_at DESC LIMIT 1";
 
 /// Normalize the storage-lossy fields to their STORED precision BEFORE both hashing and
 /// inserting, so the bytes we hash are byte-identical to the bytes storage returns on read.
@@ -343,7 +351,7 @@ pub async fn append_event(pool: &PgPool, event: EventInput) -> Result<IpScore, R
             .bind(event.source_ip.to_string())
             .bind(event.signal_type)
             .bind(new_id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?
     } else {
         None
@@ -729,6 +737,25 @@ mod tests {
         }
     }
 
+    /// The rows a plan actually read from `event`, over every scan of it and every loop
+    /// (`EXPLAIN (ANALYZE, FORMAT JSON)`).
+    fn event_rows_read(node: &serde_json::Value) -> f64 {
+        match node {
+            serde_json::Value::Object(map) => {
+                let own = match map.get("Relation Name").and_then(|v| v.as_str()) {
+                    Some("event") => {
+                        let number = |key: &str| map.get(key).and_then(|v| v.as_f64());
+                        number("Actual Rows").unwrap_or(0.0) * number("Actual Loops").unwrap_or(1.0)
+                    }
+                    _ => 0.0,
+                };
+                own + map.values().map(event_rows_read).sum::<f64>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(event_rows_read).sum(),
+            _ => 0.0,
+        }
+    }
+
     /// The dedup read as it stood when the incident happened: the address bound as a literal.
     const INCIDENT_DEDUP_SQL: &str = "SELECT MAX(observed_at) FROM event \
          WHERE source_ip = $1::inet AND signal_type = $2 AND id < $3";
@@ -775,6 +802,23 @@ mod tests {
             "the dedup read must not walk event_observed_at_idx, plan read {custom:?}"
         );
 
+        // The right index is not enough: read as an aggregate, the statement took the maximum
+        // over every one of the hot source's 30,000 rows of the signal type, on every append.
+        let ran: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON) {DEDUP_PRIOR_SQL}"
+        )))
+        .bind(HOT)
+        .bind(SignalType::HoneypotCommandExec)
+        .bind(next_id)
+        .fetch_one(&pool)
+        .await?;
+        let read = event_rows_read(&ran);
+        assert!(
+            read <= 2.0,
+            "the dedup read is one backward step, whatever the source's history; it read {read} \
+             rows: {ran}"
+        );
+
         let mut tx = pool.begin().await?;
         sqlx::query("DROP INDEX event_dedup_idx, event_dedup_tcp_idx")
             .execute(&mut *tx)
@@ -812,6 +856,19 @@ mod tests {
             !names.iter().any(|n| n == "event_observed_at_idx"),
             "the batched dedup read must not walk event_observed_at_idx, plan read {names:?}"
         );
+
+        let ran: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON) {sql}"
+        )))
+        .bind(vec![HOT.to_string(), "10.0.0.7".to_string()])
+        .bind(vec![SignalType::HoneypotCommandExec; 2])
+        .fetch_one(&pool)
+        .await?;
+        let read = event_rows_read(&ran);
+        assert!(
+            read <= 2.0,
+            "one row for each of the two keys, whatever their history; it read {read} rows: {ran}"
+        );
         Ok(())
     }
 
@@ -820,6 +877,26 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn dedup_read_plan_generic_form_uses_the_dedup_index(pool: PgPool) -> sqlx::Result<()> {
         load_incident_ledger(&pool).await?;
+        // Sixty thousand sources with two connections each, which is what most of a real ledger
+        // is. They bring the planner's estimate for a source it cannot see (a generic plan, and
+        // the address is hidden in any case) down to a couple of rows, and at that estimate an
+        // aggregate over "a couple of rows" costs the same on paper as one backward step.
+        // Written as `MAX(observed_at)`, the generic plan then took the maximum over all 30,000
+        // of the hot source's rows.
+        sqlx::raw_sql(
+            "ALTER TABLE event DISABLE TRIGGER trg_enforce_chain_linkage; \
+             INSERT INTO event (source_ip, sensor, signal_type, protocol, authenticated, \
+                                category, weight, confidence, observed_at, hash) \
+             SELECT '172.16.0.0'::inet + (g % 60000), 'catchall', 'honeypot_command_exec', 'tcp', \
+                    true, 'honeypot', 60, 0.950, \
+                    timestamptz '2026-08-01 00:00:00+00' + g * interval '5 seconds', \
+                    sha256(convert_to('low-volume' || g::text, 'UTF8')) \
+             FROM generate_series(1, 120000) AS g; \
+             ALTER TABLE event ENABLE TRIGGER trg_enforce_chain_linkage; \
+             ANALYZE event",
+        )
+        .execute(&pool)
+        .await?;
         let plan: serde_json::Value = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "EXPLAIN (GENERIC_PLAN, FORMAT JSON) {DEDUP_PRIOR_SQL}"
         )))
@@ -835,6 +912,30 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "event_observed_at_idx"),
             "the generic dedup plan must not walk event_observed_at_idx, plan read {names:?}"
+        );
+
+        // And the generic plan as it runs, on one connection made to use it.
+        let next_id: i64 = sqlx::query_scalar("SELECT max(id) + 1 FROM event")
+            .fetch_one(&pool)
+            .await?;
+        let mut conn = pool.acquire().await?;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "PREPARE dedup_generic(text, signal_type_enum, bigint) AS {DEDUP_PRIOR_SQL}; \
+             SET plan_cache_mode = force_generic_plan"
+        )))
+        .execute(&mut *conn)
+        .await?;
+        let ran: serde_json::Value = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, FORMAT JSON) \
+             EXECUTE dedup_generic('{HOT}', 'honeypot_command_exec', {next_id})"
+        )))
+        .fetch_one(&mut *conn)
+        .await?
+        .try_get(0)?;
+        let read = event_rows_read(&ran);
+        assert!(
+            read <= 2.0,
+            "the generic dedup plan is one backward step too; it read {read} rows: {ran}"
         );
         Ok(())
     }

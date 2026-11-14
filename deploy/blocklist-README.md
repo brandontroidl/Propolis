@@ -112,15 +112,16 @@ address (`::ffff:a.b.c.d`) is listed as the IPv4 address it is (`a.b.c.d`, and `
 address it was recorded with.
 
 `manifest.json` carries the build timestamp, per-feed entry counts, SHA-256 digests, and validity
-windows.
+windows. A count is the number of entries, which is the number of `.json` and `.csv` rows; `.txt`
+can state one fewer for an address recorded in both forms, since it lists that address once.
 
 ### Per-entry fields
 
 The `.json` and `.csv` formats carry, per address: `first_seen` (its first sighting of any kind),
 `last_seen` (the hour the address last earned its place in that file, which is also its
-`valid_from`), `events` (how many completed TCP connections back it), `categories` (how many
-distinct sensor classes saw it), and `signals` - the distinct activity types it triggered over
-connections it completed:
+`valid_from`), `events` (how many events over completed TCP connections back it), `categories`
+(how many distinct sensor classes saw it), and `signals` - the distinct activity types it
+triggered over connections it completed:
 
 ```
 ssh_brute_force        honeypot_command_exec    honeypot_malware_upload

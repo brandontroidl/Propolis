@@ -186,8 +186,8 @@ struct QueueRowView {
     state: &'static str,
     is_pending: bool,
     score: String,
-    /// The tier the address last earned ([`earned_tier`]), which is what the queue offers it on
-    /// and what a listing runs from, and when it earned it, for the cell's `title`.
+    /// The tier the address last earned ([`earned_tier`]), which is what the queue offers it on,
+    /// and when it earned each tier ([`earned_title`]), for the cell's `title`.
     tier: &'static str,
     tier_title: String,
     event_count: i32,
@@ -1200,10 +1200,15 @@ fn last_connection(score: &IpScore) -> DateTime<Utc> {
 }
 
 /// The tier the address last earned, by the later of its two earned times. The queue offers an
-/// address because it earned a tier, and a listing runs from that time. `score.tier` is the
-/// tier its score holds at this moment (the projection is decayed to now when it is read), which
-/// is none once the score has decayed, or after one later low-weight connection. A row with no
-/// earned time on record shows that live tier.
+/// address because it earned a tier. `score.tier` is the tier its score holds at this moment
+/// (the projection is decayed to now when it is read), which is none once the score has
+/// decayed, or after one later low-weight connection. A row with no earned time on record shows
+/// that live tier.
+///
+/// It is not always the file an approval publishes into: the aggressive file carries an address
+/// for its TTL after the aggressive time even when the standard time is the later one, and the
+/// TTLs belong to the feed service, which this one does not configure. [`earned_title`] gives
+/// both times, so the row hides neither.
 fn earned_tier(score: &IpScore) -> Option<FeedTier> {
     match (score.aggressive_earned_at, score.standard_earned_at) {
         (Some(aggressive), Some(standard)) if standard > aggressive => Some(FeedTier::Standard),
@@ -1211,6 +1216,19 @@ fn earned_tier(score: &IpScore) -> Option<FeedTier> {
         (None, Some(_)) => Some(FeedTier::Standard),
         (None, None) => score.tier,
     }
+}
+
+/// When the address earned each tier, for the Tier cell's hover text: `aggressive earned <time>;
+/// standard earned <time>`, with only the tiers it has earned. Empty if it has earned neither.
+fn earned_title(score: &IpScore) -> String {
+    [
+        ("aggressive", score.aggressive_earned_at),
+        ("standard", score.standard_earned_at),
+    ]
+    .into_iter()
+    .filter_map(|(tier, at)| Some(format!("{tier} earned {}", format_timestamp(at?))))
+    .collect::<Vec<_>>()
+    .join("; ")
 }
 
 fn row_view(
@@ -1228,10 +1246,7 @@ fn row_view(
         is_pending: review_state == ReviewState::Pending,
         score: format!("{:.1}", score.raw_score),
         tier: earned_tier(score).map(tier_label).unwrap_or("-"),
-        tier_title: score
-            .tier_earned_at()
-            .map(|at| format!("earned {}", format_timestamp(at)))
-            .unwrap_or_default(),
+        tier_title: earned_title(score),
         event_count: score.event_count,
         active,
         active_title,

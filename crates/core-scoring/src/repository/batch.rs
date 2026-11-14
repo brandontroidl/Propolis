@@ -320,10 +320,12 @@ async fn load_sources(
 /// observation already in the ledger. One correlated `MAX` per key keeps each lookup a single
 /// backward step on `event_dedup_tcp_idx` whatever the source's history or the intake lag, the
 /// property `dedup_read_plan_*` guards for the single path; `batch_dedup_read_plan_*` holds this
-/// statement to it too. Established events only, as there, on `event_dedup_tcp_idx`.
+/// statement to it too. Established events only, as there, on `event_dedup_tcp_idx`. Each lookup
+/// asks for the newest row in the index's order, as the single path's statement does and for its
+/// reason: an aggregate leaves it to the planner whether one row is read or all of them.
 pub(super) const DEDUP_PRIORS_SQL: &str = "SELECT host(k.ip) AS source_ip, k.st AS signal_type, \
-            (SELECT MAX(e.observed_at) FROM event e WHERE e.source_ip = k.ip AND e.signal_type = k.st \
-                AND e.protocol = 'tcp') AS prior \
+            (SELECT e.observed_at FROM event e WHERE e.source_ip = k.ip AND e.signal_type = k.st \
+                AND e.protocol = 'tcp' ORDER BY e.observed_at DESC LIMIT 1) AS prior \
      FROM unnest($1::text[]::inet[], $2::signal_type_enum[]) AS k(ip, st)";
 
 async fn load_dedup_priors(

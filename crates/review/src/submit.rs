@@ -537,7 +537,7 @@ fn idempotency_key(ip: IpAddr, vendor: &str, date: NaiveDate) -> String {
     format!("{ip}:{vendor}:{date}")
 }
 
-/// One index probe per category (`event_source_category_tcp_idx`, core-scoring migration 0027)
+/// One index probe per category (`event_source_category_tcp_idx`, core-scoring migration 0028)
 /// instead of `SELECT DISTINCT ON (category) ... ORDER BY category, observed_at DESC`, which
 /// reads and sorts every event the address ever produced: 1.55 s for one heavy address on the live
 /// node. The categories come from the enum itself, so a new `Category` variant needs no change
@@ -732,6 +732,11 @@ async fn insert_pending(
 /// Record the HTTP call's outcome against the row `key` identifies. `covered` is the earned time
 /// an accepted report was sent for (`None` for a report that was not accepted): what
 /// `gatekeeper::check_with` asks "anything since?" of.
+///
+/// A row that already records an accepted report is left as it is. Two nodes on one database
+/// can both retry a failure recorded earlier the same day; if one is accepted and the other
+/// fails and writes last, an unconditional update turned the accepted report back into a
+/// failure, and the gate, which reads accepted rows only, sent it again.
 async fn record_result(
     pool: &PgPool,
     key: &str,
@@ -743,7 +748,7 @@ async fn record_result(
     sqlx::query(
         "UPDATE vendor_submission \
          SET response_status = $1, response_body = $2, success = $3, earned_at = $5 \
-         WHERE idempotency_key = $4",
+         WHERE idempotency_key = $4 AND NOT success",
     )
     .bind(response_status)
     .bind(response_body)
@@ -842,6 +847,54 @@ mod tests {
             .await
             .unwrap();
         crate::migrator().run(pool).await.unwrap();
+    }
+
+    /// Two nodes on one database both retry a failure recorded earlier the same day. One is
+    /// accepted; the other fails and records its outcome last. The accepted report stays
+    /// accepted, with the earned time it covered: the gate reads accepted rows only, so a
+    /// downgrade here was a second report the next day.
+    #[sqlx::test(migrations = false)]
+    async fn a_failure_recorded_after_an_accepted_report_does_not_undo_it(pool: PgPool) {
+        migrate(&pool).await;
+        let pending = |key: &'static str| {
+            sqlx::query(
+                "INSERT INTO vendor_submission \
+                 (source_ip, vendor, idempotency_key, categories, comment, success, \
+                  response_status) \
+                 VALUES ('203.0.113.90'::inet, 'vend', $1, '{}', 'c', FALSE, 500)",
+            )
+            .bind(key)
+        };
+        let outcome = "SELECT success, response_status, earned_at FROM vendor_submission \
+                       WHERE idempotency_key = $1";
+        type Outcome = (bool, Option<i32>, Option<DateTime<Utc>>);
+        let covered: DateTime<Utc> = "2026-10-01T00:00:00Z".parse().unwrap();
+
+        pending("raced").execute(&pool).await.unwrap();
+        record_result(&pool, "raced", Some(200), "accepted", true, Some(covered))
+            .await
+            .unwrap();
+        record_result(&pool, "raced", Some(503), "busy", false, None)
+            .await
+            .unwrap();
+        let raced: Outcome = sqlx::query_as(outcome)
+            .bind("raced")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(raced, (true, Some(200), Some(covered)));
+
+        // A failure over a failure is still recorded: the newest outcome of a retry.
+        pending("failing").execute(&pool).await.unwrap();
+        record_result(&pool, "failing", Some(503), "busy", false, None)
+            .await
+            .unwrap();
+        let failing: Outcome = sqlx::query_as(outcome)
+            .bind("failing")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failing, (false, Some(503), None));
     }
 
     async fn event(

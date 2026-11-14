@@ -59,11 +59,13 @@ WHERE established_event_count < 2
 -- the upgrade, which decays with the usual half-life. A delisted address earns nothing.
 UPDATE ip_score
 SET aggressive_earned_at = established_last_seen
-WHERE tier = 'aggressive' AND eligible AND recommended_for_blocklist AND NOT delisted;
+WHERE tier = 'aggressive' AND eligible AND recommended_for_blocklist AND NOT delisted
+  AND established_last_seen IS NOT NULL;
 
 UPDATE ip_score
 SET standard_earned_at = established_last_seen
-WHERE tier = 'standard' AND eligible AND recommended_for_blocklist AND NOT delisted;
+WHERE tier = 'standard' AND eligible AND recommended_for_blocklist AND NOT delisted
+  AND established_last_seen IS NOT NULL;
 
 -- The dedup read every scored append makes (see 0013) now asks for the newest ESTABLISHED event
 -- of the same signal type, so a forgeable datagram cannot turn a real connection into a
@@ -74,16 +76,4 @@ WHERE tier = 'standard' AND eligible AND recommended_for_blocklist AND NOT delis
 -- return, so the read stays one backward step. Plain CREATE INDEX, not CONCURRENTLY, for the
 -- reasons given in 0013; the build reads the event heap once.
 CREATE INDEX event_dedup_tcp_idx ON event (source_ip, signal_type, observed_at)
-    WHERE protocol = 'tcp';
-
--- The same for the two reads that pick what is said about an address once it is listed or
--- reported: the vendor report's label lookup (one probe per category for the newest event, see
--- 0020) and the feed's category list (one probe per signal type). Both now ask for
--- established events only, so a datagram under a forged source can neither change the category
--- codes a vendor is sent nor add a category to a published entry. The feed's probe is served by
--- event_dedup_tcp_idx above. The label lookup orders by category, which only this index holds
--- for established rows alone: with event_source_category_observed_idx the probe would step
--- over every datagram at or after the address in index order before it reached a TCP row, a
--- cost anyone can raise by sending datagrams. One more read of the event heap.
-CREATE INDEX event_source_category_tcp_idx ON event (source_ip, category, observed_at DESC)
     WHERE protocol = 'tcp';

@@ -185,7 +185,7 @@ could carry a WAN vantage address - confirmed by reading all three
 The report comment is
 `"propolis: {ip} - {N} event(s) across {M} categor{y/ies} since {first_seen}, current score {raw.round_dp(1)}"`,
 and `evidence_window = (first_seen, established_last_seen)` (`crates/review/src/submit.rs#build_report`).
-`N` is `established_event_count`, the address's completed TCP connections: the stored
+`N` is `established_event_count`, the address's events over completed TCP connections: the stored
 `event_count` also counts every datagram that named the address, and the comment is public on
 OTX. The end of the window, the attack time a vendor is told, is the address's last established
 (completed-TCP) sighting, never `last_seen`, which a datagram under a forged source moves; `last_seen`

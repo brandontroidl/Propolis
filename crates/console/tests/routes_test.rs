@@ -1856,8 +1856,13 @@ async fn a_queue_row_rests_on_the_last_connection_and_the_tier_that_was_earned(p
     } else {
         r#"<span class="tier tier-standard">Standard</span>"#
     };
+    let hover = if aggressive {
+        r#"title="aggressive earned 20"#
+    } else {
+        r#"title="standard earned 20"#
+    };
     assert!(
-        row.contains(pill) && row.contains(r#"title="earned "#),
+        row.contains(pill) && row.contains(hover),
         "the tier it earned and when, not the tier its score holds now: {row}"
     );
     let last = format!("last {}", last_connection.format("%Y-%m-%d %H:%M"));

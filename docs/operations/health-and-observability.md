@@ -26,19 +26,23 @@ this order:
 
 - the host line (the alias the host has on the channel, the host name, its role), the alert
   target, the daemon's monitor and alert queue, how many units' failure alerts are still
-  undelivered, and where the root alerting state was last written;
-- the failures the failure hook recorded, newest first by first failure, each with systemd's
-  own cause (`proc.exit 1`, `proc.signal 9`, `proc.oom`...), how many times it fired, and what
-  the hook did with the latest firing (`[legacy hook: delivered]`, `undelivered`, `cooldown`,
-  `journal`). Nothing resolves a record yet, so every record is listed however old its first
-  failure; only a resolved one drops out, 7 days after it was resolved. A firing the hook could
-  not record (the lock was busy, or its time nearly spent) and wrote to its spool instead is
-  listed too, marked `[spooled, not yet in the record]`. Nothing judges these yet, so they are
-  listed as failures that happened and never change the exit status;
+  undelivered, when the witness's light pass last completed, where the root alerting state was
+  last written and when the login banner was last written;
+- `OPEN`: the incidents the witness has open, acknowledged or pending, PAGE first, then ACT,
+  then NOTICE, each with its stage, the unit's opaque id and name, since when it is open, its
+  cause as systemd gave it (`proc.exit 1`, `proc.signal 9`, `proc.oom`...), when the next
+  reminder would go out, and what today's failure hook did with the latest firing
+  (`[legacy hook: delivered]`, `undelivered`, `cooldown`, `journal`), or `[not pushed: legacy]`
+  for something only the witness saw. An open PAGE makes the exit status 2 and an open ACT 1.
+  A firing the hook could not record (the lock was busy, or its time nearly spent) and wrote to
+  its spool instead is listed too, marked `[spooled, not yet in the record]`, until the next
+  light pass takes it in. On a host where no witness pass has completed yet, the block is
+  `RECENT FAILURES` instead: the hook's records listed as failures that happened, newest first,
+  which never change the exit status, because nothing has judged them;
 - the pipeline, stage by stage: `listen`, `source`, `ship`, `gateway`, `intake`, `ledger`,
   `review`, `reports`, `feed`, `publish`, each with its last progress, then the rails beside it
-  (`alert`, `backup`, `chain`, `host`, `monitor`, `peers`), then the installed config-check's
-  findings, run live;
+  (`alert`, `backup`, `chain`, `host`, `monitor`, `witness`, `peers`), then the installed
+  config-check's findings, run live;
 - `NEXT`: the view to open and the runbook section below for the first thing to look at.
 
 **The marker.** The first stage whose own facts say it stopped is marked `>`
@@ -201,9 +205,85 @@ space or make `/var` writable; `sudo propolis-status host` shows where the last 
 <a id="witness"></a>
 ### The witness
 
-No witness pass runs on this host in this release: the failure hook's records are listed by the
-walk as recent failures, and nothing judges, reminds or resolves them: the hook stores a
-self-restarting unit's failure as pending and a oneshot's as open.
+The witness (`deploy/witness.sh#light_pass`, installed as `/usr/local/sbin/propolis-witness`) is
+a root oneshot that `propolis-witness@light.timer` runs every five minutes; `install.sh` and
+`upgrade.sh` enable the timer. It records and shows, and sends nothing: in the default profile
+each transition the new paging would send adds one to the record's `would_push`, and that is
+all. Each light pass:
+
+- asks systemd once for the state of every Propolis unit;
+- takes in the failure hook's spool files, then judges the first sightings the hook left
+  pending for units that restart themselves: one restart that healed (systemd's `NRestarts`
+  one above what the hook read, the unit up for over a minute) is dropped and counted as a
+  restart that healed, never opened, also when the record goes back to the resolve it had; a
+  unit still down, or restarting again, is opened. A oneshot's first sighting is dropped when
+  its next run succeeded and opened while it is still failed. A sighting recorded after the
+  pass read systemd waits for the next pass;
+- opens a crash loop (`unit-crashloop`, `daemon-down` for the daemon) when `NRestarts` rose by
+  three or more since the last pass, or by six within six hours, on two passes in a row, and a
+  unit left in the failed state on two passes (`unit-failed`); a sensor that loops while
+  config-check says its bind is not set opens `unit-nobind` (ACT, never reminded) instead;
+- reminds each open incident at 1 h, 4 h and 12 h after it opened (PAGE) or 4 h and 12 h (ACT),
+  once for reminders that came due while no pass ran, and resolves it with the proof of its
+  kind: a long-running unit up 10 minutes without a restart, a crash loop quiet for 30 minutes
+  (the restarts before those 30 minutes then no longer count toward the six-in-six-hours rule),
+  a oneshot's next run succeeding after the failure, or a unit disabled on purpose (a oneshot
+  whose timer is disabled or no longer exists, a unit systemd no longer knows). The third
+  reopen within a day holds the next resolve for an hour;
+- writes its line in `/run/propolis-witness/heartbeat`, `meta light_last`, and the login banner.
+
+A failure is recorded only under a unit name as systemd gives one (`sensor-ssh.service`, not
+`sensor-ssh`), and the witness asks systemd about no other word. The hook started by hand as
+`propolis-alert@sensor-ssh.service` is passed the bare word `sensor-ssh`: its alert goes out as
+before, nothing is recorded, and the journal says `incident not recorded for -: the unit name is
+not one systemd gives` under tag `propolis-witness`.
+
+The witness opens nothing in the first ten minutes after a boot, while a maintenance marker
+holds (an upgrade, a rollback, or `sudo propolis-status --maint MINUTES` for planned work: see
+[commands](../reference/commands.md#status-walk)), or in the ten minutes after a pass last saw a
+marker (`meta maint_seen`), so the restarts planned work causes have settled first, and
+restarts made under a marker or in those ten minutes no longer count toward the
+six-in-six-hours rule afterwards. A first sighting held then stays pending, a spooled one
+included. One held under a marker is flagged `maint`, by the hook or by a pass, and a record
+flagged `maint` is held for ten minutes from its sighting even when no pass saw the marker; a
+sighting held only by the boot grace is not flagged and opens on the first pass after the
+grace. A fault that comes back inside its reopen window carries the flag only when this
+sighting came under a marker. (The failure hook itself still opens a oneshot's failure at once
+in the first ten minutes after a boot and in the ten minutes after a marker ends.) In the first
+half hour after a boot a sensor's loop stays pending until
+a config-check result exists, since without one an unset bind cannot be told from a crash. A
+check that cannot run marks the pass `partial` and the pass still exits 0; three in a row open
+the NOTICE `tool-unusable`. A pass that has run for 240 s judges nothing more, keeps what it
+did and marks itself `partial`. When the state lock is not free within 60 s the pass writes no
+state, logs `state lock busy for 60 s; pass skipped` under tag `propolis-witness`, marks its
+heartbeat line `partial`, and the walk's header and the banner say `state lock busy` until a
+pass gets it again; when no lock file can be opened at all the banner says `state NOT
+PERSISTED`.
+
+The walk's `witness` rail is FAIL when `propolis-witness@light.timer` is not active, when no
+light pass has completed for 15 minutes (not judged in the first 30 minutes after a boot), or
+when the banner is missing or older than 15 minutes while the pass itself is fresh:
+`banner not written` means the pass runs but `/run/motd.d` is missing or refuses the write
+(`sudo systemd-tmpfiles --create /etc/tmpfiles.d/propolis.conf` recreates it). It warns when a hook
+spool file has waited over 10 minutes. First check `systemctl status propolis-witness@light.timer
+propolis-witness@light.service` and `journalctl -t propolis-witness`; `sudo propolis-status
+witness` shows the timer, the heartbeat lines, every `meta` key, the restarts that healed, the
+spool, the lock count and the maintenance marker.
+
+**The login banner.** At the end of every light pass the witness writes `/run/motd.d/propolis`,
+which `pam_motd` shows at login: four lines of closed words and counts, each with the time it was
+written, for example:
+
+```
+[propolis 15:20 UTC] 2 open (PAGE 1, ACT 1); profile legacy
+[propolis 15:20 UTC] alerts: topic not checked yet
+[propolis 15:20 UTC] run: sudo propolis-status
+[propolis 15:20 UTC] rewritten every 5 min; older means the witness stopped
+```
+
+It names no host, unit or log, and it is root-only (`0600`): it says whether alerting works right
+now, which a compromised sensor that can read `/run` must not learn. `pam_motd` reads it as root.
+An older time means the witness stopped. `sudo propolis-status --banner` prints the same text.
 
 ## Endpoints
 

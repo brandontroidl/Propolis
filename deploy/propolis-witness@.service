@@ -1,0 +1,70 @@
+# The root witness, one pass per instance: propolis-witness@light.service every five minutes from
+# propolis-witness@light.timer. deploy/witness.sh (installed as /usr/local/sbin/propolis-witness)
+# judges what the failure hook recorded and watches the units itself, records what it finds in
+# /var/lib/propolis/witness and writes the login banner. It sends nothing.
+#
+# Root, with no account of its own: it reads 0600 env files, root-only journal fields and other
+# accounts' 0750 directories (as those accounts, through setpriv). The grants below for
+# config-check, nft, ss and pg-exec are for the hourly pass and the probes of the next release;
+# the light pass of this one runs none of them. No RuntimeDirectory=: /run/propolis-witness comes
+# from the tmpfiles entry, because a oneshot's own runtime directory is removed when it stops,
+# under the failure hook and any other instance using it.
+#
+# A pass exits 0 after every ordinary check error and stops itself long before the 15-minute
+# limit, so this unit fails only on a bad argument, a library that cannot load, or that limit;
+# the failure hook then records it and never pages for a witness unit.
+[Unit]
+Description=Propolis root witness, %i pass
+Documentation=file:///usr/local/sbin/propolis-witness
+OnFailure=propolis-alert@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/propolis-witness %i
+TimeoutStartSec=15min
+# Low priority, not the idle classes: an idle class starves while the host is busy, and a flood
+# is when the witness must still run.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# The library sets umask 077 too; both, so nothing made before it loads is readable by others.
+UMask=0077
+MemoryMax=512M
+TasksMax=128
+
+ProtectSystem=strict
+# The three places it writes, each with `-`: a missing directory costs a recorded note, where a
+# plain grant would fail the unit with status 226 every five minutes.
+ReadWritePaths=-/var/lib/propolis/witness -/run/propolis-witness -/run/motd.d
+# Read-only, not hidden: config-check (the hourly pass, next release) reads the checkout recorded
+# at install, often under /home.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Netlink for nft and ss, which config-check runs from the hourly pass (next release); without it
+# every firewall cell is unknown. The light pass opens no socket of these families.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# Executable: the script; the installed config-check and the daemon binary (for pg-exec), which
+# the hourly pass and the next release's probes run and the light pass does not, both with `-`
+# because the witness runs on every host, a gateway-only one or a collector without the
+# daemon binary among them, and an absent unprefixed entry fails the unit with 226/NAMESPACE;
+# the distro tools under /usr/bin and /usr/sbin; Debian's PostgreSQL wrapper, which psql
+# resolves to (absent elsewhere, hence `-`); and the libraries. No capability bounding set (ss -p
+# and setpriv need theirs), so the mount syscalls are filtered: root could otherwise undo these
+# mounts.
+NoExecPaths=/
+ExecPaths=/usr/local/sbin/propolis-witness -/usr/local/lib/propolis -/usr/local/bin/propolis /usr/bin /usr/sbin -/usr/share/postgresql-common/pg_wrapper /usr/lib -/usr/lib64
+SystemCallFilter=~@mount

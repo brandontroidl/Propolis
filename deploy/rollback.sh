@@ -56,7 +56,7 @@ STORE="$ROOT/var/lib/propolis/rollback"
 KEEP=3
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4,40}$'
 SET_RE='^[0-9]{8}T[0-9]{6}Z-pre-upgrade$'
-SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert propolis-alert-lib propolis-status)
+SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert propolis-alert-lib propolis-status propolis-witness)
 # The installed config-check under /usr/local/lib/propolis, kept in lib/ of a release: the script,
 # the listener derivation it sources, and its binary list, which follows the binaries a rollback
 # puts back. repo-dir is not kept: the checkout's path does not change with a rollback.
@@ -76,6 +76,8 @@ SENSORS=(sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor
 # The marker that tells the root alerting code the restarts are planned (maint_write).
 MAINT_MARKER="$ROOT/run/propolis-witness/maintenance"
 MAINT_SET=0
+# An operator's marker (`<until><TAB><boot>`) this run wrote over and puts back (maint_clear).
+MAINT_KEEP=""
 
 usage() {
     cat >&2 <<EOF
@@ -170,13 +172,22 @@ check_hook_contract() {
 
 # maint_write: the maintenance marker, in the two-line form the root alerting code reads, ending
 # two hours from now, for this boot, with reason rollback. Best effort: under `set -e` a marker
-# that cannot be written must never stop a rollback, so this says so and goes on.
+# that cannot be written must never stop a rollback, so this says so and goes on. A planned
+# window an operator announced (`propolis-status --maint`) that is still running is remembered
+# first, so maint_clear can put it back.
 maint_write() {
-    local boot now
+    local boot now head="" t="" until="" mboot="" reason=""
     boot="$(tr -d - 2>/dev/null < /proc/sys/kernel/random/boot_id | cut -c1-8)" || boot=-
     [[ "$boot" =~ ^[0-9a-f]{8}$ ]] || boot=-
     now="$(date +%s 2>/dev/null)" || now=0
     [[ "$now" =~ ^[0-9]{1,12}$ ]] || now=0
+    if [ "$MAINT_SET" -eq 0 ] && [ -f "$MAINT_MARKER" ] && [ ! -L "$MAINT_MARKER" ]; then
+        { IFS= read -r head; IFS=$'\t' read -r t until mboot reason _; } < "$MAINT_MARKER" 2>/dev/null || true
+        if [[ "$head" =~ ^#maintenance\ v1\ g=[0-9]{1,18}$ ]] && [ "$t" = X ] && [ "$reason" = manual ] \
+            && [[ "$until" =~ ^[0-9]{1,12}$ ]] && [ "$mboot" = "$boot" ] && [ "$((10#$until))" -gt "$now" ]; then
+            MAINT_KEEP="$((10#$until))"$'\t'"$mboot"
+        fi
+    fi
     if { { [ -d "${MAINT_MARKER%/*}" ] || mkdir -m 0750 "${MAINT_MARKER%/*}"; } && printf '#maintenance v1 g=1\nX\t%s\t%s\trollback\n' "$((now + 7200))" "$boot" > "$MAINT_MARKER"; } 2>/dev/null; then
         MAINT_SET=1
     else
@@ -186,11 +197,19 @@ maint_write() {
 }
 
 # maint_clear: removes the marker this run wrote, and only that: a marker an operator or an
-# upgrade wrote is not this run's to remove. Never fails.
+# upgrade wrote is not this run's to remove, and an operator's window this run wrote over is put
+# back while its end is still ahead. Never fails.
 maint_clear() {
+    local now
     if [ "$MAINT_SET" -eq 1 ]; then
-        rm -f -- "$MAINT_MARKER" 2>/dev/null || true
-        MAINT_SET=0
+        now="$(date +%s 2>/dev/null)" || now=0
+        [[ "$now" =~ ^[0-9]{1,12}$ ]] || now=0
+        if [ -n "$MAINT_KEEP" ] && [ "${MAINT_KEEP%%$'\t'*}" -gt "$now" ]; then
+            printf '#maintenance v1 g=1\nX\t%s\tmanual\n' "$MAINT_KEEP" > "$MAINT_MARKER" 2>/dev/null || true
+        else
+            rm -f -- "$MAINT_MARKER" 2>/dev/null || true
+        fi
+        MAINT_SET=0 MAINT_KEEP=""
     fi
     return 0
 }

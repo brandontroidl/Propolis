@@ -162,27 +162,43 @@ column means and what runs without root:
 ## Status walk
 
 ```
-sudo propolis-status            # every stage in order, the first stopped one marked >
-sudo propolis-status STAGE      # one stage or rail with everything behind its row
-propolis-status -h              # usage, for any user
+sudo propolis-status                 # every stage in order, the first stopped one marked >
+sudo propolis-status STAGE           # one stage or rail with everything behind its row
+sudo propolis-status --banner        # the login banner's text
+sudo propolis-status --maint MINUTES # hold unit, collector and database kinds for planned work
+propolis-status -h                   # usage, for any user
 ```
 
 `STAGE` is one of `listen source ship gateway intake ledger review reports feed publish` or a
-rail, `alert backup chain host monitor peers`. Root only: anyone else gets
-`propolis-status needs root: run sudo propolis-status` and exit `3`. Read-only: it writes
-nothing except a temporary header file for the metrics token, removed on exit, and takes no
-lock. Its network use is the database `DATABASE_URL` names (local or remote), through
-`propolis pg-exec`, and the console on loopback, asked only while `propolis.service` runs
-(`deploy/propolis-status.sh#status_walk`). Exit `0` nothing stopped and nothing to look at; `1`
-a WARN or `?` anywhere (a row, an unreadable state file, a config-check finding or a
-config-check run that did not finish); `2` a stage is marked stopped or a rail is FAIL; `3` not
-root; `64` bad usage (an unknown word, or more than one); `70` the alert library is missing
-(the message says to reinstall it), fails its trust check (the message names the directory and
-the `chmod` that fixes it) or is older than the script needs. The failures the failure hook
-recorded, and the firings it spooled because it could not take the lock, never change the exit
-status: nothing judges them yet. A stage view exits as the walk would. What each row and NEXT
-key means:
+rail, `alert backup chain host monitor witness peers`. Root only: anyone else gets
+`propolis-status needs root: run sudo propolis-status` and exit `3`. The walk and a stage view
+are read-only: they write nothing except a temporary header file for the metrics token, removed
+on exit, and take no lock. Their network use is the database `DATABASE_URL` names (local or
+remote), through `propolis pg-exec`, and the console on loopback, asked only while
+`propolis.service` runs (`deploy/propolis-status.sh#status_walk`). Exit `0` nothing stopped and
+nothing to look at; `1` a WARN or `?` anywhere (a row, an unreadable state file, a config-check
+finding or a config-check run that did not finish) or an open ACT incident; `2` a stage is
+marked stopped, a rail is FAIL or a PAGE incident is open; `3` not root; `64` bad usage (an
+unknown word, a verb with a bad value, or more than one form); `70` the alert library is
+missing (the message says to reinstall it), fails its trust check (the message names the
+directory and the `chmod` that fixes it) or is older than the script needs. Once a witness pass
+has run on the host, the incidents it judged are listed under `OPEN`; until then the failures
+the failure hook recorded, and the firings it spooled because it could not take the lock, are
+listed as recent failures and never change the exit status. A stage view exits as the walk
+would. What each row and NEXT key means:
 [health and observability](../operations/health-and-observability.md#where-to-look-first).
+
+`--banner` prints what the witness writes to `/run/motd.d/propolis` at the end of each light
+pass, from the state files alone, and exits `0` (`deploy/propolis-status.sh#status_banner`).
+`--maint MINUTES` announces planned work (a manual `systemctl stop`, a PostgreSQL window, a
+collector powered off on purpose): it writes `/run/propolis-witness/maintenance` with reason
+`manual` until now plus `MINUTES` (1 to 120), then rewrites the banner, and nothing else; while
+it holds, unit, collector and database kinds open nothing on this host, and unit kinds stay
+held for ten minutes after the witness last saw it. An upgrade or rollback run inside the window replaces the marker with its own for its
+restarts and puts this one back afterwards while its end is still ahead. `--maint 0` ends any
+marker, whoever wrote it. It takes no lock, so it works while a hung writer holds the state
+lock. Exit `0` written or removed, `1` the marker could not be written, `64` a value outside 0
+to 120 (`deploy/propolis-status.sh#status_maint`).
 
 ## Migrations
 

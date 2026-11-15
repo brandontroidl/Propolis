@@ -63,9 +63,11 @@ The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin] [--adopt-hi
    definitions. It then writes the maintenance marker `/run/propolis-witness/maintenance`
    (reason `upgrade`, ending two hours later), so the failure hook records the failures the
    restarts below cause as planned work, flagged `maint`, rather than as incidents to open. An
-   `EXIT` trap removes it however the script ends, and it is removed once more after the status
-   line. Writing and removing it are best effort: a marker that cannot be written prints a
-   warning and never stops the upgrade, and one left by an upgrade that was killed outright
+   `EXIT` trap ends it however the script ends, and it is ended once more after the status
+   line. A marker written with `propolis-status --maint` that is still running when the script
+   starts is put back, with its end unchanged, when the script's own marker ends, if that end is
+   still ahead; otherwise the marker is removed. Writing and removing it are best effort: a
+   marker that cannot be written prints a warning and never stops the upgrade, and one left by an upgrade that was killed outright
    expires on its own.
 5. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
    if enabled.
@@ -539,8 +541,10 @@ changes nothing that is sent.
 so the failure hook records the stops and restarts as planned work. It removes the marker once
 `propolis.service` has stayed up, and a run that fails after the services were stopped removes
 it in `deploy/rollback.sh#on_exit`, after it has tried to start them again. It removes only a
-marker it wrote itself. A marker that cannot be written is reported and never stops the
-rollback.
+marker it wrote itself. A marker written with `propolis-status --maint` that is still running
+when the script writes its own is put back, with its end unchanged, when the script's own
+marker ends, if that end is still ahead. A marker that cannot be written is reported and never
+stops the rollback.
 
 **When the upgrade changed the schema**, the binaries alone are not enough. Migrations only run
 forward and no down-migration exists, so the older daemon refuses the newer database at

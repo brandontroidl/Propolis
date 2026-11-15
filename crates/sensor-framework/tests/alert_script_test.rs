@@ -1135,6 +1135,39 @@ fn a_witness_unit_is_decided_by_name_before_any_library_code() {
     assert_eq!(fx.log().matches("curl ").count(), 1, "{}", fx.log());
 }
 
+/// Now that a witness pass runs on a timer and can fail, its failure is still never a page:
+/// however the pass failed (a bad argument, a library it could not load, the unit's time limit),
+/// with or without a push target and whatever the cooldown stamps say, the hook records it and
+/// posts nothing, logs nothing as itself and exits 0.
+#[test]
+fn legacy_never_posts_for_a_witness_unit() {
+    for (result, status) in [("exit-code", "2"), ("exit-code", "3"), ("timeout", "")] {
+        for fx in [
+            Fixture::with_ntfy().with_lib(),
+            Fixture::new("").with_lib(),
+            Fixture::with_ntfy(),
+        ] {
+            let unit = "propolis-witness@light.service";
+            fx.show(unit, &show_answer(result, status, "no", "0"));
+            let monitor = [
+                ("MONITOR_SERVICE_RESULT", result),
+                ("MONITOR_EXIT_CODE", "exited"),
+                ("MONITOR_EXIT_STATUS", status),
+            ];
+            let output = fx.run(unit, &monitor);
+            assert_eq!(output.status.code(), Some(0), "{result} {status}");
+            let log = fx.log();
+            assert!(!log.contains("curl"), "{result}: no post: {log}");
+            assert!(!log.contains("-t propolis-alert"), "{result}: {log}");
+            assert!(!fx.delivered_stamp(unit).exists());
+            assert!(!fx.undelivered_stamp(unit).exists());
+            // A second failure inside what would be the cooldown is not a page either.
+            assert_eq!(fx.run(unit, &monitor).status.code(), Some(0));
+            assert!(!fx.log().contains("curl"), "{}", fx.log());
+        }
+    }
+}
+
 #[test]
 fn the_cause_comes_from_the_monitor_variables_and_falls_back_to_systemctl_show() {
     let fx = Fixture::new("PROPOLIS_FEED_ENABLED=true\n").with_lib();

@@ -286,7 +286,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "3");
+    assert_eq!(version, "4");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -3464,11 +3464,75 @@ fn the_hook_never_stores_a_five_hex_id_that_collides_with_another_units() {
     );
 }
 
-/// A unit name systemd never gives (a leading dot, a slash, a tab) is refused before anything is
-/// written, whether the step would record or spool, with one line saying so.
+/// A unit name is what systemd itself would call a unit: a type after the last dot, a prefix that
+/// does not start with `@`, an instance after an `@` when there is one, within the characters the
+/// failure hook accepts and 200 bytes.
+#[test]
+fn pa_unit_name_ok_accepts_exactly_the_names_systemd_gives_a_unit() {
+    let fx = Fx::new();
+    let long = format!("{}.service", "a".repeat(192));
+    let script = format!(
+        r#"t() {{ if pa_unit_name_ok "$1"; then echo "$2=yes"; else echo "$2=no"; fi; }}
+t 'sensor-ssh.service' plain
+t 'propolis-witness@light.service' instance
+t 'a@b@c.timer' two-at
+t '-.mount' dash
+t 'a.b.socket' dotted
+t '{long}' len-200
+t '{long}a' len-201
+t 'sensor-ssh' no-type
+t 'test' word
+t 'a.conf' other-type
+t '@a.service' at-first
+t 'a@.service' template
+t '.a.service' dot-first
+t 'a/b.service' slash
+t 'a b.service' space
+t $'a\tb.service' tab
+t 'a\x2db.service' backslash
+t '' empty
+"#
+    );
+    let r = fx.run(&script);
+    assert_eq!(r.code, 0, "{}", r.err);
+    for name in ["plain", "instance", "two-at", "dash", "dotted", "len-200"] {
+        assert_eq!(r.get(name), "yes", "{name}");
+    }
+    for name in [
+        "len-201",
+        "no-type",
+        "word",
+        "other-type",
+        "at-first",
+        "template",
+        "dot-first",
+        "slash",
+        "space",
+        "tab",
+        "backslash",
+        "empty",
+    ] {
+        assert_eq!(r.get(name), "no", "{name}");
+    }
+}
+
+/// A word that is not a unit name (a leading dot, a slash, a tab, no unit type, a template) is
+/// refused before anything is written, whether the step would record or spool, with one line
+/// saying so. `sensor-ssh` is what a hand-started `propolis-alert@sensor-ssh.service` passes:
+/// systemd would answer for it as `sensor-ssh.service`, so a record under the bare word could
+/// never be judged.
 #[test]
 fn pa_hook_record_refuses_a_unit_name_systemd_never_gives_before_writing_anything() {
-    for unit in ["..", ".x", "a/b", "a\tb.service"] {
+    for unit in [
+        "..",
+        ".x",
+        "a/b",
+        "a\tb.service",
+        "sensor-ssh",
+        "@a.service",
+        "a@.service",
+        "a.conf",
+    ] {
         for t0 in ["1", "71"] {
             let fx = Fx::new();
             write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
@@ -4031,4 +4095,725 @@ fn pa_push_scheduler_finds_a_cron_line_at_the_top_of_a_crontab_near_the_size_cap
     fx.write("etc/systemd/system/blocklist-push.service", &unit);
     let r = fx.run_env(SCHEDULER, &[("STUB_ENABLED", "blocklist-push.timer")]);
     assert_eq!(r.get("printed"), "timer 1", "{}", r.err);
+}
+
+// ---- the record-mode lifecycle -------------------------------------------------------------------
+
+/// The time seam `secs` seconds after `NOW`, in the same boot.
+fn at(secs: u64) -> [(&'static str, String); 3] {
+    [
+        ("PA_TEST_WALL", (1_000_000 + secs).to_string()),
+        ("PA_TEST_BOOT", "abcdef01".to_string()),
+        ("PA_TEST_UP", (5000 + secs).to_string()),
+    ]
+}
+
+/// The stamp the library writes `secs` seconds after `NOW`.
+fn stamp_at(secs: u64) -> String {
+    format!("{}/abcdef01/{}", 1_000_000 + secs, 5000 + secs)
+}
+
+/// Applies TX to KEY (default `unit:sensor-ssh.service`) with the firing's attributes from the
+/// environment, keeps the result in memory and writes the file once.
+const LIFE: &str = r#"pa_now
+PA_REC_KIND="${KIND:-unit-failed}" PA_REC_STAGE="${STAGE:-listen}" PA_REC_INST="${INST-u12345}" PA_REC_TIER="${TIER:-PAGE}"
+PA_REC_CAUSE="${CAUSE-proc.exit:1}" PA_REC_NR="${NR-4}" PA_REC_OUT="${OUT:-delivered}" PA_REC_FLAG="${FLAG:-}" PA_REC_PROOF="${PROOF:-}"
+pa_incident_load
+rc=0; pa_incident_transition "${KEY:-unit:sensor-ssh.service}" "$TX" || rc=$?
+echo "tx=$rc $PA_TX_DONE $PA_TX"
+prc=0; pa_incident_set || prc=$?
+[ "$prc" != 0 ] || pa_incident_write || prc=$?
+echo "put=$prc"
+"#;
+
+/// Runs LIFE at `secs` with TX and the extra variables, and returns what it printed for `tx`.
+fn life(fx: &Fx, secs: u64, tx: &str, extra: &[(&str, &str)]) -> String {
+    let now = at(secs);
+    let mut env: Vec<(&str, &str)> = now.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    env.push(("TX", tx));
+    env.extend_from_slice(extra);
+    let r = fx.run_env(LIFE, &env);
+    assert_eq!(r.get("put"), "0", "{tx} at {secs}: {}", r.err);
+    r.get("tx")
+}
+
+/// The one record of `key` in the incidents file.
+fn the_record(fx: &Fx, key: &str) -> Vec<String> {
+    incident_records(&fx.read("var/lib/propolis/witness/incidents"))
+        .into_iter()
+        .find(|f| f[2] == key)
+        .unwrap_or_else(|| panic!("no record of {key}"))
+}
+
+/// In the legacy profile the whole lifecycle runs and sends nothing: an open schedules its
+/// reminders at 1 h, 4 h and 12 h for a PAGE, at 4 h and 12 h for an ACT, none for a NOTICE, and
+/// each reminder that comes due is one more message v2 would have sent.
+#[test]
+fn the_reminder_schedule_is_one_four_and_twelve_hours_for_a_page_and_four_and_twelve_for_an_act() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    assert_eq!(life(&fx, 0, "open", &[key]), "0 open open");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!(f[16], "open", "last_tx");
+    assert_eq!(f[18], "0", "reminders");
+    assert_eq!(f[19], stamp_at(3600), "next_due");
+    assert_eq!(f[29], "1", "would_push");
+
+    // Not due yet: nothing happens.
+    assert_eq!(life(&fx, 3599, "remind", &[key]), "3 - -");
+    for (secs, next, pushed) in [
+        (3600, stamp_at(14_400), "2"),
+        (14_400, stamp_at(43_200), "3"),
+        (43_200, "-".to_string(), "4"),
+    ] {
+        assert_eq!(life(&fx, secs, "remind", &[key]), "0 remind remind");
+        let f = the_record(&fx, "unit:sensor-ssh.service");
+        assert_eq!(f[19], next, "next_due after the reminder at {secs}");
+        assert_eq!(f[29], pushed, "would_push after the reminder at {secs}");
+        assert_eq!(f[16], "remind");
+    }
+    assert_eq!(
+        life(&fx, 90_000, "remind", &[key]),
+        "3 - -",
+        "no fourth reminder"
+    );
+
+    let act = ("KEY", "unit:propolis-backup.service");
+    assert_eq!(
+        life(&fx, 0, "open", &[act, ("TIER", "ACT"), ("STAGE", "backup")]),
+        "0 open open"
+    );
+    assert_eq!(
+        the_record(&fx, "unit:propolis-backup.service")[19],
+        stamp_at(14_400)
+    );
+    assert_eq!(life(&fx, 14_400, "remind", &[act]), "0 remind remind");
+    assert_eq!(
+        the_record(&fx, "unit:propolis-backup.service")[19],
+        stamp_at(43_200)
+    );
+
+    let notice = ("KEY", "unit:propolis-logrotate.service");
+    life(
+        &fx,
+        0,
+        "open",
+        &[notice, ("TIER", "NOTICE"), ("KIND", "rotation-skipped")],
+    );
+    let f = the_record(&fx, "unit:propolis-logrotate.service");
+    assert_eq!((f[19].as_str(), f[29].as_str()), ("-", "0"));
+
+    let nobind = ("KEY", "unit:sensor-http.service");
+    life(
+        &fx,
+        0,
+        "open",
+        &[nobind, ("TIER", "ACT"), ("KIND", "unit-nobind")],
+    );
+    assert_eq!(
+        the_record(&fx, "unit:sensor-http.service")[19],
+        "-",
+        "unit-nobind has no reminders"
+    );
+}
+
+/// A resolve needs a proof from the closed list and an open or acked record; it counts as a
+/// message v2 would have sent only when the open was one.
+#[test]
+fn a_resolve_records_its_proof_and_counts_only_where_the_open_counted() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    life(&fx, 0, "open", &[key]);
+    assert_eq!(
+        life(&fx, 700, "resolve", &[key, ("PROOF", "lucky")]),
+        "2 - -",
+        "a proof outside the closed list is refused"
+    );
+    assert_eq!(
+        life(&fx, 700, "resolve", &[key, ("PROOF", "active10")]),
+        "0 resolve resolve"
+    );
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!(f[7], "resolved");
+    assert_eq!(f[21], stamp_at(700), "resolved");
+    assert_eq!(f[22], "active10", "proof");
+    assert_eq!(f[16], "resolve");
+    assert_eq!(f[19], "-", "nothing more to remind");
+    assert_eq!(f[29], "2", "the open and the resolve");
+    assert_eq!(
+        life(&fx, 800, "resolve", &[key, ("PROOF", "active10")]),
+        "3 - -",
+        "a resolved record does not resolve again"
+    );
+
+    let notice = ("KEY", "unit:propolis-logrotate.service");
+    life(
+        &fx,
+        0,
+        "open",
+        &[notice, ("TIER", "NOTICE"), ("KIND", "rotation-skipped")],
+    );
+    assert_eq!(
+        life(&fx, 400, "resolve", &[notice, ("PROOF", "nextrun")]),
+        "0 resolve -"
+    );
+    assert_eq!(the_record(&fx, "unit:propolis-logrotate.service")[29], "0");
+
+    let pending = ("KEY", "unit:sensor-http.service");
+    life(&fx, 0, "pending", &[pending]);
+    assert_eq!(
+        life(&fx, 400, "resolve", &[pending, ("PROOF", "active10")]),
+        "3 - -",
+        "a first sighting is dropped or opened, never resolved"
+    );
+}
+
+/// A pending first sighting that healed leaves no record behind; an open one cannot be dropped.
+#[test]
+fn a_dropped_first_sighting_leaves_no_record_and_an_open_record_cannot_be_dropped() {
+    let fx = Fx::salted(SALT);
+    life(&fx, 0, "pending", &[("KEY", "unit:sensor-ssh.service")]);
+    life(&fx, 0, "open", &[("KEY", "unit:sensor-http.service")]);
+    assert_eq!(
+        life(&fx, 300, "drop", &[("KEY", "unit:sensor-ssh.service")]),
+        "0 drop -"
+    );
+    assert_eq!(
+        life(&fx, 300, "drop", &[("KEY", "unit:sensor-http.service")]),
+        "3 - -"
+    );
+    assert_eq!(
+        life(&fx, 300, "drop", &[("KEY", "unit:nosuch.service")]),
+        "1 - -"
+    );
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    let records = incident_records(&text);
+    assert_eq!(records.len(), 1, "{text}");
+    assert_eq!(records[0][2], "unit:sensor-http.service");
+    assert!(
+        text.contains("\nN\t3\n"),
+        "an id is never handed out twice: {text}"
+    );
+}
+
+/// The same fault back within max(2 x (resolved - opened), 30 min) of its resolve is a reopen of
+/// the same id, with its acknowledgement cleared; later it is a new incident. The third reopen
+/// within 24 h holds the next resolve until the proof has held an hour.
+#[test]
+fn a_fault_back_within_its_reopen_window_reopens_the_same_id_and_the_third_reopen_holds_the_resolve()
+ {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    let proof = ("PROOF", "active10");
+    life(&fx, 0, "open", &[key]);
+    life(&fx, 600, "resolve", &[key, proof]);
+    // Window: max(2 x 600, 1800) = 1800 s after the resolve.
+    assert_eq!(life(&fx, 2400, "open", &[key]), "0 open reopen");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!(f[1], "w#1", "same id");
+    assert_eq!(f[7], "open");
+    assert_eq!(f[16], "reopen");
+    assert_eq!(f[23], "1", "reopens");
+    assert_eq!(f[24], stamp_at(2400), "reopen_first");
+    assert_eq!(f[21], "-", "no longer resolved");
+    assert_eq!(f[9], stamp_at(2400), "opened again");
+    assert_eq!(f[19], stamp_at(2400 + 3600), "reminders start again");
+    assert_eq!(f[29], "3", "open, resolve, reopen");
+
+    for (resolve_at, open_at) in [(2500, 2600), (2700, 2800)] {
+        life(&fx, resolve_at, "resolve", &[key, proof]);
+        assert_eq!(life(&fx, open_at, "open", &[key]), "0 open reopen");
+    }
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!(f[23], "3");
+    assert_eq!(f[25], stamp_at(2800), "the third reopen sets hold_until");
+    assert_eq!(
+        life(&fx, 2800 + 3599, "resolve", &[key, proof]),
+        "4 - -",
+        "held for an hour"
+    );
+    assert_eq!(
+        life(&fx, 2800 + 3600, "resolve", &[key, proof]),
+        "0 resolve resolve"
+    );
+
+    // Past the window it is a new incident under the next id.
+    let resolved_at = 2800 + 3600;
+    assert_eq!(
+        life(&fx, resolved_at + 1_000_000, "open", &[key]),
+        "0 open open"
+    );
+    assert_eq!(the_record(&fx, "unit:sensor-ssh.service")[1], "w#2");
+}
+
+/// A first sighting of a fault that is back within the window stays the same record: opened, it
+/// is a reopen; dropped (the restart healed), the record is resolved again as it was.
+#[test]
+fn a_first_sighting_inside_the_reopen_window_keeps_the_record_and_a_drop_puts_it_back() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    life(&fx, 0, "open", &[key]);
+    life(&fx, 600, "resolve", &[key, ("PROOF", "active10")]);
+    assert_eq!(life(&fx, 900, "pending", &[key]), "0 pending -");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!((f[1].as_str(), f[7].as_str()), ("w#1", "pending"));
+    assert_eq!(life(&fx, 1200, "drop", &[key]), "0 drop -");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!(f[7], "resolved");
+    assert_eq!(f[21], stamp_at(600), "the resolve it had");
+    assert_eq!(f[29], "2", "nothing counted for the healed restart");
+
+    life(&fx, 1300, "pending", &[key]);
+    assert_eq!(life(&fx, 1600, "open", &[key]), "0 open reopen");
+    assert_eq!(the_record(&fx, "unit:sensor-ssh.service")[1], "w#1");
+}
+
+/// The maint flag describes the sighting a record is judged on. A fault back inside the reopen
+/// window with no marker is not planned work because an earlier episode of the same record came
+/// under one; a sighting that does come under a marker is flagged again.
+#[test]
+fn a_first_sighting_inside_the_reopen_window_carries_the_maint_flag_of_this_sighting_only() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    let has_maint = |fx: &Fx| {
+        the_record(fx, "unit:sensor-ssh.service")[30]
+            .split(',')
+            .any(|x| x == "maint")
+    };
+    life(&fx, 0, "pending", &[key, ("FLAG", "maint")]);
+    life(&fx, 100, "open", &[key]);
+    assert!(has_maint(&fx), "the first episode came under a marker");
+    life(&fx, 700, "resolve", &[key, ("PROOF", "active10")]);
+
+    assert_eq!(life(&fx, 1000, "pending", &[key]), "0 pending -");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!((f[1].as_str(), f[7].as_str()), ("w#1", "pending"));
+    assert!(!has_maint(&fx), "no marker this time: {}", f[30]);
+
+    life(&fx, 1100, "drop", &[key]);
+    life(&fx, 1200, "pending", &[key, ("FLAG", "maint")]);
+    assert!(has_maint(&fx), "this sighting came under a marker");
+}
+
+/// A first sighting kept inside the reopen window is judged on what the hook read this time:
+/// its NRestarts replaces the count of the first open, and its time is the record's onset, or
+/// one healed restart would read as a unit that kept failing.
+#[test]
+fn a_first_sighting_inside_the_reopen_window_takes_the_count_and_the_time_of_this_sighting() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    life(&fx, 0, "open", &[key, ("NR", "0")]);
+    assert_eq!(the_record(&fx, "unit:sensor-ssh.service")[32], "0");
+    life(&fx, 600, "resolve", &[key, ("PROOF", "active10")]);
+    assert_eq!(
+        life(&fx, 900, "pending", &[key, ("NR", "7")]),
+        "0 pending -"
+    );
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!((f[1].as_str(), f[7].as_str()), ("w#1", "pending"));
+    assert_eq!(f[32], "7", "nr_seen of this sighting");
+    assert_eq!(f[10], stamp_at(900), "onset of this sighting");
+}
+
+/// The reopen window is twice as long as the incident was open (at least 30 minutes): open for
+/// 3000 s, the same fault 5000 s after the resolve reopens the same id, and 6100 s after it is a
+/// new incident.
+#[test]
+fn the_reopen_window_is_twice_the_time_the_incident_was_open() {
+    let fx = Fx::salted(SALT);
+    let proof = ("PROOF", "active10");
+    let inside = ("KEY", "unit:sensor-ssh.service");
+    life(&fx, 0, "open", &[inside]);
+    life(&fx, 3000, "resolve", &[inside, proof]);
+    assert_eq!(life(&fx, 8000, "open", &[inside]), "0 open reopen");
+    assert_eq!(the_record(&fx, "unit:sensor-ssh.service")[1], "w#1");
+
+    let outside = ("KEY", "unit:sensor-http.service");
+    life(&fx, 0, "open", &[outside]);
+    life(&fx, 3000, "resolve", &[outside, proof]);
+    assert_eq!(life(&fx, 9100, "open", &[outside]), "0 open open");
+    assert_eq!(the_record(&fx, "unit:sensor-http.service")[1], "w#3");
+}
+
+/// Reopens are counted within 24 h of the first: three spread over more than a day start the
+/// count again and never hold the resolve.
+#[test]
+fn three_reopens_spread_over_more_than_a_day_never_hold_the_resolve() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    let proof = ("PROOF", "active10");
+    life(&fx, 0, "open", &[key]);
+    life(&fx, 600, "resolve", &[key, proof]);
+    assert_eq!(life(&fx, 1000, "open", &[key]), "0 open reopen");
+    life(&fx, 41_000, "resolve", &[key, proof]);
+    assert_eq!(life(&fx, 50_000, "open", &[key]), "0 open reopen");
+    assert_eq!(the_record(&fx, "unit:sensor-ssh.service")[23], "2");
+    life(&fx, 90_000, "resolve", &[key, proof]);
+    assert_eq!(life(&fx, 100_000, "open", &[key]), "0 open reopen");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!(f[23], "1", "the count starts again a day after the first");
+    assert_eq!(f[24], stamp_at(100_000), "reopen_first");
+    assert_eq!(f[25], "-", "no hold");
+}
+
+/// A reminder that comes due long after its time (the timer was stopped, or the schedule was
+/// given to an old record) is one reminder: the offsets that went by meanwhile are skipped, so
+/// the next pass sends no second one.
+#[test]
+fn a_reminder_late_by_several_offsets_is_recorded_once_and_the_missed_ones_are_skipped() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    life(&fx, 0, "open", &[key]);
+    assert_eq!(life(&fx, 50_000, "remind", &[key]), "0 remind remind");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!((f[19].as_str(), f[29].as_str()), ("-", "2"));
+    assert_eq!(f[18], "1", "the skipped reminders are not counted");
+    assert_eq!(life(&fx, 50_300, "remind", &[key]), "3 - -");
+    assert_eq!(the_record(&fx, "unit:sensor-ssh.service")[29], "2");
+
+    let late = ("KEY", "unit:sensor-http.service");
+    life(&fx, 0, "open", &[late]);
+    assert_eq!(life(&fx, 20_000, "remind", &[late]), "0 remind remind");
+    let f = the_record(&fx, "unit:sensor-http.service");
+    assert_eq!(f[19], stamp_at(43_200), "the 12 h reminder is still ahead");
+    assert_eq!(f[18], "1", "the skipped reminder is not counted");
+    assert_eq!(life(&fx, 20_300, "remind", &[late]), "3 - -");
+    assert_eq!(life(&fx, 43_200, "remind", &[late]), "0 remind remind");
+    let f = the_record(&fx, "unit:sensor-http.service");
+    assert_eq!((f[18].as_str(), f[19].as_str()), ("2", "-"), "{f:?}");
+}
+
+/// An acknowledged record is past its reminders: one whose next reminder is due gets none.
+#[test]
+fn an_acknowledged_record_is_never_reminded() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:sensor-ssh.service");
+    life(&fx, 0, "open", &[key]);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    let acked: String = text
+        .lines()
+        .map(|l| {
+            let mut f: Vec<&str> = l.split('\t').collect();
+            if f[0] == "I" {
+                f[7] = "acked";
+            }
+            format!("{}\n", f.join("\t"))
+        })
+        .collect();
+    fx.write("var/lib/propolis/witness/incidents", &acked);
+    assert_eq!(life(&fx, 4000, "remind", &[key]), "3 - -");
+    let f = the_record(&fx, "unit:sensor-ssh.service");
+    assert_eq!((f[7].as_str(), f[29].as_str()), ("acked", "1"));
+}
+
+/// A change is counted when the cause changes class (the part before the dot) or the tier
+/// rises; a new code within the class, or a cause learnt where it was unknown, is not one.
+#[test]
+fn a_change_of_cause_class_or_a_rising_tier_counts_and_a_change_within_the_class_does_not() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:propolis-logrotate.service");
+    let act = [("TIER", "ACT"), ("STAGE", "source")];
+    life(&fx, 0, "open", &[key, act[0], act[1], ("CAUSE", "unknown")]);
+    assert_eq!(
+        life(
+            &fx,
+            300,
+            "change",
+            &[key, act[0], act[1], ("CAUSE", "proc.exit:1")]
+        ),
+        "0 occ -",
+        "learning the cause is not a change"
+    );
+    assert_eq!(
+        life(
+            &fx,
+            600,
+            "change",
+            &[key, act[0], act[1], ("CAUSE", "proc.signal:9")]
+        ),
+        "0 occ -"
+    );
+    let f = the_record(&fx, "unit:propolis-logrotate.service");
+    assert_eq!(f[11], "proc.signal:9");
+    assert_eq!(f[12], stamp_at(600), "cause_since");
+    assert_eq!(f[29], "1");
+    assert_eq!(
+        life(
+            &fx,
+            900,
+            "change",
+            &[key, act[0], act[1], ("CAUSE", "guard.no_space")]
+        ),
+        "0 change change"
+    );
+    let f = the_record(&fx, "unit:propolis-logrotate.service");
+    assert_eq!((f[16].as_str(), f[29].as_str()), ("change", "2"));
+    assert_eq!(
+        life(
+            &fx,
+            1200,
+            "change",
+            &[key, ("TIER", "PAGE"), ("CAUSE", "guard.no_space")]
+        ),
+        "0 change change"
+    );
+    assert_eq!(
+        the_record(&fx, "unit:propolis-logrotate.service")[6],
+        "PAGE"
+    );
+    assert_eq!(
+        life(
+            &fx,
+            1500,
+            "change",
+            &[key, ("TIER", "ACT"), ("CAUSE", "guard.no_space")]
+        ),
+        "0 occ -",
+        "a tier never falls"
+    );
+    assert_eq!(
+        the_record(&fx, "unit:propolis-logrotate.service")[6],
+        "PAGE"
+    );
+}
+
+/// Late parent: a child that is already open takes a parent that appears later; from then on it
+/// is neither reminded nor counted, and its resolve folds into the parent's.
+#[test]
+fn a_late_parent_takes_an_open_child_which_then_counts_nothing_more() {
+    let fx = Fx::salted(SALT);
+    life(&fx, 0, "open", &[("KEY", "unit:propolis.service")]);
+    life(&fx, 300, "open", &[("KEY", "db:local")]);
+    let fold = |child: &str, parent: &str| {
+        let now = at(400);
+        let mut env: Vec<(&str, &str)> = now.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        env.push(("CHILD", child));
+        env.push(("PARENT", parent));
+        let r = fx.run_env(
+            "pa_now\npa_incident_load\nrc=0; pa_incident_fold \"$CHILD\" \"$PARENT\" || rc=$?\necho \"fold=$rc\"\n\
+             [ \"$rc\" != 0 ] || { pa_incident_set && pa_incident_write; }",
+            &env,
+        );
+        r.get("fold")
+    };
+    assert_eq!(fold("unit:propolis.service", "w#9"), "1", "no such parent");
+    assert_eq!(
+        fold("unit:propolis.service", "w#1"),
+        "1",
+        "not its own parent"
+    );
+    assert_eq!(fold("unit:propolis.service", "w#2"), "0");
+    let f = the_record(&fx, "unit:propolis.service");
+    assert_eq!(f[13], "w#2", "parent");
+    assert_eq!(f[30], "folded", "flags");
+    assert_eq!(f[19], "-", "no reminders");
+    assert_eq!(f[29], "1", "folding sends nothing");
+    assert_eq!(
+        life(&fx, 3600, "remind", &[("KEY", "unit:propolis.service")]),
+        "3 - -"
+    );
+    assert_eq!(
+        life(
+            &fx,
+            3700,
+            "change",
+            &[
+                ("KEY", "unit:propolis.service"),
+                ("CAUSE", "db.unreachable")
+            ]
+        ),
+        "0 occ -",
+        "a folded child sends no change"
+    );
+    assert_eq!(
+        life(
+            &fx,
+            3800,
+            "resolve",
+            &[("KEY", "unit:propolis.service"), ("PROOF", "active10")]
+        ),
+        "0 resolve -"
+    );
+    assert_eq!(the_record(&fx, "unit:propolis.service")[29], "1");
+}
+
+/// The first-sighting rule for a unit that restarts itself: systemd raises NRestarts after the
+/// hook read it, so one healed restart is NRestarts n + 1 and is dropped; n + 2 means it failed
+/// again. Under 60 s of uptime on one sample waits a pass; on two it opens. Not active opens.
+#[test]
+fn the_first_sighting_rule_drops_one_healed_restart_opens_a_second_and_waits_once_under_a_minute() {
+    let fx = Fx::new();
+    for (seen, nr, up, prev, want) in [
+        ("4", "5", "300", "?", "drop"),
+        ("4", "4", "300", "200", "drop"),
+        ("4", "6", "300", "200", "open"),
+        ("4", "5", "-", "300", "open"),
+        ("4", "5", "20", "600", "wait"),
+        ("4", "5", "20", "?", "wait"),
+        ("4", "5", "20", "30", "open"),
+        ("4", "5", "20", "-", "open"),
+        ("-", "9", "300", "?", "drop"),
+        ("-", "9", "20", "40", "open"),
+        ("-", "9", "-", "?", "open"),
+        ("4", "", "300", "?", "drop"),
+        ("4", "5", "60", "30", "drop"),
+    ] {
+        let r = fx.run_env(
+            "echo \"judge=$(pa_first_sighting \"$SEEN\" \"$NRN\" \"$UPF\" \"$PREV\")\"",
+            &[("SEEN", seen), ("NRN", nr), ("UPF", up), ("PREV", prev)],
+        );
+        assert_eq!(
+            r.get("judge"),
+            want,
+            "seen {seen} nr {nr} up {up} prev {prev}: {}",
+            r.err
+        );
+    }
+}
+
+/// `--maint` writes the marker through the library: reason, end and boot, 0600, read back by
+/// pa_maint_active; 0 removes it whatever wrote it; out-of-range values write nothing.
+#[test]
+fn pa_maint_write_writes_a_manual_marker_pa_maint_active_honours_and_zero_removes_it() {
+    let fx = Fx::new();
+    let r = fx.run_env(
+        "umask 000; rc=0; pa_maint_write manual 30 || rc=$?; echo \"rc=$rc\"\n\
+         pa_maint_active && echo \"active=$PA_MAINT_REASON $PA_MAINT_UNTIL\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(r.get("active"), "manual 1001800");
+    let marker = fx.p("run/propolis-witness/maintenance");
+    assert_eq!(
+        fx.read("run/propolis-witness/maintenance"),
+        "#maintenance v1 g=1\nX\t1001800\tabcdef01\tmanual\n"
+    );
+    assert_eq!(mode_of(&marker), 0o600);
+    for bad in [
+        ("manual", "121"),
+        ("manual", "-1"),
+        ("manual", "x"),
+        ("party", "5"),
+    ] {
+        let r = fx.run_env(
+            "rc=0; pa_maint_write \"$R\" \"$M\" || rc=$?; echo \"rc=$rc\"",
+            &[NOW[0], NOW[1], NOW[2], ("R", bad.0), ("M", bad.1)],
+        );
+        assert_eq!(r.get("rc"), "2", "{bad:?}");
+    }
+    assert!(
+        fx.read("run/propolis-witness/maintenance")
+            .contains("1001800")
+    );
+    fx.write(
+        "run/propolis-witness/maintenance",
+        &maintenance_marker(1_003_600, "abcdef01", "upgrade"),
+    );
+    let r = fx.run_env(
+        "rc=0; pa_maint_write manual 0 || rc=$?; echo \"rc=$rc\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0");
+    assert!(!marker.exists(), "0 removes any marker");
+    let r = fx.run_env(
+        "rc=0; pa_maint_write manual 0 || rc=$?; echo \"rc=$rc\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "nothing to remove is not a failure");
+    // Without a boot id the marker could never hold, so it is not written.
+    let r = fx.run_env(
+        "rc=0; pa_maint_write manual 5 || rc=$?; echo \"rc=$rc\"",
+        &[NOW[0], ("PA_TEST_BOOT", "-"), NOW[2]],
+    );
+    assert_eq!(r.get("rc"), "1");
+    assert!(!marker.exists());
+}
+
+/// Resolved records go seven days after their resolve and withheld lines after 48 hours; open,
+/// acked and pending records always stay.
+#[test]
+fn pa_incident_prune_drops_week_old_resolved_records_and_two_day_old_withheld_lines() {
+    let fx = Fx::salted(SALT);
+    // Stamps of an earlier boot, so their ages come from the wall clock.
+    let earlier = |wall: u64| format!("{wall}/12345678/5");
+    let resolved_at = |line: String, wall: u64| {
+        let mut f: Vec<String> = line.trim_end().split('\t').map(str::to_string).collect();
+        f[21] = earlier(wall);
+        f.join("\t") + "\n"
+    };
+    let withheld = |wall: u64| format!("W\t{}\tabcd1234\topen\t1\tu12345\tbudget\n", earlier(wall));
+    let body = format!(
+        "N\t9\n{}{}{}{}{}",
+        record_line("w#1", "unit:a.service", "unit-failed", "open"),
+        resolved_at(
+            record_line("w#2", "unit:b.service", "unit-failed", "resolved"),
+            1_000_000 - 604_801
+        ),
+        resolved_at(
+            record_line("w#3", "unit:c.service", "unit-failed", "resolved"),
+            1_000_000 - 604_000
+        ),
+        withheld(1_000_000 - 172_801),
+        withheld(1_000_000 - 3600),
+    );
+    write_incidents(&fx, &body);
+    let r = fx.run_env(
+        "pa_now\npa_lock 5\npa_incident_load\npa_incident_prune\npa_incident_write; echo \"rc=$?\"\npa_unlock",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    let ids: Vec<String> = incident_records(&text)
+        .iter()
+        .map(|f| f[1].clone())
+        .collect();
+    assert_eq!(ids, ["w#1", "w#3"], "{text}");
+    assert_eq!(w_walls(&text), vec![1_000_000 - 3600], "{text}");
+}
+
+/// The banner file is replaced whole, mode 0600 whatever the umask, and leaves no temporary file.
+#[test]
+fn pa_banner_write_replaces_the_banner_whole_with_mode_0600() {
+    let fx = Fx::salted(SALT);
+    std::fs::create_dir_all(fx.p("run/motd.d")).unwrap();
+    let r = fx.run_env(
+        "umask 000; rc=0; pa_banner_write || rc=$?; echo \"rc=$rc\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let banner = fx.p("run/motd.d/propolis");
+    assert_eq!(mode_of(&banner), 0o600);
+    let text = fx.read("run/motd.d/propolis");
+    assert_eq!(text.lines().count(), 4, "{text}");
+    assert!(text.starts_with("[propolis 13:46 UTC] "), "{text}");
+    let left: Vec<_> = std::fs::read_dir(fx.p("run/motd.d"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["propolis"], "no temporary file is left");
+
+    std::fs::remove_dir_all(fx.p("run/motd.d")).unwrap();
+    let r = fx.run_env("rc=0; pa_banner_write || rc=$?; echo \"rc=$rc\"", &NOW);
+    assert_eq!(r.get("rc"), "1", "a missing directory is not created");
+    assert!(!fx.p("run/motd.d").exists());
+}
+
+/// A banner line longer than 78 bytes would wrap on a terminal and push the next one out of
+/// sight; it is replaced by `(line withheld)`, and the lines around it stay.
+#[test]
+fn a_banner_line_past_78_bytes_is_withheld_and_the_others_kept() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(
+        "_pa_undelivered_count() { printf '%s' 123456789012345678; }\npa_banner",
+        &NOW,
+    );
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines.len(), 4, "{}\n{}", r.out, r.err);
+    assert_eq!(lines[2], "[propolis 13:46 UTC] (line withheld)");
+    assert!(
+        lines[1].starts_with("[propolis 13:46 UTC] alerts: "),
+        "{}",
+        r.out
+    );
+    assert!(lines.iter().all(|l| l.len() <= 78), "{}", r.out);
 }

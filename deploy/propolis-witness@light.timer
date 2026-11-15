@@ -1,0 +1,17 @@
+# Every five minutes, the witness's light pass (propolis-witness@light.service).
+#
+# Relative to the last start, not on the clock, so it never fires on the minute with the backup
+# and rotation timers, and a pass still running is not doubled: the start job merges into the
+# running oneshot. A template timer cannot carry a schedule of its own, so this concrete file
+# names its instance.
+[Unit]
+Description=Propolis root witness, every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Unit=propolis-witness@light.service
+
+[Install]
+WantedBy=timers.target

@@ -2496,6 +2496,19 @@ fn expected_exec_paths(unit: &str, program: &str) -> Vec<String> {
             paths.push("/usr/local/sbin/propolis-logrotate-guard".to_string());
             paths.push("/usr/bin".to_string());
         }
+        "propolis-witness@.service" => {
+            // The installed config-check under /usr/local/lib/propolis, the daemon binary for
+            // `pg-exec` and psql through Debian's PostgreSQL wrapper, the distro tools under
+            // /usr/bin, and nft and ss under /usr/sbin, which config-check runs. The two
+            // /usr/local entries carry `-`: the witness runs on every host, a gateway-only one
+            // or a collector without the daemon binary among them, and an absent unprefixed
+            // entry fails the unit with 226/NAMESPACE.
+            paths.push("-/usr/local/lib/propolis".to_string());
+            paths.push("-/usr/local/bin/propolis".to_string());
+            paths.push("/usr/bin".to_string());
+            paths.push("/usr/sbin".to_string());
+            paths.push("-/usr/share/postgresql-common/pg_wrapper".to_string());
+        }
         _ => {}
     }
     paths.extend(LIBRARY_ROOTS.iter().map(|p| p.to_string()));
@@ -6665,6 +6678,198 @@ fn install_and_upgrade_install_the_status_command_executable_beside_the_library(
     );
 }
 
+/// The witness is one root oneshot template run by a timer: no account of its own, no runtime
+/// directory a stopping instance could remove under another, the three places it writes granted
+/// with `-` (a missing one costs a note, never the unit), a home it may read but not write (the
+/// checkout config-check reads is often under /home), a private /tmp, netlink for `nft` and
+/// `ss`, nothing it creates readable by another account, and a time limit far beyond its own
+/// deadline. The light timer runs relative to the last start, every five minutes. The grants
+/// for config-check and the database are there for the hourly pass, and the unit says so: the
+/// light pass of this release runs neither.
+#[test]
+fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() {
+    let raw = deploy_file("propolis-witness@.service");
+    for current in [
+        "and config-check runs nft",
+        "for nft and ss, which config-check runs;",
+    ] {
+        assert!(
+            !raw.contains(current),
+            "the unit describes the hourly pass's tools as the light pass's: {current}"
+        );
+    }
+    assert!(
+        raw.contains("the light pass of this one runs none of them"),
+        "{raw}"
+    );
+    let service = uncommented(&raw);
+    let lines: Vec<&str> = service.lines().map(str::trim).collect();
+    for directive in [
+        "Type=oneshot",
+        "ExecStart=/usr/local/sbin/propolis-witness %i",
+        "OnFailure=propolis-alert@%n.service",
+        "TimeoutStartSec=15min",
+        "UMask=0077",
+        "ReadWritePaths=-/var/lib/propolis/witness -/run/propolis-witness -/run/motd.d",
+        "ProtectSystem=strict",
+        "ProtectHome=read-only",
+        "PrivateTmp=yes",
+        "NoNewPrivileges=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+    ] {
+        assert!(
+            lines.contains(&directive),
+            "propolis-witness@.service lacks {directive}"
+        );
+    }
+    for absent in ["User=", "RuntimeDirectory", "DynamicUser="] {
+        assert!(
+            !lines.iter().any(|l| l.starts_with(absent)),
+            "propolis-witness@.service must not set {absent}"
+        );
+    }
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("ReadWritePaths="))
+            .count(),
+        1,
+        "one grant line"
+    );
+
+    let timer = uncommented(&deploy_file("propolis-witness@light.timer"));
+    let lines: Vec<&str> = timer.lines().map(str::trim).collect();
+    for directive in [
+        "OnBootSec=2min",
+        "OnUnitActiveSec=5min",
+        "Unit=propolis-witness@light.service",
+        "WantedBy=timers.target",
+    ] {
+        assert!(
+            lines.contains(&directive),
+            "propolis-witness@light.timer lacks {directive}"
+        );
+    }
+    assert!(
+        !lines.iter().any(|l| l.starts_with("OnCalendar=")),
+        "the light timer runs relative to its last start, never on the minute with the others"
+    );
+
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/witness.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(status.success(), "deploy/witness.sh is not valid bash");
+}
+
+/// Both entry points install the witness after the library it sources, install its unit and
+/// light timer in an install loop (so every unit test that walks those loops covers them), and
+/// enable the timer after systemd has reloaded; upgrade does it before any restart, so a failure
+/// aborts before a service is bounced, and after the maintenance marker, so the first pass
+/// records the restarts as planned work. The dry run shows all of it.
+#[test]
+fn install_and_upgrade_install_and_enable_the_witness_after_the_reload() {
+    for (script_name, install) in [
+        (
+            "install.sh",
+            "run install -m 0755 \"$SCRIPT_DIR/witness.sh\" /usr/local/sbin/propolis-witness",
+        ),
+        (
+            "upgrade.sh",
+            "install -m 0755 \"$SCRIPT_DIR/witness.sh\" /usr/local/sbin/propolis-witness",
+        ),
+    ] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let installs: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("/usr/local/sbin/propolis-witness"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            installs.len(),
+            1,
+            "{script_name} must install the witness once"
+        );
+        assert_eq!(lines[installs[0]], install, "{script_name}");
+        let lib = lines
+            .iter()
+            .position(|l| l.ends_with("/usr/local/sbin/propolis-alert-lib"))
+            .unwrap();
+        assert!(lib < installs[0], "{script_name}: the library first");
+        for unit in ["propolis-witness@.service", "propolis-witness@light.timer"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("for unit in ") && l.contains(unit)),
+                "{script_name} never installs {unit}"
+            );
+        }
+        let reload = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl daemon-reload"))
+            .unwrap();
+        let enable = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl enable --now propolis-witness@light.timer"))
+            .unwrap_or_else(|| panic!("{script_name} never enables the light timer"));
+        assert!(reload < enable, "{script_name} enables before the reload");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("propolis-witness@hourly.timer")),
+            "{script_name}: the hourly pass is not part of this release"
+        );
+        if script_name == "upgrade.sh" {
+            let first_restart = lines
+                .iter()
+                .position(|l| l.starts_with("systemctl restart"))
+                .unwrap();
+            let marker = lines
+                .iter()
+                .position(|l| l.contains("> /run/propolis-witness/maintenance"))
+                .unwrap();
+            assert!(
+                enable < first_restart,
+                "upgrade.sh enables before restarting"
+            );
+            assert!(marker < enable, "upgrade.sh writes the marker first");
+        }
+    }
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "witness.sh /usr/local/sbin/propolis-witness\n",
+        "propolis-witness@.service /etc/systemd/system/propolis-witness@.service\n",
+        "propolis-witness@light.timer /etc/systemd/system/propolis-witness@light.timer\n",
+        "[dry-run] systemctl enable --now propolis-witness@light.timer\n",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "dry-run output missing {expected:?}:\n{stdout}"
+        );
+    }
+    let install = deploy_file("install.sh");
+    assert!(
+        install.contains(
+            "NOT started or enabled (except the log rotation, backup and witness timers)"
+        ),
+        "install.sh's closing sentence names the witness timer it enables"
+    );
+}
+
 /// The failure hook records into the root alerting directories, granted only with the `-` prefix:
 /// a missing directory then costs the record, never the unit, where a plain grant would fail the
 /// unit with status 226 and take every failure alert on the host with it. Its time budget and the
@@ -6724,11 +6929,24 @@ fn upgrade_marks_maintenance_around_the_restarts_and_the_marker_can_never_stop_i
         &|l| l.contains("systemctl --no-pager status propolis.service"),
         "status line",
     );
-    let marker: Vec<usize> = lines
+    // The body of each marker function, which only the lines checked below call.
+    let body = |name: &str| -> std::ops::Range<usize> {
+        let start = first(&|l| l == format!("{name}() {{"), name);
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l == "}")
+                .unwrap_or_else(|| panic!("{name} has no closing brace"));
+        start..end + 1
+    };
+    let (manual, end_fn) = (body("maint_manual"), body("maint_end"));
+    let outside: Vec<usize> = (0..lines.len())
+        .filter(|i| !manual.contains(i) && !end_fn.contains(i))
+        .collect();
+    let marker: Vec<usize> = outside
         .iter()
-        .enumerate()
-        .filter(|(_, l)| l.contains("/run/propolis-witness"))
-        .map(|(i, _)| i)
+        .copied()
+        .filter(|&i| lines[i].contains("/run/propolis-witness") || lines[i].contains("maint_end"))
         .collect();
     assert_eq!(marker.len(), 3, "write, trap, removal: {marker:?}");
     let (write, trap, remove) = (marker[0], marker[1], marker[2]);
@@ -6738,11 +6956,13 @@ fn upgrade_marks_maintenance_around_the_restarts_and_the_marker_can_never_stop_i
         lines[write]
     );
     assert!(
-        lines[trap].starts_with("trap '") && lines[trap].ends_with("' EXIT"),
+        lines[trap].starts_with("trap '")
+            && lines[trap].contains("maint_end")
+            && lines[trap].ends_with("' EXIT"),
         "{}",
         lines[trap]
     );
-    assert!(lines[remove].starts_with("rm -f"), "{}", lines[remove]);
+    assert!(lines[remove].starts_with("maint_end"), "{}", lines[remove]);
     assert!(
         reload < write && write < trap && trap < restart,
         "reload {reload}, write {write}, trap {trap}, first restart {restart}"
@@ -6760,6 +6980,28 @@ fn upgrade_marks_maintenance_around_the_restarts_and_the_marker_can_never_stop_i
             "a marker line that could stop the upgrade: {l}"
         );
     }
+    // maint_end rewrites an operator's marker or removes the upgrade's, each best effort; the
+    // operator's marker is read once, before the write, where a failed read only leaves it out.
+    let writes: Vec<&String> = lines[end_fn.clone()]
+        .iter()
+        .filter(|l| l.contains("/run/propolis-witness"))
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert!(
+        writes
+            .iter()
+            .all(|l| l.contains("2>/dev/null") && l.contains("|| true")),
+        "{writes:?}"
+    );
+    let read = first(
+        &|l| l.starts_with("maint_keep=\"$(maint_manual"),
+        "maint_keep",
+    );
+    assert!(
+        read < write && lines[read].ends_with("|| maint_keep=\"\""),
+        "{}",
+        lines[read]
+    );
     // The boot id and the clock it is stamped with are read the same best-effort way.
     for var in ["maint_boot", "maint_now"] {
         let set: Vec<&String> = lines
@@ -6789,11 +7031,17 @@ fn upgrade_writes_the_maintenance_marker_0600_and_survives_a_clock_that_prints_g
     let lines: Vec<&str> = text.lines().collect();
     let start = lines
         .iter()
-        .position(|l| l.starts_with("maint_boot="))
-        .expect("upgrade.sh reads the boot id for the marker");
+        .position(|l| l.starts_with("maint_manual() {"))
+        .expect("upgrade.sh reads an operator's marker before writing its own");
+    assert!(
+        lines.iter().position(|l| l.starts_with("maint_boot=")) > Some(start),
+        "the boot id is read after the marker functions"
+    );
     let end = lines
         .iter()
-        .position(|l| l.contains("> /run/propolis-witness/maintenance"))
+        .position(|l| {
+            l.contains("\\tupgrade\\n") && l.contains("> /run/propolis-witness/maintenance")
+        })
         .expect("upgrade.sh writes the marker");
     assert!(start < end, "{start} {end}");
     let dir = tempfile::tempdir().unwrap();
@@ -6831,6 +7079,71 @@ fn upgrade_writes_the_maintenance_marker_0600_and_survives_a_clock_that_prints_g
     assert_eq!(second[0], "X", "{body}");
     assert_eq!(second[1], "7200", "{body}");
     assert_eq!(second[3], "upgrade", "{body}");
+}
+
+/// An operator's planned window (`propolis-status --maint`) that is still running when an
+/// upgrade starts is put back when the upgrade's own marker ends, with its end unchanged; one
+/// that has ended, or the upgrade's own marker, is removed.
+#[test]
+fn upgrade_puts_back_an_operators_maintenance_marker_that_is_still_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let text = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("maint_manual() {"))
+        .expect("upgrade.sh reads an operator's marker");
+    let end = lines
+        .iter()
+        .position(|l| {
+            l.contains("\\tupgrade\\n") && l.contains("> /run/propolis-witness/maintenance")
+        })
+        .expect("upgrade.sh writes the marker");
+    let boot: String = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap()
+        .replace('-', "")
+        .chars()
+        .take(8)
+        .collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (until, kept) in [(now + 3600, true), (now - 60, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let witness = dir.path().join("propolis-witness");
+        std::fs::create_dir_all(&witness).unwrap();
+        let marker = witness.join("maintenance");
+        let operator = format!("#maintenance v1 g=1\nX\t{until}\t{boot}\tmanual\n");
+        std::fs::write(&marker, &operator).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let block = lines[start..=end]
+            .join("\n")
+            .replace("/run/propolis-witness", witness.to_str().unwrap());
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -euo pipefail\n{block}\ngrep -q upgrade \"$1\" && echo upgrade-marker\nmaint_end\necho reached-the-end"
+            ))
+            .arg("_")
+            .arg(&marker)
+            .fenced_output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success()
+                && stdout.contains("upgrade-marker")
+                && stdout.contains("reached-the-end"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if kept {
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), operator);
+            assert_eq!(mode_of(&marker) & 0o077, 0);
+        } else {
+            assert!(!marker.exists(), "an ended window is not brought back");
+        }
+    }
 }
 
 /// Every path the alerting library can create under the two alerting state directories has a

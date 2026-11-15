@@ -594,6 +594,12 @@ install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
 install -m 0644 "$SCRIPT_DIR/alert-lib.sh" /usr/local/sbin/propolis-alert-lib
 # The read-only walk (sudo propolis-status), which sources the library above.
 install -m 0755 "$SCRIPT_DIR/propolis-status.sh" /usr/local/sbin/propolis-status
+# The root witness and its unit and light timer, enabled after the reload below. Record only: it
+# sends nothing.
+install -m 0755 "$SCRIPT_DIR/witness.sh" /usr/local/sbin/propolis-witness
+for unit in propolis-witness@.service propolis-witness@light.timer; do
+    install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
+done
 # The public-feed push runs from the operator's cron as propolis-blocklist out of a root-owned copy
 # the account cannot edit; refreshed here so the copy never goes stale behind the checkout.
 install -d -o root -g root -m 0755 /usr/local/lib/propolis
@@ -649,18 +655,44 @@ systemctl daemon-reload
 # more just before the final check. Every step is best effort: under `set -e` a marker that cannot
 # be written or removed must never stop an upgrade. It is two fixed lines, so the library is not
 # sourced for it. An upgrade killed outright leaves a marker that expires on its own.
+#
+# A planned window an operator announced (`propolis-status --maint`) may still be running: its
+# marker is read first (maint_manual) and put back at the end (maint_end) while its end is still
+# ahead, so the window does not end silently inside the upgrade.
+maint_manual() {
+    local head="" t="" until="" boot="" reason=""
+    [ -f /run/propolis-witness/maintenance ] && [ ! -L /run/propolis-witness/maintenance ] || return 0
+    { IFS= read -r head; IFS=$'\t' read -r t until boot reason _; } < /run/propolis-witness/maintenance || true
+    [[ "$head" =~ ^#maintenance\ v1\ g=[0-9]{1,18}$ ]] && [ "$t" = X ] && [ "$reason" = manual ] || return 0
+    [[ "$until" =~ ^[0-9]{1,12}$ ]] && [ "$boot" = "$maint_boot" ] && [ "$((10#$until))" -gt "$maint_now" ] || return 0
+    printf '%s\t%s' "$((10#$until))" "$boot"
+}
+maint_end() {
+    local now
+    now="$(date +%s 2>/dev/null)" || now=0
+    [[ "$now" =~ ^[0-9]{1,12}$ ]] || now=0
+    if [ -n "$maint_keep" ] && [ "${maint_keep%%$'\t'*}" -gt "$now" ]; then
+        (umask 077 && printf '#maintenance v1 g=1\nX\t%s\tmanual\n' "$maint_keep" > /run/propolis-witness/maintenance) 2>/dev/null || true
+    else
+        rm -f /run/propolis-witness/maintenance 2>/dev/null || true
+    fi
+}
 maint_boot="$(tr -d - 2>/dev/null < /proc/sys/kernel/random/boot_id | cut -c1-8)" || maint_boot=-
 [[ "$maint_boot" =~ ^[0-9a-f]{8}$ ]] || maint_boot=-
 maint_now="$(date +%s 2>/dev/null)" || maint_now=0
 [[ "$maint_now" =~ ^[0-9]{1,12}$ ]] || maint_now=0
+maint_keep="$(maint_manual 2>/dev/null)" || maint_keep=""
 { { [ -d /run/propolis-witness ] || mkdir -m 0750 /run/propolis-witness; } && (umask 077 && printf '#maintenance v1 g=1\nX\t%s\t%s\tupgrade\n' "$((maint_now + 7200))" "$maint_boot" > /run/propolis-witness/maintenance); } 2>/dev/null || echo "warning: could not write the maintenance marker; the witness may record the restarts as failures"
-trap 'rm -f /run/propolis-witness/maintenance 2>/dev/null || true' EXIT
+trap 'maint_end 2>/dev/null || true' EXIT
 
 # Idempotent: enabling an enabled timer is a no-op, and --now starts it if something stopped it.
 # Before the restarts so a failure here (set -e) aborts before any service is bounced.
-echo "==> enabling the log rotation and backup timers"
+# The witness's first pass may run at once: it is after the maintenance marker, so the restarts
+# below are recorded as planned work.
+echo "==> enabling the log rotation, backup and witness timers"
 systemctl enable --now propolis-logrotate.timer
 systemctl enable --now propolis-backup.timer
+systemctl enable --now propolis-witness@light.timer
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred; do
@@ -705,7 +737,7 @@ fi
 echo "==> done. checking status"
 sleep 2
 systemctl --no-pager status propolis.service | head -5
-rm -f /run/propolis-witness/maintenance 2>/dev/null || true
+maint_end 2>/dev/null || true
 
 # Last, and report-only: the upgrade has finished by now, so a finding here is something to read
 # and act on, not a reason to call the upgrade failed. config-check.sh compares what is configured

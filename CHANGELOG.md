@@ -4,6 +4,18 @@
 
 ### Upgrade note
 
+- **A root witness now runs on a timer; it records and shows, and pushes nothing in the default
+  profile.** `install.sh` and `upgrade.sh` install `/usr/local/sbin/propolis-witness`,
+  `propolis-witness@.service` and `propolis-witness@light.timer`, and enable the timer: a light
+  pass every five minutes, as root. It writes only under `/var/lib/propolis/witness`,
+  `/run/propolis-witness` and the login banner `/run/motd.d/propolis` (root-only), and no host is
+  sent anything it was not sent before. Its first pass after an upgrade judges the records the
+  failure hook kept until then: a self-restarting unit whose single restart healed is dropped
+  and counted, and the rest open, so `sudo propolis-status` may now list open incidents and exit
+  `1` or `2` for them where it exited `0` before. A rollback to a release without the witness
+  keeps it installed and running (it needs nothing from the daemon). To hold it during planned
+  work, `sudo propolis-status --maint MINUTES`.
+
 - **The shipper keeps a record of the batch it is sending.** A new file,
   `<collector id>.pending`, appears in the shipper's state directory while a batch waits for the
   gateway's answer, and `<collector id>.pending.damaged` if such a record cannot be read. The
@@ -416,6 +428,39 @@
   [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories)).
 
 ### Added
+
+- **The root witness's light pass: failures judged, reminded and resolved, in record mode** -
+  `deploy/witness.sh`, run as root every five minutes by `propolis-witness@light.timer`
+  (`deploy/witness.sh#light_pass`). Each pass asks systemd once for every Propolis unit, then
+  under the state lock takes in the failure hook's spool files and removes them, judges the
+  first sightings the hook left pending (one restart that healed, `NRestarts` one above what the
+  hook read, is dropped and counted; a unit still down or restarting again opens), opens a crash
+  loop (three restarts between passes, or six in six hours, on two passes in a row) and a unit
+  left failed on two passes, reminds open incidents at 1, 4 and 12 hours (PAGE) or 4 and 12
+  (ACT), resolves each with its kind's proof (up 10 minutes without a restart, quiet 30 minutes
+  for a loop, a oneshot's next run succeeding, disabled on purpose) and reopens the same id when
+  the fault returns soon after; a reminder that came due while no pass ran (an incident the hook
+  opened before the upgrade) is recorded once. Nothing opens in the first ten minutes after a
+  boot, while a maintenance marker holds or in the ten minutes after it, and an upgrade or
+  rollback run inside a window announced with `--maint` puts that window back when it is done.
+  Nothing is sent: each transition the new paging would send adds one
+  to the record's `would_push`. A check that cannot run never fails the unit: three in a row
+  open the NOTICE `tool-unusable`. A pass that cannot take the state lock in 60 s writes no
+  state and says so in the journal, the walk and the banner. Each pass ends by writing the
+  root-only login banner, `/run/motd.d/propolis`: four lines of counts and closed words, no host
+  or unit name. `propolis-status` gains the `witness` rail, an `OPEN` block for what the witness
+  judged (open PAGE incidents exit `2`, open ACT `1`), a third ALERTS line, `--banner` and
+  `--maint MINUTES` for planned work. The alert library is version 4: the lifecycle
+  (`pa_incident_transition` gains drop, change, remind and resolve, and reopens a recent
+  resolve), `pa_incident_fold`, `pa_first_sighting`, `pa_incident_set`, `pa_incident_write`,
+  `pa_incident_prune`, `pa_banner`, `pa_banner_write`, `pa_maint_write` and `pa_unit_name_ok`.
+  The hook still needs version 2 and sends exactly what it sent; an open it records now carries
+  its reminder schedule, a failure soon after a resolve reopens the same incident, and a firing
+  for a word that is not a unit name (`sensor-ssh` for `sensor-ssh.service`, as a hand-started
+  `propolis-alert@sensor-ssh.service` passes it) is alerted as before and no longer recorded,
+  since systemd answers for such a word under another name and the record could never be judged
+  ([health and observability](docs/operations/health-and-observability.md#witness),
+  [commands](docs/reference/commands.md#status-walk)).
 
 - **`sudo propolis-status`: where the pipeline stopped, and why** - `install.sh` and `upgrade.sh`
   install `deploy/propolis-status.sh` as `/usr/local/sbin/propolis-status` (0755), and a rollback

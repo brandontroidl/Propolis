@@ -38,7 +38,8 @@ const INVOCATION: &str = "0123456789abcdef0123456789abcdef";
 const SALT: &str = "0123456789abcdef0123456789abcdef";
 
 /// Records its argv; answers `is-enabled`, `list-unit-files` and `show` from the `UNITS` file
-/// (`unit|ActiveState|SubState|Result|NRestarts|ActiveEnterTimestamp|UnitFileState|InvocationID`).
+/// (`unit|ActiveState|SubState|Result|NRestarts|ActiveEnterTimestamp|UnitFileState|InvocationID`,
+/// and for a timer optionally `|LastTriggerUSec`).
 const SYSTEMCTL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >> "$STUB_LOG"
 [ -z "${SYSTEMCTL_FAIL:-}" ] || exit 1
@@ -67,14 +68,15 @@ case "$1" in
             esac
             shift
         done
-        a=inactive s=dead r=success n=0 t="" f="" i=""
-        while IFS='|' read -r u a2 s2 r2 n2 t2 f2 i2; do
-            [ "$u" = "$unit" ] && a="$a2" s="$s2" r="$r2" n="$n2" t="$t2" f="$f2" i="$i2"
+        a=inactive s=dead r=success n=0 t="" f="" i="" l=""
+        while IFS='|' read -r u a2 s2 r2 n2 t2 f2 i2 l2; do
+            [ "$u" = "$unit" ] && a="$a2" s="$s2" r="$r2" n="$n2" t="$t2" f="$f2" i="$i2" l="$l2"
         done < "$UNITS"
         for p in ${props//,/ }; do
             case "$p" in
                 ActiveState) v="$a" ;; SubState) v="$s" ;; Result) v="$r" ;; NRestarts) v="$n" ;;
                 ActiveEnterTimestamp) v="$t" ;; UnitFileState) v="$f" ;; InvocationID) v="$i" ;;
+                LastTriggerUSec) v="$l" ;;
                 NextElapseUSecRealtime) v="Sat 2027-01-16 03:30:00 UTC" ;; *) v="" ;;
             esac
             echo "$p=$v"
@@ -377,6 +379,7 @@ impl Fx {
             "success",
             "enabled",
         );
+        fx.light_timer();
 
         let ssh = fx.p("var/log/propolis/ssh/events.jsonl");
         let http = fx.p("var/log/propolis/http/events.jsonl");
@@ -425,6 +428,7 @@ impl Fx {
     fn collector() -> Self {
         let mut fx = Fx::single();
         fx.units.clear();
+        fx.light_timer();
         fx.unit("shipper.service", "active", "running", "success", "enabled");
         fx.unit(
             "sensor-ssh.service",
@@ -472,6 +476,36 @@ impl Fx {
         self.units.push(format!(
             "{name}|{active}|{sub}|{result}|0|Fri 2027-01-15 07:00:00 UTC|{file}|{INVOCATION}"
         ));
+    }
+
+    /// The witness's light timer, installed, enabled and waiting, and not yet fired.
+    fn light_timer(&mut self) {
+        self.unit(
+            "propolis-witness@light.timer",
+            "active",
+            "waiting",
+            "success",
+            "enabled",
+        );
+    }
+
+    /// The trace of a witness pass `ago` seconds before NOW: `meta light_last` (and `where`),
+    /// the heartbeat line, and the banner it wrote then.
+    fn witness_ran(&self, ago: u64) {
+        let s = stamp_ago(ago);
+        self.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{s}\n"),
+        );
+        self.write(
+            "run/propolis-witness/heartbeat",
+            &format!("#heartbeat v1 g=3\nB\tlight\t{s}\tpersistent\tok\n"),
+        );
+        self.write(
+            "run/motd.d/propolis",
+            "[propolis 07:55 UTC] nothing open; profile legacy\n",
+        );
+        set_mtime(&self.p("run/motd.d/propolis"), NOW - ago);
     }
 
     /// A cursor for `log` in `dir` (relative to the root) at `offset`, written at `mtime`.
@@ -669,6 +703,7 @@ fn a_healthy_single_box_marks_nothing_and_exits_zero() {
         ("chain", "info"),
         ("host", "ok"),
         ("monitor", "ok"),
+        ("witness", "ok"),
         ("peers", "info"),
     ] {
         assert_eq!(r.state(stage), state, "{stage}:\n{}", r.out);
@@ -731,10 +766,10 @@ fn a_healthy_single_box_marks_nothing_and_exits_zero() {
     );
 }
 
-/// What this release must not show yet: nothing judges the records, so nothing is open, and the
-/// witness, the gate, VERIFIED and the banner do not exist.
+/// Until a witness pass has run on the host nothing has judged the records, so nothing is open;
+/// and what later releases add (the gate, VERIFIED, the heartbeat URL, the profile) is not shown.
 #[test]
-fn the_walk_shows_no_witness_gate_verified_or_banner_and_calls_nothing_open() {
+fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_gate_verified_or_profile() {
     let fx = Fx::single();
     fx.write(
         "var/lib/propolis/witness/incidents",
@@ -755,11 +790,8 @@ fn the_walk_shows_no_witness_gate_verified_or_banner_and_calls_nothing_open() {
     let r = fx.walk();
     assert_eq!(r.code, 0, "{}", r.out);
     for absent in [
-        "    witness ",
-        "witness light",
         "gate ",
         "VERIFIED",
-        "banner",
         "OPEN ",
         " open ",
         "open since",
@@ -767,9 +799,15 @@ fn the_walk_shows_no_witness_gate_verified_or_banner_and_calls_nothing_open() {
         "would remind",
         "heartbeat",
         "profile ",
+        "hourly",
     ] {
         assert!(!r.out.contains(absent), "{absent:?} in:\n{}", r.out);
     }
+    assert!(
+        r.out.contains("        witness light never - state "),
+        "{}",
+        r.out
+    );
     // The alert view lists every record with its fields, and still no tier or `open`: the hook
     // stores a oneshot as `ACT open` at once, and nothing has judged it.
     fx.write(
@@ -1800,13 +1838,17 @@ fn bad_usage_exits_64() {
     for args in [
         vec!["nosuch"],
         vec!["listen", "ship"],
-        vec!["witness"],
         vec!["--setup"],
         vec!["--test-page"],
         vec!["--ack", "w#1"],
         vec!["--ack-test", "zzzzzz"],
-        vec!["--maint", "30"],
-        vec!["--banner"],
+        vec!["--maint"],
+        vec!["--maint", "121"],
+        vec!["--maint", "-1"],
+        vec!["--maint", "1000"],
+        vec!["--maint", "3x"],
+        vec!["--banner", "listen"],
+        vec!["listen", "--banner"],
         vec!["--maint", "30", "--banner"],
     ] {
         let r = fx.run(&args);
@@ -1819,8 +1861,11 @@ fn bad_usage_exits_64() {
     }
     assert_eq!(fx.log(), "", "nothing read before the usage check");
     let help = fx.run(&["--help"]);
-    for verb in ["--setup", "--test-page", "--ack", "--banner", "--maint"] {
+    for verb in ["--setup", "--test-page", "--ack"] {
         assert!(!help.out.contains(verb), "{verb} offered:\n{}", help.out);
+    }
+    for verb in ["--banner", "--maint MINUTES", "witness"] {
+        assert!(help.out.contains(verb), "{verb} not offered:\n{}", help.out);
     }
 }
 
@@ -1896,7 +1941,7 @@ fn exit_codes_follow_the_table() {
     );
     let r = old.walk();
     assert_eq!(r.code, 70, "an older library: {}", r.err);
-    assert!(r.err.contains("older than version 3"), "{}", r.err);
+    assert!(r.err.contains("older than version 4"), "{}", r.err);
     let missing = Fx::single();
     std::fs::remove_file(missing.p("usr/local/sbin/propolis-alert-lib")).unwrap();
     let r = missing.walk();
@@ -1939,7 +1984,8 @@ fn an_unreadable_state_file_is_named_and_counts_as_unknown() {
     );
     assert!(!fx.log().contains("logger"), "nothing logged");
     assert!(
-        r.out.contains("        state ? (meta unreadable)"),
+        r.out
+            .contains("        witness light ? - state ? (meta unreadable) - banner "),
         "{}",
         r.out
     );
@@ -2029,7 +2075,7 @@ fn the_maintenance_marker_a_clock_step_and_where_state_landed_show_in_the_header
         r.out
     );
     assert!(
-        r.out.contains("        state not persisted (run)"),
+        r.out.contains(" - state not persisted (run) - "),
         "{}",
         r.out
     );
@@ -2066,7 +2112,7 @@ fn every_stage_view_prints_its_row_and_ends() {
         "    {{ssh}} {}: regular, 100 bytes, modified 07:59:54, readable by propolis",
         ssh.display()
     );
-    let adds: [(&str, &str); 16] = [
+    let adds: [(&str, &str); 17] = [
         (
             "listen",
             "    listener sensor-ssh (sensor-ssh.service): unit active, listen 0.0.0.0:22, firewall ok",
@@ -2096,6 +2142,10 @@ fn every_stage_view_prints_its_row_and_ends() {
         (
             "monitor",
             "    ops monitor on; /ready 200; daemon queue empty",
+        ),
+        (
+            "witness",
+            "    propolis-witness@light.timer: ActiveState=active UnitFileState=enabled",
         ),
         ("peers", "cannot be seen from this host"),
     ];
@@ -2145,8 +2195,20 @@ fn a_hook_firing_that_went_to_the_spool_is_listed_as_spooled() {
         "var/lib/propolis/witness/hook/forged",
         "#hook v1 g=1\nH\tnot a stamp\n",
     );
+    // A file a witness pass claimed to take in, and did not finish: still firings no record has.
+    fx.write(
+        "var/lib/propolis/witness/hook/.ingest.4242.shipper.service",
+        &format!("#hook v1 g=2\nH\t{f}\t{f}\t2\texit-code\texited\t1\tproc.exit:1\t-\t-\n"),
+    );
     let r = fx.walk();
     assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    let shipper = r
+        .out
+        .lines()
+        .find(|l| l.contains("{shipper.service}") && l.contains("[spooled, not yet in the record]"))
+        .unwrap_or_else(|| panic!("{}", r.out));
+    assert!(shipper.contains("(2 firings)"), "{shipper}");
+    assert!(!r.out.contains(".ingest."), "{}", r.out);
     assert!(
         r.out
             .contains("RECENT FAILURES (not judged: no witness pass has run on this host)"),
@@ -3188,23 +3250,535 @@ fn a_record_line_cut_short_does_not_end_the_walk() {
     assert!(r.out.contains("IDS"), "the walk reached its end: {}", r.out);
 }
 
-/// What the docs promise about the walk and the records is what the code does.
+/// What the docs promise about the walk, its verbs and the records is what the code does.
 #[test]
-fn the_docs_say_what_the_walk_writes_and_that_the_hook_stores_records_unjudged() {
+fn the_docs_say_what_the_walk_and_its_verbs_write_and_that_the_witness_judges_the_records() {
     let commands = std::fs::read_to_string(COMMANDS).unwrap();
     let section = &commands[commands.find("\n## Status walk\n").unwrap()..];
     let section = &section[..section[1..].find("\n## ").unwrap()];
-    assert!(
-        section.contains("temporary header file for the metrics token"),
-        "{section}"
-    );
+    for promise in [
+        "temporary header file for the metrics token",
+        "`--maint MINUTES`",
+        "`--banner`",
+        "/run/propolis-witness/maintenance",
+    ] {
+        assert!(section.contains(promise), "{promise:?} not in:\n{section}");
+    }
     assert!(!section.contains("writes no\nfile"), "{section}");
     let page = std::fs::read_to_string(RUNBOOK).unwrap();
     let witness = &page[page.find("<a id=\"witness\"></a>").unwrap()..];
     let witness = &witness[..witness.find("\n## ").unwrap()];
-    assert!(!witness.contains("nothing opens"), "{witness}");
-    assert!(
-        witness.contains("nothing judges, reminds or resolves them"),
-        "{witness}"
+    assert!(!witness.contains("nothing judges"), "{witness}");
+    for promise in [
+        "light pass",
+        "every five minutes",
+        "sends nothing",
+        "banner not written",
+    ] {
+        assert!(witness.contains(promise), "{promise:?} not in:\n{witness}");
+    }
+}
+
+// ---- the witness's light pass in the walk, the banner and --maint ----------------------------
+
+/// Once a witness pass has run, the records are what it judged: an OPEN block lists the open,
+/// acked and pending ones, PAGE first, then ACT, then NOTICE, then by id, with their stage,
+/// instance, onset, cause, next reminder and what today's hook did. An open PAGE sets the exit
+/// code to 2, an open ACT alone to 1; a pending one or a NOTICE does not count.
+#[test]
+fn after_a_witness_pass_the_records_are_listed_open_with_tier_and_next_reminder() {
+    let fx = Fx::single();
+    fx.witness_ran(300);
+    let page = set_field(
+        &record(
+            "w#12",
+            "unit:sensor-ssh.service",
+            "listen",
+            "PAGE",
+            "open",
+            NOW - 2640,
+            "proc.exit:1",
+            "delivered",
+        ),
+        19,
+        &stamp_ago(1020),
     );
+    let page = set_field(&page, 9, &stamp_ago(2640));
+    let act = set_field(
+        &record(
+            "w#14",
+            "unit:propolis-backup.service",
+            "backup",
+            "ACT",
+            "open",
+            NOW - 21600,
+            "proc.exit:2",
+            "-",
+        ),
+        9,
+        &stamp_ago(21600),
+    );
+    let notice = record(
+        "w#13",
+        "tool:units",
+        "host",
+        "NOTICE",
+        "pending",
+        NOW - 600,
+        "tool.exec",
+        "-",
+    );
+    let gone = set_field(
+        &record(
+            "w#9",
+            "unit:sensor-http.service",
+            "listen",
+            "PAGE",
+            "resolved",
+            NOW - 9000,
+            "proc.exit:1",
+            "delivered",
+        ),
+        21,
+        &stamp_ago(3000),
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=9\nN\t15\n{act}{notice}{gone}{page}"),
+    );
+    let r = fx.walk();
+    assert_eq!(r.code, 2, "an open PAGE: {}", r.out);
+    let block: Vec<&str> = r
+        .out
+        .lines()
+        .skip_while(|l| !l.starts_with("OPEN"))
+        .take(4)
+        .collect();
+    assert!(
+        block[0].starts_with("OPEN    w#12 PAGE   listen   u"),
+        "{block:?}"
+    );
+    assert!(block[0].contains("={sensor-ssh.service}"), "{block:?}");
+    assert!(
+        block[0].contains("open since 07:16:00 (44 min)"),
+        "{block:?}"
+    );
+    assert!(block[0].contains("cause proc.exit 1"), "{block:?}");
+    assert!(block[0].contains("would remind 07:43"), "{block:?}");
+    assert!(block[0].ends_with("[legacy hook: delivered]"), "{block:?}");
+    assert!(
+        block[1].trim_start().starts_with("w#14 ACT    backup"),
+        "{block:?}"
+    );
+    assert!(block[1].ends_with("[not pushed: legacy]"), "{block:?}");
+    assert!(
+        block[2].trim_start().starts_with("w#13 NOTICE host"),
+        "{block:?}"
+    );
+    assert!(block[2].contains("pending since 07:50:00"), "{block:?}");
+    assert!(!block[2].contains("remind"), "{block:?}");
+    assert_eq!(
+        block[3].trim(),
+        "daemon incidents: not on disk before step 3"
+    );
+    assert!(
+        !r.out.contains("w#9 "),
+        "a resolved record is not open: {}",
+        r.out
+    );
+    assert!(!r.out.contains("RECENT FAILURES"), "{}", r.out);
+
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=10\nN\t15\n{act}{notice}"),
+    );
+    assert_eq!(fx.walk().code, 1, "an open ACT alone");
+    let acked = set_field(&page, 7, "acked");
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=11\nN\t15\n{acked}"),
+    );
+    assert_eq!(
+        fx.walk().code,
+        2,
+        "an acknowledged PAGE is still a PAGE incident open"
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=11\nN\t15\n{notice}{gone}"),
+    );
+    let r = fx.walk();
+    assert_eq!(
+        r.code, 0,
+        "pending and NOTICE records do not count: {}",
+        r.out
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        "#incidents v1 g=12\nN\t15\n",
+    );
+    assert!(fx.walk().out.contains("OPEN    none recorded"));
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/incidents")).unwrap();
+    assert!(fx.walk().out.contains("OPEN    no incident record yet"));
+}
+
+/// ALERTS line 3: when the light pass last completed, where state lands, and when the banner was
+/// written.
+#[test]
+fn the_third_alerts_line_names_the_light_pass_the_state_and_the_banner() {
+    let fx = Fx::single();
+    let r = fx.walk();
+    assert!(
+        r.out.contains(
+            "        witness light never - state nothing recorded yet - banner not written\n"
+        ),
+        "{}",
+        r.out
+    );
+    fx.witness_ran(300);
+    let r = fx.walk();
+    assert!(
+        r.out.contains(
+            "        witness light 07:55:00 (5 min) - state persisted - banner 07:55:00\n"
+        ),
+        "{}",
+        r.out
+    );
+}
+
+/// The witness rail: FAIL when the light timer is not active, when the light pass is older than
+/// 900 s (not judged in the first 1800 s of uptime), or when the banner is missing or older than
+/// 900 s while the light pass is fresh; WARN for a hook spool file waiting more than 10 min.
+#[test]
+fn the_witness_rail_says_banner_not_written() {
+    let fx = Fx::single();
+    fx.witness_ran(120);
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "ok", "{}", r.out);
+    assert_eq!(r.code, 0, "{}", r.out);
+
+    std::fs::remove_file(fx.p("run/motd.d/propolis")).unwrap();
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "FAIL", "{}", r.out);
+    assert!(r.row("witness").contains("banner not written"), "{}", r.out);
+    assert_eq!(r.code, 2);
+    assert!(
+        r.out.contains("NEXT    sudo propolis-status witness  -  runbook docs/operations/health-and-observability.md#witness"),
+        "{}",
+        r.out
+    );
+    fx.write("run/motd.d/propolis", "old\n");
+    set_mtime(&fx.p("run/motd.d/propolis"), NOW - 1000);
+    let r = fx.walk();
+    assert!(r.row("witness").contains("banner not written"), "{}", r.out);
+
+    // A stale light pass: the banner's age then says nothing new.
+    let stale = Fx::single();
+    stale.witness_ran(1000);
+    let r = stale.walk();
+    assert_eq!(r.state("witness"), "FAIL", "{}", r.out);
+    assert!(
+        r.row("witness").contains("light pass 16 min old"),
+        "{}",
+        r.out
+    );
+    assert!(
+        !r.row("witness").contains("banner not written"),
+        "{}",
+        r.out
+    );
+    // Not judged in the first half hour after a boot.
+    let mut early = Fx::single();
+    early.setenv("PROPOLIS_STATUS_NOW", &format!("{NOW}/abcdef01/1500"));
+    early.witness_ran(1000);
+    let r = early.walk();
+    assert_ne!(r.state("witness"), "FAIL", "{}", r.out);
+
+    let mut stopped = Fx::single();
+    stopped.unit(
+        "propolis-witness@light.timer",
+        "inactive",
+        "dead",
+        "success",
+        "disabled",
+    );
+    stopped.witness_ran(60);
+    let r = stopped.walk();
+    assert_eq!(r.state("witness"), "FAIL", "{}", r.out);
+    assert!(
+        r.row("witness")
+            .contains("propolis-witness@light.timer inactive"),
+        "{}",
+        r.out
+    );
+
+    // A timer that fired but whose pass never completed.
+    let mut never = Fx::single();
+    never
+        .units
+        .retain(|u| !u.starts_with("propolis-witness@light.timer|"));
+    never.units.push(
+        "propolis-witness@light.timer|active|waiting|success|0||enabled||Fri 2027-01-15 07:55:00 UTC"
+            .to_string(),
+    );
+    let r = never.walk();
+    assert_eq!(r.state("witness"), "FAIL", "{}", r.out);
+    assert!(
+        r.row("witness").contains("no light pass has completed"),
+        "{}",
+        r.out
+    );
+
+    let spool = Fx::single();
+    spool.witness_ran(60);
+    let s = stamp_ago(1200);
+    spool.write(
+        "var/lib/propolis/witness/hook/sensor-ssh.service",
+        &format!("#hook v1 g=1\nH\t{s}\t{s}\t1\texit-code\texited\t1\tproc.exit:1\t0\tdelivered\n"),
+    );
+    set_mtime(
+        &spool.p("var/lib/propolis/witness/hook/sensor-ssh.service"),
+        NOW - 1200,
+    );
+    let r = spool.walk();
+    assert_eq!(r.state("witness"), "WARN", "{}", r.out);
+    assert!(
+        r.row("witness").contains("1 hook spool file waiting"),
+        "{}",
+        r.out
+    );
+}
+
+/// The banner: four lines of at most 78 bytes, printable ASCII, each with the time, built from
+/// closed words and counts only, in every case the login banner describes.
+#[test]
+fn the_banner_is_four_ascii_lines_of_closed_words() {
+    let check = |r: &Run, case: &str| -> Vec<String> {
+        assert_eq!(r.code, 0, "{case}: {}", r.err);
+        let lines: Vec<String> = r.out.lines().map(str::to_string).collect();
+        assert_eq!(lines.len(), 4, "{case}: {}", r.out);
+        for l in &lines {
+            assert!(l.len() <= 78, "{case}: {} bytes: {l}", l.len());
+            assert!(
+                l.bytes().all(|b| (b' '..=b'~').contains(&b)),
+                "{case}: {l:?}"
+            );
+            assert!(l.starts_with("[propolis 08:00 UTC] "), "{case}: {l}");
+            for planted in [
+                "honeybox",
+                "sensor-",
+                "t0p1c",
+                "ntfy",
+                "propolis.service",
+                "tk_",
+            ] {
+                assert!(!l.contains(planted), "{case}: {planted} in {l}");
+            }
+        }
+        assert_eq!(
+            lines[3],
+            "[propolis 08:00 UTC] rewritten every 5 min; older means the witness stopped"
+        );
+        lines
+    };
+
+    let fx = Fx::single();
+    fx.witness_ran(60);
+    let l = check(&fx.run(&["--banner"]), "healthy");
+    assert_eq!(l[0], "[propolis 08:00 UTC] nothing open; profile legacy");
+    assert_eq!(l[1], "[propolis 08:00 UTC] alerts: topic not checked yet");
+    assert_eq!(l[2], "[propolis 08:00 UTC] run: sudo propolis-status");
+    assert!(!fx.log().contains("curl"), "no network: {}", fx.log());
+
+    let mut records = String::new();
+    for n in 0..120 {
+        let tier = if n % 3 == 0 { "PAGE" } else { "ACT" };
+        records.push_str(&record(
+            &format!("w#{n}"),
+            &format!("unit:sensor-{n}.service"),
+            "listen",
+            tier,
+            "open",
+            NOW - 60,
+            "proc.exit:1",
+            "-",
+        ));
+    }
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=2\nN\t200\n{records}"),
+    );
+    let l = check(&fx.run(&["--banner"]), "open");
+    assert_eq!(
+        l[0],
+        "[propolis 08:00 UTC] 120 open (PAGE 40, ACT 80); profile legacy"
+    );
+    fx.write(
+        "run/propolis-witness/maintenance",
+        &format!(
+            "#maintenance v1 g=1\nX\t{}\tabcdef01\trollback\n",
+            NOW + 600
+        ),
+    );
+    let l = check(&fx.run(&["--banner"]), "open and maintenance");
+    assert_eq!(
+        l[0],
+        "[propolis 08:00 UTC] 120 open; maint (rollback) until 08:10; profile legacy"
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        "#incidents v1 g=3\nN\t200\n",
+    );
+    let l = check(&fx.run(&["--banner"]), "maintenance alone");
+    assert_eq!(
+        l[0],
+        "[propolis 08:00 UTC] maint (rollback) until 08:10; profile legacy"
+    );
+    std::fs::remove_file(fx.p("run/propolis-witness/maintenance")).unwrap();
+
+    fx.write("run/propolis-witness/lockwait", "light\t2\n");
+    let l = check(&fx.run(&["--banner"]), "lock busy");
+    assert_eq!(
+        l[2],
+        "[propolis 08:00 UTC] state LOCK BUSY - run: sudo propolis-status"
+    );
+    std::fs::remove_file(fx.p("run/propolis-witness/lockwait")).unwrap();
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=4\nM\twhere\trun\nM\tlight_last\t{}\n",
+            stamp_ago(60)
+        ),
+    );
+    let l = check(&fx.run(&["--banner"]), "not persisted");
+    assert_eq!(
+        l[2],
+        "[propolis 08:00 UTC] state NOT PERSISTED - run: sudo propolis-status"
+    );
+    fx.witness_ran(60);
+    fx.write(
+        "run/propolis-alert/undelivered/sensor-ssh.service",
+        "1800000000 2 1800000000\n",
+    );
+    fx.write(
+        "var/lib/propolis/cursors/ops-alert-undelivered.json",
+        r#"[{"first_failed_unix":1},{"first_failed_unix":2}]"#,
+    );
+    let l = check(&fx.run(&["--banner"]), "undelivered");
+    assert_eq!(
+        l[2],
+        "[propolis 08:00 UTC] 3 alerts UNDELIVERED - run: sudo propolis-status"
+    );
+
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL");
+    let l = check(&fx.run(&["--banner"]), "no target");
+    assert_eq!(
+        l[1],
+        "[propolis 08:00 UTC] alerts: NO PUSH TARGET (journal only)"
+    );
+    let collector = Fx::collector();
+    let l = check(&collector.run(&["--banner"]), "collector");
+    assert_eq!(
+        l[1],
+        "[propolis 08:00 UTC] alerts: no push path here (collector)"
+    );
+    assert_eq!(
+        l[0],
+        "[propolis 08:00 UTC] 0 recent failures, not judged; profile legacy"
+    );
+}
+
+/// On a host where nothing of the witness exists yet the banner still prints, and says what it
+/// cannot know: the topic is not checked, and recorded failures are not judged.
+#[test]
+fn the_banner_from_a_host_with_no_witness_state_says_not_checked() {
+    let fx = Fx::single();
+    std::fs::remove_dir_all(fx.p("var/lib/propolis/witness")).unwrap();
+    std::fs::remove_dir_all(fx.p("run/propolis-witness")).unwrap();
+    let r = fx.run(&["--banner"]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert!(
+        r.out
+            .contains("] 0 recent failures, not judged; profile legacy\n"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains("] alerts: topic not checked yet\n"),
+        "{}",
+        r.out
+    );
+    assert!(
+        !fx.p("run/motd.d/propolis").exists(),
+        "--banner only prints"
+    );
+}
+
+/// `--maint MINUTES` announces planned work: it writes the marker (reason manual, this boot, now
+/// plus MINUTES), shows it in the walk's header and the banner, and `--maint 0` ends it whoever
+/// wrote it. Out of range is bad usage; a marker that cannot be written is exit 1.
+#[test]
+fn maint_writes_and_removes_the_marker_and_the_walk_shows_it() {
+    let fx = Fx::single();
+    std::fs::create_dir_all(fx.p("run/motd.d")).unwrap();
+    let r = fx.run(&["--maint", "30"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    assert_eq!(
+        r.out,
+        "maintenance until 08:30:00 UTC: unit, collector and database kinds held on this host\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.p("run/propolis-witness/maintenance")).unwrap(),
+        format!("#maintenance v1 g=1\nX\t{}\tabcdef01\tmanual\n", NOW + 1800)
+    );
+    let banner = fx.p("run/motd.d/propolis");
+    assert_eq!(
+        banner.metadata().unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert!(
+        std::fs::read_to_string(&banner)
+            .unwrap()
+            .contains("maint (manual) until 08:30"),
+        "{}",
+        std::fs::read_to_string(&banner).unwrap()
+    );
+    let walk = fx.walk();
+    assert!(
+        walk.out.contains("MAINT   manual until 08:30:00 (30 min left): unit kinds held; collector and database kinds held\n"),
+        "{}",
+        walk.out
+    );
+
+    fx.write(
+        "run/propolis-witness/maintenance",
+        &format!("#maintenance v1 g=1\nX\t{}\tabcdef01\tupgrade\n", NOW + 600),
+    );
+    let r = fx.run(&["--maint", "0"]);
+    assert_eq!(
+        (r.code, r.out.as_str()),
+        (0, "maintenance ended\n"),
+        "{}",
+        r.err
+    );
+    assert!(!fx.p("run/propolis-witness/maintenance").exists());
+    assert!(!std::fs::read_to_string(&banner).unwrap().contains("maint"));
+
+    assert_eq!(fx.run(&["--maint", "121"]).code, 64);
+    std::fs::remove_dir_all(fx.p("run/propolis-witness")).unwrap();
+    let r = fx.run(&["--maint", "10"]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(r.err.contains("could not be written"), "{}", r.err);
+}
+
+/// The verbs are root's like the walk.
+#[test]
+fn the_verbs_need_root() {
+    let mut fx = Fx::single();
+    fx.setenv("PROPOLIS_STATUS_EUID", "1000");
+    for args in [vec!["--banner"], vec!["--maint", "5"]] {
+        let r = fx.run(&args);
+        assert_eq!(r.code, 3, "{args:?}");
+    }
+    assert!(!fx.p("run/propolis-witness/maintenance").exists());
 }

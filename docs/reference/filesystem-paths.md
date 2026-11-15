@@ -83,23 +83,35 @@ kept. See [rollback](../operations/upgrade-rollback-and-dr.md#rollback).
 
 ## Alerting state and runtime directories
 
-Provisioned for the root shell alerting code. The one writer so far is the failure hook's record
-step (`deploy/alert-lib.sh#pa_hook_record`), which `propolis-alert@.service` runs after each
-alert and which records the failure; `deploy/upgrade.sh` and `deploy/rollback.sh` also write the
-maintenance marker. The configuration check sources the same library and only reads.
+Provisioned for the root shell alerting code. Two programs write the state: the failure hook's
+record step (`deploy/alert-lib.sh#pa_hook_record`), which `propolis-alert@.service` runs after
+each alert and which records the failure, and the witness's light pass
+(`deploy/witness.sh#light_pass`), which `propolis-witness@light.timer` runs every five minutes,
+both under the one state lock. `deploy/upgrade.sh`, `deploy/rollback.sh` and
+`propolis-status --maint` write the maintenance marker. The configuration check sources the same
+library and only reads.
+
+The light pass is what judges the records and clears what the hook leaves behind. Under the
+lock it takes in each hook spool file (`hook/<unit>`, `fallback/hook-<unit>`): it first renames
+the file to `.ingest.<pid>.<name>` beside it, so a firing the hook spools meanwhile starts a new
+file, and removes that copy once the records are written (a copy it could not finish is put
+back, or taken in by the next pass). It drops a first sighting whose unit healed, opens, reminds and resolves records, and removes
+resolved records seven days after their resolve (`deploy/alert-lib.sh#pa_incident_prune`). It
+also removes the temporary files (`*.tmp.<pid>`) a writer killed between writing and renaming
+left in either state directory, once they are older than ten minutes. A fallback copy of a state
+file stays until a later write of that file reaches the persistent directory, which then removes
+it, and every fallback file is gone at the next reboot. A file a writer holding the lock cannot
+read is set aside as `<name>.unreadable.<time>` (only the newest is kept) and the writer starts
+it empty.
 
 `propolis-status` (`deploy/propolis-status.sh#status_walk`) reads the records, `meta`, the
-maintenance marker, `id-salt`, `/run/propolis-witness/lockwait`, the hook spool files
-(`hook/<unit>` and `fallback/hook-<unit>`) and the fallback copies, without the lock and without
-writing anything: it lists the records and the spooled firings as recent failures
-(`deploy/propolis-status.sh#print_recent`, `deploy/propolis-status.sh#load_hook_spool`).
-Nothing judges or removes the records, the hook spool
-files or the fallback copies yet: a record stays as the hook wrote it (`pending` or `open`), and
-a file the walk cannot read is named in its output, never renamed. A spool file stays until a later firing of the
-same unit that also has to spool overwrites it, and the one in the persistent directory survives
-a reboot. A fallback copy of `incidents` or `meta` stays until a later write of that file reaches
-the persistent directory, and a fallback spool file (`fallback/hook-<unit>`) until the host
-reboots.
+heartbeat, the maintenance marker, `id-salt`, `/run/propolis-witness/lockwait`, the hook spool
+files, the fallback copies and the banner's time, without the lock and without writing anything:
+once a light pass has completed it lists the open incidents (`deploy/propolis-status.sh#print_open`),
+before that the records and the spooled firings as recent failures
+(`deploy/propolis-status.sh#print_recent`, `deploy/propolis-status.sh#load_hook_spool`). A file
+the walk cannot read is named in its output, never renamed. `propolis-status --maint` writes or
+removes the maintenance marker and rewrites the banner, and nothing else.
 
 | Path | Mode | Owner | Created by |
 |---|---|---|---|
@@ -107,16 +119,22 @@ reboots.
 | `/var/lib/propolis/witness/state.lock` | 0600, empty | root:root | `deploy/provision.sh#WITNESS_LOCK`, only when missing |
 | `/var/lib/propolis/witness/incidents` | 0600, one `I` line per failure record (`#incidents v1`) | root:root | `deploy/alert-lib.sh#pa_incident_put`, under the lock, the first time a unit fails |
 | `/var/lib/propolis/witness/id-salt` | 0600, 32 hex digits | root:root | `deploy/alert-lib.sh#pa_salt_ensure`, by the first record; deleting it renames every opaque id |
-| `/var/lib/propolis/witness/meta` | 0600, `M` lines (`#meta v1`); the hook writes only `where`, the directory its last record went to (`persistent` or `run`) | root:root | `deploy/alert-lib.sh#pa_hook_record`, under the lock, after each record it writes |
-| `/var/lib/propolis/witness/hook/<unit>` | 0700 directory; 0600 files (`#hook v1`) | root:root | `deploy/alert-lib.sh#_pa_hook_spool`, only when the record step could not take the lock or had little time left |
+| `/var/lib/propolis/witness/meta` | 0600, `M` lines (`#meta v1`): `where` (the directory the last write went to: `persistent`, `run` or `none`), `clock` and `clock_step`, `light_last` (when the last light pass completed), `healed` (how many first sightings healed, and the latest) and `maint_seen` (when a light pass last saw an active maintenance marker) | root:root | `deploy/alert-lib.sh#pa_hook_record` (`where`, after each record it writes) and `deploy/witness.sh#light_pass`, under the lock |
+| `/var/lib/propolis/witness/observe` | 0600, `U`, `R` and `P` lines (`#observe v1`): each unit's last sample, its restart baseline, and how many passes in a row a check could not run | root:root | `deploy/witness.sh#light_pass`, under the lock, every pass |
+| `/var/lib/propolis/witness/hook/<unit>` | 0700 directory; 0600 files (`#hook v1`) | root:root | `deploy/alert-lib.sh#_pa_hook_spool`, only when the record step could not take the lock or had little time left; removed by the next light pass once taken in |
 | `/run/propolis-witness/` | 0750 | root:propolis | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
 | `/run/propolis-witness/state.lock` | 0600, empty | root:root | `deploy/alert-lib.sh#pa_lock`, only when the persistent lock cannot be opened |
 | `/run/propolis-witness/fallback/` | 0700 | root:root | `deploy/alert-lib.sh#pa_state_write` and `deploy/alert-lib.sh#_pa_hook_spool`, when the persistent directory refuses a write; lost at reboot |
-| `/run/propolis-witness/maintenance` | 0600, two lines (`#maintenance v1`) | root:root | `deploy/upgrade.sh` and `deploy/rollback.sh#maint_write` while they restart services; removed when they finish |
+| `/run/propolis-witness/maintenance` | 0600, two lines (`#maintenance v1`) | root:root | `deploy/upgrade.sh` and `deploy/rollback.sh#maint_write` while they restart services, removed when they finish; `deploy/alert-lib.sh#pa_maint_write` for `propolis-status --maint MINUTES`, removed by `--maint 0` |
+| `/run/propolis-witness/heartbeat` | 0600, one `B` line per witness pass instance (`#heartbeat v1`): when it last ran, where its state went, `ok` or `partial` | root:root | `deploy/witness.sh#write_heartbeat`, under the lock, every pass |
+| `/run/propolis-witness/lockwait` | 0600, one line per witness pass instance: how many passes in a row could not take the lock | root:root | `deploy/witness.sh#lockwait_set`, without the lock, on a pass that missed it; removed by the next pass that gets it |
 | `/run/motd.d/` | 0755 | root:root | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
+| `/run/motd.d/propolis` | 0600, the four-line login banner | root:root | `deploy/alert-lib.sh#pa_banner_write`, at the end of every light pass and by `propolis-status --maint`; `pam_motd` reads it as root at login |
 | `/etc/tmpfiles.d/propolis.conf` | 0644 | root:root | `deploy/provision.sh#propolis-tmpfiles.conf`, from `deploy/propolis-tmpfiles.conf` |
 | `/usr/local/sbin/propolis-alert-lib` | 0644 | root:root | `deploy/install.sh#alert-lib.sh` and `deploy/upgrade.sh#alert-lib.sh`, from `deploy/alert-lib.sh` |
-| `/usr/local/sbin/propolis-status` | 0755 | root:root | `deploy/install.sh#propolis-status.sh` and `deploy/upgrade.sh#propolis-status.sh`, from `deploy/propolis-status.sh`; reads, never writes |
+| `/usr/local/sbin/propolis-status` | 0755 | root:root | `deploy/install.sh#propolis-status.sh` and `deploy/upgrade.sh#propolis-status.sh`, from `deploy/propolis-status.sh`; the walk reads and never writes |
+| `/usr/local/sbin/propolis-witness` | 0755 | root:root | `deploy/install.sh#witness.sh` and `deploy/upgrade.sh#witness.sh`, from `deploy/witness.sh`; run by `propolis-witness@light.service` |
+| `/etc/systemd/system/propolis-witness@.service`, `propolis-witness@light.timer` | 0644 | root:root | `deploy/install.sh#propolis-witness@light.timer` and `deploy/upgrade.sh#propolis-witness@light.timer`; both scripts enable the timer |
 | `/usr/local/lib/propolis/config-check.sh` | 0755 | root:root | `deploy/install.sh#config-check.sh` and `deploy/upgrade.sh#config-check.sh`, from `deploy/config-check.sh` |
 | `/usr/local/lib/propolis/listeners-lib.sh` | 0644 | root:root | `deploy/install.sh#listeners-lib.sh` and `deploy/upgrade.sh#listeners-lib.sh`, from `deploy/listeners-lib.sh` |
 | `/usr/local/lib/propolis/repo-dir` | 0644, one line: the checkout's absolute path | root:root | `deploy/install.sh#install_generated` and `deploy/upgrade.sh#install_generated` |

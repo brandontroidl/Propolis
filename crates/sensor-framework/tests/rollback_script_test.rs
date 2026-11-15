@@ -1097,6 +1097,58 @@ fn the_status_command_is_kept_with_the_helpers_and_put_back_executable() {
     );
 }
 
+/// The witness is one of the helpers a release keeps, and goes back executable; its units are
+/// kept by the save's `propolis-*` glob like every other Propolis unit.
+#[test]
+fn the_witness_is_kept_with_the_helpers_and_put_back_executable() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(1)).unwrap();
+    write_exec(&sbin.join("propolis-witness"), &consumer_needing(1));
+    let units = fx.root.join("etc/systemd/system");
+    std::fs::create_dir_all(&units).unwrap();
+    std::fs::write(
+        units.join("propolis-witness@.service"),
+        "[Service]\n# kept\n",
+    )
+    .unwrap();
+    std::fs::write(
+        units.join("propolis-witness@light.timer"),
+        "[Timer]\n# kept\n",
+    )
+    .unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let kept = fx.store().join(&fx.releases()[0]);
+    assert!(
+        read(&kept.join("sbin/propolis-witness")).contains("needs-alert-lib: 1"),
+        "the witness is kept with the helpers"
+    );
+    fx.upgrade();
+    write_exec(
+        &sbin.join("propolis-witness"),
+        "#!/usr/bin/env bash\necho newer\n",
+    );
+    std::fs::set_permissions(
+        sbin.join("propolis-witness"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::write(
+        units.join("propolis-witness@light.timer"),
+        "[Timer]\n# newer\n",
+    )
+    .unwrap();
+    assert_ok(&fx.run(&["--yes"], &[], None));
+    assert!(read(&sbin.join("propolis-witness")).contains("needs-alert-lib: 1"));
+    let mode = std::fs::metadata(sbin.join("propolis-witness"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(mode, 0o755, "the witness goes back 0755, got {mode:o}");
+    assert!(read(&units.join("propolis-witness@light.timer")).contains("# kept"));
+}
+
 /// The library version rule, the direction that keeps the current library: a consumer that the
 /// rollback leaves in place needs more than the kept library has, so restoring it would leave
 /// that consumer calling functions that are not there.
@@ -1388,6 +1440,41 @@ fn the_rollback_marks_maintenance_while_the_services_are_down_and_removes_it() {
     let output = fx.run(&["--yes"], &[], None);
     assert_eq!(output.status.code(), Some(1));
     assert!(!fx.root.join("run/propolis-witness/maintenance").exists());
+}
+
+/// A planned window an operator announced with `propolis-status --maint` that is still running
+/// is not ended by a rollback inside it: the rollback's own marker covers the restarts, and the
+/// operator's comes back afterwards with its end unchanged.
+#[test]
+fn an_operators_maintenance_marker_that_ends_later_survives_a_rollback() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let marker = fx.root.join("run/propolis-witness/maintenance");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let boot: String = read(Path::new("/proc/sys/kernel/random/boot_id"))
+        .replace('-', "")
+        .chars()
+        .take(8)
+        .collect();
+    let operator = format!("#maintenance v1 g=1\nX\t{}\t{boot}\tmanual\n", now + 3600);
+    std::fs::write(&marker, &operator).unwrap();
+    let output = fx.run(
+        &["--yes"],
+        &[("STUB_MARKER", marker.to_str().unwrap())],
+        None,
+    );
+    assert_ok(&output);
+    let log = fx.log();
+    let during = log
+        .lines()
+        .find(|l| l.starts_with("marker during stop: "))
+        .unwrap_or_else(|| panic!("no marker while services were stopped: {log}"));
+    assert!(during.ends_with(" rollback"), "{during}");
+    assert_eq!(read(&marker), operator, "the operator's window is back");
 }
 
 #[test]

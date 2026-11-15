@@ -28,6 +28,17 @@ installed by `deploy/install.sh`:
   delegation to `deploy/provision.sh` (`deploy/provision.sh#ensure_user`,
   `deploy/sensor-ssh.service#User=propolis-ssh`).
 
+Beside them run three oneshots on timers that need no operator input, which `install.sh` and
+`upgrade.sh` enable: log rotation (`propolis-logrotate.timer`), the nightly backup
+(`propolis-backup.timer`) and the root witness (`propolis-witness@light.timer`, which runs
+`/usr/local/sbin/propolis-witness light` every five minutes,
+`deploy/propolis-witness@light.timer#OnUnitActiveSec=5min`). The witness judges the failures
+the failure hook recorded, watches every Propolis unit for crash loops and the failed state, and
+writes the login banner; it records and shows, and sends nothing. A witness pass fails its unit
+only on a bad argument, an alert library it cannot load, or its 15-minute limit, and the failure
+hook records that failure without paging. See [health and
+observability](./health-and-observability.md#witness).
+
 The standalone `intake.service`, `review.service`, `feed.service`, and `console.service`
 units also exist in the repo but are **superseded by `propolis.service` in production and
 are not installed by `install.sh`** (`deploy/install.sh#deliberately NOT installed here`). They remain for dev and
@@ -40,8 +51,8 @@ daemon and [deployment models](./deployment-models.md) for single-node vs cluste
 
 Configuration and secrets must exist first (`install.sh` puts no value in any
 operator-owned `/etc/propolis/*.env` file - provisioning only creates them empty at `0600` and
-generates the secret-free `fleet-listeners.env` and the derived `watch.env` - and it never
-starts, enables, or migrates anything). See
+generates the secret-free `fleet-listeners.env` and the derived `watch.env` - and it starts and
+enables nothing but the rotation, backup and witness timers, and migrates nothing). See
 [configuration](./configuration.md) and [secret management](./secret-management.md).
 
 Once every service has its `/etc/propolis/*.env`:

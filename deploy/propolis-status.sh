@@ -6,15 +6,24 @@
 #   propolis-status           every stage in order (listen, source, ship, gateway, intake, ledger,
 #                             review, reports, feed, publish) with its last progress, the first one
 #                             that stopped marked `>`, then the rails beside them (alert, backup,
-#                             chain, host, monitor, peers), the failures the failure hook recorded
-#                             with their causes and what the hook did with each, the installed
-#                             config-check's findings, and the next thing to look at
+#                             chain, host, monitor, witness, peers), the incidents the witness has
+#                             open (or, on a host where no witness pass has run, the failures the
+#                             failure hook recorded) with their causes and what today's hook did
+#                             with each, the installed config-check's findings, and the next thing
+#                             to look at
 #   propolis-status STAGE     one stage or rail with everything behind its row
+#   propolis-status --banner  the login banner's text, as the witness would write it
+#   propolis-status --maint MINUTES
+#                             announce planned work: unit, collector and database kinds are held
+#                             for MINUTES (1 to 120); 0 ends it, whoever started it
 #   propolis-status -h        this text (any user)
 #
-# READ-ONLY. It writes nothing: no state file, no lock, no temporary file except the header file
-# that carries the console's metrics token to curl, which its one EXIT handler removes. It takes
-# no lock, so it shows the state files as the last writer left them. Every program it runs is
+# THE WALK IS READ-ONLY. It writes nothing: no state file, no lock, no temporary file except the
+# header file that carries the console's metrics token to curl, which its one EXIT handler
+# removes. --banner only prints. --maint writes the maintenance marker
+# (/run/propolis-witness/maintenance) and then the banner, and nothing else; it takes no lock, so
+# it works while a hung writer holds the state lock. The walk takes no lock either, so it shows
+# the state files as the last writer left them. Every program it runs is
 # bounded in time (systemctl, journalctl and timedatectl 10 s, each database probe 10 s,
 # config-check 120 s, the console 5 s), so a broken host still gets an answer. The only network it
 # touches is the console on loopback, asked only while the daemon runs, and the database
@@ -30,14 +39,17 @@
 # byte outside printable ASCII and marked [untrusted]. It never prints the ntfy token or topic, a
 # database URL or a password.
 #
-# WHAT IT CANNOT SEE. Nothing judges the failure hook's records yet, so they are listed as recent
-# failures and never change the exit status. The daemon's own causes, whether the ledger accepts
-# writes, and the chain verdict live in daemon memory; the rows say so instead of guessing. A
-# check it cannot make is `?` with the reason, never ok.
+# WHAT IT CANNOT SEE. Only the witness judges the failure hook's records: until one of its passes
+# has completed on the host (meta light_last), they are listed as recent failures and never
+# change the exit status. The daemon's own causes, whether the ledger accepts writes, and the
+# chain verdict live in daemon memory; the rows say so instead of guessing. A check it cannot make
+# is `?` with the reason, never ok.
 #
-# Exit status: 0 nothing stopped and nothing to look at; 1 a WARN or `?` anywhere; 2 a stage is
-# marked stopped or a rail is FAIL; 3 not root; 64 bad usage; 70 the alert library is missing,
-# not trusted, or older than this script needs.
+# Exit status of the walk and a stage view: 0 nothing stopped and nothing to look at; 1 a WARN or
+# `?` anywhere, or an open ACT incident; 2 a stage is marked stopped, a rail is FAIL, or a PAGE
+# incident is open. --banner: 0. --maint: 0 written or removed, 1 it could not be. Any form: 3 not
+# root; 64 bad usage; 70 the alert library is missing, not trusted, or older than this script
+# needs.
 #
 # Test seams (honoured only with PROPOLIS_STATUS_ROOT set; tests only): PROPOLIS_STATUS_ROOT puts
 # every path under that directory and keeps the caller's PATH, so stubs win; PROPOLIS_STATUS_EUID
@@ -46,7 +58,7 @@
 # its time limit in seconds.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 3
+# needs-alert-lib: 4
 
 umask 077
 STATUS_SELF="${BASH_SOURCE[0]}"
@@ -77,21 +89,34 @@ if [ -z "$STATUS_ROOT" ]; then
 fi
 
 STATUS_STAGES="listen source ship gateway intake ledger review reports feed publish"
-STATUS_RAILS="alert backup chain host monitor peers"
+STATUS_RAILS="alert backup chain host monitor witness peers"
 
 usage() {
     cat << 'EOF'
-usage: propolis-status          the walk: every stage in order, the first stopped one marked >
-       propolis-status STAGE    one stage or rail with everything behind its row
-       propolis-status -h       this text
+usage: propolis-status                  the walk: every stage in order, the first stopped one marked >
+       propolis-status STAGE            one stage or rail with everything behind its row
+       propolis-status --banner         print the login banner text
+       propolis-status --maint MINUTES  hold unit, collector and database kinds for planned work
+                                        (1 to 120 minutes; 0 ends it)
+       propolis-status -h               this text
 STAGE is one of: listen source ship gateway intake ledger review reports feed publish
-                 alert backup chain host monitor peers
+                 alert backup chain host monitor witness peers
 Run as root: sudo propolis-status
 EOF
 }
 
-VIEW=""
-if [ "$#" -gt 1 ]; then
+VIEW="" VERB="" MAINT_MINUTES=""
+if [ "$#" -eq 2 ] && [ "$1" = --maint ]; then
+    # Digits only and read as decimal: `08` is eight minutes, and nothing else reaches the
+    # arithmetic.
+    if [[ $2 =~ ^[0-9]{1,3}$ ]] && [ "$((10#$2))" -le 120 ]; then
+        VERB=maint MAINT_MINUTES="$((10#$2))"
+    else
+        echo "propolis-status: --maint takes the minutes to hold, 0 to 120" >&2
+        usage >&2
+        exit 64
+    fi
+elif [ "$#" -gt 1 ]; then
     echo "propolis-status: one form per call" >&2
     usage >&2
     exit 64
@@ -101,7 +126,15 @@ elif [ "$#" -eq 1 ]; then
             usage
             exit 0
             ;;
+        --banner) VERB=banner ;;
+        --maint)
+            echo "propolis-status: --maint takes the minutes to hold, 0 to 120" >&2
+            usage >&2
+            exit 64
+            ;;
     esac
+fi
+if [ "$#" -eq 1 ] && [ -z "$VERB" ]; then
     # One lowercase word first: a blank inside the argument would otherwise match across two names.
     [[ $1 =~ ^[a-z]{1,16}$ ]] && status_arg="$1" || status_arg="-"
     case " $STATUS_STAGES $STATUS_RAILS " in
@@ -237,7 +270,8 @@ fi
 PA_LIB_VERSION=""
 STATUS_LIB_FUNCS="pa_init pa_env_get pa_settings_load pa_role pa_alias pa_id_table pa_plain_id
 pa_ok_field pa_clean_untrusted pa_now pa_age pa_dur pa_hms pa_read_as pa_stat_as pa_trusted_exec
-pa_state_read pa_maint_active pa_pg pa_push_scheduler pa_sensor_logs pa_unit_map pa_cleanup"
+pa_state_read pa_maint_active pa_pg pa_push_scheduler pa_sensor_logs pa_unit_map pa_cleanup
+pa_banner pa_banner_write pa_maint_write"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $STATUS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -363,6 +397,7 @@ env_of() {
 # UTC; 1 when systemctl did not answer. The properties any caller asks for:
 U_ActiveState="" U_SubState="" U_Result="" U_NRestarts="" U_ActiveEnterTimestamp=""
 U_UnitFileState="" U_InvocationID="" U_ExecMainStatus="" U_NextElapseUSecRealtime=""
+U_LastTriggerUSec=""
 unit_show() {
     local unit="$1" k v out
     shift
@@ -468,6 +503,41 @@ case "$ROLE" in
 esac
 HAS_DAEMON=1
 case "$ROLE" in collector | gateway) HAS_DAEMON=0 ;; esac
+# The banner tells a collector, which has no push target by design.
+PA_ROLE="$ROLE"
+
+# ---- the verbs ------------------------------------------------------------------------------
+
+# status_banner: --banner, the login banner's text from the state files, as the witness writes
+# it. It only prints.
+status_banner() {
+    pa_banner
+    exit 0
+}
+
+# status_maint MINUTES: --maint, planned work announced: the maintenance marker for MINUTES with
+# reason manual (0 removes any marker), then the banner, which shows it. No lock: the marker is
+# not a state file, and this must work while a hung writer holds the lock.
+status_maint() {
+    local rc=0
+    pa_maint_write manual "$1" || rc=$?
+    if [ "$rc" != 0 ]; then
+        echo "propolis-status: the maintenance marker could not be written in /run/propolis-witness (is the directory there? sudo systemd-tmpfiles --create /etc/tmpfiles.d/propolis.conf)" >&2
+        exit 1
+    fi
+    if [ "$1" = 0 ]; then
+        printf 'maintenance ended\n'
+    else
+        printf 'maintenance until %s UTC: unit, collector and database kinds held on this host\n' "$(pa_hms "$PA_MAINT_UNTIL")"
+    fi
+    pa_banner_write || echo "propolis-status: the login banner was not rewritten (/run/motd.d is missing or refused the write)" >&2
+    exit 0
+}
+
+case "$VERB" in
+    banner) status_banner ;;
+    maint) status_maint "$MAINT_MINUTES" ;;
+esac
 
 env_of PROPOLIS_OPS_STALL_FOR_SECS "$PROPOLIS_ENV"
 STALL=600
@@ -1691,6 +1761,53 @@ rail_monitor() {
     fi
 }
 
+# rail_witness: the witness's light pass as seen from outside it. FAIL when its timer is not
+# active, when no light pass has completed for 900 s (three periods; not judged in the first
+# 1800 s of uptime, when every timer is just starting), or when the banner is missing or older
+# than 900 s while the pass itself is fresh: the pass then runs but cannot tell anyone at login.
+# WARN when a hook spool file has waited over 10 min, which the next pass should have taken in.
+W_TIMER_ACTIVE="" W_TIMER_FILE="" W_TIMER_LAST=""
+rail_witness() {
+    local state=ok note="" cond="" fresh=0 last
+    if ! unit_show propolis-witness@light.timer ActiveState UnitFileState LastTriggerUSec; then
+        add_row "" witness timers - - '?' "systemctl did not answer"
+        return 0
+    fi
+    W_TIMER_ACTIVE="$U_ActiveState" W_TIMER_FILE="$U_UnitFileState" W_TIMER_LAST="$U_LastTriggerUSec"
+    if [ -n "$W_LIGHT_WALL" ] && [ "$W_LIGHT_AGE" -ge 0 ] && [ "$W_LIGHT_AGE" -le 900 ]; then
+        fresh=1
+        note="light pass $(fmt_age "$W_LIGHT_AGE") ago"
+    fi
+    if [ "$W_TIMER_ACTIVE" != active ]; then
+        state=FAIL cond=witness note="propolis-witness@light.timer ${W_TIMER_ACTIVE:-not installed}"
+    elif [ "$PA_UP" -lt 1800 ]; then
+        [ -n "$note" ] || note="not judged in the first 30 min after a boot"
+    elif [ -z "$W_LIGHT_WALL" ]; then
+        last="$W_TIMER_LAST"
+        if [ -z "$last" ] || [ "$last" = n/a ] || [ "$last" = 0 ]; then
+            note="the light timer has not fired yet"
+        else
+            state=FAIL cond=witness note="no light pass has completed (the timer fired at $(fmt_time "$(ts_epoch "$last")"))"
+        fi
+    elif [ "$fresh" = 0 ]; then
+        state=FAIL cond=witness note="light pass $(fmt_age "$W_LIGHT_AGE") old"
+        [ "$W_LIGHT_AGE" -ge 0 ] || note="light pass time not known (clock)"
+    fi
+    if [ "$fresh" = 1 ] && { [ -z "$W_BANNER_MT" ] || [ "$(age_of "$W_BANNER_MT")" = - ] \
+        || [ "$(age_of "$W_BANNER_MT")" -gt 900 ]; }; then
+        state=FAIL cond=witness note="banner not written${W_BANNER_MT:+ since $(fmt_time "$W_BANNER_MT")}; $note"
+    fi
+    if [ "$W_SPOOL_OLD" -gt 0 ]; then
+        [ "$state" = FAIL ] || { state=WARN cond=witness; }
+        if [ "$W_SPOOL_OLD" = 1 ]; then
+            note="${note:+$note; }1 hook spool file waiting over 10 min"
+        else
+            note="${note:+$note; }$W_SPOOL_OLD hook spool files waiting over 10 min"
+        fi
+    fi
+    add_row "" witness timers "$(fmt_time "$W_LIGHT_WALL")" "$(fmt_age "$W_LIGHT_AGE")" "$state" "$note" direct "$cond"
+}
+
 rail_peers() {
     if [ "$ROLE" = collector ]; then
         not_here "" peers "the ledger is on the control node"
@@ -1785,6 +1902,7 @@ STATUS_NEXT=(
     "host-clock host -"
     "monitor-down monitor daemon-down"
     "monitor-off monitor -"
+    "witness witness witness"
 )
 
 # next_line: the NEXT line, for the marked row, else the first FAIL rail, else the first WARN or
@@ -1990,11 +2108,15 @@ load_hook_spool() {
         [ -d "$dir" ] && [ ! -L "$dir" ] || continue
         while IFS= read -r -d '' name; do
             unit="$name"
+            # A file the witness claimed to take in (deploy/witness.sh#ingest_spool) holds the same
+            # firings under `.ingest.<pid>.<name>` until its records are written.
+            if [[ $unit =~ ^\.ingest\.[0-9]{1,10}\.(.+)$ ]]; then unit="${BASH_REMATCH[1]}"; fi
             if [ "$dir" = "$PA_RUN/fallback" ]; then
-                [[ $name == hook-* ]] || continue
-                unit="${name#hook-}"
+                [[ $unit == hook-* ]] || continue
+                unit="${unit#hook-}"
             fi
-            [[ $unit =~ ^[A-Za-z0-9@._:-]{1,200}$ ]] || continue
+            [[ $unit =~ ^[A-Za-z0-9@._:-]{1,200}$ ]] && [[ $unit != .* ]] || continue
+            case "$unit" in *.tmp.*) continue ;; esac
             text="$(root_read "$dir/$name" 4096)" || continue
             [[ ${text%%$'\n'*} =~ ^#hook\ v1\ g=[0-9]{1,18}$ ]] || continue
             line="${text#*$'\n'}"
@@ -2029,14 +2151,106 @@ render_hook_spool() {
     done
 }
 
+# open_line LINE: one incident record as the OPEN block lists it, in OPEN_TEXT, with OPEN_SORT
+# (tier, then id number) and OPEN_TIER, OPEN_STATE. Every field is read with a default and
+# checked before it is printed: a line cut short or damaged costs its words, never the walk.
+open_line() {
+    local id key tier stage inst state first opened cause next parent flags legacy rank num w a out
+    local -a f
+    IFS=$'\t' read -r -a f <<< "$1"
+    id="${f[1]:-}" key="${f[2]:-}" stage="${f[4]:-}" tier="${f[6]:-}" state="${f[7]:-}"
+    first="${f[8]:-}" opened="${f[9]:-}" cause="${f[11]:-}" parent="${f[13]:-}" next="${f[19]:-}"
+    flags="${f[30]:--}" legacy="${f[33]:--}"
+    if [[ $id =~ ^[wd]#([0-9]{1,9})$ ]]; then
+        num="${BASH_REMATCH[1]}"
+    else
+        id="?" num=0
+    fi
+    case "$tier" in PAGE) rank=1 ;; ACT) rank=2 ;; NOTICE) rank=3 ;; *) rank=4 tier="?" ;; esac
+    OPEN_TIER="$tier" OPEN_STATE="$state"
+    OPEN_SORT="$rank$(printf '%010d' "$((10#$num))")"
+    inst=-
+    case "$key" in unit:*) inst="$(unit_shown "${key#unit:}")" ;; esac
+    out="$(printf '%s %-6s %-8s %-30s' "$id" "$tier" "$(stage_word "$stage")" "$inst")"
+    if [ "$state" = pending ]; then
+        w="${first%%/*}"
+        a="$(pa_age "$first")"
+        if [[ $w =~ ^[0-9]{1,12}$ ]] && [ "$a" -ge 0 ]; then out+="  pending since $(fmt_time "$w")"; else out+="  pending, onset not known (clock)"; fi
+    else
+        w="${opened%%/*}"
+        a="$(pa_age "$opened")"
+        [ "$state" != acked ] || out+="  acked,"
+        if [[ $w =~ ^[0-9]{1,12}$ ]] && [ "$a" -ge 0 ]; then
+            out+="  open since $(fmt_time "$w") ($(fmt_age "$a"))"
+        else
+            out+="  open, onset not known (clock)"
+        fi
+    fi
+    out+="  cause $(cause_words "$cause")"
+    if [ "$state" = open ] && [[ ${next%%/*} =~ ^[0-9]{1,12}$ ]]; then
+        out+="  would remind $(date -u -d "@${next%%/*}" +%H:%M 2> /dev/null || printf '?')"
+    fi
+    [[ ! $parent =~ ^[wd]#[0-9]{1,9}$ ]] || out+="  folded under $parent"
+    if [ "$flags" != - ]; then
+        if pa_ok_field "$flags"; then out+="  flags $flags"; else out+="  flags ?"; fi
+    fi
+    out+="  $(legacy_tag "$legacy")"
+    OPEN_TEXT="$out"
+}
+
+# OPEN_CODE: what the open incidents add to the exit code once a witness pass has judged them:
+# 2 for an open (or acked) PAGE, 1 for an open ACT; a pending record or a NOTICE adds nothing.
+OPEN_CODE=0
+load_open_code() {
+    local t
+    [ -n "${META[light_last]:-}" ] || return 0
+    while IFS= read -r t; do
+        [[ $t == I$'\t'* ]] || continue
+        open_line "$t"
+        case "$OPEN_STATE" in open | acked) ;; *) continue ;; esac
+        case "$OPEN_TIER" in
+            PAGE) OPEN_CODE=2 ;;
+            ACT) [ "$OPEN_CODE" = 2 ] || OPEN_CODE=1 ;;
+        esac
+    done <<< "$INCIDENTS_BODY"
+}
+
+# print_open: the OPEN block, once a witness pass has completed on the host: the open, acked and
+# pending records, PAGE first, then ACT, then NOTICE, then by id; then the firings still in the
+# hook's spool, which the next pass takes in.
+print_open() {
+    local -a lines=()
+    local t n=0
+    while IFS= read -r t; do
+        [[ $t == I$'\t'* ]] || continue
+        open_line "$t"
+        case "$OPEN_STATE" in open | acked | pending) ;; *) continue ;; esac
+        lines+=("$OPEN_SORT"$'\t'"$OPEN_TEXT")
+        n=$((n + 1))
+    done <<< "$INCIDENTS_BODY"
+    for t in "${HOOK_LINES[@]}"; do lines+=("9${t}"); done
+    n=$((n + ${#HOOK_LINES[@]}))
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" incidents "* ]]; then
+        printf 'OPEN    ? (incidents unreadable: see STATE)\n'
+    elif [ "$n" -gt 0 ]; then
+        printf '%s\n' "${lines[@]}" | sort | head -n 20 | cut -f 2- | sed '1s/^/OPEN    /; 2,$s/^/        /'
+        [ "$n" -le 20 ] || printf '        ... and %s more: sudo propolis-status alert\n' "$((n - 20))"
+    elif [ "$INCIDENTS_FILE" = 0 ]; then
+        printf 'OPEN    no incident record yet\n'
+    else
+        printf 'OPEN    none recorded\n'
+    fi
+    case "$ROLE" in single | control) printf '        daemon incidents: not on disk before step 3\n' ;; esac
+}
+
 print_recent() {
     local -a lines=()
     local t age old=0 n=0 title
-    if [ -z "${META[light_last]:-}" ]; then
-        title="RECENT FAILURES (not judged: no witness pass has run on this host)"
-    else
-        title="RECENT FAILURES (not judged here)"
+    if [ -n "${META[light_last]:-}" ]; then
+        print_open
+        return
     fi
+    title="RECENT FAILURES (not judged: no witness pass has run on this host)"
     # Nothing resolves a record before the witness does, so an unresolved record is listed
     # however old its first failure: the unit may have failed again a minute ago. Only a resolved
     # record ages out, by its resolve time.
@@ -2152,20 +2366,73 @@ print_header() {
 }
 
 print_alerts() {
-    local hook="failure hook legacy, $A_UNDELIVERED units undelivered"
+    local hook="failure hook legacy, $A_UNDELIVERED units undelivered" light state banner=""
     [ -z "$A_SINCE" ] || hook+=" since $(fmt_time "$A_SINCE")"
     printf 'ALERTS  target %s - daemon monitor %s - daemon queue %s - %s\n' "$A_TARGET" "$A_MONITOR" "$A_QUEUE" "$hook"
+    if [ -n "$W_BANNER_MT" ]; then banner="$(fmt_time "$W_BANNER_MT")"; else banner="not written"; fi
     # An unreadable meta reads as empty, which must not pass for a host with nothing recorded.
     if [[ " ${PA_STATE_UNREADABLE:-} " == *" meta "* ]]; then
-        printf '        state ? (meta unreadable)\n'
+        printf '        witness light ? - state ? (meta unreadable) - banner %s\n' "$banner"
         return 0
     fi
+    if [ -z "$W_LIGHT_WALL" ]; then
+        light=never
+    elif [ "$W_LIGHT_AGE" -ge 0 ]; then
+        light="$(fmt_time "$W_LIGHT_WALL") ($(fmt_age "$W_LIGHT_AGE"))"
+    else
+        light="$(fmt_time "$W_LIGHT_WALL") (age not known: clock)"
+    fi
     case "${META[where]:-}" in
-        persistent) printf '        state persisted\n' ;;
-        run) printf '        state not persisted (run)\n' ;;
-        none) printf '        state not persisted (none)\n' ;;
-        *) printf '        state: nothing recorded yet\n' ;;
+        persistent) state=persisted ;;
+        run) state="not persisted (run)" ;;
+        none) state="not persisted (none)" ;;
+        *) state="nothing recorded yet" ;;
     esac
+    printf '        witness light %s - state %s - banner %s\n' "$light" "$state" "$banner"
+}
+
+# The witness's traces, for ALERTS, the witness rail and its view: W_LIGHT_WALL and W_LIGHT_AGE
+# are the wall time and age (-1 when it cannot be read or lies in the future) of the newer of the
+# light pass's heartbeat line (in /run, lost at reboot) and meta light_last (on disk);
+# W_BANNER_MT the banner's modification time; W_SPOOL_OLD how many hook spool files have waited
+# over 10 min, and W_SPOOL_N how many there are.
+W_LIGHT_WALL="" W_LIGHT_AGE=-1 W_BANNER_MT="" W_SPOOL_OLD=0 W_SPOOL_N=0 W_HB_LINES=()
+load_witness_facts() {
+    local text head line t inst s a best="" best_age=-1 mt
+    text="$(root_read "$PA_RUN/heartbeat" 65536)" || text=""
+    head="${text%%$'\n'*}"
+    if [[ $head =~ ^#heartbeat\ v1\ g=[0-9]{1,18}$ ]]; then
+        while IFS= read -r line; do
+            IFS=$'\t' read -r t inst s _ <<< "$line"
+            if [ "$t" != B ] || ! [[ $inst =~ ^[a-z]{1,16}$ ]] || ! pa_ok_field "${s:-}"; then continue; fi
+            W_HB_LINES+=("$(printf '%s' "$line" | tr '\t' ' ' | tr -c ' -~' '?')")
+            if [ "$inst" = light ]; then best="$s"; fi
+        done <<< "${text#*$'\n'}"
+    fi
+    [ -z "$best" ] || best_age="$(pa_age "$best")"
+    s="${META[light_last]:-}"
+    if [ -n "$s" ]; then
+        a="$(pa_age "$s")"
+        if [ -z "$best" ] || { [ "$a" -ge 0 ] && { [ "$best_age" -lt 0 ] || [ "$a" -lt "$best_age" ]; }; }; then
+            best="$s" best_age="$a"
+        fi
+    fi
+    if [ -n "$best" ] && [[ ${best%%/*} =~ ^[0-9]{1,12}$ ]]; then
+        W_LIGHT_WALL="${best%%/*}" W_LIGHT_AGE="$best_age"
+    fi
+    if [ -f "$PA_MOTD/propolis" ] && [ ! -L "$PA_MOTD/propolis" ]; then
+        mt="$(timeout 5 stat -c %Y -- "$PA_MOTD/propolis" 2> /dev/null)" || mt=""
+        [[ $mt =~ ^[0-9]{1,12}$ ]] && W_BANNER_MT="$mt"
+    fi
+    # How long a spooled firing has waited, from the time the hook wrote into the file (the
+    # spool's own clock, as load_hook_spool read it), not from the file's modification time.
+    for line in "${HOOK_RAW[@]}"; do
+        IFS=$'\t' read -r _ mt _ <<< "$line"
+        W_SPOOL_N=$((W_SPOOL_N + 1))
+        if [ "$(age_of "$mt")" != - ] && [ "$(age_of "$mt")" -gt 600 ]; then
+            W_SPOOL_OLD=$((W_SPOOL_OLD + 1))
+        fi
+    done
 }
 
 print_check() {
@@ -2201,11 +2468,12 @@ print_ids() {
     printf '        {...} = a name as found where another account writes, checked to be a plain id; [untrusted] = raw text, cleaned\n'
 }
 
-# exit_code: 2 when a stage is marked or a rail is FAIL, 1 for a WARN or `?` anywhere (the rows,
-# an unreadable state file, config-check's own counts or a run that did not finish), else 0. The
-# recent failures never count: nothing has judged them.
+# exit_code: 2 when a stage is marked, a rail is FAIL or a PAGE incident is open, 1 for a WARN or
+# `?` anywhere (the rows, an unreadable state file, config-check's own counts or a run that did
+# not finish) or an open ACT incident, else 0. The recent failures listed before any witness pass
+# never count: nothing has judged them.
 exit_code() {
-    local i code=0
+    local i code="$OPEN_CODE"
     [ "$MARKED" -lt 0 ] || code=2
     for i in "${!R_STAGE[@]}"; do
         case "${R_STATE[$i]}" in
@@ -2425,7 +2693,7 @@ stage_view() {
             printf '    daemon queue: %s%s\n' "$A_QUEUE" \
                 "${A_QUEUE_OLDEST:+, oldest first_failed_unix $(fmt_time "$A_QUEUE_OLDEST")}"
             # Each record as the walk lists it, then its fields by name. Tier, state and the
-            # reminder fields stay out until the witness judges records.
+            # reminder fields stay out until a witness pass has judged the records.
             while IFS= read -r t; do
                 [[ $t == I$'\t'* ]] || continue
                 record_line "$t"
@@ -2435,6 +2703,13 @@ stage_view() {
                     "$(view_field "${name[2]:-}")" "$(view_field "${name[3]:-}")" "$(view_field "${name[11]:-}")" \
                     "$(fmt_time "${name[12]%%/*}")" "$(view_field "${name[31]:-}")" "$(view_field "${name[32]:-}")" \
                     "$(view_field "${name[33]:-}")" "$(view_field "${name[30]:-}")"
+                if [ -n "${META[light_last]:-}" ]; then
+                    printf '      tier %s  state %s  opened %s  last_tx %s  reminders %s  next_due %s  resolved %s  proof %s  reopens %s  parent %s  would_push %s\n' \
+                        "$(view_field "${name[6]:-}")" "$(view_field "${name[7]:-}")" "$(fmt_time "${name[9]%%/*}")" \
+                        "$(view_field "${name[16]:-}")" "$(view_field "${name[18]:-}")" "$(fmt_time "${name[19]%%/*}")" \
+                        "$(fmt_time "${name[21]%%/*}")" "$(view_field "${name[22]:-}")" "$(view_field "${name[23]:-}")" \
+                        "$(view_field "${name[13]:-}")" "$(view_field "${name[29]:-}")"
+                fi
             done <<< "$INCIDENTS_BODY"
             for t in "${HOOK_LINES[@]}"; do printf '    %s\n' "${t#*$'\t'}"; done
             ;;
@@ -2471,6 +2746,31 @@ stage_view() {
             view_unit propolis.service
             printf '    ops monitor %s; %s; daemon queue %s\n' "$A_MONITOR" "$(ready_words)" "$A_QUEUE"
             ;;
+        witness)
+            printf '    propolis-witness@light.timer: ActiveState=%s UnitFileState=%s LastTriggerUSec=%s\n' \
+                "${W_TIMER_ACTIVE:-?}" "${W_TIMER_FILE:-?}" "${W_TIMER_LAST:--}"
+            view_unit propolis-witness@light.service
+            for t in "${W_HB_LINES[@]}"; do printf '    heartbeat %s\n' "$t"; done
+            [ "${#W_HB_LINES[@]}" -gt 0 ] || printf '    heartbeat: no line (/run is emptied by a reboot)\n'
+            for name in "${!META[@]}"; do
+                if pa_ok_field "$name" && pa_ok_field "${META[$name]}"; then
+                    printf '    meta %s %s\n' "$name" "${META[$name]}"
+                fi
+            done | sort
+            if [[ ${META[healed]:-} =~ ^([0-9]{1,9})/([0-9]{1,12})/ ]]; then
+                printf '    restarts that healed (counted, never opened): %s, the latest %s\n' \
+                    "${BASH_REMATCH[1]}" "$(fmt_time "${BASH_REMATCH[2]}")"
+            fi
+            printf '    hook spool files: %s (%s waiting over 10 min)\n' "$W_SPOOL_N" "$W_SPOOL_OLD"
+            printf '    lockwait: %s consecutive passes without the lock\n' "$(lockwait_count)"
+            if pa_maint_active; then
+                printf '    maintenance marker: %s until %s\n' "$PA_MAINT_REASON" "$(pa_hms "$PA_MAINT_UNTIL")"
+            else
+                printf '    maintenance marker: none in force\n'
+            fi
+            printf '    banner: %s\n' "$(if [ -n "$W_BANNER_MT" ]; then fmt_time "$W_BANNER_MT"; else printf 'not written'; fi)"
+            printf '    alert library version %s\n' "$PA_LIB_VERSION"
+            ;;
         chain) printf '    the chain is verified inside the daemon, and its verdict is not written anywhere shell can read\n' ;;
         peers) printf '    other nodes on the same database cannot be seen from this host'"'"'s shell\n' ;;
     esac
@@ -2496,6 +2796,8 @@ status_walk() {
     load_hook_spool
     load_ids local
     render_hook_spool
+    load_witness_facts
+    load_open_code
     if [ -z "$VIEW" ]; then
         print_header
         print_alerts
@@ -2517,6 +2819,7 @@ status_walk() {
     rail_chain
     rail_host
     rail_monitor
+    rail_witness
     rail_peers
     first_stopped
     load_ids vendor

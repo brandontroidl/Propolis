@@ -6782,7 +6782,9 @@ fn shell_function(script: &str, name: &str) -> String {
 
 /// install_generated, run as written in each script: a command that fails leaves no temporary file
 /// and no destination; as root, a command that succeeds installs its output 0644 and leaves no
-/// temporary file either. Without root `install -o root` itself fails, which is the failure path.
+/// temporary file either. Without root `install -o root` itself fails, which is the failure path:
+/// the function reports it and leaves no temporary file. `install` has copied the file by the
+/// time the ownership change is refused, so that copy may stay at the destination.
 #[test]
 fn install_generated_always_removes_its_temporary_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -6827,8 +6829,13 @@ fn install_generated_always_removes_its_temporary_file() {
             assert_eq!(mode, 0o644, "{script_name}");
         } else {
             assert!(
-                !made.status.success() && !dest.exists(),
+                !made.status.success(),
                 "{script_name}: install -o root succeeded without root: {made:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&made.stderr)
+                    .contains(&format!("error: could not write {}", dest.display())),
+                "{script_name}: {made:?}"
             );
         }
     }

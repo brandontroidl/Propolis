@@ -374,14 +374,42 @@
   `/etc/tmpfiles.d/propolis.conf`, so `/run/propolis-witness` (0750 root:propolis) and
   `/run/motd.d` exist now and after every boot. A failure of that tmpfiles step prints a
   warning and does not stop an install or an upgrade. Both deploy scripts install the shared library
-  of the shell alerting code as `/usr/local/sbin/propolis-alert-lib` (0644); nothing sources it
-  yet. Every sensor unit also denies itself `/etc/propolis/alert.env` by mount, a name reserved
+  of the shell alerting code as `/usr/local/sbin/propolis-alert-lib` (0644); `config-check` is
+  the first script that sources it (below). Every sensor unit also denies itself `/etc/propolis/alert.env` by mount, a name reserved
   for the root alert senders; nothing reads it yet and no unit loads it. A rollback keeps the
   library with the other helpers and restores it only when it serves every script left in place
   ([rollback](docs/operations/upgrade-rollback-and-dr.md#rollback),
   [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories)).
+- **`config-check` needs the shared alert library, and may warn about env lines it passed
+  before.** It now reads env values and the intake list through the library
+  (`deploy/alert-lib.sh#pa_env_get`, `deploy/alert-lib.sh#pa_sensor_logs`), from `alert-lib.sh`
+  beside it or `/usr/local/sbin/propolis-alert-lib`; without one, or with one older than it
+  needs, it exits `70` and checks nothing, which `upgrade.sh` reports as a warning without
+  failing. Three readings widen: `NAME = value` (blanks around `=`) is now read as systemd reads
+  it, an intake entry is trimmed of Unicode spaces as the daemon trims it, and a value systemd
+  may read differently (a backslash, a quote it does not close) is taken as written instead of
+  having one pair of quotes removed. A new warning, `env-systemd-only`, names each `PROPOLIS_*` or
+  `DATABASE_URL` line in a form systemd and the shell scripts read differently, so a host it
+  passed before can now exit `1`. A checkout whose HEAD cannot be read without git (a worktree,
+  a link) is a limited check where it used to pass in silence
+  ([configuration check](docs/operations/service-lifecycle.md#configuration-check)).
 
 ### Added
+
+- **`config-check` is installed, runs from any directory, and has a TSV output** - `install.sh`
+  and `upgrade.sh` install it as `/usr/local/lib/propolis/config-check.sh` with
+  `listeners-lib.sh`, `repo-dir` (the checkout's path) and `install-bins` (`upgrade.sh`'s binary
+  list); its fix lines name the checkout's scripts, and without a usable `repo-dir` they become
+  manual steps. It no longer runs git: the checkout's HEAD is read from `.git` as the checkout's
+  owner (`deploy/config-check.sh#cc_repo_head`); the daemon's cursors are read as `propolis`,
+  capped and under a timeout, and the gateway spool's metadata without following a link, so a
+  link or a FIFO another account planted can neither redirect nor hang a root run; and the
+  installed copy reads the build as the checkout's owner. `--tsv` prints the report as tab-separated records ending in a count
+  (`deploy/config-check.sh#emit_tsv`). A rollback keeps and restores the copy with the binaries,
+  except `repo-dir` (`deploy/rollback.sh#LIB_HELPERS`)
+  ([configuration check](docs/operations/service-lifecycle.md#configuration-check),
+  [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories),
+  [rollback](docs/operations/upgrade-rollback-and-dr.md#rollback)).
 
 - **A control plane's `/metrics` carries each collector's capture counters** - intake stored a
   `sensor_stats` line only when it named the label of the log it came from. A collector's spool

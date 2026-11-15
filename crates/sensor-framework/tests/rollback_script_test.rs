@@ -1158,6 +1158,193 @@ fn a_kept_release_without_the_library_leaves_the_current_one_in_place() {
     );
 }
 
+/// A file of the checkout's deploy/ directory, as shipped.
+fn shipped(name: &str) -> String {
+    read(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../deploy/{name}")))
+}
+
+/// The library version deploy/alert-lib.sh carries.
+fn shipped_lib_version() -> u32 {
+    shipped("alert-lib.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix("PA_LIB_VERSION="))
+        .and_then(|v| v.parse().ok())
+        .expect("deploy/alert-lib.sh carries PA_LIB_VERSION=<n>")
+}
+
+/// The installed config-check as install.sh lays it out under /usr/local/lib/propolis.
+fn install_config_check(fx: &Fixture, check: &str, bins: &str, repo: &str) {
+    let lib = fx.root.join("usr/local/lib/propolis");
+    write_exec(&lib.join("config-check.sh"), check);
+    std::fs::write(
+        lib.join("listeners-lib.sh"),
+        format!("# listeners {bins}\n"),
+    )
+    .unwrap();
+    std::fs::write(lib.join("install-bins"), format!("INSTALL_BINS=({bins})\n")).unwrap();
+    std::fs::write(lib.join("repo-dir"), format!("{repo}\n")).unwrap();
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[test]
+fn save_keeps_the_config_check_copy_and_its_binary_list_but_not_the_checkout_path() {
+    let fx = Fixture::new();
+    install_config_check(
+        &fx,
+        &shipped("config-check.sh"),
+        "propolis old",
+        "/srv/checkout",
+    );
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let kept = fx.store().join(&fx.releases()[0]).join("lib");
+    assert_eq!(
+        read(&kept.join("config-check.sh")),
+        shipped("config-check.sh")
+    );
+    assert!(read(&kept.join("listeners-lib.sh")).contains("propolis old"));
+    assert!(read(&kept.join("install-bins")).contains("INSTALL_BINS=(propolis old)"));
+    assert!(
+        !kept.join("repo-dir").exists(),
+        "the checkout's path does not change with a rollback and is not kept"
+    );
+}
+
+#[test]
+fn a_rollback_puts_the_kept_config_check_copy_back_and_leaves_the_checkout_path() {
+    let fx = Fixture::new();
+    install_config_check(
+        &fx,
+        &shipped("config-check.sh"),
+        "propolis old",
+        "/srv/checkout",
+    );
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    install_config_check(
+        &fx,
+        "#!/usr/bin/env bash\n# needs-alert-lib: 1\necho new\n",
+        "propolis new",
+        "/srv/moved-checkout",
+    );
+    assert_ok(&fx.run(&["--yes"], &[], None));
+    let lib = fx.root.join("usr/local/lib/propolis");
+    assert_eq!(
+        read(&lib.join("config-check.sh")),
+        shipped("config-check.sh")
+    );
+    assert!(read(&lib.join("install-bins")).contains("INSTALL_BINS=(propolis old)"));
+    assert!(read(&lib.join("listeners-lib.sh")).contains("propolis old"));
+    assert_eq!(read(&lib.join("repo-dir")), "/srv/moved-checkout\n");
+    assert_eq!(mode_of(&lib.join("config-check.sh")), 0o755);
+    assert_eq!(mode_of(&lib.join("install-bins")), 0o644);
+    assert_eq!(mode_of(&lib.join("listeners-lib.sh")), 0o644);
+}
+
+/// A host whose /usr/local/lib/propolis went away after the save gets the directory back, 0755,
+/// with the kept files at the modes the deploy scripts give them.
+#[test]
+fn a_rollback_onto_a_root_without_the_config_check_directory_makes_it() {
+    let fx = Fixture::new();
+    install_config_check(
+        &fx,
+        &shipped("config-check.sh"),
+        "propolis old",
+        "/srv/checkout",
+    );
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let lib = fx.root.join("usr/local/lib/propolis");
+    std::fs::remove_dir_all(&lib).unwrap();
+    assert_ok(&fx.run(&["--yes"], &[], None));
+    assert_eq!(mode_of(&lib), 0o755);
+    assert_eq!(
+        read(&lib.join("config-check.sh")),
+        shipped("config-check.sh")
+    );
+    assert_eq!(mode_of(&lib.join("config-check.sh")), 0o755);
+    assert_eq!(mode_of(&lib.join("listeners-lib.sh")), 0o644);
+    assert_eq!(mode_of(&lib.join("install-bins")), 0o644);
+    assert!(!lib.join("repo-dir").exists());
+}
+
+/// The library version rule with the real files, the direction that keeps the current library:
+/// the shipped config-check stays (the kept release has no copy of it) and needs the shipped
+/// library, so an older kept library would leave it calling functions that are not there.
+#[test]
+fn the_shipped_config_check_that_stays_keeps_the_current_library_over_an_older_kept_one() {
+    let fx = Fixture::new();
+    let version = shipped_lib_version();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(version - 1)).unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), shipped("alert-lib.sh")).unwrap();
+    install_config_check(
+        &fx,
+        &shipped("config-check.sh"),
+        "propolis",
+        "/srv/checkout",
+    );
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(
+        installed_lib_version(&fx),
+        format!("PA_LIB_VERSION={version}")
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "kept the current alert library: the kept one is version {}, and config-check.sh needs {version}",
+            version - 1
+        )),
+        "{stdout}"
+    );
+}
+
+/// The other direction with the real files: the kept release holds the shipped config-check and
+/// the shipped library, and a newer library and a config-check that needs it are installed. Both
+/// kept copies go back together, since the kept library serves the kept config-check.
+#[test]
+fn the_shipped_config_check_and_library_kept_together_are_restored_together() {
+    let fx = Fixture::new();
+    let version = shipped_lib_version();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), shipped("alert-lib.sh")).unwrap();
+    install_config_check(
+        &fx,
+        &shipped("config-check.sh"),
+        "propolis",
+        "/srv/checkout",
+    );
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(version + 1)).unwrap();
+    install_config_check(
+        &fx,
+        &consumer_needing(version + 1),
+        "propolis",
+        "/srv/checkout",
+    );
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert_eq!(
+        read(&sbin.join("propolis-alert-lib")),
+        shipped("alert-lib.sh")
+    );
+    assert_eq!(
+        read(&fx.root.join("usr/local/lib/propolis/config-check.sh")),
+        shipped("config-check.sh")
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("kept the current alert library"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 /// `deploy/alert-lib.sh` as shipped with its version line replaced by `line` verbatim, for the
 /// spellings `alert_lib_at` cannot produce.
 fn alert_lib_with_version_line(line: &str) -> String {

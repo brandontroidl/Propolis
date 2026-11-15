@@ -22,6 +22,8 @@ const FLEET_SCRIPT: &str = concat!(
     "/../../deploy/fleet-listeners.sh"
 );
 const UPGRADE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/upgrade.sh");
+const ALERT_LIB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/alert-lib.sh");
+const LISTENERS_LIB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/listeners-lib.sh");
 
 struct Run {
     code: i32,
@@ -378,6 +380,16 @@ impl Fx {
             "sha256sum",
             "readlink",
             "tr",
+            // What the alert library's functions run: pa_read_as starts a child bash under
+            // timeout, and the others are what its remaining functions call.
+            "bash",
+            "od",
+            "awk",
+            "find",
+            "flock",
+            "wc",
+            "ls",
+            "setpriv",
         ] {
             let real = ["/usr/bin", "/bin"]
                 .iter()
@@ -455,6 +467,21 @@ cat "$d/psql_out"
     /// The same run with the script started through `wrapper` (a privilege drop), so a check that
     /// depends on what the account can read is exercised even when the tests run as root.
     fn run_under(&self, wrapper: &[&str], args: &[&str], env: &[(&str, &str)]) -> Run {
+        self.run_script_under(Path::new(SCRIPT), wrapper, args, env)
+    }
+
+    /// The same run of another copy of the script (an installed one).
+    fn run_script(&self, script: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
+        self.run_script_under(script, &[], args, env)
+    }
+
+    fn run_script_under(
+        &self,
+        script: &Path,
+        wrapper: &[&str],
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Run {
         let mut cmd = match wrapper.split_first() {
             Some((first, rest)) => {
                 let mut c = Command::new(first);
@@ -463,7 +490,7 @@ cat "$d/psql_out"
             }
             None => Command::new(BASH),
         };
-        cmd.arg(SCRIPT)
+        cmd.arg(script)
             .args(args)
             .arg("--env-dir")
             .arg(self.p("etc"));
@@ -506,7 +533,13 @@ cat "$d/psql_out"
             .env("PROPOLIS_CC_BACKUP_DIR", self.p("state/backups"))
             .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"))
             // Absent until a test creates it, so a run never looks at this host's own spool.
-            .env("PROPOLIS_CC_GATEWAY_SPOOL_DIR", self.p("spool/gateway"));
+            .env("PROPOLIS_CC_GATEWAY_SPOOL_DIR", self.p("spool/gateway"))
+            // The checkout's library, whichever copy of the script runs, and a root of its own.
+            .env("PROPOLIS_CC_ALERT_LIB", ALERT_LIB)
+            .env("PROPOLIS_CC_ALERT_ROOT", self.p("alert-root"))
+            // The tests run as root here and as an ordinary user in CI, and neither has the
+            // accounts the library would read as (propolis, the checkout's owner): read as self.
+            .env("PA_TEST_READ_AS_SELF", "1");
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -2721,6 +2754,16 @@ fn fix_scenarios() -> Vec<Scenario> {
                 Some("PROPOLIS_OPS_NTFY_TOPIC="),
             );
         }),
+        (
+            "an indented ntfy URL line, which systemd reads and the failure hook does not",
+            |fx| {
+                fx.set_env_line(
+                    "etc/propolis.env",
+                    "PROPOLIS_OPS_NTFY_URL=",
+                    Some("  PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid"),
+                );
+            },
+        ),
     ]
 }
 
@@ -3523,29 +3566,54 @@ fn upgrade_runs_the_check_last_in_report_only_mode_and_its_failure_cannot_fail_t
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
+    // The line that runs the check names the script and --report-only. Other lines may name the
+    // script (the one that installs the copy under /usr/local/lib/propolis), never both.
+    let runs_check = |l: &&str| l.contains("config-check.sh") && l.contains("--report-only");
     let last = *code.last().unwrap();
     assert!(
-        last.contains("config-check.sh") && last.contains("--report-only") && last.contains("||"),
+        runs_check(&last) && last.contains("||"),
         "the last command of upgrade.sh must run the check in report-only mode and tolerate its failure: {last}"
     );
     let status_at = code
         .iter()
         .position(|l| l.contains("systemctl --no-pager status propolis.service"))
         .unwrap();
-    let check_at = code
-        .iter()
-        .position(|l| l.contains("config-check.sh"))
-        .unwrap();
+    let check_at = code.iter().position(runs_check).unwrap();
     assert!(
         check_at > status_at,
         "the check must follow the restarts and the status line"
     );
+    assert_eq!(code.iter().filter(|l| runs_check(l)).count(), 1);
+    // A run without --report-only would stop the upgrade under set -e once the binaries are in.
     assert_eq!(
-        code.iter()
-            .filter(|l| l.contains("config-check.sh"))
-            .count(),
-        1
+        early_check_runs(&text),
+        Vec::<String>::new(),
+        "only the last line of upgrade.sh may run the check"
     );
+    let doctored = text.replacen(
+        "systemctl daemon-reload\n",
+        "\"$SCRIPT_DIR/config-check.sh\" --no-events\nsystemctl daemon-reload\n",
+        1,
+    );
+    assert_ne!(doctored, text);
+    assert_eq!(
+        early_check_runs(&doctored),
+        ["\"$SCRIPT_DIR/config-check.sh\" --no-events"]
+    );
+}
+
+/// The code lines of `text` before its last one that name config-check.sh and do not install it.
+fn early_check_runs(text: &str) -> Vec<String> {
+    let code: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    code[..code.len() - 1]
+        .iter()
+        .filter(|l| l.contains("config-check.sh") && !l.starts_with("install "))
+        .map(|l| l.to_string())
+        .collect()
 }
 
 fn global_state(v: &serde_json::Value, id: &str) -> String {
@@ -5588,4 +5656,1504 @@ fn a_unix_socket_database_url_reaches_psql_as_the_socket_directory() {
             "{log}"
         );
     }
+}
+
+// ---- the installed copy, the library, HEAD without git, TSV --------------------------------
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A copy of the script and its listener library in `fx/lib`, laid out as install.sh and
+/// upgrade.sh lay out /usr/local/lib/propolis: `repo-dir` holds `repo_dir` (none when `None`),
+/// and `install-bins` holds upgrade.sh's binary list plus `sensor-extra`, which upgrade.sh does not
+/// name, so a finding about it proves which list was read. Returns the copy's path.
+fn install_copy(fx: &Fx, repo_dir: Option<&str>) -> PathBuf {
+    let lib = fx.p("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::copy(SCRIPT, lib.join("config-check.sh")).unwrap();
+    std::fs::copy(LISTENERS_LIB, lib.join("listeners-lib.sh")).unwrap();
+    if let Some(dir) = repo_dir {
+        std::fs::write(lib.join("repo-dir"), dir).unwrap();
+    }
+    std::fs::write(
+        lib.join("install-bins"),
+        format!("INSTALL_BINS=({} sensor-extra)\n", install_bins().join(" ")),
+    )
+    .unwrap();
+    lib.join("config-check.sh")
+}
+
+/// The installed copy's run: PROPOLIS_CC_REPO_DIR empty, so the checkout comes from `repo-dir`.
+fn run_installed(fx: &Fx, script: &Path, args: &[&str]) -> Run {
+    fx.run_script(script, args, &[("PROPOLIS_CC_REPO_DIR", "")])
+}
+
+#[test]
+fn the_installed_copy_prints_checkout_paths_and_reads_its_own_bin_list() {
+    let fx = Fx::new();
+    fx.install_fix_stubs();
+    let repo = fx.p("repo").display().to_string();
+    // The checkout's scripts the fix lines name, so the run fixes can be executed. Its upgrade.sh
+    // lists one binary only: were it read, sensor-extra would not be reported.
+    for name in ["upgrade.sh", "watch-env.sh", "logrotate-guard.sh"] {
+        fx.exec(
+            &format!("repo/deploy/{name}"),
+            "INSTALL_BINS=(propolis)\nexit 0\n",
+        );
+    }
+    let script = install_copy(&fx, Some(&format!("{repo}\n")));
+    std::fs::remove_file(fx.p("sbin/propolis-logrotate-guard")).unwrap();
+    std::fs::remove_file(fx.p("etc/watch.env")).unwrap();
+    fx.write("state/psql_out", "ssh|60\nmqtt|90\ntftp|100\ndns|30\n");
+    let r = run_installed(&fx, &script, &["--json"]);
+    let v = r.json();
+    let by_id = |id: &str| -> serde_json::Value {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} in {}", v["findings"]))
+            .clone()
+    };
+    let bins = by_id("bins-missing");
+    assert!(
+        bins["message"].as_str().unwrap().contains("sensor-extra"),
+        "{bins}"
+    );
+    assert_eq!(bins["fix"], format!("sudo {repo}/deploy/upgrade.sh"));
+    assert_eq!(bins["fix_kind"], "run");
+    let guard = by_id("guard");
+    assert!(
+        guard["fix"].as_str().unwrap().starts_with(&format!(
+            "sudo install -m 0755 {repo}/deploy/logrotate-guard.sh "
+        )),
+        "{guard}"
+    );
+    assert_eq!(
+        by_id("watch-env-missing")["fix"],
+        format!("sudo {repo}/deploy/watch-env.sh")
+    );
+    // The ledger query runs the installed copy itself, a valid root-owned command.
+    assert!(
+        by_id("events-none")["fix"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("sudo {} ", script.display())),
+        "{}",
+        by_id("events-none")
+    );
+    for f in v["findings"].as_array().unwrap() {
+        let fix = f["fix"].as_str().unwrap();
+        assert!(
+            !fix.contains(&fx.p("lib/upgrade.sh").display().to_string())
+                && !fix.contains(&fx.p("lib/watch-env.sh").display().to_string()),
+            "a fix names the installed directory instead of the checkout: {f}"
+        );
+        assert_fix_contract(
+            &fx,
+            "installed copy",
+            f["id"].as_str().unwrap(),
+            f["fix_kind"].as_str().unwrap(),
+            fix,
+        );
+    }
+    // The checkout's HEAD is still compared, and nothing says the checkout is unknown.
+    assert!(
+        !v["limited"].to_string().contains("checkout"),
+        "{}",
+        v["limited"]
+    );
+    let tsv = run_installed(&fx, &script, &["--tsv"]);
+    let s = tsv.out.lines().nth(1).unwrap();
+    assert_eq!(s.split('\t').nth(8), Some("1"), "installed flag: {s}");
+}
+
+#[test]
+fn an_installed_copy_without_repo_dir_turns_checkout_fixes_manual() {
+    let fx = Fx::new();
+    std::fs::remove_file(fx.p("sbin/propolis-logrotate-guard")).unwrap();
+    std::fs::remove_file(fx.p("state/deploy-stamp.json")).unwrap();
+    for repo_dir in [
+        None,
+        Some("relative/path\n"),
+        Some("/one\n/two\n"),
+        Some(""),
+    ] {
+        let script = install_copy(&fx, repo_dir);
+        let _ = std::fs::remove_file(fx.p("lib/repo-dir"));
+        if let Some(text) = repo_dir {
+            std::fs::write(fx.p("lib/repo-dir"), text).unwrap();
+        }
+        let v = run_installed(&fx, &script, &["--json"]).json();
+        let limit = format!(
+            "checkout unknown: {}/repo-dir missing or invalid; fix lines that need the checkout are manual",
+            fx.p("lib").display()
+        );
+        assert!(
+            v["limited"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l == limit.as_str()),
+            "{repo_dir:?}: {}",
+            v["limited"]
+        );
+        let find = |id: &str| -> serde_json::Value {
+            v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("{repo_dir:?}: no {id} in {}", v["findings"]))
+                .clone()
+        };
+        let stamp = find("stamp-missing");
+        assert_eq!(stamp["fix_kind"], "manual", "{stamp}");
+        assert_eq!(
+            stamp["fix"],
+            "from the top of the Propolis checkout run: sudo ./deploy/upgrade.sh"
+        );
+        let guard = find("guard");
+        assert_eq!(guard["fix_kind"], "manual", "{guard}");
+        assert!(
+            guard["fix"]
+                .as_str()
+                .unwrap()
+                .starts_with("from the top of the Propolis checkout run: sudo install -m 0755 ./deploy/logrotate-guard.sh "),
+            "{guard}"
+        );
+        for f in v["findings"].as_array().unwrap() {
+            if f["fix_kind"] == "run" {
+                let fix = f["fix"].as_str().unwrap();
+                assert!(
+                    !fix.contains("deploy/")
+                        && !fix.contains(&fx.p("lib/upgrade.sh").display().to_string()),
+                    "{repo_dir:?}: a run fix names a checkout path it does not know: {f}"
+                );
+            }
+        }
+    }
+
+    // A repo-dir that is a symbolic link, even to a valid one-line file naming a real checkout, is
+    // not the installer's.
+    fx.exec("repo/deploy/upgrade.sh", "exit 0\n");
+    let script = install_copy(&fx, None);
+    let _ = std::fs::remove_file(fx.p("lib/repo-dir"));
+    fx.write(
+        "elsewhere/repo-dir",
+        &format!("{}\n", fx.p("repo").display()),
+    );
+    std::os::unix::fs::symlink(fx.p("elsewhere/repo-dir"), fx.p("lib/repo-dir")).unwrap();
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    assert!(
+        v["limited"].as_array().unwrap().iter().any(|l| l
+            == format!(
+                "checkout unknown: {}/repo-dir missing or invalid; fix lines that need the checkout are manual",
+                fx.p("lib").display()
+            )
+            .as_str()),
+        "a linked repo-dir: {}",
+        v["limited"]
+    );
+    let guard = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "guard")
+        .unwrap()
+        .clone();
+    assert_eq!(guard["fix_kind"], "manual", "a linked repo-dir: {guard}");
+    std::fs::remove_file(fx.p("lib/repo-dir")).unwrap();
+
+    // A repo-dir that names a path holding no checkout (moved, deleted, or hidden from the
+    // sandbox): the same manual fixes and a limit naming the path, whether the stamp is absent or
+    // has no head to compare, so nothing points at scripts that are not there.
+    let gone = fx.p("gone-checkout").display().to_string();
+    let script = install_copy(&fx, Some(&format!("{gone}\n")));
+    let limit = format!(
+        "checkout unknown: {}/repo-dir names {gone}, which holds no deploy/upgrade.sh (moved, deleted, or not visible from this sandbox); fix lines that need the checkout are manual",
+        fx.p("lib").display()
+    );
+    for (stamp, stamp_id) in [
+        (None, "stamp-missing"),
+        (
+            Some("{\"head_sha\": \"\", \"installed\": {\"propolis\": \"\"}}\n"),
+            "stamp-nohead",
+        ),
+    ] {
+        let _ = std::fs::remove_file(fx.p("state/deploy-stamp.json"));
+        if let Some(text) = stamp {
+            fx.write("state/deploy-stamp.json", text);
+        }
+        let v = run_installed(&fx, &script, &["--json"]).json();
+        assert!(
+            v["limited"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l == limit.as_str()),
+            "{stamp_id}: {}",
+            v["limited"]
+        );
+        let find = |id: &str| -> serde_json::Value {
+            v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["id"] == id)
+                .unwrap_or_else(|| panic!("{stamp_id}: no {id} in {}", v["findings"]))
+                .clone()
+        };
+        let stamp = find(stamp_id);
+        assert_eq!(stamp["fix_kind"], "manual", "{stamp}");
+        assert_eq!(
+            stamp["fix"],
+            "from the top of the Propolis checkout run: sudo ./deploy/upgrade.sh"
+        );
+        assert_eq!(find("guard")["fix_kind"], "manual");
+        for f in v["findings"].as_array().unwrap() {
+            assert!(
+                !f["fix"].as_str().unwrap().contains(&gone),
+                "{stamp_id}: a fix names the checkout that is not there: {f}"
+            );
+        }
+    }
+
+    // A stamp that agrees with the installed binary says nothing about the checkout. Without one
+    // the build was not compared and the stamp was not held against HEAD, so neither row may read
+    // ok, whether the checkout is gone or repo-dir is missing. Every listed binary is installed
+    // here, and no build directory is given, as on a real host.
+    fx.exec("bin/sensor-extra", "exit 0\n");
+    fx.write(
+        "state/deploy-stamp.json",
+        "{\"head_sha\": \"abcdef0123456789\", \"installed\": {\"propolis\": \"abcdef0123456789\"}}\n",
+    );
+    let global_text = |v: &serde_json::Value, id: &str| -> String {
+        v["global"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == id)
+            .map(|g| g["text"].as_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    for repo_dir in [Some(format!("{gone}\n")), None] {
+        let script = install_copy(&fx, repo_dir.as_deref());
+        if repo_dir.is_none() {
+            let _ = std::fs::remove_file(fx.p("lib/repo-dir"));
+        }
+        let v = fx
+            .run_script(
+                &script,
+                &["--json"],
+                &[("PROPOLIS_CC_REPO_DIR", ""), ("PROPOLIS_CC_BUILD_DIR", "")],
+            )
+            .json();
+        assert_eq!(global_state(&v, "binaries"), "unknown", "{repo_dir:?}: {v}");
+        assert!(
+            global_text(&v, "binaries").ends_with(", build not compared (checkout unknown)"),
+            "{repo_dir:?}: {}",
+            global_text(&v, "binaries")
+        );
+        assert_eq!(
+            global_state(&v, "deploy-stamp"),
+            "unknown",
+            "{repo_dir:?}: {v}"
+        );
+        assert!(
+            global_text(&v, "deploy-stamp")
+                .ends_with(", checkout unknown: stamp-behind not checked"),
+            "{repo_dir:?}: {}",
+            global_text(&v, "deploy-stamp")
+        );
+        assert!(
+            v["counts"]["unknown"].as_i64().unwrap() >= 2,
+            "{repo_dir:?}: the two rows count as unknown: {}",
+            v["counts"]
+        );
+        assert!(
+            !v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == "stamp-behind" || f["id"] == "bins-differ"),
+            "{repo_dir:?}: a check that was not made is not a finding: {}",
+            v["findings"]
+        );
+    }
+}
+
+/// The installed copy's build comparison: the build is read as the checkout's owner and compared
+/// by digest, and a build file it could not read is a limit and an unknown row, never a difference.
+#[test]
+fn an_installed_copy_compares_the_build_by_digest_and_an_unread_build_is_unknown_not_a_difference()
+{
+    let fx = Fx::new();
+    let repo = fx.p("repo").display().to_string();
+    fx.exec("repo/deploy/upgrade.sh", "exit 0\n");
+    let script = install_copy(&fx, Some(&format!("{repo}\n")));
+    // upgrade.sh's own list, with no sensor-extra, so only the build decides the binaries row.
+    std::fs::write(
+        fx.p("lib/install-bins"),
+        format!("INSTALL_BINS=({})\n", install_bins().join(" ")),
+    )
+    .unwrap();
+    let build = fx.p("build").display().to_string();
+    fx.write("build/sensor-mqtt", &fx.read("bin/sensor-mqtt"));
+    fx.write("build/sensor-ssh", "new build");
+    std::os::unix::fs::symlink(fx.p("bin/sensor-dns"), fx.p("build/sensor-dns")).unwrap();
+    let limit = format!(
+        "the build of sensor-dns in {build} was not compared with the installed binary: not a regular file as {}",
+        current_user()
+    );
+    let differ = |v: &serde_json::Value| -> Vec<String> {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "bins-differ")
+            .map(|f| f["message"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    let found = differ(&v);
+    assert_eq!(found.len(), 1, "{}", v["findings"]);
+    assert!(
+        found[0].contains("sensor-ssh")
+            && !found[0].contains("sensor-mqtt")
+            && !found[0].contains("sensor-dns"),
+        "{}",
+        found[0]
+    );
+    assert!(
+        v["limited"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == limit.as_str()),
+        "{}",
+        v["limited"]
+    );
+    // A difference outranks a build that was not compared.
+    assert_eq!(global_state(&v, "binaries"), "warn", "{}", v["global"]);
+
+    // The link alone: nothing differs, and the row says the build was not compared.
+    std::fs::remove_file(fx.p("build/sensor-ssh")).unwrap();
+    std::fs::remove_file(fx.p("build/sensor-mqtt")).unwrap();
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    assert!(differ(&v).is_empty(), "{}", v["findings"]);
+    assert_eq!(global_state(&v, "binaries"), "unknown", "{}", v["global"]);
+    assert!(
+        global_text(&v, "binaries").ends_with(", build not compared for: sensor-dns"),
+        "{}",
+        global_text(&v, "binaries")
+    );
+    assert!(
+        v["limited"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == limit.as_str()),
+        "{}",
+        v["limited"]
+    );
+    let r = run_installed(&fx, &script, &[]);
+    assert_eq!(r.code, 1, "{}", r.out);
+}
+
+/// `id` answers for propolis (unless `propolis_known` is false) and for `owner` with numbers of
+/// their own, and `setpriv` logs the uid it is asked to become and the file the child reads, then
+/// runs the child as the caller. Together they show which account each read drops to, as root or
+/// not.
+fn stub_privilege_drop(fx: &Fx, propolis_known: bool, owner: &str) {
+    let real_id = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+        .expect("no id on this host");
+    let propolis = if propolis_known {
+        "  -u:propolis | -g:propolis) echo 4001; exit 0 ;;\n"
+    } else {
+        "  -u:propolis | -g:propolis) exit 1 ;;\n"
+    };
+    // The library asks `id -u -- USER`, so the account is the third argument.
+    fx.exec(
+        "stubs/id",
+        &format!(
+            "case \"$1:$3\" in\n{propolis}  \"-u:{owner}\" | \"-g:{owner}\") echo 4002; exit 0 ;;\nesac\nexec {real_id} \"$@\"\n"
+        ),
+    );
+    fx.exec(
+        "stubs/setpriv",
+        r#"uid=""
+for a in "$@"; do case "$a" in --reuid=*) uid="${a#--reuid=}" ;; esac; done
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+printf '%s %s\n' "$uid" "$5" >> "$STUB_STATE/setpriv.log"
+exec "$@"
+"#,
+    );
+}
+
+/// The cursor file that holds intake's position in `path`.
+fn cursor_path(fx: &Fx, path: &str) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap();
+    fx.p(&format!(
+        "state/cursors/{}.json",
+        sha256_hex(resolved.to_str().unwrap())
+    ))
+    .display()
+    .to_string()
+}
+
+/// As root, with no read-as-self shortcut: the daemon's cursor is read as propolis, and the
+/// checkout's HEAD, its ref and its build output as the account that owns the checkout.
+#[test]
+fn the_cursor_is_read_as_propolis_and_the_checkout_and_its_build_as_their_owner() {
+    let fx = Fx::new();
+    // The checkout's owner must not be root, or a read as root would pass for a read as the
+    // owner: as root, the fixture's checkout is handed to nobody's uid.
+    if is_root() {
+        std::os::unix::fs::chown(fx.p("repo"), Some(65534), Some(65534)).unwrap();
+    }
+    let owner = String::from_utf8(
+        Command::new("stat")
+            .args(["-c", "%U"])
+            .arg(fx.p("repo"))
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(owner, "root");
+    stub_privilege_drop(&fx, true, &owner);
+    let drop = [("PA_TEST_READ_AS_SELF", ""), ("PA_TEST_UID", "0")];
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    spool_cursor(&fx, &spool, 300, None);
+    let cursor = cursor_path(&fx, &spool);
+    let repo = fx.p("repo").display().to_string();
+    let head = fx.read("repo/.git/HEAD");
+    let branch = head.trim().strip_prefix("ref: ").unwrap().to_string();
+    let v = fx.run_with(&["--json"], &drop).json();
+    let log = fx.read("state/setpriv.log");
+    let lines: Vec<&str> = log.lines().collect();
+    for want in [
+        format!("4001 {cursor}"),
+        format!("4002 {repo}/.git/HEAD"),
+        format!("4002 {repo}/.git/{branch}"),
+    ] {
+        assert!(lines.contains(&want.as_str()), "no `{want}` in:\n{log}");
+    }
+    assert!(
+        !v["limited"].to_string().contains("HEAD"),
+        "{}",
+        v["limited"]
+    );
+
+    // The installed copy reads the build as the checkout's owner too.
+    fx.exec("repo/deploy/upgrade.sh", "exit 0\n");
+    let script = install_copy(&fx, Some(&format!("{repo}\n")));
+    fx.write("build/sensor-ssh", "new build");
+    std::fs::remove_file(fx.p("state/setpriv.log")).unwrap();
+    let v = fx
+        .run_script(
+            &script,
+            &["--json"],
+            &[drop[0], drop[1], ("PROPOLIS_CC_REPO_DIR", "")],
+        )
+        .json();
+    let log = fx.read("state/setpriv.log");
+    let want = format!("4002 {}", fx.p("build/sensor-ssh").display());
+    assert!(log.lines().any(|l| l == want), "no `{want}` in:\n{log}");
+    assert!(
+        finding_messages(&v)
+            .join("\n")
+            .contains("installed binaries differ from the build"),
+        "{}",
+        v["findings"]
+    );
+}
+
+/// A cursor that cannot be read is named with the account it was read as: propolis under root
+/// (where the account may also be missing), the caller otherwise.
+#[test]
+fn a_cursor_that_cannot_be_read_names_the_account_it_was_read_as() {
+    let unlisted_message = |v: &serde_json::Value| -> String {
+        let found = spool_findings(v);
+        assert_eq!(found.len(), 1, "{found:?}");
+        found[0]["message"].as_str().unwrap().to_string()
+    };
+
+    // Root, and no propolis account to read as.
+    let fx = Fx::new();
+    stub_privilege_drop(&fx, false, &current_user());
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    spool_cursor(&fx, &spool, 300, None);
+    let cursor = cursor_path(&fx, &spool);
+    let v = fx
+        .run_with(
+            &["--json"],
+            &[("PA_TEST_READ_AS_SELF", ""), ("PA_TEST_UID", "0")],
+        )
+        .json();
+    let msg = unlisted_message(&v);
+    assert!(
+        msg.contains(&format!(
+            "its cursor {cursor} is not readable as propolis (or the propolis account is missing)"
+        )),
+        "{msg}"
+    );
+
+    // A cursor this account cannot open (mode 0000; as root, the run drops to nobody).
+    let fx = Fx::new();
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    spool_cursor(&fx, &spool, 300, None);
+    let cursor = cursor_path(&fx, &spool);
+    std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let penv = fx.p("etc/propolis.env");
+    let wrapper: Vec<&str> = if is_root() {
+        std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o644)).unwrap();
+        vec![
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+        ]
+    } else {
+        vec![]
+    };
+    let r = fx.run_under(&wrapper, &["--json"], &[("PROPOLIS_CC_EUID", "1000")]);
+    std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let msg = unlisted_message(&r.json());
+    assert!(
+        msg.contains(&format!("its cursor {cursor} is not readable as this user")),
+        "{msg}"
+    );
+
+    // A read that does not finish in time.
+    let fx = Fx::new();
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    spool_cursor(&fx, &spool, 300, None);
+    let cursor = cursor_path(&fx, &spool);
+    fx.exec("stubs/timeout", "exit 124\n");
+    let msg = unlisted_message(&fx.json());
+    assert!(
+        msg.contains(&format!("its cursor {cursor} could not be read in time")),
+        "{msg}"
+    );
+}
+
+/// Lays out `fx/heads/<name>/.git` by hand, with no git involved.
+fn fake_checkout(fx: &Fx, name: &str, files: &[(&str, &str)]) -> String {
+    for (rel, body) in files {
+        fx.write(&format!("heads/{name}/.git/{rel}"), body);
+    }
+    fx.p(&format!("heads/{name}")).display().to_string()
+}
+
+#[test]
+fn head_is_read_from_loose_packed_and_detached_refs_without_running_git() {
+    let fx = Fx::new();
+    // First on PATH: a git that leaves a mark if anything runs it.
+    fx.exec("stubs/git", "touch \"$STUB_STATE/git_ran\"\nexit 1\n");
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    let other256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let stale = "fedcba9876543210fedcba9876543210fedcba98";
+    let head = fx.head.clone();
+    let layouts = |at: &str| -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+        vec![
+            (
+                "loose",
+                vec![
+                    ("HEAD", "ref: refs/heads/main\n".to_string()),
+                    ("refs/heads/main", format!("{at}\n")),
+                ],
+            ),
+            (
+                "packed",
+                vec![
+                    ("HEAD", "ref: refs/heads/main\n".to_string()),
+                    (
+                        "packed-refs",
+                        format!(
+                            "# pack-refs with: peeled fully-peeled sorted \n{other} refs/heads/mainline\n{at} refs/heads/main\n^{other}\n"
+                        ),
+                    ),
+                ],
+            ),
+            ("detached", vec![("HEAD", format!("{at}\n"))]),
+            // git writes a moved branch as a loose ref and leaves its old packed line behind: the
+            // loose ref is the branch.
+            (
+                "both",
+                vec![
+                    ("HEAD", "ref: refs/heads/main\n".to_string()),
+                    ("refs/heads/main", format!("{at}\n")),
+                    ("packed-refs", format!("{stale} refs/heads/main\n")),
+                ],
+            ),
+        ]
+    };
+    for (at, behind) in [(other, true), (other256, true), (head.as_str(), false)] {
+        for (name, files) in layouts(at) {
+            let name = format!("{name}-{}", &at[..4]);
+            let files: Vec<(&str, &str)> = files.iter().map(|(p, b)| (*p, b.as_str())).collect();
+            let _ = std::fs::remove_dir_all(fx.p(&format!("heads/{name}")));
+            let dir = fake_checkout(&fx, &name, &files);
+            let v = fx
+                .run_with(&["--json"], &[("PROPOLIS_CC_REPO_DIR", &dir)])
+                .json();
+            let ids: Vec<&str> = v["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids.contains(&"stamp-behind"), behind, "{name}: {ids:?}");
+            if behind {
+                let msg = finding_messages(&v).join("\n");
+                assert!(
+                    msg.contains(&format!("the checkout is at {}", &at[..12])),
+                    "{name}: {msg}"
+                );
+            }
+            assert!(
+                !finding_messages(&v).join("\n").contains(&stale[..12]),
+                "{name}: the stale packed line was read before the loose ref"
+            );
+            assert!(
+                !v["limited"].to_string().contains("HEAD"),
+                "{name}: {}",
+                v["limited"]
+            );
+        }
+    }
+    assert!(!fx.p("state/git_ran").exists(), "git was run");
+}
+
+#[test]
+fn an_unreadable_or_worktree_head_is_a_limit_not_silence() {
+    let fx = Fx::new();
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    let worktree = fx.p("heads/worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /elsewhere/.git/worktrees/x\n",
+    )
+    .unwrap();
+    let escaping = fake_checkout(
+        &fx,
+        "escaping",
+        &[
+            ("HEAD", "ref: refs/heads/../../../etc/passwd\n"),
+            ("refs/heads/main", &format!("{other}\n")),
+        ],
+    );
+    let garbage = fake_checkout(&fx, "garbage", &[("HEAD", "not a head\n")]);
+    let missing_ref = fake_checkout(&fx, "missing-ref", &[("HEAD", "ref: refs/heads/gone\n")]);
+    let linked = fake_checkout(&fx, "linked", &[("real-head", &format!("{other}\n"))]);
+    std::os::unix::fs::symlink(
+        fx.p("heads/linked/.git/real-head"),
+        fx.p("heads/linked/.git/HEAD"),
+    )
+    .unwrap();
+    // A .git that is a link to a valid .git directory is not followed.
+    fake_checkout(&fx, "real", &[("HEAD", &format!("{other}\n"))]);
+    std::fs::create_dir_all(fx.p("heads/linked-git")).unwrap();
+    std::os::unix::fs::symlink(fx.p("heads/real/.git"), fx.p("heads/linked-git/.git")).unwrap();
+    let on_main = ("HEAD", "ref: refs/heads/main\n");
+    // A loose ref that is there but unusable is the answer: a packed line for the same branch,
+    // which would read as the checkout being behind, is not consulted.
+    let packed_main = format!("{other} refs/heads/main\n");
+    let packed = ("packed-refs", packed_main.as_str());
+    let dangling = fake_checkout(&fx, "dangling-ref", &[on_main, packed]);
+    std::fs::create_dir_all(fx.p("heads/dangling-ref/.git/refs/heads")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.p("heads/dangling-ref/.git/nowhere"),
+        fx.p("heads/dangling-ref/.git/refs/heads/main"),
+    )
+    .unwrap();
+    let garbage_ref = fake_checkout(
+        &fx,
+        "garbage-ref",
+        &[on_main, ("refs/heads/main", "not a commit\n"), packed],
+    );
+    let fifo_packed = fake_checkout(&fx, "fifo-packed", &[on_main]);
+    let st = Command::new("mkfifo")
+        .arg(fx.p("heads/fifo-packed/.git/packed-refs"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // A packed-refs past 1 MiB, its one line for main naming another commit.
+    let big = format!("{}\n{other} refs/heads/main\n", "#".repeat(1024 * 1024));
+    let big_packed = fake_checkout(&fx, "big-packed", &[on_main, ("packed-refs", &big)]);
+    let nowhere = fx.p("heads/nowhere").display().to_string();
+    let linked_git = fx.p("heads/linked-git").display().to_string();
+    let owner = current_user();
+    let worktree = worktree.display().to_string();
+    for (dir, why) in [
+        (
+            worktree.clone(),
+            format!("{worktree}/.git is not a directory, as in a worktree or a submodule"),
+        ),
+        (
+            escaping,
+            ".git/HEAD holds neither a commit id nor a branch under refs/heads".to_string(),
+        ),
+        (
+            garbage,
+            ".git/HEAD holds neither a commit id nor a branch under refs/heads".to_string(),
+        ),
+        (
+            missing_ref,
+            "the branch refs/heads/gone is in neither .git/refs nor .git/packed-refs".to_string(),
+        ),
+        (linked, format!(".git/HEAD not a regular file as {owner}")),
+        (
+            linked_git.clone(),
+            format!("{linked_git}/.git is a symbolic link"),
+        ),
+        (
+            dangling,
+            format!(".git/refs/heads/main not a regular file as {owner}"),
+        ),
+        (
+            garbage_ref,
+            ".git/refs/heads/main holds no commit id".to_string(),
+        ),
+        (
+            fifo_packed,
+            format!(".git/packed-refs not a regular file as {owner}"),
+        ),
+        (
+            big_packed,
+            format!(".git/packed-refs larger than expected as {owner}"),
+        ),
+        (
+            nowhere.clone(),
+            format!("checkout not visible from this sandbox: {nowhere}"),
+        ),
+    ] {
+        let v = fx
+            .run_with(&["--json"], &[("PROPOLIS_CC_REPO_DIR", &dir)])
+            .json();
+        let limited = v["limited"].to_string();
+        assert!(
+            limited.contains(&format!(
+                "checkout HEAD not readable ({why}): stamp-behind not checked"
+            )),
+            "{dir}: {limited}"
+        );
+        assert!(
+            !finding_messages(&v)
+                .join("\n")
+                .contains("the checkout is at"),
+            "{dir}: {}",
+            v["findings"]
+        );
+        // What could not be compared is unknown, never ok.
+        assert_eq!(
+            global_state(&v, "deploy-stamp"),
+            "unknown",
+            "{dir}: {}",
+            v["global"]
+        );
+        assert!(
+            global_text(&v, "deploy-stamp").ends_with(", checkout HEAD not read"),
+            "{dir}: {}",
+            global_text(&v, "deploy-stamp")
+        );
+    }
+    let r = fx.run_with(&["--tsv"], &[("PROPOLIS_CC_REPO_DIR", &worktree)]);
+    let s = &tsv_records(&r.out)[0];
+    assert!(s[5].parse::<u32>().unwrap() >= 1, "{s:?}");
+    assert_eq!(r.code, 1, "{}", r.out);
+}
+
+#[test]
+fn a_cursor_fifo_or_link_in_the_spool_check_is_unknown_and_does_not_hang() {
+    use std::os::unix::fs::MetadataExt;
+    let cursor_of = |path: &str| -> PathBuf {
+        let resolved = std::fs::canonicalize(path).unwrap();
+        PathBuf::from(format!("{}.json", sha256_hex(resolved.to_str().unwrap())))
+    };
+    let unlisted_message = |fx: &Fx| -> String {
+        let v = fx.json();
+        let found = spool_findings(&v);
+        assert_eq!(found.len(), 1, "{found:?}");
+        found[0]["message"].as_str().unwrap().to_string()
+    };
+
+    // A FIFO where the cursor should be: opened, it would block the root run.
+    let fx = Fx::new();
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    std::fs::create_dir_all(fx.p("state/cursors")).unwrap();
+    let cur = fx.p("state/cursors").join(cursor_of(&spool));
+    let st = Command::new("mkfifo").arg(&cur).status().unwrap();
+    assert!(st.success());
+    let msg = unlisted_message(&fx);
+    assert!(
+        msg.contains(&format!(
+            "its cursor {} is not a regular file",
+            cur.display()
+        )),
+        "{msg}"
+    );
+
+    // A link where the cursor should be, to a file that would read as a cursor.
+    let fx = Fx::new();
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    let ino = std::fs::metadata(&spool).unwrap().ino();
+    fx.write(
+        "elsewhere/cursor.json",
+        &format!("{{\"inode\":{ino},\"offset\":300}}"),
+    );
+    std::fs::create_dir_all(fx.p("state/cursors")).unwrap();
+    let cur = fx.p("state/cursors").join(cursor_of(&spool));
+    std::os::unix::fs::symlink(fx.p("elsewhere/cursor.json"), &cur).unwrap();
+    let msg = unlisted_message(&fx);
+    assert!(
+        msg.contains(&format!(
+            "its cursor {} is not a regular file",
+            cur.display()
+        )),
+        "{msg}"
+    );
+
+    // A cursor larger than any cursor the daemon writes.
+    let fx = Fx::new();
+    let spool = fx.spool("collector-07", 300, NOW - 7200);
+    let rel = format!("state/cursors/{}", cursor_of(&spool).display());
+    fx.write(
+        &rel,
+        &format!("{{\"inode\":1,\"offset\":1}}{}", " ".repeat(5000)),
+    );
+    let msg = unlisted_message(&fx);
+    assert!(msg.contains("is larger than a cursor"), "{msg}");
+
+    // The spool file itself a symbolic link: its metadata is not followed.
+    let fx = Fx::new();
+    fx.log("elsewhere/events.jsonl", 300, NOW - 7200);
+    std::fs::create_dir_all(fx.p("spool/gateway/collector-08")).unwrap();
+    std::os::unix::fs::symlink(
+        fx.p("elsewhere/events.jsonl"),
+        fx.p("spool/gateway/collector-08/events.jsonl"),
+    )
+    .unwrap();
+    let msg = unlisted_message(&fx);
+    assert!(
+        msg.contains(&format!(
+            "{} is a symbolic link",
+            fx.p("spool/gateway/collector-08/events.jsonl").display()
+        )),
+        "{msg}"
+    );
+
+    // The same link on a host whose stat names file types in the operator's language: systemd
+    // passes LANG to a service, and coreutils translates %F unless LC_ALL=C reaches it.
+    let real = |t: &str| -> String {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| format!("{d}/{t}"))
+            .find(|p| Path::new(p).exists())
+            .unwrap_or_else(|| panic!("no {t} on this host"))
+    };
+    fx.exec(
+        "stubs/stat",
+        &format!(
+            "case \"$*\" in\n  *%F*)\n    if [ \"${{LC_ALL:-}}\" != C ]; then\n        {stat} \"$@\" | {sed} 's/^symbolic link/symbolische Verkn\u{fc}pfung/'\n        exit 0\n    fi\n    ;;\nesac\nexec {stat} \"$@\"\n",
+            stat = real("stat"),
+            sed = real("sed")
+        ),
+    );
+    let v = fx.run_with(&["--json"], &[("LANG", "de_DE.UTF-8")]).json();
+    let found = spool_findings(&v);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let msg = found[0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!(
+            "{} is a symbolic link",
+            fx.p("spool/gateway/collector-08/events.jsonl").display()
+        )),
+        "{msg}"
+    );
+}
+
+/// The fields each TSV record type carries, the type included.
+fn tsv_fields(kind: &str) -> usize {
+    match kind {
+        "S" => 9,
+        "R" => 10,
+        "G" => 4,
+        "F" => 7,
+        "X" | "L" | "E" => 2,
+        other => panic!("unknown TSV record type {other:?}"),
+    }
+}
+
+/// Checks the TSV document's shape and returns its records, the header line left out.
+fn tsv_records(out: &str) -> Vec<Vec<String>> {
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("#config-check tsv v1"), "{out}");
+    let records: Vec<Vec<String>> = lines
+        .map(|l| l.split('\t').map(str::to_string).collect())
+        .collect();
+    for r in &records {
+        assert_eq!(r.len(), tsv_fields(&r[0]), "{r:?}");
+        assert!(r.iter().all(|f| !f.is_empty()), "an empty field: {r:?}");
+    }
+    records
+}
+
+#[test]
+fn tsv_has_one_record_per_line_and_an_end_count() {
+    let fx = Fx::new();
+    // A run fix, a manual fix and a limit in one report.
+    fx.unit("sensor-ssh.service", "disabled", "inactive");
+    let logs = fx.logs();
+    let line = format!(
+        "PROPOLIS_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl"
+    );
+    fx.set_env_line("etc/propolis.env", "PROPOLIS_SENSOR_LOGS=", Some(&line));
+    fx.remove_stub("df");
+    fx.write(
+        "state/backup-status/last-success",
+        &format!(
+            "{{\"completed_at\":\"{}\",\"reason\":\"scheduled\",\"set\":\"x\",\"encrypted\":true,\"dump_bytes\":1,\"archive_bytes\":1,\"source_bytes\":1}}\n",
+            iso(NOW - 3600)
+        ),
+    );
+    let r = fx.run(&["--tsv"]);
+    let v = fx.json();
+    assert_eq!(r.code, v["exit_code"].as_i64().unwrap() as i32);
+    let recs = tsv_records(&r.out);
+    assert_eq!(recs[0][0], "S");
+    assert_eq!(recs.last().unwrap()[0], "E");
+    let s = &recs[0];
+    assert_eq!(s[1], v["status"].as_str().unwrap());
+    assert_eq!(s[2], v["exit_code"].to_string());
+    assert_eq!(s[3], v["counts"]["fail"].to_string());
+    assert_eq!(s[4], v["counts"]["warn"].to_string());
+    assert_eq!(s[5], v["counts"]["unknown"].to_string());
+    assert_eq!(s[6], "1");
+    assert_eq!(s[7], NOW.to_string());
+    assert_eq!(s[8], "0");
+    // In order: S, the G rows, the R rows, each F with its X, the L lines, E.
+    let order: String = recs.iter().map(|r| r[0].as_str()).collect();
+    let shape = regex_like_order(&order);
+    assert!(shape, "records out of order: {order}");
+    let f: Vec<&Vec<String>> = recs.iter().filter(|r| r[0] == "F").collect();
+    let findings = v["findings"].as_array().unwrap();
+    assert_eq!(f.len(), findings.len());
+    assert_eq!(recs.last().unwrap()[1], f.len().to_string());
+    for (rec, j) in f.iter().zip(findings) {
+        assert_eq!(rec[1], j["level"].as_str().unwrap());
+        assert_eq!(rec[2], j["id"].as_str().unwrap());
+        assert_eq!(rec[4], j["scope"].as_str().unwrap());
+        let kind = j["fix_kind"].as_str().unwrap();
+        assert_eq!(rec[5], if kind.is_empty() { "-" } else { kind });
+        assert_eq!(rec[6], j["message"].as_str().unwrap());
+    }
+    // The k12 is of the whole key, instance included.
+    let disabled = f.iter().find(|r| r[2] == "unit-disabled").unwrap();
+    assert_eq!(
+        disabled[3],
+        sha256_hex("unit-disabled:sensor-ssh")[..12].to_string()
+    );
+    let fixes: Vec<&Vec<String>> = recs.iter().filter(|r| r[0] == "X").collect();
+    assert!(
+        fixes
+            .iter()
+            .any(|x| x[1] == "sudo systemctl enable --now sensor-ssh.service"),
+        "{fixes:?}"
+    );
+    let rows: Vec<&Vec<String>> = recs.iter().filter(|r| r[0] == "R").collect();
+    assert_eq!(rows.len(), v["listeners"].as_array().unwrap().len());
+    let ssh = rows.iter().find(|r| r[1] == "ssh/tcp").unwrap();
+    assert_eq!(ssh[2], "sensor-ssh");
+    assert_eq!(ssh[3], "fail");
+    for state in &ssh[4..] {
+        assert!(
+            ["ok", "warn", "fail", "unknown", "skip"].contains(&state.as_str()),
+            "{ssh:?}"
+        );
+    }
+    let limits: Vec<&Vec<String>> = recs.iter().filter(|r| r[0] == "L").collect();
+    assert_eq!(limits.len(), v["limited"].as_array().unwrap().len());
+    assert!(!limits.is_empty(), "the fixture has no limit to show");
+    // --report-only keeps exit 0 and the S line keeps the real code.
+    let r = fx.run(&["--tsv", "--report-only"]);
+    assert_eq!(r.code, 0);
+    assert_eq!(tsv_records(&r.out)[0][2], v["exit_code"].to_string());
+}
+
+/// A danger finding is put first, and its k12 travels with it: every F line's k12 is the hash of
+/// that finding's own full key.
+#[test]
+fn tsv_keeps_each_k12_with_its_finding_when_a_danger_finding_is_put_first() {
+    let fx = Fx::new();
+    fx.unit("sensor-ssh.service", "disabled", "inactive");
+    // A host PostgreSQL holds 5432, which ufw allows: danger:tcp:5432.
+    foreign_holder_on_5432(&fx);
+    let r = fx.run(&["--tsv"]);
+    let recs = tsv_records(&r.out);
+    let f: Vec<&Vec<String>> = recs.iter().filter(|r| r[0] == "F").collect();
+    assert_eq!(f[0][2], "danger", "{f:?}");
+    let k12 = |key: &str| sha256_hex(key)[..12].to_string();
+    for (id, key) in [
+        ("danger", "danger:tcp:5432"),
+        ("listen-foreign", "listen-foreign:tcp:5432"),
+        ("unit-disabled", "unit-disabled:sensor-ssh"),
+    ] {
+        let rec = f
+            .iter()
+            .find(|r| r[2] == id)
+            .unwrap_or_else(|| panic!("no {id} in {f:?}"));
+        assert_eq!(rec[3], k12(key), "{id}: {rec:?}");
+    }
+    let mut seen: Vec<&str> = f.iter().map(|r| r[3].as_str()).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), f.len(), "two findings share a k12: {f:?}");
+}
+
+/// S, then G*, R*, (F X?)*, L*, E: the order the TSV promises, written without a regex crate.
+fn regex_like_order(order: &str) -> bool {
+    let mut rest = order.strip_prefix('S').unwrap_or("!");
+    rest = rest.trim_start_matches('G');
+    rest = rest.trim_start_matches('R');
+    while let Some(r) = rest.strip_prefix('F') {
+        rest = r.strip_prefix('X').unwrap_or(r);
+    }
+    rest = rest.trim_start_matches('L');
+    rest == "E"
+}
+
+#[test]
+fn tsv_is_safe_for_hostile_values() {
+    let fx = Fx::new();
+    let logs = fx.logs();
+    let hostile = "bad\"label\\x\u{1b}[31m\u{e9}\ttab";
+    let text = fx.read("etc/propolis.env").replace(
+        "PROPOLIS_SENSOR_LOGS=",
+        &format!("PROPOLIS_SENSOR_LOGS={hostile}:{logs}/zzz/events.jsonl,"),
+    );
+    fx.write("etc/propolis.env", &text);
+    let r = fx.run(&["--tsv"]);
+    assert!(r.out.is_ascii(), "{}", r.out);
+    assert!(!r.out.contains('\u{1b}'));
+    let recs = tsv_records(&r.out);
+    assert!(
+        recs.iter()
+            .any(|r| r[0] == "F" && r[6].contains("bad\"label\\x?[31m??")),
+        "{recs:?}"
+    );
+}
+
+#[test]
+fn tsv_and_json_together_is_bad_usage() {
+    let fx = Fx::new();
+    for args in [["--tsv", "--json"], ["--json", "--tsv"]] {
+        let r = fx.run(&args);
+        assert_eq!(r.code, 64, "{args:?}: {}", r.err);
+        assert!(r.out.is_empty(), "{}", r.out);
+    }
+}
+
+#[test]
+fn config_check_makes_no_network_call() {
+    let text = std::fs::read_to_string(SCRIPT).unwrap();
+    for word in ["curl", "wget", " nc ", "pa_send", "pa_readcheck_run"] {
+        assert!(
+            !text.contains(word),
+            "deploy/config-check.sh contains {word:?}"
+        );
+    }
+    let fx = Fx::new();
+    assert!(!fx.p("tools/curl").exists() && !fx.p("stubs/curl").exists());
+    assert_eq!(fx.run(&[]).code, 0);
+}
+
+#[test]
+fn env_syntax_reports_only_the_disagreeing_forms_and_never_the_value() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/syntax.env",
+        concat!(
+            "# PROPOLIS_COMMENTED = secretvalue0\n",
+            "  PROPOLIS_A=secretvalue1\n",
+            "PROPOLIS_B = secretvalue2\n",
+            "PROPOLIS_C=secretvalue3  \n",
+            "PROPOLIS_D=secret\\value4\n",
+            "PROPOLIS_F=\"a b secretvalue6\"\n",
+            "PROPOLIS_G=secretvalue7\r\n",
+            "OTHER_KEY = secretvalue8\n",
+            "PROPOLIS_H = secretvalue9\n",
+            "PROPOLIS_H=secretvalue10\n",
+            "DATABASE_URL =secretvalue11\n",
+            // A value ending in a backslash runs into the next line, and so does a comment that
+            // ends in one (systemd before v254): Y and Z are not read on their own.
+            "PROPOLIS_X=secretvalue12\\\n",
+            "PROPOLIS_Y=secretvalue13\n",
+            "# a comment that ends in a backslash \\\n",
+            "PROPOLIS_Z=secretvalue14\n",
+            // A CR in the middle of a line ends a line for systemd, so Q is a setting of its own.
+            "PROPOLIS_P=secretvalue15\rPROPOLIS_Q=secretvalue16\n",
+            // Last: systemd runs an open quote on into the lines after it.
+            "PROPOLIS_E=\"secretvalue5\n",
+        ),
+    );
+    let file = fx.p("etc/syntax.env").display().to_string();
+    let v = fx.json();
+    // The env-files row carries what its findings say.
+    assert_eq!(global_state(&v, "env-files"), "warn", "{}", v["global"]);
+    assert!(
+        global_text(&v, "env-files")
+            .ends_with("; 12 settings in a form systemd and the shell scripts read differently"),
+        "{}",
+        global_text(&v, "env-files")
+    );
+    let found: BTreeMap<String, String> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["id"] == "env-systemd-only")
+        .map(|f| {
+            let msg = f["message"].as_str().unwrap().to_string();
+            assert_eq!(f["level"], "warn", "{f}");
+            assert_eq!(f["fix_kind"], "manual", "{f}");
+            let key = msg
+                .split(" sets ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .unwrap_or_else(|| panic!("{msg}"))
+                .to_string();
+            (key, msg)
+        })
+        .collect();
+    let keys: Vec<&str> = found.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "DATABASE_URL",
+            "PROPOLIS_A",
+            "PROPOLIS_B",
+            "PROPOLIS_C",
+            "PROPOLIS_D",
+            "PROPOLIS_E",
+            "PROPOLIS_G",
+            "PROPOLIS_P",
+            "PROPOLIS_Q",
+            "PROPOLIS_X",
+            "PROPOLIS_Y",
+            "PROPOLIS_Z"
+        ],
+        "{found:#?}"
+    );
+    let joined = "a line systemd reads as part of the line before it";
+    for (key, line, form) in [
+        ("PROPOLIS_A", 2, "blanks before the name"),
+        ("PROPOLIS_B", 3, "blanks around '='"),
+        ("PROPOLIS_C", 4, "trailing blanks or a CR"),
+        ("PROPOLIS_D", 5, "a backslash or an unmatched quote"),
+        ("PROPOLIS_G", 7, "trailing blanks or a CR"),
+        ("DATABASE_URL", 11, "blanks around '='"),
+        ("PROPOLIS_X", 12, "a backslash or an unmatched quote"),
+        ("PROPOLIS_Y", 13, joined),
+        ("PROPOLIS_Z", 15, joined),
+        ("PROPOLIS_P", 16, "trailing blanks or a CR"),
+        ("PROPOLIS_Q", 16, "trailing blanks or a CR"),
+        ("PROPOLIS_E", 17, "a backslash or an unmatched quote"),
+    ] {
+        let msg = &found[key];
+        assert!(
+            msg.starts_with(&format!("line {line} of {file} sets {key} in a form systemd reads one way and the shell scripts read another way or not at all (")),
+            "{msg}"
+        );
+        assert!(msg.contains(form), "{key}: {msg}");
+        assert!(msg.ends_with("; the value is not shown"), "{msg}");
+    }
+    // The fix names the key, except DATABASE_URL, which a fix line never names.
+    let fix_of = |key: &str| -> String {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| {
+                f["id"] == "env-systemd-only"
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!(" sets {key} "))
+            })
+            .map(|f| f["fix"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    assert_eq!(
+        fix_of("PROPOLIS_A"),
+        format!(
+            "rewrite line 2 of {file} as PROPOLIS_A=value, with nothing before PROPOLIS_A, no blanks around '=', no trailing blanks, no backslash and no unmatched quote"
+        )
+    );
+    assert_eq!(
+        fix_of("DATABASE_URL"),
+        format!(
+            "rewrite line 11 of {file} as NAME=value, with nothing before the name, no blanks around '=', no trailing blanks, no backslash and no unmatched quote"
+        )
+    );
+    assert_fix_contract(
+        &fx,
+        "env-systemd-only for DATABASE_URL",
+        "env-systemd-only",
+        "manual",
+        &fix_of("DATABASE_URL"),
+    );
+    for args in [vec![], vec!["--json"], vec!["--tsv"]] {
+        let r = fx.run(&args);
+        assert!(!r.out.contains("secretvalue"), "{args:?}: {}", r.out);
+    }
+
+    // Without the file, the row is what check_env_files makes it.
+    std::fs::remove_file(fx.p("etc/syntax.env")).unwrap();
+    assert_eq!(global_state(&fx.json(), "env-files"), "ok");
+}
+
+#[test]
+fn parse_intake_and_pa_sensor_logs_agree() {
+    let fx = Fx::new();
+    let logs = fx.logs();
+    for value in [
+        " a:L/x/1 , ,b:L/x/2,,",
+        "a;L/x/1,b:L/x/2",
+        ":L/x/3,c:",
+        "e:L/x/5:with:colons",
+        "\u{a0}d:L/x/4\u{2003}, f:L/x/6",
+    ] {
+        let value = value.replace('L', &logs);
+        let lib = Command::new(BASH)
+            .args([
+                "-c",
+                ". \"$1\"; pa_sensor_logs \"$2\"; for i in \"${!PA_LOG_LABEL[@]}\"; do printf 'good\\t%s:%s\\n' \"${PA_LOG_LABEL[$i]}\" \"${PA_LOG_PATH[$i]}\"; done; for i in \"${!PA_LOG_BAD[@]}\"; do printf 'bad\\t%s\\t%s\\n' \"${PA_LOG_BAD[$i]}\" \"${PA_LOG_BAD_WHY[$i]}\"; done",
+                "_",
+                ALERT_LIB,
+                &value,
+            ])
+            .output()
+            .unwrap();
+        assert!(lib.status.success());
+        let lib_out = String::from_utf8(lib.stdout).unwrap();
+        fx.set_env_line(
+            "etc/propolis.env",
+            "PROPOLIS_SENSOR_LOGS=",
+            Some(&format!("PROPOLIS_SENSOR_LOGS={value}")),
+        );
+        let v = fx.json();
+        let msgs = finding_messages(&v).join("\n");
+        let mut entries = 0;
+        for line in lib_out.lines() {
+            entries += 1;
+            let parts: Vec<&str> = line.split('\t').collect();
+            let want = match parts[0] {
+                "good" => format!("entry '{}'", parts[1]),
+                _ => format!("entry '{}' is malformed ({};", parts[1], parts[2]),
+            };
+            assert!(msgs.contains(&want), "{value:?}: {want} not in\n{msgs}");
+        }
+        assert!(
+            global_text(&v, "intake-list")
+                .starts_with(&format!("PROPOLIS_SENSOR_LOGS: {entries} entries")),
+            "{value:?}: {}",
+            global_text(&v, "intake-list")
+        );
+    }
+}
+
+#[test]
+fn a_missing_alert_library_exits_70_and_upgrade_still_finishes() {
+    let fx = Fx::new();
+    let lone = fx.p("lone");
+    std::fs::create_dir_all(&lone).unwrap();
+    let script = lone.join("config-check.sh");
+    std::fs::copy(SCRIPT, &script).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::copy(LISTENERS_LIB, lone.join("listeners-lib.sh")).unwrap();
+    std::fs::write(
+        lone.join("install-bins"),
+        format!("INSTALL_BINS=({})\n", install_bins().join(" ")),
+    )
+    .unwrap();
+    let error = "error: alert library not found (or too old) beside config-check.sh or at /usr/local/sbin/propolis-alert-lib";
+    let old_lib = std::fs::read_to_string(ALERT_LIB)
+        .unwrap()
+        .replace("\nPA_LIB_VERSION=", "\nPA_LIB_VERSION=0\nPA_OLD_VERSION=");
+    fx.write("libs/old-lib.sh", &old_lib);
+    let old = fx.p("libs/old-lib.sh").display().to_string();
+    let missing = fx.p("libs/none.sh").display().to_string();
+
+    // The seam names a file that is not there.
+    let r = fx.run_script(&script, &[], &[("PROPOLIS_CC_ALERT_LIB", &missing)]);
+    assert_eq!(r.code, 70, "{}{}", r.out, r.err);
+    assert!(r.err.contains(error), "{}", r.err);
+    assert!(r.out.is_empty(), "{}", r.out);
+    // --report-only does not hide it: the library is not a finding.
+    let r = fx.run_script(
+        &script,
+        &["--report-only"],
+        &[("PROPOLIS_CC_ALERT_LIB", &missing)],
+    );
+    assert_eq!(r.code, 70);
+    // The seam comes first, and a library older than the script needs is refused.
+    std::fs::copy(ALERT_LIB, lone.join("alert-lib.sh")).unwrap();
+    let r = fx.run_script(&script, &[], &[("PROPOLIS_CC_ALERT_LIB", &old)]);
+    assert_eq!(r.code, 70, "{}", r.err);
+    assert!(r.err.contains(error), "{}", r.err);
+    // Without the seam, the copy beside the script is found.
+    let r = fx.run_script(&script, &[], &[("PROPOLIS_CC_ALERT_LIB", "")]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    // ...before the installed path, so an old one beside it stops the run.
+    std::fs::copy(&old, lone.join("alert-lib.sh")).unwrap();
+    let r = fx.run_script(&script, &[], &[("PROPOLIS_CC_ALERT_LIB", "")]);
+    assert_eq!(r.code, 70, "{}", r.err);
+    std::fs::remove_file(lone.join("alert-lib.sh")).unwrap();
+
+    // A library that cannot be used is exit 70 and the error line however it fails: an unbound
+    // variable at its top level (which under set -u would end the shell itself), an exit at its
+    // top level, or the current version without one of the functions the check calls.
+    let shipped = std::fs::read_to_string(ALERT_LIB).unwrap();
+    for (name, body) in [
+        ("unbound", format!("{shipped}\n: \"$CC_UNDEFINED_THING\"\n")),
+        ("exits", format!("{shipped}\nexit 0\n")),
+        ("no-read-as", format!("{shipped}\nunset -f pa_read_as\n")),
+    ] {
+        fx.write(&format!("libs/{name}.sh"), &body);
+        let lib = fx.p(&format!("libs/{name}.sh")).display().to_string();
+        for args in [vec![], vec!["--report-only"]] {
+            let r = fx.run_script(&script, &args, &[("PROPOLIS_CC_ALERT_LIB", &lib)]);
+            assert_eq!(r.code, 70, "{name} {args:?}: {}{}", r.out, r.err);
+            assert!(r.err.contains(error), "{name} {args:?}: {}", r.err);
+            assert!(r.out.is_empty(), "{name} {args:?}: {}", r.out);
+        }
+    }
+
+    // A library this account cannot read (mode 0000; as root, the run drops to nobody).
+    fx.write("libs/unreadable.sh", &shipped);
+    let unreadable = fx.p("libs/unreadable.sh");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let wrapper: Vec<&str> = if is_root() {
+        std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+        vec![
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+        ]
+    } else {
+        vec![]
+    };
+    let r = fx.run_script_under(
+        &script,
+        &wrapper,
+        &[],
+        &[
+            ("PROPOLIS_CC_ALERT_LIB", &unreadable.display().to_string()),
+            ("PROPOLIS_CC_EUID", "1000"),
+        ],
+    );
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(r.code, 70, "unreadable: {}{}", r.out, r.err);
+    assert!(r.err.contains(error), "unreadable: {}", r.err);
+
+    // What the environment hands down is not taken for the library: exported functions and a
+    // version, with a library that defines the functions but no version, and one that has the
+    // version but defines no function.
+    let exported: Vec<(String, String)> = [
+        "pa_init",
+        "pa_env_get",
+        "pa_read_as",
+        "pa_sensor_logs",
+        "pa_cleanup",
+    ]
+    .iter()
+    .map(|f| (format!("BASH_FUNC_{f}%%"), "() {  :\n}".to_string()))
+    .collect();
+    let no_version = shipped.replace("\nPA_LIB_VERSION=", "\nPA_NOT_THE_VERSION=");
+    for (name, body) in [
+        ("no-version", no_version),
+        ("no-functions", "PA_LIB_VERSION=1\n".to_string()),
+    ] {
+        fx.write(&format!("libs/{name}.sh"), &body);
+        let lib = fx.p(&format!("libs/{name}.sh")).display().to_string();
+        let mut env: Vec<(&str, &str)> = exported
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        env.push(("PA_LIB_VERSION", "9"));
+        env.push(("PROPOLIS_CC_ALERT_LIB", &lib));
+        let r = fx.run_script(&script, &[], &env);
+        assert_eq!(r.code, 70, "{name}: {}{}", r.out, r.err);
+        assert!(r.err.contains(error), "{name}: {}", r.err);
+    }
+
+    // No seam and no library beside the script: the installed path is the last place looked.
+    let text = std::fs::read_to_string(SCRIPT).unwrap();
+    let seam = text
+        .find("CC_ALERT_LIB=\"$PROPOLIS_CC_ALERT_LIB\"")
+        .unwrap();
+    let beside = text
+        .find("CC_ALERT_LIB=\"$SCRIPT_DIR/alert-lib.sh\"")
+        .unwrap();
+    let installed = text
+        .find("CC_ALERT_LIB=/usr/local/sbin/propolis-alert-lib")
+        .unwrap();
+    assert!(
+        seam < beside && beside < installed,
+        "the lookup order is seam, beside the script, installed"
+    );
+    if Path::new("/usr/local/sbin/propolis-alert-lib").exists() {
+        eprintln!(
+            "note: this host has /usr/local/sbin/propolis-alert-lib, so the fallback run was not made; the lookup order was checked from the script text"
+        );
+    } else {
+        let r = fx.run_script(&script, &[], &[("PROPOLIS_CC_ALERT_LIB", "")]);
+        assert_eq!(r.code, 70, "fallback: {}{}", r.out, r.err);
+        assert!(r.err.contains(error), "fallback: {}", r.err);
+    }
+
+    // upgrade.sh's last line runs the check as it is written there, and still finishes.
+    let upgrade = std::fs::read_to_string(UPGRADE).unwrap();
+    let last = upgrade
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty() && !l.starts_with('#'))
+        .unwrap()
+        .to_string();
+    let out = Command::new(BASH)
+        .arg("-c")
+        .arg(&last)
+        .env_clear()
+        .env(
+            "PATH",
+            format!("{}:{}", fx.p("stubs").display(), fx.p("tools").display()),
+        )
+        .env("SCRIPT_DIR", &lone)
+        .env("PROPOLIS_CC_ALERT_LIB", &missing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{last}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("warning: config-check.sh itself failed to run"),
+        "{stdout}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains(error));
 }

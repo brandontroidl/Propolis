@@ -6,7 +6,9 @@
 #                                upgrade.sh runs this before installing anything: copies the named
 #                                binaries from /usr/local/bin, the Propolis unit files from
 #                                /etc/systemd/system, the propolis-* helpers from /usr/local/sbin,
-#                                and the deploy stamp into /var/lib/propolis/rollback/<release>/,
+#                                the installed config-check from /usr/local/lib/propolis (not
+#                                its repo-dir), and the deploy stamp into
+#                                /var/lib/propolis/rollback/<release>/,
 #                                recording SET, the pre-upgrade backup upgrade.sh just wrote (none
 #                                when it took none). Keeps 3.
 #   rollback.sh --list           lists the kept releases, newest first.
@@ -51,6 +53,10 @@ KEEP=3
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4,40}$'
 SET_RE='^[0-9]{8}T[0-9]{6}Z-pre-upgrade$'
 SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert propolis-alert-lib)
+# The installed config-check under /usr/local/lib/propolis, kept in lib/ of a release: the script,
+# the listener derivation it sources, and its binary list, which follows the binaries a rollback
+# puts back. repo-dir is not kept: the checkout's path does not change with a rollback.
+LIB_HELPERS=(config-check.sh listeners-lib.sh install-bins)
 # The shared library of the shell alerting code, and the installed scripts that may source it,
 # each as <copy in a kept release>:<installed path under ROOT>. A script that sources it states
 # the library version it needs on a `# needs-alert-lib: <n>` line (none or no line: 0); the
@@ -175,6 +181,12 @@ save() {
     done
     for helper in "${SBIN_HELPERS[@]}"; do
         [ -e "$ROOT/usr/local/sbin/$helper" ] && cp -p -- "$ROOT/usr/local/sbin/$helper" "$partial/sbin/"
+    done
+    for helper in "${LIB_HELPERS[@]}"; do
+        if [ -e "$ROOT/usr/local/lib/propolis/$helper" ]; then
+            mkdir -p "$partial/lib"
+            cp -p -- "$ROOT/usr/local/lib/propolis/$helper" "$partial/lib/"
+        fi
     done
     shopt -s nullglob
     for unit in "$ROOT"/etc/systemd/system/{propolis.service,propolis-*.service,propolis-*.timer,sensor-*.service,gateway.service,shipper.service}; do
@@ -662,6 +674,17 @@ restore() {
         fi
     done
     for f in "$dir"/units/*; do install -m 0644 "$f" "$ROOT/etc/systemd/system/$(basename "$f")"; done
+    for f in "$dir"/lib/*; do
+        name="$(basename "$f")"
+        skipped "$name" && continue
+        [ -d "$ROOT/usr/local/lib/propolis" ] || install -d -m 0755 "$ROOT/usr/local/lib/propolis"
+        # Only the script is run; what it sources and reads is 0644, as the deploy scripts install it.
+        if [ "$name" = config-check.sh ]; then
+            install -m 0755 "$f" "$ROOT/usr/local/lib/propolis/$name"
+        else
+            install -m 0644 "$f" "$ROOT/usr/local/lib/propolis/$name"
+        fi
+    done
     shopt -u nullglob
     [ -f "$dir/deploy-stamp.json" ] && install -m 0644 "$dir/deploy-stamp.json" "$ROOT/var/lib/propolis/deploy-stamp.json"
     [ -e "$dir/sbin/propolis-backup" ] || BACKUP_RUNS=0

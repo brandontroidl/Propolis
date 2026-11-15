@@ -191,8 +191,51 @@ upgrade:
 ```
 sudo ./deploy/config-check.sh              # table, one row per listener, then findings
 sudo ./deploy/config-check.sh --json       # the same, as one JSON document
+sudo ./deploy/config-check.sh --tsv        # the same, as tab-separated records
 sudo ./deploy/config-check.sh --no-events  # skip the database query
+sudo /usr/local/lib/propolis/config-check.sh   # the installed copy, from any directory
 ```
+
+**The installed copy.** `install.sh` and `upgrade.sh` install the script as
+`/usr/local/lib/propolis/config-check.sh` (0755, root's), with `listeners-lib.sh` beside it and
+two one-line files they write: `repo-dir`, the checkout's absolute path, and `install-bins`, the
+`INSTALL_BINS` line of `deploy/upgrade.sh`. The copy is told apart from the checkout's by having
+no `upgrade.sh` beside it. Its fix lines name the checkout's scripts
+(`sudo <checkout>/deploy/upgrade.sh`, `<checkout>/deploy/watch-env.sh`, the checkout's unit and
+logrotate files), its binary list is `install-bins`, and the build in `<checkout>/target/release`
+is read as the checkout's owner and compared by digest; a build file it cannot read that way is
+a `LIMITED CHECKS` line, never a difference, and a `binaries` row that would otherwise be ok
+becomes unknown. Without a usable `repo-dir` (missing, a link, not one line, not an absolute
+path, or naming a path that holds no `deploy/upgrade.sh`) a `LIMITED CHECKS` line says
+`checkout unknown`, and every fix that needs the checkout becomes a `do:` step that says to run
+the script from the top of the checkout. Nothing was compared with a checkout in that case, so
+a `binaries` row and a `deploy-stamp` row that would otherwise be ok are unknown
+(`build not compared (checkout unknown)`, `checkout unknown: stamp-behind not checked`); running
+`deploy/upgrade.sh` or `deploy/install.sh` from the checkout writes `repo-dir` again. The ledger
+query in an `EVENTS` fix names the installed copy itself.
+
+Both copies read their env values and the intake list through the shared alert library
+(`deploy/alert-lib.sh#pa_env_get`, `deploy/alert-lib.sh#pa_sensor_logs`), the checkout's from
+`deploy/alert-lib.sh` beside it, the installed copy's from `/usr/local/sbin/propolis-alert-lib`.
+When neither is there, or the library cannot be read or loaded, or is older than the script
+needs, the run prints
+`error: alert library not found (or too old) beside config-check.sh or at /usr/local/sbin/propolis-alert-lib`
+and exits `70` before it checks anything. Neither copy runs git: the checkout's commit is read
+from `.git/HEAD` and the ref it names (a loose ref or `packed-refs`) as the checkout's owner
+(`deploy/config-check.sh#cc_repo_head`), because a checkout's git configuration can name commands
+git would run. A HEAD it cannot read that way (a worktree's `.git` file, a `.git` or a HEAD that
+is a link, an unknown ref) is a `LIMITED CHECKS` line saying `stamp-behind` was not checked, and
+a `deploy-stamp` row that would otherwise be ok is unknown.
+
+**TSV.** `--tsv` prints `#config-check tsv v1`, then one record per line, fields separated by a
+tab (`deploy/config-check.sh#emit_tsv`): `S` (status, exit code, failure, warning and unknown
+counts, root `0|1`, generation time in epoch seconds, installed copy `0|1`), a `G` per HOST row
+(id, state, text), an `R` per listener row (`sensor/proto`, unit, row status, then the six column
+states), an `F` per finding (level, id, the first 12 hex digits of the SHA-256 of the finding's
+whole key, scope, fix kind `run`, `manual` or `-`, message) followed by an `X` with its fix when
+it has one, an `L` per limited check, and `E` with the number of `F` records last, so a cut-off
+output is detected. Every field is cleaned to printable ASCII with no tab, and an empty one is
+written `-`. `--tsv` with `--json` is a usage error.
 
 The listener list comes from the same derivation that builds the fleet inventory
 (`deploy/listeners-lib.sh`, used by `deploy/fleet-listeners.sh`), so the two cannot disagree
@@ -209,8 +252,10 @@ rows, `sensor-catchall` two per port, `sensor-cred` one per protocol), and each 
 | EVENTS | When did the ledger last receive an event from this sensor? | intake not following a log that is growing |
 
 The INTAKE check applies the daemon's own grammar (comma separated `label:path`, entries
-trimmed, blank ones skipped, split at the first colon, both halves non-empty;
-`crates/log-tailer/src/sensor_logs.rs`). A malformed entry makes the daemon refuse to start,
+trimmed of whitespace as the daemon's `str::trim` trims it, Unicode spaces included, blank ones
+skipped, split at the first colon, both halves non-empty;
+`crates/log-tailer/src/sensor_logs.rs`), parsed by the shared library's
+`deploy/alert-lib.sh#pa_sensor_logs`. A malformed entry makes the daemon refuse to start,
 so it is a failure, reported with the corrected entry where one can be inferred; a repeated
 label is a failure, a repeated path or a relative path a warning, and a misspelled variable
 name (`PROPOLIS_SENSOR_LOG`, `SENSOR_LOGS`, a space before the `=`) is reported by name. The
@@ -249,8 +294,9 @@ from DHCP.
 
 Below the table, HOST rows cover what no single listener owns: the log rotation timer, its
 state file (older than three hours fails, the daemon's `rotation-stale` threshold) and the
-installed policy and guard; the `INSTALL_BINS` set from `deploy/upgrade.sh` present in
-`/usr/local/bin` and equal to the build in `target/release`, and the deploy stamp's recorded
+installed policy and guard; the `INSTALL_BINS` set from `deploy/upgrade.sh` (the installed
+copy's `install-bins`) present in `/usr/local/bin` and equal to the build in `target/release`
+(a build the installed copy cannot read is a `LIMITED CHECKS` line, never `bins-differ`), and the deploy stamp's recorded
 `propolis` revision against its own commit and the checkout (an upgrade whose first run
 installed no new binary shows here); `PROPOLIS_SENSOR_LOGS` as a whole; sensor units that are
 enabled with no bind variable set (the look of a misspelled `*_BIND` name); every env file's
@@ -258,6 +304,19 @@ mode, failing one that accounts other than its owner can read (`0600` for a secr
 file, `0640` for `watch.env`, `0644` for the generated `fleet-listeners.env`; stricter is fine)
 with the `chmod` that closes it; and, where `propolis-watch` is installed, `watch.env` against
 `propolis.env` and the watcher's authorized key.
+
+**Env lines systemd and the shell scripts read differently.** For every `DATABASE_URL` and
+`PROPOLIS_*` setting in a readable `*.env`, the line systemd's `EnvironmentFile=` uses (the last
+assignment) is checked for the forms on which systemd and the shell readers (`deploy/alert.sh`,
+`migrate.sh`, `rollback.sh`, `backup.sh`, `deploy/listeners-lib.sh#read_env_var_in`) disagree:
+blanks before the name or around `=`, trailing blanks or a CR, a backslash or a quote the value
+does not close, and a line systemd reads as part of the line before it
+(`deploy/config-check.sh#check_env_syntax`). Each is a warning, `env-systemd-only`, one per file
+and setting, naming the line number and the form; the value is never printed, since these files
+hold the database password. An `env-files` HOST row that would otherwise be ok turns to a
+warning and counts them. The step
+is to rewrite the line as `<KEY>=value` with the setting's own name (`NAME=value` for
+`DATABASE_URL`, which no fix line names).
 
 **Gateway spool.** On a control plane the `gateway-spool` HOST row compares each collector's
 directory under the gateway spool (`PROPOLIS_GATEWAY_SPOOL_DIR` from `gateway.env`, else
@@ -268,7 +327,13 @@ no entry points at is a failure (`spool-unlisted`): the gateway accepts and ackn
 batches and the daemon never ingests them. The finding says, from intake's cursor for that file
 (`deploy/config-check.sh#spool_read_state`), whether there is no cursor where it looks (intake has
 not read the file, or keeps its cursors elsewhere), or it was read once and how much was written
-after it stopped, or what about the cursor could not be judged. An entry whose
+after it stopped, or what about the cursor could not be judged. The cursor is the daemon's to
+write and the spool the gateway's, so neither is trusted: the cursor is read as `propolis`, at
+most 4 KiB and within a timeout (`deploy/alert-lib.sh#pa_read_as`), and the spool file's
+metadata without following a link. A FIFO, a link or an oversized file in the cursor's place, and
+a link in the spool file's place, is reported as what could not be judged and never hangs or
+redirects the run; a spool file that is neither a link nor a regular file (a FIFO) is skipped, as
+a collector directory with no `events.jsonl` yet is. An entry whose
 path ends in `/` lists nothing, since the daemon cannot open it, and the finding names that entry.
 The step is the exact `<collector id>:<path>` entry to append; intake reads a newly listed log from
 its start, so what the file already holds is ingested once it is listed. A spool that no entry
@@ -319,7 +384,8 @@ parse error, any output on stderr, or a root-only command or env-file read witho
 finding with no fixture fails it.
 
 The exit status is `0` all ok, `1` warnings or checks
-that could not be answered, `2` at least one failure; a usage error is `64`.
+that could not be answered, `2` at least one failure; a usage error is `64`, and a missing or too
+old alert library is `70`.
 
 **Without root** it still runs, and says what it could not see under `LIMITED CHECKS`. Sensor
 env files are mode 0600 and owned by root, so as an ordinary user part of the
@@ -333,8 +399,10 @@ common rule shapes (ufw `ALLOW IN` rules and default policy, firewalld ports and
 the active zones, nftables `dport ... accept` rules in input-hook chains); a rule written another
 way reads as closed, so treat a `closed` warning as a prompt to look, not a verdict.
 
-`upgrade.sh` runs it last, with `--report-only` (full report, exit status always `0`), so a
-finding is for you to read and never fails the upgrade. The sensors were restarted seconds
+`upgrade.sh` runs the checkout's copy last, with `--report-only` (full report, exit status `0`
+whatever it finds), so a finding is for you to read and never fails the upgrade; should the run
+itself fail (exit `70` without the library), the upgrade prints a warning and still finishes. It
+also installs the copy under `/usr/local/lib/propolis` before the restarts. The sensors were restarted seconds
 earlier; if a LISTEN row shows `nothing listening` straight after an upgrade, run the check
 again once the units have settled.
 

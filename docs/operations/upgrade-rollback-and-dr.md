@@ -54,7 +54,10 @@ The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin] [--adopt-hi
    It then reinstalls the production unit files and `logrotate-sensors.conf` (the same set `install.sh`
    installs; `gateway.service`/`shipper.service` only where already enabled) and the
    `propolis-*` helpers in `/usr/local/sbin`, among them the shared library of the shell
-   alerting code, `propolis-alert-lib` (0644: it is sourced, never run), then
+   alerting code, `propolis-alert-lib` (0644: it is sourced, never run), and the installed
+   [configuration check](service-lifecycle.md#configuration-check) in `/usr/local/lib/propolis`
+   (`config-check.sh`, `listeners-lib.sh`, and `repo-dir` and `install-bins`, which it writes
+   from this checkout's path and this script's binary list), then
    runs `systemctl daemon-reload` so the restarts below pick up the new unit
    definitions.
 5. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
@@ -490,7 +493,11 @@ pre-upgrade backup. Without arguments it rolls back to the newest one; name anot
 it. It shows what it is about to do and asks you to type the release name (`--yes` skips
 that). Then it stops the enabled services, puts the kept binaries, helpers, unit files and
 deploy stamp back, reloads systemd, starts the services again and waits for
-`propolis.service` to stay up.
+`propolis.service` to stay up. The kept helpers include the installed configuration check's
+`config-check.sh` (put back 0755), `listeners-lib.sh` and `install-bins` (0644), from `lib/` in
+the kept release (`deploy/rollback.sh#LIB_HELPERS`), so its binary list follows the binaries;
+`repo-dir` is not kept, since the checkout's path does not change with a rollback. A file the
+kept release does not hold stays as it is.
 
 **The alert library goes back only when it fits.** The kept helpers include
 `/usr/local/sbin/propolis-alert-lib`, the shared library of the shell alerting code. A script
@@ -504,8 +511,10 @@ to it, and prints `kept the current alert library: the kept one is version <k>, 
 needs <n>`. Blanks around the number and a CRLF ending do not hide a line
 (`deploy/rollback.sh#number_line`), so a hand-edited copy is still weighed; a missing line counts
 as 0. A kept release from before the library was installed holds none, and the current one
-stays. No installed script carries the `# needs-alert-lib` line yet, so today the kept library
-always goes back. The restored library is installed 0644, as the deploy scripts install it.
+stays. The installed configuration check is the first script that sources the library, so its
+kept or current copy is what is weighed today; a kept release from before it holds no copy, so
+the current copy, which stays, is weighed; a host with no installed copy weighs nothing. The
+restored library is installed 0644, as the deploy scripts install it.
 
 **When the upgrade changed the schema**, the binaries alone are not enough. Migrations only run
 forward and no down-migration exists, so the older daemon refuses the newer database at

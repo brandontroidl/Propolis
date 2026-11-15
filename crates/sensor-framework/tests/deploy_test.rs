@@ -6603,6 +6603,237 @@ fn install_and_upgrade_install_the_alert_library_readable_and_not_executable() {
     );
 }
 
+/// The installed config-check: the script 0755 and its listener library 0644 under
+/// /usr/local/lib/propolis, root's, beside `repo-dir` (the checkout's path) and `install-bins`
+/// (upgrade.sh's own binary list, so the copy's list follows the binaries a rollback puts back),
+/// both written from a temporary file and installed 0644. All of it after the directory is made.
+#[test]
+fn install_and_upgrade_install_the_config_check_copy_with_its_checkout_and_binary_list() {
+    for (script_name, prefix) in [("install.sh", "run "), ("upgrade.sh", "")] {
+        let script = uncommented(&deploy_file(script_name));
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let at = |want: &str| -> usize {
+            lines
+                .iter()
+                .position(|l| *l == want)
+                .unwrap_or_else(|| panic!("{script_name} has no line `{want}`"))
+        };
+        let dir = at(&format!(
+            "{prefix}install -d -o root -g root -m 0755 /usr/local/lib/propolis"
+        ));
+        let check = at(&format!(
+            "{prefix}install -o root -g root -m 0755 \"$SCRIPT_DIR/config-check.sh\" /usr/local/lib/propolis/config-check.sh"
+        ));
+        let listeners = at(&format!(
+            "{prefix}install -o root -g root -m 0644 \"$SCRIPT_DIR/listeners-lib.sh\" /usr/local/lib/propolis/listeners-lib.sh"
+        ));
+        let bins = lines
+            .iter()
+            .position(|l| {
+                l.contains("/usr/local/lib/propolis/install-bins")
+                    && l.contains("grep -E '^INSTALL_BINS=\\(' \"$SCRIPT_DIR/upgrade.sh\"")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{script_name} does not write install-bins from upgrade.sh's INSTALL_BINS line"
+                )
+            });
+        let repo = lines
+            .iter()
+            .position(|l| l.contains("/usr/local/lib/propolis/repo-dir"))
+            .unwrap_or_else(|| panic!("{script_name} does not write repo-dir"));
+        for (what, line) in [
+            ("config-check.sh", check),
+            ("listeners-lib.sh", listeners),
+            ("install-bins", bins),
+            ("repo-dir", repo),
+        ] {
+            assert!(
+                line > dir,
+                "{script_name}: {what} is installed before /usr/local/lib/propolis is made"
+            );
+        }
+        // The two generated files go through one helper, 0644 and root's, from a temporary file.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("install -o root -g root -m 0644 \"$tmp\" \"$dest\"")),
+            "{script_name}: the generated files are not installed root's and 0644"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("tmp=\"$(mktemp")),
+            "{script_name}: the generated files are not written to a temporary file first"
+        );
+        // Both generated files go through that helper, and repo-dir holds the checkout's top.
+        for (what, line) in [("install-bins", bins), ("repo-dir", repo)] {
+            assert!(
+                lines[line].starts_with(&format!(
+                    "install_generated /usr/local/lib/propolis/{what} "
+                )),
+                "{script_name}: {what} is not written through install_generated: {}",
+                lines[line]
+            );
+        }
+        let top = if script_name == "install.sh" {
+            "\"$(cd \"$SCRIPT_DIR/..\" && pwd)\""
+        } else {
+            "\"$REPO_DIR\""
+        };
+        assert_eq!(
+            lines[repo],
+            format!("install_generated /usr/local/lib/propolis/repo-dir printf '%s\\n' {top}"),
+            "{script_name}"
+        );
+    }
+    let upgrade_lines: Vec<String> = uncommented(&deploy_file("upgrade.sh"))
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert!(
+        upgrade_lines
+            .iter()
+            .any(|l| l == "REPO_DIR=\"$(cd \"$SCRIPT_DIR/..\" && pwd)\""),
+        "upgrade.sh's REPO_DIR is not the checkout's top"
+    );
+    // In upgrade.sh, the release is saved before the copy changes, and the copy is in place before
+    // the units are reloaded and restarted.
+    let first = |pred: &dyn Fn(&str) -> bool, what: &str| -> usize {
+        upgrade_lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("upgrade.sh has no {what}"))
+    };
+    let save = first(
+        &|l| l.contains("rollback.sh\" --save"),
+        "rollback.sh --save",
+    );
+    let reload = first(&|l| l == "systemctl daemon-reload", "daemon-reload");
+    let restart = first(&|l| l.starts_with("systemctl restart"), "restart");
+    for name in [
+        "config-check.sh",
+        "listeners-lib.sh",
+        "repo-dir",
+        "install-bins",
+    ] {
+        let dest = format!("/usr/local/lib/propolis/{name}");
+        let at = first(&|l| l.contains(&dest), &dest);
+        assert!(
+            save < at && at < reload && reload < restart,
+            "upgrade.sh: {name} at line {at}, save {save}, daemon-reload {reload}, first restart {restart}"
+        );
+    }
+    // In upgrade.sh, the line that installs the copy is not the line that runs the check.
+    let upgrade = deploy_file("upgrade.sh");
+    assert!(
+        !upgrade
+            .lines()
+            .any(|l| l.contains("/usr/local/lib/propolis/config-check.sh")
+                && l.contains("--report-only"))
+    );
+}
+
+/// The dry run shows the four installs and makes no temporary file, so it still needs no
+/// privilege and leaves nothing behind.
+#[test]
+fn install_dry_run_shows_the_config_check_copy_and_leaves_no_temporary_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .env("TMPDIR", tmp.path())
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for want in [
+        "config-check.sh /usr/local/lib/propolis/config-check.sh\n",
+        "listeners-lib.sh /usr/local/lib/propolis/listeners-lib.sh\n",
+        "[dry-run] install -o root -g root -m 0644 <temporary file> /usr/local/lib/propolis/repo-dir\n",
+        "[dry-run] install -o root -g root -m 0644 <temporary file> /usr/local/lib/propolis/install-bins\n",
+    ] {
+        assert!(
+            stdout.contains(want),
+            "dry run does not show {want:?}:\n{stdout}"
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+    assert!(
+        left.is_empty(),
+        "the dry run left files in TMPDIR: {left:?}"
+    );
+}
+
+/// The text of the shell function `name` in `script`, from its `name() {` line to the `}` that
+/// closes it at the start of a line.
+fn shell_function(script: &str, name: &str) -> String {
+    let start = script
+        .find(&format!("\n{name}() {{\n"))
+        .unwrap_or_else(|| panic!("no function {name}"))
+        + 1;
+    let end = script[start..]
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("function {name} is not closed"))
+        + start
+        + 3;
+    script[start..end].to_string()
+}
+
+/// install_generated, run as written in each script: a command that fails leaves no temporary file
+/// and no destination; as root, a command that succeeds installs its output 0644 and leaves no
+/// temporary file either. Without root `install -o root` itself fails, which is the failure path.
+#[test]
+fn install_generated_always_removes_its_temporary_file() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() == 0 };
+    for script_name in ["install.sh", "upgrade.sh"] {
+        let function = shell_function(&deploy_file(script_name), "install_generated");
+        let run = |dest: &Path, tmp: &Path, cmd: &str| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "set -euo pipefail\nDRY_RUN=0\n{function}\ninstall_generated \"$1\" {cmd}"
+                ))
+                .arg("_")
+                .arg(dest)
+                .env("TMPDIR", tmp)
+                .fenced_output()
+                .expect("run install_generated")
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("repo-dir");
+        let failed = run(&dest, tmp.path(), "false");
+        assert!(!failed.status.success(), "{script_name}");
+        assert!(
+            String::from_utf8_lossy(&failed.stderr)
+                .contains(&format!("error: could not write {}", dest.display())),
+            "{script_name}: {}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert!(!dest.exists(), "{script_name}: a failed command installed");
+        let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert!(left.is_empty(), "{script_name}: left {left:?}");
+
+        let made = run(&dest, tmp.path(), "printf '%s\\n' /srv/checkout");
+        let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().collect();
+        assert!(left.is_empty(), "{script_name}: left {left:?}");
+        if root {
+            assert!(made.status.success(), "{script_name}: {made:?}");
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), "/srv/checkout\n");
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o644, "{script_name}");
+        } else {
+            assert!(
+                !made.status.success() && !dest.exists(),
+                "{script_name}: install -o root succeeded without root: {made:?}"
+            );
+        }
+    }
+}
+
 /// One to nine ASCII digits and nothing else, the number `deploy/rollback.sh#number_line`
 /// captures.
 fn plain_count(s: &str) -> Option<u32> {

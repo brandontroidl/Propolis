@@ -140,15 +140,23 @@ it never sees the daemon's secrets. Setup, envelope and filters:
 ## Configuration check
 
 ```
-sudo ./deploy/config-check.sh [--json] [--report-only] [--no-events] [--env-dir DIR]
+sudo ./deploy/config-check.sh [--json | --tsv] [--report-only] [--no-events] [--env-dir DIR]
+sudo /usr/local/lib/propolis/config-check.sh [the same options]
 ```
 
 Read-only comparison of the configured listeners with what is running: unit, port and its
 holder, firewall, log, `PROPOLIS_SENSOR_LOGS` entry, newest ledger event, plus the rotation
-timer, installed binaries, deploy stamp, env file modes, watcher env and, on a control plane, the
-collector spools `PROPOLIS_SENSOR_LOGS` does not list and intake has not read to their end. Exit `0` ok, `1` warnings or checks
-it could not answer, `2` failures, `64` bad usage; `--report-only` always exits `0`
-(`upgrade.sh` uses it). What each column means and what runs without root:
+timer, installed binaries, deploy stamp, env file modes, env lines systemd and the shell scripts
+read differently, watcher env and, on a control plane, the
+collector spools `PROPOLIS_SENSOR_LOGS` does not list and intake has not read to their end. The
+second form is the copy `install.sh` and `upgrade.sh` install, which runs from any directory and
+names the checkout's scripts in its fix lines. `--json` prints one JSON document and `--tsv`
+tab-separated records (`deploy/config-check.sh#emit_tsv`); the two together are bad usage. Exit
+`0` ok, `1` warnings or checks it could not answer, `2` failures, `64` bad usage, `70` the alert
+library (`/usr/local/sbin/propolis-alert-lib`, or `alert-lib.sh` beside the script) is missing or
+too old; with `--report-only` the findings never make it exit non-zero, though bad usage and a
+missing library still do (`upgrade.sh` uses it and tolerates both). What each
+column means and what runs without root:
 [`../operations/service-lifecycle.md`](../operations/service-lifecycle.md#configuration-check).
 
 ## Migrations

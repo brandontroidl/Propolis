@@ -75,15 +75,17 @@ it.
 Each upgrade keeps the release it replaces in `/var/lib/propolis/rollback/<UTC time>-<commit>`
 (0700 root; `deploy/rollback.sh#save`): its binaries, `propolis-*` helpers (among them the alert
 library `propolis-alert-lib`, which a rollback restores only when it fits the scripts left in
-place, `deploy/rollback.sh#check_alert_lib`), unit files, deploy
+place, `deploy/rollback.sh#check_alert_lib`), the installed config-check's `config-check.sh`,
+`listeners-lib.sh` and `install-bins` in `lib/` (`deploy/rollback.sh#LIB_HELPERS`; `repo-dir` is
+not kept), unit files, deploy
 stamp, and a `manifest` naming the commit and the pre-upgrade backup set. The newest 3 are
 kept. See [rollback](../operations/upgrade-rollback-and-dr.md#rollback).
 
 ## Alerting state and runtime directories
 
-Provisioned for the root shell alerting code. Nothing writes state into these directories yet
-and no script sources the library: the persistent directory holds only the empty lock, and the
-runtime one is empty.
+Provisioned for the root shell alerting code. Nothing writes state into these directories yet:
+the persistent directory holds only the empty lock, and the runtime one is empty. The one script
+that sources the library so far is the configuration check, which only reads.
 
 | Path | Mode | Owner | Created by |
 |---|---|---|---|
@@ -93,6 +95,10 @@ runtime one is empty.
 | `/run/motd.d/` | 0755 | root:root | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
 | `/etc/tmpfiles.d/propolis.conf` | 0644 | root:root | `deploy/provision.sh#propolis-tmpfiles.conf`, from `deploy/propolis-tmpfiles.conf` |
 | `/usr/local/sbin/propolis-alert-lib` | 0644 | root:root | `deploy/install.sh#alert-lib.sh` and `deploy/upgrade.sh#alert-lib.sh`, from `deploy/alert-lib.sh` |
+| `/usr/local/lib/propolis/config-check.sh` | 0755 | root:root | `deploy/install.sh#config-check.sh` and `deploy/upgrade.sh#config-check.sh`, from `deploy/config-check.sh` |
+| `/usr/local/lib/propolis/listeners-lib.sh` | 0644 | root:root | `deploy/install.sh#listeners-lib.sh` and `deploy/upgrade.sh#listeners-lib.sh`, from `deploy/listeners-lib.sh` |
+| `/usr/local/lib/propolis/repo-dir` | 0644, one line: the checkout's absolute path | root:root | `deploy/install.sh#install_generated` and `deploy/upgrade.sh#install_generated` |
+| `/usr/local/lib/propolis/install-bins` | 0644, one line: `deploy/upgrade.sh`'s `INSTALL_BINS=(...)` | root:root | `deploy/install.sh#install_generated` and `deploy/upgrade.sh#install_generated` |
 
 - Only root writes in `/var/lib/propolis/witness` and `/run/propolis-witness`. Group `propolis`
   may enter and read them and never write them, and their parents, `/var/lib/propolis` and

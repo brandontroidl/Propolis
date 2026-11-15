@@ -21,8 +21,9 @@
 # daemon's own rules (crates/log-tailer/src/sensor_logs.rs); and, when a database URL is readable,
 # the newest event the ledger holds for the sensor. Host-wide: the log rotation timer and its state
 # file, the binaries upgrade.sh installs against the deploy stamp, the watcher's env file, enabled
-# sensor units with no bind configured, unreadable env files, and an env file whose mode lets
-# another account read it; whether the daemon's database role can do more to the event
+# sensor units with no bind configured, unreadable env files, an env file whose mode lets
+# another account read it, and a setting written in a form systemd and the shell scripts read
+# differently (env-systemd-only); whether the daemon's database role can do more to the event
 # ledger than append to it; and, on a control plane with a gateway spool, each collector's spool
 # against PROPOLIS_SENSOR_LOGS (one the gateway acknowledges and the daemon never reads).
 #
@@ -37,44 +38,74 @@
 # database URL is unreadable. A check that cannot be answered is reported as unknown ("?"), counts
 # as a warning in the exit status, and is listed under LIMITED CHECKS: it is never a pass.
 #
-# Usage: config-check.sh [--json] [--report-only] [--no-events] [--env-dir DIR] [--newest-event SENSOR]
+# WHERE IT RUNS. From the checkout (deploy/config-check.sh), and as the copy install.sh and
+# upgrade.sh put in /usr/local/lib/propolis, which root can run from any directory and which a root
+# timer can rely on. The copy is told apart by having no upgrade.sh beside it; it finds the
+# checkout through repo-dir (one line, the checkout's absolute path) and the binary list through
+# install-bins (upgrade.sh's INSTALL_BINS line), both written by the installer, and its fix lines
+# name the checkout's scripts; a repo-dir that is missing, or names a path with no checkout in it,
+# turns those fixes into manual steps under a limit line. Neither copy runs git: the checkout's
+# HEAD is read from the files under .git as the checkout's owner, because a checkout's git config
+# can name commands git would run as root. Files another account can write are read as that
+# account through the alert library's pa_read_as, with a size cap and a timeout: the daemon's
+# cursors as propolis, and, in the installed copy only, the build output as the checkout's owner.
+# The checkout copy compares the build with cmp as whoever runs it, upgrade.sh's root run included.
+#
+# THE ALERT LIBRARY. Env values are read through its pa_env_get (systemd's reading of an
+# EnvironmentFile=) and the intake list through its pa_sensor_logs, so the witness and the failure
+# hook, once they come to use the library (later releases), parse both as this check does. Looked
+# up in this order: PROPOLIS_CC_ALERT_LIB when set (tests), alert-lib.sh beside this script (the
+# checkout), /usr/local/sbin/propolis-alert-lib (installed). Missing, unreadable, failing to load,
+# or older than the version below, the run stops with exit 70 before it reads anything.
+#
+# Usage: config-check.sh [--json | --tsv] [--report-only] [--no-events] [--env-dir DIR] [--newest-event SENSOR]
 #   --json         one JSON document on stdout instead of the table
+#   --tsv          tab-separated records on stdout instead of the table, for scripts without a
+#                  JSON parser: `#config-check tsv v1`, then S (status), G (host rows), R
+#                  (listener rows), F (findings, each followed by its X fix line when it has one),
+#                  L (limited checks) and E (the number of F lines), every field ASCII with no tab
 #   --report-only  print the report but always exit 0 (upgrade.sh uses this)
 #   --no-events    skip the ledger query
 #   --newest-event SENSOR  print when the ledger last saw SENSOR (any age) and exit; the events
 #                  findings' fix line, so the database URL never reaches a command line
 #   --env-dir DIR  directory holding the env files   (default /etc/propolis)
-# Exit status: 0 all ok, 1 warnings or unknown checks, 2 at least one failure, 64 bad usage.
+# Exit status: 0 all ok, 1 warnings or unknown checks, 2 at least one failure, 64 bad usage, 70 the
+# alert library is missing or too old (whatever --report-only says, since no check ran).
 #
 # Test seams (all default to the production path; set only by tests): PROPOLIS_CC_NOW (epoch),
 # PROPOLIS_CC_EUID, PROPOLIS_CC_BIN_DIR, PROPOLIS_CC_REPO_DIR, PROPOLIS_CC_BUILD_DIR,
 # PROPOLIS_CC_STAMP, PROPOLIS_CC_LOGROTATE_STATE, PROPOLIS_CC_LOGROTATE_POLICY,
 # PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME, PROPOLIS_CC_WATCH_ACCOUNT,
 # PROPOLIS_CC_BACKUP_DIR, PROPOLIS_CC_GATEWAY_SPOOL_DIR (the spool directory when gateway.env sets
-# none). PROPOLIS_CC_LOG_STALE_HOURS (default 24)
+# none), PROPOLIS_CC_ALERT_LIB (the only library looked at when set), PROPOLIS_CC_ALERT_ROOT (the
+# root the library's paths sit under). PROPOLIS_CC_LOG_STALE_HOURS (default 24)
 # is the age past which a log on a running sensor is reported as quiet.
 #
 # The output is plain ASCII: every value read from an env file is passed through `clean` first, so
 # a hostile or corrupt file cannot inject terminal escapes or break the JSON.
+#
+# The library version this script needs; deploy/rollback.sh reads the line below.
+# needs-alert-lib: 1
 
 set -euo pipefail
 shopt -s nullglob
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="${PROPOLIS_CC_REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 ENV_DIR=/etc/propolis
 JSON=0
+TSV=0
 REPORT_ONLY=0
 NO_EVENTS=0
 NEWEST_EVENT=""
 
 usage() {
-    echo "usage: $0 [--json] [--report-only] [--no-events] [--env-dir DIR] [--newest-event SENSOR]" >&2
+    echo "usage: $0 [--json | --tsv] [--report-only] [--no-events] [--env-dir DIR] [--newest-event SENSOR]" >&2
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --json) JSON=1 ;;
+        --tsv) TSV=1 ;;
         --report-only) REPORT_ONLY=1 ;;
         --no-events) NO_EVENTS=1 ;;
         --newest-event)
@@ -111,12 +142,131 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+if [ "$JSON" -eq 1 ] && [ "$TSV" -eq 1 ]; then
+    echo "error: --json and --tsv are two output formats; give one" >&2
+    usage
+    exit 64
+fi
+
+# ---- the alert library ---------------------------------------------------------------------
+
+CC_NEEDS_LIB=0
+while IFS= read -r cc_line; do
+    case "$cc_line" in
+        '# needs-alert-lib: '*)
+            CC_NEEDS_LIB="${cc_line#'# needs-alert-lib: '}"
+            break
+            ;;
+    esac
+done <"${BASH_SOURCE[0]}"
+unset cc_line
+if [ -n "${PROPOLIS_CC_ALERT_LIB:-}" ]; then
+    CC_ALERT_LIB="$PROPOLIS_CC_ALERT_LIB"
+elif [ -f "$SCRIPT_DIR/alert-lib.sh" ]; then
+    CC_ALERT_LIB="$SCRIPT_DIR/alert-lib.sh"
+else
+    CC_ALERT_LIB=/usr/local/sbin/propolis-alert-lib
+fi
+cc_no_library() {
+    echo "error: alert library not found (or too old) beside config-check.sh or at /usr/local/sbin/propolis-alert-lib" >&2
+    exit 70
+}
+if [ ! -f "$CC_ALERT_LIB" ] || [ ! -r "$CC_ALERT_LIB" ]; then
+    cc_no_library
+fi
+# Whatever an older or foreign file leaves behind must not read as a version or a function.
+PA_LIB_VERSION=""
+unset -f pa_init pa_env_get pa_read_as pa_sensor_logs pa_cleanup
+# Loaded once in a subshell first: under set -u an unbound variable at the library's top level
+# ends the shell that sources it, and an exit there ends it with the library's status, so either
+# would end this run with no word instead of the exit 70 promised for an unusable library.
+# shellcheck source=deploy/alert-lib.sh
+if [ "$(set +e; . "$CC_ALERT_LIB" >/dev/null 2>&1 && echo loaded)" != loaded ]; then
+    cc_no_library
+fi
+set +u
+# shellcheck source=deploy/alert-lib.sh
+if ! . "$CC_ALERT_LIB" 2>/dev/null; then
+    cc_no_library
+fi
+set -u
+if ! [[ "$PA_LIB_VERSION" =~ ^[0-9]{1,9}$ && "$CC_NEEDS_LIB" =~ ^[0-9]{1,9}$ ]] \
+    || [ "$((10#$PA_LIB_VERSION))" -lt "$((10#$CC_NEEDS_LIB))" ] \
+    || ! declare -F pa_init pa_env_get pa_read_as pa_sensor_logs pa_cleanup >/dev/null; then
+    cc_no_library
+fi
+# pa_init sets umask 077, which only narrows the files this script makes in its own temp directory.
+pa_init "${PROPOLIS_CC_ALERT_ROOT:-}"
+PA_ENV_DIR="$ENV_DIR"
+
+# ---- the checkout, from the checkout or from the installed copy ----------------------------
+
+# Installed: no upgrade.sh beside this script. The copy in /usr/local/lib/propolis has none, and
+# deploy/ always has it.
+CC_INSTALLED=0
+if [ ! -f "$SCRIPT_DIR/upgrade.sh" ]; then
+    CC_INSTALLED=1
+fi
+
+# cc_repo_dir_from FILE: the checkout path FILE holds, when it is one line naming an absolute path
+# with no control character; nothing otherwise.
+cc_repo_dir_from() {
+    local text="" re='^/[^[:cntrl:]]{1,4095}$'
+    if [ -f "$1" ] && [ ! -L "$1" ]; then
+        IFS= read -r -d '' text <"$1" 2>/dev/null || true
+        text="${text%$'\n'}"
+        if [[ "$text" =~ $re ]]; then
+            printf '%s' "$text"
+        fi
+    fi
+    return 0
+}
+
+CC_REPO_UNKNOWN=0
+# The path repo-dir names when no checkout is there (moved, deleted, or hidden from a sandbox):
+# fix lines naming its scripts would name files that do not exist, so it counts as unknown too.
+CC_REPO_GONE=""
+if [ -n "${PROPOLIS_CC_REPO_DIR:-}" ]; then
+    REPO_DIR="$PROPOLIS_CC_REPO_DIR"
+elif [ "$CC_INSTALLED" -eq 1 ]; then
+    REPO_DIR="$(cc_repo_dir_from "$SCRIPT_DIR/repo-dir")"
+    if [ -z "$REPO_DIR" ]; then
+        CC_REPO_UNKNOWN=1
+    elif [ ! -f "$REPO_DIR/deploy/upgrade.sh" ]; then
+        CC_REPO_GONE="$REPO_DIR"
+        REPO_DIR=""
+    fi
+else
+    REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
+
+# Where the fix lines find the checkout's scripts: beside this one in the checkout, the checkout's
+# deploy/ for the installed copy, and nowhere when the installed copy does not know the checkout
+# (those fixes are then written as manual steps).
+if [ "$CC_INSTALLED" -eq 0 ]; then
+    FIX_DIR="$SCRIPT_DIR"
+elif [ -n "$REPO_DIR" ]; then
+    FIX_DIR="$REPO_DIR/deploy"
+else
+    FIX_DIR=""
+fi
+if [ "$CC_INSTALLED" -eq 1 ]; then
+    INSTALL_BINS_SRC="$SCRIPT_DIR/install-bins"
+else
+    INSTALL_BINS_SRC="$SCRIPT_DIR/upgrade.sh"
+fi
 
 # shellcheck source=deploy/listeners-lib.sh
 . "$SCRIPT_DIR/listeners-lib.sh"
 
 BIN_DIR="${PROPOLIS_CC_BIN_DIR:-/usr/local/bin}"
-BUILD_DIR="${PROPOLIS_CC_BUILD_DIR:-$REPO_DIR/target/release}"
+if [ -n "${PROPOLIS_CC_BUILD_DIR:-}" ]; then
+    BUILD_DIR="$PROPOLIS_CC_BUILD_DIR"
+elif [ -n "$REPO_DIR" ]; then
+    BUILD_DIR="$REPO_DIR/target/release"
+else
+    BUILD_DIR=""
+fi
 STAMP_FILE="${PROPOLIS_CC_STAMP:-/var/lib/propolis/deploy-stamp.json}"
 ROTATE_STATE="${PROPOLIS_CC_LOGROTATE_STATE:-/var/lib/propolis/logrotate.state}"
 ROTATE_POLICY="${PROPOLIS_CC_LOGROTATE_POLICY:-/etc/logrotate.d/propolis-sensors}"
@@ -177,7 +327,7 @@ low_disk_pct() {
 }
 
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+trap 'rm -rf "$TMP_DIR"; pa_cleanup' EXIT
 
 # ---- small helpers -------------------------------------------------------------------------
 
@@ -257,6 +407,7 @@ F_MSG=()
 F_FIX=()
 F_KIND=()
 F_ID=()
+F_KEY=()
 declare -A F_SEEN=()
 LIMITED=()
 declare -A L_SEEN=()
@@ -289,6 +440,7 @@ finding() {
         F_FIX=("$(clean "$fix")" "${F_FIX[@]}")
         F_KIND=("$kind" "${F_KIND[@]}")
         F_ID=("${key%%:*}" "${F_ID[@]}")
+        F_KEY=("$key" "${F_KEY[@]}")
         return 0
     fi
     F_LEVEL+=("$level")
@@ -297,13 +449,45 @@ finding() {
     F_FIX+=("$(clean "$fix")")
     F_KIND+=("$kind")
     F_ID+=("${key%%:*}")
+    # The whole key, instance included, for the TSV's k12: two unit-down findings share an id.
+    F_KEY+=("$key")
 }
 
 # q VALUE: VALUE shell-quoted for a run line (a path with a space, or a quote, still pastes whole).
 q() { printf '%q' "$1"; }
 
-# The upgrade run, by absolute path so it works from any directory.
-upgrade_fix() { printf 'sudo %s' "$(q "$SCRIPT_DIR/upgrade.sh")"; }
+# The fix lines that run one of the checkout's scripts name it by absolute path, so they work from
+# any directory. An installed copy that does not know the checkout cannot name one, so those fixes
+# become manual steps that say where to run the script from (fix_kind_checkout gives their kind).
+CHECKOUT_TOP="from the top of the Propolis checkout run:"
+fix_kind_checkout() { if [ -n "$FIX_DIR" ]; then printf run; else printf manual; fi; }
+# checkout_fix SCRIPT: a whole fix line that runs SCRIPT as root.
+checkout_fix() {
+    if [ -n "$FIX_DIR" ]; then
+        printf 'sudo %s' "$(q "$FIX_DIR/$1")"
+    else
+        printf '%s sudo ./deploy/%s' "$CHECKOUT_TOP" "$1"
+    fi
+}
+# checkout_cmd SCRIPT: the same run, as part of a longer manual step.
+checkout_cmd() {
+    if [ -n "$FIX_DIR" ]; then
+        printf 'sudo %s' "$(q "$FIX_DIR/$1")"
+    else
+        printf 'sudo ./deploy/%s from the top of the Propolis checkout' "$1"
+    fi
+}
+# checkout_install MODE FILE DEST: the fix that installs the checkout's deploy/FILE as DEST.
+checkout_install() {
+    if [ -n "$FIX_DIR" ]; then
+        printf 'sudo install -m %s %s %s' "$1" "$(q "$FIX_DIR/$2")" "$(q "$3")"
+    else
+        printf '%s sudo install -m %s ./deploy/%s %s' "$CHECKOUT_TOP" "$1" "$2" "$(q "$3")"
+    fi
+}
+
+# The upgrade run.
+upgrade_fix() { checkout_fix upgrade.sh; }
 
 limit() {
     if [ -z "${L_SEEN["$1"]+x}" ]; then
@@ -406,6 +590,11 @@ fi
 if [ "$IS_ROOT" -eq 0 ]; then
     limit "not root: socket owners, ufw/nft rules, /var/log/propolis files and the database URL may be unreadable"
 fi
+if [ "$CC_REPO_UNKNOWN" -eq 1 ]; then
+    limit "checkout unknown: $SCRIPT_DIR/repo-dir missing or invalid; fix lines that need the checkout are manual"
+elif [ -n "$CC_REPO_GONE" ]; then
+    limit "checkout unknown: $SCRIPT_DIR/repo-dir names $CC_REPO_GONE, which holds no deploy/upgrade.sh (moved, deleted, or not visible from this sandbox); fix lines that need the checkout are manual"
+fi
 
 # ---- systemd -------------------------------------------------------------------------------
 
@@ -425,24 +614,26 @@ sysq() {
     printf '%s' "${out%%$'\n'*}"
 }
 
+# The unit is held in `un`: the alert library sourced above has an array named `u`, and shellcheck
+# reads every function of both files as one scope.
 probe_unit() {
-    local u="$1" e a
-    if [ -n "${U_ACTIVE["$u"]+x}" ]; then
+    local un="$1" e a
+    if [ -n "${U_ACTIVE["$un"]+x}" ]; then
         return 0
     fi
     if [ "$SYSTEMCTL" -eq 0 ]; then
-        U_ENABLED["$u"]=unavailable
-        U_ACTIVE["$u"]=unavailable
+        U_ENABLED["$un"]=unavailable
+        U_ACTIVE["$un"]=unavailable
         return 0
     fi
-    e="$(sysq is-enabled "$u.service")"
-    a="$(sysq is-active "$u.service")"
+    e="$(sysq is-enabled "$un.service")"
+    a="$(sysq is-active "$un.service")"
     # systemd 25x prints "not-found" for a unit with no file; older releases print nothing.
     if [ "$e" = not-found ]; then
         e=""
     fi
-    U_ENABLED["$u"]="$e"
-    U_ACTIVE["$u"]="${a:-inactive}"
+    U_ENABLED["$un"]="$e"
+    U_ACTIVE["$un"]="${a:-inactive}"
 }
 
 unit_is_enabled() {
@@ -826,38 +1017,14 @@ load_intake() {
 
 # The daemon's grammar (crates/log-tailer/src/sensor_logs.rs parse_sensor_logs): comma separated,
 # each entry trimmed, blank entries skipped, split on the FIRST colon, both halves non-empty. One
-# bad entry makes the daemon refuse to start.
+# bad entry makes the daemon refuse to start. Parsed by the alert library, so the witness and
+# propolis-status, when they come (later releases), read the list exactly as this does.
 parse_intake() {
-    local parts entry name path why
-    IFS=',' read -r -a parts <<<"$INTAKE_RAW" || true
-    for entry in "${parts[@]}"; do
-        entry="$(trim "$entry")"
-        [ -n "$entry" ] || continue
-        why=""
-        case "$entry" in
-            *:*)
-                name="${entry%%:*}"
-                path="${entry#*:}"
-                if [ -z "$name" ]; then
-                    why="empty label"
-                elif [ -z "$path" ]; then
-                    why="label with no path"
-                fi
-                ;;
-            *)
-                name=""
-                path=""
-                why="no ':' separator"
-                ;;
-        esac
-        if [ -n "$why" ]; then
-            IN_BAD+=("$entry")
-            IN_BAD_WHY+=("$why")
-        else
-            IN_LABEL+=("$name")
-            IN_PATH+=("$path")
-        fi
-    done
+    pa_sensor_logs "$INTAKE_RAW"
+    IN_LABEL=("${PA_LOG_LABEL[@]}")
+    IN_PATH=("${PA_LOG_PATH[@]}")
+    IN_BAD=("${PA_LOG_BAD[@]}")
+    IN_BAD_WHY=("${PA_LOG_BAD_WHY[@]}")
 }
 
 # The most likely intended `label:path` for a malformed entry, or nothing.
@@ -1159,8 +1326,14 @@ check_listener() {
     elif [ -z "$e" ]; then
         unit_down=1
         setcell "$i" unit fail "not installed"
+        local ufix ukind=run
+        ufix="sudo install -m 0644 $(q "$ufile")"
+        if [ -z "$REPO_DIR" ]; then
+            ufix="$CHECKOUT_TOP sudo install -m 0644 ./deploy/$unit.service"
+            ukind=manual
+        fi
         finding fail "$unit" "unit-missing:$unit" "$unit.service is not installed but $scope is configured (${R_VAR[$i]})" \
-            "sudo install -m 0644 $(q "$ufile") /etc/systemd/system/$unit.service && sudo systemctl daemon-reload && sudo systemctl enable --now $unit.service"
+            "$ufix /etc/systemd/system/$unit.service && sudo systemctl daemon-reload && sudo systemctl enable --now $unit.service" "$ukind"
     elif [ "$e" = masked ]; then
         unit_down=1
         setcell "$i" unit fail "masked"
@@ -1328,12 +1501,12 @@ check_listener() {
             setcell "$i" intake fail "wrong path"
             finding fail "$scope" "intake-wrongpath:$lp" \
                 "$INTAKE_VAR names '$want_label:$same_label' but $sensor writes $lp: intake tails a file the sensor never writes" \
-                "in $INTAKE_FILE set the entry to $want_label:$lp, then run: sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")" manual
+                "in $INTAKE_FILE set the entry to $want_label:$lp, then run: sudo systemctl restart propolis.service && $(checkout_cmd watch-env.sh)" manual
         else
             setcell "$i" intake fail "absent"
             finding fail "$scope" "intake-absent:$lp" \
                 "$lp is not in $INTAKE_VAR: events from $sensor are never ingested" \
-                "append ,$want_label:$lp to $INTAKE_VAR in $INTAKE_FILE, then run: sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")" manual
+                "append ,$want_label:$lp to $INTAKE_VAR in $INTAKE_FILE, then run: sudo systemctl restart propolis.service && $(checkout_cmd watch-env.sh)" manual
         fi
     elif [ "$INTAKE_STATE" = unreadable ]; then
         setcell "$i" intake unknown "?"
@@ -1412,13 +1585,13 @@ check_rotation() {
     if [ ! -r "$ROTATE_POLICY" ]; then
         worst=fail
         parts+=("policy missing")
-        finding fail "logrotate" "policy" "$ROTATE_POLICY is not installed" "sudo install -m 0644 $(q "$SCRIPT_DIR/logrotate-sensors.conf") $(q "$ROTATE_POLICY")"
+        finding fail "logrotate" "policy" "$ROTATE_POLICY is not installed" "$(checkout_install 0644 logrotate-sensors.conf "$ROTATE_POLICY")" "$(fix_kind_checkout)"
     fi
     if [ ! -x "$ROTATE_GUARD" ]; then
         worst=fail
         parts+=("guard missing")
         finding fail "logrotate" "guard" "$ROTATE_GUARD is not installed or not executable: every rotation fails closed" \
-            "sudo install -m 0755 $(q "$SCRIPT_DIR/logrotate-guard.sh") $(q "$ROTATE_GUARD")"
+            "$(checkout_install 0755 logrotate-guard.sh "$ROTATE_GUARD")" "$(fix_kind_checkout)"
     fi
     local text="" p
     for p in "${parts[@]}"; do text="${text:+$text, }$p"; done
@@ -1597,8 +1770,8 @@ check_alerting() {
     enabled="$(read_env_var_in PROPOLIS_OPS_ENABLED "$file")"
     # The daemon gets the two values from systemd, which trims unquoted whitespace, and treats an
     # empty value as unset; `TOPIC=   ` looks set and is not.
-    url="$(env_file_value PROPOLIS_OPS_NTFY_URL "$file")"
-    topic="$(env_file_value PROPOLIS_OPS_NTFY_TOPIC "$file")"
+    url="$(pa_env_get PROPOLIS_OPS_NTFY_URL "$file")"
+    topic="$(pa_env_get PROPOLIS_OPS_NTFY_TOPIC "$file")"
     # The failure hook reads the file itself (deploy/alert.sh env_value), only from lines that
     # start with the name, strips quotes without trimming, and pushes when both raw values are
     # non-empty. It is judged on exactly that, untrimmed, or a quoted space would be taken for
@@ -1712,7 +1885,7 @@ check_alerting() {
         worst=fail
         parts+=("failure hook missing")
         finding fail "alerting" "ops-failure-hook" "$ALERT_HOOK is not installed: a unit that dies (the daemon included) alerts nobody" \
-            "$(upgrade_fix)"
+            "$(upgrade_fix)" "$(fix_kind_checkout)"
     fi
     local text="" p
     for p in "${parts[@]}"; do text="${text:+$text, }$p"; done
@@ -1815,7 +1988,7 @@ check_cursors() {
 INSTALL_BINS=()
 load_install_bins() {
     local line list
-    line="$(grep -E '^INSTALL_BINS=\(' "$SCRIPT_DIR/upgrade.sh" 2>/dev/null | head -n 1)" || line=""
+    line="$(grep -E '^INSTALL_BINS=\(' "$INSTALL_BINS_SRC" 2>/dev/null | head -n 1)" || line=""
     list="${line#INSTALL_BINS=(}"
     list="${list%)}"
     # shellcheck disable=SC2206
@@ -1827,11 +2000,121 @@ json_field() {
     printf '%s' "$json" | sed -n "s/.*\"$key\": \"\\([^\"]*\\)\".*/\\1/p" | head -n 1
 }
 
+# read_why RC: what a pa_read_as status means, for a limit line.
+read_why() {
+    case "$1" in
+        3) printf 'not a regular file' ;;
+        4) printf 'larger than expected' ;;
+        5) printf 'not read in time' ;;
+        *) printf 'not readable' ;;
+    esac
+}
+
+# build_differs NAME: whether the build of NAME differs from the installed binary. The checkout
+# compares with cmp, as the operator who runs it there. The installed copy, which a root timer
+# runs, reads the build as the checkout's owner (the build output is that account's to write) and
+# compares digests. 0 differs, 1 same, 2 not compared (a limit line says why).
+build_differs() {
+    local b="$1" rc=0 build="" installed="" owner
+    if [ "$CC_INSTALLED" -eq 0 ]; then
+        cmp -s -- "$BUILD_DIR/$b" "$BIN_DIR/$b" && return 1
+        return 0
+    fi
+    owner="$(stat -c %U -- "${REPO_DIR:-$BUILD_DIR}" 2>/dev/null)" || owner=""
+    build="$(pa_read_as "$owner" "$BUILD_DIR/$b" 268435456 | sha256sum)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        limit "the build of $b in $BUILD_DIR was not compared with the installed binary: $(read_why "$rc") as ${owner:-its owner}"
+        return 2
+    fi
+    installed="$(sha256sum <"$BIN_DIR/$b" 2>/dev/null)" || installed=""
+    if [ -z "$installed" ]; then
+        limit "the installed $BIN_DIR/$b could not be read, so it was not compared with the build"
+        return 2
+    fi
+    [ "${build%% *}" != "${installed%% *}" ]
+}
+
+# cc_repo_head: sets CC_HEAD to the commit the checkout's HEAD names, read from the files under
+# .git as the checkout's owner, and returns 0; or sets CC_HEAD_WHY and returns 1. It runs no git:
+# a checkout's .git/config can name commands git runs (core.fsmonitor among them), so git run there
+# from a root timer would run the owner's code as root, and run as the owner it would still run
+# code the owner controls. Detached heads, loose refs and packed-refs are read; anything else (a
+# .git file of a worktree, a link, a ref outside refs/heads) is not guessed at.
+cc_repo_head() {
+    local owner text="" rc=0 ref loose hex="" line
+    local hexre='^([0-9a-f]{40}|[0-9a-f]{64})$' refre='^refs/heads/[A-Za-z0-9._/-]{1,200}$'
+    CC_HEAD="" CC_HEAD_WHY=""
+    if [ ! -d "$REPO_DIR" ]; then
+        CC_HEAD_WHY="checkout not visible from this sandbox: $REPO_DIR"
+        return 1
+    fi
+    # -d follows a link, so a .git that is one is caught by name first.
+    if [ -L "$REPO_DIR/.git" ]; then
+        CC_HEAD_WHY="$REPO_DIR/.git is a symbolic link"
+        return 1
+    fi
+    if [ ! -d "$REPO_DIR/.git" ]; then
+        if [ -e "$REPO_DIR/.git" ]; then
+            CC_HEAD_WHY="$REPO_DIR/.git is not a directory, as in a worktree or a submodule"
+        else
+            CC_HEAD_WHY="$REPO_DIR has no .git directory"
+        fi
+        return 1
+    fi
+    owner="$(stat -c %U -- "$REPO_DIR" 2>/dev/null)" || owner=""
+    text="$(pa_read_as "$owner" "$REPO_DIR/.git/HEAD" 4096)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        CC_HEAD_WHY=".git/HEAD $(read_why "$rc") as ${owner:-the owner of the checkout}"
+        return 1
+    fi
+    if [[ "$text" =~ $hexre ]]; then
+        CC_HEAD="$text"
+        return 0
+    fi
+    ref="${text#ref: }"
+    if [ "$ref" = "$text" ] || ! [[ "$ref" =~ $refre ]] || [[ "$ref" == *..* ]]; then
+        CC_HEAD_WHY=".git/HEAD holds neither a commit id nor a branch under refs/heads"
+        return 1
+    fi
+    loose="$REPO_DIR/.git/$ref"
+    if [ -e "$loose" ] || [ -L "$loose" ]; then
+        text="$(pa_read_as "$owner" "$loose" 128)" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            CC_HEAD_WHY=".git/$ref $(read_why "$rc") as $owner"
+            return 1
+        fi
+        if [[ "$text" =~ $hexre ]]; then
+            CC_HEAD="$text"
+            return 0
+        fi
+        CC_HEAD_WHY=".git/$ref holds no commit id"
+        return 1
+    fi
+    if [ -e "$REPO_DIR/.git/packed-refs" ] || [ -L "$REPO_DIR/.git/packed-refs" ]; then
+        text="$(pa_read_as "$owner" "$REPO_DIR/.git/packed-refs" 1048576)" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            CC_HEAD_WHY=".git/packed-refs $(read_why "$rc") as $owner"
+            return 1
+        fi
+        while IFS= read -r line; do
+            if [ "$line" = "${line%% *} $ref" ] && [[ "${line%% *}" =~ $hexre ]]; then
+                hex="${line%% *}"
+            fi
+        done <<<"$text"
+        if [ -n "$hex" ]; then
+            CC_HEAD="$hex"
+            return 0
+        fi
+    fi
+    CC_HEAD_WHY="the branch $ref is in neither .git/refs nor .git/packed-refs"
+    return 1
+}
+
 check_binaries() {
-    local b missing=() differ=() worst=ok text n=0 unit
+    local b missing=() differ=() not_compared=() worst=ok text n=0 unit rc
     if [ "${#INSTALL_BINS[@]}" -eq 0 ]; then
-        global binaries unknown "cannot read INSTALL_BINS from $SCRIPT_DIR/upgrade.sh"
-        limit "binary list unreadable: $SCRIPT_DIR/upgrade.sh has no INSTALL_BINS line"
+        global binaries unknown "cannot read INSTALL_BINS from $INSTALL_BINS_SRC"
+        limit "binary list unreadable: $INSTALL_BINS_SRC has no INSTALL_BINS line"
         return 0
     fi
     for b in "${INSTALL_BINS[@]}"; do
@@ -1849,8 +2132,14 @@ check_binaries() {
             continue
         fi
         n=$((n + 1))
-        if [ -f "$BUILD_DIR/$b" ] && ! cmp -s -- "$BUILD_DIR/$b" "$BIN_DIR/$b"; then
-            differ+=("$b")
+        if [ -n "$BUILD_DIR" ] && [ -f "$BUILD_DIR/$b" ]; then
+            rc=0
+            build_differs "$b" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                differ+=("$b")
+            elif [ "$rc" -eq 2 ]; then
+                not_compared+=("$b")
+            fi
         fi
     done
     text="$n installed"
@@ -1858,13 +2147,24 @@ check_binaries() {
         worst=fail
         text="$text, MISSING: ${missing[*]}"
         finding fail "binaries" "bins-missing" "binaries missing from $BIN_DIR: ${missing[*]} (the units that run them fail to start); the upgrade script builds and installs them" \
-            "$(upgrade_fix)"
+            "$(upgrade_fix)" "$(fix_kind_checkout)"
     fi
     if [ "${#differ[@]}" -gt 0 ]; then
         if [ "$worst" = ok ]; then worst=warn; fi
         text="$text, differ from $BUILD_DIR: ${differ[*]}"
         finding warn "binaries" "bins-differ" "installed binaries differ from the build in $BUILD_DIR: ${differ[*]} (built but not installed, or the install did not replace them)" \
-            "$(upgrade_fix)"
+            "$(upgrade_fix)" "$(fix_kind_checkout)"
+    fi
+    # A build that could not be read is not known to match: build_differs gave its limit line.
+    if [ "${#not_compared[@]}" -gt 0 ]; then
+        if [ "$worst" = ok ]; then worst=unknown; fi
+        text="$text, build not compared for: ${not_compared[*]}"
+    fi
+    # The installed copy that does not know its checkout compared no build at all, which is not a
+    # match either. Its limit line says where the checkout was expected.
+    if [ "$CC_INSTALLED" -eq 1 ] && [ -z "$BUILD_DIR" ] && [ "$n" -gt 0 ]; then
+        if [ "$worst" = ok ]; then worst=unknown; fi
+        text="$text, build not compared (checkout unknown)"
     fi
     global binaries "$worst" "$text"
 
@@ -1873,7 +2173,7 @@ check_binaries() {
     if [ ! -r "$STAMP_FILE" ]; then
         global deploy-stamp warn "$STAMP_FILE not found: no deploy has recorded itself"
         finding warn "deploy-stamp" "stamp-missing" "$STAMP_FILE not found, so the installed version cannot be compared with the checkout" \
-            "$(upgrade_fix)"
+            "$(upgrade_fix)" "$(fix_kind_checkout)"
         return 0
     fi
     stamp="$(cat -- "$STAMP_FILE" 2>/dev/null)" || stamp=""
@@ -1884,12 +2184,12 @@ check_binaries() {
     if [ -z "$head" ]; then
         worst=warn
         text="stamp has no head_sha"
-        finding warn "deploy-stamp" "stamp-nohead" "$STAMP_FILE records no head_sha" "$(upgrade_fix)"
+        finding warn "deploy-stamp" "stamp-nohead" "$STAMP_FILE records no head_sha" "$(upgrade_fix)" "$(fix_kind_checkout)"
     elif [ -z "$installed" ]; then
         worst=warn
         text="$text, installed propolis version not recorded"
         finding warn "deploy-stamp" "stamp-noinstalled" "the stamp records no installed propolis revision (the binary did not answer --version at deploy time)" \
-            "$(upgrade_fix)"
+            "$(upgrade_fix)" "$(fix_kind_checkout)"
     else
         case "$head" in
             "${installed%+dirty}"*) text="$text, propolis binary ${installed:0:12}" ;;
@@ -1897,17 +2197,28 @@ check_binaries() {
                 worst=fail
                 text="$text, propolis binary ${installed:0:12} (MISMATCH)"
                 finding fail "deploy-stamp" "stamp-mismatch" "the installed propolis binary reports ${installed:0:12} but the deploy built $head: the install did not replace the binary (a first run after a script change re-executes itself; run the upgrade twice if the binary is still old)" \
-                    "$(upgrade_fix)"
+                    "$(upgrade_fix)" "$(fix_kind_checkout)"
                 ;;
         esac
     fi
-    if have git; then
-        git_head="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)" || git_head=""
-        if [ -n "$git_head" ] && [ -n "$head" ] && [ "$git_head" != "$head" ]; then
-            if [ "$worst" = ok ]; then worst=warn; fi
-            text="$text, checkout is at ${git_head:0:12}"
-            finding warn "deploy-stamp" "stamp-behind" "the checkout is at ${git_head:0:12} but the last deploy was ${head:0:12}" \
-                "$(upgrade_fix)"
+    if [ -n "$head" ] && [ -z "$REPO_DIR" ]; then
+        # The installed copy that does not know its checkout: its limit line has said so, and a
+        # stamp that was not compared with a checkout is not known to be current.
+        if [ "$worst" = ok ]; then worst=unknown; fi
+        text="$text, checkout unknown: stamp-behind not checked"
+    elif [ -n "$head" ]; then
+        if cc_repo_head; then
+            git_head="$CC_HEAD"
+            if [ "$git_head" != "$head" ]; then
+                if [ "$worst" = ok ]; then worst=warn; fi
+                text="$text, checkout is at ${git_head:0:12}"
+                finding warn "deploy-stamp" "stamp-behind" "the checkout is at ${git_head:0:12} but the last deploy was ${head:0:12}" \
+                    "$(upgrade_fix)" "$(fix_kind_checkout)"
+            fi
+        else
+            if [ "$worst" = ok ]; then worst=unknown; fi
+            text="$text, checkout HEAD not read"
+            limit "checkout HEAD not readable ($CC_HEAD_WHY): stamp-behind not checked"
         fi
     fi
     global deploy-stamp "$worst" "$text"
@@ -1977,7 +2288,7 @@ check_intake_list() {
                 # spool-unlisted finding then names the slash.
                 if [ "$known" -eq 0 ] && [ "$INTAKE_VAR" = PROPOLIS_SENSOR_LOGS ]; then
                     if [ -z "$gsdir" ]; then
-                        [ ! -r "$ENV_DIR/gateway.env" ] || gs_configured="$(env_file_value PROPOLIS_GATEWAY_SPOOL_DIR "$ENV_DIR/gateway.env")"
+                        [ ! -r "$ENV_DIR/gateway.env" ] || gs_configured="$(pa_env_get PROPOLIS_GATEWAY_SPOOL_DIR "$ENV_DIR/gateway.env")"
                         gsdir="${gs_configured:-$GATEWAY_SPOOL_DEFAULT}"
                         gsdir_r="$(readlink -m -- "$gsdir" 2>/dev/null)" || gsdir_r="$gsdir"
                     fi
@@ -2111,22 +2422,6 @@ spool_subsystem() {
     return 1
 }
 
-# env_file_value NAME FILE: the last assignment of NAME in FILE as systemd's EnvironmentFile=
-# hands it to the unit: surrounding whitespace trimmed and one pair of surrounding quotes removed.
-# read_env_var_in keeps trailing whitespace, so `DIR=/srv/spool ` would be read as another path.
-env_file_value() {
-    local line v
-    line="$(grep -hE "^[[:space:]]*$1=" -- "$2" 2>/dev/null | tail -n 1)" || line=""
-    [ -n "$line" ] || return 0
-    v="$(trim "${line#*=}")"
-    if [ "${#v}" -ge 2 ]; then
-        case "$v" in
-            \"*\" | \'*\') v="${v:1:${#v}-2}" ;;
-        esac
-    fi
-    printf '%s' "$v"
-}
-
 # alert_hook_value NAME FILE: NAME as the failure hook reads it (deploy/alert.sh env_value): the
 # last line that starts with NAME= (an indented one is not seen), with a leading and a trailing
 # quote removed and no whitespace trimmed. Kept identical to the hook so the check sees what it sees.
@@ -2147,11 +2442,23 @@ alert_hook_value() {
 # listed the file. Prints one of: `end` (read to its current size), `unread N` (N bytes written
 # after the cursor), `none` (no cursor in that directory: not read, or the daemon keeps its
 # cursors elsewhere), or `unknown REASON`.
+#
+# The gateway writes the spool and the daemon the cursor, so neither is trusted by this root run:
+# the spool file's metadata is read without following a link (the gateway makes none), and the
+# cursor is read as propolis, capped and under a timeout, so a FIFO or a link planted in its place
+# can neither hang the run nor point it at another file.
 spool_read_state() {
-    local file="$1" cdir="$2" st inode size cur json c_inode c_offset
-    st="$(stat -L -c '%i %s' -- "$file" 2>/dev/null)" || st=""
-    inode="${st%% *}"
+    local file="$1" cdir="$2" st rest inode size cur json c_inode c_offset rc=0 who="this user"
+    # Tested by the shell, not by stat's %F: coreutils translates that word into the locale's
+    # language, and systemd hands a service the host's LANG.
+    if [ -L "$file" ]; then
+        printf 'unknown %s is a symbolic link' "$file"
+        return 0
+    fi
+    st="$(stat -c '%i %s' -- "$file" 2>/dev/null)" || st=""
     size="${st##* }"
+    rest="${st% *}"
+    inode="${rest##* }"
     if ! [[ "$inode" =~ ^[0-9]+$ ]] || ! [[ "$size" =~ ^[0-9]+$ ]]; then
         printf 'unknown %s could not be read with stat' "$file"
         return 0
@@ -2165,14 +2472,25 @@ spool_read_state() {
         return 0
     fi
     cur="$cdir/$(printf '%s' "$(readlink -f -- "$file" 2>/dev/null || printf '%s' "$file")" | sha256sum | cut -d' ' -f1).json"
-    if [ ! -e "$cur" ]; then
+    if [ ! -e "$cur" ] && [ ! -L "$cur" ]; then
         printf 'none'
         return 0
     fi
-    if ! json="$(cat -- "$cur" 2>/dev/null)"; then
-        printf 'unknown its cursor %s is not readable as this user' "$cur"
-        return 0
+    json="$(pa_read_as propolis "$cur" 4096)" || rc=$?
+    # The account the read ran as, by the library's own rule (_pa_as): propolis under root, where a
+    # missing account fails the same way, and the caller otherwise.
+    local me="$UID"
+    [ -z "${PA_ROOT:-}" ] || me="${PA_TEST_UID:-$UID}"
+    if [ "$me" = 0 ] && [ "${PA_TEST_READ_AS_SELF:-}" != 1 ]; then
+        who="propolis (or the propolis account is missing)"
     fi
+    case "$rc" in
+        0) ;;
+        3) printf 'unknown its cursor %s is not a regular file' "$cur"; return 0 ;;
+        4) printf 'unknown its cursor %s is larger than a cursor' "$cur"; return 0 ;;
+        5) printf 'unknown its cursor %s could not be read in time' "$cur"; return 0 ;;
+        *) printf 'unknown its cursor %s is not readable as %s' "$cur" "$who"; return 0 ;;
+    esac
     c_inode="$(printf '%s' "$json" | sed -n 's/.*"inode":\([0-9][0-9]*\).*/\1/p')"
     c_offset="$(printf '%s' "$json" | sed -n 's/.*"offset":\([0-9][0-9]*\).*/\1/p')"
     if [ -z "$c_inode" ] || [ -z "$c_offset" ]; then
@@ -2201,7 +2519,7 @@ check_gateway_spool() {
         return 0
     fi
     if [ -r "$genv" ]; then
-        configured="$(env_file_value PROPOLIS_GATEWAY_SPOOL_DIR "$genv")"
+        configured="$(pa_env_get PROPOLIS_GATEWAY_SPOOL_DIR "$genv")"
     fi
     sdir="${configured:-$GATEWAY_SPOOL_DEFAULT}"
     if [ -n "$configured" ] && [ ! -d "$sdir" ]; then
@@ -2229,7 +2547,7 @@ check_gateway_spool() {
     local -a unlisted=() retired=() order=() waiting=()
     local -A listed=() trailing=()
     local restart newid cdir
-    restart="sudo systemctl restart propolis.service && sudo $(q "$SCRIPT_DIR/watch-env.sh")"
+    restart="sudo systemctl restart propolis.service && $(checkout_cmd watch-env.sh)"
     newid="give this collector a new id (docs/operations/split-deployment.md, Rebuilding a collector) and list $sdir/<new id>/events.jsonl under that id in PROPOLIS_SENSOR_LOGS in $penv, then run: $restart"
     # The daemon's cursor directory, the one check_cursors reads: a spool no entry lists any more
     # still has its cursor there, which tells whether intake read it to its end.
@@ -2453,7 +2771,7 @@ check_watcher() {
         worst=fail
         parts+=("watch.env missing")
         finding fail "watcher" "watch-env-missing" "$wenv does not exist: propolis-watch has no log list and exits" \
-            "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
+            "$(checkout_fix watch-env.sh)" "$(fix_kind_checkout)"
     elif [ ! -r "$wenv" ]; then
         worst=unknown
         parts+=("watch.env unreadable")
@@ -2462,13 +2780,13 @@ check_watcher() {
         worst=fail
         parts+=("watch.env not readable by $WATCH_ACCOUNT")
         finding fail "watcher" "watch-env-owner" "$wenv is not readable by the $WATCH_ACCOUNT account (it must be owned by root, group $WATCH_ACCOUNT, mode 0640): the watcher cannot read its log list and exits" \
-            "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
+            "$(checkout_fix watch-env.sh)" "$(fix_kind_checkout)"
     else
         watch_line="$(grep -E '^PROPOLIS_SENSOR_LOGS=' "$wenv" 2>/dev/null | tail -n 1 || true)"
         if [ -z "$watch_line" ]; then
             worst=fail
             parts+=("watch.env has no PROPOLIS_SENSOR_LOGS")
-            finding fail "watcher" "watch-env-empty" "$wenv sets no PROPOLIS_SENSOR_LOGS" "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
+            finding fail "watcher" "watch-env-empty" "$wenv sets no PROPOLIS_SENSOR_LOGS" "$(checkout_fix watch-env.sh)" "$(fix_kind_checkout)"
         elif [ -r "$ENV_DIR/propolis.env" ]; then
             src_line="$(grep -E '^PROPOLIS_SENSOR_LOGS=' "$ENV_DIR/propolis.env" 2>/dev/null | tail -n 1 || true)"
             if [ "$src_line" = "$watch_line" ]; then
@@ -2477,7 +2795,7 @@ check_watcher() {
                 worst=fail
                 parts+=("watch.env differs from propolis.env")
                 finding fail "watcher" "watch-env-drift" "$wenv differs from PROPOLIS_SENSOR_LOGS in propolis.env: the watcher follows a different list than the daemon" \
-                    "sudo $(q "$SCRIPT_DIR/watch-env.sh")"
+                    "$(checkout_fix watch-env.sh)" "$(fix_kind_checkout)"
             fi
         else
             parts+=("watch.env present (propolis.env unreadable, drift not checked)")
@@ -2605,6 +2923,106 @@ check_env_files() {
     fi
 }
 
+# The line systemd's EnvironmentFile= uses for a Propolis setting, in a form the shell readers
+# (deploy/alert.sh#env_value, migrate.sh, rollback.sh, backup.sh, listeners-lib.sh#read_env_var_in)
+# read differently or not at all: blanks before the name or around '=' (the readers that match
+# `^NAME=` miss the line), trailing blanks or a CR (they keep them in the value), a backslash or a
+# quote the value does not close (systemd unescapes and joins lines, they do not). The daemon and
+# a shell script then act on two different values, and nothing else says so. Only the line
+# systemd uses (the last assignment) is judged, and the value is never printed: these files hold
+# the database password.
+check_env_syntax() {
+    local f phys n line t key k v cr forms form msg re='^(DATABASE_URL|PROPOLIS_[A-Z0-9_]+)$'
+    local ws=$' \t' found=0 g name before
+    local -a order pieces
+    local -A at text has_cr
+    for f in "${ENV_FILES[@]}"; do
+        if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+            continue
+        fi
+        order=()
+        at=()
+        text=()
+        has_cr=()
+        n=0
+        while IFS= read -r phys || [ -n "$phys" ]; do
+            n=$((n + 1))
+            pieces=("$phys")
+            cr=0
+            case "$phys" in
+                *$'\r'*)
+                    cr=1
+                    IFS=$'\r' read -r -a pieces <<<"$phys" || true
+                    ;;
+            esac
+            for line in ${pieces[@]+"${pieces[@]}"}; do
+                t="${line#"${line%%[!"$ws"]*}"}"
+                case "$t" in
+                    '#'* | ';'*) continue ;;
+                    *=*) ;;
+                    *) continue ;;
+                esac
+                key="${t%%=*}"
+                key="${key%"${key##*[!"$ws"]}"}"
+                [[ "$key" =~ $re ]] || continue
+                [ -n "${at[$key]+x}" ] || order+=("$key")
+                at[$key]="$n"
+                text[$key]="$line"
+                has_cr[$key]="$cr"
+            done
+        done <"$f"
+        for key in ${order[@]+"${order[@]}"}; do
+            pa_env_get "$key" "$f" >/dev/null || true
+            line="${text[$key]}"
+            t="${line#"${line%%[!"$ws"]*}"}"
+            k="${t%%=*}"
+            v="${t#*=}"
+            forms=""
+            if [ "$t" != "$line" ]; then
+                forms="blanks before the name"
+            fi
+            case "$k" in *[$ws]) form=1 ;; *) form=0 ;; esac
+            case "$v" in [$ws]*) form=1 ;; esac
+            if [ "$form" -eq 1 ]; then
+                forms="${forms:+$forms, }blanks around '='"
+            fi
+            case "$v" in
+                *[$ws]) form=1 ;;
+                *) form="${has_cr[$key]}" ;;
+            esac
+            if [ "$form" -eq 1 ]; then
+                forms="${forms:+$forms, }trailing blanks or a CR"
+            fi
+            if [ "${PA_ENV_COMPLEX:-0}" = 1 ]; then
+                case "$v" in
+                    *[\\\"\']*) forms="${forms:+$forms, }a backslash or an unmatched quote" ;;
+                    *) [ "${has_cr[$key]}" = 1 ] || forms="${forms:+$forms, }a line systemd reads as part of the line before it" ;;
+                esac
+            fi
+            [ -n "$forms" ] || continue
+            found=$((found + 1))
+            msg="line ${at[$key]} of $f sets $key in a form systemd reads one way and the shell scripts read another way or not at all ($forms); the value is not shown"
+            # A fix line never names DATABASE_URL (config_check_test.rs#assert_fix_contract).
+            if [ "$key" = DATABASE_URL ]; then
+                name=NAME before="the name"
+            else
+                name="$key" before="$key"
+            fi
+            finding warn "env-files" "env-systemd-only:$f:$key" "$msg" \
+                "rewrite line ${at[$key]} of $f as $name=value, with nothing before $before, no blanks around '=', no trailing blanks, no backslash and no unmatched quote" manual
+        done
+    done
+    # The env-files row says what its findings say, as every other row does.
+    if [ "$found" -gt 0 ]; then
+        for ((g = 0; g < ${#G_ID[@]}; g++)); do
+            if [ "${G_ID[$g]}" = env-files ] && [ "${G_LEVEL[$g]}" = ok ]; then
+                G_LEVEL[g]=warn
+                G_TEXT[g]="${G_TEXT[$g]}; $found settings in a form systemd and the shell scripts read differently"
+            fi
+        done
+    fi
+}
+
 # ---- run -----------------------------------------------------------------------------------
 
 load_rotate_size
@@ -2628,6 +3046,7 @@ check_gateway_spool
 check_cursors
 check_unconfigured_units
 check_watcher
+check_env_syntax
 
 # ---- totals --------------------------------------------------------------------------------
 
@@ -2717,6 +3136,48 @@ emit_json() {
     printf ']}\n'
 }
 
+# tsv_field VALUE: VALUE as one TSV field. clean turns every byte outside space..~, the tab
+# included, into '?', so no field can hold a tab or a newline; an empty field is written '-'.
+tsv_field() {
+    local s
+    s="$(clean "$1")"
+    printf '%s' "${s:--}"
+}
+
+# For the witness, when it comes (a later release): bash with no JSON parser, and a key per finding
+# it can hash without the instance part that --json drops. The E line closes the document, so a
+# cut-off run is detected.
+emit_tsv() {
+    local i c k12
+    printf '#config-check tsv v1\n'
+    printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$STATUS" "$EXIT_CODE" "$N_FAIL" "$N_WARN" \
+        "$UNKNOWN_COUNT" "$IS_ROOT" "$(tsv_field "$NOW")" "$CC_INSTALLED"
+    for ((i = 0; i < ${#G_ID[@]}; i++)); do
+        printf 'G\t%s\t%s\t%s\n' "$(tsv_field "${G_ID[$i]}")" "${G_LEVEL[$i]}" "$(tsv_field "${G_TEXT[$i]}")"
+    done
+    for ((i = 0; i < ROW_COUNT; i++)); do
+        printf 'R\t%s\t%s\t%s' "$(tsv_field "${R_SENSOR[$i]}/${R_PROTO[$i]}")" "$(tsv_field "${R_UNIT[$i]}")" "$(row_status "$i")"
+        for c in "${COLUMNS[@]}"; do
+            printf '\t%s' "$(cell_level "$i" "$c")"
+        done
+        printf '\n'
+    done
+    for ((i = 0; i < ${#F_LEVEL[@]}; i++)); do
+        k12="$(printf '%s' "${F_KEY[$i]}" | sha256sum 2>/dev/null)" || k12=""
+        k12="${k12:0:12}"
+        [[ "$k12" =~ ^[0-9a-f]{12}$ ]] || k12=-
+        printf 'F\t%s\t%s\t%s\t%s\t%s\t%s\n' "${F_LEVEL[$i]}" "$(tsv_field "${F_ID[$i]}")" "$k12" \
+            "$(tsv_field "${F_SCOPE[$i]}")" "${F_KIND[$i]:--}" "$(tsv_field "${F_MSG[$i]}")"
+        if [ -n "${F_FIX[$i]}" ]; then
+            printf 'X\t%s\n' "$(tsv_field "${F_FIX[$i]}")"
+        fi
+    done
+    for c in "${LIMITED[@]}"; do
+        printf 'L\t%s\n' "$(tsv_field "$c")"
+    done
+    printf 'E\t%s\n' "${#F_LEVEL[@]}"
+}
+
 mark() {
     case "$1" in
         ok) printf 'ok' ;;
@@ -2791,6 +3252,8 @@ emit_text() {
 
 if [ "$JSON" -eq 1 ]; then
     emit_json
+elif [ "$TSV" -eq 1 ]; then
+    emit_tsv
 else
     emit_text
 fi

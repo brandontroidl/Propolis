@@ -194,6 +194,31 @@ run install -m 0644 "$SCRIPT_DIR/alert-lib.sh" /usr/local/sbin/propolis-alert-li
 run install -d -o root -g root -m 0755 /usr/local/lib/propolis
 run install -o root -g root -m 0755 "$SCRIPT_DIR/blocklist-sync.sh" /usr/local/lib/propolis/blocklist-sync.sh
 run install -o root -g root -m 0644 "$SCRIPT_DIR/blocklist-README.md" /usr/local/lib/propolis/blocklist-README.md
+# The configuration check as a root-owned copy root can run from any directory: with its listener
+# derivation, the checkout's path (its fix lines name the checkout's scripts) and upgrade.sh's
+# binary list (rollback.sh keeps that list with the binaries it puts back).
+run install -o root -g root -m 0755 "$SCRIPT_DIR/config-check.sh" /usr/local/lib/propolis/config-check.sh
+run install -o root -g root -m 0644 "$SCRIPT_DIR/listeners-lib.sh" /usr/local/lib/propolis/listeners-lib.sh
+# install_generated DEST CMD...: CMD's output as DEST, root:root 0644, by way of a temporary file
+# that is always removed. The dry run makes no temporary file and prints the install instead.
+install_generated() {
+    local dest="$1" tmp
+    shift
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] install -o root -g root -m 0644 <temporary file> %q\n' "$dest"
+        return 0
+    fi
+    tmp="$(mktemp)"
+    if "$@" >"$tmp" && install -o root -g root -m 0644 "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 0
+    fi
+    rm -f -- "$tmp"
+    echo "error: could not write $dest" >&2
+    return 1
+}
+install_generated /usr/local/lib/propolis/repo-dir printf '%s\n' "$(cd "$SCRIPT_DIR/.." && pwd)"
+install_generated /usr/local/lib/propolis/install-bins grep -E '^INSTALL_BINS=\(' "$SCRIPT_DIR/upgrade.sh"
 # The off-host pull's forced command; inert until the operator adds a key for propolis-backup-pull.
 run install -m 0755 "$SCRIPT_DIR/backup-serve.sh" /usr/local/sbin/propolis-backup-serve
 run install -m 0644 "$SCRIPT_DIR/propolis-alert@.service" /etc/systemd/system/propolis-alert@.service

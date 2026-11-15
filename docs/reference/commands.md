@@ -159,6 +159,31 @@ missing library still do (`upgrade.sh` uses it and tolerates both). What each
 column means and what runs without root:
 [`../operations/service-lifecycle.md`](../operations/service-lifecycle.md#configuration-check).
 
+## Status walk
+
+```
+sudo propolis-status            # every stage in order, the first stopped one marked >
+sudo propolis-status STAGE      # one stage or rail with everything behind its row
+propolis-status -h              # usage, for any user
+```
+
+`STAGE` is one of `listen source ship gateway intake ledger review reports feed publish` or a
+rail, `alert backup chain host monitor peers`. Root only: anyone else gets
+`propolis-status needs root: run sudo propolis-status` and exit `3`. Read-only: it writes
+nothing except a temporary header file for the metrics token, removed on exit, and takes no
+lock. Its network use is the database `DATABASE_URL` names (local or remote), through
+`propolis pg-exec`, and the console on loopback, asked only while `propolis.service` runs
+(`deploy/propolis-status.sh#status_walk`). Exit `0` nothing stopped and nothing to look at; `1`
+a WARN or `?` anywhere (a row, an unreadable state file, a config-check finding or a
+config-check run that did not finish); `2` a stage is marked stopped or a rail is FAIL; `3` not
+root; `64` bad usage (an unknown word, or more than one); `70` the alert library is missing
+(the message says to reinstall it), fails its trust check (the message names the directory and
+the `chmod` that fixes it) or is older than the script needs. The failures the failure hook
+recorded, and the firings it spooled because it could not take the lock, never change the exit
+status: nothing judges them yet. A stage view exits as the walk would. What each row and NEXT
+key means:
+[health and observability](../operations/health-and-observability.md#where-to-look-first).
+
 ## Migrations
 
 There is no standalone migrate command in the shipped surface. The `propolis`

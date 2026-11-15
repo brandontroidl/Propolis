@@ -1043,17 +1043,30 @@ fn a_library_older_than_the_hook_needs_records_nothing_and_changes_nothing() {
         fx.queries()
     );
 
-    // At exactly the version the hook needs, it records.
-    let fx = Fixture::with_ntfy().with_lib();
+    // At exactly the version the hook needs, it records. The shipped library may be newer: a
+    // newer library only adds functions, so it serves an older consumer.
     let shipped: u32 = shipped_lib()
         .lines()
         .find_map(|l| l.strip_prefix("PA_LIB_VERSION="))
         .and_then(|v| v.parse().ok())
         .unwrap();
-    assert_eq!(
-        shipped, need,
-        "the shipped hook needs exactly the shipped library"
+    assert!(
+        shipped >= need,
+        "the shipped library ({shipped}) must serve the shipped hook ({need})"
     );
+    let at_need: String = shipped_lib()
+        .lines()
+        .map(|l| {
+            if l.starts_with("PA_LIB_VERSION=") {
+                format!("PA_LIB_VERSION={need}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let fx = Fixture::with_ntfy();
+    fx.install_lib(&at_need);
     assert_ok(&fx.run("sensor-ssh.service", &[]));
     assert_eq!(fx.records().len(), 1);
 }

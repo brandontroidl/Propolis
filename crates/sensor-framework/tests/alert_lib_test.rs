@@ -286,7 +286,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "2");
+    assert_eq!(version, "3");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -3625,4 +3625,410 @@ fn a_firing_for_a_resolved_key_replaces_its_record_with_a_new_incident() {
     assert_eq!(f[7], "pending");
     assert_eq!(f[31], "1", "occ starts again");
     assert_eq!(f[21], "-", "not resolved");
+}
+
+// ---- the database probe and the push scheduler -------------------------------------------------
+
+/// A stand-in for `/usr/local/bin/propolis`: it carries pg-exec's guard string, writes each
+/// argument on its own line and the `DATABASE_URL` it was given to `STUB_LOG`, then prints
+/// `PG_OUT`, writes `PG_ERR` to stderr, sleeps `PG_SLEEP` seconds and exits `PG_RC`.
+const PROPOLIS_PG_STUB: &str = r#"#!/usr/bin/env bash
+# propolis pg-exec: DATABASE_URL is not set
+{ printf 'argv\n'; for a in "$@"; do printf 'arg[%s]\n' "$a"; done; printf 'url[%s]\n' "${DATABASE_URL:-}"; } >> "$STUB_LOG"
+[ -z "${PG_SLEEP:-}" ] || sleep "$PG_SLEEP"
+[ -z "${PG_OUT:-}" ] || printf '%s\n' "$PG_OUT"
+[ -z "${PG_ERR:-}" ] || printf '%s\n' "$PG_ERR" >&2
+exit "${PG_RC:-0}"
+"#;
+
+/// Puts `body` at the daemon binary's path under the root, with every directory on the way
+/// 0755, so the trust check passes unless a case loosens one.
+fn install_daemon_binary(fx: &Fx, body: &str) {
+    write_exec(&fx.p("usr/local/bin/propolis"), body);
+    for rel in ["usr", "usr/local", "usr/local/bin"] {
+        std::fs::set_permissions(fx.p(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::set_permissions(&fx.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+const PG_PROBE: &str = r#"rc=0
+out="$(pa_pg "${T:-10}" 'SELECT 1')" || rc=$?
+pa_pg "${T:-10}" 'SELECT 1' > /dev/null
+echo "rc=$rc"
+echo "out=$out"
+echo "var=$PA_PG_OUT"
+echo "cause=$PA_PG_CAUSE"
+echo "why=$PA_PG_WHY"
+echo "where=$PA_PG_WHERE"
+"#;
+
+#[test]
+fn pa_pg_gives_the_url_only_in_the_environment_and_asks_for_a_read_only_bounded_session() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    fx.write(
+        "etc/propolis/fleet-listeners.env",
+        "DATABASE_URL=postgres://early@db.example.invalid/x\n",
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        "DATABASE_URL=postgres://propolis:s3cret@localhost/propolis\n",
+    );
+    let r = fx.run_env(
+        "rc=0\npa_pg 10 'SELECT 1' 'SELECT 2' > /dev/null || rc=$?\necho \"rc=$rc\"\necho \"cause=$PA_PG_CAUSE\"\necho \"where=$PA_PG_WHERE\"\nPA_PG_APP=propolis-status pa_pg 10 'SELECT 3' > /dev/null",
+        &[("PG_OUT", "1")],
+    );
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("rc"), "0");
+    assert_eq!(r.get("cause"), "-");
+    assert_eq!(r.get("where"), "local");
+    let log = fx.log();
+    let first: Vec<&str> = log.split("argv\n").nth(1).unwrap().lines().collect();
+    assert_eq!(
+        first,
+        vec![
+            "arg[pg-exec]",
+            "arg[psql]",
+            "arg[-X]",
+            "arg[-A]",
+            "arg[-t]",
+            "arg[-q]",
+            "arg[-w]",
+            "arg[-v]",
+            "arg[ON_ERROR_STOP=1]",
+            "arg[-d]",
+            "arg[connect_timeout=5 application_name=propolis-witness options='-c statement_timeout=5000 -c default_transaction_read_only=on']",
+            "arg[-c]",
+            "arg[SELECT 1]",
+            "arg[-c]",
+            "arg[SELECT 2]",
+            "url[postgres://propolis:s3cret@localhost/propolis]",
+        ],
+        "propolis.env is read after fleet-listeners.env, as systemd loads them"
+    );
+    assert!(
+        log.contains("application_name=propolis-status "),
+        "a caller names its own session: {log}"
+    );
+    assert!(
+        !log.lines()
+            .filter(|l| l.starts_with("arg["))
+            .any(|l| l.contains("s3cret") || l.contains("postgres://")),
+        "the URL never reaches a command line: {log}"
+    );
+}
+
+#[test]
+fn pa_pg_prints_what_psql_printed_and_keeps_it_in_a_variable() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "DATABASE_URL=postgres://propolis@db.example.invalid:5433/propolis\n",
+    );
+    let r = fx.run_env(PG_PROBE, &[("PG_OUT", "9812440|1763133664")]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("rc"), "0");
+    assert_eq!(r.get("out"), "9812440|1763133664");
+    assert_eq!(r.get("var"), "9812440|1763133664");
+    assert_eq!(r.get("where"), "remote");
+}
+
+/// Each row of the classification table, from psql's exit status and stderr. psql's stderr is
+/// kept for a person to read, never matched beyond these fixed texts.
+#[test]
+fn pa_pg_classifies_each_failure_by_its_status_and_fixed_texts() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "DATABASE_URL=postgres://propolis@/propolis?host=/run/postgresql\n",
+    );
+    for (rc, err, cause) in [
+        ("124", "", "db.timeout"),
+        ("2", "psql: error: timeout expired", "db.timeout"),
+        ("126", "", "tool.exec"),
+        ("127", "", "tool.exec"),
+        (
+            "127",
+            "propolis pg-exec: cannot run psql: No such file or directory",
+            "tool.exec",
+        ),
+        (
+            "2",
+            "psql: error: could not open file: Permission denied",
+            "tool.exec",
+        ),
+        (
+            "2",
+            "psql: error: FATAL:  password authentication failed for user \"propolis\"",
+            "db.auth",
+        ),
+        (
+            "2",
+            "psql: error: FATAL:  Peer authentication failed for user \"propolis\"",
+            "db.auth",
+        ),
+        (
+            "2",
+            "psql: error: FATAL:  no pg_hba.conf entry for host",
+            "db.auth",
+        ),
+        (
+            "2",
+            "psql: error: FATAL:  role \"propolis\" does not exist",
+            "db.auth",
+        ),
+        (
+            "2",
+            "psql: error: connection to server on socket \"/run/postgresql/.s.PGSQL.5432\" failed: fe_sendauth: no password supplied",
+            "db.auth",
+        ),
+        (
+            "2",
+            "psql: error: connection to server failed: Connection refused",
+            "db.unreachable",
+        ),
+        (
+            "2",
+            "psql: error: could not translate host name \"db\" to address",
+            "db.unreachable",
+        ),
+        ("2", "psql: error: something new", "db.unreachable"),
+        (
+            "1",
+            "propolis pg-exec: DATABASE_URL is not set",
+            "config.invalid",
+        ),
+        (
+            "1",
+            "propolis pg-exec: DATABASE_URL is not a postgres URL",
+            "config.invalid",
+        ),
+        ("3", "ERROR:  relation \"event\" does not exist", "unknown"),
+    ] {
+        let r = fx.run_env(PG_PROBE, &[("PG_RC", rc), ("PG_ERR", err)]);
+        assert_eq!(r.code, 0, "{}", r.err);
+        assert_eq!(r.get("rc"), "1", "exit {rc} {err:?}");
+        assert_eq!(r.get("cause"), cause, "exit {rc} {err:?}");
+        assert_eq!(r.get("where"), "local");
+    }
+}
+
+#[test]
+fn pa_pg_keeps_psqls_stderr_for_a_person_and_never_prints_it() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "DATABASE_URL=postgres://propolis@localhost/propolis\n",
+    );
+    let r = fx.run_env(
+        "pa_pg 10 'SELECT 1'\necho\necho \"err=$(printf '%s' \"$PA_PG_ERR\" | tr '\\n' '|')\"",
+        &[("PG_RC", "2"), ("PG_ERR", "line one\nline two")],
+    );
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("err"), "line one|line two");
+    assert!(!r.out.lines().next().unwrap().contains("line"), "{}", r.out);
+    assert!(!r.err.contains("line one"), "{}", r.err);
+}
+
+#[test]
+fn pa_pg_stops_a_probe_that_outlives_its_time_limit() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "DATABASE_URL=postgres://propolis@localhost/propolis\n",
+    );
+    let started = std::time::Instant::now();
+    let r = fx.run_env(PG_PROBE, &[("PG_SLEEP", "30"), ("T", "1")]);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("cause"), "db.timeout");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "two probes of 1 s each took {:?}",
+        started.elapsed()
+    );
+}
+
+/// An older binary without pg-exec would start the daemon as root, so it is never run; nor is a
+/// binary in a directory another account can write, nor anything when no URL is set.
+#[test]
+fn pa_pg_never_runs_a_binary_without_pg_exec_an_untrusted_one_or_one_without_a_url() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, &PROPOLIS_PG_STUB.replace("propolis pg-exec:", "old:"));
+    fx.write(
+        "etc/propolis/propolis.env",
+        "DATABASE_URL=postgres://propolis@localhost/propolis\n",
+    );
+    let r = fx.run_env(PG_PROBE, &[]);
+    assert_eq!(r.get("rc"), "1");
+    assert_eq!(r.get("cause"), "tool.exec");
+    assert_eq!(r.get("why"), "daemon binary predates pg-exec");
+    assert!(!fx.log().contains("argv"), "{}", fx.log());
+
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    std::fs::set_permissions(
+        fx.p("usr/local/bin"),
+        std::fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+    let r = fx.run_env(PG_PROBE, &[]);
+    assert_eq!(r.get("cause"), "tool.exec");
+    assert!(
+        r.get("why").starts_with("not trusted: ")
+            && r.get("why").contains("usr/local/bin: group-writable"),
+        "{}",
+        r.get("why")
+    );
+    assert!(!fx.log().contains("argv"), "{}", fx.log());
+
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    fx.write("etc/propolis/propolis.env", "# no URL\n");
+    let r = fx.run_env(PG_PROBE, &[]);
+    assert_eq!(r.get("rc"), "1");
+    assert_eq!(r.get("cause"), "config.invalid");
+    assert_eq!(r.get("why"), "DATABASE_URL is not set");
+    assert!(!fx.log().contains("argv"), "{}", fx.log());
+}
+
+#[test]
+fn pa_pg_tells_a_local_database_from_a_remote_one_by_the_urls_host() {
+    let fx = Fx::new();
+    install_daemon_binary(&fx, PROPOLIS_PG_STUB);
+    for (url, where_) in [
+        ("postgres://propolis@/propolis", "local"),
+        ("postgres://propolis:pw@localhost:5432/propolis", "local"),
+        ("postgresql://propolis@127.0.0.1/propolis", "local"),
+        ("postgres://propolis@[::1]:5432/propolis", "local"),
+        ("postgres://propolis@%2Frun%2Fpostgresql/propolis", "local"),
+        (
+            "postgres://propolis@db/propolis?host=/run/postgresql",
+            "local",
+        ),
+        ("postgres://propolis@10.0.0.5/propolis", "remote"),
+        (
+            "postgres://propolis@db.example.invalid:5432/propolis",
+            "remote",
+        ),
+        ("postgres://propolis@[2001:db8::5]/propolis", "remote"),
+    ] {
+        fx.write(
+            "etc/propolis/propolis.env",
+            &format!("DATABASE_URL={url}\n"),
+        );
+        let r = fx.run_env(PG_PROBE, &[]);
+        assert_eq!(r.get("where"), where_, "{url}");
+    }
+}
+
+const SCHEDULER: &str = r#"rc=0
+pa_push_scheduler > /dev/null || rc=$?
+echo "rc=$rc"
+echo "printed=$(pa_push_scheduler)"
+echo "kind=$PA_SCHED"
+echo "count=$PA_SCHED_N"
+"#;
+
+#[test]
+fn pa_push_scheduler_finds_an_uncommented_cron_line_in_any_of_the_crontab_places() {
+    let fx = Fx::new();
+    let r = fx.run(SCHEDULER);
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("rc"), "0");
+    assert_eq!(r.get("printed"), "none 0");
+
+    fx.write(
+        "etc/cron.d/propolis",
+        "# 5 * * * * propolis-blocklist /usr/local/lib/propolis/blocklist-sync.sh\n",
+    );
+    assert_eq!(fx.run(SCHEDULER).get("printed"), "none 0");
+
+    for (i, rel) in [
+        "etc/crontab",
+        "etc/cron.d/propolis",
+        "var/spool/cron/crontabs/propolis-blocklist",
+        "var/spool/cron/propolis-blocklist",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fx.write(
+            rel,
+            "SHELL=/bin/sh\n  5 * * * * /usr/local/lib/propolis/blocklist-sync.sh\n",
+        );
+        let r = fx.run(SCHEDULER);
+        assert_eq!(r.get("kind"), "cron", "{rel}");
+        assert_eq!(r.get("count"), (i + 1).to_string(), "{rel}");
+    }
+}
+
+#[test]
+fn pa_push_scheduler_counts_a_service_only_when_its_timer_is_enabled() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/systemd/system/blocklist-push.service",
+        "[Service]\nUser=propolis-blocklist\nExecStart=/usr/local/lib/propolis/blocklist-sync.sh\n",
+    );
+    fx.write(
+        "etc/systemd/system/blocklist-push.timer",
+        "[Timer]\nOnCalendar=hourly\n",
+    );
+    assert_eq!(fx.run(SCHEDULER).get("printed"), "none 0");
+    let r = fx.run_env(SCHEDULER, &[("STUB_ENABLED", "blocklist-push.timer")]);
+    assert_eq!(r.get("printed"), "timer 1");
+    assert!(
+        fx.log()
+            .contains("systemctl is-enabled --quiet blocklist-push.timer"),
+        "{}",
+        fx.log()
+    );
+}
+
+/// A link, a directory or an oversized file is never read as root; a file that cannot be read
+/// makes the answer unknown (status 1), never `none`.
+#[test]
+fn pa_push_scheduler_reads_only_regular_files_and_says_when_it_could_not_read_one() {
+    let fx = Fx::new();
+    fx.write(
+        "scratch-target",
+        "5 * * * * /usr/local/lib/propolis/blocklist-sync.sh\n",
+    );
+    std::fs::create_dir_all(fx.p("etc/cron.d")).unwrap();
+    std::os::unix::fs::symlink(fx.p("scratch-target"), fx.p("etc/cron.d/linked")).unwrap();
+    std::fs::create_dir_all(fx.p("var/spool/cron/crontabs")).unwrap();
+    let r = fx.run(SCHEDULER);
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(r.get("printed"), "none 0");
+
+    fx.write("etc/cron.d/huge", &"#".repeat(70_000));
+    let r = fx.run(SCHEDULER);
+    assert_eq!(r.get("rc"), "1");
+    assert_eq!(r.get("printed"), "none 0");
+}
+
+/// Under pipefail a `grep -q` that stops at the first match would kill the writers before it
+/// and fail the pipeline, so a match early in a crontab near the size cap would be missed.
+#[test]
+fn pa_push_scheduler_finds_a_cron_line_at_the_top_of_a_crontab_near_the_size_cap() {
+    let fx = Fx::new();
+    let mut text =
+        String::from("5 * * * * propolis-blocklist /usr/local/lib/propolis/blocklist-sync.sh\n");
+    while text.len() + 20 <= 65_536 {
+        text.push_str("0 0 * * * /bin/true\n");
+    }
+    fx.write("etc/cron.d/propolis", &text);
+    let r = fx.run(SCHEDULER);
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(r.get("printed"), "cron 1");
+
+    let mut unit = String::from("[Service]\nExecStart=/usr/local/lib/propolis/blocklist-sync.sh\n");
+    while unit.len() + 20 <= 65_536 {
+        unit.push_str("# padding padding.\n");
+    }
+    std::fs::remove_file(fx.p("etc/cron.d/propolis")).unwrap();
+    fx.write("etc/systemd/system/blocklist-push.service", &unit);
+    let r = fx.run_env(SCHEDULER, &[("STUB_ENABLED", "blocklist-push.timer")]);
+    assert_eq!(r.get("printed"), "timer 1", "{}", r.err);
 }

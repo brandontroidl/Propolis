@@ -1061,6 +1061,42 @@ fn save_keeps_the_alert_library_with_the_other_helpers() {
     );
 }
 
+/// The status command is one of the helpers a release keeps, and goes back executable.
+#[test]
+fn the_status_command_is_kept_with_the_helpers_and_put_back_executable() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(1)).unwrap();
+    write_exec(&sbin.join("propolis-status"), &consumer_needing(1));
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    let kept = fx.store().join(&fx.releases()[0]);
+    assert!(
+        read(&kept.join("sbin/propolis-status")).contains("needs-alert-lib: 1"),
+        "the status command is kept with the helpers"
+    );
+    fx.upgrade();
+    write_exec(
+        &sbin.join("propolis-status"),
+        "#!/usr/bin/env bash\necho newer\n",
+    );
+    std::fs::set_permissions(
+        sbin.join("propolis-status"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    assert_ok(&fx.run(&["--yes"], &[], None));
+    assert!(read(&sbin.join("propolis-status")).contains("needs-alert-lib: 1"));
+    let mode = std::fs::metadata(sbin.join("propolis-status"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        mode, 0o755,
+        "the status command goes back 0755, got {mode:o}"
+    );
+}
+
 /// The library version rule, the direction that keeps the current library: a consumer that the
 /// rollback leaves in place needs more than the kept library has, so restoring it would leave
 /// that consumer calling functions that are not there.
@@ -1072,7 +1108,7 @@ fn a_kept_library_older_than_a_consumer_that_stays_keeps_the_current_library_and
     assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     fx.upgrade();
     std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
-    // Not one of the helpers a kept release holds, so the newer copy stays after the rollback.
+    // Installed after the save, so the kept release holds none and this newer copy stays.
     write_exec(&sbin.join("propolis-status"), &consumer_needing(2));
     let output = fx.run(&["--yes"], &[], None);
     assert_ok(&output);

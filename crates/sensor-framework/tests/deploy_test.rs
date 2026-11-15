@@ -6603,6 +6603,68 @@ fn install_and_upgrade_install_the_alert_library_readable_and_not_executable() {
     );
 }
 
+/// The status command is installed beside the library it sources, executable by root, and is
+/// valid bash; the dry run shows it.
+#[test]
+fn install_and_upgrade_install_the_status_command_executable_beside_the_library() {
+    for (script_name, expected) in [
+        (
+            "install.sh",
+            "run install -m 0755 \"$SCRIPT_DIR/propolis-status.sh\" /usr/local/sbin/propolis-status",
+        ),
+        (
+            "upgrade.sh",
+            "install -m 0755 \"$SCRIPT_DIR/propolis-status.sh\" /usr/local/sbin/propolis-status",
+        ),
+    ] {
+        let script = deploy_file(script_name);
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let installs: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("/usr/local/sbin/propolis-status"))
+            .collect();
+        assert_eq!(
+            installs,
+            vec![&expected],
+            "{script_name} must install the status command once, 0755"
+        );
+        let lib = lines
+            .iter()
+            .position(|l| l.ends_with("/usr/local/sbin/propolis-alert-lib"))
+            .unwrap_or_else(|| panic!("{script_name} does not install the library"));
+        let status = lines.iter().position(|l| *l == expected).unwrap();
+        assert!(
+            lib < status,
+            "{script_name}: install the status command after the library it sources"
+        );
+    }
+    let status = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/propolis-status.sh"
+        ))
+        .fenced_status()
+        .expect("bash -n runs");
+    assert!(
+        status.success(),
+        "deploy/propolis-status.sh is not valid bash"
+    );
+    let output = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/install.sh"
+    ))
+    .arg("--dry-run")
+    .fenced_output()
+    .expect("failed to run deploy/install.sh --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("propolis-status.sh /usr/local/sbin/propolis-status\n"),
+        "dry-run output does not show the status command install:\n{stdout}"
+    );
+}
+
 /// The failure hook records into the root alerting directories, granted only with the `-` prefix:
 /// a missing directory then costs the record, never the unit, where a plain grant would fail the
 /// unit with status 226 and take every failure alert on the host with it. Its time budget and the

@@ -56,7 +56,7 @@ STORE="$ROOT/var/lib/propolis/rollback"
 KEEP=3
 RELEASE_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4,40}$'
 SET_RE='^[0-9]{8}T[0-9]{6}Z-pre-upgrade$'
-SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert propolis-alert-lib)
+SBIN_HELPERS=(propolis-backup propolis-logrotate-guard propolis-alert propolis-alert-lib propolis-status)
 # The installed config-check under /usr/local/lib/propolis, kept in lib/ of a release: the script,
 # the listener derivation it sources, and its binary list, which follows the binaries a rollback
 # puts back. repo-dir is not kept: the checkout's path does not change with a rollback.

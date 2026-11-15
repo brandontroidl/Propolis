@@ -417,6 +417,25 @@
 
 ### Added
 
+- **`sudo propolis-status`: where the pipeline stopped, and why** - `install.sh` and `upgrade.sh`
+  install `deploy/propolis-status.sh` as `/usr/local/sbin/propolis-status` (0755), and a rollback
+  keeps and restores it with the other helpers. Run as root, it prints every stage in order
+  (listen, source, ship, gateway, intake, ledger, review, reports, feed, publish) with its last
+  progress and marks the first one that stopped, then the rails (alert, backup, chain, host,
+  monitor, peers), the failures the failure hook recorded (every unresolved one, resolved ones
+  for 7 days) and the firings it spooled, with systemd's cause and what the hook did with each,
+  the installed config-check's findings, and the view and runbook section to read next;
+  `propolis-status <stage>` expands one row. It writes nothing except a temporary header file
+  for the metrics token, removed on exit,
+  takes no lock, bounds every call, reads files other accounts write as those accounts, prints
+  names found there only when they are plain ids and journal text only cleaned and marked, and
+  never prints the ntfy token or topic or a database URL. Nothing judges the hook's records yet,
+  so they never change its exit status. The alert library is now at version 3, with the
+  database probe through pg-exec (`pa_pg`) and the public-feed push scheduler check
+  (`pa_push_scheduler`). The runbook it points at is the new first section of
+  [health and observability](docs/operations/health-and-observability.md#where-to-look-first);
+  forms and exit codes in [commands](docs/reference/commands.md#status-walk).
+
 - **`config-check` is installed, runs from any directory, and has a TSV output** - `install.sh`
   and `upgrade.sh` install it as `/usr/local/lib/propolis/config-check.sh` with
   `listeners-lib.sh`, `repo-dir` (the checkout's path) and `install-bins` (`upgrade.sh`'s binary

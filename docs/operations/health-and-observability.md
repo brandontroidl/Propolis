@@ -13,6 +13,197 @@ The health, readiness, and metrics endpoints; what the fleet pane's per-listener
 counts; how the daemon logs; the drop and spool-refusal
 counters an operator watches under load; and the opt-in ops-alert monitor. Route details are
 owned by [console routes](../reference/console-routes.md); this page is the operational view.
+It starts with the one command to run when something is wrong, and what each of its next steps
+means.
+
+## Where to look first
+
+On the host an alert named, run `sudo propolis-status` (`deploy/propolis-status.sh#status_walk`;
+forms and exit codes in [commands](../reference/commands.md#status-walk)). It changes nothing:
+it writes nothing except a temporary header file for the metrics token, removed on exit, takes
+no lock and restarts nothing, so it is safe to run first, before any other step. It prints, in
+this order:
+
+- the host line (the alias the host has on the channel, the host name, its role), the alert
+  target, the daemon's monitor and alert queue, how many units' failure alerts are still
+  undelivered, and where the root alerting state was last written;
+- the failures the failure hook recorded, newest first by first failure, each with systemd's
+  own cause (`proc.exit 1`, `proc.signal 9`, `proc.oom`...), how many times it fired, and what
+  the hook did with the latest firing (`[legacy hook: delivered]`, `undelivered`, `cooldown`,
+  `journal`). Nothing resolves a record yet, so every record is listed however old its first
+  failure; only a resolved one drops out, 7 days after it was resolved. A firing the hook could
+  not record (the lock was busy, or its time nearly spent) and wrote to its spool instead is
+  listed too, marked `[spooled, not yet in the record]`. Nothing judges these yet, so they are
+  listed as failures that happened and never change the exit status;
+- the pipeline, stage by stage: `listen`, `source`, `ship`, `gateway`, `intake`, `ledger`,
+  `review`, `reports`, `feed`, `publish`, each with its last progress, then the rails beside it
+  (`alert`, `backup`, `chain`, `host`, `monitor`, `peers`), then the installed config-check's
+  findings, run live;
+- `NEXT`: the view to open and the runbook section below for the first thing to look at.
+
+**The marker.** The first stage whose own facts say it stopped is marked `>`
+(`deploy/propolis-status.sh#first_stopped`). Only a fault the row can see directly (a unit that
+is enabled and not running, a log the reader cannot open, a failed database connection, a
+config-check finding that stops capture) or a stage with work waiting and no progress for longer
+than `PROPOLIS_OPS_STALL_FOR_SECS` can take it. A parked sensor (disabled with its bind still
+set) only warns, so it never takes the marker from a real fault further down. A stage after the
+marker that stopped only for lack of input reads `starved`; one with a fault of its own stays
+`FAIL (also)`. One exception: when the daemon is down, the database refuses connections and the
+daemon's last run logged `propolis: failed to connect to PostgreSQL` (matched by unit, uid and
+invocation id, which no other process can forge), the marker goes on `ledger` and `intake` reads
+`starved`. A row that could not be read shows `?` with the reason and never takes the marker.
+Stages 7 to 10 are shown, not judged.
+
+**What shell cannot see before step 3.** Whether the ledger accepts writes (a ledger that
+answers reads and refuses writes shows as intake stopped and the ledger row `ok`), the daemon's
+own causes for what it is doing, the hash-chain verdict, whether the daemon's alerts are answered,
+and other nodes on the same database. The rows say so instead of guessing.
+
+`sudo propolis-status <stage>` opens one row: every unit's properties, the cursor of every log,
+the config-check findings for that row with their fix lines, and the last 20 journal lines of a
+unit that is not running. Text a unit or the database wrote is shown cleaned of every byte
+outside printable ASCII and marked `[untrusted]`.
+
+<a id="listen-down"></a>
+### A listener is not capturing
+
+A sensor unit that is enabled is not running, or config-check found its port held by another
+process, bound only on loopback, not listening, or closed by the firewall. `sudo propolis-status
+listen` shows each unit's state, the findings with their fix lines, and the last journal lines
+of a unit that is not running. Fix what the journal says, then `sudo systemctl restart
+sensor-<name>.service`.
+
+<a id="daemon-down"></a>
+### The daemon is down
+
+Step 0: do not restart anything until the walk shows where it stopped. `propolis.service` is
+enabled and not running, or `/ready` names a subsystem that gave up. `sudo propolis-status
+intake` shows the unit, how far behind each log is (from the cursor files, which work with the
+daemon dead) and its last journal lines. When the walk marks `ledger` instead, the daemon cannot
+start because the database does not answer: see [db-unreachable](#db-unreachable).
+
+<a id="db-unreachable"></a>
+### The database does not answer
+
+`SELECT 1` through `propolis pg-exec` failed with `db.unreachable`, `db.auth` or `db.timeout`.
+`sudo propolis-status ledger` shows psql's own error, cleaned. For a local database check
+`systemctl status postgresql`; for `db.auth`, the role and `pg_hba.conf`
+([database roles](database-roles.md)). A `tool.exec` is not an outage: psql itself could not run
+(see [tool](#tool)).
+
+<a id="db-state"></a>
+### The database answers, in a state that blocks writes
+
+A standby (`pg_is_in_recovery()` true), transaction ids near wraparound, or lock waits.
+`sudo propolis-status ledger` prints each of these read-only probes; nothing judges them yet.
+
+<a id="alert-path"></a>
+### Alerts are not leaving the host
+
+The failure hook kept an undelivered file under `/run/propolis-alert/undelivered/`, or the
+daemon's queue `ops-alert-undelivered.json` holds alerts. `sudo propolis-status alert` counts
+both and the hook's journal lines of the last 24 h. Check the ntfy URL, topic and token in
+`propolis.env` and that the host can reach the server.
+
+<a id="ship-down"></a>
+### The shipper is down
+
+On a collector, `shipper.service` is enabled and not running. `sudo propolis-status ship` shows
+its properties and its last journal lines.
+
+<a id="ship-failing"></a>
+### The shipper has bytes it cannot send
+
+On a collector, a log has unread bytes and the gateway has accepted no batch for longer than
+`PROPOLIS_OPS_STALL_FOR_SECS`. `sudo propolis-status ship` shows each log's cursor against the
+file; check that the gateway is reachable and the certificates ([split
+deployment](split-deployment.md)).
+
+<a id="spool-quiet"></a>
+### A collector has gone quiet
+
+On a control node, a collector has sent nothing for a while. The control node cannot see the
+collector's side, where a quiet honeypot and a dead shipper look the same: run `sudo
+propolis-status` on that collector.
+
+<a id="gateway-down"></a>
+### The gateway is down
+
+`gateway.service` is enabled and not running on a control node or gateway. `sudo
+propolis-status gateway` shows its properties, each collector's spool and the gateway's error
+lines of the last 24 h.
+
+<a id="gateway-dup"></a>
+### The gateway dropped a rebuilt batch
+
+The gateway logged `gateway: batch reuses the last accepted seq with different content;
+acknowledged as Duplicate without storing it`: a collector sent a batch number again with other
+content, and those records were not stored. `sudo propolis-status gateway` counts the gateway's
+error lines of the last 24 h; the line's `collector_id` names the collector whose shipper state
+to check.
+
+<a id="backup-failed"></a>
+### The backup failed or is old
+
+The last backup run failed after the last good one, the last good one is older than
+`PROPOLIS_OPS_BACKUP_MAX_AGE_SECS`, the timer is not enabled, or config-check has a backup
+finding. `sudo propolis-status backup` prints both status files, including the step a failed run
+was in; see [backup and restore](backup-and-restore.md).
+
+<a id="backup-hung"></a>
+### A backup run does not end
+
+A run that does not end holds the backup lock, so the next nightly run waits behind it.
+`systemctl status propolis-backup.service` shows whether one is running and since when, and
+`journalctl -u propolis-backup.service` the last step it logged.
+
+<a id="rotation"></a>
+### Log rotation is late or refused
+
+config-check reports rotation stale, a log over its rotation size, or the free-space guard
+missing. `sudo propolis-status source` shows the logrotate state file's age and counts the
+guard's skip and refusal lines of the last 24 h; `systemctl status propolis-logrotate.timer`
+shows the timer ([retention](retention.md#log-rotation)).
+
+<a id="push-failing"></a>
+### The public feed push is not happening
+
+`/var/lib/propolis/blocklist-status/last-pushed` is old or missing. `sudo propolis-status
+publish` shows the marker's time and whether a crontab line or an enabled timer runs
+`deploy/blocklist-sync.sh`; run that by hand as `propolis-blocklist` to see its error.
+
+<a id="volume"></a>
+### A volume is filling
+
+A filesystem Propolis writes to (`/var/lib/propolis`, `/var/log/propolis`,
+`/var/spool/propolis`) has less than 15% of its space or inodes free. `sudo propolis-status
+host` shows which; freeing space or moving the store is the fix.
+
+<a id="finding"></a>
+### config-check found something
+
+The row names config-check finding ids. Run `sudo /usr/local/lib/propolis/config-check.sh`: each
+finding has a `fix:` line to paste or a `do:` line to follow.
+
+<a id="tool"></a>
+### A program a check needs cannot run
+
+For example psql through pg-exec (`tool.exec`), blocked by a sandbox or missing. That is not an
+outage of what it checks: fix the program, and the row reads again.
+
+<a id="state"></a>
+### The alerting state is not on disk
+
+The last write of the root alerting state could not reach `/var/lib/propolis/witness`: the walk
+shows `state not persisted (run)` (written to `/run` only, lost at reboot) or `(none)`. Free
+space or make `/var` writable; `sudo propolis-status host` shows where the last write landed.
+
+<a id="witness"></a>
+### The witness
+
+No witness pass runs on this host in this release: the failure hook's records are listed by the
+walk as recent failures, and nothing judges, reminds or resolves them: the hook stores a
+self-restarting unit's failure as pending and a oneshot's as open.
 
 ## Endpoints
 

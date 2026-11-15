@@ -19,8 +19,10 @@
 # as the account that owns a file, for paths another account can write; the trust check for a
 # program root is about to run; atomic 0600 writes; the one state lock; state files that fall
 # back to /run when the disk refuses a write; the PROPOLIS_SENSOR_LOGS grammar; the cause codes
-# of a failed run and the unit map; the maintenance marker; the incident record; and the failure
-# hook's record step (pa_hook_record), which the hook runs in a child process of its own.
+# of a failed run and the unit map; the maintenance marker; the database probe through pg-exec
+# (pa_pg) and the public-feed push scheduler check (pa_push_scheduler), so the status command
+# and the witness judge both by one rule; the incident record; and the failure hook's record step
+# (pa_hook_record), which the hook runs in a child process of its own.
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
 # EXIT handler runs pa_cleanup, which removes them.
@@ -38,7 +40,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=2
+PA_LIB_VERSION=3
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -1163,6 +1165,182 @@ pa_maint_active() {
     PA_MAINT_REASON="$reason" PA_MAINT_UNTIL="$((10#$until))"
 }
 
+# ---- the database probe and the push scheduler -------------------------------------------------
+
+# _pa_pg_where URL: local when the URL names no host, a loopback host or a socket directory (a
+# path, %2F-encoded in the host position or given as a host= query), else remote. Which one
+# decides whether an outage is this host's own database or one several nodes may share.
+_pa_pg_where() {
+    local rest="${1#*://}" query="" host
+    case "$rest" in *\?*) query="${rest#*\?}" rest="${rest%%\?*}" ;; esac
+    rest="${rest%%/*}"
+    host="${rest##*@}"
+    case "$host" in
+        \[*\]*) host="${host%%]*}" host="${host#[}" ;;
+        *) host="${host%%:*}" ;;
+    esac
+    case "&$query" in
+        *'&host=/'* | *'&host=%2F'* | *'&host=%2f'*)
+            printf local
+            return 0
+            ;;
+    esac
+    case "$host" in
+        '' | localhost | 127.0.0.1 | ::1 | /* | %2F* | %2f*) printf local ;;
+        *) printf remote ;;
+    esac
+}
+
+# pa_pg TIMEOUT SQL...: one psql session through `propolis pg-exec`, with the daemon's DATABASE_URL
+# (fleet-listeners.env then propolis.env, systemd's order for propolis.service) given in that one
+# process's environment and never on a command line. pg-exec drops every inherited PG* variable and
+# sets its own from the URL, so the bounds go in psql's conninfo, which libpq merges with those:
+# a 5 s connect timeout, a 5 s statement timeout and a read-only transaction, all inside an outer
+# `timeout TIMEOUT`. PA_PG_APP names the session (default propolis-witness). Each SQL is one -c.
+# psql never asks for a password (-w): it would ask on the terminal, past the closed stdin, and
+# stop there until the timeout, so a server that wants one the URL lacks reads as db.auth.
+#
+# Before the binary is run as root it must pass pa_trusted_exec and carry pg-exec's guard string
+# (the check deploy/backup.sh makes): an older binary would start the daemon as root instead.
+#
+# Prints psql's output and also sets PA_PG_OUT, because a caller reading it through $() would lose
+# the rest: PA_PG_CAUSE (`-` on success, else a cause code of the closed list), PA_PG_WHY (why the
+# binary was not run), PA_PG_ERR (psql's stderr, raw text another party wrote: a caller shows it
+# only cleaned, and never stores or sends it) and PA_PG_WHERE (local or remote). 0 on success, 1
+# otherwise, 2 for bad arguments.
+pa_pg() {
+    local t="${1:-}" url bin="$PA_ROOT/usr/local/bin/propolis" app="${PA_PG_APP:-propolis-witness}"
+    local both line rc="" sql err
+    local -a args=()
+    PA_PG_OUT="" PA_PG_ERR="" PA_PG_CAUSE=unknown PA_PG_WHY="" PA_PG_WHERE=""
+    [[ $t =~ ^[1-9][0-9]{0,2}$ ]] || return 2
+    shift
+    [ "$#" -ge 1 ] || return 2
+    [[ $app =~ ^[a-z][a-z0-9-]{0,40}$ ]] || app=propolis-witness
+    pa_env_get DATABASE_URL "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    url="$PA_ENV_VALUE"
+    if [ -z "$url" ]; then
+        PA_PG_CAUSE=config.invalid PA_PG_WHY="DATABASE_URL is not set"
+        [ -z "$PA_ENV_UNREADABLE" ] || PA_PG_WHY="${PA_ENV_UNREADABLE##*/} cannot be read"
+        return 1
+    fi
+    PA_PG_WHERE="$(_pa_pg_where "$url")"
+    if ! pa_trusted_exec "$bin"; then
+        PA_PG_CAUSE=tool.exec PA_PG_WHY="not trusted: $PA_UNTRUSTED"
+        return 1
+    fi
+    if ! timeout 30 grep -q -a -F 'propolis pg-exec: DATABASE_URL is not set' -- "$bin" 2> /dev/null; then
+        PA_PG_CAUSE=tool.exec PA_PG_WHY="daemon binary predates pg-exec"
+        return 1
+    fi
+    for sql in "$@"; do args+=(-c "$sql"); done
+    # Both streams come back through one capture, each line tagged by its stream, because a value
+    # with no NUL cannot carry them apart otherwise and the walk may write no temporary file. The
+    # NUL bytes a server message could hold are dropped before bash would warn about them.
+    both="$(
+        {
+            o="$(DATABASE_URL="$url" timeout -k 2 "$t" "$bin" pg-exec psql -X -A -t -q -w -v ON_ERROR_STOP=1 \
+                -d "connect_timeout=5 application_name=$app options='-c statement_timeout=5000 -c default_transaction_read_only=on'" \
+                "${args[@]}" < /dev/null 2> >(LC_ALL=C tr -d '\000' | LC_ALL=C sed 's/^/E/' >&4) \
+                | LC_ALL=C tr -d '\000'
+            exit "${PIPESTATUS[0]}")"
+            printf 'R%s\n' "$?"
+            [ -z "$o" ] || printf '%s\n' "$o" | LC_ALL=C sed 's/^/O/'
+        } 4>&1
+    )"
+    while IFS= read -r line; do
+        case "$line" in
+            R*) rc="${line#R}" ;;
+            O*) PA_PG_OUT+="${line#O}"$'\n' ;;
+            E*) PA_PG_ERR+="${line#E}"$'\n' ;;
+        esac
+    done <<< "$both"
+    PA_PG_OUT="${PA_PG_OUT%$'\n'}" PA_PG_ERR="${PA_PG_ERR%$'\n'}"
+    if [ "$rc" = 0 ]; then
+        PA_PG_CAUSE=-
+        printf '%s' "$PA_PG_OUT"
+        return 0
+    fi
+    err="$PA_PG_ERR"
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ] || [[ $err == *'timeout expired'* ]]; then
+        PA_PG_CAUSE=db.timeout
+    elif [ "$rc" = 126 ] || [ "$rc" = 127 ] || [[ $err == 'propolis pg-exec: cannot run psql'* ]] \
+        || [[ ${err%%$'\n'*} == *'Permission denied'* ]]; then
+        PA_PG_CAUSE=tool.exec
+    elif [[ $err == *'password authentication failed'* || $err == *'Peer authentication failed'* \
+        || $err == *'Ident authentication failed'* || $err == *'no pg_hba.conf entry'* \
+        || $err == *'no password supplied'* \
+        || ($err == *'role "'* && $err == *'does not exist'*) ]]; then
+        PA_PG_CAUSE=db.auth
+    elif [[ $err == *'could not connect'* || $err == *'Connection refused'* \
+        || $err == *'could not translate host name'* || $err == *'No route to host'* ]]; then
+        PA_PG_CAUSE=db.unreachable
+    elif [[ $err == *'propolis pg-exec: '* ]]; then
+        PA_PG_CAUSE=config.invalid
+    elif [ "$rc" = 2 ]; then
+        PA_PG_CAUSE=db.unreachable
+    fi
+    return 1
+}
+
+# _pa_sched_text FILE: sets _PA_SCHED_TEXT to FILE's content, read as root only when it is a
+# regular file and not a link, at most 64 KiB, under `timeout 5`. Fails otherwise.
+_pa_sched_text() {
+    local s
+    _PA_SCHED_TEXT=""
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    s="$(timeout 5 stat -c %s -- "$1" 2> /dev/null)" || return 1
+    [[ $s =~ ^[0-9]{1,12}$ ]] && [ "$s" -le 65536 ] || return 1
+    _PA_SCHED_TEXT="$(timeout 5 head -c 65536 -- "$1" 2> /dev/null | LC_ALL=C tr -d '\000')" || return 1
+}
+
+# pa_push_scheduler: whether anything runs the public-feed push (deploy/blocklist-sync.sh). A
+# crontab line that is not a comment and names blocklist-sync, in /etc/crontab, /etc/cron.d/*,
+# /var/spool/cron/crontabs/* (Debian) or /var/spool/cron/* (RHEL), counts as cron; a unit in
+# /etc/systemd/system whose ExecStart= names it counts as timer when the timer of the same name is
+# enabled. The spool files are read directly, never through the setgid crontab binary; their
+# directories are not writable by the accounts they belong to, so no account can plant a link or a
+# FIFO there, and every file is still read only when regular and small (_pa_sched_text). Prints
+# `<cron|timer|none> <count>` and sets PA_SCHED and PA_SCHED_N. Status 1 when a file could not be
+# read, so a caller that found nothing shows unknown, never none.
+pa_push_scheduler() {
+    local f name bad=0 cron=0 timer=0
+    for f in "$PA_ROOT/etc/crontab" "$PA_ROOT"/etc/cron.d/* "$PA_ROOT"/var/spool/cron/crontabs/* \
+        "$PA_ROOT"/var/spool/cron/*; do
+        { [ -e "$f" ] || [ -L "$f" ]; } && [ ! -L "$f" ] && [ ! -d "$f" ] || continue
+        if ! _pa_sched_text "$f"; then
+            bad=1
+            continue
+        fi
+        # grep -c reads to the end: a grep -q stopping at the first match would kill the writers
+        # before it, and under the caller's pipefail the match would read as a failure.
+        if [ "$(printf '%s\n' "$_PA_SCHED_TEXT" | grep -v '^[[:space:]]*#' | grep -c -F blocklist-sync)" -gt 0 ]; then
+            cron=$((cron + 1))
+        fi
+    done
+    for f in "$PA_ROOT"/etc/systemd/system/*.service; do
+        [ -e "$f" ] && [ ! -L "$f" ] || continue
+        if ! _pa_sched_text "$f"; then
+            bad=1
+            continue
+        fi
+        [ "$(printf '%s\n' "$_PA_SCHED_TEXT" | grep -c '^[[:space:]]*ExecStart=.*blocklist-sync')" -gt 0 ] || continue
+        name="${f##*/}"
+        name="${name%.service}"
+        if timeout 10 systemctl is-enabled --quiet "$name.timer" 2> /dev/null; then
+            timer=$((timer + 1))
+        fi
+    done
+    PA_SCHED=none PA_SCHED_N=$((cron + timer))
+    if [ "$cron" -gt 0 ]; then
+        PA_SCHED=cron
+    elif [ "$timer" -gt 0 ]; then
+        PA_SCHED=timer
+    fi
+    printf '%s %s' "$PA_SCHED" "$PA_SCHED_N"
+    [ "$bad" = 0 ]
+}
+
 # ---- the incident record -----------------------------------------------------------------------
 #
 # incidents holds an `N<TAB><next number>` line, one `I` line of 34 fields per incident (the
@@ -1477,9 +1655,9 @@ _pa_hook_field() {
 # _pa_hook_spool UNIT OUT: the firing written to the hook spool, for when the lock cannot be had
 # or the hook's time is nearly spent: PA_STATE/hook/UNIT, else PA_RUN/fallback/hook-UNIT. One file
 # per unit, overwritten each time with the first time kept and the count raised, so a crash loop
-# cannot grow it. Written without the lock, which is the point. Nothing reads or removes the
-# file yet: the witness's light pass will take it in under the lock and delete it. The cause is
-# PA_CAUSE.
+# cannot grow it. Written without the lock, which is the point. propolis-status lists the file
+# (deploy/propolis-status.sh#load_hook_spool reads this format), and nothing removes it yet: the
+# witness's light pass will take it in under the lock and delete it. The cause is PA_CAUSE.
 _pa_hook_spool() {
     local unit="$1" out="$2" dir f head="" t="" a="" b="" c="" g first count
     for dir in "$PA_STATE/hook" "$PA_RUN/fallback"; do

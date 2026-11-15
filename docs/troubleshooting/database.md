@@ -24,6 +24,11 @@ enums, and migration list are owned by
 > about to touch. Truncating or deleting unread lines loses them for good, and a restart of
 > `propolis` clears the `gave_up` list `/ready` reports.
 
+Before anything else, run `sudo propolis-status ledger`. It changes nothing: it shows whether
+the database answers a read (`SELECT 1` through `propolis pg-exec`, with psql's own error when it
+does not), and the walk without an argument marks the ledger, not intake, when the daemon is
+down because its connect failed.
+
 Find out first, with what is running: `curl -s localhost:8080/ready` (below) returns
 `{"status":"unavailable"}` while the database is down, or names the subsystems that gave up
 once it answers; `journalctl -u propolis --since '1 hour ago'` shows the error intake and the

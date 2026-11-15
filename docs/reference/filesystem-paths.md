@@ -88,8 +88,14 @@ step (`deploy/alert-lib.sh#pa_hook_record`), which `propolis-alert@.service` run
 alert and which records the failure; `deploy/upgrade.sh` and `deploy/rollback.sh` also write the
 maintenance marker. The configuration check sources the same library and only reads.
 
-Nothing reads or removes the records, the hook spool files or the fallback copies yet: a record
-stays as the hook wrote it (`pending` or `open`). A spool file stays until a later firing of the
+`propolis-status` (`deploy/propolis-status.sh#status_walk`) reads the records, `meta`, the
+maintenance marker, `id-salt`, `/run/propolis-witness/lockwait`, the hook spool files
+(`hook/<unit>` and `fallback/hook-<unit>`) and the fallback copies, without the lock and without
+writing anything: it lists the records and the spooled firings as recent failures
+(`deploy/propolis-status.sh#print_recent`, `deploy/propolis-status.sh#load_hook_spool`).
+Nothing judges or removes the records, the hook spool
+files or the fallback copies yet: a record stays as the hook wrote it (`pending` or `open`), and
+a file the walk cannot read is named in its output, never renamed. A spool file stays until a later firing of the
 same unit that also has to spool overwrites it, and the one in the persistent directory survives
 a reboot. A fallback copy of `incidents` or `meta` stays until a later write of that file reaches
 the persistent directory, and a fallback spool file (`fallback/hook-<unit>`) until the host
@@ -110,6 +116,7 @@ reboots.
 | `/run/motd.d/` | 0755 | root:root | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
 | `/etc/tmpfiles.d/propolis.conf` | 0644 | root:root | `deploy/provision.sh#propolis-tmpfiles.conf`, from `deploy/propolis-tmpfiles.conf` |
 | `/usr/local/sbin/propolis-alert-lib` | 0644 | root:root | `deploy/install.sh#alert-lib.sh` and `deploy/upgrade.sh#alert-lib.sh`, from `deploy/alert-lib.sh` |
+| `/usr/local/sbin/propolis-status` | 0755 | root:root | `deploy/install.sh#propolis-status.sh` and `deploy/upgrade.sh#propolis-status.sh`, from `deploy/propolis-status.sh`; reads, never writes |
 | `/usr/local/lib/propolis/config-check.sh` | 0755 | root:root | `deploy/install.sh#config-check.sh` and `deploy/upgrade.sh#config-check.sh`, from `deploy/config-check.sh` |
 | `/usr/local/lib/propolis/listeners-lib.sh` | 0644 | root:root | `deploy/install.sh#listeners-lib.sh` and `deploy/upgrade.sh#listeners-lib.sh`, from `deploy/listeners-lib.sh` |
 | `/usr/local/lib/propolis/repo-dir` | 0644, one line: the checkout's absolute path | root:root | `deploy/install.sh#install_generated` and `deploy/upgrade.sh#install_generated` |

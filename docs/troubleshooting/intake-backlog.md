@@ -28,6 +28,11 @@ because all appends share one lock (see [why it happens](#why-it-happens)).
 > `propolis` clears the `gave_up` list `/ready` reports, and the behind badge reads
 > `age unknown` until intake appends again.
 
+Before anything else, run `sudo propolis-status intake`. It changes nothing: it reads each log's
+saved cursor as the daemon's own account and prints how far behind each log is, which works with
+the daemon dead, with `/ready` and the daemon's last journal lines. The walk without an argument
+marks the first stage that stopped.
+
 Find out first, with the daemon still running:
 
 - **Is the daemon serving and are its subsystems alive?**
@@ -78,7 +83,8 @@ Find out first, with the daemon still running:
   its cursors somewhere else. Its errors in `journalctl -u shipper.service` name the log as
   `sensor=<label>`.
 
-If the daemon is not running, nothing reports how far it read: leave the logs as they are, since
+If the daemon is not running, `/metrics` reports nothing; `sudo propolis-status intake` still
+shows how far intake had read each log, from its saved cursors. Leave the logs as they are, since
 intake resumes from its saved cursor when it starts. A split-deployment collector runs the
 shipper, not intake, and has no `/metrics`: check how far the shipper has sent a log as
 [retention](../operations/retention.md#a-log-too-large-to-rotate) describes.

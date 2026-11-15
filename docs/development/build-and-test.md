@@ -129,7 +129,7 @@ is not reserved. The `review` crate's `test-public-ranges` feature
 Counted by `#[test]` / `#[tokio::test]` / `#[sqlx::test]` attributes. "Unit" = under
 `crates/<c>/src/` (`#[cfg(test)]`); "integration" = under `crates/<c>/tests/`.
 
-- **Total: 5391 test functions** (3027 unit + 2364 integration).
+- **Total: 5481 test functions** (3027 unit + 2454 integration).
 - **DB-backed (`sqlx::test`): 574** - console 268, review 152, core-scoring 53, intake 43, propolis 26, feed 23, fleet 9. These provision a fresh database per test.
 - **Ignored: exactly 3.** `live_forward_confirmed_reverse_lookup_of_a_stable_public_ip`
   in `crates/console/src/rdns.rs`, a live reverse-lookup test `#[ignore]`d so the
@@ -178,7 +178,7 @@ Per-crate breakdown:
 | sensor-catchall | 18 | 13 | arrival, env_strict, integration, udp_budget |
 | sensor-cred | 37 | 46 | arrival, env_strict, integration, source_flood, tls_integration |
 | sensor-dns | 64 | 71 | arrival, env_strict, integration, tls |
-| sensor-framework | 1505 | 632 | alert_lib_test, alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, tls_integration |
+| sensor-framework | 1505 | 722 | alert_lib_test, alert_script_test, arrival_coverage, backup_pull_test, backup_script_test, blocklist_sync_test, budget_product_test, build_stamp_test, command_flood, config_check_test, deploy_test, finish_line_overhead, listener_integration, listener_log_volume, make_room, migrate_script_test, rollback_script_test, session_memory, shell_line_charging, shell_replay, shell_session_memory, spool_dedup_alloc, spool_integration, stats_wiring_test, status_script_test, tls_integration |
 | sensor-ftp | 16 | 57 | arrival, env_strict, integration, parked_control, tls_config |
 | sensor-http | 35 | 63 | arrival, env_strict, integration, session_memory_limit, tls |
 | sensor-mqtt | 64 | 65 | arrival, env_strict, integration, parked_reply, session_memory_limit, shutdown_tracking, tls |
@@ -190,7 +190,7 @@ Per-crate breakdown:
 | sensor-wire | 33 | 0 | - |
 | shipper | 11 | 67 | acceptance, audit_regressions, batcher, config, end_to_end, in_flight, logging, stalled_gateway |
 | watch | 16 | 23 | config, read_only, status, stream |
-| **Total** | **3027** | **2364** | |
+| **Total** | **3027** | **2454** | |
 
 ### Test styles by layer
 

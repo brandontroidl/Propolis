@@ -17,8 +17,13 @@ symptoms and link there for values.
 Most Propolis config is **fail-closed**: a required variable that is missing or
 empty, or a numeric bound that is present-but-invalid or (usually) zero, aborts
 startup rather than running degraded. So the single most common class of problem
-is a service that exits immediately at boot with a logged reason. Start with
-`journalctl -u <unit>` in every case.
+is a service that exits immediately at boot with a logged reason.
+
+**First step, every time:** on the host the alert or the symptom names, run
+`sudo propolis-status`. It changes nothing, marks the first pipeline stage that stopped, lists
+the failures the failure hook recorded with systemd's cause for each, and names the view and the
+runbook section to read next ([where to look first](../operations/health-and-observability.md#where-to-look-first)).
+Then `journalctl -u <unit>` for the unit it points at.
 
 ## Symptom table
 

@@ -54,7 +54,8 @@ The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin] [--adopt-hi
    It then reinstalls the production unit files and `logrotate-sensors.conf` (the same set `install.sh`
    installs; `gateway.service`/`shipper.service` only where already enabled) and the
    `propolis-*` helpers in `/usr/local/sbin`, among them the shared library of the shell
-   alerting code, `propolis-alert-lib` (0644: it is sourced, never run), and the installed
+   alerting code, `propolis-alert-lib` (0644: it is sourced, never run), and the read-only walk
+   [`propolis-status`](health-and-observability.md#where-to-look-first) (0755), and the installed
    [configuration check](service-lifecycle.md#configuration-check) in `/usr/local/lib/propolis`
    (`config-check.sh`, `listeners-lib.sh`, and `repo-dir` and `install-bins`, which it writes
    from this checkout's path and this script's binary list), then

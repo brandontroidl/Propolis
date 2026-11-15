@@ -24,8 +24,9 @@
 # sensor units with no bind configured, unreadable env files, an env file whose mode lets
 # another account read it, and a setting written in a form systemd and the shell scripts read
 # differently (env-systemd-only); whether the daemon's database role can do more to the event
-# ledger than append to it; and, on a control plane with a gateway spool, each collector's spool
-# against PROPOLIS_SENSOR_LOGS (one the gateway acknowledges and the daemon never reads).
+# ledger than append to it; on a control plane with a gateway spool, each collector's spool
+# against PROPOLIS_SENSOR_LOGS (one the gateway acknowledges and the daemon never reads); and
+# whether the root witness and its library are installed and both its timers enabled.
 #
 # NEVER MUTATES. It writes nothing outside a private temp directory it removes, restarts nothing,
 # and changes no firewall rule. Every external tool is optional: a missing one makes its check
@@ -53,7 +54,7 @@
 #
 # THE ALERT LIBRARY. Env values are read through its pa_env_get (systemd's reading of an
 # EnvironmentFile=) and the intake list through its pa_sensor_logs, so the witness and the failure
-# hook, once they come to use the library (later releases), parse both as this check does. Looked
+# hook, which use the same library, parse both as this check does. Looked
 # up in this order: PROPOLIS_CC_ALERT_LIB when set (tests), alert-lib.sh beside this script (the
 # checkout), /usr/local/sbin/propolis-alert-lib (installed). Missing, unreadable, failing to load,
 # or older than the version below, the run stops with exit 70 before it reads anything.
@@ -78,7 +79,8 @@
 # PROPOLIS_CC_LOGROTATE_GUARD, PROPOLIS_CC_WATCH_HOME, PROPOLIS_CC_WATCH_ACCOUNT,
 # PROPOLIS_CC_BACKUP_DIR, PROPOLIS_CC_GATEWAY_SPOOL_DIR (the spool directory when gateway.env sets
 # none), PROPOLIS_CC_ALERT_LIB (the only library looked at when set), PROPOLIS_CC_ALERT_ROOT (the
-# root the library's paths sit under). PROPOLIS_CC_LOG_STALE_HOURS (default 24)
+# root the library's paths sit under), PROPOLIS_CC_WITNESS (the installed witness program).
+# PROPOLIS_CC_LOG_STALE_HOURS (default 24)
 # is the age past which a log on a running sensor is reported as quiet.
 #
 # The output is plain ASCII: every value read from an env file is passed through `clean` first, so
@@ -275,6 +277,7 @@ WATCH_HOME="${PROPOLIS_CC_WATCH_HOME:-/var/lib/propolis-watch}"
 WATCH_ACCOUNT="${PROPOLIS_CC_WATCH_ACCOUNT:-propolis-watch}"
 BACKUP_STATUS="${PROPOLIS_CC_BACKUP_STATUS:-/var/lib/propolis/backup-status}"
 ALERT_HOOK="${PROPOLIS_CC_ALERT_HOOK:-/usr/local/sbin/propolis-alert}"
+WITNESS_BIN="${PROPOLIS_CC_WITNESS:-/usr/local/sbin/propolis-witness}"
 STALE_HOURS="${PROPOLIS_CC_LOG_STALE_HOURS:-24}"
 case "$STALE_HOURS" in '' | *[!0-9]*) STALE_HOURS=24 ;; esac
 NOW="${PROPOLIS_CC_NOW:-$(date +%s)}"
@@ -3023,6 +3026,57 @@ check_env_syntax() {
     fi
 }
 
+# The root witness judges the failure hook's records, watches the units and runs this check on a
+# timer. A host where it is missing, or its library is, records nothing and nobody hears about
+# it: a collector that never got the witness looks healthy from everywhere else. Two timers run
+# it, and either one stopped leaves half of it unrun. The library is the one this run loaded,
+# the path its lookup resolved (CC_ALERT_LIB).
+check_witness() {
+    local b any=0 timers_off="" t e
+    for b in "${INSTALL_BINS[@]}"; do
+        probe_unit "$b"
+        if unit_is_enabled "$b"; then any=1; fi
+    done
+    if [ "$SYSTEMCTL" -eq 0 ]; then
+        global witness unknown "systemctl not found: whether the witness's timers are enabled is unknown"
+        return 0
+    fi
+    if [ "$any" -eq 0 ]; then
+        global witness ok "no Propolis unit enabled on this host"
+        return 0
+    fi
+    if [ ! -x "$WITNESS_BIN" ] || [ ! -f "$CC_ALERT_LIB" ]; then
+        local what="$WITNESS_BIN is not installed"
+        [ -x "$WITNESS_BIN" ] || [ -f "$CC_ALERT_LIB" ] || what="$what, nor its library"
+        [ ! -x "$WITNESS_BIN" ] || what="the witness's library $CC_ALERT_LIB is missing"
+        global witness warn "$what"
+        # A collector has no upgrade script of its own: the written steps install the witness.
+        local role fix kind
+        role="$(pa_role 2>/dev/null || true)"
+        fix="$(upgrade_fix)" kind="$(fix_kind_checkout)"
+        if [ "${role##*$'\n'}" = collector ]; then
+            fix="install the witness as in docs/operations/split-deployment.md, Upgrading" kind=manual
+        fi
+        finding warn "witness" "witness-missing" "$what, though Propolis units are enabled here: nothing on this host judges a failure, watches the units or runs this check on a timer" "$fix" "$kind"
+        return 0
+    fi
+    for t in propolis-witness@light.timer propolis-witness@hourly.timer; do
+        e="$(sysq is-enabled "$t")"
+        [ "$e" = enabled ] || timers_off="${timers_off:+$timers_off, }$t ${e:-not installed}"
+    done
+    if [ -n "$timers_off" ]; then
+        global witness warn "timers not enabled: $timers_off"
+        finding warn "witness" "witness-timer" "the witness is installed but $timers_off: that pass does not run (the light pass every five minutes, the hourly pass config-check and the anonymous-read check)" \
+            "sudo systemctl enable --now propolis-witness@light.timer propolis-witness@hourly.timer"
+        return 0
+    fi
+    if [ ! -d "$PA_RUN" ]; then
+        global witness warn "installed, both timers enabled, but $PA_RUN is missing (the tmpfiles entry was not applied; run: sudo systemd-tmpfiles --create /etc/tmpfiles.d/propolis.conf)"
+        return 0
+    fi
+    global witness ok "installed, both timers enabled"
+}
+
 # ---- run -----------------------------------------------------------------------------------
 
 load_rotate_size
@@ -3047,6 +3101,7 @@ check_cursors
 check_unconfigured_units
 check_watcher
 check_env_syntax
+check_witness
 
 # ---- totals --------------------------------------------------------------------------------
 

@@ -200,6 +200,27 @@ marker, whoever wrote it. It takes no lock, so it works while a hung writer hold
 lock. Exit `0` written or removed, `1` the marker could not be written, `64` a value outside 0
 to 120 (`deploy/propolis-status.sh#status_maint`).
 
+The walk's `ALERTS` line also shows the gate (`gate full`, `gate pointer:<reason>` or `gate
+none:notarget`) and when the anonymous-read check last ran, worked out from the answer the
+witness stored, without a network request; its third line shows when the light and the hourly
+pass of the witness last completed.
+
+## Witness
+
+```
+sudo /usr/local/sbin/propolis-witness light    # one light pass, as propolis-witness@light.timer runs it
+sudo /usr/local/sbin/propolis-witness hourly   # one hourly pass, as propolis-witness@hourly.timer runs it
+```
+
+The root witness's two passes, normally started only by their timers
+(`deploy/propolis-witness@light.timer`, `deploy/propolis-witness@hourly.timer`). The hourly pass
+runs the installed configuration check, records its findings, and sends three GET requests (four
+with a token) to the configured ntfy server to see whether the alert topic can be read without
+credentials. Neither pass sends a message. Exit `0` after every pass that ran, whatever it found;
+`2` an argument other than `light` or `hourly`; `3` the alert library is missing, not trusted,
+fails to load or is older than the script needs (`deploy/witness.sh#hourly_pass`). What each
+pass does: [health and observability](../operations/health-and-observability.md#witness).
+
 ## Migrations
 
 There is no standalone migrate command in the shipped surface. The `propolis`

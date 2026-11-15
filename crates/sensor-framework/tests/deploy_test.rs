@@ -6683,23 +6683,26 @@ fn install_and_upgrade_install_the_status_command_executable_beside_the_library(
 /// with `-` (a missing one costs a note, never the unit), a home it may read but not write (the
 /// checkout config-check reads is often under /home), a private /tmp, netlink for `nft` and
 /// `ss`, nothing it creates readable by another account, and a time limit far beyond its own
-/// deadline. The light timer runs relative to the last start, every five minutes. The grants
-/// for config-check and the database are there for the hourly pass, and the unit says so: the
-/// light pass of this release runs neither.
+/// deadline. The light timer runs relative to the last start, every five minutes; the hourly
+/// timer once an hour, first a few minutes after it is enabled and spread by a random delay. The
+/// unit says which pass uses which grant: config-check for the hourly pass, the database binary
+/// for a probe a later release adds, and no comment still calls the hourly pass a future one.
 #[test]
 fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() {
     let raw = deploy_file("propolis-witness@.service");
     for current in [
         "and config-check runs nft",
         "for nft and ss, which config-check runs;",
+        "next release",
+        "the light pass of this one runs none of them",
     ] {
         assert!(
             !raw.contains(current),
-            "the unit describes the hourly pass's tools as the light pass's: {current}"
+            "the unit describes its passes as they were before the hourly pass: {current}"
         );
     }
     assert!(
-        raw.contains("the light pass of this one runs none of them"),
+        raw.contains("pass's database probe, which a later release adds"),
         "{raw}"
     );
     let service = uncommented(&raw);
@@ -6755,6 +6758,22 @@ fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() 
         "the light timer runs relative to its last start, never on the minute with the others"
     );
 
+    let timer = uncommented(&deploy_file("propolis-witness@hourly.timer"));
+    let lines: Vec<&str> = timer.lines().map(str::trim).collect();
+    for directive in [
+        "OnActiveSec=3min",
+        "OnCalendar=hourly",
+        "RandomizedDelaySec=600",
+        "Persistent=true",
+        "Unit=propolis-witness@hourly.service",
+        "WantedBy=timers.target",
+    ] {
+        assert!(
+            lines.contains(&directive),
+            "propolis-witness@hourly.timer lacks {directive}"
+        );
+    }
+
     let status = std::process::Command::new("bash")
         .arg("-n")
         .arg(concat!(
@@ -6766,9 +6785,43 @@ fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() 
     assert!(status.success(), "deploy/witness.sh is not valid bash");
 }
 
-/// Both entry points install the witness after the library it sources, install its unit and
-/// light timer in an install loop (so every unit test that walks those loops covers them), and
-/// enable the timer after systemd has reloaded; upgrade does it before any restart, so a failure
+/// The hourly pass runs config-check as root, so it runs only the copy the deploy scripts install
+/// under /usr/local/lib/propolis, owned by root, and what that copy sources beside itself; never a
+/// checkout's copy, which whoever owns the checkout can change.
+#[test]
+fn the_witness_runs_only_the_installed_config_check() {
+    let raw = deploy_file("witness.sh");
+    let code = uncommented(&raw);
+    assert!(
+        code.contains("CC_PATH=\"$ROOT/usr/local/lib/propolis/config-check.sh\""),
+        "the witness names the installed config-check"
+    );
+    assert!(
+        code.contains("\"$ROOT/usr/local/lib/propolis/listeners-lib.sh\""),
+        "the witness checks the installed listener library config-check sources"
+    );
+    for checkout in [
+        "SCRIPT_DIR",
+        "deploy/config-check.sh",
+        "repo-dir",
+        "PROPOLIS_CC_",
+    ] {
+        assert!(
+            !code.contains(checkout),
+            "the witness must not reach a checkout's config-check: {checkout}"
+        );
+    }
+    assert_eq!(
+        code.matches("config-check.sh").count(),
+        1,
+        "config-check is named in one place"
+    );
+}
+
+/// Both entry points install the witness after the library it sources, install its unit and both
+/// timers in an install loop (so every unit test that walks those loops covers them), and enable
+/// the timers after systemd has reloaded, the hourly one on the line after the light one, as the
+/// light one is enabled; upgrade does it before any restart, so a failure
 /// aborts before a service is bounced, and after the maintenance marker, so the first pass
 /// records the restarts as planned work. The dry run shows all of it.
 #[test]
@@ -6802,7 +6855,11 @@ fn install_and_upgrade_install_and_enable_the_witness_after_the_reload() {
             .position(|l| l.ends_with("/usr/local/sbin/propolis-alert-lib"))
             .unwrap();
         assert!(lib < installs[0], "{script_name}: the library first");
-        for unit in ["propolis-witness@.service", "propolis-witness@light.timer"] {
+        for unit in [
+            "propolis-witness@.service",
+            "propolis-witness@light.timer",
+            "propolis-witness@hourly.timer",
+        ] {
             assert!(
                 lines
                     .iter()
@@ -6819,11 +6876,14 @@ fn install_and_upgrade_install_and_enable_the_witness_after_the_reload() {
             .position(|l| l.ends_with("systemctl enable --now propolis-witness@light.timer"))
             .unwrap_or_else(|| panic!("{script_name} never enables the light timer"));
         assert!(reload < enable, "{script_name} enables before the reload");
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains("propolis-witness@hourly.timer")),
-            "{script_name}: the hourly pass is not part of this release"
+        let hourly = lines
+            .iter()
+            .position(|l| l.ends_with("systemctl enable --now propolis-witness@hourly.timer"))
+            .unwrap_or_else(|| panic!("{script_name} never enables the hourly timer"));
+        assert_eq!(
+            hourly,
+            enable + 1,
+            "{script_name} enables the hourly timer on its own line, right after the light one"
         );
         if script_name == "upgrade.sh" {
             let first_restart = lines
@@ -6855,6 +6915,8 @@ fn install_and_upgrade_install_and_enable_the_witness_after_the_reload() {
         "propolis-witness@.service /etc/systemd/system/propolis-witness@.service\n",
         "propolis-witness@light.timer /etc/systemd/system/propolis-witness@light.timer\n",
         "[dry-run] systemctl enable --now propolis-witness@light.timer\n",
+        "propolis-witness@hourly.timer /etc/systemd/system/propolis-witness@hourly.timer\n",
+        "[dry-run] systemctl enable --now propolis-witness@hourly.timer\n",
     ] {
         assert!(
             stdout.contains(expected),

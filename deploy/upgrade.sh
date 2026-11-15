@@ -594,10 +594,10 @@ install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
 install -m 0644 "$SCRIPT_DIR/alert-lib.sh" /usr/local/sbin/propolis-alert-lib
 # The read-only walk (sudo propolis-status), which sources the library above.
 install -m 0755 "$SCRIPT_DIR/propolis-status.sh" /usr/local/sbin/propolis-status
-# The root witness and its unit and light timer, enabled after the reload below. Record only: it
+# The root witness and its unit and timers, enabled after the reload below. Record only: it
 # sends nothing.
 install -m 0755 "$SCRIPT_DIR/witness.sh" /usr/local/sbin/propolis-witness
-for unit in propolis-witness@.service propolis-witness@light.timer; do
+for unit in propolis-witness@.service propolis-witness@light.timer propolis-witness@hourly.timer; do
     install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
 done
 # The public-feed push runs from the operator's cron as propolis-blocklist out of a root-owned copy
@@ -693,6 +693,7 @@ echo "==> enabling the log rotation, backup and witness timers"
 systemctl enable --now propolis-logrotate.timer
 systemctl enable --now propolis-backup.timer
 systemctl enable --now propolis-witness@light.timer
+systemctl enable --now propolis-witness@hourly.timer
 
 echo "==> restarting sensors"
 for unit in sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred; do

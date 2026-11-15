@@ -28,15 +28,19 @@ installed by `deploy/install.sh`:
   delegation to `deploy/provision.sh` (`deploy/provision.sh#ensure_user`,
   `deploy/sensor-ssh.service#User=propolis-ssh`).
 
-Beside them run three oneshots on timers that need no operator input, which `install.sh` and
+Beside them run oneshots on timers that need no operator input, which `install.sh` and
 `upgrade.sh` enable: log rotation (`propolis-logrotate.timer`), the nightly backup
-(`propolis-backup.timer`) and the root witness (`propolis-witness@light.timer`, which runs
-`/usr/local/sbin/propolis-witness light` every five minutes,
-`deploy/propolis-witness@light.timer#OnUnitActiveSec=5min`). The witness judges the failures
-the failure hook recorded, watches every Propolis unit for crash loops and the failed state, and
-writes the login banner; it records and shows, and sends nothing. A witness pass fails its unit
-only on a bad argument, an alert library it cannot load, or its 15-minute limit, and the failure
-hook records that failure without paging. See [health and
+(`propolis-backup.timer`) and the root witness's two passes (`propolis-witness@light.timer`, which
+runs `/usr/local/sbin/propolis-witness light` every five minutes,
+`deploy/propolis-witness@light.timer#OnUnitActiveSec=5min`, and `propolis-witness@hourly.timer`,
+which runs `/usr/local/sbin/propolis-witness hourly` once an hour,
+`deploy/propolis-witness@hourly.timer#OnCalendar=hourly`). The light pass judges the failures the
+failure hook recorded, watches every Propolis unit for crash loops and the failed state, and
+writes the login banner; the hourly pass runs the installed configuration check and records its
+findings, asks the ntfy server whether the alert topic can be read without credentials, and each
+pass checks that the other is still running. The witness records and shows, and sends nothing. A
+witness pass fails its unit only on a bad argument, an alert library it cannot load, or its
+15-minute limit, and the failure hook records that failure without paging. See [health and
 observability](./health-and-observability.md#witness).
 
 The standalone `intake.service`, `review.service`, `feed.service`, and `console.service`
@@ -313,8 +317,16 @@ installed no new binary shows here); `PROPOLIS_SENSOR_LOGS` as a whole; sensor u
 enabled with no bind variable set (the look of a misspelled `*_BIND` name); every env file's
 mode, failing one that accounts other than its owner can read (`0600` for a secret-bearing
 file, `0640` for `watch.env`, `0644` for the generated `fleet-listeners.env`; stricter is fine)
-with the `chmod` that closes it; and, where `propolis-watch` is installed, `watch.env` against
-`propolis.env` and the watcher's authorized key.
+with the `chmod` that closes it; where `propolis-watch` is installed, `watch.env` against
+`propolis.env` and the watcher's authorized key; and the `witness` row
+(`deploy/config-check.sh#check_witness`): where any Propolis unit is enabled, a warning
+`witness-missing` when `/usr/local/sbin/propolis-witness` or the alert library this run loaded is
+missing (fix: the upgrade script; on a collector, the written steps of
+[split deployment](split-deployment.md)), a warning `witness-timer` when
+`propolis-witness@light.timer` or `propolis-witness@hourly.timer` is not enabled (fix: `sudo
+systemctl enable --now` both), and a warning on the row when `/run/propolis-witness` is missing
+because the tmpfiles entry was not applied. The witness's hourly pass runs this check and records
+its findings ([health and observability](health-and-observability.md#finding)).
 
 **Env lines systemd and the shell scripts read differently.** For every `DATABASE_URL` and
 `PROPOLIS_*` setting in a readable `*.env`, the line systemd's `EnvironmentFile=` uses (the last

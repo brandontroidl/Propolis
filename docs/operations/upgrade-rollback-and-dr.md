@@ -643,7 +643,9 @@ reports is also written to the journal, because the terminal may be gone:
 the rollback inside `tmux` or `screen`.
 
 Rolling back to a release from before the nightly backup disables `propolis-backup.timer` until
-the next upgrade, because that release's binary has no `pg-exec`.
+the next upgrade, because that release's binary has no `pg-exec`. Rolling back to a release whose
+witness has no hourly pass disables `propolis-witness@hourly.timer` until the next upgrade,
+because that witness takes only `light`.
 
 ## Disaster recovery
 

@@ -4,6 +4,39 @@
 
 ### Upgrade note
 
+- **The witness gains an hourly pass: a second root timer, an hourly config-check and an
+  anonymous-read check of the alert topic. Nothing is sent.** `install.sh` and `upgrade.sh` now
+  also install and enable `propolis-witness@hourly.timer`, so an upgraded host has a second root
+  timer, `propolis-witness@hourly.service`, which runs `/usr/local/sbin/propolis-witness hourly`
+  first 3 to 13 minutes after the upgrade and then once an hour. Each hourly pass runs the
+  installed `/usr/local/lib/propolis/config-check.sh --tsv --no-events --report-only` once, as
+  root, and records its findings as incidents (sixteen finding ids as PAGE or ACT, the rest as
+  NOTICEs), each only after two runs in a row; a config-check that does not complete on two
+  hourly passes opens `cc-stopped`. Where a push target is set, each hourly pass also sends three
+  GET requests without credentials to the configured ntfy server (the topic's `json`, `raw` and
+  `sse` read paths, asking only for the last second, so nothing stored is fetched), and one more
+  GET with the token when a token is set, to learn whether anyone who knows the topic's name can
+  read it; a light pass does the same once after the URL or topic changes. The answer is stored
+  in `/var/lib/propolis/witness/readcheck` (a hash of the URL and topic, never the topic). The walk
+  gains a `gate` field and the hourly pass's time on its `ALERTS` lines, the read check's answer
+  on the `alert` rail (which now warns while the topic is not proven to refuse anonymous reads),
+  and the hourly timer, the hourly pass's age, the last config-check exit and `cc-stopped` on the
+  `witness` rail, so `sudo propolis-status` may exit `1` where it exited `0` before. The login
+  banner's alert line now reads `topic READABLE by anyone` for a definite answer other than a
+  refusal, `topic refuses anonymous reads` only while the refusal is proven (refused within 24
+  hours, an attempt within 3 hours, over `https://`), `topic not proven private (plain http)`
+  for a refusal over plain HTTP, which anyone on the path could have given, `topic check is
+  stale` when the answer or the last attempt is too old, and `topic not checked yet` before
+  there is an answer for the target in use. Each pass also watches the other: a stopped timer, or a pass
+  older than three hours (hourly) or twenty minutes (light), opens `witness-stale`; a timer just
+  enabled by the upgrade has three hours before its first pass counts as late, and nothing is
+  judged in the first half hour after a boot. `config-check` gains a `witness` row with the
+  warnings `witness-missing` and `witness-timer`. A rollback to a kept release whose witness has
+  no hourly pass disables `propolis-witness@hourly.timer` until the next upgrade, and says so,
+  since that witness would exit 2 every hour. Nothing is pushed: no message goes to the
+  ntfy server or anywhere else, and every transition the new paging would send only adds one to
+  the record's `would_push`.
+
 - **A root witness now runs on a timer; it records and shows, and pushes nothing in the default
   profile.** `install.sh` and `upgrade.sh` install `/usr/local/sbin/propolis-witness`,
   `propolis-witness@.service` and `propolis-witness@light.timer`, and enable the timer: a light

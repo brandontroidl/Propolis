@@ -1149,6 +1149,66 @@ fn the_witness_is_kept_with_the_helpers_and_put_back_executable() {
     assert!(read(&units.join("propolis-witness@light.timer")).contains("# kept"));
 }
 
+/// A kept witness from before the hourly pass takes only `light` and exits 2 for anything else,
+/// so the newer release's propolis-witness@hourly.timer would fail every hour once it is back: the
+/// rollback turns that timer off until the next upgrade and says so. A kept release with no
+/// witness at all keeps the current witness, and leaves its hourly timer alone.
+#[test]
+fn a_kept_witness_without_an_hourly_pass_turns_the_hourly_timer_off() {
+    let fx = Fixture::new();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(1)).unwrap();
+    write_exec(&sbin.join("propolis-witness"), &consumer_needing(1));
+    let units = fx.root.join("etc/systemd/system");
+    std::fs::write(units.join("propolis-witness@.service"), "[Service]\n").unwrap();
+    std::fs::write(units.join("propolis-witness@light.timer"), "[Timer]\n").unwrap();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(
+        units.join("propolis-witness@hourly.timer"),
+        "[Timer]\n# newer\n",
+    )
+    .unwrap();
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    let log = fx.log();
+    assert!(
+        log.contains("systemctl disable --now propolis-witness@hourly.timer"),
+        "{log}"
+    );
+    assert_in_order(
+        &log,
+        &[
+            "systemctl daemon-reload",
+            "systemctl disable --now propolis-witness@hourly.timer",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "the kept witness has no hourly pass: propolis-witness@hourly.timer is disabled until the next upgrade"
+        ),
+        "{stdout}"
+    );
+
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let sbin = fx.root.join("usr/local/sbin");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(1)).unwrap();
+    write_exec(&sbin.join("propolis-witness"), &consumer_needing(1));
+    let units = fx.root.join("etc/systemd/system");
+    std::fs::write(units.join("propolis-witness@hourly.timer"), "[Timer]\n").unwrap();
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    assert!(
+        !fx.log().contains("propolis-witness@hourly.timer"),
+        "{}",
+        fx.log()
+    );
+    assert!(read(&sbin.join("propolis-witness")).contains("needs-alert-lib: 1"));
+}
+
 /// The library version rule, the direction that keeps the current library: a consumer that the
 /// rollback leaves in place needs more than the kept library has, so restoring it would leave
 /// that consumer calling functions that are not there.

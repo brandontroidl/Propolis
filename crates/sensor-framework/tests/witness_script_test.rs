@@ -92,11 +92,40 @@ const LOGGER_STUB: &str = r#"#!/usr/bin/env bash
 printf 'logger %s\n' "$*" >> "$STUB_LOG"
 "#;
 
-/// The witness of this release pushes nothing: any call is recorded and fails.
+/// The witness pushes nothing; its only requests are the read check's GETs. Records its argv in
+/// the stub log and its environment in `curl.env`; with no `curl.answer` beside the units it
+/// fails as an unreachable server does, and with one (`code|content type`) it answers every GET
+/// with that, an empty body, in the `-w` form asked for.
 const CURL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$STUB_LOG"
-exit 7
+d="${UNITS%/units}"
+env | sed 's/^/curl-env /' >> "$d/curl.env"
+[ -f "$d/curl.answer" ] || exit 7
+out=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift ;; esac
+    shift
+done
+: > "$out"
+IFS='|' read -r code ct < "$d/curl.answer"
+printf '%s\t%s' "$code" "$ct"
 "#;
+
+/// The installed config-check: records its argv, runs `cc.during` (a bash script) when there is
+/// one, as something else that happens on the host while it runs, prints `cc.tsv` and exits with
+/// the status in `cc.rc` (0 without one).
+const CC_STUB: &str = r#"#!/usr/bin/env bash
+printf 'config-check %s\n' "$*" >> "$STUB_LOG"
+d="${UNITS%/units}"
+[ ! -f "$d/cc.during" ] || bash "$d/cc.during"
+[ ! -f "$d/cc.tsv" ] || cat "$d/cc.tsv"
+rc=0
+[ ! -f "$d/cc.rc" ] || rc="$(cat "$d/cc.rc")"
+exit "$rc"
+"#;
+
+/// The read-check binding of the fixture's target (https://ntfy.example.invalid, t0p1c-secret).
+const FX_BINDING: &str = "8f24b729c8ebd3c1";
 
 const SETPRIV_STUB: &str = r#"#!/usr/bin/env bash
 printf 'setpriv %s\n' "$*" >> "$STUB_LOG"
@@ -119,6 +148,14 @@ fn mode_of(path: &Path) -> u32 {
 /// The stamp of time `t` (seconds after the first pass) in this boot.
 fn stamp(t: u64) -> String {
     format!("{}/{BOOT}/{}", WALL + t, UP + t)
+}
+
+/// The readcheck file every fixture starts with: one attempt for the fixture's target, no answer.
+fn fixture_readcheck() -> String {
+    format!(
+        "#readcheck v1 g=1\nR\t{FX_BINDING}\t{}\ttransient\t-\t-\t-\t000\t000\tboth\t000\n",
+        stamp(0)
+    )
 }
 
 /// `ActiveEnterTimestampMonotonic` of a unit that, at time `t`, has been active for `secs`.
@@ -242,6 +279,23 @@ impl Fx {
         ] {
             fx.unit(timer, &[("SubState", "waiting")]);
         }
+        // The hourly timer was enabled ten minutes before the first pass, and the hourly pass has
+        // not run yet: what a host sees just after the upgrade that brought it.
+        fx.unit(
+            "propolis-witness@hourly.timer",
+            &[
+                ("SubState", "waiting"),
+                ("ActiveEnterTimestampMonotonic", &entered(0, 600)),
+            ],
+        );
+        // An attempt of the read check is stored for the fixture's target, without an answer, so a
+        // light pass has nothing to check and the banner reads `topic not checked yet`.
+        fx.write("var/lib/propolis/witness/readcheck", &fixture_readcheck());
+        std::fs::set_permissions(
+            fx.p("var/lib/propolis/witness/readcheck"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         fx
     }
 
@@ -346,6 +400,73 @@ impl Fx {
         r
     }
 
+    /// One hourly pass at time `t`, with the light pass's heartbeat line made fresh first (on a
+    /// host the light pass runs every five minutes); every pass must exit 0.
+    fn hourly(&self, t: u64) -> Run {
+        let hb = self.read("run/propolis-witness/heartbeat");
+        let mut body: String = hb
+            .lines()
+            .filter(|l| l.starts_with("B\t") && !l.starts_with("B\tlight\t"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        body.push_str(&format!("B\tlight\t{}\tpersistent\tok\n", stamp(t)));
+        self.write(
+            "run/propolis-witness/heartbeat",
+            &format!("#heartbeat v1 g=1\n{body}"),
+        );
+        self.hourly_alone(t)
+    }
+
+    /// One hourly pass at time `t`, the heartbeat file left as it is; it must exit 0.
+    fn hourly_alone(&self, t: u64) -> Run {
+        let r = self.run_args(&["hourly"], t);
+        assert_eq!(r.code, 0, "hourly pass at {t}: {}\n{}", r.out, r.err);
+        r
+    }
+
+    /// Installs the config-check stub where the witness runs it from, under directories the
+    /// ownership check accepts.
+    fn install_cc(&self) {
+        write_exec(&self.p("usr/local/lib/propolis/config-check.sh"), CC_STUB);
+        // What the installed config-check sources beside itself, as the deploy scripts install it.
+        self.write(
+            "usr/local/lib/propolis/listeners-lib.sh",
+            "# the listener inventory\n",
+        );
+        std::fs::set_permissions(
+            self.p("usr/local/lib/propolis/listeners-lib.sh"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        for d in ["usr/local/lib", "usr/local/lib/propolis"] {
+            std::fs::set_permissions(self.p(d), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// What the config-check stub prints on its next run (and with what status).
+    fn cc(&self, tsv: &str, rc: i32) {
+        std::fs::write(self.dir.path().join("cc.tsv"), tsv).unwrap();
+        std::fs::write(self.dir.path().join("cc.rc"), rc.to_string()).unwrap();
+    }
+
+    /// A bash script the config-check stub runs while it runs.
+    fn cc_during(&self, script: &str) {
+        std::fs::write(self.dir.path().join("cc.during"), script).unwrap();
+    }
+
+    /// What the curl stub answers every GET with (`code|content type`).
+    fn curl_answers(&self, answer: &str) {
+        std::fs::write(self.dir.path().join("curl.answer"), answer).unwrap();
+    }
+
+    fn curl_env(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("curl.env")).unwrap_or_default()
+    }
+
+    fn observe_text(&self) -> String {
+        self.read("var/lib/propolis/witness/observe")
+    }
+
     fn records(&self) -> Vec<Vec<String>> {
         self.read("var/lib/propolis/witness/incidents")
             .lines()
@@ -372,7 +493,8 @@ impl Fx {
         );
     }
 
-    /// Every file under the root's alerting directories (not the lock the fixture made).
+    /// Every file under the root's alerting directories (not the lock the fixture made, nor its
+    /// read-check line while no pass has rewritten it).
     fn state_files(&self) -> Vec<PathBuf> {
         let mut out = Vec::new();
         for d in [
@@ -383,6 +505,10 @@ impl Fx {
             walk(&self.p(d), &mut out);
         }
         out.retain(|p| !p.ends_with("var/lib/propolis/witness/state.lock"));
+        out.retain(|p| {
+            !(p.ends_with("var/lib/propolis/witness/readcheck")
+                && std::fs::read_to_string(p).unwrap_or_default() == fixture_readcheck())
+        });
         out
     }
 
@@ -1466,7 +1592,8 @@ fn an_argument_other_than_light_exits_2_before_anything_is_read() {
     let fx = Fx::new();
     for args in [
         vec![],
-        vec!["hourly"],
+        vec!["Hourly"],
+        vec!["hourly", "light"],
         vec!["Light"],
         vec!["light", "light"],
         vec!["light;x"],
@@ -2682,4 +2809,1573 @@ fn a_library_in_a_world_writable_directory_is_never_sourced() {
     );
     assert!(!sourced.exists(), "the library was sourced");
     assert!(fx.state_files().is_empty());
+}
+
+// ---- the hourly pass --------------------------------------------------------------------------
+
+/// The first 12 hex of sha256(KEY), as config-check's TSV carries a finding's key.
+fn k12(key: &str) -> String {
+    use std::io::Write;
+    let mut child = {
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        Command::new("sha256sum")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(key.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout)[..12].to_string()
+}
+
+/// A completed config-check run in its TSV form: `lines` (G and R records) as written, then one
+/// F record (with an X fix line) per finding, given as (level, full key, scope), and the E count.
+fn cc_tsv(lines: &[&str], findings: &[(&str, &str, &str)]) -> String {
+    let mut s = String::from("#config-check tsv v1\nS\tfail\t2\t1\t0\t0\t1\t1800000000\t1\n");
+    for l in lines {
+        s.push_str(l);
+        s.push('\n');
+    }
+    for (level, key, scope) in findings {
+        let id = key.split(':').next().unwrap();
+        s.push_str(&format!(
+            "F\t{level}\t{id}\t{}\t{scope}\tmanual\tthe message\nX\tthe fix\n",
+            k12(key)
+        ));
+    }
+    s.push_str(&format!("E\t{}\n", findings.len()));
+    s
+}
+
+/// A listener row of the TSV: scope, unit, and every cell ok but the firewall cell given.
+fn r_line(scope: &str, unit: &str, firewall: &str) -> String {
+    format!("R\t{scope}\t{unit}\tfail\tok\tfail\t{firewall}\tok\tok\tok")
+}
+
+/// Every page row of WITNESS_CC_TABLE, fed twice by a completed run, opens one finding record at
+/// the table's tier and stage with the instance the row says how to find, and v2 would push each
+/// open once. A daily row opens a NOTICE that would push nothing; a never row, and an id with no
+/// row, are not recorded; every unlisted spool folds into one record that counts them.
+#[test]
+fn every_page_row_of_the_eligibility_table_opens_once_after_two_completed_runs() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_SENSOR_LOGS=ssh:/var/log/propolis/ssh/events.jsonl,http:/var/log/propolis/http/events.jsonl,c1:/var/spool/propolis/gateway/c1/events.jsonl\n",
+    );
+    fx.unit(
+        "sensor-redis.service",
+        &[("ActiveState", "inactive"), ("SubState", "dead")],
+    );
+    let page: &[(&str, &str, &str, &str, &str, char)] = &[
+        (
+            "fail",
+            "unit-missing:sensor-telnet",
+            "sensor-telnet",
+            "PAGE",
+            "listen",
+            'u',
+        ),
+        (
+            "fail",
+            "unit-down:sensor-redis",
+            "sensor-redis",
+            "PAGE",
+            "listen",
+            'u',
+        ),
+        (
+            "fail",
+            "listen-foreign:tcp:22",
+            "ssh/tcp",
+            "PAGE",
+            "listen",
+            'u',
+        ),
+        (
+            "fail",
+            "listen-loopback:tcp:80",
+            "http/tcp",
+            "PAGE",
+            "listen",
+            'u',
+        ),
+        (
+            "fail",
+            "listen-none:udp:69",
+            "tftp/udp",
+            "PAGE",
+            "listen",
+            'u',
+        ),
+        ("warn", "fw:tcp:21", "ftp/tcp", "ACT", "listen", 'u'),
+        ("fail", "danger:tcp:25", "smtp/tcp", "PAGE", "listen", 'u'),
+        (
+            "fail",
+            "spool-label-sensor:/var/spool/propolis/gateway/c1/events.jsonl",
+            "gateway-spool",
+            "PAGE",
+            "gateway",
+            's',
+        ),
+        (
+            "fail",
+            "intake-wrongpath:/var/log/propolis/ssh/events.jsonl",
+            "ssh/tcp",
+            "ACT",
+            "intake",
+            's',
+        ),
+        (
+            "fail",
+            "intake-absent:/var/log/propolis/mqtt/events.jsonl",
+            "mqtt/tcp",
+            "ACT",
+            "intake",
+            '-',
+        ),
+        (
+            "fail",
+            "logsize-fail:/var/log/propolis/http/events.jsonl",
+            "http/tcp",
+            "ACT",
+            "source",
+            's',
+        ),
+        ("fail", "stale", "logrotate", "ACT", "source", '-'),
+        ("fail", "backup-timer", "backup", "ACT", "backup", '-'),
+        ("fail", "backup-stale", "backup", "ACT", "backup", '-'),
+        ("fail", "ops-failure-hook", "alerting", "ACT", "alert", '-'),
+    ];
+    let mut findings: Vec<(&str, &str, &str)> = page.iter().map(|p| (p.0, p.1, p.2)).collect();
+    findings.extend([
+        ("fail", "spool-unlisted:collector-01", "gateway-spool"),
+        ("fail", "spool-unlisted:collector-02", "gateway-spool"),
+        ("warn", "unit-notenabled:sensor-ssh", "sensor-ssh"),
+        ("warn", "stamp-behind", "deploy-stamp"),
+        ("fail", "made-up-finding:x", "x"),
+    ]);
+    let rows = [
+        r_line("ssh/tcp", "sensor-ssh", "ok"),
+        r_line("http/tcp", "sensor-http", "ok"),
+        r_line("tftp/udp", "sensor-tftp", "ok"),
+        r_line("ftp/tcp", "sensor-ftp", "fail"),
+        r_line("smtp/tcp", "sensor-smtp", "ok"),
+        r_line("mqtt/tcp", "sensor-mqtt", "ok"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    fx.cc(&cc_tsv(&rows, &findings), 0);
+    fx.hourly(0);
+    for p in page {
+        let key = format!("finding:{}:{}", p.1.split(':').next().unwrap(), k12(p.1));
+        let f = fx.record(&key).unwrap_or_else(|| {
+            panic!(
+                "{} not recorded:\n{}",
+                p.1,
+                fx.read("var/lib/propolis/witness/incidents")
+            )
+        });
+        assert_eq!(f[7], "pending", "{}: one run opens nothing", p.1);
+    }
+    fx.hourly(3600);
+    for (_, key_text, _, tier, stage, inst) in page {
+        let key = format!(
+            "finding:{}:{}",
+            key_text.split(':').next().unwrap(),
+            k12(key_text)
+        );
+        let f = fx.record(&key).unwrap();
+        assert_eq!(
+            (f[3].as_str(), f[4].as_str(), f[6].as_str(), f[7].as_str()),
+            ("finding", *stage, *tier, "open"),
+            "{key_text}"
+        );
+        assert_eq!(
+            (f[11].as_str(), f[29].as_str()),
+            ("config.finding", "1"),
+            "{key_text}"
+        );
+        if *inst == '-' {
+            assert_eq!(f[5], "-", "{key_text}");
+        } else {
+            assert!(
+                f[5].starts_with(*inst) && f[5].len() == 6,
+                "{key_text}: instance {}",
+                f[5]
+            );
+        }
+    }
+    let f = fx.record("finding:spool-unlisted:all").unwrap();
+    assert_eq!(
+        (f[6].as_str(), f[7].as_str(), f[34].as_str()),
+        ("ACT", "open", "2"),
+        "every unlisted spool in one record"
+    );
+    let f = fx
+        .record(&format!(
+            "finding:unit-notenabled:{}",
+            k12("unit-notenabled:sensor-ssh")
+        ))
+        .unwrap();
+    assert_eq!(
+        (f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("NOTICE", "open", "0")
+    );
+    for absent in ["stamp-behind", "made-up-finding:x"] {
+        let id = absent.split(':').next().unwrap();
+        assert!(
+            fx.record(&format!("finding:{id}:{}", k12(absent)))
+                .is_none(),
+            "{absent} recorded"
+        );
+    }
+    assert_eq!(
+        fx.records().len(),
+        page.len() + 2,
+        "{}",
+        fx.read("var/lib/propolis/witness/incidents")
+    );
+    assert!(
+        fx.log()
+            .contains("config-check --tsv --no-events --report-only\n"),
+        "{}",
+        fx.log()
+    );
+    let hb = fx.read("run/propolis-witness/heartbeat");
+    assert!(
+        hb.contains(&format!("B\thourly\t{}\t", stamp(3600))),
+        "{hb}"
+    );
+    assert_eq!(fx.meta("hourly_last"), Some(stamp(3600)));
+    assert!(
+        fx.meta("cc_last")
+            .is_some_and(|v| v.starts_with(&format!("{}/0/", stamp(3600)))),
+        "{:?}",
+        fx.meta("cc_last")
+    );
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("0"));
+}
+
+/// A finding seen once is dropped when the next completed run lacks it. An open one resolves
+/// clean2 on the second completed run in a row without it, and a run whose row for the finding
+/// could not be checked says nothing either way. A unit-down whose unit systemd calls failed and
+/// a listen-foreign on a port a danger finding holds are daily for those passes (a NOTICE); a fw
+/// finding whose firewall cell is unknown is held: neither opened nor counted clean.
+#[test]
+fn a_finding_resolves_after_two_clean_runs_and_a_limited_row_or_a_held_finding_says_nothing() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.unit(
+        "sensor-redis.service",
+        &[("ActiveState", "failed"), ("SubState", "failed")],
+    );
+    let held = [
+        ("fail", "unit-down:sensor-redis", "sensor-redis"),
+        ("fail", "listen-foreign:tcp:25", "smtp/tcp"),
+        ("fail", "danger:tcp:25", "smtp/tcp"),
+        ("warn", "fw:tcp:21", "ftp/tcp"),
+    ];
+    let rows = [
+        r_line("smtp/tcp", "sensor-smtp", "ok"),
+        r_line("ftp/tcp", "sensor-ftp", "unknown"),
+    ];
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let mut first = vec![
+        ("fail", "stale", "logrotate"),
+        ("fail", "backup-timer", "backup"),
+    ];
+    first.extend(held);
+    fx.cc(&cc_tsv(&rows, &first), 0);
+    fx.hourly(0);
+    let stale = format!("finding:stale:{}", k12("stale"));
+    let timer = format!("finding:backup-timer:{}", k12("backup-timer"));
+    assert_eq!(fx.record(&stale).unwrap()[7], "pending");
+    assert_eq!(fx.record(&timer).unwrap()[7], "pending");
+    let mut second = vec![("fail", "stale", "logrotate")];
+    second.extend(held);
+    fx.cc(&cc_tsv(&rows, &second), 0);
+    fx.hourly(3600);
+    assert_eq!(fx.record(&stale).unwrap()[7], "open");
+    assert!(
+        fx.record(&timer).is_none(),
+        "seen once, then absent: dropped"
+    );
+    // A unit-down whose unit systemd calls failed (unit-failed pages it) and a listen-foreign on a
+    // port a danger finding holds (danger pages it) are daily for those passes: a NOTICE that would
+    // push nothing. A fw finding whose firewall cell is unknown is held: never opened.
+    for (_, key, _) in held {
+        let id = key.split(':').next().unwrap();
+        let f = fx.record(&format!("finding:{id}:{}", k12(key)));
+        match id {
+            "danger" => {}
+            "unit-down" | "listen-foreign" => {
+                let f = f.unwrap_or_else(|| panic!("{key} not recorded"));
+                assert_eq!(
+                    (f[6].as_str(), f[7].as_str(), f[29].as_str()),
+                    ("NOTICE", "open", "0"),
+                    "{key}"
+                );
+            }
+            _ => assert!(f.is_none(), "{key} is held, never opened"),
+        }
+    }
+    fx.cc(
+        &cc_tsv(&["G\tlogrotate\tunknown\tstate file not readable"], &[]),
+        0,
+    );
+    fx.hourly(7200);
+    assert_eq!(
+        fx.record(&stale).unwrap()[7],
+        "open",
+        "a limited row says nothing"
+    );
+    assert!(
+        !fx.observe_text().contains(&format!("clean:{stale}")),
+        "{}",
+        fx.observe_text()
+    );
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.hourly(10800);
+    assert_eq!(
+        fx.record(&stale).unwrap()[7],
+        "open",
+        "one clean run is not two"
+    );
+    assert!(
+        fx.observe_text().contains(&format!("P\tclean:{stale}\t")),
+        "{}",
+        fx.observe_text()
+    );
+    fx.hourly(14400);
+    let f = fx.record(&stale).unwrap();
+    assert_eq!(
+        (f[7].as_str(), f[22].as_str(), f[29].as_str()),
+        ("resolved", "clean2", "2")
+    );
+    assert!(
+        !fx.observe_text().contains(&format!("clean:{stale}")),
+        "{}",
+        fx.observe_text()
+    );
+}
+
+/// A config-check that does not complete (an exit with no output, an output cut off before its E
+/// line, a missing or untrusted script) raises meta cc_fail and marks the pass partial; the second
+/// hourly pass in a row opens cc-stopped, an ACT on the witness rail with cause cc.stopped. Two
+/// completed runs resolve it. The pass still exits 0, and a finding of the last completed run
+/// keeps its state.
+#[test]
+fn config_check_failing_twice_opens_cc_stopped_and_two_completed_runs_resolve_it() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let stale = format!("finding:stale:{}", k12("stale"));
+    assert_eq!(fx.record(&stale).unwrap()[7], "open");
+    fx.cc("", 70);
+    fx.hourly(7200);
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("1"));
+    assert!(fx.record("tool:config-check").is_none());
+    assert!(
+        fx.read("run/propolis-witness/heartbeat").contains(&format!(
+            "B\thourly\t{}\tpersistent\tpartial\n",
+            stamp(7200)
+        )),
+        "{}",
+        fx.read("run/propolis-witness/heartbeat")
+    );
+    let cut = cc_tsv(&[], &[("fail", "stale", "logrotate")]);
+    let cut = cut.rsplit_once("E\t").unwrap().0.to_string();
+    fx.cc(&cut, 0);
+    fx.hourly(10800);
+    let f = fx.record("tool:config-check").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str()
+        ),
+        ("cc-stopped", "witness", "ACT", "open", "cc.stopped")
+    );
+    assert_eq!(f[29], "1", "v2 would push it");
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("2"));
+    assert_eq!(
+        fx.record(&stale).unwrap()[7],
+        "open",
+        "the last completed run's finding stays"
+    );
+    assert!(
+        fx.log()
+            .contains("config-check did not complete: output cut off or incomplete"),
+        "{}",
+        fx.log()
+    );
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.hourly(14400);
+    assert_eq!(fx.record("tool:config-check").unwrap()[7], "open");
+    fx.hourly(18000);
+    let f = fx.record("tool:config-check").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "clean2"));
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("0"));
+
+    // Missing, then not trusted: not run, a failure all the same, and no exit status is claimed
+    // for a run that did not take place.
+    let fx = Fx::new();
+    fx.hourly(0);
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("1"));
+    assert_eq!(fx.meta("cc_last"), Some(format!("{}/-/0", stamp(0))));
+    assert!(
+        fx.log()
+            .contains("config-check did not complete: not installed"),
+        "{}",
+        fx.log()
+    );
+    fx.install_cc();
+    std::fs::set_permissions(
+        fx.p("usr/local/lib/propolis"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    fx.hourly(3600);
+    assert!(
+        !fx.log().contains("config-check --tsv"),
+        "an untrusted config-check never runs"
+    );
+    assert!(
+        fx.log()
+            .contains("config-check did not complete: not trusted: "),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(fx.record("tool:config-check").unwrap()[7], "open");
+}
+
+/// config-check's output is untrusted text: a finding line whose id or key hash is not in its
+/// form is skipped and counted, and a finding's tier comes from the table, not from its level.
+#[test]
+fn a_finding_line_out_of_form_is_skipped_and_the_tier_comes_from_the_table() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let good = cc_tsv(&[], &[("fail", "unit-notenabled:sensor-ssh", "sensor-ssh")]);
+    let bad = good.replace(
+        "E\t1\n",
+        "F\tfail\tunit missing\t0123456789ab\tx\t-\tm\nF\tfail\tstale\tnot-hex-at-a\tx\t-\tm\nE\t3\n",
+    );
+    fx.cc(&bad, 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx
+        .record(&format!(
+            "finding:unit-notenabled:{}",
+            k12("unit-notenabled:sensor-ssh")
+        ))
+        .unwrap();
+    assert_eq!((f[6].as_str(), f[7].as_str()), ("NOTICE", "open"));
+    assert_eq!(
+        fx.records().len(),
+        1,
+        "{}",
+        fx.read("var/lib/propolis/witness/incidents")
+    );
+    assert!(
+        fx.log()
+            .contains("config-check printed 2 finding lines that are not in its form; skipped"),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(fx.meta("cc_skipped").as_deref(), Some("2"));
+    fx.cc(&good, 0);
+    fx.hourly(7200);
+    assert_eq!(fx.meta("cc_skipped").as_deref(), Some("0"));
+}
+
+/// The hourly pass computes without the lock and then reads the state files afresh: a record the
+/// failure hook changed while config-check ran keeps that change, the light pass's observe lines
+/// stay exactly as written, and the hourly pass adds only its own.
+#[test]
+fn a_record_the_hook_changes_while_the_hourly_pass_computes_keeps_the_change() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.incidents(&[hook_record("w#8", "shipper.service", "ACT", "open", 0, "0")]);
+    let light_lines = format!(
+        "U\tsensor-ssh.service\t{s}\t0\t{BOOT}\tactive\t{a}\t0\t{s}\nR\tsensor-ssh.service\t{s}\t0\nP\tunits\t{s}\tok\t-\t4\n",
+        s = stamp(0),
+        a = entered(0, 86_400)
+    );
+    fx.observe(&light_lines);
+    fx.cc_during(
+        ". \"$PROPOLIS_ALERT_ROOT/usr/local/sbin/propolis-alert-lib\" && pa_init \"$PROPOLIS_ALERT_ROOT\" \
+         && PA_HOOK_UNIT=shipper.service PA_HOOK_OUT=undelivered PA_HOOK_T0=0 pa_hook_record\n\
+         . \"$PROPOLIS_ALERT_ROOT/usr/local/sbin/propolis-alert-lib\" && pa_init \"$PROPOLIS_ALERT_ROOT\" \
+         && PA_HOOK_UNIT=sensor-ssh.service PA_HOOK_OUT=delivered PA_HOOK_T0=0 pa_hook_record\n",
+    );
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.hourly(300);
+    let f = fx.record("unit:shipper.service").unwrap();
+    assert_eq!(
+        (f[7].as_str(), f[31].as_str(), f[33].as_str()),
+        ("open", "2", "undelivered"),
+        "the hook's firing during the pass is kept"
+    );
+    assert_eq!(fx.record("unit:sensor-ssh.service").unwrap()[7], "pending");
+    assert_eq!(
+        fx.record(&format!("finding:stale:{}", k12("stale")))
+            .unwrap()[7],
+        "pending"
+    );
+    let observe = fx.observe_text();
+    for line in light_lines.lines() {
+        assert!(
+            observe.contains(&format!("{line}\n")),
+            "{line} lost:\n{observe}"
+        );
+    }
+    assert!(observe.contains("P\tconfig-check\t"), "{observe}");
+}
+
+/// The readcheck file may hold lines of a type this release does not know (a later release's): a
+/// pass that stores its own answer keeps them as read.
+#[test]
+fn a_readcheck_line_of_an_unknown_type_survives_a_pass_that_stores_its_answer() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=7\nR\t{FX_BINDING}\t{s}\ttransient\t-\t-\t-\t000\t000\tboth\t000\nZ\tkept\tfor-a-later-release\n",
+            s = stamp(0)
+        ),
+    );
+    fx.curl_answers("403|text/plain; charset=utf-8");
+    fx.hourly(300);
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(
+        rc.contains(&format!("\trefused\t{}\trefused\t", stamp(300))),
+        "the pass stored its answer: {rc}"
+    );
+    assert!(rc.contains("Z\tkept\tfor-a-later-release\n"), "{rc}");
+}
+
+/// The read check from the hourly pass: three anonymous GETs and, with a token set, a fourth with
+/// it; the topic and the token reach curl through files, never its arguments or environment. The
+/// answer is stored for the gate and the banner; a light pass does not ask again while the
+/// target is the same, and asks within five minutes once the topic changes. Nothing is posted.
+#[test]
+fn the_hourly_read_check_stores_its_answer_and_a_changed_topic_is_checked_by_the_light_pass() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk_s3cret-value\n",
+    );
+    fx.curl_answers("403|text/plain; charset=utf-8");
+    fx.hourly(0);
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(
+        rc.contains(&format!(
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tboth\t403\n",
+            s = stamp(0)
+        )),
+        "{rc}"
+    );
+    let calls: Vec<String> = fx
+        .log()
+        .lines()
+        .filter(|l| l.starts_with("curl "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    for call in &calls {
+        assert!(call.contains(" -K "), "{call}");
+        for word in [" -d", "--data", " -X", " -T", "POST"] {
+            assert!(!call.contains(word), "{call}");
+        }
+    }
+    for secret in ["t0p1c-secret", "tk_s3cret-value"] {
+        assert!(!fx.log().contains(secret), "{secret} on a command line");
+        assert!(
+            !fx.curl_env().contains(secret),
+            "{secret} in curl's environment"
+        );
+    }
+    fx.pass(300);
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        4,
+        "the light pass does not ask again for the same target"
+    );
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .contains("alerts: topic refuses anonymous reads"),
+        "{}",
+        fx.read("run/motd.d/propolis")
+    );
+
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=n3w-topic\n",
+    );
+    fx.curl_answers("200|application/x-ndjson");
+    fx.pass(600);
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        7
+    );
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert_eq!(
+        rc.lines().filter(|l| l.starts_with("R\t")).count(),
+        1,
+        "{rc}"
+    );
+    assert!(
+        rc.contains(&format!(
+            "\treadable\t{}\treadable\t-\t200\t200\tboth\t200\n",
+            stamp(600)
+        )),
+        "{rc}"
+    );
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .contains("alerts: topic READABLE by anyone"),
+        "{}",
+        fx.read("run/motd.d/propolis")
+    );
+    assert!(!fx.log().contains("n3w-topic"));
+}
+
+/// A read check that keeps getting no answer is a check that cannot run: unknown on three hourly
+/// passes in a row opens the NOTICE tool-unusable on tool:readcheck, and each such pass is partial.
+#[test]
+fn a_read_check_without_an_answer_on_three_hourly_passes_opens_tool_unusable() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    for t in [0, 3600, 7200] {
+        fx.hourly(t);
+    }
+    let f = fx.record("tool:readcheck").unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[7].as_str(), f[11].as_str()),
+        ("tool-unusable", "NOTICE", "open", "net.connect")
+    );
+    assert!(
+        fx.read("run/propolis-witness/heartbeat")
+            .contains("\tpartial\n")
+    );
+}
+
+/// The light pass judges the hourly pass: a stopped hourly timer opens witness-stale on
+/// witness:hourly on the second light pass, and two fresh checks resolve it fresh2. A host just
+/// upgraded, whose hourly timer started ten minutes ago and has not run yet, is not stale; one
+/// whose timer has run for over three hours without a pass is.
+#[test]
+fn a_stopped_hourly_timer_opens_witness_stale_and_a_new_one_has_three_hours_to_run() {
+    let fx = Fx::new();
+    for t in [0, 300, 600] {
+        fx.pass(t);
+    }
+    assert!(
+        fx.record("witness:hourly").is_none(),
+        "a timer started 10 min ago is fresh"
+    );
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveState", "inactive"), ("UnitFileState", "disabled")],
+    );
+    fx.pass(900);
+    assert_eq!(fx.record("witness:hourly").unwrap()[7], "pending");
+    fx.pass(1200);
+    let f = fx.record("witness:hourly").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        (
+            "witness-stale",
+            "witness",
+            "ACT",
+            "open",
+            "witness.stale",
+            "1"
+        )
+    );
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveEnterTimestampMonotonic", &entered(1500, 60))],
+    );
+    fx.pass(1500);
+    assert_eq!(
+        fx.record("witness:hourly").unwrap()[7],
+        "open",
+        "one fresh check is not two"
+    );
+    fx.pass(1800);
+    let f = fx.record("witness:hourly").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "fresh2"));
+
+    let fx = Fx::new();
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveEnterTimestampMonotonic", &entered(0, 10_900))],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("witness:hourly").unwrap()[7], "open");
+}
+
+/// The other pass's age is the newer of its heartbeat line and its meta stamp: after a reboot
+/// /run is empty, and a recent meta stamp still counts. Nothing is judged in the first 1800 s of
+/// uptime, when the hourly timer's first run may still be minutes away.
+#[test]
+fn witness_stale_is_not_judged_after_a_boot_and_a_recent_meta_stamp_counts_without_run() {
+    let mut fx = Fx::new();
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveEnterTimestampMonotonic", &entered(0, 20_000))],
+    );
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\thourly_last\t{}/{BOOT}/{}\n",
+            WALL - 3000,
+            UP - 3000
+        ),
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert!(fx.record("witness:hourly").is_none(), "{:?}", fx.records());
+
+    fx.write("var/lib/propolis/witness/meta", "#meta v1 g=1\n");
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveState", "inactive"), ("UnitFileState", "disabled")],
+    );
+    for t in [600u64, 900, 1200] {
+        fx.setenv(
+            "PROPOLIS_WITNESS_NOW",
+            &format!("{}/{BOOT}/{}", WALL + t, 100 + t),
+        );
+        fx.pass(t);
+    }
+    assert!(fx.record("witness:hourly").is_none(), "{:?}", fx.records());
+}
+
+/// The hourly pass judges the light pass: a light pass over twenty minutes old opens
+/// witness-stale on witness:light on the second hourly pass.
+#[test]
+fn the_hourly_pass_opens_witness_stale_for_a_light_pass_over_twenty_minutes_old() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=1\nM\tlight_last\t{}\n", stamp(0)),
+    );
+    fx.hourly_alone(1500);
+    assert_eq!(fx.record("witness:light").unwrap()[7], "pending");
+    fx.hourly_alone(5100);
+    let f = fx.record("witness:light").unwrap();
+    assert_eq!((f[3].as_str(), f[7].as_str()), ("witness-stale", "open"));
+    fx.pass(5200);
+    fx.hourly_alone(5300);
+    assert_eq!(fx.record("witness:light").unwrap()[7], "open");
+    fx.pass(5400);
+    fx.hourly_alone(5500);
+    assert_eq!(fx.record("witness:light").unwrap()[22], "fresh2");
+}
+
+/// An hourly pass past its deadline judges nothing more: its findings stay unrecorded, its
+/// heartbeat line is partial, and it still exits 0.
+#[test]
+fn an_hourly_pass_past_its_deadline_judges_nothing_more_and_is_partial() {
+    let mut fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.setenv("PROPOLIS_WITNESS_DEADLINE", "0");
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert!(fx.records().is_empty(), "{:?}", fx.records());
+    assert!(
+        fx.read("run/propolis-witness/heartbeat").contains(&format!(
+            "B\thourly\t{}\tpersistent\tpartial\n",
+            stamp(3600)
+        )),
+        "{}",
+        fx.read("run/propolis-witness/heartbeat")
+    );
+    assert!(
+        fx.log().lines().all(|l| !l.starts_with("curl ")),
+        "{}",
+        fx.log()
+    );
+    // A pass that judged nothing says nothing of config-check either.
+    assert_eq!(fx.meta("hourly_last"), Some(stamp(3600)));
+    assert_eq!(fx.meta("cc_last"), None);
+    assert_eq!(fx.meta("cc_fail"), None);
+}
+
+/// A backup too old because the nightly run keeps failing is the failed run's to report: while
+/// the backup unit's record is open and its last failure is newer than its last success, the
+/// backup-stale finding folds under it and v2 would push nothing for it. Without that failure
+/// it opens on its own.
+#[test]
+fn backup_stale_folds_under_an_open_failed_backup_and_opens_alone_without_one() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.incidents(&[hook_record(
+        "w#8",
+        "propolis-backup.service",
+        "ACT",
+        "open",
+        0,
+        "-",
+    )]);
+    fx.write(
+        "var/lib/propolis/backup-status/last-failure",
+        "{\"failed_at\":\"2027-01-15T02:00:00Z\",\"step\":\"dumping the database\"}\n",
+    );
+    fx.cc(&cc_tsv(&[], &[("fail", "backup-stale", "backup")]), 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let key = format!("finding:backup-stale:{}", k12("backup-stale"));
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (f[7].as_str(), f[13].as_str(), f[29].as_str()),
+        ("open", "w#8", "0"),
+        "folded under the failed run"
+    );
+    assert!(f[30].contains("folded"), "{}", f[30]);
+
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "backup-stale", "backup")]), 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (f[7].as_str(), f[13].as_str(), f[29].as_str()),
+        ("open", "-", "1")
+    );
+}
+
+/// An hourly pass that cannot get the lock writes no state and counts the miss on its own
+/// lockwait line.
+#[test]
+fn an_hourly_pass_that_misses_the_lock_counts_it_on_its_own_lockwait_line() {
+    let mut fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.setenv("PROPOLIS_WITNESS_LOCK_WAIT", "1");
+    fx.write("run/propolis-witness/lockwait", "light\t3\n");
+    let mut holder = fx.hold_lock();
+    fx.hourly(0);
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert_eq!(
+        fx.read("run/propolis-witness/lockwait"),
+        "light\t3\nhourly\t1\n"
+    );
+    assert!(!fx.p("var/lib/propolis/witness/meta").exists());
+    assert!(fx.records().is_empty());
+    assert!(
+        fx.log()
+            .contains("state lock busy for 1 s; hourly pass skipped"),
+        "{}",
+        fx.log()
+    );
+}
+
+/// The state word of `key`'s record, or `none`.
+fn state_of(fx: &Fx, key: &str) -> String {
+    fx.record(key)
+        .map(|f| f[7].clone())
+        .unwrap_or_else(|| "none".into())
+}
+
+/// An F line out of form cannot be tied to a key, so the run that printed it cannot prove a
+/// finding of that id absent: an open finding whose line turns malformed (its key hash `-`, which
+/// config-check prints when sha256sum fails) stays open with no clean count, and a line whose id
+/// is out of form keeps every absent finding from counting clean. A malformed line of another id
+/// does not hold this one, and the count of such lines is kept for the walk.
+#[test]
+fn an_open_finding_whose_line_turns_malformed_stays_open_with_no_clean_count() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let good = cc_tsv(&[], &[("fail", "stale", "logrotate")]);
+    fx.cc(&good, 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let stale = format!("finding:stale:{}", k12("stale"));
+    assert_eq!(state_of(&fx, &stale), "open");
+    fx.cc(&good.replace(&k12("stale"), "-"), 0);
+    for t in [7200, 10800] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &stale), "open", "at {t}");
+        assert!(
+            !fx.observe_text().contains(&format!("clean:{stale}")),
+            "{}",
+            fx.observe_text()
+        );
+    }
+    assert_eq!(fx.meta("cc_skipped").as_deref(), Some("1"));
+    let bad_id = cc_tsv(&[], &[]).replace(
+        "E\t0\n",
+        "F\tfail\tnot an id\t0123456789ab\tx\t-\tm\nE\t1\n",
+    );
+    fx.cc(&bad_id, 0);
+    for t in [14400, 18000] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &stale), "open", "at {t}");
+        assert!(!fx.observe_text().contains(&format!("clean:{stale}")));
+    }
+    let other = cc_tsv(&[], &[("fail", "backup-timer", "backup")]);
+    fx.cc(&other.replace(&k12("backup-timer"), "-"), 0);
+    fx.hourly(21600);
+    assert!(
+        fx.observe_text().contains(&format!("P\tclean:{stale}\t")),
+        "a malformed line of another id holds nothing of this one: {}",
+        fx.observe_text()
+    );
+}
+
+/// A run whose L lines name a limit of a finding's group says nothing of that group, whatever its
+/// G row reads: config-check leaves the backup row at fail when df is missing, yet the headroom
+/// check did not run. An open backup finding then stays open with no clean count; a run without
+/// the limit starts the count, and an L line no group is known for holds every group.
+#[test]
+fn an_absent_finding_in_a_group_whose_limit_line_names_it_stays_open() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "backup-timer", "backup")]), 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let timer = format!("finding:backup-timer:{}", k12("backup-timer"));
+    assert_eq!(state_of(&fx, &timer), "open");
+    let g = "G\tbackup\tfail\tthe last backup run failed";
+    let limited = cc_tsv(
+        &[
+            g,
+            "L\tdf is not installed: the backup volume's headroom was not checked",
+        ],
+        &[("fail", "backup-failing", "backup")],
+    );
+    fx.cc(&limited, 0);
+    for t in [7200, 10800] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &timer), "open", "at {t}");
+        assert!(
+            !fx.observe_text().contains(&format!("clean:{timer}")),
+            "{}",
+            fx.observe_text()
+        );
+    }
+    fx.cc(&cc_tsv(&[g], &[("fail", "backup-failing", "backup")]), 0);
+    fx.hourly(14400);
+    assert!(
+        fx.observe_text().contains(&format!("P\tclean:{timer}\t")),
+        "{}",
+        fx.observe_text()
+    );
+    fx.cc(
+        &cc_tsv(
+            &[g, "L\ta limit no release before this one printed"],
+            &[("fail", "backup-failing", "backup")],
+        ),
+        0,
+    );
+    fx.hourly(18000);
+    assert_eq!(state_of(&fx, &timer), "open");
+    assert!(
+        !fx.observe_text().contains(&format!("clean:{timer}")),
+        "an unknown limit holds every group: {}",
+        fx.observe_text()
+    );
+}
+
+/// What the installed config-check sources beside itself runs as root too: a listeners-lib.sh
+/// another account can write, or an alert-lib.sh beside it that can be, keeps config-check from
+/// running at all, and that counts toward cc-stopped like a missing script.
+#[test]
+fn a_config_check_library_another_account_can_write_keeps_config_check_from_running() {
+    for (name, mode) in [("listeners-lib.sh", 0o664), ("alert-lib.sh", 0o666)] {
+        let fx = Fx::new();
+        fx.install_cc();
+        fx.cc(&cc_tsv(&[], &[]), 0);
+        let rel = format!("usr/local/lib/propolis/{name}");
+        if name == "alert-lib.sh" {
+            fx.write(&rel, "# the alert library beside config-check\n");
+        }
+        std::fs::set_permissions(fx.p(&rel), std::fs::Permissions::from_mode(mode)).unwrap();
+        fx.hourly(0);
+        assert!(!fx.log().contains("config-check --tsv"), "{name}: it ran");
+        assert!(
+            fx.log()
+                .contains("config-check did not complete: not trusted: "),
+            "{name}: {}",
+            fx.log()
+        );
+        assert_eq!(fx.meta("cc_fail").as_deref(), Some("1"), "{name}");
+        assert_eq!(fx.meta("cc_last"), Some(format!("{}/-/0", stamp(0))));
+        fx.hourly(3600);
+        assert_eq!(state_of(&fx, "tool:config-check"), "open", "{name}");
+    }
+}
+
+/// Two passes means two consecutive passes: a pending finding that a run could not check (its
+/// group limited) and did not show is dropped, so seen again it is pending, not open.
+#[test]
+fn a_pending_finding_not_seen_on_a_run_that_could_not_check_it_is_dropped() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let stale = format!("finding:stale:{}", k12("stale"));
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.hourly(0);
+    assert_eq!(state_of(&fx, &stale), "pending");
+    fx.cc(
+        &cc_tsv(&["G\tlogrotate\tunknown\tstate file not readable"], &[]),
+        0,
+    );
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &stale), "none");
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    fx.hourly(7200);
+    assert_eq!(state_of(&fx, &stale), "pending");
+}
+
+/// The same for witness-stale: one stale check, then a check that cannot judge (the first half
+/// hour after a boot), then a stale check, is not two stale checks in a row.
+#[test]
+fn a_pending_witness_stale_is_dropped_by_a_check_that_could_not_judge_it() {
+    let mut fx = Fx::new();
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveState", "inactive"), ("UnitFileState", "disabled")],
+    );
+    fx.pass(0);
+    assert_eq!(state_of(&fx, "witness:hourly"), "pending");
+    fx.setenv(
+        "PROPOLIS_WITNESS_NOW",
+        &format!("{}/abcdef02/400", WALL + 900),
+    );
+    fx.pass(900);
+    assert_eq!(state_of(&fx, "witness:hourly"), "none");
+    fx.setenv(
+        "PROPOLIS_WITNESS_NOW",
+        &format!("{}/abcdef02/2100", WALL + 2600),
+    );
+    fx.pass(2600);
+    assert_eq!(state_of(&fx, "witness:hourly"), "pending");
+}
+
+/// A listener finding resolves only on runs that could check listeners: its own R line with an
+/// unknown cell (here the socket owner) keeps it open with no clean count, and two runs with
+/// every cell known resolve it.
+#[test]
+fn an_open_listener_finding_stays_open_while_its_row_has_an_unknown_cell() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let ok_row = r_line("telnet/tcp", "sensor-telnet", "ok");
+    let unknown_row = "R\ttelnet/tcp\tsensor-telnet\tfail\tok\tunknown\tok\tok\tok\tok";
+    let missing = format!("finding:unit-missing:{}", k12("unit-missing:sensor-telnet"));
+    fx.cc(
+        &cc_tsv(
+            &[&ok_row],
+            &[("fail", "unit-missing:sensor-telnet", "sensor-telnet")],
+        ),
+        0,
+    );
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &missing), "open");
+    fx.cc(&cc_tsv(&[unknown_row], &[]), 0);
+    for t in [7200, 10800] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &missing), "open", "at {t}");
+        assert!(!fx.observe_text().contains(&format!("clean:{missing}")));
+    }
+    fx.cc(&cc_tsv(&[&ok_row], &[]), 0);
+    fx.hourly(14400);
+    assert_eq!(state_of(&fx, &missing), "open");
+    fx.hourly(18000);
+    let f = fx.record(&missing).unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "clean2"));
+}
+
+/// The config-check result a sensor's early loop waits for is a completed one: in the first half
+/// hour after a boot, a recent cc_last whose run did not complete (cc_fail 1) keeps the loop
+/// pending as no result would; with cc_fail 0 the same loop opens.
+#[test]
+fn a_sensor_loop_in_the_first_half_hour_waits_while_the_last_config_check_failed() {
+    for (fail, want) in [("1", "pending"), ("0", "open")] {
+        let mut fx = Fx::new();
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!(
+                "#meta v1 g=1\nM\tcc_last\t{}/0/12\nM\tcc_fail\t{fail}\n",
+                early(0)
+            ),
+        );
+        for (t, n) in [(0u64, 0u64), (300, 4), (600, 8), (900, 12)] {
+            fx.setenv("PROPOLIS_WITNESS_NOW", &early(t));
+            fx.unit(
+                "sensor-ssh.service",
+                &[
+                    ("NRestarts", &n.to_string()),
+                    (
+                        "ActiveEnterTimestampMonotonic",
+                        &((600 + t - 5) * 1_000_000).to_string(),
+                    ),
+                ],
+            );
+            fx.pass(t);
+        }
+        assert_eq!(
+            state_of(&fx, "unit:sensor-ssh.service"),
+            want,
+            "cc_fail {fail}"
+        );
+    }
+}
+
+/// The light pass wants the hourly timer active and enabled: one active but disabled, or masked,
+/// will not come back after a reboot, and opens witness-stale on the second light pass.
+#[test]
+fn an_hourly_timer_that_is_active_but_disabled_or_masked_opens_witness_stale() {
+    for file in ["disabled", "masked"] {
+        let fx = Fx::new();
+        fx.unit(
+            "propolis-witness@hourly.timer",
+            &[
+                ("SubState", "waiting"),
+                ("ActiveEnterTimestampMonotonic", &entered(0, 600)),
+                ("UnitFileState", file),
+            ],
+        );
+        fx.pass(0);
+        fx.pass(300);
+        assert_eq!(state_of(&fx, "witness:hourly"), "open", "{file}");
+    }
+}
+
+/// One stale check is a first sighting: a fresh check after it drops it, never opens it.
+#[test]
+fn one_stale_check_then_a_fresh_one_drops_witness_stale() {
+    let fx = Fx::new();
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[("ActiveState", "inactive"), ("UnitFileState", "disabled")],
+    );
+    fx.pass(0);
+    assert_eq!(state_of(&fx, "witness:hourly"), "pending");
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        &[
+            ("SubState", "waiting"),
+            ("ActiveEnterTimestampMonotonic", &entered(300, 60)),
+        ],
+    );
+    fx.pass(300);
+    assert_eq!(state_of(&fx, "witness:hourly"), "none");
+}
+
+/// The hourly pass computes without the lock and applies its result to the state files as they
+/// are when it takes the lock: a light pass that runs while config-check runs (storing the read
+/// check's refusal, its observe lines and meta light_last), and a healed count written meanwhile,
+/// all survive exactly; the hourly pass adds its own P lines and meta keys, keeps the refusal
+/// through its own unanswered attempt, and judges the light pass by the light_last written
+/// meanwhile.
+#[test]
+fn a_light_pass_during_config_check_loses_nothing_to_the_hourly_pass() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[("fail", "stale", "logrotate")]), 0);
+    // Bound to another target: the light pass checks the current one.
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t0000000000000000\t{}\ttransient\t-\t-\t-\t000\t000\tboth\t000\n",
+            stamp(0)
+        ),
+    );
+    let healed = format!("3/{}", stamp(200));
+    fx.cc_during(&format!(
+        "d=\"${{UNITS%/units}}\"\n\
+         st=\"$PROPOLIS_ALERT_ROOT/var/lib/propolis/witness\"\n\
+         printf '403|text/plain\\n' > \"$d/curl.answer\"\n\
+         bash '{SCRIPT}' light > /dev/null 2>&1; echo \"$?\" > \"$d/light.rc\"\n\
+         rm -f \"$d/curl.answer\"\n\
+         . \"$PROPOLIS_ALERT_ROOT/usr/local/sbin/propolis-alert-lib\" && pa_init \"$PROPOLIS_ALERT_ROOT\" \
+         && pa_lock 10 && _pa_meta_set healed '{healed}' && pa_unlock\n\
+         cp \"$st/observe\" \"$d/observe.light\"\n\
+         grep -v \"^B\tlight\t\" \"$PROPOLIS_ALERT_ROOT/run/propolis-witness/heartbeat\" > \"$d/hb\"\n\
+         cat \"$d/hb\" > \"$PROPOLIS_ALERT_ROOT/run/propolis-witness/heartbeat\"\n"
+    ));
+    fx.hourly(300);
+    let d = fx.dir.path();
+    assert_eq!(
+        std::fs::read_to_string(d.join("light.rc")).unwrap(),
+        "0\n",
+        "the light pass ran"
+    );
+    let observe = fx.observe_text();
+    let light_lines: Vec<String> = std::fs::read_to_string(d.join("observe.light"))
+        .unwrap()
+        .lines()
+        .filter(|l| {
+            l.starts_with("U\t")
+                || l.starts_with("R\t")
+                || l.starts_with("P\tunits\t")
+                || l.starts_with("P\twitness-hourly\t")
+        })
+        .map(str::to_string)
+        .collect();
+    assert!(
+        light_lines.iter().any(|l| l.starts_with("U\t")),
+        "{light_lines:?}"
+    );
+    for line in &light_lines {
+        assert!(
+            observe.contains(&format!("{line}\n")),
+            "{line} lost:\n{observe}"
+        );
+    }
+    for own in ["P\tconfig-check\t", "P\treadcheck\t"] {
+        assert!(observe.contains(own), "{own} missing:\n{observe}");
+    }
+    assert_eq!(fx.meta("light_last"), Some(stamp(300)));
+    assert_eq!(fx.meta("healed"), Some(healed));
+    assert_eq!(fx.meta("hourly_last"), Some(stamp(300)));
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("0"));
+    assert!(
+        fx.meta("cc_last")
+            .is_some_and(|v| v.starts_with(&format!("{}/0/", stamp(300)))),
+        "{:?}",
+        fx.meta("cc_last")
+    );
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/readcheck")
+            .lines()
+            .filter(|l| l.starts_with("R\t"))
+            .collect::<Vec<_>>(),
+        vec![format!(
+            "R\t{FX_BINDING}\t{s}\ttransient\t{s}\trefused\t-\t403\t403\tboth\t403",
+            s = stamp(300)
+        )],
+        "the refusal the light pass stored stands through the hourly pass's unanswered attempt"
+    );
+    assert_eq!(
+        state_of(&fx, "witness:light"),
+        "none",
+        "light_last written meanwhile shows the light pass fresh"
+    );
+    assert_eq!(
+        state_of(&fx, &format!("finding:stale:{}", k12("stale"))),
+        "pending"
+    );
+}
+
+/// A fw finding seen on a run where its firewall cell is unknown is present, if held: the clean
+/// count it had restarts, so one clean run after it does not resolve it.
+#[test]
+fn an_open_fw_finding_seen_held_between_two_clean_runs_restarts_its_clean_count() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let known = r_line("ftp/tcp", "sensor-ftp", "fail");
+    let unknown = r_line("ftp/tcp", "sensor-ftp", "unknown");
+    let fw = format!("finding:fw:{}", k12("fw:tcp:21"));
+    let present = [("warn", "fw:tcp:21", "ftp/tcp")];
+    fx.cc(&cc_tsv(&[&known], &present), 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &fw), "open");
+    fx.cc(&cc_tsv(&[&known], &[]), 0);
+    fx.hourly(7200);
+    assert!(fx.observe_text().contains(&format!("P\tclean:{fw}\t")));
+    fx.cc(&cc_tsv(&[&unknown], &present), 0);
+    fx.hourly(10800);
+    fx.cc(&cc_tsv(&[&known], &[]), 0);
+    fx.hourly(14400);
+    assert_eq!(state_of(&fx, &fw), "open", "the clean count restarted");
+}
+
+/// The unlisted spools of a run all fold into one record whose count follows the latest run.
+#[test]
+fn unlisted_spools_fold_into_one_record_whose_count_follows_the_latest_run() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let names = ["c-a", "c-b", "c-c", "c-d", "c-e"];
+    let spools = |n: usize| -> Vec<(String, String, String)> {
+        names[..n]
+            .iter()
+            .map(|c| {
+                (
+                    "fail".to_string(),
+                    format!("spool-unlisted:{c}"),
+                    "gateway-spool".to_string(),
+                )
+            })
+            .collect()
+    };
+    let tsv = |n: usize| {
+        let s = spools(n);
+        let f: Vec<(&str, &str, &str)> = s
+            .iter()
+            .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+            .collect();
+        cc_tsv(&[], &f)
+    };
+    fx.cc(&tsv(3), 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx.record("finding:spool-unlisted:all").unwrap();
+    assert_eq!((f[7].as_str(), f[34].as_str()), ("open", "3"));
+    fx.cc(&tsv(5), 0);
+    fx.hourly(7200);
+    let f = fx.record("finding:spool-unlisted:all").unwrap();
+    assert_eq!((f[7].as_str(), f[34].as_str()), ("open", "5"));
+    assert_eq!(
+        fx.records()
+            .iter()
+            .filter(|f| f[2].starts_with("finding:"))
+            .count(),
+        1,
+        "{:?}",
+        fx.records()
+    );
+}
+
+/// config-check prints at most 20 spool-unlisted lines (SPOOL_MAX_REPORTED), so a run that
+/// reaches that many is counted as at least that many, not as exactly 20.
+#[test]
+fn unlisted_spools_at_config_checks_cap_are_counted_as_at_least_the_cap() {
+    let cc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/config-check.sh"
+    ))
+    .unwrap();
+    assert!(cc.contains("\nSPOOL_MAX_REPORTED=20\n"));
+    assert!(
+        std::fs::read_to_string(SCRIPT)
+            .unwrap()
+            .contains("\nWITNESS_SPOOL_REPORTED=20\n")
+    );
+    let fx = Fx::new();
+    fx.install_cc();
+    let keys: Vec<String> = (0..20).map(|i| format!("spool-unlisted:c{i:02}")).collect();
+    let f: Vec<(&str, &str, &str)> = keys
+        .iter()
+        .map(|k| ("fail", k.as_str(), "gateway-spool"))
+        .collect();
+    let g = "G\tgateway-spool\tfail\t50 collectors in /var/spool/propolis/gateway, not in PROPOLIS_SENSOR_LOGS: c00, c01, c02, c03, c04 and 45 more";
+    fx.cc(&cc_tsv(&[g], &f), 0);
+    fx.hourly(0);
+    let f = fx.record("finding:spool-unlisted:all").unwrap();
+    assert_eq!(f[34], "20+");
+}
+
+/// The TSV reader accepts only the form it knows: another header version, or a G line before the
+/// S line, is a run that did not complete, and raises cc_fail.
+#[test]
+fn a_config_check_output_with_another_header_or_a_line_before_s_is_not_completed() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let good = cc_tsv(&[], &[("fail", "stale", "logrotate")]);
+    fx.cc(&good.replace("tsv v1", "tsv v2"), 0);
+    fx.hourly(0);
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("1"));
+    assert!(
+        fx.log()
+            .contains("config-check did not complete: not in the TSV form"),
+        "{}",
+        fx.log()
+    );
+    fx.cc(
+        &good.replacen(
+            "#config-check tsv v1\n",
+            "#config-check tsv v1\nG\tlogrotate\tok\trotation ran\n",
+            1,
+        ),
+        0,
+    );
+    fx.hourly(3600);
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("2"));
+    assert_eq!(state_of(&fx, "tool:config-check"), "open");
+    assert_eq!(
+        state_of(&fx, &format!("finding:stale:{}", k12("stale"))),
+        "none"
+    );
+}
+
+/// A config-check that timed out did not complete, even with a whole TSV printed; nor did one
+/// whose output passed the 2 MiB cap before its E line.
+#[test]
+fn a_config_check_that_times_out_or_prints_past_the_cap_is_not_completed() {
+    let fx = Fx::new();
+    fx.install_cc();
+    let good = cc_tsv(&[], &[("fail", "stale", "logrotate")]);
+    fx.cc(&good, 124);
+    fx.hourly(0);
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("1"));
+    assert!(
+        fx.log()
+            .contains("config-check did not complete: timed out after 300 s"),
+        "{}",
+        fx.log()
+    );
+    let pad: String = (0..2200)
+        .map(|i| format!("G\tpad{i}\tok\t{}\n", "x".repeat(1000)))
+        .collect();
+    let (head, tail) = good.rsplit_once("E\t").unwrap();
+    fx.cc(&format!("{head}{pad}E\t{tail}"), 0);
+    fx.hourly(3600);
+    assert_eq!(fx.meta("cc_fail").as_deref(), Some("2"));
+    assert!(
+        fx.log()
+            .contains("config-check did not complete: output cut off or incomplete"),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(
+        state_of(&fx, &format!("finding:stale:{}", k12("stale"))),
+        "none"
+    );
+}
+
+/// A unit-down finding is judged by what systemd says of the unit now: when systemctl cannot be
+/// asked, nothing opens, and an open one gets no clean count from the run either.
+#[test]
+fn a_unit_down_finding_whose_unit_cannot_be_read_neither_opens_nor_counts_clean() {
+    let mut fx = Fx::new();
+    fx.install_cc();
+    fx.unit(
+        "sensor-redis.service",
+        &[("ActiveState", "inactive"), ("SubState", "dead")],
+    );
+    let down = format!("finding:unit-down:{}", k12("unit-down:sensor-redis"));
+    let present = cc_tsv(&[], &[("fail", "unit-down:sensor-redis", "sensor-redis")]);
+    fx.cc(&present, 0);
+    fx.setenv("SYSTEMCTL_FAIL", "1");
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &down), "none");
+    fx.setenv("SYSTEMCTL_FAIL", "");
+    fx.hourly(7200);
+    fx.hourly(10800);
+    assert_eq!(state_of(&fx, &down), "open");
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.hourly(14400);
+    assert!(fx.observe_text().contains(&format!("P\tclean:{down}\t")));
+    fx.cc(&present, 0);
+    fx.setenv("SYSTEMCTL_FAIL", "1");
+    fx.hourly(18000);
+    fx.setenv("SYSTEMCTL_FAIL", "");
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.hourly(21600);
+    assert_eq!(state_of(&fx, &down), "open", "the clean count restarted");
+}
+
+/// The table makes unit-down daily for a pass where systemd calls the unit failed (unit-failed
+/// pages that): the finding is recorded as a NOTICE that would push nothing, and once the unit is
+/// inactive, a dead listener nothing else reports, its tier rises to PAGE, which v2 would push.
+#[test]
+fn a_unit_down_on_a_failed_unit_is_a_notice_and_rises_to_page_once_the_unit_is_inactive() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.unit(
+        "sensor-redis.service",
+        &[("ActiveState", "failed"), ("SubState", "failed")],
+    );
+    let down = format!("finding:unit-down:{}", k12("unit-down:sensor-redis"));
+    fx.cc(
+        &cc_tsv(&[], &[("fail", "unit-down:sensor-redis", "sensor-redis")]),
+        0,
+    );
+    fx.hourly(0);
+    let f = fx.record(&down).unwrap();
+    assert_eq!((f[6].as_str(), f[7].as_str()), ("NOTICE", "pending"));
+    fx.hourly(3600);
+    let f = fx.record(&down).unwrap();
+    assert_eq!(
+        (f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("NOTICE", "open", "0")
+    );
+    fx.unit(
+        "sensor-redis.service",
+        &[("ActiveState", "inactive"), ("SubState", "dead")],
+    );
+    fx.hourly(7200);
+    let f = fx.record(&down).unwrap();
+    assert_eq!(
+        (f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("PAGE", "open", "1")
+    );
+}
+
+/// Without a target there is nothing to check and nothing to keep: a stored line goes.
+#[test]
+fn an_hourly_pass_with_no_target_leaves_no_read_check_line() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403\n",
+            s = stamp(0)
+        ),
+    );
+    fx.write("etc/propolis/propolis.env", "");
+    fx.hourly(300);
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(!rc.lines().any(|l| l.starts_with("R\t")), "{rc}");
+    assert!(fx.log().lines().all(|l| !l.starts_with("curl ")));
+}
+
+/// A stored shell line for a target the shell and the daemon now share is not that target's
+/// both line: the light pass checks it again and stores one line with role both.
+#[test]
+fn a_stored_shell_line_for_a_target_both_roles_share_is_checked_again_as_both() {
+    let fx = Fx::new();
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tshell\t403\n",
+            s = stamp(0)
+        ),
+    );
+    fx.curl_answers("403|text/plain");
+    fx.pass(300);
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("curl ")).count(),
+        3
+    );
+    let rc = fx.read("var/lib/propolis/witness/readcheck");
+    let lines: Vec<&str> = rc.lines().filter(|l| l.starts_with("R\t")).collect();
+    assert_eq!(
+        lines,
+        vec![format!(
+            "R\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403",
+            s = stamp(300)
+        )],
+        "{rc}"
+    );
 }

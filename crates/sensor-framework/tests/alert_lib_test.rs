@@ -286,7 +286,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "4");
+    assert_eq!(version, "5");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -4816,4 +4816,711 @@ fn a_banner_line_past_78_bytes_is_withheld_and_the_others_kept() {
         r.out
     );
     assert!(lines.iter().all(|l| l.len() <= 78), "{}", r.out);
+}
+
+// ---- the anonymous-read check and the gate ------------------------------------------------------
+
+/// The read check's target in these cases, and the first 16 hex of sha256(URL LF TOPIC LF).
+const RC_URL: &str = "https://ntfy.invalid";
+const RC_TOPIC: &str = "t0p1c-secret";
+const RC_TOKEN: &str = "tk_s3cret-value";
+const RC_BINDING: &str = "74f3449395001972";
+const RC_BINDING_HTTP: &str = "24be4e16a628c14e";
+
+/// Records its argv and its environment, then answers the URL named in the `-K` config file from
+/// `RC_JSON`, `RC_RAW` or `RC_SSE` (by endpoint) or `RC_TOKEN_ANSWER` (when a `-H @file` header
+/// file with content is given), each `code|content type|body`: the body goes to the `-o` file and
+/// the code and type to stdout in the `-w` form asked for. A host other than ntfy.invalid makes
+/// it exit 7 and log `bad host`.
+const CURL_RC_STUB: &str = r#"#!/usr/bin/env bash
+{ printf 'curl'; printf ' [%s]' "$@"; printf '\n'; env | sed 's/^/env /'; } >> "$STUB_LOG"
+conf="" hdr="" out=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -K) conf="$2"; shift ;;
+        -H) hdr="${2#@}"; shift ;;
+        -o) out="$2"; shift ;;
+    esac
+    shift
+done
+url="$(sed -n 's/^url = "\(.*\)"$/\1/p' "$conf")"
+case "$url" in
+    https://ntfy.invalid/* | http://ntfy.invalid/*) ;;
+    *) echo "bad host" >> "$STUB_LOG"; exit 7 ;;
+esac
+ep="${url##*/}"
+ep="${ep%%\?*}"
+if [ -n "${MODES_LOG:-}" ]; then
+    for f in "$conf" "$out" ${hdr:+"$hdr"}; do stat -c %a -- "$f" >> "$MODES_LOG"; done
+fi
+if [ -n "$hdr" ] && [ -s "$hdr" ]; then
+    grep -q '^Authorization: Bearer ' "$hdr" && echo "header file holds the token" >> "$STUB_LOG"
+    v="${RC_TOKEN_ANSWER:-}"
+else
+    case "$ep" in json) v="${RC_JSON:-}" ;; raw) v="${RC_RAW:-}" ;; sse) v="${RC_SSE:-}" ;; esac
+fi
+IFS='|' read -r code ct body <<< "$v"
+printf '%b' "$body" > "$out"
+printf '%s\t%s' "$code" "$ct"
+"#;
+
+impl Fx {
+    fn with_curl(&self) {
+        write_exec(&self.bin.join("curl"), CURL_RC_STUB);
+    }
+}
+
+/// One answer of each row of the classification table, through pa_readcheck_class: the status
+/// code, the content type up to its `;`, and for json whether the body is ntfy's.
+#[test]
+fn pa_readcheck_class_follows_every_row_of_the_classification_table() {
+    let fx = Fx::new();
+    let d = fx.scratch();
+    std::fs::write(d.join("empty"), "").unwrap();
+    std::fs::write(
+        d.join("ntfy"),
+        "{\"id\":\"a1\",\"time\":1}\n{\"id\":\"b2\",\"time\":2}\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("html"), "<html>sign in</html>\n").unwrap();
+    std::fs::write(
+        d.join("big"),
+        format!("{{\"id\":\"{}\"}}\n", "x".repeat(70_000)),
+    )
+    .unwrap();
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        ("json", "401", "", "empty", "refused"),
+        ("raw", "403", "text/html", "html", "refused"),
+        (
+            "json",
+            "200",
+            "application/x-ndjson; charset=utf-8",
+            "empty",
+            "readable",
+        ),
+        ("json", "200", "application/json", "ntfy", "readable"),
+        ("json", "200", "Application/X-NDJSON", "ntfy", "readable"),
+        ("json", "200", "application/x-ndjson", "html", "not_ntfy"),
+        ("json", "200", "application/x-ndjson", "big", "not_ntfy"),
+        (
+            "json",
+            "200",
+            "text/html; charset=utf-8",
+            "empty",
+            "not_ntfy",
+        ),
+        (
+            "raw",
+            "200",
+            "text/plain; charset=utf-8",
+            "html",
+            "readable",
+        ),
+        ("raw", "200", "application/json", "empty", "not_ntfy"),
+        ("sse", "200", "text/event-stream", "html", "readable"),
+        ("sse", "200", "text/plain", "empty", "not_ntfy"),
+        ("json", "301", "", "empty", "redirect"),
+        ("json", "302", "", "empty", "redirect"),
+        ("json", "303", "", "empty", "redirect"),
+        ("json", "307", "", "empty", "redirect"),
+        ("json", "308", "", "empty", "redirect"),
+        ("json", "404", "", "empty", "not_found"),
+        ("json", "429", "", "empty", "transient"),
+        ("json", "500", "", "empty", "transient"),
+        ("json", "503", "", "empty", "transient"),
+        ("json", "000", "", "empty", "transient"),
+        ("json", "204", "", "empty", "unexpected"),
+        ("json", "418", "", "empty", "unexpected"),
+        ("json", "xxx", "", "empty", "unexpected"),
+        ("json", "20", "", "empty", "unexpected"),
+    ];
+    for (ep, code, ct, body, want) in cases {
+        let r = fx.run_env(
+            &format!("echo \"class=$(pa_readcheck_class '{ep}' '{code}' '{ct}' \"$D/{body}\")\""),
+            &[],
+        );
+        assert_eq!(
+            r.get("class"),
+            *want,
+            "{ep} {code} {ct:?} {body}: {}",
+            r.err
+        );
+    }
+}
+
+/// pa_readcheck_run combines the three answers: any transient makes the attempt transient, three
+/// refusals make it refused, and otherwise it takes the class of the first answer that was not
+/// refused. The token check sorts the token into reads, noread or unknown, and is not made
+/// without a token.
+#[test]
+fn pa_readcheck_run_combines_the_three_answers_and_classifies_the_token() {
+    let fx = Fx::new();
+    fx.with_curl();
+    let script = format!(
+        "pa_readcheck_run '{RC_URL}' '{RC_TOPIC}' \"$TOKEN\"\n\
+         echo \"class=$PA_RC_CLASS\"; echo \"codes=$PA_RC_JSON/$PA_RC_RAW/$PA_RC_SSE\"\n\
+         echo \"token=$PA_RC_TOKEN\"; echo \"cause=$PA_RC_CAUSE\""
+    );
+    let deny = "403|text/plain|forbidden";
+    let ndjson = "200|application/x-ndjson|";
+    let cases: &[(&str, &str, &str, &str, &str, &str)] = &[
+        (deny, deny, deny, "", "refused", "-"),
+        (deny, "503||", deny, "", "transient", "-"),
+        ("000||", deny, deny, "", "transient", "-"),
+        (deny, "200|text/plain|", "302||", "", "readable", "-"),
+        (deny, "302||", "200|text/event-stream|", "", "redirect", "-"),
+        (ndjson, deny, deny, "", "readable", "-"),
+        ("200|text/html|<form>", deny, deny, "", "not_ntfy", "-"),
+        ("404||", "404||", "404||", "", "not_found", "-"),
+        (deny, deny, "418||", "", "unexpected", "-"),
+        (deny, deny, deny, RC_TOKEN, "refused", "reads"),
+    ];
+    for (json, raw, sse, token, class, tok) in cases {
+        let r = fx.run_env(
+            &script,
+            &[
+                ("RC_JSON", json),
+                ("RC_RAW", raw),
+                ("RC_SSE", sse),
+                ("RC_TOKEN_ANSWER", ndjson),
+                ("TOKEN", token),
+            ],
+        );
+        assert_eq!(r.get("class"), *class, "{json} {raw} {sse}: {}", r.err);
+        assert_eq!(r.get("token"), *tok, "{json} {raw} {sse}");
+        assert_eq!(r.get("cause"), "-");
+    }
+    let r = fx.run_env(
+        &script,
+        &[
+            ("RC_JSON", deny),
+            ("RC_RAW", deny),
+            ("RC_SSE", deny),
+            ("RC_TOKEN_ANSWER", "401||"),
+            ("TOKEN", RC_TOKEN),
+        ],
+    );
+    assert_eq!(r.get("token"), "noread");
+    assert_eq!(r.get("codes"), "403/403/403");
+    let r = fx.run_env(
+        &script,
+        &[
+            ("RC_JSON", deny),
+            ("RC_RAW", deny),
+            ("RC_SSE", deny),
+            ("RC_TOKEN_ANSWER", "200|text/html|<p>"),
+            ("TOKEN", RC_TOKEN),
+        ],
+    );
+    assert_eq!(r.get("token"), "unknown");
+    let calls = fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    assert_eq!(
+        calls,
+        3 * 9 + 4 * 3,
+        "three GETs each, a fourth with a token"
+    );
+    assert!(!fx.log().contains("bad host"), "{}", fx.log());
+    // -q first, so no .curlrc can add to the request; https or http only; no redirect followed.
+    for call in fx.log().lines().filter(|l| l.starts_with("curl ")) {
+        assert!(call.starts_with("curl [-q] "), "{call}");
+        assert!(call.contains(" [--proto] [=https,http]"), "{call}");
+        assert!(
+            !call.contains("[-L]") && !call.contains("[--location"),
+            "{call}"
+        );
+    }
+}
+
+/// The topic and the token are secrets: they reach curl through files (a config file for the
+/// URL, a header file for the token), never through its arguments or its environment; the files
+/// are 0600 while they exist and are gone when the check returns; and nothing the check prints
+/// names them or carries the answer's body.
+#[test]
+fn the_read_check_never_puts_the_topic_or_the_token_on_a_command_line_or_in_an_environment() {
+    let fx = Fx::new();
+    fx.with_curl();
+    let probe = fx.scratch().join("modes");
+    let tmp = fx.scratch().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let r = fx.run_env(
+        &format!(
+            "PA_TOKEN='{RC_TOKEN}'\n\
+             pa_readcheck_run '{RC_URL}' '{RC_TOPIC}' '{RC_TOKEN}'; echo \"class=$PA_RC_CLASS\""
+        ),
+        &[
+            ("MODES_LOG", probe.to_str().unwrap()),
+            ("TMPDIR", tmp.to_str().unwrap()),
+            (
+                "RC_JSON",
+                "200|application/x-ndjson|{\"id\":\"zzz-body-marker\"}",
+            ),
+            ("RC_RAW", "403||"),
+            ("RC_SSE", "403||"),
+            ("RC_TOKEN_ANSWER", "401||"),
+        ],
+    );
+    assert_eq!(r.get("class"), "readable", "{}", r.err);
+    let log = fx.log();
+    assert!(log.contains("header file holds the token"), "{log}");
+    for secret in [RC_TOPIC, RC_TOKEN] {
+        assert!(
+            !log.contains(secret),
+            "{secret} reached curl's argv or environment: {log}"
+        );
+    }
+    for secret in [RC_TOPIC, RC_TOKEN, "zzz-body-marker"] {
+        assert!(
+            !r.out.contains(secret) && !r.err.contains(secret),
+            "{secret} printed"
+        );
+    }
+    let modes = std::fs::read_to_string(&probe).unwrap();
+    assert!(
+        !modes.is_empty() && modes.lines().all(|m| m == "600"),
+        "every file curl was handed is 0600: {modes}"
+    );
+    let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().collect();
+    assert!(left.is_empty(), "temporary files left: {left:?}");
+}
+
+/// Without curl the check cannot run: the attempt is transient (it never counts as an answer)
+/// with the cause tool.exec.
+#[test]
+fn a_read_check_without_curl_is_transient_with_the_cause_tool_exec() {
+    let fx = Fx::new();
+    let r = fx.run_env(
+        &format!(
+            "PATH=/nonexistent\nrc=0; pa_readcheck_run '{RC_URL}' '{RC_TOPIC}' '' || rc=$?\n\
+             echo \"rc=$rc class=$PA_RC_CLASS cause=$PA_RC_CAUSE\""
+        ),
+        &[],
+    );
+    assert!(
+        r.out.contains("rc=1 class=transient cause=tool.exec"),
+        "{}{}",
+        r.out,
+        r.err
+    );
+}
+
+/// A transient attempt with the same binding changes only the attempt fields, so a 503 never
+/// undoes a definite refusal; a definite answer replaces both; a new binding replaces the line.
+#[test]
+fn pa_readcheck_merge_keeps_a_definite_answer_through_a_transient_attempt() {
+    let fx = Fx::new();
+    let old = format!(
+        "#readcheck v1 g=3\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\tnoread\t403\t403\tboth\t403\n"
+    );
+    fx.write("var/lib/propolis/witness/readcheck", &old);
+    let merge = |class: &str, binding: &str| {
+        fx.run_env(
+            &format!(
+                "pa_now; have=0; _pa_rc_line shell && have=1\n\
+                 PA_RC_CLASS={class} PA_RC_TOKEN=- PA_RC_JSON=503 PA_RC_RAW=403 PA_RC_SSE=403\n\
+                 pa_readcheck_merge both {binding} \"$have\""
+            ),
+            &NOW,
+        )
+        .out
+    };
+    assert_eq!(
+        merge("transient", RC_BINDING),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\ttransient\t999000/abcdef01/4000\trefused\tnoread\t403\t403\tboth\t403\n"
+        )
+    );
+    assert_eq!(
+        merge("readable", RC_BINDING),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\treadable\t1000000/abcdef01/5000\treadable\t-\t503\t403\tboth\t403\n"
+        )
+    );
+    assert_eq!(
+        merge("transient", RC_BINDING_HTTP),
+        format!(
+            "R\t{RC_BINDING_HTTP}\t1000000/abcdef01/5000\ttransient\t-\t-\t-\t503\t403\tboth\t403\n"
+        )
+    );
+}
+
+/// A token GET that got no answer (a timeout, a 429 or a 5xx leaves the token class unknown) never
+/// undoes a proven `reads`, even when the three anonymous GETs of the same attempt were definite:
+/// the merged line keeps `reads`, and the gate on a collector stays pointer:token-reads.
+#[test]
+fn a_token_get_without_an_answer_keeps_a_stored_reads_and_the_collector_gate_stays_pointer() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n"),
+    );
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=3\nR\t{RC_BINDING}\t999000/abcdef01/4000\trefused\t999000/abcdef01/4000\trefused\treads\t403\t403\tboth\t403\n"
+        ),
+    );
+    let r = fx.run_env(
+        &format!(
+            "pa_now; have=0; _pa_rc_line shell && have=1\n\
+             PA_RC_CLASS=refused PA_RC_TOKEN=unknown PA_RC_JSON=403 PA_RC_RAW=403 PA_RC_SSE=403\n\
+             line=\"$(pa_readcheck_merge both {RC_BINDING} \"$have\")\"\n\
+             echo \"line=$line\"\n\
+             printf '#readcheck v1 g=4\\n%s\\n' \"$line\" > \"$PA_STATE/readcheck\"\n\
+             pa_settings_load; PA_ROLE=collector; echo \"gate=$(pa_gate)\""
+        ),
+        &NOW,
+    );
+    assert_eq!(
+        r.get("line"),
+        format!(
+            "R\t{RC_BINDING}\t1000000/abcdef01/5000\trefused\t1000000/abcdef01/5000\trefused\treads\t403\t403\tboth\t403"
+        ),
+        "{}",
+        r.err
+    );
+    assert_eq!(r.get("gate"), "pointer:token-reads", "{}", r.err);
+}
+
+/// Each rule of the gate, with one case that passes it (the gate goes on to the next rule, and
+/// the last case is full) and one that fails it with its reason word.
+#[test]
+fn pa_gate_gives_full_only_when_every_rule_holds_and_names_the_rule_that_failed() {
+    let fx = Fx::new();
+    let line = |binding: &str, astamp: &str, dstamp: &str, dclass: &str, token: &str| {
+        format!(
+            "#readcheck v1 g=1\nR\t{binding}\t{astamp}\ttransient\t{dstamp}\t{dclass}\t{token}\t403\t403\tboth\t403\n"
+        )
+    };
+    let fresh = "999000/abcdef01/4000";
+    let gate = |env_file: &str, readcheck: Option<&str>, extra: &str| {
+        fx.write("etc/propolis/propolis.env", env_file);
+        match readcheck {
+            Some(r) => fx.write("var/lib/propolis/witness/readcheck", r),
+            None => {
+                let _ = std::fs::remove_file(fx.p("var/lib/propolis/witness/readcheck"));
+            }
+        }
+        fx.run_env(
+            &format!("pa_settings_load; {extra}\necho \"gate=$(pa_gate)\""),
+            &NOW,
+        )
+        .get("gate")
+    };
+    let https = format!("PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n");
+    let http =
+        format!("PROPOLIS_OPS_NTFY_URL=http://ntfy.invalid\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n");
+    let good = line(RC_BINDING, fresh, fresh, "refused", "noread");
+    // Rule 1: a target.
+    assert_eq!(gate("", Some(&good), ""), "none:notarget");
+    // Rule 2: the detail setting.
+    assert_eq!(
+        gate(&https, Some(&good), "PA_DETAIL=pointer"),
+        "pointer:detail-pointer"
+    );
+    // Rule 3: a stored line, bound to this target.
+    assert_eq!(gate(&https, None, ""), "pointer:never");
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(RC_BINDING_HTTP, fresh, fresh, "refused", "-")),
+            ""
+        ),
+        "pointer:unbound"
+    );
+    // Rule 4: a definite refusal.
+    assert_eq!(
+        gate(&https, Some(&line(RC_BINDING, fresh, "-", "-", "-")), ""),
+        "pointer:never"
+    );
+    for class in [
+        "readable",
+        "not_ntfy",
+        "redirect",
+        "not_found",
+        "unexpected",
+    ] {
+        assert_eq!(
+            gate(
+                &https,
+                Some(&line(RC_BINDING, fresh, fresh, class, "-")),
+                ""
+            ),
+            format!("pointer:{class}")
+        );
+    }
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(RC_BINDING, fresh, fresh, "bogus", "-")),
+            ""
+        ),
+        "pointer:unexpected"
+    );
+    // Rule 5: decided within 24 h, and not in the future.
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(
+                RC_BINDING,
+                fresh,
+                "913000/0000aaaa/1",
+                "refused",
+                "-"
+            )),
+            ""
+        ),
+        "pointer:stale"
+    );
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(
+                RC_BINDING,
+                fresh,
+                "1000000/abcdef01/6000",
+                "refused",
+                "-"
+            )),
+            ""
+        ),
+        "pointer:stale"
+    );
+    // Rule 6: an attempt within 3 h.
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(
+                RC_BINDING,
+                "980000/0000aaaa/1",
+                fresh,
+                "refused",
+                "-"
+            )),
+            ""
+        ),
+        "pointer:stale"
+    );
+    // An attempt dated ahead of the clock in this boot is no proof the checker is alive; the
+    // bound itself is inclusive: 10800 s passes, 10801 s does not.
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(
+                RC_BINDING,
+                "1000000/abcdef01/6000",
+                fresh,
+                "refused",
+                "-"
+            )),
+            ""
+        ),
+        "pointer:stale"
+    );
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(
+                RC_BINDING,
+                "989200/0000aaaa/1",
+                fresh,
+                "refused",
+                "-"
+            )),
+            ""
+        ),
+        "full"
+    );
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(
+                RC_BINDING,
+                "989199/0000aaaa/1",
+                fresh,
+                "refused",
+                "-"
+            )),
+            ""
+        ),
+        "pointer:stale"
+    );
+    // Rule 7: on a collector, a token that cannot read the topic.
+    let reads = line(RC_BINDING, fresh, fresh, "refused", "reads");
+    assert_eq!(
+        gate(&https, Some(&reads), "PA_ROLE=collector"),
+        "pointer:token-reads"
+    );
+    assert_eq!(gate(&https, Some(&reads), "PA_ROLE=single"), "full");
+    // The gate finds the role itself when its caller has not set one, so a collector is never
+    // taken for another host because nobody said so; a host whose role cannot be told (systemd
+    // not answering here) is held to the collector's rule.
+    write_exec(&fx.bin.join("systemctl"), "#!/usr/bin/env bash\nexit 1\n");
+    fx.write(
+        "etc/propolis/shipper.env",
+        "SHIPPER_GATEWAY=gw.invalid:8443\n",
+    );
+    assert_eq!(
+        gate(&https, Some(&reads), "unset PA_ROLE"),
+        "pointer:token-reads",
+        "a collector, with no role set by the caller"
+    );
+    std::fs::remove_file(fx.p("etc/propolis/shipper.env")).unwrap();
+    assert_eq!(
+        gate(&https, Some(&reads), "unset PA_ROLE"),
+        "pointer:token-reads",
+        "a host whose role cannot be told"
+    );
+    assert_eq!(
+        gate(
+            &https,
+            Some(&line(RC_BINDING, fresh, fresh, "refused", "noread")),
+            "unset PA_ROLE"
+        ),
+        "full",
+        "the role matters only when the token reads"
+    );
+    // Rule 8: https.
+    assert_eq!(
+        gate(
+            &http,
+            Some(&line(RC_BINDING_HTTP, fresh, fresh, "refused", "-")),
+            ""
+        ),
+        "pointer:insecure"
+    );
+    assert_eq!(gate(&https, Some(&good), ""), "full");
+}
+
+/// pa_finding_inst recovers a finding's instance only by matching: a unit by the hash of
+/// `<id>:<unit>`, a listener by its row's scope, a log by the hash of `<id>:<path>`; a finding it
+/// cannot place gives nothing, and no name that fails the checks is printed.
+#[test]
+fn pa_finding_inst_matches_units_scopes_and_log_paths_and_otherwise_gives_nothing() {
+    let fx = Fx::new();
+    let k12 = |s: &str| {
+        let r = fx.run_raw(&format!("printf '%s' '{s}' | sha256sum | cut -c1-12"), &[]);
+        r.out.trim().to_string()
+    };
+    let unit_k = k12("unit-down:sensor-ssh");
+    let log_k = k12("intake-wrongpath:/var/log/propolis/ssh/events.jsonl");
+    let r = fx.run_env(
+        &format!(
+            "PA_FI_UNITS=(sensor-http sensor-ssh)\n\
+             PA_FI_SCOPE=(ssh/tcp 'x/y') PA_FI_UNIT=(sensor-ssh 'bad unit')\n\
+             pa_sensor_logs 'ssh:/var/log/propolis/ssh/events.jsonl,http:/var/log/propolis/http/events.jsonl'\n\
+             echo \"a=$(pa_finding_inst unit unit-down {unit_k} sensor-ssh)\"\n\
+             echo \"b=$(pa_finding_inst unit unit-down 000000000000 sensor-ssh)\"\n\
+             echo \"c=$(pa_finding_inst scope listen-none - ssh/tcp)\"\n\
+             echo \"d=$(pa_finding_inst scope listen-none - x/y)\"\n\
+             echo \"e=$(pa_finding_inst logpath intake-wrongpath {log_k} ssh/tcp)\"\n\
+             echo \"f=$(pa_finding_inst logpath intake-absent {log_k} ssh/tcp)\"\n\
+             echo \"g=$(pa_finding_inst unit unit-down 'not-hex' sensor-ssh)\""
+        ),
+        &[],
+    );
+    assert_eq!(r.get("a"), "unit\tsensor-ssh.service", "{}", r.err);
+    assert_eq!(r.get("b"), "");
+    assert_eq!(r.get("c"), "unit\tsensor-ssh.service");
+    assert_eq!(
+        r.get("d"),
+        "",
+        "a unit name that is not one is never printed"
+    );
+    assert_eq!(r.get("e"), "source\tssh");
+    assert_eq!(r.get("f"), "", "another finding's hash does not match");
+    assert_eq!(r.get("g"), "");
+}
+
+/// The banner's alert part follows the stored read check of the target in use: READABLE for a
+/// definite answer other than refused (the shell's or the daemon's), refuses anonymous reads for
+/// a refusal, and not checked yet for no answer or one bound to another target.
+#[test]
+fn the_banner_says_readable_refuses_or_not_checked_from_the_stored_read_check() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n"),
+    );
+    let alerts = |readcheck: Option<String>| {
+        match readcheck {
+            Some(r) => fx.write("var/lib/propolis/witness/readcheck", &r),
+            None => {
+                let _ = std::fs::remove_file(fx.p("var/lib/propolis/witness/readcheck"));
+            }
+        }
+        let r = fx.run_env("pa_banner", &NOW);
+        r.out.lines().nth(1).unwrap_or_default().to_string()
+    };
+    let line = |binding: &str, class: &str| {
+        Some(format!(
+            "#readcheck v1 g=1\nR\t{binding}\t999000/abcdef01/4000\t{class}\t999000/abcdef01/4000\t{class}\t-\t403\t403\tboth\t403\n"
+        ))
+    };
+    assert_eq!(
+        alerts(None),
+        "[propolis 13:46 UTC] alerts: topic not checked yet"
+    );
+    assert_eq!(
+        alerts(line(RC_BINDING, "refused")),
+        "[propolis 13:46 UTC] alerts: topic refuses anonymous reads"
+    );
+    assert_eq!(
+        alerts(line(RC_BINDING, "readable")),
+        "[propolis 13:46 UTC] alerts: topic READABLE by anyone"
+    );
+    assert_eq!(
+        alerts(line(RC_BINDING_HTTP, "readable")),
+        "[propolis 13:46 UTC] alerts: topic not checked yet",
+        "a result for another target says nothing about this one"
+    );
+}
+
+/// The banner claims a refusal only where the gate holds it proven. A refusal decided over a day
+/// ago, or a checker whose last attempt is over three hours old, reads `topic check is stale`,
+/// and a refusal over plain HTTP (which anyone on the path could have answered) reads `topic not
+/// proven private (plain http)`: a check did run in each case, so `not checked yet` would be
+/// untrue. A fresh refusal over https still reads `refuses anonymous reads`, and so does one on
+/// a collector whose token can read, since the anonymous refusal itself is proven there.
+#[test]
+fn the_banner_claims_a_refusal_only_when_the_gate_holds_it_proven() {
+    let fx = Fx::salted(SALT);
+    let https = format!("PROPOLIS_OPS_NTFY_URL={RC_URL}\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n");
+    let http =
+        format!("PROPOLIS_OPS_NTFY_URL=http://ntfy.invalid\nPROPOLIS_OPS_NTFY_TOPIC={RC_TOPIC}\n");
+    let alerts = |env_file: &str, binding: &str, astamp: &str, dstamp: &str, token: &str| {
+        fx.write("etc/propolis/propolis.env", env_file);
+        fx.write(
+            "var/lib/propolis/witness/readcheck",
+            &format!(
+                "#readcheck v1 g=1\nR\t{binding}\t{astamp}\trefused\t{dstamp}\trefused\t{token}\t403\t403\tboth\t403\n"
+            ),
+        );
+        let r = fx.run_env("PA_ROLE=collector; pa_banner", &NOW);
+        r.out.lines().nth(1).unwrap_or_default().to_string()
+    };
+    let fresh = "999000/abcdef01/4000";
+    let refuses = "[propolis 13:46 UTC] alerts: topic refuses anonymous reads";
+    let stale = "[propolis 13:46 UTC] alerts: topic check is stale";
+    let plain = "[propolis 13:46 UTC] alerts: topic not proven private (plain http)";
+    assert_eq!(alerts(&https, RC_BINDING, fresh, fresh, "-"), refuses);
+    assert_eq!(
+        alerts(&https, RC_BINDING, fresh, fresh, "reads"),
+        refuses,
+        "a token that reads does not undo the anonymous refusal"
+    );
+    assert_eq!(
+        alerts(&https, RC_BINDING, fresh, "910000/0000aaaa/1", "-"),
+        stale,
+        "a refusal decided 25 h ago"
+    );
+    assert_eq!(
+        alerts(&https, RC_BINDING, "989199/0000aaaa/1", fresh, "-"),
+        stale,
+        "a last attempt 3 h 1 s ago"
+    );
+    assert_eq!(
+        alerts(&http, RC_BINDING_HTTP, fresh, fresh, "-"),
+        plain,
+        "a refusal over plain HTTP proves nothing"
+    );
 }

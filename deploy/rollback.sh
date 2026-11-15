@@ -805,6 +805,15 @@ restore() {
         echo "    the kept release predates the nightly backup: propolis-backup.timer is disabled until the next upgrade"
     fi
 
+    # A witness from before the hourly pass takes only `light` and exits 2 for anything else, so
+    # the newer release's hourly timer would fail every hour against it. A kept release with no
+    # witness at all keeps the current one, and the timer with it.
+    STEP="setting the witness's hourly timer"
+    if [ -e "$dir/sbin/propolis-witness" ] && [ ! -e "$dir/units/propolis-witness@hourly.timer" ]; then
+        systemctl disable --now propolis-witness@hourly.timer 2>/dev/null || true
+        echo "    the kept witness has no hourly pass: propolis-witness@hourly.timer is disabled until the next upgrade"
+    fi
+
     echo "==> starting services"
     STEP="starting services"
     for unit in "${SENSORS[@]}"; do

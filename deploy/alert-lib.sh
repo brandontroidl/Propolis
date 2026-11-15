@@ -40,7 +40,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=4
+PA_LIB_VERSION=5
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -1294,7 +1294,7 @@ pa_banner() {
     if [ "${PA_TARGET:-0}" != 1 ]; then
         if [ "${PA_ROLE:-}" = collector ]; then alert="no push path here (collector)"; else alert="NO PUSH TARGET (journal only)"; fi
     else
-        alert="topic not checked yet"
+        alert="$(_pa_banner_alert)"
     fi
     lines+=("alerts: $alert")
     if [ -f "$PA_RUN/lockwait" ] && [ ! -L "$PA_RUN/lockwait" ]; then
@@ -1339,6 +1339,339 @@ pa_banner_write() {
     fi
     rm -f -- "$tmp" 2> /dev/null
     return 1
+}
+
+# _pa_banner_alert: the banner's word on a target that exists: READABLE when the stored read check
+# of the shell target or of the daemon's (propolis.env) target, bound to the target in use now,
+# has a definite class other than refused; that it refuses anonymous reads when pa_gate holds the
+# shell target's refusal proven; that the refusal is not proof over plain http, or that the check
+# is stale, when that is why the gate does not; else not checked yet.
+_pa_banner_alert() {
+    local b
+    b="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || b=""
+    if _pa_rc_line shell && [ "$PA_RCL_BIND" = "$b" ]; then
+        case "$PA_RCL_DCLASS" in
+            - | refused) ;;
+            *)
+                printf 'topic READABLE by anyone'
+                return 0
+                ;;
+        esac
+    fi
+    if [ "${PA_D_TARGET:-0}" = 1 ]; then
+        b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || b=""
+        if _pa_rc_line daemon && [ "$PA_RCL_BIND" = "$b" ]; then
+            case "$PA_RCL_DCLASS" in
+                - | refused) ;;
+                *)
+                    printf 'topic READABLE by anyone'
+                    return 0
+                    ;;
+            esac
+        fi
+    fi
+    # A refusal is claimed only where the gate holds it proven: decided within a day, an attempt
+    # within three hours, over https. A token that can read is the gate's own reason to hold full
+    # detail back, not a sign the anonymous refusal is unproven, and so is the detail setting,
+    # which is why the gate is asked with it at auto.
+    # A check that ran and proves nothing is not `not checked yet`: over plain HTTP no refusal
+    # can prove the topic private, and a stale one means the checker stopped or its answer aged.
+    case "$(PA_DETAIL=auto pa_gate)" in
+        full | pointer:token-reads) printf 'topic refuses anonymous reads' ;;
+        pointer:insecure) printf 'topic not proven private (plain http)' ;;
+        pointer:stale) printf 'topic check is stale' ;;
+        *) printf 'topic not checked yet' ;;
+    esac
+}
+
+# ---- the anonymous-read check and the gate -----------------------------------------------------
+#
+# Whether anyone who knows the topic's name can read what is pushed to it. Three GETs without
+# credentials (json, raw and sse, so a proxy guarding one or two read paths cannot pass), and
+# with a token one more json GET carrying it. The topic and the token are secrets: they reach curl
+# only through files made 0600 here (a curl config file for the URL, a header file for the
+# token), listed in PA_CLEANUP and removed before the function returns, never through a command
+# line or a child's environment, and no message names them. The answer is untrusted: its body is
+# capped, never printed, and judged only by the status code, the content type up to its first
+# `;`, and whether every line of a json body starts with ntfy's own `{"id":"`. Anything that
+# cannot be classified is not refused, so the gate falls to pointer mode. The readcheck state file
+# holds one line per target role (shell, daemon, or both when they are the same):
+# R binding attempt-stamp attempt-class definite-stamp definite-class token json raw role sse.
+
+PA_RC_CLASSES="refused readable not_ntfy redirect not_found transient unexpected"
+
+# pa_readcheck_binding URL TOPIC: the first 16 hex of sha256(URL LF TOPIC LF). A stored result is
+# used only for the target whose binding it carries, so a changed URL or topic voids it at once.
+pa_readcheck_binding() {
+    local h
+    h="$(printf '%s\n%s\n' "${1:-}" "${2:-}" | sha256sum 2> /dev/null)" || return 1
+    h="${h%% *}"
+    [[ $h =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "${h:0:16}"
+}
+
+# pa_readcheck_class ENDPOINT CODE CTYPE BODY: the class of one answer (json, raw or sse) from its
+# HTTP status, its content type and, for json, its body file. A 200 is readable only with the
+# endpoint's own content type and, for json, an empty body or one whose every line is an ntfy
+# message; any other 200 is a login page or a portal (not_ntfy). 000 (no answer), 429 and 5xx are
+# transient; a status that is not three digits, or one not named here, is unexpected.
+pa_readcheck_class() {
+    local ep="${1:-}" code="${2:-}" ct="${3:-}" body="${4:-}" s bad
+    if ! [[ $code =~ ^[0-9]{3}$ ]]; then
+        printf unexpected
+        return 0
+    fi
+    case "$code" in
+        401 | 403) printf refused ;;
+        200)
+            ct="${ct%%;*}"
+            ct="${ct//[[:space:]]/}"
+            ct="${ct,,}"
+            case "$ep:$ct" in
+                json:application/x-ndjson | json:application/json)
+                    s="$(stat -c %s -- "$body" 2> /dev/null)" || s=x
+                    if ! [[ $s =~ ^[0-9]{1,12}$ ]] || [ "$((10#$s))" -gt 65536 ]; then
+                        printf not_ntfy
+                        return 0
+                    fi
+                    bad="$(head -c 65536 -- "$body" 2> /dev/null | LC_ALL=C grep -c -a -v -e '^{"id":"' -e '^$')" || true
+                    if [[ $bad =~ ^[0-9]{1,9}$ ]] && [ "$((10#$bad))" -eq 0 ]; then printf readable; else printf not_ntfy; fi
+                    ;;
+                raw:text/plain | sse:text/event-stream) printf readable ;;
+                *) printf not_ntfy ;;
+            esac
+            ;;
+        301 | 302 | 303 | 307 | 308) printf redirect ;;
+        404) printf not_found ;;
+        000 | 429 | 5[0-9][0-9]) printf transient ;;
+        *) printf unexpected ;;
+    esac
+}
+
+# _pa_rc_get CONFIG HEADER BODY: one GET of the URL in the curl config file CONFIG (with the
+# headers in HEADER when it is not empty), the body into BODY. Prints `<code><TAB><content type>`,
+# code 000 when curl gave nothing usable. -q first, so no .curlrc of root's can add to the
+# request; no -L, so a redirect is an answer, not a second request; a file size limit with
+# SIGXFSZ ignored, so a body larger than any ntfy answer ends the transfer with a write error.
+_pa_rc_get() {
+    local out code
+    out="$(
+        trap '' XFSZ
+        ulimit -f 1024 2> /dev/null
+        if [ -n "$2" ]; then
+            timeout 15 curl -q -K "$1" -H "@$2" -sS -o "$3" -w '%{http_code}\t%{content_type}' \
+                --connect-timeout 5 --max-time 10 --max-filesize 65536 --proto '=https,http' 2> /dev/null
+        else
+            timeout 15 curl -q -K "$1" -sS -o "$3" -w '%{http_code}\t%{content_type}' \
+                --connect-timeout 5 --max-time 10 --max-filesize 65536 --proto '=https,http' 2> /dev/null
+        fi
+    )" || true
+    out="${out:0:512}"
+    code="${out%%$'\t'*}"
+    if [ "$code" = "$out" ] || ! [[ $code =~ ^[0-9]{3}$ ]]; then
+        # Nothing parseable: no answer at all is 000; a reply curl printed but not in the form
+        # asked for is something this check cannot classify.
+        if [ -z "$out" ]; then printf '000\t'; else printf 'xxx\t'; fi
+        return 0
+    fi
+    printf '%s\t%s' "$code" "${out#*$'\t'}"
+}
+
+# _pa_rc_conf FILE URL: writes FILE as a curl config file naming URL, quoted the way curl's config
+# parser reads a quoted value.
+_pa_rc_conf() {
+    local u="$2"
+    u="${u//\\/\\\\}"
+    u="${u//\"/\\\"}"
+    { printf 'url = "%s"\n' "$u" > "$1"; } 2> /dev/null && chmod 0600 -- "$1" 2> /dev/null
+}
+
+# pa_readcheck_run URL TOPIC TOKEN: the read check of one target (TOKEN may be empty). Sets
+# PA_RC_CLASS (the attempt's class: transient when any answer was, refused when all three were,
+# else the class of the first answer that was not refused), PA_RC_JSON, PA_RC_RAW and PA_RC_SSE
+# (each status code), PA_RC_TOKEN (reads, noread, unknown, or `-` without a token) and PA_RC_CAUSE
+# (`-`, or tool.exec when curl or a private temporary file was not to be had, the class then being
+# transient). Status 0, or 1 with that cause.
+pa_readcheck_run() {
+    local url="${1:-}" topic="${2:-}" token="${3:-}" conf hdr body ep r code ct cls first="" any_t=0 all_r=1
+    PA_RC_CLASS=transient PA_RC_JSON=000 PA_RC_RAW=000 PA_RC_SSE=000 PA_RC_TOKEN=- PA_RC_CAUSE=-
+    if ! command -v curl > /dev/null 2>&1; then
+        PA_RC_CAUSE=tool.exec
+        return 1
+    fi
+    conf="$(umask 077 && mktemp 2> /dev/null)" || conf=""
+    hdr="$(umask 077 && mktemp 2> /dev/null)" || hdr=""
+    body="$(umask 077 && mktemp 2> /dev/null)" || body=""
+    PA_CLEANUP+=("$conf" "$hdr" "$body")
+    if [ -z "$conf" ] || [ -z "$hdr" ] || [ -z "$body" ]; then
+        rm -f -- "$conf" "$hdr" "$body" 2> /dev/null
+        PA_RC_CAUSE=tool.exec
+        return 1
+    fi
+    for ep in json raw sse; do
+        : > "$body" 2> /dev/null
+        if ! _pa_rc_conf "$conf" "$url/$topic/$ep?poll=1&since=1s"; then
+            rm -f -- "$conf" "$hdr" "$body" 2> /dev/null
+            PA_RC_CAUSE=tool.exec
+            return 1
+        fi
+        r="$(_pa_rc_get "$conf" "" "$body")"
+        code="${r%%$'\t'*}" ct="${r#*$'\t'}"
+        cls="$(pa_readcheck_class "$ep" "$code" "$ct" "$body")"
+        [[ $code =~ ^[0-9]{3}$ ]] || code=-
+        case "$ep" in
+            json) PA_RC_JSON="$code" ;;
+            raw) PA_RC_RAW="$code" ;;
+            sse) PA_RC_SSE="$code" ;;
+        esac
+        [ "$cls" != transient ] || any_t=1
+        if [ "$cls" != refused ]; then
+            all_r=0
+            [ -n "$first" ] || first="$cls"
+        fi
+    done
+    if [ "$any_t" = 1 ]; then
+        PA_RC_CLASS=transient
+    elif [ "$all_r" = 1 ]; then
+        PA_RC_CLASS=refused
+    else
+        PA_RC_CLASS="$first"
+    fi
+    if [ -n "$token" ]; then
+        PA_RC_TOKEN=unknown
+        : > "$body" 2> /dev/null
+        if _pa_rc_conf "$conf" "$url/$topic/json?poll=1&since=1s" \
+            && { printf 'Authorization: Bearer %s\n' "$token" > "$hdr"; } 2> /dev/null; then
+            r="$(_pa_rc_get "$conf" "$hdr" "$body")"
+            code="${r%%$'\t'*}" ct="${r#*$'\t'}"
+            case "$(pa_readcheck_class json "$code" "$ct" "$body")" in
+                readable) PA_RC_TOKEN=reads ;;
+                refused) PA_RC_TOKEN=noread ;;
+            esac
+        fi
+    fi
+    rm -f -- "$conf" "$hdr" "$body" 2> /dev/null
+    return 0
+}
+
+# _pa_rc_line ROLE: the stored readcheck line for ROLE (shell or daemon; a `both` line serves
+# either). Sets PA_RCL_BIND, PA_RCL_ASTAMP, PA_RCL_ACLASS, PA_RCL_DSTAMP, PA_RCL_DCLASS,
+# PA_RCL_TOKEN, PA_RCL_JSON, PA_RCL_RAW, PA_RCL_ROLE and PA_RCL_SSE, every field checked against
+# its form (a class outside the closed list reads unexpected, a stamp that cannot be read `-`).
+# Status 1 when there is none.
+_pa_rc_line() {
+    local want="${1:-}" t b as ac ds dc tk j r role s found=""
+    PA_RCL_BIND="" PA_RCL_ASTAMP=- PA_RCL_ACLASS=- PA_RCL_DSTAMP=- PA_RCL_DCLASS=- PA_RCL_TOKEN=-
+    PA_RCL_JSON=- PA_RCL_RAW=- PA_RCL_ROLE="" PA_RCL_SSE=-
+    while IFS=$'\t' read -r t b as ac ds dc tk j r role s _; do
+        [ "$t" = R ] && [[ ${b:-} =~ ^[0-9a-f]{16}$ ]] || continue
+        case "${role:-}" in shell | daemon | both) ;; *) continue ;; esac
+        if [ "$role" = "$want" ]; then
+            found=1
+        elif [ "$role" = both ] && [ -z "$found" ]; then
+            found=both
+        else
+            continue
+        fi
+        PA_RCL_BIND="$b" PA_RCL_ROLE="$role"
+        PA_RCL_ASTAMP=- PA_RCL_DSTAMP=-
+        if _pa_stamp_split "${as:-}"; then PA_RCL_ASTAMP="$as"; fi
+        if _pa_stamp_split "${ds:-}"; then PA_RCL_DSTAMP="$ds"; fi
+        PA_RCL_ACLASS="$(_pa_rc_word "${ac:-}")" PA_RCL_DCLASS="$(_pa_rc_word "${dc:-}")"
+        case "${tk:-}" in reads | noread | unknown) PA_RCL_TOKEN="$tk" ;; *) PA_RCL_TOKEN=- ;; esac
+        if [[ ${j:-} =~ ^[0-9]{3}$ ]]; then PA_RCL_JSON="$j"; else PA_RCL_JSON=-; fi
+        if [[ ${r:-} =~ ^[0-9]{3}$ ]]; then PA_RCL_RAW="$r"; else PA_RCL_RAW=-; fi
+        if [[ ${s:-} =~ ^[0-9]{3}$ ]]; then PA_RCL_SSE="$s"; else PA_RCL_SSE=-; fi
+        [ "$found" != 1 ] || break
+    done < <(pa_state_read readcheck)
+    [ -n "$found" ]
+}
+
+# _pa_rc_word W: W when it is a read-check class, `-` for `-`, else unexpected.
+_pa_rc_word() {
+    if [ "${1:-}" = - ] || [ -z "${1:-}" ]; then
+        printf -- -
+    elif [[ " $PA_RC_CLASSES " == *" $1 "* ]]; then
+        printf '%s' "$1"
+    else
+        printf unexpected
+    fi
+}
+
+# pa_gate: full, pointer:<reason> or none:notarget for the shell target, from the stored read
+# check and the settings; no network. full only when: there is a target; the detail setting is
+# auto (PA_DETAIL, read from a later release; auto until then); the stored line is bound to this
+# target; its definite class is refused, decided within 24 h; an attempt was made within 3 h (the
+# checker is alive); on a collector the token cannot read the topic (the role is PA_ROLE, or
+# pa_role's answer when the caller set none, and a role that cannot be told counts as a
+# collector's); and the URL is https (over plain HTTP anyone on the path can answer 403 to the
+# check and then read every push). A stamp that cannot be read or lies in the future fails its
+# rule. Sets PA_GATE, and PA_GATE_CHECKED to the stored attempt stamp (`-` without one).
+pa_gate() {
+    local b a role
+    PA_GATE="" PA_GATE_CHECKED=-
+    if [ "${PA_TARGET:-0}" != 1 ]; then
+        PA_GATE=none:notarget
+    elif [ "${PA_DETAIL:-auto}" != auto ]; then
+        PA_GATE=pointer:detail-pointer
+    elif ! _pa_rc_line shell; then
+        PA_GATE=pointer:never
+    else
+        PA_GATE_CHECKED="$PA_RCL_ASTAMP"
+        b="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || b=""
+        if [ "$PA_RCL_BIND" != "$b" ]; then
+            PA_GATE=pointer:unbound PA_GATE_CHECKED=-
+        elif [ "$PA_RCL_DCLASS" = - ]; then
+            PA_GATE=pointer:never
+        elif [ "$PA_RCL_DCLASS" != refused ]; then
+            PA_GATE="pointer:$PA_RCL_DCLASS"
+        else
+            a="$(pa_age "$PA_RCL_DSTAMP")"
+            if [ "$a" -lt 0 ] || [ "$a" -gt 86400 ]; then
+                PA_GATE=pointer:stale
+            else
+                a="$(pa_age "$PA_RCL_ASTAMP")"
+                # The role is asked for here when the caller has not set it, and only when it
+                # decides anything: a collector must never pass for another host because nobody
+                # said what it is, and a host whose role cannot be told is held to its rule.
+                role="${PA_ROLE:-}"
+                if [ "$PA_RCL_TOKEN" = reads ] && [ -z "$role" ]; then role="$(pa_role)"; fi
+                if [ "$a" -lt 0 ] || [ "$a" -gt 10800 ]; then
+                    PA_GATE=pointer:stale
+                elif [ "$PA_RCL_TOKEN" = reads ] && { [ "$role" = collector ] || [ "$role" = unknown ]; }; then
+                    PA_GATE=pointer:token-reads
+                elif [[ ${PA_URL:-} != https://* ]]; then
+                    PA_GATE=pointer:insecure
+                else
+                    PA_GATE=full
+                fi
+            fi
+        fi
+    fi
+    printf '%s' "$PA_GATE"
+}
+
+# pa_readcheck_merge ROLE BINDING HAVE: the readcheck line for ROLE after an attempt whose results
+# are in PA_RC_* (pa_readcheck_run), merged with the stored line the caller read under the lock
+# with _pa_rc_line (HAVE 1, its fields in PA_RCL_*) or without one (HAVE 0). A new binding replaces the line; an attempt with the same
+# binding that was transient changes only the attempt fields, so a 429, a 5xx or a timeout never
+# undoes an earlier definite answer. Prints the line.
+pa_readcheck_merge() {
+    local role="${1:-}" b="${2:-}" have="${3:-0}" ds dc tk j r s
+    ds="$PA_STAMP" dc="$PA_RC_CLASS" tk="$PA_RC_TOKEN" j="$PA_RC_JSON" r="$PA_RC_RAW" s="$PA_RC_SSE"
+    if [ "$PA_RC_CLASS" = transient ]; then
+        ds=- dc=-
+        if [ "$have" = 1 ] && [ "$PA_RCL_BIND" = "$b" ]; then
+            ds="$PA_RCL_DSTAMP" dc="$PA_RCL_DCLASS" tk="$PA_RCL_TOKEN" j="$PA_RCL_JSON" r="$PA_RCL_RAW" s="$PA_RCL_SSE"
+        fi
+    elif [ "$PA_RC_TOKEN" = unknown ] && [ "$have" = 1 ] && [ "$PA_RCL_BIND" = "$b" ] \
+        && { [ "$PA_RCL_TOKEN" = reads ] || [ "$PA_RCL_TOKEN" = noread ]; }; then
+        # The token GET got no answer while the anonymous ones did: what is known of the token
+        # stands, so a timed-out GET cannot lift a collector out of pointer mode.
+        tk="$PA_RCL_TOKEN"
+    fi
+    printf 'R\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$b" "$PA_STAMP" "$PA_RC_CLASS" "$ds" "$dc" \
+        "${tk:--}" "${j:--}" "${r:--}" "$role" "${s:--}"
 }
 
 # ---- the database probe and the push scheduler -------------------------------------------------
@@ -1590,6 +1923,49 @@ pa_incident_get() {
         return 0
     done
     return 1
+}
+
+# pa_finding_inst RULE ID K12 SCOPE: the instance a config-check finding is about, printed as
+# `<kind><TAB><name>` for pa_id_table, or nothing when it cannot be recovered (the finding then
+# reads `a listener` or `a source`). config-check's TSV carries only a hash of the finding's key
+# and its scope, which is text, so the instance is found by matching, never taken from the line:
+# RULE unit hashes `<id>:<unit>` for each configured sensor unit in PA_FI_UNITS (names without
+# .service); scope finds the listener row (PA_FI_SCOPE, PA_FI_UNIT, from the run's R lines) whose
+# scope is SCOPE; logpath hashes `<id>:<path>` for each path of PROPOLIS_SENSOR_LOGS
+# (PA_LOG_LABEL and PA_LOG_PATH, from pa_sensor_logs) and gives that log's label. A unit found is
+# printed only when its name passes pa_unit_name_ok.
+pa_finding_inst() {
+    local rule="${1:-}" id="${2:-}" k12="${3:-}" scope="${4:-}" i h u
+    [[ $k12 =~ ^[0-9a-f]{12}$ ]] || [ "$rule" = scope ] || return 0
+    case "$rule" in
+        unit)
+            for u in "${PA_FI_UNITS[@]}"; do
+                h="$(printf '%s' "$id:$u" | sha256sum 2> /dev/null)" || continue
+                if [ "${h:0:12}" = "$k12" ] && pa_unit_name_ok "$u.service"; then
+                    printf 'unit\t%s.service' "$u"
+                    return 0
+                fi
+            done
+            ;;
+        scope)
+            for i in "${!PA_FI_SCOPE[@]}"; do
+                [ "${PA_FI_SCOPE[$i]}" = "$scope" ] || continue
+                u="${PA_FI_UNIT[$i]:-}.service"
+                if pa_unit_name_ok "$u"; then printf 'unit\t%s' "$u"; fi
+                return 0
+            done
+            ;;
+        logpath)
+            for i in "${!PA_LOG_PATH[@]}"; do
+                h="$(printf '%s' "$id:${PA_LOG_PATH[$i]}" | sha256sum 2> /dev/null)" || continue
+                if [ "${h:0:12}" = "$k12" ] && pa_plain_id "${PA_LOG_LABEL[$i]}"; then
+                    printf 'source\t%s' "${PA_LOG_LABEL[$i]}"
+                    return 0
+                fi
+            done
+            ;;
+    esac
+    return 0
 }
 
 # _pa_tier_rank T: 3 for PAGE, 2 for ACT, 1 for NOTICE, 0 for anything else, so a record whose

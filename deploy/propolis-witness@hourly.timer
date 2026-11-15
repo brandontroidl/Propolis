@@ -1,0 +1,20 @@
+# Once an hour, the witness's hourly pass (propolis-witness@hourly.service): the installed
+# config-check, the anonymous-read check of the alert topic, and the light pass's health.
+#
+# OnActiveSec runs the first pass soon after install or upgrade enables the timer; systemd adds the
+# randomized delay to every elapse, so that first run starts 3 to 13 minutes after enabling, and the
+# light pass gives a new timer three hours before it calls the hourly pass stale. The delay spreads
+# the hourly runs of many hosts over ten minutes. Persistent runs a missed hour at boot. A template
+# timer cannot carry a schedule of its own, so this concrete file names its instance.
+[Unit]
+Description=Propolis root witness, hourly
+
+[Timer]
+OnActiveSec=3min
+OnCalendar=hourly
+RandomizedDelaySec=600
+Persistent=true
+Unit=propolis-witness@hourly.service
+
+[Install]
+WantedBy=timers.target

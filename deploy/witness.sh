@@ -3,7 +3,8 @@
 # The root witness: the part of the shell alerting code that runs on its own, on a timer.
 # Installed as /usr/local/sbin/propolis-witness by deploy/install.sh and deploy/upgrade.sh;
 # propolis-witness@light.service runs `propolis-witness light` every five minutes from
-# propolis-witness@light.timer.
+# propolis-witness@light.timer, and propolis-witness@hourly.service runs `propolis-witness hourly`
+# once an hour from propolis-witness@hourly.timer.
 #
 # WHAT A LIGHT PASS DOES. It asks systemd once for the state of every Propolis unit (and reads
 # the rotation guard's journal for a failed rotation run), then, under the state lock: takes in
@@ -14,6 +15,22 @@
 # unit left in the failed state on two passes; reminds open incidents on their schedule and
 # resolves each with the proof of its kind; and writes its line in the heartbeat file and
 # `meta light_last`. Last it writes the login banner, /run/motd.d/propolis, from the state files.
+# When the alert target's URL or topic differs from the one the stored read check was made for,
+# it runs the read check (below) before it takes the lock. It also judges the hourly pass from
+# outside: its timer active and enabled, and a pass under three hours old.
+#
+# WHAT AN HOURLY PASS DOES. Without the lock: it runs the installed config-check
+# (/usr/local/lib/propolis/config-check.sh --tsv --no-events --report-only) and reads its findings;
+# it asks the ntfy server, without credentials, whether the topic can be read by anyone (three
+# GETs, and one more with the token when a token is set; the anonymous-read check); and it asks
+# systemd about the light pass's timer. Then, under the lock, it reads the state files afresh and
+# changes only what is its own: a finding seen on two completed runs in a row is recorded with
+# its tier from WITNESS_CC_TABLE, and resolved once absent from two that could check it (a run
+# whose G row, listener cell or L line says its group was not checked says nothing of it, nor
+# does one that printed a line out of form that could be it); a config-check that did not
+# complete on two hourly passes opens cc-stopped; the read check's answer is stored for the gate
+# and the banner; a light pass over twenty minutes old, or its timer stopped, opens witness-stale.
+# What the light pass and the failure hook recorded in the meantime is kept as they wrote it.
 #
 # WHAT HOLDS AN OPEN. No unit kind opens in the first ten minutes of uptime, while a maintenance
 # marker holds, or in the ten minutes after a marker was last seen (`meta maint_seen`): planned
@@ -25,15 +42,16 @@
 # pending, for a config-check result, without which an unset bind cannot be told from a crash.
 #
 # RECORD ONLY. Nothing here sends, pages or posts. Each transition the v2 profile would push adds
-# one to the record's would_push, which the status walk shows; that is all. It runs no curl, no
-# config-check and no database probe.
+# one to the record's would_push, which the status walk shows; that is all. Its only network
+# requests are the read check's GETs, which carry no message; it runs no database probe.
 #
 # SAFE TO RUN FOREVER. An ordinary check error is recorded and the pass still exits 0, so it is
 # never a failed unit for the failure hook to report; three in a row open the NOTICE
-# tool-unusable. Every program it runs has a time limit, the pass stops its optional reads after
-# 200 s and its judgement after 240 s (marking itself partial), well inside the unit's 15
-# minutes, and nothing slow runs while it holds the state lock. When the lock is not free within
-# 60 s it writes no state, logs one line, counts the miss in /run/propolis-witness/lockwait
+# tool-unusable. Every program it runs has a time limit, the light pass stops its optional reads
+# after 200 s and its judgement after 240 s, the hourly pass its judgement after 720 s (marking
+# itself partial), well inside the unit's 15 minutes, and nothing slow runs while it holds the
+# state lock. When the lock is not free within 60 s (the hourly pass: 120 s) it writes no state,
+# logs one line, counts the miss in /run/propolis-witness/lockwait
 # (which the walk and the banner show), marks its heartbeat line partial and tries again on the
 # next pass. No file it writes grows without bound: resolved records leave the incidents file
 # after seven days, there is one spool file per unit and each is removed once taken in, and
@@ -44,20 +62,27 @@
 # WHAT IT TRUSTS. It sources the alert library (/usr/local/sbin/propolis-alert-lib) only after
 # checking that it, and every directory above it, is owned by root and writable by no one else.
 # Unit names are checked against systemd's own form before they reach a file name or a command
-# line, and every value systemctl prints is checked against its form before it is used.
+# line, and every value systemctl prints is checked against its form before it is used. The
+# installed config-check runs as root only after the same ownership check, of the script and of
+# the libraries it sources beside itself, with a fixed argument list, a time limit and a cap on
+# its output; every field of its output is checked before use, a line out of form is skipped and
+# never taken as a finding gone, and a tier or a stage comes only from WITNESS_CC_TABLE, never
+# from the output. The read check's
+# topic and token reach curl only through files the library makes 0600, and the answer is judged
+# by its status code and content type alone.
 #
 # Exit status: 0 after every pass that ran, whatever it found; 2 a bad argument; 3 the alert
 # library is missing, not trusted, fails to load or is older than this script needs. Only those
 # reach the failure hook, which records a witness unit's failure and never pages for it.
 #
 # Test seams (honoured only with PROPOLIS_ALERT_ROOT set; tests only): PROPOLIS_ALERT_ROOT puts
-# every path under that directory and keeps the caller's PATH, so stubs win;
-# PROPOLIS_WITNESS_NOW is the time as a WALL/BOOT/UP stamp; PROPOLIS_WITNESS_LOCK_WAIT replaces
-# the 60 s wait for the state lock; PROPOLIS_WITNESS_DEADLINE replaces the 240 s after which the
-# pass judges nothing more.
+# every path under that directory (the installed config-check among them) and keeps the caller's
+# PATH, so stubs win; PROPOLIS_WITNESS_NOW is the time as a WALL/BOOT/UP stamp;
+# PROPOLIS_WITNESS_LOCK_WAIT replaces the wait for the state lock; PROPOLIS_WITNESS_DEADLINE
+# replaces the 240 s (light) or 720 s (hourly) after which the pass judges nothing more.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 4
+# needs-alert-lib: 5
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -76,10 +101,11 @@ export LC_ALL=C TZ=UTC
 IFS=$' \t\n'
 set -uo pipefail
 
-if [ "$#" -ne 1 ] || [ "$1" != light ]; then
-    echo "usage: propolis-witness light   (the light pass; this release has no other)" >&2
+if [ "$#" -ne 1 ] || { [ "$1" != light ] && [ "$1" != hourly ]; }; then
+    echo "usage: propolis-witness light|hourly   (light: the five-minute pass; hourly: config-check, the anonymous-read check and the light pass's health)" >&2
     exit 2
 fi
+INSTANCE="$1"
 
 ROOT="${PROPOLIS_ALERT_ROOT:-}"
 if [ -z "$ROOT" ]; then
@@ -205,7 +231,8 @@ WITNESS_LIB_FUNCS="pa_init pa_settings_load pa_role pa_now pa_age pa_clock_check
 pa_id_table pa_ok_field pa_write pa_lock pa_unlock pa_state_read pa_state_write pa_maint_active
 pa_cause pa_unit_map pa_incident_load pa_incident_get pa_incident_transition pa_incident_set
 pa_incident_write pa_incident_prune pa_first_sighting pa_banner_write pa_trusted_exec pa_cleanup
-pa_unit_name_ok"
+pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding pa_readcheck_run
+pa_readcheck_merge"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -239,6 +266,18 @@ LOCK_WAIT=60
 # The pass judges nothing more once this many seconds have gone: what
 # it did is still written, and its heartbeat line says partial.
 WITNESS_DEADLINE=240
+if [ "$INSTANCE" = hourly ]; then
+    # The programs an hourly pass runs on purpose each have their own limit: config-check 300 s;
+    # the read check of two targets, four GETs each at 15 s, 120 s; systemctl 20 s for the timer
+    # sample and 40 s for the role's two questions; about ten small reads of 5 s, 50 s; the state
+    # lock 120 s. 650 s in all, inside 720 s. The local reads and writes of the state files have
+    # no limit of their own: the library's `cat` and `stat` of each state file, pa_write's
+    # `sync`, and the ownership checks' `stat` and `readlink` of each path. On a local disk they
+    # take milliseconds; what bounds them on a disk that hangs is the unit's TimeoutStartSec of
+    # 15 minutes.
+    LOCK_WAIT=120
+    WITNESS_DEADLINE=720
+fi
 if [ -n "$ROOT" ]; then
     if [[ ${PROPOLIS_WITNESS_NOW:-} =~ ^([0-9]{1,12})/([0-9a-f]{8})/([0-9]{1,10})$ ]]; then
         export PA_TEST_WALL="${BASH_REMATCH[1]}" PA_TEST_BOOT="${BASH_REMATCH[2]}" PA_TEST_UP="${BASH_REMATCH[3]}"
@@ -328,6 +367,26 @@ commit_block() {
     _B=()
 }
 
+# parse_show TEXT: the blocks `systemctl show` printed, kept by commit_block for the units asked.
+parse_show() {
+    local line k
+    _B=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ -z "$line" ]; then
+            commit_block
+            continue
+        fi
+        k="${line%%=*}"
+        [ "$k" != "$line" ] || continue
+        case "$k" in
+            Id | LoadState | ActiveState | SubState | Result | NRestarts | ExecMainStatus \
+                | ActiveEnterTimestampMonotonic | InactiveEnterTimestampMonotonic | UnitFileState \
+                | InvocationID | Restart) _B[$k]="${line#*=}" ;;
+        esac
+    done <<< "$1"
+    commit_block
+}
+
 # collect_sample: one `systemctl show` for every unit in scope, the units named by a record or a
 # spool file among them (and the timer of each such oneshot), so a record is judged whatever
 # unit it names. A word that is not a unit name is left out: systemd would answer for a unit of
@@ -335,7 +394,7 @@ commit_block() {
 # or SAMPLE_CAUSE when systemd could not be asked. A failed
 # rotation run's journal is read here too, before the pass takes the lock, as the hook reads it.
 collect_sample() {
-    local out rc line k t key u name dir timer
+    local out rc t key u name dir timer
     local -a units=("${WITNESS_UNITS[@]}" "${WITNESS_TIMERS[@]}")
     for u in "${units[@]}"; do WANT[$u]=1; done
     while IFS=$'\t' read -r t _ key _; do
@@ -367,21 +426,7 @@ collect_sample() {
         case "$rc" in 126 | 127) SAMPLE_CAUSE=tool.exec ;; *) SAMPLE_CAUSE=unknown ;; esac
         return 0
     fi
-    _B=()
-    while IFS= read -r line || [ -n "$line" ]; do
-        if [ -z "$line" ]; then
-            commit_block
-            continue
-        fi
-        k="${line%%=*}"
-        [ "$k" != "$line" ] || continue
-        case "$k" in
-            Id | LoadState | ActiveState | SubState | Result | NRestarts | ExecMainStatus \
-                | ActiveEnterTimestampMonotonic | InactiveEnterTimestampMonotonic | UnitFileState \
-                | InvocationID | Restart) _B[$k]="${line#*=}" ;;
-        esac
-    done <<< "$out"
-    commit_block
+    parse_show "$out"
     if [ "${#S_LOAD[@]}" -eq 0 ]; then
         SAMPLE_CAUSE=unknown
         return 0
@@ -462,23 +507,42 @@ unit_facts() {
 # a unit's baseline for the slow rule, `R unit stamp nrestarts`, and a P line counts one check's
 # results: `P check stamp result cause consecutive`.
 
+#
+# The hourly pass owns its own P lines: `config-check` (completed runs, ok, or not, error),
+# `readcheck`, `witness-light` (the light pass fresh or stale, as it judged it) and one
+# `clean:<key>` line per open finding, counting the completed runs in a row without it. The
+# light pass's `witness-hourly` line is the same for the hourly pass. Every other line, the other
+# instance's U and R lines among them, is kept exactly as read.
+
 declare -A OBS_U=() OBS_R=() OBS_P=() NEW_U=() NEW_R=() JUDGED=()
 OBS_KEEP=()
-OBS_MINE_P=" units "
+OBS_MINE_P=" units witness-hourly "
+[ "$INSTANCE" != hourly ] || OBS_MINE_P=" config-check readcheck witness-light "
+
+# obs_mine NAME: the P line NAME belongs to this instance.
+obs_mine() {
+    case "$OBS_MINE_P" in *" $1 "*) return 0 ;; esac
+    [ "$INSTANCE" = hourly ] && [[ $1 == clean:* ]]
+}
 
 load_observe() {
     local line t name rest
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         IFS=$'\t' read -r t name rest <<< "$line"
+        if [ "$INSTANCE" = hourly ] && { [ "$t" = U ] || [ "$t" = R ]; }; then
+            OBS_KEEP+=("$line")
+            continue
+        fi
         case "$t" in
             U) pa_unit_name_ok "$name" && OBS_U[$name]="${rest:-}" ;;
             R) pa_unit_name_ok "$name" && OBS_R[$name]="${rest:-}" ;;
             P)
-                case "$OBS_MINE_P" in
-                    *" $name "*) OBS_P[$name]="${rest:-}" ;;
-                    *) OBS_KEEP+=("$line") ;;
-                esac
+                if obs_mine "$name"; then
+                    OBS_P[$name]="${rest:-}"
+                else
+                    OBS_KEEP+=("$line")
+                fi
                 ;;
             *) OBS_KEEP+=("$line") ;;
         esac
@@ -535,7 +599,7 @@ lockwait_get() {
         return 0
     }
     while read -r t c _; do
-        [ "$t" = light ] && [[ $c =~ ^[0-9]{1,9}$ ]] && n=$((10#$c))
+        [ "$t" = "$INSTANCE" ] && [[ $c =~ ^[0-9]{1,9}$ ]] && n=$((10#$c))
     done < <(timeout 5 head -c 4096 -- "$f" 2> /dev/null)
     printf '%s' "$n"
 }
@@ -546,13 +610,13 @@ lockwait_set() {
     local f="$PA_RUN/lockwait" t c body=""
     if [ -f "$f" ] && [ ! -L "$f" ]; then
         while read -r t c _; do
-            [[ $t =~ ^[a-z]{1,16}$ && $c =~ ^[0-9]{1,9}$ ]] && [ "$t" != light ] || continue
+            [[ $t =~ ^[a-z]{1,16}$ && $c =~ ^[0-9]{1,9}$ ]] && [ "$t" != "$INSTANCE" ] || continue
             body+="$t"$'\t'"$c"$'\n'
         done < <(timeout 5 head -c 4096 -- "$f" 2> /dev/null)
     elif [ "$1" = 0 ]; then
         return 0
     fi
-    [ "$1" = 0 ] || body+="light"$'\t'"$1"$'\n'
+    [ "$1" = 0 ] || body+="$INSTANCE"$'\t'"$1"$'\n'
     if [ -z "$body" ]; then
         rm -f -- "$f" 2> /dev/null || true
     else
@@ -570,7 +634,7 @@ write_heartbeat() {
             while IFS= read -r line; do
                 IFS=$'\t' read -r t inst s w r _ <<< "$line"
                 [ "$t" = B ] && [[ $inst =~ ^[a-z]{1,16}$ ]] || continue
-                if [ "$inst" = light ]; then
+                if [ "$inst" = "$INSTANCE" ]; then
                     case "${w:-}" in persistent | run | none) was="$w" ;; esac
                     continue
                 fi
@@ -580,8 +644,23 @@ write_heartbeat() {
         } < <(timeout 5 head -c 65536 -- "$f" 2> /dev/null)
         [[ $head =~ ^#heartbeat\ v1\ g=([0-9]{1,18})$ ]] && g=$((10#${BASH_REMATCH[1]}))
     fi
-    body+="B"$'\t'"light"$'\t'"$PA_STAMP"$'\t'"${WHERE:-${was:-none}}"$'\t'"$1"$'\n'
+    body+="B"$'\t'"$INSTANCE"$'\t'"$PA_STAMP"$'\t'"${WHERE:-${was:-none}}"$'\t'"$1"$'\n'
     pa_write "$f" < <(printf '#heartbeat v1 g=%s\n%s' "$((g + 1))" "$body") || true
+}
+
+# heartbeat_stamp INSTANCE: the stamp of INSTANCE's line in the heartbeat file, or nothing.
+heartbeat_stamp() {
+    local f="$PA_RUN/heartbeat" head="" line t inst s out=""
+    [ -f "$f" ] && [ ! -L "$f" ] || return 0
+    {
+        IFS= read -r head
+        [[ $head =~ ^#heartbeat\ v1\ g=[0-9]{1,18}$ ]] || return 0
+        while IFS= read -r line; do
+            IFS=$'\t' read -r t inst s _ <<< "$line"
+            if [ "$t" = B ] && [ "$inst" = "$1" ] && _pa_stamp_split "${s:-}"; then out="$s"; fi
+        done
+    } < <(timeout 5 head -c 65536 -- "$f" 2> /dev/null)
+    printf '%s' "$out"
 }
 
 # sweep_stale: the temporary files of writers killed between writing and renaming, older than
@@ -911,10 +990,11 @@ judge_unit() {
 }
 
 # cc_result_recent: a config-check run completed in this boot or in the last two hours (meta
-# cc_last, written by the hourly pass).
+# cc_last, written by the hourly pass for every run, and cc_fail 0: the last one completed).
 cc_result_recent() {
     local v="${META_CC_LAST%%/*}"
     [ -n "$v" ] || return 1
+    [ "$(_pa_num "${META_CC_FAIL:-0}")" = 0 ] || return 1
     v="${META_CC_LAST%/*/*}"
     _pa_stamp_split "$v" || return 1
     [ "$_PA_B" = "$PA_BOOT" ] && return 0
@@ -1152,9 +1232,710 @@ remind_all() {
     return 0
 }
 
+# ---- config-check's findings ----------------------------------------------------------------
+#
+# WITNESS_CC_TABLE: every finding id deploy/config-check.sh emits, and what the witness does with
+# it. Fields, separated by `|`: the id; page (recorded at the tier shown, pushed under v2), daily
+# (recorded as a NOTICE, seen in the walk and counted in the daily message) or never (not
+# recorded); the tier; the stage or rail; the config-check row whose limitation makes a run say
+# nothing about the finding (listener for the per-listener rows); how its instance is found (unit:
+# the hash of `<id>:<unit>` for each configured sensor; scope: the listener row of its scope;
+# logpath: the hash of `<id>:<path>` for each log of PROPOLIS_SENSOR_LOGS; fold: every name folds
+# into one record; `-`: one per host); and the phrase a push will carry. A tier or a stage never
+# comes from config-check's output, and an id with no row here is not recorded. A page row is
+# there because nothing else sees its fault; the reason for each daily and never row is that
+# another kind already pages the same fault, or that the condition is standing or deliberate.
+WITNESS_CC_TABLE='
+unit-missing|page|PAGE|listen|listener|unit|listener <inst> not installed
+unit-down|page|PAGE|listen|listener|unit|listener <inst> stopped while enabled
+listen-foreign|page|PAGE|listen|listener|scope|port of <inst> held by another process
+listen-loopback|page|PAGE|listen|listener|scope|port of <inst> held on loopback
+listen-none|page|PAGE|listen|listener|scope|listener <inst> up, nothing listening
+fw|page|ACT|listen|listener|scope|firewall drops a port of <inst>
+danger|page|PAGE|listen|listener|scope|real service exposed on a port of <inst>
+spool-label-sensor|page|PAGE|gateway|gateway-spool|logpath|source <inst> refused at the gateway
+spool-unlisted|page|ACT|gateway|gateway-spool|fold|collector <inst> not listed
+intake-wrongpath|page|ACT|intake|listener|logpath|intake reads the wrong file for <inst>
+intake-absent|page|ACT|intake|listener|logpath|source <inst> not ingested
+logsize-fail|page|ACT|source|listener|logpath|log <inst> not rotated in time
+stale|page|ACT|source|logrotate|-|rotation has not run for 3 h
+backup-timer|page|ACT|backup|backup|-|no backup scheduled
+backup-stale|page|ACT|backup|backup|-|last good backup too old
+ops-failure-hook|page|ACT|alert|alerting|-|failure hook not installed
+badbind|daily|NOTICE|listen|listener|-|-
+unit-masked|daily|NOTICE|listen|listener|-|-
+unit-disabled|daily|NOTICE|listen|listener|-|-
+unit-notenabled|daily|NOTICE|listen|listener|-|-
+listen-ownerless|daily|NOTICE|listen|listener|-|-
+nofw|daily|NOTICE|listen|listener|-|-
+logpath|daily|NOTICE|listen|listener|-|-
+logquiet|daily|NOTICE|listen|listener|-|-
+logmissing|daily|NOTICE|listen|listener|-|-
+noconfig|daily|NOTICE|listen|units|-|-
+logsize-warn|daily|NOTICE|source|listener|-|-
+timer|daily|NOTICE|source|logrotate|-|-
+timer-enabled|daily|NOTICE|source|logrotate|-|-
+service-failed|never|-|source|logrotate|-|-
+never|daily|NOTICE|source|logrotate|-|-
+policy|daily|NOTICE|source|logrotate|-|-
+guard|daily|NOTICE|source|logrotate|-|-
+cursor-dir-unseen|daily|NOTICE|source|cursors|-|-
+cursor-missing|daily|NOTICE|source|cursors|-|-
+intake-none|daily|NOTICE|intake|intake-list|-|-
+intake-bad|daily|NOTICE|intake|intake-list|-|-
+intake-duplabel|daily|NOTICE|intake|intake-list|-|-
+intake-duppath|daily|NOTICE|intake|intake-list|-|-
+intake-rel|daily|NOTICE|intake|intake-list|-|-
+intake-nodir|daily|NOTICE|intake|intake-list|-|-
+intake-orphan|daily|NOTICE|intake|intake-list|-|-
+intake-name|daily|NOTICE|intake|intake-list|-|-
+events-none|never|-|intake|listener|-|-
+events-old|never|-|intake|listener|-|-
+spool-label-subsystem|daily|NOTICE|gateway|gateway-spool|-|-
+spool-label-other|daily|NOTICE|gateway|gateway-spool|-|-
+ledger-owner|never|-|ledger|ledger|-|-
+ledger-database|never|-|ledger|ledger|-|-
+ledger-grants|never|-|ledger|ledger|-|-
+backup-headroom|daily|NOTICE|backup|backup|-|-
+backup-timer-enabled|daily|NOTICE|backup|backup|-|-
+backup-plaintext|daily|NOTICE|backup|backup|-|-
+backup-failing|daily|NOTICE|backup|backup|-|-
+backup-never|daily|NOTICE|backup|backup|-|-
+backup-age-missing|daily|NOTICE|backup|backup|-|-
+ops-monitor-off|daily|NOTICE|alert|alerting|-|-
+ops-no-push|daily|NOTICE|alert|alerting|-|-
+ops-no-heartbeat|daily|NOTICE|alert|alerting|-|-
+ops-push-half|daily|NOTICE|alert|alerting|-|-
+clock-unsynced|daily|NOTICE|host|clock|-|-
+bins-missing|daily|NOTICE|host|binaries|-|-
+bins-differ|never|-|host|binaries|-|-
+stamp-missing|never|-|host|deploy-stamp|-|-
+stamp-nohead|never|-|host|deploy-stamp|-|-
+stamp-noinstalled|never|-|host|deploy-stamp|-|-
+stamp-mismatch|daily|NOTICE|host|deploy-stamp|-|-
+stamp-behind|never|-|host|deploy-stamp|-|-
+watch-env-missing|daily|NOTICE|host|watcher|-|-
+watch-env-owner|daily|NOTICE|host|watcher|-|-
+watch-env-empty|daily|NOTICE|host|watcher|-|-
+watch-env-drift|daily|NOTICE|host|watcher|-|-
+watch-key-empty|daily|NOTICE|host|watcher|-|-
+watch-key-missing|daily|NOTICE|host|watcher|-|-
+env-mode|daily|NOTICE|host|env-files|-|-
+env-none|daily|NOTICE|host|env-files|-|-
+env-empty|daily|NOTICE|host|env-files|-|-
+env-systemd-only|daily|NOTICE|host|env-files|-|-
+witness-missing|daily|NOTICE|witness|witness|-|-
+witness-timer|daily|NOTICE|witness|witness|-|-
+'
+
+declare -A T_ELIG=() T_TIER=() T_STAGE=() T_GROUP=() T_INST=()
+load_table() {
+    local id elig tier stage group inst
+    while IFS='|' read -r id elig tier stage group inst _; do
+        [ -n "$id" ] || continue
+        T_ELIG[$id]="$elig" T_TIER[$id]="$tier" T_STAGE[$id]="$stage" T_GROUP[$id]="$group" T_INST[$id]="$inst"
+    done <<< "$WITNESS_CC_TABLE"
+}
+
+CC_PATH="$ROOT/usr/local/lib/propolis/config-check.sh"
+# What the installed config-check sources from its own directory, as root like the script itself:
+# the listener library always, and an alert library there in preference to the installed one.
+CC_SOURCED=("$ROOT/usr/local/lib/propolis/listeners-lib.sh" "$ROOT/usr/local/lib/propolis/alert-lib.sh")
+# config-check prints at most this many spool-unlisted findings (deploy/config-check.sh
+# SPOOL_MAX_REPORTED), so a run that prints this many may have found more.
+WITNESS_SPOOL_REPORTED=20
+CC_DONE=0 CC_RC=- CC_SECS=0 CC_WHY="" CC_BAD=0 CC_BAD_ALL=0 CC_LIMIT_ALL=0 CC_FOLD_N=0
+declare -A CC_PRESENT=() CC_HELD=() CC_DAILY=() CC_LIMITED=() CC_INST=() CC_FW_UNKNOWN=() CC_DANGER=()
+declare -A CC_DOWN_UNIT=() CC_BAD_ID=()
+CF_ID=() CF_K12=() CF_SCOPE=()
+PA_FI_UNITS=() PA_FI_SCOPE=() PA_FI_UNIT=()
+
+# cc_limit TEXT: the groups an L line says the run could not check, from the fixed start of its
+# text (deploy/config-check.sh#limit). A text with no group here limits every group, so a limit
+# that a later config-check adds can never let a finding resolve unchecked.
+cc_limit() {
+    case "$1" in
+        'ss unavailable'* | 'firewall rules unreadable'* | 'socket owners hidden'* \
+            | 'log files not traversable'* | 'propolis.env / shipper.env not readable'*)
+            CC_LIMITED[listener]=1
+            ;;
+        'df is not installed'* | 'the free space of '* | 'the backup directory '*) CC_LIMITED[backup]=1 ;;
+        'gateway spool'*) CC_LIMITED[gateway-spool]=1 ;;
+        'ledger query skipped'*) CC_LIMITED[ledger]=1 ;;
+        'the build of '* | 'the installed '* | 'binary list unreadable'*) CC_LIMITED[binaries]=1 ;;
+        'checkout HEAD not readable'*) CC_LIMITED[deploy-stamp]=1 ;;
+        'checkout unknown'*) CC_LIMITED[deploy-stamp]=1 CC_LIMITED[binaries]=1 ;;
+        'watch.env not readable'* | 'watcher home not traversable'*) CC_LIMITED[watcher]=1 ;;
+        *) CC_LIMIT_ALL=1 ;;
+    esac
+}
+
+# cc_run: the installed config-check, once, as root: only after the ownership check every program
+# root runs passes, for the script and for what it sources beside itself, with the fixed argument
+# list, under `timeout 300`, its output cut at 2 MiB and never shown. Sets CC_DONE (1 for a
+# completed run: the header, S first, E last and E's count equal to the F lines), CC_RC (its exit
+# status, `-` when it was not run), CC_SECS, CC_WHY, and from a completed run the findings (CF_*),
+# the listener rows (PA_FI_SCOPE, PA_FI_UNIT), the rows that could not be checked (CC_LIMITED from
+# G rows, listener cells and L lines; CC_LIMIT_ALL for an L line of no known group) and the scopes
+# whose firewall cell is unknown. Every field is checked before use: an F line whose id fails
+# pa_ok_field, or whose key hash is not 12 hex, is skipped and counted in CC_BAD (CC_BAD_ALL for a
+# bad id, CC_BAD_ID[id] for a bad hash of a good id), since it cannot be tied to a key.
+cc_run() {
+    local out rc t0 line t a b c d n_f=0 n_e="" first=1 second=0 last="" i f
+    local -a cells
+    CC_DONE=0 CC_RC=- CC_SECS=0 CC_WHY="" CC_BAD=0 CC_BAD_ALL=0 CC_LIMIT_ALL=0
+    if ! pa_trusted_exec "$CC_PATH"; then
+        CC_WHY="not trusted: $PA_UNTRUSTED"
+        [ -e "$CC_PATH" ] || [ -L "$CC_PATH" ] || CC_WHY="not installed"
+        return 0
+    fi
+    for f in "${CC_SOURCED[@]}"; do
+        # The alert library beside it is optional (config-check falls back to the installed one,
+        # which this script already trusts); the listener library is not.
+        [ "$f" != "${CC_SOURCED[1]}" ] || [ -e "$f" ] || [ -L "$f" ] || continue
+        if ! pa_trusted_exec "$f"; then
+            CC_WHY="not trusted: $PA_UNTRUSTED"
+            return 0
+        fi
+    done
+    t0="$SECONDS"
+    out="$(
+        timeout 300 "$CC_PATH" --tsv --no-events --report-only < /dev/null 2> /dev/null \
+            | LC_ALL=C head -c 2097152 | LC_ALL=C tr -d '\000'
+        exit "${PIPESTATUS[0]}"
+    )"
+    rc=$?
+    CC_RC="$rc" CC_SECS=$((SECONDS - t0))
+    if [ "$rc" = 124 ]; then
+        CC_WHY="timed out after 300 s"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        last="$line"
+        if [ "$first" = 1 ]; then
+            first=0
+            [ "$line" = "#config-check tsv v1" ] || {
+                CC_WHY="not in the TSV form"
+                return 0
+            }
+            second=1
+            continue
+        fi
+        IFS=$'\t' read -r t a b c d _ <<< "$line"
+        if [ "$second" = 1 ]; then
+            second=0
+            [ "$t" = S ] || {
+                CC_WHY="not in the TSV form"
+                return 0
+            }
+            continue
+        fi
+        case "$t" in
+            G)
+                if pa_ok_field "${a:-}" && [ "${b:-}" = unknown ]; then CC_LIMITED[$a]=1; fi
+                ;;
+            R)
+                if ! pa_ok_field "${a:-}" || ! pa_ok_field "${b:-}"; then continue; fi
+                PA_FI_SCOPE+=("$a") PA_FI_UNIT+=("$b")
+                IFS=$'\t' read -r -a cells <<< "$line"
+                for i in 4 5 6 7 8 9; do
+                    [ "${cells[$i]:-}" != unknown ] || CC_LIMITED[listener]=1
+                done
+                [ "${cells[6]:-}" != unknown ] || CC_FW_UNKNOWN[$a]=1
+                ;;
+            F)
+                n_f=$((n_f + 1))
+                if ! pa_ok_field "${b:-}"; then
+                    CC_BAD=$((CC_BAD + 1)) CC_BAD_ALL=1
+                    continue
+                fi
+                if ! [[ ${c:-} =~ ^[0-9a-f]{12}$ ]]; then
+                    CC_BAD=$((CC_BAD + 1))
+                    CC_BAD_ID[$b]=1
+                    continue
+                fi
+                pa_ok_field "${d:-}" || d=-
+                CF_ID+=("$b") CF_K12+=("$c") CF_SCOPE+=("$d")
+                ;;
+            L) cc_limit "${a:-}" ;;
+            E) n_e="${a:-}" ;;
+        esac
+    done <<< "$out"
+    if [[ ${last%%$'\t'*} != E || ! $n_e =~ ^[0-9]{1,9}$ ]] || [ "$((10#$n_e))" -ne "$n_f" ]; then
+        CC_WHY="output cut off or incomplete"
+        CF_ID=() CF_K12=() CF_SCOPE=() PA_FI_SCOPE=() PA_FI_UNIT=() CC_LIMITED=() CC_FW_UNKNOWN=()
+        CC_BAD_ID=() CC_BAD_ALL=0 CC_LIMIT_ALL=0
+        return 0
+    fi
+    CC_DONE=1
+}
+
+# cc_findings: the findings of a completed run that the table records, by key, with their
+# instances. Every spool-unlisted finding folds into finding:spool-unlisted:all (its names come
+# from directories the gateway account writes, which must not be able to fill the record bound).
+# A finding another kind pages on this run is daily for the run (CC_DAILY): a listen-foreign on a
+# port a danger finding holds, and (judge_findings decides it, from systemd) a unit-down whose unit
+# is failed, which unit-failed carries. A finding seen but not judged on this run is held
+# (CC_HELD): a unit-down whose unit cannot be placed or is neither inactive nor failed, a fw
+# finding whose firewall cell is unknown.
+cc_findings() {
+    local i id k12 scope key inst
+    for i in "${!CF_ID[@]}"; do
+        [ "${CF_ID[$i]}" != danger ] || CC_DANGER[${CF_SCOPE[$i]}]=1
+    done
+    for i in "${!CF_ID[@]}"; do
+        id="${CF_ID[$i]}" k12="${CF_K12[$i]}" scope="${CF_SCOPE[$i]}"
+        case "${T_ELIG[$id]:-}" in page | daily) ;; *) continue ;; esac
+        if [ "$id" = spool-unlisted ]; then
+            key=finding:spool-unlisted:all
+            CC_FOLD_N=$((CC_FOLD_N + 1))
+        else
+            key="finding:$id:$k12"
+        fi
+        pa_ok_field "$key" || continue
+        CC_PRESENT[$key]="$id"
+        inst="$(pa_finding_inst "${T_INST[$id]}" "$id" "$k12" "$scope")"
+        [ -z "$inst" ] || CC_INST[$key]="$inst"
+        case "$id" in
+            unit-down)
+                if [ -n "$inst" ]; then CC_DOWN_UNIT[$key]="${inst#*$'\t'}"; else CC_HELD[$key]=1; fi
+                ;;
+            listen-foreign) [ -z "${CC_DANGER[$scope]:-}" ] || CC_DAILY[$key]=1 ;;
+            fw) [ -z "${CC_FW_UNKNOWN[$scope]:-}" ] || CC_HELD[$key]=1 ;;
+        esac
+    done
+}
+
+# ---- the anonymous-read check ---------------------------------------------------------------
+
+declare -A RC_CLASS=() RC_JSON=() RC_RAW=() RC_SSE=() RC_TOKEN=() RC_BIND=() RC_CAUSE=()
+RC_ROLES=()
+
+# rc_roles: the targets to check, by role: both when the shell target and the daemon's are the
+# same one, else shell and daemon apiece (from a later release they can differ); none without a
+# target. Sets RC_ROLES and RC_BIND.
+rc_roles() {
+    local sb="" db=""
+    RC_ROLES=()
+    [ "${PA_TARGET:-0}" != 1 ] || sb="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || sb=""
+    [ "${PA_D_TARGET:-0}" != 1 ] || db="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || db=""
+    if [ -n "$sb" ] && [ "$sb" = "$db" ]; then
+        RC_ROLES=(both) RC_BIND[both]="$sb"
+    else
+        [ -z "$sb" ] || RC_ROLES+=(shell) RC_BIND[shell]="$sb"
+        [ -z "$db" ] || RC_ROLES+=(daemon) RC_BIND[daemon]="$db"
+    fi
+}
+
+# rc_collect ALL: the read check of each target role, without the lock: every role (ALL 1, the
+# hourly pass), or only those whose stored line is bound to another target or missing (ALL 0, a
+# light pass, so a changed URL or topic is checked within five minutes). The results wait in
+# RC_* for rc_store.
+rc_collect() {
+    local role url topic token
+    rc_roles
+    for role in "${RC_ROLES[@]}"; do
+        if [ "$1" = 0 ]; then
+            if _pa_rc_line "${role/both/shell}" && [ "$PA_RCL_BIND" = "${RC_BIND[$role]}" ] \
+                && { [ "$PA_RCL_ROLE" = "$role" ] || [ "$role" != both ]; }; then
+                continue
+            fi
+        fi
+        past_deadline && return 0
+        if [ "$role" = daemon ]; then
+            url="$PA_D_URL" topic="$PA_D_TOPIC" token=""
+        else
+            url="$PA_URL" topic="$PA_TOPIC" token="${PA_TOKEN:-}"
+        fi
+        pa_readcheck_run "$url" "$topic" "$token" || true
+        RC_CLASS[$role]="$PA_RC_CLASS" RC_JSON[$role]="$PA_RC_JSON" RC_RAW[$role]="$PA_RC_RAW"
+        RC_SSE[$role]="$PA_RC_SSE" RC_TOKEN[$role]="$PA_RC_TOKEN" RC_CAUSE[$role]="$PA_RC_CAUSE"
+    done
+}
+
+# rc_store: under the lock, the readcheck file read afresh with this pass's answers merged in. A
+# line of a role no target has now goes, except that a both line stands for the shell target
+# when that has no line of its own; a line this pass did not check, and a line of a type this
+# release does not know, are kept as read.
+rc_store() {
+    local line t role new="" old="" r keep b
+    local -A have=()
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        old+="$line"$'\n'
+        IFS=$'\t' read -r t _ _ _ _ _ _ _ _ role _ <<< "$line"
+        if [ "$t" != R ]; then
+            # A line of a type this release does not know belongs to one that does.
+            new+="$line"$'\n'
+            continue
+        fi
+        keep=""
+        for r in "${RC_ROLES[@]}"; do
+            [ -z "${RC_CLASS[$r]:-}" ] || continue
+            if [ "$role" = "$r" ]; then
+                keep="$line"
+            elif [ "$role" = both ] && [ "$r" = shell ]; then
+                keep="${line%$'\t'both$'\t'*}"$'\t'shell$'\t'"${line##*$'\t'both$'\t'}"
+            fi
+        done
+        if [ -n "$keep" ] && [ -z "${have[$role]:-}" ]; then
+            new+="$keep"$'\n'
+            have[$role]=1
+        fi
+    done < <(pa_state_read readcheck)
+    for r in "${RC_ROLES[@]}"; do
+        [ -n "${RC_CLASS[$r]:-}" ] || continue
+        b=0
+        if _pa_rc_line "${r/both/shell}" && { [ "$PA_RCL_ROLE" = "$r" ] || [ "$PA_RCL_ROLE" = both ]; }; then b=1; fi
+        PA_RC_CLASS="${RC_CLASS[$r]}" PA_RC_JSON="${RC_JSON[$r]}" PA_RC_RAW="${RC_RAW[$r]}"
+        PA_RC_SSE="${RC_SSE[$r]}" PA_RC_TOKEN="${RC_TOKEN[$r]}"
+        new+="$(pa_readcheck_merge "$r" "${RC_BIND[$r]}" "$b")"$'\n'
+    done
+    [ "$new" != "$old" ] || return 0
+    pa_state_write readcheck < <(printf '%s' "$new")
+    where_merge
+}
+
+# rc_result: the hourly pass's one result for the read check (ok, or unknown with a cause, for
+# the P line and tool-unusable): unknown when an attempt could not be made or got no definite
+# answer.
+rc_result() {
+    local r code
+    RCR_RESULT=ok RCR_CAUSE=-
+    for r in "${RC_ROLES[@]}"; do
+        [ -n "${RC_CLASS[$r]:-}" ] || continue
+        if [ "${RC_CAUSE[$r]}" != - ]; then
+            RCR_RESULT=unknown RCR_CAUSE="${RC_CAUSE[$r]}"
+        elif [ "${RC_CLASS[$r]}" = transient ]; then
+            RCR_RESULT=unknown
+            for code in "${RC_JSON[$r]}" "${RC_RAW[$r]}" "${RC_SSE[$r]}"; do
+                case "$code" in
+                    000) RCR_CAUSE=net.connect ;;
+                    429) RCR_CAUSE=http.rate ;;
+                    5[0-9][0-9]) RCR_CAUSE=http.server ;;
+                    *) continue ;;
+                esac
+                break
+            done
+            [ "$RCR_CAUSE" != - ] || RCR_CAUSE=unknown
+        fi
+    done
+}
+
+# ---- the other pass's health ----------------------------------------------------------------
+
+# streak NAME RESULT: one more result (ok or error) in this instance's P line NAME; sets STREAK_N
+# to how many in a row it now has (a variable, since the line must change in this shell).
+streak() {
+    local prev consec=0
+    IFS=$'\t' read -r _ prev _ consec _ <<< "${OBS_P[$1]:-}"
+    if [ "${prev:-}" = "$2" ] && [[ ${consec:-} =~ ^[0-9]{1,9}$ ]]; then
+        consec=$((10#$consec + 1))
+    else
+        consec=1
+    fi
+    [ "$consec" -le 999999 ] || consec=999999
+    OBS_P[$1]="$PA_STAMP"$'\t'"$2"$'\t'-$'\t'"$consec"
+    STREAK_N="$consec"
+}
+
+# pass_age OTHER META_STAMP: the age of the other instance's last completed pass, the newer of its
+# heartbeat line in /run (emptied by a reboot) and its meta stamp (on disk), or -1 when neither can
+# be read or both lie in the future.
+pass_age() {
+    local s a best=-1
+    for s in "$(heartbeat_stamp "$1")" "$2"; do
+        _pa_stamp_split "$s" || continue
+        a="$(pa_age "$s")"
+        [ "$a" -ge 0 ] || continue
+        if [ "$best" -lt 0 ] || [ "$a" -lt "$best" ]; then best="$a"; fi
+    done
+    printf '%s' "$best"
+}
+
+# judge_other OTHER LIMIT META_STAMP: witness-stale on witness:OTHER, from this pass. OTHER is stale
+# when its timer is not active and enabled, or its last pass is older than LIMIT seconds; a pass
+# that has never completed counts from when its timer started in this boot, which is what keeps a
+# host upgraded to a release with a new timer quiet until that timer's first run has had its time.
+# Not judged in the first 1800 s of uptime (the hourly timer's first run after a boot can come 13
+# minutes after the light pass's first), or when the timer's state or the pass's age cannot be
+# read: unknown never opens or resolves anything, and drops a first sighting, since the next
+# stale check is not the second in a row. Opened on two checks in a row, resolved fresh2 on two
+# fresh checks in a row.
+judge_other() {
+    local other="$1" limit="$2" timer="propolis-witness@$1.timer" key="witness:$1" age verdict n aem
+    local name="witness-$1"
+    verdict=unknown
+    if [ "$PA_UP" -ge 1800 ] && [ -n "${S_LOAD[$timer]:-}" ] && [ "${S_LOAD[$timer]}" != "?" ]; then
+        if [ "${S_ACT[$timer]:-}" != active ] || [ "${S_FILE[$timer]:-}" != enabled ]; then
+            verdict=stale
+        else
+            age="$(pass_age "$other" "$3")"
+            if [ "$age" -lt 0 ] && [[ ${S_AEM[$timer]:-} =~ ^[0-9]{1,18}$ ]] && [ "${S_AEM[$timer]}" != 0 ]; then
+                aem=$((10#${S_AEM[$timer]} / 1000000))
+                [ "$aem" -gt "$((10#$PA_UP))" ] || age=$((10#$PA_UP - aem))
+            fi
+            if [ "$age" -ge 0 ]; then
+                if [ "$age" -gt "$limit" ]; then verdict=stale; else verdict=fresh; fi
+            fi
+        fi
+    fi
+    pa_incident_get "$key" || PA_INC=()
+    case "$verdict:${PA_INC[7]:-none}" in
+        stale:none | stale:resolved)
+            PA_REC_KIND=witness-stale PA_REC_TIER=ACT PA_REC_STAGE=witness PA_REC_CAUSE=witness.stale
+            PA_REC_INST=- PA_REC_NR=- PA_REC_OUT=- PA_REC_FLAG=""
+            pa_incident_transition "$key" pending && rec_set
+            unset 'OBS_P[$name]'
+            ;;
+        stale:pending)
+            PA_REC_KIND=witness-stale PA_REC_TIER=ACT PA_REC_STAGE=witness PA_REC_CAUSE=witness.stale
+            PA_REC_INST=- PA_REC_NR=- PA_REC_OUT=- PA_REC_FLAG=""
+            pa_incident_transition "$key" open && rec_set
+            unset 'OBS_P[$name]'
+            ;;
+        stale:*) unset 'OBS_P[$name]' ;;
+        fresh:pending)
+            pa_incident_transition "$key" drop && rec_set
+            unset 'OBS_P[$name]'
+            ;;
+        fresh:open | fresh:acked)
+            streak "$name" ok
+            n="$STREAK_N"
+            if [ "$n" -ge 2 ]; then
+                PA_REC_PROOF=fresh2
+                pa_incident_transition "$key" resolve && rec_set
+                unset 'OBS_P[$name]'
+            fi
+            ;;
+        unknown:pending)
+            # Two checks in a row means two that could judge: a stale check after one that could
+            # not is a first sighting again.
+            pa_incident_transition "$key" drop && rec_set
+            unset 'OBS_P[$name]'
+            ;;
+        *) unset 'OBS_P[$name]' ;;
+    esac
+    return 0
+}
+
+# ---- the hourly pass's judgement ------------------------------------------------------------
+
+# finding_attrs ID KEY: the record attributes of a finding, from the table alone.
+finding_attrs() {
+    local inst="${CC_INST[$2]:-}" kind name
+    PA_REC_KIND=finding PA_REC_TIER="${T_TIER[$1]}" PA_REC_STAGE="${T_STAGE[$1]}"
+    PA_REC_CAUSE=config.finding PA_REC_NR=- PA_REC_OUT=- PA_REC_FLAG="" PA_REC_INST=-
+    if [ -n "$inst" ]; then
+        kind="${inst%%$'\t'*}" name="${inst#*$'\t'}"
+        PA_REC_INST="${FIDS[$kind/$name]:--}"
+    fi
+}
+
+# cc_unknown_for ID: the run says nothing of ID's absence: its group could not be checked (a G row
+# or a listener cell reading unknown, or an L line naming the group or none known), or a line out
+# of form could have been one of ID's findings (a bad hash of ID, or a bad id).
+cc_unknown_for() {
+    [ "$CC_LIMIT_ALL" = 0 ] && [ "$CC_BAD_ALL" = 0 ] && [ -z "${CC_BAD_ID[$1]:-}" ] || return 0
+    [ -n "${T_GROUP[$1]:-}" ] && [ -n "${CC_LIMITED[${T_GROUP[$1]}]:-}" ]
+}
+
+# judge_findings: the transitions of every finding record against a completed run. Present on
+# this run: none becomes pending, pending opens, an open one counts nothing more but rises to the
+# table's tier when it was recorded lower. Daily for this run (another kind pages the fault now):
+# the same at NOTICE, a first sighting's tier lowered with it (it has pushed nothing), an open
+# record's tier left as it is (a tier never falls while open). Absent from a run that could check
+# it: pending is dropped, an open one resolves clean2 on the second such run in a row. A finding
+# held on this run is present and changes nothing else; one the run says nothing of is unknown:
+# an open one changes nothing and its clean count starts again, a pending one is dropped, since
+# its next sighting would not be on the next run.
+judge_findings() {
+    local key id line state n parent daily
+    local -a keys=()
+    for key in "${!CC_PRESENT[@]}"; do
+        past_deadline && return 1
+        # Seen, held or not, is not absent: the run of clean checks starts again.
+        unset 'OBS_P[clean:$key]'
+        [ -z "${CC_HELD[$key]:-}" ] || continue
+        id="${CC_PRESENT[$key]}"
+        daily="${CC_DAILY[$key]:-}"
+        if [ -n "${CC_DOWN_UNIT[$key]:-}" ]; then
+            case "${DOWN_STATE[${CC_DOWN_UNIT[$key]}]:-}" in
+                inactive) ;;
+                failed) daily=1 ;;
+                *)
+                    CC_HELD[$key]=1
+                    continue
+                    ;;
+            esac
+        fi
+        state=none
+        if pa_incident_get "$key"; then state="${PA_INC[7]}"; fi
+        finding_attrs "$id" "$key"
+        if [ -n "$daily" ]; then
+            PA_REC_TIER=NOTICE
+            case "$state" in
+                none | resolved) pa_incident_transition "$key" pending && rec_set ;;
+                pending)
+                    PA_INC[6]=NOTICE
+                    rec_set
+                    pa_incident_transition "$key" open && rec_set
+                    ;;
+            esac
+        else
+            case "$state" in
+                none | resolved) pa_incident_transition "$key" pending && rec_set ;;
+                pending) pa_incident_transition "$key" open && rec_set ;;
+                open | acked)
+                    if [ "$(_pa_tier_rank "$PA_REC_TIER")" -gt "$(_pa_tier_rank "${PA_INC[6]}")" ]; then
+                        pa_incident_transition "$key" change && rec_set
+                    fi
+                    ;;
+            esac
+        fi
+        if [ "$key" = finding:spool-unlisted:all ] && pa_incident_get "$key"; then
+            n="$CC_FOLD_N"
+            [ "$n" -lt "$WITNESS_SPOOL_REPORTED" ] || n="$WITNESS_SPOOL_REPORTED+"
+            if [ "${PA_INC[34]}" != "$n" ]; then
+                PA_INC[34]="$n"
+                rec_set
+            fi
+        fi
+    done
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ <<< "$line"
+        [[ $key == finding:* ]] && [ -z "${CC_PRESENT[$key]:-}" ] && keys+=("$key")
+    done
+    for key in "${keys[@]}"; do
+        past_deadline && return 1
+        id="${key#finding:}"
+        id="${id%%:*}"
+        pa_incident_get "$key" || continue
+        state="${PA_INC[7]}"
+        if cc_unknown_for "$id"; then
+            unset 'OBS_P[clean:$key]'
+            [ "$state" != pending ] || { pa_incident_transition "$key" drop && rec_set; }
+            continue
+        fi
+        case "$state" in
+            pending) pa_incident_transition "$key" drop && rec_set ;;
+            open | acked)
+                streak "clean:$key" ok
+                n="$STREAK_N"
+                if [ "$n" -ge 2 ]; then
+                    PA_REC_PROOF=clean2
+                    pa_incident_transition "$key" resolve && rec_set
+                    unset 'OBS_P[clean:$key]'
+                fi
+                ;;
+        esac
+    done
+    # A backup that is too old because the nightly run keeps failing is the failed run's to
+    # report, which the hook already does: the finding folds under that open record.
+    for key in "${!CC_PRESENT[@]}"; do
+        [ "${CC_PRESENT[$key]}" = backup-stale ] || continue
+        [ "$BACKUP_FAILED_LAST" = 1 ] || continue
+        pa_incident_get unit:propolis-backup.service || continue
+        case "${PA_INC[7]}" in open | acked) parent="${PA_INC[1]}" ;; *) continue ;; esac
+        pa_incident_get "$key" || continue
+        [ "${PA_INC[13]}" = - ] || continue
+        if pa_incident_fold "$key" "$parent"; then rec_set; fi
+    done
+    # A clean count whose record is no longer open counts nothing.
+    for key in "${!OBS_P[@]}"; do
+        [[ $key == clean:* ]] || continue
+        if pa_incident_get "${key#clean:}"; then
+            case "${PA_INC[7]}" in open | acked) continue ;; esac
+        fi
+        unset 'OBS_P[$key]'
+    done
+    return 0
+}
+
+# judge_cc_run: a config-check that did not complete raises cc_fail; on the second hourly pass in
+# a row it opens cc-stopped, an ACT on the witness rail, because every finding it would have
+# reported is unseen while it cannot run. Two completed runs in a row resolve it.
+judge_cc_run() {
+    local n
+    if [ "$CC_DONE" = 1 ]; then
+        CC_FAIL=0
+        streak config-check ok
+        n="$STREAK_N"
+        if [ "$n" -ge 2 ] && pa_incident_get tool:config-check; then
+            case "${PA_INC[7]}" in
+                open | acked)
+                    PA_REC_PROOF=clean2
+                    pa_incident_transition tool:config-check resolve && rec_set
+                    ;;
+            esac
+        fi
+        return 0
+    fi
+    CC_FAIL=$(($(_pa_num "$CC_FAIL") + 1))
+    streak config-check error
+    [ "$CC_FAIL" -ge 2 ] || return 0
+    if ! pa_incident_get tool:config-check || [ "${PA_INC[7]}" = resolved ]; then
+        PA_REC_KIND=cc-stopped PA_REC_TIER=ACT PA_REC_STAGE=witness PA_REC_CAUSE=cc.stopped
+        PA_REC_INST=- PA_REC_NR=- PA_REC_OUT=- PA_REC_FLAG=""
+        pa_incident_transition tool:config-check open && rec_set
+    fi
+}
+
+declare -A FIDS=() DOWN_STATE=()
+BACKUP_FAILED_LAST=0 CC_FAIL=0 STREAK_N=0
+
+# hourly_ids: opaque ids for the instances a finding can name: every unit the light pass samples
+# and every log label of PROPOLIS_SENSOR_LOGS.
+hourly_ids() {
+    local input="" u i id kind name
+    for u in "${WITNESS_UNITS[@]}"; do input+="unit"$'\t'"$u"$'\n'; done
+    for i in "${!PA_LOG_LABEL[@]}"; do
+        pa_plain_id "${PA_LOG_LABEL[$i]}" && input+="source"$'\t'"${PA_LOG_LABEL[$i]}"$'\n'
+    done
+    while IFS=$'\t' read -r id kind name; do
+        [ -n "$name" ] && FIDS[$kind/$name]="$id"
+    done < <(printf '%s' "$input" | pa_id_table 2> /dev/null)
+}
+
+# hourly_sample: one `systemctl show` for the light pass's timer and the units of unit-down
+# findings, without the lock.
+hourly_sample() {
+    local out u key
+    local -a units=(propolis-witness@light.timer)
+    for key in "${!CC_DOWN_UNIT[@]}"; do
+        u="${CC_DOWN_UNIT[$key]}"
+        pa_unit_name_ok "$u" && [ -z "${WANT[$u]:-}" ] || continue
+        units+=("$u")
+    done
+    for u in "${units[@]}"; do WANT[$u]=1; done
+    out="$(systemctl show -p Id,LoadState,ActiveState,SubState,UnitFileState,ActiveEnterTimestampMonotonic -- "${units[@]}" 2> /dev/null)" || return 0
+    parse_show "$out"
+    for key in "${!CC_DOWN_UNIT[@]}"; do
+        u="${CC_DOWN_UNIT[$key]}"
+        DOWN_STATE[$u]="${S_ACT[$u]:-}"
+    done
+}
+
+# backup_failed_last: the backup's last-failure is newer than its last-success (both written by
+# root, deploy/backup.sh); an mtime that cannot be read says no.
+backup_failed_last() {
+    local d="$ROOT/var/lib/propolis/backup-status" f s
+    BACKUP_FAILED_LAST=0
+    [ -f "$d/last-failure" ] && [ ! -L "$d/last-failure" ] || return 0
+    f="$(timeout 5 stat -c %Y -- "$d/last-failure" 2> /dev/null)" || return 0
+    [[ $f =~ ^[0-9]{1,12}$ ]] || return 0
+    if [ -f "$d/last-success" ] && [ ! -L "$d/last-success" ]; then
+        s="$(timeout 5 stat -c %Y -- "$d/last-success" 2> /dev/null)" || return 0
+        [[ $s =~ ^[0-9]{1,12}$ ]] || return 0
+        [ "$((10#$f))" -gt "$((10#$s))" ] || return 0
+    fi
+    BACKUP_FAILED_LAST=1
+}
+
 # ---- one pass -------------------------------------------------------------------------------
 
-META_CC_LAST="" META_MAINT_SEEN=""
+META_CC_LAST="" META_MAINT_SEEN="" META_CC_FAIL=""
 
 # past_deadline: the pass has used the time it may judge for (WITNESS_DEADLINE).
 past_deadline() {
@@ -1163,12 +1944,13 @@ past_deadline() {
 
 # light_pass: the light pass. See the header for what it does and in what order.
 light_pass() {
-    local rc u n status=ok healed="" t k v ok
+    local rc u n status=ok healed="" hourly="" t k v ok
     local -a meta=()
     pa_settings_load
     PA_ROLE="$(pa_role)"
     if pa_maint_active; then MAINT=1; fi
     collect_sample
+    rc_collect 0
 
     rc=0
     pa_lock "$LOCK_WAIT" || rc=$?
@@ -1196,6 +1978,8 @@ light_pass() {
         [ "$t" = M ] || continue
         case "$k" in
             cc_last) META_CC_LAST="$v" ;;
+            cc_fail) META_CC_FAIL="$v" ;;
+            hourly_last) hourly="$v" ;;
             healed) healed="$v" ;;
             maint_seen) META_MAINT_SEEN="$v" ;;
         esac
@@ -1205,6 +1989,7 @@ light_pass() {
     sweep_stale
     load_ids
     ingest_spool
+    rc_store
 
     if [ "$SAMPLE_OK" = 1 ]; then
         check_counts units ok -
@@ -1223,6 +2008,7 @@ light_pass() {
     if past_deadline; then
         status=partial
     else
+        [ "$SAMPLE_OK" = 0 ] || judge_other hourly 10800 "$hourly"
         remind_all
     fi
     if ! past_deadline; then
@@ -1259,5 +2045,100 @@ light_pass() {
     return 0
 }
 
-light_pass
+# hourly_pass: the hourly pass. See the header for what it does and in what order. Everything
+# slow (config-check, the read check, systemd) happens before the lock; under it the state files
+# are read afresh and only the hourly pass's own records, observe lines and meta keys change, so
+# what the light pass or the hook wrote while this pass computed is kept.
+hourly_pass() {
+    local rc n status=ok t k v light="" judged=0
+    pa_settings_load
+    PA_ROLE="$(pa_role)"
+    load_table
+    for k in "${WITNESS_UNITS[@]}"; do
+        case "$k" in sensor-*.service) PA_FI_UNITS+=("${k%.service}") ;; esac
+    done
+    pa_env_get PROPOLIS_SENSOR_LOGS "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    pa_sensor_logs "$PA_ENV_VALUE"
+    cc_run
+    [ "$CC_DONE" = 1 ] || status=partial
+    if past_deadline; then
+        status=partial
+    else
+        [ "$CC_DONE" = 0 ] || cc_findings
+        rc_collect 1
+        hourly_sample
+        backup_failed_last
+    fi
+    past_deadline && status=partial
+
+    rc=0
+    pa_lock "$LOCK_WAIT" || rc=$?
+    if [ "$rc" != 0 ]; then
+        if [ "$rc" = 1 ] && command -v flock > /dev/null 2>&1; then
+            n="$(lockwait_get)"
+            lockwait_set "$((n + 1))"
+            note "state lock busy for $LOCK_WAIT s; hourly pass skipped"
+        else
+            note "state lock cannot be taken (no lock file can be opened, or flock is missing); hourly pass skipped"
+            WHERE=none PA_WHERE=none
+        fi
+        write_heartbeat partial
+        return 0
+    fi
+    [ "$(lockwait_get)" = 0 ] || lockwait_set 0
+
+    pa_salt_ensure || true
+    pa_clock_check || true
+    where_merge
+    while IFS=$'\t' read -r t k v _; do
+        [ "$t" = M ] || continue
+        case "$k" in
+            light_last) light="$v" ;;
+            cc_fail) CC_FAIL="$v" ;;
+        esac
+    done < <(pa_state_read meta)
+    pa_incident_load
+    load_observe
+    hourly_ids
+    if ! past_deadline; then
+        judged=1
+        judge_cc_run
+        if [ "$CC_DONE" = 1 ]; then
+            judge_findings || status=partial
+        fi
+        if ! past_deadline; then
+            rc_store
+            rc_result
+            [ "$RCR_RESULT" = ok ] || status=partial
+            check_counts readcheck "$RCR_RESULT" "$RCR_CAUSE"
+            judge_other light 1200 "$light"
+        fi
+    fi
+    past_deadline && status=partial
+    if [ "$CHANGED" = 1 ]; then
+        pa_incident_write
+        where_merge
+    fi
+    pa_state_write observe < <(observe_body)
+    where_merge
+    local -a meta=(hourly_last "$PA_STAMP" where "${WHERE:-none}")
+    [ "$judged" = 0 ] || meta+=(cc_last "$PA_STAMP/$CC_RC/$CC_SECS" cc_fail "$(_pa_num "$CC_FAIL")")
+    # How many lines the last completed run printed out of form, for the walk.
+    [ "$judged" = 0 ] || [ "$CC_DONE" = 0 ] || meta+=(cc_skipped "$CC_BAD")
+    _pa_meta_set "${meta[@]}"
+    where_merge
+    [ "$WHERE" != none ] || status=partial
+    write_heartbeat "$status"
+    pa_unlock
+    [ "$CC_DONE" = 1 ] || note "config-check did not complete: ${CC_WHY:-exit $CC_RC}"
+    [ "$CC_BAD" = 0 ] || note "config-check printed $CC_BAD finding lines that are not in its form; skipped, and no finding they could be is taken as gone"
+    [ "$WHERE" != none ] || note "state not persisted: neither /var/lib/propolis/witness nor /run/propolis-witness took a write"
+    return 0
+}
+
+if [ "$INSTANCE" = hourly ]; then
+    hourly_pass
+else
+    light_pass
+fi
 exit 0

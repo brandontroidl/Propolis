@@ -58,7 +58,7 @@
 # its time limit in seconds.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 4
+# needs-alert-lib: 5
 
 umask 077
 STATUS_SELF="${BASH_SOURCE[0]}"
@@ -271,7 +271,7 @@ PA_LIB_VERSION=""
 STATUS_LIB_FUNCS="pa_init pa_env_get pa_settings_load pa_role pa_alias pa_id_table pa_plain_id
 pa_ok_field pa_clean_untrusted pa_now pa_age pa_dur pa_hms pa_read_as pa_stat_as pa_trusted_exec
 pa_state_read pa_maint_active pa_pg pa_push_scheduler pa_sensor_logs pa_unit_map pa_cleanup
-pa_banner pa_banner_write pa_maint_write"
+pa_banner pa_banner_write pa_maint_write pa_gate pa_readcheck_binding"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $STATUS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -1468,10 +1468,63 @@ row_publish() {
 
 # The ALERTS facts, shared by the header and the alert rail.
 A_TARGET="" A_MONITOR="" A_QUEUE="" A_UNDELIVERED="" A_SINCE="" A_QUEUE_N=0 A_UNDELIVERED_N=0
-A_QUEUE_OLDEST=""
+A_QUEUE_OLDEST="" A_GATE="" A_GATE_CHECKED=- A_RC_NOTE="" A_DAEMON_PRIVATE=0
+
+# load_readcheck_facts: the gate (from the stored read check and the settings; no network), when
+# the check was last attempted, one note per stored line (the shell's and the daemon's target, or
+# one line for both), and whether the daemon's target (propolis.env, where the legacy hook and the
+# daemon post) is proven private: a refusal for its current binding decided within 24 h, an
+# attempt within 3 h, and the URL https.
+load_readcheck_facts() {
+    local role b a word
+    pa_state_read readcheck > /dev/null
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" readcheck "* ]]; then
+        A_GATE="?"
+        A_RC_NOTE="readcheck unreadable"
+        return 0
+    fi
+    PA_ROLE="$ROLE"
+    pa_gate > /dev/null
+    A_GATE="$PA_GATE" A_GATE_CHECKED="$PA_GATE_CHECKED"
+    for role in shell daemon; do
+        if [ "$role" = shell ]; then
+            [ "$PA_TARGET" = 1 ] || continue
+            b="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || b=""
+        else
+            [ "${PA_D_TARGET:-0}" = 1 ] || continue
+            b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || b=""
+        fi
+        _pa_rc_line "$role" || continue
+        # The gate's own terms (2.4.5 rules 5, 6 and 8): over plain HTTP a 403 proves nothing, and a
+        # refusal no attempt has confirmed for three hours is no longer known.
+        if [ "$role" = daemon ] && [ "$PA_RCL_BIND" = "$b" ] && [ "$PA_RCL_DCLASS" = refused ] \
+            && [[ ${PA_D_URL:-} == https://* ]]; then
+            a="$(pa_age "$PA_RCL_DSTAMP")"
+            if [ "$a" -ge 0 ] && [ "$a" -le 86400 ]; then
+                a="$(pa_age "$PA_RCL_ASTAMP")"
+                [ "$a" -lt 0 ] || [ "$a" -gt 10800 ] || A_DAEMON_PRIVATE=1
+            fi
+        fi
+        # A both line was named once, for the shell target.
+        [ "$role" = shell ] || [ "$PA_RCL_ROLE" != both ] || continue
+        if [ "$PA_RCL_BIND" != "$b" ]; then
+            word="not checked for the current target"
+        elif [ "$PA_RCL_DCLASS" = - ]; then
+            word="no answer yet (last attempt $PA_RCL_ACLASS)"
+        else
+            word="$PA_RCL_DCLASS"
+            [ "$PA_RCL_DCLASS" != readable ] || word="READABLE"
+            word+=" (checked $(fmt_time "${PA_RCL_DSTAMP%%/*}"))"
+            [ "$PA_RCL_TOKEN" = - ] || word+=", token $PA_RCL_TOKEN"
+        fi
+        A_RC_NOTE+="${A_RC_NOTE:+; }${PA_RCL_ROLE/both/shell and daemon} topic $word"
+    done
+}
+
 load_alert_facts() {
     local f first text rc dir n=0 oldest="" list name
     pa_settings_load
+    load_readcheck_facts
     if [ -e "$PROPOLIS_ENV" ] && { [ ! -f "$PROPOLIS_ENV" ] || [ ! -r "$PROPOLIS_ENV" ]; }; then
         A_TARGET="?"
     elif [ "$PA_TARGET" = 1 ]; then
@@ -1559,6 +1612,25 @@ rail_alert() {
         state=WARN cond=alert-target
         note="${note:+$note; }invalid value ignored: $PA_INVALID"
     }
+    # The gate holds full detail back until a stored read check proves the topic refuses
+    # anonymous reads; the daemon's own topic (propolis.env), where today's hook sends host and
+    # unit names and the daemon its titles, is judged apart, so a private shell topic cannot hide
+    # a readable daemon topic.
+    if [ "$A_GATE" = "?" ]; then
+        [ "$state" = WARN ] || state='?'
+        note="${note:+$note; }readcheck cannot be read"
+    else
+        if [ "$PA_TARGET" = 1 ] && [ "$A_GATE" != full ]; then
+            [ "$state" = '?' ] || state=WARN
+            cond="${cond:-alert-target}" note="${note:+$note; }gate ${A_GATE}"
+        fi
+        if [ "${PA_D_TARGET:-0}" = 1 ] && [ "$A_DAEMON_PRIVATE" = 0 ]; then
+            [ "$state" = '?' ] || state=WARN
+            cond="${cond:-alert-target}"
+            note="${note:+$note; }legacy hook carries host and unit names; daemon titles name this host's software (until step 3)"
+        fi
+    fi
+    [ -z "$A_RC_NOTE" ] || note="${note:+$note; }$A_RC_NOTE"
     if [ "$A_UNDELIVERED" = "?" ]; then
         state='?' note="${note:+$note; }undelivered list cannot be read"
     elif [ "$A_UNDELIVERED_N" -gt 0 ]; then
@@ -1766,6 +1838,11 @@ rail_monitor() {
 # 1800 s of uptime, when every timer is just starting), or when the banner is missing or older
 # than 900 s while the pass itself is fresh: the pass then runs but cannot tell anyone at login.
 # WARN when a hook spool file has waited over 10 min, which the next pass should have taken in.
+# The hourly pass: FAIL when its timer is not active or cc-stopped is open (config-check has not
+# completed on two hourly passes, so every finding it reports goes unseen); WARN when the pass is
+# over two hours and ten minutes old, when its timer fired over 15 minutes ago and no pass has
+# ever completed, when the last config-check exited with a status above 2 or was not run at all,
+# or when the last completed run printed lines out of form.
 W_TIMER_ACTIVE="" W_TIMER_FILE="" W_TIMER_LAST=""
 rail_witness() {
     local state=ok note="" cond="" fresh=0 last
@@ -1796,6 +1873,49 @@ rail_witness() {
     if [ "$fresh" = 1 ] && { [ -z "$W_BANNER_MT" ] || [ "$(age_of "$W_BANNER_MT")" = - ] \
         || [ "$(age_of "$W_BANNER_MT")" -gt 900 ]; }; then
         state=FAIL cond=witness note="banner not written${W_BANNER_MT:+ since $(fmt_time "$W_BANNER_MT")}; $note"
+    fi
+    # The hourly pass: its timer, its age (two hours and ten minutes, since its timer adds up to
+    # ten minutes of random delay to each hour), the last config-check's exit, and cc-stopped.
+    if unit_show propolis-witness@hourly.timer ActiveState UnitFileState LastTriggerUSec; then
+        last="$(ts_epoch "$U_LastTriggerUSec")"
+        if [ "$U_ActiveState" != active ]; then
+            state=FAIL cond=witness note="${note:+$note; }propolis-witness@hourly.timer ${U_ActiveState:-not installed}"
+        elif [ "$PA_UP" -ge 1800 ] && [ -z "$W_HOURLY_WALL" ] && [ -n "$last" ] \
+            && [ "$(age_of "$last")" != - ] && [ "$(age_of "$last")" -gt 900 ]; then
+            # The timer fired more than the unit's 15 minutes ago and no pass ever completed:
+            # each run is failing or being killed, which the light pass's view of the hourly
+            # pass's age cannot show until one completes.
+            [ "$state" = FAIL ] || { state=WARN cond=witness; }
+            note="${note:+$note; }no hourly pass has completed (the timer fired at $(fmt_time "$last"))"
+        elif [ "$PA_UP" -ge 1800 ] && [ -n "$W_HOURLY_WALL" ] && { [ "$W_HOURLY_AGE" -lt 0 ] || [ "$W_HOURLY_AGE" -gt 7800 ]; }; then
+            [ "$state" = FAIL ] || { state=WARN cond=witness; }
+            if [ "$W_HOURLY_AGE" -ge 0 ]; then
+                note="${note:+$note; }hourly pass $(fmt_age "$W_HOURLY_AGE") old"
+            else
+                note="${note:+$note; }hourly pass time not known (clock)"
+            fi
+        elif [ -n "$W_HOURLY_WALL" ]; then
+            note="${note:+$note; }hourly pass $(fmt_age "$W_HOURLY_AGE") ago"
+        fi
+    else
+        [ "$state" = FAIL ] || state='?'
+        note="${note:+$note; }hourly timer: systemctl did not answer"
+    fi
+    if [[ ${META[cc_last]:-} =~ /([0-9]{1,3})/([0-9]{1,6})$ ]] && [ "$((10#${BASH_REMATCH[1]}))" -gt 2 ]; then
+        [ "$state" = FAIL ] || { state=WARN cond=witness; }
+        note="${note:+$note; }last config-check exited ${BASH_REMATCH[1]}"
+    elif [[ ${META[cc_last]:-} == */-/[0-9]* ]]; then
+        [ "$state" = FAIL ] || { state=WARN cond=witness; }
+        note="${note:+$note; }last config-check not run (missing or not trusted)"
+    fi
+    # A line config-check printed out of form cannot be tied to a finding, so none it could be
+    # was taken as gone; the count says the check's output needs a look.
+    if [[ ${META[cc_skipped]:-} =~ ^[0-9]{1,9}$ ]] && [ "$((10#${META[cc_skipped]}))" -gt 0 ]; then
+        [ "$state" = FAIL ] || { state=WARN cond=witness; }
+        note="${note:+$note; }config-check printed $((10#${META[cc_skipped]})) lines out of form"
+    fi
+    if [ "$(printf '%s\n' "$INCIDENTS_BODY" | grep -cE $'^I\t[^\t]*\ttool:config-check\t([^\t]*\t){4}(open|acked)\t')" -gt 0 ]; then
+        state=FAIL cond=witness-tool note="${note:+$note; }cc-stopped: config-check has not completed on two hourly passes"
     fi
     if [ "$W_SPOOL_OLD" -gt 0 ]; then
         [ "$state" = FAIL ] || { state=WARN cond=witness; }
@@ -1903,6 +2023,7 @@ STATUS_NEXT=(
     "monitor-down monitor daemon-down"
     "monitor-off monitor -"
     "witness witness witness"
+    "witness-tool witness tool"
 )
 
 # next_line: the NEXT line, for the marked row, else the first FAIL rail, else the first WARN or
@@ -2366,13 +2487,17 @@ print_header() {
 }
 
 print_alerts() {
-    local hook="failure hook legacy, $A_UNDELIVERED units undelivered" light state banner=""
+    local hook="failure hook legacy, $A_UNDELIVERED units undelivered" light state banner="" gate hourly
     [ -z "$A_SINCE" ] || hook+=" since $(fmt_time "$A_SINCE")"
-    printf 'ALERTS  target %s - daemon monitor %s - daemon queue %s - %s\n' "$A_TARGET" "$A_MONITOR" "$A_QUEUE" "$hook"
+    gate="gate $A_GATE"
+    if _pa_stamp_split "$A_GATE_CHECKED"; then
+        gate+=" (checked $(fmt_time "$_PA_W"), $(fmt_age "$(pa_age "$A_GATE_CHECKED")"))"
+    fi
+    printf 'ALERTS  target %s - %s - daemon monitor %s - daemon queue %s - %s\n' "$A_TARGET" "$gate" "$A_MONITOR" "$A_QUEUE" "$hook"
     if [ -n "$W_BANNER_MT" ]; then banner="$(fmt_time "$W_BANNER_MT")"; else banner="not written"; fi
     # An unreadable meta reads as empty, which must not pass for a host with nothing recorded.
     if [[ " ${PA_STATE_UNREADABLE:-} " == *" meta "* ]]; then
-        printf '        witness light ? - state ? (meta unreadable) - banner %s\n' "$banner"
+        printf '        witness light ? - hourly ? - state ? (meta unreadable) - banner %s\n' "$banner"
         return 0
     fi
     if [ -z "$W_LIGHT_WALL" ]; then
@@ -2382,6 +2507,14 @@ print_alerts() {
     else
         light="$(fmt_time "$W_LIGHT_WALL") (age not known: clock)"
     fi
+    if [ -z "$W_HOURLY_WALL" ]; then
+        hourly=never
+    elif [ "$W_HOURLY_AGE" -ge 0 ]; then
+        hourly="$(fmt_time "$W_HOURLY_WALL") ($(fmt_age "$W_HOURLY_AGE"))"
+    else
+        hourly="$(fmt_time "$W_HOURLY_WALL") (age not known: clock)"
+    fi
+    light+=" - hourly $hourly"
     case "${META[where]:-}" in
         persistent) state=persisted ;;
         run) state="not persisted (run)" ;;
@@ -2397,20 +2530,15 @@ print_alerts() {
 # W_BANNER_MT the banner's modification time; W_SPOOL_OLD how many hook spool files have waited
 # over 10 min, and W_SPOOL_N how many there are.
 W_LIGHT_WALL="" W_LIGHT_AGE=-1 W_BANNER_MT="" W_SPOOL_OLD=0 W_SPOOL_N=0 W_HB_LINES=()
-load_witness_facts() {
-    local text head line t inst s a best="" best_age=-1 mt
-    text="$(root_read "$PA_RUN/heartbeat" 65536)" || text=""
-    head="${text%%$'\n'*}"
-    if [[ $head =~ ^#heartbeat\ v1\ g=[0-9]{1,18}$ ]]; then
-        while IFS= read -r line; do
-            IFS=$'\t' read -r t inst s _ <<< "$line"
-            if [ "$t" != B ] || ! [[ $inst =~ ^[a-z]{1,16}$ ]] || ! pa_ok_field "${s:-}"; then continue; fi
-            W_HB_LINES+=("$(printf '%s' "$line" | tr '\t' ' ' | tr -c ' -~' '?')")
-            if [ "$inst" = light ]; then best="$s"; fi
-        done <<< "${text#*$'\n'}"
-    fi
+W_HOURLY_WALL="" W_HOURLY_AGE=-1
+declare -A W_HB=()
+
+# witness_pass_time INSTANCE META_STAMP: sets W_PASS_WALL and W_PASS_AGE to the newer of the
+# instance's heartbeat line and its meta stamp (W_PASS_WALL empty when neither can be read).
+witness_pass_time() {
+    local best="${W_HB[$1]:-}" best_age=-1 s="$2" a
+    W_PASS_WALL="" W_PASS_AGE=-1
     [ -z "$best" ] || best_age="$(pa_age "$best")"
-    s="${META[light_last]:-}"
     if [ -n "$s" ]; then
         a="$(pa_age "$s")"
         if [ -z "$best" ] || { [ "$a" -ge 0 ] && { [ "$best_age" -lt 0 ] || [ "$a" -lt "$best_age" ]; }; }; then
@@ -2418,8 +2546,26 @@ load_witness_facts() {
         fi
     fi
     if [ -n "$best" ] && [[ ${best%%/*} =~ ^[0-9]{1,12}$ ]]; then
-        W_LIGHT_WALL="${best%%/*}" W_LIGHT_AGE="$best_age"
+        W_PASS_WALL="${best%%/*}" W_PASS_AGE="$best_age"
     fi
+}
+
+load_witness_facts() {
+    local text head line t inst s mt
+    text="$(root_read "$PA_RUN/heartbeat" 65536)" || text=""
+    head="${text%%$'\n'*}"
+    if [[ $head =~ ^#heartbeat\ v1\ g=[0-9]{1,18}$ ]]; then
+        while IFS= read -r line; do
+            IFS=$'\t' read -r t inst s _ <<< "$line"
+            if [ "$t" != B ] || ! [[ $inst =~ ^[a-z]{1,16}$ ]] || ! pa_ok_field "${s:-}"; then continue; fi
+            W_HB_LINES+=("$(printf '%s' "$line" | tr '\t' ' ' | tr -c ' -~' '?')")
+            W_HB[$inst]="$s"
+        done <<< "${text#*$'\n'}"
+    fi
+    witness_pass_time light "${META[light_last]:-}"
+    W_LIGHT_WALL="$W_PASS_WALL" W_LIGHT_AGE="$W_PASS_AGE"
+    witness_pass_time hourly "${META[hourly_last]:-}"
+    W_HOURLY_WALL="$W_PASS_WALL" W_HOURLY_AGE="$W_PASS_AGE"
     if [ -f "$PA_MOTD/propolis" ] && [ ! -L "$PA_MOTD/propolis" ]; then
         mt="$(timeout 5 stat -c %Y -- "$PA_MOTD/propolis" 2> /dev/null)" || mt=""
         [[ $mt =~ ^[0-9]{1,12}$ ]] && W_BANNER_MT="$mt"

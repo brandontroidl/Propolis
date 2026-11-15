@@ -189,11 +189,32 @@ host` shows which; freeing space or moving the store is the fix.
 The row names config-check finding ids. Run `sudo /usr/local/lib/propolis/config-check.sh`: each
 finding has a `fix:` line to paste or a `do:` line to follow.
 
+The witness's hourly pass runs the same check and records what it finds: a finding seen on two
+runs in a row opens a `finding` record, at the tier its row of `deploy/witness.sh#WITNESS_CC_TABLE`
+gives (sixteen ids that nothing else sees are PAGE or ACT; the rest are NOTICEs, or not recorded),
+and resolves once it is absent from two runs in a row that could check it. A run could not check
+a finding when its group's `G` row, a listener cell or one of its `L` (limit) lines says that part
+was not checked (an `L` line the witness does not know holds every group), or when it printed a
+finding line out of form that could have been that finding; a first sighting such a run did not
+show is dropped, since seen again it is not on two runs in a row. A `unit-down` whose unit systemd
+calls failed (the unit's own failure pages it) and a `listen-foreign` on a port a `danger` finding
+holds are recorded as NOTICEs for that run; once the fault is the finding's alone its tier rises
+to the table's. Every unlisted collector spool folds into one record that counts them; config-check
+names at most 20, so 20 or more reads `20+`. The walk's OPEN block shows the listener, log or
+collector each record is about.
+
 <a id="tool"></a>
 ### A program a check needs cannot run
 
 For example psql through pg-exec (`tool.exec`), blocked by a sandbox or missing. That is not an
 outage of what it checks: fix the program, and the row reads again.
+
+`cc-stopped` on the `witness` rail is the one case that is not a NOTICE: the installed config-check
+did not complete on two hourly passes in a row (it timed out after 300 s, is missing, failed the
+ownership check every program root runs must pass, as must the `listeners-lib.sh` it sources
+beside itself and an `alert-lib.sh` there, or printed an incomplete report), so every
+finding it would record goes unseen. Run `sudo /usr/local/lib/propolis/config-check.sh` and read
+`journalctl -t propolis-witness`; two completed runs resolve it.
 
 <a id="state"></a>
 ### The alerting state is not on disk
@@ -206,10 +227,11 @@ space or make `/var` writable; `sudo propolis-status host` shows where the last 
 ### The witness
 
 The witness (`deploy/witness.sh#light_pass`, installed as `/usr/local/sbin/propolis-witness`) is
-a root oneshot that `propolis-witness@light.timer` runs every five minutes; `install.sh` and
-`upgrade.sh` enable the timer. It records and shows, and sends nothing: in the default profile
-each transition the new paging would send adds one to the record's `would_push`, and that is
-all. Each light pass:
+a root oneshot with two passes: `propolis-witness@light.timer` runs the light pass
+every five minutes, and `propolis-witness@hourly.timer` the hourly pass
+(`deploy/witness.sh#hourly_pass`) once an hour, first 3 to 13 minutes after the timer is enabled; `install.sh` and `upgrade.sh` enable
+both timers. It records and shows, and sends nothing: in the default profile each transition the
+new paging would send adds one to the record's `would_push`, and that is all. Each light pass:
 
 - asks systemd once for the state of every Propolis unit;
 - takes in the failure hook's spool files, then judges the first sightings the hook left
@@ -230,7 +252,41 @@ all. Each light pass:
   a oneshot's next run succeeding after the failure, or a unit disabled on purpose (a oneshot
   whose timer is disabled or no longer exists, a unit systemd no longer knows). The third
   reopen within a day holds the next resolve for an hour;
+- judges the hourly pass (below);
 - writes its line in `/run/propolis-witness/heartbeat`, `meta light_last`, and the login banner.
+
+Each hourly pass, all slow work first and without the state lock:
+
+- runs the installed config-check (`/usr/local/lib/propolis/config-check.sh --tsv --no-events
+  --report-only`, under `timeout 300`, only after the same ownership check every program root
+  runs must pass) and records its findings (see [config-check found something](#finding)); a
+  run that does not complete on two hourly passes in a row opens `cc-stopped` (ACT, `witness`
+  rail). `meta cc_last` holds when the hourly pass that ran it started, its exit status (`-`
+  when it was not run: missing or not trusted) and how long it took; `meta cc_skipped` holds how
+  many of its lines the last completed run printed out of form, which the `witness` rail shows;
+- runs the anonymous-read check: three GET requests without credentials to the configured
+  ntfy server for the alert topic (its `json`, `raw` and `sse` read paths, each asking only for
+  the last second, so nothing stored is fetched), and one more with the token when one is set.
+  The topic and the token go to curl in files only root can read, never on a command line. A
+  401 or 403 on all three is `refused`; a readable answer, a login page, a redirect, a 404 or
+  anything else is recorded by that name; a 429, a 5xx or no answer at all changes nothing
+  already decided. The answer is stored in `/var/lib/propolis/witness/readcheck` with a hash of
+  the URL and topic, so a changed target is checked again by the next light pass;
+- checks the light pass: its timer active and enabled, and a pass completed within 20 minutes.
+
+Then, under the lock, it reads the state files again and changes only its own records, its own
+lines of `observe` and its own `meta` keys, so what the light pass or the failure hook recorded
+meanwhile is kept. A pass that has run for 720 s judges nothing more and marks itself `partial`.
+
+Each pass judges the other one from outside: a timer that is not active and enabled, or a pass
+older than 3 hours (the hourly pass) or 20 minutes (the light pass), seen on two checks in a row,
+opens `witness-stale` (ACT, key `witness:hourly` or `witness:light`), which resolves when the
+other pass is fresh on two checks. The age of a pass is the newer of its heartbeat line and its
+`meta` stamp, because a reboot empties `/run`. A pass that has never run counts from when its
+timer started, so a host just upgraded gives the new hourly timer its three hours. Nothing is
+judged in the first 30 minutes after a boot, when the hourly timer's first run may still be
+minutes away; a first sighting such a check cannot judge is dropped, so the two stale checks
+that open it are two in a row.
 
 A failure is recorded only under a unit name as systemd gives one (`sensor-ssh.service`, not
 `sensor-ssh`), and the witness asks systemd about no other word. The hook started by hand as
@@ -260,15 +316,32 @@ heartbeat line `partial`, and the walk's header and the banner say `state lock b
 pass gets it again; when no lock file can be opened at all the banner says `state NOT
 PERSISTED`.
 
-The walk's `witness` rail is FAIL when `propolis-witness@light.timer` is not active, when no
-light pass has completed for 15 minutes (not judged in the first 30 minutes after a boot), or
-when the banner is missing or older than 15 minutes while the pass itself is fresh:
-`banner not written` means the pass runs but `/run/motd.d` is missing or refuses the write
-(`sudo systemd-tmpfiles --create /etc/tmpfiles.d/propolis.conf` recreates it). It warns when a hook
-spool file has waited over 10 minutes. First check `systemctl status propolis-witness@light.timer
-propolis-witness@light.service` and `journalctl -t propolis-witness`; `sudo propolis-status
+The walk's `witness` rail is FAIL when `propolis-witness@light.timer` or
+`propolis-witness@hourly.timer` is not active, when no light pass has completed for 15 minutes
+(not judged in the first 30 minutes after a boot), when `cc-stopped` is open, or when the banner
+is missing or older than 15 minutes while the pass itself is fresh: `banner not written` means the
+pass runs but `/run/motd.d` is missing or refuses the write (`sudo systemd-tmpfiles --create
+/etc/tmpfiles.d/propolis.conf` recreates it). It warns when the hourly pass is over two hours and
+ten minutes old, when its timer fired over 15 minutes ago and no hourly pass has ever completed
+(`no hourly pass has completed (the timer fired at <time>)`), when the last config-check exited
+with a status above 2 or was not run at all (`last config-check not run (missing or not
+trusted)`), when the last completed run printed lines out of form (`config-check printed <n>
+lines out of form`), and when a hook spool file has waited over 10 minutes. First check `systemctl status propolis-witness@light.timer
+propolis-witness@hourly.timer` and `journalctl -t propolis-witness`; `sudo propolis-status
 witness` shows the timer, the heartbeat lines, every `meta` key, the restarts that healed, the
 spool, the lock count and the maintenance marker.
+
+**The gate.** The `ALERTS` line of the walk shows `gate full`, `gate pointer:<reason>` or `gate
+none:notarget`, with when the read check last ran. It is worked out from the stored answer alone,
+without asking the server: `full` only when the stored answer is for the target in use, is
+`refused`, was decided within 24 hours, an attempt was made within 3 hours, the URL is `https://`
+(over plain HTTP anyone on the path could answer 403 and read the rest), and, on a collector, the
+token cannot read the topic. A token GET that got no answer keeps what was known of the token, so
+a timeout cannot lift a collector out of pointer mode. Nothing uses the gate to send yet. The
+`alert` rail warns while the gate is not `full`, and while the daemon's own topic (in
+`propolis.env`, where today's failure hook sends this host's name and the failed unit) is not
+proven private on the same terms (refused within 24 hours, an attempt within 3 hours, over
+`https://`), and it lists what each stored answer was.
 
 **The login banner.** At the end of every light pass the witness writes `/run/motd.d/propolis`,
 which `pam_motd` shows at login: four lines of closed words and counts, each with the time it was
@@ -280,6 +353,14 @@ written, for example:
 [propolis 15:20 UTC] run: sudo propolis-status
 [propolis 15:20 UTC] rewritten every 5 min; older means the witness stopped
 ```
+
+The alerts line reads `topic READABLE by anyone` when the stored read check of the alert topic got
+a definite answer other than a refusal, `topic refuses anonymous reads` when the gate holds the
+refusal proven (refused within 24 hours, an attempt within 3 hours, over `https://`), `topic not
+proven private (plain http)` for a refusal over plain HTTP, which anyone on the path could have
+given, `topic check is stale` when the refusal or the last attempt is too old, `topic not checked
+yet` while there is no answer for the target in use, and `NO PUSH TARGET (journal only)` without
+a target.
 
 It names no host, unit or log, and it is root-only (`0600`): it says whether alerting works right
 now, which a compromised sensor that can read `/run` must not learn. `pam_motd` reads it as root.

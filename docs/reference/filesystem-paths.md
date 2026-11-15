@@ -85,9 +85,13 @@ kept. See [rollback](../operations/upgrade-rollback-and-dr.md#rollback).
 
 Provisioned for the root shell alerting code. Two programs write the state: the failure hook's
 record step (`deploy/alert-lib.sh#pa_hook_record`), which `propolis-alert@.service` runs after
-each alert and which records the failure, and the witness's light pass
+each alert and which records the failure, and the witness's two passes, the light pass
 (`deploy/witness.sh#light_pass`), which `propolis-witness@light.timer` runs every five minutes,
-both under the one state lock. `deploy/upgrade.sh`, `deploy/rollback.sh` and
+and the hourly pass (`deploy/witness.sh#hourly_pass`), which `propolis-witness@hourly.timer` runs
+once an hour, all under the one state lock. The hourly pass reads every file afresh under the
+lock and changes only its own records (config-check findings, `cc-stopped`, `witness-stale` for
+the light pass, `tool-unusable` for the read check), its own `observe` lines and its own `meta`
+keys. `deploy/upgrade.sh`, `deploy/rollback.sh` and
 `propolis-status --maint` write the maintenance marker. The configuration check sources the same
 library and only reads.
 
@@ -119,8 +123,9 @@ removes the maintenance marker and rewrites the banner, and nothing else.
 | `/var/lib/propolis/witness/state.lock` | 0600, empty | root:root | `deploy/provision.sh#WITNESS_LOCK`, only when missing |
 | `/var/lib/propolis/witness/incidents` | 0600, one `I` line per failure record (`#incidents v1`) | root:root | `deploy/alert-lib.sh#pa_incident_put`, under the lock, the first time a unit fails |
 | `/var/lib/propolis/witness/id-salt` | 0600, 32 hex digits | root:root | `deploy/alert-lib.sh#pa_salt_ensure`, by the first record; deleting it renames every opaque id |
-| `/var/lib/propolis/witness/meta` | 0600, `M` lines (`#meta v1`): `where` (the directory the last write went to: `persistent`, `run` or `none`), `clock` and `clock_step`, `light_last` (when the last light pass completed), `healed` (how many first sightings healed, and the latest) and `maint_seen` (when a light pass last saw an active maintenance marker) | root:root | `deploy/alert-lib.sh#pa_hook_record` (`where`, after each record it writes) and `deploy/witness.sh#light_pass`, under the lock |
-| `/var/lib/propolis/witness/observe` | 0600, `U`, `R` and `P` lines (`#observe v1`): each unit's last sample, its restart baseline, and how many passes in a row a check could not run | root:root | `deploy/witness.sh#light_pass`, under the lock, every pass |
+| `/var/lib/propolis/witness/meta` | 0600, `M` lines (`#meta v1`): `where` (the directory the last write went to: `persistent`, `run` or `none`), `clock` and `clock_step`, `light_last` and `hourly_last` (when the last light and hourly pass completed), `healed` (how many first sightings healed, and the latest), `maint_seen` (when a light pass last saw an active maintenance marker), `cc_last` (when the hourly pass that ran the last config-check started, its exit status, `-` when it was not run, and its seconds), `cc_fail` (how many hourly passes in a row it did not complete) and `cc_skipped` (how many lines the last completed run printed out of form) | root:root | `deploy/alert-lib.sh#pa_hook_record` (`where`, after each record it writes), `deploy/witness.sh#light_pass` and `deploy/witness.sh#hourly_pass`, under the lock |
+| `/var/lib/propolis/witness/observe` | 0600, `U`, `R` and `P` lines (`#observe v1`): each unit's last sample, its restart baseline, and per check how many results in a row it had (the hourly pass's `config-check`, `readcheck`, `witness-light` and one `clean:<record>` line per open finding; the light pass's `units` and `witness-hourly`) | root:root | `deploy/witness.sh#light_pass` and `deploy/witness.sh#hourly_pass`, under the lock, each replacing only its own lines |
+| `/var/lib/propolis/witness/readcheck` | 0600, one `R` line per alert target (`#readcheck v1`): a hash of its URL and topic (never the topic), when the anonymous-read check last ran and its class, the last definite answer and when, the token's class, and the status code of each read path | root:root | `deploy/witness.sh#rc_store`, under the lock, after each hourly pass and after a light pass that found the target changed |
 | `/var/lib/propolis/witness/hook/<unit>` | 0700 directory; 0600 files (`#hook v1`) | root:root | `deploy/alert-lib.sh#_pa_hook_spool`, only when the record step could not take the lock or had little time left; removed by the next light pass once taken in |
 | `/run/propolis-witness/` | 0750 | root:propolis | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
 | `/run/propolis-witness/state.lock` | 0600, empty | root:root | `deploy/alert-lib.sh#pa_lock`, only when the persistent lock cannot be opened |
@@ -133,8 +138,8 @@ removes the maintenance marker and rewrites the banner, and nothing else.
 | `/etc/tmpfiles.d/propolis.conf` | 0644 | root:root | `deploy/provision.sh#propolis-tmpfiles.conf`, from `deploy/propolis-tmpfiles.conf` |
 | `/usr/local/sbin/propolis-alert-lib` | 0644 | root:root | `deploy/install.sh#alert-lib.sh` and `deploy/upgrade.sh#alert-lib.sh`, from `deploy/alert-lib.sh` |
 | `/usr/local/sbin/propolis-status` | 0755 | root:root | `deploy/install.sh#propolis-status.sh` and `deploy/upgrade.sh#propolis-status.sh`, from `deploy/propolis-status.sh`; the walk reads and never writes |
-| `/usr/local/sbin/propolis-witness` | 0755 | root:root | `deploy/install.sh#witness.sh` and `deploy/upgrade.sh#witness.sh`, from `deploy/witness.sh`; run by `propolis-witness@light.service` |
-| `/etc/systemd/system/propolis-witness@.service`, `propolis-witness@light.timer` | 0644 | root:root | `deploy/install.sh#propolis-witness@light.timer` and `deploy/upgrade.sh#propolis-witness@light.timer`; both scripts enable the timer |
+| `/usr/local/sbin/propolis-witness` | 0755 | root:root | `deploy/install.sh#witness.sh` and `deploy/upgrade.sh#witness.sh`, from `deploy/witness.sh`; run by `propolis-witness@light.service` and `propolis-witness@hourly.service` |
+| `/etc/systemd/system/propolis-witness@.service`, `propolis-witness@light.timer`, `propolis-witness@hourly.timer` | 0644 | root:root | `deploy/install.sh#propolis-witness@hourly.timer` and `deploy/upgrade.sh#propolis-witness@hourly.timer`; both scripts enable both timers |
 | `/usr/local/lib/propolis/config-check.sh` | 0755 | root:root | `deploy/install.sh#config-check.sh` and `deploy/upgrade.sh#config-check.sh`, from `deploy/config-check.sh` |
 | `/usr/local/lib/propolis/listeners-lib.sh` | 0644 | root:root | `deploy/install.sh#listeners-lib.sh` and `deploy/upgrade.sh#listeners-lib.sh`, from `deploy/listeners-lib.sh` |
 | `/usr/local/lib/propolis/repo-dir` | 0644, one line: the checkout's absolute path | root:root | `deploy/install.sh#install_generated` and `deploy/upgrade.sh#install_generated` |

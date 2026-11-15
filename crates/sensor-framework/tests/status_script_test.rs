@@ -380,6 +380,7 @@ impl Fx {
             "enabled",
         );
         fx.light_timer();
+        fx.readcheck("refused");
 
         let ssh = fx.p("var/log/propolis/ssh/events.jsonl");
         let http = fx.p("var/log/propolis/http/events.jsonl");
@@ -478,14 +479,26 @@ impl Fx {
         ));
     }
 
-    /// The witness's light timer, installed, enabled and waiting, and not yet fired.
+    /// The witness's two timers, installed, enabled and waiting; the light one not yet fired.
     fn light_timer(&mut self) {
-        self.unit(
+        for timer in [
             "propolis-witness@light.timer",
-            "active",
-            "waiting",
-            "success",
-            "enabled",
+            "propolis-witness@hourly.timer",
+        ] {
+            self.unit(timer, "active", "waiting", "success", "enabled");
+        }
+    }
+
+    /// The stored read check of the fixture's target (https://ntfy.example.invalid, t0p1c-secret):
+    /// one line for the shell and the daemon, with this definite class, decided and attempted
+    /// ten minutes ago.
+    fn readcheck(&self, class: &str) {
+        let s = stamp_ago(600);
+        self.write(
+            "var/lib/propolis/witness/readcheck",
+            &format!(
+                "#readcheck v1 g=2\nR\t8f24b729c8ebd3c1\t{s}\t{class}\t{s}\t{class}\treads\t403\t403\tboth\t403\n"
+            ),
         );
     }
 
@@ -745,7 +758,7 @@ fn a_healthy_single_box_marks_nothing_and_exits_zero() {
         "{}",
         r.out
     );
-    assert!(r.out.contains("ALERTS  target ntfy from propolis.env - daemon monitor on - daemon queue empty - failure hook legacy, 0 units undelivered"), "{}", r.out);
+    assert!(r.out.contains("ALERTS  target ntfy from propolis.env - gate full (checked 07:50:00, 10 min) - daemon monitor on - daemon queue empty - failure hook legacy, 0 units undelivered"), "{}", r.out);
     assert!(
         r.out.contains("CHECK   config-check 08:00:00 ("),
         "{}",
@@ -767,9 +780,9 @@ fn a_healthy_single_box_marks_nothing_and_exits_zero() {
 }
 
 /// Until a witness pass has run on the host nothing has judged the records, so nothing is open;
-/// and what later releases add (the gate, VERIFIED, the heartbeat URL, the profile) is not shown.
+/// and what later releases add (VERIFIED, the heartbeat URL, the profile) is not shown.
 #[test]
-fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_gate_verified_or_profile() {
+fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_verified_or_profile() {
     let fx = Fx::single();
     fx.write(
         "var/lib/propolis/witness/incidents",
@@ -790,7 +803,6 @@ fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_gate_verified_
     let r = fx.walk();
     assert_eq!(r.code, 0, "{}", r.out);
     for absent in [
-        "gate ",
         "VERIFIED",
         "OPEN ",
         " open ",
@@ -799,12 +811,12 @@ fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_gate_verified_
         "would remind",
         "heartbeat",
         "profile ",
-        "hourly",
     ] {
         assert!(!r.out.contains(absent), "{absent:?} in:\n{}", r.out);
     }
     assert!(
-        r.out.contains("        witness light never - state "),
+        r.out
+            .contains("        witness light never - hourly never - state "),
         "{}",
         r.out
     );
@@ -1353,7 +1365,7 @@ fn a_dead_daemon_is_marked_at_intake_with_lag_from_cursor_files() {
     );
     assert!(
         r.out
-            .contains("ALERTS  target ntfy from propolis.env - daemon monitor down"),
+            .contains("ALERTS  target ntfy from propolis.env - gate full (checked 07:50:00, 10 min) - daemon monitor down"),
         "{}",
         r.out
     );
@@ -1941,7 +1953,7 @@ fn exit_codes_follow_the_table() {
     );
     let r = old.walk();
     assert_eq!(r.code, 70, "an older library: {}", r.err);
-    assert!(r.err.contains("older than version 4"), "{}", r.err);
+    assert!(r.err.contains("older than version 5"), "{}", r.err);
     let missing = Fx::single();
     std::fs::remove_file(missing.p("usr/local/sbin/propolis-alert-lib")).unwrap();
     let r = missing.walk();
@@ -1985,7 +1997,7 @@ fn an_unreadable_state_file_is_named_and_counts_as_unknown() {
     assert!(!fx.log().contains("logger"), "nothing logged");
     assert!(
         r.out
-            .contains("        witness light ? - state ? (meta unreadable) - banner "),
+            .contains("        witness light ? - hourly ? - state ? (meta unreadable) - banner "),
         "{}",
         r.out
     );
@@ -3422,15 +3434,15 @@ fn after_a_witness_pass_the_records_are_listed_open_with_tier_and_next_reminder(
     assert!(fx.walk().out.contains("OPEN    no incident record yet"));
 }
 
-/// ALERTS line 3: when the light pass last completed, where state lands, and when the banner was
-/// written.
+/// ALERTS line 3: when the light and hourly passes last completed, where state lands, and when
+/// the banner was written.
 #[test]
 fn the_third_alerts_line_names_the_light_pass_the_state_and_the_banner() {
     let fx = Fx::single();
     let r = fx.walk();
     assert!(
         r.out.contains(
-            "        witness light never - state nothing recorded yet - banner not written\n"
+            "        witness light never - hourly never - state nothing recorded yet - banner not written\n"
         ),
         "{}",
         r.out
@@ -3439,7 +3451,23 @@ fn the_third_alerts_line_names_the_light_pass_the_state_and_the_banner() {
     let r = fx.walk();
     assert!(
         r.out.contains(
-            "        witness light 07:55:00 (5 min) - state persisted - banner 07:55:00\n"
+            "        witness light 07:55:00 (5 min) - hourly never - state persisted - banner 07:55:00\n"
+        ),
+        "{}",
+        r.out
+    );
+    fx.write(
+        "run/propolis-witness/heartbeat",
+        &format!(
+            "#heartbeat v1 g=4\nB\tlight\t{}\tpersistent\tok\nB\thourly\t{}\tpersistent\tok\n",
+            stamp_ago(300),
+            stamp_ago(1800)
+        ),
+    );
+    let r = fx.walk();
+    assert!(
+        r.out.contains(
+            "        witness light 07:55:00 (5 min) - hourly 07:30:00 (30 min) - state persisted - banner 07:55:00\n"
         ),
         "{}",
         r.out
@@ -3586,9 +3614,21 @@ fn the_banner_is_four_ascii_lines_of_closed_words() {
     fx.witness_ran(60);
     let l = check(&fx.run(&["--banner"]), "healthy");
     assert_eq!(l[0], "[propolis 08:00 UTC] nothing open; profile legacy");
-    assert_eq!(l[1], "[propolis 08:00 UTC] alerts: topic not checked yet");
+    assert_eq!(
+        l[1],
+        "[propolis 08:00 UTC] alerts: topic refuses anonymous reads"
+    );
     assert_eq!(l[2], "[propolis 08:00 UTC] run: sudo propolis-status");
     assert!(!fx.log().contains("curl"), "no network: {}", fx.log());
+    fx.readcheck("readable");
+    let l = check(&fx.run(&["--banner"]), "readable");
+    assert_eq!(
+        l[1],
+        "[propolis 08:00 UTC] alerts: topic READABLE by anyone"
+    );
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
+    let l = check(&fx.run(&["--banner"]), "not checked");
+    assert_eq!(l[1], "[propolis 08:00 UTC] alerts: topic not checked yet");
 
     let mut records = String::new();
     for n in 0..120 {
@@ -3781,4 +3821,284 @@ fn the_verbs_need_root() {
         assert_eq!(r.code, 3, "{args:?}");
     }
     assert!(!fx.p("run/propolis-witness/maintenance").exists());
+}
+
+/// The gate field and the alert rail come from the stored read check alone: never checked, or
+/// answered readable, holds the gate in pointer mode and warns on the rail with the answer named;
+/// a fresh refusal over https gives full and an ok rail.
+#[test]
+fn the_gate_field_and_the_alert_rail_follow_the_stored_read_check() {
+    let fx = Fx::single();
+    let r = fx.walk();
+    assert_eq!(r.state("alert"), "ok", "{}", r.out);
+    assert!(
+        r.row("alert")
+            .contains("shell and daemon topic refused (checked 07:50:00), token reads"),
+        "{}",
+        r.out
+    );
+
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
+    let r = fx.walk();
+    assert!(r.out.contains(" - gate pointer:never - "), "{}", r.out);
+    assert_eq!(r.state("alert"), "WARN", "{}", r.out);
+    assert!(r.row("alert").contains("gate pointer:never"), "{}", r.out);
+    assert!(
+        r.row("alert")
+            .contains("legacy hook carries host and unit names"),
+        "{}",
+        r.out
+    );
+    assert_eq!(r.code, 1, "{}", r.out);
+
+    fx.readcheck("readable");
+    let r = fx.walk();
+    assert!(
+        r.out
+            .contains(" - gate pointer:readable (checked 07:50:00, 10 min) - "),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.row("alert").contains("shell and daemon topic READABLE"),
+        "{}",
+        r.out
+    );
+    for secret in ["t0p1c-secret", "tk_secret"] {
+        assert!(!r.out.contains(secret), "{secret} printed");
+    }
+}
+
+/// The daemon's topic (propolis.env), where today's hook sends host and unit names, is judged on
+/// its own line: a private shell topic gives the gate full, and a readable daemon topic still
+/// warns on the alert rail.
+#[test]
+fn a_readable_daemon_topic_warns_even_when_the_shell_topic_is_private() {
+    let fx = Fx::single();
+    let s = stamp_ago(600);
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=2\nR\t8f24b729c8ebd3c1\t{s}\trefused\t{s}\trefused\tnoread\t403\t403\tshell\t403\n\
+             R\t8f24b729c8ebd3c1\t{s}\treadable\t{s}\treadable\t-\t200\t200\tdaemon\t200\n"
+        ),
+    );
+    let r = fx.walk();
+    assert!(r.out.contains(" - gate full (checked "), "{}", r.out);
+    assert_eq!(r.state("alert"), "WARN", "{}", r.out);
+    let row = r.row("alert");
+    assert!(
+        row.contains("daemon titles name this host's software (until step 3)"),
+        "{row}"
+    );
+    assert!(
+        row.contains("shell topic refused") && row.contains("daemon topic READABLE"),
+        "{row}"
+    );
+}
+
+/// The witness rail judges the hourly pass too: FAIL when its timer is not active or cc-stopped
+/// is open (NEXT then names the tool runbook), WARN when the pass is over two hours and ten
+/// minutes old or the last config-check exited above 2.
+#[test]
+fn the_witness_rail_judges_the_hourly_timer_its_age_and_cc_stopped() {
+    let mut fx = Fx::single();
+    fx.witness_ran(120);
+    fx.unit(
+        "propolis-witness@hourly.timer",
+        "inactive",
+        "dead",
+        "success",
+        "disabled",
+    );
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "FAIL", "{}", r.out);
+    assert!(
+        r.row("witness")
+            .contains("propolis-witness@hourly.timer inactive"),
+        "{}",
+        r.out
+    );
+
+    let fx = Fx::single();
+    fx.witness_ran(120);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\thourly_last\t{}\nM\tcc_last\t{}/124/300\n",
+            stamp_ago(120),
+            stamp_ago(10_800),
+            stamp_ago(10_800)
+        ),
+    );
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "WARN", "{}", r.out);
+    assert!(
+        r.row("witness").contains("hourly pass 3 h old"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.row("witness").contains("last config-check exited 124"),
+        "{}",
+        r.out
+    );
+
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=2\nN\t2\n{}",
+            record(
+                "w#1",
+                "tool:config-check",
+                "witness",
+                "ACT",
+                "open",
+                NOW - 600,
+                "cc.stopped",
+                "-"
+            )
+        ),
+    );
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "FAIL", "{}", r.out);
+    assert!(r.row("witness").contains("cc-stopped"), "{}", r.out);
+    assert!(
+        r.out
+            .contains("runbook docs/operations/health-and-observability.md#tool"),
+        "{}",
+        r.out
+    );
+}
+
+/// The witness rail says what the last config-check left unsaid: a run that was not run at all
+/// (missing or not trusted, exit field `-`) is named as such, never as an exit status, and a
+/// completed run that printed lines out of form names how many.
+#[test]
+fn the_witness_rail_names_a_config_check_not_run_and_lines_printed_out_of_form() {
+    let fx = Fx::single();
+    fx.witness_ran(120);
+    let meta = |extra: &str| {
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!(
+                "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{l}\nM\thourly_last\t{h}\n{extra}",
+                l = stamp_ago(120),
+                h = stamp_ago(600)
+            ),
+        );
+    };
+    meta(&format!("M\tcc_last\t{}/-/0\n", stamp_ago(600)));
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "WARN", "{}", r.out);
+    assert!(
+        r.row("witness")
+            .contains("last config-check not run (missing or not trusted)"),
+        "{}",
+        r.out
+    );
+    assert!(!r.row("witness").contains("exited"), "{}", r.out);
+
+    meta(&format!(
+        "M\tcc_last\t{}/0/12\nM\tcc_skipped\t2\n",
+        stamp_ago(600)
+    ));
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "WARN", "{}", r.out);
+    assert!(
+        r.row("witness")
+            .contains("config-check printed 2 lines out of form"),
+        "{}",
+        r.out
+    );
+
+    meta(&format!(
+        "M\tcc_last\t{}/0/12\nM\tcc_skipped\t0\n",
+        stamp_ago(600)
+    ));
+    assert_eq!(fx.walk().state("witness"), "ok");
+}
+
+/// An hourly timer that fired while no hourly pass ever completed (killed at its limit every
+/// hour, say) is a witness that does not run: the rail warns, naming when the timer fired.
+#[test]
+fn the_witness_rail_warns_when_the_hourly_timer_fired_and_no_hourly_pass_completed() {
+    let mut fx = Fx::single();
+    fx.witness_ran(120);
+    // Four hours of uptime, the light pass two minutes ago in this boot.
+    let up = 14_400u64;
+    let light = format!("{}/abcdef01/{}", NOW - 120, up - 120);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{light}\n"),
+    );
+    fx.write(
+        "run/propolis-witness/heartbeat",
+        &format!("#heartbeat v1 g=3\nB\tlight\t{light}\tpersistent\tok\n"),
+    );
+    fx.setenv("PROPOLIS_STATUS_NOW", &format!("{NOW}/abcdef01/{up}"));
+    fx.units
+        .retain(|u| !u.starts_with("propolis-witness@hourly.timer|"));
+    fx.units.push(format!(
+        "propolis-witness@hourly.timer|active|waiting|success|0|Fri 2027-01-15 04:00:00 UTC|enabled|{INVOCATION}|Fri 2027-01-15 05:00:00 UTC"
+    ));
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "WARN", "{}", r.out);
+    assert!(
+        r.row("witness")
+            .contains("no hourly pass has completed (the timer fired at 05:00:00)"),
+        "{}",
+        r.out
+    );
+
+    // The same timer, not fired yet: nothing to say.
+    fx.units
+        .retain(|u| !u.starts_with("propolis-witness@hourly.timer|"));
+    fx.units.push(format!(
+        "propolis-witness@hourly.timer|active|waiting|success|0|Fri 2027-01-15 04:00:00 UTC|enabled|{INVOCATION}|n/a"
+    ));
+    let r = fx.walk();
+    assert_eq!(r.state("witness"), "ok", "{}", r.out);
+}
+
+/// The daemon's topic counts as private only on the gate's own terms: a refusal decided within
+/// 24 h, an attempt within 3 h, over https. A refusal 25 h old, one over plain HTTP, and one
+/// whose last attempt is over 3 h old each leave the legacy-hook warning on the alert rail.
+#[test]
+fn the_daemon_topic_is_private_only_when_its_refusal_is_fresh_checked_and_over_https() {
+    let fx = Fx::single();
+    let line = |binding: &str, astamp: &str, dstamp: &str| {
+        format!(
+            "#readcheck v1 g=2\nR\t{binding}\t{astamp}\trefused\t{dstamp}\trefused\tnoread\t403\t403\tboth\t403\n"
+        )
+    };
+    let warns = |what: &str| {
+        let r = fx.walk();
+        assert_eq!(r.state("alert"), "WARN", "{what}: {}", r.out);
+        let row = r.row("alert");
+        assert!(
+            row.contains("legacy hook carries host and unit names")
+                && row.contains("daemon titles name this host's software"),
+            "{what}: {row}"
+        );
+    };
+    let https = "8f24b729c8ebd3c1";
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &line(https, &stamp_ago(600), &stamp_ago(90_000)),
+    );
+    warns("a refusal 25 h old");
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &line(https, &stamp_ago(14_400), &stamp_ago(72_000)),
+    );
+    warns("a refusal 20 h old whose last attempt is 4 h old");
+    // The binding of http://ntfy.example.invalid and the fixture's topic.
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid");
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &line("e9960faaf48b78f0", &stamp_ago(600), &stamp_ago(600)),
+    );
+    warns("a fresh refusal over plain HTTP");
 }

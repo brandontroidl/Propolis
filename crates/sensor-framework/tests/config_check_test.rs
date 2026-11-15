@@ -246,6 +246,11 @@ impl Fx {
         );
         fx.unit("propolis-backup.timer", "enabled", "active");
         fx.exec("sbin/propolis-alert", "exit 0\n");
+        // The witness installed, both its timers enabled, its /run directory made by tmpfiles.
+        fx.exec("sbin/propolis-witness", "exit 0\n");
+        fx.unit("propolis-witness@light.timer", "enabled", "active");
+        fx.unit("propolis-witness@hourly.timer", "enabled", "active");
+        std::fs::create_dir_all(fx.p("alert-root/run/propolis-witness")).unwrap();
         fx.write("etc/watch.env", &format!("{sensor_logs}\n"));
         for (dir, file) in [
             ("ssh", "events"),
@@ -532,6 +537,7 @@ cat "$d/psql_out"
             .env("PROPOLIS_CC_BACKUP_STATUS", self.p("state/backup-status"))
             .env("PROPOLIS_CC_BACKUP_DIR", self.p("state/backups"))
             .env("PROPOLIS_CC_ALERT_HOOK", self.p("sbin/propolis-alert"))
+            .env("PROPOLIS_CC_WITNESS", self.p("sbin/propolis-witness"))
             // Absent until a test creates it, so a run never looks at this host's own spool.
             .env("PROPOLIS_CC_GATEWAY_SPOOL_DIR", self.p("spool/gateway"))
             // The checkout's library, whichever copy of the script runs, and a root of its own.
@@ -2430,6 +2436,12 @@ fn fix_scenarios() -> Vec<Scenario> {
                 fx.write("state/psql_role_out", "propolis|f||t|t\n");
             },
         ),
+        ("the witness is not installed", |fx| {
+            std::fs::remove_file(fx.p("sbin/propolis-witness")).unwrap();
+        }),
+        ("the witness's hourly timer is not enabled", |fx| {
+            fx.unit("propolis-witness@hourly.timer", "disabled", "inactive");
+        }),
         ("env files all empty", |fx| {
             for name in ["ssh", "mqtt", "cred", "tftp", "dns", "propolis"] {
                 // Comments only, as a copied example file leaves them.
@@ -3287,6 +3299,140 @@ fn every_finding_has_a_fix_that_is_a_command_run_as_pasted_or_a_labelled_manual_
         "findings no scenario exercises (add a fixture that raises each, so its fix is checked): {missing:?}"
     );
     assert!(runs > 40 && manuals > 8, "runs {runs}, manuals {manuals}");
+}
+
+/// The witness records config-check's findings by deploy/witness.sh's WITNESS_CC_TABLE, and an id
+/// with no row there is never recorded: so every id this script emits has exactly one row, every
+/// row names an id the script emits, and every page row has a tier, a stage, a way to find its
+/// instance and the phrase a push will carry.
+#[test]
+fn every_finding_id_has_a_witness_eligibility_row() {
+    let witness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/witness.sh"
+    ))
+    .unwrap();
+    let start = witness
+        .find("WITNESS_CC_TABLE='\n")
+        .expect("deploy/witness.sh has WITNESS_CC_TABLE")
+        + "WITNESS_CC_TABLE='\n".len();
+    let end = start + witness[start..].find("\n'\n").unwrap();
+    let mut rows = std::collections::BTreeMap::new();
+    for line in witness[start..end].lines() {
+        let f: Vec<&str> = line.split('|').collect();
+        assert_eq!(f.len(), 7, "{line}");
+        assert!(
+            rows.insert(f[0].to_string(), f).is_none(),
+            "{line}: a second row"
+        );
+    }
+    let ids: std::collections::BTreeSet<String> = script_finding_ids().into_iter().collect();
+    for id in &ids {
+        assert!(rows.contains_key(id), "{id} has no row in WITNESS_CC_TABLE");
+    }
+    for (id, f) in &rows {
+        assert!(
+            ids.contains(id),
+            "row {id} names no id deploy/config-check.sh emits"
+        );
+        match f[1] {
+            "page" => {
+                assert!(["PAGE", "ACT"].contains(&f[2]), "{id}: {}", f[2]);
+                assert!(
+                    ["unit", "scope", "logpath", "fold", "-"].contains(&f[5]),
+                    "{id}: {}",
+                    f[5]
+                );
+                assert!(f[6] != "-" && !f[6].is_empty(), "{id} has no phrase");
+                assert_eq!(f[6].contains("<inst>"), f[5] != "-", "{id}: {}", f[6]);
+            }
+            "daily" => assert_eq!(f[2], "NOTICE", "{id}"),
+            "never" => assert_eq!(f[2], "-", "{id}"),
+            other => panic!("{id}: eligibility {other}"),
+        }
+        assert!(
+            !f[3].is_empty() && !f[4].is_empty(),
+            "{id}: a stage and a row"
+        );
+    }
+    let pages = rows.values().filter(|f| f[1] == "page").count();
+    assert_eq!(pages, 16, "the sixteen page rows");
+}
+
+/// A host with Propolis units enabled and no witness, or with one of its two timers not enabled,
+/// gets a warning on the witness row with the fix for each; a collector, which has no upgrade
+/// script to run, gets the written steps. A missing /run directory is named on the row.
+#[test]
+fn witness_missing_and_witness_timer_are_warnings_on_the_witness_row() {
+    let witness_row = |v: &serde_json::Value| {
+        v["global"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == "witness")
+            .cloned()
+            .unwrap()
+    };
+    let finding = |v: &serde_json::Value, id: &str| {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == id)
+            .cloned()
+    };
+    let fx = Fx::new();
+    let v = fx.json();
+    assert_eq!(witness_row(&v)["state"], "ok", "{}", witness_row(&v));
+    assert!(finding(&v, "witness-missing").is_none() && finding(&v, "witness-timer").is_none());
+
+    let fx = Fx::new();
+    std::fs::remove_file(fx.p("sbin/propolis-witness")).unwrap();
+    let v = fx.json();
+    let f = finding(&v, "witness-missing").unwrap();
+    assert_eq!(
+        (f["level"].as_str(), f["fix_kind"].as_str()),
+        (Some("warn"), Some("run"))
+    );
+    assert!(f["fix"].as_str().unwrap().ends_with("upgrade.sh"), "{f}");
+    assert_eq!(witness_row(&v)["state"], "warn");
+    fx.write("etc/shipper.env", "PROPOLIS_SHIPPER_SENSOR_LOGS=\n");
+    let f = finding(&fx.json(), "witness-missing").unwrap();
+    assert_eq!(f["fix_kind"], "manual", "{f}");
+    assert!(
+        f["fix"].as_str().unwrap().contains("split-deployment.md"),
+        "{f}"
+    );
+
+    let fx = Fx::new();
+    fx.unit("propolis-witness@light.timer", "disabled", "inactive");
+    let v = fx.json();
+    let f = finding(&v, "witness-timer").unwrap();
+    assert_eq!(f["level"], "warn");
+    assert_eq!(
+        f["fix"],
+        "sudo systemctl enable --now propolis-witness@light.timer propolis-witness@hourly.timer"
+    );
+    assert!(
+        f["message"]
+            .as_str()
+            .unwrap()
+            .contains("propolis-witness@light.timer disabled"),
+        "{f}"
+    );
+
+    let fx = Fx::new();
+    std::fs::remove_dir(fx.p("alert-root/run/propolis-witness")).unwrap();
+    let v = fx.json();
+    assert_eq!(witness_row(&v)["state"], "warn");
+    assert!(
+        witness_row(&v)["text"]
+            .as_str()
+            .unwrap()
+            .contains("is missing (the tmpfiles entry"),
+        "{}",
+        witness_row(&v)
+    );
 }
 
 #[test]

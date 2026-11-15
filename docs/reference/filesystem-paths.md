@@ -83,15 +83,30 @@ kept. See [rollback](../operations/upgrade-rollback-and-dr.md#rollback).
 
 ## Alerting state and runtime directories
 
-Provisioned for the root shell alerting code. Nothing writes state into these directories yet:
-the persistent directory holds only the empty lock, and the runtime one is empty. The one script
-that sources the library so far is the configuration check, which only reads.
+Provisioned for the root shell alerting code. The one writer so far is the failure hook's record
+step (`deploy/alert-lib.sh#pa_hook_record`), which `propolis-alert@.service` runs after each
+alert and which records the failure; `deploy/upgrade.sh` and `deploy/rollback.sh` also write the
+maintenance marker. The configuration check sources the same library and only reads.
+
+Nothing reads or removes the records, the hook spool files or the fallback copies yet: a record
+stays as the hook wrote it (`pending` or `open`). A spool file stays until a later firing of the
+same unit that also has to spool overwrites it, and the one in the persistent directory survives
+a reboot. A fallback copy of `incidents` or `meta` stays until a later write of that file reaches
+the persistent directory, and a fallback spool file (`fallback/hook-<unit>`) until the host
+reboots.
 
 | Path | Mode | Owner | Created by |
 |---|---|---|---|
 | `/var/lib/propolis/witness/` | 0750 | root:propolis | `deploy/provision.sh#ensure_dir /var/lib/propolis/witness` |
 | `/var/lib/propolis/witness/state.lock` | 0600, empty | root:root | `deploy/provision.sh#WITNESS_LOCK`, only when missing |
+| `/var/lib/propolis/witness/incidents` | 0600, one `I` line per failure record (`#incidents v1`) | root:root | `deploy/alert-lib.sh#pa_incident_put`, under the lock, the first time a unit fails |
+| `/var/lib/propolis/witness/id-salt` | 0600, 32 hex digits | root:root | `deploy/alert-lib.sh#pa_salt_ensure`, by the first record; deleting it renames every opaque id |
+| `/var/lib/propolis/witness/meta` | 0600, `M` lines (`#meta v1`); the hook writes only `where`, the directory its last record went to (`persistent` or `run`) | root:root | `deploy/alert-lib.sh#pa_hook_record`, under the lock, after each record it writes |
+| `/var/lib/propolis/witness/hook/<unit>` | 0700 directory; 0600 files (`#hook v1`) | root:root | `deploy/alert-lib.sh#_pa_hook_spool`, only when the record step could not take the lock or had little time left |
 | `/run/propolis-witness/` | 0750 | root:propolis | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
+| `/run/propolis-witness/state.lock` | 0600, empty | root:root | `deploy/alert-lib.sh#pa_lock`, only when the persistent lock cannot be opened |
+| `/run/propolis-witness/fallback/` | 0700 | root:root | `deploy/alert-lib.sh#pa_state_write` and `deploy/alert-lib.sh#_pa_hook_spool`, when the persistent directory refuses a write; lost at reboot |
+| `/run/propolis-witness/maintenance` | 0600, two lines (`#maintenance v1`) | root:root | `deploy/upgrade.sh` and `deploy/rollback.sh#maint_write` while they restart services; removed when they finish |
 | `/run/motd.d/` | 0755 | root:root | systemd-tmpfiles, from `/etc/tmpfiles.d/propolis.conf` |
 | `/etc/tmpfiles.d/propolis.conf` | 0644 | root:root | `deploy/provision.sh#propolis-tmpfiles.conf`, from `deploy/propolis-tmpfiles.conf` |
 | `/usr/local/sbin/propolis-alert-lib` | 0644 | root:root | `deploy/install.sh#alert-lib.sh` and `deploy/upgrade.sh#alert-lib.sh`, from `deploy/alert-lib.sh` |

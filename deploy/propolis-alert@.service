@@ -6,6 +6,11 @@
 #
 # Runs as root to read the unit's journal and /etc/propolis/propolis.env (0600). The rate-limit
 # stamps live in /run/propolis-alert, kept across instances by RuntimeDirectoryPreserve=.
+#
+# After the alert is sent the script records the failure in the root alerting state, so it may
+# write there. Both grants carry `-`: a missing directory costs the record, never the unit, where
+# a plain grant would fail the unit with status 226 and take every failure alert on the host with
+# it. /run/propolis-witness comes from the tmpfiles entry, which provisioning applies.
 [Unit]
 Description=Alert that %i failed
 
@@ -15,6 +20,7 @@ ExecStart=/usr/local/sbin/propolis-alert %i
 RuntimeDirectory=propolis-alert
 RuntimeDirectoryPreserve=yes
 TimeoutStartSec=90s
+ReadWritePaths=-/var/lib/propolis/witness -/run/propolis-witness
 
 ProtectSystem=strict
 ProtectHome=yes

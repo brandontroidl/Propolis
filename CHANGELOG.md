@@ -393,6 +393,27 @@
   passed before can now exit `1`. A checkout whose HEAD cannot be read without git (a worktree,
   a link) is a limited check where it used to pass in silence
   ([configuration check](docs/operations/service-lifecycle.md#configuration-check)).
+- **The failure hook now records each failure; what it sends does not change.** After it has
+  posted, held or journaled its alert exactly as before, `propolis-alert` records the failure in
+  `/var/lib/propolis/witness/incidents` (or `/run/propolis-witness/fallback/` when the disk
+  refuses) with systemd's own cause (`proc.exit:<status>`, `proc.signal:<n>`, `proc.sigsys`,
+  `proc.oom`, `proc.panic` and the rest, from the `MONITOR_*` variables or `systemctl show`) and
+  what it did with the alert (`delivered`, `undelivered`, `cooldown` or `journal`). A unit that
+  restarts itself is recorded as a first sighting (`pending`), a oneshot as `open`; a log rotation
+  that the guard only skipped (nothing else in the run's journal) is recorded as
+  `rotation-skipped` at NOTICE, and a repeat never lowers the tier of a failure already
+  recorded; `meta` says whether the last record went to the persistent directory or to `/run`.
+  The opaque id of the unit is left `-` in the record. A failed witness pass
+  (`propolis-witness@<instance>.service`) is recorded and never posted. The record is made by the
+  shared library in a separate, time-bounded process, so a missing or broken library cannot touch
+  the alert: it costs the record and one journal line under tag `propolis-witness`
+  (`journalctl -t propolis-witness`). `propolis-alert@.service` gains
+  `ReadWritePaths=-/var/lib/propolis/witness -/run/propolis-witness`; the library is now at
+  version 2. `upgrade.sh` and `rollback.sh` write a maintenance marker while they restart
+  services, best effort, and a rollback keeps the current hook, library and alert unit when the
+  kept hook states an older `# hook-contract:` than the current one
+  ([rollback](docs/operations/upgrade-rollback-and-dr.md#rollback),
+  [paths](docs/reference/filesystem-paths.md#alerting-state-and-runtime-directories)).
 
 ### Added
 

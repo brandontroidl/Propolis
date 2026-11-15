@@ -21,6 +21,9 @@ const SET: &str = "20261011T120000Z-pre-upgrade";
 
 const SYSTEMCTL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >> "$STUB_LOG"
+if [ -n "${STUB_MARKER:-}" ] && [ -f "$STUB_MARKER" ] && { [ "$1" = stop ] || [ "$1" = start ]; }; then
+    printf 'marker during %s: %s\n' "$1" "$(sed -n 2p "$STUB_MARKER" | tr '\t' ' ')" >> "$STUB_LOG"
+fi
 case "$1" in
     is-enabled) [[ " ${STUB_ENABLED:-} " == *" ${3:-$2} "* ]] ;;
     is-active) [ -z "${STUB_INACTIVE:-}" ] ;;
@@ -233,6 +236,8 @@ impl Fixture {
             std::fs::write(units.join(name), body).unwrap();
         }
         std::fs::create_dir_all(root.join("etc/propolis")).unwrap();
+        // Where the maintenance marker goes, as the tmpfiles entry leaves it.
+        std::fs::create_dir_all(root.join("run/propolis-witness")).unwrap();
         std::fs::write(
             root.join("etc/propolis/propolis.env"),
             "DATABASE_URL=\"postgres://propolis:pw@localhost/propolis\"\n",
@@ -1158,6 +1163,286 @@ fn a_kept_release_without_the_library_leaves_the_current_one_in_place() {
     );
 }
 
+/// A failure hook that states contract `n`, or no contract line at all.
+fn hook_with_contract(n: Option<u32>, tag: &str) -> String {
+    match n {
+        Some(n) => {
+            format!("#!/usr/bin/env bash\n# hook-contract: {n}\n# needs-alert-lib: 1\necho {tag}\n")
+        }
+        None => format!("#!/usr/bin/env bash\n# needs-alert-lib: 1\necho {tag}\n"),
+    }
+}
+
+/// Keeps a release whose hook is `kept` (none when `None`), with a library at version 1 and the
+/// alert unit marked old; upgrades to a hook `current`, a library at 2 and a new alert unit; rolls
+/// back. Returns what the run printed.
+fn roll_back_hooks(fx: &Fixture, kept: Option<String>, current: &str) -> String {
+    let sbin = fx.root.join("usr/local/sbin");
+    let alert_unit = fx.root.join("etc/systemd/system/propolis-alert@.service");
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(1)).unwrap();
+    std::fs::write(&alert_unit, "[Service]\nExecStart=old-alert\n").unwrap();
+    if let Some(hook) = &kept {
+        write_exec(&sbin.join("propolis-alert"), hook);
+    }
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(2)).unwrap();
+    std::fs::write(&alert_unit, "[Service]\nExecStart=new-alert\n").unwrap();
+    write_exec(&sbin.join("propolis-alert"), current);
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The current hook, library and alert unit all stayed, and the rest of the release went back.
+fn assert_current_trio_kept(fx: &Fixture, current: &str, stdout: &str, kept: u32, now: u32) {
+    let sbin = fx.root.join("usr/local/sbin");
+    assert_eq!(read(&sbin.join("propolis-alert")), current);
+    assert_eq!(installed_lib_version(fx), "PA_LIB_VERSION=2");
+    assert!(
+        read(&fx.root.join("etc/systemd/system/propolis-alert@.service")).contains("new-alert")
+    );
+    assert!(
+        stdout.contains(&format!(
+            "kept the current failure hook: the kept release's hook has contract {kept}, older than {now} (under profile v2 it would put the host name back into alert titles)"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("kept the current alert library"),
+        "the library is kept with the hook, not weighed again: {stdout}"
+    );
+    assert!(read(&fx.root.join("etc/systemd/system/propolis.service")).contains("ExecStart=old"));
+    assert!(read(&fx.root.join("var/lib/propolis/deploy-stamp.json")).contains("old"));
+}
+
+/// The hook contract rule: a kept hook with no contract line counts as contract 0, older than the
+/// current contract-1 hook, so the hook, its library and its unit stay as they are.
+#[test]
+fn a_kept_hook_without_a_contract_line_keeps_the_current_hook_library_and_alert_unit() {
+    let fx = Fixture::new();
+    let current = hook_with_contract(Some(1), "current");
+    let stdout = roll_back_hooks(&fx, Some(hook_with_contract(None, "kept")), &current);
+    assert_current_trio_kept(&fx, &current, &stdout, 0, 1);
+}
+
+/// A kept release with no hook at all counts as contract 0 too.
+#[test]
+fn a_kept_release_without_a_hook_keeps_the_current_hook_library_and_alert_unit() {
+    let fx = Fixture::new();
+    let current = hook_with_contract(Some(1), "current");
+    let stdout = roll_back_hooks(&fx, None, &current);
+    assert_current_trio_kept(&fx, &current, &stdout, 0, 1);
+}
+
+/// The number decides, not the presence of the line: a contract-1 hook is older than a
+/// contract-2 one.
+#[test]
+fn a_kept_contract_one_hook_under_a_current_contract_two_keeps_the_current_trio() {
+    let fx = Fixture::new();
+    let current = hook_with_contract(Some(2), "current");
+    let stdout = roll_back_hooks(&fx, Some(hook_with_contract(Some(1), "kept")), &current);
+    assert_current_trio_kept(&fx, &current, &stdout, 1, 2);
+}
+
+/// Equal contracts restore the kept hook, library and unit with the rest of the release.
+#[test]
+fn equal_hook_contracts_restore_the_kept_hook_library_and_alert_unit() {
+    let fx = Fixture::new();
+    let kept = hook_with_contract(Some(1), "kept");
+    let stdout = roll_back_hooks(
+        &fx,
+        Some(kept.clone()),
+        &hook_with_contract(Some(1), "current"),
+    );
+    let sbin = fx.root.join("usr/local/sbin");
+    assert_eq!(read(&sbin.join("propolis-alert")), kept);
+    assert_eq!(installed_lib_version(&fx), "PA_LIB_VERSION=1");
+    assert!(
+        read(&fx.root.join("etc/systemd/system/propolis-alert@.service")).contains("old-alert")
+    );
+    assert!(
+        !stdout.contains("kept the current failure hook"),
+        "{stdout}"
+    );
+
+    // A newer kept contract than the current one is no reason to keep anything either.
+    let fx = Fixture::new();
+    let kept = hook_with_contract(Some(2), "kept");
+    let stdout = roll_back_hooks(
+        &fx,
+        Some(kept.clone()),
+        &hook_with_contract(Some(1), "current"),
+    );
+    assert_eq!(read(&fx.root.join("usr/local/sbin/propolis-alert")), kept);
+    assert!(
+        !stdout.contains("kept the current failure hook"),
+        "{stdout}"
+    );
+}
+
+/// The shipped hook against a kept one from before contracts: the shipped one stays.
+#[test]
+fn the_shipped_hook_stays_over_a_kept_hook_from_before_hook_contracts() {
+    let fx = Fixture::new();
+    let current = shipped("alert.sh");
+    let contract = current
+        .lines()
+        .find_map(|l| l.strip_prefix("# hook-contract: "))
+        .and_then(|n| n.parse::<u32>().ok())
+        .expect("deploy/alert.sh states its contract");
+    let stdout = roll_back_hooks(&fx, Some(hook_with_contract(None, "kept")), &current);
+    assert_current_trio_kept(&fx, &current, &stdout, 0, contract);
+}
+
+/// While the services are down the maintenance marker says so, with reason `rollback`, this
+/// boot and an end at most two hours ahead; once propolis.service is back it is gone.
+#[test]
+fn the_rollback_marks_maintenance_while_the_services_are_down_and_removes_it() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let marker = fx.root.join("run/propolis-witness/maintenance");
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let output = fx.run(
+        &["--yes"],
+        &[("STUB_MARKER", marker.to_str().unwrap())],
+        None,
+    );
+    assert_ok(&output);
+    assert!(
+        !marker.exists(),
+        "the marker is removed once the services are up"
+    );
+    let log = fx.log();
+    let during: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("marker during stop: "))
+        .collect();
+    assert!(
+        !during.is_empty(),
+        "no marker while services were stopped: {log}"
+    );
+    let fields: Vec<&str> = during[0]
+        .trim_start_matches("marker during stop: ")
+        .split(' ')
+        .collect();
+    assert_eq!(fields[0], "X", "{log}");
+    let until: u64 = fields[1].parse().unwrap();
+    assert!(
+        until > before && until <= before + 7200 + 60,
+        "{until} vs {before}"
+    );
+    let boot: String = read(Path::new("/proc/sys/kernel/random/boot_id"))
+        .replace('-', "")
+        .chars()
+        .take(8)
+        .collect();
+    assert_eq!(fields[2], boot);
+    assert_eq!(fields[3], "rollback");
+    assert!(
+        log.contains("marker during start: "),
+        "the restarts are under the marker too: {log}"
+    );
+    // A refusal before anything is stopped writes no marker.
+    let fx = Fixture::new();
+    let output = fx.run(&["--yes"], &[], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!fx.root.join("run/propolis-witness/maintenance").exists());
+}
+
+#[test]
+fn a_maintenance_marker_that_cannot_be_written_does_not_stop_the_rollback() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let run = fx.root.join("run/propolis-witness");
+    std::fs::remove_dir_all(&run).unwrap();
+    // A file where the directory should be refuses the write, whoever runs the test.
+    std::fs::write(&run, "not a directory").unwrap();
+    let output = fx.run(&["--yes"], &[], None);
+    assert_ok(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("warning: could not write the maintenance marker"),
+        "{stdout}"
+    );
+    assert!(read(&fx.root.join("etc/systemd/system/propolis.service")).contains("ExecStart=old"));
+}
+
+#[test]
+fn a_rollback_that_fails_once_the_services_are_stopped_leaves_no_marker() {
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let marker = fx.root.join("run/propolis-witness/maintenance");
+    let output = fx.run(
+        &["--yes"],
+        &[
+            ("STUB_INACTIVE", "1"),
+            ("STUB_MARKER", marker.to_str().unwrap()),
+        ],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("did not stay up"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fx.log().contains("marker during stop: "), "{}", fx.log());
+    assert!(!marker.exists(), "on_exit removes the marker");
+}
+
+/// A rollback refused before it writes its own marker (no kept release, or the release name not
+/// confirmed) leaves a marker someone else wrote exactly as it was: the run removes only what it
+/// wrote.
+#[test]
+fn a_rollback_refused_before_it_marks_maintenance_leaves_an_operators_marker_alone() {
+    let operator = "#maintenance v1 g=1\nX\t4102444800\t0badc0de\tmanual\n";
+
+    let fx = Fixture::new();
+    let marker = fx.root.join("run/propolis-witness/maintenance");
+    std::fs::write(&marker, operator).unwrap();
+    let output = fx.run(&["--yes"], &[], None);
+    assert_eq!(output.status.code(), Some(1), "no kept release");
+    assert_eq!(read(&marker), operator);
+
+    let fx = Fixture::new();
+    assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
+    fx.upgrade();
+    let marker = fx.root.join("run/propolis-witness/maintenance");
+    std::fs::write(&marker, operator).unwrap();
+    let output = fx.run(&[], &[], Some("nope\n"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("not confirmed"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(read(&marker), operator);
+}
+
+/// Once the hook contract rule keeps the current library, the library version rule does not
+/// weigh the kept one again: here the kept hook that stays out needs version 2 and the kept
+/// library is 1, which would otherwise print a second, misleading line.
+#[test]
+fn a_library_kept_by_the_hook_contract_rule_is_not_weighed_again_by_the_version_rule() {
+    let fx = Fixture::new();
+    let kept = "#!/usr/bin/env bash\n# needs-alert-lib: 2\necho kept\n".to_string();
+    let current = hook_with_contract(Some(1), "current");
+    let stdout = roll_back_hooks(&fx, Some(kept), &current);
+    assert_current_trio_kept(&fx, &current, &stdout, 0, 1);
+    let kept_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("kept the current"))
+        .collect();
+    assert_eq!(kept_lines.len(), 1, "{stdout}");
+}
+
 /// A file of the checkout's deploy/ directory, as shipped.
 fn shipped(name: &str) -> String {
     read(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../deploy/{name}")))
@@ -1270,15 +1555,25 @@ fn a_rollback_onto_a_root_without_the_config_check_directory_makes_it() {
     assert!(!lib.join("repo-dir").exists());
 }
 
+/// The library version the shipped config-check states it needs.
+fn shipped_config_check_needs() -> u32 {
+    shipped("config-check.sh")
+        .lines()
+        .find_map(|l| l.strip_prefix("# needs-alert-lib: "))
+        .and_then(|v| v.parse().ok())
+        .expect("deploy/config-check.sh carries `# needs-alert-lib: <n>`")
+}
+
 /// The library version rule with the real files, the direction that keeps the current library:
-/// the shipped config-check stays (the kept release has no copy of it) and needs the shipped
-/// library, so an older kept library would leave it calling functions that are not there.
+/// the shipped config-check stays (the kept release has no copy of it), and a kept library older
+/// than the version it needs would leave it calling functions that are not there.
 #[test]
 fn the_shipped_config_check_that_stays_keeps_the_current_library_over_an_older_kept_one() {
     let fx = Fixture::new();
     let version = shipped_lib_version();
+    let needs = shipped_config_check_needs();
     let sbin = fx.root.join("usr/local/sbin");
-    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(version - 1)).unwrap();
+    std::fs::write(sbin.join("propolis-alert-lib"), alert_lib_at(needs - 1)).unwrap();
     assert_ok(&fx.run(&["--save", "--backup-set", SET, "propolis"], &[], None));
     fx.upgrade();
     std::fs::write(sbin.join("propolis-alert-lib"), shipped("alert-lib.sh")).unwrap();
@@ -1297,8 +1592,8 @@ fn the_shipped_config_check_that_stays_keeps_the_current_library_over_an_older_k
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains(&format!(
-            "kept the current alert library: the kept one is version {}, and config-check.sh needs {version}",
-            version - 1
+            "kept the current alert library: the kept one is version {}, and config-check.sh needs {needs}",
+            needs - 1
         )),
         "{stdout}"
     );

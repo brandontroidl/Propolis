@@ -18,7 +18,9 @@
 # stamps that survive a clock step (WALL/BOOT/UP: within a boot, ages come from uptime); a read
 # as the account that owns a file, for paths another account can write; the trust check for a
 # program root is about to run; atomic 0600 writes; the one state lock; state files that fall
-# back to /run when the disk refuses a write; the PROPOLIS_SENSOR_LOGS grammar.
+# back to /run when the disk refuses a write; the PROPOLIS_SENSOR_LOGS grammar; the cause codes
+# of a failed run and the unit map; the maintenance marker; the incident record; and the failure
+# hook's record step (pa_hook_record), which the hook runs in a child process of its own.
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
 # EXIT handler runs pa_cleanup, which removes them.
@@ -36,7 +38,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=1
+PA_LIB_VERSION=2
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -1051,4 +1053,547 @@ pa_sensor_logs() {
             PA_LOG_PATH+=("$path")
         fi
     done
+}
+
+# ---- causes, the unit map and the maintenance marker -------------------------------------------
+
+# _pa_signal S: sets _PA_SIGNUM and _PA_SIGNAME from a signal number (systemctl's ExecMainStatus)
+# or a name with or without SIG (systemd's MONITOR_EXIT_STATUS), or fails. The names and numbers
+# are bash's own `kill -l`, so SYS is whatever number this architecture gives it.
+_pa_signal() {
+    local s="${1#SIG}" out
+    _PA_SIGNUM="" _PA_SIGNAME=""
+    if [[ ${1:-} =~ ^[0-9]{1,2}$ ]] && [ "$((10#$1))" -ge 1 ]; then
+        out="$(kill -l "$((10#$1))" 2> /dev/null)" || return 1
+        [[ $out =~ ^[A-Z][A-Z0-9+-]{0,15}$ ]] || return 1
+        _PA_SIGNUM="$((10#$1))" _PA_SIGNAME="$out"
+    elif [[ $s =~ ^[A-Z][A-Z0-9+-]{0,15}$ ]]; then
+        out="$(kill -l "$s" 2> /dev/null)" || return 1
+        [[ $out =~ ^[0-9]{1,2}$ ]] || return 1
+        _PA_SIGNUM="$((10#$out))" _PA_SIGNAME="$s"
+    else
+        return 1
+    fi
+}
+
+# pa_cause RESULT STATUS PANICS: the cause code of a failed run, from systemd's result (the
+# unit's SERVICE_RESULT, or Result= from systemctl show), its exit status or signal, and how many
+# `panicked at` lines the run logged. Prints the code and sets PA_CAUSE. A state field holds no
+# blank, so a code that carries a number joins it with a colon (`proc.exit:3`); the class is the
+# part before the dot, and every code here is class proc, so a run that changes how it crashes is
+# still the same class. A sandbox exit (200 to 243, systemd's own setup) means the program never
+# ran, so a panic line cannot be its cause. Anything not recognised is `unknown`.
+pa_cause() {
+    local result="${1:-}" status="${2:-}" panics="${3:-0}" n
+    PA_CAUSE=unknown
+    [[ $panics =~ ^[0-9]{1,9}$ ]] || panics=0
+    case "$result" in
+        exit-code)
+            if [[ $status =~ ^[0-9]{1,3}$ ]] && [ "$((10#$status))" -le 255 ]; then
+                n=$((10#$status))
+                if [ "$n" -ge 200 ] && [ "$n" -le 243 ]; then
+                    PA_CAUSE="proc.sandbox:$n"
+                elif [ "$panics" -gt 0 ]; then
+                    PA_CAUSE=proc.panic
+                else
+                    PA_CAUSE="proc.exit:$n"
+                fi
+            fi
+            ;;
+        signal | core-dump)
+            if _pa_signal "$status"; then
+                if [ "$_PA_SIGNAME" = SYS ]; then
+                    PA_CAUSE=proc.sigsys
+                elif [ "$panics" -gt 0 ]; then
+                    PA_CAUSE=proc.panic
+                else
+                    PA_CAUSE="proc.signal:$_PA_SIGNUM"
+                fi
+            fi
+            ;;
+        oom-kill) PA_CAUSE=proc.oom ;;
+        timeout) PA_CAUSE=proc.timeout ;;
+        watchdog) PA_CAUSE=proc.watchdog ;;
+        start-limit-hit) PA_CAUSE=proc.start_limit ;;
+        resources) PA_CAUSE=proc.resources ;;
+    esac
+    printf '%s' "$PA_CAUSE"
+}
+
+# pa_unit_map UNIT: where a unit's failure shows and how loud it is. Sets PA_UNIT_STAGE (a stage
+# or rail word), PA_UNIT_TIER, PA_UNIT_LISTENER (yes for a listener) and PA_UNIT_RESERVE (the
+# reserve kind, or -). Any unit not named here is a host matter.
+pa_unit_map() {
+    PA_UNIT_STAGE=host PA_UNIT_TIER=ACT PA_UNIT_LISTENER=no PA_UNIT_RESERVE=-
+    case "${1:-}" in
+        sensor-*.service) PA_UNIT_STAGE=listen PA_UNIT_TIER=PAGE PA_UNIT_LISTENER=yes ;;
+        propolis.service) PA_UNIT_STAGE=intake PA_UNIT_TIER=PAGE PA_UNIT_RESERVE=daemon-down ;;
+        shipper.service) PA_UNIT_STAGE=ship ;;
+        gateway.service) PA_UNIT_STAGE=gateway ;;
+        propolis-logrotate.service) PA_UNIT_STAGE=source ;;
+        propolis-backup.service) PA_UNIT_STAGE=backup ;;
+        propolis-witness@*.service) PA_UNIT_STAGE=witness ;;
+    esac
+    return 0
+}
+
+# pa_maint_active: true while the maintenance marker in PA_RUN holds: written in this boot (a
+# marker cannot outlive a reboot, and /run is emptied by one anyway), ending in the future but no
+# more than 7200 s ahead, so a forgotten or forged far-off end cannot hide a fault for longer than
+# an upgrade could. Sets PA_MAINT_REASON (upgrade, rollback or manual) and PA_MAINT_UNTIL. A
+# marker that is not a regular file, or not in the two-line form, holds nothing.
+pa_maint_active() {
+    local f="$PA_RUN/maintenance" head="" t="" until="" boot="" reason="" ahead
+    PA_MAINT_REASON="" PA_MAINT_UNTIL=""
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    [ -n "${PA_STAMP:-}" ] || pa_now
+    [ "$PA_BOOT" != - ] || return 1
+    {
+        IFS= read -r head
+        IFS=$'\t' read -r t until boot reason _
+    } < "$f" 2> /dev/null
+    [[ $head =~ ^#maintenance\ v1\ g=[0-9]{1,18}$ ]] || return 1
+    [ "$t" = X ] && [[ $until =~ ^[0-9]{1,12}$ ]] && [ "$boot" = "$PA_BOOT" ] || return 1
+    case "$reason" in
+        upgrade | rollback | manual) ;;
+        *) return 1 ;;
+    esac
+    ahead=$((10#$until - 10#$PA_WALL))
+    [ "$ahead" -gt 0 ] && [ "$ahead" -le 7200 ] || return 1
+    PA_MAINT_REASON="$reason" PA_MAINT_UNTIL="$((10#$until))"
+}
+
+# ---- the incident record -----------------------------------------------------------------------
+#
+# incidents holds an `N<TAB><next number>` line, one `I` line of 34 fields per incident (the
+# fields are numbered from 1: 1 id, 2 key, 3 kind, 4 stage, 5 inst, 6 tier, 7 state, 8 first_seen,
+# 9 opened, 10 onset, 11 cause, 12 cause_since, 13 parent, 14 sends, 15 last_sent, 16 last_tx,
+# 17 delivered_open, 18 reminders, 19 next_due, 20 acked, 21 resolved, 22 proof, 23 reopens,
+# 24 reopen_first, 25 hold_until, 26 pending_tx, 27 pending_since, 28 ref, 29 would_push, 30 flags,
+# 31 occ, 32 nr_seen, 33 legacy_out, 34 count) and `W` lines of withheld transitions. One key, one
+# record. The caller holds the lock from pa_incident_load to pa_incident_put.
+#
+# What is built so far is the part the failure hook needs: a first sighting (pending), an open,
+# and a repeat that only counts. Nothing is sent: in the legacy profile an open that v2 would push
+# adds one to would_push, and a NOTICE never would.
+
+# _pa_num V: V when it is a plain count, else 0.
+_pa_num() {
+    if [[ ${1:-} =~ ^[0-9]{1,9}$ ]]; then printf '%s' "$((10#$1))"; else printf 0; fi
+}
+
+# pa_incident_load: reads incidents into memory (the persistent copy or /run's, whichever is
+# newer). Lines of other types, and fields after the 34th, are kept as they are for the version
+# that knows them. The next number is never below one past the highest id already used, so a
+# damaged N line cannot hand out an id twice.
+pa_incident_load() {
+    local line n top=0
+    _PA_INC_N=1 _PA_INC_I=() _PA_INC_REST=() PA_INC=() PA_INC_AT=-1 PA_INC_EXTRA=""
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            N$'\t'*)
+                n="${line#N$'\t'}"
+                n="${n%%$'\t'*}"
+                if [[ $n =~ ^[0-9]{1,9}$ ]]; then _PA_INC_N=$((10#$n)); fi
+                ;;
+            I$'\t'*)
+                _PA_INC_I+=("$line")
+                n="${line#I$'\t'w#}"
+                n="${n%%$'\t'*}"
+                if [[ $n =~ ^[0-9]{1,9}$ ]] && [ "$((10#$n))" -ge "$top" ]; then top=$((10#$n + 1)); fi
+                ;;
+            *) _PA_INC_REST+=("$line") ;;
+        esac
+    done < <(pa_state_read incidents)
+    [ "$_PA_INC_N" -ge "$top" ] || _PA_INC_N="$top"
+    [ "$_PA_INC_N" -ge 1 ] || _PA_INC_N=1
+    return 0
+}
+
+# pa_incident_get KEY: finds KEY's record. Sets PA_INC to its fields (PA_INC[1] the id to
+# PA_INC[34] the count; a field an older writer did not have reads `-`), PA_INC_AT to its place
+# and PA_INC_EXTRA to the fields after the 34th. Status 1, with PA_INC empty and PA_INC_AT -1,
+# when there is none.
+pa_incident_get() {
+    local i
+    local -a f
+    PA_INC=() PA_INC_AT=-1 PA_INC_EXTRA=""
+    for i in "${!_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r -a f <<< "${_PA_INC_I[$i]}"
+        [ "${f[2]:-}" = "${1:-}" ] || continue
+        PA_INC=("${f[@]:0:35}")
+        while [ "${#PA_INC[@]}" -lt 35 ]; do PA_INC+=(-); done
+        if [ "${#f[@]}" -gt 35 ]; then
+            PA_INC_EXTRA="$(
+                IFS=$'\t'
+                printf '%s' "${f[*]:35}"
+            )"
+        fi
+        PA_INC_AT="$i"
+        return 0
+    done
+    return 1
+}
+
+# _pa_tier_rank T: 3 for PAGE, 2 for ACT, 1 for NOTICE, 0 for anything else, so a record whose
+# tier field is damaged takes the next firing's.
+_pa_tier_rank() {
+    case "${1:-}" in
+        PAGE) printf 3 ;;
+        ACT) printf 2 ;;
+        NOTICE) printf 1 ;;
+        *) printf 0 ;;
+    esac
+}
+
+# _pa_flag_add F: adds flag F to the current record's flag list (field 30), once.
+_pa_flag_add() {
+    local flags="${PA_INC[30]:--}"
+    [ -n "${1:-}" ] || return 0
+    case ",$flags," in *",$1,"*) return 0 ;; esac
+    if [ "$flags" = - ]; then PA_INC[30]="$1"; else PA_INC[30]="$flags,$1"; fi
+}
+
+# pa_incident_transition KEY TX: applies a firing to KEY's record in memory. TX is `pending` (a
+# first sighting, which the witness's light pass later opens or drops) or `open`. The firing's
+# attributes come from PA_REC_KIND, PA_REC_STAGE, PA_REC_INST, PA_REC_TIER, PA_REC_CAUSE,
+# PA_REC_NR (NRestarts at the sighting), PA_REC_OUT (what today's hook did) and PA_REC_FLAG (one
+# flag to add, or empty). Sets PA_TX_DONE to pending, open or occ, and PA_TX to what v2 would
+# send (`open`) or `-`. For a record already pending, open or acked the firing raises occ, takes
+# the latest outcome and adds its flag. It takes the firing's kind, stage, tier and cause too,
+# unless its tier ranks below the record's (PAGE over ACT over NOTICE): one key can carry firings
+# of two tiers (a refused rotation at ACT, then a routine skip at NOTICE), and an unresolved fault
+# must stay recorded at the tier it has, because a tier may rise while an incident is open but
+# never fall. An inst the record lacks (`-`) is filled from the firing; one it has is kept. A
+# pending record opens when TX is open. A record that was resolved is replaced by a new incident
+# with the next id. pa_incident_put writes the result.
+pa_incident_transition() {
+    local key="${1:-}" tx="${2:-}" flags
+    PA_TX=- PA_TX_DONE=-
+    case "$tx" in
+        pending | open) ;;
+        *) return 2 ;;
+    esac
+    [ -n "${PA_STAMP:-}" ] || pa_now
+    if pa_incident_get "$key" && [ "${PA_INC[7]}" != resolved ]; then
+        if [ -z "${PA_REC_TIER:-}" ] \
+            || [ "$(_pa_tier_rank "$PA_REC_TIER")" -ge "$(_pa_tier_rank "${PA_INC[6]}")" ]; then
+            [ -z "${PA_REC_KIND:-}" ] || PA_INC[3]="$PA_REC_KIND"
+            [ -z "${PA_REC_STAGE:-}" ] || PA_INC[4]="$PA_REC_STAGE"
+            [ -z "${PA_REC_TIER:-}" ] || PA_INC[6]="$PA_REC_TIER"
+            if [ -n "${PA_REC_CAUSE:-}" ] && [ "$PA_REC_CAUSE" != "${PA_INC[11]}" ]; then
+                PA_INC[11]="$PA_REC_CAUSE" PA_INC[12]="$PA_STAMP"
+            fi
+        fi
+        if [ "${PA_INC[5]}" = - ] && [ "${PA_REC_INST:--}" != - ]; then
+            PA_INC[5]="$PA_REC_INST"
+        fi
+        PA_INC[31]=$(($(_pa_num "${PA_INC[31]}") + 1))
+        [ "${PA_INC[31]}" -le 999999999 ] || PA_INC[31]=999999999
+        PA_INC[33]="${PA_REC_OUT:--}"
+        _pa_flag_add "${PA_REC_FLAG:-}"
+        PA_TX_DONE=occ
+        if [ "${PA_INC[7]}" = pending ] && [ "$tx" = open ]; then
+            PA_INC[7]=open PA_INC[9]="$PA_STAMP"
+            if [ "${PA_INC[6]}" != NOTICE ]; then PA_INC[29]=$(($(_pa_num "${PA_INC[29]}") + 1)); fi
+            PA_TX=open PA_TX_DONE=open
+        fi
+        return 0
+    fi
+    # A new incident, in place of a resolved record of the same key when there is one.
+    flags="${PA_REC_FLAG:-}"
+    PA_INC=(I "w#$_PA_INC_N" "$key" "${PA_REC_KIND:--}" "${PA_REC_STAGE:--}" "${PA_REC_INST:--}"
+        "${PA_REC_TIER:--}" "$tx" "$PA_STAMP" - "$PA_STAMP" "${PA_REC_CAUSE:-unknown}" "$PA_STAMP"
+        - 0 - - 0 0 - - - - 0 - - - - - 0 "${flags:--}" 1 "${PA_REC_NR:--}" "${PA_REC_OUT:--}" -)
+    PA_INC_EXTRA=""
+    _PA_INC_N=$((_PA_INC_N + 1))
+    PA_TX_DONE="$tx"
+    if [ "$tx" = open ]; then
+        PA_INC[9]="$PA_STAMP"
+        if [ "${PA_INC[6]}" != NOTICE ]; then PA_INC[29]=1; fi
+        PA_TX=open
+    fi
+    return 0
+}
+
+# _pa_incident_make_room: drops the first resolved record, for a new one past the 512-record
+# bound. Fails when every record is open, acked or pending: those are never dropped.
+_pa_incident_make_room() {
+    local i
+    local -a f
+    for i in "${!_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r -a f <<< "${_PA_INC_I[$i]}"
+        if [ "${f[7]:-}" = resolved ]; then
+            unset '_PA_INC_I[i]'
+            _PA_INC_I=("${_PA_INC_I[@]}")
+            return 0
+        fi
+    done
+    return 1
+}
+
+# pa_incident_put: puts the current record (PA_INC) back in its place, or appends it, and writes
+# incidents with pa_state_write, which sets PA_WHERE. A field that is empty is written `-` and one
+# that fails pa_ok_field `?`. Status 2 when the key itself fails pa_ok_field (a `?` key would merge
+# unrelated incidents), 3 when 512 records are open or pending and none can make room, and
+# pa_state_write's status otherwise.
+pa_incident_put() {
+    local i v line out
+    [ "${#PA_INC[@]}" -ge 35 ] || return 2
+    pa_ok_field "${PA_INC[2]}" || return 2
+    line=I
+    for ((i = 1; i <= 34; i++)); do
+        v="${PA_INC[$i]}"
+        if [ -z "$v" ]; then
+            v=-
+        elif ! pa_ok_field "$v"; then
+            v='?'
+        fi
+        line+=$'\t'"$v"
+    done
+    [ -z "$PA_INC_EXTRA" ] || line+=$'\t'"$PA_INC_EXTRA"
+    if [ "$PA_INC_AT" -ge 0 ]; then
+        _PA_INC_I[PA_INC_AT]="$line"
+    else
+        if [ "${#_PA_INC_I[@]}" -ge 512 ] && ! _pa_incident_make_room; then
+            return 3
+        fi
+        _PA_INC_I+=("$line")
+        PA_INC_AT=$((${#_PA_INC_I[@]} - 1))
+    fi
+    out="N"$'\t'"$_PA_INC_N"$'\n'
+    for line in "${_PA_INC_I[@]}" "${_PA_INC_REST[@]}"; do
+        out+="$line"$'\n'
+    done
+    pa_state_write incidents < <(printf '%s' "$out")
+}
+
+# ---- the failure hook's record step ------------------------------------------------------------
+#
+# deploy/alert.sh runs pa_hook_record after it has sent (or not sent) today's alert, in a child
+# bash of its own under `timeout`, so nothing here can change what the hook sends, logs as
+# propolis-alert or returns. Its input is the environment: PA_HOOK_UNIT (the unit, already checked
+# by the hook), PA_HOOK_OUT (what today's hook did: delivered, undelivered, cooldown or journal),
+# PA_HOOK_T0 (the hook's SECONDS when it started this step) and systemd's MONITOR_* variables.
+# Every value from them is checked against a closed form before it is written or reaches a
+# command line, and nothing a unit logged is ever copied: journal lines are only counted or
+# matched against fixed prefixes.
+
+# _pa_hook_unrecorded UNIT WHY: the one journal line that says a firing was not recorded.
+_pa_hook_unrecorded() {
+    logger -p daemon.notice -t propolis-witness "incident not recorded for $1: $2" 2> /dev/null || true
+}
+
+# _pa_hook_facts UNIT ASK: what systemd says about the failed run. Sets _PA_HK_RESULT,
+# _PA_HK_CODE (exited, killed or dumped), _PA_HK_STATUS, _PA_HK_INV (the invocation id),
+# _PA_HK_RESTART and _PA_HK_NR (NRestarts), each empty when unknown. The MONITOR_* variables
+# (systemd 251 and later) describe the run that failed and win; systemctl show is asked when ASK
+# is 1, for Restart and NRestarts always and for the run's own values when the MONITOR_* ones are
+# absent. Both answers stay within one source, so a result and a status never come from two runs.
+_pa_hook_facts() {
+    local unit="$1" ask="$2" k v s_result="" s_code="" s_status="" s_inv=""
+    _PA_HK_RESULT="" _PA_HK_CODE="" _PA_HK_STATUS="" _PA_HK_INV="" _PA_HK_RESTART="" _PA_HK_NR=""
+    if [ "$ask" = 1 ]; then
+        while IFS='=' read -r k v; do
+            case "$k" in
+                Result) if [[ $v =~ ^[a-z-]{1,32}$ ]]; then s_result="$v"; fi ;;
+                ExecMainCode)
+                    case "$v" in
+                        1) s_code=exited ;;
+                        2) s_code=killed ;;
+                        3) s_code=dumped ;;
+                    esac
+                    ;;
+                ExecMainStatus) if [[ $v =~ ^[0-9]{1,3}$ ]]; then s_status="$v"; fi ;;
+                InvocationID) if [[ $v =~ ^[0-9a-f]{32}$ ]]; then s_inv="$v"; fi ;;
+                Restart) if [[ $v =~ ^[a-z-]{1,24}$ ]]; then _PA_HK_RESTART="$v"; fi ;;
+                NRestarts) if [[ $v =~ ^[0-9]{1,9}$ ]]; then _PA_HK_NR="$((10#$v))"; fi ;;
+            esac
+        done < <(timeout 3 systemctl show -p Result,ExecMainCode,ExecMainStatus,InvocationID,Restart,Type,NRestarts -- "$unit" 2> /dev/null)
+    fi
+    if [ -n "${MONITOR_SERVICE_RESULT:-}" ]; then
+        if [[ $MONITOR_SERVICE_RESULT =~ ^[a-z-]{1,32}$ ]]; then _PA_HK_RESULT="$MONITOR_SERVICE_RESULT"; fi
+        case "${MONITOR_EXIT_CODE:-}" in
+            exited | killed | dumped) _PA_HK_CODE="$MONITOR_EXIT_CODE" ;;
+        esac
+        if [[ ${MONITOR_EXIT_STATUS:-} =~ ^([0-9]{1,3}|[A-Z][A-Z0-9+-]{0,15})$ ]]; then
+            _PA_HK_STATUS="$MONITOR_EXIT_STATUS"
+        fi
+        if [[ ${MONITOR_INVOCATION_ID:-} =~ ^[0-9a-f]{32}$ ]]; then _PA_HK_INV="$MONITOR_INVOCATION_ID"; fi
+    else
+        _PA_HK_RESULT="$s_result" _PA_HK_CODE="$s_code" _PA_HK_STATUS="$s_status" _PA_HK_INV="$s_inv"
+    fi
+}
+
+# _pa_hook_guard: for propolis-logrotate.service, what the rotation guard said in the failed run.
+# The run's journal is read by trusted fields only (the unit, uid 0 and the invocation id, which
+# journald sets and no `logger -t` can forge), and its lines are matched against the guard's two
+# fixed prefixes and logrotate's companion line for a failed prerotate script. A refusal for want
+# of space is a failure with its own cause. A run is the routine skip of a reader that is behind,
+# a NOTICE, only when every line it logged is a skip or a companion, at least one is a skip, and
+# there are no more companions than skips: any other line (a guard that broke on another log, a
+# note that it rotated blind, an error from logrotate) or a companion with no skip of its own
+# means something besides the skip failed. A value that cannot be read is never a pass, so a read
+# that failed, timed out or was cut at 10000 lines leaves the failure as it is. Without an
+# invocation id the run cannot be told from another, so it stays an ordinary failure too.
+_pa_hook_guard() {
+    local out st line n=0 skip=0 companion=0 refuse=0 other=0
+    [ -n "$_PA_HK_INV" ] || return 0
+    out="$(
+        timeout 3 journalctl -q -o cat _SYSTEMD_UNIT=propolis-logrotate.service _UID=0 \
+            "_SYSTEMD_INVOCATION_ID=$_PA_HK_INV" 2> /dev/null | head -n 10001
+        exit "${PIPESTATUS[0]}"
+    )"
+    st=$?
+    while IFS= read -r line; do
+        n=$((n + 1))
+        case "$line" in
+            'propolis-logrotate-guard: refusing to rotate'*) refuse=1 ;;
+            'propolis-logrotate-guard: skipping rotation of'*) skip=$((skip + 1)) ;;
+            'error: error running non-shared prerotate script for'*) companion=$((companion + 1)) ;;
+            *) other=1 ;;
+        esac
+    done <<< "$out"
+    if [ "$refuse" = 1 ]; then
+        PA_REC_CAUSE=guard.no_space
+    elif [ "$st" = 0 ] && [ "$n" -le 10000 ] && [ "$other" = 0 ] && [ "$skip" -ge 1 ] \
+        && [ "$companion" -le "$skip" ]; then
+        PA_REC_KIND=rotation-skipped PA_REC_TIER=NOTICE PA_REC_CAUSE=guard.behind
+    fi
+}
+
+# _pa_hook_field V: V for a spool field: `-` when empty, `?` when it fails pa_ok_field.
+_pa_hook_field() {
+    if [ -z "${1:-}" ]; then
+        printf -- '-'
+    elif pa_ok_field "$1"; then
+        printf '%s' "$1"
+    else
+        printf '?'
+    fi
+}
+
+# _pa_hook_spool UNIT OUT: the firing written to the hook spool, for when the lock cannot be had
+# or the hook's time is nearly spent: PA_STATE/hook/UNIT, else PA_RUN/fallback/hook-UNIT. One file
+# per unit, overwritten each time with the first time kept and the count raised, so a crash loop
+# cannot grow it. Written without the lock, which is the point. Nothing reads or removes the
+# file yet: the witness's light pass will take it in under the lock and delete it. The cause is
+# PA_CAUSE.
+_pa_hook_spool() {
+    local unit="$1" out="$2" dir f head="" t="" a="" b="" c="" g first count
+    for dir in "$PA_STATE/hook" "$PA_RUN/fallback"; do
+        { [ -d "$dir" ] || mkdir -m 0700 -- "$dir"; } 2> /dev/null || continue
+        if [ "$dir" = "$PA_RUN/fallback" ]; then f="$dir/hook-$unit"; else f="$dir/$unit"; fi
+        g=0 first="$PA_STAMP" count=0
+        if [ -f "$f" ] && [ ! -L "$f" ]; then
+            {
+                IFS= read -r head
+                IFS=$'\t' read -r t a b c _
+            } < "$f" 2> /dev/null
+            if [[ $head =~ ^#hook\ v1\ g=([0-9]{1,18})$ ]] && [ "$t" = H ]; then
+                g=$((10#${BASH_REMATCH[1]}))
+                if _pa_stamp_split "$a"; then first="$a"; fi
+                count="$(_pa_num "$c")"
+            fi
+        fi
+        count=$((count + 1))
+        [ "$count" -le 999999999 ] || count=999999999
+        if pa_write "$f" < <(printf '#hook v1 g=%s\nH\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$((g + 1))" "$first" "$PA_STAMP" "$count" "$(_pa_hook_field "$_PA_HK_RESULT")" \
+            "$(_pa_hook_field "$_PA_HK_CODE")" "$(_pa_hook_field "$_PA_HK_STATUS")" \
+            "$(_pa_hook_field "$PA_CAUSE")" "$(_pa_hook_field "$_PA_HK_NR")" "$out"); then
+            return 0
+        fi
+    done
+    _pa_hook_unrecorded "$unit" "neither the state directory nor /run took the hook spool"
+    return 1
+}
+
+# pa_hook_record: records one firing of the failure hook (see the section comment). Within the
+# hook's time it asks systemd and the journal (3 s each) and takes the lock for at most 5 s; when
+# the lock cannot be had, or the hook started this step 70 s or more into its 90 s, the firing goes
+# to the hook spool with the cause from the MONITOR_* variables alone. A unit that restarts itself
+# (or whose Restart= cannot be read) is a first sighting, left pending for the witness to judge;
+# one that does not opens at once, and under an active maintenance marker it too stays pending,
+# flagged maint. It logs one line under propolis-witness only when nothing could be written, and
+# returns 0 then too: that line is the whole account of the failure.
+pa_hook_record() {
+    local unit="${PA_HOOK_UNIT:-}" out="${PA_HOOK_OUT:-}" t0="${PA_HOOK_T0:-0}" panics=0 tx rc k12
+    case "$out" in
+        delivered | undelivered | cooldown | journal) ;;
+        *) out=- ;;
+    esac
+    [[ $t0 =~ ^[0-9]{1,9}$ ]] || t0=0
+    if ! [[ $unit =~ ^[A-Za-z0-9@._:-]{1,200}$ ]] || [[ $unit == .* ]]; then
+        _pa_hook_unrecorded - "the unit name is not one systemd gives"
+        return 0
+    fi
+    pa_now
+    if [ "$((10#$t0))" -ge 70 ]; then
+        _pa_hook_facts "$unit" 0
+        pa_cause "$_PA_HK_RESULT" "$_PA_HK_STATUS" 0 > /dev/null
+        _pa_hook_spool "$unit" "$out" || true
+        return 0
+    fi
+    _pa_hook_facts "$unit" 1
+    if [ -n "$_PA_HK_INV" ]; then
+        panics="$(timeout 3 journalctl -q -o cat "_SYSTEMD_UNIT=$unit" "_SYSTEMD_INVOCATION_ID=$_PA_HK_INV" \
+            2> /dev/null | grep -c -F 'panicked at')" || true
+        panics="$(_pa_num "$panics")"
+    fi
+    pa_cause "$_PA_HK_RESULT" "$_PA_HK_STATUS" "$panics" > /dev/null
+    pa_unit_map "$unit"
+    PA_REC_KIND=unit-failed PA_REC_STAGE="$PA_UNIT_STAGE" PA_REC_TIER="$PA_UNIT_TIER"
+    PA_REC_CAUSE="$PA_CAUSE" PA_REC_NR="$_PA_HK_NR" PA_REC_OUT="$out" PA_REC_FLAG="" PA_REC_INST=-
+    case "$unit" in
+        propolis.service) PA_REC_KIND=daemon-down ;;
+        propolis-logrotate.service) _pa_hook_guard ;;
+    esac
+    tx=pending
+    [ "$_PA_HK_RESTART" != no ] || tx=open
+    if pa_maint_active; then
+        tx=pending PA_REC_FLAG=maint
+    fi
+    rc=0
+    pa_lock 5 || rc=$?
+    if [ "$rc" != 0 ]; then
+        _pa_hook_spool "$unit" "$out" || true
+        return 0
+    fi
+    # The opaque id stays `-` (PA_REC_INST above). pa_id_table widens two colliding names only
+    # among the instances it is given, and the hook knows one unit, so an id it took could differ
+    # from the one the walk and the witness show for the same unit; the witness, which builds the
+    # table from every configured unit, fills it. The salt is still made here, as the first root
+    # writer makes it, so ids exist from the first record on.
+    pa_salt_ensure || true
+    pa_incident_load
+    # A sensor with no bind configured, as an open config-check finding says, restarts on
+    # nothing to bind: its own kind, which is not reminded.
+    case "$unit" in
+        sensor-*.service)
+            k12="$(_pa_sha256 "noconfig:${unit%.service}")" || k12=""
+            if [ -n "$k12" ] && pa_incident_get "finding:noconfig:${k12:0:12}"; then
+                case "${PA_INC[7]}" in
+                    pending | open | acked) PA_REC_KIND=unit-nobind PA_REC_TIER=ACT PA_REC_STAGE=listen ;;
+                esac
+            fi
+            ;;
+    esac
+    pa_incident_transition "unit:$unit" "$tx"
+    rc=0
+    pa_incident_put || rc=$?
+    # Where the record landed, for the walk's state row: a host whose records go to /run must
+    # show it before the witness ever runs.
+    if [ "$rc" = 0 ]; then
+        _pa_meta_set where "$PA_WHERE" > /dev/null 2>&1 || true
+    fi
+    pa_unlock
+    case "$rc" in
+        0) ;;
+        2) _pa_hook_unrecorded "$unit" "the unit name is too long for a record" ;;
+        3) _pa_hook_unrecorded "$unit" "512 incidents are open or pending (notpersisted)" ;;
+        *) _pa_hook_unrecorded "$unit" "neither the state directory nor /run took the write" ;;
+    esac
+    return 0
 }

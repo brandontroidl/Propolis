@@ -59,7 +59,13 @@ The script (run as root, `sudo ./deploy/upgrade.sh [--accept-origin] [--adopt-hi
    (`config-check.sh`, `listeners-lib.sh`, and `repo-dir` and `install-bins`, which it writes
    from this checkout's path and this script's binary list), then
    runs `systemctl daemon-reload` so the restarts below pick up the new unit
-   definitions.
+   definitions. It then writes the maintenance marker `/run/propolis-witness/maintenance`
+   (reason `upgrade`, ending two hours later), so the failure hook records the failures the
+   restarts below cause as planned work, flagged `maint`, rather than as incidents to open. An
+   `EXIT` trap removes it however the script ends, and it is removed once more after the status
+   line. Writing and removing it are best effort: a marker that cannot be written prints a
+   warning and never stops the upgrade, and one left by an upgrade that was killed outright
+   expires on its own.
 5. Restarts each `sensor-*.service` **only if it is enabled**, then `gateway.service`
    if enabled.
 6. Restarts `propolis.service`, so the daemon runs any new migrations after the
@@ -511,10 +517,29 @@ to it, and prints `kept the current alert library: the kept one is version <k>, 
 needs <n>`. Blanks around the number and a CRLF ending do not hide a line
 (`deploy/rollback.sh#number_line`), so a hand-edited copy is still weighed; a missing line counts
 as 0. A kept release from before the library was installed holds none, and the current one
-stays. The installed configuration check is the first script that sources the library, so its
-kept or current copy is what is weighed today; a kept release from before it holds no copy, so
-the current copy, which stays, is weighed; a host with no installed copy weighs nothing. The
-restored library is installed 0644, as the deploy scripts install it.
+stays. The scripts weighed today are the installed configuration check and the failure hook
+(`/usr/local/sbin/propolis-alert`, whose record step sources the library); a kept release from
+before either holds no copy of it, so the current copy, which stays, is weighed, and a host
+without one weighs nothing for it. The restored library is installed 0644, as the deploy scripts
+install it.
+
+**The failure hook goes back only when its contract is not older.** The hook states a contract
+number on a `# hook-contract: <n>` line; a kept release without a hook, or a hook without the
+line, counts as 0. Before the library rule, the script compares the kept hook's number with the
+current one's (`deploy/rollback.sh#check_hook_contract`). When the kept number is lower it keeps
+the current `propolis-alert`, `propolis-alert-lib` and `propolis-alert@.service` all three, and
+prints `kept the current failure hook: the kept release's hook has contract <k>, older than <n>
+(under profile v2 it would put the host name back into alert titles)`. The rest of the release
+goes back as usual. Every hook released so far sends the same alert, so keeping the current one
+changes nothing that is sent.
+
+**The maintenance marker.** Just before it stops the services the script writes
+`/run/propolis-witness/maintenance` with reason `rollback` (`deploy/rollback.sh#maint_write`),
+so the failure hook records the stops and restarts as planned work. It removes the marker once
+`propolis.service` has stayed up, and a run that fails after the services were stopped removes
+it in `deploy/rollback.sh#on_exit`, after it has tried to start them again. It removes only a
+marker it wrote itself. A marker that cannot be written is reported and never stops the
+rollback.
 
 **When the upgrade changed the schema**, the binaries alone are not enough. Migrations only run
 forward and no down-migration exists, so the older daemon refuses the newer database at

@@ -17,7 +17,11 @@
 #                                reloads systemd and starts them again. The kept alert library
 #                                goes back only when it serves every script that sources it and
 #                                is in place afterwards (check_alert_lib); otherwise the current
-#                                one stays.
+#                                one stays. A kept failure hook with an older contract than the
+#                                current one stays out, with its library and unit
+#                                (check_hook_contract). While the services are down a
+#                                maintenance marker tells the root alerting code the restarts are
+#                                planned.
 #
 # Binaries alone are enough when the upgrade changed no schema. When it ran new migrations, the
 # older daemon refuses the newer database at startup (sqlx reports a migration it does not know),
@@ -69,6 +73,9 @@ ALERT_LIB_CONSUMERS=(
     lib/config-check.sh:usr/local/lib/propolis/config-check.sh
 )
 SENSORS=(sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred)
+# The marker that tells the root alerting code the restarts are planned (maint_write).
+MAINT_MARKER="$ROOT/run/propolis-witness/maintenance"
+MAINT_SET=0
 
 usage() {
     cat >&2 <<EOF
@@ -121,6 +128,8 @@ check_alert_lib() {
     local dir="$1" pair kept current copy need lib_version
     local most=0 who=""
     [ -f "$dir/sbin/$ALERT_LIB" ] || return 0
+    # The hook contract rule already keeps the current library, with the hook it serves.
+    skipped "$ALERT_LIB" && return 0
     for pair in "${ALERT_LIB_CONSUMERS[@]}"; do
         kept="${pair%%:*}"
         current="${pair#*:}"
@@ -140,6 +149,50 @@ check_alert_lib() {
         echo "    kept the current alert library: the kept one is version $lib_version, and $who needs $most"
         RESTORE_SKIP+=("$ALERT_LIB")
     fi
+}
+
+# The hook contract rule, applied before the library version rule. The failure hook states a
+# contract number on a `# hook-contract: <n>` line (no hook, or no line: 0), and a higher number
+# promises what an older hook does not keep: from contract 2 the hook can send under profile v2,
+# where an older one would put the host and unit names back into alert titles. So when the kept
+# hook's number is lower than the current one's, the current hook stays, and with it the library
+# it sources and the unit that runs it. Hooks up to contract 1 all send the same bytes, so keeping
+# the current one costs nothing that is sent.
+check_hook_contract() {
+    local dir="$1" kept current
+    kept="$(number_line "$dir/sbin/propolis-alert" '# hook-contract: ')"
+    current="$(number_line "$ROOT/usr/local/sbin/propolis-alert" '# hook-contract: ')"
+    if [ "$kept" -lt "$current" ]; then
+        echo "    kept the current failure hook: the kept release's hook has contract $kept, older than $current (under profile v2 it would put the host name back into alert titles)"
+        RESTORE_SKIP+=(propolis-alert "$ALERT_LIB" propolis-alert@.service)
+    fi
+}
+
+# maint_write: the maintenance marker, in the two-line form the root alerting code reads, ending
+# two hours from now, for this boot, with reason rollback. Best effort: under `set -e` a marker
+# that cannot be written must never stop a rollback, so this says so and goes on.
+maint_write() {
+    local boot now
+    boot="$(tr -d - 2>/dev/null < /proc/sys/kernel/random/boot_id | cut -c1-8)" || boot=-
+    [[ "$boot" =~ ^[0-9a-f]{8}$ ]] || boot=-
+    now="$(date +%s 2>/dev/null)" || now=0
+    [[ "$now" =~ ^[0-9]{1,12}$ ]] || now=0
+    if { { [ -d "${MAINT_MARKER%/*}" ] || mkdir -m 0750 "${MAINT_MARKER%/*}"; } && printf '#maintenance v1 g=1\nX\t%s\t%s\trollback\n' "$((now + 7200))" "$boot" > "$MAINT_MARKER"; } 2>/dev/null; then
+        MAINT_SET=1
+    else
+        echo "    warning: could not write the maintenance marker; the witness may record the restarts as failures"
+    fi
+    return 0
+}
+
+# maint_clear: removes the marker this run wrote, and only that: a marker an operator or an
+# upgrade wrote is not this run's to remove. Never fails.
+maint_clear() {
+    if [ "$MAINT_SET" -eq 1 ]; then
+        rm -f -- "$MAINT_MARKER" 2>/dev/null || true
+        MAINT_SET=0
+    fi
+    return 0
 }
 
 # skipped NAME: whether a rule above keeps the current copy of NAME.
@@ -319,7 +372,10 @@ on_exit() {
     local daemon=1
     # Keyed on what was done, not on the exit status: ended by a signal, bash runs this with the
     # status of the last command that finished, which is usually 0.
-    [ "$STOPPED" -eq 1 ] || return 0
+    if [ "$STOPPED" -ne 1 ]; then
+        maint_clear
+        return 0
+    fi
     # From here to the last line nothing may end the script: not a step that fails, not a write
     # to a terminal that has gone away, not a second signal. The commands it runs inherit the
     # ignored signals, so the rename that puts the database back survives a hangup too.
@@ -395,6 +451,8 @@ on_exit() {
     if [ "$ROLES_BY_HAND" -eq 1 ]; then
         roles_caveat
     fi
+    # After the services were started again above, which were planned restarts too.
+    maint_clear
     return 0
 }
 trap on_exit EXIT
@@ -647,6 +705,7 @@ restore() {
         [ "$answer" = "$release" ] || { echo "not confirmed; nothing changed"; exit 1; }
     fi
 
+    maint_write
     echo "==> stopping services"
     STOPPED=1
     STEP="stopping services"
@@ -659,6 +718,7 @@ restore() {
 
     echo "==> putting the kept binaries, helpers and units back"
     STEP="putting the kept files back"
+    check_hook_contract "$dir"
     check_alert_lib "$dir"
     local name
     shopt -s nullglob
@@ -673,7 +733,11 @@ restore() {
             install -m 0755 "$f" "$ROOT/usr/local/sbin/$name"
         fi
     done
-    for f in "$dir"/units/*; do install -m 0644 "$f" "$ROOT/etc/systemd/system/$(basename "$f")"; done
+    for f in "$dir"/units/*; do
+        name="$(basename "$f")"
+        skipped "$name" && continue
+        install -m 0644 "$f" "$ROOT/etc/systemd/system/$name"
+    done
     for f in "$dir"/lib/*; do
         name="$(basename "$f")"
         skipped "$name" && continue
@@ -746,6 +810,7 @@ restore() {
         fi
         exit 1
     fi
+    maint_clear
     STOPPED=0
     echo "Rolled back to $release (commit $commit)."
     [ -n "$ASIDE" ] && echo "The database from before the rollback is kept as $ASIDE; drop it once you are satisfied."

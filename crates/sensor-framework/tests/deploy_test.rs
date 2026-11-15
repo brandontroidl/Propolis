@@ -974,8 +974,8 @@ fn run_dirs_missing_from_tmpfiles(unit_text: &str, created: &HashSet<String>) ->
         .collect()
 }
 
-/// No unit grants a `/run` directory yet, so the walk above checks nothing today; this holds the
-/// walker itself to what it must find once one does.
+/// The walk above passes once every grant is created, so this holds the walker itself to what it
+/// must find when one is not.
 #[test]
 fn a_run_grant_missing_from_tmpfiles_is_found_with_or_without_the_dash_prefix() {
     let created: HashSet<String> = ["/run/propolis-witness", "/run/motd.d"]
@@ -6600,6 +6600,233 @@ fn install_and_upgrade_install_the_alert_library_readable_and_not_executable() {
         stdout.contains("alert-lib.sh /usr/local/sbin/propolis-alert-lib\n")
             && stdout.contains("[dry-run] install -m 0644 "),
         "dry-run output does not show the library install:\n{stdout}"
+    );
+}
+
+/// The failure hook records into the root alerting directories, granted only with the `-` prefix:
+/// a missing directory then costs the record, never the unit, where a plain grant would fail the
+/// unit with status 226 and take every failure alert on the host with it. Its time budget and the
+/// rest of its sandbox stay as they were.
+#[test]
+fn the_alert_unit_grants_the_alerting_state_directories_only_with_the_dash_prefix() {
+    let alert = uncommented(&deploy_file("propolis-alert@.service"));
+    let grants: Vec<&str> = alert
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("ReadWritePaths="))
+        .collect();
+    assert_eq!(
+        grants,
+        ["ReadWritePaths=-/var/lib/propolis/witness -/run/propolis-witness"]
+    );
+    for directive in [
+        "TimeoutStartSec=90s",
+        "RuntimeDirectory=propolis-alert",
+        "RuntimeDirectoryPreserve=yes",
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        "NoExecPaths=/",
+        "ExecPaths=/usr/local/sbin/propolis-alert /usr/bin /usr/lib -/usr/lib64",
+        "SystemCallFilter=~@mount",
+    ] {
+        assert!(
+            alert.lines().any(|l| l.trim() == directive),
+            "propolis-alert@.service lost {directive}"
+        );
+    }
+}
+
+/// The maintenance marker in upgrade.sh: written after the reload and before the first restart,
+/// removed by an EXIT trap set with it (so the migration failure's exit removes it too) and once
+/// more after the status line, just before the final config-check line, which stays last. Every
+/// line that touches it is best effort: it discards its errors and carries `|| echo` or `|| true`,
+/// so under `set -e` the marker can never stop an upgrade.
+#[test]
+fn upgrade_marks_maintenance_around_the_restarts_and_the_marker_can_never_stop_it() {
+    let lines: Vec<String> = uncommented(&deploy_file("upgrade.sh"))
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let first = |pred: &dyn Fn(&str) -> bool, what: &str| -> usize {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("upgrade.sh has no {what}"))
+    };
+    let reload = first(&|l| l == "systemctl daemon-reload", "daemon-reload");
+    let restart = first(&|l| l.starts_with("systemctl restart"), "restart");
+    let status = first(
+        &|l| l.contains("systemctl --no-pager status propolis.service"),
+        "status line",
+    );
+    let marker: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("/run/propolis-witness"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(marker.len(), 3, "write, trap, removal: {marker:?}");
+    let (write, trap, remove) = (marker[0], marker[1], marker[2]);
+    assert!(
+        lines[write].contains("#maintenance v1 g=1\\nX\\t%s\\t%s\\tupgrade\\n"),
+        "{}",
+        lines[write]
+    );
+    assert!(
+        lines[trap].starts_with("trap '") && lines[trap].ends_with("' EXIT"),
+        "{}",
+        lines[trap]
+    );
+    assert!(lines[remove].starts_with("rm -f"), "{}", lines[remove]);
+    assert!(
+        reload < write && write < trap && trap < restart,
+        "reload {reload}, write {write}, trap {trap}, first restart {restart}"
+    );
+    assert!(
+        status < remove && remove + 2 >= lines.len() - 1 && remove < lines.len() - 1,
+        "the removal comes after the status line ({status}) and just before the last line: {remove} of {}",
+        lines.len()
+    );
+    assert!(lines.last().unwrap().contains("config-check.sh"));
+    for &at in &marker {
+        let l = &lines[at];
+        assert!(
+            l.contains("2>/dev/null") && (l.contains("|| echo") || l.contains("|| true")),
+            "a marker line that could stop the upgrade: {l}"
+        );
+    }
+    // The boot id and the clock it is stamped with are read the same best-effort way.
+    for var in ["maint_boot", "maint_now"] {
+        let set: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with(&format!("{var}=")))
+            .collect();
+        assert!(
+            !set.is_empty() && set.iter().all(|l| l.contains(&format!("|| {var}="))),
+            "{var} must fall back when it cannot be read: {set:?}"
+        );
+    }
+    // Only the trap set here: upgrade.sh has no other, so nothing else is replaced.
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("trap ")).count(),
+        1,
+        "upgrade.sh sets one trap"
+    );
+}
+
+/// The marker lines of upgrade.sh, run as written under its own `set -euo pipefail` with the
+/// directory swapped for a scratch one: under a caller's umask 022 the marker is still 0600, and
+/// a `date` that prints garbage gives an end of 7200 instead of an arithmetic error that would
+/// abort the upgrade before any service is restarted.
+#[test]
+fn upgrade_writes_the_maintenance_marker_0600_and_survives_a_clock_that_prints_garbage() {
+    let text = deploy_file("upgrade.sh");
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("maint_boot="))
+        .expect("upgrade.sh reads the boot id for the marker");
+    let end = lines
+        .iter()
+        .position(|l| l.contains("> /run/propolis-witness/maintenance"))
+        .expect("upgrade.sh writes the marker");
+    assert!(start < end, "{start} {end}");
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let witness = run.join("propolis-witness");
+    let block = lines[start..=end]
+        .join("\n")
+        .replace("/run/propolis-witness", witness.to_str().unwrap());
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_executable(&bin.join("date"), "#!/bin/sh\necho 1x\n");
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -euo pipefail\numask 022\n{block}\necho reached-the-end"
+        ))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .fenced_output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("reached-the-end"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let marker = witness.join("maintenance");
+    assert_eq!(mode_of(&marker), 0o600);
+    assert_eq!(mode_of(&witness), 0o750);
+    let body = std::fs::read_to_string(&marker).unwrap();
+    let second: Vec<&str> = body.lines().nth(1).unwrap().split('\t').collect();
+    assert_eq!(second[0], "X", "{body}");
+    assert_eq!(second[1], "7200", "{body}");
+    assert_eq!(second[3], "upgrade", "{body}");
+}
+
+/// Every path the alerting library can create under the two alerting state directories has a
+/// row in the filesystem paths reference: each literal `$PA_STATE/<name>` and `$PA_RUN/<name>`
+/// it names, and each state file it writes by name with `pa_state_write`. A path the library
+/// writes only when another fails (/run's lock, the fallback copies) counts too.
+#[test]
+fn every_path_the_alert_library_can_create_is_in_the_filesystem_paths_reference() {
+    let lib = deploy_file("alert-lib.sh");
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/reference/filesystem-paths.md"
+    ))
+    .unwrap();
+    let name_of = |piece: &str| -> String {
+        piece
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || "._-".contains(*c))
+            .collect()
+    };
+    let mut wanted = std::collections::BTreeSet::new();
+    for (var, dir) in [
+        ("$PA_STATE/", "/var/lib/propolis/witness/"),
+        ("$PA_RUN/", "/run/propolis-witness/"),
+    ] {
+        for piece in lib.split(var).skip(1) {
+            let name = name_of(piece);
+            if !name.is_empty() {
+                wanted.insert(format!("{dir}{name}"));
+            }
+        }
+    }
+    for piece in lib.split("pa_state_write ").skip(1) {
+        let name = name_of(piece);
+        if !name.is_empty()
+            && name.chars().all(|c| c.is_ascii_lowercase())
+            && piece[name.len()..].starts_with(" <")
+        {
+            wanted.insert(format!("/var/lib/propolis/witness/{name}"));
+        }
+    }
+    for must in [
+        "/run/propolis-witness/state.lock",
+        "/var/lib/propolis/witness/meta",
+        "/var/lib/propolis/witness/incidents",
+    ] {
+        assert!(
+            wanted.contains(must),
+            "the walk over alert-lib.sh lost {must}: {wanted:?}"
+        );
+    }
+    let missing: Vec<&String> = wanted
+        .iter()
+        .filter(|p| !doc.contains(&format!("`{p}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "docs/reference/filesystem-paths.md has no row for {missing:?}"
     );
 }
 

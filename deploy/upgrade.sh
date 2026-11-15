@@ -641,6 +641,19 @@ PROPOLIS_DEPLOY_PULLED_AT="$PULLED_AT" PROPOLIS_DEPLOY_ORIGIN_URL="$ORIGIN_URL" 
 echo "==> reloading systemd unit files"
 systemctl daemon-reload
 
+# The maintenance marker: until it is removed, or two hours pass, the root alerting code records
+# the restarts below as planned work rather than as failures. Written here, before the first
+# restart, and removed by the EXIT trap (so the migration failure's exit removes it too) and once
+# more just before the final check. Every step is best effort: under `set -e` a marker that cannot
+# be written or removed must never stop an upgrade. It is two fixed lines, so the library is not
+# sourced for it. An upgrade killed outright leaves a marker that expires on its own.
+maint_boot="$(tr -d - 2>/dev/null < /proc/sys/kernel/random/boot_id | cut -c1-8)" || maint_boot=-
+[[ "$maint_boot" =~ ^[0-9a-f]{8}$ ]] || maint_boot=-
+maint_now="$(date +%s 2>/dev/null)" || maint_now=0
+[[ "$maint_now" =~ ^[0-9]{1,12}$ ]] || maint_now=0
+{ { [ -d /run/propolis-witness ] || mkdir -m 0750 /run/propolis-witness; } && (umask 077 && printf '#maintenance v1 g=1\nX\t%s\t%s\tupgrade\n' "$((maint_now + 7200))" "$maint_boot" > /run/propolis-witness/maintenance); } 2>/dev/null || echo "warning: could not write the maintenance marker; the witness may record the restarts as failures"
+trap 'rm -f /run/propolis-witness/maintenance 2>/dev/null || true' EXIT
+
 # Idempotent: enabling an enabled timer is a no-op, and --now starts it if something stopped it.
 # Before the restarts so a failure here (set -e) aborts before any service is bounced.
 echo "==> enabling the log rotation and backup timers"
@@ -690,6 +703,7 @@ fi
 echo "==> done. checking status"
 sleep 2
 systemctl --no-pager status propolis.service | head -5
+rm -f /run/propolis-witness/maintenance 2>/dev/null || true
 
 # Last, and report-only: the upgrade has finished by now, so a finding here is something to read
 # and act on, not a reason to call the upgrade failed. config-check.sh compares what is configured

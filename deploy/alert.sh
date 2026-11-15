@@ -26,8 +26,25 @@
 # checked to be digits before it is used, and it goes only in the body. The token goes to curl in
 # a header file, never on its command line.
 #
+# Whatever path it took, unless the argument was refused, the failure is then recorded in the root
+# alerting state (/var/lib/propolis/witness/incidents) with systemd's own cause and what this hook
+# did with it. The record is made by the shared library (/usr/local/sbin/propolis-alert-lib), and
+# none of its code runs in this shell: under `set -euo pipefail` an unbound variable or an arithmetic
+# error inside a sourced file ends the shell even behind `|| true`, and this is the alert that
+# must still go out when everything else is broken. So the record runs once the send is decided,
+# from the EXIT handler, in a separate bash under `timeout` within the unit's 90 s, with its
+# output discarded. A library that is missing, too old, broken or hung loses the record and writes
+# one journal line under tag propolis-witness; what this hook sends, logs as propolis-alert,
+# leaves in its own state files and returns stays exactly as it was.
+#
 # Usage: propolis-alert <unit name>
 # PROPOLIS_ALERT_ROOT reads every path under that directory instead of / (tests only).
+#
+# The two lines below are read by deploy/rollback.sh and the deploy tests, in exactly this form:
+# this hook's contract number, which rollback compares before it puts an older hook back, and the
+# version of the library the record step needs.
+# hook-contract: 1
+# needs-alert-lib: 2
 
 set -euo pipefail
 umask 077
@@ -39,6 +56,48 @@ if ! [[ "$UNIT" =~ ^[A-Za-z0-9@._:-]{1,200}$ ]]; then
 fi
 
 ROOT="${PROPOLIS_ALERT_ROOT:-}"
+LIB="$ROOT/usr/local/sbin/propolis-alert-lib"
+# The same number as the library version line above. The record step checks it before calling
+# anything, so an older library is never asked for a function it does not have.
+LIB_NEEDS=2
+# What this hook did with the failure, for the record: set just before each exit below, and
+# before the post. A plain assignment, so it sends and logs nothing.
+PA_HOOK_OUT=-
+
+# The record step, run once whatever path this hook took has ended. It keeps the status the hook
+# was ending with: `set +e` first, so no step here can replace it, and `${headers:-}` because the
+# cooldown and early paths end before the header file exists. The child gets the unit, the
+# outcome and how far into its time the hook is, inherits systemd's MONITOR_* variables, and has
+# whatever is left of 85 s (at least 1), plus 2 s before it is killed: inside TimeoutStartSec=90s.
+# The child's own EXIT handler runs the library's pa_cleanup, so a child stopped by its time limit
+# between writing a temporary state file and renaming it leaves no temporary file behind (bash
+# runs an EXIT handler on the TERM that timeout sends). Before the library is sourced there is
+# nothing to clean, and the handler's error is discarded.
+# shellcheck disable=SC2317,SC2329 # run by the EXIT trap below; every path of this script ends in an explicit exit, and shellcheck does not follow those into the trap
+record_on_exit() {
+    local rc=$? budget
+    set +e
+    rm -f -- "${headers:-}"
+    budget=$(( 85 - SECONDS ))
+    [ "$budget" -ge 1 ] || budget=1
+    # shellcheck source=deploy/alert-lib.sh
+    # shellcheck disable=SC2016 # the child bash expands these, with the library as $1
+    PA_HOOK_UNIT="$UNIT" PA_HOOK_OUT="$PA_HOOK_OUT" PA_HOOK_T0="$SECONDS" \
+        timeout --kill-after=2 "$budget" \
+        bash -c 'trap "pa_cleanup 2>/dev/null" EXIT; . "$1" && [ "${PA_LIB_VERSION:-0}" -ge "$3" ] && pa_init "$2" && pa_hook_record' \
+        _ "$LIB" "$ROOT" "$LIB_NEEDS" < /dev/null > /dev/null 2>&1 \
+        || logger -p daemon.notice -t propolis-witness "incident not recorded for $UNIT (library missing, too old or failed)" 2>/dev/null
+    exit "$rc"
+}
+
+trap record_on_exit EXIT
+# Units that did not exist before the record step are decided by name alone, before anything
+# else: a failed witness pass is recorded, never paged, so no host is sent a page it was not sent
+# before.
+if [[ "$UNIT" =~ ^propolis-witness@[a-z]+\.service$ ]]; then
+    exit 0
+fi
+
 ENV_FILE="$ROOT/etc/propolis/propolis.env"
 STATE_DIR="${PROPOLIS_ALERT_STATE_DIR:-$ROOT/run/propolis-alert}"
 COOLDOWN="${PROPOLIS_ALERT_COOLDOWN_SECS:-1800}"
@@ -81,6 +140,7 @@ pending="$STATE_DIR/undelivered/$UNIT"
 now="$(date +%s)"
 if ! expired "$(age_of "$stamp")" "$COOLDOWN"; then
     logger -p daemon.notice -t propolis-alert "$UNIT failed again; alerted within the last $COOLDOWN s, not repeating"
+    PA_HOOK_OUT=cooldown
     exit 0
 fi
 
@@ -107,9 +167,12 @@ url="$(env_value PROPOLIS_OPS_NTFY_URL)"
 topic="$(env_value PROPOLIS_OPS_NTFY_TOPIC)"
 token="$(env_value PROPOLIS_OPS_NTFY_TOKEN)"
 
+# $1, when given, is what the record calls this outcome (journal for the no-target path, whose
+# journal line is the delivery).
 delivered() {
     touch -- "$stamp" 2>/dev/null || true
     rm -f -- "$pending" 2>/dev/null || true
+    PA_HOOK_OUT="${1:-delivered}"
     exit 0
 }
 
@@ -129,13 +192,14 @@ undelivered() {
     fi
     { printf '%s %s %s\n' "$(( 10#$first ))" "$count" "$(( 10#$logged ))" > "$pending" \
         && touch -d "@$2" -- "$pending"; } 2>/dev/null || true
+    PA_HOOK_OUT=undelivered
     exit 0
 }
 
 if [ -z "$url" ] || [ -z "$topic" ]; then
     # No push target: the journal line is the alert, so it counts as delivered.
     logger -p daemon.err -t propolis-alert "$body"
-    delivered
+    delivered journal
 fi
 
 if [ -n "$first" ]; then
@@ -149,8 +213,8 @@ if ! command -v curl > /dev/null 2>&1; then
     undelivered "curl is not installed, so this host cannot push alerts; install it" "$now"
 fi
 
+# The EXIT handler above removes it.
 headers="$(mktemp 2>/dev/null)" || undelivered "could not create the ntfy header file in the temporary directory" "$now"
-trap 'rm -f -- "$headers"' EXIT
 {
     printf 'Title: propolis: %s failed on %s\n' "$UNIT" "$host"
     printf 'Priority: 5\n'
@@ -163,6 +227,9 @@ trap 'rm -f -- "$headers"' EXIT
 # the server sends: its 40 s plus the last attempt's 20 s stay well under the unit's
 # TimeoutStartSec=90s, so a slow ntfy still ends in undelivered below instead of systemd killing
 # the hook before the failure is recorded.
+# Once the post has started, a hook stopped by a signal must not be recorded as having handled
+# nothing; delivered() overwrites this, and like today's hook an interrupted post leaves no stamp.
+PA_HOOK_OUT=undelivered
 if printf '%s' "$body" | curl -fsS --max-time 20 --retry 2 --retry-max-time 40 -H "@$headers" --data-binary @- \
     "${url%/}/$topic" > /dev/null; then
     delivered

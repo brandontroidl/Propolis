@@ -286,7 +286,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "1");
+    assert_eq!(version, "2");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -2601,4 +2601,1028 @@ echo "bad=${#PA_LOG_BAD[@]}"
     assert_eq!(r.get("label1"), "[ftp] [/c]");
     assert_eq!(r.get("label2"), "[http] [/b]");
     assert_eq!(r.get("label3"), "[\u{200b}dns] [/d]");
+}
+
+/// The fields of every `I` record in `incidents`, numbered as the format numbers them: index 0
+/// is the record type, 1 the id, 2 the key, and so on to 34.
+fn incident_records(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .filter(|l| l.starts_with("I\t"))
+        .map(|l| l.split('\t').map(str::to_string).collect())
+        .collect()
+}
+
+#[test]
+fn pa_cause_maps_every_row_of_the_cause_map() {
+    let fx = Fx::new();
+    for (result, status, panics, want) in [
+        ("exit-code", "1", "0", "proc.exit:1"),
+        ("exit-code", "199", "0", "proc.exit:199"),
+        ("exit-code", "244", "0", "proc.exit:244"),
+        ("exit-code", "200", "0", "proc.sandbox:200"),
+        ("exit-code", "226", "0", "proc.sandbox:226"),
+        ("exit-code", "243", "0", "proc.sandbox:243"),
+        ("exit-code", "101", "2", "proc.panic"),
+        ("exit-code", "226", "1", "proc.sandbox:226"),
+        ("signal", "9", "0", "proc.signal:9"),
+        ("signal", "KILL", "0", "proc.signal:9"),
+        ("core-dump", "SIGSEGV", "0", "proc.signal:11"),
+        ("core-dump", "6", "1", "proc.panic"),
+        ("signal", "31", "0", "proc.sigsys"),
+        ("core-dump", "SYS", "0", "proc.sigsys"),
+        // The syscall filter is named even when the run also logged a panic line.
+        ("signal", "31", "1", "proc.sigsys"),
+        ("core-dump", "SYS", "2", "proc.sigsys"),
+        ("oom-kill", "9", "0", "proc.oom"),
+        ("timeout", "-", "0", "proc.timeout"),
+        ("watchdog", "-", "0", "proc.watchdog"),
+        ("start-limit-hit", "-", "0", "proc.start_limit"),
+        ("resources", "-", "0", "proc.resources"),
+        ("success", "0", "0", "unknown"),
+        ("", "", "", "unknown"),
+        ("exit-code", "1; touch /tmp/x", "0", "unknown"),
+        ("exit-code", "1234", "0", "unknown"),
+        ("signal", "NOT A SIGNAL", "0", "unknown"),
+        ("signal", "999", "0", "unknown"),
+        ("exit-code", "3", "lots", "proc.exit:3"),
+    ] {
+        let r = fx.run_env(
+            "out=\"$(pa_cause \"$R\" \"$S\" \"$P\")\"\npa_cause \"$R\" \"$S\" \"$P\" > /dev/null\n\
+             echo \"out=$out\"\necho \"var=$PA_CAUSE\"",
+            &[("R", result), ("S", status), ("P", panics)],
+        );
+        assert_eq!(r.code, 0, "{result} {status}: {}", r.err);
+        assert_eq!(r.get("out"), want, "{result:?} {status:?} {panics:?}");
+        assert_eq!(r.get("var"), want, "{result:?} {status:?} {panics:?}");
+    }
+}
+
+#[test]
+fn every_cause_pa_cause_prints_passes_pa_ok_field_and_its_class_is_the_part_before_the_dot() {
+    let fx = Fx::new();
+    let r = fx.run(
+        r#"for row in "exit-code 3" "exit-code 226" "signal 9" "signal 31" "oom-kill -" "timeout -" "nothing -"; do
+    set -- $row
+    pa_cause "$1" "$2" 0 > /dev/null
+    if pa_ok_field "$PA_CAUSE"; then echo "ok ${PA_CAUSE%%.*}"; else echo "bad $PA_CAUSE"; fi
+done"#,
+    );
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(
+        r.out.lines().collect::<Vec<_>>(),
+        vec![
+            "ok proc",
+            "ok proc",
+            "ok proc",
+            "ok proc",
+            "ok proc",
+            "ok proc",
+            "ok unknown"
+        ]
+    );
+}
+
+#[test]
+fn pa_unit_map_gives_each_unit_its_stage_tier_and_reserve() {
+    let fx = Fx::new();
+    for (unit, want) in [
+        ("sensor-ssh.service", "listen PAGE yes -"),
+        ("propolis.service", "intake PAGE no daemon-down"),
+        ("shipper.service", "ship ACT no -"),
+        ("gateway.service", "gateway ACT no -"),
+        ("propolis-logrotate.service", "source ACT no -"),
+        ("propolis-backup.service", "backup ACT no -"),
+        ("propolis-witness@light.service", "witness ACT no -"),
+        ("ssh.service", "host ACT no -"),
+        ("propolis-alert@x.service", "host ACT no -"),
+    ] {
+        let r = fx.run_env(
+            "pa_unit_map \"$U\"\necho \"m=$PA_UNIT_STAGE $PA_UNIT_TIER $PA_UNIT_LISTENER $PA_UNIT_RESERVE\"",
+            &[("U", unit)],
+        );
+        assert_eq!(r.code, 0, "{unit}: {}", r.err);
+        assert_eq!(r.get("m"), want, "{unit}");
+    }
+}
+
+/// The marker upgrade.sh and rollback.sh write, in the two-line form they write it.
+fn maintenance_marker(until: u64, boot: &str, reason: &str) -> String {
+    format!("#maintenance v1 g=1\nX\t{until}\t{boot}\t{reason}\n")
+}
+
+#[test]
+fn pa_maint_active_holds_only_for_this_boot_and_at_most_two_hours_ahead() {
+    for (body, active) in [
+        (maintenance_marker(1_003_600, "abcdef01", "upgrade"), true),
+        (maintenance_marker(1_007_200, "abcdef01", "rollback"), true),
+        (maintenance_marker(1_000_060, "abcdef01", "manual"), true),
+        (maintenance_marker(1_007_201, "abcdef01", "upgrade"), false),
+        (maintenance_marker(1_000_000, "abcdef01", "upgrade"), false),
+        (maintenance_marker(999_000, "abcdef01", "upgrade"), false),
+        (maintenance_marker(1_003_600, "12345678", "upgrade"), false),
+        (maintenance_marker(1_003_600, "-", "upgrade"), false),
+        (maintenance_marker(1_003_600, "abcdef01", "party"), false),
+        (
+            "#maintenance v2 g=1\nX\t1003600\tabcdef01\tupgrade\n".to_string(),
+            false,
+        ),
+        ("X\t1003600\tabcdef01\tupgrade\n".to_string(), false),
+        (String::new(), false),
+    ] {
+        let fx = Fx::new();
+        fx.write("run/propolis-witness/maintenance", &body);
+        let r = fx.run_env(
+            "if pa_maint_active; then echo \"active=yes $PA_MAINT_REASON $PA_MAINT_UNTIL\"; else echo active=no; fi",
+            &NOW,
+        );
+        assert_eq!(r.code, 0, "{}", r.err);
+        let got = r.get("active");
+        assert_eq!(got.starts_with("yes"), active, "{body:?}: {got}");
+        if active {
+            let reason = body.trim_end().rsplit('\t').next().unwrap();
+            assert!(got.contains(reason), "{got}");
+        }
+    }
+
+    // No marker, or something that is not a regular file in its place, is no maintenance.
+    let fx = Fx::new();
+    let r = fx.run_env("pa_maint_active && echo active=yes || echo active=no", &NOW);
+    assert_eq!(r.get("active"), "no");
+    let target = fx.scratch().join("marker");
+    std::fs::write(
+        &target,
+        maintenance_marker(1_003_600, "abcdef01", "upgrade"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&target, fx.p("run/propolis-witness/maintenance")).unwrap();
+    let r = fx.run_env("pa_maint_active && echo active=yes || echo active=no", &NOW);
+    assert_eq!(r.get("active"), "no", "a link is never followed");
+}
+
+/// Sets the attributes a firing gives a record and applies TX to `unit:sensor-ssh.service`.
+const TRANSITION: &str = r#"pa_now
+PA_REC_KIND="${KIND:-unit-failed}" PA_REC_STAGE="${STAGE:-listen}" PA_REC_INST="${INST-u12345}" PA_REC_TIER="${TIER:-PAGE}"
+PA_REC_CAUSE="${CAUSE:-proc.exit:1}" PA_REC_NR="${NR-4}" PA_REC_OUT="${OUT:-delivered}" PA_REC_FLAG="${FLAG:-}"
+pa_incident_load
+pa_incident_transition "${KEY:-unit:sensor-ssh.service}" "$TX"
+echo "done=$PA_TX_DONE tx=$PA_TX"
+rc=0; pa_incident_put || rc=$?
+echo "rc=$rc where=$PA_WHERE"
+"#;
+
+#[test]
+fn a_first_sighting_writes_one_pending_record_and_nothing_v2_would_push() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "pending")]);
+    assert_eq!(r.get("done"), "pending tx=-", "{}", r.err);
+    assert_eq!(r.get("rc"), "0 where=persistent");
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    assert!(text.starts_with("#incidents v1 g=1\nN\t2\n"), "{text}");
+    let records = incident_records(&text);
+    assert_eq!(records.len(), 1, "{text}");
+    let f = &records[0];
+    assert_eq!(f.len(), 35, "34 fields after the type: {f:?}");
+    let stamp = "1000000/abcdef01/5000";
+    assert_eq!(f[1], "w#1");
+    assert_eq!(f[2], "unit:sensor-ssh.service");
+    assert_eq!(f[3], "unit-failed");
+    assert_eq!(f[4], "listen");
+    assert_eq!(f[5], "u12345");
+    assert_eq!(f[6], "PAGE");
+    assert_eq!(f[7], "pending");
+    assert_eq!(f[8], stamp, "first_seen");
+    assert_eq!(f[9], "-", "not opened");
+    assert_eq!(f[10], stamp, "onset");
+    assert_eq!(f[11], "proc.exit:1");
+    assert_eq!(f[12], stamp, "cause_since");
+    assert_eq!(f[14], "0", "sends");
+    assert_eq!(f[17], "0", "delivered_open");
+    assert_eq!(f[29], "0", "would_push");
+    assert_eq!(f[30], "-", "flags");
+    assert_eq!(f[31], "1", "occ");
+    assert_eq!(f[32], "4", "nr_seen");
+    assert_eq!(f[33], "delivered", "legacy_out");
+    assert_eq!(f[34], "-", "count");
+    assert!(
+        f[1..].iter().all(|v| !v.is_empty()),
+        "no field is empty: {f:?}"
+    );
+    assert_eq!(mode_of(&fx.p("var/lib/propolis/witness/incidents")), 0o600);
+}
+
+#[test]
+fn an_open_counts_one_would_push_and_a_repeat_only_raises_occ() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "open")]);
+    assert_eq!(r.get("done"), "open tx=open", "{}", r.err);
+    let later = [
+        ("PA_TEST_WALL", "1000300"),
+        ("PA_TEST_BOOT", "abcdef01"),
+        ("PA_TEST_UP", "5300"),
+    ];
+    for out in ["cooldown", "undelivered"] {
+        let r = fx.run_env(
+            TRANSITION,
+            &[later[0], later[1], later[2], ("TX", "open"), ("OUT", out)],
+        );
+        assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    }
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    let records = incident_records(&text);
+    assert_eq!(records.len(), 1, "one record per key: {text}");
+    let f = &records[0];
+    assert_eq!(f[1], "w#1", "a repeat keeps the id");
+    assert_eq!(f[7], "open");
+    assert_eq!(f[9], "1000000/abcdef01/5000", "opened at the first firing");
+    assert_eq!(f[29], "1", "only the open counts as a push v2 would make");
+    assert_eq!(f[31], "3", "occ counts every firing");
+    assert_eq!(f[33], "undelivered", "legacy_out is the latest firing's");
+    assert_eq!(f[12], "1000000/abcdef01/5000", "the cause did not change");
+
+    // A different cause is recorded with its own time, and is still not a new incident.
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            later[0],
+            later[1],
+            later[2],
+            ("TX", "open"),
+            ("CAUSE", "proc.signal:9"),
+        ],
+    );
+    assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    let records = incident_records(&fx.read("var/lib/propolis/witness/incidents"));
+    assert_eq!(records[0][11], "proc.signal:9");
+    assert_eq!(records[0][12], "1000300/abcdef01/5300");
+    assert_eq!(records[0][29], "1");
+}
+
+#[test]
+fn a_pending_record_opens_when_an_open_follows_and_another_key_gets_the_next_id() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "pending")]);
+    assert_eq!(r.get("done"), "pending tx=-", "{}", r.err);
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "pending")]);
+    assert_eq!(r.get("done"), "occ tx=-", "a second sighting only counts");
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "open")]);
+    assert_eq!(r.get("done"), "open tx=open", "{}", r.err);
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("TX", "open"),
+            ("KEY", "unit:propolis-backup.service"),
+            ("TIER", "ACT"),
+        ],
+    );
+    assert_eq!(r.get("done"), "open tx=open", "{}", r.err);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    assert!(text.contains("\nN\t3\n"), "{text}");
+    let records = incident_records(&text);
+    assert_eq!(records.len(), 2, "{text}");
+    assert_eq!(records[0][1], "w#1");
+    assert_eq!(records[0][7], "open");
+    assert_eq!(records[0][31], "3");
+    assert_eq!(records[0][29], "1");
+    assert_eq!(records[1][1], "w#2");
+    assert_eq!(records[1][2], "unit:propolis-backup.service");
+}
+
+#[test]
+fn a_notice_open_is_recorded_without_a_would_push_and_a_flag_is_added_once() {
+    let fx = Fx::salted(SALT);
+    for _ in 0..2 {
+        let r = fx.run_env(
+            TRANSITION,
+            &[
+                NOW[0],
+                NOW[1],
+                NOW[2],
+                ("TX", "open"),
+                ("TIER", "NOTICE"),
+                ("KIND", "rotation-skipped"),
+                ("FLAG", "maint"),
+            ],
+        );
+        assert_eq!(r.get("rc"), "0 where=persistent", "{}", r.err);
+    }
+    let records = incident_records(&fx.read("var/lib/propolis/witness/incidents"));
+    assert_eq!(records[0][29], "0", "a NOTICE never pushes");
+    assert_eq!(records[0][30], "maint");
+}
+
+#[test]
+fn a_value_that_fails_pa_ok_field_is_written_as_a_question_mark_and_a_bad_key_is_refused() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("TX", "pending"),
+            ("CAUSE", "proc exit\t1"),
+            ("NR", ""),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0 where=persistent", "{}", r.err);
+    let records = incident_records(&fx.read("var/lib/propolis/witness/incidents"));
+    assert_eq!(records[0].len(), 35);
+    assert_eq!(records[0][11], "?");
+    assert_eq!(records[0][32], "-", "an absent value is `-`");
+
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("TX", "pending"),
+            ("KEY", "unit:bad name.service"),
+        ],
+    );
+    assert_ne!(r.get("rc"), "0 where=persistent", "{}", r.out);
+    assert_eq!(
+        incident_records(&fx.read("var/lib/propolis/witness/incidents")).len(),
+        1
+    );
+}
+
+#[test]
+fn records_written_by_a_newer_revision_keep_their_extra_fields_and_other_lines() {
+    let fx = Fx::salted(SALT);
+    let fields: Vec<String> = (1..=34)
+        .map(|i| match i {
+            1 => "w#7".to_string(),
+            2 => "unit:sensor-ssh.service".to_string(),
+            7 => "open".to_string(),
+            29 => "1".to_string(),
+            31 => "1".to_string(),
+            _ => "-".to_string(),
+        })
+        .collect();
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=9\nN\t8\nI\t{}\tfield35\nW\t1/abcdef01/1\tdeadbeef\topen\t1\t-\tbudget\nQ\tunknown\n",
+            fields.join("\t")
+        ),
+    );
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "open")]);
+    assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    assert!(text.starts_with("#incidents v1 g=10\nN\t8\n"), "{text}");
+    let records = incident_records(&text);
+    assert_eq!(records[0][1], "w#7");
+    assert_eq!(records[0][31], "2");
+    assert_eq!(records[0].get(35).map(String::as_str), Some("field35"));
+    assert!(
+        text.contains("\nW\t1/abcdef01/1\tdeadbeef\topen\t1\t-\tbudget\n"),
+        "{text}"
+    );
+    assert!(text.contains("\nQ\tunknown\n"), "{text}");
+}
+
+/// Answers `systemctl show ... -- UNIT` from `$STUB_SHOW`; every other call fails.
+const SYSTEMCTL_SHOW_STUB: &str = r#"#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "$STUB_LOG"
+[ "$1" = show ] && [ -n "${STUB_SHOW:-}" ] || exit 1
+printf '%b' "$STUB_SHOW"
+"#;
+
+/// Prints `$STUB_JOURNAL` for any query and records it.
+const JOURNALCTL_RUN_STUB: &str = r#"#!/usr/bin/env bash
+printf 'journalctl %s\n' "$*" >> "$STUB_LOG"
+printf '%b' "${STUB_JOURNAL:-}"
+"#;
+
+const INVOCATION: &str = "0123456789abcdef0123456789abcdef";
+
+#[test]
+fn pa_hook_record_writes_what_todays_hook_did_with_systemds_cause() {
+    let fx = Fx::new();
+    write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+    write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+    fx.write("var/lib/propolis/witness/state.lock", "");
+    let show = format!(
+        "Result=exit-code\\nExecMainCode=1\\nExecMainStatus=2\\nInvocationID={INVOCATION}\\nRestart=no\\nType=oneshot\\nNRestarts=0\\n"
+    );
+    let r = fx.run_env(
+        "rc=0; pa_hook_record || rc=$?\necho \"rc=$rc\"",
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("PA_HOOK_UNIT", "propolis-backup.service"),
+            ("PA_HOOK_OUT", "undelivered"),
+            ("PA_HOOK_T0", "3"),
+            ("STUB_SHOW", &show),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert!(r.out.trim() == "rc=0", "it prints nothing: {}", r.out);
+    let records = incident_records(&fx.read("var/lib/propolis/witness/incidents"));
+    assert_eq!(records.len(), 1);
+    let f = &records[0];
+    assert_eq!(f[2], "unit:propolis-backup.service");
+    assert_eq!(f[3], "unit-failed");
+    assert_eq!(f[4], "backup");
+    assert_eq!(f[6], "ACT");
+    assert_eq!(
+        f[7], "open",
+        "a unit that does not restart itself opens at once"
+    );
+    assert_eq!(f[11], "proc.exit:2");
+    assert_eq!(f[33], "undelivered");
+    assert_eq!(
+        f[5], "-",
+        "inst: an id widened against every configured unit is the witness's to give"
+    );
+    assert!(
+        fx.p("var/lib/propolis/witness/id-salt").exists(),
+        "the first root writer makes the salt"
+    );
+    let log = fx.log();
+    assert!(
+        log.contains("systemctl show -p Result,ExecMainCode,ExecMainStatus,InvocationID,Restart,Type,NRestarts -- propolis-backup.service"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "journalctl -q -o cat _SYSTEMD_UNIT=propolis-backup.service _SYSTEMD_INVOCATION_ID={INVOCATION}"
+        )),
+        "{log}"
+    );
+    assert!(
+        !log.contains("logger"),
+        "a written record logs nothing: {log}"
+    );
+}
+
+#[test]
+fn pa_hook_record_takes_monitor_variables_over_systemctl_and_refuses_hostile_values() {
+    let fx = Fx::new();
+    write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+    write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+    fx.write("var/lib/propolis/witness/state.lock", "");
+    let show = "Result=exit-code\\nExecMainStatus=2\\nRestart=always\\nNRestarts=7\\n";
+    let r = fx.run_env(
+        "pa_hook_record; echo rc=$?",
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("PA_HOOK_UNIT", "sensor-ssh.service"),
+            ("PA_HOOK_OUT", "delivered"),
+            ("PA_HOOK_T0", "1"),
+            ("STUB_SHOW", show),
+            ("MONITOR_SERVICE_RESULT", "signal"),
+            ("MONITOR_EXIT_CODE", "killed"),
+            ("MONITOR_EXIT_STATUS", "SYS"),
+            ("MONITOR_INVOCATION_ID", INVOCATION),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let f = incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0].clone();
+    assert_eq!(f[11], "proc.sigsys");
+    assert_eq!(f[7], "pending", "a restarting unit is a first sighting");
+    assert_eq!(f[32], "7");
+
+    // Hostile values from the environment are never written or run.
+    let fx = Fx::new();
+    write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+    write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+    fx.write("var/lib/propolis/witness/state.lock", "");
+    let r = fx.run_env(
+        "pa_hook_record; echo rc=$?",
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("PA_HOOK_UNIT", "sensor-ssh.service"),
+            ("PA_HOOK_OUT", "delivered;rm"),
+            ("PA_HOOK_T0", "1"),
+            ("MONITOR_SERVICE_RESULT", "exit-code"),
+            ("MONITOR_EXIT_STATUS", "1$(touch $D/pwned)"),
+            ("MONITOR_INVOCATION_ID", "x _SYSTEMD_UNIT=other"),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let f = incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0].clone();
+    assert_eq!(f[11], "unknown");
+    assert_eq!(f[33], "-", "an outcome outside the closed list is `-`");
+    assert!(!fx.scratch().join("pwned").exists());
+    assert!(
+        !fx.log().contains("_SYSTEMD_UNIT=other"),
+        "an invocation id that is not 32 hex digits never reaches journalctl: {}",
+        fx.log()
+    );
+}
+
+#[test]
+fn pa_hook_record_spools_when_the_lock_is_held_and_logs_only_when_nothing_could_be_written() {
+    let fx = Fx::new();
+    write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+    write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+    fx.write("var/lib/propolis/witness/state.lock", "");
+    let r = fx.run_env(
+        r#"flock -n "$PA_STATE/state.lock" bash -c 'source "$LIB"; pa_init "$ROOT"; pa_hook_record; echo rc=$?'"#,
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("PA_HOOK_UNIT", "propolis.service"),
+            ("PA_HOOK_OUT", "journal"),
+            ("PA_HOOK_T0", "1"),
+            ("MONITOR_SERVICE_RESULT", "oom-kill"),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert!(!fx.p("var/lib/propolis/witness/incidents").exists());
+    let spool = fx.read("var/lib/propolis/witness/hook/propolis.service");
+    let stamp = "1000000/abcdef01/5000";
+    assert_eq!(
+        spool,
+        format!("#hook v1 g=1\nH\t{stamp}\t{stamp}\t1\toom-kill\t-\t-\tproc.oom\t-\tjournal\n")
+    );
+    assert_eq!(
+        mode_of(&fx.p("var/lib/propolis/witness/hook/propolis.service")),
+        0o600
+    );
+    assert!(!fx.log().contains("logger"), "{}", fx.log());
+
+    // A second spooled firing keeps the first time and counts.
+    std::fs::write(&fx.log, b"").unwrap();
+    let later = [
+        ("PA_TEST_WALL", "1000100"),
+        ("PA_TEST_BOOT", "abcdef01"),
+        ("PA_TEST_UP", "5100"),
+    ];
+    let r = fx.run_env(
+        "pa_hook_record; echo rc=$?",
+        &[
+            later[0],
+            later[1],
+            later[2],
+            ("PA_HOOK_UNIT", "propolis.service"),
+            ("PA_HOOK_OUT", "cooldown"),
+            ("PA_HOOK_T0", "71"),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/hook/propolis.service"),
+        format!(
+            "#hook v1 g=2\nH\t{stamp}\t1000100/abcdef01/5100\t2\t-\t-\t-\tunknown\t-\tcooldown\n"
+        ),
+        "past 70 s the record goes to the spool at once, with no systemctl or journal read"
+    );
+    assert!(!fx.log().contains("systemctl"), "{}", fx.log());
+
+    // With nowhere to write, one line under propolis-witness says so.
+    let fx = Fx::new();
+    std::fs::remove_dir_all(fx.p("var/lib/propolis/witness")).unwrap();
+    std::fs::write(fx.p("var/lib/propolis/witness"), "not a directory").unwrap();
+    std::fs::remove_dir_all(fx.p("run/propolis-witness")).unwrap();
+    std::fs::write(fx.p("run/propolis-witness"), "not a directory").unwrap();
+    let r = fx.run_env(
+        "pa_hook_record; echo rc=$?",
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("PA_HOOK_UNIT", "propolis.service"),
+            ("PA_HOOK_OUT", "delivered"),
+            ("PA_HOOK_T0", "1"),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let log = fx.log();
+    let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("logger")).collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(
+        lines[0].starts_with(
+            "logger -p daemon.notice -t propolis-witness incident not recorded for propolis.service: "
+        ),
+        "{log}"
+    );
+}
+
+/// A firing at a lower tier than the open incident it repeats (a routine rotation skip after a
+/// refused rotation) only counts: the kind, stage, tier and cause recorded stay, so an open fault
+/// is never relabelled as a NOTICE. A firing at the same or a higher tier takes its own.
+#[test]
+fn a_lower_tier_firing_on_an_open_incident_only_counts_and_keeps_what_was_recorded() {
+    let fx = Fx::salted(SALT);
+    let key = ("KEY", "unit:propolis-logrotate.service");
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            key,
+            ("TX", "open"),
+            ("TIER", "ACT"),
+            ("STAGE", "source"),
+            ("CAUSE", "guard.no_space"),
+        ],
+    );
+    assert_eq!(r.get("done"), "open tx=open", "{}", r.err);
+    let later = [
+        ("PA_TEST_WALL", "1000300"),
+        ("PA_TEST_BOOT", "abcdef01"),
+        ("PA_TEST_UP", "5300"),
+    ];
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            later[0],
+            later[1],
+            later[2],
+            key,
+            ("TX", "open"),
+            ("TIER", "NOTICE"),
+            ("KIND", "rotation-skipped"),
+            ("STAGE", "source"),
+            ("CAUSE", "guard.behind"),
+            ("OUT", "cooldown"),
+            ("FLAG", "maint"),
+        ],
+    );
+    assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    let f = incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0].clone();
+    assert_eq!(
+        (f[3].as_str(), f[4].as_str(), f[6].as_str(), f[11].as_str()),
+        ("unit-failed", "source", "ACT", "guard.no_space")
+    );
+    assert_eq!(f[12], "1000000/abcdef01/5000", "cause_since");
+    assert_eq!(f[29], "1", "would_push");
+    assert_eq!(f[31], "2", "occ");
+    assert_eq!(f[33], "cooldown", "legacy_out is still the latest firing's");
+    assert_eq!(f[30], "maint", "the flag is still added");
+
+    // The same tier with another cause, then a higher tier, each take the firing's own.
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            later[0],
+            later[1],
+            later[2],
+            key,
+            ("TX", "open"),
+            ("TIER", "ACT"),
+            ("STAGE", "source"),
+            ("CAUSE", "proc.exit:1"),
+        ],
+    );
+    assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    let f = incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0].clone();
+    assert_eq!(f[11], "proc.exit:1");
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            later[0],
+            later[1],
+            later[2],
+            key,
+            ("TX", "open"),
+            ("TIER", "PAGE"),
+        ],
+    );
+    assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    let f = incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0].clone();
+    assert_eq!(f[6], "PAGE");
+    assert_eq!(f[31], "4");
+}
+
+/// A repeat fills an opaque id the record did not have yet, and never replaces one it has.
+#[test]
+fn a_repeat_fills_an_unset_inst_and_keeps_a_set_one() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(
+        TRANSITION,
+        &[NOW[0], NOW[1], NOW[2], ("TX", "pending"), ("INST", "-")],
+    );
+    assert_eq!(r.get("done"), "pending tx=-", "{}", r.err);
+    let inst =
+        |fx: &Fx| incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0][5].clone();
+    assert_eq!(inst(&fx), "-");
+    let r = fx.run_env(
+        TRANSITION,
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("TX", "pending"),
+            ("INST", "u12345"),
+        ],
+    );
+    assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+    assert_eq!(inst(&fx), "u12345");
+    for other in ["uabcde", "-"] {
+        let r = fx.run_env(
+            TRANSITION,
+            &[NOW[0], NOW[1], NOW[2], ("TX", "pending"), ("INST", other)],
+        );
+        assert_eq!(r.get("done"), "occ tx=-", "{}", r.err);
+        assert_eq!(inst(&fx), "u12345", "{other}");
+    }
+}
+
+/// The first 12 hex digits of sha256(TEXT), as config-check keys a finding.
+fn k12(text: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8(out.stdout).unwrap()[..12].to_string()
+}
+
+/// One `I` line with id `id`, key `key`, kind `kind` and state `state`; every other field `-`
+/// or 0.
+fn record_line(id: &str, key: &str, kind: &str, state: &str) -> String {
+    let fields: Vec<String> = (1..=34)
+        .map(|i| match i {
+            1 => id.to_string(),
+            2 => key.to_string(),
+            3 => kind.to_string(),
+            6 => "ACT".to_string(),
+            7 => state.to_string(),
+            14 | 17 | 18 | 23 | 29 => "0".to_string(),
+            31 => "1".to_string(),
+            _ => "-".to_string(),
+        })
+        .collect();
+    format!("I\t{}\n", fields.join("\t"))
+}
+
+/// A sensor that fails while config-check's `noconfig` finding for it is open or pending has no
+/// bind configured: it is recorded as unit-nobind at ACT. A resolved finding, or one for another
+/// sensor, leaves the ordinary listener failure at PAGE.
+#[test]
+fn a_sensor_failing_under_an_open_noconfig_finding_is_recorded_as_unit_nobind() {
+    let show =
+        "Result=exit-code\\nExecMainCode=1\\nExecMainStatus=1\\nRestart=always\\nNRestarts=3\\n";
+    let ssh = format!("finding:noconfig:{}", k12("noconfig:sensor-ssh"));
+    let http = format!("finding:noconfig:{}", k12("noconfig:sensor-http"));
+    for (finding_key, state, want) in [
+        (&ssh, "open", ("unit-nobind", "ACT", "listen")),
+        (&ssh, "pending", ("unit-nobind", "ACT", "listen")),
+        (&ssh, "acked", ("unit-nobind", "ACT", "listen")),
+        (&ssh, "resolved", ("unit-failed", "PAGE", "listen")),
+        (&http, "open", ("unit-failed", "PAGE", "listen")),
+    ] {
+        let fx = Fx::new();
+        write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+        write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+        fx.write("var/lib/propolis/witness/state.lock", "");
+        fx.write(
+            "var/lib/propolis/witness/incidents",
+            &format!(
+                "#incidents v1 g=1\nN\t2\n{}",
+                record_line("w#1", finding_key, "finding", state)
+            ),
+        );
+        let r = fx.run_env(
+            "pa_hook_record; echo rc=$?",
+            &[
+                NOW[0],
+                NOW[1],
+                NOW[2],
+                ("PA_HOOK_UNIT", "sensor-ssh.service"),
+                ("PA_HOOK_OUT", "delivered"),
+                ("PA_HOOK_T0", "1"),
+                ("STUB_SHOW", show),
+            ],
+        );
+        assert_eq!(r.get("rc"), "0", "{}", r.err);
+        let records = incident_records(&fx.read("var/lib/propolis/witness/incidents"));
+        let f = records
+            .iter()
+            .find(|f| f[2] == "unit:sensor-ssh.service")
+            .unwrap_or_else(|| panic!("no record for the sensor: {records:?}"));
+        assert_eq!(
+            (f[3].as_str(), f[6].as_str(), f[4].as_str()),
+            want,
+            "{finding_key} {state}"
+        );
+        assert_eq!(records.len(), 2, "the finding's record stays as it was");
+    }
+}
+
+/// Two configured sensors whose 5-hex ids collide under this salt: the hook sees only the one
+/// that failed, so it cannot widen the id, and writes `-` for the witness to fill rather than an
+/// id the walk would show differently.
+#[test]
+fn the_hook_never_stores_a_five_hex_id_that_collides_with_another_units() {
+    let fx = Fx::salted(SALT);
+    write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+    write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+    fx.write("var/lib/propolis/witness/state.lock", "");
+    let (a, b) = ("sensor-c495.service", "sensor-c1059.service");
+    let r = fx.run_env(
+        "echo \"a=$(pa_id unit \"$A\")\"\necho \"b=$(pa_id unit \"$B\")\"\n\
+         printf 'unit\\t%s\\nunit\\t%s\\n' \"$A\" \"$B\" | pa_id_table | while IFS=$'\\t' read -r id _ n; do echo \"table $n=$id\"; done",
+        &[("A", a), ("B", b)],
+    );
+    assert_eq!(r.code, 0, "{}", r.err);
+    assert_eq!(r.get("a"), r.get("b"), "the two names collide in 5 hex");
+    let widened = r.get(&format!("table {a}"));
+    assert_eq!(widened.len(), 9, "pa_id_table widens both: {}", r.out);
+
+    let show =
+        "Result=exit-code\\nExecMainCode=1\\nExecMainStatus=1\\nRestart=always\\nNRestarts=1\\n";
+    let r = fx.run_env(
+        "pa_hook_record; echo rc=$?",
+        &[
+            NOW[0],
+            NOW[1],
+            NOW[2],
+            ("PA_HOOK_UNIT", a),
+            ("PA_HOOK_OUT", "delivered"),
+            ("PA_HOOK_T0", "1"),
+            ("STUB_SHOW", show),
+        ],
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let inst = incident_records(&fx.read("var/lib/propolis/witness/incidents"))[0][5].clone();
+    assert!(
+        inst == "-" || inst == widened,
+        "inst {inst}: neither `-` nor the widened {widened}"
+    );
+}
+
+/// A unit name systemd never gives (a leading dot, a slash, a tab) is refused before anything is
+/// written, whether the step would record or spool, with one line saying so.
+#[test]
+fn pa_hook_record_refuses_a_unit_name_systemd_never_gives_before_writing_anything() {
+    for unit in ["..", ".x", "a/b", "a\tb.service"] {
+        for t0 in ["1", "71"] {
+            let fx = Fx::new();
+            write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+            write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+            fx.write("var/lib/propolis/witness/state.lock", "");
+            let r = fx.run_env(
+                "pa_hook_record; echo rc=$?",
+                &[
+                    NOW[0],
+                    NOW[1],
+                    NOW[2],
+                    ("PA_HOOK_UNIT", unit),
+                    ("PA_HOOK_OUT", "delivered"),
+                    ("PA_HOOK_T0", t0),
+                ],
+            );
+            assert_eq!(r.get("rc"), "0", "{unit:?} {t0}: {}", r.err);
+            for dir in [
+                "var/lib/propolis/witness/hook",
+                "run/propolis-witness/fallback",
+            ] {
+                let entries: Vec<_> = std::fs::read_dir(fx.p(dir))
+                    .map(|d| d.flatten().map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                assert!(entries.is_empty(), "{unit:?} {t0}: {entries:?}");
+            }
+            assert!(
+                !fx.p("var/lib/propolis/witness/incidents").exists(),
+                "{unit:?} {t0}"
+            );
+            let log = fx.log();
+            let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("logger")).collect();
+            assert_eq!(lines.len(), 1, "{unit:?} {t0}: {log}");
+            assert!(
+                lines[0].ends_with("the unit name is not one systemd gives"),
+                "{log}"
+            );
+        }
+    }
+}
+
+/// With 512 records open or pending a new one is not written, and one line says so; with one of
+/// them resolved, that one makes room.
+#[test]
+fn a_new_incident_past_512_open_records_is_not_written_unless_a_resolved_one_makes_room() {
+    let show =
+        "Result=exit-code\\nExecMainCode=1\\nExecMainStatus=1\\nRestart=always\\nNRestarts=1\\n";
+    let run = |fx: &Fx| {
+        let r = fx.run_env(
+            "pa_hook_record; echo rc=$?",
+            &[
+                NOW[0],
+                NOW[1],
+                NOW[2],
+                ("PA_HOOK_UNIT", "sensor-ssh.service"),
+                ("PA_HOOK_OUT", "delivered"),
+                ("PA_HOOK_T0", "1"),
+                ("STUB_SHOW", show),
+            ],
+        );
+        assert_eq!(r.get("rc"), "0", "{}", r.err);
+    };
+    let setup = |first_state: &str, first_resolved: Option<u64>| {
+        let fx = Fx::salted(SALT);
+        write_exec(&fx.bin.join("systemctl"), SYSTEMCTL_SHOW_STUB);
+        write_exec(&fx.bin.join("journalctl"), JOURNALCTL_RUN_STUB);
+        fx.write("var/lib/propolis/witness/state.lock", "");
+        let mut body = String::from("#incidents v1 g=1\nN\t513\n");
+        body.push_str(&i_line(1, first_state, first_resolved));
+        for n in 2..=512 {
+            body.push_str(&i_line(n, "open", None));
+        }
+        fx.write("var/lib/propolis/witness/incidents", &body);
+        (fx, body)
+    };
+
+    let (fx, before) = setup("open", None);
+    run(&fx);
+    assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+    let log = fx.log();
+    let lines: Vec<&str> = log.lines().filter(|l| l.starts_with("logger")).collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(
+        lines[0].ends_with("512 incidents are open or pending (notpersisted)"),
+        "{log}"
+    );
+
+    let (fx, _) = setup("resolved", Some(2000));
+    run(&fx);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    let records = incident_records(&text);
+    assert_eq!(records.len(), 512);
+    assert!(
+        records.iter().all(|f| f[1] != "w#1"),
+        "the resolved record made room"
+    );
+    let new: Vec<&Vec<String>> = records
+        .iter()
+        .filter(|f| f[2] == "unit:sensor-ssh.service")
+        .collect();
+    assert_eq!(new.len(), 1, "{text}");
+    assert_eq!(new[0][1], "w#513");
+    assert!(!fx.log().contains("logger"), "{}", fx.log());
+}
+
+/// The next number is never below one past the highest id in use: a damaged `N` line cannot hand
+/// out an id twice.
+#[test]
+fn a_next_number_below_an_id_in_use_is_raised_past_it() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t1\n{}",
+            record_line("w#7", "unit:other.service", "unit-failed", "open")
+        ),
+    );
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "pending")]);
+    assert_eq!(r.get("done"), "pending tx=-", "{}", r.err);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    assert!(text.contains("\nN\t9\n"), "{text}");
+    let records = incident_records(&text);
+    let new = records
+        .iter()
+        .find(|f| f[2] == "unit:sensor-ssh.service")
+        .unwrap();
+    assert_eq!(new[1], "w#8");
+}
+
+/// One key, one record: a firing for a key whose record is resolved replaces that record with a
+/// new incident under the next id (a reopen is the witness's, in a later increment).
+#[test]
+fn a_firing_for_a_resolved_key_replaces_its_record_with_a_new_incident() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t4\n{}{}",
+            record_line("w#2", "unit:other.service", "unit-failed", "open"),
+            record_line("w#3", "unit:sensor-ssh.service", "unit-failed", "resolved")
+        ),
+    );
+    let r = fx.run_env(TRANSITION, &[NOW[0], NOW[1], NOW[2], ("TX", "pending")]);
+    assert_eq!(r.get("done"), "pending tx=-", "{}", r.err);
+    let text = fx.read("var/lib/propolis/witness/incidents");
+    assert!(text.contains("\nN\t5\n"), "{text}");
+    let records = incident_records(&text);
+    assert_eq!(records.len(), 2, "{text}");
+    let f = records
+        .iter()
+        .find(|f| f[2] == "unit:sensor-ssh.service")
+        .unwrap();
+    assert_eq!(f[1], "w#4");
+    assert_eq!(f[7], "pending");
+    assert_eq!(f[31], "1", "occ starts again");
+    assert_eq!(f[21], "-", "not resolved");
 }

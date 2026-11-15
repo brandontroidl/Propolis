@@ -35,10 +35,14 @@ runs `/usr/local/sbin/propolis-witness light` every five minutes,
 `deploy/propolis-witness@light.timer#OnUnitActiveSec=5min`, and `propolis-witness@hourly.timer`,
 which runs `/usr/local/sbin/propolis-witness hourly` once an hour,
 `deploy/propolis-witness@hourly.timer#OnCalendar=hourly`). The light pass judges the failures the
-failure hook recorded, watches every Propolis unit for crash loops and the failed state, and
-writes the login banner; the hourly pass runs the installed configuration check and records its
+failure hook recorded, watches every Propolis unit for crash loops and the failed state, asks
+the daemon's database a read-only question and the daemon's console on loopback whether it is
+ready, reads the journal lines of the Propolis units that nothing else reads, and writes the
+login banner; the hourly pass runs the installed configuration check and records its
 findings, asks the ntfy server whether the alert topic can be read without credentials, and each
-pass checks that the other is still running. The witness records and shows, and sends nothing. A
+pass checks that the other is still running. The witness records and shows, and sends no message:
+beside the read check's requests, its only outbound request is the optional GET of
+`PROPOLIS_WITNESS_HEARTBEAT_URL`. A
 witness pass fails its unit only on a bad argument, an alert library it cannot load, or its
 15-minute limit, and the failure hook records that failure without paging. See [health and
 observability](./health-and-observability.md#witness).

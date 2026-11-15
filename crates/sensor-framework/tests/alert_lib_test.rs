@@ -276,6 +276,97 @@ const NOW: [(&str, &str); 3] = [
     ("PA_TEST_UP", "5000"),
 ];
 
+/// The heartbeat URL is taken from alert.env over propolis.env and only when it is https; any
+/// other value is held back with its reason and never offered for a request. An inherited
+/// PA_PG_GUARD_KNOWN is dropped at load, so no caller's environment can vouch for a binary. A
+/// stored journal cursor is used only in a cursor's form, and each journal class lists its texts.
+#[test]
+fn the_heartbeat_url_needs_https_and_a_cursor_needs_its_form() {
+    let fx = Fx::new();
+    let show = "pa_settings_load\necho \"state=$PA_HB_STATE\"\necho \"url=${PA_HB_URL:-none}\"\necho \"ops=$PA_OPS_ENABLED\"";
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=http://hc.example.invalid/a\nPROPOLIS_OPS_ENABLED=Yes\n",
+    );
+    let r = fx.run(show);
+    assert_eq!(
+        (r.get("state"), r.get("url"), r.get("ops")),
+        ("insecure".into(), "none".into(), "1".into())
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/b\n",
+    );
+    let r = fx.run(show);
+    assert_eq!(
+        (r.get("state"), r.get("url")),
+        ("set".into(), "https://hc.example.invalid/b".into())
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=\"https://hc.example.invalid/c\\\"\n",
+    );
+    assert_eq!(fx.run(show).get("state"), "invalid");
+
+    let r = fx.run_env(
+        "echo \"known=${PA_PG_GUARD_KNOWN:-none}\"",
+        &[("PA_PG_GUARD_KNOWN", "1/2/3")],
+    );
+    assert_eq!(r.get("known"), "none");
+
+    let r = fx.run(
+        "for c in 's=0123abcd;i=1f;b=89ef;m=2a;t=5;x=9' 's=1' 's=1;i=2 x' '../etc/shadow'; do\n\
+         if pa_jcursor_ok \"$c\"; then echo \"c=ok\"; else echo \"c=no\"; fi\ndone\n\
+         echo \"hook=$(pa_journal_patterns hook | wc -l)\"\n\
+         pa_journal_patterns nosuch > /dev/null; echo \"none=$?\"",
+    );
+    let cs: Vec<&str> = r.out.lines().filter_map(|l| l.strip_prefix("c=")).collect();
+    assert_eq!(cs, ["ok", "no", "no", "no"]);
+    // Sixteen fields of 64 hex digits each have a cursor's form but pass the 512-byte cap.
+    let long = (0..16u8)
+        .map(|i| format!("{}={}", (b'a' + i) as char, "0123456789abcdef".repeat(4)))
+        .collect::<Vec<_>>()
+        .join(";");
+    assert!(long.len() > 512);
+    let capped = fx.run(&format!(
+        "if pa_jcursor_ok '{long}'; then echo c=ok; else echo c=no; fi"
+    ));
+    assert_eq!(capped.get("c"), "no");
+    assert_eq!(r.get("hook").trim(), "3");
+    assert_eq!(r.get("none"), "1");
+}
+
+/// What the heartbeat request records for each answer: ok for any 2xx and a cause word for the
+/// rest. A redirect is an answer from the server (never followed), not a failed connection.
+#[test]
+fn pa_heartbeat_get_names_each_answer_by_its_cause() {
+    let fx = Fx::new();
+    write_exec(
+        &fx.bin.join("curl"),
+        "#!/usr/bin/env bash\nprintf '%s' \"$HB_CODE\"\nexit \"${HB_RC:-0}\"\n",
+    );
+    for (code, rc, want) in [
+        ("200", "0", "ok"),
+        ("204", "0", "ok"),
+        ("301", "0", "http.client"),
+        ("307", "0", "http.client"),
+        ("401", "0", "http.auth"),
+        ("404", "0", "http.not_found"),
+        ("429", "0", "http.rate"),
+        ("418", "0", "http.client"),
+        ("503", "0", "http.server"),
+        ("000", "28", "net.timeout"),
+        ("000", "7", "net.connect"),
+        ("", "7", "net.connect"),
+    ] {
+        let r = fx.run_env(
+            "PA_HB_URL=https://hc.example.invalid/x; pa_heartbeat_get; echo \"result=$PA_HB_RESULT\"",
+            &[("HB_CODE", code), ("HB_RC", rc)],
+        );
+        assert_eq!(r.get("result"), want, "code {code:?} status {rc}");
+    }
+}
+
 #[test]
 fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_running_it_refuses() {
     let fx = Fx::new();
@@ -286,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);

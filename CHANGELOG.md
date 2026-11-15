@@ -4,6 +4,44 @@
 
 ### Upgrade note
 
+- **The witness's light pass now probes the database, the daemon's readiness and the journal,
+  and can ping an optional heartbeat URL. No message is sent: beside the read check's GETs, that
+  optional request is the only one that leaves the host.**
+  After the upgrade, every light pass (every five minutes, as root) also: asks the daemon's
+  database, where `DATABASE_URL` is set, `SELECT pg_is_in_recovery()` through the daemon binary
+  (`/usr/local/bin/propolis pg-exec psql`, read-only, 5 s limits; the URL stays in that one
+  process, and psql's error text is never kept); asks `ss` who holds the daemon's console port and,
+  only when the daemon does, sends one plain-HTTP GET of `/ready` to the console on its loopback
+  address while `propolis.service` is enabled and running (an address in `PROPOLIS_CONSOLE_BIND`
+  that is not loopback is not asked); and reads the journal of the Propolis units it watches by
+  fields journald sets itself (the legacy failure hook's lines, the rotation guard's, journald's
+  own notice of suppressed lines, and the daemon's last completed run while the database does not
+  answer), keeping only counts and a cursor per class in `/var/lib/propolis/witness/jcursor/`,
+  never a line. New records follow: `db-unreachable` and `db-readonly` (PAGE, two passes in a row;
+  not in the first 15 minutes after a boot or under a `sudo propolis-status --maint` marker), with
+  a daemon crash that the database caused folded under `db-unreachable` instead of recorded beside
+  it, and kept folded until `db-unreachable` resolves; `daemon-degraded` (ACT) for a daemon that
+  answers `/ready` 503 while the database answers root; `daemon-down` also for a daemon running
+  half an hour without a `/ready` answer, and it now resolves only on two `/ready` answers five
+  minutes apart (where the console is not on loopback, on ten minutes running without a restart);
+  `alert-path` (PAGE) for an alert the legacy hook could not deliver or a failure hook that failed,
+  resolved only once an alert is seen delivered after it opened; and the NOTICE `journal-dropped`.
+  A record whose proof could not be checked for six hours is flagged `cannotverify`. All show in
+  the walk's `OPEN` block, an open
+  `alert-path` fails the `alert` rail, and an open `tool-unusable` (for example `tool:pg` on a host
+  whose psql the witness's sandbox cannot run) warns on the `host` rail, so `sudo propolis-status`
+  may exit `1` or `2` where it exited `0` before. The optional `PROPOLIS_WITNESS_HEARTBEAT_URL`
+  (`https://` only) is the ping URL of an external dead-man check; set it in
+  `/etc/propolis/alert.env`, since `propolis.env`, where it is also read, is the daemon's
+  environment file and would put it in the daemon's environment too. After each light pass that
+  was complete and clean the witness sends it one GET, and it skips the GET while a check could not
+  tell, `alert-path` is open, a transition waits, the state lock cannot be had or state cannot be
+  written, and for 30 minutes after any skip. Skipping is the signal, so the
+  dead-man check alerts when the host is not well as well as when it is down. Unset, nothing is
+  requested. `ALERTS` line 3 says whether it is set and when it was last asked or skipped, never the
+  URL. Nothing is pushed: no message goes to the ntfy server or anywhere else, and every
+  transition the new paging would send only adds one to the record's `would_push`.
+
 - **The witness gains an hourly pass: a second root timer, an hourly config-check and an
   anonymous-read check of the alert topic. Nothing is sent.** `install.sh` and `upgrade.sh` now
   also install and enable `propolis-witness@hourly.timer`, so an upgraded host has a second root

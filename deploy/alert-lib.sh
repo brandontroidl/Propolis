@@ -19,10 +19,11 @@
 # as the account that owns a file, for paths another account can write; the trust check for a
 # program root is about to run; atomic 0600 writes; the one state lock; state files that fall
 # back to /run when the disk refuses a write; the PROPOLIS_SENSOR_LOGS grammar; the cause codes
-# of a failed run and the unit map; the maintenance marker; the database probe through pg-exec
-# (pa_pg) and the public-feed push scheduler check (pa_push_scheduler), so the status command
-# and the witness judge both by one rule; the incident record; and the failure hook's record step
-# (pa_hook_record), which the hook runs in a child process of its own.
+# of a failed run and the unit map; the maintenance marker; the witness's heartbeat URL request
+# (pa_heartbeat_get) and the fixed journal lines it looks for (PA_JOURNAL_CLASSES); the database
+# probe through pg-exec (pa_pg) and the public-feed push scheduler check (pa_push_scheduler), so
+# the status command and the witness judge both by one rule; the incident record; and the failure
+# hook's record step (pa_hook_record), which the hook runs in a child process of its own.
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
 # EXIT handler runs pa_cleanup, which removes them.
@@ -40,7 +41,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=5
+PA_LIB_VERSION=6
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -53,15 +54,17 @@ PA_STATE_MAX=1048576
 PA_STATE_NAMES="incidents send-ledger readcheck meta observe testpage"
 
 # Internal state never comes from the environment: an inherited PA_LOCK_FD would make pa_lock
-# skip the lock, and an inherited PA_CLEANUP would make pa_cleanup delete a path someone else
-# chose. A value this shell set itself, before sourcing again, is kept. Bash cannot export an
+# skip the lock, an inherited PA_PG_GUARD_KNOWN would make pa_pg run, as root, a binary whose
+# pg-exec guard nobody read, and an inherited PA_CLEANUP would make pa_cleanup delete a path
+# someone else chose. A value this shell set itself, before sourcing again, is kept. Bash cannot export an
 # array, so an inherited PA_CLEANUP is always a scalar.
-for _PA_V in PA_LOCK_FD _PA_UNREADABLE_LOGGED; do
+for _PA_V in PA_LOCK_FD _PA_UNREADABLE_LOGGED PA_PG_GUARD_KNOWN; do
     if [[ $(declare -p "$_PA_V" 2> /dev/null) =~ ^declare\ -[a-zA-Z]*x ]]; then unset "$_PA_V"; fi
 done
 unset _PA_V
 PA_LOCK_FD="${PA_LOCK_FD:-}"
 _PA_UNREADABLE_LOGGED="${_PA_UNREADABLE_LOGGED:-}"
+PA_PG_GUARD_KNOWN="${PA_PG_GUARD_KNOWN:-}"
 if [[ $(declare -p PA_CLEANUP 2> /dev/null) != 'declare -a'* ]]; then
     unset PA_CLEANUP
     PA_CLEANUP=()
@@ -334,6 +337,13 @@ _pa_setting() {
 # that honour alert.env exist, so the target is the daemon's (PA_D_*) as well. The target exists
 # (PA_TARGET=1) only when URL and topic are both valid and come from the same file; PA_INVALID
 # names every key that was set to an invalid value and ignored.
+#
+# Also the witness's heartbeat URL, PROPOLIS_WITNESS_HEARTBEAT_URL (alert.env over propolis.env):
+# PA_HB_URL holds it only when it is a valid https:// URL, and PA_HB_STATE says set, unset,
+# insecure (any other scheme: whoever can read or answer plain HTTP on the path could silence the
+# dead-man check, so it is never requested) or invalid. The URL is a secret: it is held in this
+# variable, given to curl only through a 0600 config file (pa_heartbeat_get), and never printed.
+# PA_OPS_ENABLED is 1 when propolis.env turns the daemon's monitor on, read as the daemon reads it.
 pa_settings_load() {
     local env="$PA_ENV_DIR/propolis.env" url_src topic_src
     PA_INVALID="" PA_TARGET=0 PA_TARGET_SRC=""
@@ -348,6 +358,20 @@ pa_settings_load() {
         PA_TARGET_SRC="${url_src##*/}"
     fi
     PA_D_URL="$PA_URL" PA_D_TOPIC="$PA_TOPIC" PA_D_TARGET="$PA_TARGET"
+    PA_HB_URL="" PA_HB_STATE=unset
+    pa_env_get PROPOLIS_WITNESS_HEARTBEAT_URL "$env" "$PA_ENV_DIR/$PA_ALERT_ENV_NAME" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        if [ "$PA_ENV_COMPLEX" != 0 ] || ! _pa_valid_url "$PA_ENV_VALUE"; then
+            PA_HB_STATE=invalid
+        elif [[ $PA_ENV_VALUE != https://* ]]; then
+            PA_HB_STATE=insecure
+        else
+            PA_HB_URL="$PA_ENV_VALUE" PA_HB_STATE=set
+        fi
+    fi
+    PA_OPS_ENABLED=0
+    pa_env_get PROPOLIS_OPS_ENABLED "$env" > /dev/null
+    case "${PA_ENV_VALUE,,}" in true | 1 | yes | on) PA_OPS_ENABLED=1 ;; esac
     return 0
 }
 
@@ -1674,6 +1698,98 @@ pa_readcheck_merge() {
         "${tk:--}" "${j:--}" "${r:--}" "$role" "${s:--}"
 }
 
+# ---- the heartbeat URL -------------------------------------------------------------------------
+
+# pa_heartbeat_get: one GET of PA_HB_URL (pa_settings_load), the witness's ping to an external
+# dead-man check. Whoever holds the URL can keep that check quiet, so it reaches curl only through
+# a curl config file made 0600 here and removed before return, never a command line or a child's
+# environment; -q first, so no .curlrc of root's adds to the request; https only and no
+# redirects, so the request never leaves for another host or for plain HTTP. Nothing of the answer
+# is kept but its status code. Sets PA_HB_RESULT to ok (any 2xx) or a cause code: http.auth,
+# http.not_found, http.rate, http.client (any other 4xx, and a redirect), http.server,
+# net.timeout, net.connect (no answer), nocurl, tool.exec (no private file), config.invalid (no
+# https URL to ask). Status 0 for ok, else 1.
+pa_heartbeat_get() {
+    local conf out rc
+    PA_HB_RESULT=config.invalid
+    [ -n "${PA_HB_URL:-}" ] && [[ $PA_HB_URL == https://* ]] && _pa_valid_url "$PA_HB_URL" || return 1
+    if ! command -v curl > /dev/null 2>&1; then
+        PA_HB_RESULT=nocurl
+        return 1
+    fi
+    PA_HB_RESULT=tool.exec
+    conf="$(umask 077 && mktemp 2> /dev/null)" || return 1
+    PA_CLEANUP+=("$conf")
+    if ! _pa_rc_conf "$conf" "$PA_HB_URL"; then
+        rm -f -- "$conf" 2> /dev/null
+        return 1
+    fi
+    out="$(timeout 15 curl -q -K "$conf" -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 \
+        --max-time 10 --max-redirs 0 --proto '=https' 2> /dev/null)"
+    rc=$?
+    rm -f -- "$conf" 2> /dev/null
+    out="${out:0:3}"
+    [[ $out =~ ^[0-9]{3}$ ]] || out=000
+    case "$out" in
+        2[0-9][0-9]) PA_HB_RESULT=ok ;;
+        401 | 403) PA_HB_RESULT=http.auth ;;
+        404) PA_HB_RESULT=http.not_found ;;
+        429) PA_HB_RESULT=http.rate ;;
+        # A redirect is the server's answer and is never followed: the URL is not the check's.
+        [134][0-9][0-9]) PA_HB_RESULT=http.client ;;
+        5[0-9][0-9]) PA_HB_RESULT=http.server ;;
+        *)
+            case "$rc" in
+                28 | 124) PA_HB_RESULT=net.timeout ;;
+                126 | 127) PA_HB_RESULT=nocurl ;;
+                *) PA_HB_RESULT=net.connect ;;
+            esac
+            ;;
+    esac
+    [ "$PA_HB_RESULT" = ok ]
+}
+
+# ---- the journal classes -----------------------------------------------------------------------
+#
+# PA_JOURNAL_CLASSES: the fixed lines the witness's light pass looks for in the journal, one per
+# line as `class|writer|text`, the writer being the source file that prints the text (systemd for
+# journald's own message). The journal is written by other accounts and by whoever can reach a
+# sensor, so a class is first narrowed by fields journald sets itself (the unit from the cgroup,
+# the uid from the socket credentials, the invocation id), and only then matched against these
+# texts as fixed strings; no line is ever kept, printed or sent, only counted. A test holds each
+# text to its writer, so a reworded message fails the build instead of leaving its class blind.
+# The daemon class's order matters: its first text is the connect failure that ties the daemon's
+# failure to the database, its second the start line that says the last run connected after all.
+PA_JOURNAL_CLASSES='
+hook|deploy/alert.sh|; alert follows
+hook|deploy/alert.sh|still undelivered since
+hook|deploy/alert.sh| entered the failed state on
+guard|deploy/logrotate-guard.sh|propolis-logrotate-guard: refusing to rotate
+guard|deploy/logrotate-guard.sh|propolis-logrotate-guard: skipping rotation of
+daemon|crates/propolis/src/main.rs|propolis: failed to connect to PostgreSQL
+daemon|crates/propolis/src/main.rs|propolis: starting unified daemon
+journald|systemd|Suppressed
+'
+
+# pa_journal_patterns CLASS: the texts of CLASS, one per line, in the order listed. Status 1 for a
+# class with none.
+pa_journal_patterns() {
+    local c w p found=1
+    while IFS='|' read -r c w p; do
+        [ -n "$c" ] && [ "$c" = "${1:-}" ] || continue
+        printf '%s\n' "$p"
+        found=0
+    done <<< "$PA_JOURNAL_CLASSES"
+    return "$found"
+}
+
+# pa_jcursor_ok TEXT: TEXT has the form of a journal cursor (`s=...;i=...;b=...`, hex fields), and
+# so may be handed back to journalctl, which is all a stored cursor is ever used for.
+pa_jcursor_ok() {
+    local LC_ALL=C re='^[a-z]=[0-9a-f]{1,64}(;[a-z]=[0-9a-f]{1,64}){1,15}$'
+    [ "${#1}" -le 512 ] && [[ ${1:-} =~ $re ]]
+}
+
 # ---- the database probe and the push scheduler -------------------------------------------------
 
 # _pa_pg_where URL: local when the URL names no host, a loopback host or a socket directory (a
@@ -1711,6 +1827,10 @@ _pa_pg_where() {
 #
 # Before the binary is run as root it must pass pa_trusted_exec and carry pg-exec's guard string
 # (the check deploy/backup.sh makes): an older binary would start the daemon as root instead.
+# Reading 50 MB for the string every five minutes is waste, so a caller that keeps the answer may
+# set PA_PG_GUARD_KNOWN to the inode/size/mtime (PA_PG_BIN_ID) of a binary that carried it: the
+# same file is then not read again. PA_PG_GUARD says 1 (carries it), 0 (does not) or `-` (not
+# looked at). The variable is never taken from the environment (see the top of this file).
 #
 # Prints psql's output and also sets PA_PG_OUT, because a caller reading it through $() would lose
 # the rest: PA_PG_CAUSE (`-` on success, else a cause code of the closed list), PA_PG_WHY (why the
@@ -1721,7 +1841,7 @@ pa_pg() {
     local t="${1:-}" url bin="$PA_ROOT/usr/local/bin/propolis" app="${PA_PG_APP:-propolis-witness}"
     local both line rc="" sql err
     local -a args=()
-    PA_PG_OUT="" PA_PG_ERR="" PA_PG_CAUSE=unknown PA_PG_WHY="" PA_PG_WHERE=""
+    PA_PG_OUT="" PA_PG_ERR="" PA_PG_CAUSE=unknown PA_PG_WHY="" PA_PG_WHERE="" PA_PG_GUARD=- PA_PG_BIN_ID=""
     [[ $t =~ ^[1-9][0-9]{0,2}$ ]] || return 2
     shift
     [ "$#" -ge 1 ] || return 2
@@ -1738,8 +1858,14 @@ pa_pg() {
         PA_PG_CAUSE=tool.exec PA_PG_WHY="not trusted: $PA_UNTRUSTED"
         return 1
     fi
-    if ! timeout 30 grep -q -a -F 'propolis pg-exec: DATABASE_URL is not set' -- "$bin" 2> /dev/null; then
-        PA_PG_CAUSE=tool.exec PA_PG_WHY="daemon binary predates pg-exec"
+    PA_PG_BIN_ID="$(timeout 5 stat -c '%i/%s/%Y' -- "$bin" 2> /dev/null)" || PA_PG_BIN_ID=""
+    [[ $PA_PG_BIN_ID =~ ^[0-9]{1,20}/[0-9]{1,20}/[0-9]{1,12}$ ]] || PA_PG_BIN_ID=""
+    if [ -n "$PA_PG_BIN_ID" ] && [ "$PA_PG_GUARD_KNOWN" = "$PA_PG_BIN_ID" ]; then
+        PA_PG_GUARD=1
+    elif timeout 30 grep -q -a -F 'propolis pg-exec: DATABASE_URL is not set' -- "$bin" 2> /dev/null; then
+        PA_PG_GUARD=1
+    else
+        PA_PG_GUARD=0 PA_PG_CAUSE=tool.exec PA_PG_WHY="daemon binary predates pg-exec"
         return 1
     fi
     for sql in "$@"; do args+=(-c "$sql"); done

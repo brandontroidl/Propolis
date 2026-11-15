@@ -203,7 +203,9 @@ to 120 (`deploy/propolis-status.sh#status_maint`).
 The walk's `ALERTS` line also shows the gate (`gate full`, `gate pointer:<reason>` or `gate
 none:notarget`) and when the anonymous-read check last ran, worked out from the answer the
 witness stored, without a network request; its third line shows when the light and the hourly
-pass of the witness last completed.
+pass of the witness last completed and, once a light pass has run, the heartbeat URL: `not set`,
+`refused (not an https URL)`, or `set` with when it was last asked and the result, or last
+skipped and why. The URL itself is never printed.
 
 ## Witness
 

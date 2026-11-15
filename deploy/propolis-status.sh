@@ -58,7 +58,7 @@
 # its time limit in seconds.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 5
+# needs-alert-lib: 6
 
 umask 077
 STATUS_SELF="${BASH_SOURCE[0]}"
@@ -1642,8 +1642,36 @@ rail_alert() {
     case "$A_QUEUE" in
         '?'*) [ "$state" = WARN ] || state='?' note="${note:+$note; }daemon queue $A_QUEUE" ;;
     esac
+    # The witness opened alert-path: the legacy hook logged an alert it could not deliver, or a
+    # failure hook itself failed.
+    if open_record alert:shell; then
+        state=FAIL cond=alert-path note="alert-path open: failure alerts are not leaving the host${note:+; $note}"
+    fi
     [ -n "$note" ] || note="failure hook legacy; daemon queue $A_QUEUE"
     add_row "" alert "$inst" - - "$state" "$note" "" "$cond"
+}
+
+# open_record KEY: the witness's record of KEY is open or acknowledged.
+open_record() {
+    local t k st
+    while IFS=$'\t' read -r t _ k _ _ _ _ st _; do
+        [ "$t" = I ] && [ "$k" = "$1" ] || continue
+        case "$st" in open | acked) return 0 ;; esac
+    done <<< "$INCIDENTS_BODY"
+    return 1
+}
+
+# open_tools: the checks whose tool-unusable record is open (tool:<check>, config-check aside:
+# that is cc-stopped on the witness rail), space separated.
+open_tools() {
+    local t k kind st out=""
+    while IFS=$'\t' read -r t _ k kind _ _ _ st _; do
+        [ "$t" = I ] && [ "$kind" = tool-unusable ] && [[ $k == tool:* ]] || continue
+        case "$st" in open | acked) ;; *) continue ;; esac
+        pa_ok_field "$k" || continue
+        out+="${out:+ }${k#tool:}"
+    done <<< "$INCIDENTS_BODY"
+    printf '%s' "$out"
 }
 
 B_SUCCESS="" B_FAILURE="" B_STEP="" B_SET=""
@@ -1704,7 +1732,7 @@ rail_chain() {
 }
 
 rail_host() {
-    local state=ok note="" cond="" d use worst="" first="" sync out step lw k flag
+    local state=ok note="" cond="" d use worst="" first="" sync out step lw k flag tools
     local -a dirs=() names=()
     for d in /var/lib/propolis /var/log/propolis /var/spool/propolis; do
         [ ! -d "$STATUS_ROOT$d" ] || dirs+=("$STATUS_ROOT$d") names+=("$d")
@@ -1776,6 +1804,14 @@ rail_host() {
         [ "$state" = WARN ] || [ "$state" = FAIL ] || cond='host-state'
         [ "$state" = FAIL ] || state=WARN
         note+="; state lock busy ($lw passes)"
+    fi
+    # A check the witness could not make on three passes in a row: what it watches through that
+    # check is unseen until it can run again.
+    tools="$(open_tools)"
+    if [ -n "$tools" ]; then
+        [ "$state" = WARN ] || [ "$state" = FAIL ] || cond='host-tool'
+        [ "$state" = FAIL ] || state=WARN
+        note+="; a check cannot run: $tools"
     fi
     add_row "" host volumes - - "$state" "$note" direct "$cond"
 }
@@ -1917,6 +1953,13 @@ rail_witness() {
     if [ "$(printf '%s\n' "$INCIDENTS_BODY" | grep -cE $'^I\t[^\t]*\ttool:config-check\t([^\t]*\t){4}(open|acked)\t')" -gt 0 ]; then
         state=FAIL cond=witness-tool note="${note:+$note; }cc-stopped: config-check has not completed on two hourly passes"
     fi
+    # A journal class whose read could not finish twice in a row started again from the last 15
+    # minutes, so the lines between are unread.
+    if [[ ${META[jskip]:-} =~ ^([0-9]{1,12})/[0-9a-f-]{1,8}/[0-9]{1,10}/([a-z,]{1,64})$ ]] \
+        && [ "$(age_of "$((10#${BASH_REMATCH[1]}))")" != - ] \
+        && [ "$(age_of "$((10#${BASH_REMATCH[1]}))")" -le 86400 ]; then
+        note="${note:+$note; }journal class ${BASH_REMATCH[2]//,/, }: lines may have been skipped ($(fmt_time "$((10#${BASH_REMATCH[1]}))"))"
+    fi
     if [ "$W_SPOOL_OLD" -gt 0 ]; then
         [ "$state" = FAIL ] || { state=WARN cond=witness; }
         if [ "$W_SPOOL_OLD" = 1 ]; then
@@ -2020,6 +2063,7 @@ STATUS_NEXT=(
     "host-volume host volume"
     "host-state host state"
     "host-clock host -"
+    "host-tool host tool"
     "monitor-down monitor daemon-down"
     "monitor-off monitor -"
     "witness witness witness"
@@ -2521,7 +2565,38 @@ print_alerts() {
         none) state="not persisted (none)" ;;
         *) state="nothing recorded yet" ;;
     esac
-    printf '        witness light %s - state %s - banner %s\n' "$light" "$state" "$banner"
+    printf '        witness light %s - state %s - banner %s%s\n' "$light" "$state" "$banner" "$(hb_words)"
+}
+
+# hb_words: the heartbeat URL field of ALERTS line 3, once a light pass has run (no pass asks it
+# before): whether it is set (the URL itself is a secret and is never printed), refused because it
+# is not https, and when it was last asked with what result, or last skipped and why. Skipping it
+# is how the external dead-man check learns the host is not well.
+hb_words() {
+    local word last="" lres="" skip="" sres="" lw sw
+    [ -n "$W_LIGHT_WALL" ] || return 0
+    case "${PA_HB_STATE:-unset}" in
+        set) word="set" ;;
+        insecure | invalid) word="refused (not an https URL)" ;;
+        *) word="not set" ;;
+    esac
+    if [ "$word" = set ]; then
+        if [[ ${META[hb_last]:-} =~ ^([0-9]{1,12}/[0-9a-f-]{1,8}/[0-9]{1,10})/([a-z][a-z0-9._-]{0,31})$ ]]; then
+            last="${BASH_REMATCH[1]}" lres="${BASH_REMATCH[2]}"
+        fi
+        if [[ ${META[hb_skip]:-} =~ ^([0-9]{1,12}/[0-9a-f-]{1,8}/[0-9]{1,10})/([a-z][a-z0-9._-]{0,31})$ ]]; then
+            skip="${BASH_REMATCH[1]}" sres="${BASH_REMATCH[2]}"
+        fi
+        lw="${last%%/*}" sw="${skip%%/*}"
+        if [ -n "$skip" ] && { [ -z "$last" ] || [ "$((10#$sw))" -gt "$((10#$lw))" ]; }; then
+            word+=", skipped $(fmt_time "$((10#$sw))") ($sres)"
+        elif [ -n "$last" ]; then
+            word+=", asked $(fmt_time "$((10#$lw))") ($lres)"
+        else
+            word+=", not asked yet"
+        fi
+    fi
+    printf ' - heartbeat URL %s' "$word"
 }
 
 # The witness's traces, for ALERTS, the witness rail and its view: W_LIGHT_WALL and W_LIGHT_AGE

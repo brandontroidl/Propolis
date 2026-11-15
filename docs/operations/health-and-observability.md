@@ -27,7 +27,8 @@ this order:
 - the host line (the alias the host has on the channel, the host name, its role), the alert
   target, the daemon's monitor and alert queue, how many units' failure alerts are still
   undelivered, when the witness's light pass last completed, where the root alerting state was
-  last written and when the login banner was last written;
+  last written, when the login banner was last written and, once a light pass has run, whether a
+  heartbeat URL is set and when it was last asked or skipped (never the URL itself);
 - `OPEN`: the incidents the witness has open, acknowledged or pending, PAGE first, then ACT,
   then NOTICE, each with its stage, the unit's opaque id and name, since when it is open, its
   cause as systemd gave it (`proc.exit 1`, `proc.signal 9`, `proc.oom`...), when the next
@@ -86,6 +87,26 @@ intake` shows the unit, how far behind each log is (from the cursor files, which
 daemon dead) and its last journal lines. When the walk marks `ledger` instead, the daemon cannot
 start because the database does not answer: see [db-unreachable](#db-unreachable).
 
+The witness records `daemon-down` (PAGE) when the daemon is failed, stopped, waiting to be
+restarted, or starting for over half an hour, on two light passes in a row, and when it has been
+running for half an hour and its console does not answer `/ready` on two (cause `net.connect` or
+`net.timeout`). A daemon running for less than half an hour without an answer is still starting
+(migrations can take that long) and nothing is recorded. It resolves only when `/ready` answers 200
+on two passes at least five minutes apart with no restart between (`monitor ready twice`), not on
+the daemon merely running. `/ready` is believed only from a listener the daemon holds (its main
+process, or a socket of the `propolis` account, by `ss`): an answer from anything else on the port
+reads unknown and resolves nothing, and nothing listening reads as no answer. Where
+`PROPOLIS_CONSOLE_BIND` is not a loopback address `/ready` is not asked at all, and `daemon-down`
+resolves once the daemon has run ten minutes without a restart (`active10`). A daemon that answers
+`/ready` 503 on two passes while the witness's own database probe succeeds, or cannot run at all,
+is `daemon-degraded` (ACT, key `ready:local`, cause `ready.db`, or `ready.gave_up` when the answer
+names a subsystem that gave up). While the database probe fails and the daemon's last completed
+run logged that it could not connect (the newest of that line and its start line, so a fresh
+attempt that has logged nothing yet still counts), the daemon's record waits pending and folds
+under `db-unreachable`, so a database outage is recorded once, under its cause. A folded record
+sends nothing while `db-unreachable` is open. Once that resolves, a daemon that is ready again is
+dropped as a healed restart, and one still not up half an hour later opens as its own incident.
+
 <a id="db-unreachable"></a>
 ### The database does not answer
 
@@ -95,11 +116,28 @@ start because the database does not answer: see [db-unreachable](#db-unreachable
 ([database roles](database-roles.md)). A `tool.exec` is not an outage: psql itself could not run
 (see [tool](#tool)).
 
+Every light pass of the witness asks the same question as the daemon's own role,
+`SELECT pg_is_in_recovery()` through `propolis pg-exec` (read-only, with 5 s limits to connect
+and per statement); the database URL goes only to that one process, and psql's error text is
+dropped, never stored. A failure with `db.unreachable`, `db.auth` or `db.timeout` on two passes in
+a row opens `db-unreachable` (PAGE, key `db:local` or `db:remote`, `ledger` stage), which resolves
+when the database answers on two passes (`database answered twice`). Neither it nor
+`db-readonly` opens in the first 15 minutes after a boot, while a database is still recovering,
+nor under a marker written with `sudo propolis-status --maint MINUTES` (reason `manual`), which is
+how planned database work is announced. `tool.exec` and `config.invalid` never open it: they count
+toward `tool-unusable` on `tool:pg` instead. When the probe has not been able to tell for six hours
+(72 passes) while a database record is open, the record is flagged `cannotverify`: it cannot
+resolve until the probe works again. The same flag marks an open `daemon-down` or
+`daemon-degraded` whose `/ready` could not be asked, or timed out, for six hours.
+
 <a id="db-state"></a>
 ### The database answers, in a state that blocks writes
 
 A standby (`pg_is_in_recovery()` true), transaction ids near wraparound, or lock waits.
-`sudo propolis-status ledger` prints each of these read-only probes; nothing judges them yet.
+`sudo propolis-status ledger` prints each of these read-only probes. The witness's light pass
+records a standby seen on two passes as `db-readonly` (PAGE, key `db:recovery`): the daemon points
+at a server that refuses writes. It resolves when the database is writable on two passes. The
+other states are not judged yet.
 
 <a id="alert-path"></a>
 ### Alerts are not leaving the host
@@ -108,6 +146,23 @@ The failure hook kept an undelivered file under `/run/propolis-alert/undelivered
 daemon's queue `ops-alert-undelivered.json` holds alerts. `sudo propolis-status alert` counts
 both and the hook's journal lines of the last 24 h. Check the ntfy URL, topic and token in
 `propolis.env` and that the host can reach the server.
+
+The witness opens `alert-path` (PAGE, key `alert:shell`, the `alert` rail FAIL) on first sight of
+the legacy hook's own journal line for an alert it could not deliver (`...; alert follows` or
+`... still undelivered since ...`, cause `nocurl`, `net.connect` or `unknown` from the reason the
+line gives), and of a failure hook that itself failed or timed out (a failed
+`propolis-alert@` instance whose failure is newer than the last open or resolve; its own cause).
+The hook's lines are read only from entries journald itself tied to a `propolis-alert@` unit, and
+only the first line of each, so text a sensor logged and the hook quoted cannot count. It resolves
+(`an alert got through`) only on proof that an alert went out after it opened: the legacy hook's
+delivered stamp `/run/propolis-alert/<unit>` dated after the open, a failure hook's record of a
+firing that delivered its alert (or, with no push target, logged it to the journal), or, with no
+push target, a failure alert logged with no undelivered line; and then only with no undelivered
+file left and no failure hook failed since the open. Nothing seen is never the proof, and the
+proof holds across a reboot. A failed hook instance stays failed until `sudo systemctl
+reset-failed 'propolis-alert@*'`, so reset it once you have read its journal; one that failed
+before the open does not hold the resolve back. While `alert-path` is open the heartbeat URL is not
+asked, so an external dead-man check notices.
 
 <a id="ship-down"></a>
 ### The shipper is down
@@ -207,7 +262,13 @@ collector each record is about.
 ### A program a check needs cannot run
 
 For example psql through pg-exec (`tool.exec`), blocked by a sandbox or missing. That is not an
-outage of what it checks: fix the program, and the row reads again.
+outage of what it checks: fix the program, and the row reads again. A check of the witness that
+cannot tell on three passes in a row opens `tool-unusable` (NOTICE, key `tool:<check>`: `units`,
+`pg`, `ready`, `alertunit`, `journal:hook`, `journal:guard`, `journal:journald` or
+`journal:daemon`), and the `host` rail warns with `a check cannot run: <check>` until two clean
+results resolve it. On a host whose psql lives where the witness's sandbox does not allow it (the
+PGDG layout under `/usr/pgsql-<N>/bin`), `tool:pg` stays open; a database outage there is still
+seen through the daemon's `/ready` answer (`daemon-degraded`).
 
 `cc-stopped` on the `witness` rail is the one case that is not a NOTICE: the installed config-check
 did not complete on two hourly passes in a row (it timed out after 300 s, is missing, failed the
@@ -230,10 +291,40 @@ The witness (`deploy/witness.sh#light_pass`, installed as `/usr/local/sbin/propo
 a root oneshot with two passes: `propolis-witness@light.timer` runs the light pass
 every five minutes, and `propolis-witness@hourly.timer` the hourly pass
 (`deploy/witness.sh#hourly_pass`) once an hour, first 3 to 13 minutes after the timer is enabled; `install.sh` and `upgrade.sh` enable
-both timers. It records and shows, and sends nothing: in the default profile each transition the
-new paging would send adds one to the record's `would_push`, and that is all. Each light pass:
+both timers. It records and shows, and sends nothing that carries a message: in the default
+profile each transition the new paging would send adds one to the record's `would_push`, and
+that is all. Beside the read check's GETs (below), the only request that leaves the host is the
+optional heartbeat URL's GET, which carries no message either. Each light pass:
 
+- first asks the database, as the daemon's own role, whether it answers and takes writes (see
+  [db-unreachable](#db-unreachable)), before anything else is read, so a database outage is known
+  before the daemon's failure is judged;
 - asks systemd once for the state of every Propolis unit;
+- asks the daemon's console `/ready` once, over plain HTTP on its loopback address (the address in
+  `PROPOLIS_CONSOLE_BIND`, `0.0.0.0` asked as `127.0.0.1` and `[::]` as `[::1]`; any other address
+  is not asked and the check reads unknown), with no credentials and no proxy, while
+  `propolis.service` is enabled and running and only when `ss` shows the daemon holds the port;
+  only the status code and whether the body holds `"gave_up"` are judged (see
+  [daemon-down](#daemon-down));
+- reads the journal lines nobody else reads, each narrowed first by fields journald sets itself
+  (the unit, the uid, the run's invocation id) and then matched against fixed text
+  (`deploy/alert-lib.sh#PA_JOURNAL_CLASSES`): the legacy hook's lines for alerts it could not
+  deliver and failed failure hooks (see [alert-path](#alert-path)), in the compact json of current
+  journalctl and the spaced form older releases print; journald's notice that it suppressed lines
+  from a Propolis unit (`Suppressed <n> messages from <unit>`, the unit named as journald names it
+  since systemd 236, or by a cgroup path whose last part is the unit), which opens the NOTICE
+  `journal-dropped` (key `journal:<unit>`, resolved after a day without one); the rotation guard's
+  refusals and skips, counted; and, while the database probe fails, whether the daemon's last
+  completed run logged that it could not connect. Each class reads on from its own cursor in
+  `/var/lib/propolis/witness/jcursor/` (in `/run/propolis-witness/jcursor/` while the disk refuses
+  writes), or the last 15 minutes without one; a cursor file or directory that is a link is not
+  used. A cursor moves on only once the lines read were judged and the result written, so a pass
+  cut short by its deadline, or one whose records could not be written, leaves the lines for the
+  next pass. It reads to the end of the new entries and keeps only lines that carry its text before
+  it cuts anything to 1 MiB, so a flood of other lines costs time, never a line it looks for. A read
+  cut off by its time limit is unknown for that pass; after two in a row the class starts again
+  from the last 15 minutes and the `witness` rail says `journal class <class>: lines may have been
+  skipped`. No line, nor any part of one, is kept or shown: only counts (in `meta jlines`);
 - takes in the failure hook's spool files, then judges the first sightings the hook left
   pending for units that restart themselves: one restart that healed (systemd's `NRestarts`
   one above what the hook read, the unit up for over a minute) is dropped and counted as a
@@ -247,13 +338,43 @@ new paging would send adds one to the record's `would_push`, and that is all. Ea
   config-check says its bind is not set opens `unit-nobind` (ACT, never reminded) instead;
 - reminds each open incident at 1 h, 4 h and 12 h after it opened (PAGE) or 4 h and 12 h (ACT),
   once for reminders that came due while no pass ran, and resolves it with the proof of its
-  kind: a long-running unit up 10 minutes without a restart, a crash loop quiet for 30 minutes
+  kind: a long-running unit up 10 minutes without a restart (the daemon: `/ready` 200 on two
+  passes five minutes apart, a few seconds' rounding of the passes' stamps allowed), a crash loop
+  quiet for 30 minutes
   (the restarts before those 30 minutes then no longer count toward the six-in-six-hours rule),
   a oneshot's next run succeeding after the failure, or a unit disabled on purpose (a oneshot
   whose timer is disabled or no longer exists, a unit systemd no longer knows). The third
   reopen within a day holds the next resolve for an hour;
 - judges the hourly pass (below);
-- writes its line in `/run/propolis-witness/heartbeat`, `meta light_last`, and the login banner.
+- writes its line in `/run/propolis-witness/heartbeat`, `meta light_last`, and the login banner;
+- last, when `PROPOLIS_WITNESS_HEARTBEAT_URL` is set, asks that URL once (below).
+
+Every probe of a light pass runs before it takes the state lock, and none starts unless its whole
+time limit (the account lookup and journal read of the daemon's tie, the `ss` lookup and GET of
+`/ready`, the listing of the undelivered files among them) ends within 160 s of the pass's start;
+one that cannot is unknown for that pass. Only the ownership checks' `stat` and `readlink` of the
+daemon binary's path have no limit of their own, as the reads of the state files have none.
+
+**The heartbeat URL.** `PROPOLIS_WITNESS_HEARTBEAT_URL` is the ping URL of an external dead-man
+check, such as a private healthchecks.io check with no public status page. Put it in
+`/etc/propolis/alert.env`, which only root reads and the daemon does not load. It is read from
+`propolis.env` when `alert.env` does not set it, but `propolis.env` is the daemon's
+`EnvironmentFile`, so a URL there is also in the environment of the internet-facing daemon
+process, readable by the `propolis` account through `/proc`. After a light pass that was complete
+and clean, the witness sends it one GET (no body, no redirect, 10 s at most); the check's service
+alerts when the GETs stop. It is skipped while systemd could not be asked, the state lock could not
+be had or no state could be written, while `alert-path` is open, while a transition has waited
+over 15 minutes, or when a check could not tell on that pass and no `tool-unusable` record says so
+yet; after a skip it resumes only once 30 minutes have passed clean. A pass that could not write
+`meta` keeps its skip in `/run/propolis-witness/hbskip` (0600), and the next pass that can moves it
+into `meta`, so the 30 minutes hold for those passes too. A standing limitation that is already
+recorded (`tool-unusable` open) does not stop it, or the dead-man check would fire every day.
+Skipping is the only signal: there is no failure URL. The URL is a secret, since whoever has it can
+keep the check quiet: it reaches curl only through a file only root can read, and is never written
+to a state file, the journal, the banner or the walk. Only `https://` URLs are asked; any other is
+refused with one journal line and the walk reads `heartbeat URL refused (not an https URL)`. `meta
+hb_last` keeps the time and the result of the last GET, `meta hb_skip` the time and reason of the
+last skip.
 
 Each hourly pass, all slow work first and without the state lock:
 

@@ -19,6 +19,25 @@
 # it runs the read check (below) before it takes the lock. It also judges the hourly pass from
 # outside: its timer active and enabled, and a pass under three hours old.
 #
+# THE LIGHT PASS'S PROBES, all read before the lock. First the database, as the daemon's own role
+# through the daemon binary's pg-exec (read-only, `SELECT pg_is_in_recovery()`): one that does not
+# answer on two passes opens db-unreachable, one that is a standby db-readonly. Then the daemon's
+# readiness, one plain-HTTP GET of /ready on its console's loopback address, asked only of a
+# listener the daemon itself holds: a daemon up for half an hour that does not answer is
+# daemon-down, one that answers 503 while the database answers root is daemon-degraded, and
+# daemon-down now resolves only on two ready answers five minutes apart (ten steady minutes where
+# the console is not on loopback and cannot be asked). While the database is down and the daemon's
+# last completed run logged that it could not connect, the daemon's own failure stays pending and
+# folds under db-unreachable, so the outage is recorded once, under its cause; folded, it waits
+# for that record to resolve. Then the journal lines nobody reads: the legacy hook's lines for an
+# alert it could not deliver, and a failed failure hook, open alert-path, which resolves only on an
+# alert delivered after it opened; journald's notice that it dropped a Propolis unit's lines opens
+# journal-dropped; the rotation guard's lines are counted. A class's cursor moves on only once what
+# it read was judged and kept. Last, after the pass, the optional heartbeat URL
+# (PROPOLIS_WITNESS_HEARTBEAT_URL): one GET to an external dead-man check, made only after a pass
+# that was complete and clean and 30 minutes after the last one that was not; skipping it is the
+# signal.
+#
 # WHAT AN HOURLY PASS DOES. Without the lock: it runs the installed config-check
 # (/usr/local/lib/propolis/config-check.sh --tsv --no-events --report-only) and reads its findings;
 # it asks the ntfy server, without credentials, whether the topic can be read by anyone (three
@@ -43,12 +62,14 @@
 #
 # RECORD ONLY. Nothing here sends, pages or posts. Each transition the v2 profile would push adds
 # one to the record's would_push, which the status walk shows; that is all. Its only network
-# requests are the read check's GETs, which carry no message; it runs no database probe.
+# requests are the read check's GETs and the heartbeat URL's GET, which carry no message, the GET
+# of the daemon's /ready on loopback, and the read-only database probe.
 #
 # SAFE TO RUN FOREVER. An ordinary check error is recorded and the pass still exits 0, so it is
 # never a failed unit for the failure hook to report; three in a row open the NOTICE
-# tool-unusable. Every program it runs has a time limit, the light pass stops its optional reads
-# after 200 s and its judgement after 240 s, the hourly pass its judgement after 720 s (marking
+# tool-unusable. Every program it runs has a time limit, the light pass starts no probe that
+# could end past 160 s and stops its judgement after 240 s, the hourly pass its judgement after
+# 720 s (marking
 # itself partial), well inside the unit's 15 minutes, and nothing slow runs while it holds the
 # state lock. When the lock is not free within 60 s (the hourly pass: 120 s) it writes no state,
 # logs one line, counts the miss in /run/propolis-witness/lockwait
@@ -69,7 +90,13 @@
 # never taken as a finding gone, and a tier or a stage comes only from WITNESS_CC_TABLE, never
 # from the output. The read check's
 # topic and token reach curl only through files the library makes 0600, and the answer is judged
-# by its status code and content type alone.
+# by its status code and content type alone; so does the heartbeat URL, which is never written to
+# a state file, a journal line or the banner. A journal line is matched only after the fields
+# journald sets itself (the unit, the uid, the invocation id) have narrowed it to its writer, and
+# then against fixed strings; no line, nor any part of one, is kept or shown, only counted. The
+# daemon's /ready answer is taken only from a listener the kernel says the daemon holds, and is
+# judged by its status code and one fixed token; the database URL stays in the one process that
+# needs it.
 #
 # Exit status: 0 after every pass that ran, whatever it found; 2 a bad argument; 3 the alert
 # library is missing, not trusted, fails to load or is older than this script needs. Only those
@@ -79,10 +106,11 @@
 # every path under that directory (the installed config-check among them) and keeps the caller's
 # PATH, so stubs win; PROPOLIS_WITNESS_NOW is the time as a WALL/BOOT/UP stamp;
 # PROPOLIS_WITNESS_LOCK_WAIT replaces the wait for the state lock; PROPOLIS_WITNESS_DEADLINE
-# replaces the 240 s (light) or 720 s (hourly) after which the pass judges nothing more.
+# replaces the 240 s (light) or 720 s (hourly) after which the pass judges nothing more;
+# PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 5
+# needs-alert-lib: 6
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -115,7 +143,7 @@ if [ -z "$ROOT" ]; then
     export PATH
     # The library's own time and privilege seams must not reach a production run either.
     unset PA_TEST_WALL PA_TEST_BOOT PA_TEST_UP PA_TEST_READ_AS_SELF PA_TEST_UID PA_TEST_PROFILE
-    unset PROPOLIS_WITNESS_NOW PROPOLIS_WITNESS_LOCK_WAIT PROPOLIS_WITNESS_DEADLINE
+    unset PROPOLIS_WITNESS_NOW PROPOLIS_WITNESS_LOCK_WAIT PROPOLIS_WITNESS_DEADLINE PROPOLIS_WITNESS_SOFT_DEADLINE
 fi
 
 # ---- the alert library ----------------------------------------------------------------------
@@ -232,7 +260,7 @@ pa_id_table pa_ok_field pa_write pa_lock pa_unlock pa_state_read pa_state_write 
 pa_cause pa_unit_map pa_incident_load pa_incident_get pa_incident_transition pa_incident_set
 pa_incident_write pa_incident_prune pa_first_sighting pa_banner_write pa_trusted_exec pa_cleanup
 pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding pa_readcheck_run
-pa_readcheck_merge"
+pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -265,6 +293,24 @@ fi
 LOCK_WAIT=60
 # The pass judges nothing more once this many seconds have gone: what
 # it did is still written, and its heartbeat line says partial.
+#
+# Before the lock a light pass may call, each under its own limit: systemd for the role, two
+# questions at 20 s, 40 s; the spool listing, two finds at 10 s, 20 s; the unit sample, 20 s; the
+# rotation guard's journal, 3 s; the database probe, 5 s to stat the daemon binary, 30 s to find
+# its pg-exec guard when that is not known from an earlier pass and psql's 20 s with 2 s to be
+# killed, 57 s; the daemon's last run in the journal, 5 s for the account and 30 s, 35 s; /ready,
+# 5 s to ask who holds its port, 5 s for the account, 8 s for the GET and 5 s for its body, 23 s;
+# three journal classes at 30 s, 90 s, and 5 s each for the cursor and the kept lines, 15 s; the
+# failed alert units, two questions at 20 s, 40 s; the undelivered list and the delivered stamps,
+# 5 s each, 10 s; a changed target's read check, two targets of four GETs at 15 s, 120 s. 503 s in
+# all, more than the deadline, so only the role, the spool listing, the sample and the guard's
+# journal (83 s) always run: every other probe starts only when its whole limit still ends by
+# WITNESS_SOFT_DEADLINE (below, 160 s), and one that cannot is unknown for the pass, which is then
+# partial. The ownership checks' `stat` and `readlink` of the daemon binary's path have no limit
+# of their own, as the state files' reads have none (see the hourly pass below). With the lock's
+# 60 s that is 220 s, inside 240 s.
+# After the pass come the banner and the heartbeat URL's GET, 15 s, and 10 s for the lock to note
+# its result, far inside the unit's 15 minutes.
 WITNESS_DEADLINE=240
 if [ "$INSTANCE" = hourly ]; then
     # The programs an hourly pass runs on purpose each have their own limit: config-check 300 s;
@@ -297,9 +343,12 @@ note() {
     logger -p daemon.notice -t propolis-witness "$1" 2> /dev/null || true
 }
 
-# The pass stops its optional reads (the rotation guard's journal) once this many seconds have
-# gone, far inside the unit's TimeoutStartSec=15min.
-WITNESS_SOFT_DEADLINE=200
+# No optional read (the rotation guard's journal, each probe of the light pass) starts unless it
+# ends by this many seconds, so the lock's wait still ends inside WITNESS_DEADLINE.
+WITNESS_SOFT_DEADLINE=160
+if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SOFT_DEADLINE:-} =~ ^[0-9]{1,3}$ ]]; then
+    WITNESS_SOFT_DEADLINE="$((10#$PROPOLIS_WITNESS_SOFT_DEADLINE))"
+fi
 
 # ---- what a pass looks at -------------------------------------------------------------------
 
@@ -335,7 +384,7 @@ spool_unit() {
 # ---- the systemd sample ---------------------------------------------------------------------
 
 declare -A S_LOAD=() S_ACT=() S_SUB=() S_RES=() S_NR=() S_STATUS=() S_AEM=() S_IEM=() S_FILE=()
-declare -A S_INV=() S_RESTART=() WANT=() _B=()
+declare -A S_INV=() S_RESTART=() S_PID=() WANT=() _B=()
 SAMPLE_OK=0 SAMPLE_CAUSE=""
 SAMPLED=()
 # The rotation guard's reading of a failed propolis-logrotate.service run, taken with the sample.
@@ -362,6 +411,7 @@ commit_block() {
         S_FILE[$id]="$(sample_word "${_B[UnitFileState]:-}" '^[a-z-]{1,24}$')"
         S_INV[$id]="$(sample_word "${_B[InvocationID]:-}" '^[0-9a-f]{32}$')"
         S_RESTART[$id]="$(sample_word "${_B[Restart]:-}" '^[a-z-]{1,24}$')"
+        S_PID[$id]="$(sample_word "${_B[MainPID]:-}" '^[1-9][0-9]{0,9}$')"
         [ -n "${S_LOAD[$id]}" ] || S_LOAD[$id]="?"
     fi
     _B=()
@@ -381,7 +431,7 @@ parse_show() {
         case "$k" in
             Id | LoadState | ActiveState | SubState | Result | NRestarts | ExecMainStatus \
                 | ActiveEnterTimestampMonotonic | InactiveEnterTimestampMonotonic | UnitFileState \
-                | InvocationID | Restart) _B[$k]="${line#*=}" ;;
+                | InvocationID | Restart | MainPID) _B[$k]="${line#*=}" ;;
         esac
     done <<< "$1"
     commit_block
@@ -439,7 +489,7 @@ collect_sample() {
     # The guard's journal query is slow next to the rest of the pass, and the state lock is never
     # held across a slow read: sample_cause reuses what it found.
     u=propolis-logrotate.service
-    if [ "${S_ACT[$u]:-}" = failed ] && [ -n "${S_INV[$u]:-}" ] && [ "$SECONDS" -lt "$WITNESS_SOFT_DEADLINE" ]; then
+    if [ "${S_ACT[$u]:-}" = failed ] && [ -n "${S_INV[$u]:-}" ] && fits 3; then
         pa_cause "${S_RES[$u]:-}" "${S_STATUS[$u]:-}" 0 > /dev/null
         PA_REC_KIND="" PA_REC_TIER="" PA_REC_CAUSE="$PA_CAUSE"
         _PA_HK_INV="${S_INV[$u]}"
@@ -513,16 +563,26 @@ unit_facts() {
 # `clean:<key>` line per open finding, counting the completed runs in a row without it. The
 # light pass's `witness-hourly` line is the same for the hourly pass. Every other line, the other
 # instance's U and R lines among them, is kept exactly as read.
+#
+# The light pass's probes add their own: per check (`pg`, `ready`, `alertunit` and
+# `journal:<class>`) the results in a row; `db` the database's last answer (ok, recovery or
+# down), `ready-code` the last /ready status, and `daemon` what the daemon was seen to be (ok,
+# down, activating, starting, degraded, dbcarried), each with how many passes in a row; and one
+# `seen:journal:<unit>` line per open journal-dropped record, the last pass that saw its line.
 
 declare -A OBS_U=() OBS_R=() OBS_P=() NEW_U=() NEW_R=() JUDGED=()
 OBS_KEEP=()
-OBS_MINE_P=" units witness-hourly "
+OBS_MINE_P=" units witness-hourly pg ready alertunit db ready-code daemon "
 [ "$INSTANCE" != hourly ] || OBS_MINE_P=" config-check readcheck witness-light "
 
 # obs_mine NAME: the P line NAME belongs to this instance.
 obs_mine() {
     case "$OBS_MINE_P" in *" $1 "*) return 0 ;; esac
-    [ "$INSTANCE" = hourly ] && [[ $1 == clean:* ]]
+    if [ "$INSTANCE" = hourly ]; then
+        [[ $1 == clean:* ]]
+    else
+        [[ $1 == journal:* || $1 == seen:* ]]
+    fi
 }
 
 load_observe() {
@@ -667,7 +727,7 @@ heartbeat_stamp() {
 # ten minutes (no writer holds one that long), in both state directories and beside the banner.
 sweep_stale() {
     local d
-    for d in "$PA_STATE" "$PA_STATE/hook" "$PA_RUN" "$PA_RUN/fallback"; do
+    for d in "$PA_STATE" "$PA_STATE/hook" "$PA_STATE/jcursor" "$PA_RUN" "$PA_RUN/fallback" "$PA_RUN/jcursor"; do
         [ -d "$d" ] && [ ! -L "$d" ] || continue
         timeout 10 find "$d" -mindepth 1 -maxdepth 1 -type f -name '*.tmp.*' -mmin +10 -delete 2> /dev/null || true
     done
@@ -751,9 +811,14 @@ sample_cause() {
 }
 
 # proof_for UNIT STEADY: the proof the record of UNIT has met on this sample, or nothing. Its
-# kind decides: a oneshot's next run succeeded after the onset (nextrun); a crash loop or an
-# unset bind has stayed up 30 min without a restart (quiet30); any other unit has stayed up
-# 10 min without one (active10). Met on the first look after a reboot, it is `restart`.
+# kind decides: a oneshot's next run succeeded after the onset (nextrun); the daemon answered
+# /ready 200 on two passes at least five minutes apart (READY_GAP), up with the same start since
+# the first of them (ready2: running is not ready, and a daemon that crashes between two answers
+# has not recovered), or, where its console's address is not loopback and /ready cannot be asked
+# at all (config.invalid), up 10 min without a restart (active10, which is what the proof field
+# then says); a crash loop or an unset bind has stayed up 30 min without a restart (quiet30); any
+# other unit has stayed up 10 min without one (active10). Met on the first look after a reboot,
+# it is `restart`.
 proof_for() {
     local u="$1" steady="$2" kind="${PA_INC[3]:-}" onset="${PA_INC[10]:-}" iem met=""
     if [ "$F_ONESHOT" = 1 ] || [ "$kind" = rotation-skipped ]; then
@@ -765,6 +830,10 @@ proof_for() {
                 met=nextrun
             fi
         fi
+    elif [ "$steady" != - ] && [ "$u" = propolis.service ] && [ "$READY_CAUSE" = config.invalid ]; then
+        [ "$(pa_age "$steady")" -lt 600 ] || met=active10
+    elif [ "$steady" != - ] && [ "$u" = propolis.service ]; then
+        [ "$READY2" != 1 ] || [ "$(pa_age "$steady")" -lt "$READY_GAP" ] || met=ready2
     elif [ "$steady" != - ]; then
         case "$kind" in
             unit-crashloop | unit-nobind) [ "$(pa_age "$steady")" -lt 1800 ] || met=quiet30 ;;
@@ -784,7 +853,7 @@ MAINT=0
 judge_unit() {
     local u="$1" key="unit:$1" pstamp pnr pboot pstate paem ploop psteady same=0 d age loop=0
     local bstamp="" bnr="" prevup="?" steady=- failed2=0 loop2=0 state="" judge hold="" proof k
-    local nocc=0
+    local nocc=0 ddown2=0 dcause=""
     JUDGED[$u]=1
     unit_facts "$u"
     # A unit systemd no longer knows has nothing to sample: only a record of it is settled, as
@@ -847,6 +916,16 @@ judge_unit() {
         esac
         [ "$F_ACTIVE" != failed ] || [ "$pstate" != failed ] || failed2=1
     fi
+    # The daemon is down too when it is stopped, waits to be restarted, or has been starting for
+    # over half an hour, on two passes, and when it has been up half an hour and its console does
+    # not answer (daemon_observe).
+    if [ "$u" = propolis.service ]; then
+        case "$DOBS" in
+            down) [ "$DOBS_N" -lt 2 ] || ddown2=1 ;;
+            activating) [ "$DOBS_N" -lt 8 ] || ddown2=1 ;;
+        esac
+        dcause="$DCAUSE"
+    fi
     NEW_U[$u]="$PA_STAMP"$'\t'"${F_NR:--}"$'\t'"$PA_BOOT"$'\t'"$F_ACTIVE"$'\t'"${F_AEM:--}"$'\t'"$loop"$'\t'"$steady"
     NEW_R[$u]="$bstamp"$'\t'"${bnr:--}"
 
@@ -896,6 +975,10 @@ judge_unit() {
             # marker often comes and goes between two passes, unseen by any: the ten minutes
             # then count from the sighting itself.
             if [ -z "$hold" ] && flagged_maint_recent; then hold="tail"; fi
+            if [ "${PA_INC[13]:--}" != - ]; then
+                folded_pending "$u" "$key" "$prevup" "$hold"
+                return 0
+            fi
             if [ "$F_ONESHOT" = 1 ]; then
                 # A oneshot does not restart itself: its next run is the answer. One that
                 # succeeded after the sighting healed it; one still failed opens.
@@ -909,7 +992,7 @@ judge_unit() {
                 fi
             else
                 judge="$(pa_first_sighting "${PA_INC[32]:--}" "$F_NR" "$F_UP" "$prevup")"
-                if [ "$loop2" = 1 ] || [ "$failed2" = 1 ]; then judge=open; fi
+                if [ "$loop2" = 1 ] || [ "$failed2" = 1 ] || [ "$ddown2" = 1 ]; then judge=open; fi
             fi
             case "$judge" in
                 open)
@@ -929,7 +1012,7 @@ judge_unit() {
                                 open_attrs "$u" unit-crashloop
                                 k="$O_KIND"
                             fi
-                            rec_open "$key" "$k" "" "" "" "$F_NR"
+                            unit_open "$u" "$key" "$k" "" "" "" "$F_NR"
                             ;;
                     esac
                     ;;
@@ -943,7 +1026,24 @@ judge_unit() {
             esac
             ;;
         open | acked)
-            if [ "$loop2" = 1 ] && [ "${PA_INC[3]}" = unit-failed ]; then
+            if [ "$u" = propolis.service ] && ready_unverified; then
+                flag_cannotverify "$key"
+                pa_incident_get "$key" || return 0
+            fi
+            if [ "$u" = propolis.service ] && [ "$TIE_HOLD" = 1 ]; then
+                # Opened before its parent existed: it takes db-unreachable as its parent once
+                # that is open (the late-parent rule), and the database's cause with it. A daemon
+                # in a fresh attempt is active and still failing, so its state is no test here.
+                if tie_fold "$key" && [ "${PA_INC[11]}" != db.unreachable ]; then
+                    PA_REC_KIND="" PA_REC_TIER="" PA_REC_CAUSE=db.unreachable
+                    pa_incident_transition "$key" change && rec_set
+                fi
+            elif [ "$u" = propolis.service ] && { [ "$F_ACTIVE" != active ] || [ "$DOBS" = down ]; } \
+                && [ "${PA_INC[13]}" != - ] && parent_gone "${PA_INC[13]}" 1800; then
+                # Still down, not merely not ready: a daemon that runs and answers 503 is
+                # daemon-degraded's to report, and one whose answer cannot be read is unknown.
+                unfold_open
+            elif [ "$loop2" = 1 ] && [ "${PA_INC[3]}" = unit-failed ]; then
                 open_attrs "$u" unit-crashloop
                 PA_REC_KIND="$O_KIND" PA_REC_TIER="" PA_REC_CAUSE=""
                 pa_incident_transition "$key" change && rec_set
@@ -976,13 +1076,20 @@ judge_unit() {
                     pa_incident_transition "$key" pending && rec_set
                     return 0
                 fi
-                rec_open "$key" "$O_KIND" "$O_TIER" "$O_STAGE" "$PA_CAUSE" "$F_NR"
+                unit_open "$u" "$key" "$O_KIND" "$O_TIER" "$O_STAGE" "$PA_CAUSE" "$F_NR"
             elif [ "$failed2" = 1 ]; then
                 sample_cause "$u"
                 open_attrs "$u" unit-failed
                 [ -z "$C_KIND" ] || O_KIND="$C_KIND"
                 [ -z "$C_TIER" ] || O_TIER="$C_TIER"
-                rec_open "$key" "$O_KIND" "$O_TIER" "$O_STAGE" "$C_CAUSE" "$F_NR"
+                unit_open "$u" "$key" "$O_KIND" "$O_TIER" "$O_STAGE" "$C_CAUSE" "$F_NR"
+            elif [ "$ddown2" = 1 ]; then
+                # Stopped, waiting to restart, starting for over half an hour, or up without an
+                # answer from its console: the cause is systemd's, or the console's for the last.
+                sample_cause "$u"
+                [ -z "$dcause" ] || C_CAUSE="$dcause"
+                open_attrs "$u" unit-failed
+                unit_open "$u" "$key" "$O_KIND" "$O_TIER" "$O_STAGE" "$C_CAUSE" "$F_NR"
             fi
             ;;
     esac
@@ -1543,6 +1650,9 @@ rc_collect() {
             fi
         fi
         past_deadline && return 0
+        # A light pass starts a target's four GETs only when all of them end by its soft deadline;
+        # the next pass checks what this one could not.
+        [ "$INSTANCE" != light ] || fits 60 || return 0
         if [ "$role" = daemon ]; then
             url="$PA_D_URL" topic="$PA_D_TOPIC" token=""
         else
@@ -1933,9 +2043,1298 @@ backup_failed_last() {
     BACKUP_FAILED_LAST=1
 }
 
+# ---- the light pass's probes ----------------------------------------------------------------
+#
+# Each reads before the lock, which is never held across a slow call, and each starts only when
+# its whole time limit still ends by WITNESS_SOFT_DEADLINE: one that cannot is unknown for the
+# pass. Under the lock only what they found is judged. A check's result (ok, or unknown with a
+# cause) goes to its P line, where three unknowns in a row open tool-unusable on tool:<check>.
+
+declare -A CHK_RESULT=() CHK_CAUSE=()
+CHECK_BAD=()
+
+# fits SECONDS: a call that may take this long still ends by the soft deadline.
+fits() {
+    [ "$((SECONDS + $1))" -le "$WITNESS_SOFT_DEADLINE" ]
+}
+
+# check_result NAME RESULT CAUSE: what one check came to on this pass, for probe_counts.
+check_result() {
+    CHK_RESULT[$1]="$2" CHK_CAUSE[$1]="$3"
+}
+
+# account_uid NAME: the uid of a local account, or failure when there is none.
+account_uid() {
+    local u
+    u="$(timeout 5 id -u -- "$1" 2> /dev/null)" || return 1
+    [[ $u =~ ^[0-9]{1,10}$ ]] || return 1
+    printf '%s' "$((10#$u))"
+}
+
+DB_RESULT=skip DB_CAUSE=- DB_WHERE=local DB_GUARD=- DB_BIN_ID=""
+
+# db_probe: whether the daemon's database answers, asked as the daemon's own role through the
+# daemon binary's pg-exec (pa_pg: read-only, 5 s to connect, 5 s per statement). DB_RESULT is f
+# (it answers and takes writes), t (a standby: the daemon's writes fail), down (db.unreachable,
+# db.auth or db.timeout, in DB_CAUSE), unknown (the probe could not tell: tool.exec,
+# config.invalid, an answer out of form, or no time left) or skip (no DATABASE_URL, or a host that
+# runs no daemon). psql's own words are another party's: they are dropped here, never kept.
+db_probe() {
+    local known="" need=57
+    DB_RESULT=skip
+    case "${PA_ROLE:-}" in collector | gateway) return 0 ;; esac
+    pa_env_get DATABASE_URL "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    if [ -z "$PA_ENV_VALUE" ] && [ -z "$PA_ENV_UNREADABLE" ]; then return 0; fi
+    PA_ENV_VALUE=""
+    # Whether this very binary carried pg-exec's guard on an earlier pass, so 50 MB are not read
+    # every five minutes; meta is read here without the lock, and only as a hint pa_pg checks
+    # against the binary's inode, size and mtime.
+    [ "$(_pa_meta_get pgexec_ok)" != 1 ] || known="$(_pa_meta_get pgexec_id)"
+    [ -z "$known" ] || need=27
+    if ! fits "$need"; then
+        DB_RESULT=unknown DB_CAUSE=unknown
+        check_result pg unknown unknown
+        return 0
+    fi
+    PA_PG_GUARD_KNOWN="$known" PA_PG_APP=propolis-witness
+    if pa_pg 20 'SELECT pg_is_in_recovery()' > /dev/null; then
+        case "$PA_PG_OUT" in
+            f) DB_RESULT=f DB_CAUSE=- ;;
+            t) DB_RESULT=t DB_CAUSE=db.recovery ;;
+            *) DB_RESULT=unknown DB_CAUSE=unknown ;;
+        esac
+    else
+        DB_CAUSE="$PA_PG_CAUSE"
+        case "$DB_CAUSE" in
+            db.unreachable | db.auth | db.timeout) DB_RESULT=down ;;
+            *) DB_RESULT=unknown ;;
+        esac
+    fi
+    DB_WHERE="${PA_PG_WHERE:-local}" DB_GUARD="$PA_PG_GUARD" DB_BIN_ID="$PA_PG_BIN_ID"
+    PA_PG_ERR="" PA_PG_OUT="" PA_PG_GUARD_KNOWN=""
+    pa_ok_field "$DB_CAUSE" || DB_CAUSE=unknown
+    if [ "$DB_RESULT" = unknown ]; then
+        check_result pg unknown "$DB_CAUSE"
+    else
+        check_result pg ok -
+    fi
+}
+
+TIE=0 PROPOLIS_UID=""
+
+# daemon_tie: while the probe fails with a database cause, whether the daemon's last completed run
+# logged that it could not connect to PostgreSQL. Its journal is narrowed by the fields journald
+# sets (the unit and the daemon account's uid), then matched as fixed strings: the newest of the
+# connect line and the start line the daemon logs once it has connected decides, and only the
+# connect line ties the daemon's failure to the database. A run that failed or waits to be
+# restarted is its own last run, read by its invocation id. A run in progress is not: the daemon
+# logs the connect line only when its pool's acquire timeout (30 s) ends, so a fresh attempt has
+# logged nothing yet, and its last completed run is read from the last 15 minutes instead. Without
+# the account, or the id of a run that ended, there is no tie, and a read cut short says nothing.
+daemon_tie() {
+    local u=propolis.service inv="${S_INV[propolis.service]:-}" uid out st
+    local -a pats=() m=()
+    TIE=0
+    [ "$DB_RESULT" = down ] || return 0
+    # The account's 5 s and the journal's 30 s, both inside the soft deadline.
+    if ! fits 35; then
+        check_result journal:daemon unknown unknown
+        return 0
+    fi
+    uid="$(account_uid propolis)" || return 0
+    PROPOLIS_UID="$uid"
+    mapfile -t pats < <(pa_journal_patterns daemon)
+    [ "${#pats[@]}" -ge 2 ] || return 0
+    case "${S_ACT[$u]:-}:${S_SUB[$u]:-}" in
+        failed:* | activating:auto-restart)
+            [ -n "$inv" ] || return 0
+            m=("_SYSTEMD_INVOCATION_ID=$inv")
+            ;;
+        *) m=(--since=-15min) ;;
+    esac
+    out="$(
+        timeout 30 journalctl -q --no-pager -o cat "_SYSTEMD_UNIT=propolis.service" "_UID=$uid" \
+            "${m[@]}" 2> /dev/null | LC_ALL=C grep -a -F -e "${pats[0]}" -e "${pats[1]}" \
+            | LC_ALL=C tail -n 1 | LC_ALL=C cut -b 1-400
+        exit "${PIPESTATUS[0]}"
+    )"
+    st=$?
+    if [ "$st" != 0 ]; then
+        case "$st" in
+            126 | 127) check_result journal:daemon unknown tool.exec ;;
+            *) check_result journal:daemon unknown unknown ;;
+        esac
+        return 0
+    fi
+    check_result journal:daemon ok -
+    case "$out" in *"${pats[0]}"*) TIE=1 ;; esac
+    return 0
+}
+
+READY_RESULT=skip READY_CAUSE=- READY_ADDR="" READY_OWNER="" READY_OWNER_CAUSE=""
+
+# console_addr: the daemon's console address from PROPOLIS_CONSOLE_BIND (the daemon's two env
+# files, its default 127.0.0.1:8080) as READY_ADDR, with 0.0.0.0 asked as 127.0.0.1 and [::] as
+# [::1]. Fails for any address that is not a loopback one: /ready is asked of the daemon on this
+# host and of nothing reachable from elsewhere.
+console_addr() {
+    local bind host port o
+    pa_env_get PROPOLIS_CONSOLE_BIND "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    [ "$PA_ENV_COMPLEX" = 0 ] && [ -z "$PA_ENV_UNREADABLE" ] || return 1
+    bind="${PA_ENV_VALUE:-127.0.0.1:8080}"
+    case "$bind" in
+        \[*\]:*) host="${bind%%]*}" host="${host#[}" port="${bind##*]:}" ;;
+        *:*) host="${bind%:*}" port="${bind##*:}" ;;
+        *) return 1 ;;
+    esac
+    [[ $port =~ ^[0-9]{1,5}$ ]] && [ "$((10#$port))" -ge 1 ] && [ "$((10#$port))" -le 65535 ] || return 1
+    port=$((10#$port))
+    case "$host" in
+        :: | ::1)
+            READY_ADDR="[::1]:$port"
+            return 0
+            ;;
+        0.0.0.0) host=127.0.0.1 ;;
+    esac
+    [[ $host =~ ^127\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done
+    READY_ADDR="127.$((10#${BASH_REMATCH[1]})).$((10#${BASH_REMATCH[2]})).$((10#${BASH_REMATCH[3]})):$port"
+}
+
+# ready_owner PORT: who holds the TCP listeners that take a connection to READY_ADDR on PORT, from
+# the kernel's socket table (ss over netlink, with the holding process and the socket's uid).
+# READY_OWNER is daemon when every such listener is held by propolis.service's sampled MainPID or
+# created by the propolis account, none when there is none, other for any other holder, and
+# unknown (READY_OWNER_CAUSE) when ss could not tell.
+ready_owner() {
+    local port="$1" out rc=0 line rest p q uid ok any=0 re_pid='pid=([0-9]{1,10})' re_uid=' uid:([0-9]{1,10})'
+    local main="${S_PID[propolis.service]:-}" want="${READY_ADDR%:*}" bound
+    READY_OWNER=unknown READY_OWNER_CAUSE=unknown
+    out="$(timeout 5 ss -Hltnpe "sport = :$port" 2> /dev/null)" || rc=$?
+    if [ "$rc" != 0 ]; then
+        case "$rc" in 126 | 127) READY_OWNER_CAUSE=tool.exec ;; esac
+        return 0
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # Only a listener that can take a connection to the address asked counts: one bound to
+        # that address, or to a wildcard of its family (`*` is both families). Another service
+        # on the same port number at another address, a sensor on the public address say, holds
+        # nothing of the console's.
+        read -r _ _ _ bound _ <<< "$line"
+        bound="${bound%:*}"
+        bound="${bound%%%*}"
+        case "$bound" in
+            "$want" | '*') ;;
+            0.0.0.0) [[ $want != \[* ]] || continue ;;
+            '[::]') [[ $want == \[* ]] || continue ;;
+            *) continue ;;
+        esac
+        any=1 ok=0 rest="$line" p=""
+        while [[ $rest =~ $re_pid ]]; do
+            p+=" $((10#${BASH_REMATCH[1]}))"
+            rest="${rest#*"${BASH_REMATCH[0]}"}"
+        done
+        if [ -n "$p" ] && [ -n "$main" ]; then
+            ok=1
+            for q in $p; do [ "$q" = "$main" ] || ok=0; done
+        fi
+        if [ "$ok" = 0 ] && [[ $line =~ $re_uid ]]; then
+            uid="$((10#${BASH_REMATCH[1]}))"
+            # `-` once the account is known to be missing, so it is asked once a pass.
+            [ -n "$PROPOLIS_UID" ] || PROPOLIS_UID="$(account_uid propolis)" || PROPOLIS_UID=-
+            [ "$uid" != "$PROPOLIS_UID" ] || ok=1
+        fi
+        if [ "$ok" = 0 ]; then
+            READY_OWNER=other
+            return 0
+        fi
+    done <<< "$out"
+    if [ "$any" = 0 ]; then READY_OWNER=none; else READY_OWNER=daemon; fi
+}
+
+# ready_probe: the daemon's readiness, one GET of /ready on its console's loopback address, over
+# plain HTTP as the daemon serves it, with no credentials, no proxy, no redirect, a 64 KiB cap and
+# time limits; asked only while propolis.service is enabled and up, and only of a listener the
+# daemon holds (ready_owner). A daemon whose console failed to bind keeps running, and no sensor's
+# sandbox keeps it from binding a loopback port, so while the daemon restarts, or after its bind
+# failed, another local account could hold the port and answer for it. The body is the daemon's:
+# only its status code is judged, and whether the one fixed token `"gave_up"` occurs.
+# READY_RESULT: 200, 503 (the daemon's pool cannot reach its database), 503g (a subsystem gave
+# up), 000 (no answer, or nothing listening; net.connect or net.timeout in READY_CAUSE), unknown
+# (an address that is not loopback, config.invalid; a listener another holds or one ss cannot
+# name; a status the daemon does not give; curl missing; no time left), notup or skip (not asked).
+ready_probe() {
+    local u=propolis.service body code rc n
+    READY_RESULT=skip READY_CAUSE=-
+    case "${PA_ROLE:-}" in collector | gateway) return 0 ;; esac
+    [ "$SAMPLE_OK" = 1 ] && [ "${S_FILE[$u]:-}" = enabled ] || return 0
+    case "${S_ACT[$u]:-}" in
+        active | reloading) ;;
+        *)
+            READY_RESULT=notup
+            return 0
+            ;;
+    esac
+    if ! console_addr; then
+        READY_RESULT=unknown READY_CAUSE=config.invalid
+        check_result ready unknown config.invalid
+        return 0
+    fi
+    body="$(umask 077 && mktemp 2> /dev/null)" || body=""
+    if [ -z "$body" ] || ! fits 23; then
+        READY_RESULT=unknown READY_CAUSE=unknown
+        [ -n "$body" ] || READY_CAUSE=tool.exec
+        check_result ready unknown "$READY_CAUSE"
+        return 0
+    fi
+    PA_CLEANUP+=("$body")
+    ready_owner "${READY_ADDR##*:}"
+    case "$READY_OWNER" in
+        daemon) ;;
+        none)
+            rm -f -- "$body" 2> /dev/null
+            READY_RESULT=000 READY_CAUSE=net.connect
+            check_result ready ok -
+            return 0
+            ;;
+        *)
+            rm -f -- "$body" 2> /dev/null
+            READY_RESULT=unknown READY_CAUSE="$READY_OWNER_CAUSE"
+            check_result ready unknown "$READY_CAUSE"
+            return 0
+            ;;
+    esac
+    code="$(timeout 8 curl -q -sS --noproxy '*' -o "$body" -w '%{http_code}' --max-time 5 \
+        --max-filesize 65536 --max-redirs 0 --proto '=http' "http://$READY_ADDR/ready" 2> /dev/null)"
+    rc=$?
+    code="${code:0:3}"
+    [[ $code =~ ^[0-9]{3}$ ]] || code=000
+    case "$code" in
+        200) READY_RESULT=200 ;;
+        503)
+            n="$(timeout 5 head -c 65536 -- "$body" 2> /dev/null | LC_ALL=C grep -c -a -F '"gave_up"')" || true
+            if [[ $n =~ ^[0-9]{1,9}$ ]] && [ "$((10#$n))" -gt 0 ]; then READY_RESULT=503g; else READY_RESULT=503; fi
+            ;;
+        000)
+            case "$rc" in
+                126 | 127) READY_RESULT=unknown READY_CAUSE=tool.exec ;;
+                28 | 124) READY_RESULT=000 READY_CAUSE=net.timeout ;;
+                *) READY_RESULT=000 READY_CAUSE=net.connect ;;
+            esac
+            ;;
+        4[0-9][0-9]) READY_RESULT=unknown READY_CAUSE=http.client ;;
+        *) READY_RESULT=unknown READY_CAUSE=http.server ;;
+    esac
+    rm -f -- "$body" 2> /dev/null
+    if [ "$READY_RESULT" = unknown ]; then
+        check_result ready unknown "$READY_CAUSE"
+    else
+        check_result ready ok -
+    fi
+}
+
+# The reason the legacy hook gives before `; alert follows` or before `; the alert ... is still
+# undelivered since`, by its fixed start (deploy/alert.sh, the calls of undelivered), and the cause
+# recorded for it; any other reason is unknown. `cause|start`, no start holding a `;`.
+WITNESS_HOOK_REASONS='nocurl|curl is not installed;net.connect|could not post to ntfy;net.connect|the last attempt to deliver was less than'
+
+# hook_records A B C: the legacy hook's lines, from journalctl's json output on stdin, as one word
+# per kept entry: `A <cause>` (an alert it could not deliver, logged in full next), `B <cause>`
+# (one still undelivered) or `C` (a failure alert, delivered or not). An entry counts only when
+# its _SYSTEMD_UNIT, a field journald sets from the cgroup, names a propolis-alert@ instance, and
+# then only the first line of its MESSAGE is matched: the full alert the hook logs carries the
+# failed unit's last journal lines, which anyone who can reach a sensor writes. Inside a JSON
+# string every quote is escaped, so no such text can pass for a field of the entry, and an entry
+# whose MESSAGE journald gives in binary form (not a string) is not the hook's. journalctl before
+# systemd 246 prints `{ "KEY" : "value", ... }`, with blanks around the colons and commas; such a
+# line has its blanks outside strings taken out first, so it reads as the compact form.
+hook_records() {
+    LC_ALL=C awk -v a="$1" -v b="$2" -v c="$3" -v reasons="$WITNESS_HOOK_REASONS" '
+        function squeeze(s,    out, i, n, ch, ins) {
+            out = ""
+            ins = 0
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (ins) {
+                    out = out ch
+                    if (ch == "\\") { i++; out = out substr(s, i, 1) }
+                    else if (ch == "\"") ins = 0
+                } else if (ch == "\"") { ins = 1; out = out ch }
+                else if (ch != " " && ch != "\t") out = out ch
+            }
+            return out
+        }
+        BEGIN {
+            nr = split(reasons, rs, ";")
+            for (i = 1; i <= nr; i++) {
+                k = index(rs[i], "|")
+                rc[i] = substr(rs[i], 1, k - 1)
+                rp[i] = substr(rs[i], k + 1)
+            }
+        }
+        substr($0, 1, 1) != "{" { next }
+        {
+            line = $0
+            if (substr(line, 2, 1) == " ") line = squeeze(line)
+            if (index(line, ",\"_SYSTEMD_UNIT\":\"propolis-alert@") == 0 \
+                && index(line, "{\"_SYSTEMD_UNIT\":\"propolis-alert@") != 1) next
+            p = index(line, ",\"MESSAGE\":\"")
+            if (p > 0) p += 12
+            else if (index(line, "{\"MESSAGE\":\"") == 1) p = 13
+            else next
+            s = substr(line, p)
+            gsub(/\\\\/, "\001", s)
+            e = 0
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                ch = substr(s, i, 1)
+                if (ch == "\\") { i++; continue }
+                if (ch == "\"") { e = i; break }
+            }
+            if (e == 0) next
+            m = substr(s, 1, e - 1)
+            k = index(m, "\\n")
+            if (k > 0) m = substr(m, 1, k - 1)
+            kind = ""
+            if (length(m) >= length(a) && substr(m, length(m) - length(a) + 1) == a) kind = "A"
+            else if (index(m, b) > 0) kind = "B"
+            else {
+                k = index(m, c)
+                if (k > 1 && substr(m, 1, k - 1) ~ /^[A-Za-z0-9@._:-]+$/) { print "C"; next }
+            }
+            if (kind == "") next
+            cause = "unknown"
+            for (i = 1; i <= nr; i++) if (index(m, rp[i]) == 1) { cause = rc[i]; break }
+            print kind " " cause
+        }'
+}
+
+declare -A J_RESULT=() J_NEWCUR=() J_LINES=()
+J_DROP=()
+
+# jcursor_get CLASS: the stored cursor of CLASS when it has a cursor's form, else nothing. The
+# copy in /run is newer whenever there is one: it is written only while the disk refuses writes,
+# and removed once the disk takes one again. Neither the file nor its directory may be a link,
+# which would let whatever it points at choose where the class starts reading.
+jcursor_get() {
+    local d f c
+    for d in "$PA_RUN/jcursor" "$PA_STATE/jcursor"; do
+        f="$d/$1"
+        [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$f" ] && [ ! -L "$f" ] || continue
+        c="$(timeout 5 head -c 600 -- "$f" 2> /dev/null)" || continue
+        c="${c%$'\n'}"
+        if pa_jcursor_ok "$c"; then
+            printf '%s' "$c"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# jclass_read CLASS MODE MATCH...: the entries of CLASS's journal (MATCH, fields journald sets)
+# since its stored cursor, or the last 15 minutes without one, filtered first and only then cut:
+# the fixed-string grep (MODE cat) or hook_records (MODE json) keeps only lines that carry a
+# pattern, and those are cut to 1 MiB and 400 bytes a line into J_LINES. journalctl reads to the
+# end of the entries either way, so a flood of other lines from the same unit costs read time,
+# never a pattern line or the cursor's progress. journalctl writes its cursor into a private
+# file, read back here only in a cursor's form, for jcursor_store to keep. A read that timed out
+# or failed is unknown for the pass and its cursor is not taken.
+jclass_read() {
+    local class="$1" mode="$2" cur tmpc tmpo st0="" st1="" c p
+    local -a pats=() gr=() cargs=()
+    shift 2
+    J_RESULT[$class]=unknown J_NEWCUR[$class]="" J_LINES[$class]=""
+    if ! fits 45; then
+        check_result "journal:$class" unknown unknown
+        return 0
+    fi
+    tmpc="$(umask 077 && mktemp 2> /dev/null)" || tmpc=""
+    tmpo="$(umask 077 && mktemp 2> /dev/null)" || tmpo=""
+    PA_CLEANUP+=("$tmpc" "$tmpo")
+    if [ -z "$tmpc" ] || [ -z "$tmpo" ]; then
+        check_result "journal:$class" unknown tool.exec
+        return 0
+    fi
+    mapfile -t pats < <(pa_journal_patterns "$class")
+    for p in "${pats[@]}"; do gr+=(-e "$p"); done
+    cur="$(jcursor_get "$class")"
+    if [ -n "$cur" ]; then
+        printf '%s\n' "$cur" > "$tmpc"
+        cargs=("--cursor-file=$tmpc")
+    else
+        rm -f -- "$tmpc"
+        cargs=("--cursor-file=$tmpc" --since=-15min)
+    fi
+    if [ "$mode" = json ]; then
+        read -r st0 st1 < <(
+            timeout 30 journalctl -q --no-pager -o json --output-fields=_SYSTEMD_UNIT,MESSAGE \
+                "${cargs[@]}" "$@" 2> /dev/null | hook_records "${pats[@]}" > "$tmpo"
+            printf '%s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[1]}"
+        )
+    else
+        read -r st0 st1 < <(
+            timeout 30 journalctl -q --no-pager -o cat "${cargs[@]}" "$@" 2> /dev/null \
+                | LC_ALL=C grep -a -F "${gr[@]}" > "$tmpo"
+            printf '%s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[1]}"
+        )
+    fi
+    if [ "$st0" != 0 ] || ! [[ $st1 =~ ^[01]$ ]]; then
+        case "$st0" in
+            126 | 127) check_result "journal:$class" unknown tool.exec ;;
+            *) check_result "journal:$class" unknown unknown ;;
+        esac
+        rm -f -- "$tmpc" "$tmpo" 2> /dev/null
+        return 0
+    fi
+    J_LINES[$class]="$(timeout 5 head -c 1048576 -- "$tmpo" 2> /dev/null | LC_ALL=C cut -b 1-400)"
+    c=""
+    if [ -f "$tmpc" ] && [ ! -L "$tmpc" ]; then
+        c="$(timeout 5 head -c 600 -- "$tmpc" 2> /dev/null)" || c=""
+        c="${c%$'\n'}"
+    fi
+    if [ -n "$c" ] && [ "$c" != "$cur" ] && pa_jcursor_ok "$c"; then J_NEWCUR[$class]="$c"; fi
+    rm -f -- "$tmpc" "$tmpo" 2> /dev/null
+    J_RESULT[$class]=ok
+    check_result "journal:$class" ok -
+}
+
+declare -A AU_IEM=() AU_CAUSE=()
+AU_RESULT=skip
+
+# alertunit_read: failure hooks that themselves failed or timed out: the failed propolis-alert@
+# instances systemd lists, and for each when it failed (uptime) and its own proc.* cause. A failed
+# instance stays failed until reset-failed, so the time is what tells a new failure from an old
+# one. At most 32 instances, and only names in systemd's form.
+alertunit_read() {
+    local out u rc=0
+    local -a units=()
+    AU_RESULT=unknown
+    if ! fits 40; then
+        check_result alertunit unknown unknown
+        return 0
+    fi
+    out="$(systemctl list-units --all --plain --no-legend --state=failed 'propolis-alert@*' 2> /dev/null)" || rc=$?
+    if [ "$rc" != 0 ]; then
+        case "$rc" in
+            126 | 127) check_result alertunit unknown tool.exec ;;
+            *) check_result alertunit unknown unknown ;;
+        esac
+        return 0
+    fi
+    while read -r u _; do
+        if [[ $u != propolis-alert@* ]] || ! pa_unit_name_ok "$u"; then continue; fi
+        [ "${#units[@]}" -lt 32 ] || break
+        units+=("$u")
+    done <<< "$out"
+    if [ "${#units[@]}" -gt 0 ]; then
+        for u in "${units[@]}"; do WANT[$u]=1; done
+        if ! out="$(systemctl show -p Id,LoadState,ActiveState,Result,ExecMainStatus,InactiveEnterTimestampMonotonic -- "${units[@]}" 2> /dev/null)"; then
+            check_result alertunit unknown unknown
+            return 0
+        fi
+        parse_show "$out"
+        for u in "${units[@]}"; do
+            [ "${S_ACT[$u]:-}" = failed ] || continue
+            # A failure whose time cannot be read cannot be told from an old one: it opens nothing.
+            [[ ${S_IEM[$u]:-} =~ ^[0-9]{1,18}$ ]] && [ "${S_IEM[$u]}" != 0 ] || continue
+            pa_cause "${S_RES[$u]:-}" "${S_STATUS[$u]:-}" 0 > /dev/null
+            AU_IEM[$u]=$((10#${S_IEM[$u]} / 1000000)) AU_CAUSE[$u]="$PA_CAUSE"
+        done
+    fi
+    AU_RESULT=ok
+    check_result alertunit ok -
+}
+
+UNDELIV_N="" DELIV_LAST=""
+
+# delivered_last: the newest of the legacy hook's delivered stamps, /run/propolis-alert/<unit>
+# (deploy/alert.sh touches one each time an alert for that unit goes out, to the push target or,
+# with none, to the journal), as wall-clock seconds in DELIV_LAST; 0 when there is none, nothing
+# when the directory cannot be listed or there is no time left to list it.
+delivered_last() {
+    local dir="$ROOT/run/propolis-alert" t name best=0 st=1
+    DELIV_LAST=""
+    fits 5 || return 0
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        DELIV_LAST=0
+        return 0
+    fi
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+    # NUL-separated, so a name can never pass for a second entry with a time of its own choosing.
+    while IFS= read -r -d '' name; do
+        if [ "$name" = "status=0" ]; then
+            st=0
+            continue
+        fi
+        t="${name%% *}" name="${name#* }"
+        [[ $name =~ ^[A-Za-z0-9@._:-]{1,200}$ && $t =~ ^([0-9]{1,12})(\.[0-9]*)?$ ]] || continue
+        t="$((10#${BASH_REMATCH[1]}))"
+        [ "$t" -le "$best" ] || best="$t"
+    done < <(
+        timeout 5 find "$dir" -mindepth 1 -maxdepth 1 -type f -printf '%T@ %f\0' 2> /dev/null
+        printf 'status=%s\0' "$?"
+    )
+    # A listing that failed or was cut off says nothing.
+    [ "$st" = 0 ] || return 0
+    DELIV_LAST="$best"
+}
+
+# undelivered_count: how many of the legacy hook's undelivered files /run/propolis-alert holds (one
+# per unit, root-written by deploy/alert.sh, removed once that unit's alert goes out); nothing when
+# the directory cannot be listed or there is no time left to list it.
+undelivered_count() {
+    local dir="$ROOT/run/propolis-alert/undelivered" name list n=0
+    UNDELIV_N=""
+    fits 5 || return 0
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        UNDELIV_N=0
+        return 0
+    fi
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+    list="$(timeout 5 find "$dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' 2> /dev/null)" || return 0
+    while IFS= read -r name; do
+        [[ $name =~ ^[A-Za-z0-9@._:-]{1,200}$ ]] && n=$((n + 1))
+    done <<< "$list"
+    UNDELIV_N="$n"
+}
+
+# light_probes: everything the light pass's checks read, before the lock, in order: the database
+# first (light_pass runs it before the sample), then the daemon's last run while the database is
+# down, /ready, the journal classes, the failed failure hooks, the undelivered list and the
+# delivered stamps.
+light_probes() {
+    daemon_tie
+    ready_probe
+    jclass_read hook json _UID=0 SYSLOG_IDENTIFIER=propolis-alert
+    jclass_read guard cat _SYSTEMD_UNIT=propolis-logrotate.service _UID=0
+    jclass_read journald cat MESSAGE_ID=a596d6fe7bfa4994828e72309e95d61e _SYSTEMD_UNIT=systemd-journald.service _UID=0
+    alertunit_read
+    undelivered_count
+    delivered_last
+}
+
+# ---- the light pass's judgement of its probes -------------------------------------------------
+
+# rec_attrs KIND TIER STAGE CAUSE: the attributes of a kind the witness sees itself, with no unit.
+rec_attrs() {
+    PA_REC_KIND="$1" PA_REC_TIER="$2" PA_REC_STAGE="$3" PA_REC_CAUSE="$4"
+    PA_REC_INST=- PA_REC_NR=- PA_REC_OUT=- PA_REC_FLAG=""
+}
+
+# two_pass KEY SEEN HOLD: the rule of two passes for a condition the witness sees, with the
+# attributes in PA_REC_*. Seen (SEEN 1) with no record, or after a resolve, it is pending; seen on
+# the next pass too it opens, unless HOLD (the boot grace, a marker) keeps it pending; seen while
+# open it is a fresh reading (a change only when the cause's class moves). Not seen (SEEN 0, which
+# an unknown is too) a pending record is dropped, since the next sighting would not be the second
+# in a row, and an open one waits for its proof.
+two_pass() {
+    local key="$1" saw="$2" hold="$3" st=none
+    if pa_incident_get "$key"; then st="${PA_INC[7]}"; fi
+    if [ "$saw" = 1 ]; then
+        case "$st" in
+            none | resolved) pa_incident_transition "$key" pending && rec_set ;;
+            pending) [ -n "$hold" ] || { pa_incident_transition "$key" open && rec_set; } ;;
+            open | acked) pa_incident_transition "$key" change && rec_set ;;
+        esac
+    elif [ "$st" = pending ]; then
+        pa_incident_transition "$key" drop && rec_set
+    fi
+    return 0
+}
+
+# resolve_if KEY MET PROOF: an open or acked record of KEY resolves with PROOF when MET is 1.
+resolve_if() {
+    [ "$2" = 1 ] && pa_incident_get "$1" || return 0
+    case "${PA_INC[7]}" in
+        open | acked)
+            PA_REC_PROOF="$3"
+            pa_incident_transition "$1" resolve && rec_set
+            ;;
+    esac
+    return 0
+}
+
+# probe_counts: every check this pass ran, in its P line; three that could not tell in a row open
+# tool-unusable. CHECK_BAD names this pass's.
+probe_counts() {
+    local c
+    for c in "${!CHK_RESULT[@]}"; do
+        check_counts "$c" "${CHK_RESULT[$c]}" "${CHK_CAUSE[$c]}"
+        [ "${CHK_RESULT[$c]}" = ok ] || CHECK_BAD+=("$c")
+    done
+}
+
+DB_PARENT="" TIE_HOLD=0 MAINT_REASON=""
+
+# judge_db: db-unreachable (db:local or db:remote, PAGE) when the probe fails with a database cause
+# on two passes in a row, db-readonly (db:recovery, PAGE) when the database is a standby on two;
+# both resolve db2, two passes in a row on which it answered (writable, for db-readonly). Neither
+# opens in the first 900 s of uptime, while a database is still recovering from the boot, nor under
+# a maintenance marker of planned work (reason manual), which is how the operator says the database
+# is being worked on. tool.exec and config.invalid say nothing of the database: they open nothing
+# here, and count toward tool-unusable instead. Then, for the daemon's record: the open
+# db-unreachable record a tie may fold it under (DB_PARENT), and whether the tie holds.
+judge_db() {
+    local prev="" hold="" key k answered2=0 f2=0
+    DB_PARENT="" TIE_HOLD=0
+    [ "$DB_RESULT" != skip ] || return 0
+    IFS=$'\t' read -r _ prev _ <<< "${OBS_P[db]:-}"
+    case "$DB_RESULT" in
+        f) streak db ok ;;
+        t) streak db recovery ;;
+        down) streak db down ;;
+        *) unset 'OBS_P[db]' ;;
+    esac
+    case "$DB_RESULT:${prev:-}" in
+        f:ok | f:recovery | t:ok | t:recovery) answered2=1 ;;
+    esac
+    [ "$DB_RESULT:${prev:-}" != f:ok ] || f2=1
+    [ "$PA_UP" -ge 900 ] || hold=grace
+    if [ "$MAINT" = 1 ] && [ "$MAINT_REASON" = manual ]; then hold=maint; fi
+    key="db:$DB_WHERE"
+    for k in db:local db:remote; do
+        rec_attrs db-unreachable PAGE ledger "$DB_CAUSE"
+        if [ "$k" = "$key" ] && [ "$DB_RESULT" = down ]; then
+            two_pass "$k" 1 "$hold"
+        else
+            two_pass "$k" 0 ""
+            resolve_if "$k" "$answered2" db2
+        fi
+    done
+    rec_attrs db-readonly PAGE ledger db.recovery
+    if [ "$DB_RESULT" = t ]; then
+        two_pass db:recovery 1 "$hold"
+    else
+        two_pass db:recovery 0 ""
+        resolve_if db:recovery "$f2" db2
+    fi
+    # A probe that could not tell for six hours leaves every open database record unverifiable.
+    if [ "$DB_RESULT" = unknown ] && unknown_for pg; then
+        for k in db:local db:remote db:recovery; do flag_cannotverify "$k"; done
+    fi
+    if pa_incident_get "$key"; then
+        case "${PA_INC[7]}" in open | acked) DB_PARENT="${PA_INC[1]}" ;; esac
+    fi
+    if [ "$DB_RESULT" = down ] && [ "$TIE" = 1 ]; then TIE_HOLD=1; fi
+}
+
+# unknown_for CHECK: CHECK's P line has said it could not tell on 72 passes in a row, six hours
+# of light passes.
+unknown_for() {
+    local result consec
+    IFS=$'\t' read -r _ result _ consec _ <<< "${OBS_P[$1]:-}"
+    [ "${result:-ok}" != ok ] && [[ ${consec:-} =~ ^[0-9]{1,9}$ ]] && [ "$((10#$consec))" -ge 72 ]
+}
+
+# ready_unverified: /ready has been no proof input for six hours: it could not be asked or judged
+# (P ready), or it timed out on 72 passes in a row and on this one.
+ready_unverified() {
+    local code consec
+    unknown_for ready && return 0
+    [ "$READY_RESULT:$READY_CAUSE" = 000:net.timeout ] || return 1
+    IFS=$'\t' read -r _ code _ consec _ <<< "${OBS_P[ready-code]:-}"
+    [ "${code:-}" = 000 ] && [[ ${consec:-} =~ ^[0-9]{1,9}$ ]] && [ "$((10#$consec))" -ge 72 ]
+}
+
+# flag_cannotverify KEY: an open or acked record of KEY is flagged cannotverify, once: its proof's
+# input has been unknown for six hours. Unknown still resolves nothing.
+flag_cannotverify() {
+    pa_incident_get "$1" || return 0
+    case "${PA_INC[7]}" in open | acked) ;; *) return 0 ;; esac
+    case ",${PA_INC[30]}," in *,cannotverify,*) return 0 ;; esac
+    _pa_flag_add cannotverify
+    rec_set
+}
+
+# parent_gone ID SECONDS: the record with id ID resolved at least SECONDS ago, or is gone.
+parent_gone() {
+    local line id st rs a
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ id _ _ _ _ _ st _ _ _ _ _ _ _ _ _ _ _ _ _ rs _ <<< "$line"
+        [ "$id" = "$1" ] || continue
+        [ "$st" = resolved ] || return 1
+        a="$(pa_age "${rs:-}")"
+        [ "$a" -ge "$2" ]
+        return
+    done
+    return 0
+}
+
+# tie_fold KEY: the daemon's record folds under the open db-unreachable record (DB_PARENT), now or
+# already, and is the current record after. Status 1 while there is no open parent, or when it is
+# folded under another.
+tie_fold() {
+    [ -n "$DB_PARENT" ] && pa_incident_get "$1" || return 1
+    [ "${PA_INC[13]}" != "$DB_PARENT" ] || return 0
+    [ "${PA_INC[13]}" = - ] || return 1
+    pa_incident_fold "$1" "$DB_PARENT" || return 1
+    rec_set
+}
+
+# unfold_open: the current record, folded under a parent that resolved half an hour ago while it
+# is still failing, is its own incident again, and opens as one: what the parent's resolve said
+# for it is no longer true.
+unfold_open() {
+    PA_INC[13]=-
+    _pa_flag_drop folded
+    PA_INC[9]="$PA_STAMP" PA_INC[16]=open PA_INC[18]=0
+    _pa_counts && PA_INC[29]=$(($(_pa_num "${PA_INC[29]}") + 1))
+    _pa_schedule
+    rec_set
+}
+
+# daemon_up: the unit judged (unit_facts) is up and, for the daemon, ready: /ready answered 200,
+# or, where it cannot be asked (config.invalid), it has been up ten minutes.
+daemon_up() {
+    [ "$F_ACTIVE" = active ] || return 1
+    case "$READY_RESULT:$READY_CAUSE" in
+        200:*) return 0 ;;
+        *:config.invalid) [ "$F_UP" != - ] && [ "$F_UP" -ge 600 ] ;;
+        *) return 1 ;;
+    esac
+}
+
+# folded_pending UNIT KEY PREVUP HOLD: a first sighting folded under a parent (the daemon's under
+# db-unreachable) sends nothing while that parent is open, whatever the tie says meanwhile: a
+# journal read that lapses, or a database that answers once, does not make the outage two. Its
+# NRestarts are kept current, so restarts during the outage are not taken for a new failure after
+# it. Once the parent has resolved the child heals (dropped and counted) when it is up and ready
+# or meets the first-sighting rule, and opens as its own incident only when it is still not up
+# half an hour after the parent resolved (in v2 its message says it was folded under the parent).
+folded_pending() {
+    local u="$1" key="$2" prevup="$3" hold="$4" parent="${PA_INC[13]}" k judge
+    if ! parent_gone "$parent" 0; then
+        k="${PA_INC[30]:--}/${PA_INC[32]:--}"
+        [[ ! $F_NR =~ ^[0-9]{1,9}$ ]] || PA_INC[32]="$F_NR"
+        _pa_flag_add folded
+        [ "${PA_INC[30]:--}/${PA_INC[32]:--}" = "$k" ] || rec_set
+        return 0
+    fi
+    judge="$(pa_first_sighting "${PA_INC[32]:--}" "$F_NR" "$F_UP" "$prevup")"
+    if { [ "$u" = propolis.service ] && daemon_up; } || [ "$judge" = drop ]; then
+        HEALED=$((HEALED + 1))
+        pa_incident_transition "$key" drop && rec_set
+        return 0
+    fi
+    [ -z "$hold" ] && parent_gone "$parent" 1800 || return 0
+    PA_INC[13]=-
+    _pa_flag_drop folded
+    if [ "${PA_INC[11]}" = db.unreachable ]; then
+        sample_cause "$u"
+        PA_INC[11]="$C_CAUSE" PA_INC[12]="$PA_STAMP"
+    fi
+    rec_set || return 0
+    rec_open "$key" "" "" "" "" "$F_NR"
+}
+
+# unit_open UNIT KEY KIND TIER STAGE CAUSE NR: rec_open, except for the daemon while its failure is
+# the database's: the probe fails with a database cause and its last run logged that it could not
+# connect (TIE_HOLD). Its record then stays pending, with the database's cause, and folds under
+# db-unreachable once that opens, so the first word of the outage names the database and the
+# daemon's reserve slot is not spent on it. Not yet folded, it opens as usual the moment either
+# stops holding, then as an incident of its own, with systemd's cause; once folded, only
+# folded_pending decides, by its parent.
+unit_open() {
+    local u="$1" key="$2" out=- occ=1 had=0 cause="$6"
+    shift 2
+    if [ "$u" = propolis.service ] && [ "$TIE_HOLD" = 1 ]; then
+        if pa_incident_get "$key" && [ "${PA_INC[7]}" != resolved ]; then
+            had=1 out="${PA_INC[33]}" occ="${PA_INC[31]}"
+        fi
+        PA_REC_KIND=daemon-down PA_REC_TIER=PAGE PA_REC_STAGE=intake PA_REC_CAUSE=db.unreachable
+        PA_REC_NR="$5" PA_REC_INST="${IDS[$u]:--}" PA_REC_OUT=- PA_REC_FLAG=""
+        pa_incident_transition "$key" pending || return 0
+        if [ "$had" = 1 ]; then PA_INC[33]="$out" PA_INC[31]="$occ"; fi
+        rec_set || return 0
+        tie_fold "$key" || true
+        return 0
+    fi
+    if [ "$u" = propolis.service ] && pa_incident_get "$key" && [ "${PA_INC[7]}" != resolved ]; then
+        [ "${PA_INC[13]}" = - ] || return 0
+        if [ -z "$cause" ] && [ "${PA_INC[11]}" = db.unreachable ]; then
+            sample_cause "$u"
+            cause="$C_CAUSE"
+        fi
+    fi
+    rec_open "$key" "$1" "$2" "$3" "$cause" "$5"
+}
+
+DOBS="" DOBS_N=0 DCAUSE="" READY2=0
+
+# daemon_observe: what the daemon was seen to be on this pass, in its P line with how many passes
+# in a row: down (stopped, failed or waiting to restart; or up for half an hour without an answer
+# from its console, DCAUSE then the console's cause), activating (systemd still starting it),
+# starting (up under half an hour without an answer: migrations can take that long, and calling
+# it down invites a restart that makes things worse), degraded (503: its pool cannot reach a
+# database root can reach, or a subsystem gave up, in DCAUSE), dbcarried (503 while the probe
+# fails too: db-unreachable carries it), ok (200), off (disabled on purpose). READY2: /ready
+# answered 200 on this pass and on the one before, at least five minutes earlier. The timer starts
+# a pass five minutes after the last one started, and each stamp is whole seconds taken after a
+# start whose length varies, so two passes five minutes apart can be stamped 299 s apart: five
+# minutes is READY_GAP, ten seconds short of 300 and still far above any shorter gap.
+READY_GAP=290
+daemon_observe() {
+    local u=propolis.service prevs="" prevr=""
+    DOBS="" DOBS_N=0 DCAUSE="" READY2=0
+    IFS=$'\t' read -r prevs prevr _ <<< "${OBS_P[ready-code]:-}"
+    case "$READY_RESULT" in
+        200 | 000 | 503 | 503g) streak ready-code "$READY_RESULT" ;;
+        *) unset 'OBS_P[ready-code]' ;;
+    esac
+    if [ "$READY_RESULT" = 200 ] && [ "${prevr:-}" = 200 ] && _pa_stamp_split "${prevs:-}" \
+        && [ "$(pa_age "$prevs")" -ge "$READY_GAP" ]; then
+        READY2=1
+    fi
+    if [ "$SAMPLE_OK" != 1 ] || [ -z "${S_LOAD[$u]:-}" ] || [ "${S_LOAD[$u]}" = "?" ]; then
+        unset 'OBS_P[daemon]'
+        return 0
+    fi
+    case "${PA_ROLE:-}" in
+        collector | gateway)
+            unset 'OBS_P[daemon]'
+            return 0
+            ;;
+    esac
+    unit_facts "$u"
+    if [ "$F_DISABLED" = 1 ]; then
+        DOBS=off
+        unset 'OBS_P[daemon]'
+        return 0
+    fi
+    case "$F_ACTIVE" in
+        failed | inactive | restarting) DOBS=down ;;
+        starting) DOBS=activating ;;
+        *)
+            case "$READY_RESULT" in
+                200) DOBS=ok ;;
+                000)
+                    if [ "$F_UP" != - ] && [ "$F_UP" -ge 1800 ]; then DOBS=down DCAUSE="$READY_CAUSE"; else DOBS=starting; fi
+                    ;;
+                503g) DOBS=degraded DCAUSE=ready.gave_up ;;
+                503)
+                    if [ "$DB_RESULT" = down ]; then DOBS=dbcarried; else DOBS=degraded DCAUSE=ready.db; fi
+                    ;;
+                *) DOBS="" ;;
+            esac
+            ;;
+    esac
+    if [ -z "$DOBS" ]; then
+        unset 'OBS_P[daemon]'
+        return 0
+    fi
+    streak daemon "$DOBS"
+    DOBS_N="$STREAK_N"
+}
+
+# judge_degraded: daemon-degraded (ready:local, ACT) when the daemon is up and answers /ready 503
+# on two passes, unless the probe fails too (db-unreachable carries that). A 503 while root's probe
+# could not test the database (tool.exec, config.invalid, unknown) counts: the daemon's answer is
+# then the only word on the database. Not opened in the first ten minutes after a boot or under a
+# maintenance marker; resolved ready2, or disabled with the daemon.
+judge_degraded() {
+    local key=ready:local hold=""
+    [ "$PA_UP" -ge 600 ] || hold=grace
+    [ "$MAINT" = 0 ] || hold=maint
+    rec_attrs daemon-degraded ACT intake "${DCAUSE:-ready.db}"
+    case "$DOBS" in
+        degraded) two_pass "$key" 1 "$hold" ;;
+        ok)
+            two_pass "$key" 0 ""
+            resolve_if "$key" "$READY2" ready2
+            ;;
+        off)
+            two_pass "$key" 0 ""
+            resolve_if "$key" 1 disabled
+            ;;
+        *) two_pass "$key" 0 "" ;;
+    esac
+    if ready_unverified; then flag_cannotverify "$key"; fi
+}
+
+HOOK_A=0 HOOK_B=0 HOOK_C=0 HOOK_CAUSE=""
+
+# hook_counts: the legacy hook's lines this pass, from J_LINES[hook].
+hook_counts() {
+    local w c
+    HOOK_A=0 HOOK_B=0 HOOK_C=0 HOOK_CAUSE=""
+    [ "${J_RESULT[hook]:-}" = ok ] || return 0
+    while read -r w c _; do
+        case "$w" in
+            A) HOOK_A=$((HOOK_A + 1)) ;;
+            B) HOOK_B=$((HOOK_B + 1)) ;;
+            C) HOOK_C=$((HOOK_C + 1)) ;;
+            *) continue ;;
+        esac
+        case "$w:${c:-}" in
+            A:nocurl | A:net.connect | A:unknown | B:nocurl | B:net.connect | B:unknown) HOOK_CAUSE="$c" ;;
+        esac
+    done <<< "${J_LINES[hook]}"
+}
+
+# judge_alert_path: alert-path (alert:shell, PAGE) opens on first sight of a fact: the legacy hook
+# logged that it could not deliver an alert (cause from its reason: nocurl, net.connect or
+# unknown), or a failure hook failed (a failed propolis-alert@ instance whose failure is newer
+# than this key's last open or resolve; its own proc.* cause). It resolves sent2xx on a pass
+# whose reads all worked, on proof that an alert got through after the open (alert_delivered),
+# with none of the legacy hook's undelivered files left (it removes its file once that unit's
+# alert goes out) and no failure hook failed since the open. Nothing seen is never the proof: a
+# hook killed by its time limit writes no undelivered file, and a reboot empties /run. Proof of a
+# delivery holds across a reboot, and a failed hook listed now that failed before the open, in its
+# boot, is the failure the record already holds.
+judge_alert_path() {
+    local key=alert:shell cause="" st=none ref="" u
+    if pa_incident_get "$key"; then
+        st="${PA_INC[7]}"
+        case "$st" in
+            open | acked | pending) ref="${PA_INC[9]}" ;;
+            resolved) ref="${PA_INC[21]}" ;;
+        esac
+    fi
+    if [ "$((HOOK_A + HOOK_B))" -gt 0 ]; then cause="${HOOK_CAUSE:-unknown}"; fi
+    if [ "$AU_RESULT" = ok ]; then
+        for u in "${!AU_IEM[@]}"; do
+            # A failed state does not outlive a boot, so an instance failed in this one is newer
+            # than an open or resolve of another; within one boot the uptimes tell. A time that
+            # cannot be placed opens nothing.
+            if [ -n "$ref" ]; then
+                _pa_stamp_split "$ref" && [ "$_PA_B" != - ] && [ "$PA_BOOT" != - ] || continue
+                if [ "$_PA_B" = "$PA_BOOT" ]; then
+                    [ "${AU_IEM[$u]}" -gt "$((10#$_PA_U))" ] || continue
+                fi
+            fi
+            cause="${AU_CAUSE[$u]}"
+        done
+    fi
+    if [ -n "$cause" ]; then
+        rec_attrs alert-path PAGE alert "$cause"
+        case "$st" in
+            open | acked) pa_incident_transition "$key" change && rec_set ;;
+            *) pa_incident_transition "$key" open && rec_set ;;
+        esac
+        return 0
+    fi
+    case "$st" in open | acked) ;; *) return 0 ;; esac
+    [ "${J_RESULT[hook]:-}" = ok ] && [ "$AU_RESULT" = ok ] && [ "$UNDELIV_N" = 0 ] || return 0
+    ref="${PA_INC[9]}"
+    _pa_stamp_split "$ref" || return 0
+    for u in "${!AU_IEM[@]}"; do
+        # Listed now, so failed in this boot: older than the open only when the open is of this
+        # boot too and its uptime is later.
+        [ "$_PA_B" != - ] && [ "$_PA_B" = "$PA_BOOT" ] && [ "${AU_IEM[$u]}" -le "$((10#$_PA_U))" ] || return 0
+    done
+    alert_delivered "$ref" || return 0
+    pa_incident_get "$key" || return 0
+    PA_REC_PROOF=sent2xx
+    pa_incident_transition "$key" resolve && rec_set
+    return 0
+}
+
+# alert_delivered OPENED: an alert went out after stamp OPENED, by one of: the legacy hook's
+# delivered stamp for some unit (DELIV_LAST) dated after it on the wall clock; a failure hook's
+# record of a unit (unit:*) whose firing said delivered, or journal on a host with no push target,
+# and whose sighting (first seen, or a later onset) is after it; or, on a host with no push target,
+# a failure alert logged on this pass with no undelivered line beside it.
+alert_delivered() {
+    local opened="$1" ow line s
+    local -a f
+    _pa_stamp_split "$opened" || return 1
+    ow="$((10#$_PA_W))"
+    if [[ $DELIV_LAST =~ ^[0-9]{1,12}$ ]] && [ "$((10#$DELIV_LAST))" -gt "$ow" ]; then return 0; fi
+    if [ "${PA_TARGET:-0}" != 1 ] && [ "$HOOK_C" -gt 0 ] && [ "$((HOOK_A + HOOK_B))" = 0 ]; then return 0; fi
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r -a f <<< "$line"
+        [[ ${f[2]:-} == unit:* ]] || continue
+        case "${f[33]:-}" in delivered | journal) ;; *) continue ;; esac
+        for s in "${f[8]:-}" "${f[10]:-}"; do
+            _pa_stamp_split "$s" || continue
+            s="$(_pa_stamp_span "$opened" "$s")" || continue
+            [ "$s" -le 0 ] || return 0
+        done
+    done
+    return 1
+}
+
+declare -A JD_N=()
+
+# judge_journald: journal-dropped (journal:<unit>, NOTICE) on first sight of journald's notice that
+# it suppressed lines of one of the units this witness watches, named exactly; resolved quiet24, a
+# day with no such notice (the latest, OBS_P seen:<key>), judged only on passes whose read worked.
+# journald names the unit itself (`Suppressed <n> messages from sensor-ssh.service`) since its
+# client context rework in systemd 236, so on every supported host; older ones named the cgroup
+# path, whose last part is the unit, and that form is taken too.
+judge_journald() {
+    local line n u key a s
+    local re='^Suppressed ([0-9]{1,9}) messages from (/[A-Za-z0-9@._:/-]{0,300}/)?([A-Za-z0-9@._:-]{1,256})$'
+    local -A watched=()
+    [ "${J_RESULT[journald]:-}" = ok ] || return 0
+    for u in "${WITNESS_UNITS[@]}"; do watched[$u]=1; done
+    while IFS= read -r line; do
+        [[ $line =~ $re ]] || continue
+        n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[3]}"
+        [ -n "${watched[$u]:-}" ] || continue
+        JD_N[$u]=$(($(_pa_num "${JD_N[$u]:-}") + 10#$n))
+    done <<< "${J_LINES[journald]}"
+    for u in "${!JD_N[@]}"; do
+        key="journal:$u"
+        rec_attrs journal-dropped NOTICE host journal.suppressed
+        PA_REC_INST="${IDS[$u]:--}"
+        pa_incident_transition "$key" open && rec_set
+        OBS_P[seen:$key]="$PA_STAMP"$'\t'ok$'\t'-$'\t'1
+    done
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ <<< "$line"
+        [[ $key == journal:* ]] && [ -z "${JD_N[${key#journal:}]:-}" ] || continue
+        pa_incident_get "$key" || continue
+        case "${PA_INC[7]}" in open | acked) ;; *) continue ;; esac
+        IFS=$'\t' read -r s _ <<< "${OBS_P[seen:$key]:-}"
+        _pa_stamp_split "${s:-}" || s="${PA_INC[9]}"
+        a="$(pa_age "$s")"
+        if [ "$a" -ge 86400 ]; then
+            PA_REC_PROOF=quiet24
+            pa_incident_transition "$key" resolve && rec_set
+        fi
+    done
+    for key in "${!OBS_P[@]}"; do
+        [[ $key == seen:journal:* ]] || continue
+        if pa_incident_get "${key#seen:}"; then
+            case "${PA_INC[7]}" in open | acked) continue ;; esac
+        fi
+        unset 'OBS_P[$key]'
+    done
+}
+
+META_JLINES="" META_HB_SKIP=""
+JLINES_NEW=""
+
+# journal_tally: the counts the daily message and the walk read, added up in meta jlines:
+# undelivered (the legacy hook's two undelivered lines), journal (failure alerts that went only to
+# the journal: alerts logged with no undelivered line before them), guard (the rotation guard's
+# refusals and skips) and suppressed (journald's lines dropped from watched units). Each a count of
+# lines, never their text.
+journal_tally() {
+    local part k v line g=0 sup=0 jo
+    local -a parts=()
+    local -A t=([undelivered]=0 [journal]=0 [guard]=0 [suppressed]=0)
+    IFS=, read -r -a parts <<< "$META_JLINES"
+    for part in "${parts[@]}"; do
+        k="${part%%:*}" v="${part#*:}"
+        [ -n "${t[$k]+x}" ] || continue
+        t[$k]="$(_pa_num "$v")"
+    done
+    jo=$((HOOK_C - HOOK_A))
+    [ "$jo" -ge 0 ] || jo=0
+    if [ "${J_RESULT[guard]:-}" = ok ]; then
+        while IFS= read -r line; do [ -z "$line" ] || g=$((g + 1)); done <<< "${J_LINES[guard]}"
+    fi
+    for k in "${!JD_N[@]}"; do sup=$((sup + JD_N[$k])); done
+    t[undelivered]=$((t[undelivered] + HOOK_A + HOOK_B)) t[journal]=$((t[journal] + jo))
+    t[guard]=$((t[guard] + g)) t[suppressed]=$((t[suppressed] + sup))
+    for k in "${!t[@]}"; do [ "${t[$k]}" -le 999999999 ] || t[$k]=999999999; done
+    JLINES_NEW="undelivered:${t[undelivered]},journal:${t[journal]},guard:${t[guard]},suppressed:${t[suppressed]}"
+}
+
+# journal_restarts: a class whose read could not finish on two passes in a row starts again from
+# the last 15 minutes without its cursor (J_DROP), since the cursor may stand before a stretch it
+# can never get through; meta jskip says which, for the walk.
+JSKIP_NEW=""
+journal_restarts() {
+    local c consec
+    J_DROP=() JSKIP_NEW=""
+    for c in hook guard journald; do
+        [ "${J_RESULT[$c]:-}" = unknown ] || continue
+        IFS=$'\t' read -r _ _ _ consec _ <<< "${OBS_P[journal:$c]:-}"
+        [[ ${consec:-} =~ ^[0-9]{1,9}$ ]] && [ "$((10#$consec))" -ge 2 ] || continue
+        J_DROP+=("$c")
+        J_NEWCUR[$c]=""
+        [ "$((10#$consec))" != 2 ] || JSKIP_NEW+="${JSKIP_NEW:+,}$c"
+    done
+    [ -z "$JSKIP_NEW" ] || JSKIP_NEW="$PA_STAMP/$JSKIP_NEW"
+}
+
+# jcursor_write DIR CLASS CURSOR: CURSOR as DIR/CLASS, 0600, by pa_write; DIR made 0700 if missing.
+jcursor_write() {
+    { [ -d "$1" ] || mkdir -m 0700 -- "$1"; } 2> /dev/null || return 1
+    [ ! -L "$1" ] || return 1
+    pa_write "$1/$2" < <(printf '%s\n' "$3")
+}
+
+# jcursor_store KEPT: under the lock, each class's new cursor in the state directory when this
+# pass's state reached the disk, else in /run; the cursors of the classes that start again
+# removed. KEPT 0 (the pass judged nothing, or what it judged was not written) moves no cursor:
+# the next pass reads the same lines again, since a cursor past lines nobody judged loses them.
+jcursor_store() {
+    local c
+    if [ "$1" != 1 ]; then
+        J_NEWCUR=() J_DROP=()
+        return 0
+    fi
+    for c in "${!J_NEWCUR[@]}"; do
+        [ -n "${J_NEWCUR[$c]}" ] || continue
+        if [ "$WHERE" = persistent ] && jcursor_write "$PA_STATE/jcursor" "$c" "${J_NEWCUR[$c]}"; then
+            rm -f -- "$PA_RUN/jcursor/$c" 2> /dev/null || true
+        else
+            jcursor_write "$PA_RUN/jcursor" "$c" "${J_NEWCUR[$c]}" || true
+        fi
+    done
+    for c in "${J_DROP[@]}"; do
+        rm -f -- "$PA_STATE/jcursor/$c" "$PA_RUN/jcursor/$c" 2> /dev/null || true
+    done
+}
+
+# judge_probes: the probes' transitions, before any unit is judged: the database first, so the
+# daemon's record knows whether its failure is the database's.
+judge_probes() {
+    probe_counts
+    judge_db
+    daemon_observe
+    judge_degraded
+    hook_counts
+    judge_alert_path
+    judge_journald
+    journal_tally
+    journal_restarts
+}
+
+HB_GO=0 HB_WHY="" HB_SKIP_NEW="" HB_SKIP_FILE=""
+
+# hbskip_get: the skip a pass that could not write meta kept (a missed lock, or no state written),
+# `<stamp>/<reason>` in HB_SKIP_FILE: the newer of the copies in /run and in the state directory,
+# a stamp dated ahead of the clock counting as newest. A file that is a link, or not in that form,
+# is not read.
+hbskip_get() {
+    local f v
+    HB_SKIP_FILE=""
+    for f in "$PA_RUN/hbskip" "$PA_STATE/hbskip"; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        v="$(timeout 5 head -c 100 -- "$f" 2> /dev/null)" || continue
+        v="${v%$'\n'}"
+        [[ $v =~ ^[0-9]{1,12}/[0-9a-f-]{1,8}/[0-9]{1,10}/[a-z][a-z0-9._-]{0,31}$ ]] || continue
+        HB_SKIP_FILE="$(hb_newer "$HB_SKIP_FILE" "$v")"
+    done
+    return 0
+}
+
+# hbskip_put VALUE: keeps a skip outside the locked state, 0600, in /run beside the heartbeat, or
+# in the state directory when /run refuses it; only with a heartbeat URL to skip.
+hbskip_put() {
+    [ "${PA_HB_STATE:-unset}" = set ] || return 0
+    pa_write "$PA_RUN/hbskip" < <(printf '%s\n' "$1") && return 0
+    pa_write "$PA_STATE/hbskip" < <(printf '%s\n' "$1") || true
+}
+
+# hbskip_clear: the kept skip, once meta holds it.
+hbskip_clear() {
+    rm -f -- "$PA_RUN/hbskip" "$PA_STATE/hbskip" 2> /dev/null || true
+}
+
+# hb_newer A B: the newer of two `<stamp>/<reason>` values (either may be empty), one dated ahead
+# of the clock counting as newest.
+hb_newer() {
+    local a b
+    if [ -z "$1" ] || [ -z "$2" ]; then
+        printf '%s' "${1:-$2}"
+        return 0
+    fi
+    a="$(pa_age "${1%/*}")" b="$(pa_age "${2%/*}")"
+    if [ "$a" -lt 0 ] || { [ "$b" -ge 0 ] && [ "$a" -le "$b" ]; }; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+
+# hb_gate: whether the heartbeat URL is asked after this pass (HB_GO 1), else why not (HB_WHY,
+# and in HB_SKIP_NEW the stamp and reason meta hb_skip keeps, from which 30 clean minutes count):
+# insecure (not an https URL: refused, never requested), core (systemd could not be asked, or no
+# state could be written; a pass that missed the lock is core too, and like one that wrote no
+# state it keeps its skip with hbskip_put), alert-path (an alert path that is open: the dead-man
+# check is then the one word that still gets out), pending (a transition waiting over 15
+# minutes), check (a check that could not tell on this pass and has no open tool-unusable record,
+# or a pass the deadline cut short) or clean30 (the last skip for any of those under 30 minutes
+# ago). A standing limitation
+# that is already recorded does not skip it, or the operator's dead-man check would fire every day
+# until they deleted it. Skipping is the signal: nothing else is sent.
+hb_gate() {
+    HB_GO=0 HB_WHY="" HB_SKIP_NEW=""
+    case "${PA_HB_STATE:-unset}" in
+        set) hb_why ;;
+        insecure | invalid) HB_WHY=insecure ;;
+        *) return 0 ;;
+    esac
+    if [ -n "$HB_WHY" ]; then
+        HB_SKIP_NEW="$PA_STAMP/$HB_WHY"
+        return 0
+    fi
+    # The ping resumes only after 30 minutes clean, counted from the newer of meta's last skip and
+    # the one a pass that could not write meta kept beside it. A last skip whose time cannot be
+    # read, or lies ahead of the clock, is never in the past: the 30 minutes count from now.
+    local last a
+    last="$(hb_newer "$META_HB_SKIP" "$HB_SKIP_FILE")"
+    if [ -n "$last" ]; then
+        a="$(pa_age "${last%/*}")"
+        if [ "$a" -lt 0 ]; then
+            HB_WHY=clean30 HB_SKIP_NEW="$PA_STAMP/clean30"
+            return 0
+        fi
+        if [ "$a" -lt 1800 ]; then
+            HB_WHY=clean30
+            return 0
+        fi
+    fi
+    HB_GO=1
+}
+
+# hb_why: sets HB_WHY to the first rule of hb_gate this pass breaks, or leaves it empty.
+hb_why() {
+    local c line a ptx ps
+    if [ "$SAMPLE_OK" != 1 ] || [ "$WHERE" = none ]; then
+        HB_WHY=core
+        return 0
+    fi
+    if pa_incident_get alert:shell; then
+        case "${PA_INC[7]}" in
+            open | acked)
+                HB_WHY="alert-path"
+                return 0
+                ;;
+        esac
+    fi
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ ptx ps _ <<< "$line"
+        [ "${ptx:--}" != - ] || continue
+        a="$(pa_age "${ps:-}")"
+        if [ "$a" -lt 0 ] || [ "$a" -gt 900 ]; then
+            HB_WHY=pending
+            return 0
+        fi
+    done
+    if [ "$DEADLINE_CUT" = 1 ]; then
+        HB_WHY=check
+        return 0
+    fi
+    for c in "${CHECK_BAD[@]}"; do
+        if pa_incident_get "tool:$c"; then
+            case "${PA_INC[7]}" in open | acked) continue ;; esac
+        fi
+        HB_WHY=check
+        return 0
+    done
+}
+
+# hb_send: the heartbeat URL's GET, after the pass and without the lock, then its result in meta
+# hb_last (a stamp and a closed word, never the URL) under the lock for at most 10 s.
+hb_send() {
+    local rc=0
+    pa_heartbeat_get || note "heartbeat URL request failed ($PA_HB_RESULT)"
+    pa_lock 10 || rc=$?
+    if [ "$rc" = 0 ]; then
+        _pa_meta_set hb_last "$PA_STAMP/$PA_HB_RESULT" || true
+        pa_unlock
+    fi
+    return 0
+}
+
 # ---- one pass -------------------------------------------------------------------------------
 
-META_CC_LAST="" META_MAINT_SEEN="" META_CC_FAIL=""
+META_CC_LAST="" META_MAINT_SEEN="" META_CC_FAIL="" DEADLINE_CUT=0 PROBES_JUDGED=0
 
 # past_deadline: the pass has used the time it may judge for (WITNESS_DEADLINE).
 past_deadline() {
@@ -1948,8 +3347,11 @@ light_pass() {
     local -a meta=()
     pa_settings_load
     PA_ROLE="$(pa_role)"
-    if pa_maint_active; then MAINT=1; fi
+    if pa_maint_active; then MAINT=1 MAINT_REASON="$PA_MAINT_REASON"; fi
+    # The database first: whether it answers decides how the daemon's failure is recorded.
+    db_probe
     collect_sample
+    light_probes
     rc_collect 0
 
     rc=0
@@ -1964,8 +3366,10 @@ light_pass() {
             # Nothing this host writes can be kept while no lock can be had: the banner says so.
             WHERE=none PA_WHERE=none
         fi
-        # The heartbeat is not a locked state file; pa_write keeps its rewrite whole.
+        # The heartbeat is not a locked state file; pa_write keeps its rewrite whole. Nor is the
+        # kept skip: without it the next clean pass would ping at once, not 30 minutes on.
         write_heartbeat partial
+        hbskip_put "$PA_STAMP/core"
         pa_banner_write || note "banner not written: /run/motd.d is missing or refused the write"
         return 0
     fi
@@ -1982,14 +3386,24 @@ light_pass() {
             hourly_last) hourly="$v" ;;
             healed) healed="$v" ;;
             maint_seen) META_MAINT_SEEN="$v" ;;
+            jlines) META_JLINES="$v" ;;
+            hb_skip) META_HB_SKIP="$v" ;;
         esac
     done < <(pa_state_read meta)
+    hbskip_get
     pa_incident_load
     load_observe
     sweep_stale
     load_ids
     ingest_spool
     rc_store
+    if past_deadline; then
+        status=partial
+    else
+        judge_probes
+        PROBES_JUDGED=1
+    fi
+    [ "${#CHECK_BAD[@]}" = 0 ] || status=partial
 
     if [ "$SAMPLE_OK" = 1 ]; then
         check_counts units ok -
@@ -2016,7 +3430,9 @@ light_pass() {
         pa_incident_prune
         [ "$n" = "${#_PA_INC_I[@]}/${#_PA_INC_REST[@]}" ] || CHANGED=1
     fi
+    if past_deadline; then DEADLINE_CUT=1; fi
 
+    ok=1
     if [ "$CHANGED" = 1 ]; then
         ok=0
         pa_incident_write && ok=1
@@ -2025,6 +3441,13 @@ light_pass() {
     fi
     observe_body | pa_state_write observe
     where_merge
+    # The cursors follow only lines that were judged and whose result was kept.
+    if [ "$PROBES_JUDGED" = 1 ] && [ "$ok" = 1 ] && [ "$WHERE" != none ]; then
+        jcursor_store 1
+    else
+        jcursor_store 0
+    fi
+    hb_gate
     # The restarts that healed are counted, never opened: the total and the latest.
     meta=(light_last "$PA_STAMP" where "${WHERE:-none}")
     if [ "$HEALED" -gt 0 ]; then
@@ -2033,15 +3456,34 @@ light_pass() {
     fi
     # When a maintenance marker was last seen, for the ten minutes it still holds (maint_recent).
     [ "$MAINT" = 0 ] || meta+=(maint_seen "$PA_STAMP")
+    [ -z "$JLINES_NEW" ] || [ "$JLINES_NEW" = "$META_JLINES" ] || meta+=(jlines "$JLINES_NEW")
+    [ -z "$JSKIP_NEW" ] || meta+=(jskip "$JSKIP_NEW")
+    # A skip kept beside the state by a pass that could not write meta moves into meta here.
+    v="$(hb_newer "${HB_SKIP_NEW:-$META_HB_SKIP}" "$HB_SKIP_FILE")"
+    [ -z "$v" ] || [ "$v" = "$META_HB_SKIP" ] || meta+=(hb_skip "$v")
+    # Whether this daemon binary carries pg-exec's guard, by its inode, size and mtime, so the
+    # next pass need not read it again.
+    case "$DB_GUARD" in
+        0 | 1) [ -z "$DB_BIN_ID" ] || meta+=(pgexec_id "$DB_BIN_ID" pgexec_ok "$DB_GUARD") ;;
+    esac
     _pa_meta_set "${meta[@]}"
     where_merge
-    [ "$WHERE" != none ] || status=partial
+    if [ "$WHERE" = none ]; then
+        status=partial HB_GO=0
+        hbskip_put "$PA_STAMP/core"
+    elif [ -n "$HB_SKIP_FILE" ]; then
+        hbskip_clear
+    fi
     write_heartbeat "$status"
     pa_unlock
     [ "$WHERE" != none ] || note "state not persisted: neither /var/lib/propolis/witness nor /run/propolis-witness took a write"
+    if [ "$HB_WHY" = insecure ] && [ "${META_HB_SKIP#*/*/*/}" != insecure ]; then
+        note "heartbeat URL not requested: PROPOLIS_WITNESS_HEARTBEAT_URL is not a valid https:// URL"
+    fi
 
     PA_WHERE="$WHERE"
     pa_banner_write || note "banner not written: /run/motd.d is missing or refused the write"
+    [ "$HB_GO" = 0 ] || hb_send
     return 0
 }
 

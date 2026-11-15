@@ -1953,7 +1953,16 @@ fn exit_codes_follow_the_table() {
     );
     let r = old.walk();
     assert_eq!(r.code, 70, "an older library: {}", r.err);
-    assert!(r.err.contains("older than version 5"), "{}", r.err);
+    let needs = std::fs::read_to_string(SCRIPT)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("# needs-alert-lib: ").map(str::to_string))
+        .unwrap();
+    assert!(
+        r.err.contains(&format!("older than version {needs}")),
+        "{}",
+        r.err
+    );
     let missing = Fx::single();
     std::fs::remove_file(missing.p("usr/local/sbin/propolis-alert-lib")).unwrap();
     let r = missing.walk();
@@ -3434,8 +3443,8 @@ fn after_a_witness_pass_the_records_are_listed_open_with_tier_and_next_reminder(
     assert!(fx.walk().out.contains("OPEN    no incident record yet"));
 }
 
-/// ALERTS line 3: when the light and hourly passes last completed, where state lands, and when
-/// the banner was written.
+/// ALERTS line 3: when the light and hourly passes last completed, where state lands, when the
+/// banner was written, and once a light pass has run whether the heartbeat URL is set.
 #[test]
 fn the_third_alerts_line_names_the_light_pass_the_state_and_the_banner() {
     let fx = Fx::single();
@@ -3451,7 +3460,7 @@ fn the_third_alerts_line_names_the_light_pass_the_state_and_the_banner() {
     let r = fx.walk();
     assert!(
         r.out.contains(
-            "        witness light 07:55:00 (5 min) - hourly never - state persisted - banner 07:55:00\n"
+            "        witness light 07:55:00 (5 min) - hourly never - state persisted - banner 07:55:00 - heartbeat URL not set\n"
         ),
         "{}",
         r.out
@@ -3467,11 +3476,123 @@ fn the_third_alerts_line_names_the_light_pass_the_state_and_the_banner() {
     let r = fx.walk();
     assert!(
         r.out.contains(
-            "        witness light 07:55:00 (5 min) - hourly 07:30:00 (30 min) - state persisted - banner 07:55:00\n"
+            "        witness light 07:55:00 (5 min) - hourly 07:30:00 (30 min) - state persisted - banner 07:55:00 - heartbeat URL not set\n"
         ),
         "{}",
         r.out
     );
+}
+
+/// What the light pass's probes leave for the walk: the heartbeat URL's state with its last
+/// request or skip on ALERTS line 3, never the URL itself (a URL that is not https reads
+/// refused); an open alert-path fails the alert rail; an open tool-unusable warns on the host rail
+/// with the check it names; and a journal class that started again without its cursor is noted on
+/// the witness rail.
+#[test]
+fn the_walk_shows_the_heartbeat_url_alert_path_tool_unusable_and_skipped_journal_lines() {
+    let fx = Fx::single();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/hb-s3cret\n",
+    );
+    fx.witness_ran(300);
+    let s = stamp_ago(300);
+    let meta = format!(
+        "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{s}\nM\thb_last\t{}/ok\n",
+        stamp_ago(600)
+    );
+    fx.write("var/lib/propolis/witness/meta", &meta);
+    let r = fx.walk();
+    assert!(
+        r.out
+            .contains(" - heartbeat URL set, asked 07:50:00 (ok)\n"),
+        "{}",
+        r.out
+    );
+    assert_eq!(r.code, 0, "{}", r.out);
+
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("{meta}M\thb_skip\t{s}/check\nM\tjskip\t{s}/guard\n"),
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=2\nN\t3\n{}{}",
+            set_field(
+                &set_field(
+                    &record(
+                        "w#1",
+                        "alert:shell",
+                        "alert",
+                        "PAGE",
+                        "open",
+                        NOW - 300,
+                        "nocurl",
+                        "-"
+                    ),
+                    3,
+                    "alert-path"
+                ),
+                9,
+                &s
+            ),
+            set_field(
+                &set_field(
+                    &record(
+                        "w#2",
+                        "tool:pg",
+                        "host",
+                        "NOTICE",
+                        "open",
+                        NOW - 300,
+                        "tool.exec",
+                        "-"
+                    ),
+                    3,
+                    "tool-unusable"
+                ),
+                9,
+                &s
+            )
+        ),
+    );
+    let r = fx.walk();
+    assert!(
+        r.out
+            .contains(" - heartbeat URL set, skipped 07:55:00 (check)\n"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("hb-s3cret"), "{}", r.out);
+    assert_eq!(r.state("alert"), "FAIL", "{}", r.out);
+    assert!(r.row("alert").contains("alert-path open"), "{}", r.out);
+    assert_eq!(r.state("host"), "WARN", "{}", r.out);
+    assert!(
+        r.row("host").contains("a check cannot run: pg"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.row("witness")
+            .contains("journal class guard: lines may have been skipped (07:55:00)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(r.code, 2, "{}", r.out);
+
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=http://hc.example.invalid/ping/hb-s3cret\n",
+    );
+    let r = fx.walk();
+    assert!(
+        r.out
+            .contains(" - heartbeat URL refused (not an https URL)\n"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("hb-s3cret"), "{}", r.out);
 }
 
 /// The witness rail: FAIL when the light timer is not active, when the light pass is older than

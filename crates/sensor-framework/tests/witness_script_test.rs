@@ -1,6 +1,7 @@
 //! Runs `deploy/witness.sh light` (the witness's light pass) under a scratch root with
 //! `PROPOLIS_ALERT_ROOT` and a fixed `PROPOLIS_WITNESS_NOW`, with stub `systemctl`, `journalctl`,
-//! `logger`, `curl` and `setpriv` on `PATH`, the real `flock`, and the shipped alert library
+//! `logger`, `curl`, `setpriv`, `id`, `ss` and `sync` on `PATH`, the real `flock`, and the shipped
+//! alert library
 //! installed under the root. Each pass is given the time it runs at, so the light passes of a
 //! case are five minutes apart in the library's clock however fast the test runs.
 //!
@@ -51,18 +52,105 @@ case "$1" in
             if [ -f "$UNITS/$u" ]; then cat "$UNITS/$u"; else printf 'LoadState=not-found\nActiveState=inactive\n'; fi
         done
         ;;
+    list-units)
+        f="${UNITS%/units}/failed-alert-units"
+        [ ! -f "$f" ] || cat "$f"
+        ;;
     *) exit 1 ;;
 esac
 "#;
 
 /// Records its argv and prints `$JOURNAL_FILE` when it is set. With `LOCK_PROBE` set to the lock
-/// file it also records whether the state lock was free while it ran.
+/// file it also records whether the state lock was free while it ran. Each read of the light
+/// pass is told apart by its matches (hook, guard, journald, daemon for the daemon's runs): it
+/// prints `journal.<class>` beside the units when there is one, logs the cursor it was handed,
+/// copies `journal.<class>.cursor` into its cursor file as journalctl writes its last cursor,
+/// and exits with `journal.<class>.rc` when there is one (124: what `timeout` returns). A run of
+/// the daemon named in `journal.daemon.fresh` has logged nothing yet: a read narrowed to that
+/// invocation id prints nothing.
 const JOURNALCTL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'journalctl %s\n' "$*" >> "$STUB_LOG"
 if [ -n "${LOCK_PROBE:-}" ]; then
     if flock -n "$LOCK_PROBE" true; then echo 'journalctl lock free' >> "$STUB_LOG"; else echo 'journalctl lock held' >> "$STUB_LOG"; fi
 fi
+d="${UNITS%/units}"
+class="" cf=""
+case " $* " in
+    *" SYSLOG_IDENTIFIER=propolis-alert "*) class=hook ;;
+    *" MESSAGE_ID="*) class=journald ;;
+    *" _SYSTEMD_UNIT=propolis.service "*) class=daemon ;;
+    *"_SYSTEMD_INVOCATION_ID="*) class=run ;;
+    *" _SYSTEMD_UNIT=propolis-logrotate.service "*) class=guard ;;
+esac
+for a in "$@"; do
+    case "$a" in --cursor-file=*) cf="${a#--cursor-file=}" ;; esac
+done
+if [ "$class" = daemon ] && [ -f "$d/journal.daemon.fresh" ] \
+    && [[ " $* " == *" _SYSTEMD_INVOCATION_ID=$(cat "$d/journal.daemon.fresh") "* ]]; then
+    class=fresh
+fi
+if [ -n "$cf" ] && [ -f "$cf" ]; then printf 'journalctl %s cursor %s\n' "$class" "$(cat "$cf")" >> "$STUB_LOG"; fi
 [ -z "${JOURNAL_FILE:-}" ] || cat "$JOURNAL_FILE"
+[ -z "$class" ] || [ ! -f "$d/journal.$class" ] || cat "$d/journal.$class"
+if [ -n "$cf" ] && [ -f "$d/journal.$class.cursor" ]; then cat "$d/journal.$class.cursor" > "$cf"; fi
+[ -z "$class" ] || [ ! -f "$d/journal.$class.rc" ] || exit "$(cat "$d/journal.$class.rc")"
+exit 0
+"#;
+
+/// `id`: records its argv; the uid of an account the case named in `uid.<name>` beside the units
+/// (`none`: no such account), else the real `id`.
+const ID_STUB: &str = r#"#!/usr/bin/env bash
+d="${UNITS%/units}"
+name="${!#}"
+printf 'id %s\n' "$*" >> "$STUB_LOG"
+if [ "${1:-}" = -u ] && [ -f "$d/uid.$name" ]; then
+    [ "$(cat "$d/uid.$name")" != none ] || exit 1
+    cat "$d/uid.$name"
+    exit 0
+fi
+exec /usr/bin/id "$@"
+"#;
+
+/// `ss`: records its argv; prints `ss.out` beside the units when there is one (empty: nothing
+/// listens), else one listener on the port asked about, on every address of both families (as
+/// ss shows a dual-stack wildcard socket), held by pid 4242 (every unit's MainPID in the
+/// fixture) under uid 998.
+const SS_STUB: &str = r#"#!/usr/bin/env bash
+d="${UNITS%/units}"
+printf 'ss %s\n' "$*" >> "$STUB_LOG"
+if [ -f "$d/ss.out" ]; then cat "$d/ss.out"; exit 0; fi
+port="${*##*sport = :}"
+port="${port%% *}"
+printf 'LISTEN 0      4096       *:%s      *:*    users:(("propolis",pid=4242,fd=9)) uid:998 ino:31337 sk:1 <->\n' "$port"
+"#;
+
+/// `sync`: fails, as a disk that refuses writes does, for a path that matches a glob listed in
+/// `disk.refuses` beside the units; otherwise the real `sync`.
+const SYNC_STUB: &str = r#"#!/usr/bin/env bash
+d="${UNITS%/units}"
+if [ -f "$d/disk.refuses" ]; then
+    while IFS= read -r glob; do
+        for a in "$@"; do
+            [[ $a != $glob ]] || exit 1
+        done
+    done < "$d/disk.refuses"
+fi
+exec /usr/bin/sync "$@"
+"#;
+
+/// The daemon binary, as far as pg-exec goes: it carries pg-exec's guard string, records its
+/// argv, and answers from `pg.answer` beside the units (`exit status|stdout|stderr`, `0|f|`
+/// without one).
+const PROPOLIS_STUB: &str = r#"#!/usr/bin/env bash
+# propolis pg-exec: DATABASE_URL is not set
+d="${UNITS%/units}"
+printf 'propolis %s\n' "$*" >> "$STUB_LOG"
+answer='0|f|'
+[ ! -f "$d/pg.answer" ] || answer="$(cat "$d/pg.answer")"
+IFS='|' read -r rc out err <<< "$answer"
+[ -z "$err" ] || printf '%s\n' "$err" >&2
+[ -z "$out" ] || printf '%s\n' "$out"
+exit "$rc"
 "#;
 
 /// The real `head`, and once, right after it has read `$RACE_SPOOL` (or the copy a pass claimed
@@ -92,20 +180,44 @@ const LOGGER_STUB: &str = r#"#!/usr/bin/env bash
 printf 'logger %s\n' "$*" >> "$STUB_LOG"
 "#;
 
-/// The witness pushes nothing; its only requests are the read check's GETs. Records its argv in
-/// the stub log and its environment in `curl.env`; with no `curl.answer` beside the units it
-/// fails as an unreachable server does, and with one (`code|content type`) it answers every GET
-/// with that, an empty body, in the `-w` form asked for.
+/// The witness pushes nothing; its requests that leave the host are the read check's GETs and the
+/// heartbeat URL's. Records the argv of those in the stub log as `curl ...`, its environment in
+/// `curl.env` and the config file it was handed in `curl.conf`; with no `curl.answer` beside the
+/// units it fails as an unreachable server does, and with one (`code|content type`) it answers
+/// every GET with that, an empty body, in the `-w` form asked for, and the mode of the config file
+/// goes to `curl.confmode`. The GET of the daemon's `/ready` on loopback is logged apart, as
+/// `ready <url>` and its argv as `ready-argv ...`, and answered from `ready.code` (200 without
+/// one; 000 fails as a closed port does, 000t as a request that timed out) and `ready.body`.
 const CURL_STUB: &str = r#"#!/usr/bin/env bash
-printf 'curl %s\n' "$*" >> "$STUB_LOG"
 d="${UNITS%/units}"
-env | sed 's/^/curl-env /' >> "$d/curl.env"
-[ -f "$d/curl.answer" ] || exit 7
-out=""
+args="$*"
+out="" conf="" url=""
 while [ "$#" -gt 0 ]; do
-    case "$1" in -o) out="$2"; shift ;; esac
+    case "$1" in
+        -o) out="$2"; shift ;;
+        -K) conf="$2"; shift ;;
+        http://* | https://*) url="$1" ;;
+    esac
     shift
 done
+case "$url" in
+    */ready)
+        printf 'ready %s\n' "$url" >> "$STUB_LOG"
+        printf 'ready-argv %s\n' "$args" >> "$STUB_LOG"
+        code=200
+        [ ! -f "$d/ready.code" ] || code="$(cat "$d/ready.code")"
+        if [ "$code" = 000 ]; then printf '000'; exit 7; fi
+        if [ "$code" = 000t ]; then printf '000'; exit 28; fi
+        if [ -f "$d/ready.body" ]; then cat "$d/ready.body" > "$out"; else printf '{"status":"ok"}' > "$out"; fi
+        printf '%s' "$code"
+        exit 0
+        ;;
+esac
+printf 'curl %s\n' "$args" >> "$STUB_LOG"
+env | sed 's/^/curl-env /' >> "$d/curl.env"
+[ -z "$conf" ] || cat "$conf" >> "$d/curl.conf"
+[ -z "$conf" ] || stat -c %a "$conf" > "$d/curl.confmode"
+[ -f "$d/curl.answer" ] || exit 7
 : > "$out"
 IFS='|' read -r code ct < "$d/curl.answer"
 printf '%s\t%s' "$code" "$ct"
@@ -126,6 +238,14 @@ exit "$rc"
 
 /// The read-check binding of the fixture's target (https://ntfy.example.invalid, t0p1c-secret).
 const FX_BINDING: &str = "8f24b729c8ebd3c1";
+
+/// The daemon's database URL in the cases that give it one; its password must never reach a
+/// command line.
+const DB_URL: &str = "postgres://propolis:db-s3cret@127.0.0.1:5432/propolis";
+
+/// What psql says through pg-exec when the server refuses the connection.
+const PG_REFUSED: &str =
+    "2||psql: error: connection to server at \"127.0.0.1\", port 5432 failed: Connection refused";
 
 const SETPRIV_STUB: &str = r#"#!/usr/bin/env bash
 printf 'setpriv %s\n' "$*" >> "$STUB_LOG"
@@ -208,6 +328,9 @@ impl Fx {
             ("logger", LOGGER_STUB),
             ("curl", CURL_STUB),
             ("setpriv", SETPRIV_STUB),
+            ("id", ID_STUB),
+            ("ss", SS_STUB),
+            ("sync", SYNC_STUB),
         ] {
             write_exec(&bin.join(name), body);
         }
@@ -335,6 +458,7 @@ impl Fx {
             ("UnitFileState", "enabled"),
             ("InvocationID", INVOCATION),
             ("Restart", "always"),
+            ("MainPID", "4242"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -375,6 +499,7 @@ impl Fx {
             .env_remove("PA_LOCK_FD")
             .env_remove("PA_CLEANUP")
             .env_remove("PROPOLIS_WITNESS_LOCK_WAIT")
+            .env_remove("DATABASE_URL")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -461,6 +586,36 @@ impl Fx {
 
     fn curl_env(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("curl.env")).unwrap_or_default()
+    }
+
+    /// A file beside the units, where the stubs read what to answer.
+    fn stub_file(&self, name: &str, body: &str) {
+        std::fs::write(self.dir.path().join(name), body).unwrap();
+    }
+
+    /// A database for the daemon: DATABASE_URL in propolis.env (with the push target), the daemon
+    /// binary's stub installed where pg-exec runs from, and what psql answers through it
+    /// (`exit status|stdout|stderr`).
+    fn database(&self, answer: &str) {
+        self.write(
+            "etc/propolis/propolis.env",
+            &format!(
+                "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+                 DATABASE_URL={DB_URL}\n"
+            ),
+        );
+        write_exec(&self.p("usr/local/bin/propolis"), PROPOLIS_STUB);
+        std::fs::set_permissions(
+            self.p("usr/local/bin"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        self.stub_file("pg.answer", answer);
+    }
+
+    /// The `propolis` account, uid 998, as `id` reports it.
+    fn daemon_account(&self) {
+        self.stub_file("uid.propolis", "998\n");
     }
 
     fn observe_text(&self) -> String {
@@ -4378,4 +4533,2148 @@ fn a_stored_shell_line_for_a_target_both_roles_share_is_checked_again_as_both() 
         )],
         "{rc}"
     );
+}
+
+// ---- the light pass's probes ------------------------------------------------------------------
+
+/// The daemon's own journal line for a database it cannot reach, as journald keeps it.
+const CONNECT_LINE: &str = "2026-11-15T08:00:00.000000Z ERROR propolis: failed to connect to PostgreSQL error=pool timed out\n";
+
+/// What `systemctl show` says of a daemon that failed and waits to be restarted.
+fn restarting_daemon(fx: &Fx) {
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "activating"),
+            ("SubState", "auto-restart"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+            ("Restart", "on-failure"),
+            ("NRestarts", "1"),
+        ],
+    );
+}
+
+/// The stub log from now on only: what one pass does.
+fn clear_log(fx: &Fx) {
+    std::fs::write(&fx.log, b"").unwrap();
+}
+
+/// Every file under the root's alerting directories, with its text.
+fn state_text(fx: &Fx) -> String {
+    let mut out = String::new();
+    for p in fx.state_files() {
+        out.push_str(&String::from_utf8_lossy(
+            &std::fs::read(&p).unwrap_or_default(),
+        ));
+    }
+    out
+}
+
+/// A database outage reaches the daemon first: the failure hook records the daemon's failure
+/// before any pass has seen the database fail. The probe runs before the units are judged, and
+/// while it fails with a database cause and the daemon's last run logged that it could not
+/// connect (read by that run's own fields), the daemon's record waits pending with the
+/// database's cause, then folds under db-unreachable when that opens on the second pass: one
+/// PAGE, on the ledger stage. A folded child sends nothing while its parent is open, even once
+/// the database answers again; a daemon still restarting half an hour after db-unreachable
+/// resolved opens as an incident of its own with systemd's cause, and not before.
+#[test]
+fn a_daemon_failure_the_hook_saw_first_waits_for_db_unreachable_and_folds_under_it() {
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    restarting_daemon(&fx);
+    fx.hook_fires("propolis.service", 0);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "pending");
+
+    clear_log(&fx);
+    fx.pass(300);
+    let log = fx.log();
+    let probe = log.find("propolis pg-exec").expect(&log);
+    let sample = log.find("systemctl show").expect(&log);
+    assert!(probe < sample, "the probe runs first:\n{log}");
+    assert!(
+        log.contains(&format!(
+            "_SYSTEMD_UNIT=propolis.service _UID=998 _SYSTEMD_INVOCATION_ID={INVOCATION}"
+        )),
+        "{log}"
+    );
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(
+        (db[7].as_str(), db[11].as_str()),
+        ("pending", "db.unreachable")
+    );
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[3].as_str(), d[7].as_str(), d[11].as_str(), d[13].as_str()),
+        ("daemon-down", "pending", "db.unreachable", "-")
+    );
+
+    fx.pass(600);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(
+        (
+            db[3].as_str(),
+            db[4].as_str(),
+            db[6].as_str(),
+            db[7].as_str(),
+            db[29].as_str()
+        ),
+        ("db-unreachable", "ledger", "PAGE", "open", "1")
+    );
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((d[7].as_str(), d[13].as_str()), ("pending", db[1].as_str()));
+    assert!(d[30].split(',').any(|f| f == "folded"), "{}", d[30]);
+    assert_eq!(d[29], "0", "the daemon's record sends nothing of its own");
+    let log = fx.log();
+    assert!(
+        !log.contains("db-s3cret"),
+        "the database URL on a command line:\n{log}"
+    );
+    assert!(
+        !state_text(&fx).contains("Connection refused"),
+        "psql's words kept"
+    );
+
+    fx.stub_file("pg.answer", "0|f|");
+    fx.pass(900);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[13].as_str(), d[29].as_str()),
+        ("pending", db[1].as_str(), "0"),
+        "folded while its parent is open"
+    );
+    assert_eq!(
+        fx.record("db:local").unwrap()[7],
+        "open",
+        "one answer is not two"
+    );
+    fx.pass(1200);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!((db[7].as_str(), db[22].as_str()), ("resolved", "db2"));
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "pending");
+    fx.pass(1200 + 1500);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[29].as_str()),
+        ("pending", "0"),
+        "not before half an hour"
+    );
+    fx.pass(1200 + 1800);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (
+            d[7].as_str(),
+            d[11].as_str(),
+            d[13].as_str(),
+            d[29].as_str()
+        ),
+        ("open", "proc.exit:1", "-", "1")
+    );
+    assert!(!d[30].split(',').any(|f| f == "folded"), "{}", d[30]);
+}
+
+/// The daemon's crash loop in a fresh attempt: while it tries to connect it is active under a new
+/// invocation id that has logged nothing yet. The tie reads its last completed run instead, the
+/// newest connect or start line in the daemon's own journal, so its failure still waits for
+/// db-unreachable and folds under it with nothing sent of its own.
+#[test]
+fn a_daemon_failure_in_a_fresh_attempt_folds_under_db_unreachable_by_its_last_completed_run() {
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.daemon_account();
+    fx.stub_file(
+        "journal.daemon",
+        &format!(
+            "2026-11-15T07:59:00.000000Z INFO propolis: starting unified daemon\n{CONNECT_LINE}"
+        ),
+    );
+    fx.stub_file("journal.daemon.fresh", INVOCATION);
+    fx.stub_file("ss.out", "");
+    fx.stub_file("ready.code", "000");
+    let attempt = |fx: &Fx, t: u64, nr: u64| {
+        fx.unit(
+            "propolis.service",
+            &[
+                ("Restart", "on-failure"),
+                ("NRestarts", &nr.to_string()),
+                ("ActiveEnterTimestampMonotonic", &entered(t, 3)),
+            ],
+        );
+    };
+    attempt(&fx, 0, 1);
+    fx.hook_fires("propolis.service", 0);
+    attempt(&fx, 300, 9);
+    fx.pass(300);
+    assert!(
+        fx.log()
+            .contains("_SYSTEMD_UNIT=propolis.service _UID=998 --since=-15min"),
+        "{}",
+        fx.log()
+    );
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[11].as_str(), d[29].as_str()),
+        ("pending", "db.unreachable", "0")
+    );
+    attempt(&fx, 600, 17);
+    fx.pass(600);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(db[7], "open");
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[13].as_str(), d[29].as_str()),
+        ("pending", db[1].as_str(), "0")
+    );
+    assert!(d[30].split(',').any(|f| f == "folded"), "{}", d[30]);
+
+    // A start line newer than the connect line: the last run connected, so there is no tie.
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.daemon_account();
+    fx.stub_file(
+        "journal.daemon",
+        &format!(
+            "{CONNECT_LINE}2026-11-15T08:01:00.000000Z INFO propolis: starting unified daemon\n"
+        ),
+    );
+    fx.stub_file("journal.daemon.fresh", INVOCATION);
+    fx.stub_file("ss.out", "");
+    attempt(&fx, 0, 1);
+    fx.hook_fires("propolis.service", 0);
+    attempt(&fx, 300, 9);
+    fx.pass(300);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((d[7].as_str(), d[13].as_str()), ("open", "-"));
+}
+
+/// A folded daemon-down waits for its parent whatever the tie says meanwhile: a journal read that
+/// lapses mid-outage leaves it pending and folded. Once the database answers and the daemon is
+/// ready again it opens nothing, and when db-unreachable resolves the record is dropped as a
+/// healed restart.
+#[test]
+fn a_folded_daemon_down_stays_pending_while_its_parent_is_open_and_heals_once_it_resolves() {
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    restarting_daemon(&fx);
+    fx.hook_fires("propolis.service", 0);
+    fx.pass(300);
+    fx.pass(600);
+    let db = fx.record("db:local").unwrap();
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((d[7].as_str(), d[13].as_str()), ("pending", db[1].as_str()));
+
+    fx.stub_file("journal.daemon", "");
+    fx.pass(900);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[13].as_str(), d[29].as_str()),
+        ("pending", db[1].as_str(), "0"),
+        "the tie lapsed while the parent is open"
+    );
+    assert_eq!(fx.record("db:local").unwrap()[7], "open");
+
+    fx.stub_file("pg.answer", "0|f|");
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            ("NRestarts", "5"),
+            ("ActiveEnterTimestampMonotonic", &entered(1200, 60)),
+        ],
+    );
+    fx.pass(1200);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((d[7].as_str(), d[29].as_str()), ("pending", "0"));
+    fx.pass(1500);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!((db[7].as_str(), db[22].as_str()), ("resolved", "db2"));
+    assert!(
+        fx.record("unit:propolis.service").is_none(),
+        "{:?}",
+        fx.records()
+    );
+    assert!(
+        fx.meta("healed").unwrap_or_default().starts_with("1/"),
+        "{:?}",
+        fx.meta("healed")
+    );
+}
+
+/// A daemon-down that opened before its parent and folded under it by the late-parent rule
+/// becomes its own incident again, counted once more, when it is still failing half an hour
+/// after db-unreachable resolved, and not before.
+#[test]
+fn a_folded_open_daemon_down_still_failing_half_an_hour_after_its_parent_resolves_opens_on_its_own()
+{
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    fx.stub_file("pg.answer", PG_REFUSED);
+    fx.pass(600);
+    fx.pass(900);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[13], db[1]);
+    fx.stub_file("pg.answer", "0|f|");
+    fx.pass(1200);
+    fx.pass(1500);
+    assert_eq!(fx.record("db:local").unwrap()[7], "resolved");
+    fx.pass(1500 + 1500);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((d[13].as_str(), d[29].as_str()), (db[1].as_str(), "1"));
+    fx.pass(1500 + 1800);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[13].as_str(), d[29].as_str()),
+        ("open", "-", "2")
+    );
+}
+
+/// A folded daemon-down is not made its own incident again while the daemon runs: one that is up
+/// but answers /ready 503 half an hour after db-unreachable resolved is daemon-degraded's to
+/// report, and the folded record stays as it is.
+#[test]
+fn a_folded_open_daemon_down_whose_daemon_runs_again_is_not_reopened_on_its_own() {
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    fx.stub_file("pg.answer", PG_REFUSED);
+    fx.pass(600);
+    fx.pass(900);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[13], db[1]);
+    fx.stub_file("pg.answer", "0|f|");
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            ("NRestarts", "1"),
+            ("ActiveEnterTimestampMonotonic", &entered(1200, 30)),
+        ],
+    );
+    fx.stub_file("ready.code", "503");
+    fx.pass(1200);
+    fx.pass(1500);
+    assert_eq!(fx.record("db:local").unwrap()[7], "resolved");
+    fx.pass(1500 + 1800);
+    fx.pass(1500 + 2100);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[13].as_str(), d[29].as_str()),
+        ("open", db[1].as_str(), "1"),
+        "{d:?}"
+    );
+}
+
+/// The late-parent rule holds for a daemon caught in a fresh attempt too: an open daemon-down
+/// whose daemon is active again for a few seconds, between two failed connects, still takes
+/// db-unreachable as its parent, with the database's cause, and counts nothing more.
+#[test]
+fn an_open_daemon_down_in_a_fresh_attempt_still_takes_db_unreachable_as_its_late_parent() {
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.daemon_account();
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((d[7].as_str(), d[29].as_str()), ("open", "1"));
+    fx.stub_file("pg.answer", PG_REFUSED);
+    fx.stub_file(
+        "journal.daemon",
+        &format!(
+            "2026-11-15T07:59:00.000000Z INFO propolis: starting unified daemon\n{CONNECT_LINE}"
+        ),
+    );
+    fx.stub_file("journal.daemon.fresh", INVOCATION);
+    fx.stub_file("ss.out", "");
+    fx.stub_file("ready.code", "000");
+    for (t, restarts) in [(600u64, 9u64), (900, 17)] {
+        fx.unit(
+            "propolis.service",
+            &[
+                ("Restart", "on-failure"),
+                ("NRestarts", &restarts.to_string()),
+                ("ActiveEnterTimestampMonotonic", &entered(t, 3)),
+            ],
+        );
+        fx.pass(t);
+    }
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(db[7], "open");
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (
+            d[7].as_str(),
+            d[11].as_str(),
+            d[13].as_str(),
+            d[29].as_str()
+        ),
+        ("open", "db.unreachable", db[1].as_str(), "1"),
+        "{d:?}"
+    );
+}
+
+/// A daemon-down that opened before the database was seen to fail takes db-unreachable as its
+/// parent once that opens, with the database's cause: no change is counted for it, and no
+/// reminder of its own comes due.
+#[test]
+fn a_daemon_down_already_open_takes_db_unreachable_as_its_late_parent_and_counts_nothing_more() {
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (d[7].as_str(), d[11].as_str(), d[29].as_str()),
+        ("open", "proc.exit:1", "1")
+    );
+    fx.stub_file("pg.answer", PG_REFUSED);
+    fx.pass(600);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[13], "-");
+    fx.pass(900);
+    let db = fx.record("db:local").unwrap();
+    assert_eq!(db[7], "open");
+    let d = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (
+            d[7].as_str(),
+            d[11].as_str(),
+            d[13].as_str(),
+            d[19].as_str(),
+            d[29].as_str()
+        ),
+        ("open", "db.unreachable", db[1].as_str(), "-", "1")
+    );
+    fx.pass(900 + 3600);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[29], "1");
+}
+
+/// /ready 503 while root's probe reaches the database is daemon-degraded (ACT, cause ready.db)
+/// after two passes, and two ready answers five minutes apart resolve it; `"gave_up"` in the body
+/// makes the cause ready.gave_up. A 503 while the probe fails too opens nothing new:
+/// db-unreachable carries it. A 503 while the probe cannot run at all (tool.exec) still opens
+/// daemon-degraded, since the daemon's answer is then the only word on the database, and the
+/// probe's tool.exec never opens db-unreachable: three of them open tool-unusable.
+#[test]
+fn a_ready_503_opens_daemon_degraded_unless_the_probe_fails_too_and_counts_when_the_probe_cannot_run()
+ {
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.stub_file("ready.code", "503");
+    fx.stub_file("ready.body", "{\"status\":\"unavailable\"}");
+    fx.pass(0);
+    assert_eq!(fx.record("ready:local").unwrap()[7], "pending");
+    fx.pass(300);
+    let f = fx.record("ready:local").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        ("daemon-degraded", "intake", "ACT", "open", "ready.db", "1")
+    );
+    assert!(
+        fx.log().contains("ready http://127.0.0.1:8080/ready"),
+        "{}",
+        fx.log()
+    );
+    fx.stub_file("ready.code", "200");
+    fx.pass(600);
+    assert_eq!(fx.record("ready:local").unwrap()[7], "open");
+    fx.pass(900);
+    let f = fx.record("ready:local").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "ready2"));
+
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.stub_file("ready.code", "503");
+    fx.stub_file(
+        "ready.body",
+        "{\"status\":\"unavailable\",\"gave_up\":[\"review\"]}",
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("ready:local").unwrap()[11], "ready.gave_up");
+
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.stub_file("ready.code", "503");
+    fx.pass(0);
+    fx.pass(300);
+    assert!(fx.record("ready:local").is_none());
+    assert_eq!(fx.record("db:local").unwrap()[7], "open");
+
+    let fx = Fx::new();
+    fx.database("127||propolis pg-exec: cannot run psql: No such file or directory");
+    fx.stub_file("ready.code", "503");
+    fx.pass(0);
+    fx.pass(300);
+    let f = fx.record("ready:local").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "ready.db"));
+    fx.pass(600);
+    assert!(fx.record("db:local").is_none());
+    let t = fx.record("tool:pg").unwrap();
+    assert_eq!(
+        (t[3].as_str(), t[6].as_str(), t[7].as_str(), t[11].as_str()),
+        ("tool-unusable", "NOTICE", "open", "tool.exec")
+    );
+}
+
+/// A daemon up for half an hour whose console does not answer /ready is down (cause
+/// net.connect) on the second such pass, and daemon-down resolves only on two ready answers five
+/// minutes apart (ready2), not on ten quiet minutes of running. One up for under half an hour is
+/// still starting: nothing opens.
+#[test]
+fn a_daemon_up_half_an_hour_without_a_ready_answer_is_down_and_resolves_only_by_ready_twice() {
+    let fx = Fx::new();
+    fx.stub_file("ready.code", "000");
+    fx.pass(0);
+    assert!(fx.record("unit:propolis.service").is_none());
+    fx.pass(300);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[7].as_str(), f[11].as_str(), f[29].as_str()),
+        ("daemon-down", "open", "net.connect", "1")
+    );
+    fx.pass(1200);
+    assert_eq!(
+        fx.record("unit:propolis.service").unwrap()[7],
+        "open",
+        "running is not ready"
+    );
+    fx.stub_file("ready.code", "200");
+    fx.pass(1500);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "open");
+    fx.pass(1800);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "ready2"));
+
+    let fx = Fx::new();
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            ("ActiveEnterTimestampMonotonic", &entered(0, 600)),
+        ],
+    );
+    fx.stub_file("ready.code", "000");
+    fx.pass(0);
+    fx.pass(300);
+    assert!(
+        fx.record("unit:propolis.service").is_none(),
+        "{:?}",
+        fx.records()
+    );
+}
+
+/// The database kinds wait out the first fifteen minutes of uptime, when a database is still
+/// recovering from the boot, and a maintenance marker of planned work (reason manual); an
+/// upgrade's marker does not hold them.
+#[test]
+fn db_unreachable_waits_out_fifteen_minutes_of_uptime_and_a_manual_marker() {
+    let mut fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.setenv("PROPOLIS_WITNESS_NOW", &early(0));
+    fx.pass(0);
+    fx.setenv("PROPOLIS_WITNESS_NOW", &early(250));
+    fx.pass(250);
+    assert_eq!(fx.record("db:local").unwrap()[7], "pending");
+    fx.setenv("PROPOLIS_WITNESS_NOW", &early(400));
+    fx.pass(400);
+    assert_eq!(fx.record("db:local").unwrap()[7], "open");
+
+    for (reason, state) in [("manual", "pending"), ("upgrade", "open")] {
+        let fx = Fx::new();
+        fx.database(PG_REFUSED);
+        fx.write(
+            "run/propolis-witness/maintenance",
+            &format!(
+                "#maintenance v1 g=1\nX\t{}\t{BOOT}\t{reason}\n",
+                WALL + 3600
+            ),
+        );
+        fx.pass(0);
+        fx.pass(300);
+        assert_eq!(fx.record("db:local").unwrap()[7], state, "{reason}");
+    }
+}
+
+/// The address the daemon's console binds is asked on loopback only: 0.0.0.0 as 127.0.0.1, [::]
+/// as [::1], and any other address is not asked at all, the check reading unknown (a partial
+/// pass) instead.
+#[test]
+fn ready_is_asked_only_on_a_loopback_address_and_any_other_reads_unknown() {
+    let fx = Fx::new();
+    for (bind, asked) in [
+        ("0.0.0.0:9090", Some("http://127.0.0.1:9090/ready")),
+        ("[::]:8080", Some("http://[::1]:8080/ready")),
+        ("192.0.2.10:8080", None),
+        ("127.0.0.256:8080", None),
+    ] {
+        fx.write(
+            "etc/propolis/propolis.env",
+            &format!(
+                "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\nPROPOLIS_CONSOLE_BIND={bind}\n"
+            ),
+        );
+        clear_log(&fx);
+        fx.pass(0);
+        let log = fx.log();
+        match asked {
+            Some(url) => assert!(log.contains(&format!("ready {url}\n")), "{bind}: {log}"),
+            None => {
+                assert!(!log.contains("ready "), "{bind}: {log}");
+                assert!(
+                    fx.observe_text().contains("P\tready\t")
+                        && fx.observe_text().contains("\tunknown\tconfig.invalid\t"),
+                    "{}",
+                    fx.observe_text()
+                );
+                assert!(
+                    fx.read("run/propolis-witness/heartbeat")
+                        .contains("\tpartial")
+                );
+            }
+        }
+    }
+}
+
+/// The heartbeat URL (alert.env over propolis.env) is asked once after a clean pass, through a
+/// curl config file, never on a command line, in curl's environment or in any state file, and its
+/// result is kept as a stamp and a word. A pass whose core failed skips it, and it resumes only
+/// after 30 clean minutes; an open alert-path and a transition pending over 15 minutes skip it too;
+/// a URL that is not https is never asked.
+#[test]
+fn the_heartbeat_url_is_skipped_under_each_gate_rule_and_resumes_after_thirty_clean_minutes() {
+    let mut fx = Fx::new();
+    let secret = "hb-s3cret-0123";
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_WITNESS_HEARTBEAT_URL=http://hc.example.invalid/plain\n",
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        &format!("PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/{secret}\n"),
+    );
+    fx.curl_answers("200|text/plain");
+    let pings = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    fx.pass(0);
+    assert_eq!(pings(&fx), 1, "{}", fx.log());
+    assert_eq!(
+        fx.meta("hb_last").as_deref(),
+        Some(format!("{}/ok", stamp(0)).as_str())
+    );
+    let conf = std::fs::read_to_string(fx.dir.path().join("curl.conf")).unwrap();
+    assert!(
+        conf.contains(&format!("https://hc.example.invalid/ping/{secret}")),
+        "{conf}"
+    );
+    assert!(!fx.log().contains(secret), "{}", fx.log());
+    assert!(!fx.curl_env().contains(secret));
+    assert!(!state_text(&fx).contains(secret));
+    let ping = fx
+        .log()
+        .lines()
+        .find(|l| l.starts_with("curl "))
+        .unwrap()
+        .to_string();
+    assert!(ping.starts_with("curl -q -K "), "{ping}");
+    assert!(
+        ping.contains("--proto =https") && ping.contains("--max-redirs 0"),
+        "{ping}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.path().join("curl.confmode"))
+            .unwrap()
+            .trim(),
+        "600"
+    );
+
+    fx.setenv("SYSTEMCTL_FAIL", "1");
+    fx.pass(300);
+    assert_eq!(pings(&fx), 1);
+    assert_eq!(
+        fx.meta("hb_skip").as_deref(),
+        Some(format!("{}/core", stamp(300)).as_str())
+    );
+    fx.env.clear();
+    fx.pass(1800);
+    assert_eq!(pings(&fx), 1, "30 clean minutes have not passed");
+    fx.pass(2100);
+    assert_eq!(pings(&fx), 2);
+
+    let open = with_field(
+        &with_field(
+            &with_field(
+                &hook_record("w#1", "propolis.service", "PAGE", "open", 2000, "-"),
+                2,
+                "alert:shell",
+            ),
+            3,
+            "alert-path",
+        ),
+        4,
+        "alert",
+    );
+    fx.incidents(&[open]);
+    // The alert the hook could not deliver is still waiting, so the path is still broken.
+    fx.write(
+        "run/propolis-alert/undelivered/sensor-ssh.service",
+        "1800000000 1 1800000000\n",
+    );
+    fx.pass(2400);
+    assert_eq!(pings(&fx), 2);
+    assert_eq!(
+        fx.meta("hb_skip").as_deref(),
+        Some(format!("{}/alert-path", stamp(2400)).as_str())
+    );
+
+    let waiting = with_field(
+        &with_field(
+            &hook_record("w#2", "sensor-ssh.service", "PAGE", "open", 2400, "0"),
+            26,
+            "open",
+        ),
+        27,
+        &stamp(2400),
+    );
+    fx.incidents(&[waiting]);
+    fx.pass(2400 + 1200);
+    assert_eq!(pings(&fx), 2);
+    assert_eq!(
+        fx.meta("hb_skip").as_deref(),
+        Some(format!("{}/pending", stamp(3600)).as_str())
+    );
+
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=http://hc.example.invalid/ping\n",
+    );
+    fx.curl_answers("200|text/plain");
+    fx.pass(0);
+    assert_eq!(pings(&fx), 0);
+    assert!(
+        fx.log().contains("heartbeat URL not requested"),
+        "{}",
+        fx.log()
+    );
+}
+
+/// On a host where psql cannot run (a PGDG layout the unit does not grant), the probe is
+/// tool.exec on every pass: the ping is skipped while that is a check error nobody has recorded,
+/// and once tool-unusable records it the ping resumes after 30 clean minutes, so the operator's
+/// dead-man check does not fire every day for a known limitation.
+#[test]
+fn a_standing_tool_exec_stops_skipping_the_ping_once_tool_unusable_is_open() {
+    let fx = Fx::new();
+    fx.database("127||propolis pg-exec: cannot run psql: No such file or directory");
+    let mut env = fx.read("etc/propolis/propolis.env");
+    env.push_str("PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/abc\n");
+    fx.write("etc/propolis/propolis.env", &env);
+    fx.curl_answers("200|text/plain");
+    let pings = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    for t in [0, 300, 600] {
+        fx.pass(t);
+    }
+    assert_eq!(fx.record("tool:pg").unwrap()[7], "open");
+    assert_eq!(pings(&fx), 0);
+    assert_eq!(
+        fx.meta("hb_skip").as_deref(),
+        Some(format!("{}/check", stamp(300)).as_str())
+    );
+    fx.pass(1800);
+    assert_eq!(pings(&fx), 0);
+    fx.pass(2100);
+    assert_eq!(pings(&fx), 1);
+}
+
+/// A journal class reads to the end of its entries and keeps only the lines that carry a pattern
+/// before it cuts anything, so a flood of 2 MiB of other lines from the same unit neither hides a
+/// guard line past the first MiB nor holds its cursor back; the cursor journalctl leaves is kept
+/// 0600 and handed back on the next pass. A read cut off by its time limit is unknown, leaves the
+/// cursor where it was, starts again without it on the second cut in a row (the walk is told), and
+/// on the third opens tool-unusable. No line of it is kept anywhere.
+#[test]
+fn a_journal_class_finds_its_line_past_a_flood_keeps_its_cursor_and_a_cut_read_is_unknown() {
+    let fx = Fx::new();
+    let mut flood = String::with_capacity(2_200_000);
+    while flood.len() < 2 * 1024 * 1024 {
+        flood.push_str("propolis-logrotate: rotating /var/log/propolis/sensor.log as planned\n");
+    }
+    flood.push_str(
+        "propolis-logrotate-guard: skipping rotation of /var/log/propolis/ssh.log: reader behind\n",
+    );
+    fx.stub_file("journal.guard", &flood);
+    let cursor = "s=0123456789abcdef0123456789abcdef;i=1f;b=fedcba9876543210fedcba9876543210;m=2a;t=5e1;x=9c";
+    fx.stub_file("journal.guard.cursor", &format!("{cursor}\n"));
+    fx.pass(0);
+    assert!(
+        fx.meta("jlines").unwrap_or_default().contains("guard:1"),
+        "{:?}",
+        fx.meta("jlines")
+    );
+    let kept = fx.p("var/lib/propolis/witness/jcursor/guard");
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        format!("{cursor}\n")
+    );
+    assert_eq!(mode_of(&kept), 0o600);
+    fx.pass(300);
+    assert!(
+        fx.log()
+            .contains(&format!("journalctl guard cursor {cursor}")),
+        "{}",
+        fx.log()
+    );
+    assert!(fx.meta("jlines").unwrap_or_default().contains("guard:2"));
+    assert!(fx.read("run/propolis-witness/heartbeat").contains("\tok"));
+
+    fx.stub_file("journal.guard.rc", "124");
+    fx.stub_file("journal.guard.cursor", "s=ffff;i=1\n");
+    fx.pass(600);
+    assert!(
+        fx.read("run/propolis-witness/heartbeat")
+            .contains("\tpartial")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&kept).unwrap(),
+        format!("{cursor}\n")
+    );
+    fx.pass(900);
+    assert!(
+        !kept.exists(),
+        "the second cut in a row starts the class again"
+    );
+    assert_eq!(
+        fx.meta("jskip").as_deref(),
+        Some(format!("{}/guard", stamp(900)).as_str())
+    );
+    fx.pass(1200);
+    assert_eq!(fx.record("tool:journal:guard").unwrap()[7], "open");
+    assert!(!state_text(&fx).contains("rotating /var/log"));
+}
+
+/// The hook class keeps an entry only when journald's own _SYSTEMD_UNIT field names a failure
+/// hook, and matches only the first line of its message: an alert the hook logged in full counts
+/// as one failure alert however its quoted journal lines read, and a line in the same words from
+/// another unit, or a field name inside a message, counts as nothing. The legacy hook's own
+/// undelivered line opens alert-path (PAGE) at once, cause from its reason, and it resolves once
+/// its undelivered file is gone, no such line comes, and an alert went out after the open.
+#[test]
+fn the_hook_class_reads_the_unit_from_each_entry_and_only_the_hooks_own_line_opens_alert_path() {
+    let fx = Fx::new();
+    let body = "{\"__CURSOR\":\"s=2\",\"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\",\
+        \"MESSAGE\":\"sensor-ssh.service entered the failed state on h at t.\\n\\nLast journal lines:\\n\
+        x could not post to ntfy; alert follows\\n{\\\"_SYSTEMD_UNIT\\\":\\\"propolis-alert@x\\\",\
+        \\\"MESSAGE\\\":\\\"y; alert follows\\\"}\"}\n";
+    let other = "{\"__CURSOR\":\"s=3\",\"_SYSTEMD_UNIT\":\"sensor-ssh.service\",\
+        \"MESSAGE\":\"could not post to ntfy; alert follows\"}\n";
+    let inner = "{\"__CURSOR\":\"s=4\",\"_SYSTEMD_UNIT\":\"sensor-http.service\",\
+        \"MESSAGE\":\"x\\\",\\\"_SYSTEMD_UNIT\\\":\\\"propolis-alert@y\\\",\\\"MESSAGE\\\":\\\"could not post to ntfy; alert follows\"}\n";
+    fx.stub_file("journal.hook", &format!("{body}{other}{inner}"));
+    fx.pass(0);
+    assert!(fx.record("alert:shell").is_none(), "{:?}", fx.records());
+    assert_eq!(
+        fx.meta("jlines").as_deref(),
+        Some("undelivered:0,journal:1,guard:0,suppressed:0")
+    );
+    assert!(
+        fx.log()
+            .contains("-o json --output-fields=_SYSTEMD_UNIT,MESSAGE"),
+        "{}",
+        fx.log()
+    );
+
+    let real = "{\"__CURSOR\":\"s=5\",\"MESSAGE\":\"curl is not installed, so this host cannot push alerts; install it; alert follows\",\
+        \"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\"}\n";
+    fx.stub_file("journal.hook", real);
+    fx.write(
+        "run/propolis-alert/undelivered/sensor-ssh.service",
+        "1800000000 1 1800000000\n",
+    );
+    fx.pass(300);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        ("alert-path", "alert", "PAGE", "open", "nocurl", "1")
+    );
+    fx.stub_file("journal.hook", "");
+    fx.pass(600);
+    assert_eq!(
+        fx.record("alert:shell").unwrap()[7],
+        "open",
+        "its file is still there"
+    );
+    std::fs::remove_file(fx.p("run/propolis-alert/undelivered/sensor-ssh.service")).unwrap();
+    fx.pass(900);
+    assert_eq!(
+        fx.record("alert:shell").unwrap()[7],
+        "open",
+        "a file gone is not an alert delivered"
+    );
+    delivered_at(&fx, "sensor-ssh.service", 1000);
+    fx.pass(1200);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "sent2xx"));
+}
+
+/// The legacy hook's delivered stamp for `unit` (`/run/propolis-alert/<unit>`, which
+/// deploy/alert.sh touches when an alert goes out), dated at time `t`.
+fn delivered_at(fx: &Fx, unit: &str, t: u64) {
+    let rel = format!("run/propolis-alert/{unit}");
+    fx.write(&rel, "");
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(WALL + t);
+    std::fs::File::options()
+        .write(true)
+        .open(fx.p(&rel))
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// An alert-path record (PAGE, the alert rail) opened at stamp `s`.
+fn alert_path_record(s: &str) -> String {
+    let r = with_field(
+        &with_field(
+            &with_field(
+                &hook_record_at("w#1", "propolis.service", "PAGE", "open", s, "-"),
+                2,
+                "alert:shell",
+            ),
+            3,
+            "alert-path",
+        ),
+        4,
+        "alert",
+    );
+    with_field(&r, 11, "nocurl")
+}
+
+/// alert-path resolves on an alert delivered after its open, across a reboot too (a reboot empties
+/// /run, which alone proves nothing, but a delivery after it does), and a failure hook that failed
+/// before the open and was never reset does not hold the resolve back.
+#[test]
+fn alert_path_resolves_on_a_delivery_after_its_open_across_a_boot_and_past_an_older_failed_hook() {
+    let fx = Fx::new();
+    fx.incidents(&[alert_path_record("1799990000/12345678/5000")]);
+    fx.pass(0);
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "open", "no delivery");
+    delivered_at(&fx, "sensor-ssh.service", 100);
+    fx.pass(300);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "sent2xx"));
+
+    let fx = Fx::new();
+    let hook = "propolis-alert@sensor-ssh.service.service";
+    fx.stub_file(
+        "failed-alert-units",
+        &format!("{hook} loaded failed failed Propolis alert\n"),
+    );
+    fx.unit(
+        hook,
+        &[
+            ("ActiveState", "failed"),
+            ("Result", "timeout"),
+            ("InactiveEnterTimestampMonotonic", &entered(0, 60)),
+        ],
+    );
+    fx.incidents(&[alert_path_record(&stamp(0))]);
+    delivered_at(&fx, "sensor-ssh.service", 100);
+    fx.pass(300);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "sent2xx"));
+
+    // A failure hook that failed after the open still holds it.
+    let fx = Fx::new();
+    fx.stub_file(
+        "failed-alert-units",
+        &format!("{hook} loaded failed failed Propolis alert\n"),
+    );
+    fx.unit(
+        hook,
+        &[
+            ("ActiveState", "failed"),
+            ("Result", "timeout"),
+            ("InactiveEnterTimestampMonotonic", &entered(0, 60)),
+        ],
+    );
+    fx.incidents(&[alert_path_record(
+        &stamp(0).replace(&format!("/{UP}"), &format!("/{}", UP - 120)),
+    )]);
+    delivered_at(&fx, "sensor-ssh.service", 100);
+    fx.pass(300);
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "open");
+}
+
+/// alert-path never resolves on absence: opened by a failure hook that timed out, then reset, with
+/// no undelivered line, no undelivered file and no delivery, it stays open; a hook firing that
+/// delivered its alert after the open resolves it.
+#[test]
+fn alert_path_opened_by_a_failed_hook_never_resolves_on_absence_and_resolves_on_a_delivery() {
+    let fx = Fx::new();
+    let hook = "propolis-alert@sensor-ssh.service.service";
+    fx.stub_file(
+        "failed-alert-units",
+        &format!("{hook} loaded failed failed Propolis alert\n"),
+    );
+    fx.unit(
+        hook,
+        &[
+            ("ActiveState", "failed"),
+            ("Result", "timeout"),
+            ("InactiveEnterTimestampMonotonic", &entered(0, 60)),
+        ],
+    );
+    fx.pass(0);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "proc.timeout"));
+    std::fs::remove_file(fx.dir.path().join("failed-alert-units")).unwrap();
+    fx.pass(300);
+    fx.pass(600);
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "open");
+    fx.hook_fires("sensor-ssh.service", 700);
+    fx.pass(900);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "sent2xx"));
+}
+
+/// A failure hook that itself failed (a failed propolis-alert@ instance) opens alert-path with
+/// its own cause when its failure is newer than the key's last resolve; one that failed before
+/// that resolve, and was never reset, opens nothing again.
+#[test]
+fn a_failure_hook_that_failed_after_the_last_resolve_opens_alert_path_and_an_older_one_does_not() {
+    let fx = Fx::new();
+    let hook = "propolis-alert@sensor-ssh.service.service";
+    fx.stub_file(
+        "failed-alert-units",
+        &format!("{hook} loaded failed failed Propolis alert\n"),
+    );
+    fx.unit(
+        hook,
+        &[
+            ("ActiveState", "failed"),
+            ("Result", "timeout"),
+            ("InactiveEnterTimestampMonotonic", &entered(0, 60)),
+        ],
+    );
+    fx.pass(0);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "proc.timeout"));
+
+    let resolved = with_field(
+        &with_field(&with_field(&f.join("\t"), 7, "resolved"), 21, &stamp(100)),
+        22,
+        "sent2xx",
+    );
+    fx.incidents(&[format!("{}\n", resolved.trim_end())]);
+    fx.pass(300);
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "resolved");
+    fx.unit(
+        hook,
+        &[
+            ("ActiveState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+            ("InactiveEnterTimestampMonotonic", &entered(600, 10)),
+        ],
+    );
+    fx.pass(600);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "proc.exit:1"));
+}
+
+/// journald's own notice that it suppressed lines (its catalog id, from its own unit and uid)
+/// opens journal-dropped, a NOTICE, for a unit this witness watches, named as journald names it
+/// (the unit name since systemd 236, a cgroup path before) and counted; a unit it does not watch
+/// opens nothing. A day without the notice resolves it.
+#[test]
+fn the_journald_class_matches_the_catalog_id_and_a_watched_unit_by_name_or_cgroup_path() {
+    let fx = Fx::new();
+    fx.stub_file(
+        "journal.journald",
+        "Suppressed 1234 messages from sensor-ssh.service\n\
+         Suppressed 9 messages from /system.slice/cron.service\n",
+    );
+    fx.pass(0);
+    assert_eq!(
+        fx.meta("jlines").as_deref(),
+        Some("undelivered:0,journal:0,guard:0,suppressed:1234")
+    );
+    let log = fx.log();
+    assert!(
+        log.contains(
+            "MESSAGE_ID=a596d6fe7bfa4994828e72309e95d61e _SYSTEMD_UNIT=systemd-journald.service _UID=0"
+        ),
+        "{log}"
+    );
+    let f = fx.record("journal:sensor-ssh.service").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        (
+            "journal-dropped",
+            "NOTICE",
+            "open",
+            "journal.suppressed",
+            "0"
+        )
+    );
+    assert!(fx.record("journal:cron.service").is_none());
+    fx.stub_file(
+        "journal.journald",
+        "Suppressed 7 messages from /system.slice/sensor-http.service\n",
+    );
+    fx.pass(300);
+    assert_eq!(fx.record("journal:sensor-ssh.service").unwrap()[7], "open");
+    assert_eq!(fx.record("journal:sensor-http.service").unwrap()[7], "open");
+    assert!(
+        fx.meta("jlines")
+            .unwrap_or_default()
+            .ends_with("suppressed:1241")
+    );
+    fx.stub_file("journal.journald", "");
+    fx.pass(86_700);
+    let f = fx.record("journal:sensor-ssh.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "quiet24"));
+}
+
+/// A second suppression notice for the same unit restarts its quiet day: the record stays open
+/// until 24 hours after the latest notice, not the first.
+#[test]
+fn a_second_suppression_notice_keeps_journal_dropped_open_a_day_from_that_notice() {
+    let fx = Fx::new();
+    let line = "Suppressed 5 messages from sensor-ssh.service\n";
+    fx.stub_file("journal.journald", line);
+    fx.pass(0);
+    fx.stub_file("journal.journald", "");
+    fx.pass(300);
+    fx.stub_file("journal.journald", line);
+    fx.pass(72_000);
+    fx.stub_file("journal.journald", "");
+    fx.pass(86_700);
+    assert_eq!(fx.record("journal:sensor-ssh.service").unwrap()[7], "open");
+    fx.pass(72_000 + 86_100);
+    assert_eq!(fx.record("journal:sensor-ssh.service").unwrap()[7], "open");
+    fx.pass(72_000 + 86_400);
+    let f = fx.record("journal:sensor-ssh.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "quiet24"));
+}
+
+/// Each journal class's text occurs verbatim in the source of the program that writes it, so a
+/// reworded message fails here instead of leaving its class blind; so does each start of the
+/// legacy hook's reasons the witness maps to a cause. journald's class is exempt: systemd writes
+/// it, matched by its catalog id.
+#[test]
+fn every_journal_class_names_a_literal_its_writer_prints() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let lib = std::fs::read_to_string(LIB).unwrap();
+    let start = lib
+        .find("PA_JOURNAL_CLASSES='")
+        .expect("PA_JOURNAL_CLASSES")
+        + "PA_JOURNAL_CLASSES='".len();
+    let table = &lib[start..start + lib[start..].find('\'').unwrap()];
+    let mut classes = std::collections::BTreeSet::new();
+    for line in table.lines().filter(|l| !l.is_empty()) {
+        let mut parts = line.splitn(3, '|');
+        let (class, writer, text) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        classes.insert(class.to_string());
+        assert!(!text.trim().is_empty(), "{line}");
+        if writer == "systemd" {
+            assert_eq!(class, "journald", "{line}");
+            continue;
+        }
+        let source = std::fs::read_to_string(format!("{root}/{writer}"))
+            .unwrap_or_else(|e| panic!("{writer}: {e}"));
+        assert!(source.contains(text), "{writer} does not print {text:?}");
+    }
+    for class in ["hook", "guard", "daemon", "journald"] {
+        assert!(classes.contains(class), "no class {class}: {classes:?}");
+    }
+    let witness = std::fs::read_to_string(SCRIPT).unwrap();
+    let reasons = witness
+        .lines()
+        .find_map(|l| l.strip_prefix("WITNESS_HOOK_REASONS='"))
+        .expect("WITNESS_HOOK_REASONS")
+        .trim_end_matches('\'');
+    let alert = std::fs::read_to_string(format!("{root}/deploy/alert.sh")).unwrap();
+    for entry in reasons.split(';') {
+        let (_, start) = entry.split_once('|').unwrap();
+        assert!(
+            alert.contains(&format!("undelivered \"{start}")),
+            "deploy/alert.sh gives no reason starting {start:?}"
+        );
+    }
+}
+
+/// The observe file with its P line `name` set to `rest` (the fields after the name).
+fn seed_p(fx: &Fx, name: &str, rest: &str) {
+    let text = fx.observe_text();
+    let prefix = format!("P\t{name}\t");
+    let mut body: String = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(&prefix))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    body.push_str(&format!("{prefix}{rest}\n"));
+    fx.observe(&body);
+}
+
+/// The P line `name` of the observe file, without its type and name.
+fn p_line(fx: &Fx, name: &str) -> String {
+    let prefix = format!("P\t{name}\t");
+    fx.observe_text()
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// An open daemon-down record, as the hook would have left it, opened at time `t`.
+fn open_daemon_down(t: u64) -> String {
+    hook_record("w#1", "propolis.service", "PAGE", "open", t, "0")
+}
+
+/// pg_is_in_recovery() true on two passes opens db-readonly (db:recovery, PAGE, ledger, cause
+/// db.recovery); the uptime grace and a manual marker hold it pending; one writable answer between
+/// two standby ones resolves nothing, and two writable answers in a row resolve it db2.
+#[test]
+fn db_readonly_opens_after_two_standby_answers_and_resolves_on_two_writable_ones() {
+    let fx = Fx::new();
+    fx.database("0|t|");
+    fx.pass(0);
+    assert_eq!(fx.record("db:recovery").unwrap()[7], "pending");
+    fx.pass(300);
+    let f = fx.record("db:recovery").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str()
+        ),
+        ("db-readonly", "ledger", "PAGE", "open", "db.recovery")
+    );
+    assert!(fx.record("db:local").is_none());
+    for (t, answer, state) in [
+        (600, "0|f|", "open"),
+        (900, "0|t|", "open"),
+        (1200, "0|f|", "open"),
+        (1500, "0|f|", "resolved"),
+    ] {
+        fx.stub_file("pg.answer", answer);
+        fx.pass(t);
+        assert_eq!(fx.record("db:recovery").unwrap()[7], state, "at {t}");
+    }
+    assert_eq!(fx.record("db:recovery").unwrap()[22], "db2");
+
+    let mut fx = Fx::new();
+    fx.database("0|t|");
+    for t in [0, 250] {
+        fx.setenv("PROPOLIS_WITNESS_NOW", &early(t));
+        fx.pass(t);
+    }
+    assert_eq!(fx.record("db:recovery").unwrap()[7], "pending");
+
+    let fx = Fx::new();
+    fx.database("0|t|");
+    fx.write(
+        "run/propolis-witness/maintenance",
+        &format!("#maintenance v1 g=1\nX\t{}\t{BOOT}\tmanual\n", WALL + 3600),
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("db:recovery").unwrap()[7], "pending");
+}
+
+/// A database on another host is keyed db:remote: an outage there may be one several nodes
+/// share, and is never this host's db:local.
+#[test]
+fn a_remote_database_url_refused_on_two_passes_opens_db_remote_not_db_local() {
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         DATABASE_URL=postgres://propolis@10.0.0.5/propolis\n",
+    );
+    fx.pass(0);
+    fx.pass(300);
+    let f = fx.record("db:remote").unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[7].as_str(), f[11].as_str()),
+        ("db-unreachable", "open", "db.unreachable")
+    );
+    assert!(fx.record("db:local").is_none());
+}
+
+/// Whether the daemon binary carries pg-exec's guard is read once per binary (its inode, size and
+/// mtime, kept in meta): the same binary is not read again, and one replaced by a binary without
+/// the guard is read again, found wanting and never run as root.
+#[test]
+fn the_pg_exec_guard_is_read_once_per_binary_and_a_replaced_binary_without_it_is_never_run() {
+    let fx = Fx::new();
+    fx.database("0|f|");
+    write_exec(
+        &fx.bin.join("grep"),
+        "#!/usr/bin/env bash\n\
+         case \"$*\" in *'propolis pg-exec: DATABASE_URL is not set'*) printf 'grep-guard %s\\n' \"${!#}\" >> \"$STUB_LOG\" ;; esac\n\
+         exec /usr/bin/grep \"$@\"\n",
+    );
+    fx.pass(0);
+    assert!(fx.log().contains("grep-guard "), "{}", fx.log());
+    assert_eq!(fx.meta("pgexec_ok").as_deref(), Some("1"));
+    let id = fx.meta("pgexec_id").unwrap();
+    clear_log(&fx);
+    fx.pass(300);
+    let log = fx.log();
+    assert!(!log.contains("grep-guard "), "{log}");
+    assert!(log.contains("propolis pg-exec"), "{log}");
+    assert_eq!(fx.meta("pgexec_id").as_deref(), Some(id.as_str()));
+
+    write_exec(
+        &fx.p("usr/local/bin/propolis"),
+        "#!/usr/bin/env bash\nprintf 'propolis %s\\n' \"$*\" >> \"$STUB_LOG\"\n",
+    );
+    clear_log(&fx);
+    fx.pass(600);
+    let log = fx.log();
+    assert!(log.contains("grep-guard "), "{log}");
+    assert!(!log.contains("propolis pg-exec"), "run as root: {log}");
+    assert!(
+        p_line(&fx, "pg").contains("\tunknown\ttool.exec\t"),
+        "{}",
+        fx.observe_text()
+    );
+    assert_eq!(fx.meta("pgexec_ok").as_deref(), Some("0"));
+    assert_ne!(fx.meta("pgexec_id").as_deref(), Some(id.as_str()));
+}
+
+/// When a proof's input has been unknown for six hours (72 light passes) while its record is open,
+/// the record is flagged cannotverify and stays open: the database probe that cannot run psql for
+/// db-unreachable, a /ready that times out for daemon-down, and a /ready that cannot be asked for
+/// a daemon that never runs ten minutes steady.
+#[test]
+fn records_whose_proof_input_is_unknown_for_six_hours_are_flagged_cannotverify() {
+    let flagged = |f: &[String]| f[30].split(',').any(|x| x == "cannotverify");
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("db:local").unwrap()[7], "open");
+    fx.stub_file(
+        "pg.answer",
+        "127||propolis pg-exec: cannot run psql: No such file or directory",
+    );
+    seed_p(
+        &fx,
+        "pg",
+        &format!("{}\tunknown\ttool.exec\t70", stamp(300)),
+    );
+    fx.pass(600);
+    assert!(!flagged(&fx.record("db:local").unwrap()));
+    fx.pass(900);
+    let f = fx.record("db:local").unwrap();
+    assert!(flagged(&f), "{f:?}");
+    assert_eq!(f[7], "open");
+
+    let fx = Fx::new();
+    fx.stub_file("ready.code", "000t");
+    fx.pass(0);
+    fx.pass(300);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "net.timeout"));
+    seed_p(&fx, "ready-code", &format!("{}\t000\t-\t70", stamp(300)));
+    fx.pass(600);
+    assert!(!flagged(&fx.record("unit:propolis.service").unwrap()));
+    fx.pass(900);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert!(flagged(&f), "{f:?}");
+    assert_eq!(f[7], "open");
+
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_CONSOLE_BIND=192.0.2.10:8080\n",
+    );
+    fx.incidents(&[open_daemon_down(0)]);
+    fx.observe(&format!(
+        "P\tready\t{}\tunknown\tconfig.invalid\t70\n",
+        stamp(300)
+    ));
+    for (t, flag) in [(600, false), (900, true)] {
+        fx.unit(
+            "propolis.service",
+            &[
+                ("Restart", "on-failure"),
+                ("ActiveEnterTimestampMonotonic", &entered(t, 30)),
+            ],
+        );
+        fx.pass(t);
+        let f = fx.record("unit:propolis.service").unwrap();
+        assert_eq!((flagged(&f), f[7].as_str()), (flag, "open"), "at {t}");
+    }
+}
+
+/// A daemon whose console binds an address that is not loopback cannot be asked /ready, so
+/// daemon-down resolves by the fallback proof active10: up ten minutes with the same start and no
+/// restart.
+#[test]
+fn a_daemon_whose_console_is_not_on_loopback_resolves_daemon_down_after_ten_steady_minutes() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_CONSOLE_BIND=192.0.2.10:8080\n",
+    );
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "open");
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            ("ActiveEnterTimestampMonotonic", &entered(600, 0)),
+        ],
+    );
+    fx.pass(600);
+    fx.pass(900);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "open");
+    fx.pass(1200);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "active10"));
+    assert!(!fx.log().contains("ready http"), "{}", fx.log());
+}
+
+/// /ready is believed only from a listener the daemon owns (its MainPID, or the propolis
+/// account's uid): another local account that took the console port while the daemon restarted
+/// could otherwise answer 200 for it. Such an answer reads unknown, resolves nothing and makes the
+/// pass partial; nothing listening at all is 000, with no request made.
+#[test]
+fn ready_answered_by_a_listener_the_daemon_does_not_own_is_unknown_and_resolves_nothing() {
+    let fx = Fx::new();
+    fx.incidents(&[open_daemon_down(0)]);
+    fx.stub_file(
+        "ss.out",
+        "LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* users:((\"python3\",pid=777,fd=3)) uid:1001 ino:9 sk:2 <->\n",
+    );
+    fx.pass(300);
+    fx.pass(600);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "open");
+    assert!(
+        p_line(&fx, "ready").contains("\tunknown\t"),
+        "{}",
+        fx.observe_text()
+    );
+    assert!(
+        fx.read("run/propolis-witness/heartbeat")
+            .contains("\tpartial")
+    );
+    assert!(
+        fx.log().contains("ss -Hltnpe sport = :8080"),
+        "{}",
+        fx.log()
+    );
+    assert!(!fx.log().contains("ready http"), "{}", fx.log());
+
+    fx.stub_file("ss.out", "");
+    clear_log(&fx);
+    fx.pass(900);
+    assert!(!fx.log().contains("ready http"), "{}", fx.log());
+    assert!(p_line(&fx, "ready-code").contains("\t000\t"));
+
+    std::fs::remove_file(fx.dir.path().join("ss.out")).unwrap();
+    fx.pass(1200);
+    fx.pass(1500);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "ready2"));
+
+    // The propolis account's uid stands in for a pid ss could not name.
+    let fx = Fx::new();
+    fx.daemon_account();
+    fx.incidents(&[open_daemon_down(0)]);
+    fx.stub_file(
+        "ss.out",
+        "LISTEN 0 128 127.0.0.1:8080 0.0.0.0:* uid:998 ino:9 sk:2 <->\n",
+    );
+    fx.pass(300);
+    fx.pass(600);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "ready2"));
+}
+
+/// Only a listener that can take a connection to the console's own address counts as holding it.
+/// Another service on the same port number at another address (an HTTP sensor on the public
+/// address at 8080 while the console holds 127.0.0.1:8080) is not in the way: /ready is asked and
+/// believed. A wildcard listener does take such a connection, so one held by another account is
+/// not believed.
+#[test]
+fn only_a_listener_on_the_consoles_own_address_or_a_wildcard_decides_who_answers_ready() {
+    let fx = Fx::new();
+    fx.incidents(&[open_daemon_down(0)]);
+    fx.stub_file(
+        "ss.out",
+        "LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:((\"propolis\",pid=4242,fd=9)) uid:998 ino:1 sk:1 <->\n\
+         LISTEN 0 4096 192.0.2.10:8080 0.0.0.0:* users:((\"sensor-http\",pid=777,fd=3)) uid:1001 ino:2 sk:2 <->\n\
+         LISTEN 0 4096 [2001:db8::10]:8080 [::]:* users:((\"sensor-http\",pid=777,fd=4)) uid:1001 ino:3 sk:3 <->\n\
+         LISTEN 0 4096 [::]:8080 [::]:* users:((\"sensor-http\",pid=777,fd=5)) uid:1001 ino:4 sk:4 <->\n",
+    );
+    fx.pass(300);
+    fx.pass(600);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (f[7].as_str(), f[22].as_str()),
+        ("resolved", "ready2"),
+        "{}",
+        fx.observe_text()
+    );
+    assert!(
+        fx.log().contains("ready http://127.0.0.1:8080/ready"),
+        "{}",
+        fx.log()
+    );
+
+    // The same for a console on the IPv6 loopback: an IPv4 wildcard takes none of its connections.
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\nPROPOLIS_CONSOLE_BIND=[::1]:8080\n",
+    );
+    fx.stub_file(
+        "ss.out",
+        "LISTEN 0 4096 [::1]:8080 [::]:* users:((\"propolis\",pid=4242,fd=9)) uid:998 ino:1 sk:1 <->\n\
+         LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:* users:((\"sensor-http\",pid=777,fd=3)) uid:1001 ino:2 sk:2 <->\n",
+    );
+    fx.pass(300);
+    assert!(
+        fx.log().contains("ready http://[::1]:8080/ready"),
+        "{}",
+        fx.log()
+    );
+
+    for wildcard in ["0.0.0.0:8080", "*:8080"] {
+        let fx = Fx::new();
+        fx.incidents(&[open_daemon_down(0)]);
+        fx.stub_file(
+            "ss.out",
+            &format!(
+                "LISTEN 0 4096 {wildcard} 0.0.0.0:* users:((\"python3\",pid=777,fd=3)) uid:1001 ino:9 sk:2 <->\n"
+            ),
+        );
+        fx.pass(300);
+        fx.pass(600);
+        assert_eq!(
+            fx.record("unit:propolis.service").unwrap()[7],
+            "open",
+            "{wildcard}"
+        );
+        assert!(!fx.log().contains("ready http"), "{wildcard}: {}", fx.log());
+    }
+}
+
+/// The ping stays skipped for 30 minutes after a pass that missed the lock or could write no
+/// state, though neither could write meta: the skip is kept in /run beside the heartbeat and moved
+/// into meta by the next pass that can write it.
+#[test]
+fn the_heartbeat_stays_skipped_for_thirty_minutes_after_a_pass_that_missed_the_lock_or_wrote_no_state()
+ {
+    let pings = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    for case in ["lock", "nowhere"] {
+        let mut fx = Fx::new();
+        fx.write(
+            "etc/propolis/alert.env",
+            "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/abc\n",
+        );
+        fx.curl_answers("200|text/plain");
+        fx.pass(0);
+        assert_eq!(pings(&fx), 1, "{case}");
+        if case == "lock" {
+            let mut holder = fx.hold_lock();
+            fx.setenv("PROPOLIS_WITNESS_LOCK_WAIT", "1");
+            fx.pass(300);
+            holder.kill().unwrap();
+            holder.wait().unwrap();
+            fx.env.clear();
+        } else {
+            fx.stub_file(
+                "disk.refuses",
+                "*/var/lib/propolis/witness/*\n*/run/propolis-witness/fallback/*\n",
+            );
+            fx.pass(300);
+            assert!(
+                fx.log().contains("state not persisted"),
+                "{case}: {}",
+                fx.log()
+            );
+            std::fs::remove_file(fx.dir.path().join("disk.refuses")).unwrap();
+        }
+        assert_eq!(pings(&fx), 1, "{case}");
+        fx.pass(600);
+        assert_eq!(pings(&fx), 1, "{case}: a clean pass within 30 minutes");
+        assert_eq!(
+            fx.meta("hb_skip").as_deref(),
+            Some(format!("{}/core", stamp(300)).as_str()),
+            "{case}"
+        );
+        fx.pass(1800);
+        assert_eq!(pings(&fx), 1, "{case}");
+        fx.pass(2100);
+        assert_eq!(pings(&fx), 2, "{case}");
+    }
+}
+
+/// A pass the deadline cut short skips the ping (check), and a last skip dated ahead of the clock
+/// starts the 30 minutes again from now instead of never ending.
+#[test]
+fn a_pass_cut_by_its_deadline_skips_the_heartbeat_and_a_skip_dated_ahead_restarts_the_thirty_minutes()
+ {
+    let pings = |fx: &Fx| fx.log().lines().filter(|l| l.starts_with("curl ")).count();
+    let mut fx = Fx::new();
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/ping/abc\n",
+    );
+    fx.curl_answers("200|text/plain");
+    fx.setenv("PROPOLIS_WITNESS_DEADLINE", "0");
+    fx.pass(0);
+    assert_eq!(pings(&fx), 0);
+    assert_eq!(
+        fx.meta("hb_skip").as_deref(),
+        Some(format!("{}/check", stamp(0)).as_str())
+    );
+    fx.env.clear();
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=9\nM\thb_skip\t{}/check\n", stamp(90_000)),
+    );
+    fx.pass(300);
+    assert_eq!(pings(&fx), 0);
+    assert_eq!(
+        fx.meta("hb_skip").as_deref(),
+        Some(format!("{}/clean30", stamp(300)).as_str())
+    );
+    fx.pass(2100);
+    assert_eq!(pings(&fx), 1);
+}
+
+/// A journal class's cursor moves only after its lines were judged and the result kept: a pass
+/// past its deadline judges nothing, so the hook's undelivered line it read is read again by the
+/// next pass, from the old cursor, and opens alert-path then.
+#[test]
+fn journal_cursors_stay_put_when_the_pass_judged_nothing_and_the_next_pass_reads_the_lines_again() {
+    let mut fx = Fx::new();
+    let old = "s=0123;i=1";
+    fx.write("var/lib/propolis/witness/jcursor/hook", &format!("{old}\n"));
+    fx.stub_file(
+        "journal.hook",
+        "{\"__CURSOR\":\"s=5\",\"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\",\
+         \"MESSAGE\":\"could not post to ntfy; alert follows\"}\n",
+    );
+    fx.stub_file("journal.hook.cursor", "s=0123;i=2\n");
+    fx.setenv("PROPOLIS_WITNESS_DEADLINE", "0");
+    fx.pass(0);
+    assert!(fx.record("alert:shell").is_none());
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/jcursor/hook"),
+        format!("{old}\n")
+    );
+    assert!(!fx.p("run/propolis-witness/jcursor/hook").exists());
+    fx.env.clear();
+    clear_log(&fx);
+    fx.pass(300);
+    assert!(
+        fx.log().contains(&format!("journalctl hook cursor {old}")),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(fx.record("alert:shell").unwrap()[7], "open");
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/jcursor/hook"),
+        "s=0123;i=2\n"
+    );
+}
+
+/// While the disk refuses writes a class's cursor goes to /run and is handed back from there; once
+/// the disk takes writes again it moves to the state directory and the copy in /run is removed.
+#[test]
+fn a_cursor_goes_to_run_while_the_disk_refuses_writes_and_back_to_the_disk_after() {
+    let fx = Fx::new();
+    let first = "s=0abc;i=7";
+    fx.stub_file("journal.guard.cursor", &format!("{first}\n"));
+    fx.stub_file("disk.refuses", "*/var/lib/propolis/witness/*\n");
+    fx.pass(0);
+    assert_eq!(
+        fx.read("run/propolis-witness/jcursor/guard"),
+        format!("{first}\n")
+    );
+    assert!(!fx.p("var/lib/propolis/witness/jcursor/guard").exists());
+    std::fs::remove_file(fx.dir.path().join("disk.refuses")).unwrap();
+    fx.stub_file("journal.guard.cursor", "s=0abc;i=8\n");
+    clear_log(&fx);
+    fx.pass(300);
+    assert!(
+        fx.log()
+            .contains(&format!("journalctl guard cursor {first}")),
+        "{}",
+        fx.log()
+    );
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/jcursor/guard"),
+        "s=0abc;i=8\n"
+    );
+    assert!(!fx.p("run/propolis-witness/jcursor/guard").exists());
+}
+
+/// A cursor file that is a symbolic link, or a cursor directory that is one, is neither read nor
+/// written through: the class reads the last 15 minutes instead, and what the link points at is
+/// left as it was.
+#[test]
+fn a_cursor_file_or_directory_that_is_a_symbolic_link_is_neither_read_nor_written_through() {
+    let fx = Fx::new();
+    let elsewhere = fx.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("hook"), "s=dead;i=1\n").unwrap();
+    std::fs::create_dir_all(fx.p("var/lib/propolis/witness/jcursor")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.join("hook"),
+        fx.p("var/lib/propolis/witness/jcursor/hook"),
+    )
+    .unwrap();
+    fx.stub_file("journal.hook.cursor", "s=beef;i=2\n");
+    fx.pass(0);
+    let log = fx.log();
+    let hook = log
+        .lines()
+        .find(|l| l.contains("SYSLOG_IDENTIFIER=propolis-alert"))
+        .unwrap();
+    assert!(hook.contains("--since=-15min"), "{log}");
+    assert!(!log.contains("cursor s=dead"), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("hook")).unwrap(),
+        "s=dead;i=1\n"
+    );
+
+    let fx = Fx::new();
+    let elsewhere = fx.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("hook"), "s=dead;i=1\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fx.p("var/lib/propolis/witness/jcursor")).unwrap();
+    fx.stub_file("journal.hook.cursor", "s=beef;i=2\n");
+    fx.pass(0);
+    let log = fx.log();
+    assert!(!log.contains("cursor s=dead"), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("hook")).unwrap(),
+        "s=dead;i=1\n"
+    );
+    assert!(!elsewhere.join("guard").exists());
+}
+
+/// daemon-degraded waits out the first ten minutes of uptime and a maintenance marker, pending.
+#[test]
+fn a_ready_503_under_ten_minutes_of_uptime_or_under_a_marker_stays_pending() {
+    let mut fx = Fx::new();
+    fx.database("0|f|");
+    fx.stub_file("ready.code", "503");
+    for t in [0, 300] {
+        fx.setenv(
+            "PROPOLIS_WITNESS_NOW",
+            &format!("{}/{BOOT}/{}", WALL + t, 100 + t),
+        );
+        fx.pass(t);
+    }
+    assert_eq!(fx.record("ready:local").unwrap()[7], "pending");
+
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.stub_file("ready.code", "503");
+    fx.write(
+        "run/propolis-witness/maintenance",
+        &format!("#maintenance v1 g=1\nX\t{}\t{BOOT}\tupgrade\n", WALL + 3600),
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(fx.record("ready:local").unwrap()[7], "pending");
+}
+
+/// A daemon systemd is still starting is down once it has been starting for over half an hour:
+/// on the eighth pass in a row, not the seventh. It is never asked /ready meanwhile.
+#[test]
+fn a_daemon_starting_for_over_half_an_hour_opens_daemon_down_on_the_eighth_pass() {
+    let fx = Fx::new();
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "activating"),
+            ("SubState", "start"),
+            ("Restart", "on-failure"),
+        ],
+    );
+    for i in 0..7 {
+        fx.pass(i * 300);
+    }
+    assert!(
+        fx.record("unit:propolis.service").is_none(),
+        "{:?}",
+        fx.records()
+    );
+    fx.pass(7 * 300);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[3].as_str(), f[7].as_str()), ("daemon-down", "open"));
+    assert!(!fx.log().contains("ready http"), "{}", fx.log());
+}
+
+/// ready2 needs the same start across its two answers: two 200s with a restart between them, or a
+/// new start, prove nothing; the next answer five minutes after the new start does.
+#[test]
+fn two_ready_answers_across_a_restart_or_a_new_start_do_not_resolve_daemon_down() {
+    for change in ["NRestarts", "ActiveEnterTimestampMonotonic"] {
+        let fx = Fx::new();
+        fx.incidents(&[open_daemon_down(0)]);
+        fx.pass(300);
+        let v = if change == "NRestarts" {
+            "1".to_string()
+        } else {
+            entered(600, 20)
+        };
+        fx.unit(
+            "propolis.service",
+            &[("Restart", "on-failure"), (change, &v)],
+        );
+        fx.pass(600);
+        assert_eq!(
+            fx.record("unit:propolis.service").unwrap()[7],
+            "open",
+            "{change}"
+        );
+        fx.pass(900);
+        let f = fx.record("unit:propolis.service").unwrap();
+        assert_eq!(
+            (f[7].as_str(), f[22].as_str()),
+            ("resolved", "ready2"),
+            "{change}"
+        );
+    }
+}
+
+/// Two light passes five minutes apart by their timer can carry stamps a second short of it:
+/// answers 299 s apart with the same start still prove ready2.
+#[test]
+fn ready_answers_299_seconds_apart_with_the_same_start_resolve_daemon_down() {
+    let fx = Fx::new();
+    fx.incidents(&[open_daemon_down(0)]);
+    fx.pass(0);
+    assert_eq!(fx.record("unit:propolis.service").unwrap()[7], "open");
+    fx.pass(299);
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "ready2"));
+}
+
+/// /ready is asked only of a daemon that is enabled and up: one stopped, failed or still starting,
+/// or not enabled, is never asked, since any local account could hold its port.
+#[test]
+fn ready_is_not_asked_of_a_daemon_that_is_stopped_failed_starting_or_not_enabled() {
+    let fx = Fx::new();
+    for (what, changes) in [
+        (
+            "stopped",
+            vec![("ActiveState", "inactive"), ("SubState", "dead")],
+        ),
+        (
+            "failed",
+            vec![
+                ("ActiveState", "failed"),
+                ("SubState", "failed"),
+                ("Result", "exit-code"),
+            ],
+        ),
+        (
+            "starting",
+            vec![("ActiveState", "activating"), ("SubState", "start")],
+        ),
+        ("static", vec![("UnitFileState", "static")]),
+        ("disabled", vec![("UnitFileState", "disabled")]),
+    ] {
+        fx.unit("propolis.service", &changes);
+        clear_log(&fx);
+        fx.pass(0);
+        assert!(!fx.log().contains("ready http"), "{what}: {}", fx.log());
+    }
+    fx.unit("propolis.service", &[]);
+    clear_log(&fx);
+    fx.pass(0);
+    assert!(fx.log().contains("ready http"), "{}", fx.log());
+}
+
+/// The /ready GET goes straight to loopback whatever the environment says: no .curlrc (-q), no
+/// proxy even with http_proxy set, plain http only, no redirect and a 64 KiB cap on the body.
+#[test]
+fn ready_is_asked_with_no_proxy_no_redirect_plain_http_and_a_size_cap() {
+    let mut fx = Fx::new();
+    for proxy in [None, Some("http://proxy.example.invalid:3128")] {
+        if let Some(p) = proxy {
+            fx.setenv("http_proxy", p);
+            fx.setenv("HTTP_PROXY", p);
+        }
+        clear_log(&fx);
+        fx.pass(0);
+        let log = fx.log();
+        let argv = log
+            .lines()
+            .find_map(|l| l.strip_prefix("ready-argv "))
+            .expect(&log);
+        for want in [
+            "-q ",
+            "--noproxy * ",
+            "--proto =http ",
+            "--max-redirs 0 ",
+            "--max-filesize 65536 ",
+        ] {
+            assert!(argv.contains(want), "{want:?} in {argv} ({proxy:?})");
+        }
+    }
+}
+
+/// The legacy hook's retry hold (`the last attempt to deliver was less than ...`) is a delivery
+/// that is not getting through: alert-path, cause net.connect. A reason the witness does not know
+/// opens it too, cause unknown.
+#[test]
+fn the_legacy_hooks_retry_hold_is_net_connect_and_an_unknown_reason_is_unknown() {
+    for (msg, cause) in [
+        (
+            "the last attempt to deliver was less than 300 s ago, not retrying yet; the alert for sensor-ssh.service is still undelivered since 2027-01-15T08:00:00Z (2 failures since then; the full text was logged at 2027-01-15T08:00:00Z)",
+            "net.connect",
+        ),
+        ("something nobody planned for; alert follows", "unknown"),
+    ] {
+        let fx = Fx::new();
+        fx.stub_file(
+            "journal.hook",
+            &format!(
+                "{{\"__CURSOR\":\"s=6\",\"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\",\"MESSAGE\":\"{msg}\"}}\n"
+            ),
+        );
+        fx.pass(0);
+        let f = fx.record("alert:shell").unwrap();
+        assert_eq!((f[7].as_str(), f[11].as_str()), ("open", cause), "{msg}");
+    }
+}
+
+/// The hook reader finds the unit and the message whichever comes first in an entry, reads past an
+/// escaped backslash before an escaped quote inside a message, and skips a message journald gives
+/// in binary form.
+#[test]
+fn the_hook_reader_finds_unit_and_message_in_any_order_and_reads_past_escaped_backslashes() {
+    let fx = Fx::new();
+    fx.stub_file(
+        "journal.hook",
+        "{\"MESSAGE\":\"sensor-ssh.service entered the failed state on h at t.\",\"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\"}\n\
+         {\"_SYSTEMD_UNIT\":\"propolis-alert@sensor-ssh.service.service\",\"MESSAGE\":[115,101]}\n",
+    );
+    fx.pass(0);
+    assert_eq!(
+        fx.meta("jlines").as_deref(),
+        Some("undelivered:0,journal:1,guard:0,suppressed:0")
+    );
+    fx.stub_file(
+        "journal.hook",
+        "{\"_SYSTEMD_UNIT\":\"propolis-alert@c.service.service\",\"MESSAGE\":\"q\\\\\\\"x; alert follows\"}\n\
+         {\"_SYSTEMD_UNIT\":\"propolis-alert@a.service.service\",\"MESSAGE\":\"could not post to ntfy; alert follows\"}\n\
+         {\"MESSAGE\":\"could not post to ntfy; the alert for b.service is still undelivered since x\",\"_SYSTEMD_UNIT\":\"propolis-alert@b.service.service\"}\n",
+    );
+    fx.pass(300);
+    assert_eq!(
+        fx.meta("jlines").as_deref(),
+        Some("undelivered:3,journal:1,guard:0,suppressed:0")
+    );
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "net.connect"));
+}
+
+/// journalctl before systemd 246 prints its json with blanks around the colons and commas; the
+/// hook reader takes that form too.
+#[test]
+fn the_hook_reader_accepts_the_spaced_json_older_journalctl_prints() {
+    let fx = Fx::new();
+    fx.stub_file(
+        "journal.hook",
+        "{ \"__CURSOR\" : \"s=5\", \"_SYSTEMD_UNIT\" : \"propolis-alert@sensor-ssh.service.service\", \"MESSAGE\" : \"curl is not installed, so this host cannot push alerts; install it; alert follows\" }\n",
+    );
+    fx.pass(0);
+    let f = fx.record("alert:shell").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "nocurl"));
+}
+
+/// Without the daemon's account there is no tie: its journal is not read, and the daemon's
+/// failure is judged on its own while the database is down.
+#[test]
+fn without_the_daemon_account_there_is_no_tie_and_the_daemon_failure_is_judged_on_its_own() {
+    let fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.stub_file("uid.propolis", "none");
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    restarting_daemon(&fx);
+    fx.hook_fires("propolis.service", 0);
+    clear_log(&fx);
+    fx.pass(300);
+    assert!(
+        !fx.log()
+            .contains("journalctl -q --no-pager -o cat _SYSTEMD_UNIT=propolis.service"),
+        "{}",
+        fx.log()
+    );
+    let f = fx.record("unit:propolis.service").unwrap();
+    assert_eq!(
+        (
+            f[7].as_str(),
+            f[11].as_str(),
+            f[13].as_str(),
+            f[29].as_str()
+        ),
+        ("open", "proc.exit:1", "-", "1")
+    );
+}
+
+/// No probe starts unless its whole time limit ends by the soft deadline: one that cannot is
+/// skipped, its check reads unknown and the pass is partial.
+#[test]
+fn a_probe_that_cannot_finish_by_the_soft_deadline_is_skipped_and_reads_unknown() {
+    let mut fx = Fx::new();
+    fx.database(PG_REFUSED);
+    fx.daemon_account();
+    fx.stub_file("journal.daemon", CONNECT_LINE);
+    write_exec(
+        &fx.bin.join("find"),
+        "#!/usr/bin/env bash\nprintf 'find %s\\n' \"$*\" >> \"$STUB_LOG\"\nexec /usr/bin/find \"$@\"\n",
+    );
+    std::fs::create_dir_all(fx.p("run/propolis-alert/undelivered")).unwrap();
+    fx.pass(0);
+    assert_eq!(fx.meta("pgexec_ok").as_deref(), Some("1"));
+
+    fx.setenv("PROPOLIS_WITNESS_SOFT_DEADLINE", "30");
+    clear_log(&fx);
+    fx.pass(300);
+    let log = fx.log();
+    assert!(log.contains("propolis pg-exec"), "{log}");
+    assert!(!log.contains("id -u"), "{log}");
+    assert!(!log.contains("journalctl"), "{log}");
+    assert!(!log.contains("list-units"), "{log}");
+    assert!(log.contains("ready http"), "{log}");
+    // The probe's own listings (the banner's count of the same directory comes after the pass).
+    let undelivered =
+        "run/propolis-alert/undelivered -mindepth 1 -maxdepth 1 -type f -printf %f\\n";
+    let stamps = "run/propolis-alert -mindepth 1 -maxdepth 1 -type f -printf %T@ %f\\0";
+    assert!(log.contains(undelivered) && log.contains(stamps), "{log}");
+    for check in [
+        "journal:daemon",
+        "journal:hook",
+        "journal:guard",
+        "journal:journald",
+        "alertunit",
+    ] {
+        assert!(
+            p_line(&fx, check).contains("\tunknown\t"),
+            "{check}: {}",
+            fx.observe_text()
+        );
+    }
+    assert!(
+        fx.read("run/propolis-witness/heartbeat")
+            .contains("\tpartial")
+    );
+
+    fx.setenv("PROPOLIS_WITNESS_SOFT_DEADLINE", "4");
+    clear_log(&fx);
+    fx.pass(600);
+    let log = fx.log();
+    assert!(!log.contains("propolis pg-exec"), "{log}");
+    assert!(!log.contains("ready http"), "{log}");
+    assert!(!log.contains(undelivered) && !log.contains(stamps), "{log}");
+    for check in ["pg", "ready"] {
+        assert!(
+            p_line(&fx, check).contains("\tunknown\t"),
+            "{check}: {}",
+            fx.observe_text()
+        );
+    }
 }

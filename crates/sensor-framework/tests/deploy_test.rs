@@ -6686,7 +6686,7 @@ fn install_and_upgrade_install_the_status_command_executable_beside_the_library(
 /// deadline. The light timer runs relative to the last start, every five minutes; the hourly
 /// timer once an hour, first a few minutes after it is enabled and spread by a random delay. The
 /// unit says which pass uses which grant: config-check for the hourly pass, the database binary
-/// for a probe a later release adds, and no comment still calls the hourly pass a future one.
+/// for the light pass's database probe, and no comment still calls either a future one.
 #[test]
 fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() {
     let raw = deploy_file("propolis-witness@.service");
@@ -6695,14 +6695,15 @@ fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() 
         "for nft and ss, which config-check runs;",
         "next release",
         "the light pass of this one runs none of them",
+        "later release",
     ] {
         assert!(
             !raw.contains(current),
-            "the unit describes its passes as they were before the hourly pass: {current}"
+            "the unit describes its passes as they were before they were built: {current}"
         );
     }
     assert!(
-        raw.contains("pass's database probe, which a later release adds"),
+        raw.contains("pass's database probe, which runs psql through it"),
         "{raw}"
     );
     let service = uncommented(&raw);

@@ -411,6 +411,19 @@ u32.
 | `PROPOLIS_OPS_HEARTBEAT_INTERVAL_SECS` | no | `300` | min 30 | at most one ping per interval; a failed ping is retried on the next round |
 | `PROPOLIS_OPS_BACKUP_MAX_AGE_SECS` | no | `129600` (36 h) | min 3600 | `backup-stale`: the newest good backup (`deploy/backup.sh`) older than this, or none since the backup timer was installed this long ago |
 
+### The root witness (`deploy/witness.sh`)
+
+Read by the witness's light pass as root, through `deploy/alert-lib.sh#pa_settings_load`, from
+`/etc/propolis/alert.env` and then `/etc/propolis/propolis.env` (a value in `alert.env` wins). It
+is not read by the daemon, and it is a different setting from the daemon's own
+`PROPOLIS_OPS_HEARTBEAT_URL`. The witness also reads the daemon's `DATABASE_URL` (for its
+read-only database probe through `propolis pg-exec`) and `PROPOLIS_CONSOLE_BIND` (for the one
+`/ready` request on loopback), as the daemon reads them.
+
+| Variable | Req | Default | Min/bounds | Notes |
+|---|---|---|---|---|
+| `PROPOLIS_WITNESS_HEARTBEAT_URL` | no | none (no request) | `https://` only; any other value is never requested, one journal line says so, and the walk reads `heartbeat URL refused (not an https URL)` | the ping URL of an external dead-man check (a private check with no public status page): one GET after each light pass that was complete and clean, every five minutes; skipped while a check could not tell and nothing records it, `alert-path` is open, a transition has waited over 15 minutes, the state lock could not be had or state could not be written, and for 30 minutes after a skip. Skipping is the signal; there is no failure URL. The URL is a secret: it reaches curl only through a file only root can read and is never logged, stored or shown. Set it in `alert.env`, which only root reads and the daemon does not load: `propolis.env` is the daemon's `EnvironmentFile`, so a URL there is also in the environment of the internet-facing daemon process, which the `propolis` account can read through `/proc` |
+
 ---
 
 ## Collector/control-plane split binaries (SP-A)

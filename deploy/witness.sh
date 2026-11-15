@@ -49,6 +49,17 @@
 # does one that printed a line out of form that could be it); a config-check that did not
 # complete on two hourly passes opens cc-stopped; the read check's answer is stored for the gate
 # and the banner; a light pass over twenty minutes old, or its timer stopped, opens witness-stale.
+# It also samples the free space and inodes of every store's filesystem with one df each and
+# keeps a week of samples: a filesystem short of space or inodes, or that would fill within 72
+# hours at the week's rate or the last day's, whichever is faster, opens volume-filling (at the
+# lower tier of its two passes), rising to volume-full-soon within 12 hours
+# or under 1.5 GiB free; a rotation refused for want of space folds under the record of the
+# filesystem holding the sensor logs. Where the daemon has a database it reads its state in one
+# read-only session (an old transaction id opens db-xid, slots nearly full db-slots, lock waits
+# db-locks), and once a day the local data directory as the postgres account. It hashes the files
+# that configure Propolis (of an env file only the whole content and its key names, never a
+# value) and opens change-pending for a unit running with an env file changed since it started,
+# needing a daemon reload, or running a binary since replaced.
 # What the light pass and the failure hook recorded in the meantime is kept as they wrote it.
 #
 # WHAT HOLDS AN OPEN. No unit kind opens in the first ten minutes of uptime, while a maintenance
@@ -63,7 +74,7 @@
 # RECORD ONLY. Nothing here sends, pages or posts. Each transition the v2 profile would push adds
 # one to the record's would_push, which the status walk shows; that is all. Its only network
 # requests are the read check's GETs and the heartbeat URL's GET, which carry no message, the GET
-# of the daemon's /ready on loopback, and the read-only database probe.
+# of the daemon's /ready on loopback, and the read-only database probe and hourly state session.
 #
 # SAFE TO RUN FOREVER. An ordinary check error is recorded and the pass still exits 0, so it is
 # never a failed unit for the failure hook to report; three in a row open the NOTICE
@@ -110,7 +121,7 @@
 # PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 6
+# needs-alert-lib: 7
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -260,7 +271,8 @@ pa_id_table pa_ok_field pa_write pa_lock pa_unlock pa_state_read pa_state_write 
 pa_cause pa_unit_map pa_incident_load pa_incident_get pa_incident_transition pa_incident_set
 pa_incident_write pa_incident_prune pa_first_sighting pa_banner_write pa_trusted_exec pa_cleanup
 pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding pa_readcheck_run
-pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok"
+pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok pa_vol_project pa_vol_judge
+pa_vol_stores"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -313,14 +325,21 @@ LOCK_WAIT=60
 # its result, far inside the unit's 15 minutes.
 WITNESS_DEADLINE=240
 if [ "$INSTANCE" = hourly ]; then
-    # The programs an hourly pass runs on purpose each have their own limit: config-check 300 s;
-    # the read check of two targets, four GETs each at 15 s, 120 s; systemctl 20 s for the timer
-    # sample and 40 s for the role's two questions; about ten small reads of 5 s, 50 s; the state
-    # lock 120 s. 650 s in all, inside 720 s. The local reads and writes of the state files have
-    # no limit of their own: the library's `cat` and `stat` of each state file, pa_write's
-    # `sync`, and the ownership checks' `stat` and `readlink` of each path. On a local disk they
-    # take milliseconds; what bounds them on a disk that hangs is the unit's TimeoutStartSec of
-    # 15 minutes.
+    # The programs an hourly pass always runs each have their own limit: config-check 300 s; the
+    # read check of two targets, four GETs each at 15 s, 120 s; systemctl 20 s for the timer
+    # sample and 40 s for the role's two questions; about ten small reads of 5 s, 50 s. 530 s.
+    # The reads of the stores, the database and the watched files come after them, and each
+    # starts only when its whole limit still ends by WITNESS_SOFT_DEADLINE (570 s here; one that
+    # cannot is unknown for the pass): systemctl 20 s for the units' properties and 5 s for each
+    # running unit's binary; pa_pg's 30 s with 2 s to be killed, 5 s to stat the daemon binary
+    # and 30 s to find its guard when no light pass has; 5 s for the postgres account and 15 s
+    # for its psql; 5 s to place each store and 10 s for each filesystem's df; 10 s for each
+    # listing of the watched directories, 30 s for their hashes, 5 s for each env file's key
+    # names and 5 s for the binaries' stat. With the state lock's 120 s the pass ends by 690 s,
+    # inside 720 s. The local reads and writes of the state files have no limit of their own:
+    # the library's `cat` and `stat` of each state file, pa_write's `sync`, and the ownership
+    # checks' `stat` and `readlink` of each path. On a local disk they take milliseconds; what
+    # bounds them on a disk that hangs is the unit's TimeoutStartSec of 15 minutes.
     LOCK_WAIT=120
     WITNESS_DEADLINE=720
 fi
@@ -343,9 +362,11 @@ note() {
     logger -p daemon.notice -t propolis-witness "$1" 2> /dev/null || true
 }
 
-# No optional read (the rotation guard's journal, each probe of the light pass) starts unless it
-# ends by this many seconds, so the lock's wait still ends inside WITNESS_DEADLINE.
+# No optional read (the rotation guard's journal, each probe of the light pass, each read of the
+# hourly pass's stores, database and watched files) starts unless it ends by this many seconds, so
+# the lock's wait still ends inside WITNESS_DEADLINE.
 WITNESS_SOFT_DEADLINE=160
+[ "$INSTANCE" != hourly ] || WITNESS_SOFT_DEADLINE=570
 if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SOFT_DEADLINE:-} =~ ^[0-9]{1,3}$ ]]; then
     WITNESS_SOFT_DEADLINE="$((10#$PROPOLIS_WITNESS_SOFT_DEADLINE))"
 fi
@@ -573,7 +594,7 @@ unit_facts() {
 declare -A OBS_U=() OBS_R=() OBS_P=() NEW_U=() NEW_R=() JUDGED=()
 OBS_KEEP=()
 OBS_MINE_P=" units witness-hourly pg ready alertunit db ready-code daemon "
-[ "$INSTANCE" != hourly ] || OBS_MINE_P=" config-check readcheck witness-light "
+[ "$INSTANCE" != hourly ] || OBS_MINE_P=" config-check readcheck witness-light volume pgstate changes "
 
 # obs_mine NAME: the P line NAME belongs to this instance.
 obs_mine() {
@@ -590,9 +611,21 @@ load_observe() {
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         IFS=$'\t' read -r t name rest <<< "$line"
-        if [ "$INSTANCE" = hourly ] && { [ "$t" = U ] || [ "$t" = R ]; }; then
-            OBS_KEEP+=("$line")
-            continue
+        if [ "$INSTANCE" = hourly ]; then
+            case "$t" in
+                U | R)
+                    OBS_KEEP+=("$line")
+                    continue
+                    ;;
+                Z)
+                    OBS_Z+=("$line")
+                    continue
+                    ;;
+                H)
+                    if pa_ok_field "$name"; then OBS_H[$name]="${rest:-}"; fi
+                    continue
+                    ;;
+            esac
         fi
         case "$t" in
             U) pa_unit_name_ok "$name" && OBS_U[$name]="${rest:-}" ;;
@@ -632,6 +665,20 @@ observe_body() {
         [ "$ok" = 0 ] || printf '%s\n' "$line"
     done
     for u in "${!OBS_P[@]}"; do printf 'P\t%s\t%s\n' "$u" "${OBS_P[$u]}"; done
+    # The hourly pass's samples of the stores and hashes of the watched files: what it judged, or,
+    # when it judged nothing, every line as read.
+    if [ "$INSTANCE" = hourly ]; then
+        if [ "$VOL_JUDGED" = 1 ]; then
+            for line in "${NEW_Z[@]}"; do printf '%s\n' "$line"; done
+        else
+            for line in "${OBS_Z[@]}"; do printf '%s\n' "$line"; done
+        fi
+        if [ "$H_JUDGED" = 1 ]; then
+            for u in "${!NEW_H[@]}"; do printf 'H\t%s\t%s\n' "$u" "${NEW_H[$u]}"; done
+        else
+            for u in "${!OBS_H[@]}"; do printf 'H\t%s\t%s\n' "$u" "${OBS_H[$u]}"; done
+        fi
+    fi
     for line in "${OBS_KEEP[@]}"; do printf '%s\n' "$line"; done
 }
 
@@ -2041,6 +2088,874 @@ backup_failed_last() {
         [ "$((10#$f))" -gt "$((10#$s))" ] || return 0
     fi
     BACKUP_FAILED_LAST=1
+}
+
+# ---- the hourly pass's stores, database and changes -------------------------------------------
+#
+# Each read runs before the lock, under its own time limit, and starts only when that limit still
+# ends by WITNESS_SOFT_DEADLINE; one that cannot, or that times out, is unknown for the pass, never
+# a value. Under the lock only what they found is judged. A path taken from an env file, a unit's
+# properties or psql is used only once it passes path_ok, and what another account can write is
+# read as that account.
+
+# The binaries deploy/upgrade.sh installs in /usr/local/bin (its INSTALL_BINS), watched by inode,
+# size and modification time: hashing some hundred megabytes every hour would show nothing a
+# replaced file does not already show in those three.
+WITNESS_BINS=(propolis sensor-catchall sensor-ssh sensor-telnet sensor-redis sensor-adb sensor-http sensor-ftp sensor-smtp sensor-tftp sensor-mqtt sensor-dns sensor-cred gateway shipper propolis-watch)
+
+# path_ok PATH: an absolute path of the closed character set a path read from a file, a unit's
+# properties or psql must keep to before it reaches a command line: no blank, quote or glob
+# character, and no `..` component.
+path_ok() {
+    local LC_ALL=C
+    [[ ${1:-} =~ ^/[A-Za-z0-9._/-]{1,200}$ ]] && [[ /$1/ != */../* ]]
+}
+
+# root_uid: the owner that stands for root: uid 0, or under a test root that root's owner, as the
+# library's ownership check takes it.
+root_uid() {
+    local u=0
+    if [ -n "$ROOT" ]; then
+        u="$(timeout 5 stat -c %u -- "$ROOT" 2> /dev/null)" || u=0
+        [[ $u =~ ^[0-9]{1,10}$ ]] || u=0
+    fi
+    printf '%s' "$((10#$u))"
+}
+
+declare -A CS_ACT=() CS_AEM=() CS_PID=() CS_NDR=() CS_ENVF=() CS_DEL=()
+CS_OK=0 CS_BACKUP_ENV="" CS_EXE_BLIND=0
+
+# change_sample: one `systemctl show` of every unit in scope for what change-pending judges: the
+# state and start of each, its main process, whether systemd needs a daemon reload for it, and the
+# env files it loads; and the backup unit's environment, where a drop-in may set
+# PROPOLIS_BACKUP_DIR. Then, for each running unit, whether its main process runs a binary since
+# replaced (its exe link ends in ` (deleted)`), read as root from /proc; a link that cannot be read
+# is unknown (CS_DEL `?`), and when not one running unit's could be read CS_EXE_BLIND is 1: a
+# replaced binary could not be seen anywhere. Sets CS_OK once systemd answered.
+change_sample() {
+    local out line k v u t running=0 linked=0
+    local -a units=("${WITNESS_UNITS[@]}" "${WITNESS_TIMERS[@]}")
+    fits 20 || return 0
+    out="$(systemctl show -p Id,ActiveState,ActiveEnterTimestampMonotonic,MainPID,NeedDaemonReload,EnvironmentFiles,Environment -- "${units[@]}" 2> /dev/null)" || return 0
+    _C=() _C_ENVF=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ -z "$line" ]; then
+            cs_commit
+            continue
+        fi
+        k="${line%%=*}" v="${line#*=}"
+        [ "$k" != "$line" ] || continue
+        case "$k" in
+            # A unit may load several env files: systemctl prints one line for each.
+            EnvironmentFiles)
+                v="${v%% (*}"
+                ! path_ok "$v" || _C_ENVF+=" $v"
+                ;;
+            Id | ActiveState | ActiveEnterTimestampMonotonic | MainPID | NeedDaemonReload | Environment) _C[$k]="$v" ;;
+        esac
+    done <<< "$out"
+    cs_commit
+    CS_OK=1
+    for u in "${WITNESS_UNITS[@]}"; do
+        [ "${CS_ACT[$u]:-}" = active ] && [ -n "${CS_PID[$u]:-}" ] || continue
+        CS_DEL[$u]="?" running=$((running + 1))
+        fits 5 || continue
+        t="$(timeout 5 readlink -- "$ROOT/proc/${CS_PID[$u]}/exe" 2> /dev/null)" || continue
+        linked=$((linked + 1))
+        case "$t" in *' (deleted)') CS_DEL[$u]=1 ;; *) CS_DEL[$u]=0 ;; esac
+    done
+    if [ "$running" -gt 0 ] && [ "$linked" = 0 ]; then CS_EXE_BLIND=1; fi
+}
+declare -A WANT_C=() _C=()
+_C_ENVF=""
+for witness_u in "${WITNESS_UNITS[@]}" "${WITNESS_TIMERS[@]}"; do WANT_C[$witness_u]=1; done
+unset witness_u
+
+# cs_commit: the block of `key=value` lines just read (_C, and the env files in _C_ENVF), kept when
+# it names a unit in scope; every value is checked against its form first.
+cs_commit() {
+    local u="${_C[Id]:-}"
+    if [ -n "$u" ] && [ -n "${WANT_C[$u]:-}" ]; then
+        CS_ACT[$u]="$(sample_word "${_C[ActiveState]:-}" '^[a-z-]{1,24}$')"
+        CS_AEM[$u]="$(sample_word "${_C[ActiveEnterTimestampMonotonic]:-}" '^[0-9]{1,18}$')"
+        CS_PID[$u]="$(sample_word "${_C[MainPID]:-}" '^[1-9][0-9]{0,9}$')"
+        CS_NDR[$u]="$(sample_word "${_C[NeedDaemonReload]:-}" '^(yes|no)$')"
+        CS_ENVF[$u]="$_C_ENVF"
+        # Read for the backup directory alone, by pa_vol_stores; never stored or printed.
+        [ "$u" != propolis-backup.service ] || CS_BACKUP_ENV="${_C[Environment]:-}"
+    fi
+    _C=() _C_ENVF=""
+}
+
+PG_RESULT=skip PG_CAUSE=- PG_WHERE="" PG_XID="" PG_CONN="" PG_USABLE="" PG_LOCKS="" PG_SIZE=""
+PG_DATADIR="" PG_DATADIR_NEW=0 PG_DATADIR_KNOWN=1 PG_DATADIR_CAUSE=unknown
+# The hourly state, readable by the daemon's own role: pg_database and pg_locks are public, other
+# roles' rows of pg_stat_activity are counted with their columns nulled. Lock waits have a start
+# time from server 14 (pg_locks.waitstart); before that, sessions waiting on a lock since their
+# state changed. The column is read through to_jsonb, so the one statement parses on every server.
+PG_SQL_XID='SELECT age(datfrozenxid) FROM pg_database WHERE datname = current_database()'
+# Only client connections take a slot of max_connections; the server's own background processes
+# (five or six on an idle server) are rows of pg_stat_activity too. backend_type came with server
+# 10: read through to_jsonb so the statement parses on an older one, which then counts every row.
+PG_SQL_SLOTS="SELECT count(*) FILTER (WHERE coalesce(to_jsonb(a)->>'backend_type', 'client backend') = 'client backend'), current_setting('max_connections'), current_setting('superuser_reserved_connections') FROM pg_stat_activity a"
+PG_SQL_LOCKS="SELECT CASE WHEN current_setting('server_version_num')::int >= 140000 THEN (SELECT count(*) FROM pg_locks l WHERE NOT l.granted AND (to_jsonb(l)->>'waitstart')::timestamptz < now() - interval '120 seconds') ELSE (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND state_change < now() - interval '120 seconds') END"
+PG_SQL_SIZE='SELECT pg_database_size(current_database())'
+
+# pg_state_read: the database's state in one pa_pg session of four statements (30 s): the age of
+# its oldest unfrozen transaction id, connections against max_connections less the reserved
+# slots, lock waits over 120 s, and its size, which is recorded only. Skipped where the light
+# pass's probe is (no DATABASE_URL, a collector, a gateway-only host). PG_RESULT is ok, unknown
+# (with PG_CAUSE) or skip; psql's own words are dropped here, never kept.
+pg_state_read() {
+    local known="" need=67 x c mx rs l z
+    local -a lines=()
+    PG_RESULT=skip
+    case "${PA_ROLE:-}" in collector | gateway) return 0 ;; esac
+    pa_env_get DATABASE_URL "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    if [ -z "$PA_ENV_VALUE" ] && [ -z "$PA_ENV_UNREADABLE" ]; then return 0; fi
+    PA_ENV_VALUE=""
+    PG_RESULT=unknown PG_CAUSE=unknown
+    # The light pass keeps whether this binary carries pg-exec's guard; read here as a hint only.
+    [ "$(_pa_meta_get pgexec_ok)" != 1 ] || known="$(_pa_meta_get pgexec_id)"
+    [ -z "$known" ] || need=37
+    fits "$need" || return 0
+    PA_PG_GUARD_KNOWN="$known" PA_PG_APP=propolis-witness
+    if pa_pg 30 "$PG_SQL_XID" "$PG_SQL_SLOTS" "$PG_SQL_LOCKS" "$PG_SQL_SIZE" > /dev/null; then
+        mapfile -t lines <<< "$PA_PG_OUT"
+        x="${lines[0]:-}" l="${lines[2]:-}" z="${lines[3]:-}"
+        IFS='|' read -r c mx rs _ <<< "${lines[1]:-}"
+        if [ "${#lines[@]}" = 4 ] && [[ $x =~ ^[0-9]{1,18}$ && $c =~ ^[0-9]{1,9}$ && $mx =~ ^[0-9]{1,9}$ \
+            && $rs =~ ^[0-9]{1,9}$ && $l =~ ^[0-9]{1,9}$ && $z =~ ^[0-9]{1,18}$ ]]; then
+            PG_RESULT=ok PG_CAUSE=-
+            PG_XID=$((10#$x)) PG_CONN=$((10#$c)) PG_LOCKS=$((10#$l)) PG_SIZE=$((10#$z))
+            PG_USABLE=$((10#$mx - 10#$rs))
+            [ "$PG_USABLE" -ge 0 ] || PG_USABLE=0
+        fi
+    else
+        PG_CAUSE="$PA_PG_CAUSE"
+    fi
+    PG_WHERE="${PA_PG_WHERE:-}"
+    PA_PG_ERR="" PA_PG_OUT="" PA_PG_GUARD_KNOWN=""
+    pa_ok_field "$PG_CAUSE" || PG_CAUSE=unknown
+}
+
+# pg_datadir_read: the local data directory, a store of its own, read once a day as the postgres
+# account (`SHOW data_directory` needs pg_read_all_settings, which the daemon's role lacks), never
+# as root, through setpriv, which runs no PAM session module, with a reset environment and none of
+# this shell's descriptors, and kept in meta pg_datadir (with pg_datadir_stamp) in between. psql
+# is looked for in /usr/bin and /bin only: --reset-env would put /usr/local/bin in its search, where
+# a program put on a host whose /usr/local is writable by a group would run as postgres. A remote
+# database has no data directory here. Only a path in path_ok's form is taken; psql's error text
+# goes nowhere. PG_DATADIR_KNOWN is 0 when a local database's data directory, or where the
+# database is, could not be learnt on this pass: the cached path, if any, is still sampled, but a
+# filesystem missing from the stores then proves nothing.
+pg_datadir_read() {
+    local cached stamp a out rc
+    PG_DATADIR="" PG_DATADIR_KNOWN=1 PG_DATADIR_CAUSE=unknown
+    [ "$PG_RESULT" != skip ] || return 0
+    cached="$(_pa_meta_get pg_datadir)" stamp="$(_pa_meta_get pg_datadir_stamp)"
+    path_ok "$cached" || cached=""
+    case "$PG_WHERE" in
+        remote) return 0 ;;
+        local) PG_DATADIR="$cached" ;;
+        *)
+            PG_DATADIR="$cached" PG_DATADIR_KNOWN=0
+            return 0
+            ;;
+    esac
+    # A stamp that cannot be read, or lies ahead of the clock, is no proof the cache is fresh.
+    a="$(pa_age "$stamp")"
+    if [ -n "$cached" ] && [ "$a" -ge 0 ] && [ "$a" -lt 86400 ]; then return 0; fi
+    # With no postgres account the server runs elsewhere (a container on loopback): no data
+    # directory here to place.
+    account_uid postgres > /dev/null || return 0
+    # A cache past its day still names where the data was; with none, the store is not known.
+    [ -n "$cached" ] || PG_DATADIR_KNOWN=0
+    fits 20 || return 0
+    out="$(_pa_without_fds timeout 15 setpriv --reuid=postgres --regid=postgres --init-groups --reset-env -- \
+        /usr/bin/env PATH=/usr/bin:/bin psql -X -A -t -c 'SHOW data_directory')"
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        # Why the store is not known, for the record of a check that stays unusable: psql that
+        # cannot be run here, or a server that does not take the postgres account's connection.
+        case "$rc" in
+            126 | 127) PG_DATADIR_CAUSE=tool.exec ;;
+            2) PG_DATADIR_CAUSE=db.unreachable ;;
+        esac
+        return 0
+    fi
+    out="${out%%$'\n'*}"
+    path_ok "$out" || return 0
+    PG_DATADIR="$out" PG_DATADIR_NEW=1 PG_DATADIR_KNOWN=1
+}
+
+VOL_DEV=() VOL_PATH=() VOL_AS=() VOL_TARGET=() VOL_SIZE=() VOL_AVAIL=() VOL_IT=() VOL_IA=() VOL_OK=() VOL_MID=()
+VOL_ALL=1 VOL_CAUSE=unknown VOL_PCT=15 LOG_DEVS=" "
+
+# What vol_stat runs, as root or as another account: stat with links followed, its words in the C
+# locale, so a path that is not there (status 2) is told apart from one that could not be checked
+# (status 1).
+# shellcheck disable=SC2016 # the child bash expands these, with the path as $1
+VOL_STAT_PROG='s="$(LC_ALL=C stat -L -c "%d %F" -- "$1" 2>&1)" && { printf "%s" "$s"; exit 0; }; case "$s" in *"No such file or directory"* | *"Not a directory"*) exit 2 ;; esac; exit 1'
+
+# vol_stat PATH ACCOUNT: the filesystem and type of a store, `<dev> <type>`, links followed, as
+# root or, when ACCOUNT is set, as that account, which could put a link on the path: root then
+# never opens where it leads. Status 2 when the path is not there (a link to nothing included), 124
+# when stat outlived its limit, 1 when it could not tell, a failed drop to ACCOUNT included.
+vol_stat() {
+    local out rc
+    if [ -n "$2" ]; then
+        out="$(_pa_as "$2" bash -c "$VOL_STAT_PROG" _ "$1")"
+    else
+        out="$(timeout 5 bash -c "$VOL_STAT_PROG" _ "$1" 2> /dev/null)"
+    fi
+    rc=$?
+    case "$rc" in
+        0) printf '%s' "$out" ;;
+        2 | 124) return "$rc" ;;
+        *) return 1 ;;
+    esac
+}
+
+# vol_sample: the sizes of every store with one df sample per filesystem. The stores are
+# pa_vol_stores', the list the walk maps mount ids back by: the state, cursors, feed and witness
+# under /var/lib/propolis, the sensor logs, the spools, the gateway's spool, the journal, the
+# backups, the local data directory and the configured log directories. Each is reduced to its
+# filesystem with vol_stat, then `df -B1 --output=size,avail,itotal,iavail,target` runs once for
+# each filesystem, 10 s at most, as the account that placed it; two stores df puts on one mount
+# point (subvolumes without a mount of their own) are one. A store that is not there is skipped.
+# VOL_ALL is 0 when this pass cannot tell that it found every store: a path that could not be
+# learnt (systemd did not answer for the backup unit, gateway.env could not be read, where the
+# database is was not learnt), a store that could not be checked, or a mount that hangs, which is
+# unknown for that filesystem, never a value. LOG_DEVS holds the filesystems of the sensor logs,
+# for the rotation guard's tie.
+vol_sample() {
+    local p benv="?" out rc dev type i j as line size avail it ia target
+    local -A at=()
+    VOL_ALL=1
+    pa_env_get PROPOLIS_OPS_CAPACITY_FREE_PCT "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    # Out of the daemon's 1..100, it would refuse to start: the default is what it would use then.
+    VOL_PCT=15
+    if [[ $PA_ENV_VALUE =~ ^[0-9]{1,3}$ ]] && [ "$((10#$PA_ENV_VALUE))" -ge 1 ] && [ "$((10#$PA_ENV_VALUE))" -le 100 ]; then
+        VOL_PCT=$((10#$PA_ENV_VALUE))
+    fi
+    [ "$CS_OK" != 1 ] || benv="$CS_BACKUP_ENV"
+    pa_vol_stores "$benv" "$PG_DATADIR"
+    [ "$PA_VOL_STORE_KNOWN" = 1 ] && [ "$PG_DATADIR_KNOWN" = 1 ] || VOL_ALL=0
+    [ "$PG_DATADIR_KNOWN" = 1 ] || VOL_CAUSE="$PG_DATADIR_CAUSE"
+    for i in "${!PA_VOL_STORE[@]}"; do
+        p="${PA_VOL_STORE[$i]}" as="${PA_VOL_STORE_AS[$i]}"
+        # With no propolis account no daemon reads or writes the configured logs here.
+        if [ "$as" = propolis ] && ! account_uid propolis > /dev/null; then continue; fi
+        if ! fits 5; then
+            VOL_ALL=0
+            continue
+        fi
+        out="$(vol_stat "$ROOT$p" "$as")"
+        rc=$?
+        [ "$rc" != 2 ] || continue
+        if [ "$rc" != 0 ]; then
+            VOL_ALL=0
+            continue
+        fi
+        read -r dev type <<< "$out"
+        # Not a directory: not a store on this host.
+        [[ $dev =~ ^[0-9]{1,20}$ ]] && [ "$type" = directory ] || continue
+        [ "${PA_VOL_STORE_LOG[$i]}" != 1 ] || LOG_DEVS+="$dev "
+        [ -z "${at[$dev]:-}" ] || continue
+        at[$dev]=1
+        VOL_DEV+=("$dev") VOL_PATH+=("$p") VOL_AS+=("$as") VOL_OK+=(0) VOL_TARGET+=("") VOL_SIZE+=("")
+        VOL_AVAIL+=("") VOL_IT+=("") VOL_IA+=("") VOL_MID+=("")
+    done
+    for i in "${!VOL_DEV[@]}"; do
+        if ! fits 10; then
+            VOL_ALL=0
+            continue
+        fi
+        if [ -n "${VOL_AS[$i]}" ]; then
+            out="$(_pa_as_t 10 "${VOL_AS[$i]}" df -B1 --output=size,avail,itotal,iavail,target -- "$ROOT${VOL_PATH[$i]}")"
+        else
+            out="$(timeout 10 df -B1 --output=size,avail,itotal,iavail,target -- "$ROOT${VOL_PATH[$i]}" 2> /dev/null)"
+        fi
+        rc=$?
+        if [ "$rc" != 0 ]; then
+            VOL_ALL=0
+            case "$rc" in 126 | 127) VOL_CAUSE=tool.exec ;; esac
+            continue
+        fi
+        line="$(printf '%s\n' "$out" | sed -n 2p)"
+        size="" avail="" it="" ia="" target=""
+        read -r size avail it ia target <<< "$line"
+        if ! [[ $size =~ ^[0-9]{1,18}$ && $avail =~ ^[0-9]{1,18}$ && $it =~ ^[0-9]{1,18}$ && $ia =~ ^[0-9]{1,18}$ ]] \
+            || ! [[ $target =~ ^/[\ -~]{0,255}$ ]]; then
+            VOL_ALL=0
+            continue
+        fi
+        VOL_OK[i]=1 VOL_SIZE[i]=$((10#$size)) VOL_AVAIL[i]=$((10#$avail)) VOL_IT[i]=$((10#$it))
+        VOL_IA[i]=$((10#$ia)) VOL_TARGET[i]="$target"
+    done
+    # Records and samples are keyed by the mount point: a later filesystem df puts on the same one
+    # adds neither, and holds the sensor logs for the first one's record.
+    for i in "${!VOL_DEV[@]}"; do
+        [ "${VOL_OK[$i]}" = 1 ] || continue
+        for ((j = 0; j < i; j++)); do
+            [ "${VOL_OK[$j]}" = 1 ] && [ "${VOL_TARGET[$j]}" = "${VOL_TARGET[$i]}" ] || continue
+            VOL_OK[i]=0
+            [[ $LOG_DEVS != *" ${VOL_DEV[$i]} "* ]] || LOG_DEVS+="${VOL_DEV[$j]} "
+            break
+        done
+    done
+}
+
+declare -A CH_SHA=() CH_KEYS=() CH_FAILED=() CH_CTIME=()
+CH_DONE=0
+
+# The watched files, as `directory|depth`: each is listed with find (regular files of root's,
+# never a link), and ch_watched picks the names that count.
+WITNESS_WATCHED_DIRS=(/etc/propolis\|1 /etc/systemd/system\|2 /etc/logrotate.d\|1 /etc/tmpfiles.d\|1 /var/lib/propolis\|1 /usr/local/sbin\|1 /usr/local/lib/propolis\|1 /usr/local/bin\|1)
+
+# The key names of an env file, one a line, by the rules pa_env_get reads systemd's
+# EnvironmentFile= by: `KEY=value` and `KEY = value`, comments starting with # or ;, a value that
+# runs on over lines inside a quote or past a trailing backslash, and a comment ending in a
+# backslash that runs into the next line. Only a line that starts an entry gives its key, so no
+# line of a value is ever printed, whatever it looks like. The states are _pa_env_scan's: k a line
+# that starts afresh, c the line a comment runs into, v an unquoted value continued, s and d a
+# single or double quote still open (e and f the character after a backslash).
+# shellcheck disable=SC2016 # awk's own fields and strings, not the shell's
+CH_KEYS_AWK='
+function scan(m, t,   i, c, n) {
+    if (m == "v" || (m == "p" && index(t, "\"") == 0 && index(t, "\047") == 0)) {
+        n = 0
+        if (match(t, /\\+$/)) n = RLENGTH
+        return (n % 2) ? "v" : "k"
+    }
+    for (i = 1; i <= length(t); i++) {
+        c = substr(t, i, 1)
+        if (m == "p") {
+            if (c == "\047") m = "s"
+            else if (c == "\"") m = "d"
+            else if (c == "\\") m = "e"
+            else if (c != " " && c != "\t") m = "v"
+        } else if (m == "v") {
+            if (c == "\\") m = "e"
+        } else if (m == "e") {
+            m = "v"
+        } else if (m == "s") {
+            if (c == "\047") m = "p"
+        } else if (m == "d") {
+            if (c == "\"") m = "p"
+            else if (c == "\\") m = "f"
+        } else if (m == "f") {
+            m = "d"
+        }
+    }
+    if (m == "p" || m == "v") return "k"
+    if (m == "e") return "v"
+    return m
+}
+BEGIN { st = "k" }
+{
+    if (st == "c") { st = "k"; next }
+    if (st != "k") { st = scan(st, $0); next }
+    if ($0 ~ /^[ \t]*[#;]/) {
+        if (match($0, /\\+$/) && RLENGTH % 2 == 1) st = "c"
+        next
+    }
+    if (index($0, "=") == 0) next
+    if ($0 ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=/) {
+        k = $0
+        sub(/^[ \t]*/, "", k)
+        sub(/[ \t]*=.*$/, "", k)
+        print k
+    }
+    v = $0
+    sub(/^[^=]*=/, "", v)
+    st = scan("p", v)
+}'
+
+# ch_watched DIR REL: how a listed file is watched: env (a hash of the content and of the sorted key
+# names), file (a hash of the content), bin (inode, size and modification time), or not at all.
+ch_watched() {
+    local dir="$1" rel="$2" sub="" b
+    case "$rel" in */*) sub="${rel%/*}" rel="${rel##*/}" ;; esac
+    if [ -n "$sub" ]; then
+        # Below a directory only a unit's drop-ins count: <unit>.d/<name>.conf.
+        [ "$dir" = /etc/systemd/system ] && [[ $sub == *.d && $sub != */* && $rel == *.conf ]] \
+            && ch_unit "${sub%.d}" && printf file
+        return
+    fi
+    case "$dir|$rel" in
+        "/etc/propolis|"*.env) printf env ;;
+        "/etc/propolis|backup-recipients.txt" | "/etc/logrotate.d|propolis-sensors" \
+            | "/etc/tmpfiles.d|propolis.conf" | "/var/lib/propolis|deploy-stamp.json" \
+            | "/usr/local/sbin|propolis-"* | "/usr/local/lib/propolis|"*) printf file ;;
+        "/etc/systemd/system|"*) ch_unit "$rel" && printf file ;;
+        "/usr/local/bin|"*)
+            for b in "${WITNESS_BINS[@]}"; do
+                if [ "$rel" = "$b" ]; then
+                    printf bin
+                    return 0
+                fi
+            done
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# ch_unit NAME: NAME is one of the Propolis units deploy/install.sh puts in /etc/systemd/system.
+ch_unit() {
+    case "$1" in
+        propolis.service | propolis-*.service | propolis-*.timer | sensor-*.service | gateway.service | shipper.service) return 0 ;;
+    esac
+    return 1
+}
+
+# change_read: a hash of each watched file, for its H line: sha256 of the content (env files and
+# root's scripts, units and settings), of `inode/size/mtime` for the binaries, and for an env file
+# the first 8 hex of sha256 of its sorted key names. No value of an env file is stored, hashed on
+# its own or printed: the content reaches sha256sum and awk as a file they open, and awk passes on
+# the key names alone. An env file's ctime is read too (CH_CTIME), for env_after_start. A
+# directory whose listing failed keeps its files' last lines (CH_FAILED); a hash that timed out
+# leaves CH_DONE 0, and every line is kept as read.
+change_read() {
+    local owner spec dir depth tmp rc s rel p kind h id out line
+    local -a hashed=() theirs=() envs=() ctimes=() bins=() entries=()
+    CH_DONE=0
+    owner="$(root_uid)"
+    tmp="$(mktemp 2> /dev/null)" || return 0
+    PA_CLEANUP+=("$tmp")
+    for spec in "${WITNESS_WATCHED_DIRS[@]}"; do
+        dir="${spec%|*}" depth="${spec#*|}"
+        if ! fits 10; then
+            CH_FAILED[$dir]=1
+            continue
+        fi
+        [ -d "$ROOT$dir" ] || continue
+        timeout 10 find "$ROOT$dir" -mindepth 1 -maxdepth "$depth" -type f -user "$owner" -printf '%s\t%P\0' > "$tmp" 2> /dev/null
+        rc=$?
+        if [ "$rc" != 0 ]; then
+            CH_FAILED[$dir]=1
+            continue
+        fi
+        mapfile -d '' -t entries < "$tmp"
+        for line in "${entries[@]}"; do
+            s="${line%%$'\t'*}" rel="${line#*$'\t'}"
+            p="$dir/$rel"
+            pa_ok_field "$p" || continue
+            kind="$(ch_watched "$dir" "$rel")" || continue
+            case "$kind" in
+                bin) bins+=("$p") ;;
+                env)
+                    # An env file over 1 MiB is no env file systemd would load whole: its keys are
+                    # not read.
+                    hashed+=("$p") ctimes+=("$p")
+                    [[ $s =~ ^[0-9]{1,7}$ ]] && [ "$((10#$s))" -le 1048576 ] && envs+=("$p")
+                    ;;
+                *)
+                    # /var/lib/propolis is the daemon account's own directory.
+                    if [ "$dir" = /var/lib/propolis ]; then theirs+=("$p"); else hashed+=("$p"); fi
+                    ;;
+            esac
+            [ "${#hashed[@]}" -le 400 ] || break
+        done
+    done
+    if [ "${#hashed[@]}" -gt 0 ]; then
+        fits 30 || return 0
+        out="$(timeout 30 sha256sum -- "${hashed[@]/#/$ROOT}" 2> /dev/null)"
+        rc=$?
+        [ "$rc" != 124 ] || return 0
+        while read -r h p; do
+            [[ $h =~ ^[0-9a-f]{64}$ ]] || continue
+            p="${p#"$ROOT"}"
+            pa_ok_field "$p" || continue
+            CH_SHA[$p]="${h:0:16}" CH_KEYS[$p]=-
+        done <<< "$out"
+    fi
+    # A file in the daemon account's directory is hashed as that account. It can swap the name
+    # for a link between the listing and the hash, and root would then open something else: a
+    # file only root may read, or one that never ends.
+    for p in "${theirs[@]}"; do
+        fits 10 || return 0
+        out="$(_pa_as_t 10 propolis sha256sum -- "$ROOT$p" 2> /dev/null)" || continue
+        h="${out%% *}"
+        [[ $h =~ ^[0-9a-f]{64}$ ]] || continue
+        CH_SHA[$p]="${h:0:16}" CH_KEYS[$p]=-
+    done
+    for p in "${envs[@]}"; do
+        if [ -z "${CH_SHA[$p]:-}" ] || ! fits 5; then continue; fi
+        h="$(timeout 5 awk "$CH_KEYS_AWK" "$ROOT$p" 2> /dev/null | LC_ALL=C sort -u | sha256sum 2> /dev/null)" || continue
+        [[ ${h:0:8} =~ ^[0-9a-f]{8}$ ]] && CH_KEYS[$p]="${h:0:8}"
+    done
+    for p in "${ctimes[@]}"; do
+        if [ -z "${CH_SHA[$p]:-}" ] || ! fits 5; then continue; fi
+        h="$(timeout 5 stat -c %Z -- "$ROOT$p" 2> /dev/null)" || continue
+        [[ $h =~ ^[0-9]{1,12}$ ]] && CH_CTIME[$p]=$((10#$h))
+    done
+    if [ "${#bins[@]}" -gt 0 ] && fits 5; then
+        out="$(timeout 5 stat -c '%i/%s/%Y %n' -- "${bins[@]/#/$ROOT}" 2> /dev/null)"
+        while read -r id p; do
+            [[ $id =~ ^[0-9]{1,20}/[0-9]{1,20}/[0-9]{1,12}$ ]] || continue
+            p="${p#"$ROOT"}"
+            pa_ok_field "$p" || continue
+            h="$(printf '%s' "$id" | sha256sum 2> /dev/null)" || continue
+            CH_SHA[$p]="${h:0:16}" CH_KEYS[$p]=-
+        done <<< "$out"
+    fi
+    CH_DONE=1
+}
+
+# ---- the hourly pass's judgement of stores, the database and changes --------------------------
+
+declare -A OBS_H=() NEW_H=()
+OBS_Z=() NEW_Z=()
+VOL_JUDGED=0 H_JUDGED=0
+
+# absent_clean KEY: KEY's condition did not hold on a pass that could see it: a pending record is
+# dropped (the next sighting would not be the second in a row), an open one counts one more clean
+# pass and resolves with PROOF (in ABSENT_PROOF) on the second.
+ABSENT_PROOF=clean2
+absent_clean() {
+    pa_incident_get "$1" || {
+        unset 'OBS_P[clean:$1]'
+        return 0
+    }
+    case "${PA_INC[7]}" in
+        pending) pa_incident_transition "$1" drop && rec_set ;;
+        open | acked)
+            streak "clean:$1" ok
+            if [ "$STREAK_N" -ge 2 ]; then
+                PA_REC_PROOF="$ABSENT_PROOF"
+                pa_incident_transition "$1" resolve && rec_set
+                unset 'OBS_P[clean:$1]'
+            fi
+            ;;
+        *) unset 'OBS_P[clean:$1]' ;;
+    esac
+    return 0
+}
+
+# absent_unknown KEY: KEY's condition could not be seen on this pass: unknown opens nothing and
+# resolves nothing; a pending record is dropped, an open one's clean count starts again.
+absent_unknown() {
+    unset 'OBS_P[clean:$1]'
+    pa_incident_get "$1" && [ "${PA_INC[7]}" = pending ] || return 0
+    pa_incident_transition "$1" drop && rec_set
+    return 0
+}
+
+# seen_hold KEY HOLD: KEY's condition holds on this pass (attributes in PA_REC_*): the rule of two
+# passes, its clean count cleared.
+seen_hold() {
+    unset 'OBS_P[clean:$1]'
+    two_pass "$1" 1 "$2"
+}
+
+# judge_volumes: volume-filling (ACT) and volume-full-soon (PAGE) on vol:<mount id>, one record per
+# filesystem whatever it rises to, from this pass's samples and the history in the Z lines (the
+# triggers and the projection are the library's pa_vol_judge and pa_vol_project). A rise from the
+# first to the second is a change; a tier never falls while the record is open. Room again on two
+# passes resolves it (room2). A filesystem whose df did not answer is unknown; one no store lives
+# on any more, on a pass that sampled every store, is no longer filling. Then the Z lines: this
+# pass's samples, the earlier ones under seven days old, at most one per filesystem in any 45
+# minutes, and none of a filesystem that went.
+judge_volumes() {
+    local input="" i id kind name m key hist line t lm ls age trig
+    local -A mid_of=() sampled=() count=()
+    local -a keys=() kept=()
+    for i in "${!VOL_DEV[@]}"; do
+        [ "${VOL_OK[$i]}" = 1 ] && input+="mount"$'\t'"${VOL_TARGET[$i]}"$'\n'
+    done
+    if [ -n "$input" ]; then
+        while IFS=$'\t' read -r id kind name; do
+            [ "$kind" = mount ] && [ -n "$name" ] && mid_of[$name]="$id"
+        done < <(printf '%s' "$input" | pa_id_table 2> /dev/null)
+    fi
+    for i in "${!VOL_DEV[@]}"; do
+        [ "${VOL_OK[$i]}" = 1 ] || continue
+        m="${mid_of[${VOL_TARGET[$i]}]:-}"
+        if [ -z "$m" ]; then
+            # No salt, no id: nothing can be keyed, so nothing is judged or dropped.
+            VOL_ALL=0 VOL_OK[i]=0
+            continue
+        fi
+        VOL_MID[i]="$m" sampled[$m]=1
+        hist=""
+        for line in "${OBS_Z[@]}"; do
+            IFS=$'\t' read -r _ lm ls _ t _ <<< "$line"
+            [ "$lm" = "$m" ] && hist+="$ls"$'\t'"$t"$'\n'
+        done
+        pa_vol_project "$PA_STAMP" "${VOL_AVAIL[$i]}" <<< "$hist"
+        pa_vol_judge "${VOL_SIZE[$i]}" "${VOL_AVAIL[$i]}" "${VOL_IT[$i]}" "${VOL_IA[$i]}" "$VOL_PCT" "$PA_VOL_HOURS" || continue
+        key="vol:$m"
+        trig=$((PA_VOL_A | PA_VOL_B | PA_VOL_C | PA_VOL_SOON))
+        if [ "$trig" = 1 ]; then
+            if [ "$PA_VOL_SOON" = 1 ]; then
+                rec_attrs volume-full-soon PAGE host "$PA_VOL_CAUSE"
+            else
+                rec_attrs volume-filling ACT host "$PA_VOL_CAUSE"
+            fi
+            if pa_incident_get "$key"; then
+                case "${PA_INC[7]}" in
+                    # Open at PAGE, the record stays volume-full-soon until it resolves.
+                    open | acked) [ "$PA_VOL_SOON" = 1 ] || [ "${PA_INC[6]}" != PAGE ] || PA_REC_KIND="" ;;
+                    # Two passes in a row open the record at the lower of their tiers: one reading
+                    # of full soon alone pages nothing, and the next one raises it as a change.
+                    pending)
+                        if [ "$PA_VOL_SOON" = 1 ] && [ "${PA_INC[6]}" = ACT ]; then
+                            rec_attrs volume-filling ACT host "$PA_VOL_CAUSE"
+                        elif [ "$PA_VOL_SOON" = 0 ] && [ "${PA_INC[6]}" = PAGE ]; then
+                            PA_INC[3]=volume-filling PA_INC[6]=ACT
+                            rec_set
+                        fi
+                        ;;
+                esac
+            fi
+            PA_REC_INST="$m"
+            seen_hold "$key" ""
+        else
+            ABSENT_PROOF=room2 absent_clean "$key"
+        fi
+    done
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ <<< "$line"
+        [[ $key == vol:* ]] && [ -z "${sampled[${key#vol:}]:-}" ] && keys+=("$key")
+    done
+    for key in "${keys[@]}"; do
+        if [ "$VOL_ALL" = 1 ]; then
+            ABSENT_PROOF=room2 absent_clean "$key"
+        else
+            absent_unknown "$key"
+        fi
+    done
+    for line in "${OBS_Z[@]}"; do
+        IFS=$'\t' read -r _ lm ls _ <<< "$line"
+        [[ $lm =~ ^m[0-9a-f]{5,8}$ ]] || continue
+        age="$(pa_age "$ls")"
+        [ "$age" -ge 0 ] && [ "$age" -le 604800 ] || continue
+        if [ -n "${sampled[$lm]:-}" ]; then
+            [ "$age" -ge 2700 ] || continue
+        elif [ "$VOL_ALL" = 1 ]; then
+            continue
+        fi
+        kept+=("$line")
+    done
+    for i in "${!VOL_DEV[@]}"; do
+        [ "${VOL_OK[$i]}" = 1 ] || continue
+        kept+=("Z"$'\t'"${VOL_MID[$i]}"$'\t'"$PA_STAMP"$'\t'"${VOL_SIZE[$i]}"$'\t'"${VOL_AVAIL[$i]}"$'\t'"${VOL_IT[$i]}"$'\t'"${VOL_IA[$i]}")
+    done
+    # The newest 224 of each filesystem at most, seven days of passes 45 minutes apart: lines are
+    # kept in the order written, so the oldest go first.
+    for line in "${kept[@]}"; do
+        IFS=$'\t' read -r _ lm _ <<< "$line"
+        count[$lm]=$((${count[$lm]:-0} + 1))
+    done
+    NEW_Z=()
+    for line in "${kept[@]}"; do
+        IFS=$'\t' read -r _ lm _ <<< "$line"
+        if [ "${count[$lm]}" -gt 224 ]; then
+            count[$lm]=$((${count[$lm]} - 1))
+            continue
+        fi
+        NEW_Z+=("$line")
+    done
+    VOL_JUDGED=1
+}
+
+# judge_pgstate: db-xid (ACT) when the oldest unfrozen transaction id is over a thousand million
+# old, half way to wraparound and far past autovacuum's own 200 million; db-slots (ACT) when the
+# connections reach 90% of max_connections less the reserved slots; db-locks (NOTICE) for lock
+# waits over 120 s; each on dbstate:<name>, on the second hourly pass, resolved clean2. Like the
+# light pass's database kinds, none opens in the first 900 s of uptime or under a manual marker.
+judge_pgstate() {
+    local hold="" k xid=0 slots=0 locks=0
+    [ "$PG_RESULT" != skip ] || return 0
+    if [ "$PG_RESULT" != ok ]; then
+        for k in xid slots locks; do absent_unknown "dbstate:$k"; done
+        return 0
+    fi
+    [ "$PA_UP" -ge 900 ] || hold=grace
+    if [ "$MAINT" = 1 ] && [ "$MAINT_REASON" = manual ]; then hold=maint; fi
+    [ "$PG_XID" -le 1000000000 ] || xid=1
+    if [ "$PG_USABLE" -gt 0 ] && [ "$((PG_CONN * 10))" -ge "$((PG_USABLE * 9))" ]; then slots=1; fi
+    [ "$PG_LOCKS" = 0 ] || locks=1
+    if [ "$xid" = 1 ]; then
+        rec_attrs db-xid ACT ledger db.xid
+        seen_hold dbstate:xid "$hold"
+    else
+        absent_clean dbstate:xid
+    fi
+    if [ "$slots" = 1 ]; then
+        rec_attrs db-slots ACT ledger db.slots
+        seen_hold dbstate:slots "$hold"
+    else
+        absent_clean dbstate:slots
+    fi
+    if [ "$locks" = 1 ]; then
+        rec_attrs db-locks NOTICE ledger db.locks
+        seen_hold dbstate:locks "$hold"
+    else
+        absent_clean dbstate:locks
+    fi
+}
+
+# judge_hlines: this pass's H lines, `H path sha16 changed keys8 seen before`: the hash, the pass
+# that first saw it (`-` for a file first seen, which is no change), the key-name hash of an env
+# file, the last pass that saw it, and the last pass that saw the value before it. A file a pass
+# could not list keeps its line as read; one no longer there drops out.
+judge_hlines() {
+    local p osha ochg oseen obef d keep
+    NEW_H=()
+    if [ "$CH_DONE" != 1 ]; then
+        for p in "${!OBS_H[@]}"; do NEW_H[$p]="${OBS_H[$p]}"; done
+        return 0
+    fi
+    for p in "${!CH_SHA[@]}"; do
+        osha="" ochg="" oseen="" obef=""
+        IFS=$'\t' read -r osha ochg _ oseen obef _ <<< "${OBS_H[$p]:-}"
+        if [ -z "$osha" ]; then
+            NEW_H[$p]="${CH_SHA[$p]}"$'\t'-$'\t'"${CH_KEYS[$p]}"$'\t'"$PA_STAMP"$'\t'-
+        elif [ "$osha" = "${CH_SHA[$p]}" ]; then
+            pa_ok_field "${ochg:-}" || ochg=-
+            pa_ok_field "${obef:-}" || obef=-
+            NEW_H[$p]="${CH_SHA[$p]}"$'\t'"$ochg"$'\t'"${CH_KEYS[$p]}"$'\t'"$PA_STAMP"$'\t'"$obef"
+        else
+            pa_ok_field "${oseen:-}" || oseen=-
+            NEW_H[$p]="${CH_SHA[$p]}"$'\t'"$PA_STAMP"$'\t'"${CH_KEYS[$p]}"$'\t'"$PA_STAMP"$'\t'"$oseen"
+        fi
+    done
+    for p in "${!OBS_H[@]}"; do
+        [ -z "${NEW_H[$p]:-}" ] || continue
+        keep=0
+        for d in "${!CH_FAILED[@]}"; do
+            case "$p" in "$d"/*) keep=1 ;; esac
+        done
+        [ "$keep" = 0 ] || NEW_H[$p]="${OBS_H[$p]}"
+    done
+    H_JUDGED=1
+}
+
+# env_after_start UNIT: an env file UNIT loads changed after UNIT started. The pass that first saw
+# the new value must be in this boot and no earlier than the unit's start (uptime against uptime,
+# which a clock step cannot move); across a boot the unit started after the boot, so only a change
+# seen after that start counts. That pass alone would not do: a unit restarted between the edit
+# and it already runs with the new value. So the change counts when the last pass that saw the
+# earlier value is in this boot and no earlier than the start too; and when the start falls
+# between those two passes, or the earlier pass was in another boot, the file's last change (its
+# ctime, a root-owned file's) against the start on the wall clock decides. A clock stepped since
+# the start makes that comparison worthless: then the first pass that saw the new value decides.
+env_after_start() {
+    local u="$1" f start chg bef ct step=0 cs=""
+    [ "${CS_ACT[$u]:-}" = active ] && [ -n "${CS_AEM[$u]:-}" ] && [ "${CS_AEM[$u]}" != 0 ] || return 1
+    [ "$PA_BOOT" != - ] || return 1
+    start=$((10#${CS_AEM[$u]} / 1000000))
+    cs="$(_pa_meta_get clock_step)"
+    if _pa_stamp_split "${cs%/*}" && [ "$_PA_B" = "$PA_BOOT" ] && [ "$((10#$_PA_U))" -ge "$start" ]; then
+        step=1
+    fi
+    for f in ${CS_ENVF[$u]:-}; do
+        [[ $f == /etc/propolis/*.env ]] || continue
+        chg="" bef=""
+        IFS=$'\t' read -r _ chg _ _ bef _ <<< "${NEW_H[$f]:-}"
+        _pa_stamp_split "${chg:-}" && [ "$_PA_B" = "$PA_BOOT" ] && [ "$((10#$_PA_U))" -ge "$start" ] || continue
+        if _pa_stamp_split "${bef:-}" && [ "$_PA_B" = "$PA_BOOT" ] && [ "$((10#$_PA_U))" -ge "$start" ]; then
+            return 0
+        fi
+        [ "$step" = 0 ] || return 0
+        ct="${CH_CTIME[$f]:-}"
+        [ -n "$ct" ] || continue
+        [ "$ct" -le "$((10#$PA_WALL - 10#$PA_UP + start))" ] || return 0
+    done
+    return 1
+}
+
+# judge_changes: change-pending (NOTICE, host) on change:<unit>, on the second hourly pass: an env
+# file edited after the unit that loads it started (change.env), a unit systemd needs a daemon
+# reload for (change.unit), a unit whose running binary was replaced (change.binary). Clean on two
+# passes resolves it. A binary that could not be checked is unknown for a record that says it was
+# replaced.
+judge_changes() {
+    local u key cause
+    if [ "$CS_OK" != 1 ]; then
+        for u in "${WITNESS_UNITS[@]}" "${WITNESS_TIMERS[@]}"; do absent_unknown "change:$u"; done
+        return 0
+    fi
+    for u in "${WITNESS_UNITS[@]}" "${WITNESS_TIMERS[@]}"; do
+        key="change:$u" cause=""
+        if [ "${CS_DEL[$u]:-}" = 1 ]; then
+            cause=change.binary
+        elif [ "${CS_NDR[$u]:-}" = yes ]; then
+            cause=change.unit
+        elif env_after_start "$u"; then
+            cause=change.env
+        fi
+        if [ -n "$cause" ]; then
+            rec_attrs change-pending NOTICE host "$cause"
+            PA_REC_INST="${FIDS[unit/$u]:--}"
+            seen_hold "$key" ""
+        elif [ "${CS_DEL[$u]:-}" = "?" ] && pa_incident_get "$key" && [ "${PA_INC[11]}" = change.binary ]; then
+            absent_unknown "$key"
+        else
+            absent_clean "$key"
+        fi
+    done
+}
+
+# tie_rotation: a propolis-logrotate failure the guard refused for want of space (guard.no_space)
+# takes as its parent the open volume record of the filesystem that holds the sensor logs, by the
+# late-parent rule: from then on it counts nothing, and the volume's record speaks for both.
+tie_rotation() {
+    local key=unit:propolis-logrotate.service parent="" i
+    pa_incident_get "$key" || return 0
+    case "${PA_INC[7]}" in pending | open | acked) ;; *) return 0 ;; esac
+    [ "${PA_INC[11]}" = guard.no_space ] && [ "${PA_INC[13]}" = - ] || return 0
+    for i in "${!VOL_DEV[@]}"; do
+        [ -n "${VOL_MID[$i]:-}" ] && [[ $LOG_DEVS == *" ${VOL_DEV[$i]} "* ]] || continue
+        pa_incident_get "vol:${VOL_MID[$i]}" || continue
+        case "${PA_INC[7]}" in
+            open | acked)
+                parent="${PA_INC[1]}"
+                break
+                ;;
+        esac
+    done
+    [ -n "$parent" ] || return 0
+    if pa_incident_fold "$key" "$parent"; then rec_set; fi
+}
+
+# judge_stores: under the lock, the stores, the rotation guard's tie, the database's state and the
+# changes, and each check's result in its P line (volume, pgstate, changes), where three unknowns
+# in a row open tool-unusable. Status 1 when a check could not tell on this pass.
+judge_stores() {
+    local bad=0
+    judge_volumes
+    tie_rotation
+    if [ "$VOL_ALL" = 1 ]; then
+        check_counts volume ok -
+    else
+        check_counts volume unknown "$VOL_CAUSE"
+        bad=1
+    fi
+    judge_pgstate
+    case "$PG_RESULT" in
+        ok) check_counts pgstate ok - ;;
+        unknown)
+            check_counts pgstate unknown "$PG_CAUSE"
+            bad=1
+            ;;
+    esac
+    judge_hlines
+    judge_changes
+    if [ "$CS_OK" = 1 ] && [ "$CS_EXE_BLIND" = 1 ]; then
+        check_counts changes unknown tool.exec
+        bad=1
+    elif [ "$CS_OK" = 1 ] && [ "$CH_DONE" = 1 ] && [ "${#CH_FAILED[@]}" = 0 ]; then
+        check_counts changes ok -
+    else
+        check_counts changes unknown unknown
+        bad=1
+    fi
+    [ "$bad" = 0 ]
 }
 
 # ---- the light pass's probes ----------------------------------------------------------------
@@ -3495,6 +4410,7 @@ hourly_pass() {
     local rc n status=ok t k v light="" judged=0
     pa_settings_load
     PA_ROLE="$(pa_role)"
+    if pa_maint_active; then MAINT=1 MAINT_REASON="$PA_MAINT_REASON"; fi
     load_table
     for k in "${WITNESS_UNITS[@]}"; do
         case "$k" in sensor-*.service) PA_FI_UNITS+=("${k%.service}") ;; esac
@@ -3510,6 +4426,12 @@ hourly_pass() {
         rc_collect 1
         hourly_sample
         backup_failed_last
+        # The units' properties first: the backup unit's environment names a store.
+        change_sample
+        pg_state_read
+        pg_datadir_read
+        vol_sample
+        change_read
     fi
     past_deadline && status=partial
 
@@ -3555,6 +4477,9 @@ hourly_pass() {
             check_counts readcheck "$RCR_RESULT" "$RCR_CAUSE"
             judge_other light 1200 "$light"
         fi
+        if ! past_deadline; then
+            judge_stores || status=partial
+        fi
     fi
     past_deadline && status=partial
     if [ "$CHANGED" = 1 ]; then
@@ -3567,6 +4492,11 @@ hourly_pass() {
     [ "$judged" = 0 ] || meta+=(cc_last "$PA_STAMP/$CC_RC/$CC_SECS" cc_fail "$(_pa_num "$CC_FAIL")")
     # How many lines the last completed run printed out of form, for the walk.
     [ "$judged" = 0 ] || [ "$CC_DONE" = 0 ] || meta+=(cc_skipped "$CC_BAD")
+    # The database's last state, for the walk's ledger row, and the local data directory once read.
+    if [ "$judged" = 1 ] && [ "$PG_RESULT" = ok ]; then
+        meta+=(pg_state "$PA_STAMP/$PG_XID/$PG_CONN/$PG_USABLE/$PG_LOCKS/$PG_SIZE")
+    fi
+    [ "$PG_DATADIR_NEW" = 0 ] || meta+=(pg_datadir "$PG_DATADIR" pg_datadir_stamp "$PA_STAMP")
     _pa_meta_set "${meta[@]}"
     where_merge
     [ "$WHERE" != none ] || status=partial

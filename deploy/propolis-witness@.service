@@ -2,16 +2,20 @@
 # propolis-witness@light.timer, propolis-witness@hourly.service once an hour from
 # propolis-witness@hourly.timer. deploy/witness.sh (installed as /usr/local/sbin/propolis-witness)
 # judges what the failure hook recorded and watches the units, the database, the daemon's /ready
-# and the journal itself (light), runs the installed config-check and asks the ntfy server whether
-# the alert topic can be read by anyone (hourly), records what it finds in
-# /var/lib/propolis/witness and writes the login banner. It sends no message: beside the read
-# check's GETs to the ntfy server, the only request that leaves the host is the optional
-# heartbeat URL's GET.
+# and the journal itself (light), runs the installed config-check, asks the ntfy server whether
+# the alert topic can be read by anyone, samples the free space of every store, reads the
+# database's state and records the files that configure Propolis (hourly), records what it finds
+# in /var/lib/propolis/witness and writes the login banner. It sends no message: beside the read
+# check's GETs to the ntfy server and the read-only database sessions, the only request that
+# leaves the host is the optional heartbeat URL's GET.
 #
-# Root, with no account of its own: it reads 0600 env files, root-only journal fields and other
-# accounts' 0750 directories (as those accounts, through setpriv). The hourly pass runs
-# config-check, which runs nft and ss; the grant for the daemon binary (pg-exec) is for the light
-# pass's database probe, which runs psql through it. No RuntimeDirectory=: /run/propolis-witness
+# Root, with no account of its own: it reads 0600 env files, root-only journal fields, other
+# accounts' 0750 directories (as those accounts, through setpriv) and each Propolis unit's
+# /proc/<pid>/exe link (root's ptrace capability, kept since there is no capability bounding set).
+# The hourly pass runs config-check, which runs nft and ss, df on every store, and psql as the
+# postgres account through setpriv for SHOW data_directory (the same psql and wrapper as below);
+# the grant for the daemon binary (pg-exec) is for both passes' database sessions, which run psql
+# through it. No RuntimeDirectory=: /run/propolis-witness
 # comes from the tmpfiles entry, because a oneshot's own runtime directory is removed when it
 # stops, under the failure hook and any other instance using it.
 #
@@ -55,7 +59,7 @@ ProtectClock=yes
 ProtectHostname=yes
 # Netlink for nft and ss, which config-check runs from the hourly pass; without it every firewall
 # cell is unknown. The internet families carry the read check's requests to the ntfy server, the
-# heartbeat URL's GET, the /ready GET on loopback and the database probe's connection.
+# heartbeat URL's GET, the /ready GET on loopback and the database sessions' connections.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -64,7 +68,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # Executable: the script; the installed config-check, which the hourly pass runs, and the daemon
-# binary (for pg-exec), which the light pass's database probe runs, both with `-`
+# binary (for pg-exec), which both passes' database sessions run, both with `-`
 # because the witness runs on every host, a gateway-only one or a collector without the
 # daemon binary among them, and an absent unprefixed entry fails the unit with 226/NAMESPACE;
 # the distro tools under /usr/bin and /usr/sbin; Debian's PostgreSQL wrapper, which psql

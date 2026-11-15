@@ -22,7 +22,8 @@
 # of a failed run and the unit map; the maintenance marker; the witness's heartbeat URL request
 # (pa_heartbeat_get) and the fixed journal lines it looks for (PA_JOURNAL_CLASSES); the database
 # probe through pg-exec (pa_pg) and the public-feed push scheduler check (pa_push_scheduler), so
-# the status command and the witness judge both by one rule; the incident record; and the failure
+# the status command and the witness judge both by one rule; the volume projection and triggers
+# (pa_vol_project, pa_vol_judge), for the same reason; the incident record; and the failure
 # hook's record step (pa_hook_record), which the hook runs in a child process of its own.
 #
 # TEMPORARY FILES. A function that makes one appends its path to PA_CLEANUP. Each caller's single
@@ -41,7 +42,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=6
+PA_LIB_VERSION=7
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -627,15 +628,22 @@ pa_dur() {
 # reach sensor logs only through supplementary groups), and without the state-lock descriptor,
 # so a process running as another account never holds root's lock.
 _pa_as() {
-    local user="$1" uid gid me="$UID"
-    shift
+    _pa_as_t 5 "$@"
+}
+
+# _pa_as_t SECONDS USER CMD...: _pa_as under `timeout SECONDS` (1 to 99), for a command that may
+# wait on a slow mount for longer than 5 s.
+_pa_as_t() {
+    local t="$1" user="$2" uid gid me="$UID"
+    shift 2
+    [[ $t =~ ^[1-9][0-9]?$ ]] || t=5
     [ -z "${PA_ROOT:-}" ] || me="${PA_TEST_UID:-$UID}"
     if [ "$me" != 0 ] || [ "${PA_TEST_READ_AS_SELF:-}" = 1 ]; then
-        set -- timeout 5 "$@"
+        set -- timeout "$t" "$@"
     else
         uid="$(id -u -- "$user" 2> /dev/null)" || return 1
         gid="$(id -g -- "$user" 2> /dev/null)" || return 1
-        set -- timeout 5 setpriv --reuid="$uid" --regid="$gid" --init-groups --no-new-privs -- "$@"
+        set -- timeout "$t" setpriv --reuid="$uid" --regid="$gid" --init-groups --no-new-privs -- "$@"
     fi
     if [[ $PA_LOCK_FD =~ ^[0-9]+$ ]]; then
         _pa_without_fds "$@" {PA_LOCK_FD}>&-
@@ -1788,6 +1796,173 @@ pa_journal_patterns() {
 pa_jcursor_ok() {
     local LC_ALL=C re='^[a-z]=[0-9a-f]{1,64}(;[a-z]=[0-9a-f]{1,64}){1,15}$'
     [ "${#1}" -le 512 ] && [[ ${1:-} =~ $re ]]
+}
+
+# ---- volumes -----------------------------------------------------------------------------------
+#
+# The witness's hourly pass keeps one sample of every filesystem a store lives on (observe `Z`
+# lines) and judges each with these two functions; the status walk shows the same projection from
+# the same lines, so the two can never disagree on when a volume fills. Sizes are bytes and can
+# pass 2^53, while bash counts in 64-bit signed integers: every size is held to 18 digits and
+# taken down to KiB before any product is formed, and no division is made by a number not first
+# shown to be above zero.
+
+# _pa_kib V: V (bytes, at most 18 digits) in whole KiB, or failure for anything else.
+_pa_kib() {
+    [[ ${1:-} =~ ^[0-9]{1,18}$ ]] || return 1
+    printf '%s' "$((10#$1 / 1024))"
+}
+
+# pa_vol_project NOW_STAMP NOW_AVAIL: reads earlier samples of one filesystem on stdin, one
+# `stamp<TAB>avail` line each (avail in bytes, any order), and sets PA_VOL_SPAN (seconds from the
+# oldest usable sample to NOW_STAMP), PA_VOL_RATE (the KiB an hour by which the free space
+# shrinks, or `-`) and PA_VOL_HOURS (whole hours until the free space falls to 1 GiB at that
+# rate, or `-`). Time between samples is measured from their stamps (uptime within a boot, the
+# wall clock across boots), so a host that was off for a day does not make the same fall look
+# faster. A projection needs samples spanning 72 hours and a free space that shrank over that
+# span (the seven-day rate): a nightly backup or a one-off copy is a step, and only a fall that
+# lasts is a trend. The rate is then the larger of the seven-day rate and the rate since the
+# oldest sample of the last 24 hours, the latter only over at least 12 hours. A sample that
+# cannot be read, lies ahead of NOW_STAMP or is over seven days old is not used. Status 2 for
+# arguments out of form.
+pa_vol_project() {
+    local now="${1:-}" nowk st av span k old=-1 oldk=0 b24=-1 b24k=0 rate=-1 r
+    PA_VOL_SPAN=0 PA_VOL_RATE=- PA_VOL_HOURS=-
+    _pa_stamp_split "$now" || return 2
+    nowk="$(_pa_kib "${2:-}")" || return 2
+    while IFS=$'\t' read -r st av _ || [ -n "$st" ]; do
+        k="$(_pa_kib "$av")" || continue
+        span="$(_pa_stamp_span "$st" "$now")" || continue
+        [ "$span" -gt 0 ] && [ "$span" -le 604800 ] || continue
+        if [ "$span" -gt "$old" ]; then old="$span" oldk="$k"; fi
+        if [ "$span" -le 86400 ] && [ "$span" -gt "$b24" ]; then b24="$span" b24k="$k"; fi
+    done
+    [ "$old" -gt 0 ] || return 0
+    PA_VOL_SPAN="$old"
+    [ "$old" -ge 259200 ] || return 0
+    # KiB times 3600 stays under 2^63 for any size of 18 digits (under 1e15 KiB).
+    rate=$(((oldk - nowk) * 3600 / old))
+    [ "$rate" -gt 0 ] || return 0
+    if [ "$b24" -ge 43200 ]; then
+        r=$(((b24k - nowk) * 3600 / b24))
+        [ "$r" -le "$rate" ] || rate="$r"
+    fi
+    PA_VOL_RATE="$rate"
+    if [ "$nowk" -le 1048576 ]; then
+        PA_VOL_HOURS=0
+    else
+        PA_VOL_HOURS=$(((nowk - 1048576) / rate))
+    fi
+    return 0
+}
+
+# pa_vol_judge SIZE AVAIL ITOTAL IAVAIL PCT HOURS: the triggers of one sample, from its sizes (bytes)
+# and inode counts, the share of free space below which a volume is filling (PCT, the daemon's
+# PROPOLIS_OPS_CAPACITY_FREE_PCT) and the projection's HOURS (`-` for none). Sets PA_VOL_A (free
+# space under PCT of the size), PA_VOL_B (free inodes under 10%; never on a filesystem that
+# reports no inodes, as btrfs does), PA_VOL_C (full within 72 hours at the current rate),
+# PA_VOL_SOON (full within 12 hours, under 1 GiB and the rotation guard's 512 MiB reserve free on
+# a filesystem that is also under half free, or free inodes under 2%), each 0 or 1, and
+# PA_VOL_CAUSE (vol.low, vol.inodes or vol.projected for the first that holds, or `-`). Status 2
+# for numbers out of form: unknown is never a trigger.
+pa_vol_judge() {
+    local size="${1:-}" avail="${2:-}" it="${3:-}" ia="${4:-}" pct="${5:-}" hours="${6:--}"
+    local low=0 ilow=0
+    PA_VOL_A=0 PA_VOL_B=0 PA_VOL_C=0 PA_VOL_SOON=0 PA_VOL_CAUSE=-
+    [[ $size =~ ^[0-9]{1,18}$ && $avail =~ ^[0-9]{1,18}$ && $it =~ ^[0-9]{1,18}$ && $ia =~ ^[0-9]{1,18}$ ]] || return 2
+    [[ $pct =~ ^[0-9]{1,3}$ ]] && [ "$((10#$pct))" -le 100 ] || return 2
+    [[ $hours == - || $hours =~ ^[0-9]{1,18}$ ]] || return 2
+    size=$((10#$size)) avail=$((10#$avail)) it=$((10#$it)) ia=$((10#$ia)) pct=$((10#$pct))
+    # A filesystem that reports no size has no share of it free to judge, and one that reports no
+    # inodes has no inode count to run out of.
+    # shellcheck disable=SC2017 # dividing first keeps the product under 2^63 for a size of 18 digits
+    if [ "$size" -gt 0 ] && [ "$avail" -lt "$((size / 100 * pct))" ]; then PA_VOL_A=1; fi
+    # The floor is a size, so a filesystem smaller than about that is under it even when empty:
+    # it counts only when the filesystem is under half free as well.
+    if [ "$size" -gt 0 ] && [ "$avail" -lt 1610612736 ] && [ "$avail" -lt "$((size / 2))" ]; then low=1; fi
+    if [ "$it" -gt 0 ] && [ "$ia" -lt "$((it / 10))" ]; then PA_VOL_B=1; fi
+    if [ "$it" -gt 0 ] && [ "$ia" -lt "$((it / 50))" ]; then ilow=1; fi
+    if [ "$hours" != - ] && [ "$((10#$hours))" -lt 72 ]; then PA_VOL_C=1; fi
+    if [ "$low" = 1 ] || [ "$ilow" = 1 ] || { [ "$hours" != - ] && [ "$((10#$hours))" -lt 12 ]; }; then
+        PA_VOL_SOON=1
+    fi
+    if [ "$PA_VOL_A" = 1 ] || [ "$low" = 1 ]; then
+        PA_VOL_CAUSE=vol.low
+    elif [ "$PA_VOL_B" = 1 ] || [ "$ilow" = 1 ]; then
+        PA_VOL_CAUSE=vol.inodes
+    elif [ "$PA_VOL_C" = 1 ]; then
+        PA_VOL_CAUSE=vol.projected
+    fi
+    return 0
+}
+
+# _pa_path_ok PATH: an absolute path of the closed character set a path read from a file or a
+# unit's properties must keep to before it reaches a command line: no blank, quote or glob
+# character, and no `..` component.
+_pa_path_ok() {
+    local LC_ALL=C
+    [[ ${1:-} =~ ^/[A-Za-z0-9._/-]{1,200}$ ]] && [[ /$1/ != */../* ]]
+}
+
+# pa_vol_stores BACKUP_ENV DATADIR: the stores whose filesystems the witness's hourly pass samples,
+# which the walk's host view maps back to mount points; one list for both, so the walk can name
+# every filesystem the witness keeps samples of. They are /var/lib/propolis, /var/log/propolis,
+# /var/spool/propolis, the gateway's spool (PROPOLIS_GATEWAY_SPOOL_DIR in gateway.env, its
+# default when unset or out of form), the journal, the backups (the last PROPOLIS_BACKUP_DIR in
+# BACKUP_ENV, the backup unit's Environment property as systemctl prints it, the default when
+# none is set or it is out of form), the local data directory DATADIR (empty: none) and the
+# directory of each configured sensor log (PA_LOG_PATH, from pa_sensor_logs). A path is taken from
+# a file or a property only in _pa_path_ok's form. BACKUP_ENV `?` is a property that could not be
+# read.
+#
+# Sets PA_VOL_STORE (each path once), PA_VOL_STORE_AS (the account that reaches it: postgres for
+# the data directory and propolis for a configured log directory, since that account could put a
+# link on the path; empty for root's own), PA_VOL_STORE_LOG (1 for a store of sensor logs) and
+# PA_VOL_STORE_KNOWN (0 when a path could not be learnt and its default stands in for it: a
+# filesystem missing from the stores then proves nothing).
+pa_vol_stores() {
+    local benv="${1:-}" data="${2:-}" gw=/var/spool/propolis/gateway bk=/var/backups/propolis w bd="" p
+    local -a words=()
+    local -A at=()
+    PA_VOL_STORE=() PA_VOL_STORE_AS=() PA_VOL_STORE_LOG=() PA_VOL_STORE_KNOWN=1
+    pa_env_get PROPOLIS_GATEWAY_SPOOL_DIR "$PA_ENV_DIR/gateway.env" > /dev/null
+    [ -z "$PA_ENV_UNREADABLE" ] || PA_VOL_STORE_KNOWN=0
+    if [ "$PA_ENV_COMPLEX" = 0 ] && _pa_path_ok "$PA_ENV_VALUE"; then gw="$PA_ENV_VALUE"; fi
+    PA_ENV_VALUE=""
+    if [ "$benv" = "?" ]; then
+        PA_VOL_STORE_KNOWN=0
+    else
+        # systemd uses the last assignment; one it had to quote holds a character no store path has.
+        read -r -a words <<< "$benv" || true
+        for w in "${words[@]}"; do
+            case "$w" in PROPOLIS_BACKUP_DIR=*) bd="${w#PROPOLIS_BACKUP_DIR=}" ;; esac
+        done
+        ! _pa_path_ok "$bd" || bk="$bd"
+    fi
+    _pa_vol_store /var/lib/propolis "" 0
+    _pa_vol_store /var/log/propolis "" 1
+    _pa_vol_store /var/spool/propolis "" 0
+    _pa_vol_store "$gw" "" 0
+    _pa_vol_store /var/log/journal "" 0
+    _pa_vol_store "$bk" "" 0
+    ! _pa_path_ok "$data" || _pa_vol_store "$data" postgres 0
+    for p in "${PA_LOG_PATH[@]}"; do
+        p="${p%/*}"
+        ! _pa_path_ok "$p" || _pa_vol_store "$p" propolis 1
+    done
+}
+
+# _pa_vol_store PATH AS LOG: adds one store to pa_vol_stores' lists; a path already there keeps
+# the account it was added with, and is a store of logs when either says so.
+_pa_vol_store() {
+    local k
+    if [ -n "${at[$1]:-}" ]; then
+        k=$((at[$1] - 1))
+        [ "$3" != 1 ] || PA_VOL_STORE_LOG[k]=1
+        return 0
+    fi
+    PA_VOL_STORE+=("$1") PA_VOL_STORE_AS+=("$2") PA_VOL_STORE_LOG+=("$3")
+    at[$1]="${#PA_VOL_STORE[@]}"
 }
 
 # ---- the database probe and the push scheduler -------------------------------------------------

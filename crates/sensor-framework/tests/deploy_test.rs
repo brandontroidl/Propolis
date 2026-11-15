@@ -6703,7 +6703,7 @@ fn propolis_witness_units_run_as_root_in_their_own_sandbox_on_the_light_timer() 
         );
     }
     assert!(
-        raw.contains("pass's database probe, which runs psql through it"),
+        raw.contains("both passes' database sessions, which run psql"),
         "{raw}"
     );
     let service = uncommented(&raw);

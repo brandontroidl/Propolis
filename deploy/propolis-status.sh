@@ -58,7 +58,7 @@
 # its time limit in seconds.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 6
+# needs-alert-lib: 7
 
 umask 077
 STATUS_SELF="${BASH_SOURCE[0]}"
@@ -271,7 +271,8 @@ PA_LIB_VERSION=""
 STATUS_LIB_FUNCS="pa_init pa_env_get pa_settings_load pa_role pa_alias pa_id_table pa_plain_id
 pa_ok_field pa_clean_untrusted pa_now pa_age pa_dur pa_hms pa_read_as pa_stat_as pa_trusted_exec
 pa_state_read pa_maint_active pa_pg pa_push_scheduler pa_sensor_logs pa_unit_map pa_cleanup
-pa_banner pa_banner_write pa_maint_write pa_gate pa_readcheck_binding"
+pa_banner pa_banner_write pa_maint_write pa_gate pa_readcheck_binding pa_vol_project pa_vol_judge
+pa_vol_stores"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $STATUS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -1298,7 +1299,7 @@ row_intake() {
 
 LEDGER_OK=0 LEDGER_CAUSE=""
 row_ledger() {
-    local where id at note
+    local where id at note state cond words open
     if [ "$HAS_DAEMON" = 0 ]; then
         not_here 6 ledger "on the control node: run sudo propolis-status there"
         return 0
@@ -1330,7 +1331,16 @@ row_ledger() {
     [ -z "$id" ] || note="last event #$id"
     [ "$PA_PG_CAUSE" = - ] || note="reads answer; last event not read ($PA_PG_CAUSE)"
     note+="; writes not visible from shell (step 3)"
-    add_row 6 ledger "$where" "$(fmt_time "$at")" "$(fmt_age "$(age_of "$at")")" ok "$note"
+    # The witness's hourly reading of the database's state, and what it holds open of it: an old
+    # transaction id, slots nearly full or lock waits warn here; they stop no stage.
+    state=ok cond=""
+    words="$(pg_state_words)"
+    [ -z "$words" ] || note+="; $words"
+    open="$(dbstate_open)"
+    if [ -n "$open" ]; then
+        state=WARN cond=ledger-state note+="; open: $open"
+    fi
+    add_row 6 ledger "$where" "$(fmt_time "$at")" "$(fmt_age "$(age_of "$at")")" "$state" "$note" "" "$cond"
 }
 
 # ledger_unread: why rows 7 and 8 were not read. Only a connection-class cause is an outage
@@ -1674,6 +1684,54 @@ open_tools() {
     printf '%s' "$out"
 }
 
+# open_vols: the filesystems the witness's hourly pass records as filling or full soon, by their
+# opaque mount id, `volume <id> filling` or `volume <id> full soon`, joined by `; `.
+open_vols() {
+    local t k kind inst st out=""
+    while IFS=$'\t' read -r t _ k kind _ inst _ st _; do
+        [ "$t" = I ] && [[ $k == vol:* ]] || continue
+        case "$st" in open | acked) ;; *) continue ;; esac
+        [[ $inst =~ ^m[0-9a-f]{5,8}$ ]] || inst="?"
+        case "$kind" in
+            volume-full-soon) out+="${out:+; }volume $inst full soon" ;;
+            *) out+="${out:+; }volume $inst filling" ;;
+        esac
+    done <<< "$INCIDENTS_BODY"
+    printf '%s' "$out"
+}
+
+# open_count KIND: how many of the witness's records of KIND are open or acknowledged.
+open_count() {
+    local t kind st n=0
+    while IFS=$'\t' read -r t _ _ kind _ _ _ st _; do
+        [ "$t" = I ] && [ "$kind" = "$1" ] || continue
+        case "$st" in open | acked) n=$((n + 1)) ;; esac
+    done <<< "$INCIDENTS_BODY"
+    printf '%s' "$n"
+}
+
+# pg_state_words: the database's state as the witness's hourly pass last read it (meta pg_state),
+# for the ledger row: transaction-id age, connections of the usable slots, lock waits over 120 s
+# and the size; nothing when none was read.
+pg_state_words() {
+    local v="${META[pg_state]:-}"
+    [[ $v =~ ^([0-9]{1,12})/[0-9a-f-]{1,8}/[0-9]{1,10}/([0-9]{1,18})/([0-9]{1,9})/([0-9]{1,9})/([0-9]{1,9})/([0-9]{1,18})$ ]] || return 0
+    printf 'hourly %s: xid age %s, slots %s of %s, lock waits %s, size %s' "$(fmt_time "${BASH_REMATCH[1]}")" \
+        "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))" "$((10#${BASH_REMATCH[4]}))" \
+        "$((10#${BASH_REMATCH[5]}))" "$(human_bytes "$((10#${BASH_REMATCH[6]}))")"
+}
+
+# dbstate_open: the database states the hourly pass records as open: xid, slots, locks.
+dbstate_open() {
+    local t k st out=""
+    while IFS=$'\t' read -r t _ k _ _ _ _ st _; do
+        [ "$t" = I ] && [[ $k == dbstate:* ]] || continue
+        case "$st" in open | acked) ;; *) continue ;; esac
+        case "${k#dbstate:}" in xid | slots | locks) out+="${out:+ }${k#dbstate:}" ;; esac
+    done <<< "$INCIDENTS_BODY"
+    printf '%s' "$out"
+}
+
 B_SUCCESS="" B_FAILURE="" B_STEP="" B_SET=""
 rail_backup() {
     local dir s f fails warns state=ok note="" cond="" t
@@ -1732,7 +1790,7 @@ rail_chain() {
 }
 
 rail_host() {
-    local state=ok note="" cond="" d use worst="" first="" sync out step lw k flag tools
+    local state=ok note="" cond="" d use worst="" first="" sync out step lw k flag tools vols changes
     local -a dirs=() names=()
     for d in /var/lib/propolis /var/log/propolis /var/spool/propolis; do
         [ ! -d "$STATUS_ROOT$d" ] || dirs+=("$STATUS_ROOT$d") names+=("$d")
@@ -1813,6 +1871,17 @@ rail_host() {
         [ "$state" = FAIL ] || state=WARN
         note+="; a check cannot run: $tools"
     fi
+    # The witness's hourly pass judges every store, with a projection from a week of samples;
+    # the opaque ids map to mount points in the host view.
+    vols="$(open_vols)"
+    if [ -n "$vols" ]; then
+        [ "$state" = WARN ] || [ "$state" = FAIL ] || cond='host-volume'
+        [ "$state" = FAIL ] || state=WARN
+        note+="; $vols"
+    fi
+    # Recorded, not judged here: a NOTICE that a change waits for a restart or a reload.
+    changes="$(open_count change-pending)"
+    [ "$changes" = 0 ] || note+="; changed, not in force: $changes units (host view)"
     add_row "" host volumes - - "$state" "$note" direct "$cond"
 }
 
@@ -2057,6 +2126,7 @@ STATUS_NEXT=(
     "intake-down intake daemon-down"
     "intake-finding intake finding"
     "ledger-down ledger db-unreachable"
+    "ledger-state ledger db-state"
     "alert-path alert alert-path"
     "alert-target alert -"
     "backup-failed backup backup-failed"
@@ -2335,7 +2405,12 @@ open_line() {
     OPEN_TIER="$tier" OPEN_STATE="$state"
     OPEN_SORT="$rank$(printf '%010d' "$((10#$num))")"
     inst=-
-    case "$key" in unit:*) inst="$(unit_shown "${key#unit:}")" ;; esac
+    case "$key" in
+        unit:*) inst="$(unit_shown "${key#unit:}")" ;;
+        change:*) inst="$(unit_shown "${key#change:}")" ;;
+        # A mount point is shown only in the host view, beside its id.
+        vol:*) [[ ! ${f[5]:-} =~ ^m[0-9a-f]{5,8}$ ]] || inst="${f[5]}" ;;
+    esac
     out="$(printf '%s %-6s %-8s %-30s' "$id" "$tier" "$(stage_word "$stage")" "$inst")"
     if [ "$state" = pending ]; then
         w="${first%%/*}"
@@ -2716,6 +2791,142 @@ view_untrusted() {
     pa_clean_untrusted 200 20 | sed 's/^/        /'
 }
 
+# view_volumes: for each filesystem the witness's hourly pass samples (observe Z lines), its last
+# sample, how long its samples reach back and the projection from them (the library's
+# pa_vol_project, the rule the witness opens by), with the mount point beside the opaque id where
+# a store here maps to it. The stores are the library's pa_vol_stores, the witness's own list, each
+# mapped by its own df: as root for root's stores, and for the data directory and a configured log
+# directory as the account that owns it, since this walk runs as root with no sandbox and must not
+# open a path that account could swap for a link to anything. An id no store maps to reads `mount
+# point not known here` when a store's path could not be learnt or checked. Only this view, run by
+# root, shows a mount point.
+view_volumes() {
+    local obs line t m s size avail it ia d out target input="" id kind name n first a hist w i as
+    local benv="?" data="" known=1 remote=0 risk
+    local -A mount_of=() last=() cnt=() oldest=()
+    local -a mids=()
+    obs="$(pa_state_read observe)"
+    # Where the database is: a remote one's data volume is not on this host.
+    pa_env_get DATABASE_URL "$FLEET_ENV" "$PROPOLIS_ENV" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        case "$ROLE" in
+            collector | gateway) ;;
+            *)
+                if [ "$(_pa_pg_where "$PA_ENV_VALUE")" = remote ]; then
+                    remote=1
+                else
+                    data="${META[pg_datadir]:-}"
+                    [ -n "$data" ] || known=0
+                fi
+                ;;
+        esac
+    elif [ -n "$PA_ENV_UNREADABLE" ]; then
+        known=0
+    fi
+    PA_ENV_VALUE=""
+    if out="$(systemctl show -p Environment -- propolis-backup.service 2> /dev/null)"; then
+        benv="${out#Environment=}"
+    fi
+    pa_env_get PROPOLIS_SENSOR_LOGS "$FLEET_ENV" "$PROPOLIS_ENV" > /dev/null
+    pa_sensor_logs "$PA_ENV_VALUE"
+    PA_ENV_VALUE=""
+    pa_vol_stores "$benv" "$data"
+    [ "$PA_VOL_STORE_KNOWN" = 1 ] || known=0
+    for i in "${!PA_VOL_STORE[@]}"; do
+        d="$STATUS_ROOT${PA_VOL_STORE[$i]}" as="${PA_VOL_STORE_AS[$i]}"
+        # A stat, which opens nothing; then df, which opens the path, as whoever owns it.
+        [ -e "$d" ] || continue
+        if [ -z "$as" ]; then
+            out="$(timeout 10 df -P -- "$d" 2> /dev/null)"
+        else
+            out="$(_pa_as_t 10 "$as" df -P -- "$d")"
+        fi
+        # shellcheck disable=SC2181 # one status for the two branches above
+        if [ "$?" != 0 ]; then
+            known=0
+            continue
+        fi
+        target="$(printf '%s\n' "$out" | sed -n 2p)"
+        read -r _ _ _ _ _ target <<< "$target"
+        [[ $target =~ ^/[\ -~]{0,255}$ ]] && input+="mount"$'\t'"$target"$'\n'
+    done
+    if [ -n "$input" ] && [ "$SALT" = 1 ]; then
+        while IFS=$'\t' read -r id kind name; do
+            [ "$kind" = mount ] && mount_of[$id]="$name"
+        done < <(printf '%s' "$input" | pa_id_table 2> /dev/null)
+    fi
+    [ "$remote" = 0 ] || printf '    data volume: not readable here (remote database)\n'
+    while IFS=$'\t' read -r t m s size avail it ia _; do
+        [ "$t" = Z ] && [[ $m =~ ^m[0-9a-f]{5,8}$ ]] || continue
+        [[ $size =~ ^[0-9]{1,18}$ && $avail =~ ^[0-9]{1,18}$ && $it =~ ^[0-9]{1,18}$ && $ia =~ ^[0-9]{1,18}$ ]] || continue
+        _pa_stamp_split "$s" 2> /dev/null || continue
+        [ -n "${cnt[$m]:-}" ] || mids+=("$m")
+        cnt[$m]=$((${cnt[$m]:-0} + 1))
+        [ -n "${oldest[$m]:-}" ] || oldest[$m]="$s"
+        last[$m]="$s"$'\t'"$size"$'\t'"$avail"$'\t'"$it"$'\t'"$ia"
+    done <<< "$obs"
+    if [ "${#mids[@]}" = 0 ]; then
+        printf '    volumes: no samples from the witness'"'"'s hourly pass yet\n'
+        return 0
+    fi
+    for m in "${mids[@]}"; do
+        IFS=$'\t' read -r s size avail it ia <<< "${last[$m]}"
+        name="${mount_of[$m]:-}"
+        if [ -z "$name" ]; then
+            name="no store here is on it now"
+            [ "$known" = 1 ] || name="mount point not known here"
+        fi
+        printf '    volume %s (%s): %s of %s free' "$m" "$(printf '%s' "$name" | tr -c ' -~' '?')" \
+            "$(human_bytes "$avail")" "$(human_bytes "$size")"
+        if [ "$((10#$it))" -gt 0 ]; then printf ', inodes %s of %s free' "$((10#$ia))" "$((10#$it))"; else printf ', no inode count'; fi
+        n="${cnt[$m]}" first="${oldest[$m]}"
+        a="$(pa_age "$first")"
+        printf '; %s samples since %s\n' "$n" "$(fmt_time "${first%%/*}")"
+        hist=""
+        while IFS=$'\t' read -r t d w _ line _; do
+            [ "$t" = Z ] && [ "$d" = "$m" ] && [ "$w" != "$s" ] && hist+="$w"$'\t'"$line"$'\n'
+        done <<< "$obs"
+        pa_vol_project "$s" "$avail" <<< "$hist"
+        if [ "$PA_VOL_RATE" = - ]; then
+            printf '      no projection: it needs 72 h of samples and a fall over them (%s now)\n' "$(fmt_age "$a")"
+        else
+            # fmt_time drops the year, which a date months off needs.
+            w="${s%%/*}"
+            if [ "$PA_VOL_HOURS" -gt 8760 ]; then
+                risk="at risk in more than a year"
+            else
+                w=$((10#$w + PA_VOL_HOURS * 3600))
+                if [ "$(date -u -d "@$w" +%Y 2> /dev/null)" = "$(date -u -d "@$PA_WALL" +%Y 2> /dev/null)" ]; then
+                    risk="at risk by $(fmt_time "$w")"
+                else
+                    risk="at risk by $(date -u -d "@$w" '+%F %H:%M' 2> /dev/null || printf '?')"
+                fi
+            fi
+            printf '      falling %s an hour; at that rate full of its last GiB in %s h, %s\n' \
+                "$(human_bytes "$((PA_VOL_RATE * 1024))")" "$PA_VOL_HOURS" "$risk"
+        fi
+    done
+}
+
+# view_changes: the units the witness's hourly pass records as changed and not in force, and why.
+view_changes() {
+    local t k kind st cause u any=0 why
+    while IFS=$'\t' read -r t _ k kind _ _ _ st _ _ _ cause _; do
+        [ "$t" = I ] && [ "$kind" = change-pending ] && [[ $k == change:* ]] || continue
+        case "$st" in open | acked | pending) ;; *) continue ;; esac
+        u="${k#change:}"
+        case "$cause" in
+            change.env) why="an env file it loads changed after it started: restart it" ;;
+            change.unit) why="its unit file changed: sudo systemctl daemon-reload" ;;
+            change.binary) why="its binary was replaced while it runs: restart it" ;;
+            *) why="?" ;;
+        esac
+        printf '    changed, not in force (%s): %s - %s\n' "$st" "$(unit_shown "$u")" "$why"
+        any=1
+    done <<< "$INCIDENTS_BODY"
+    [ "$any" = 1 ] || printf '    changes: nothing recorded as waiting for a restart or a reload\n'
+}
+
 view_unit() {
     local unit="$1"
     if unit_show "$unit" ActiveState SubState Result NRestarts ActiveEnterTimestamp UnitFileState ExecMainStatus InvocationID; then
@@ -2955,6 +3166,8 @@ stage_view() {
             timeout 10 df -P -- "$STATUS_ROOT/var/lib/propolis" "$STATUS_ROOT/var/log/propolis" "$STATUS_ROOT/var/spool/propolis" 2> /dev/null | sed 's/^/    /'
             timeout 10 df -Pi -- "$STATUS_ROOT/var/lib/propolis" "$STATUS_ROOT/var/log/propolis" "$STATUS_ROOT/var/spool/propolis" 2> /dev/null | sed 's/^/    /'
             journalctl --disk-usage 2> /dev/null | tr -c ' -~\n' '?' | head -n 2 | sed 's/^/    /'
+            view_volumes
+            view_changes
             printf '    clock: %s; %s\n' "${HOST_SYNC:-sync not read}" "${HOST_STEP:-no step in 24 h}"
             printf '    id salt: %s\n' "${HOST_SALT:-not checked}"
             if [[ " ${PA_STATE_UNREADABLE:-} " == *" meta "* ]]; then

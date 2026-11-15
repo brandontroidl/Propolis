@@ -77,6 +77,7 @@ case "$1" in
                 ActiveState) v="$a" ;; SubState) v="$s" ;; Result) v="$r" ;; NRestarts) v="$n" ;;
                 ActiveEnterTimestamp) v="$t" ;; UnitFileState) v="$f" ;; InvocationID) v="$i" ;;
                 LastTriggerUSec) v="$l" ;;
+                Environment) v=""; [ "$unit" != propolis-backup.service ] || v="${BACKUP_UNIT_ENV:-}" ;;
                 NextElapseUSecRealtime) v="Sat 2027-01-16 03:30:00 UTC" ;; *) v="" ;;
             esac
             echo "$p=$v"
@@ -155,14 +156,24 @@ const TIMEDATECTL_STUB: &str = r#"#!/usr/bin/env bash
 echo "NTPSynchronized=${NTP:-yes}"
 "#;
 
-/// One line per directory asked about, with `DF_USE` (or `DF_IUSE` for inodes) used.
+/// Records its argv; one line per directory asked about, with `DF_USE` (or `DF_IUSE` for inodes)
+/// used, mounted on `/` or on the mount point the file `DF_MAP` gives the directory (lines
+/// `path<TAB>mount point`, the path as on the host, without the test root).
 const DF_STUB: &str = r#"#!/usr/bin/env bash
+printf 'df %s\n' "$*" >> "$STUB_LOG"
 use="${DF_USE:-61%}"
 [ "$1" != -Pi ] || use="${DF_IUSE:-12%}"
 shift
 [ "$1" != -- ] || shift
 echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
-for d in "$@"; do echo "/dev/sda1 1000 610 390 $use /"; done
+for d in "$@"; do
+    m=/
+    rel="${d#"${PROPOLIS_STATUS_ROOT:-}"}"
+    if [ -n "${DF_MAP:-}" ] && [ -f "$DF_MAP" ]; then
+        while IFS=$'\t' read -r p t; do [ "$p" != "$rel" ] || m="$t"; done < "$DF_MAP"
+    fi
+    echo "/dev/sda1 1000 610 390 $use $m"
+done
 "#;
 
 const HOSTNAME_STUB: &str = "#!/usr/bin/env bash\necho honeybox\n";
@@ -4222,4 +4233,329 @@ fn the_daemon_topic_is_private_only_when_its_refusal_is_fresh_checked_and_over_h
         &line("e9960faaf48b78f0", &stamp_ago(600), &stamp_ago(600)),
     );
     warns("a fresh refusal over plain HTTP");
+}
+
+/// The opaque id of the mount point `target` under the fixture's salt.
+fn mount_id(target: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg("printf '%s\\0%s\\0%s' \"$1\" mount \"$2\" | sha256sum")
+        .arg("_")
+        .arg(SALT)
+        .arg(target)
+        .output()
+        .unwrap();
+    format!("m{}", &String::from_utf8_lossy(&out.stdout)[..5])
+}
+
+/// An open volume record of the witness's hourly pass warns on the host rail by its opaque id
+/// (exit 1, NEXT naming the `volume` runbook), and a unit whose change is not in force is noted
+/// there without a warning; the host view maps the id to its mount point, shows the last sample,
+/// and the projection from the week of `Z` samples: falling 1 GiB an hour, full of its last GiB
+/// in 19 h. The walk itself never prints the mount point.
+#[test]
+fn an_open_volume_record_warns_on_the_host_rail_and_the_host_view_shows_its_projection() {
+    let fx = Fx::single();
+    fx.witness_ran(60);
+    let m = mount_id("/");
+    let vol = set_field(
+        &set_field(
+            &record(
+                "w#4",
+                &format!("vol:{m}"),
+                "host",
+                "ACT",
+                "open",
+                NOW - 3600,
+                "vol.projected",
+                "-",
+            ),
+            3,
+            "volume-filling",
+        ),
+        5,
+        &m,
+    );
+    let change = set_field(
+        &record(
+            "w#5",
+            "change:sensor-ssh.service",
+            "host",
+            "NOTICE",
+            "open",
+            NOW - 3600,
+            "change.env",
+            "-",
+        ),
+        3,
+        "change-pending",
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t6\n{vol}{change}"),
+    );
+    let gib: u64 = 1_073_741_824;
+    let mut z = String::new();
+    for h in (0..=73u64).rev() {
+        z.push_str(&format!(
+            "Z\t{m}\t{}\t{}\t{}\t6000000\t5000000\n",
+            stamp_ago(h * 3600 + 120),
+            100 * gib,
+            (20 + h) * gib
+        ));
+    }
+    fx.write(
+        "var/lib/propolis/witness/observe",
+        &format!("#observe v1 g=2\n{z}"),
+    );
+    let r = fx.walk();
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    assert_eq!(r.state("host"), "WARN", "{}", r.out);
+    let row = r.row("host");
+    assert!(row.contains(&format!("volume {m} filling")), "{row}");
+    assert!(row.contains("changed, not in force: 1 units"), "{row}");
+    assert!(r.out.contains("#volume"), "{}", r.out);
+    let open = r.out.lines().find(|l| l.contains("w#4 ")).unwrap();
+    assert!(
+        open.contains(&m) && open.contains("cause vol.projected"),
+        "{open}"
+    );
+    let view = fx.run(&["host"]);
+    assert!(
+        view.out
+            .contains(&format!("volume {m} (/): 20.0 GiB of 100.0 GiB free")),
+        "{}",
+        view.out
+    );
+    assert!(view.out.contains("74 samples since"), "{}", view.out);
+    assert!(
+        view.out
+            .contains("falling 1.0 GiB an hour; at that rate full of its last GiB in 19 h"),
+        "{}",
+        view.out
+    );
+    assert!(
+        view.out
+            .contains("{sensor-ssh.service} - an env file it loads changed after it started"),
+        "{}",
+        view.out
+    );
+}
+
+/// The ledger row shows the database's state as the witness's hourly pass last read it (meta
+/// pg_state: transaction-id age, slots, lock waits, size), and warns while it holds db-xid,
+/// db-slots or db-locks open, with NEXT naming the `db-state` runbook; such a warning never
+/// takes the marker.
+#[test]
+fn the_ledger_row_shows_the_hourly_database_state_and_warns_while_a_state_record_is_open() {
+    let fx = Fx::single();
+    fx.witness_ran(60);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tpg_state\t{}/1500000000/91/97/2/123456789\n",
+            stamp_ago(60),
+            stamp_ago(600)
+        ),
+    );
+    let r = fx.walk();
+    assert_eq!(r.state("ledger"), "ok", "{}", r.out);
+    assert!(
+        r.row("ledger")
+            .contains("xid age 1500000000, slots 91 of 97, lock waits 2, size 117.7 MiB"),
+        "{}",
+        r.row("ledger")
+    );
+    let xid = set_field(
+        &record(
+            "w#2",
+            "dbstate:xid",
+            "ledger",
+            "ACT",
+            "open",
+            NOW - 3600,
+            "db.xid",
+            "-",
+        ),
+        3,
+        "db-xid",
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t3\n{xid}"),
+    );
+    let r = fx.walk();
+    assert_eq!(r.state("ledger"), "WARN", "{}", r.out);
+    assert!(r.row("ledger").contains("open: xid"), "{}", r.row("ledger"));
+    assert_eq!(r.marked(), None, "{}", r.out);
+    assert!(r.out.contains("sudo propolis-status ledger"), "{}", r.out);
+    assert!(r.out.contains("#db-state"), "{}", r.out);
+}
+
+/// One `Z` sample of mount id `m`, `ago` seconds before NOW: 100 GiB, 60 GiB free.
+fn z_line(m: &str, ago: u64) -> String {
+    format!(
+        "Z\t{m}\t{}\t107374182400\t64424509440\t6000000\t5000000\n",
+        stamp_ago(ago)
+    )
+}
+
+/// The host view maps every filesystem the witness samples back to its mount point, from the
+/// same list of stores the witness takes: a backup directory a drop-in of the backup unit sets,
+/// the gateway's spool gateway.env sets, and a store reached through a symbolic link. None of
+/// them reads as having no store on it.
+#[test]
+fn the_host_view_maps_a_custom_backup_directory_a_gateway_spool_and_a_linked_store() {
+    let mut fx = Fx::single();
+    fx.witness_ran(60);
+    fx.setenv("BACKUP_UNIT_ENV", "PROPOLIS_BACKUP_DIR=/srv/b");
+    fx.write(
+        "etc/propolis/gateway.env",
+        "PROPOLIS_GATEWAY_SPOOL_DIR=/srv/gw\n",
+    );
+    for d in ["srv/b", "srv/gw", "data/spool", "var/spool"] {
+        std::fs::create_dir_all(fx.p(d)).unwrap();
+    }
+    std::os::unix::fs::symlink(fx.p("data/spool"), fx.p("var/spool/propolis")).unwrap();
+    let map = fx.dir.path().join("df.map");
+    std::fs::write(
+        &map,
+        "/srv/b\t/srv/b\n/srv/gw\t/srv/gw\n/var/spool/propolis\t/data/spool\n",
+    )
+    .unwrap();
+    fx.setenv("DF_MAP", &map.display().to_string());
+    let ids: Vec<(String, &str)> = ["/srv/b", "/srv/gw", "/data/spool"]
+        .iter()
+        .map(|t| (mount_id(t), *t))
+        .collect();
+    let z: String = ids.iter().map(|(m, _)| z_line(m, 600)).collect();
+    fx.write(
+        "var/lib/propolis/witness/observe",
+        &format!("#observe v1 g=2\n{z}"),
+    );
+    let view = fx.run(&["host"]);
+    for (m, t) in &ids {
+        assert!(
+            view.out.contains(&format!("volume {m} ({t}): ")),
+            "{t}: {}",
+            view.out
+        );
+    }
+    assert!(
+        !view.out.contains("no store here is on it now"),
+        "{}",
+        view.out
+    );
+}
+
+/// The walk runs as root with no sandbox, so it never has df open a path the postgres account
+/// owns, which that account could swap for a link to anything: the data directory's df runs as
+/// postgres through setpriv, and no df as root names it.
+#[test]
+fn the_walk_runs_the_data_directory_s_df_as_the_postgres_account() {
+    let fx = Fx::single();
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tpg_datadir\t/var/lib/postgresql/16/main\n",
+            stamp_ago(60)
+        ),
+    );
+    std::fs::create_dir_all(fx.p("var/lib/postgresql/16/main")).unwrap();
+    fx.write(
+        "var/lib/propolis/witness/observe",
+        &format!("#observe v1 g=2\n{}", z_line(&mount_id("/"), 600)),
+    );
+    let view = fx.run(&["host"]);
+    let log = fx.log();
+    let path = fx.p("var/lib/postgresql/16/main").display().to_string();
+    let dropped = log
+        .lines()
+        .filter(|l| {
+            l.starts_with("setpriv --reuid=4242 --regid=4343 ")
+                && l.ends_with(&format!(" -- df -P -- {path}"))
+        })
+        .count();
+    let dfs = log
+        .lines()
+        .filter(|l| l.starts_with("df ") && l.contains(&path))
+        .count();
+    assert_eq!((dropped, dfs), (1, 1), "{log}\n{}", view.out);
+}
+
+/// The projected day a volume fills is shown with its year once it lies outside the current
+/// one, and as more than a year once it is over 8760 hours off: falling 50 MiB an hour with
+/// 500 GiB free is over a year, never a bare month and day.
+#[test]
+fn a_projection_more_than_a_year_off_says_so_and_never_shows_a_bare_month_and_day() {
+    let fx = Fx::single();
+    fx.witness_ran(60);
+    let m = mount_id("/");
+    let gib: u64 = 1_073_741_824;
+    let mib: u64 = 1_048_576;
+    let mut z = String::new();
+    for h in (0..=80u64).rev() {
+        z.push_str(&format!(
+            "Z\t{m}\t{}\t{}\t{}\t6000000\t5000000\n",
+            stamp_ago(h * 3600 + 120),
+            1000 * gib,
+            500 * gib + h * 50 * mib
+        ));
+    }
+    fx.write(
+        "var/lib/propolis/witness/observe",
+        &format!("#observe v1 g=2\n{z}"),
+    );
+    let view = fx.run(&["host"]);
+    let line = view
+        .out
+        .lines()
+        .find(|l| l.contains("falling "))
+        .unwrap_or_else(|| panic!("{}", view.out));
+    assert!(line.contains("at risk in more than a year"), "{line}");
+    let bare = regex_like_month_day(line);
+    assert!(!bare, "{line}");
+}
+
+/// Whether `line` holds a month and day (`MM-DD `) with no year before it.
+fn regex_like_month_day(line: &str) -> bool {
+    let b = line.as_bytes();
+    (0..b.len().saturating_sub(5)).any(|i| {
+        b[i].is_ascii_digit()
+            && b[i + 1].is_ascii_digit()
+            && b[i + 2] == b'-'
+            && b[i + 3].is_ascii_digit()
+            && b[i + 4].is_ascii_digit()
+            && b[i + 5] == b' '
+            && (i < 3 || b[i - 1] != b'-')
+    })
+}
+
+/// With a remote database the data volume is not on this host: the host view says it is not
+/// readable here, and a data directory a local database left in meta is not mapped.
+#[test]
+fn a_remote_database_s_data_volume_reads_not_readable_here() {
+    let fx = Fx::single();
+    fx.env_drop("DATABASE_URL=");
+    fx.env_line("DATABASE_URL=postgres://propolis:pw@db.example.invalid/propolis");
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tpg_datadir\t/var/lib/postgresql/16/main\n",
+            stamp_ago(60)
+        ),
+    );
+    std::fs::create_dir_all(fx.p("var/lib/postgresql/16/main")).unwrap();
+    fx.write(
+        "var/lib/propolis/witness/observe",
+        &format!("#observe v1 g=2\n{}", z_line(&mount_id("/"), 600)),
+    );
+    let view = fx.run(&["host"]);
+    assert!(
+        view.out
+            .contains("data volume: not readable here (remote database)"),
+        "{}",
+        view.out
+    );
+    assert!(!fx.log().contains("var/lib/postgresql"), "{}", fx.log());
 }

@@ -1,6 +1,7 @@
 //! Runs `deploy/witness.sh light` (the witness's light pass) under a scratch root with
 //! `PROPOLIS_ALERT_ROOT` and a fixed `PROPOLIS_WITNESS_NOW`, with stub `systemctl`, `journalctl`,
-//! `logger`, `curl`, `setpriv`, `id`, `ss` and `sync` on `PATH`, the real `flock`, and the shipped
+//! `logger`, `curl`, `setpriv`, `id`, `ss`, `sync`, `df` and `psql` on `PATH`, the real `flock`,
+//! `stat`, `find` and `sha256sum`, and the shipped
 //! alert library
 //! installed under the root. Each pass is given the time it runs at, so the light passes of a
 //! case are five minutes apart in the library's clock however fast the test runs.
@@ -21,6 +22,7 @@ static EXEC_FENCE: Mutex<()> = Mutex::new(());
 const SCRIPT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/witness.sh");
 const LIB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/alert-lib.sh");
 const INSTALL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/install.sh");
+const UPGRADE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/upgrade.sh");
 
 /// The wall clock and uptime of the first pass of every case (boot `abcdef01`).
 const WALL: u64 = 1_800_000_000;
@@ -30,10 +32,11 @@ const INVOCATION: &str = "0123456789abcdef0123456789abcdef";
 
 /// Records its argv. `show` prints one block per unit asked about, from `$UNITS/<unit>`, with a
 /// blank line between blocks; `is-enabled` succeeds for a unit whose file says it is enabled.
-/// `SYSTEMCTL_FAIL` makes every call fail.
+/// `SYSTEMCTL_FAIL` makes every call fail, `SYSTEMCTL_FAIL_ON` every call whose arguments hold it.
 const SYSTEMCTL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >> "$STUB_LOG"
 [ -z "${SYSTEMCTL_FAIL:-}" ] || exit 1
+[ -z "${SYSTEMCTL_FAIL_ON:-}" ] || [[ "$*" != *"$SYSTEMCTL_FAIL_ON"* ]] || exit 1
 [ -z "${SYSTEMCTL_SLEEP:-}" ] || [ "$1" != show ] || sleep "$SYSTEMCTL_SLEEP"
 case "$1" in
     is-enabled)
@@ -97,13 +100,13 @@ if [ -n "$cf" ] && [ -f "$d/journal.$class.cursor" ]; then cat "$d/journal.$clas
 exit 0
 "#;
 
-/// `id`: records its argv; the uid of an account the case named in `uid.<name>` beside the units
-/// (`none`: no such account), else the real `id`.
+/// `id`: records its argv; the uid (and the same number as its gid) of an account the case named
+/// in `uid.<name>` beside the units (`none`: no such account), else the real `id`.
 const ID_STUB: &str = r#"#!/usr/bin/env bash
 d="${UNITS%/units}"
 name="${!#}"
 printf 'id %s\n' "$*" >> "$STUB_LOG"
-if [ "${1:-}" = -u ] && [ -f "$d/uid.$name" ]; then
+if { [ "${1:-}" = -u ] || [ "${1:-}" = -g ]; } && [ -f "$d/uid.$name" ]; then
     [ "$(cat "$d/uid.$name")" != none ] || exit 1
     cat "$d/uid.$name"
     exit 0
@@ -141,10 +144,22 @@ exec /usr/bin/sync "$@"
 /// The daemon binary, as far as pg-exec goes: it carries pg-exec's guard string, records its
 /// argv, and answers from `pg.answer` beside the units (`exit status|stdout|stderr`, `0|f|`
 /// without one).
+/// The hourly pass's state query (the one that reads `datfrozenxid`) is answered from `pg.state`
+/// instead when there is one, printed as it is, with the status in `pg.state.rc` (0 without one).
 const PROPOLIS_STUB: &str = r#"#!/usr/bin/env bash
 # propolis pg-exec: DATABASE_URL is not set
 d="${UNITS%/units}"
 printf 'propolis %s\n' "$*" >> "$STUB_LOG"
+case "$*" in
+    *datfrozenxid*)
+        if [ -f "$d/pg.state" ]; then
+            cat "$d/pg.state"
+            rc=0
+            [ ! -f "$d/pg.state.rc" ] || rc="$(cat "$d/pg.state.rc")"
+            exit "$rc"
+        fi
+        ;;
+esac
 answer='0|f|'
 [ ! -f "$d/pg.answer" ] || answer="$(cat "$d/pg.answer")"
 IFS='|' read -r rc out err <<< "$answer"
@@ -247,11 +262,77 @@ const DB_URL: &str = "postgres://propolis:db-s3cret@127.0.0.1:5432/propolis";
 const PG_REFUSED: &str =
     "2||psql: error: connection to server at \"127.0.0.1\", port 5432 failed: Connection refused";
 
+/// Records its argv and runs the command after `--` as the caller; it exits 1 instead when its
+/// arguments hold `--reuid=$SETPRIV_FAIL`, as a drop that fails does. A command run through
+/// `/usr/bin/env PATH=/usr/bin:/bin` gets this directory in front of that PATH, since the stubs
+/// stand in for the system's programs.
 const SETPRIV_STUB: &str = r#"#!/usr/bin/env bash
 printf 'setpriv %s\n' "$*" >> "$STUB_LOG"
+[ -z "${SETPRIV_FAIL:-}" ] || [[ " $* " != *" --reuid=$SETPRIV_FAIL "* ]] || exit 1
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 shift
+if [ "${1:-}" = /usr/bin/env ] && [ "${2:-}" = PATH=/usr/bin:/bin ]; then
+    shift 2
+    set -- /usr/bin/env "PATH=${0%/*}:/usr/bin:/bin" "$@"
+fi
 exec "$@"
+"#;
+
+/// `df -B1 --output=size,avail,itotal,iavail,target -- PATH`: records its argv and prints GNU df's
+/// header and one line: the answer `df.map` beside the units gives PATH (lines `path<TAB>answer`,
+/// the path as on the host, without the test root), else `df.answer`
+/// (`size avail itotal iavail target`), else a roomy filesystem mounted on `/`. `hang` exits 124,
+/// as `timeout` does when it cuts off a df stuck on a mount that does not answer.
+const DF_STUB: &str = r#"#!/usr/bin/env bash
+d="${UNITS%/units}"
+printf 'df %s\n' "$*" >> "$STUB_LOG"
+ans="100000000000 60000000000 6000000 5000000 /"
+[ ! -f "$d/df.answer" ] || ans="$(cat "$d/df.answer")"
+rel="${!#}"
+rel="${rel#"${PROPOLIS_ALERT_ROOT:-}"}"
+if [ -f "$d/df.map" ]; then
+    while IFS=$'\t' read -r p a; do [ "$p" != "$rel" ] || ans="$a"; done < "$d/df.map"
+fi
+[ "$ans" != hang ] || exit 124
+echo "     1B-blocks        Avail  Inodes   IFree Mounted on"
+echo "$ans"
+"#;
+
+/// `psql`, as the hourly pass runs it as the postgres account for `SHOW data_directory`: records
+/// its argv, its HOME and its PATH, prints `psql.out` beside the units (a Debian data directory
+/// without one) and an error line on stderr, which must never be kept, and exits with `psql.rc`
+/// (0 without one).
+const PSQL_STUB: &str = r#"#!/usr/bin/env bash
+d="${UNITS%/units}"
+printf 'psql %s HOME=%s PATH=%s\n' "$*" "${HOME:-unset}" "${PATH:-unset}" >> "$STUB_LOG"
+echo 'psql: warning: s3cret-error-text' >&2
+if [ -f "$d/psql.out" ]; then cat "$d/psql.out"; else echo /var/lib/postgresql/16/main; fi
+[ ! -f "$d/psql.rc" ] || exit "$(cat "$d/psql.rc")"
+"#;
+
+/// `stat`, installed by the cases that place stores on filesystems of their own or date a file's
+/// last change: an answer from `stat.map` beside the units (lines `path<TAB>L<TAB>format<TAB>value`,
+/// the path as on the host, L `-L` for a call that follows links and `-` for one that does not),
+/// else the real `stat`.
+const STAT_STUB: &str = r#"#!/usr/bin/env bash
+d="${UNITS%/units}"
+l=- fmt="" prev=""
+for a in "$@"; do
+    [ "$a" != -L ] || l=-L
+    [ "$prev" != -c ] || fmt="$a"
+    prev="$a"
+done
+rel="${!#}"
+rel="${rel#"${PROPOLIS_ALERT_ROOT:-}"}"
+if [ -f "$d/stat.map" ]; then
+    while IFS=$'\t' read -r p f c v; do
+        if [ "$p" = "$rel" ] && [ "$f" = "$l" ] && [ "$c" = "$fmt" ]; then
+            printf '%s\n' "$v"
+            exit 0
+        fi
+    done < "$d/stat.map"
+fi
+exec /usr/bin/stat "$@"
 "#;
 
 fn write_exec(path: &Path, body: &str) {
@@ -331,6 +412,8 @@ impl Fx {
             ("id", ID_STUB),
             ("ss", SS_STUB),
             ("sync", SYNC_STUB),
+            ("df", DF_STUB),
+            ("psql", PSQL_STUB),
         ] {
             write_exec(&bin.join(name), body);
         }
@@ -419,7 +502,46 @@ impl Fx {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+        // Every unit's main process (pid 4242) runs the binary it started with.
+        std::fs::create_dir_all(fx.p("proc/4242")).unwrap();
+        std::os::unix::fs::symlink("/usr/local/bin/propolis", fx.p("proc/4242/exe")).unwrap();
         fx
+    }
+
+    /// What `df` answers for each of these host paths (`size avail itotal iavail target`, or
+    /// `hang`).
+    fn df_map(&self, entries: &[(&str, &str)]) {
+        let text: String = entries.iter().map(|(p, a)| format!("{p}\t{a}\n")).collect();
+        self.stub_file("df.map", &text);
+    }
+
+    /// Installs the `stat` stub with these answers: `(host path, -L or -, format, value)`.
+    fn stat_map(&self, entries: &[(&str, &str, &str, &str)]) {
+        write_exec(&self.bin.join("stat"), STAT_STUB);
+        let text: String = entries
+            .iter()
+            .map(|(p, l, f, v)| format!("{p}\t{l}\t{f}\t{v}\n"))
+            .collect();
+        self.stub_file("stat.map", &text);
+    }
+
+    /// Places each of these host directories (made under the root) on a filesystem of its own,
+    /// device `dev`, as `stat -L` reports it.
+    fn filesystems(&self, dirs: &[(&str, u32)]) {
+        let entries: Vec<(String, u32)> = dirs.iter().map(|(d, n)| (d.to_string(), *n)).collect();
+        for (d, _) in &entries {
+            std::fs::create_dir_all(self.p(d.trim_start_matches('/'))).unwrap();
+        }
+        let values: Vec<String> = entries
+            .iter()
+            .map(|(_, n)| format!("{n} directory"))
+            .collect();
+        let map: Vec<(&str, &str, &str, &str)> = entries
+            .iter()
+            .zip(values.iter())
+            .map(|((d, _), v)| (d.as_str(), "-L", "%d %F", v.as_str()))
+            .collect();
+        self.stat_map(&map);
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -6677,4 +6799,1617 @@ fn a_probe_that_cannot_finish_by_the_soft_deadline_is_skipped_and_reads_unknown(
             fx.observe_text()
         );
     }
+}
+
+/// The salt the volume cases give the witness, so a mount id is a known value.
+const VOL_SALT: &str = "0123456789abcdef0123456789abcdef";
+
+/// Gives the fixture a known salt (the witness never replaces a valid one).
+fn salt(fx: &Fx) {
+    fx.write("var/lib/propolis/witness/id-salt", &format!("{VOL_SALT}\n"));
+    std::fs::set_permissions(
+        fx.p("var/lib/propolis/witness/id-salt"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
+/// The opaque id of the mount point `target` under `VOL_SALT`: `m` and 5 hex of
+/// sha256(salt NUL "mount" NUL target).
+fn mount_id(target: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg("printf '%s\\0%s\\0%s' \"$1\" mount \"$2\" | sha256sum")
+        .arg("_")
+        .arg(VOL_SALT)
+        .arg(target)
+        .output()
+        .unwrap();
+    format!("m{}", &String::from_utf8_lossy(&out.stdout)[..5])
+}
+
+/// A stamp `secs` before the first pass, in the same boot.
+fn before(secs: u64) -> String {
+    format!("{}/{BOOT}/{}", WALL - secs, UP - secs)
+}
+
+/// Every file the state directories hold and the stub log, as one text, to look for words that
+/// must never be kept.
+fn everything(fx: &Fx) -> String {
+    let mut text = fx.log();
+    for f in fx.state_files() {
+        text.push_str(&std::fs::read_to_string(&f).unwrap_or_default());
+    }
+    text
+}
+
+/// A filesystem of a store with free space under the daemon's share (15% by default) opens
+/// volume-filling (ACT, host rail) on the second hourly pass, keyed and named by the mount's
+/// opaque id: the mount point is in no record and no observe line. Each pass keeps one `Z` sample
+/// of the filesystem, from one `df` asked for bytes and inodes. Room again on two passes resolves
+/// it room2.
+#[test]
+fn a_volume_short_of_free_space_opens_volume_filling_on_the_second_hourly_pass_and_resolves_on_room_twice()
+ {
+    let fx = Fx::new();
+    salt(&fx);
+    std::fs::create_dir_all(fx.p("var/log/propolis")).unwrap();
+    fx.stub_file(
+        "df.answer",
+        "100000000000 10000000000 6000000 5000000 /srv/data7",
+    );
+    let key = format!("vol:{}", mount_id("/srv/data7"));
+    fx.hourly(0);
+    let f = fx
+        .record(&key)
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[5].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str()
+        ),
+        (
+            "volume-filling",
+            "host",
+            &key[4..],
+            "ACT",
+            "pending",
+            "vol.low"
+        )
+    );
+    let log = fx.log();
+    let df: Vec<&str> = log.lines().filter(|l| l.starts_with("df ")).collect();
+    assert_eq!(df.len(), 1, "one df for the one filesystem: {df:?}");
+    assert!(
+        df[0].starts_with("df -B1 --output=size,avail,itotal,iavail,target -- "),
+        "{}",
+        df[0]
+    );
+    let z = format!(
+        "Z\t{}\t{}\t100000000000\t10000000000\t6000000\t5000000\n",
+        &key[4..],
+        stamp(0)
+    );
+    assert!(fx.observe_text().contains(&z), "{}", fx.observe_text());
+    fx.hourly(3600);
+    let f = fx.record(&key).unwrap();
+    assert_eq!((f[7].as_str(), f[29].as_str()), ("open", "1"));
+    assert!(
+        !fx.read("var/lib/propolis/witness/incidents")
+            .contains("/srv/data7")
+    );
+    assert!(!fx.observe_text().contains("/srv/data7"));
+    assert_eq!(
+        fx.observe_text()
+            .lines()
+            .filter(|l| l.starts_with("Z\t"))
+            .count(),
+        2
+    );
+
+    fx.stub_file(
+        "df.answer",
+        "100000000000 60000000000 6000000 5000000 /srv/data7",
+    );
+    fx.hourly(7200);
+    assert_eq!(
+        state_of(&fx, &key),
+        "open",
+        "one roomy pass resolves nothing"
+    );
+    fx.hourly(10800);
+    let f = fx.record(&key).unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "room2"));
+}
+
+/// Free space under 1 GiB and the guard's 512 MiB reserve is volume-full-soon (PAGE): on a record
+/// already open as volume-filling it is a rise of tier, a change v2 would push, and the same
+/// record (one key per mount) carries it.
+#[test]
+fn a_volume_that_falls_under_a_gibibyte_and_a_half_rises_to_volume_full_soon_as_a_change() {
+    let fx = Fx::new();
+    salt(&fx);
+    fx.stub_file("df.answer", "100000000000 10000000000 6000000 5000000 /");
+    let key = format!("vol:{}", mount_id("/"));
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[29].as_str()),
+        ("volume-filling", "ACT", "1")
+    );
+    fx.stub_file("df.answer", "100000000000 1000000000 6000000 5000000 /");
+    fx.hourly(7200);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[16].as_str(),
+            f[29].as_str()
+        ),
+        ("volume-full-soon", "PAGE", "open", "change", "2")
+    );
+    assert_eq!(
+        fx.records()
+            .iter()
+            .filter(|r| r[2].starts_with("vol:"))
+            .count(),
+        1
+    );
+}
+
+/// A filesystem that reports no inodes (btrfs) has no inode trigger, and the share of free space
+/// is the daemon's PROPOLIS_OPS_CAPACITY_FREE_PCT: 10% free under a setting of 5 opens nothing. A
+/// df that does not answer (a hung mount) is unknown for that filesystem, never a value: nothing
+/// opens, the pass is partial, and the third such pass in a row opens tool-unusable on
+/// tool:volume.
+#[test]
+fn a_filesystem_with_no_inodes_and_a_df_that_does_not_answer_open_nothing() {
+    let fx = Fx::new();
+    salt(&fx);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_CAPACITY_FREE_PCT=5\n",
+    );
+    fx.stub_file("df.answer", "100000000000 10000000000 0 0 /");
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert!(
+        !fx.records().iter().any(|r| r[2].starts_with("vol:")),
+        "{}",
+        state_text(&fx)
+    );
+    fx.stub_file("df.answer", "hang");
+    seed_p(
+        &fx,
+        "volume",
+        &format!("{}\tunknown\tunknown\t2", stamp(3600)),
+    );
+    fx.hourly(7200);
+    assert!(!fx.records().iter().any(|r| r[2].starts_with("vol:")));
+    assert!(
+        fx.read("run/propolis-witness/heartbeat")
+            .contains("B\thourly\t")
+            && fx
+                .read("run/propolis-witness/heartbeat")
+                .contains("\tpartial")
+    );
+    let f = fx
+        .record("tool:volume")
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!((f[3].as_str(), f[7].as_str()), ("tool-unusable", "open"));
+    assert!(
+        fx.observe_text()
+            .lines()
+            .filter(|l| l.starts_with("Z\t"))
+            .count()
+            == 2,
+        "the samples of a filesystem that did not answer are kept: {}",
+        fx.observe_text()
+    );
+}
+
+/// Three days of samples falling 1 GiB an hour project the volume full of its last GiB in 19
+/// hours: volume-filling opens on the projection alone (cause vol.projected), with 20% still free.
+/// The `Z` lines stay bounded: a sample over seven days old is dropped, one under 45 minutes old
+/// is replaced by this pass's, a filesystem no store lives on any more drops out, and a light pass
+/// keeps every `Z` line exactly as the hourly pass wrote it.
+#[test]
+fn a_fall_over_three_days_opens_volume_filling_on_its_projection_and_the_samples_stay_bounded() {
+    let fx = Fx::new();
+    salt(&fx);
+    let gib: u64 = 1_073_741_824;
+    let m = mount_id("/");
+    let mut lines = String::new();
+    lines.push_str(&format!(
+        "Z\t{m}\t{}\t{}\t{}\t6000000\t5000000\n",
+        before(8 * 86_400),
+        100 * gib,
+        99 * gib
+    ));
+    for h in 1..=73u64 {
+        lines.push_str(&format!(
+            "Z\t{m}\t{}\t{}\t{}\t6000000\t5000000\n",
+            before(h * 3600),
+            100 * gib,
+            (20 + h) * gib
+        ));
+    }
+    lines.push_str(&format!(
+        "Z\t{m}\t{}\t{}\t{}\t6000000\t5000000\n",
+        before(600),
+        100 * gib,
+        20 * gib
+    ));
+    lines.push_str(&format!("Z\tm00000\t{}\t1000\t500\t10\t5\n", before(3600)));
+    lines.push_str(&format!(
+        "U\tsensor-ssh.service\t{}\t0\t{BOOT}\n",
+        before(300)
+    ));
+    fx.observe(&lines);
+    fx.stub_file(
+        "df.answer",
+        &format!("{} {} 6000000 5000000 /", 100 * gib, 20 * gib),
+    );
+    fx.hourly(0);
+    let f = fx
+        .record(&format!("vol:{m}"))
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!(
+        (f[3].as_str(), f[7].as_str(), f[11].as_str()),
+        ("volume-filling", "pending", "vol.projected")
+    );
+    let obs = fx.observe_text();
+    let z: Vec<&str> = obs.lines().filter(|l| l.starts_with("Z\t")).collect();
+    assert_eq!(z.len(), 74, "73 hourly samples kept and this pass's: {obs}");
+    assert!(!obs.contains(&before(8 * 86_400)), "{obs}");
+    assert!(!obs.contains(&before(600)), "{obs}");
+    assert!(!obs.contains("m00000"), "{obs}");
+    assert!(
+        obs.contains(&format!("U\tsensor-ssh.service\t{}", before(300))),
+        "{obs}"
+    );
+    let zs: Vec<String> = z.iter().map(|l| l.to_string()).collect();
+    fx.pass(60);
+    let after: Vec<String> = fx
+        .observe_text()
+        .lines()
+        .filter(|l| l.starts_with("Z\t"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(after, zs);
+}
+
+/// The hourly PostgreSQL state comes from one pa_pg call with four statements: transaction-id age
+/// over 1,000,000,000 opens db-xid (ACT), connections at 90% of max_connections less the reserved
+/// slots db-slots (ACT), lock waits over 120 s db-locks (NOTICE), each on the second hourly pass,
+/// on the ledger stage; the database size is recorded only (meta pg_state). Two clean passes
+/// resolve them clean2. The local data directory is read once a day as the postgres account
+/// through setpriv, with a reset environment, cached in meta, and psql's error text is never kept;
+/// a path out of form is never stored.
+#[test]
+fn the_hourly_database_state_opens_db_xid_db_slots_and_db_locks_from_one_query() {
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.stub_file("uid.postgres", "117\n");
+    fx.stub_file("pg.state", "1500000000\n91|100|3\n2\n123456789\n");
+    fx.hourly(0);
+    let calls: Vec<String> = fx
+        .log()
+        .lines()
+        .filter(|l| l.starts_with("propolis pg-exec"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    for sql in [
+        "datfrozenxid",
+        "pg_stat_activity",
+        "pg_locks",
+        "pg_database_size",
+    ] {
+        assert!(calls[0].contains(sql), "{sql}: {}", calls[0]);
+    }
+    // Only client connections take one of the slots the count is held against: the server's own
+    // background processes are rows of pg_stat_activity too, and are left out.
+    assert!(
+        calls[0].contains("backend_type") && calls[0].contains("'client backend'"),
+        "{}",
+        calls[0]
+    );
+    assert!(!calls[0].contains("db-s3cret"));
+    for key in ["dbstate:xid", "dbstate:slots", "dbstate:locks"] {
+        assert_eq!(state_of(&fx, key), "pending", "{key}");
+    }
+    assert_eq!(
+        fx.meta("pg_state").unwrap(),
+        format!("{}/1500000000/91/97/2/123456789", stamp(0))
+    );
+    let log = fx.log();
+    assert!(
+        log.contains("setpriv --reuid=postgres --regid=postgres --init-groups --reset-env -- /usr/bin/env PATH=/usr/bin:/bin psql -X -A -t -c SHOW data_directory"),
+        "{log}"
+    );
+    // psql is looked for in the system's directories only: a program under /usr/local can never
+    // stand in for it.
+    let psql = log.lines().find(|l| l.starts_with("psql ")).unwrap();
+    assert!(!psql.contains("/usr/local"), "{psql}");
+    assert_eq!(
+        fx.meta("pg_datadir").as_deref(),
+        Some("/var/lib/postgresql/16/main")
+    );
+    assert_eq!(fx.meta("pg_datadir_stamp"), Some(stamp(0)));
+
+    clear_log(&fx);
+    fx.hourly(3600);
+    assert!(
+        !fx.log().contains("setpriv --reuid=postgres"),
+        "read once a day: {}",
+        fx.log()
+    );
+    let x = fx.record("dbstate:xid").unwrap();
+    let s = fx.record("dbstate:slots").unwrap();
+    let l = fx.record("dbstate:locks").unwrap();
+    assert_eq!(
+        (
+            x[3].as_str(),
+            x[4].as_str(),
+            x[6].as_str(),
+            x[7].as_str(),
+            x[11].as_str(),
+            x[29].as_str()
+        ),
+        ("db-xid", "ledger", "ACT", "open", "db.xid", "1")
+    );
+    assert_eq!(
+        (s[3].as_str(), s[6].as_str(), s[11].as_str()),
+        ("db-slots", "ACT", "db.slots")
+    );
+    assert_eq!(
+        (l[3].as_str(), l[6].as_str(), l[7].as_str(), l[29].as_str()),
+        ("db-locks", "NOTICE", "open", "0")
+    );
+
+    fx.stub_file("pg.state", "100\n10|100|3\n0\n123456789\n");
+    fx.hourly(7200);
+    assert_eq!(state_of(&fx, "dbstate:xid"), "open");
+    fx.hourly(10800);
+    for key in ["dbstate:xid", "dbstate:slots", "dbstate:locks"] {
+        let f = fx.record(key).unwrap();
+        assert_eq!(
+            (f[7].as_str(), f[22].as_str()),
+            ("resolved", "clean2"),
+            "{key}"
+        );
+    }
+    assert!(!everything(&fx).contains("s3cret-error-text"));
+
+    let fx = Fx::new();
+    fx.database("0|f|");
+    fx.stub_file("uid.postgres", "117\n");
+    fx.stub_file("pg.state", "100\n10|100|3\n0\n1\n");
+    fx.stub_file("psql.out", "/var/lib/pg main\n");
+    fx.hourly(0);
+    assert_eq!(fx.meta("pg_datadir"), None);
+}
+
+/// An env file changed after the unit that loads it started (`EnvironmentFiles` from systemctl,
+/// the change seen by a pass after the unit's start, in the same boot) is edited and not in force:
+/// change-pending (NOTICE, host) on change:<unit> on the second hourly pass. A unit restarted
+/// since the edit is not. An env file's `H` line holds a hash of the whole file and a hash of its
+/// sorted key names, and nothing of its values.
+#[test]
+fn an_env_file_edited_after_its_unit_started_opens_change_pending_and_no_value_is_kept() {
+    let fx = Fx::new();
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            (
+                "EnvironmentFiles",
+                "/etc/propolis/propolis.env (ignore_errors=no)",
+            ),
+            ("NeedDaemonReload", "no"),
+        ],
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[(
+            "EnvironmentFiles",
+            "/etc/propolis/sensors.env (ignore_errors=yes)",
+        )],
+    );
+    fx.write(
+        "etc/propolis/sensors.env",
+        "PROPOLIS_HTTP_BIND=0.0.0.0:80\n",
+    );
+    fx.hourly(0);
+    let h = fx
+        .observe_text()
+        .lines()
+        .find(|l| l.starts_with("H\t/etc/propolis/propolis.env\t"))
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("{}", fx.observe_text()));
+    let f: Vec<&str> = h.split('\t').collect();
+    assert_eq!(f[3], "-", "a file first seen has no change: {h}");
+    let keys = Command::new("bash")
+        .arg("-c")
+        .arg("printf 'PROPOLIS_OPS_NTFY_TOPIC\\nPROPOLIS_OPS_NTFY_URL\\n' | sha256sum")
+        .output()
+        .unwrap();
+    assert_eq!(f[4], &String::from_utf8_lossy(&keys.stdout)[..8], "{h}");
+    assert!(fx.records().iter().all(|r| !r[2].starts_with("change:")));
+
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_OPS_NTFY_TOKEN=tk-s3cret-value\n",
+    );
+    fx.write(
+        "etc/propolis/sensors.env",
+        "PROPOLIS_HTTP_BIND=0.0.0.0:8080\n",
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[
+            (
+                "EnvironmentFiles",
+                "/etc/propolis/sensors.env (ignore_errors=yes)",
+            ),
+            ("ActiveEnterTimestampMonotonic", &entered(3600, 600)),
+        ],
+    );
+    // sensors.env was edited at 2000 s, before sensor-http restarted at 3000 s.
+    fx.stat_map(&[(
+        "/etc/propolis/sensors.env",
+        "-",
+        "%Z",
+        &(WALL + 2000).to_string(),
+    )]);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "change:propolis.service"), "pending");
+    assert_eq!(state_of(&fx, "change:sensor-http.service"), "none");
+    fx.hourly(7200);
+    let f = fx.record("change:propolis.service").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        (
+            "change-pending",
+            "host",
+            "NOTICE",
+            "open",
+            "change.env",
+            "0"
+        )
+    );
+    assert_eq!(state_of(&fx, "change:sensor-http.service"), "none");
+    let kept = everything(&fx);
+    for secret in [
+        "t0p1c-secret",
+        "tk-s3cret-value",
+        "ntfy.example.invalid",
+        "0.0.0.0:8080",
+    ] {
+        assert!(!kept.contains(secret), "{secret} was kept");
+    }
+}
+
+/// A unit systemd says needs a daemon reload (its unit file changed under it) and a unit whose
+/// running binary was replaced (its /proc exe link ends in ` (deleted)`) open change-pending on
+/// the second hourly pass, causes change.unit and change.binary; clean on two passes resolves them.
+#[test]
+fn a_unit_needing_a_reload_or_running_a_deleted_binary_opens_change_pending() {
+    let fx = Fx::new();
+    fx.unit("sensor-ssh.service", &[("NeedDaemonReload", "yes")]);
+    fx.unit("sensor-http.service", &[("MainPID", "5151")]);
+    std::fs::create_dir_all(fx.p("proc/5151")).unwrap();
+    std::os::unix::fs::symlink(
+        "/usr/local/bin/sensor-http (deleted)",
+        fx.p("proc/5151/exe"),
+    )
+    .unwrap();
+    fx.hourly(0);
+    fx.hourly(3600);
+    let s = fx
+        .record("change:sensor-ssh.service")
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    let h = fx.record("change:sensor-http.service").unwrap();
+    assert_eq!((s[7].as_str(), s[11].as_str()), ("open", "change.unit"));
+    assert_eq!((h[7].as_str(), h[11].as_str()), ("open", "change.binary"));
+    fx.unit("sensor-ssh.service", &[("NeedDaemonReload", "no")]);
+    std::fs::remove_file(fx.p("proc/5151/exe")).unwrap();
+    std::os::unix::fs::symlink("/usr/local/bin/sensor-http", fx.p("proc/5151/exe")).unwrap();
+    fx.hourly(7200);
+    fx.hourly(10800);
+    for key in ["change:sensor-ssh.service", "change:sensor-http.service"] {
+        let f = fx.record(key).unwrap();
+        assert_eq!(
+            (f[7].as_str(), f[22].as_str()),
+            ("resolved", "clean2"),
+            "{key}"
+        );
+    }
+}
+
+/// A rotation the guard refused for want of space (cause guard.no_space) folds under the open
+/// volume record of the filesystem that holds the sensor logs, by the late-parent rule: it counts
+/// nothing more. While the volume record is only pending there is no parent.
+#[test]
+fn a_rotation_refused_for_space_folds_under_the_open_volume_record_of_the_log_filesystem() {
+    let fx = Fx::new();
+    salt(&fx);
+    std::fs::create_dir_all(fx.p("var/log/propolis")).unwrap();
+    let rot = with_field(
+        &hook_record("w#7", "propolis-logrotate.service", "ACT", "open", 0, "-"),
+        11,
+        "guard.no_space",
+    );
+    fx.incidents(&[rot]);
+    fx.stub_file("df.answer", "100000000000 10000000000 6000000 5000000 /");
+    let vol = format!("vol:{}", mount_id("/"));
+    fx.hourly(0);
+    assert_eq!(
+        fx.record("unit:propolis-logrotate.service").unwrap()[13],
+        "-"
+    );
+    fx.hourly(3600);
+    let parent = fx.record(&vol).unwrap();
+    assert_eq!(parent[7], "open");
+    let f = fx.record("unit:propolis-logrotate.service").unwrap();
+    assert_eq!((f[13].as_str(), f[29].as_str()), (parent[1].as_str(), "1"));
+    assert!(f[30].contains("folded"), "{}", f[30]);
+}
+
+/// The witness watches, by inode, size and modification time, every binary deploy/upgrade.sh
+/// installs in /usr/local/bin (its INSTALL_BINS, which is install.sh's list and the split
+/// deployment's two).
+#[test]
+fn the_witness_watches_every_binary_upgrade_sh_installs() {
+    let upgrade = std::fs::read_to_string(UPGRADE).unwrap();
+    let script = std::fs::read_to_string(SCRIPT).unwrap();
+    let names = |text: &str, prefix: &str| -> Vec<String> {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} line"));
+        line[prefix.len()..]
+            .trim_end_matches(')')
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let installed = names(&upgrade, "INSTALL_BINS=(");
+    assert!(installed.len() >= 16, "{installed:?}");
+    assert_eq!(names(&script, "WITNESS_BINS=("), installed);
+}
+
+/// A filesystem of 100 GB with 10% free, under the daemon's default share of 15%.
+const VOL_LOW: &str = "100000000000 10000000000 6000000 5000000";
+/// The same with 60% free.
+const VOL_ROOMY: &str = "100000000000 60000000000 6000000 5000000";
+/// The same with 1 GB free: under 1 GiB and the guard's 512 MiB reserve.
+const VOL_SOON: &str = "100000000000 1000000000 6000000 5000000";
+/// The data directory a Debian PostgreSQL 16 gives `SHOW data_directory`.
+const DATA_DIR: &str = "/var/lib/postgresql/16/main";
+
+/// A df answer for a filesystem mounted on `target`.
+fn vol(answer: &str, target: &str) -> String {
+    format!("{answer} {target}")
+}
+
+/// How many `df` calls the stub log holds for the host path `path`.
+fn df_calls(fx: &Fx, path: &str) -> usize {
+    let tail = format!(" {}", fx.p(path.trim_start_matches('/')).display());
+    fx.log()
+        .lines()
+        .filter(|l| l.starts_with("df ") && l.ends_with(&tail))
+        .count()
+}
+
+/// The `Z` lines of mount id `m` in the observe file.
+fn z_lines(fx: &Fx, m: &str) -> Vec<String> {
+    let prefix = format!("Z\t{m}\t");
+    fx.observe_text()
+        .lines()
+        .filter(|l| l.starts_with(&prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The result (ok or unknown) of the P line `name`.
+fn result_of(fx: &Fx, name: &str) -> String {
+    p_line(fx, name)
+        .split('\t')
+        .nth(1)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The backup unit, idle, with this Environment property.
+fn backup_env(fx: &Fx, env: &str) {
+    fx.unit(
+        "propolis-backup.service",
+        &[
+            ("ActiveState", "inactive"),
+            ("SubState", "dead"),
+            ("Restart", "no"),
+            ("UnitFileState", "static"),
+            ("Environment", env),
+        ],
+    );
+}
+
+/// A local database whose state query answers with nothing to report, and the postgres account.
+fn quiet_database(fx: &Fx) {
+    fx.database("0|f|");
+    fx.stub_file("uid.postgres", "117\n");
+    fx.stub_file("pg.state", "100\n10|100|3\n0\n1\n");
+}
+
+/// The push target, the database and these lines, as propolis.env.
+fn propolis_env_with(fx: &Fx, lines: &str) {
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+             DATABASE_URL={DB_URL}\n{lines}"
+        ),
+    );
+}
+
+/// The H line of `path` in the observe file, its fields after `H` and the path.
+fn h_line(fx: &Fx, path: &str) -> Option<String> {
+    let prefix = format!("H\t{path}\t");
+    fx.observe_text()
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// The first 8 hex of sha256 of `text`.
+fn sha8(text: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg("printf '%s' \"$1\" | sha256sum")
+        .arg("_")
+        .arg(text)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)[..8].to_string()
+}
+
+/// Every store's filesystem gets one df: the backups where a drop-in of the backup unit moves
+/// them (PROPOLIS_BACKUP_DIR in its Environment property), the gateway's spool where gateway.env
+/// moves it, and the local data directory, each on a filesystem of its own here. The pass
+/// completes, writes its heartbeat line and the volume check reads ok. A backup directory with a
+/// `..` component and a gateway spool with a blank in it are not used: their defaults are sampled.
+#[test]
+fn every_store_filesystem_gets_one_df_including_the_backup_directory_its_unit_sets() {
+    let fx = Fx::new();
+    salt(&fx);
+    quiet_database(&fx);
+    backup_env(&fx, "PROPOLIS_BACKUP_DIR=/srv/b");
+    fx.write(
+        "etc/propolis/gateway.env",
+        "PROPOLIS_GATEWAY_SPOOL_DIR=/srv/gw\n",
+    );
+    fx.filesystems(&[
+        ("/var/lib/propolis", 801),
+        ("/srv/b", 802),
+        ("/srv/gw", 803),
+        (DATA_DIR, 804),
+    ]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_ROOMY, "/")),
+        ("/srv/b", &vol(VOL_ROOMY, "/srv/b")),
+        ("/srv/gw", &vol(VOL_ROOMY, "/srv/gw")),
+        (DATA_DIR, &vol(VOL_ROOMY, "/pg")),
+    ]);
+    fx.hourly(0);
+    for p in ["/var/lib/propolis", "/srv/b", "/srv/gw", DATA_DIR] {
+        assert_eq!(df_calls(&fx, p), 1, "{p}: {}", fx.log());
+    }
+    assert_eq!(
+        fx.log().lines().filter(|l| l.starts_with("df ")).count(),
+        4,
+        "{}",
+        fx.log()
+    );
+    for t in ["/", "/srv/b", "/srv/gw", "/pg"] {
+        assert_eq!(
+            z_lines(&fx, &mount_id(t)).len(),
+            1,
+            "{t}: {}",
+            fx.observe_text()
+        );
+    }
+    assert!(
+        fx.read("run/propolis-witness/heartbeat")
+            .contains("B\thourly\t")
+    );
+    assert_eq!(result_of(&fx, "volume"), "ok", "{}", fx.observe_text());
+
+    backup_env(&fx, "PROPOLIS_BACKUP_DIR=/srv/../etc");
+    fx.write(
+        "etc/propolis/gateway.env",
+        "PROPOLIS_GATEWAY_SPOOL_DIR=\"/srv/g w\"\n",
+    );
+    fx.filesystems(&[
+        ("/var/lib/propolis", 801),
+        ("/srv/b", 802),
+        ("/srv/gw", 803),
+        (DATA_DIR, 804),
+        ("/var/spool/propolis", 805),
+        ("/var/spool/propolis/gateway", 806),
+        ("/var/backups/propolis", 807),
+    ]);
+    clear_log(&fx);
+    fx.hourly(3600);
+    for p in ["/var/spool/propolis/gateway", "/var/backups/propolis"] {
+        assert_eq!(df_calls(&fx, p), 1, "{p}: {}", fx.log());
+    }
+    for p in ["/srv/b", "/srv/gw"] {
+        assert_eq!(df_calls(&fx, p), 0, "{p}: {}", fx.log());
+    }
+    assert!(!fx.log().contains("/srv/../etc"), "{}", fx.log());
+}
+
+/// A store's path that could not be learnt on a pass (here the backup directory, while systemd
+/// does not answer the change sample) leaves the open volume record of its filesystem open and
+/// its samples kept, and the volume check reads unknown: a filesystem missing from the samples
+/// proves nothing unless every store's path was known. Three such passes in a row open
+/// tool-unusable on tool:changes.
+#[test]
+fn a_store_path_that_could_not_be_learnt_keeps_its_volume_record_and_samples() {
+    let mut fx = Fx::new();
+    salt(&fx);
+    backup_env(&fx, "PROPOLIS_BACKUP_DIR=/srv/b");
+    fx.filesystems(&[("/var/lib/propolis", 801), ("/srv/b", 802)]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_ROOMY, "/")),
+        ("/srv/b", &vol(VOL_LOW, "/srv/b")),
+    ]);
+    let m = mount_id("/srv/b");
+    let key = format!("vol:{m}");
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &key), "open", "{}", state_text(&fx));
+    fx.setenv("SYSTEMCTL_FAIL_ON", "NeedDaemonReload");
+    for t in [7200, 10800, 14400] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &key), "open", "at {t}: {}", state_text(&fx));
+        assert_eq!(z_lines(&fx, &m).len(), 2, "at {t}: {}", fx.observe_text());
+        assert_eq!(result_of(&fx, "volume"), "unknown", "at {t}");
+        assert_eq!(result_of(&fx, "changes"), "unknown", "at {t}");
+    }
+    assert_eq!(state_of(&fx, "tool:changes"), "open");
+}
+
+/// A data directory the pass had no time to place (the state query could not start by the soft
+/// deadline, so where the database is was not learnt) is still sampled from its cached path, the
+/// volume record on its filesystem stays open, and the volume check reads unknown.
+#[test]
+fn a_data_directory_the_pass_could_not_place_is_sampled_from_its_cache_and_its_record_kept() {
+    let mut fx = Fx::new();
+    salt(&fx);
+    quiet_database(&fx);
+    fx.filesystems(&[("/var/lib/propolis", 801), (DATA_DIR, 804)]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_ROOMY, "/")),
+        (DATA_DIR, &vol(VOL_LOW, "/pg")),
+    ]);
+    let key = format!("vol:{}", mount_id("/pg"));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &key), "open", "{}", state_text(&fx));
+    fx.setenv("PROPOLIS_WITNESS_SOFT_DEADLINE", "50");
+    for t in [7200, 10800] {
+        clear_log(&fx);
+        fx.hourly(t);
+        assert!(
+            !fx.log().contains("datfrozenxid"),
+            "the state query had no time: {}",
+            fx.log()
+        );
+        assert_eq!(df_calls(&fx, DATA_DIR), 1, "at {t}: {}", fx.log());
+        assert_eq!(state_of(&fx, &key), "open", "at {t}: {}", state_text(&fx));
+        assert_eq!(result_of(&fx, "volume"), "unknown", "at {t}");
+        assert_eq!(result_of(&fx, "pgstate"), "unknown", "at {t}");
+    }
+}
+
+/// A store whose stat fails for another reason than its absence (here the drop to the postgres
+/// account fails) is unknown, not gone: the volume record on its filesystem stays open and the
+/// volume check reads unknown.
+#[test]
+fn a_store_whose_stat_fails_for_another_reason_than_absence_keeps_its_volume_record() {
+    let mut fx = Fx::new();
+    fx.setenv("PA_TEST_READ_AS_SELF", "0");
+    fx.setenv("PA_TEST_UID", "0");
+    salt(&fx);
+    quiet_database(&fx);
+    fx.filesystems(&[("/var/lib/propolis", 801), (DATA_DIR, 804)]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_ROOMY, "/")),
+        (DATA_DIR, &vol(VOL_LOW, "/pg")),
+    ]);
+    let key = format!("vol:{}", mount_id("/pg"));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &key), "open", "{}", state_text(&fx));
+    fx.setenv("SETPRIV_FAIL", "117");
+    for t in [7200, 10800] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &key), "open", "at {t}: {}", state_text(&fx));
+        assert_eq!(result_of(&fx, "volume"), "unknown", "at {t}");
+    }
+}
+
+/// While df does not answer (a hung mount), an open volume record is unknown, never clean: it
+/// stays open over two such passes, and its samples are kept.
+#[test]
+fn an_open_volume_record_stays_open_while_df_does_not_answer() {
+    let fx = Fx::new();
+    salt(&fx);
+    let m = mount_id("/");
+    fx.stub_file("df.answer", &vol(VOL_LOW, "/"));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &format!("vol:{m}")), "open");
+    fx.stub_file("df.answer", "hang");
+    for t in [7200, 10800] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, &format!("vol:{m}")), "open", "at {t}");
+        assert_eq!(z_lines(&fx, &m).len(), 2, "at {t}");
+    }
+}
+
+/// The rule of two passes opens a volume record at the lower tier of its two passes: full soon
+/// and then only filling opens volume-filling (ACT); filling and then full soon opens
+/// volume-filling too, and the next full-soon pass raises it to volume-full-soon (PAGE) as a
+/// change. Open at PAGE, it stays volume-full-soon on a pass that sees it only filling, with
+/// nothing more to push.
+#[test]
+fn a_volume_record_opens_at_the_lower_tier_of_its_two_passes() {
+    let fx = Fx::new();
+    salt(&fx);
+    let key = format!("vol:{}", mount_id("/"));
+    fx.stub_file("df.answer", &vol(VOL_SOON, "/"));
+    fx.hourly(0);
+    let f = fx.record(&key).unwrap();
+    assert_eq!((f[6].as_str(), f[7].as_str()), ("PAGE", "pending"));
+    fx.stub_file("df.answer", &vol(VOL_LOW, "/"));
+    fx.hourly(3600);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("volume-filling", "ACT", "open", "1")
+    );
+
+    let fx = Fx::new();
+    salt(&fx);
+    fx.stub_file("df.answer", &vol(VOL_LOW, "/"));
+    fx.hourly(0);
+    fx.stub_file("df.answer", &vol(VOL_SOON, "/"));
+    fx.hourly(3600);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("volume-filling", "ACT", "open", "1")
+    );
+    fx.hourly(7200);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[16].as_str(),
+            f[29].as_str()
+        ),
+        ("volume-full-soon", "PAGE", "open", "change", "2")
+    );
+    fx.stub_file("df.answer", &vol(VOL_LOW, "/"));
+    fx.hourly(10800);
+    let f = fx.record(&key).unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("volume-full-soon", "PAGE", "open", "2")
+    );
+}
+
+/// A data directory reached through a symbolic link (PGDATA moved to a bigger disk, with `SHOW
+/// data_directory` naming the link) is sampled where the link leads: the postgres account's stat
+/// follows it as root's does, its filesystem gets a df and a Z line, and the record opened on it
+/// stays open. A configured sensor log directory that is a link counts the filesystem it leads
+/// to as the logs' own: a rotation the guard refused for space folds under that filesystem's
+/// open record.
+#[test]
+fn a_store_reached_through_a_symbolic_link_is_sampled_where_the_link_leads() {
+    let fx = Fx::new();
+    salt(&fx);
+    quiet_database(&fx);
+    fx.daemon_account();
+    propolis_env_with(&fx, "PROPOLIS_SENSOR_LOGS=ssh:/srv/logs/x.jsonl\n");
+    for d in ["data/pg", "data/logs", "var/lib/postgresql/16", "srv"] {
+        std::fs::create_dir_all(fx.p(d)).unwrap();
+    }
+    std::os::unix::fs::symlink(fx.p("data/pg"), fx.p(&DATA_DIR[1..])).unwrap();
+    std::os::unix::fs::symlink(fx.p("data/logs"), fx.p("srv/logs")).unwrap();
+    // The link to the logs leads to a filesystem of its own; the data directory's target is the
+    // test's own filesystem, which no other store here is on.
+    fx.stat_map(&[
+        ("/var/lib/propolis", "-L", "%d %F", "801 directory"),
+        ("/srv/logs", "-L", "%d %F", "806 directory"),
+    ]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_ROOMY, "/")),
+        (DATA_DIR, &vol(VOL_LOW, "/data/pg")),
+        ("/srv/logs", &vol(VOL_LOW, "/data/logs")),
+    ]);
+    let rot = with_field(
+        &hook_record("w#7", "propolis-logrotate.service", "ACT", "open", 0, "-"),
+        11,
+        "guard.no_space",
+    );
+    fx.incidents(&[rot]);
+    let pg = format!("vol:{}", mount_id("/data/pg"));
+    let logs = format!("vol:{}", mount_id("/data/logs"));
+    fx.hourly(0);
+    assert_eq!(df_calls(&fx, DATA_DIR), 1, "{}", fx.log());
+    assert_eq!(
+        z_lines(&fx, &mount_id("/data/pg")).len(),
+        1,
+        "{}",
+        fx.observe_text()
+    );
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, &pg), "open", "{}", state_text(&fx));
+    let parent = fx.record(&logs).unwrap();
+    assert_eq!(parent[7], "open");
+    assert_eq!(
+        fx.record("unit:propolis-logrotate.service").unwrap()[13],
+        parent[1]
+    );
+    fx.hourly(7200);
+    assert_eq!(state_of(&fx, &pg), "open", "{}", state_text(&fx));
+}
+
+/// A configured sensor log directory on a filesystem no fixed store is on is a store of its own:
+/// one df, a Z line under its mount id, and its volume record is the one a rotation refused for
+/// space folds under, never the open record of a filesystem that holds no logs.
+#[test]
+fn a_configured_log_directory_on_its_own_filesystem_is_sampled_and_takes_the_rotation_fold() {
+    let fx = Fx::new();
+    salt(&fx);
+    fx.daemon_account();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+         PROPOLIS_SENSOR_LOGS=ssh:/srv/logs/x.jsonl\n",
+    );
+    fx.filesystems(&[("/var/lib/propolis", 801), ("/srv/logs", 806)]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_LOW, "/varlib")),
+        ("/srv/logs", &vol(VOL_LOW, "/srv/logs")),
+    ]);
+    let rot = with_field(
+        &hook_record("w#7", "propolis-logrotate.service", "ACT", "open", 0, "-"),
+        11,
+        "guard.no_space",
+    );
+    fx.incidents(&[rot]);
+    let m = mount_id("/srv/logs");
+    fx.hourly(0);
+    assert_eq!(df_calls(&fx, "/srv/logs"), 1, "{}", fx.log());
+    assert_eq!(z_lines(&fx, &m).len(), 1, "{}", fx.observe_text());
+    fx.hourly(3600);
+    let logs = fx.record(&format!("vol:{m}")).unwrap();
+    let other = fx.record(&format!("vol:{}", mount_id("/varlib"))).unwrap();
+    assert_eq!((logs[7].as_str(), other[7].as_str()), ("open", "open"));
+    let f = fx.record("unit:propolis-logrotate.service").unwrap();
+    assert_eq!(f[13], logs[1], "{}", state_text(&fx));
+}
+
+/// An env file edited after its unit restarted, where the restart came after the pass that last
+/// saw the old content, is edited and not in force: the file's last change (its ctime) lies after
+/// the unit's start, so change.env opens on the second hourly pass. An edit made before the
+/// restart, in the same window, opens nothing.
+#[test]
+fn an_env_file_edited_after_a_restart_that_followed_the_last_pass_opens_change_pending() {
+    let fx = Fx::new();
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            (
+                "EnvironmentFiles",
+                "/etc/propolis/propolis.env (ignore_errors=no)",
+            ),
+        ],
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[(
+            "EnvironmentFiles",
+            "/etc/propolis/sensors.env (ignore_errors=yes)",
+        )],
+    );
+    fx.write(
+        "etc/propolis/sensors.env",
+        "PROPOLIS_HTTP_BIND=0.0.0.0:80\n",
+    );
+    fx.hourly(0);
+    // Both units restart at 3000 s; propolis.env is edited at 3300 s, sensors.env at 2000 s.
+    fx.unit(
+        "propolis.service",
+        &[
+            ("Restart", "on-failure"),
+            (
+                "EnvironmentFiles",
+                "/etc/propolis/propolis.env (ignore_errors=no)",
+            ),
+            ("ActiveEnterTimestampMonotonic", &entered(3600, 600)),
+        ],
+    );
+    fx.unit(
+        "sensor-http.service",
+        &[
+            (
+                "EnvironmentFiles",
+                "/etc/propolis/sensors.env (ignore_errors=yes)",
+            ),
+            ("ActiveEnterTimestampMonotonic", &entered(3600, 600)),
+        ],
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-other\n",
+    );
+    fx.write(
+        "etc/propolis/sensors.env",
+        "PROPOLIS_HTTP_BIND=0.0.0.0:8080\n",
+    );
+    fx.stat_map(&[
+        (
+            "/etc/propolis/propolis.env",
+            "-",
+            "%Z",
+            &(WALL + 3300).to_string(),
+        ),
+        (
+            "/etc/propolis/sensors.env",
+            "-",
+            "%Z",
+            &(WALL + 2000).to_string(),
+        ),
+    ]);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "change:propolis.service"), "pending");
+    fx.hourly(7200);
+    let f = fx.record("change:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "change.env"));
+    assert_eq!(state_of(&fx, "change:sensor-http.service"), "none");
+}
+
+/// A pass of another boot that last saw an env file's old content proves nothing about a unit
+/// started in this boot, whatever its uptime: the file's ctime decides, and an edit before the
+/// unit's start opens nothing while one after it opens change.env. Once the clock was stepped
+/// since the unit started, the ctime is no measure and the pass that first saw the new content
+/// decides, as uptime against uptime.
+#[test]
+fn a_pass_of_another_boot_that_last_saw_the_old_content_proves_no_edit_after_a_start() {
+    // The last pass of the boot before saw other content, at an uptime past this unit's start.
+    let other = format!("{}/0badb007/{}", WALL - 7200, UP + 50_000);
+    let setup = |ctime: u64, meta: &str| -> Fx {
+        let fx = Fx::new();
+        fx.unit(
+            "propolis.service",
+            &[
+                ("Restart", "on-failure"),
+                (
+                    "EnvironmentFiles",
+                    "/etc/propolis/propolis.env (ignore_errors=no)",
+                ),
+                ("ActiveEnterTimestampMonotonic", &entered(0, 600)),
+            ],
+        );
+        fx.observe(&format!(
+            "H\t/etc/propolis/propolis.env\t0000000000000000\t-\t-\t{other}\t-\n"
+        ));
+        if !meta.is_empty() {
+            fx.write(
+                "var/lib/propolis/witness/meta",
+                &format!("#meta v1 g=1\n{meta}"),
+            );
+        }
+        fx.stat_map(&[("/etc/propolis/propolis.env", "-", "%Z", &ctime.to_string())]);
+        fx.hourly(0);
+        fx.hourly(3600);
+        fx
+    };
+    let fx = setup(WALL - 3600, "");
+    let h = h_line(&fx, "/etc/propolis/propolis.env").unwrap();
+    assert!(h.ends_with(&format!("\t{other}")), "{h}");
+    assert_eq!(
+        state_of(&fx, "change:propolis.service"),
+        "none",
+        "{}",
+        state_text(&fx)
+    );
+    let fx = setup(WALL - 300, "");
+    let f = fx.record("change:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "change.env"));
+    let fx = setup(WALL - 3600, &format!("M\tclock_step\t{}/+500\n", stamp(0)));
+    let f = fx.record("change:propolis.service").unwrap();
+    assert_eq!((f[7].as_str(), f[11].as_str()), ("open", "change.env"));
+}
+
+/// The data directory belongs to the postgres account, which can swap any part of the path for a
+/// link between a check and a use: its stat (following links) and its df both run as postgres
+/// through setpriv, never as root, so whatever the path leads to is opened with that account's
+/// rights.
+#[test]
+fn the_data_directory_is_stat_and_df_as_the_postgres_account() {
+    let mut fx = Fx::new();
+    fx.setenv("PA_TEST_READ_AS_SELF", "0");
+    fx.setenv("PA_TEST_UID", "0");
+    salt(&fx);
+    quiet_database(&fx);
+    std::fs::create_dir_all(fx.p(&DATA_DIR[1..])).unwrap();
+    fx.filesystems(&[("/var/lib/propolis", 801)]);
+    fx.hourly(0);
+    let log = fx.log();
+    let path = fx.p(&DATA_DIR[1..]).display().to_string();
+    let drops: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("setpriv --reuid=117 ") && l.contains(&path))
+        .collect();
+    assert!(drops.iter().any(|l| l.contains("stat -L -c")), "{log}");
+    let df = format!("-- df -B1 --output=size,avail,itotal,iavail,target -- {path}");
+    assert!(drops.iter().any(|l| l.ends_with(&df)), "{log}");
+    let dfs = log
+        .lines()
+        .filter(|l| l.starts_with("df ") && l.ends_with(&path))
+        .count();
+    let dropped = drops.iter().filter(|l| l.contains(" df ")).count();
+    assert_eq!((dfs, dropped), (1, 1), "{log}");
+}
+
+/// The deploy stamp lies in the daemon account's own directory, which that account can rearrange
+/// between the listing and the hash (a name swapped for a link to a file only root may read, or
+/// to one that never ends): it is hashed as that account, never opened by root.
+#[test]
+fn a_watched_file_in_the_daemons_own_directory_is_hashed_as_the_daemon_account() {
+    let mut fx = Fx::new();
+    fx.setenv("PA_TEST_READ_AS_SELF", "0");
+    fx.setenv("PA_TEST_UID", "0");
+    fx.daemon_account();
+    fx.write(
+        "var/lib/propolis/deploy-stamp.json",
+        "{\"commit\":\"abc\"}\n",
+    );
+    fx.hourly(0);
+    let log = fx.log();
+    let path = fx
+        .p("var/lib/propolis/deploy-stamp.json")
+        .display()
+        .to_string();
+    assert!(
+        log.lines().any(|l| l.starts_with("setpriv --reuid=998 ")
+            && l.contains(" sha256sum ")
+            && l.ends_with(&path)),
+        "{log}"
+    );
+    assert!(
+        h_line(&fx, "/var/lib/propolis/deploy-stamp.json").is_some(),
+        "{}",
+        fx.observe_text()
+    );
+}
+
+/// A local database whose data directory could never be read (psql cannot run as the postgres
+/// account here, or the server refuses it) leaves the volume check unknown with the cause of
+/// that read, not a bare unknown, so the record of the unusable check says what to mend.
+#[test]
+fn a_data_directory_that_was_never_read_names_why_the_volume_check_is_unknown() {
+    for (rc, cause) in [("127", "tool.exec"), ("2", "db.unreachable")] {
+        let fx = Fx::new();
+        salt(&fx);
+        quiet_database(&fx);
+        fx.filesystems(&[("/var/lib/propolis", 801)]);
+        fx.stub_file("psql.rc", rc);
+        fx.hourly(0);
+        assert!(fx.meta("pg_datadir").is_none(), "{rc}");
+        let p = p_line(&fx, "volume");
+        assert!(
+            p.contains(&format!("\tunknown\t{cause}\t")),
+            "psql status {rc}: {p}"
+        );
+    }
+}
+
+/// The key names of an env file are those of the lines that start an entry: a value that runs
+/// on over lines inside a quote, or past a trailing backslash, and a line a comment ending in a
+/// backslash runs into, put nothing in the key-name hash, whatever they look like.
+#[test]
+fn the_key_name_hash_takes_no_line_of_a_value_that_runs_over_lines() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_X=\"line1\nsecretpart=foo\"\n",
+    );
+    fx.hourly(0);
+    let h = h_line(&fx, "/etc/propolis/propolis.env").unwrap();
+    assert_eq!(
+        h.split('\t').nth(2),
+        Some(sha8("PROPOLIS_X\n").as_str()),
+        "{h}"
+    );
+
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_X=\"line1\nsecretpart=foo\"\nPROPOLIS_Y=a\\\ncontinued=b\n# comment\\\nhidden=c\n\
+         PROPOLIS_Z='q\nsq=1'\nPROPOLIS_W = \"a \\\" b\"\n",
+    );
+    fx.hourly(0);
+    let h = h_line(&fx, "/etc/propolis/propolis.env").unwrap();
+    assert_eq!(
+        h.split('\t').nth(2),
+        Some(sha8("PROPOLIS_W\nPROPOLIS_X\nPROPOLIS_Y\nPROPOLIS_Z\n").as_str()),
+        "{h}"
+    );
+}
+
+/// When no running unit's /proc exe link can be read (a capability bounding set without
+/// CAP_SYS_PTRACE, say), change.binary could never open: the change check reads unknown
+/// (tool.exec), and three such passes in a row open tool-unusable on tool:changes.
+#[test]
+fn a_change_check_that_cannot_read_any_running_binary_reads_unknown() {
+    let fx = Fx::new();
+    std::fs::remove_file(fx.p("proc/4242/exe")).unwrap();
+    for t in [0, 3600, 7200] {
+        fx.hourly(t);
+        let p = p_line(&fx, "changes");
+        assert!(p.contains("\tunknown\ttool.exec\t"), "at {t}: {p}");
+    }
+    assert_eq!(state_of(&fx, "tool:changes"), "open");
+}
+
+/// An open change.binary record whose /proc exe link cannot be read is unknown, never clean: it
+/// stays open and its clean count starts again, so it resolves only after two readable clean
+/// passes in a row.
+#[test]
+fn an_open_change_binary_record_stays_open_while_the_exe_link_cannot_be_read() {
+    let fx = Fx::new();
+    fx.unit("sensor-http.service", &[("MainPID", "5151")]);
+    std::fs::create_dir_all(fx.p("proc/5151")).unwrap();
+    let exe = fx.p("proc/5151/exe");
+    std::os::unix::fs::symlink("/usr/local/bin/sensor-http (deleted)", &exe).unwrap();
+    fx.hourly(0);
+    fx.hourly(3600);
+    let key = "change:sensor-http.service";
+    assert_eq!(fx.record(key).unwrap()[11], "change.binary");
+    std::fs::remove_file(&exe).unwrap();
+    std::os::unix::fs::symlink("/usr/local/bin/sensor-http", &exe).unwrap();
+    fx.hourly(7200);
+    assert_eq!(state_of(&fx, key), "open");
+    std::fs::remove_file(&exe).unwrap();
+    fx.hourly(10800);
+    assert_eq!(state_of(&fx, key), "open");
+    std::os::unix::fs::symlink("/usr/local/bin/sensor-http", &exe).unwrap();
+    fx.hourly(14400);
+    assert_eq!(state_of(&fx, key), "open", "the clean count started again");
+    fx.hourly(18000);
+    let f = fx.record(key).unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "clean2"));
+}
+
+/// Two stores on filesystems stat tells apart but df reports on one mount point (btrfs
+/// subvolumes without mounts of their own) are one volume: judged once a pass, so the record is
+/// pending after the first pass and not open, and one Z line a pass.
+#[test]
+fn two_stores_that_df_puts_on_one_mount_point_are_judged_once() {
+    let fx = Fx::new();
+    salt(&fx);
+    fx.filesystems(&[("/var/lib/propolis", 801), ("/var/spool/propolis", 802)]);
+    fx.df_map(&[
+        ("/var/lib/propolis", &vol(VOL_LOW, "/")),
+        ("/var/spool/propolis", &vol(VOL_LOW, "/")),
+    ]);
+    let m = mount_id("/");
+    fx.hourly(0);
+    assert_eq!(
+        state_of(&fx, &format!("vol:{m}")),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    assert_eq!(z_lines(&fx, &m).len(), 1, "{}", fx.observe_text());
+}
+
+/// The database's state kinds wait out the boot grace: db-xid seen on two hourly passes under
+/// 900 s of uptime stays pending and opens on the next pass after it. A manual maintenance marker
+/// holds it pending too; an upgrade's marker does not.
+#[test]
+fn the_database_state_waits_out_the_boot_grace_and_a_manual_marker_but_not_an_upgrade_marker() {
+    let mut fx = Fx::new();
+    quiet_database(&fx);
+    fx.stub_file("pg.state", "1500000000\n10|100|3\n0\n1\n");
+    for t in [0, 200] {
+        fx.setenv("PROPOLIS_WITNESS_NOW", &early(t));
+        fx.hourly_alone(t);
+        assert_eq!(state_of(&fx, "dbstate:xid"), "pending", "at {t}");
+    }
+    fx.setenv("PROPOLIS_WITNESS_NOW", &early(400));
+    fx.hourly_alone(400);
+    assert_eq!(state_of(&fx, "dbstate:xid"), "open");
+
+    for (reason, state) in [("manual", "pending"), ("upgrade", "open")] {
+        let fx = Fx::new();
+        quiet_database(&fx);
+        fx.stub_file("pg.state", "1500000000\n10|100|3\n0\n1\n");
+        fx.write(
+            "run/propolis-witness/maintenance",
+            &format!(
+                "#maintenance v1 g=1\nX\t{}\t{BOOT}\t{reason}\n",
+                WALL + 7200
+            ),
+        );
+        fx.hourly(0);
+        fx.hourly(3600);
+        assert_eq!(state_of(&fx, "dbstate:xid"), state, "{reason}");
+    }
+}
+
+/// The cached data directory is read again once its stamp is a day old, and when the stamp lies
+/// ahead of the clock (no proof the cache is fresh); a read that fails keeps the cached path,
+/// which is still sampled as a store.
+#[test]
+fn the_data_directory_is_read_again_after_a_day_or_a_stamp_ahead_and_a_failed_read_keeps_the_cache()
+{
+    let fx = Fx::new();
+    salt(&fx);
+    quiet_database(&fx);
+    fx.filesystems(&[("/var/lib/propolis", 801), (DATA_DIR, 804)]);
+    let meta = |stamp: &str| {
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=1\nM\tpg_datadir\t{DATA_DIR}\nM\tpg_datadir_stamp\t{stamp}\n"),
+        );
+    };
+    let psql = |fx: &Fx| fx.log().lines().any(|l| l.starts_with("psql "));
+    meta(&before(86_400));
+    fx.hourly(0);
+    assert!(psql(&fx), "a day old: {}", fx.log());
+    meta(&stamp(90_000));
+    clear_log(&fx);
+    fx.hourly(3600);
+    assert!(psql(&fx), "ahead of the clock: {}", fx.log());
+    meta(&before(86_400));
+    fx.stub_file("psql.rc", "2");
+    clear_log(&fx);
+    fx.hourly(7200);
+    assert!(psql(&fx), "{}", fx.log());
+    assert_eq!(df_calls(&fx, DATA_DIR), 1, "{}", fx.log());
+    assert_eq!(fx.meta("pg_datadir").as_deref(), Some(DATA_DIR));
+}
+
+/// A watched directory whose listing fails keeps every line of its files exactly as read, though
+/// a file in it changed, and the change check reads unknown.
+#[test]
+fn a_watched_directory_whose_listing_fails_keeps_its_files_lines_and_the_change_check_reads_unknown()
+ {
+    let fx = Fx::new();
+    fx.hourly(0);
+    let lines = |fx: &Fx| -> Vec<String> {
+        let mut v: Vec<String> = fx
+            .observe_text()
+            .lines()
+            .filter(|l| l.starts_with("H\t/etc/propolis/"))
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v
+    };
+    let before = lines(&fx);
+    assert!(!before.is_empty(), "{}", fx.observe_text());
+    write_exec(
+        &fx.bin.join("find"),
+        "#!/usr/bin/env bash\nd=\"${UNITS%/units}\"\n\
+         if [[ $1 == */etc/propolis ]] && [ -f \"$d/find.fail\" ]; then exit 1; fi\n\
+         exec /usr/bin/find \"$@\"\n",
+    );
+    fx.stub_file("find.fail", "");
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-other\n",
+    );
+    fx.hourly(3600);
+    assert_eq!(lines(&fx), before);
+    assert_eq!(result_of(&fx, "changes"), "unknown");
+}
+
+/// A filesystem's samples are held to the newest 224 (seven days of passes 45 minutes apart): with
+/// 230 kept and this pass's added, the seven oldest go.
+#[test]
+fn the_samples_of_one_filesystem_are_held_to_224_and_the_oldest_go_first() {
+    let fx = Fx::new();
+    salt(&fx);
+    let m = mount_id("/");
+    let ages: Vec<u64> = (0..230u64).map(|i| 518_400 - i * 2248).collect();
+    let text: String = ages
+        .iter()
+        .map(|a| format!("Z\t{m}\t{}\t{VOL_ROOMY_TAB}\n", before(*a)))
+        .collect();
+    fx.observe(&text);
+    fx.hourly(0);
+    let z = z_lines(&fx, &m);
+    assert_eq!(z.len(), 224);
+    for a in &ages[..7] {
+        assert!(
+            !z.iter().any(|l| l.contains(&before(*a))),
+            "{} was kept",
+            before(*a)
+        );
+    }
+    assert!(z[0].contains(&before(ages[7])), "{}", z[0]);
+    assert!(z[223].contains(&stamp(0)), "{}", z[223]);
+}
+
+/// VOL_ROOMY as the four tab-separated fields of a Z line.
+const VOL_ROOMY_TAB: &str = "100000000000\t60000000000\t6000000\t5000000";
+
+/// PROPOLIS_OPS_CAPACITY_FREE_PCT outside the daemon's 1 to 100 would make it refuse to start, so
+/// the witness judges by the default of 15 then: 12% free opens volume-filling.
+#[test]
+fn a_free_share_setting_out_of_range_judges_by_the_default_of_fifteen() {
+    for pct in ["0", "101"] {
+        let fx = Fx::new();
+        salt(&fx);
+        fx.write(
+            "etc/propolis/propolis.env",
+            &format!(
+                "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+                 PROPOLIS_OPS_CAPACITY_FREE_PCT={pct}\n"
+            ),
+        );
+        fx.stub_file("df.answer", "100000000000 12000000000 6000000 5000000 /");
+        fx.hourly(0);
+        fx.hourly(3600);
+        let f = fx
+            .record(&format!("vol:{}", mount_id("/")))
+            .unwrap_or_else(|| panic!("{pct}: {}", state_text(&fx)));
+        assert_eq!(
+            (f[3].as_str(), f[7].as_str()),
+            ("volume-filling", "open"),
+            "{pct}"
+        );
+    }
+}
+
+/// A state query that fails on three hourly passes in a row opens tool-unusable on tool:pgstate.
+#[test]
+fn a_state_query_that_fails_three_times_opens_tool_unusable() {
+    let fx = Fx::new();
+    quiet_database(&fx);
+    fx.stub_file("pg.state.rc", "2");
+    for t in [0, 3600, 7200] {
+        fx.hourly(t);
+        assert_eq!(result_of(&fx, "pgstate"), "unknown", "at {t}");
+    }
+    assert_eq!(state_of(&fx, "tool:pgstate"), "open");
+}
+
+/// A server whose reserved slots take every connection (max_connections 3, 3 reserved) has no
+/// usable slot to count against: no db-slots, and no arithmetic error.
+#[test]
+fn a_server_with_every_slot_reserved_opens_no_db_slots() {
+    let fx = Fx::new();
+    quiet_database(&fx);
+    fx.stub_file("pg.state", "100\n3|3|3\n0\n1\n");
+    fx.hourly(0);
+    let r = fx.hourly(3600);
+    assert_eq!(
+        state_of(&fx, "dbstate:slots"),
+        "none",
+        "{}",
+        state_text(&fx)
+    );
+    assert_eq!(result_of(&fx, "pgstate"), "ok");
+    assert!(
+        !r.err.contains("division") && !r.err.contains("syntax error"),
+        "{}",
+        r.err
+    );
+}
+
+/// An open db-xid record is unknown, never clean, while the state query fails: it stays open over
+/// two such passes and the check reads unknown.
+#[test]
+fn an_open_database_state_record_stays_open_while_the_query_fails() {
+    let fx = Fx::new();
+    quiet_database(&fx);
+    fx.stub_file("pg.state", "1500000000\n10|100|3\n0\n1\n");
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "dbstate:xid"), "open");
+    fx.stub_file("pg.state.rc", "2");
+    for t in [7200, 10800] {
+        fx.hourly(t);
+        assert_eq!(state_of(&fx, "dbstate:xid"), "open", "at {t}");
+        assert_eq!(result_of(&fx, "pgstate"), "unknown", "at {t}");
+    }
+}
+
+/// A data directory psql names with a `..` component is never stored, and an EnvironmentFiles
+/// value with a blank in it (which would split into two paths) is not used: a unit that loads
+/// some other file opens no change.env for an edit of propolis.env.
+#[test]
+fn paths_out_of_form_from_psql_or_a_unit_are_never_used() {
+    let fx = Fx::new();
+    quiet_database(&fx);
+    fx.stub_file("psql.out", "/var/lib/../etc\n");
+    fx.hourly(0);
+    assert_eq!(fx.meta("pg_datadir"), None);
+
+    let fx = Fx::new();
+    fx.unit(
+        "sensor-http.service",
+        &[(
+            "EnvironmentFiles",
+            "/etc/propolis/x.env /etc/propolis/propolis.env (ignore_errors=yes)",
+        )],
+    );
+    fx.hourly(0);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-other\n",
+    );
+    fx.hourly(3600);
+    fx.hourly(7200);
+    assert_eq!(
+        state_of(&fx, "change:sensor-http.service"),
+        "none",
+        "{}",
+        state_text(&fx)
+    );
+}
+
+/// An env file over 1 MiB is no env file systemd would load whole: its key names are not read
+/// (keys8 `-`). A file in /etc/propolis that root does not own gets no H line; only a run as root
+/// can give a file another owner, so a run without root checks the other half, that root's own
+/// file gets one.
+#[test]
+fn an_env_file_over_a_mebibyte_has_no_key_hash_and_a_file_root_does_not_own_no_h_line() {
+    let fx = Fx::new();
+    let big = format!("PROPOLIS_A=1\n#{}\n", "x".repeat(1_048_576));
+    fx.write("etc/propolis/big.env", &big);
+    fx.write("etc/propolis/other.env", "PROPOLIS_B=1\n");
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let root = unsafe { libc::geteuid() } == 0;
+    if root {
+        std::os::unix::fs::chown(fx.p("etc/propolis/other.env"), Some(65534), Some(65534)).unwrap();
+    } else {
+        eprintln!(
+            "not root: a file of another owner cannot be made; checking root's own file instead"
+        );
+    }
+    fx.hourly(0);
+    let h = h_line(&fx, "/etc/propolis/big.env").unwrap_or_else(|| panic!("{}", fx.observe_text()));
+    assert_eq!(h.split('\t').nth(2), Some("-"), "{h}");
+    assert_eq!(h_line(&fx, "/etc/propolis/other.env").is_some(), !root);
 }

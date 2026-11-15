@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "6");
+    assert_eq!(version, "7");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -5614,4 +5614,306 @@ fn the_banner_claims_a_refusal_only_when_the_gate_holds_it_proven() {
         plain,
         "a refusal over plain HTTP proves nothing"
     );
+}
+
+/// One GiB, in bytes.
+const GIB: u64 = 1_073_741_824;
+
+/// Runs `pa_vol_project` at NOW (wall 1_000_000) on samples of another boot, so their ages come
+/// from the wall clock, given as `(hours before NOW, free bytes)`, and prints the three results.
+fn project(fx: &Fx, samples: &[(u64, u64)], now_avail: u64) -> (String, String, String) {
+    let input: String = samples
+        .iter()
+        .map(|(h, a)| format!("{}/0000aaaa/1\t{a}\n", 1_000_000 - h * 3600))
+        .collect();
+    fx.write("input", &input);
+    let r = fx.run_env(
+        &format!(
+            "pa_vol_project 1000000/abcdef01/5000 {now_avail} < \"$ROOT/input\"; echo \"rc=$?\"\n\
+             echo \"span=$PA_VOL_SPAN\"; echo \"rate=$PA_VOL_RATE\"; echo \"hours=$PA_VOL_HOURS\""
+        ),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    (r.get("span"), r.get("rate"), r.get("hours"))
+}
+
+/// A volume's projection needs samples over 72 hours and a free space that fell over that span:
+/// 71 hours of a steady fall of 1 GiB an hour give none, 73 hours give 19 hours to the last GiB of
+/// 20, and a week in which the free space grew gives none whatever the last day did.
+#[test]
+fn the_projection_needs_seventy_two_hours_of_samples_and_a_positive_seven_day_rate() {
+    let fx = Fx::new();
+    let falling =
+        |hours: u64| -> Vec<(u64, u64)> { (1..=hours).map(|h| (h, (20 + h) * GIB)).collect() };
+    let (span, rate, hours) = project(&fx, &falling(71), 20 * GIB);
+    assert_eq!(
+        (span.as_str(), rate.as_str(), hours.as_str()),
+        ("255600", "-", "-")
+    );
+    let (_, rate, hours) = project(&fx, &falling(73), 20 * GIB);
+    assert_eq!((rate.as_str(), hours.as_str()), ("1048576", "19"));
+    // Six days of growth, then a fall of 5 GiB in the last day: the week still grew.
+    let mut grew: Vec<(u64, u64)> = (25..=168).map(|h| (h, 10 * GIB)).collect();
+    grew.extend((1..=24).map(|h| (h, 25 * GIB + h * GIB / 5)));
+    let (_, rate, hours) = project(&fx, &grew, 25 * GIB);
+    assert_eq!((rate.as_str(), hours.as_str()), ("-", "-"));
+}
+
+/// A nightly backup writes a set and prunes the oldest, so the free space dips for an hour and
+/// comes back: over a week that is no fall at all, though a sample of the last day dipped. A step
+/// that stays (the first set, or a one-off copy) on a roomy volume projects nothing near.
+#[test]
+fn a_nightly_backup_is_a_step_and_not_a_trend() {
+    let fx = Fx::new();
+    let sawtooth: Vec<(u64, u64)> = (1..=168)
+        .map(|h| (h, if h % 24 == 5 { 28 * GIB } else { 30 * GIB }))
+        .collect();
+    let (_, rate, hours) = project(&fx, &sawtooth, 30 * GIB);
+    assert_eq!((rate.as_str(), hours.as_str()), ("-", "-"));
+    let step: Vec<(u64, u64)> = (1..=168)
+        .map(|h| (h, if h <= 3 { 28 * GIB } else { 30 * GIB }))
+        .collect();
+    let (_, _, hours) = project(&fx, &step, 28 * GIB);
+    let hours: u64 = hours.parse().unwrap();
+    assert!(
+        hours > 72,
+        "a 2 GiB step with 28 GiB free projected {hours} h"
+    );
+}
+
+/// A host that was off for a day: three days of samples end over a day before NOW. The fall of
+/// 24 GiB is spread over the 96 hours that really passed (80 hours to the last GiB of 21, no
+/// trigger), not over the 72 samples, which would have made it about 60.
+#[test]
+fn a_host_that_was_off_for_a_day_measures_the_fall_over_the_time_that_passed() {
+    let fx = Fx::new();
+    let gap: Vec<(u64, u64)> = (25..=96).map(|h| (h, 21 * GIB + h * GIB / 4)).collect();
+    let (span, rate, hours) = project(&fx, &gap, 21 * GIB);
+    assert_eq!(
+        (span.as_str(), rate.as_str(), hours.as_str()),
+        ("345600", "262144", "80")
+    );
+    let r = fx.run(&format!(
+        "pa_vol_judge {} {} 1000 900 15 80; echo \"c=$PA_VOL_C soon=$PA_VOL_SOON\"",
+        200 * GIB,
+        21 * GIB
+    ));
+    assert_eq!(r.get("c"), "0 soon=0");
+}
+
+/// The triggers of one sample: a filesystem that reports no inodes (btrfs) has no inode trigger,
+/// a free share under the setting is filling, under 1.5 GiB free or 2% of the inodes is full soon,
+/// sizes past 2^53 are judged without overflow, and a number of more than 18 digits is unknown and
+/// never a trigger.
+#[test]
+fn a_filesystem_that_reports_no_inodes_has_no_inode_trigger() {
+    let fx = Fx::new();
+    let judge = |args: &str| -> String {
+        let r = fx.run(&format!(
+            "pa_vol_judge {args}; echo \"r=$? $PA_VOL_A$PA_VOL_B$PA_VOL_C$PA_VOL_SOON $PA_VOL_CAUSE\""
+        ));
+        r.get("r")
+    };
+    let big = 100 * GIB;
+    assert_eq!(judge(&format!("{big} {} 0 0 15 -", 50 * GIB)), "0 0000 -");
+    assert_eq!(
+        judge(&format!("{big} {} 1000 50 15 -", 50 * GIB)),
+        "0 0100 vol.inodes"
+    );
+    assert_eq!(
+        judge(&format!("{big} {} 1000 10 15 -", 50 * GIB)),
+        "0 0101 vol.inodes"
+    );
+    assert_eq!(
+        judge(&format!("{big} {} 0 0 15 -", 10 * GIB)),
+        "0 1000 vol.low"
+    );
+    assert_eq!(judge(&format!("{big} {} 0 0 15 -", GIB)), "0 1001 vol.low");
+    assert_eq!(
+        judge(&format!("{big} {} 0 0 15 40", 50 * GIB)),
+        "0 0010 vol.projected"
+    );
+    assert_eq!(
+        judge(&format!("{big} {} 0 0 15 11", 50 * GIB)),
+        "0 0011 vol.projected"
+    );
+    assert_eq!(
+        judge("900000000000000000 100000000000000000 0 0 15 -"),
+        "0 1000 vol.low"
+    );
+    assert_eq!(judge("9000000000000000000 1 0 0 15 -"), "2 0000 -");
+    assert_eq!(
+        judge(&format!("{big} {} 0 0 15 soon", 50 * GIB)),
+        "2 0000 -"
+    );
+}
+
+/// The floor of a gibibyte and a half free is a size, and a filesystem smaller than about that is
+/// under it even when empty: such a store is full soon only when it is also under half free, so
+/// a small dedicated volume with room is not a standing page.
+#[test]
+fn a_small_filesystem_that_is_mostly_free_is_not_full_soon() {
+    let fx = Fx::new();
+    let judge = |args: &str| -> String {
+        let r = fx.run(&format!(
+            "pa_vol_judge {args}; echo \"r=$? $PA_VOL_A$PA_VOL_B$PA_VOL_C$PA_VOL_SOON $PA_VOL_CAUSE\""
+        ));
+        r.get("r")
+    };
+    let mib = GIB / 1024;
+    // 1 GiB, 900 MiB free: under the floor, mostly free.
+    assert_eq!(judge(&format!("{GIB} {} 0 0 15 -", 900 * mib)), "0 0000 -");
+    // 2 GiB, 800 MiB free: under the floor and under half free.
+    assert_eq!(
+        judge(&format!("{} {} 0 0 15 -", 2 * GIB, 800 * mib)),
+        "0 0001 vol.low"
+    );
+    // 1 GiB, 100 MiB free: short of its share as well.
+    assert_eq!(
+        judge(&format!("{GIB} {} 0 0 15 -", 100 * mib)),
+        "0 1001 vol.low"
+    );
+    // A large one under the floor, as before.
+    assert_eq!(
+        judge(&format!("{} {GIB} 0 0 15 -", 100 * GIB)),
+        "0 1001 vol.low"
+    );
+}
+
+/// The rate `pa_vol_project` reaches from the free space `then` and `now` (bytes) `secs` apart, in
+/// KiB an hour, as it computes it.
+fn kib_rate(then: u64, now: u64, secs: u64) -> u64 {
+    (then / 1024 - now / 1024) * 3600 / secs
+}
+
+/// The projection takes the larger of the week's rate and the last day's: a week falling 0.1
+/// GiB an hour, then 1 GiB an hour over the last 20 hours, projects at the last day's rate. The
+/// last day's rate counts only over at least 12 hours of samples: with only the last 2 hours in
+/// the day, the week's rate stands.
+#[test]
+fn the_projection_takes_the_last_day_s_rate_when_faster_and_only_over_twelve_hours() {
+    let fx = Fx::new();
+    let tenth = GIB / 10;
+    let now = 100 * GIB;
+    let at = |h: u64| -> u64 {
+        if h <= 20 {
+            now + h * GIB
+        } else {
+            now + 20 * GIB + (h - 20) * tenth
+        }
+    };
+    let week: Vec<(u64, u64)> = (1..=168).map(|h| (h, at(h))).collect();
+    let (_, rate, hours) = project(&fx, &week, now);
+    let day = kib_rate(at(24), now, 86_400);
+    let seven = kib_rate(at(168), now, 168 * 3600);
+    assert!(day > seven, "{day} {seven}");
+    assert_eq!(rate, day.to_string());
+    assert_eq!(hours, ((now / 1024 - 1_048_576) / day).to_string());
+
+    let mut short: Vec<(u64, u64)> = (25..=168).map(|h| (h, at(h))).collect();
+    short.extend([(1, at(1)), (2, at(2))]);
+    let (_, rate, _) = project(&fx, &short, now);
+    assert_eq!(rate, seven.to_string());
+}
+
+/// A one-off copy is one step, and it counts in the last day's rate until it is a day old: 1.4 TB
+/// written 2 hours ago on a week that held 2 TB free projects the volume full within 12 hours,
+/// while the same step 25 hours ago leaves only the week's slower rate.
+#[test]
+fn a_one_off_copy_counts_in_the_last_day_s_rate_until_it_is_a_day_old() {
+    let fx = Fx::new();
+    let tb: u64 = 1_000_000_000_000;
+    let after = 2 * tb - 1_400_000_000_000;
+    let step = |ago: u64| -> Vec<(u64, u64)> {
+        (1..=168)
+            .map(|h| (h, if h <= ago { after } else { 2 * tb }))
+            .collect()
+    };
+    let (_, rate, hours) = project(&fx, &step(2), after);
+    assert_eq!(rate, kib_rate(2 * tb, after, 86_400).to_string());
+    let hours: u64 = hours.parse().unwrap();
+    assert!(hours < 12, "{hours}");
+    let (_, rate, hours) = project(&fx, &step(25), after);
+    assert_eq!(rate, kib_rate(2 * tb, after, 168 * 3600).to_string());
+    let hours: u64 = hours.parse().unwrap();
+    assert!(hours > 12, "{hours}");
+}
+
+/// `pa_vol_stores` names every store the witness samples and the walk maps, once each: the fixed
+/// paths, the gateway's spool from gateway.env, the backups from the backup unit's Environment
+/// property (its last PROPOLIS_BACKUP_DIR), the data directory as the postgres account's and the
+/// configured log directories as the propolis account's. A value out of form leaves the default,
+/// and a property or file that could not be read marks the list as not fully known.
+#[test]
+fn the_store_list_takes_the_backup_unit_s_directory_the_gateway_spool_and_the_log_directories() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/gateway.env",
+        "PROPOLIS_GATEWAY_SPOOL_DIR=/srv/gw\n",
+    );
+    let list = |args: &str| -> Run {
+        fx.run(&format!(
+            "pa_sensor_logs 'ssh:/srv/logs/ssh.jsonl,http:/var/log/propolis/http.jsonl,odd:rel.jsonl'\n\
+             pa_vol_stores {args}\n\
+             for i in \"${{!PA_VOL_STORE[@]}}\"; do\n\
+                 echo \"s=${{PA_VOL_STORE[$i]}}|${{PA_VOL_STORE_AS[$i]}}|${{PA_VOL_STORE_LOG[$i]}}\"\n\
+             done\n\
+             echo \"known=$PA_VOL_STORE_KNOWN\""
+        ))
+    };
+    let stores = |r: &Run| -> Vec<String> {
+        r.out
+            .lines()
+            .filter_map(|l| l.strip_prefix("s="))
+            .map(str::to_string)
+            .collect()
+    };
+    let r = list(
+        "'A=1 PROPOLIS_BACKUP_DIR=/old PROPOLIS_BACKUP_DIR=/srv/b' /var/lib/postgresql/16/main",
+    );
+    assert_eq!(
+        stores(&r),
+        [
+            "/var/lib/propolis||0",
+            "/var/log/propolis||1",
+            "/var/spool/propolis||0",
+            "/srv/gw||0",
+            "/var/log/journal||0",
+            "/srv/b||0",
+            "/var/lib/postgresql/16/main|postgres|0",
+            "/srv/logs|propolis|1",
+        ],
+        "{}",
+        r.err
+    );
+    assert_eq!(r.get("known"), "1");
+
+    fx.write(
+        "etc/propolis/gateway.env",
+        "PROPOLIS_GATEWAY_SPOOL_DIR=/srv/../gw\n",
+    );
+    let r = list("'PROPOLIS_BACKUP_DIR=/srv/../etc' ''");
+    let s = stores(&r);
+    assert!(
+        s.contains(&"/var/spool/propolis/gateway||0".to_string()),
+        "{s:?}"
+    );
+    assert!(s.contains(&"/var/backups/propolis||0".to_string()), "{s:?}");
+    assert!(
+        !s.iter().any(|p| p.contains("..") || p.contains("postgres")),
+        "{s:?}"
+    );
+    assert_eq!(r.get("known"), "1");
+
+    let r = list("'?' ''");
+    assert!(stores(&r).contains(&"/var/backups/propolis||0".to_string()));
+    assert_eq!(r.get("known"), "0");
+
+    // A gateway.env that is there but cannot be read (here not a regular file).
+    std::fs::remove_file(fx.p("etc/propolis/gateway.env")).unwrap();
+    std::fs::create_dir(fx.p("etc/propolis/gateway.env")).unwrap();
+    let r = list("'' ''");
+    assert!(stores(&r).contains(&"/var/spool/propolis/gateway||0".to_string()));
+    assert_eq!(r.get("known"), "0");
 }

@@ -4,6 +4,47 @@
 
 ### Upgrade note
 
+- **The witness's hourly pass now records the stores' free space, the database's state and
+  changes not yet in force. Nothing is sent.** After the upgrade, each hourly pass (as root, before
+  it takes the state lock) also: places every store on its filesystem with `stat` and runs one `df
+  -B1 --output=size,avail,itotal,iavail,target` per filesystem (`/var/lib/propolis`,
+  `/var/log/propolis`, `/var/spool/propolis`, the gateway's spool from `gateway.env`, the journal
+  in `/var/log/journal`, the backups from the backup unit's `PROPOLIS_BACKUP_DIR`, the local
+  PostgreSQL data directory, placed and sized as the `postgres` account, and the directories of the
+  sensor logs `PROPOLIS_SENSOR_LOGS` names, as `propolis`), each under its own time limit, keeping one sample per filesystem an
+  hour for seven days in `observe` `Z` lines under an opaque mount id; where `DATABASE_URL` is set,
+  sends the daemon's database one read-only session of four statements through the daemon binary
+  (the oldest transaction id's age, connections against `max_connections`, lock waits over 120 s,
+  the database's size); once a day reads `SHOW data_directory` as the `postgres` account through
+  `setpriv` (never as root), kept in `meta pg_datadir`; and hashes the files that configure
+  Propolis: the env files in `/etc/propolis`, the Propolis unit files and drop-ins in
+  `/etc/systemd/system`, the logrotate and tmpfiles entries, the backup recipients, the deploy stamp
+  and the scripts in `/usr/local/sbin` and `/usr/local/lib/propolis`, and takes the inode, size and
+  modification time of each binary in `/usr/local/bin`, one `H` line each in `observe`. Of an env
+  file it stores a hash of the whole file and a hash of its sorted key names, and nothing else: no
+  value, no hash of a value, no line of it in the journal. It also reads, for each Propolis unit,
+  the env files it loads, whether systemd needs a daemon reload for it, and whether its running
+  binary was replaced (`/proc/<pid>/exe`). New records follow, each on the second hourly pass in a
+  row: `volume-filling` (ACT) when a filesystem has less than `PROPOLIS_OPS_CAPACITY_FREE_PCT`
+  (default 15%) free, under 10% of its inodes free (never on a filesystem that reports no inodes),
+  or would fill within 72 hours at the larger of the week's rate of fall and the last day's (over
+  at least 12 hours; only with 72 hours of samples and space that fell over the week, so a nightly
+  backup's dip that comes back is no trend, while a one-off copy counts in the last day's rate
+  until it is a day old and can open a volume record for that day); `volume-full-soon`
+  (PAGE, on the same record, as a change) under 12 hours to full, under 1.5 GiB free or under 2%
+  of the inodes, a record opening at the lower tier of its two passes; `db-xid` (ACT) for a transaction id over a thousand million old, `db-slots`
+  (ACT) at 90% of the usable connections, and the NOTICE `db-locks`; and the NOTICE
+  `change-pending` for a unit whose env file changed after it started, that needs a daemon reload,
+  or that runs a binary since replaced. A rotation the guard refused for want of space folds under
+  the open volume record of the filesystem holding the sensor logs. The walk's `host` rail warns
+  on an open volume record by its id and notes changes not in force, `sudo propolis-status host`
+  shows each filesystem's last sample, its mount point and the day it fills at the current rate,
+  and the `ledger` row shows the database's state and warns while one of its records is open, so
+  `sudo propolis-status` may exit `1` or `2` where it exited `0` before. A check that cannot tell
+  on three hourly passes in a row opens `tool-unusable` on `tool:volume`, `tool:pgstate` or
+  `tool:changes`. Nothing is pushed: no message goes to the ntfy server or anywhere else, and each
+  transition the new paging would send only adds one to the record's `would_push`.
+
 - **The witness's light pass now probes the database, the daemon's readiness and the journal,
   and can ping an optional heartbeat URL. No message is sent: beside the read check's GETs, that
   optional request is the only one that leaves the host.**

@@ -133,11 +133,29 @@ resolve until the probe works again. The same flag marks an open `daemon-down` o
 <a id="db-state"></a>
 ### The database answers, in a state that blocks writes
 
-A standby (`pg_is_in_recovery()` true), transaction ids near wraparound, or lock waits.
-`sudo propolis-status ledger` prints each of these read-only probes. The witness's light pass
-records a standby seen on two passes as `db-readonly` (PAGE, key `db:recovery`): the daemon points
-at a server that refuses writes. It resolves when the database is writable on two passes. The
-other states are not judged yet.
+A standby (`pg_is_in_recovery()` true), transaction ids near wraparound, connection slots nearly
+full, or lock waits. `sudo propolis-status ledger` prints each of these read-only probes. The
+witness's light pass records a standby seen on two passes as `db-readonly` (PAGE, key
+`db:recovery`): the daemon points at a server that refuses writes. It resolves when the database
+is writable on two passes.
+
+The witness's hourly pass reads the rest once an hour, as the daemon's own role, in one read-only
+session through the daemon binary (`deploy/witness.sh#pg_state_read`): the age of the database's
+oldest unfrozen transaction id, the client connections (the server's own background processes
+take no slot and are not counted) against `max_connections` less
+`superuser_reserved_connections`, the lock waits older than 120 s (from `pg_locks.waitstart` on
+server 14 and later, before that the sessions waiting on a lock since their state last changed),
+and the database's size, which is recorded only. The walk's `ledger` row shows the last reading
+(`hourly <time>: xid age <n>, slots <n> of <n>, lock waits <n>, size <bytes>`). Each condition
+seen on two hourly passes in a row opens a record on the `ledger` stage: `db-xid` (ACT, key
+`dbstate:xid`) for a transaction id over 1,000,000,000 old, half way to wraparound and far past
+autovacuum's own 200 million (run `VACUUM` on the database, and look for a long transaction or an
+abandoned prepared transaction holding it back); `db-slots` (ACT, `dbstate:slots`) at 90% of the
+usable slots (a client leaking connections, or `max_connections` too low for the fleet); `db-locks`
+(NOTICE, `dbstate:locks`) for any lock wait over 120 s. None opens in the first 15 minutes after a
+boot or under a manual maintenance marker; two clean hourly passes resolve each. While one is open
+the `ledger` row warns (`open: xid slots locks`) and never takes the marker. Lock holders are not
+named yet.
 
 <a id="alert-path"></a>
 ### Alerts are not leaving the host
@@ -238,6 +256,50 @@ A filesystem Propolis writes to (`/var/lib/propolis`, `/var/log/propolis`,
 `/var/spool/propolis`) has less than 15% of its space or inodes free. `sudo propolis-status
 host` shows which; freeing space or moving the store is the fix.
 
+The witness's hourly pass watches every store (`deploy/witness.sh#vol_sample`, the list in
+`deploy/alert-lib.sh#pa_vol_stores`): those three, the gateway's spool
+(`PROPOLIS_GATEWAY_SPOOL_DIR` in `gateway.env`, else `/var/spool/propolis/gateway`), the journal
+in `/var/log/journal`, the backups (`PROPOLIS_BACKUP_DIR` from the backup unit's environment, else
+`/var/backups/propolis`), with a local database the PostgreSQL data directory, and the directory
+of each sensor log `PROPOLIS_SENSOR_LOGS` names. Each existing store is placed on its filesystem,
+links followed, and each filesystem gets one `df` an hour, kept for seven days as a sample under an
+opaque mount id (`m` and 5 hex digits); two stores `df` reports on one mount point are one volume.
+The data directory is placed and sized as the `postgres` account and a configured log directory as
+`propolis`, never as root, since those accounts could put a link on the path. A `df` that does not
+answer within 10 s (a hung mount) is unknown for that hour, never a value, and so is a pass on which
+a store's path could not be learnt (systemd did not say where the backups go, `gateway.env` could
+not be read, where the database is was not found, or a local database's data directory was never
+read: `SHOW data_directory` as the `postgres` account failed, with the cause `tool.exec` where
+`psql` cannot be run from the witness's unit and `db.unreachable` where the server refused the
+connection) or a store could not be checked for another reason than being absent: a filesystem
+missing from such a pass is not taken as free of stores, so an open record stays open and its
+samples are kept. While that lasts the other stores are still sampled and judged, and after three
+such passes the NOTICE `tool-unusable` on `tool:volume` carries the cause. On two hourly
+passes in a row a filesystem opens `volume-filling` (ACT, key `vol:<mount id>`, `host` rail) when
+its free space is under `PROPOLIS_OPS_CAPACITY_FREE_PCT` (the daemon's setting, 15% by default),
+its free inodes under 10% (never on a filesystem that reports no inodes, such as btrfs), or when it
+would fill to its last GiB within 72 hours at the current rate; and `volume-full-soon` (PAGE, the
+same record, its rise a change) when that is under 12 hours, its free space under 1 GiB plus the
+rotation guard's 512 MiB reserve on a filesystem that is also under half free (a small volume with
+room is under that size even when empty), or its free inodes under 2%. A record opens at the lower tier of
+its two passes, so one reading of `volume-full-soon` alone pages nothing. The rate is the larger of
+the fall of free space over the week of samples and its fall over the last day (over at least 12
+hours of samples), measured over the time that really passed, and used only with 72 hours of
+samples and a week in which free space fell. A nightly backup's dip that comes back is no fall over
+the week; a one-off copy counts in the last day's rate until it is a day old, and can open a volume
+record for that day. Room again on two hourly passes resolves it. A rotation the guard refused for
+want of space, while a filesystem holding the sensor logs has such a record open, folds under it.
+
+The walk's `host` rail warns with `volume <id> filling` or `volume <id> full soon`, and `sudo
+propolis-status host` lists each filesystem by its id and mount point with its last sample, how far
+back its samples reach and, once they span 72 hours of falling space, the rate and the time it
+would fill (`at risk by`, with its year once that is not the current one, or `at risk in more than
+a year`). It maps ids back by the same list of stores, the data directory and the log directories
+sized as their accounts; an id it cannot map reads `mount point not known here` when a store's path
+could not be learnt or checked, else `no store here is on it now`. With a remote database it prints
+`data volume: not readable here (remote database)`. The mount point is shown only there, never
+stored in a record.
+
 <a id="finding"></a>
 ### config-check found something
 
@@ -265,7 +327,8 @@ For example psql through pg-exec (`tool.exec`), blocked by a sandbox or missing.
 outage of what it checks: fix the program, and the row reads again. A check of the witness that
 cannot tell on three passes in a row opens `tool-unusable` (NOTICE, key `tool:<check>`: `units`,
 `pg`, `ready`, `alertunit`, `journal:hook`, `journal:guard`, `journal:journald` or
-`journal:daemon`), and the `host` rail warns with `a check cannot run: <check>` until two clean
+`journal:daemon` of the light pass; `readcheck`, `volume`, `pgstate` or `changes` of the hourly
+pass), and the `host` rail warns with `a check cannot run: <check>` until two clean
 results resolve it. On a host whose psql lives where the witness's sandbox does not allow it (the
 PGDG layout under `/usr/pgsql-<N>/bin`), `tool:pg` stays open; a database outage there is still
 seen through the daemon's `/ready` answer (`daemon-degraded`).
@@ -393,11 +456,43 @@ Each hourly pass, all slow work first and without the state lock:
   anything else is recorded by that name; a 429, a 5xx or no answer at all changes nothing
   already decided. The answer is stored in `/var/lib/propolis/witness/readcheck` with a hash of
   the URL and topic, so a changed target is checked again by the next light pass;
-- checks the light pass: its timer active and enabled, and a pass completed within 20 minutes.
+- checks the light pass: its timer active and enabled, and a pass completed within 20 minutes;
+- samples the free space and inodes of every store's filesystem (see [volume](#volume));
+- where `DATABASE_URL` is set, reads the database's state in one read-only session (see
+  [db-state](#db-state)), and once a day, for a local database, `SHOW data_directory` as the
+  `postgres` account through `setpriv` (never as root, and with a reset environment), kept in
+  `meta pg_datadir` and `pg_datadir_stamp`; psql's error text is never kept;
+- hashes the files that configure Propolis, one `H` line each in `observe`: the env files in
+  `/etc/propolis` and `backup-recipients.txt`, the Propolis unit files and their drop-ins in
+  `/etc/systemd/system`, `/etc/logrotate.d/propolis-sensors`, `/etc/tmpfiles.d/propolis.conf`,
+  `/var/lib/propolis/deploy-stamp.json`, `/usr/local/sbin/propolis-*` and
+  `/usr/local/lib/propolis/*` (sha256 of the content), and the binaries `deploy/upgrade.sh`
+  installs in `/usr/local/bin` (their inode, size and modification time). Only files root owns
+  are read, never through a link. Of an env file it keeps a hash of the whole file and the first 8
+  hex digits of a hash of its sorted key names: no value, nor a hash of one, is stored, and no line
+  of it is printed or logged. Each line keeps when the current content was first seen, and when the
+  content before it was last seen;
+- asks systemd, for each Propolis unit, which env files it loads, whether it needs a daemon reload
+  and its main process, and reads that process's `/proc/<pid>/exe` link. The NOTICE
+  `change-pending` (key `change:<unit>`, `host` rail) opens on two hourly passes in a row for a
+  running unit an env file of which changed after it started (the content before the change was
+  still seen after the unit's start, in the same boot; or, when the unit started between the pass
+  that last saw the old content and the one that first saw the new, or that last pass was in
+  another boot, the file's last change time is later than the start; once the clock was stepped
+  since the start, the pass that first saw the new content decides: a unit restarted after the edit
+  already runs with it), for a unit systemd needs a daemon reload for, and for one whose binary
+  was replaced while it runs (`(deleted)`); two clean passes resolve it. A pass that could read no
+  running unit's `/proc/<pid>/exe` link reads the check as unknown (`tool.exec`), since a replaced
+  binary could not be seen. The `host` rail notes `changed, not in
+  force: <n> units`, and `sudo propolis-status host` names each and the fix (restart it, or `sudo
+  systemctl daemon-reload`).
 
 Then, under the lock, it reads the state files again and changes only its own records, its own
-lines of `observe` and its own `meta` keys, so what the light pass or the failure hook recorded
-meanwhile is kept. A pass that has run for 720 s judges nothing more and marks itself `partial`.
+lines of `observe` (the `Z` and `H` lines and its own `P` lines) and its own `meta` keys, so what
+the light pass or the failure hook recorded meanwhile is kept. Every read of the stores, the
+database and the watched files starts only when its whole time limit still ends within 570 s of the
+pass's start; one that cannot is unknown for that pass. A pass that has run for 720 s judges
+nothing more and marks itself `partial`.
 
 Each pass judges the other one from outside: a timer that is not active and enabled, or a pass
 older than 3 hours (the hourly pass) or 20 minutes (the light pass), seen on two checks in a row,

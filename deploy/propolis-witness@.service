@@ -6,9 +6,12 @@
 # config-check, asks the ntfy server whether the alert topic can be read by anyone, samples the
 # free space of every store, reads the database's state, records the files that configure
 # Propolis, and reads the public push's schedule and markers and the backup sets (hourly),
-# records what it finds in /var/lib/propolis/witness and writes the login banner. It sends no
-# message: beside the read check's GETs to the ntfy server and the read-only database sessions,
-# the only request that leaves the host is the optional heartbeat URL's GET.
+# records what it finds in /var/lib/propolis/witness and writes the login banner. It sends one
+# message, the daily message, once a day, from the light pass (from the hourly pass while the
+# light pass is stale), and only to a push target over https whose topic the read check proved
+# to refuse anonymous reads; beside that post, the read check's GETs to the ntfy server and the
+# read-only database sessions, the only request that leaves the host is the optional heartbeat
+# URL's GET.
 #
 # Root, with no account of its own: it reads 0600 env files, root-only journal fields, other
 # accounts' 0750 directories (as those accounts, through setpriv: the gateway spool as the gateway
@@ -63,7 +66,8 @@ ProtectClock=yes
 ProtectHostname=yes
 # Netlink for nft and ss, which config-check runs from the hourly pass; without it every firewall
 # cell is unknown. The internet families carry the read check's requests to the ntfy server, the
-# heartbeat URL's GET, the /ready GET on loopback and the database sessions' connections.
+# daily message's post (curl under /usr/bin, its config file in the private /tmp), the heartbeat
+# URL's GET, the /ready GET on loopback and the database sessions' connections.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes

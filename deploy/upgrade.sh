@@ -594,8 +594,8 @@ install -m 0755 "$SCRIPT_DIR/alert.sh" /usr/local/sbin/propolis-alert
 install -m 0644 "$SCRIPT_DIR/alert-lib.sh" /usr/local/sbin/propolis-alert-lib
 # The read-only walk (sudo propolis-status), which sources the library above.
 install -m 0755 "$SCRIPT_DIR/propolis-status.sh" /usr/local/sbin/propolis-status
-# The root witness and its unit and timers, enabled after the reload below. Record only: it
-# sends nothing.
+# The root witness and its unit and timers, enabled after the reload below. It records, and
+# sends only one low-priority daily message, to a topic proven to refuse anonymous reads.
 install -m 0755 "$SCRIPT_DIR/witness.sh" /usr/local/sbin/propolis-witness
 for unit in propolis-witness@.service propolis-witness@light.timer propolis-witness@hourly.timer; do
     install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"

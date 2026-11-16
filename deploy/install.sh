@@ -23,7 +23,8 @@
 #     which needs no env file and bounds the sensor logs, propolis-backup.timer, which reads
 #     the daemon's own DATABASE_URL and records "not configured" until it is set, and
 #     propolis-witness@light.timer and propolis-witness@hourly.timer, the root witness, which
-#     records and shows and sends nothing.
+#     records and shows, and sends one low-priority daily message only to a push target whose
+#     topic is proven to refuse anonymous reads (none on a fresh install, which has no target).
 #   - create, seed, or migrate the PostgreSQL database. The propolis binary runs its own migrations
 #     (core-scoring + review) at startup once DATABASE_URL is reachable; provisioning the database
 #     server itself is an independent operator/DBA action.
@@ -196,8 +197,9 @@ run install -m 0644 "$SCRIPT_DIR/alert-lib.sh" /usr/local/sbin/propolis-alert-li
 run install -m 0755 "$SCRIPT_DIR/propolis-status.sh" /usr/local/sbin/propolis-status
 # The root witness, which also sources the library: a light pass every five minutes judges what
 # the failure hook recorded, watches the units, and writes the login banner; an hourly pass runs
-# the installed config-check and the anonymous-read check of the alert topic. Record only: it
-# sends nothing. Enabled in step 9, once systemd has loaded the units.
+# the installed config-check and the anonymous-read check of the alert topic. It records, and
+# sends only the daily message, to a topic proven private. Enabled in step 9, once systemd has
+# loaded the units.
 run install -m 0755 "$SCRIPT_DIR/witness.sh" /usr/local/sbin/propolis-witness
 for unit in propolis-witness@.service propolis-witness@light.timer propolis-witness@hourly.timer; do
     run install -m 0644 "$SCRIPT_DIR/$unit" "/etc/systemd/system/$unit"
@@ -264,7 +266,8 @@ run systemctl daemon-reload
 run systemctl enable --now propolis-logrotate.timer
 run systemctl enable --now propolis-backup.timer
 # The witness takes no operator input either, and it is what notices a failure the operator was
-# not told about; it pushes nothing, so enabling it sends no host anything new.
+# not told about; it pushes no incident, and its daily message goes only to a topic proven to
+# refuse anonymous reads, which a fresh install has none of.
 run systemctl enable --now propolis-witness@light.timer
 run systemctl enable --now propolis-witness@hourly.timer
 

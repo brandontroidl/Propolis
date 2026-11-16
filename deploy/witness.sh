@@ -14,7 +14,8 @@
 # crash loop (NRestarts rising fast, or six times in six hours, on two passes in a row) and a
 # unit left in the failed state on two passes; reminds open incidents on their schedule and
 # resolves each with the proof of its kind; and writes its line in the heartbeat file and
-# `meta light_last`. Last it writes the login banner, /run/motd.d/propolis, from the state files.
+# `meta light_last`. Then, once a day, it posts the daily message (below), and last it writes the
+# login banner, /run/motd.d/propolis, from the state files.
 # When the alert target's URL or topic differs from the one the stored read check was made for,
 # it runs the read check (below) before it takes the lock. It also judges the hourly pass from
 # outside: its timer active and enabled, and a pass under three hours old.
@@ -75,6 +76,7 @@
 # configured, a set that has waited over three days for it opens backup-offhost. A failed backup folds
 # under db-unreachable or the backup volume's record by the step it failed in.
 # What the light pass and the failure hook recorded in the meantime is kept as they wrote it.
+# While the light pass is over 15 minutes stale, it posts the daily message in its place.
 #
 # WHAT HOLDS AN OPEN. No unit kind opens in the first ten minutes of uptime, while a maintenance
 # marker holds, or in the ten minutes after a marker was last seen (`meta maint_seen`): planned
@@ -85,10 +87,19 @@
 # and go unseen between two passes. A sensor's loop in the first half hour of uptime waits,
 # pending, for a config-check result, without which an unset bind cannot be told from a crash.
 #
-# RECORD ONLY. Nothing here sends, pages or posts. Each transition the v2 profile would push adds
-# one to the record's would_push, which the status walk shows; that is all. Its only network
-# requests are the read check's GETs and the heartbeat URL's GET, which carry no message, the GET
-# of the daemon's /ready on loopback, and the read-only database probe and hourly state session.
+# RECORD ONLY, BUT FOR ONE DAILY MESSAGE. No incident is sent or paged: each transition the v2
+# profile would push adds one to the record's would_push, which the status walk shows. The one
+# message it posts is the daily message: once a local day, past PROPOLIS_OPS_DAILY_AT (08:41 by
+# default; `off` turns it off) in the host's own zone, at least 20 hours after the last, priority
+# 2, and only while the gate is full (a target over https whose topic a fresh read check proved
+# to refuse anonymous reads). It carries the alias, counts, opaque incident ids, VERIFIED, the
+# profile and whether the state was kept: never a name, a cause, a path or text read from the
+# host. The light pass sends it, the hourly pass only while the light pass is over 15 minutes
+# stale; both decide under the lock, and count it in meta and the send ledger before the post, so
+# one that failed or was cut short is not sent again that day, and none goes where the state
+# cannot be kept. Its other network requests are the read check's GETs and the heartbeat URL's
+# GET, which carry no message, the GET of the daemon's /ready on loopback, and the read-only
+# database probe and hourly state session.
 #
 # SAFE TO RUN FOREVER. An ordinary check error is recorded and the pass still exits 0, so it is
 # never a failed unit for the failure hook to report; three in a row open the NOTICE
@@ -116,7 +127,8 @@
 # from the output. The read check's
 # topic and token reach curl only through files the library makes 0600, and the answer is judged
 # by its status code and content type alone; so does the heartbeat URL, which is never written to
-# a state file, a journal line or the banner. A journal line is matched only after the fields
+# a state file, a journal line or the banner, and so do the daily message's, whose config file is
+# removed as soon as curl returns. A journal line is matched only after the fields
 # journald sets itself (the unit, the uid, the invocation id) have narrowed it to its writer, and
 # then against fixed strings; no line, nor any part of one, is kept or shown, only counted. The
 # daemon's /ready answer is taken only from a listener the kernel says the daemon holds, and is
@@ -138,7 +150,7 @@
 # PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 8
+# needs-alert-lib: 10
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -153,6 +165,9 @@ while IFS= read -r witness_line; do
 done < "$WITNESS_SELF"
 unset witness_line
 cd / || exit 3
+# The zone this pass was started with is the host's: the daily message's time of day is read in
+# it, and in nothing else, so every stamp, log line and comparison stays in UTC.
+WITNESS_TZ_SET="${TZ+1}" WITNESS_TZ="${TZ-}"
 export LC_ALL=C TZ=UTC
 IFS=$' \t\n'
 set -uo pipefail
@@ -290,7 +305,7 @@ pa_cause pa_unit_map pa_incident_load pa_incident_get pa_incident_transition pa_
 pa_incident_write pa_incident_prune pa_first_sighting pa_banner_write pa_trusted_exec pa_cleanup
 pa_unit_name_ok pa_incident_fold pa_env_get pa_sensor_logs pa_readcheck_binding pa_readcheck_run
 pa_readcheck_merge pa_pg pa_heartbeat_get pa_journal_patterns pa_jcursor_ok pa_vol_project pa_vol_judge
-pa_vol_stores"
+pa_vol_stores pa_gate pa_daily_due pa_budget_admit pa_render pa_ledger_add pa_ledger_result"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $WITNESS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -315,6 +330,7 @@ if ! [[ $PA_LIB_VERSION =~ ^[0-9]{1,9}$ && $WITNESS_NEEDS_LIB =~ ^[0-9]{1,9}$ ]]
 fi
 trap 'pa_cleanup' EXIT
 pa_init "$ROOT"
+if [ "$WITNESS_TZ_SET" = 1 ]; then PA_HOST_TZ="$WITNESS_TZ"; else unset PA_HOST_TZ; fi
 # The library's own check, which also resolves every link on the way, now that it is loaded.
 if ! pa_trusted_exec "$WITNESS_LIB"; then
     witness_no_library "alert library not trusted: $PA_UNTRUSTED; $WITNESS_FIX"
@@ -342,8 +358,10 @@ LOCK_WAIT=60
 # partial. The ownership checks' `stat` and `readlink` of the daemon binary's path have no limit
 # of their own, as the state files' reads have none (see the hourly pass below). With the lock's
 # 60 s that is 220 s, inside 240 s.
-# After the pass come the banner and the heartbeat URL's GET, 15 s, and 10 s for the lock to note
-# its result, far inside the unit's 15 minutes.
+# After the pass come, once a day, the daily message's post, 40 s, and 30 s for the lock to note
+# its result; then the banner and the heartbeat URL's GET, 15 s, and 10 s for the lock to note
+# its result: 95 s at most, far inside the unit's 15 minutes. The hourly pass posts the daily
+# message only while the light pass is stale, after its own 690 s, which ends by 760 s.
 WITNESS_DEADLINE=240
 if [ "$INSTANCE" = hourly ]; then
     # The programs an hourly pass always runs each have their own limit: config-check 300 s; the
@@ -4120,11 +4138,12 @@ judge_journald() {
 META_JLINES="" META_HB_SKIP=""
 JLINES_NEW=""
 
-# journal_tally: the counts the daily message and the walk read, added up in meta jlines:
-# undelivered (the legacy hook's two undelivered lines), journal (failure alerts that went only to
-# the journal: alerts logged with no undelivered line before them), guard (the rotation guard's
-# refusals and skips) and suppressed (journald's lines dropped from watched units). Each a count of
-# lines, never their text.
+# journal_tally: the counts the walk reads, added up in meta jlines: undelivered (the legacy hook's
+# two undelivered lines), journal (failure alerts that went only to the journal: alerts logged
+# with no undelivered line before them), guard (the rotation guard's refusals and skips) and
+# suppressed (journald's lines dropped from watched units). Each a count of lines, never their
+# text. The daily message does not carry them: they are running totals, not counts of its 24
+# hours, and it would need a copy kept at each send to tell them apart.
 journal_tally() {
     local part k v line g=0 sup=0 jo
     local -a parts=()
@@ -5407,6 +5426,92 @@ unlisted_inst_read() {
     done
 }
 
+# ---- the daily message ----------------------------------------------------------------------
+#
+# One message a day, priority 2, to the push target, only while the gate is full and only from
+# the host that runs the daemon (a single box or control node): its absence
+# then tells the operator to look. The light pass sends it; the hourly pass sends it only while
+# the light pass is stale, and the two decide under the state lock, from meta and the send
+# ledger, so only one of them can. It is counted before it goes (meta daily_last and
+# daily_last_stamp, then a ledger line already claimed as sending), so a send that failed, timed
+# out or was cut short by a killed pass is not tried again that day. The request is made with the
+# lock released.
+
+DAILY_GO=0 DAILY_STAMP="" DAILY_TITLE="" DAILY_PRIO="" DAILY_BODY=""
+
+# light_stale LIGHT_LAST: the light pass's last pass (its heartbeat line or meta light_last, the
+# newer) is over 15 minutes old, or none can be dated after the first half hour of uptime: what
+# makes the hourly pass send what the light pass would.
+light_stale() {
+    local age
+    age="$(pass_age light "$1")"
+    if [ "$age" -lt 0 ]; then
+        [ "$((10#$PA_UP))" -gt 1800 ]
+    else
+        [ "$age" -gt 900 ]
+    fi
+}
+
+# daily_prepare: under the lock, after this pass's own writes, whether the daily message is due,
+# and if so its rendering, its count in meta and its claimed ledger line. Not where the state
+# cannot be kept (WHERE none): with nothing to remember it by, the next pass would send it again.
+# What would send nothing whatever the server answered (no rendering, no curl) is settled here,
+# before anything is counted. DAILY_GO is 1 when daily_send is to post it.
+daily_prepare() {
+    local t k v last_date="" last=""
+    DAILY_GO=0
+    [ "${WHERE:-none}" != none ] || return 0
+    past_deadline && return 0
+    # Under the legacy profile the message is the daemon host's alone: a split deployment gets
+    # one a day, from its control node, and whether a credential kept on a collector can read
+    # the topic never decides a send. A role that cannot be told sends none.
+    case "${PA_ROLE:-}" in single | control) ;; *) return 0 ;; esac
+    while IFS=$'\t' read -r t k v _; do
+        [ "$t" = M ] || continue
+        case "$k" in
+            daily_last) last_date="$v" ;;
+            daily_last_stamp) last="$v" ;;
+        esac
+    done < <(pa_state_read meta)
+    pa_daily_due "$last_date" "$last" || return 0
+    [ "$(pa_gate)" = full ] || return 0
+    pa_budget_admit daily - daily 1 > /dev/null || return 0
+    PA_WHERE="$WHERE"
+    PA_DAILY_LISTED=""
+    # The hourly pass loads the collectors only for an unlisted spool: standing in for the light
+    # pass, it loads them here, or its message could not count them.
+    case "${PA_ROLE:-}" in
+        control | gateway) [ "$COLL_TRIED" = 1 ] || { fits 25 && collectors_load; } || true ;;
+    esac
+    [ "$COLL_OK" != 1 ] || PA_DAILY_LISTED="${#CN_ID[@]}"
+    pa_render full daily - || return 0
+    command -v curl > /dev/null 2>&1 || return 0
+    # meta first: a ledger write that fails after it costs this day's message, never a second.
+    _pa_meta_set daily_last "$PA_LOCAL_DATE" daily_last_stamp "$PA_STAMP" || return 0
+    where_merge
+    [ "$WHERE" != none ] || return 0
+    pa_ledger_add daily - daily full sending "$INSTANCE" || return 0
+    where_merge
+    DAILY_STAMP="$PA_LEDGER_STAMP" DAILY_TITLE="$PA_TITLE" DAILY_PRIO="$PA_PRIO" DAILY_BODY="$PA_BODY"
+    DAILY_GO=1
+}
+
+# daily_send: the post daily_prepare readied, made without the lock; then its result in its
+# ledger line, under the lock. A lock not had within 30 s leaves the line claimed, which counts
+# as sent: the count errs toward fewer messages, never more.
+daily_send() {
+    local result
+    [ "$DAILY_GO" = 1 ] || return 0
+    pa_send "$DAILY_TITLE" "$DAILY_PRIO" < <(printf '%s\n' "$DAILY_BODY") || true
+    result="$PA_SEND_RESULT"
+    if pa_lock 30; then
+        pa_ledger_result "$DAILY_STAMP" daily "$result" "$INSTANCE" || true
+        pa_unlock
+    fi
+    [ "$result" = ok ] || note "daily message not delivered ($result)"
+    return 0
+}
+
 # ---- one pass -------------------------------------------------------------------------------
 
 META_CC_LAST="" META_MAINT_SEEN="" META_CC_FAIL="" DEADLINE_CUT=0 PROBES_JUDGED=0
@@ -5554,12 +5659,14 @@ light_pass() {
     elif [ -n "$HB_SKIP_FILE" ]; then
         hbskip_clear
     fi
+    daily_prepare
     write_heartbeat "$status"
     pa_unlock
     [ "$WHERE" != none ] || note "state not persisted: neither /var/lib/propolis/witness nor /run/propolis-witness took a write"
     if [ "$HB_WHY" = insecure ] && [ "${META_HB_SKIP#*/*/*/}" != insecure ]; then
         note "heartbeat URL not requested: PROPOLIS_WITNESS_HEARTBEAT_URL is not a valid https:// URL"
     fi
+    daily_send
 
     PA_WHERE="$WHERE"
     pa_banner_write || note "banner not written: /run/motd.d is missing or refused the write"
@@ -5569,7 +5676,8 @@ light_pass() {
 
 # hourly_pass: the hourly pass. See the header for what it does and in what order. Everything
 # slow (config-check, the read check, systemd) happens before the lock; under it the state files
-# are read afresh and only the hourly pass's own records, observe lines and meta keys change, so
+# are read afresh and only the hourly pass's own records, observe lines and meta keys change (and,
+# while it stands in for a stale light pass, the daily message's meta keys and ledger line), so
 # what the light pass or the hook wrote while this pass computed is kept.
 hourly_pass() {
     local rc n status=ok t k v light="" judged=0
@@ -5684,8 +5792,11 @@ hourly_pass() {
     _pa_meta_set "${meta[@]}"
     where_merge
     [ "$WHERE" != none ] || status=partial
+    # The light pass sends the daily message; while it is stale, this pass stands in for it.
+    if light_stale "$light"; then daily_prepare; fi
     write_heartbeat "$status"
     pa_unlock
+    daily_send
     [ "$CC_DONE" = 1 ] || note "config-check did not complete: ${CC_WHY:-exit $CC_RC}"
     [ "$CC_BAD" = 0 ] || note "config-check printed $CC_BAD finding lines that are not in its form; skipped, and no finding they could be is taken as gone"
     [ "$WHERE" != none ] || note "state not persisted: neither /var/lib/propolis/witness nor /run/propolis-witness took a write"

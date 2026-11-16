@@ -4,8 +4,62 @@
 
 ### Upgrade note
 
-- **Alerting setup, one test page on request, and VERIFIED. Nothing new is sent unless you run
-  `sudo propolis-status --test-page`.** After the upgrade:
+- **One low-priority daily message from the witness, to a proven-private topic only.** After
+  this upgrade a host that runs the daemon (a single box, or the control node of a split
+  deployment) and whose alert topic is proven private sends one low-priority message a day
+  from the witness. `PROPOLIS_OPS_DAILY_AT=off` in `/etc/propolis/propolis.env` stops it. A host
+  whose topic can be read by anyone, or was not checked, gets nothing new, and a collector or a
+  gateway-only host sends none, whatever its topic: a split deployment gets one a day, from
+  its control node, which counts the collectors it lists. In detail:
+  - Proven private means the gate is `full`: a push target from `propolis.env` over `https://`
+    whose topic the witness's anonymous-read check refused within the last day, checked again
+    within the last three hours. Over plain http, to a readable or unchecked topic, on a check
+    that is stale or got no answer, or without a target, nothing is sent; neither where the
+    witness can keep no state, since it would not remember that it sent one. `sudo
+    propolis-status --setup` says which gate this host has.
+  - The light pass sends it once a local day (the host's own time zone), at or after
+    `PROPOLIS_OPS_DAILY_AT` (`HH:MM`, default `08:41`; a value that is neither `HH:MM` nor `off`
+    keeps `08:41`, and `--setup` and the walk say so), at least 20 hours after the last one; the
+    hourly pass sends it instead only while the light pass is over 15 minutes stale, and the two
+    never both send. It is counted before it goes, so a send that failed is not tried again that
+    day. The first one goes on the first light pass after the upgrade once the local time is past
+    `PROPOLIS_OPS_DAILY_AT` (on an afternoon upgrade, that afternoon), and since none is sent
+    within 20 hours of the one before, a late one moves the next one later by as much: after one
+    at 15:05 the next goes at 11:05 the day after; the walk's `daily` line says `next not before
+    <time>` while that holds. A time after `23:50` may skip days, since a pass must fall between
+    it and midnight. Priority 2, title `<alias>: daily`; the body holds only counts, opaque
+    incident ids (`w#<n>`), VERIFIED, the profile and whether the state is kept, never a host,
+    unit, sensor or collector name, a cause, a path, an address, the topic or the token. It does
+    not carry the journal counts the walk shows (`meta jlines`): those are running totals, not
+    counts of the last 24 hours. It goes through the same sender as the test page, the URL, topic
+    and token in a 0600 config file, never on a command line.
+  - `PROPOLIS_OPS_HOST_ALIAS` names this host on the channel (3 to 32 of `a-z`, `0-9`, `-`,
+    starting with a letter, never the host name, never holding `propolis` or `honey`; where
+    `hostname` cannot answer, the kernel's host name is compared, and with no name to compare no
+    alias is taken); unset or refused, the fallback `host-<4 hex>` from the id salt is used, as
+    before. The test page uses the same alias. `--setup` gains an `alias` line and a `daily` line,
+    and its channel line warns off a single box only while the alias is a fallback; the walk's
+    `ALERTS` block gains a `daily` line, and a line when the alias is refused. The alert library
+    is version 10; the witness and the status command need it.
+  - Both settings take effect at the witness's next pass, with no restart. Where the daemon runs,
+    `propolis.env` is also its `EnvironmentFile`, so editing it opens the change-pending notice
+    and the walk's `the daemon loaded an older configuration` line until `propolis` is next
+    restarted; the daemon reads neither setting, so that restart can wait for a convenient time.
+  - `PROPOLIS_OPS_DAILY_AT` is read as `off` when its value starts with `off`, `false`, `no`,
+    `n`, `0`, `none`, `never`, `stop`, `disable` or `disabled`, in any letter case, alone or
+    with a blank or a punctuation mark after the word (a comment, a quote), so a message you
+    tried to stop does stop; `--setup` and the walk then say it is off. An empty value is the
+    default time.
+  - The anonymous-read check now takes a user and password written into
+    `PROPOLIS_OPS_NTFY_URL` off its three anonymous requests: sent as Basic credentials, a 401
+    for them would have passed for a refusal of anonymous reads. Without a token, one more
+    request then asks whether those credentials can read the topic, as the token's read is
+    asked, since on a collector a credential that reads holds the gate at `pointer`; `--setup`
+    says which credential it asked.
+  - What its absence means, and how it is put together:
+    `docs/operations/health-and-observability.md` ("The daily message").
+- **Alerting setup, one test page on request, and VERIFIED. Nothing else new is sent unless you
+  run `sudo propolis-status --test-page`.** After the upgrade:
   - `install.sh` and `upgrade.sh` end with one fixed line, `alerting: profile legacy; to see what
     reaches you and this host's name on the channel: sudo propolis-status --setup` (upgrade.sh
     prints it just before its final configuration check). They write no state for it and print
@@ -14,11 +68,12 @@
     single box, that a fallback alias cannot be told from other hosts'; today's failure alerts
     still name the host by its host name), the push target from `propolis.env` (the URL's scheme
     and host, the topic's length, whether a token is set; never the topic or the token), an
-    anonymous-read check made then and there (three GETs, four with a token, to the configured
-    ntfy server) with every status code and content type and its class, what the token can read,
+    anonymous-read check made then and there (three GETs to the configured ntfy server, and a
+    fourth with the token or, without one, with a user and password written into the URL) with
+    every status code and content type and its class, whether that credential can read the topic,
     the gate, what the daemon and today's failure hook reveal on a topic that does not refuse
-    anonymous reads, the heartbeat URL and VERIFIED. The gate governs only the test page (and the
-    shell messages a later release adds): today's failure hook and the daemon are not gated, so
+    anonymous reads, the heartbeat URL and VERIFIED. The gate governs the daily message (above)
+    and the test page: today's failure hook and the daemon are not gated, so
     wherever the hook posts over plain http, or to a topic not proven to refuse anonymous reads,
     a `failures` line says that each failure alert carries the host name, the failed unit and its
     last journal lines (over plain http in clear, the token too). It stores the check's answer
@@ -37,8 +92,9 @@
     budget says when the next page is allowed. A page that arrives proves that unit, the network
     and the target as the shell senders read `propolis.env`. The topic and the token reach curl only in a 0600 config file
     removed straight after the call; no command line, journal line, printed line or state file
-    holds them. `sudo propolis-status --ack-test <code>` types the code back. This is the only
-    message the shell code sends; the failure hook sends exactly what it sent before for every
+    holds them. `sudo propolis-status --ack-test <code>` types the code back. Beside the daily
+    message (above), this is the only message the shell code sends; the failure hook sends
+    exactly what it sent before for every
     other unit name, with the same journal lines, stamp files and exit status, whatever state the
     library is in.
   - The walk's `ALERTS` line ends with `VERIFIED <dur> (shell)` or `NOT VERIFIED (<word>)`, with
@@ -165,11 +221,12 @@
   one journal line per file it serves, `served <set> <file>` under the identifier
   `propolis-backup-serve`; what it serves, refuses and exits with is unchanged, and so is a pull
   when `logger` is missing. The alert library is version 8 (new journal classes); the witness needs
-  it. Nothing is pushed: no message goes to the ntfy server or anywhere else, and each transition
-  the new paging would send only adds one to the record's `would_push`.
+  it. None of this is pushed (the witness's one message is the daily message, in the first entry,
+  which carries counts and opaque ids only), and each transition the new paging would send only
+  adds one to the record's `would_push`.
 
 - **The witness's hourly pass now records the stores' free space, the database's state and
-  changes not yet in force. Nothing is sent.** After the upgrade, each hourly pass (as root, before
+  changes not yet in force. None of it is sent.** After the upgrade, each hourly pass (as root, before
   it takes the state lock) also: places every store on its filesystem with `stat` and runs one `df
   -B1 --output=size,avail,itotal,iavail,target` per filesystem (`/var/lib/propolis`,
   `/var/log/propolis`, `/var/spool/propolis`, the gateway's spool from `gateway.env`, the journal
@@ -206,12 +263,14 @@
   and the `ledger` row shows the database's state and warns while one of its records is open, so
   `sudo propolis-status` may exit `1` or `2` where it exited `0` before. A check that cannot tell
   on three hourly passes in a row opens `tool-unusable` on `tool:volume`, `tool:pgstate` or
-  `tool:changes`. Nothing is pushed: no message goes to the ntfy server or anywhere else, and each
-  transition the new paging would send only adds one to the record's `would_push`.
+  `tool:changes`. None of this is pushed (the witness's one message is the daily message, in the
+  first entry), and each transition the new paging would send only adds one to the record's
+  `would_push`.
 
 - **The witness's light pass now probes the database, the daemon's readiness and the journal,
-  and can ping an optional heartbeat URL. No message is sent: beside the read check's GETs, that
-  optional request is the only one that leaves the host.**
+  and can ping an optional heartbeat URL. None of it sends a message: beside the read check's
+  GETs and the daily message (first entry), that optional request is the only one that leaves the
+  host.**
   After the upgrade, every light pass (every five minutes, as root) also: asks the daemon's
   database, where `DATABASE_URL` is set, `SELECT pg_is_in_recovery()` through the daemon binary
   (`/usr/local/bin/propolis pg-exec psql`, read-only, 5 s limits; the URL stays in that one
@@ -244,11 +303,12 @@
   written, and for 30 minutes after any skip. Skipping is the signal, so the
   dead-man check alerts when the host is not well as well as when it is down. Unset, nothing is
   requested. `ALERTS` line 3 says whether it is set and when it was last asked or skipped, never the
-  URL. Nothing is pushed: no message goes to the ntfy server or anywhere else, and every
-  transition the new paging would send only adds one to the record's `would_push`.
+  URL. None of this is pushed (the witness's one message is the daily message, in the first
+  entry), and every transition the new paging would send only adds one to the record's
+  `would_push`.
 
 - **The witness gains an hourly pass: a second root timer, an hourly config-check and an
-  anonymous-read check of the alert topic. Nothing is sent.** `install.sh` and `upgrade.sh` now
+  anonymous-read check of the alert topic. The hourly pass sends nothing of its own.** `install.sh` and `upgrade.sh` now
   also install and enable `propolis-witness@hourly.timer`, so an upgraded host has a second root
   timer, `propolis-witness@hourly.service`, which runs `/usr/local/sbin/propolis-witness hourly`
   first 3 to 13 minutes after the upgrade and then once an hour. Each hourly pass runs the
@@ -279,16 +339,17 @@
   judged in the first half hour after a boot. `config-check` gains a `witness` row with the
   warnings `witness-missing` and `witness-timer`. A rollback to a kept release whose witness has
   no hourly pass disables `propolis-witness@hourly.timer` until the next upgrade, and says so,
-  since that witness would exit 2 every hour. Nothing is pushed: no message goes to the
-  ntfy server or anywhere else, and every transition the new paging would send only adds one to
-  the record's `would_push`.
+  since that witness would exit 2 every hour. None of this is pushed (the witness's one message
+  is the daily message, in the first entry), and every transition the new paging would send only
+  adds one to the record's `would_push`.
 
-- **A root witness now runs on a timer; it records and shows, and pushes nothing in the default
-  profile.** `install.sh` and `upgrade.sh` install `/usr/local/sbin/propolis-witness`,
+- **A root witness now runs on a timer; it records and shows, and pushes no incident in the
+  default profile.** `install.sh` and `upgrade.sh` install `/usr/local/sbin/propolis-witness`,
   `propolis-witness@.service` and `propolis-witness@light.timer`, and enable the timer: a light
   pass every five minutes, as root. It writes only under `/var/lib/propolis/witness`,
   `/run/propolis-witness` and the login banner `/run/motd.d/propolis` (root-only), and no host is
-  sent anything it was not sent before. Its first pass after an upgrade judges the records the
+  sent anything it was not sent before beside the daily message (first entry), which goes only to
+  a topic proven private. Its first pass after an upgrade judges the records the
   failure hook kept until then: a self-restarting unit whose single restart healed is dropped
   and counted, and the rest open, so `sudo propolis-status` may now list open incidents and exit
   `1` or `2` for them where it exited `0` before. A rollback to a release without the witness

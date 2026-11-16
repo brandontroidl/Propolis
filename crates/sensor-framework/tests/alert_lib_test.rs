@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "9");
+    assert_eq!(version, "10");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -6202,9 +6202,7 @@ fn the_budget_admits_three_test_pages_a_day_and_nothing_of_another_class() {
         "admit",
         "another class"
     );
-    for class in [
-        "pool", "reserve", "daily", "storm", "summary", "switch", "pointer",
-    ] {
+    for class in ["pool", "reserve", "storm", "summary", "switch", "pointer"] {
         let r = fx.run_env(
             &format!("pa_budget_admit {class} k open 1; echo; echo \"rc=$?\""),
             &NOW,
@@ -6367,5 +6365,1004 @@ fn every_library_request_turns_curl_url_globbing_off_and_keeps_braces_as_written
             line.starts_with(&format!("url = \"{url}")),
             "the URL is not as written: {line}"
         );
+    }
+}
+
+/// PROPOLIS_OPS_DAILY_AT is `off` or HH:MM on the 24-hour clock; anything else, a line systemd
+/// may read otherwise among them, keeps the default 08:41 and says so. PROPOLIS_OPS_HOST_ALIAS
+/// reaches pa_alias, which takes it only in its allowed form and never the host's name. Neither
+/// setting is listed among the push settings today's failure hook and the daemon also read.
+#[test]
+fn the_daily_time_and_the_alias_are_read_from_propolis_env_and_a_time_out_of_form_keeps_the_default()
+ {
+    let fx = Fx::salted(SALT);
+    let show = "pa_settings_load\necho \"at=$PA_DAILY_AT\"\necho \"state=$PA_DAILY_STATE\"\n\
+                echo \"invalid=${PA_INVALID:-none}\"\npa_alias > /dev/null\n\
+                echo \"alias=$PA_ALIAS\"\necho \"rejected=$PA_ALIAS_REJECTED\"\necho \"astate=$PA_ALIAS_STATE\"";
+    let base =
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c\n";
+    let read = |extra: &str| -> (String, String, String) {
+        fx.write("etc/propolis/propolis.env", &format!("{base}{extra}"));
+        let r = fx.run(show);
+        assert_eq!(r.get("invalid"), "none", "{extra:?}");
+        (r.get("at"), r.get("state"), r.get("alias"))
+    };
+    let fallback = "host-908b".to_string();
+    assert_eq!(
+        read(""),
+        ("08:41".into(), "default".into(), fallback.clone())
+    );
+    assert_eq!(
+        read("PROPOLIS_OPS_DAILY_AT=off\n"),
+        ("off".into(), "set".into(), fallback.clone())
+    );
+    assert_eq!(read("PROPOLIS_OPS_DAILY_AT = 23:59\n").0, "23:59");
+    assert_eq!(read("PROPOLIS_OPS_DAILY_AT=00:00\n").0, "00:00");
+    for bad in [
+        "7:05", "24:00", "08:60", "08:41:00", "0841", "\"08:41", "offline", "noon", "off-peak",
+        "no_daily", "0:30",
+    ] {
+        assert_eq!(
+            read(&format!("PROPOLIS_OPS_DAILY_AT={bad}\n")),
+            ("08:41".into(), "invalid".into(), fallback.clone()),
+            "{bad:?}"
+        );
+    }
+    // Whatever an operator writes to turn the message off turns it off: the word in any letter
+    // case, the words used for off elsewhere, and a word with a comment or a stray quote beside
+    // it. Read any other way, the operator would go on getting a message they tried to stop.
+    for off in [
+        "Off",
+        "OFF",
+        "oFf",
+        "false",
+        "No",
+        "n",
+        "0",
+        "none",
+        "NEVER",
+        "stop",
+        "disable",
+        "disabled",
+        "off # stop it",
+        "off;",
+        "\"off",
+        "'off' ",
+    ] {
+        assert_eq!(
+            read(&format!("PROPOLIS_OPS_DAILY_AT={off}\n")),
+            ("off".into(), "set".into(), fallback.clone()),
+            "{off:?}"
+        );
+    }
+    assert_eq!(
+        read("PROPOLIS_OPS_HOST_ALIAS=north-relay\n").2,
+        "north-relay"
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("{base}PROPOLIS_OPS_HOST_ALIAS=edge07\n"),
+    );
+    let r = fx.run(show);
+    assert_eq!(
+        (r.get("alias"), r.get("rejected"), r.get("astate")),
+        (fallback.clone(), "1".into(), "set".into()),
+        "the host's own name is refused"
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("{base}PROPOLIS_OPS_HOST_ALIAS=\"north-relay\\\"\n"),
+    );
+    let r = fx.run(show);
+    assert_eq!(
+        (r.get("alias"), r.get("astate")),
+        (fallback, "invalid".into())
+    );
+}
+
+/// The daily message is due once the host's local time of day is past PROPOLIS_OPS_DAILY_AT, on
+/// a local date it was not sent on, and at least 20 hours after the last one. The witness runs
+/// with TZ=UTC, so the zone is the one it was started with (PA_HOST_TZ), here a zone an hour or
+/// two east of UTC with summer time, written as a POSIX rule so no zone file is needed: across a
+/// change of day and across both changes of summer time (a 23-hour and a 25-hour day).
+#[test]
+fn the_daily_message_is_due_once_a_local_day_past_its_time_and_twenty_hours_after_the_last() {
+    let fx = Fx::new();
+    const CET: &str = "CET-1CEST,M3.5.0,M10.5.0/3";
+    let due = |tz: &str, at: &str, wall: u64, last_date: &str, last_wall: Option<i64>| -> String {
+        let last = match last_wall {
+            Some(w) => format!("{w}/00000000/1"),
+            None => "-".to_string(),
+        };
+        let r = fx.run_env(
+            "PA_DAILY_AT=\"$AT\"\n\
+             if pa_daily_due \"$LD\" \"$LS\"; then rc=0; else rc=1; fi\n\
+             echo \"got=$rc $PA_DAILY_WHY ${PA_LOCAL_DATE:-nodate}\"",
+            &[
+                ("PA_HOST_TZ", tz),
+                ("AT", at),
+                ("LD", last_date),
+                ("LS", &last),
+                ("PA_TEST_WALL", &wall.to_string()),
+                ("PA_TEST_BOOT", "abcdef01"),
+                ("PA_TEST_UP", "5000"),
+            ],
+        );
+        r.get("got")
+    };
+    // 2027-01-15 08:00 UTC, 09:00 in the zone.
+    let jan = 1_800_000_000u64;
+    assert_eq!(due(CET, "08:50", jan, "", None), "0 due 2027-01-15");
+    assert_eq!(
+        due("UTC0", "08:50", jan, "", None),
+        "1 early 2027-01-15",
+        "in UTC it is 08:00"
+    );
+    assert_eq!(
+        due(CET, "08:50", jan + 300, "2027-01-15", Some(jan as i64)),
+        "1 sent 2027-01-15"
+    );
+    // The next day at 08:50 in the zone, 23 h 50 min on.
+    assert_eq!(
+        due(CET, "08:50", jan + 85_800, "2027-01-15", Some(jan as i64)),
+        "0 due 2027-01-16"
+    );
+    // 00:40 in the zone on the 16th is still the 15th in UTC; a new local day, but under 20 h.
+    assert_eq!(
+        due(CET, "00:30", jan + 56_400, "2027-01-15", Some(jan as i64)),
+        "1 soon 2027-01-16"
+    );
+    assert_eq!(
+        due(CET, "00:30", jan + 72_000, "2027-01-15", Some(jan as i64)),
+        "0 due 2027-01-16"
+    );
+    // Summer time begins on Sunday 2027-03-28: 08:45 on Saturday is 07:45 UTC, 08:50 on Sunday
+    // 06:50 UTC, 23 h 5 min later. Without summer time 06:50 UTC would read 07:50.
+    let sat = 1_806_133_500u64;
+    let sun = 1_806_216_600u64;
+    assert_eq!(due(CET, "08:41", sat, "", None), "0 due 2027-03-27");
+    assert_eq!(
+        due(CET, "08:41", sun, "2027-03-27", Some(sat as i64)),
+        "0 due 2027-03-28"
+    );
+    assert_eq!(
+        due(CET, "08:41", sun - 900, "2027-03-27", Some(sat as i64)),
+        "1 early 2027-03-28"
+    );
+    // Summer time ends on Sunday 2027-10-31: 08:45 on Saturday is 06:45 UTC; on Sunday 07:35 UTC
+    // is 08:35, not yet the time, and 07:45 UTC is 08:45, 25 h after Saturday's.
+    let sat = 1_824_878_700u64;
+    let sun = 1_824_968_700u64;
+    assert_eq!(due(CET, "08:41", sat, "", None), "0 due 2027-10-30");
+    assert_eq!(
+        due(CET, "08:41", sun - 600, "2027-10-30", Some(sat as i64)),
+        "1 early 2027-10-31"
+    );
+    assert_eq!(
+        due(CET, "08:41", sun, "2027-10-30", Some(sat as i64)),
+        "0 due 2027-10-31"
+    );
+    // Off is never due. A last stamp from another boot dated ahead of the clock (only a wall clock
+    // that was ahead before the boot can leave one) counts as none, as the ledger counts such a
+    // line, so the message is not held back for as long as the clock was ahead; the local date
+    // still holds a second one back on the same day. One out of form is no stamp either, the
+    // send ledger's own count still standing behind it.
+    assert_eq!(due(CET, "off", jan, "", None), "1 off nodate");
+    assert_eq!(
+        due(CET, "08:50", jan, "2027-01-14", Some(jan as i64 + 600)),
+        "0 due 2027-01-15"
+    );
+    assert_eq!(
+        due(CET, "08:50", jan, "2027-01-14", Some(jan as i64 + 259_200)),
+        "0 due 2027-01-15"
+    );
+    assert_eq!(
+        due(CET, "08:50", jan, "2027-01-15", Some(jan as i64 + 600)),
+        "1 sent 2027-01-15"
+    );
+    let r = fx.run_env(
+        "PA_DAILY_AT=08:50\nif pa_daily_due 2027-01-14 '?'; then echo got=due; else echo \"got=$PA_DAILY_WHY\"; fi",
+        &[
+            ("PA_HOST_TZ", CET),
+            ("PA_TEST_WALL", &jan.to_string()),
+            ("PA_TEST_BOOT", "abcdef01"),
+            ("PA_TEST_UP", "5000"),
+        ],
+    );
+    assert_eq!(r.get("got"), "due");
+}
+
+/// The class daily admits one message 20 hours after the last one the ledger counts: sending,
+/// ok, perm and transient lines, and a pending one under 120 s old. A line that sent nothing and
+/// another class's lines do not count; a ledger that cannot be read admits nothing.
+#[test]
+fn the_daily_class_admits_one_message_twenty_hours_after_the_last_it_counts() {
+    let fx = Fx::new();
+    let admit = |ledger: &str| -> String {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{ledger}"),
+        );
+        fx.run_env("pa_budget_admit daily - daily 1; echo", &NOW)
+            .out
+            .trim()
+            .to_string()
+    };
+    let line = |age: u64, class: &str, result: &str| {
+        format!(
+            "L\t{}/abcdef01/{}\t{class}\t-\tdaily\tfull\t{result}\tlight\n",
+            1_000_000 - age,
+            5000u64.saturating_sub(age).max(1)
+        )
+    };
+    // Ages past the boot's 5000 s of uptime are dated in another boot, by the wall clock.
+    let old = |age: u64, result: &str| {
+        format!(
+            "L\t{}/0000aaaa/1\tdaily\t-\tdaily\tfull\t{result}\tlight\n",
+            1_000_000 - age
+        )
+    };
+    assert_eq!(admit(""), "admit");
+    for result in ["sending", "ok", "perm:403", "transient:000"] {
+        assert_eq!(
+            admit(&line(3600, "daily", result)),
+            "withhold:daily-cap",
+            "{result}"
+        );
+        assert_eq!(
+            admit(&old(68_400, result)),
+            "withhold:daily-cap",
+            "{result} 19 h ago"
+        );
+        assert_eq!(admit(&old(75_600, result)), "admit", "{result} 21 h ago");
+    }
+    assert_eq!(admit(&line(60, "daily", "pending")), "withhold:daily-cap");
+    assert_eq!(admit(&line(200, "daily", "pending")), "admit");
+    for idle in ["norender", "nocurl", "notarget", "noclaim"] {
+        assert_eq!(admit(&line(60, "daily", idle)), "admit", "{idle}");
+    }
+    assert_eq!(admit(&line(60, "test", "ok")), "admit", "another class");
+    assert_eq!(
+        admit("L\t1000500/0000aaaa/1\tdaily\t-\tdaily\tfull\tok\tlight\n"),
+        "admit",
+        "a line dated ahead of the clock counts nothing"
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    assert_eq!(
+        fx.run_env("pa_budget_admit daily - daily 1; echo", &NOW)
+            .out
+            .trim(),
+        "withhold:ledger"
+    );
+}
+
+/// The daily message: title `<alias>: daily`, priority 2, and in its body only counts, opaque
+/// incident ids, VERIFIED, the profile and the state. The notice count is of notices opened in
+/// the last 24 hours, not standing ones, and no line says `daemon not verified`, which nothing
+/// before the daemon's own test page could clear. The legacy profile adds what v2 would have
+/// pushed in 24 hours, counted from the times each record keeps. Nothing in it comes from a
+/// record's key, kind, cause or instance, nor from the host's name. Collectors are counted on a
+/// control node only. Pointer mode renders no daily message.
+#[test]
+fn the_daily_message_holds_counts_ids_verified_and_the_state_and_no_name() {
+    let fx = Fx::salted(SALT);
+    let at = |ago: u64| format!("{}/abcdef01/{}", 1_000_000 - ago, 5000 - ago.min(4999));
+    let far = |ago: u64| format!("{}/0000aaaa/1", 1_000_000 - ago);
+    // Fields 1 to 34; the planted words sit where a record keeps names and causes.
+    let rec = |id: &str,
+               key: &str,
+               kind: &str,
+               tier: &str,
+               state: &str,
+               opened: &str,
+               resolved: &str,
+               reminders: &str,
+               wp: &str| {
+        let f: Vec<String> = [
+            id,
+            key,
+            kind,
+            "listen",
+            "uplanted",
+            tier,
+            state,
+            opened,
+            opened,
+            opened,
+            "proc.exit:1",
+            opened,
+            "-",
+            "0",
+            "-",
+            "open",
+            "0",
+            reminders,
+            "-",
+            "-",
+            resolved,
+            "-",
+            "0",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            wp,
+            "-",
+            "1",
+            "-",
+            "delivered",
+            "-",
+        ]
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+        assert_eq!(f.len(), 34);
+        format!("I\t{}\n", f.join("\t"))
+    };
+    let incidents = [
+        rec(
+            "w#3",
+            "unit:sensor-plantedname.service",
+            "unit-failed",
+            "PAGE",
+            "open",
+            &at(1800),
+            "-",
+            "0",
+            "1",
+        ),
+        // Opened 30 h ago: its 4 h reminder came 26 h ago, its 12 h one 18 h ago.
+        rec(
+            "w#5",
+            "finding:plantedfinding:0123456789ab",
+            "plantedkind",
+            "ACT",
+            "open",
+            &far(108_000),
+            "-",
+            "2",
+            "3",
+        ),
+        rec(
+            "w#7",
+            "spool:cplanted",
+            "spool-quiet",
+            "NOTICE",
+            "open",
+            &at(3600),
+            "-",
+            "0",
+            "0",
+        ),
+        rec(
+            "w#8",
+            "finding:standing:0123456789ab",
+            "ops-no-heartbeat",
+            "NOTICE",
+            "open",
+            &far(259_200),
+            "-",
+            "0",
+            "0",
+        ),
+        // Opened 1 h 10 min ago and resolved 10 min ago: the open and the resolve.
+        rec(
+            "w#9",
+            "unit:shipper.service",
+            "unit-failed",
+            "ACT",
+            "resolved",
+            &at(4200),
+            &at(600),
+            "0",
+            "2",
+        ),
+        rec(
+            "w#10",
+            "db:local",
+            "db-unreachable",
+            "PAGE",
+            "resolved",
+            &far(400_000),
+            &far(259_200),
+            "0",
+            "2",
+        ),
+        // An id out of form is counted as open but never copied into the body.
+        rec(
+            "w#3planted",
+            "finding:other:0123456789ab",
+            "ops-no-push",
+            "NOTICE",
+            "open",
+            &far(259_200),
+            "-",
+            "0",
+            "0",
+        ),
+    ]
+    .concat();
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t11\n{incidents}W\t{}\tplanted\n",
+            at(3600)
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=2\nM\tclock_step\t{}/+300\nM\tplanted\tplantedvalue\n",
+            at(3600)
+        ),
+    );
+    let render = "PA_WHERE=persistent; PA_ROLE=\"$ROLE\"; PA_DAILY_LISTED=4\n\
+                  pa_settings_load\n\
+                  if pa_render full daily -; then echo rc=0; else echo rc=1; fi\n\
+                  printf 'title=%s\\nprio=%s\\n' \"$PA_TITLE\" \"$PA_PRIO\"\n\
+                  printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'\n\
+                  if pa_render pointer daily -; then echo pointer=0; else echo pointer=1; fi";
+    let r = fx.run_env(render, &[NOW[0], NOW[1], NOW[2], ("ROLE", "single")]);
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    let alias = fx.run("pa_alias").out;
+    assert_eq!(r.get("title"), format!("{alias}: daily"));
+    assert_eq!(r.get("prio"), "2");
+    let body: Vec<&str> = r
+        .out
+        .lines()
+        .filter_map(|l| l.strip_prefix("body="))
+        .collect();
+    assert_eq!(
+        body,
+        [
+            "open: 5 (PAGE 1, ACT 1) w#3 w#5 w#7 w#8",
+            "resolved 24 h: 1; withheld by budget 24 h: 1",
+            "new notices 24 h: 1; clock step +300 s",
+            "alerts: NOT VERIFIED (never); profile legacy",
+            "v2 would have pushed 4 in 24 h",
+            "state: persisted",
+            "Do: status",
+        ],
+        "{}",
+        r.out
+    );
+    assert_eq!(r.get("pointer"), "1");
+    for word in [
+        "planted",
+        "edge07",
+        "propolis",
+        "honey",
+        "daemon not verified",
+        "proc.exit",
+    ] {
+        assert!(!r.out.to_lowercase().contains(word), "{word}: {}", r.out);
+    }
+
+    let r = fx.run_env(
+        &render.replace("PA_WHERE=persistent", "PA_WHERE=run"),
+        &[NOW[0], NOW[1], NOW[2], ("ROLE", "control")],
+    );
+    let body: Vec<&str> = r
+        .out
+        .lines()
+        .filter_map(|l| l.strip_prefix("body="))
+        .collect();
+    assert_eq!(
+        &body[5..],
+        [
+            "collectors: 4 listed, 1 quiet",
+            "state: not persisted (run)",
+            "Do: status"
+        ],
+        "{}",
+        r.out
+    );
+
+    // A clock step with anything after its offset is out of form, and is left out whole.
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=3\nM\tclock_step\t{}/+300planted\n", at(3600)),
+    );
+    let r = fx.run_env(render, &[NOW[0], NOW[1], NOW[2], ("ROLE", "single")]);
+    let body: Vec<&str> = r
+        .out
+        .lines()
+        .filter_map(|l| l.strip_prefix("body="))
+        .collect();
+    assert_eq!(body.get(2), Some(&"new notices 24 h: 1"), "{}", r.out);
+    assert!(!r.out.contains("planted"), "{}", r.out);
+}
+
+/// A stamp `ago` seconds before the library tests' NOW, in this boot while it is under the boot's
+/// uptime, else in another boot (dated by the wall clock alone).
+fn lib_at(ago: u64) -> String {
+    if ago < 5000 {
+        format!("{}/abcdef01/{}", 1_000_000 - ago, 5000 - ago)
+    } else {
+        format!("{}/0000aaaa/1", 1_000_000 - ago)
+    }
+}
+
+/// An `incidents` record of 34 fields for the daily message's counts: an open ACT record whose
+/// times are all `lib_at(1800)`, reminded 0 times, would_push 9, with the fields in `set`
+/// (numbered from 1 after the `I`, as the library numbers them) replaced.
+fn daily_record(set: &[(usize, &str)]) -> String {
+    let stamp = lib_at(1800);
+    let t = stamp.as_str();
+    let mut f: Vec<String> = [
+        "w#1",
+        "unit:sensor-x.service",
+        "unit-failed",
+        "listen",
+        "-",
+        "ACT",
+        "open",
+        t,
+        t,
+        t,
+        "proc.exit:1",
+        t,
+        "-",
+        "0",
+        "-",
+        "open",
+        "0",
+        "0",
+        "-",
+        "-",
+        "-",
+        "-",
+        "0",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "9",
+        "-",
+        "1",
+        "-",
+        "delivered",
+        "-",
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect();
+    for (i, v) in set {
+        f[i - 1] = v.to_string();
+    }
+    assert_eq!(f.len(), 34);
+    format!("I\t{}\n", f.join("\t"))
+}
+
+/// The daily message's body over these records (and meta, when given), as lines.
+fn daily_body(fx: &Fx, records: &[String], prelude: &str) -> Vec<String> {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        &format!(
+            "PA_WHERE=persistent; PA_ROLE=single\npa_settings_load\n{prelude}\n\
+             if pa_render full daily -; then echo rc=0; else echo rc=1; fi\n\
+             printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'"
+        ),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "{}\n{}", r.out, r.err);
+    r.out
+        .lines()
+        .filter_map(|l| l.strip_prefix("body="))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Of twelve open records, PAGE, ACT and NOTICE mixed in the file's order, the body counts all
+/// twelve and names exactly ten: every PAGE first, then every ACT, then NOTICEs until ten.
+#[test]
+fn the_daily_message_names_ten_open_ids_page_first_then_act_then_notice() {
+    let fx = Fx::salted(SALT);
+    let tiers = ["NOTICE", "ACT", "PAGE"];
+    let records: Vec<String> = (1..=12)
+        .map(|n| {
+            let id = format!("w#{n}");
+            daily_record(&[(1, &id), (6, tiers[n % 3])])
+        })
+        .collect();
+    let body = daily_body(&fx, &records, "");
+    assert_eq!(
+        body[0],
+        "open: 12 (PAGE 4, ACT 4) w#2 w#5 w#8 w#11 w#1 w#4 w#7 w#10 w#3 w#6"
+    );
+}
+
+/// What v2 would have pushed in 24 hours, record by record: an ACT record opened 13 hours ago and
+/// never reminded counts its open alone, not the 4 h and 12 h reminders it has not had; a record
+/// whose times give two is held to its would_push of one; a child folded under a parent and a
+/// duplicate count nothing; a change of cause in the last 24 hours counts one.
+#[test]
+fn the_daily_v2_count_takes_only_reminders_had_holds_to_would_push_and_skips_folded_and_duplicates()
+{
+    let fx = Fx::salted(SALT);
+    let v2 =
+        |rec: &[(usize, &str)]| -> String { daily_body(&fx, &[daily_record(rec)], "")[4].clone() };
+    let open13 = lib_at(46_800);
+    assert_eq!(
+        v2(&[(9, &open13)]),
+        "v2 would have pushed 1 in 24 h",
+        "only the open"
+    );
+    assert_eq!(
+        v2(&[(9, &open13), (18, "2")]),
+        "v2 would have pushed 3 in 24 h",
+        "the open and both reminders it had"
+    );
+    let resolved = lib_at(600);
+    assert_eq!(
+        v2(&[(7, "resolved"), (21, &resolved), (29, "1")]),
+        "v2 would have pushed 1 in 24 h",
+        "two by its times, held to its would_push"
+    );
+    assert_eq!(
+        v2(&[(7, "resolved"), (21, &resolved), (29, "2")]),
+        "v2 would have pushed 2 in 24 h"
+    );
+    assert_eq!(
+        v2(&[(13, "w#3")]),
+        "v2 would have pushed 0 in 24 h",
+        "folded"
+    );
+    assert_eq!(
+        v2(&[(30, "dup")]),
+        "v2 would have pushed 0 in 24 h",
+        "duplicate"
+    );
+    let old = lib_at(108_000);
+    let since = lib_at(7200);
+    assert_eq!(
+        v2(&[(9, &old), (16, "change"), (12, &since)]),
+        "v2 would have pushed 1 in 24 h",
+        "a change of cause"
+    );
+    assert_eq!(
+        v2(&[(9, &old), (16, "open"), (12, &since)]),
+        "v2 would have pushed 0 in 24 h"
+    );
+}
+
+/// An acknowledged PAGE still counts as open; VERIFIED reads `VERIFIED <dur> (shell)`, and an
+/// answer of pa_verified in neither of its forms reads as not verified, never as itself; a
+/// damaged incidents file gives `open: ?` rather than a count of nothing; a clock step older than
+/// a day is left out.
+#[test]
+fn the_daily_message_counts_acked_records_reads_verified_in_its_forms_and_says_when_state_is_unreadable()
+ {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c\n",
+    );
+    let acked = [daily_record(&[(1, "w#4"), (6, "PAGE"), (7, "acked")])];
+    let body = daily_body(&fx, &acked, "");
+    assert_eq!(body[0], "open: 1 (PAGE 1, ACT 0) w#4");
+    assert_eq!(body[3], "alerts: NOT VERIFIED (never); profile legacy");
+
+    let r = fx.run_env(
+        "pa_settings_load\necho \"bind=$(pa_readcheck_binding \"$PA_URL\" \"$PA_TOPIC\")\"",
+        &NOW,
+    );
+    fx.write(
+        "var/lib/propolis/witness/testpage",
+        &format!(
+            "#testpage v1 g=1\nT\tabc123\t{}\t{}\t-\tok\t{}\t0\n",
+            lib_at(4000),
+            r.get("bind"),
+            lib_at(3600)
+        ),
+    );
+    let body = daily_body(&fx, &acked, "");
+    assert!(
+        body[3].starts_with("alerts: VERIFIED ") && body[3].ends_with(" (shell); profile legacy"),
+        "{}",
+        body[3]
+    );
+    let body = daily_body(&fx, &acked, "pa_verified() { printf 'plantedjunk'; }");
+    assert_eq!(body[3], "alerts: NOT VERIFIED (unreadable); profile legacy");
+
+    fx.write("var/lib/propolis/witness/incidents", "garbage\n");
+    let r = fx.run_env(
+        "PA_WHERE=persistent; PA_ROLE=single\npa_settings_load\n\
+         if pa_render full daily -; then echo rc=0; else echo rc=1; fi\n\
+         printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'",
+        &NOW,
+    );
+    assert_eq!(r.get("body"), "open: ? (state unreadable)", "{}", r.out);
+
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=3\nM\tclock_step\t{}/+300\n", lib_at(108_000)),
+    );
+    let body = daily_body(&fx, &acked, "");
+    assert_eq!(body[2], "new notices 24 h: 0");
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=4\nM\tclock_step\t{}/-120\n",
+            lib_at(108_000 - 30_000)
+        ),
+    );
+    let body = daily_body(&fx, &acked, "");
+    assert_eq!(body[2], "new notices 24 h: 0; clock step -120 s");
+}
+
+/// pa_render checks every line of the daily message's body before it is sent: a line over 200
+/// bytes or one holding a control byte leaves nothing to send (status 1, PA_BODY empty).
+#[test]
+fn a_daily_body_with_a_long_line_or_a_control_byte_is_not_rendered() {
+    let fx = Fx::salted(SALT);
+    for (name, line) in [
+        ("long", "printf '%0201d\\n' 0"),
+        ("control", "printf 'open: 0\\033[2J\\n'"),
+    ] {
+        let r = fx.run_env(
+            &format!(
+                "_pa_render_daily() {{ printf 'open: 0\\n'; {line}; printf 'Do: status\\n'; }}\n\
+                 if pa_render full daily -; then echo rc=0; else echo rc=1; fi\n\
+                 echo \"body=${{#PA_BODY}} title=${{#PA_TITLE}}\""
+            ),
+            &NOW,
+        );
+        assert_eq!(r.get("rc"), "1", "{name}");
+        assert_eq!(r.get("body"), "0 title=0", "{name}");
+    }
+    let r = fx.run_env(
+        "_pa_render_daily() { printf 'open: 0\\n%0200d\\n' 0; }\n\
+         if pa_render full daily -; then echo rc=0; else echo rc=1; fi",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "a line of 200 bytes is allowed");
+}
+
+/// The read check is anonymous: user and password written into PROPOLIS_OPS_NTFY_URL would make
+/// curl send them as Basic credentials, and a 401 for those would pass for a refusal of anonymous
+/// reads. They are taken off every URL the check requests; the binding keeps the URL as set.
+#[test]
+fn the_read_check_takes_credentials_written_in_the_url_off_every_request() {
+    let fx = Fx::new();
+    write_exec(
+        &fx.bin.join("curl"),
+        "#!/usr/bin/env bash\nprev=\"\"\nfor a in \"$@\"; do\n    if [ \"$prev\" = -K ]; then { echo '---'; cat -- \"$a\"; } >> \"$D/confs\"; fi\n    prev=\"$a\"\ndone\nprintf '403\\ttext/plain'\n",
+    );
+    for url in [
+        "https://alice:pw@ntfy.example.invalid",
+        "https://alice@ntfy.example.invalid",
+        "http://a:b@c@ntfy.example.invalid/base",
+    ] {
+        let _ = std::fs::remove_file(fx.scratch().join("confs"));
+        let r = fx.run_env(
+            "pa_readcheck_run \"$U\" t tk_x\necho \"class=$PA_RC_CLASS\"",
+            &[("U", url)],
+        );
+        assert_eq!(r.get("class"), "refused", "{}", r.err);
+        let confs = std::fs::read_to_string(fx.scratch().join("confs")).unwrap();
+        let files: Vec<&str> = confs.split("---\n").filter(|c| !c.is_empty()).collect();
+        assert_eq!(files.len(), 4, "{confs}");
+        let base = if url.ends_with("/base") {
+            "http://ntfy.example.invalid/base/t/"
+        } else {
+            "https://ntfy.example.invalid/t/"
+        };
+        for file in &files {
+            let line = file.lines().find(|l| l.starts_with("url = ")).unwrap();
+            assert!(!line.contains("alice") && !line.contains('@'), "{line}");
+            assert!(line.starts_with(&format!("url = \"{base}")), "{line}");
+        }
+    }
+    // The host ends at the first `/`, `?` or `#`: an `@` after that is no user, and what stands
+    // behind it is never taken for the host the check asks.
+    let _ = std::fs::remove_file(fx.scratch().join("confs"));
+    let r = fx.run_env(
+        "pa_readcheck_run \"$U\" t ''\necho \"cred=$PA_RC_CRED\"",
+        &[("U", "https://ntfy.example.invalid?x@other.invalid")],
+    );
+    assert_eq!(r.get("cred"), "-", "{}", r.err);
+    let confs = std::fs::read_to_string(fx.scratch().join("confs")).unwrap();
+    let urls: Vec<&str> = confs.lines().filter(|l| l.starts_with("url = ")).collect();
+    assert_eq!(urls.len(), 3, "{confs}");
+    for line in urls {
+        assert!(
+            line.starts_with("url = \"https://ntfy.example.invalid?x@other.invalid/t/"),
+            "{line}"
+        );
+    }
+}
+
+/// A user and password in the URL are what a post from this host carries when no token is set.
+/// So after the three anonymous requests, which never hold them, one more asks whether they can
+/// read the topic, with the URL as set, and its answer is kept where the token's would be: on a
+/// collector a credential that reads holds the gate at pointer. A token, when set, is what a post
+/// carries instead, and is the one asked; with neither nothing more is asked.
+#[test]
+fn credentials_written_in_the_url_are_asked_whether_they_can_read_the_topic() {
+    let fx = Fx::new();
+    // 200 to a request whose URL holds the user, 403 to every other; `$D/answer` turns that off.
+    write_exec(
+        &fx.bin.join("curl"),
+        "#!/usr/bin/env bash\nprev=\"\" conf=\"\"\nfor a in \"$@\"; do\n    if [ \"$prev\" = -K ]; then conf=\"$a\"; { echo '---'; cat -- \"$a\"; } >> \"$D/confs\"; fi\n    prev=\"$a\"\ndone\nif [ ! -e \"$D/deny\" ] && grep -q 'alice' -- \"$conf\" 2> /dev/null; then\n    printf '200\\tapplication/x-ndjson'\nelse\n    printf '403\\ttext/plain'\nfi\n",
+    );
+    let show = "pa_readcheck_run \"$U\" t \"$K\"\necho \"class=$PA_RC_CLASS\"\necho \"token=$PA_RC_TOKEN\"\necho \"cred=$PA_RC_CRED\"";
+    let confs = |fx: &Fx| -> Vec<String> {
+        std::fs::read_to_string(fx.scratch().join("confs"))
+            .unwrap()
+            .split("---\n")
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                c.lines()
+                    .find(|l| l.starts_with("url = "))
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    let url = "https://alice:pw@ntfy.example.invalid";
+
+    let r = fx.run_env(show, &[("U", url), ("K", "")]);
+    assert_eq!(
+        (r.get("class"), r.get("token"), r.get("cred")),
+        ("refused".into(), "reads".into(), "url".into()),
+        "{}",
+        r.err
+    );
+    let asked = confs(&fx);
+    assert_eq!(asked.len(), 4, "{asked:?}");
+    for line in &asked[..3] {
+        assert!(!line.contains("alice") && !line.contains('@'), "{line}");
+    }
+    assert_eq!(
+        asked[3],
+        "url = \"https://alice:pw@ntfy.example.invalid/t/json?poll=1&since=1s\""
+    );
+
+    std::fs::write(fx.scratch().join("deny"), b"").unwrap();
+    std::fs::remove_file(fx.scratch().join("confs")).unwrap();
+    let r = fx.run_env(show, &[("U", url), ("K", "")]);
+    assert_eq!(
+        (r.get("class"), r.get("token"), r.get("cred")),
+        ("refused".into(), "noread".into(), "url".into()),
+        "{}",
+        r.err
+    );
+    std::fs::remove_file(fx.scratch().join("deny")).unwrap();
+
+    // A token is what the post carries when one is set: it is asked, never the URL's user.
+    std::fs::remove_file(fx.scratch().join("confs")).unwrap();
+    let r = fx.run_env(show, &[("U", url), ("K", "tk_x")]);
+    assert_eq!(
+        (r.get("token"), r.get("cred")),
+        ("noread".into(), "token".into()),
+        "{}",
+        r.err
+    );
+    let asked = confs(&fx);
+    assert_eq!(asked.len(), 4, "{asked:?}");
+    for line in &asked {
+        assert!(!line.contains("alice"), "{line}");
+    }
+
+    // Neither: three anonymous requests and nothing kept for a credential.
+    std::fs::remove_file(fx.scratch().join("confs")).unwrap();
+    let r = fx.run_env(show, &[("U", "https://ntfy.example.invalid"), ("K", "")]);
+    assert_eq!(
+        (r.get("token"), r.get("cred")),
+        ("-".into(), "-".into()),
+        "{}",
+        r.err
+    );
+    assert_eq!(confs(&fx).len(), 3);
+}
+
+/// A zone file of one fixed offset east of UTC, `XPT` at +01:00, in the TZif form the C library
+/// reads: no transitions, one local time type, and the POSIX rule after the data.
+fn tzif_plus_one() -> Vec<u8> {
+    let mut v = Vec::new();
+    for _ in 0..2 {
+        v.extend_from_slice(b"TZif2");
+        v.extend_from_slice(&[0u8; 15]);
+        for count in [0u32, 0, 0, 0, 1, 4] {
+            v.extend_from_slice(&count.to_be_bytes());
+        }
+        v.extend_from_slice(&3600i32.to_be_bytes());
+        v.extend_from_slice(&[0, 0]);
+        v.extend_from_slice(b"XPT\0");
+    }
+    v.extend_from_slice(b"\nXPT-1\n");
+    v
+}
+
+/// Production units set no TZ, so when the witness was started without one the host's
+/// /etc/localtime decides the daily time, not the TZ=UTC the witness sets for everything else:
+/// under a root the zone file is the root's, here one an hour east of UTC, and without a root the
+/// answer is the host's own, as `date` gives it with TZ unset. A zone passed in PA_HOST_TZ wins.
+#[test]
+fn without_a_zone_passed_the_daily_time_is_read_in_the_hosts_localtime_not_in_utc() {
+    let fx = Fx::new();
+    std::fs::write(fx.p("etc/localtime"), tzif_plus_one()).unwrap();
+    let show = "export TZ=UTC0\nunset PA_HOST_TZ\npa_local_time 1800000000\n\
+                echo \"got=$PA_LOCAL_DATE $PA_LOCAL_HM\"";
+    assert_eq!(fx.run(show).get("got"), "2027-01-15 09:00");
+    assert_eq!(
+        fx.run_env(&show.replace("unset PA_HOST_TZ", "PA_HOST_TZ=UTC0"), &[])
+            .get("got"),
+        "2027-01-15 08:00"
+    );
+    let host = Command::new("env")
+        .args(["-u", "TZ", "date", "-d", "@1800000000", "+%F %H:%M"])
+        .output()
+        .unwrap();
+    let host = String::from_utf8_lossy(&host.stdout).trim().to_string();
+    let r = fx.run_raw(
+        &format!("set -u -o pipefail\nsource \"$LIB\"\npa_init ''\n{show}"),
+        &[],
+    );
+    assert_eq!(r.get("got"), host);
+}
+
+/// When `hostname` cannot answer, the alias is compared with the kernel's host name instead, and
+/// when no name can be read at all no alias is taken: an alias equal to the host's name must never
+/// reach the channel because the tool that would have told them apart is missing.
+#[test]
+fn an_alias_is_refused_when_it_is_the_kernels_host_name_or_no_host_name_can_be_read() {
+    let fx = Fx::salted(SALT);
+    write_exec(&fx.bin.join("hostname"), "#!/usr/bin/env bash\nexit 1\n");
+    let kernel = fx.scratch().join("kernel-hostname");
+    std::fs::write(&kernel, "Edge07.lab.example\n").unwrap();
+    let show = "pa_settings_load\npa_alias > /dev/null\n\
+                echo \"alias=$PA_ALIAS rejected=$PA_ALIAS_REJECTED\"";
+    let alias = |value: &str, seam: Option<&Path>| -> String {
+        fx.write(
+            "etc/propolis/propolis.env",
+            &format!("PROPOLIS_OPS_HOST_ALIAS={value}\n"),
+        );
+        let seam = seam.map(|p| p.display().to_string());
+        let env: Vec<(&str, &str)> = seam
+            .as_deref()
+            .map(|p| vec![("PA_TEST_KERNEL_HOSTNAME", p)])
+            .unwrap_or_default();
+        fx.run_env(show, &env).get("alias")
+    };
+    assert_eq!(
+        alias("edge07", Some(&kernel)),
+        "host-908b rejected=1",
+        "the kernel's short name"
+    );
+    assert_eq!(
+        alias("north-relay", Some(&kernel)),
+        "north-relay rejected=0"
+    );
+    let missing = fx.scratch().join("no-such-file");
+    assert_eq!(
+        alias("north-relay", Some(&missing)),
+        "host-908b rejected=1",
+        "no name could be read"
+    );
+    // Without the seam the kernel's own file is read.
+    let own = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap()
+        .trim()
+        .to_lowercase();
+    let short = own.split('.').next().unwrap().to_string();
+    let fits = |a: &str| {
+        (3..=32).contains(&a.len())
+            && a.starts_with(|c: char| c.is_ascii_lowercase())
+            && a.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !a.contains("propolis")
+            && !a.contains("honey")
+    };
+    if fits(&short) {
+        assert_eq!(alias(&short, None), "host-908b rejected=1", "{short}");
+    } else {
+        assert_eq!(alias("north-relay", None), "north-relay rejected=0");
     }
 }

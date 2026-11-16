@@ -869,7 +869,9 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
   `intake-stalled` fires only when intake falls behind a file it can read
   (`crates/propolis/src/ops_alert/monitor.rs#default_conditions`,
   `crates/propolis/src/ops_alert/conditions/intake.rs#IntakeStalled`). The root witness records
-  these, and sends nothing yet: on the control node its light pass opens `spool-quiet` for a
+  these and pages for none of them yet (the control node's daily message, on a private topic,
+  counts the listed and quiet collectors; a collector sends no daily message of its own): on the
+  control node its light pass opens `spool-quiet` for a
   listed collector whose spool has not been written for longer than twice the longest gap of its
   week (never under half an hour, the week a day old, the gateway up fifteen minutes, and held by
   `sudo propolis-status --maint MINUTES` for a collector off on purpose) and `gateway-dup` for the

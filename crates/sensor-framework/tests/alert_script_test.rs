@@ -2134,7 +2134,10 @@ fn a_missing_old_or_broken_library_on_the_test_page_path_logs_one_line_and_exits
         ("missing", None),
         (
             "older",
-            Some(shipped.replace("PA_LIB_VERSION=9", "PA_LIB_VERSION=8")),
+            Some(shipped.replace(
+                &format!("PA_LIB_VERSION={}", shipped_lib_version()),
+                "PA_LIB_VERSION=8",
+            )),
         ),
         (
             "unbound",
@@ -2171,19 +2174,30 @@ fn a_missing_old_or_broken_library_on_the_test_page_path_logs_one_line_and_exits
         assert!(fx.state("testpage").contains("\tpending\t"), "{name}");
     }
     assert!(
-        shipped_hook().contains("TP_NEEDS=9") && shipped_lib().contains("PA_LIB_VERSION=9"),
-        "the test-page path asks for the library version that has it"
+        shipped_hook().contains("TP_NEEDS=9") && shipped_lib_version() >= 9,
+        "the test-page path asks for the library version that brought it, which the shipped library meets"
     );
 }
 
-/// The test page is the one message the new code can send: pa_send is called from exactly one
-/// place in deploy/, the hook's test-page function, and that function is run only from the
+/// The shipped library's version, from its `PA_LIB_VERSION=<n>` line.
+fn shipped_lib_version() -> u32 {
+    shipped_lib()
+        .lines()
+        .find_map(|l| l.strip_prefix("PA_LIB_VERSION="))
+        .and_then(|v| v.parse().ok())
+        .expect("deploy/alert-lib.sh carries `PA_LIB_VERSION=<n>`")
+}
+
+/// The shell code sends two messages, the test page and the witness's daily message: pa_send is
+/// called from exactly two places in deploy/, the hook's test-page function and the witness's
+/// daily_send, which only its two passes call; the test-page function is run only from the
 /// failure hook's test-page path.
 #[test]
-fn no_code_but_the_test_page_path_calls_pa_send() {
+fn pa_send_is_called_only_by_the_test_page_path_and_the_witness_daily_message() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
     let mut send_calls = Vec::new();
     let mut runs = Vec::new();
+    let mut daily = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|e| e != "sh") {
@@ -2208,14 +2222,24 @@ fn no_code_but_the_test_page_path_calls_pa_send() {
             if t.contains("pa_hook_test_page") && !t.starts_with("pa_hook_test_page()") {
                 runs.push(name.clone());
             }
+            if t.contains("daily_send") && !t.starts_with("daily_send()") {
+                daily.push(format!("{name}:{function}"));
+            }
         }
     }
+    send_calls.sort();
+    daily.sort();
     assert_eq!(
         send_calls,
-        ["alert-lib.sh:pa_hook_test_page"],
+        ["alert-lib.sh:pa_hook_test_page", "witness.sh:daily_send"],
         "pa_send call sites"
     );
     assert_eq!(runs, ["alert.sh"], "pa_hook_test_page call sites");
+    assert_eq!(
+        daily,
+        ["witness.sh:hourly_pass", "witness.sh:light_pass"],
+        "daily_send call sites"
+    );
 }
 
 impl Fixture {

@@ -434,10 +434,11 @@ The witness (`deploy/witness.sh#light_pass`, installed as `/usr/local/sbin/propo
 a root oneshot with two passes: `propolis-witness@light.timer` runs the light pass
 every five minutes, and `propolis-witness@hourly.timer` the hourly pass
 (`deploy/witness.sh#hourly_pass`) once an hour, first 3 to 13 minutes after the timer is enabled; `install.sh` and `upgrade.sh` enable
-both timers. It records and shows, and sends nothing that carries a message: in the default
-profile each transition the new paging would send adds one to the record's `would_push`, and
-that is all. Beside the read check's GETs (below), the only request that leaves the host is the
-optional heartbeat URL's GET, which carries no message either. Each light pass:
+both timers. It records and shows, and sends no incident: in the default profile each
+transition the new paging would send adds one to the record's `would_push`. The one message it
+sends is [the daily message](#the-daily-message), once a day and only to a topic proven to refuse
+anonymous reads. Beside that and the read check's GETs (below), the only request that leaves the
+host is the optional heartbeat URL's GET, which carries no message. Each light pass:
 
 - first asks the database, as the daemon's own role, whether it answers and takes writes (see
   [db-unreachable](#db-unreachable)), before anything else is read, so a database outage is known
@@ -544,6 +545,8 @@ Each hourly pass, all slow work first and without the state lock:
 - runs the anonymous-read check: three GET requests without credentials to the configured
   ntfy server for the alert topic (its `json`, `raw` and `sse` read paths, each asking only for
   the last second, so nothing stored is fetched), and one more with the token when one is set.
+  A user and password written into the URL are taken off those three, and without a token one
+  more request carries them, to learn whether they can read the topic.
   The topic and the token go to curl in files only root can read, never on a command line. A
   401 or 403 on all three is `refused`; a readable answer, a login page, a redirect, a 404 or
   anything else is recorded by that name; a 429, a 5xx or no answer at all changes nothing
@@ -653,9 +656,12 @@ spool, the lock count and the maintenance marker.
 none:notarget`, with when the read check last ran. It is worked out from the stored answer alone,
 without asking the server: `full` only when the stored answer is for the target in use, is
 `refused`, was decided within 24 hours, an attempt was made within 3 hours, the URL is `https://`
-(over plain HTTP anyone on the path could answer 403 and read the rest), and, on a collector, the
-token cannot read the topic. A token GET that got no answer keeps what was known of the token, so
-a timeout cannot lift a collector out of pointer mode. Nothing uses the gate to send yet. The
+(over plain HTTP anyone on the path could answer 403 and read the rest), and, on a collector or a
+host whose role cannot be told, the credential a post carries (its token, or without one a user
+and password written into the URL) was not found able to read the topic. A credential's GET that
+got no answer keeps what was known of it, so a timeout cannot lift a collector out of pointer
+mode. The daily message is sent only while the gate is `full`, and only from the host that runs
+the daemon. The
 `alert` rail warns while the gate is not `full`, and while the daemon's own topic (in
 `propolis.env`, where today's failure hook sends this host's name and the failed unit) is not
 proven private on the same terms (refused within 24 hours, an attempt within 3 hours, over
@@ -683,15 +689,16 @@ last attempt is too old, `topic not checked yet` while there is no answer for th
 and `NO PUSH TARGET (journal only)` without a target.
 
 **Setup, the test page and VERIFIED.** `sudo propolis-status --setup` says what reaches you and
-why: the alias test pages name this host by (today's failure alerts name it by its host name),
-the push target (never the topic or the token), the anonymous-read check made then and there
-with its answer in words, the gate, which governs only the test page and the shell messages a
-later release adds, what the daemon and today's failure hook, which are not gated, reveal on a
-topic that does not refuse anonymous reads or over plain http, and the private heartbeat URL it
-recommends. `sudo propolis-status --test-page` sends one test page through the
-failure-alert unit (at most three a day), and `sudo propolis-status --ack-test <code>` types back
-the code it carried ([commands](../reference/commands.md#status-walk)). Apart from today's failure
-alerts, which the hook sends as before, nothing else in the shell code sends a message.
+why: the alias the test page and the daily message name this host by (today's failure alerts name
+it by its host name), the push target (never the topic or the token), the anonymous-read check
+made then and there with its answer in words, the gate, which governs the daily message, what the
+daemon and today's failure hook, which are not gated, reveal on a topic that does not refuse
+anonymous reads or over plain http, where the alias comes from, when the daily message goes, and
+the private heartbeat URL it recommends. `sudo propolis-status --test-page` sends one test page
+through the failure-alert unit (at most three a day), and `sudo propolis-status --ack-test <code>`
+types back the code it carried ([commands](../reference/commands.md#status-walk)). Apart from
+today's failure alerts, which the hook sends as before, the shell code sends only the test page
+and [the daily message](#the-daily-message).
 
 `VERIFIED` (`deploy/alert-lib.sh#pa_verified`) means: a test page sent by this host's
 failure-alert unit, to the target and with the token now in the files, reached a phone whose owner
@@ -717,6 +724,94 @@ VERIFIED` only after a send fails.
 It names no host, unit or log, and it is root-only (`0600`): it says whether alerting works right
 now, which a compromised sensor that can read `/run` must not learn. `pam_motd` reads it as root.
 An older time means the witness stopped. `sudo propolis-status --banner` prints the same text.
+
+### The daily message
+
+Once a day the witness on the host that runs the daemon (a single box, or the control node of a
+split deployment) sends one low-priority message (ntfy priority 2) to the push target, so
+that its absence tells you to look (`deploy/witness.sh#daily_prepare`,
+`deploy/alert-lib.sh#_pa_render_daily`). A collector or a gateway-only host sends none: a
+deployment gets one a day, and the control node's counts the collectors it lists. It looks like
+this:
+
+```text
+Title: host-3fa2: daily
+open: 2 (PAGE 0, ACT 1) w#12 w#14
+resolved 24 h: 1; withheld by budget 24 h: 0
+new notices 24 h: 1; clock step +300 s
+alerts: VERIFIED 3 d (shell); profile legacy
+v2 would have pushed 4 in 24 h
+state: persisted
+Do: status
+```
+
+The title is the alias (`PROPOLIS_OPS_HOST_ALIAS`, else the fallback from the id salt) and the
+word `daily`. The body holds only counts, opaque incident ids (`w#<n>`, which `sudo
+propolis-status` maps to what they are), VERIFIED, the profile and whether the state is kept:
+the open incidents by tier with up to ten ids, the resolves and withheld messages of the last 24
+hours, the notices opened in the last 24 hours (a standing notice is in the walk, not here) with a
+clock step of that time, what the `v2` profile would have pushed in 24 hours (counted from the
+times each record keeps: its last open, its reminders by their schedule, its last change and its
+resolve), on a control node the listed collectors and how many are quiet, and `state:
+persisted`, `not persisted (run)` or `not persisted (none)`. It never holds the host name, a unit,
+sensor or collector name, a finding, a cause, a path, an address, the topic, the token, a journal
+line, the word that names the software (`Do: status` stands for `sudo propolis-status`) or any
+text another account or a remote party chose. It has no `daemon not verified` line: nothing can
+clear that before the daemon gets a test page of its own, so it stays in the walk and the banner.
+
+**When it is sent.** By the light pass, once the host's local time of day (its own zone, not the
+UTC the witness uses for everything else) is past `PROPOLIS_OPS_DAILY_AT` (default `08:41`), on
+a local date it was not sent on, and at least 20 hours after the last one (so a summer-time change
+or a late message never brings two close together). The hourly pass sends it only while the
+light pass is over 15 minutes stale, and both decide under the state lock from `meta` and the
+send ledger, so only one of them sends. It is counted before it goes (`meta daily_last` and
+`daily_last_stamp`, then a ledger line of class `daily` already claimed as `sending`), so a send
+that failed, timed out or was cut short by a killed pass is not tried again that day.
+
+**When it is not sent.** On a collector, a gateway-only host or a host whose role cannot be told
+(the walk says `daily off: only the host that runs the daemon sends it`);
+`PROPOLIS_OPS_DAILY_AT=off` (it is never sent, and the walk and
+`--setup` say so; `off` in any letter case, and `false`, `no`, `n`, `0`, `none`, `never`, `stop`,
+`disable` or `disabled`, alone or with a blank or a punctuation mark after the word, such as a
+comment or a quote, are all read as `off`); the gate is not `full`:
+no target, a URL that is not `https://` (over plain
+http anyone on the path can answer the read check's 403 and read what is sent), a topic that is
+readable or not proven to refuse anonymous reads, or a read check whose refusal is over a day old
+or whose last attempt is over three hours old;
+no state can be kept (`state NOT PERSISTED` with nowhere to write, which would forget that it was
+sent); the send ledger cannot be read (a count that cannot be made is not zero); there is no
+alias yet because the id salt could not be written; curl is not installed; the host's local time
+cannot be told; the pass is past its time limit; neither pass ran. An empty
+`PROPOLIS_OPS_DAILY_AT` is the default, and any other value that is not `HH:MM`
+keeps `08:41`, and the walk and `--setup` say so. The walk's `ALERTS` block has a `daily` line:
+the host's time of day, then, in UTC like every time the walk prints, when the last one went with
+the server's answer (`last sent <time> UTC (ok)`, `last sent <time> UTC (result not recorded)`
+when the pass never wrote the answer, `last tried <time> UTC, not delivered (<result>)`, or `last
+counted <time> UTC (the send ledger holds no line for it)` when the message was counted and its
+ledger line could not be written, so nothing went, or is over two days old) and, while the 20
+hours since it hold the next one back, `next not before <time>
+UTC`; or `daily off (PROPOLIS_OPS_DAILY_AT=off)`,
+`daily off: topic readable`, or `daily off: gate <gate>`; and, when `PROPOLIS_OPS_HOST_ALIAS` is
+refused, `invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)`. Both
+settings take effect at the witness's next pass with no restart; where the daemon runs,
+`propolis.env` is also its `EnvironmentFile`, so editing it opens the change-pending notice and
+the walk's older-configuration line until `propolis` is next restarted, which can wait. A time after
+`23:50` may skip days, since a pass must fall between it and midnight.
+
+**What its absence means.** The first message goes on the first light pass after the upgrade
+that installs it, whatever the time of day, once the local time is past `PROPOLIS_OPS_DAILY_AT`
+(on an afternoon upgrade, that afternoon). A message is never sent within 20 hours of the one
+before, so one that went late (that first one, or one after a day the witness was down until
+late) moves the next one later by as much: after a message at 15:05 the next goes at 11:05 the
+day after, not at 08:41, and the walk's `next not before` says when. Otherwise, if you get it
+every morning and it has not come an hour after `PROPOLIS_OPS_DAILY_AT`, one of these holds: the
+host, its witness or its way out to the push server is down; the topic became readable or is no
+longer proven private; or the setting changed. Each needs a look, and `sudo propolis-status` says
+which. On a private topic its absence
+tells an outsider nothing, since they cannot read the topic. On a readable topic it is never
+sent, so there its absence means nothing; that is one reason `--setup` recommends a private topic
+and a private heartbeat URL (`PROPOLIS_WITNESS_HEARTBEAT_URL`), which notices a host that stops
+within minutes rather than by the next morning.
 
 ## Endpoints
 

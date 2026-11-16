@@ -204,18 +204,33 @@ marker, whoever wrote it. It takes no lock, so it works while a hung writer hold
 lock. Exit `0` written or removed, `1` the marker could not be written, `64` a value outside 0
 to 120 (`deploy/propolis-status.sh#status_maint`).
 
-`--setup` says what reaches the operator and why, one item a line: the alias test pages (and the
-shell messages of a later release) name this host by (record it; off a single box it warns that
-a fallback alias cannot be told from other hosts') and that today's failure alerts name it by its
+`--setup` says what reaches the operator and why, one item a line: the alias test pages and the
+daily message name this host by (on a host that sends no daily message, the test pages alone;
+record it; off a single box, with a fallback alias, it warns
+that a fallback alias cannot be told from other hosts' and that `PROPOLIS_OPS_HOST_ALIAS` should
+be set on every host) and that today's failure alerts name it by its
 host name, with no channel line where neither has a target; the push target from
 `/etc/propolis/propolis.env` (of the URL only its scheme and host, of the topic only its length,
-of the token only whether it is set), the anonymous-read check made now (three GETs, four with a
-token) with each status code and content type and the class it gives, what the token can read,
+of the token only whether it is set), the anonymous-read check made now (three GETs, which never
+carry a user and password written into the URL, and a fourth with the token, or without a token
+with those credentials) with each status code and content type and the class it gives, whether
+the credential a post carries can read the topic (`this token`, or `the user and password in the
+URL`; neither is printed),
 the gate, what the daemon and today's failure hook still reveal on a topic that does not refuse
-anonymous reads, the heartbeat URL and VERIFIED. The gate governs only the test page and the
-shell messages a later release adds, and the test page carries only the alias and the code in
-every mode, so at `full` only those later messages may carry detail; today's failure hook and the
-daemon are not gated. Wherever
+anonymous reads, the `alias` line (the alias in use and whether it is `PROPOLIS_OPS_HOST_ALIAS`,
+the fallback with how to name the host, or the fallback because the setting is refused), the
+`daily` line (`PROPOLIS_OPS_DAILY_AT` in the host's local time, that the daily message goes only
+while the gate is full and whether it goes now, `off`, that a value out of form keeps
+`08:41`, and a warning that a time after `23:50` may skip days; on a collector, a gateway-only
+host or a host whose role cannot be told, only `not sent from this host: only the host that runs
+the daemon (a single box or control node) sends the daily message`), the heartbeat URL and
+VERIFIED. The `alias` line, and the `daily` line where the message can go, end with `no restart
+needed: the witness reads it at its next pass`, and where the daemon runs with a note that while
+`propolis` runs, editing `propolis.env` still shows the change-pending notice until it is next
+restarted. The gate governs the daily message, which is sent only
+while it is `full` and only by the host that runs the daemon (elsewhere the gate line says what
+was proven and nothing of a message); the test page carries only the alias and the code in every mode; today's
+failure hook and the daemon are not gated. Wherever
 the hook posts (its own reader finds a URL and a topic) over plain http, or to a topic not proven
 to refuse anonymous reads, a `failures` line says that the gate does not apply to its alerts and
 that each carries the host name, the failed unit and its last journal lines (over plain http in
@@ -274,7 +289,8 @@ another `perm:*` the URL and the topic, for `transient:*` to try later) and that
 day. Exit `0` when the page went out (`ok`), `1` when it did not, when its result could not be
 recorded, or when the budget is spent, `75` when the lock was busy
 (`deploy/propolis-status.sh#status_test_page`). Apart from today's failure alerts, which the hook
-sends as before, it is the only message the shell code of this release can send.
+sends as before, the shell code of this release sends only the test page and the witness's
+[daily message](../operations/health-and-observability.md#the-daily-message).
 
 `--ack-test CODE` (6 characters, `0-9` and `a-f`, checked before anything is read) acknowledges
 the waiting test page when `CODE` is its code, it went out (`ok`, or `sending` when its result
@@ -292,7 +308,17 @@ none:notarget`) and when the anonymous-read check last ran, worked out from the 
 witness stored, without a network request, and at its end `VERIFIED <dur> (shell)` or `NOT
 VERIFIED (<word>)` (`deploy/alert-lib.sh#pa_verified`), with `daemon not verified` wherever the
 daemon is enabled, and under it `the daemon loaded an older configuration: restart propolis to
-apply it` when `propolis.env` changed after the running daemon started; its third line shows when the light and the hourly
+apply it` when `propolis.env` changed after the running daemon started, then the `daily` line
+(`daily <HH:MM> local, last sent <time> UTC (ok)`, `last sent <time> UTC (result not recorded)`
+when the pass never wrote the server's answer, `last tried <time> UTC, not delivered (<result>)`
+when it did not go or the server did not take it, or `last counted <time> UTC (the send ledger
+holds no line for it)`, each followed by `; next not before <time> UTC (20 h
+after the last)` while that holds, and with `(PROPOLIS_OPS_DAILY_AT out of form: the default is
+used)` after the time when that is so; `... none sent yet`; `daily off
+(PROPOLIS_OPS_DAILY_AT=off)`, `daily off: topic readable`, `daily off: gate <gate>`, or on a host
+that does not run the daemon `daily off: only the host that runs the daemon sends it`,
+`deploy/propolis-status.sh#daily_walk_words`) and, when `PROPOLIS_OPS_HOST_ALIAS` is refused,
+`invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)`; its last line shows when the light and the hourly
 pass of the witness last completed and, once a light pass has run, the heartbeat URL: `not set`,
 `refused (not an https URL)`, or `set` with when it was last asked and the result, or last
 skipped and why. The URL itself is never printed.

@@ -15,7 +15,9 @@
 #   propolis-status --setup   what reaches the operator and why: this host's name on the channel,
 #                             the push target (never its topic or token), the anonymous-read
 #                             check run now and its answer in words, what the daemon and today's
-#                             failure hook still reveal, the heartbeat URL, and VERIFIED
+#                             failure hook still reveal, the alias and its setting, when the daily
+#                             message goes and the setting that turns it off, the heartbeat URL,
+#                             and VERIFIED
 #   propolis-status --test-page
 #                             one test page through the failure-alert unit (at most 3 in 24 h):
 #                             it proves that unit, the network and the target as the library
@@ -74,7 +76,7 @@
 # its time limit in seconds.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 9
+# needs-alert-lib: 10
 
 umask 077
 STATUS_SELF="${BASH_SOURCE[0]}"
@@ -844,17 +846,53 @@ status_ack_test() {
     exit 1
 }
 
-# gate_words GATE: the gate in words, for --setup, as what it governs: the test page and the
-# shell messages a later release adds. Today's failure hook and the daemon are not gated, so no
-# word here speaks of pushes in general (the failures line says what those carry).
+# gate_words GATE: the gate in words, for --setup, as what it governs: the daily message, sent
+# only while it is full, and the test page. Today's failure hook and the daemon are not gated, so
+# no word here speaks of pushes in general (the failures line says what those carry).
 gate_words() {
-    local what="the test page (and the shell messages of a later release)"
+    local off=0 here=1
+    [ "${PA_DAILY_AT:-08:41}" != off ] || off=1
+    # Only the host that runs the daemon sends the daily message (the daily line says so), so
+    # elsewhere the gate's line says what was proven and nothing of a message.
+    case "$ROLE" in single | control) ;; *) here=0 ;; esac
+    if [ "$here" = 0 ]; then
+        case "$1" in
+            full)
+                printf 'full - the topic refuses anonymous reads (the test page carries only the alias and the code in every mode)'
+                return 0
+                ;;
+            pointer:insecure)
+                printf '%s  - over plain http a refusal proves nothing' "$1"
+                return 0
+                ;;
+            pointer:token-reads)
+                printf '%s  - a credential this host holds can read the topic' "$1"
+                return 0
+                ;;
+            pointer:*)
+                printf '%s  - anonymous reads are not proven refused' "$1"
+                return 0
+                ;;
+        esac
+    fi
     case "$1" in
-        # pa_render builds the same test page in either mode, so only the later messages gain.
-        full) printf 'full - the shell messages of a later release may carry detail: the topic refuses anonymous reads (the test page carries only the alias and the code in every mode)' ;;
-        pointer:insecure) printf '%s  - %s carries no detail: over plain http a refusal proves nothing' "$1" "$what" ;;
-        pointer:token-reads) printf '%s  - %s carries no detail: the token this host holds can read the topic' "$1" "$what" ;;
-        pointer:*) printf '%s  - %s carries no detail until anonymous reads are refused' "$1" "$what" ;;
+        # pa_render builds the same test page in either mode: only the daily message waits on it.
+        full)
+            if [ "$off" = 1 ]; then
+                printf 'full - the topic refuses anonymous reads: the daily message would be sent, with counts and opaque ids only; it is off by PROPOLIS_OPS_DAILY_AT (the test page carries only the alias and the code in every mode)'
+            else
+                printf 'full - the topic refuses anonymous reads: the daily message is sent, with counts and opaque ids only (the test page carries only the alias and the code in every mode)'
+            fi
+            ;;
+        pointer:insecure) printf '%s  - no daily message is sent: over plain http a refusal proves nothing' "$1" ;;
+        pointer:token-reads) printf '%s  - no daily message is sent: a credential this host holds can read the topic' "$1" ;;
+        pointer:*)
+            if [ "$off" = 1 ]; then
+                printf '%s  - no daily message is sent: it is off by PROPOLIS_OPS_DAILY_AT' "$1"
+            else
+                printf '%s  - no daily message is sent until anonymous reads are refused' "$1"
+            fi
+            ;;
         *)
             # A target the shell senders ignore as invalid can still be today's hook's.
             if [ "${HOOK_POSTS:-0}" = 1 ]; then
@@ -864,6 +902,69 @@ gate_words() {
             fi
             ;;
     esac
+}
+
+# alias_words ALIAS: --setup's alias line: the alias in use and where it comes from, with how to
+# name the host where it is the fallback, which comes from the id salt and changes with it.
+alias_words() {
+    local fix="To name it: PROPOLIS_OPS_HOST_ALIAS=<3 to 32 of a-z 0-9 -, starting with a letter, not the host name> in /etc/propolis/propolis.env"
+    local salt="Deleting /var/lib/propolis/witness/id-salt renames a fallback alias"
+    if [ "$1" = - ]; then
+        printf 'none yet: the id salt could not be written'
+    elif [ "${PA_ALIAS_STATE:-unset}" = set ] && [ "$1" = "${PA_ALIAS_SET:-}" ]; then
+        printf '%s (PROPOLIS_OPS_HOST_ALIAS)' "$1"
+    elif [ "${PA_ALIAS_STATE:-unset}" = unset ]; then
+        printf '%s (fallback). %s. %s' "$1" "$fix" "$salt"
+    else
+        printf '%s (fallback: PROPOLIS_OPS_HOST_ALIAS is refused: it must be 3 to 32 of a-z 0-9 -, start with a letter, not be the host name, not hold propolis or honey, and be written plainly on one line). %s' "$1" "$salt"
+    fi
+    no_restart_words
+}
+
+# no_restart_words: what the alias and daily lines add: their settings are the witness's alone, so
+# they need no restart, while propolis.env is also the daemon's EnvironmentFile, whose edit opens
+# the change-pending notice an operator could take for a call to restart now. That notice exists
+# only where the daemon runs, so only there is it spoken of.
+no_restart_words() {
+    printf '; no restart needed: the witness reads it at its next pass'
+    case "$ROLE" in
+        single | control) printf " (while propolis runs, editing propolis.env still shows the change-pending notice and the walk's older-configuration line until it is next restarted, which can wait)" ;;
+    esac
+}
+
+# daily_words GATE: --setup's daily line: when the daily message goes, in the host's local time,
+# that it goes only while the gate is full, whether it goes now, and the one setting that turns
+# it off. A value out of form keeps the default time, and the line says so. A time after 23:50 is
+# warned of: a pass must fall between it and midnight, and passes are five minutes apart and run
+# for a while, so some days none does.
+daily_words() {
+    local now="" late=""
+    # One a day for a whole deployment, from the host that runs the daemon: a collector's or a
+    # gateway's setting changes nothing, so its line says only that.
+    case "$ROLE" in
+        single | control) ;;
+        *)
+            printf 'not sent from this host: only the host that runs the daemon (a single box or control node) sends the daily message'
+            return 0
+            ;;
+    esac
+    if [ "${PA_DAILY_AT:-08:41}" = off ]; then
+        printf 'off (PROPOLIS_OPS_DAILY_AT=off): no daily message is sent; remove the setting, or set a time as HH:MM, to have one'
+        no_restart_words
+        return 0
+    fi
+    case "$1" in
+        full) ;;
+        none:*) now="; not sent: no push target" ;;
+        *) now="; not sent now (gate $1): the daily message is not sent to a topic not proven to refuse anonymous reads" ;;
+    esac
+    [[ ! ${PA_DAILY_AT:-08:41} > 23:50 ]] || late="; a time after 23:50 may skip days: passes are five minutes apart, and the message waits for one on a local date it was not sent on"
+    if [ "${PA_DAILY_STATE:-default}" = invalid ]; then
+        printf '%s local (PROPOLIS_OPS_DAILY_AT is neither HH:MM nor off, so the default is used), sent only while the gate is full%s. PROPOLIS_OPS_DAILY_AT=off turns it off' "$PA_DAILY_AT" "$now"
+    else
+        printf '%s local, sent only while the gate is full%s%s. PROPOLIS_OPS_DAILY_AT=off turns it off' "${PA_DAILY_AT:-08:41}" "$late" "$now"
+    fi
+    no_restart_words
 }
 
 # setting_rule KEY: the rule a shell sender's push setting must meet, in config-check's words
@@ -997,20 +1098,23 @@ status_setup() {
         *) role="unknown role" ;;
     esac
     printf 'setup on %s (%s, %s)\n' "$alias" "${host:-?}" "$role"
-    # Only the test page carries the alias in this release; today's failure alerts name the host
+    # The test page and the daily message carry the alias; today's failure alerts name the host
     # by its host name. Where nothing posts, nothing names the host on a channel.
     t=""
     [ "$hook_any" = 0 ] || t="today's failure alerts name it by its host name, ${host:-?}"
+    # Only the host that runs the daemon sends a daily message for the alias to name.
+    local named="test pages and the daily message name"
+    case "$ROLE" in single | control) ;; *) named="test pages name" ;; esac
     if [ "$PA_TARGET" != 1 ]; then
         if [ "$hook_any" = 1 ]; then
-            printf "channel     today's failure alerts name this host by its host name, %s; no test page names it while the shell senders have no target\n" "${host:-?}"
+            printf "channel     today's failure alerts name this host by its host name, %s; no test page or daily message names it while the shell senders have no target\n" "${host:-?}"
         fi
     elif [ "$alias" = - ]; then
         printf 'channel     no alias yet: the id salt could not be written%s\n' "${t:+; $t}"
-    elif [ "$ROLE" = single ]; then
-        printf 'channel     test pages (and the shell messages of a later release) name this host by its alias, %s: record it%s\n' "$alias" "${t:+; $t}"
+    elif [ "$ROLE" = single ] || [ "$alias" = "${PA_ALIAS_SET:-}" ]; then
+        printf 'channel     %s this host by its alias, %s: record it%s\n' "$named" "$alias" "${t:+; $t}"
     else
-        printf "channel     test pages (and the shell messages of a later release) name this host by its alias, %s: record it%s; warning: a fallback alias cannot be told from other hosts' on a phone, and this release has no setting to name it\n" "$alias" "${t:+; $t}"
+        printf "channel     %s this host by its alias, %s: record it%s; warning: a fallback alias cannot be told from other hosts' on a phone; set PROPOLIS_OPS_HOST_ALIAS on every host\n" "$named" "$alias" "${t:+; $t}"
     fi
     if [ "$HOOK_POSTS" = 1 ]; then
         # The hook posts the raw values: without a scheme curl falls back to plain http.
@@ -1073,13 +1177,23 @@ status_setup() {
         if [[ $PA_URL != https://* ]]; then
             printf 'anon read   gate needs https: over http anyone on the path can fake this answer and read the pushes\n'
         fi
+        # Without a token, what a post carries is the user and password written into the URL.
+        local cred="this token"
+        [ "${PA_RC_CRED:-}" != url ] || cred="the user and password in the URL"
         case "$PA_RC_TOKEN" in
-            reads) printf 'token       reads (this token can read the topic)\n' ;;
-            noread) printf 'token       noread (this token cannot read the topic)\n' ;;
-            unknown) printf 'token       unknown (its read got no answer that says)\n' ;;
+            reads) printf 'token       reads (%s can read the topic)\n' "$cred" ;;
+            noread) printf 'token       noread (%s cannot read the topic)\n' "$cred" ;;
+            unknown)
+                if [ "${PA_RC_CRED:-}" = url ]; then
+                    printf 'token       unknown (the read with the user and password in the URL got no answer that says)\n'
+                else
+                    printf 'token       unknown (its read got no answer that says)\n'
+                fi
+                ;;
             *)
-                # A check that never ran says nothing about the token.
-                if [ "$PA_RC_CAUSE" != - ] && [ -n "${PA_TOKEN:-}" ]; then
+                # A check that never ran says nothing about the token, nor about a user and
+                # password in the URL, which are a credential too.
+                if [ "$PA_RC_CAUSE" != - ] && { [ -n "${PA_TOKEN:-}" ] || [[ ${PA_URL:-} =~ ^[a-z]+://[^/?#]*@ ]]; }; then
                     printf 'token       not checked\n'
                 else
                     printf 'token       none\n'
@@ -1131,6 +1245,8 @@ status_setup() {
             printf "daemon      the daemon posts to this topic; its titles name this host's software (until step 3)\n"
         fi
     fi
+    printf 'alias       %s\n' "$(alias_words "$alias")"
+    printf 'daily       %s\n' "$(daily_words "$gate")"
     case "${PA_HB_STATE:-unset}" in
         set) printf 'heartbeat   set (the URL is not shown)\n' ;;
         insecure | invalid) printf 'heartbeat   refused (not an https URL): PROPOLIS_WITNESS_HEARTBEAT_URL is ignored\n' ;;
@@ -3396,6 +3512,13 @@ print_alerts() {
     printf 'ALERTS  target %s - %s - daemon monitor %s - daemon queue %s - %s - %s\n' "$A_TARGET" "$gate" \
         "$A_MONITOR" "$A_QUEUE" "$hook" "$A_VERIFIED"
     [ "$A_OLDCONF" = 0 ] || printf '        the daemon loaded an older configuration: restart propolis to apply it\n'
+    printf '        %s\n' "$(daily_walk_words)"
+    # The alias is the shell senders' alone, so it is kept out of PA_INVALID; a refused one is
+    # still said here, as --setup says it.
+    if [ "${PA_ALIAS_STATE:-unset}" = invalid ] \
+        || { [ "${PA_ALIAS_STATE:-unset}" = set ] && ! _pa_alias_ok "${PA_ALIAS_SET:-}"; }; then
+        printf '        invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)\n'
+    fi
     if [ -n "$W_BANNER_MT" ]; then banner="$(fmt_time "$W_BANNER_MT")"; else banner="not written"; fi
     # An unreadable meta reads as empty, which must not pass for a host with nothing recorded.
     if [[ " ${PA_STATE_UNREADABLE:-} " == *" meta "* ]]; then
@@ -3424,6 +3547,70 @@ print_alerts() {
         *) state="nothing recorded yet" ;;
     esac
     printf '        witness light %s - state %s - banner %s%s\n' "$light" "$state" "$banner" "$(hb_words)"
+}
+
+# daily_walk_words: the daily message's line under ALERTS: off by the setting, off while the gate
+# is not full (on a readable topic it is never sent, so its absence means nothing), or its local
+# time with when the last one went and what the server answered, from meta and the send ledger.
+daily_walk_words() {
+    local t s c r w lw=0 last="" res="" at a
+    case "$ROLE" in
+        single | control) ;;
+        *)
+            printf 'daily off: only the host that runs the daemon sends it'
+            return 0
+            ;;
+    esac
+    if [ "${PA_DAILY_AT:-08:41}" = off ]; then
+        printf 'daily off (PROPOLIS_OPS_DAILY_AT=off): no daily message is sent'
+        return 0
+    fi
+    case "$A_GATE" in
+        full) ;;
+        pointer:readable)
+            printf 'daily off: topic readable'
+            return 0
+            ;;
+        *)
+            printf 'daily off: gate %s' "$A_GATE"
+            return 0
+            ;;
+    esac
+    at="$PA_DAILY_AT local"
+    [ "${PA_DAILY_STATE:-default}" != invalid ] || at+=" (PROPOLIS_OPS_DAILY_AT out of form: the default is used)"
+    if _pa_stamp_split "${META[daily_last_stamp]:-}"; then last="$((10#$_PA_W))"; fi
+    # Meta is dated when the pass starts and the ledger line when it is written, seconds or
+    # minutes later in the same pass: the newest daily line of the 15 minutes from meta's stamp
+    # is that message's.
+    while [ -n "$last" ] && IFS=$'\t' read -r t s c _ _ _ r _; do
+        [ "$t" = L ] && [ "$c" = daily ] && [[ ${s%%/*} =~ ^[0-9]{1,12}$ ]] || continue
+        w="$((10#${s%%/*}))"
+        [ "$w" -ge "$last" ] && [ "$w" -le "$((last + 900))" ] && [ "$w" -ge "$lw" ] || continue
+        case "${r:-}" in
+            sending | ok | perm:[0-9][0-9][0-9] | transient:[0-9][0-9][0-9] | norender | notarget | nocurl) res="$r" lw="$w" ;;
+        esac
+    done < <(pa_state_read send-ledger)
+    if [ -z "$last" ]; then
+        printf 'daily %s, sent only while the gate is full: none sent yet' "$at"
+    else
+        # The time of day before these is the host's; these two are the walk's own, in UTC, and
+        # say so. A message the server did not take was tried, not sent.
+        # Meta counts the message before its ledger line is written, so a stamp with no line is
+        # a message whose line could not be written (nothing went), or one over two days old.
+        case "$res" in
+            ok) printf 'daily %s, last sent %s UTC (ok)' "$at" "$(fmt_time "$last")" ;;
+            sending) printf 'daily %s, last sent %s UTC (result not recorded)' "$at" "$(fmt_time "$last")" ;;
+            "") printf 'daily %s, last counted %s UTC (the send ledger holds no line for it)' "$at" "$(fmt_time "$last")" ;;
+            *) printf 'daily %s, last tried %s UTC, not delivered (%s)' "$at" "$(fmt_time "$last")" "$res" ;;
+        esac
+        # None is sent within 20 hours of the last, so a late one moves the next one as late. The
+        # hold is counted as the senders count it, by the stamp's age: a stamp ahead of the clock
+        # holds nothing back there, so none is named here.
+        a="$(pa_age "${META[daily_last_stamp]:-}")"
+        if [ "$a" -ge 0 ] && [ "$a" -lt 72000 ]; then
+            printf '; next not before %s UTC (20 h after the last)' "$(fmt_time "$((10#$PA_WALL + 72000 - a))")"
+        fi
+    fi
 }
 
 # hb_words: the heartbeat URL field of ALERTS line 3, once a light pass has run (no pass asks it

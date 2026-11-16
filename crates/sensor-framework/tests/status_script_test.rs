@@ -30,6 +30,12 @@ const COMMANDS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/reference/commands.md"
 );
+const ENV_VARS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/reference/environment-variables.md"
+);
+/// How --setup's alias and daily lines end: the settings are the witness's, read at its next pass.
+const NO_RESTART: &str = "; no restart needed: the witness reads it at its next pass (while propolis runs, editing propolis.env still shows the change-pending notice and the walk's older-configuration line until it is next restarted, which can wait)";
 
 /// 2027-01-15 08:00:00 UTC.
 const NOW: u64 = 1_800_000_000;
@@ -139,7 +145,8 @@ exit 0
 /// `POST_CODE` (default 200); with `POST_HOLD_LOCK` set it first starts a process that takes that
 /// lock file and holds it for a minute, its pid in `STUB_LOG.holder`; a GET answers from `RC_JSON`, `RC_RAW` and `RC_SSE` by the
 /// endpoint the URL names (`code|content type`, default 403), and `RC_TOKEN_ANSWER` when a header
-/// file is given. A URL on any host but ntfy.example.invalid answers nothing and exits 7.
+/// file is given. A URL on any host but ntfy.example.invalid (with or without a user before the
+/// host) answers nothing and exits 7.
 const CURL_STUB: &str = r#"#!/usr/bin/env bash
 { printf 'curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$STUB_LOG"
 conf="" prev="" hdr="" out=""
@@ -150,10 +157,7 @@ done
 if [ -n "$conf" ]; then
     { printf -- '--- %s\n' "$(stat -c %a -- "$conf")"; cat -- "$conf"; } >> "$STUB_LOG.conf"
     url="$(sed -n 's/^url = "\(.*\)"$/\1/p' "$conf")"
-    case "$url" in
-        https://ntfy.example.invalid/* | http://ntfy.example.invalid/*) ;;
-        *) exit 7 ;;
-    esac
+    [[ $url =~ ^https?://([^/@]*@)?ntfy\.example\.invalid/ ]] || exit 7
     if grep -q '^data-binary' "$conf"; then
         { printf -- '--- body\n'; cat; printf '\n'; } >> "$STUB_LOG.post"
         if [ -n "${POST_HOLD_LOCK:-}" ]; then
@@ -3463,7 +3467,8 @@ fn the_docs_say_what_the_walk_and_its_verbs_write_and_that_the_witness_judges_th
     for promise in [
         "light pass",
         "every five minutes",
-        "sends nothing",
+        "sends no incident",
+        "[the daily message](#the-daily-message)",
         "banner not written",
     ] {
         assert!(witness.contains(promise), "{promise:?} not in:\n{witness}");
@@ -5640,6 +5645,31 @@ fn setup_classifies_each_answer_and_never_prints_the_token_or_topic() {
     }
 }
 
+/// A user and password written into the URL are the credential a post carries when no token is
+/// set: --setup says whether they can read the topic, in words that do not call them a token,
+/// and prints neither.
+#[test]
+fn setup_says_whether_credentials_in_the_url_can_read_the_topic() {
+    let fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://alice:pw7secret@ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"
+        ),
+    );
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "token       noread (the user and password in the URL cannot read the topic)"
+        ),
+        "{}",
+        r.out
+    );
+    for hidden in ["alice", "pw7secret"] {
+        assert!(!r.out.contains(hidden), "{hidden} in:\n{}", r.out);
+    }
+}
+
 /// On a collector whose token can read the topic, --setup says so, says a collector should use a
 /// topic of its own, holds the gate at pointer and exits 1. The alert.env lines a later release
 /// adds are not offered.
@@ -5658,7 +5688,9 @@ fn setup_on_a_collector_with_a_reading_token_says_so() {
         ", collector)",
         "token       reads (this token can read the topic)",
         "collectors should use their own topic: on ntfy.sh a token carries its user's read rights",
-        "gate        pointer:token-reads",
+        "gate        pointer:token-reads  - a credential this host holds can read the topic\n",
+        "channel     test pages name this host by its alias, host-",
+        "daily       not sent from this host: only the host that runs the daemon (a single box or control node) sends the daily message\n",
         "verified    NOT VERIFIED (never). Run: sudo propolis-status --test-page",
     ] {
         assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
@@ -5667,17 +5699,17 @@ fn setup_on_a_collector_with_a_reading_token_says_so() {
         "alert.env",
         "PROPOLIS_ALERT_PROFILE",
         "daemon not verified",
-        "daily",
         "profile",
     ] {
         assert!(!r.out.contains(absent), "{absent} in:\n{}", r.out);
     }
 }
 
-/// The channel line names the alias test pages name this host by, the same one the walk shows,
-/// and says that today's failure alerts name it by its host name; off a single box it warns that a
-/// fallback alias cannot be told from other hosts'. --setup makes the salt the alias comes from
-/// when there is none yet, mode 0600.
+/// The channel line names the alias test pages and the daily message name this host by, the same
+/// one the walk shows, and says that today's failure alerts name it by its host name; off a single
+/// box it warns that a fallback alias cannot be told from other hosts' and names the setting,
+/// and with the setting it does not warn. --setup makes the salt the alias comes from when there
+/// is none yet, mode 0600.
 #[test]
 fn setup_prints_the_channel_alias_and_warns_on_a_fallback_off_a_single_box() {
     let fx = Fx::single();
@@ -5700,7 +5732,7 @@ fn setup_prints_the_channel_alias_and_warns_on_a_fallback_off_a_single_box() {
     );
     assert!(
         r.out.contains(&format!(
-            "channel     test pages (and the shell messages of a later release) name this host by its alias, {alias}: record it; today's failure alerts name it by its host name, honeybox\n"
+            "channel     test pages and the daily message name this host by its alias, {alias}: record it; today's failure alerts name it by its host name, honeybox\n"
         )),
         "{}",
         r.out
@@ -5710,12 +5742,122 @@ fn setup_prints_the_channel_alias_and_warns_on_a_fallback_off_a_single_box() {
     let r = fx.run(&["--setup"]);
     assert!(
         r.out.contains(
-            "record it; today's failure alerts name it by its host name, honeybox; warning: a fallback alias cannot be told from other hosts' on a phone"
+            "record it; today's failure alerts name it by its host name, honeybox; warning: a fallback alias cannot be told from other hosts' on a phone; set PROPOLIS_OPS_HOST_ALIAS on every host\n"
         ),
         "{}",
         r.out
     );
     assert!(r.out.contains("salt        ok"), "{}", r.out);
+    // An alias of its own is told apart on a phone: no warning.
+    fx.env_line("PROPOLIS_OPS_HOST_ALIAS=north-relay");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "channel     test pages and the daily message name this host by its alias, north-relay: record it;"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("warning"), "{}", r.out);
+}
+
+/// --setup names the alias in use and where it comes from (the fallback with how to name the host,
+/// the setting, or the setting refused) and when the daily message goes, in the host's local time
+/// and only while the gate is full; PROPOLIS_OPS_DAILY_AT=off turns it off, and a value out of form
+/// keeps 08:41 and says so. The walk says the same: the time and the last one sent, off by the
+/// setting, or off while the topic is readable, where its absence means nothing.
+#[test]
+fn setup_and_the_walk_say_which_alias_names_the_host_and_when_the_daily_message_goes() {
+    let fx = Fx::single();
+    fx.witness_ran(300);
+    let alias = fx.alias();
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    for want in [
+        format!(
+            "alias       {alias} (fallback). To name it: PROPOLIS_OPS_HOST_ALIAS=<3 to 32 of a-z 0-9 -, starting with a letter, not the host name> in /etc/propolis/propolis.env. Deleting /var/lib/propolis/witness/id-salt renames a fallback alias{NO_RESTART}\n"
+        ),
+        format!(
+            "daily       08:41 local, sent only while the gate is full. PROPOLIS_OPS_DAILY_AT=off turns it off{NO_RESTART}\n"
+        ),
+    ] {
+        assert!(r.out.contains(&want), "{want} not in:\n{}", r.out);
+    }
+    assert!(
+        fx.walk().out.contains(
+            "        daily 08:41 local, sent only while the gate is full: none sent yet\n"
+        ),
+        "{}",
+        fx.walk().out
+    );
+    let sent = stamp_ago(3600);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=4\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tdaily_last\t2027-01-15\nM\tdaily_last_stamp\t{sent}\n",
+            stamp_ago(300)
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\nL\t{sent}\tdaily\t-\tdaily\tfull\tok\tlight\n"),
+    );
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily 08:41 local, last sent 07:00:00 UTC (ok); next not before 01-16 03:00 UTC (20 h after the last)\n"),
+        "{walk}"
+    );
+
+    fx.env_line("PROPOLIS_OPS_HOST_ALIAS=north-relay");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(&format!(
+            "alias       north-relay (PROPOLIS_OPS_HOST_ALIAS){NO_RESTART}\n"
+        )),
+        "{}",
+        r.out
+    );
+    fx.env_drop("PROPOLIS_OPS_HOST_ALIAS=");
+    fx.env_line("PROPOLIS_OPS_HOST_ALIAS=honeybox");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(&format!(
+            "alias       {alias} (fallback: PROPOLIS_OPS_HOST_ALIAS is refused: it must be 3 to 32 of a-z 0-9 -"
+        )),
+        "{}",
+        r.out
+    );
+
+    fx.env_line("PROPOLIS_OPS_DAILY_AT=off");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(&format!(
+            "daily       off (PROPOLIS_OPS_DAILY_AT=off): no daily message is sent; remove the setting, or set a time as HH:MM, to have one{NO_RESTART}\n"
+        )),
+        "{}",
+        r.out
+    );
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily off (PROPOLIS_OPS_DAILY_AT=off): no daily message is sent\n"),
+        "{walk}"
+    );
+    fx.env_drop("PROPOLIS_OPS_DAILY_AT=");
+    fx.env_line("PROPOLIS_OPS_DAILY_AT=8:41");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "daily       08:41 local (PROPOLIS_OPS_DAILY_AT is neither HH:MM nor off, so the default is used), sent only while the gate is full."
+        ),
+        "{}",
+        r.out
+    );
+    fx.readcheck("readable");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily off: topic readable\n"),
+        "{walk}"
+    );
 }
 
 /// Over plain http a 403 proves nothing: anyone on the path could have answered it and can read
@@ -6158,8 +6300,8 @@ fn an_indented_empty_line_the_hook_never_sees_is_reported_as_the_hook_still_post
     }
 }
 
-/// The gate governs only the test page (and the shell messages of a later release); today's
-/// failure hook is not gated. Over plain http, whatever the server answers, --setup says what
+/// The gate governs only the daily message and the test page; today's failure hook is not
+/// gated. Over plain http, whatever the server answers, --setup says what
 /// today's failure alerts carry and that the gate does not apply to them, and nothing says
 /// without qualification that pushes carry no detail. Behind a fresh refusal over https that line
 /// is not printed.
@@ -6176,7 +6318,7 @@ fn setup_says_the_gate_does_not_apply_to_todays_failure_alerts() {
         r.out
     );
     assert!(
-        r.out.contains("gate        pointer:insecure  - the test page (and the shell messages of a later release) carries no detail: over plain http a refusal proves nothing\n"),
+        r.out.contains("gate        pointer:insecure  - no daily message is sent: over plain http a refusal proves nothing\n"),
         "{}",
         r.out
     );
@@ -6193,7 +6335,7 @@ fn setup_says_the_gate_does_not_apply_to_todays_failure_alerts() {
     let fx = Fx::single();
     let r = fx.run(&["--setup"]);
     assert!(
-        r.out.contains("gate        full - the shell messages of a later release may carry detail: the topic refuses anonymous reads (the test page carries only the alias and the code in every mode)\n"),
+        r.out.contains("gate        full - the topic refuses anonymous reads: the daily message is sent, with counts and opaque ids only (the test page carries only the alias and the code in every mode)\n"),
         "{}",
         r.out
     );
@@ -6689,5 +6831,227 @@ fn the_production_branch_resets_tmpdir() {
             .lines()
             .any(|l| l.trim() == "unset TMPDIR" || l.trim() == "export TMPDIR=/tmp"),
         "TMPDIR is not reset in the production branch:\n{block}"
+    );
+}
+
+/// The daily message's meta and ledger lines as a pass leaves them: meta dated `meta` and the
+/// ledger line, written a moment later in the same pass, dated `ledger`, with `result`.
+fn daily_sent(fx: &Fx, meta: &str, ledger: &str, result: &str) {
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=4\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tdaily_last\t2027-01-14\nM\tdaily_last_stamp\t{meta}\n",
+            stamp_ago(300)
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\nL\t{ledger}\tdaily\t-\tdaily\tfull\t{result}\tlight\n"),
+    );
+}
+
+/// A pass dates meta when it starts and the ledger line when it writes it, seconds later: the walk
+/// finds the line written in the minutes after meta's stamp, so it shows the server's answer, and
+/// a daily line of another day is not taken for it.
+#[test]
+fn the_walk_shows_the_answer_of_a_daily_message_whose_ledger_line_came_seconds_after_meta() {
+    let fx = Fx::single();
+    daily_sent(&fx, &stamp_ago(3600), &stamp_ago(3598), "transient:503");
+    let walk = fx.walk().out;
+    // The time of day is the host's and these two are the walk's, in UTC: each says which. A
+    // message the server did not take was tried, not sent.
+    assert!(
+        walk.contains(
+            "        daily 08:41 local, last tried 07:00:00 UTC, not delivered (transient:503)"
+        ),
+        "{walk}"
+    );
+    // A message that could not go out after it was counted was tried too.
+    daily_sent(&fx, &stamp_ago(3600), &stamp_ago(3598), "nocurl");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily 08:41 local, last tried 07:00:00 UTC, not delivered (nocurl)"),
+        "{walk}"
+    );
+    // A line still claimed is a message whose pass never wrote what the server said.
+    daily_sent(&fx, &stamp_ago(3600), &stamp_ago(3598), "sending");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily 08:41 local, last sent 07:00:00 UTC (result not recorded)"),
+        "{walk}"
+    );
+    // Meta counts a message before the ledger line is written: with no line for it (the write
+    // failed, so nothing went, or the line is over two days old) the walk does not say sent.
+    daily_sent(&fx, &stamp_ago(3600), &stamp_ago(3600 + 86_400), "ok");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains(
+            "        daily 08:41 local, last counted 07:00:00 UTC (the send ledger holds no line for it)"
+        ),
+        "{walk}"
+    );
+}
+
+/// A message is never sent within 20 hours of the last one, so one that went late holds the next
+/// back as long: the walk says when the next may go while that holds, and nothing once it is past.
+#[test]
+fn the_walk_says_when_the_next_daily_message_may_go_after_a_late_one() {
+    let fx = Fx::single();
+    // 15:05 on the day before NOW (08:00): the next not before 11:05.
+    let late = stamp_ago(60_900);
+    daily_sent(&fx, &late, &late, "ok");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily 08:41 local, last sent 01-14 15:05 UTC (ok); next not before 11:05:00 UTC (20 h after the last)\n"),
+        "{walk}"
+    );
+    let early = stamp_ago(86_400);
+    daily_sent(&fx, &early, &early, "ok");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily 08:41 local, last sent 01-14 08:00 UTC (ok)\n"),
+        "{walk}"
+    );
+    // The senders count the 20 hours by the stamp's age, and a stamp from another boot dated
+    // ahead of the clock (a clock that was wrong when the message went) holds nothing back: the
+    // walk names no hold the senders do not apply.
+    let ahead = "1800259200/0badf00d/50";
+    daily_sent(&fx, ahead, ahead, "ok");
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily 08:41 local, last sent "),
+        "{walk}"
+    );
+    assert!(!walk.contains("next not before"), "{walk}");
+}
+
+/// The two settings of the daily message are the witness's alone: --setup says each takes effect
+/// at the witness's next pass with no restart, and that editing propolis.env still shows the
+/// daemon's change-pending notice until the daemon is next restarted, which can wait; the
+/// environment reference says the same of both rows, and warns that a time after 23:50 may skip
+/// days, as --setup does.
+#[test]
+fn setup_and_the_reference_say_the_alias_and_daily_settings_need_no_restart() {
+    let fx = Fx::single();
+    let r = fx.run(&["--setup"]);
+    for key in ["alias       ", "daily       "] {
+        let line = r
+            .out
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key} line in:\n{}", r.out));
+        assert!(line.contains("no restart"), "{line}");
+        assert!(line.contains("change-pending"), "{line}");
+    }
+    assert!(!r.out.contains("may skip days"), "{}", r.out);
+    fx.env_line("PROPOLIS_OPS_DAILY_AT=23:58");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("daily       23:58 local, sent only while the gate is full; a time after 23:50 may skip days: passes are five minutes apart, and the message waits for one on a local date it was not sent on"),
+        "{}",
+        r.out
+    );
+    let doc = std::fs::read_to_string(ENV_VARS).unwrap();
+    for key in [
+        "| `PROPOLIS_OPS_HOST_ALIAS` |",
+        "| `PROPOLIS_OPS_DAILY_AT` |",
+    ] {
+        let row = doc
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key} row"));
+        assert!(row.contains("no restart"), "{row}");
+        assert!(row.contains("change-pending"), "{row}");
+    }
+    let row = doc
+        .lines()
+        .find(|l| l.starts_with("| `PROPOLIS_OPS_DAILY_AT` |"))
+        .unwrap();
+    assert!(row.contains("after `23:50` may skip days"), "{row}");
+
+    // Where no daemon runs nothing loads propolis.env that would need a restart, so no notice
+    // follows the edit and the lines do not speak of one.
+    let fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"
+        ),
+    );
+    let r = fx.run(&["--setup"]);
+    let line = r
+        .out
+        .lines()
+        .find(|l| l.starts_with("alias       "))
+        .unwrap_or_else(|| panic!("no alias line in:\n{}", r.out));
+    assert!(
+        line.ends_with("; no restart needed: the witness reads it at its next pass"),
+        "{line}"
+    );
+    assert!(!line.contains("change-pending"), "{line}");
+    // And a collector sends no daily message at all: only the host that runs the daemon does,
+    // so a split deployment gets one a day. --setup and the walk say so, whatever the gate.
+    assert!(
+        r.out.contains(
+            "daily       not sent from this host: only the host that runs the daemon (a single box or control node) sends the daily message\n"
+        ),
+        "{}",
+        r.out
+    );
+    let walk = fx.walk().out;
+    assert!(
+        walk.contains("        daily off: only the host that runs the daemon sends it\n"),
+        "{walk}"
+    );
+}
+
+/// With the daily message off, the gate line does not say it is sent; without a target the daily
+/// line gives that as the reason, not a topic there is none of; and the walk says when the alias
+/// set is refused and the fallback named the host instead.
+#[test]
+fn setup_and_the_walk_do_not_contradict_the_daily_setting_the_target_or_the_alias() {
+    let fx = Fx::single();
+    fx.env_line("PROPOLIS_OPS_DAILY_AT=off");
+    let r = fx.run(&["--setup"]);
+    assert!(r.out.contains("gate        full - "), "{}", r.out);
+    assert!(
+        r.out.contains("the daily message would be sent, with counts and opaque ids only; it is off by PROPOLIS_OPS_DAILY_AT"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("the daily message is sent"), "{}", r.out);
+    let fx = Fx::single();
+    fx.write("etc/propolis/propolis.env", "");
+    let r = fx.run(&["--setup"]);
+    let daily = r
+        .out
+        .lines()
+        .find(|l| l.starts_with("daily       "))
+        .unwrap_or_else(|| panic!("{}", r.out));
+    assert!(daily.contains("not sent: no push target"), "{daily}");
+    assert!(!daily.contains("topic"), "{daily}");
+
+    let fx = Fx::single();
+    let r = fx.walk();
+    assert!(!r.out.contains("PROPOLIS_OPS_HOST_ALIAS"), "{}", r.out);
+    fx.env_line("PROPOLIS_OPS_HOST_ALIAS=honeybox");
+    let r = fx.walk();
+    assert!(
+        r.out.contains(
+            "        invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)\n"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(r.out.starts_with("host-"), "{}", r.out);
+    fx.env_drop("PROPOLIS_OPS_HOST_ALIAS=");
+    fx.env_line("PROPOLIS_OPS_HOST_ALIAS=\"north-relay\\\"");
+    let r = fx.walk();
+    assert!(
+        r.out.contains(
+            "invalid value ignored: PROPOLIS_OPS_HOST_ALIAS (the fallback alias is used)"
+        ),
+        "{}",
+        r.out
     );
 }

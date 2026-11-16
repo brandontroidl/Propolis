@@ -201,11 +201,21 @@ const LOGGER_STUB: &str = r#"#!/usr/bin/env bash
 printf 'logger %s\n' "$*" >> "$STUB_LOG"
 "#;
 
-/// The witness pushes nothing; its requests that leave the host are the read check's GETs and the
-/// heartbeat URL's. Records the argv of those in the stub log as `curl ...`, its environment in
+/// The one message the witness posts is the daily message, through a config file with
+/// `data-binary`: its argv goes to the stub log as `post ...`, the config file to
+/// `curl.post.conf` and its mode to `curl.post.mode`, its environment to `curl.post.env`, the body
+/// it reads on stdin to `curl.posts` (each followed by a `--` line), and it is answered with the
+/// status in `curl.post` (200 without one). With `curl.post.hold` (the path of the state lock) it
+/// first starts a process that takes that lock and keeps it, its pid in `curl.post.holder`, as
+/// another writer would that holds it past the witness's wait. Its other requests that leave the
+/// host are the read
+/// check's GETs and the heartbeat URL's. Records the argv of those in the stub log as `curl ...`,
+/// its environment in
 /// `curl.env` and the config file it was handed in `curl.conf`; with no `curl.answer` beside the
 /// units it fails as an unreachable server does, and with one (`code|content type`) it answers
-/// every GET with that, an empty body, in the `-w` form asked for, and the mode of the config file
+/// every GET with that, an empty body, in the `-w` form asked for (a GET whose URL carries a user
+/// and password is answered from `curl.answer.userinfo` instead, when there is one, as a server
+/// answers credentials it refuses), and the mode of the config file
 /// goes to `curl.confmode`. The GET of the daemon's `/ready` on loopback is logged apart, as
 /// `ready <url>` and its argv as `ready-argv ...`, and answered from `ready.code` (200 without
 /// one; 000 fails as a closed port does, 000t as a request that timed out) and `ready.body`.
@@ -234,13 +244,35 @@ case "$url" in
         exit 0
         ;;
 esac
+if [ -n "$conf" ] && grep -q '^data-binary' "$conf"; then
+    printf 'post %s\n' "$args" >> "$STUB_LOG"
+    cat "$conf" >> "$d/curl.post.conf"
+    stat -c %a "$conf" > "$d/curl.post.mode"
+    env | sed 's/^/curl-env /' >> "$d/curl.post.env"
+    { cat; printf '\n--\n'; } >> "$d/curl.posts"
+    if [ -f "$d/curl.post.hold" ]; then
+        bash -c 'exec 9< "$1"; flock 9; : > "$2"; exec sleep 120' _ "$(cat "$d/curl.post.hold")" \
+            "$d/curl.post.held" < /dev/null > /dev/null 2>&1 &
+        echo "$!" > "$d/curl.post.holder"
+        n=0
+        while [ ! -e "$d/curl.post.held" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+    fi
+    code=200
+    [ ! -f "$d/curl.post" ] || code="$(cat "$d/curl.post")"
+    printf '%s' "$code"
+    exit 0
+fi
 printf 'curl %s\n' "$args" >> "$STUB_LOG"
 env | sed 's/^/curl-env /' >> "$d/curl.env"
 [ -z "$conf" ] || cat "$conf" >> "$d/curl.conf"
 [ -z "$conf" ] || stat -c %a "$conf" > "$d/curl.confmode"
 [ -f "$d/curl.answer" ] || exit 7
+answer="$d/curl.answer"
+if [ -f "$d/curl.answer.userinfo" ] && [ -n "$conf" ] && grep -q '^url = "[a-z]*://[^/"]*@' "$conf"; then
+    answer="$d/curl.answer.userinfo"
+fi
 : > "$out"
-IFS='|' read -r code ct < "$d/curl.answer"
+IFS='|' read -r code ct < "$answer"
 printf '%s\t%s' "$code" "$ct"
 "#;
 
@@ -399,6 +431,8 @@ struct Fx {
     bin: PathBuf,
     log: PathBuf,
     env: Vec<(String, String)>,
+    /// Variables the pass is started without, as a unit that sets none of them starts it.
+    unset: Vec<String>,
 }
 
 impl Fx {
@@ -433,6 +467,7 @@ impl Fx {
             bin,
             log,
             env: Vec::new(),
+            unset: Vec::new(),
         };
         for d in [
             "usr/local/sbin",
@@ -573,7 +608,14 @@ impl Fx {
 
     fn setenv(&mut self, k: &str, v: &str) {
         self.env.retain(|(name, _)| name != k);
+        self.unset.retain(|name| name != k);
         self.env.push((k.to_string(), v.to_string()));
+    }
+
+    /// The pass is started without `k` at all.
+    fn unsetenv(&mut self, k: &str) {
+        self.env.retain(|(name, _)| name != k);
+        self.unset.push(k.to_string());
     }
 
     /// What `systemctl show` says about `name`: a running, enabled unit that restarts itself and
@@ -624,6 +666,9 @@ impl Fx {
             .env("PATH", path)
             .env("PROPOLIS_ALERT_ROOT", &self.root)
             .env("PROPOLIS_WITNESS_NOW", stamp(t))
+            // The zone the witness is started with is the host's for the daily message; a case
+            // that needs another sets TZ itself.
+            .env("TZ", "UTC0")
             .env("PA_TEST_READ_AS_SELF", "1")
             .env("STUB_LOG", &self.log)
             .env("UNITS", self.dir.path().join("units"))
@@ -640,6 +685,9 @@ impl Fx {
             .stderr(Stdio::piped());
         for (k, v) in &self.env {
             command.env(k, v);
+        }
+        for k in &self.unset {
+            command.env_remove(k);
         }
         let child = {
             let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
@@ -721,6 +769,42 @@ impl Fx {
 
     fn curl_env(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("curl.env")).unwrap_or_default()
+    }
+
+    /// The fixture's topic proven private at time `t`: a read check of that moment found every
+    /// anonymous read refused.
+    fn private_topic(&self, t: u64) {
+        self.write(
+            "var/lib/propolis/witness/readcheck",
+            &format!(
+                "#readcheck v1 g=1\nR\t{FX_BINDING}\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403\n",
+                s = stamp(t)
+            ),
+        );
+    }
+
+    /// The bodies the curl stub was posted, in order.
+    fn posts(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.path().join("curl.posts"))
+            .unwrap_or_default()
+            .split("\n--\n")
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A file the curl stub wrote beside the units, empty when it wrote none.
+    fn stub_text(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.path().join(name)).unwrap_or_default()
+    }
+
+    /// The send ledger's lines of class daily.
+    fn daily_lines(&self) -> Vec<String> {
+        self.read("var/lib/propolis/witness/send-ledger")
+            .lines()
+            .filter(|l| l.starts_with("L\t") && l.split('\t').nth(2) == Some("daily"))
+            .map(str::to_string)
+            .collect()
     }
 
     /// A file beside the units, where the stubs read what to answer.
@@ -10801,4 +10885,729 @@ fn the_pull_class_matches_exactly_the_line_backup_serve_logs() {
         })
         .unwrap();
     assert_eq!(re, want);
+}
+
+// ---- the daily message -------------------------------------------------------------------------
+
+/// The fixture's push settings with these lines added.
+fn push_env(extra: &str) -> String {
+    format!(
+        "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n{extra}"
+    )
+}
+
+/// Past 08:41 UTC on a topic a fresh read check proved private, the light pass sends one daily
+/// message at priority 2, titled with the alias. The URL, the topic and the token reach curl only
+/// in a 0600 config file that is gone once the pass ends, never on a command line or in its
+/// environment. The message is counted before it goes, in meta (the local date and the stamp)
+/// and in a send-ledger line claimed as sending, which takes the result; a pass five minutes on
+/// sends nothing.
+#[test]
+fn the_light_pass_sends_one_daily_message_to_a_proven_private_topic_and_counts_it_before_the_send()
+{
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env("PROPOLIS_OPS_NTFY_TOKEN=tk_s3cret-value\n"),
+    );
+    fx.private_topic(3600);
+    fx.pass(3600);
+    let posts = fx.posts();
+    assert_eq!(posts.len(), 1, "{}", fx.log());
+    let conf = fx.stub_text("curl.post.conf");
+    let title = conf
+        .lines()
+        .find_map(|l| l.strip_prefix("header = \"Title: "))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{conf}"));
+    assert!(
+        title.starts_with("host-") && title.ends_with(": daily") && title.len() == 16,
+        "{title}"
+    );
+    assert!(conf.contains("header = \"Priority: 2\"\n"), "{conf}");
+    assert!(
+        conf.contains("url = \"https://ntfy.example.invalid/t0p1c-secret\"\n"),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("header = \"Authorization: Bearer tk_s3cret-value\"\n"),
+        "{conf}"
+    );
+    assert_eq!(fx.stub_text("curl.post.mode").trim(), "600");
+    let log = fx.log();
+    let post = log.lines().find(|l| l.starts_with("post ")).unwrap();
+    let file = post.strip_prefix("post -q -K ").unwrap();
+    assert!(!file.contains(' '), "{post}");
+    assert!(!Path::new(file).exists(), "the config file is removed");
+    for secret in ["t0p1c-secret", "tk_s3cret-value"] {
+        assert!(!log.contains(secret), "{secret} on a command line: {log}");
+        assert!(
+            !fx.stub_text("curl.post.env").contains(secret),
+            "{secret} in curl's environment"
+        );
+    }
+    assert_eq!(
+        posts[0].lines().collect::<Vec<_>>(),
+        [
+            "open: 0 (PAGE 0, ACT 0)",
+            "resolved 24 h: 0; withheld by budget 24 h: 0",
+            "new notices 24 h: 0",
+            "alerts: NOT VERIFIED (never); profile legacy",
+            "v2 would have pushed 0 in 24 h",
+            "state: persisted",
+            "Do: status",
+        ]
+    );
+    assert_eq!(
+        fx.daily_lines(),
+        [format!(
+            "L\t{}\tdaily\t-\tdaily\tfull\tok\tlight",
+            stamp(3600)
+        )]
+    );
+    assert_eq!(fx.meta("daily_last").as_deref(), Some("2027-01-15"));
+    assert_eq!(fx.meta("daily_last_stamp"), Some(stamp(3600)));
+    fx.pass(3900);
+    assert_eq!(fx.posts().len(), 1, "one a day");
+}
+
+/// The daily message goes only where the gate is full: never over plain http (where anyone on
+/// the path can answer the read check's 403 and read what is posted), never to a topic that is
+/// readable, that no check has answered for (a check that could not be made is no refusal), whose
+/// refusal is over a day old or whose checker has not tried for three hours, and never without a
+/// target.
+#[test]
+fn no_daily_message_goes_over_http_to_an_unproven_topic_on_a_stale_check_or_without_a_target() {
+    let line = |attempt: &str, aclass: &str, definite: &str, dclass: &str| {
+        format!(
+            "#readcheck v1 g=1\nR\t{FX_BINDING}\t{attempt}\t{aclass}\t{definite}\t{dclass}\t-\t403\t403\tboth\t403\n"
+        )
+    };
+    let cases: [(&str, u64); 6] = [
+        ("http", 3600),
+        ("readable", 3600),
+        ("never answered", 3600),
+        ("refusal over a day old", 93_600),
+        ("no attempt for three hours", 14_400),
+        ("no target", 3600),
+    ];
+    for (name, t) in cases {
+        let fx = Fx::new();
+        match name {
+            "http" => {
+                fx.write(
+                    "etc/propolis/propolis.env",
+                    "PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n",
+                );
+                fx.curl_answers("403|text/plain");
+            }
+            "readable" => fx.write(
+                "var/lib/propolis/witness/readcheck",
+                &line(&stamp(t), "readable", &stamp(t), "readable"),
+            ),
+            "never answered" => {}
+            "refusal over a day old" => fx.write(
+                "var/lib/propolis/witness/readcheck",
+                &line(&stamp(t), "transient", &stamp(3600), "refused"),
+            ),
+            "no attempt for three hours" => fx.private_topic(0),
+            _ => {
+                fx.private_topic(t);
+                fx.write("etc/propolis/propolis.env", "");
+            }
+        }
+        fx.pass(t);
+        assert!(fx.posts().is_empty(), "{name}: {}", fx.log());
+        assert!(fx.daily_lines().is_empty(), "{name}");
+        assert_eq!(fx.meta("daily_last"), None, "{name}");
+        if name == "http" {
+            let rc = fx.read("var/lib/propolis/witness/readcheck");
+            assert!(
+                rc.contains(&format!("\trefused\t{}\trefused\t", stamp(t))),
+                "the read check over http was refused, and that proves nothing: {rc}"
+            );
+        }
+    }
+}
+
+/// PROPOLIS_OPS_DAILY_AT=off sends nothing; a value that is neither off nor HH:MM keeps the
+/// default time, 08:41, and the pass still ends as every pass does.
+#[test]
+fn daily_at_off_sends_nothing_and_a_value_out_of_form_keeps_the_default_time() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env("PROPOLIS_OPS_DAILY_AT=off\n"),
+    );
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.daily_lines().is_empty());
+
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env("PROPOLIS_OPS_DAILY_AT=9am\n"),
+    );
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+}
+
+/// The daily time is the host's local time, from the zone the pass was started with: at 08:00
+/// UTC, 09:00 an hour east, a message set for 08:50 goes, and is dated by that zone's day, while
+/// the rest of the pass (the banner here) keeps UTC.
+#[test]
+fn the_daily_time_is_read_in_the_hosts_zone_while_the_pass_keeps_utc() {
+    let mut fx = Fx::new();
+    fx.setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3");
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env("PROPOLIS_OPS_DAILY_AT=08:50\n"),
+    );
+    fx.private_topic(0);
+    fx.pass(0);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert_eq!(fx.meta("daily_last").as_deref(), Some("2027-01-15"));
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .starts_with("[propolis 08:00 UTC] "),
+        "{}",
+        fx.read("run/motd.d/propolis")
+    );
+}
+
+/// The message is counted before it goes, so a send that failed is not tried again that day, and
+/// a pass killed while it sent leaves what keeps the next from sending a second: either the
+/// claimed ledger line or meta's date holds it on its own.
+#[test]
+fn a_daily_message_that_failed_or_whose_pass_was_killed_is_not_sent_again_that_day() {
+    let fx = Fx::new();
+    fx.stub_file("curl.post", "503");
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert_eq!(fx.posts().len(), 1);
+    assert_eq!(
+        fx.daily_lines(),
+        [format!(
+            "L\t{}\tdaily\t-\tdaily\tfull\ttransient:503\tlight",
+            stamp(3600)
+        )]
+    );
+    assert!(
+        fx.log()
+            .contains("-t propolis-witness daily message not delivered (transient:503)"),
+        "{}",
+        fx.log()
+    );
+    fx.pass(3900);
+    assert_eq!(fx.posts().len(), 1, "not tried again");
+
+    let fx = Fx::new();
+    fx.private_topic(3600);
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\nL\t{}\tdaily\t-\tdaily\tfull\tsending\tlight\n",
+            stamp(2700)
+        ),
+    );
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "the claimed line holds it");
+
+    let fx = Fx::new();
+    fx.private_topic(3600);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=1\nM\tdaily_last\t2027-01-15\nM\tdaily_last_stamp\t{}\n",
+            stamp(2700)
+        ),
+    );
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "meta's date holds it");
+}
+
+/// Where no state can be kept, nothing would remember the message, so none is sent.
+#[test]
+fn no_daily_message_is_sent_while_no_state_can_be_kept() {
+    let fx = Fx::new();
+    fx.write(
+        "var/lib/propolis/witness/id-salt",
+        "0123456789abcdef0123456789abcdef\n",
+    );
+    fx.private_topic(3600);
+    fx.stub_file("disk.refuses", "*/var/lib/propolis/witness/*\n");
+    fx.write(
+        "run/propolis-witness/fallback",
+        "a file where the directory would go",
+    );
+    fx.pass(3600);
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .contains("state NOT PERSISTED"),
+        "{}",
+        fx.read("run/motd.d/propolis")
+    );
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+}
+
+/// The hourly pass sends the daily message only while the light pass is stale (its last pass over
+/// 15 minutes old), with itself as the sender in the ledger; the light pass that runs again
+/// afterwards finds it counted and sends no second.
+#[test]
+fn the_hourly_pass_sends_the_daily_message_only_while_the_light_pass_is_stale_and_never_twice() {
+    let fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    fx.hourly(3600);
+    assert!(
+        fx.read("var/lib/propolis/witness/readcheck")
+            .contains(&format!("\trefused\t{}\trefused\t", stamp(3600))),
+        "the topic is proven private"
+    );
+    assert!(fx.posts().is_empty(), "the light pass is fresh");
+    fx.hourly_alone(7200);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert_eq!(
+        fx.daily_lines(),
+        [format!(
+            "L\t{}\tdaily\t-\tdaily\tfull\tok\thourly",
+            stamp(7200)
+        )]
+    );
+    fx.pass(7500);
+    assert_eq!(fx.posts().len(), 1, "never twice");
+}
+
+/// The daily message names the host by its alias alone and carries nothing a record, the host or
+/// another account chose: no host name, unit, finding, collector, cause or label, no path, address,
+/// topic or token, and not the word that names the software. Notices count only when opened in
+/// the last 24 hours, the legacy profile adds what v2 would have pushed, and no line says the
+/// daemon is not verified, which nothing could clear before the daemon gets a test page of its own.
+#[test]
+fn the_daily_message_names_nothing_but_the_alias_and_holds_no_line_that_cannot_clear() {
+    let fx = Fx::new();
+    write_exec(
+        &fx.bin.join("hostname"),
+        "#!/usr/bin/env bash\necho plantedhost\n",
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env(
+            "PROPOLIS_OPS_HOST_ALIAS=north-relay\n\
+             PROPOLIS_SENSOR_LOGS=plantedlabel:/var/log/propolis/plantedlog/events.jsonl\n",
+        ),
+    );
+    let planted = |id: &str, key: &str, tier: &str, t: u64| {
+        let r = hook_record(id, "sensor-plantedunit.service", tier, "open", t, "0");
+        let r = with_field(&r, 2, key);
+        let r = with_field(&r, 3, "plantedkind");
+        let r = with_field(&r, 5, "uplanted");
+        with_field(&r, 11, "planted.cause")
+    };
+    fx.incidents(&[
+        planted("w#3", "finding:plantedfinding:0123456789ab", "ACT", 1800),
+        planted("w#4", "spool:cplanted", "NOTICE", 1800),
+        with_field(
+            &planted("w#5", "tool:plantedtool", "NOTICE", 0),
+            9,
+            &format!("{}/0000aaaa/1", WALL - 172_800),
+        ),
+        // An id out of form: counted as open, never copied.
+        with_field(
+            &planted("w#3planted", "tool:otherplanted", "NOTICE", 0),
+            9,
+            &format!("{}/0000aaaa/1", WALL - 172_800),
+        ),
+    ]);
+    // A clock step with words after its offset is out of form and left out whole.
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=1\nM\tclock_step\t{}/+300planted\n", stamp(0)),
+    );
+    fx.private_topic(3600);
+    fx.pass(3600);
+    let posts = fx.posts();
+    assert_eq!(posts.len(), 1, "{}", fx.log());
+    let conf = fx.stub_text("curl.post.conf");
+    assert!(
+        conf.contains("header = \"Title: north-relay: daily\"\n"),
+        "{conf}"
+    );
+    let body = &posts[0];
+    assert!(
+        body.starts_with("open: 4 (PAGE 0, ACT 1) w#3 w#4 w#5\n"),
+        "{body}"
+    );
+    assert!(body.contains("\nnew notices 24 h: 1\n"), "{body}");
+    assert!(
+        body.contains("\nv2 would have pushed 1 in 24 h\n"),
+        "{body}"
+    );
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .contains("daemon not verified")
+    );
+    let headers: String = conf
+        .lines()
+        .filter(|l| l.starts_with("header = \"Title") || l.starts_with("header = \"Priority"))
+        .collect();
+    for word in [
+        "planted",
+        "propolis",
+        "honey",
+        "daemon not verified",
+        "t0p1c-secret",
+        "ntfy.example.invalid",
+        "sensor-",
+        ".service",
+        "/",
+        "127.0.0.1",
+    ] {
+        assert!(!body.contains(word), "{word} in the body: {body}");
+        assert!(!headers.contains(word), "{word} in the title: {headers}");
+    }
+
+    // An alias that is the host's own name is refused, and the fallback names the host instead.
+    let fx = Fx::new();
+    write_exec(
+        &fx.bin.join("hostname"),
+        "#!/usr/bin/env bash\necho plantedhost\n",
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env("PROPOLIS_OPS_HOST_ALIAS=plantedhost\n"),
+    );
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    let conf = fx.stub_text("curl.post.conf");
+    let title = conf
+        .lines()
+        .find_map(|l| l.strip_prefix("header = \"Title: "))
+        .and_then(|l| l.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{conf}"));
+    assert!(
+        title.len() == 16
+            && title.starts_with("host-")
+            && title[5..9].bytes().all(|b| b.is_ascii_hexdigit())
+            && title.ends_with(": daily"),
+        "{title}"
+    );
+    assert!(!fx.posts()[0].contains("planted"), "{:?}", fx.posts());
+}
+
+/// A zone file of one fixed offset an hour east of UTC, `XPT`, in the TZif form the C library
+/// reads: no transitions, one local time type, and the POSIX rule after the data.
+fn tzif_plus_one() -> Vec<u8> {
+    let mut v = Vec::new();
+    for _ in 0..2 {
+        v.extend_from_slice(b"TZif2");
+        v.extend_from_slice(&[0u8; 15]);
+        for count in [0u32, 0, 0, 0, 1, 4] {
+            v.extend_from_slice(&count.to_be_bytes());
+        }
+        v.extend_from_slice(&3600i32.to_be_bytes());
+        v.extend_from_slice(&[0, 0]);
+        v.extend_from_slice(b"XPT\0");
+    }
+    v.extend_from_slice(b"\nXPT-1\n");
+    v
+}
+
+/// The units set no TZ, so a pass started without one reads the daily time in the host's
+/// /etc/localtime (the root's here, an hour east of UTC), not in the UTC it keeps for the rest:
+/// at 08:00 UTC, 09:00 local, a message set for 08:50 goes and is dated by the local day.
+#[test]
+fn a_pass_started_without_a_zone_reads_the_daily_time_in_the_hosts_localtime() {
+    let mut fx = Fx::new();
+    fx.unsetenv("TZ");
+    std::fs::write(fx.p("etc/localtime"), tzif_plus_one()).unwrap();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &push_env("PROPOLIS_OPS_DAILY_AT=08:50\n"),
+    );
+    fx.private_topic(0);
+    fx.pass(0);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert_eq!(fx.meta("daily_last").as_deref(), Some("2027-01-15"));
+    assert!(
+        fx.read("run/motd.d/propolis")
+            .starts_with("[propolis 08:00 UTC] "),
+        "{}",
+        fx.read("run/motd.d/propolis")
+    );
+}
+
+/// A message sent late, at 15:05, holds the next back for 20 hours: none at 08:41 the next day,
+/// one at 11:05.
+#[test]
+fn a_daily_message_sent_at_15_05_is_not_followed_at_08_41_but_twenty_hours_after_it() {
+    let fx = Fx::new();
+    // 15:05 UTC on 2027-01-15, then 08:41 and 11:05 on the 16th.
+    let first = 25_500;
+    for (t, want) in [
+        (first, 1),
+        (first + 300, 1),
+        (88_860, 1),
+        (first + 72_000, 2),
+    ] {
+        fx.private_topic(t);
+        fx.pass(t);
+        assert_eq!(fx.posts().len(), want, "at {t}: {}", fx.log());
+    }
+    assert_eq!(fx.meta("daily_last").as_deref(), Some("2027-01-16"));
+}
+
+/// A pass that has used the time it may judge for counts and sends no daily message.
+#[test]
+fn a_pass_past_its_deadline_sends_no_daily_message() {
+    let mut fx = Fx::new();
+    fx.setenv("PROPOLIS_WITNESS_DEADLINE", "0");
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.daily_lines().is_empty());
+    assert_eq!(fx.meta("daily_last"), None);
+    assert!(fx.meta("light_last").is_some(), "the pass did write meta");
+}
+
+/// A directory of links to every program on `PATH` (the fixture's stubs first) but `curl`.
+fn path_without_curl(fx: &Fx) -> PathBuf {
+    let dir = fx.dir.path().join("nocurl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = format!("{}:{}", fx.bin.display(), std::env::var("PATH").unwrap());
+    for d in path.split(':') {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let link = dir.join(&name);
+            if name == "curl" || link.symlink_metadata().is_ok() {
+                continue;
+            }
+            std::os::unix::fs::symlink(entry.path(), &link).unwrap();
+        }
+    }
+    dir
+}
+
+/// Without curl the message could not leave the host whatever the server said: nothing is
+/// counted for it, so the day's message is still owed once curl is back.
+#[test]
+fn without_curl_no_daily_message_is_counted() {
+    let mut fx = Fx::new();
+    fx.private_topic(3600);
+    let dir = path_without_curl(&fx);
+    fx.setenv("PATH", &dir.display().to_string());
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.daily_lines().is_empty());
+    assert_eq!(fx.meta("daily_last"), None);
+    assert!(fx.meta("light_last").is_some(), "the pass did write meta");
+}
+
+/// A write of this pass that nothing took (the incidents file here, refused in both directories
+/// while the pass resolves a record) leaves the pass's state not kept even though meta still takes
+/// its lines: no daily message is counted or sent then, since what remembers it may be what was
+/// lost.
+#[test]
+fn a_pass_whose_earlier_write_was_kept_nowhere_sends_no_daily_message() {
+    let fx = Fx::new();
+    fx.private_topic(3600);
+    fx.incidents(&[hook_record(
+        "w#1",
+        "sensor-ssh.service",
+        "ACT",
+        "open",
+        0,
+        "0",
+    )]);
+    fx.stub_file("disk.refuses", "*/incidents.tmp.*\n");
+    fx.pass(3600);
+    assert_eq!(fx.meta("where").as_deref(), Some("none"), "{}", fx.log());
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    assert!(fx.daily_lines().is_empty());
+    assert_eq!(fx.meta("daily_last"), None);
+}
+
+/// The result is written under the lock after the send; a lock not had within 30 s leaves the
+/// ledger line claimed as `sending`, which counts as sent, so no second message follows.
+#[test]
+fn a_lock_held_past_thirty_seconds_after_the_send_leaves_the_line_claimed_and_nothing_follows() {
+    let fx = Fx::new();
+    fx.private_topic(3600);
+    fx.stub_file(
+        "curl.post.hold",
+        &fx.p("var/lib/propolis/witness/state.lock")
+            .display()
+            .to_string(),
+    );
+    fx.pass(3600);
+    let holder = fx.stub_text("curl.post.holder");
+    let _ = Command::new("kill").arg(holder.trim()).status();
+    assert!(
+        fx.dir.path().join("curl.post.held").exists(),
+        "the lock was taken"
+    );
+    std::fs::remove_file(fx.dir.path().join("curl.post.hold")).unwrap();
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert_eq!(
+        fx.daily_lines(),
+        [format!(
+            "L\t{}\tdaily\t-\tdaily\tfull\tsending\tlight",
+            stamp(3600)
+        )]
+    );
+    fx.private_topic(3900);
+    fx.pass(3900);
+    assert_eq!(fx.posts().len(), 1, "nothing follows");
+}
+
+/// With no light pass to date at all, the hourly pass takes it as stale only after the first half
+/// hour of uptime, when one should have run: at 1700 s it sends nothing, at 1900 s it sends the
+/// daily message as its sender.
+#[test]
+fn with_no_light_pass_on_record_the_hourly_pass_stands_in_only_after_half_an_hour_of_uptime() {
+    let mut fx = Fx::new();
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("403|text/plain");
+    let _ = std::fs::remove_file(fx.p("run/propolis-witness/heartbeat"));
+    let _ = std::fs::remove_file(fx.p("var/lib/propolis/witness/meta"));
+    let at = |up: u64| format!("{}/{BOOT}/{up}", WALL + 3600 + up - 1700);
+    fx.setenv("PROPOLIS_WITNESS_NOW", &at(1700));
+    fx.hourly_alone(3600);
+    assert!(
+        fx.read("var/lib/propolis/witness/readcheck")
+            .contains(&format!("\trefused\t{}\trefused\t", at(1700))),
+        "{}",
+        fx.read("var/lib/propolis/witness/readcheck")
+    );
+    assert_eq!(fx.meta("light_last"), None);
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+    fx.setenv("PROPOLIS_WITNESS_NOW", &at(1900));
+    fx.hourly_alone(3800);
+    assert_eq!(fx.posts().len(), 1, "{}", fx.log());
+    assert_eq!(
+        fx.daily_lines(),
+        [format!(
+            "L\t{}\tdaily\t-\tdaily\tfull\tok\thourly",
+            at(1900)
+        )]
+    );
+}
+
+/// On a control node the message counts the listed collectors, whichever pass sends it: the
+/// light pass, and the hourly pass standing in for a stale light pass, which loads the list
+/// itself.
+#[test]
+fn on_a_control_node_both_passes_count_the_listed_collectors_in_the_daily_message() {
+    for hourly in [false, true] {
+        let fx = Fx::new();
+        control_node(&fx, &["c-north", "c-south"]);
+        for cn in ["c-north", "c-south"] {
+            spool_at(&fx, cn, WALL + 3500);
+        }
+        fx.private_topic(3600);
+        if hourly {
+            fx.install_cc();
+            fx.cc(&cc_tsv(&[], &[]), 0);
+            fx.curl_answers("403|text/plain");
+            fx.hourly_alone(3600);
+        } else {
+            fx.pass(3600);
+        }
+        let posts = fx.posts();
+        assert_eq!(posts.len(), 1, "hourly {hourly}: {}", fx.log());
+        assert!(
+            posts[0].contains("\ncollectors: 2 listed, 0 quiet\n"),
+            "hourly {hourly}: {}",
+            posts[0]
+        );
+    }
+}
+
+/// The read check is anonymous even where the URL carries a user and password: a server that
+/// refuses those credentials with 401 but serves anonymous reads must not pass for a private
+/// topic, so no daily message goes.
+#[test]
+fn credentials_in_the_url_never_make_a_topic_pass_for_private() {
+    let fx = Fx::new();
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://alice:pw@ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n",
+    );
+    fx.install_cc();
+    fx.cc(&cc_tsv(&[], &[]), 0);
+    fx.curl_answers("404|text/plain");
+    fx.stub_file("curl.answer.userinfo", "401|text/plain");
+    fx.hourly(3600);
+    fx.pass(3600);
+    let confs = fx.stub_text("curl.conf");
+    assert!(
+        confs.contains("url = \"https://ntfy.example.invalid/t0p1c-secret/json"),
+        "{confs}"
+    );
+    // The three anonymous requests never hold the user. With no token set a fourth asks whether
+    // the URL's own credentials can read the topic, and is the only one that holds them.
+    let urls: Vec<&str> = confs.lines().filter(|l| l.starts_with("url = ")).collect();
+    assert!(urls.len() >= 4, "{confs}");
+    for line in &urls[..3] {
+        assert!(!line.contains("alice"), "{line}");
+    }
+    assert_eq!(
+        urls[3],
+        "url = \"https://alice:pw@ntfy.example.invalid/t0p1c-secret/json?poll=1&since=1s\""
+    );
+    let stored = fx.read("var/lib/propolis/witness/readcheck");
+    assert!(!stored.contains("\trefused\t"), "{stored}");
+    assert!(stored.contains("\tnoread\t"), "{stored}");
+    assert!(fx.posts().is_empty(), "{}", fx.log());
+}
+
+/// Under the legacy profile only the host that runs the daemon sends the daily message: a split
+/// deployment gets one a day, from its control node, and whether a credential kept on a collector
+/// can read the topic never decides a send. A collector, and a host whose role cannot be told,
+/// send none and count none, on a topic proven private, at a time a single box sends at.
+#[test]
+fn only_the_host_that_runs_the_daemon_sends_the_daily_message() {
+    let fx = Fx::new();
+    fx.write("etc/propolis/propolis.env", &push_env(""));
+    collector_host(&fx);
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "collector: {}", fx.log());
+    assert!(fx.daily_lines().is_empty(), "collector");
+    assert!(
+        !fx.read("var/lib/propolis/witness/meta")
+            .contains("daily_last"),
+        "collector: {}",
+        fx.read("var/lib/propolis/witness/meta")
+    );
+
+    let fx = Fx::new();
+    fx.write("etc/propolis/propolis.env", &push_env(""));
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "inactive"),
+            ("SubState", "dead"),
+            ("UnitFileState", "disabled"),
+        ],
+    );
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert!(fx.posts().is_empty(), "unknown role: {}", fx.log());
+    assert!(fx.daily_lines().is_empty(), "unknown role");
+
+    // The same topic and time on a single box: one message.
+    let fx = Fx::new();
+    fx.write("etc/propolis/propolis.env", &push_env(""));
+    fx.private_topic(3600);
+    fx.pass(3600);
+    assert_eq!(fx.posts().len(), 1, "single box: {}", fx.log());
 }

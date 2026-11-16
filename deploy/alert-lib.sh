@@ -42,7 +42,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=9
+PA_LIB_VERSION=10
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -345,6 +345,15 @@ _pa_setting() {
 # dead-man check, so it is never requested) or invalid. The URL is a secret: it is held in this
 # variable, given to curl only through a 0600 config file (pa_heartbeat_get), and never printed.
 # PA_OPS_ENABLED is 1 when propolis.env turns the daemon's monitor on, read as the daemon reads it.
+#
+# The alias and the daily message's time come from propolis.env too. PA_ALIAS_SET holds
+# PROPOLIS_OPS_HOST_ALIAS as written, for pa_alias to judge, and PA_ALIAS_STATE says unset, set or
+# invalid (a line systemd may read otherwise; pa_alias then takes the fallback). PA_DAILY_AT is
+# PROPOLIS_OPS_DAILY_AT when it is HH:MM, `off` when the value starts with a word that means off
+# (_pa_daily_off), else 08:41, with PA_DAILY_STATE default, set or invalid: a value of neither
+# form keeps the default time rather than turning the message off, because the message goes only
+# to a topic proven to refuse anonymous reads, so one more message reveals nothing, while a daily
+# message that silently stopped is the absence the operator reads as the host being down.
 pa_settings_load() {
     local env="$PA_ENV_DIR/propolis.env" url_src topic_src
     PA_INVALID="" PA_TARGET=0 PA_TARGET_SRC=""
@@ -373,7 +382,41 @@ pa_settings_load() {
     PA_OPS_ENABLED=0
     pa_env_get PROPOLIS_OPS_ENABLED "$env" > /dev/null
     case "${PA_ENV_VALUE,,}" in true | 1 | yes | on) PA_OPS_ENABLED=1 ;; esac
+    # Neither goes into PA_INVALID: that list is of the push settings today's failure hook and
+    # the daemon read too, and these two are the shell senders' alone.
+    PA_ALIAS_SET="" PA_ALIAS_STATE=unset
+    pa_env_get PROPOLIS_OPS_HOST_ALIAS "$env" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        if [ "$PA_ENV_COMPLEX" = 0 ]; then PA_ALIAS_SET="$PA_ENV_VALUE" PA_ALIAS_STATE=set; else PA_ALIAS_STATE=invalid; fi
+    fi
+    PA_DAILY_AT=08:41 PA_DAILY_STATE=default
+    pa_env_get PROPOLIS_OPS_DAILY_AT "$env" > /dev/null
+    if [ -n "$PA_ENV_VALUE" ]; then
+        if _pa_daily_off "$PA_ENV_VALUE"; then
+            PA_DAILY_AT=off PA_DAILY_STATE=set
+        elif [ "$PA_ENV_COMPLEX" = 0 ] && _pa_valid_daily "$PA_ENV_VALUE"; then
+            PA_DAILY_AT="$PA_ENV_VALUE" PA_DAILY_STATE=set
+        else
+            PA_DAILY_STATE=invalid
+        fi
+    fi
     return 0
+}
+
+# _pa_valid_daily V: `off`, or a time of day as HH:MM on the 24-hour clock.
+_pa_valid_daily() {
+    [ "${1:-}" = off ] || [[ ${1:-} =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+# _pa_daily_off V: V starts with a word an operator writes to turn the message off (off, false,
+# no, n, 0, none, never, stop, disable, disabled), in any letter case, alone or with a blank or a
+# punctuation mark after it: a comment, a quote, a line systemd would read otherwise. A letter, a
+# digit, `:`, `_` or `-` straight after the word makes it another word (offline, noon, 08:41).
+# Read this loosely on purpose. Only this library reads the setting, and the other way to misread
+# it is a message a day that the operator tried to stop.
+_pa_daily_off() {
+    local v="${1:-}" re="^[\"'[:blank:]]*(off|false|no|n|0|none|never|stop|disabled?)([^a-z0-9:_-]|\$)"
+    [[ ${v,,} =~ $re ]]
 }
 
 # pa_hook_env_value KEY [FILE]: KEY as today's failure hook reads it (deploy/alert.sh env_value)
@@ -529,17 +572,27 @@ pa_id_table() {
 
 # _pa_alias_ok A: the shape, and neither the host's names nor a word that says what it runs.
 _pa_alias_ok() {
-    local a="$1" h hs
+    local a="$1" h hs k
     local LC_ALL=C
     [[ ${#a} -ge 3 && ${#a} -le 32 && $a == [a-z]* && $a != *[!a-z0-9-]* ]] || return 1
     case "$a" in *propolis* | *honey*) return 1 ;; esac
     h="$(hostname 2> /dev/null)" || h=""
     hs="$(hostname -s 2> /dev/null)" || hs=""
+    # Where `hostname` cannot answer (not installed on every distribution), the kernel's name is
+    # read instead, and without any name the alias is refused: an empty name would let the host's
+    # own name through. PA_TEST_KERNEL_HOSTNAME replaces the kernel's file under a test root only.
+    if [ -z "$h" ] && [ -z "$hs" ]; then
+        k=/proc/sys/kernel/hostname
+        [ -z "${PA_ROOT:-}" ] || k="${PA_TEST_KERNEL_HOSTNAME:-$k}"
+        h="$(head -c 256 -- "$k" 2> /dev/null | tr -d '\n')" || h=""
+        hs="${h%%.*}"
+        [ -n "$h" ] || return 1
+    fi
     [ "$a" != "${h,,}" ] && [ "$a" != "${hs,,}" ]
 }
 
-# pa_alias: the host's name on the channel. PA_ALIAS_SET (read from PROPOLIS_OPS_HOST_ALIAS by the
-# settings once the daily message exists) when it passes _pa_alias_ok; otherwise host- and 4 hex
+# pa_alias: the host's name on the channel. PA_ALIAS_SET (read from PROPOLIS_OPS_HOST_ALIAS by
+# pa_settings_load) when it passes _pa_alias_ok; otherwise host- and 4 hex
 # of sha256(salt NUL "alias"), which never involves the hostname. Sets PA_ALIAS, and
 # PA_ALIAS_REJECTED=1 when a set alias was refused. Status 1 without a salt.
 pa_alias() {
@@ -1579,13 +1632,29 @@ _pa_rc_conf() {
 # PA_RC_CLASS (the attempt's class: transient when any answer was, refused when all three were,
 # else the class of the first answer that was not refused), PA_RC_JSON, PA_RC_RAW and PA_RC_SSE
 # (each status code) with PA_RC_JSON_CT, PA_RC_RAW_CT and PA_RC_SSE_CT (each content type's word,
-# `-` when there was none in a type's form), PA_RC_TOKEN (reads, noread, unknown, or `-` without a token) and PA_RC_CAUSE
-# (`-`, or tool.exec when curl or a private temporary file was not to be had, the class then being
-# transient). Status 0, or 1 with that cause.
+# `-` when there was none in a type's form), PA_RC_TOKEN (whether the credential a post carries
+# can read the topic: reads, noread, unknown, or `-` when there is none), PA_RC_CRED (which
+# credential that was: token, url for a user and password written into the URL, or `-`) and
+# PA_RC_CAUSE (`-`, or tool.exec when curl or a private temporary file was not to be had, the
+# class then being transient). Status 0, or 1 with that cause.
 pa_readcheck_run() {
     local url="${1:-}" topic="${2:-}" token="${3:-}" conf hdr body ep r code ct cls first="" any_t=0 all_r=1
+    local rest auth url_set="${1:-}" url_cred=0
     PA_RC_CLASS=transient PA_RC_JSON=000 PA_RC_RAW=000 PA_RC_SSE=000 PA_RC_TOKEN=- PA_RC_CAUSE=-
-    PA_RC_JSON_CT=- PA_RC_RAW_CT=- PA_RC_SSE_CT=-
+    PA_RC_JSON_CT=- PA_RC_RAW_CT=- PA_RC_SSE_CT=- PA_RC_CRED=-
+    # The check is of anonymous reads: a user and password written into the URL would go out as
+    # Basic credentials, and a 401 for those would pass for a refusal of anyone. They are taken
+    # off the anonymous requests here; the binding is the caller's, of the URL as set.
+    if [[ $url == *://* ]]; then
+        rest="${url#*://}"
+        # The authority ends at the first /, ? or #, as curl and pa_url_shown end it: an @ after
+        # that is no user.
+        auth="${rest%%[/?#]*}"
+        if [[ $auth == *@* ]]; then
+            url="${url%%://*}://${auth##*@}${rest:${#auth}}"
+            url_cred=1
+        fi
+    fi
     if ! command -v curl > /dev/null 2>&1; then
         PA_RC_CAUSE=tool.exec
         return 1
@@ -1633,12 +1702,26 @@ pa_readcheck_run() {
     else
         PA_RC_CLASS="$first"
     fi
+    # What a post from this host carries is asked too, since on a collector a credential that can
+    # read the topic holds the gate at pointer: the token when one is set (its header replaces
+    # any user in the URL), else the user and password written into the URL, sent as they are.
     if [ -n "$token" ]; then
-        PA_RC_TOKEN=unknown
+        PA_RC_TOKEN=unknown PA_RC_CRED=token
         : > "$body" 2> /dev/null
         if _pa_rc_conf "$conf" "$url/$topic/json?poll=1&since=1s" \
             && { printf 'Authorization: Bearer %s\n' "$token" > "$hdr"; } 2> /dev/null; then
             r="$(_pa_rc_get "$conf" "$hdr" "$body")"
+            code="${r%%$'\t'*}" ct="${r#*$'\t'}"
+            case "$(pa_readcheck_class json "$code" "$ct" "$body")" in
+                readable) PA_RC_TOKEN=reads ;;
+                refused) PA_RC_TOKEN=noread ;;
+            esac
+        fi
+    elif [ "$url_cred" = 1 ]; then
+        PA_RC_TOKEN=unknown PA_RC_CRED=url
+        : > "$body" 2> /dev/null
+        if _pa_rc_conf "$conf" "$url_set/$topic/json?poll=1&since=1s"; then
+            r="$(_pa_rc_get "$conf" "" "$body")"
             code="${r%%$'\t'*}" ct="${r#*$'\t'}"
             case "$(pa_readcheck_class json "$code" "$ct" "$body")" in
                 readable) PA_RC_TOKEN=reads ;;
@@ -3048,10 +3131,11 @@ pa_hook_record() {
     return 0
 }
 
-# ---- the test page: the send ledger, the budget, the sender and VERIFIED -----------------------
+# ---- the messages: the send ledger, the budget, the sender and VERIFIED ------------------------
 #
-# The one message this release's shell code sends is the test page the operator asks for with
-# `propolis-status --test-page`. The status command counts it in the send ledger and writes the
+# The shell code of this release sends two messages: the witness's daily message (see "the daily
+# message" below) and the test page the operator asks for with `propolis-status --test-page`.
+# For the test page the status command counts it in the send ledger and writes the
 # testpage record under the lock, then starts propolis-alert@propolis-test-page-<CODE>.service;
 # the failure hook sends it through pa_send from the same unit a real failure alert runs in, so a
 # test page that arrives proves that unit, the network and the target as this library reads it.
@@ -3072,7 +3156,8 @@ pa_hook_record() {
 # write its claim on the send ledger and sent nothing), or the sender's own word when
 # nothing was sent (norender, nocurl, notarget).
 # send-ledger: L stamp class keyhash8 tx mode result sender, one line per admitted message,
-# written before the send with result pending; lines over 48 h old go on every write.
+# written before the send, pending (a test page, which the hook claims as sending) or sending (a
+# daily message, claimed by the witness as it writes it); lines over 48 h old go on every write.
 
 # pa_url_shown URL: the scheme and host (with a port) of URL, or `the target` when it is not a
 # plain http or https URL. A user name and password before the host, a path (a topic written into
@@ -3178,15 +3263,33 @@ pa_send() {
 }
 
 # pa_render MODE TX ID: the message for transition TX, in PA_TITLE, PA_PRIO and PA_BODY. This
-# release renders one, the test page (TX test, ID its code), which is the same in full and pointer
+# release renders two. The test page (TX test, ID its code) is the same in full and pointer
 # mode: it carries the host's alias and the code and nothing else, no tier, host name or unit.
-# Status 1, with nothing set, for any other message, a code not of 6 hex, or no alias yet.
+# The daily message (TX daily, MODE full only: it goes only where the gate is full) is
+# _pa_render_daily's. Status 1, with nothing set, for any other message, a code not of 6 hex, a
+# line pa_ok_line refuses, or no alias yet.
 pa_render() {
-    local tx="${2:-}" id="${3:-}"
+    local mode="${1:-}" tx="${2:-}" id="${3:-}" line
     PA_TITLE="" PA_PRIO="" PA_BODY=""
-    [ "$tx" = test ] && [[ $id =~ ^[0-9a-f]{6}$ ]] || return 1
+    case "$tx" in
+        test) [[ $id =~ ^[0-9a-f]{6}$ ]] || return 1 ;;
+        daily) [ "$mode" = full ] || return 1 ;;
+        *) return 1 ;;
+    esac
     pa_alias > /dev/null 2>&1 || return 1
     [ "$PA_ALIAS" != - ] && pa_ok_field "$PA_ALIAS" || return 1
+    if [ "$tx" = daily ]; then
+        PA_BODY="$(_pa_render_daily)" || PA_BODY=""
+        while IFS= read -r line; do
+            pa_ok_line "$line" || PA_BODY=""
+        done <<< "$PA_BODY"
+        if [ -z "$PA_BODY" ]; then
+            return 1
+        fi
+        PA_TITLE="$PA_ALIAS: daily"
+        PA_PRIO=2
+        return 0
+    fi
     PA_TITLE="$PA_ALIAS: test page $id"
     PA_PRIO=3
     PA_BODY="Type back on $PA_ALIAS: status --ack-test $id"
@@ -3283,11 +3386,12 @@ pa_ledger_result() {
 # not installed, its start refused) would otherwise lock the operator out for a day after it is
 # fixed. A late hook cannot send for such a line either, once a new test page has replaced the
 # record and its code. Each line also carries the seconds until it stops counting, so the time
-# the next page is allowed follows the same two limits.
+# the next page is allowed follows the same two limits. CLASS (test when none is given) names the
+# class whose lines are counted: the daily message is claimed in the same way, by its witness pass.
 _pa_budget_ages() {
-    local t s c r a
+    local class="${1:-test}" t s c r a
     while IFS=$'\t' read -r t s c _ _ _ r _; do
-        [ "$t" = L ] && [ "$c" = test ] || continue
+        [ "$t" = L ] && [ "$c" = "$class" ] || continue
         case "${r:-}" in pending | sending | ok | perm:* | transient:*) ;; *) continue ;; esac
         a="$(pa_age "${s:-}")"
         [ "$a" -ge 0 ] && [ "$a" -le 86400 ] || continue
@@ -3301,20 +3405,33 @@ _pa_budget_ages() {
 }
 
 # pa_budget_admit CLASS KEY TX NEW: admit or withhold:<reason>, from the ledger, which the caller
-# read under the lock. This release sends one class, test (the test page): at most 3 in 24 h, of
-# the lines _pa_budget_ages counts. Every other class is withheld (unbuilt), since no other sender
-# exists yet, and a ledger that cannot be read admits nothing (ledger): a count that cannot be
-# made is not zero.
+# read under the lock. This release sends two classes: test (the test page), at most 3 in 24 h,
+# and daily (the daily message), none while a line it counts is under 20 h old (the witness also
+# holds it to one a local date), each of the lines _pa_budget_ages counts. Every other class is
+# withheld (unbuilt), since no other sender exists yet, and a ledger that cannot be read admits
+# nothing (ledger): a count that cannot be made is not zero.
 pa_budget_admit() {
     local class="${1:-}" a n=0
-    if [ "$class" != test ]; then
-        printf 'withhold:unbuilt'
-        return 1
-    fi
+    case "$class" in
+        test | daily) ;;
+        *)
+            printf 'withhold:unbuilt'
+            return 1
+            ;;
+    esac
     pa_state_read send-ledger > /dev/null
     if [[ " ${PA_STATE_UNREADABLE:-} " == *" send-ledger "* ]]; then
         printf 'withhold:ledger'
         return 1
+    fi
+    if [ "$class" = daily ]; then
+        while read -r a _; do
+            [[ ${a:-} =~ ^[0-9]{1,12}$ ]] && [ "$((10#$a))" -lt 72000 ] || continue
+            printf 'withhold:daily-cap'
+            return 1
+        done < <(_pa_budget_ages daily)
+        printf admit
+        return 0
     fi
     while read -r a; do
         [ -n "$a" ] || continue
@@ -3579,4 +3696,178 @@ pa_hook_test_page() {
 # _pa_tp_log TEXT: the one journal line of the test-page path.
 _pa_tp_log() {
     logger -p daemon.notice -t propolis-witness "$1" 2> /dev/null || true
+}
+
+# ---- the daily message -------------------------------------------------------------------------
+#
+# One low-priority message a day from the witness, so that an operator who stops receiving it
+# knows to look. It is sent only where the gate is full (a target over https whose topic a fresh
+# read check proved to refuse anonymous reads), so it may carry counts and opaque incident ids;
+# it never carries a name, a cause, a path or any text read from the host. The time of day is the
+# host's: the witness keeps TZ=UTC for everything else, so the zone it was started with is passed
+# in PA_HOST_TZ for this one comparison, and when that is unset the host's /etc/localtime decides.
+
+# pa_local_time WALL: the host's local date and time of day at WALL (epoch seconds), in
+# PA_LOCAL_DATE (YYYY-MM-DD) and PA_LOCAL_HM (HH:MM). Status 1, both empty, when date cannot tell.
+# Without PA_HOST_TZ the zone file is named outright, `:<root>/etc/localtime`, which is what the C
+# library reads with TZ unset (a missing file is UTC either way); naming it under the root lets a
+# test give the host a zone of its own, so a TZ=UTC that leaked through cannot pass on a UTC host.
+pa_local_time() {
+    local w="${1:-}" out re='^([0-9]{4}-[0-9]{2}-[0-9]{2}) ([0-2][0-9]:[0-5][0-9])$'
+    PA_LOCAL_DATE="" PA_LOCAL_HM=""
+    [[ $w =~ ^[0-9]{1,12}$ ]] || return 1
+    if [ -n "${PA_HOST_TZ+set}" ]; then
+        out="$(TZ="$PA_HOST_TZ" date -d "@$w" '+%Y-%m-%d %H:%M' 2> /dev/null)" || out=""
+    else
+        out="$(TZ=":${PA_ROOT:-}/etc/localtime" date -d "@$w" '+%Y-%m-%d %H:%M' 2> /dev/null)" || out=""
+    fi
+    [[ $out =~ $re ]] || return 1
+    PA_LOCAL_DATE="${BASH_REMATCH[1]}" PA_LOCAL_HM="${BASH_REMATCH[2]}"
+}
+
+# pa_daily_due LAST_DATE LAST_STAMP: whether the daily message is due now (PA_WALL), from
+# PA_DAILY_AT (pa_settings_load) and the last one sent (meta daily_last, the local date, and
+# daily_last_stamp). Due once the local time of day is at or past PA_DAILY_AT, on a local date
+# other than LAST_DATE, at least 20 hours after LAST_STAMP. Sets PA_DAILY_WHY: due, off, early,
+# sent (today's went), soon (under 20 h), clock (the local time cannot be told: unknown never
+# counts as due). A last stamp out of form is taken as none; the send ledger's count
+# (pa_budget_admit daily) still holds the 20 hours. A last stamp ahead of the clock (pa_age -1,
+# which only a stamp from another boot can give, its age being the wall clock's) counts as none
+# too, as the ledger counts such a line, so a clock that was ahead does not hold the message back
+# for as long as it was; the local date still allows one a day. Status 0 when due.
+pa_daily_due() {
+    local last_date="${1:-}" last="${2:-}" a
+    PA_DAILY_WHY=""
+    [ -n "${PA_STAMP:-}" ] || pa_now
+    if [ "${PA_DAILY_AT:-08:41}" = off ]; then
+        PA_LOCAL_DATE="" PA_LOCAL_HM="" PA_DAILY_WHY=off
+        return 1
+    fi
+    if ! pa_local_time "$PA_WALL"; then
+        PA_DAILY_WHY=clock
+        return 1
+    fi
+    if [[ $PA_LOCAL_HM < ${PA_DAILY_AT:-08:41} ]]; then
+        PA_DAILY_WHY=early
+        return 1
+    fi
+    if [ "$last_date" = "$PA_LOCAL_DATE" ]; then
+        PA_DAILY_WHY=sent
+        return 1
+    fi
+    if _pa_stamp_split "$last"; then
+        a="$(pa_age "$last")"
+        if [ "$a" -ge 0 ] && [ "$a" -lt 72000 ]; then
+            PA_DAILY_WHY=soon
+            return 1
+        fi
+    fi
+    PA_DAILY_WHY=due
+}
+
+# _pa_in_day STAMP: STAMP lies within the last 24 hours (and not ahead of the clock).
+_pa_in_day() {
+    local a
+    a="$(pa_age "${1:-}")"
+    [ "$a" -ge 0 ] && [ "$a" -le 86400 ]
+}
+
+# _pa_render_daily: the daily message's body, from the state files: the open incidents counted
+# by tier with up to ten of their opaque ids (PAGE first, then ACT, then NOTICE); the resolves and
+# the withheld (W) lines of the last 24 h; the notices opened in the last 24 h (a standing notice
+# is in the walk, and a count that could never fall would teach the operator to skip the line)
+# and a clock step of that time; VERIFIED; what v2 would have pushed in 24 h, counted from the
+# times each record keeps (its last open or reopen, its reminders by their schedule, its last
+# change and its resolve), never more than its would_push; on a control node or gateway the
+# listed collectors (PA_DAILY_LISTED, `?` when the caller could not count them) and the quiet
+# ones; and where the state was kept (PA_WHERE). No key, kind, cause or instance is read into it,
+# and no line names the daemon's own sender, which no test page reaches before step 3, so a line
+# that said so could never clear. The caller has run pa_settings_load.
+_pa_render_daily() {
+    local line st tier open=0 page=0 act=0 res=0 notices=0 wp=0 w=0 quiet=0 n k off s cap
+    local ids="" idp="" ida="" idn="" nid=0 step="" v where listed id
+    local -a f
+    pa_state_read incidents > /dev/null
+    while IFS= read -r line; do
+        case "$line" in
+            I$'\t'*)
+                IFS=$'\t' read -r -a f <<< "$line"
+                st="${f[7]:-}" tier="${f[6]:-}" id="${f[1]:-}"
+                [[ $id =~ ^w#[0-9]{1,9}$ ]] || id=""
+                case "$st" in
+                    open | acked)
+                        open=$((open + 1))
+                        case "$tier" in
+                            PAGE) page=$((page + 1)) idp+="${id:+ $id}" ;;
+                            ACT) act=$((act + 1)) ida+="${id:+ $id}" ;;
+                            *) idn+="${id:+ $id}" ;;
+                        esac
+                        [ "${f[3]:-}" != spool-quiet ] || quiet=$((quiet + 1))
+                        ;;
+                    resolved) if _pa_in_day "${f[21]:-}"; then res=$((res + 1)); fi ;;
+                esac
+                case "$tier:$st" in
+                    NOTICE:open | NOTICE:acked | NOTICE:resolved) if _pa_in_day "${f[9]:-}"; then notices=$((notices + 1)); fi ;;
+                esac
+                # Only what v2 would push: not a NOTICE, not folded under a parent, not a duplicate.
+                if [ "$tier" != NOTICE ] && [ "${f[13]:--}" = - ] && [[ ,${f[30]:--}, != *,dup,* ]]; then
+                    n=0
+                    if _pa_in_day "${f[9]:-}"; then n=$((n + 1)); fi
+                    k=0
+                    for off in $(_pa_reminder_offsets "$tier"); do
+                        [ "$k" -lt "$(_pa_num "${f[18]:-}")" ] || break
+                        k=$((k + 1))
+                        if s="$(_pa_stamp_add "${f[9]:-}" "$off")" && _pa_in_day "$s"; then n=$((n + 1)); fi
+                    done
+                    if [ "${f[16]:-}" = change ] && _pa_in_day "${f[12]:-}"; then n=$((n + 1)); fi
+                    if [ "$st" = resolved ] && _pa_in_day "${f[21]:-}"; then n=$((n + 1)); fi
+                    cap="$(_pa_num "${f[29]:-}")"
+                    [ "$n" -le "$cap" ] || n="$cap"
+                    wp=$((wp + n))
+                fi
+                ;;
+            W$'\t'*)
+                IFS=$'\t' read -r -a f <<< "$line"
+                if _pa_in_day "${f[1]:-}"; then w=$((w + 1)); fi
+                ;;
+        esac
+    done < <(pa_state_read incidents)
+    for id in $idp $ida $idn; do
+        [ "$nid" -lt 10 ] || break
+        ids+=" $id" nid=$((nid + 1))
+    done
+    v="$(_pa_meta_get clock_step)"
+    if [[ $v =~ ^([0-9]{1,12}/([0-9a-f]{8}|-)/[0-9]{1,10})/([+-][0-9]{1,12})$ ]]; then
+        step="${BASH_REMATCH[3]}" s="${BASH_REMATCH[1]}"
+        _pa_in_day "$s" || step=""
+    fi
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" incidents "* ]]; then
+        printf 'open: ? (state unreadable)\n'
+    else
+        printf 'open: %s (PAGE %s, ACT %s)%s\n' "$open" "$page" "$act" "$ids"
+    fi
+    printf 'resolved 24 h: %s; withheld by budget 24 h: %s\n' "$res" "$w"
+    printf 'new notices 24 h: %s%s\n' "$notices" "${step:+; clock step $step s}"
+    v="$(pa_verified)" || true
+    case "$v" in
+        VERIFIED*) v+=" (shell)" ;;
+        "NOT VERIFIED ("*")") ;;
+        *) v="NOT VERIFIED (unreadable)" ;;
+    esac
+    printf 'alerts: %s; profile legacy\n' "$v"
+    printf 'v2 would have pushed %s in 24 h\n' "$wp"
+    case "${PA_ROLE:-}" in
+        control | gateway)
+            listed="${PA_DAILY_LISTED:-}"
+            [[ $listed =~ ^[0-9]{1,6}$ ]] || listed="?"
+            printf 'collectors: %s listed, %s quiet\n' "$listed" "$quiet"
+            ;;
+    esac
+    case "${PA_WHERE:-}" in
+        persistent) where=persisted ;;
+        run) where="not persisted (run)" ;;
+        none) where="not persisted (none)" ;;
+        *) where="?" ;;
+    esac
+    printf 'state: %s\nDo: status\n' "$where"
 }

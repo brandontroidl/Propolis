@@ -48,9 +48,12 @@ connection slots, lock waits, size) and records the files that configure Propoli
 when a volume will fill and which unit runs with a change not yet in force, and on a single box or
 control node reads whether the public push is scheduled and keeping up with the feed, counts the
 backup sets against `PROPOLIS_BACKUP_KEEP` and notes an off-host pull that stopped; and each pass checks
-that the other is still running. The witness records and shows, and sends no message:
-beside the read check's requests, its only outbound request is the optional GET of
-`PROPOLIS_WITNESS_HEARTBEAT_URL`. A
+that the other is still running. The witness records and shows, and sends one message: the
+[daily message](./health-and-observability.md#the-daily-message), once a day, priority 2, only
+from a single box or control node and only
+to a push target over `https://` whose topic is proven to refuse anonymous reads
+(`PROPOLIS_OPS_DAILY_AT=off` stops it); beside that and the read check's requests, its only
+outbound request is the optional GET of `PROPOLIS_WITNESS_HEARTBEAT_URL`. A
 witness pass fails its unit only on a bad argument, an alert library it cannot load, or its
 15-minute limit, and the failure hook records that failure without paging. See [health and
 observability](./health-and-observability.md#witness).

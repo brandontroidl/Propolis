@@ -1311,10 +1311,11 @@ fn an_idle_collector_with_nothing_unread_is_not_marked() {
     assert_eq!(r.state("ship"), "idle", "{}", r.out);
 }
 
-/// Step 5 item 6 of the split deployment page quotes what the walk prints on a healthy collector
-/// and names the findings the installed config-check reports there today. Each quoted phrase must
-/// still be what the walk prints, so a change of wording in the walk fails here instead of
-/// leaving the page describing output nobody sees.
+/// Step 5 item 6 of the split deployment page quotes what the walk prints on a healthy collector,
+/// where the installed config-check reports no finding (it leaves the daemon's checks to the
+/// control node), and says the walk exits 0 there. Each quoted phrase must still be what the walk
+/// prints, so a change of wording in the walk fails here instead of leaving the page describing
+/// output nobody sees.
 #[test]
 fn the_walk_on_a_healthy_collector_prints_what_the_split_deployment_page_quotes() {
     let page = std::fs::read_to_string(concat!(
@@ -1333,18 +1334,8 @@ fn the_walk_on_a_healthy_collector_prints_what_the_split_deployment_page_quotes(
     let fx = Fx::collector();
     let ssh = fx.p("var/log/propolis/ssh/events.jsonl");
     fx.cursor("var/lib/propolis/shipper/cursors", &ssh, 100, NOW - 4000);
-    // What the installed config-check reports on every collector until it checks by role.
-    let standing = [
-        ("warn", "ops-monitor-off", "alerting"),
-        ("warn", "ops-no-push", "alerting"),
-        ("warn", "ops-no-heartbeat", "alerting"),
-        ("warn", "backup-never", "backup"),
-        ("fail", "watch-env-missing", "watcher"),
-        ("warn", "watch-key-missing", "watcher"),
-        ("warn", "bins-differ", "binaries"),
-        ("warn", "stamp-behind", "deploy-stamp"),
-    ];
-    fx.tsv(&standing);
+    // What the installed config-check reports on a healthy collector: nothing.
+    fx.tsv(&[]);
     let r = fx.walk();
     for phrase in [
         "collector",
@@ -1381,19 +1372,19 @@ fn the_walk_on_a_healthy_collector_prints_what_the_split_deployment_page_quotes(
         .lines()
         .find(|l| l.starts_with("CHECK "))
         .unwrap_or_else(|| panic!("no CHECK line:\n{}", r.out));
-    for (_, id, _) in standing {
-        assert!(check.contains(id), "{id} not on the CHECK line: {check}");
-        assert!(
-            item.contains(&format!("`{id}`")),
-            "item 6 does not name `{id}`, which the walk lists on a collector: {item}"
-        );
-    }
+    assert!(!check.contains("ids:"), "{check}");
+    let item = item.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        item.contains("names no finding"),
+        "item 6 must say the CHECK line names no finding on a healthy collector: {item}"
+    );
     assert_eq!(
-        r.code, 1,
-        "item 6 says the walk exits 1 on a collector with these findings:\n{}",
+        r.code, 0,
+        "item 6 says the walk exits 0 on a healthy collector:\n{}",
         r.out
     );
-    assert!(item.contains("exits 1"), "{item}");
+    assert!(item.contains("exits 0"), "{item}");
+    assert!(!item.contains("exits 1"), "{item}");
 }
 
 #[test]

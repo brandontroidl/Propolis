@@ -2688,8 +2688,9 @@ fn the_split_deployment_page_does_not_mention_alert_env_before_a_collector_can_p
 }
 
 /// install.sh enables the backup timer on every host. On a collector backup.sh only records
-/// `not configured`, but a disabled timer makes config-check report backup-timer, which the
-/// witness opens as an ACT record: step 1 must keep the operator from disabling it there.
+/// `not configured` and config-check leaves the backup to the control node, so the timer can
+/// stay as install.sh left it: step 1 must say so, or an operator reading that the backup is the
+/// control node's would wonder whether to disable it.
 #[test]
 fn the_split_deployment_page_says_the_backup_timer_stays_enabled_on_a_collector() {
     let doc = split_deployment_page();

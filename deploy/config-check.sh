@@ -28,6 +28,17 @@
 # against PROPOLIS_SENSOR_LOGS (one the gateway acknowledges and the daemon never reads); and
 # whether the root witness and its library are installed and both its timers enabled.
 #
+# BY ROLE. A collector and a gateway-only host (the alert library's pa_role) with no
+# propolis.service enabled or running and a propolis.env that configures no daemon (names no
+# DATABASE_URL and no PROPOLIS_SENSOR_LOGS) run no daemon, so what only exists beside the daemon
+# is not checked there: the daemon's alert monitor and heartbeat, the backup of its database and
+# the live watch of its intake list, which config-check checks on the host that runs
+# propolis.service; and the binaries no unit on the host runs and, on a collector, the deploy
+# stamp, which its hand upgrade never writes, which no host checks for this one. Those rows read
+# skip and the report names both lists in one line. The failure hook stays checked, with the push
+# target it reads from this host's propolis.env. Every other role, and any answer that is not
+# certain, runs every check.
+#
 # NEVER MUTATES. It writes nothing outside a private temp directory it removes, restarts nothing,
 # and changes no firewall rule. Every external tool is optional: a missing one makes its check
 # "unknown" and is named under LIMITED CHECKS, never a crash. It does not execute any installed
@@ -646,6 +657,60 @@ unit_is_enabled() {
     esac
 }
 
+# ---- the host's role -----------------------------------------------------------------------
+
+# propolis_env_configures_no_daemon: succeeds when propolis.env is absent, or readable and names
+# neither DATABASE_URL nor PROPOLIS_SENSOR_LOGS. deploy/backup.sh dumps the database the first
+# names and deploy/watch-env.sh writes watch.env from the second on whatever host they run, so a
+# host whose propolis.env names either has a backup and a live watch to judge, whatever pa_role
+# says of it (a control node with its daemon stopped reads gateway, a single box with a leftover
+# shipper.env reads collector). A file that cannot be read is not known to name neither.
+propolis_env_configures_no_daemon() {
+    local penv="$ENV_DIR/propolis.env"
+    [ -e "$penv" ] || return 0
+    [ -r "$penv" ] || return 1
+    [ -z "$(read_env_var_in DATABASE_URL "$penv")" ] && [ -z "$(read_env_var_in PROPOLIS_SENSOR_LOGS "$penv")" ]
+}
+
+# Asked once. pa_role judges the daemon from the exit status of `systemctl is-enabled`, which a
+# systemctl that cannot answer fails too, and then calls a host with shipper.env a collector; so
+# a host is taken to run no daemon (CC_DAEMONLESS, the role word) only when systemctl itself shows
+# the daemon's unit installed or absent, not enabled, and stopped, and propolis.env configures no
+# daemon. A library that cannot answer, a word that is not a role, a daemon that is enabled,
+# running or not answered for, or a propolis.env that names the daemon's database or intake list
+# or cannot be read leaves it empty, and then every check runs as it always has: a host that runs
+# the daemon must never lose a finding to a role read wrong.
+CC_ROLE=""
+if declare -F pa_role >/dev/null; then
+    CC_ROLE="$(pa_role 2>/dev/null)" || CC_ROLE=""
+    CC_ROLE="${CC_ROLE##*$'\n'}"
+fi
+CC_DAEMONLESS=""
+case "$CC_ROLE" in
+    collector | gateway)
+        # Belt and braces: without systemctl, sysq prints nothing and the case below would not
+        # match either; the guard states the rule where it is read.
+        if [ "$SYSTEMCTL" -eq 1 ] && propolis_env_configures_no_daemon; then
+            case "$(sysq is-enabled propolis.service)" in
+                disabled | masked | masked-runtime | not-found)
+                    if [ "$(sysq is-active propolis.service)" = inactive ]; then
+                        CC_DAEMONLESS="$CC_ROLE"
+                    fi
+                    ;;
+            esac
+        fi
+        ;;
+esac
+# For the report's one line: the daemon's checks, which config-check runs on the host that runs
+# propolis.service (CC_LEFT_OUT), and what no host checks for this one (CC_NOT_HERE), each entry
+# with its own reason.
+CC_LEFT_OUT=()
+CC_NOT_HERE=()
+# role_word: the role as the report and the rows name it.
+role_word() {
+    if [ "$CC_DAEMONLESS" = gateway ]; then printf 'gateway only'; else printf '%s' "$CC_DAEMONLESS"; fi
+}
+
 # ---- sockets -------------------------------------------------------------------------------
 
 declare -A SS_OUT=()
@@ -997,6 +1062,25 @@ IN_LABEL=()
 IN_PATH=()
 IN_BAD=()
 IN_BAD_WHY=()
+
+# intake_restart [FILE]: what to run after an edit to the list of sensor logs in FILE (default:
+# the file the list was read from). The shipper reads shipper.env and the daemon propolis.env, so
+# a fix on a collector never tells the operator to start a daemon the host does not run.
+intake_restart() {
+    case "${1:-$INTAKE_FILE}" in
+        */shipper.env) printf 'sudo systemctl restart shipper.service' ;;
+        *) printf 'sudo systemctl restart propolis.service' ;;
+    esac
+}
+
+# intake_restart_watch: the same for the file the list was read from, and where the daemon reads
+# it also the script that copies the list to the live watch's env file.
+intake_restart_watch() {
+    case "$INTAKE_FILE" in
+        */shipper.env) intake_restart ;;
+        *) printf '%s && %s' "$(intake_restart)" "$(checkout_cmd watch-env.sh)" ;;
+    esac
+}
 
 load_intake() {
     local f v
@@ -1504,12 +1588,12 @@ check_listener() {
             setcell "$i" intake fail "wrong path"
             finding fail "$scope" "intake-wrongpath:$lp" \
                 "$INTAKE_VAR names '$want_label:$same_label' but $sensor writes $lp: intake tails a file the sensor never writes" \
-                "in $INTAKE_FILE set the entry to $want_label:$lp, then run: sudo systemctl restart propolis.service && $(checkout_cmd watch-env.sh)" manual
+                "in $INTAKE_FILE set the entry to $want_label:$lp, then run: $(intake_restart_watch)" manual
         else
             setcell "$i" intake fail "absent"
             finding fail "$scope" "intake-absent:$lp" \
                 "$lp is not in $INTAKE_VAR: events from $sensor are never ingested" \
-                "append ,$want_label:$lp to $INTAKE_VAR in $INTAKE_FILE, then run: sudo systemctl restart propolis.service && $(checkout_cmd watch-env.sh)" manual
+                "append ,$want_label:$lp to $INTAKE_VAR in $INTAKE_FILE, then run: $(intake_restart_watch)" manual
         fi
     elif [ "$INTAKE_STATE" = unreadable ]; then
         setcell "$i" intake unknown "?"
@@ -1760,12 +1844,79 @@ check_backup() {
     global backup "$worst" "$text"
 }
 
+# deploy/backup.sh dumps the database DATABASE_URL in propolis.env names, on whatever host it
+# runs, and without one records `not configured` and exits 0. A host that runs no daemon has a
+# propolis.env that names no database (propolis_env_configures_no_daemon), so there is no backup
+# to judge.
+backup_applies() {
+    [ -z "$CC_DAEMONLESS" ]
+}
+
+# hook_target_shown URL: the scheme and host (with a port) of URL, or `the target` when it is not
+# a plain http or https URL. A user name and password before the host, a path (a topic written
+# into the URL) and a query (ntfy takes a token there) are never copied out of propolis.env into
+# a report.
+hook_target_shown() {
+    if [[ "$1" =~ ^(https?://)([^/@?#]*@)?([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?([/?#].*)?$ ]]; then
+        printf '%s%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+    else
+        printf 'the target'
+    fi
+}
+
+# On a host that runs no daemon, what is left of the alerting check is the failure hook, which
+# every unit there names in OnFailure=: the monitor and its heartbeat are settings the daemon
+# reads, and their fix lines restart it. The hook (deploy/alert.sh) reads its push target from
+# this host's own propolis.env and posts unit failures there whatever the role, so the row says
+# where that is.
+check_alerting_hook() {
+    local file="$ENV_DIR/propolis.env" hook_url="" hook_topic="" where
+    CC_LEFT_OUT+=("the daemon's alert monitor and heartbeat")
+    if [ -r "$file" ]; then
+        hook_url="$(alert_hook_value PROPOLIS_OPS_NTFY_URL "$file")"
+        hook_topic="$(alert_hook_value PROPOLIS_OPS_NTFY_TOPIC "$file")"
+    fi
+    if [ -n "$hook_url" ] && [ -n "$hook_topic" ]; then
+        where="it posts unit failures to $(hook_target_shown "$hook_url") (PROPOLIS_OPS_NTFY_* in $file)"
+    else
+        where="journal only"
+    fi
+    if [ -x "$ALERT_HOOK" ]; then
+        if [ "$where" = "journal only" ]; then
+            global alerting ok "failure hook installed (journal only); the daemon's monitor and heartbeat are checked on the control node"
+        else
+            global alerting ok "failure hook installed; $where; the daemon's monitor and heartbeat are checked on the control node"
+        fi
+        return 0
+    fi
+    global alerting fail "failure hook missing; the daemon's monitor and heartbeat are checked on the control node"
+    hook_missing
+}
+
+# hook_missing: the finding for a missing failure hook, on either path of check_alerting.
+hook_missing() {
+    local fix kind what="a unit that dies (the daemon included) alerts nobody"
+    fix="$(upgrade_fix)" kind="$(fix_kind_checkout)"
+    if [ -n "$CC_DAEMONLESS" ]; then
+        what="a unit that dies alerts nobody"
+    fi
+    # A collector has no upgrade script of its own: the written steps install the hook.
+    if [ "$CC_DAEMONLESS" = collector ]; then
+        fix="install the failure hook as in docs/operations/split-deployment.md, Upgrading" kind=manual
+    fi
+    finding fail "alerting" "ops-failure-hook" "$ALERT_HOOK is not installed: $what" "$fix" "$kind"
+}
+
 # Whether anything reaches the operator when something breaks: the daemon's monitor (off by
 # default), a push target for it, the dead-man's switch that covers a dead host, and the
 # OnFailure= hook that covers a dead daemon.
 check_alerting() {
     local file="$ENV_DIR/propolis.env" enabled url topic heartbeat worst=ok parts=() on=0
     local have missing private hook_url hook_topic hook_push=0 hidden="" indented=1 extra="" v dv hv
+    if [ -n "$CC_DAEMONLESS" ]; then
+        check_alerting_hook
+        return
+    fi
     if [ ! -r "$file" ]; then
         global alerting unknown "$file is not readable"
         return
@@ -1887,8 +2038,7 @@ check_alerting() {
     if [ ! -x "$ALERT_HOOK" ]; then
         worst=fail
         parts+=("failure hook missing")
-        finding fail "alerting" "ops-failure-hook" "$ALERT_HOOK is not installed: a unit that dies (the daemon included) alerts nobody" \
-            "$(upgrade_fix)" "$(fix_kind_checkout)"
+        hook_missing
     fi
     local text="" p
     for p in "${parts[@]}"; do text="${text:+$text, }$p"; done
@@ -2114,13 +2264,29 @@ cc_repo_head() {
 }
 
 check_binaries() {
-    local b missing=() differ=() not_compared=() worst=ok text n=0 unit rc
+    local b missing=() differ=() not_compared=() worst=ok text n=0 unit rc idle=()
     if [ "${#INSTALL_BINS[@]}" -eq 0 ]; then
         global binaries unknown "cannot read INSTALL_BINS from $INSTALL_BINS_SRC"
         limit "binary list unreadable: $INSTALL_BINS_SRC has no INSTALL_BINS line"
         return 0
     fi
+    # A collector's hand upgrade builds and installs the binaries its units run and nothing
+    # else, so on a host that runs no daemon a binary is compared only where an enabled unit of
+    # its name runs it: the daemon's binary and propolis-watch belong to the control node.
+    local bfix bkind bhow="the upgrade script builds and installs them"
+    bfix="$(upgrade_fix)" bkind="$(fix_kind_checkout)"
+    if [ "$CC_DAEMONLESS" = collector ]; then
+        bfix="build and install them as in docs/operations/split-deployment.md, Upgrading" bkind=manual
+        bhow="the collector's upgrade steps build and install them"
+    fi
     for b in "${INSTALL_BINS[@]}"; do
+        if [ -n "$CC_DAEMONLESS" ]; then
+            probe_unit "$b"
+            if ! unit_is_enabled "$b"; then
+                idle+=("$b")
+                continue
+            fi
+        fi
         if [ ! -x "$BIN_DIR/$b" ]; then
             case "$b" in
                 gateway | shipper)
@@ -2149,14 +2315,14 @@ check_binaries() {
     if [ "${#missing[@]}" -gt 0 ]; then
         worst=fail
         text="$text, MISSING: ${missing[*]}"
-        finding fail "binaries" "bins-missing" "binaries missing from $BIN_DIR: ${missing[*]} (the units that run them fail to start); the upgrade script builds and installs them" \
-            "$(upgrade_fix)" "$(fix_kind_checkout)"
+        finding fail "binaries" "bins-missing" "binaries missing from $BIN_DIR: ${missing[*]} (the units that run them fail to start); $bhow" \
+            "$bfix" "$bkind"
     fi
     if [ "${#differ[@]}" -gt 0 ]; then
         if [ "$worst" = ok ]; then worst=warn; fi
         text="$text, differ from $BUILD_DIR: ${differ[*]}"
         finding warn "binaries" "bins-differ" "installed binaries differ from the build in $BUILD_DIR: ${differ[*]} (built but not installed, or the install did not replace them)" \
-            "$(upgrade_fix)" "$(fix_kind_checkout)"
+            "$bfix" "$bkind"
     fi
     # A build that could not be read is not known to match: build_differs gave its limit line.
     if [ "${#not_compared[@]}" -gt 0 ]; then
@@ -2169,7 +2335,20 @@ check_binaries() {
         if [ "$worst" = ok ]; then worst=unknown; fi
         text="$text, build not compared (checkout unknown)"
     fi
+    if [ "${#idle[@]}" -gt 0 ]; then
+        text="$text; not compared, as no unit here runs them: ${idle[*]}"
+        CC_NOT_HERE+=("the binaries no unit here runs")
+    fi
     global binaries "$worst" "$text"
+
+    # The stamp records an install by install.sh or upgrade.sh and the daemon binary's revision.
+    # A collector must not run upgrade.sh, and its hand upgrade writes no stamp, so there the
+    # stamp only ever describes the first install.
+    if [ "$CC_DAEMONLESS" = collector ]; then
+        global deploy-stamp skip "not compared here (role collector): the collector's upgrade steps do not write the deploy stamp"
+        CC_NOT_HERE+=("the deploy stamp, which the collector's upgrade steps do not write")
+        return 0
+    fi
 
     # The deploy stamp: what the last deploy recorded, against the checkout.
     local stamp head installed git_head
@@ -2236,9 +2415,17 @@ check_intake_list() {
             ;;
         missing)
             if [ "$ROW_COUNT" -gt 0 ]; then
-                global intake-list fail "no PROPOLIS_SENSOR_LOGS in $ENV_DIR/propolis.env"
-                finding fail "intake-list" "intake-none" "PROPOLIS_SENSOR_LOGS is not set in $ENV_DIR/propolis.env (nor PROPOLIS_SHIPPER_SENSOR_LOGS in shipper.env): the daemon refuses to start and no sensor log is ingested" \
-                    "set PROPOLIS_SENSOR_LOGS=<label>:<path>,... in $ENV_DIR/propolis.env (see deploy/propolis.env.example), then run: sudo systemctl restart propolis.service" manual
+                local nfile="$ENV_DIR/propolis.env" nvar=PROPOLIS_SENSOR_LOGS nmsg nfix
+                nmsg="PROPOLIS_SENSOR_LOGS is not set in $nfile (nor PROPOLIS_SHIPPER_SENSOR_LOGS in shipper.env): the daemon refuses to start and no sensor log is ingested"
+                nfix="set PROPOLIS_SENSOR_LOGS=<label>:<path>,... in $nfile (see deploy/propolis.env.example), then run: $(intake_restart "$nfile")"
+                # A collector's list is the shipper's: the daemon's file and unit are not its to fix.
+                if [ "$CC_DAEMONLESS" = collector ]; then
+                    nfile="$ENV_DIR/shipper.env" nvar=PROPOLIS_SHIPPER_SENSOR_LOGS
+                    nmsg="PROPOLIS_SHIPPER_SENSOR_LOGS is not set in $nfile: the shipper has no sensor log to ship"
+                    nfix="set PROPOLIS_SHIPPER_SENSOR_LOGS=<label>:<path>,... in $nfile (docs/operations/split-deployment.md, Set up the collector), then run: $(intake_restart "$nfile")"
+                fi
+                global intake-list fail "no $nvar in $nfile"
+                finding fail "intake-list" "intake-none" "$nmsg" "$nfix" manual
             fi
             ;;
         present)
@@ -2250,7 +2437,7 @@ check_intake_list() {
                 sug="$(suggest_entry "${IN_BAD[$i]}" "${IN_BAD_WHY[$i]}")"
                 finding fail "intake-list" "intake-bad:${IN_BAD[$i]}" \
                     "$INTAKE_VAR entry '${IN_BAD[$i]}' is malformed (${IN_BAD_WHY[$i]}; expected label:path): the daemon refuses to start" \
-                    "edit $INTAKE_FILE${sug:+ and change it to $sug}, then run: sudo systemctl restart propolis.service" manual
+                    "edit $INTAKE_FILE${sug:+ and change it to $sug}, then run: $(intake_restart)" manual
             done
             for ((i = 0; i < ${#IN_LABEL[@]}; i++)); do
                 for ((j = i + 1; j < ${#IN_LABEL[@]}; j++)); do
@@ -2258,12 +2445,12 @@ check_intake_list() {
                         worst=fail
                         finding fail "intake-list" "intake-duplabel:${IN_LABEL[$i]}" \
                             "label '${IN_LABEL[$i]}' appears twice in $INTAKE_VAR (${IN_PATH[$i]} and ${IN_PATH[$j]}): per-log state is keyed by label" \
-                            "give each entry a unique label in $INTAKE_FILE, then run: sudo systemctl restart propolis.service" manual
+                            "give each entry a unique label in $INTAKE_FILE, then run: $(intake_restart)" manual
                     elif [ "${IN_PATH[$i]}" = "${IN_PATH[$j]}" ]; then
                         if [ "$worst" = ok ]; then worst=warn; fi
                         finding warn "intake-list" "intake-duppath:${IN_PATH[$i]}" \
                             "path ${IN_PATH[$i]} is listed twice in $INTAKE_VAR (labels ${IN_LABEL[$i]} and ${IN_LABEL[$j]}): every event is read twice" \
-                            "remove one of the two entries from $INTAKE_FILE, then run: sudo systemctl restart propolis.service" manual
+                            "remove one of the two entries from $INTAKE_FILE, then run: $(intake_restart)" manual
                     fi
                 done
             done
@@ -2305,7 +2492,7 @@ check_intake_list() {
                         worst=fail
                         finding fail "intake-list" "intake-nodir:$lp" \
                             "$INTAKE_VAR entry '${IN_LABEL[$i]}:$lp' names a directory that does not exist, and no configured sensor writes to it (a typo?)" \
-                            "correct the path in $INTAKE_FILE (sensors write under /var/log/propolis/<name>/), then run: sudo systemctl restart propolis.service" manual
+                            "correct the path in $INTAKE_FILE (sensors write under /var/log/propolis/<name>/), then run: $(intake_restart)" manual
                     else
                         if [ "$worst" = ok ]; then worst=warn; fi
                         finding warn "intake-list" "intake-orphan:$lp" \
@@ -2336,7 +2523,7 @@ check_intake_list() {
                 worst=fail
                 finding fail "intake-list" "intake-name:$file:$tname" \
                     "$file sets '$name', which is not a variable anything reads (expected PROPOLIS_SENSOR_LOGS, or PROPOLIS_SHIPPER_SENSOR_LOGS on a collector, with no space before '=')" \
-                    "rename it to PROPOLIS_SENSOR_LOGS in $file, then run: sudo systemctl restart propolis.service" manual
+                    "rename it to $(case "$file" in */shipper.env) printf PROPOLIS_SHIPPER_SENSOR_LOGS ;; *) printf PROPOLIS_SENSOR_LOGS ;; esac) in $file, then run: $(intake_restart "$file")" manual
             fi
         done <<<"$hits"
     done
@@ -2762,6 +2949,14 @@ watcher_can_read() {
 
 check_watcher() {
     local installed=0 worst=ok text parts=() src_line watch_line key_file
+    # propolis-watch follows the daemon's intake list, which deploy/watch-env.sh copies out of
+    # propolis.env into watch.env and does not write without one: on a host that runs no daemon
+    # there is no list to watch, and the live watch is set up on the control node.
+    if [ -n "$CC_DAEMONLESS" ]; then
+        global watcher skip "not checked here (role $(role_word)): propolis-watch follows the daemon's intake list, on the control node"
+        CC_LEFT_OUT+=("the live watch (propolis-watch)")
+        return 0
+    fi
     if [ -x "$BIN_DIR/propolis-watch" ] || id -u propolis-watch >/dev/null 2>&1; then
         installed=1
     fi
@@ -3051,10 +3246,9 @@ check_witness() {
         [ ! -x "$WITNESS_BIN" ] || what="the witness's library $CC_ALERT_LIB is missing"
         global witness warn "$what"
         # A collector has no upgrade script of its own: the written steps install the witness.
-        local role fix kind
-        role="$(pa_role 2>/dev/null || true)"
+        local fix kind
         fix="$(upgrade_fix)" kind="$(fix_kind_checkout)"
-        if [ "${role##*$'\n'}" = collector ]; then
+        if [ "$CC_ROLE" = collector ]; then
             fix="install the witness as in docs/operations/split-deployment.md, Upgrading" kind=manual
         fi
         finding warn "witness" "witness-missing" "$what, though Propolis units are enabled here: nothing on this host judges a failure, watches the units or runs this check on a timer" "$fix" "$kind"
@@ -3091,7 +3285,12 @@ done
 
 check_env_files
 check_rotation
-check_backup
+if backup_applies; then
+    check_backup
+else
+    global backup skip "not checked here (role $(role_word)): propolis.env names no database for the backup to dump; the control node backs up the daemon's"
+    CC_LEFT_OUT+=("the backup of the daemon's database")
+fi
 check_alerting
 check_clock
 check_binaries
@@ -3280,6 +3479,23 @@ emit_text() {
     for ((i = 0; i < ${#G_ID[@]}; i++)); do
         printf '  %-5s %-13s %s\n' "$(mark "${G_LEVEL[$i]}")" "${G_ID[$i]}" "${G_TEXT[$i]}"
     done
+    # Said once in words, so a short report on a collector is not read as a clean bill for the
+    # checks it did not run.
+    # The two lists are kept apart because only the first is checked anywhere: no host compares
+    # another's binaries or deploy stamp.
+    if [ "${#CC_LEFT_OUT[@]}" -gt 0 ] || [ "${#CC_NOT_HERE[@]}" -gt 0 ]; then
+        local left="" none="" part line
+        for part in "${CC_LEFT_OUT[@]}"; do left="${left:+$left, }$part"; done
+        for part in "${CC_NOT_HERE[@]}"; do none="${none:+$none, }$part"; done
+        line="role: $(role_word)"
+        if [ -n "$left" ]; then
+            line="$line; checked by config-check on the host that runs propolis.service: $left"
+        fi
+        if [ -n "$none" ]; then
+            line="$line; not checked here: $none"
+        fi
+        printf '\n%s\n' "$line"
+    fi
 
     if [ "${#F_LEVEL[@]}" -gt 0 ]; then
         printf '\nFINDINGS (%s)\n' "${#F_LEVEL[@]}"

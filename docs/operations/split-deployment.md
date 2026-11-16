@@ -123,8 +123,9 @@ sensor units on the control plane, and on the collector no `propolis.service`.
 `./deploy/provision.sh` creates `/etc/propolis/propolis.env` empty on every host; on a collector
 it stays empty, since that file is where the database credential would live. The backup
 timer (`propolis-backup.timer`) stays enabled on a collector: there `deploy/backup.sh` finds no
-`DATABASE_URL`, records `not configured` each night and exits 0, while a disabled timer makes
-the installed config-check report `backup-timer`, which the witness opens as an ACT record.
+`DATABASE_URL`, records `not configured` each night and exits 0. Whether it is enabled does not
+matter to config-check, which leaves the backup to the control node on a collector whose
+`propolis.env` names no database.
 
 ## 2. Create the certificates
 
@@ -384,15 +385,23 @@ kernel's TCP connect timeout, because the shipper sets none.
    collector the header names the role `collector`, its own stages (listen, source, ship) read ok
    (ship reads `idle` while nothing waits to be sent) with the source row ending
    `all readable by propolis-shipper`, and every stage from the gateway on reads
-   `on the control node: run sudo propolis-status there`. The installed config-check does not
-   yet check by role, so the walk's `CHECK` line on a healthy collector also lists findings that
-   only the control node can clear: `ops-monitor-off`, `ops-no-push`, `ops-no-heartbeat`,
-   `backup-never`, `watch-env-missing` (or `watch-env-empty`), `watch-key-missing` and, after a
-   hand upgrade, `bins-differ` and `stamp-behind`; the walk exits 1 there, and from the second
-   hourly pass on the first six stay open as NOTICE records (the login banner then reads
-   `6 open (PAGE 0, ACT 0)`; before that, `nothing open`). Their fixes are for the control node:
-   on a collector, do not set `PROPOLIS_OPS_*` in `/etc/propolis/propolis.env`, do not start
-   `propolis` and do not run `deploy/upgrade.sh`.
+   `on the control node: run sudo propolis-status there`. The walk's `CHECK` line names no
+   finding there and the walk exits 0. On a collector the installed config-check checks what the
+   collector runs: its sensor units and listeners, the shipper's log list and cursors, log
+   rotation, the clock, the env files, the failure hook, the witness and the binaries its units
+   run. Its `alerting` row says where the failure hook posts unit failures: to the
+   `PROPOLIS_OPS_NTFY_*` target in the collector's own `/etc/propolis/propolis.env`, which
+   `deploy/alert.sh` reads whatever the role, or to the journal only. It leaves the daemon's
+   alert monitor and heartbeat, the backup and the live watch (`propolis-watch`) to config-check
+   on the host that runs `propolis.service`, and does not compare the binaries no unit on the
+   collector runs or the deploy stamp, which nothing on the collector runs or refreshes and no
+   other host compares; its report names both in one line that starts `role: collector;`. The
+   role comes from `deploy/alert-lib.sh#pa_role`. A collector is checked this way only when no
+   `propolis.service` is enabled or running there and its `propolis.env` configures no daemon
+   (names neither `DATABASE_URL` nor `PROPOLIS_SENSOR_LOGS`); any other host is checked in full,
+   whatever its role. On a collector, keep `PROPOLIS_OPS_*` out of `/etc/propolis/propolis.env`:
+   the failure hook posts with it, and a collector sends no message. Do not start `propolis` and
+   do not run `deploy/upgrade.sh` there.
 
 The console's fleet pane can prove the whole path on its own schedule. With the listener probe on,
 the control plane connects to each collector listener, and a row reads ok only when that connect
@@ -527,17 +536,10 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
   banner; its hourly pass runs the installed config-check. `sudo propolis-status` shows the
   collector's own stages and leaves the rest to the control node (step 5.6). A collector sends no
   message: what it records stays on the host, in the walk and in the banner. The installed
-  config-check does not yet check by role, so on every collector, freshly set up or upgraded by
-  hand, it reports what only the control node can clear, and the witness records it:
-  `ops-monitor-off`, `ops-no-push` and `ops-no-heartbeat` (the empty
-  `/etc/propolis/propolis.env` that `./deploy/provision.sh` creates), `backup-never` (the
-  nightly `not configured` record), and `watch-env-missing` (or `watch-env-empty`) and
-  `watch-key-missing` (the `propolis-watch` account with no log list and no key) stay open as
-  NOTICE records from the second hourly pass on, so the login banner reads
-  `6 open (PAGE 0, ACT 0)`; `bins-differ` and `stamp-behind` (the binaries and the deploy stamp
-  this hand upgrade does not refresh) appear only on the walk's `CHECK` line; and the walk
-  exits 1. Their fixes are for the control node: on a collector, do not set `PROPOLIS_OPS_*` in
-  `propolis.env`, do not start `propolis` and do not run `deploy/upgrade.sh`.
+  config-check checks only what the collector runs (step 5.6), so on a healthy collector it gives
+  the witness nothing to record. It compares the binaries the collector's units run with the
+  build, which this hand upgrade installs, and not the daemon's binary, `propolis-watch` or the
+  deploy stamp, which the hand upgrade leaves as `deploy/install.sh` wrote them.
 
   Until a collector's shipper is upgraded, its sensors' `sensor_stats` counters on the control
   plane are only as trustworthy as its least trusted sensor. The control plane reads the whole

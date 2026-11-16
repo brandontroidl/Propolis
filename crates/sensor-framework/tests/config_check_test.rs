@@ -409,6 +409,13 @@ impl Fx {
         self.exec(
             "stubs/systemctl",
             r#"d="$STUB_STATE"
+# pa_role asks `is-enabled --quiet UNIT` and reads only the status; quiet_fails makes those
+# queries fail as a systemctl that cannot answer them would.
+if [ "$1" = is-enabled ] && [ "${2:-}" = --quiet ]; then
+  [ ! -f "$d/quiet_fails" ] || exit 1
+  set -- is-enabled "$3"
+  exec >/dev/null
+fi
 case "$1" in
   is-enabled) f="$d/enabled/$2"; if [ -f "$f" ]; then cat "$f"; [ "$(cat "$f")" = enabled ]; exit $?; fi; echo not-found; exit 4 ;;
   is-active) f="$d/active/$2"; if [ -f "$f" ]; then cat "$f"; [ "$(cat "$f")" = active ]; exit $?; fi; echo inactive; exit 3 ;;
@@ -5941,31 +5948,59 @@ fn witness_eligibility() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// A healthy collector as deploy/install.sh and the hand upgrade leave it: provisioning's empty
-/// propolis.env, the shipper's list in shipper.env with a cursor for every log, the
-/// propolis-watch account with neither a watch.env (watch-env.sh writes none without
-/// PROPOLIS_SENSOR_LOGS) nor a key, and the nightly backup recording `not configured`. The
-/// installed config-check does not check by role yet, so the witness keeps what it reports here
-/// open as NOTICE records, and the split deployment page must name each one so an operator does
-/// not act on fixes meant for the control node. Once config-check skips these checks on a
-/// collector (pa_role), this test must instead assert that no daily or page id is reported, and
-/// the page's paragraph goes.
-#[test]
-fn every_finding_a_healthy_collector_records_is_named_on_the_split_deployment_page() {
-    use sha2::{Digest, Sha256};
-    let page = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/operations/split-deployment.md"
-    ))
-    .unwrap();
-    let para_start = page
-        .find("What the block gives a collector.")
-        .expect("split-deployment.md has no `What the block gives a collector.` paragraph");
-    let para = page[para_start..].split("\n\n").next().unwrap().to_string();
+/// The finding ids of a run's TSV, each once, in the order printed.
+fn tsv_ids(tsv: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in tsv
+        .lines()
+        .filter_map(|l| l.strip_prefix("F\t"))
+        .filter_map(|l| l.split('\t').nth(1))
+    {
+        if !ids.iter().any(|i| i == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
 
-    let fx = Fx::new();
+/// The ids among a run's findings that the witness records (daily or page in WITNESS_CC_TABLE).
+fn recorded_ids(tsv: &str) -> Vec<String> {
+    let elig = witness_eligibility();
+    tsv_ids(tsv)
+        .into_iter()
+        .filter(|id| matches!(elig.get(id).map(String::as_str), Some("daily" | "page")))
+        .collect()
+}
+
+/// What a healthy collector or gateway-only host reported every hour before config-check asked
+/// the host's role: the daemon's alert monitor, its push target and heartbeat, the backup of the
+/// daemon's database and the live watch of the daemon's intake list.
+const DAEMON_HOST_IDS: [&str; 6] = [
+    "ops-monitor-off",
+    "ops-no-push",
+    "ops-no-heartbeat",
+    "backup-never",
+    "watch-env-missing",
+    "watch-key-missing",
+];
+
+/// The line of the human report that starts with `prefix`, if there is one.
+fn report_line<'a>(r: &'a Run, prefix: &str) -> Option<&'a str> {
+    r.out.lines().find(|l| l.starts_with(prefix))
+}
+
+/// A healthy collector as deploy/install.sh and a hand upgrade leave it: provisioning's empty
+/// propolis.env beside the daemon's unit installed and disabled, the shipper's list in
+/// shipper.env with a cursor for every log, the propolis-watch account with neither a watch.env
+/// (watch-env.sh writes none without PROPOLIS_SENSOR_LOGS in propolis.env) nor a key, the nightly
+/// backup recording `not configured`, and what the hand upgrade leaves behind: a checkout one
+/// commit past the deploy stamp and a build of the daemon that differs from its installed binary,
+/// beside a shipper build that was installed. Returns the installed copy of config-check.
+fn healthy_collector(fx: &Fx) -> PathBuf {
+    use sha2::{Digest, Sha256};
     let logs = fx.logs();
     fx.write("etc/propolis.env", "");
+    fx.unit("propolis.service", "disabled", "inactive");
     // The shipper's cursors in the directory every run of this file reads them from
     // (PROPOLIS_CC_CURSOR_DIR), as the default directory is on a collector.
     fx.write(
@@ -5996,47 +6031,922 @@ fn every_finding_a_healthy_collector_records_is_named_on_the_split_deployment_pa
         "state/backup-status/last-failure",
         "{\"failed_at\":\"2027-01-15T03:00:00Z\",\"reason\":\"scheduled\",\"step\":\"not configured: no DATABASE_URL in /etc/propolis/propolis.env\",\"exit_code\":0}\n",
     );
+    // The hand upgrade installs the sensors and the shipper from the build, and leaves the
+    // daemon's binary and the deploy stamp as install.sh wrote them.
+    fx.exec("build/shipper", "exit 0\n");
+    fx.exec("build/propolis", "exit 1\n");
+    // The checkout repo-dir names holds deploy/upgrade.sh, as a real one does.
+    fx.exec("repo/deploy/upgrade.sh", "exit 0\n");
+    let st = Command::new("git")
+        .current_dir(fx.p("repo"))
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "pulled",
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
     // install-bins as the collector block writes it: upgrade.sh's own line, every binary
     // install.sh put in place.
-    let script = install_copy(&fx, Some(&format!("{}\n", fx.p("repo").display())));
+    let script = install_copy(fx, Some(&format!("{}\n", fx.p("repo").display())));
     std::fs::write(
         fx.p("lib/install-bins"),
         format!("INSTALL_BINS=({})\n", install_bins().join(" ")),
     )
     .unwrap();
-    let r = run_installed(&fx, &script, &["--tsv"]);
+    script
+}
+
+/// A healthy gateway-only host: the gateway enabled with its spool, the daemon's and the sensors'
+/// units installed and disabled, no sensor configured, provisioning's empty propolis.env, the
+/// propolis-watch account with no watch.env and no key, and the nightly backup recording `not
+/// configured`.
+fn healthy_gateway_only_host(fx: &Fx) {
+    for name in ["ssh", "mqtt", "cred", "tftp", "dns"] {
+        std::fs::remove_file(fx.p(&format!("etc/{name}.env"))).unwrap();
+    }
+    for u in [
+        "sensor-ssh",
+        "sensor-mqtt",
+        "sensor-cred",
+        "sensor-tftp",
+        "sensor-dns",
+    ] {
+        fx.unit(&format!("{u}.service"), "disabled", "inactive");
+    }
+    fx.write("etc/propolis.env", "");
+    fx.unit("propolis.service", "disabled", "inactive");
+    fx.unit("gateway.service", "enabled", "active");
+    std::fs::create_dir_all(fx.p("spool/gateway")).unwrap();
+    fx.write(
+        "etc/gateway.env",
+        &format!("PROPOLIS_GATEWAY_SPOOL_DIR={}\n", fx.spool_dir()),
+    );
+    std::fs::remove_file(fx.p("etc/watch.env")).unwrap();
+    std::fs::remove_file(fx.p("home-watch/.ssh/authorized_keys")).unwrap();
+    std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
+    fx.write(
+        "state/backup-status/last-failure",
+        "{\"failed_at\":\"2027-01-15T03:00:00Z\",\"reason\":\"scheduled\",\"step\":\"not configured: no DATABASE_URL in /etc/propolis/propolis.env\",\"exit_code\":0}\n",
+    );
+}
+
+/// Sets propolis-backup.timer as install.sh leaves it (enabled), as an operator who disabled it
+/// leaves it, or as a host from before the timer existed has it (not installed).
+fn set_backup_timer(fx: &Fx, state: Option<(&str, &str)>) {
+    match state {
+        Some((enabled, active)) => fx.unit("propolis-backup.timer", enabled, active),
+        None => {
+            for dir in ["enabled", "active"] {
+                let _ = std::fs::remove_file(fx.p(&format!("state/{dir}/propolis-backup.timer")));
+            }
+        }
+    }
+}
+
+const BACKUP_TIMER_STATES: [Option<(&str, &str)>; 3] = [
+    Some(("enabled", "active")),
+    Some(("disabled", "inactive")),
+    None,
+];
+
+/// The witness runs the installed config-check every hour and records each daily or page finding
+/// it prints. A collector does not run the daemon, so the daemon's alert monitor, the backup of
+/// its database, the live watch of its intake list and the deploy stamp of its install are not
+/// the collector's to report: a healthy collector records nothing, whether install.sh's backup
+/// timer is still enabled, was disabled, or was never installed, and the human report names in
+/// one line what it leaves to the control node.
+#[test]
+fn a_healthy_collectors_installed_config_check_prints_no_daily_or_page_finding() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    for timer in BACKUP_TIMER_STATES {
+        set_backup_timer(&fx, timer);
+        let r = run_installed(&fx, &script, &["--tsv"]);
+        assert!(
+            r.out.starts_with("#config-check tsv v1\n"),
+            "{}\n{}",
+            r.out,
+            r.err
+        );
+        let recorded = recorded_ids(&r.out);
+        assert!(
+            recorded.is_empty(),
+            "backup timer {timer:?}: a healthy collector records {recorded:?}\n{}",
+            r.out
+        );
+        let text = run_installed(&fx, &script, &[]);
+        assert_eq!(text.code, 0, "backup timer {timer:?}:\n{}", text.out);
+        assert!(
+            !text.has("\nFINDINGS"),
+            "backup timer {timer:?}:\n{}",
+            text.out
+        );
+        let line = report_line(&text, "role: collector;")
+            .unwrap_or_else(|| panic!("no role line:\n{}", text.out));
+        // The host that runs the daemon checks its own monitor, backup and watch; no host
+        // compares this collector's binaries or stamp, so those are named apart, as not checked.
+        let (daemon_host, not_here) = role_line_clauses(line);
+        for part in ["alert monitor", "backup", "live watch"] {
+            assert!(
+                daemon_host.contains(part),
+                "the role line's clause for the host that runs propolis.service names no \
+                 {part}: {line}"
+            );
+        }
+        for part in ["deploy stamp", "binaries"] {
+            assert!(
+                not_here.contains(part),
+                "the role line names no {part} after `not checked here`: {line}"
+            );
+            assert!(
+                !daemon_host.contains(part),
+                "the role line says the host that runs propolis.service checks {part}: {line}"
+            );
+        }
+    }
+}
+
+/// The role line's two clauses: what config-check checks on the host that runs propolis.service,
+/// and what is not checked anywhere (empty when the line has no such clause).
+fn role_line_clauses(line: &str) -> (&str, &str) {
+    let daemon = "checked by config-check on the host that runs propolis.service:";
+    let start = line
+        .find(daemon)
+        .unwrap_or_else(|| panic!("the role line has no `{daemon}` clause: {line}"));
+    let rest = &line[start + daemon.len()..];
+    match rest.find("not checked here") {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    }
+}
+
+/// A gateway-only host does not run the daemon either: it reports none of the daemon's checks,
+/// with the backup timer in any state, and says what it leaves to the control node. Its deploy
+/// stamp is still compared, since nothing shows that a gateway-only host is upgraded by hand.
+#[test]
+fn a_healthy_gateway_only_host_prints_no_daily_or_page_finding_and_names_what_the_control_node_checks()
+ {
+    let fx = Fx::new();
+    healthy_gateway_only_host(&fx);
+    for timer in BACKUP_TIMER_STATES {
+        set_backup_timer(&fx, timer);
+        let r = fx.run(&["--tsv"]);
+        let recorded = recorded_ids(&r.out);
+        assert!(
+            recorded.is_empty(),
+            "backup timer {timer:?}: a healthy gateway-only host records {recorded:?}\n{}",
+            r.out
+        );
+        let ids = tsv_ids(&r.out);
+        assert!(
+            !ids.iter().any(|i| i == "backup-timer"),
+            "backup timer {timer:?}: {ids:?}"
+        );
+        let text = fx.run(&[]);
+        assert_eq!(text.code, 0, "backup timer {timer:?}:\n{}", text.out);
+        let line = report_line(&text, "role: gateway only;")
+            .unwrap_or_else(|| panic!("no role line:\n{}", text.out));
+        let (daemon_host, _) = role_line_clauses(line);
+        for part in ["alert monitor", "backup", "live watch"] {
+            assert!(
+                daemon_host.contains(part),
+                "the role line names no {part}: {line}"
+            );
+        }
+        assert!(!line.contains("deploy stamp"), "{line}");
+        // A gateway-only host is upgraded with deploy/upgrade.sh, which installs every binary:
+        // the line must not say nothing on the host refreshes the ones it does not compare.
+        assert!(!line.contains("refresh"), "{line}");
+        assert!(
+            text.out.contains("deploy-stamp"),
+            "the stamp row is still there:\n{}",
+            text.out
+        );
+    }
+}
+
+/// A finding about the list of sensor logs names the file the list is in, and its fix restarts
+/// whoever reads that file: on a collector the list is PROPOLIS_SHIPPER_SENSOR_LOGS in
+/// shipper.env and the reader is the shipper, so the fix restarts shipper.service and never the
+/// daemon, which a collector does not run. Where the daemon reads the list, the fix is as before.
+#[test]
+fn an_intake_finding_on_a_collector_restarts_the_shipper_and_never_the_daemon() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    let logs = fx.logs();
+    // The ssh entry under a wrong path, and the mqtt log not listed at all.
+    fx.write(
+        "etc/shipper.env",
+        &format!(
+            "PROPOLIS_SHIPPER_SENSOR_LOGS=ssh:{logs}/ssh/other.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl\n"
+        ),
+    );
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    for id in ["intake-wrongpath", "intake-absent"] {
+        let f = json_finding(&v, id);
+        assert!(
+            f["fix"]
+                .as_str()
+                .unwrap()
+                .contains("sudo systemctl restart shipper.service"),
+            "{id}: {f}"
+        );
+    }
+    // No finding about the list, whatever its fix, names the daemon's unit or the live watch's
+    // script on a collector.
+    for f in v["findings"].as_array().unwrap() {
+        let id = f["id"].as_str().unwrap();
+        if id.starts_with("intake-") {
+            let fix = f["fix"].as_str().unwrap();
+            assert!(!fix.contains("propolis.service"), "{id}: {f}");
+            assert!(!fix.contains("watch-env.sh"), "{id}: {f}");
+        }
+    }
+
+    // No list at all, and a misspelt name for it: both are the shipper's file to fix.
+    fx.write("etc/shipper.env", "PROPOLIS_SHIPER_SENSOR_LOGS=x:/y\n");
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    for id in ["intake-none", "intake-name"] {
+        let f = json_finding(&v, id);
+        let fix = f["fix"].as_str().unwrap();
+        assert!(
+            fix.contains("PROPOLIS_SHIPPER_SENSOR_LOGS")
+                && fix.contains("shipper.env")
+                && fix.contains("sudo systemctl restart shipper.service"),
+            "{id}: {f}"
+        );
+        assert!(!fix.contains("propolis.service"), "{id}: {f}");
+    }
+
+    // On a host whose daemon reads the list, the same two findings restart the daemon.
+    let fx = Fx::new();
+    let logs = fx.logs();
+    let env = fx.read("etc/propolis.env").replace(
+        &format!("ssh:{logs}/ssh/events.jsonl"),
+        &format!("ssh:{logs}/ssh/other.jsonl"),
+    );
+    fx.write("etc/propolis.env", &env);
+    let v = fx.json();
+    let f = json_finding(&v, "intake-wrongpath");
     assert!(
-        r.out.starts_with("#config-check tsv v1\n"),
-        "{}\n{}",
-        r.out,
-        r.err
+        f["fix"]
+            .as_str()
+            .unwrap()
+            .contains("sudo systemctl restart propolis.service"),
+        "{f}"
+    );
+}
+
+/// What a collector or a gateway-only host runs itself is still checked there: its sensor units,
+/// the log rotation install.sh enables, the clock, the witness, the env files' modes, the
+/// failure hook every unit names in OnFailure= and the binaries its units run.
+#[test]
+fn a_collector_and_a_gateway_only_host_still_report_their_own_units_rotation_clock_witness_env_files_hook_and_binaries()
+ {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    fx.unit("sensor-ssh.service", "enabled", "inactive");
+    fx.unit("propolis-logrotate.timer", "enabled", "inactive");
+    fx.write("state/ntp_unsynced", "");
+    fx.unit("propolis-witness@hourly.timer", "disabled", "inactive");
+    std::fs::set_permissions(
+        fx.p("etc/shipper.env"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::remove_file(fx.p("sbin/propolis-alert")).unwrap();
+    fx.exec("build/shipper", "exit 2\n");
+    // The shipper's list and cursors: one log the shipper has not saved a cursor for.
+    let ssh = std::fs::canonicalize(fx.p("logs/ssh/events.jsonl")).unwrap();
+    let ssh = ssh.to_str().unwrap().to_string();
+    std::fs::remove_file(fx.p(&format!("state/cursors/{}.json", sha256_hex(&ssh)))).unwrap();
+    let ids = tsv_ids(&run_installed(&fx, &script, &["--tsv"]).out);
+    for id in [
+        "unit-down",
+        "timer",
+        "clock-unsynced",
+        "witness-timer",
+        "env-mode",
+        "ops-failure-hook",
+        "bins-differ",
+        "cursor-missing",
+    ] {
+        assert!(ids.iter().any(|i| i == id), "collector: no {id} in {ids:?}");
+    }
+    for id in DAEMON_HOST_IDS {
+        assert!(!ids.iter().any(|i| i == id), "collector: {id} in {ids:?}");
+    }
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    assert!(
+        v["findings"].as_array().unwrap().iter().any(|f| {
+            f["id"] == "cursor-missing" && f["message"].as_str().unwrap().contains(&ssh)
+        }),
+        "collector: no cursor-missing for {ssh}: {}",
+        v["findings"]
     );
 
-    let elig = witness_eligibility();
-    let mut recorded: Vec<String> = r
-        .out
-        .lines()
-        .filter_map(|l| l.strip_prefix("F\t"))
-        .filter_map(|l| l.split('\t').nth(1))
-        .map(|id| id.split(':').next().unwrap().to_string())
-        .filter(|id| matches!(elig.get(id).map(String::as_str), Some("daily" | "page")))
+    let fx = Fx::new();
+    healthy_gateway_only_host(&fx);
+    fx.unit("propolis-logrotate.timer", "enabled", "inactive");
+    fx.write("state/ntp_unsynced", "");
+    fx.unit("propolis-witness@hourly.timer", "disabled", "inactive");
+    std::fs::set_permissions(
+        fx.p("etc/gateway.env"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::remove_file(fx.p("sbin/propolis-alert")).unwrap();
+    fx.exec("build/gateway", "exit 2\n");
+    // The gateway's spool: a collector directory no intake entry lists.
+    fx.spool("collector-unlisted", 200, NOW - 60);
+    let v = fx.json();
+    let ids: Vec<String> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap().to_string())
         .collect();
-    recorded.sort();
-    recorded.dedup();
     assert!(
-        !recorded.is_empty(),
-        "the collector fixture records nothing: if config-check now checks by role, assert that \
-         here and remove the paragraph's list of standing findings\n{}",
-        r.out
+        v["findings"].as_array().unwrap().iter().any(|f| {
+            f["id"] == "spool-unlisted"
+                && f["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("collector-unlisted")
+        }),
+        "gateway: no spool-unlisted for collector-unlisted: {}",
+        v["findings"]
     );
-    for id in &recorded {
+    for id in [
+        "timer",
+        "clock-unsynced",
+        "witness-timer",
+        "env-mode",
+        "ops-failure-hook",
+        "bins-differ",
+        "spool-unlisted",
+    ] {
+        assert!(ids.iter().any(|i| i == id), "gateway: no {id} in {ids:?}");
+    }
+    for id in DAEMON_HOST_IDS {
+        assert!(!ids.iter().any(|i| i == id), "gateway: {id} in {ids:?}");
+    }
+    assert!(
+        finding_messages(&v)
+            .join("\n")
+            .contains(": gateway (built but not installed"),
+        "{}",
+        v["findings"]
+    );
+}
+
+/// A host whose daemon is enabled, or running though not enabled, is not a collector or a
+/// gateway-only host, whatever env files it has: every check runs again, also when pa_role's own
+/// systemctl query fails and it still answers collector from shipper.env alone.
+#[test]
+fn a_collector_or_gateway_only_host_whose_daemon_is_enabled_or_running_reports_every_check_again() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    for (case, enabled, active, quiet_fails) in [
+        ("enabled", "enabled", "active", false),
+        (
+            "enabled, pa_role still answering collector",
+            "enabled",
+            "active",
+            true,
+        ),
+        (
+            "enabled, stopped, pa_role still answering collector",
+            "enabled",
+            "inactive",
+            true,
+        ),
+        ("started by hand", "disabled", "active", false),
+        // Failed is not stopped: a daemon that dies is still this host's.
+        ("disabled and failed", "disabled", "failed", false),
+    ] {
+        fx.unit("propolis.service", enabled, active);
+        if quiet_fails {
+            fx.write("state/quiet_fails", "");
+        } else {
+            let _ = std::fs::remove_file(fx.p("state/quiet_fails"));
+        }
+        let ids = tsv_ids(&run_installed(&fx, &script, &["--tsv"]).out);
+        for id in DAEMON_HOST_IDS
+            .iter()
+            .copied()
+            .chain(["bins-differ", "stamp-behind"])
+        {
+            assert!(ids.iter().any(|i| i == id), "{case}: no {id} in {ids:?}");
+        }
+        let text = run_installed(&fx, &script, &[]);
         assert!(
-            para.contains(&format!("`{id}`")),
-            "a healthy collector records {id}, which the split deployment page's `What the block \
-             gives a collector.` paragraph does not name:\n{para}\n{}",
+            report_line(&text, "role:").is_none(),
+            "{case}:\n{}",
+            text.out
+        );
+    }
+
+    let fx = Fx::new();
+    healthy_gateway_only_host(&fx);
+    fx.unit("propolis.service", "enabled", "active");
+    let ids = tsv_ids(&fx.run(&["--tsv"]).out);
+    for id in DAEMON_HOST_IDS {
+        assert!(ids.iter().any(|i| i == id), "gateway: no {id} in {ids:?}");
+    }
+    assert!(report_line(&fx.run(&[]), "role:").is_none());
+}
+
+/// A role that cannot be read never hides a finding: with no systemctl to ask (pa_role then finds
+/// no unit enabled and answers collector from shipper.env alone), with a library that has no
+/// pa_role, whose pa_role fails or answers a word that is not a role, and with role unknown, every
+/// check runs as on a host that runs the daemon.
+#[test]
+fn a_host_whose_role_cannot_be_read_reports_every_check() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    let expect = |case: &str, r: &Run| {
+        let ids = tsv_ids(&r.out);
+        for id in DAEMON_HOST_IDS {
+            assert!(
+                ids.iter().any(|i| i == id),
+                "{case}: no {id} in {ids:?}\n{}\n{}",
+                r.out,
+                r.err
+            );
+        }
+    };
+
+    std::fs::rename(fx.p("stubs/systemctl"), fx.p("stubs-systemctl")).unwrap();
+    expect("no systemctl", &run_installed(&fx, &script, &["--tsv"]));
+    let text = run_installed(&fx, &script, &[]);
+    assert!(report_line(&text, "role:").is_none(), "{}", text.out);
+    std::fs::rename(fx.p("stubs-systemctl"), fx.p("stubs/systemctl")).unwrap();
+
+    for (case, body) in [
+        ("no pa_role", "unset -f pa_role\n"),
+        (
+            "pa_role fails after a word",
+            "pa_role() { printf collector; return 1; }\n",
+        ),
+        (
+            "pa_role answers no role",
+            "pa_role() { printf 'collectors'; }\n",
+        ),
+    ] {
+        let lib = fx.p("old-lib/alert-lib.sh");
+        fx.write("old-lib/alert-lib.sh", &format!(". {ALERT_LIB}\n{body}"));
+        let lib = lib.display().to_string();
+        let env = [
+            ("PROPOLIS_CC_REPO_DIR", ""),
+            ("PROPOLIS_CC_ALERT_LIB", lib.as_str()),
+        ];
+        expect(case, &fx.run_script(&script, &["--tsv"], &env));
+        let text = fx.run_script(&script, &[], &env);
+        assert!(
+            report_line(&text, "role:").is_none(),
+            "{case}:\n{}",
+            text.out
+        );
+    }
+
+    std::fs::remove_file(fx.p("etc/shipper.env")).unwrap();
+    expect("role unknown", &run_installed(&fx, &script, &["--tsv"]));
+}
+
+/// The witness and the walk parse --tsv. On a collector a check that was not run prints no F
+/// line, no L line (one of no group the witness knows would keep every finding from resolving)
+/// and no G row in a problem state: its row reads skip, and the S record counts nothing.
+#[test]
+fn a_collectors_tsv_holds_no_finding_limit_or_problem_row_for_a_check_it_left_out() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    set_backup_timer(&fx, Some(("disabled", "inactive")));
+    let r = run_installed(&fx, &script, &["--tsv"]);
+    let lines: Vec<&str> = r.out.lines().collect();
+    assert_eq!(lines[0], "#config-check tsv v1", "{}", r.out);
+    let s: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(&s[..6], &["S", "ok", "0", "0", "0", "0"], "{}", r.out);
+    assert_eq!(lines.last(), Some(&"E\t0"), "{}", r.out);
+    for l in &lines {
+        assert!(
+            !l.starts_with("F\t") && !l.starts_with("L\t"),
+            "{l}\n{}",
             r.out
         );
     }
+    let row = |id: &str| -> String {
+        lines
+            .iter()
+            .find_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                (f[0] == "G" && f.get(1) == Some(&id)).then(|| f[2].to_string())
+            })
+            .unwrap_or_else(|| panic!("no G row {id}:\n{}", r.out))
+    };
+    for id in ["backup", "watcher", "deploy-stamp"] {
+        assert_eq!(row(id), "skip", "{id}:\n{}", r.out);
+    }
+    assert_eq!(row("alerting"), "ok", "{}", r.out);
+    for l in lines.iter().filter(|l| l.starts_with("G\t")) {
+        let state = l.split('\t').nth(2).unwrap();
+        assert!(state == "ok" || state == "skip", "{l}\n{}", r.out);
+    }
+}
+
+/// A collector's hand upgrade installs the sensors and the shipper from the build and leaves the
+/// daemon's binary, propolis-watch and the deploy stamp as install.sh wrote them. The binaries a
+/// unit on the collector runs are still compared and still reported missing, with the collector's
+/// own steps as the fix (deploy/upgrade.sh must not run there); the others and the stamp are the
+/// control node's. With the daemon enabled the whole comparison comes back.
+#[test]
+fn a_collector_compares_only_the_binaries_its_units_run_and_leaves_the_deploy_stamp_to_the_control_node()
+ {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    fx.exec("build/shipper", "exit 2\n");
+    fx.exec("build/propolis-watch", "exit 2\n");
+    std::fs::remove_file(fx.p("bin/sensor-mqtt")).unwrap();
+    std::fs::remove_file(fx.p("bin/propolis")).unwrap();
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    let by_id = |v: &serde_json::Value, id: &str| -> serde_json::Value {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} in {}", v["findings"]))
+    };
+    let differ = by_id(&v, "bins-differ");
+    let msg = differ["message"].as_str().unwrap();
+    assert!(msg.contains(": shipper (built"), "{msg}");
+    assert!(!msg.contains("propolis-watch"), "{msg}");
+    let missing = by_id(&v, "bins-missing");
+    let msg = missing["message"].as_str().unwrap();
+    assert!(msg.contains(": sensor-mqtt (the units"), "{msg}");
+    for f in [&differ, &missing] {
+        assert_eq!(f["fix_kind"], "manual", "{f}");
+        let fix = f["fix"].as_str().unwrap();
+        assert!(fix.contains("docs/operations/split-deployment.md"), "{f}");
+        assert!(!fix.contains("upgrade.sh"), "{f}");
+    }
+    let ids: Vec<&str> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(!ids.iter().any(|i| i.starts_with("stamp-")), "{ids:?}");
+    assert_eq!(global_state(&v, "deploy-stamp"), "skip", "{}", v["global"]);
+
+    fx.unit("propolis.service", "enabled", "active");
+    let v = run_installed(&fx, &script, &["--json"]).json();
+    let msg = by_id(&v, "bins-differ")["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(msg.contains("propolis-watch"), "{msg}");
+    let missing = by_id(&v, "bins-missing");
+    assert!(
+        missing["message"]
+            .as_str()
+            .unwrap()
+            .contains(": propolis sensor-mqtt ("),
+        "{missing}"
+    );
+    assert!(
+        missing["fix"].as_str().unwrap().ends_with("upgrade.sh"),
+        "{missing}"
+    );
+    by_id(&v, "stamp-behind");
+}
+
+/// deploy/backup.sh dumps whatever database DATABASE_URL in propolis.env names, on any host, so a
+/// collector or a gateway-only host that has one still has its backup checked.
+#[test]
+fn a_collector_or_gateway_only_host_with_a_database_url_still_has_its_backup_checked() {
+    let url = "DATABASE_URL=postgres://propolis@db.example.invalid/propolis\n";
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    fx.write("etc/propolis.env", url);
+    set_backup_timer(&fx, Some(("disabled", "inactive")));
+    let ids = tsv_ids(&run_installed(&fx, &script, &["--tsv", "--no-events"]).out);
+    for id in ["backup-never", "backup-timer"] {
+        assert!(ids.iter().any(|i| i == id), "collector: no {id} in {ids:?}");
+    }
+
+    let fx = Fx::new();
+    healthy_gateway_only_host(&fx);
+    fx.write("etc/propolis.env", url);
+    set_backup_timer(&fx, Some(("disabled", "inactive")));
+    let ids = tsv_ids(&fx.run(&["--tsv", "--no-events"]).out);
+    for id in ["backup-never", "backup-timer"] {
+        assert!(ids.iter().any(|i| i == id), "gateway: no {id} in {ids:?}");
+    }
+}
+
+/// The text of the HOST row `id` in a run's TSV.
+fn tsv_row_text(tsv: &str, id: &str) -> String {
+    tsv.lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0] == "G" && f.get(1) == Some(&id)).then(|| f.get(3).unwrap_or(&"").to_string())
+        })
+        .unwrap_or_else(|| panic!("no G row {id}:\n{tsv}"))
+}
+
+/// The finding `id` of a --json run.
+fn json_finding(v: &serde_json::Value, id: &str) -> serde_json::Value {
+    v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {id} in {}", v["findings"]))
+}
+
+/// deploy/watch-env.sh writes watch.env from PROPOLIS_SENSOR_LOGS in propolis.env, and
+/// deploy/backup.sh dumps the database DATABASE_URL there names, on whatever host they run. So a
+/// host whose propolis.env names either is set up to run the daemon, and is checked in full even
+/// when its daemon is stopped and pa_role reads gateway (a control node with the daemon disabled
+/// or masked) or collector (a single box with a leftover shipper.env).
+#[test]
+fn a_host_whose_propolis_env_configures_the_daemon_is_checked_in_full_though_the_daemon_is_stopped()
+{
+    let setup = |fx: &Fx| {
+        std::fs::remove_file(fx.p("etc/watch.env")).unwrap();
+        std::fs::remove_file(fx.p("home-watch/.ssh/authorized_keys")).unwrap();
+        fx.set_env_line("etc/propolis.env", "PROPOLIS_OPS_ENABLED=", None);
+        fx.exec("build/propolis", "exit 2\n");
+    };
+    let expect = |case: &str, fx: &Fx| {
+        let r = fx.run(&["--tsv"]);
+        let ids = tsv_ids(&r.out);
+        for id in [
+            "watch-env-missing",
+            "watch-key-missing",
+            "ops-monitor-off",
+            "bins-differ",
+        ] {
+            assert!(
+                ids.iter().any(|i| i == id),
+                "{case}: no {id} in {ids:?}\n{}",
+                r.out
+            );
+        }
+        let v = fx.json();
+        assert!(
+            json_finding(&v, "bins-differ")["message"]
+                .as_str()
+                .unwrap()
+                .contains("propolis"),
+            "{case}: {}",
+            v["findings"]
+        );
+        let text = fx.run(&[]);
+        assert!(
+            report_line(&text, "role:").is_none(),
+            "{case}:\n{}",
+            text.out
+        );
+    };
+
+    // A control node whose daemon is stopped: pa_role reads gateway.
+    for daemon in ["disabled", "masked"] {
+        let fx = Fx::new();
+        setup(&fx);
+        fx.unit("gateway.service", "enabled", "active");
+        fx.unit("propolis.service", daemon, "inactive");
+        expect(&format!("control node, daemon {daemon}"), &fx);
+    }
+
+    // A single box with a shipper.env left behind: pa_role reads collector.
+    let fx = Fx::new();
+    setup(&fx);
+    fx.write(
+        "etc/shipper.env",
+        &format!(
+            "PROPOLIS_SHIPPER_SENSOR_LOGS=ssh:{}/ssh/events.jsonl\n",
+            fx.logs()
+        ),
+    );
+    fx.unit("propolis.service", "disabled", "inactive");
+    expect("single box with a leftover shipper.env", &fx);
+
+    // Either setting alone is enough.
+    let fx = Fx::new();
+    setup(&fx);
+    fx.unit("gateway.service", "enabled", "active");
+    fx.unit("propolis.service", "disabled", "inactive");
+    fx.set_env_line("etc/propolis.env", "DATABASE_URL=", None);
+    expect("intake list only", &fx);
+}
+
+/// Where a collector has no propolis.env at all, nothing on it configures the daemon: the
+/// daemon's checks are left out as with provisioning's empty file.
+#[test]
+fn a_collector_without_a_propolis_env_leaves_the_daemons_checks_out() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    std::fs::remove_file(fx.p("etc/propolis.env")).unwrap();
+    let ids = tsv_ids(&run_installed(&fx, &script, &["--tsv"]).out);
+    for id in DAEMON_HOST_IDS {
+        assert!(!ids.iter().any(|i| i == id), "{id} in {ids:?}");
+    }
+    let text = run_installed(&fx, &script, &[]);
+    assert!(
+        report_line(&text, "role: collector;").is_some(),
+        "{}",
+        text.out
+    );
+}
+
+/// deploy/alert.sh, the failure hook every unit on a collector names in OnFailure=, posts each
+/// unit failure to the PROPOLIS_OPS_NTFY_* target in this host's own propolis.env, whatever the
+/// role. So the alerting row says where the hook posts, or that it writes to the journal only,
+/// and leaves to the control node only the daemon's monitor and heartbeat. A URL is shown without
+/// any user name or password it carries.
+#[test]
+fn a_collectors_alerting_row_names_where_its_failure_hook_posts() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    fx.write(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t\n",
+    );
+    let r = run_installed(&fx, &script, &["--tsv"]);
+    let row = tsv_row_text(&r.out, "alerting");
+    assert!(row.contains("http://ntfy.example.invalid"), "{row}");
+    assert!(!row.contains("push target"), "{row}");
+    assert!(!row.contains("journal only"), "{row}");
+    assert!(
+        row.contains("monitor and heartbeat are checked on the control node"),
+        "{row}"
+    );
+    let ids = tsv_ids(&r.out);
+    for id in DAEMON_HOST_IDS {
+        assert!(!ids.iter().any(|i| i == id), "{id} in {ids:?}");
+    }
+
+    // Of the URL the report shows the scheme and the host only: a user name and password, a
+    // path (a topic written into the URL) and a query (ntfy takes a token there) stay in the file.
+    fx.write(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://ops:s3cret@ntfy.example.invalid:8443/pathpart?auth=tok3n\nPROPOLIS_OPS_NTFY_TOPIC=t\n",
+    );
+    for mode in ["--tsv", "--json"] {
+        let r = run_installed(&fx, &script, &[mode]);
+        assert!(
+            r.out.contains("https://ntfy.example.invalid:8443 "),
+            "{mode}: {}",
+            r.out
+        );
+        for part in ["s3cret", "ops:", "pathpart", "tok3n", "auth="] {
+            assert!(!r.out.contains(part), "{mode}: {part} in {}", r.out);
+        }
+    }
+    // A value that is not a plain URL of that form is not shown at all.
+    fx.write(
+        "etc/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid/pathpart\nPROPOLIS_OPS_NTFY_TOPIC=t\n",
+    );
+    let r = run_installed(&fx, &script, &["--tsv"]);
+    let row = tsv_row_text(&r.out, "alerting");
+    assert!(
+        row.contains("it posts unit failures to the target"),
+        "{row}"
+    );
+    assert!(!r.out.contains("pathpart"), "{}", r.out);
+
+    fx.write("etc/propolis.env", "");
+    let row = tsv_row_text(&run_installed(&fx, &script, &["--tsv"]).out, "alerting");
+    assert!(row.contains("journal only"), "{row}");
+    assert!(!row.contains("ntfy.example.invalid"), "{row}");
+}
+
+/// A collector has no upgrade script of its own, so a missing failure hook there names the
+/// collector's written steps, and its message does not speak of a daemon the host does not run.
+/// A gateway-only host is upgraded with deploy/upgrade.sh, which installs the hook.
+#[test]
+fn a_missing_failure_hook_names_the_collectors_steps_on_a_collector_and_the_upgrade_script_on_a_gateway_only_host()
+ {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    std::fs::remove_file(fx.p("sbin/propolis-alert")).unwrap();
+    let f = json_finding(
+        &run_installed(&fx, &script, &["--json"]).json(),
+        "ops-failure-hook",
+    );
+    assert_eq!(f["fix_kind"], "manual", "{f}");
+    let fix = f["fix"].as_str().unwrap();
+    assert!(fix.contains("docs/operations/split-deployment.md"), "{f}");
+    assert!(!fix.contains("upgrade.sh"), "{f}");
+    let message = f["message"].as_str().unwrap();
+    assert!(!message.contains("(the daemon included)"), "{f}");
+    // The witness on this host still records a unit it samples as failed, hook or no hook.
+    assert!(!message.contains("not recorded"), "{f}");
+
+    let fx = Fx::new();
+    healthy_gateway_only_host(&fx);
+    fx.exec("repo/deploy/upgrade.sh", "exit 0\n");
+    std::fs::remove_file(fx.p("sbin/propolis-alert")).unwrap();
+    let f = json_finding(&fx.json(), "ops-failure-hook");
+    assert!(f["fix"].as_str().unwrap().ends_with("upgrade.sh"), "{f}");
+    assert_ne!(f["fix_kind"], "manual", "{f}");
+}
+
+/// A gateway-only host is upgraded with deploy/upgrade.sh, so a binary of its own that differs
+/// from the build names that script; only a collector's fix is its written steps.
+#[test]
+fn a_gateway_only_hosts_differing_binary_names_the_upgrade_script() {
+    let fx = Fx::new();
+    healthy_gateway_only_host(&fx);
+    fx.exec("repo/deploy/upgrade.sh", "exit 0\n");
+    fx.exec("build/gateway", "exit 2\n");
+    let f = json_finding(&fx.json(), "bins-differ");
+    assert!(f["fix"].as_str().unwrap().ends_with("upgrade.sh"), "{f}");
+    assert_ne!(f["fix_kind"], "manual", "{f}");
+}
+
+/// systemd reports a unit that cannot be started as masked, and a unit with no file as
+/// not-found: on a collector either leaves the daemon's checks out, as disabled does.
+#[test]
+fn a_collector_whose_daemon_unit_is_masked_or_not_installed_leaves_the_daemons_checks_out() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    for case in ["masked", "not installed"] {
+        if case == "masked" {
+            fx.unit("propolis.service", "masked", "inactive");
+        } else {
+            for dir in ["enabled", "active"] {
+                std::fs::remove_file(fx.p(&format!("state/{dir}/propolis.service"))).unwrap();
+            }
+        }
+        let ids = tsv_ids(&run_installed(&fx, &script, &["--tsv"]).out);
+        for id in DAEMON_HOST_IDS {
+            assert!(!ids.iter().any(|i| i == id), "{case}: {id} in {ids:?}");
+        }
+        let text = run_installed(&fx, &script, &[]);
+        assert!(
+            report_line(&text, "role: collector;").is_some(),
+            "{case}:\n{}",
+            text.out
+        );
+    }
+}
+
+/// A propolis.env this run cannot read is not known to configure no daemon: the host is checked
+/// in full, its backup included, and no role line claims a check was left out.
+#[test]
+fn a_collector_whose_propolis_env_cannot_be_read_is_checked_in_full() {
+    let fx = Fx::new();
+    let script = healthy_collector(&fx);
+    let penv = fx.p("etc/propolis.env");
+    // Root reads through any mode, so as root the run drops to nobody, with the fixture's own
+    // directories opened for traversal and propolis.env left root's at 0600.
+    let wrapper: Vec<&str> = if is_root() {
+        std::fs::set_permissions(fx.p(""), std::fs::Permissions::from_mode(0o755)).unwrap();
+        vec![
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+        ]
+    } else {
+        std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o000)).unwrap();
+        vec![]
+    };
+    let env = [("PROPOLIS_CC_REPO_DIR", ""), ("PROPOLIS_CC_EUID", "1000")];
+    let r = fx.run_script_under(&script, &wrapper, &["--tsv"], &env);
+    let text = fx.run_script_under(&script, &wrapper, &[], &env);
+    std::fs::set_permissions(&penv, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let backup = r
+        .out
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0] == "G" && f.get(1) == Some(&"backup")).then(|| f[2].to_string())
+        })
+        .unwrap_or_else(|| panic!("no G row backup:\n{}\n{}", r.out, r.err));
+    assert_ne!(backup, "skip", "{}", r.out);
+    assert!(
+        report_line(&text, "role:").is_none(),
+        "{}\n{}",
+        text.out,
+        text.err
+    );
 }
 
 #[test]

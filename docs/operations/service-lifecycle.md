@@ -340,6 +340,30 @@ systemctl enable --now` both), and a warning on the row when `/run/propolis-witn
 because the tmpfiles entry was not applied. The witness's hourly pass runs this check and records
 its findings ([health and observability](health-and-observability.md#finding)).
 
+**By role.** The check asks the host's role once (`deploy/alert-lib.sh#pa_role`). A collector or
+a gateway-only host runs no daemon when no `propolis.service` is enabled or running there and its
+`propolis.env` configures no daemon: the file is absent, or names neither `DATABASE_URL` (which
+`deploy/backup.sh` would dump) nor `PROPOLIS_SENSOR_LOGS` (which `deploy/watch-env.sh` would copy
+into `watch.env`). On such a host the check leaves out what exists only beside the daemon: the
+`alerting` row keeps the failure hook (`ops-failure-hook`) and says where it posts unit failures
+(the `PROPOLIS_OPS_NTFY_*` target in this host's `propolis.env`, which `deploy/alert.sh` reads
+whatever the role) or that it writes to the journal only, while the daemon's monitor and heartbeat
+are left out; the `backup` row reads skip; the `watcher` row reads skip, since `propolis-watch`
+follows the daemon's intake list; the `binaries` row compares only the binaries an enabled unit of
+the host runs; and on a collector the `deploy-stamp` row reads skip, since its hand upgrade writes
+no stamp, and the fix for a missing or stale binary or failure hook is the collector's upgrade
+steps in [split deployment](split-deployment.md), not `deploy/upgrade.sh`. After the HOST rows the
+report prints one line, starting `role: collector;` or `role: gateway only;`, that names the
+daemon's checks as checked by config-check on the host that runs `propolis.service`, and as not
+checked here the binaries no unit on the host runs and, on a collector, the deploy stamp its
+upgrade steps do not write: no other host compares those for this one. A finding about the list
+of sensor logs names the file the list is in and restarts whoever reads it: `shipper.service` for
+`shipper.env`, the daemon for `propolis.env`. Nothing is left out on a single box, a
+control node, a host whose `propolis.env` names the daemon's database or intake list or cannot be
+read, or a host whose role cannot be told: a library that cannot answer, no `systemctl`, or a
+`propolis.service` that is enabled, running, failed or not answered for runs every check.
+`--json` and `--tsv` carry the skipped rows as `skip` and print no finding for them.
+
 **Env lines systemd and the shell scripts read differently.** For every `DATABASE_URL` and
 `PROPOLIS_*` setting in a readable `*.env`, the line systemd's `EnvironmentFile=` uses (the last
 assignment) is checked for the forms on which systemd and the shell readers (`deploy/alert.sh`,

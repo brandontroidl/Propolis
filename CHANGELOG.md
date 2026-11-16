@@ -21,13 +21,35 @@
   hand upgrade refreshed, and the hook records the failure under `/var/lib/propolis/witness` and
   writes its journal line; the witness records what it finds there and writes the login banner;
   `sudo propolis-status` shows the collector's own stages; and the installed config-check runs
-  every hour. That check does not yet know a collector from the control node, so on a collector
-  it reports `ops-monitor-off`, `ops-no-push`, `ops-no-heartbeat`, `backup-never`,
-  `watch-env-missing` and `watch-key-missing`, which the witness keeps open as NOTICE records,
-  and the walk exits 1; the page says why, and that their fixes are for the control node. A
-  collector sends no message: there is no target on a collector, so nothing it records leaves the
-  host. On a collector that did not run it, nothing changes. A collector set up fresh already has
+  every hour, reporting only what a collector runs (see the next entry). A collector sends no
+  message: the page keeps `PROPOLIS_OPS_*`, the failure hook's push target, out of a collector's
+  `propolis.env`, so nothing it records leaves the host. On a collector that did not run it, nothing changes. A collector set up fresh already has
   these files from `deploy/install.sh`. A test checks the block against `deploy/upgrade.sh`.
+- **Split deployments: config-check reports what applies to the host's role.** On a collector or
+  a gateway-only host with no `propolis.service` enabled or running and a `propolis.env` that
+  configures no daemon (absent, or naming neither `DATABASE_URL` nor `PROPOLIS_SENSOR_LOGS`),
+  config-check, by hand and every hour under the witness, no longer reports the daemon's alert
+  monitor, push target and heartbeat (`ops-monitor-off`, `ops-no-push`, `ops-no-heartbeat`), the
+  backup (`backup-never`, and `backup-timer` where the timer was disabled or never installed),
+  the live watch (`watch-env-missing`, `watch-env-empty`, `watch-key-missing`), or binaries no
+  unit on the host runs; on a collector it also leaves out the deploy stamp (`stamp-behind` after
+  a hand upgrade). Those rows read `skip`, and one `role:` line in the report names the daemon's
+  checks as checked by config-check on the host that runs `propolis.service`, and the binaries
+  and the deploy stamp as not checked here. The `alerting` row still checks the failure hook and
+  says where it posts unit failures: the `PROPOLIS_OPS_NTFY_*` target in the host's own
+  `propolis.env`, which `deploy/alert.sh` reads whatever the role (of its URL the report shows
+  the scheme and host only), or the journal only. A finding about the list of sensor logs on a
+  collector now tells the operator to restart `shipper.service`, which reads that list from
+  `shipper.env`, where it used to say to restart the daemon. A host
+  whose `propolis.env` names the daemon's database or intake list, or cannot be read, is checked
+  in full whatever its role. A collector still reports its sensors, the
+  shipper's list and cursors, rotation, the clock, the env files, the failure hook, the witness
+  and the binaries its units run, and a missing one there names the collector's upgrade steps as
+  the fix instead of `deploy/upgrade.sh`. After upgrading, a healthy collector's report and the
+  walk's `CHECK` line show no finding, the walk exits 0 there, and the NOTICE records the witness
+  kept for these ids resolve by its existing rule, after two completed hourly passes that no
+  longer print them. Nothing changes on a single box, a control
+  node or a host whose role cannot be told. Nothing is sent and no setting is added.
 - **The witness now records the public push, the backups, quiet collectors and the gateway's and
   the shipper's journal lines, and `deploy/backup-serve.sh` logs each file it serves. Nothing is
   sent.** After the upgrade, every light pass (as root, before it takes the state lock, each read

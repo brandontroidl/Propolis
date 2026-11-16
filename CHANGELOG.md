@@ -4,6 +4,30 @@
 
 ### Upgrade note
 
+- **Split deployments: a collector now gets the failure hook, the status walk, the root witness
+  and the installed config-check, from a block of commands on the split deployment page.**
+  Collectors are upgraded by hand and never run `deploy/upgrade.sh`, so when upgrading a
+  collector by hand, run the collector block under "Upgrading" in
+  `docs/operations/split-deployment.md` after `./deploy/provision.sh` and before the restarts,
+  as the page now shows, as root from the top of the checkout, on this and every later hand
+  upgrade. It installs the same files to the same places, with the same modes and owners, as
+  `deploy/upgrade.sh`, writes `/usr/local/lib/propolis/repo-dir` and `install-bins` the way it
+  does, reloads systemd, sets a 30-minute maintenance window for the restarts and enables
+  `propolis-witness@light.timer` and `propolis-witness@hourly.timer`; the page's steps then
+  restart the sensors and the shipper, end the window with `propolis-status --maint 0` (or put
+  back a manual window that was already running) and run `sudo propolis-status`. On a collector
+  that ran it: a sensor that fails runs the current hook its unit names
+  (`OnFailure=propolis-alert@%n.service`), not the copy `deploy/install.sh` left there, which no
+  hand upgrade refreshed, and the hook records the failure under `/var/lib/propolis/witness` and
+  writes its journal line; the witness records what it finds there and writes the login banner;
+  `sudo propolis-status` shows the collector's own stages; and the installed config-check runs
+  every hour. That check does not yet know a collector from the control node, so on a collector
+  it reports `ops-monitor-off`, `ops-no-push`, `ops-no-heartbeat`, `backup-never`,
+  `watch-env-missing` and `watch-key-missing`, which the witness keeps open as NOTICE records,
+  and the walk exits 1; the page says why, and that their fixes are for the control node. A
+  collector sends no message: there is no target on a collector, so nothing it records leaves the
+  host. On a collector that did not run it, nothing changes. A collector set up fresh already has
+  these files from `deploy/install.sh`. A test checks the block against `deploy/upgrade.sh`.
 - **The witness now records the public push, the backups, quiet collectors and the gateway's and
   the shipper's journal lines, and `deploy/backup-serve.sh` logs each file it serves. Nothing is
   sent.** After the upgrade, every light pass (as root, before it takes the state lock, each read

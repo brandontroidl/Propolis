@@ -5920,6 +5920,125 @@ fn the_installed_copy_prints_checkout_paths_and_reads_its_own_bin_list() {
     assert_eq!(s.split('\t').nth(8), Some("1"), "installed flag: {s}");
 }
 
+/// deploy/witness.sh#WITNESS_CC_TABLE as id to eligibility (`page`, `daily` or `never`).
+fn witness_eligibility() -> BTreeMap<String, String> {
+    let witness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/witness.sh"
+    ))
+    .unwrap();
+    let start = witness
+        .find("WITNESS_CC_TABLE='\n")
+        .expect("deploy/witness.sh has WITNESS_CC_TABLE")
+        + "WITNESS_CC_TABLE='\n".len();
+    let end = start + witness[start..].find("\n'\n").unwrap();
+    witness[start..end]
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('|');
+            Some((f.next()?.to_string(), f.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// A healthy collector as deploy/install.sh and the hand upgrade leave it: provisioning's empty
+/// propolis.env, the shipper's list in shipper.env with a cursor for every log, the
+/// propolis-watch account with neither a watch.env (watch-env.sh writes none without
+/// PROPOLIS_SENSOR_LOGS) nor a key, and the nightly backup recording `not configured`. The
+/// installed config-check does not check by role yet, so the witness keeps what it reports here
+/// open as NOTICE records, and the split deployment page must name each one so an operator does
+/// not act on fixes meant for the control node. Once config-check skips these checks on a
+/// collector (pa_role), this test must instead assert that no daily or page id is reported, and
+/// the page's paragraph goes.
+#[test]
+fn every_finding_a_healthy_collector_records_is_named_on_the_split_deployment_page() {
+    use sha2::{Digest, Sha256};
+    let page = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/operations/split-deployment.md"
+    ))
+    .unwrap();
+    let para_start = page
+        .find("What the block gives a collector.")
+        .expect("split-deployment.md has no `What the block gives a collector.` paragraph");
+    let para = page[para_start..].split("\n\n").next().unwrap().to_string();
+
+    let fx = Fx::new();
+    let logs = fx.logs();
+    fx.write("etc/propolis.env", "");
+    // The shipper's cursors in the directory every run of this file reads them from
+    // (PROPOLIS_CC_CURSOR_DIR), as the default directory is on a collector.
+    fx.write(
+        "etc/shipper.env",
+        &format!(
+            "PROPOLIS_SHIPPER_SENSOR_LOGS=ssh:{logs}/ssh/events.jsonl,mqtt:{logs}/mqtt/events.jsonl,dns:{logs}/dns/events.jsonl,tftp:{logs}/tftp/events.jsonl,cred-pg:{logs}/cred/postgresql.jsonl\n"
+        ),
+    );
+    for rel in [
+        "logs/ssh/events.jsonl",
+        "logs/mqtt/events.jsonl",
+        "logs/dns/events.jsonl",
+        "logs/tftp/events.jsonl",
+        "logs/cred/postgresql.jsonl",
+    ] {
+        let resolved = std::fs::canonicalize(fx.p(rel)).unwrap();
+        let hash: String = Sha256::digest(resolved.to_str().unwrap().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        fx.write(&format!("state/cursors/{hash}.json"), "{}");
+    }
+    fx.unit("shipper.service", "enabled", "active");
+    std::fs::remove_file(fx.p("etc/watch.env")).unwrap();
+    std::fs::remove_file(fx.p("home-watch/.ssh/authorized_keys")).unwrap();
+    std::fs::remove_file(fx.p("state/backup-status/last-success")).unwrap();
+    fx.write(
+        "state/backup-status/last-failure",
+        "{\"failed_at\":\"2027-01-15T03:00:00Z\",\"reason\":\"scheduled\",\"step\":\"not configured: no DATABASE_URL in /etc/propolis/propolis.env\",\"exit_code\":0}\n",
+    );
+    // install-bins as the collector block writes it: upgrade.sh's own line, every binary
+    // install.sh put in place.
+    let script = install_copy(&fx, Some(&format!("{}\n", fx.p("repo").display())));
+    std::fs::write(
+        fx.p("lib/install-bins"),
+        format!("INSTALL_BINS=({})\n", install_bins().join(" ")),
+    )
+    .unwrap();
+    let r = run_installed(&fx, &script, &["--tsv"]);
+    assert!(
+        r.out.starts_with("#config-check tsv v1\n"),
+        "{}\n{}",
+        r.out,
+        r.err
+    );
+
+    let elig = witness_eligibility();
+    let mut recorded: Vec<String> = r
+        .out
+        .lines()
+        .filter_map(|l| l.strip_prefix("F\t"))
+        .filter_map(|l| l.split('\t').nth(1))
+        .map(|id| id.split(':').next().unwrap().to_string())
+        .filter(|id| matches!(elig.get(id).map(String::as_str), Some("daily" | "page")))
+        .collect();
+    recorded.sort();
+    recorded.dedup();
+    assert!(
+        !recorded.is_empty(),
+        "the collector fixture records nothing: if config-check now checks by role, assert that \
+         here and remove the paragraph's list of standing findings\n{}",
+        r.out
+    );
+    for id in &recorded {
+        assert!(
+            para.contains(&format!("`{id}`")),
+            "a healthy collector records {id}, which the split deployment page's `What the block \
+             gives a collector.` paragraph does not name:\n{para}\n{}",
+            r.out
+        );
+    }
+}
+
 #[test]
 fn an_installed_copy_without_repo_dir_turns_checkout_fixes_manual() {
     let fx = Fx::new();

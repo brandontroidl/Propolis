@@ -117,9 +117,14 @@ sudo install -m 0755 target/release/gateway /usr/local/bin/gateway
 sudo install -m 0755 target/release/shipper /usr/local/bin/shipper
 ```
 
-`install.sh` enables nothing, and neither host should enable what belongs to the other role: no
-sensor units on the control plane, and on the collector neither `propolis.service` nor an
-`/etc/propolis/propolis.env`, which is where the database credential would live.
+`install.sh` enables no service, only its timers (log rotation, the backup and the root witness's
+two), and neither host should enable what belongs to the other role: no
+sensor units on the control plane, and on the collector no `propolis.service`.
+`./deploy/provision.sh` creates `/etc/propolis/propolis.env` empty on every host; on a collector
+it stays empty, since that file is where the database credential would live. The backup
+timer (`propolis-backup.timer`) stays enabled on a collector: there `deploy/backup.sh` finds no
+`DATABASE_URL`, records `not configured` each night and exits 0, while a disabled timer makes
+the installed config-check report `backup-timer`, which the witness opens as an ACT record.
 
 ## 2. Create the certificates
 
@@ -330,6 +335,11 @@ files expect it to match the shipper's. Then:
    sudo systemctl enable --now shipper.service
    ```
 
+`deploy/install.sh` in step 1 already put the failure hook, the status walk, the root witness with
+its two timers (and enabled both) and the installed config-check on this host: the same files the
+collector block under [Upgrading](#upgrading) installs. A collector set up from an earlier release
+gets them from that block.
+
 The two hosts can come up in either order, and intake waits for the spool file to appear. The
 shipper keeps trying for as long as the gateway is unreachable: each pass tries one connection per
 entry in `PROPOLIS_SHIPPER_SENSOR_LOGS`, then waits one poll interval (1 s by default). A refused
@@ -368,6 +378,21 @@ kernel's TCP connect timeout, because the shipper sets none.
    sudo stat -c %s "$log"
    sudo cat "/var/lib/propolis/shipper/cursors/$(printf '%s' "$log" | sha256sum | cut -d' ' -f1).json"
    ```
+
+6. `sudo propolis-status` on each host walks the pipeline in order and marks the first stage that
+   stopped ([where to look first](health-and-observability.md#where-to-look-first)). On a healthy
+   collector the header names the role `collector`, its own stages (listen, source, ship) read ok
+   (ship reads `idle` while nothing waits to be sent) with the source row ending
+   `all readable by propolis-shipper`, and every stage from the gateway on reads
+   `on the control node: run sudo propolis-status there`. The installed config-check does not
+   yet check by role, so the walk's `CHECK` line on a healthy collector also lists findings that
+   only the control node can clear: `ops-monitor-off`, `ops-no-push`, `ops-no-heartbeat`,
+   `backup-never`, `watch-env-missing` (or `watch-env-empty`), `watch-key-missing` and, after a
+   hand upgrade, `bins-differ` and `stamp-behind`; the walk exits 1 there, and from the second
+   hourly pass on the first six stay open as NOTICE records (the login banner then reads
+   `6 open (PAGE 0, ACT 0)`; before that, `nothing open`). Their fixes are for the control node:
+   on a collector, do not set `PROPOLIS_OPS_*` in `/etc/propolis/propolis.env`, do not start
+   `propolis` and do not run `deploy/upgrade.sh`.
 
 The console's fleet pane can prove the whole path on its own schedule. With the listener probe on,
 the control plane connects to each collector listener, and a row reads ok only when that connect
@@ -453,7 +478,66 @@ PROPOLIS_FLEET_PROBE_SOURCE_IPS=192.0.2.20
   The guard goes in with the policy: the policy calls it before every rotation, so a missing
   guard stops every sensor log from rotating.
 
-  Then restart each enabled sensor unit, and `shipper.service` last.
+  Then, still as root from the top of the checkout, the collector block: the failure hook and its
+  library, the status walk, the root witness with its unit and two timers, the installed
+  config-check with the files it reads beside it, and the hook's unit. Each line puts its file
+  where `deploy/upgrade.sh` puts it, with the same mode and owner; the two piped lines write
+  what `deploy/upgrade.sh#install_generated` writes there (the checkout's path and the binary
+  list). It leaves out what only the control plane uses: the daemon, the database, the backup
+  script and the public feed push. The backup timer that `deploy/install.sh` enabled stays
+  enabled, as step 1 says.
+
+  ```sh
+  install -m 0755 deploy/alert.sh /usr/local/sbin/propolis-alert
+  install -m 0644 deploy/alert-lib.sh /usr/local/sbin/propolis-alert-lib
+  install -m 0755 deploy/propolis-status.sh /usr/local/sbin/propolis-status
+  install -m 0755 deploy/witness.sh /usr/local/sbin/propolis-witness
+  install -m 0644 deploy/propolis-witness@.service /etc/systemd/system/propolis-witness@.service
+  install -m 0644 deploy/propolis-witness@light.timer /etc/systemd/system/propolis-witness@light.timer
+  install -m 0644 deploy/propolis-witness@hourly.timer /etc/systemd/system/propolis-witness@hourly.timer
+  install -d -o root -g root -m 0755 /usr/local/lib/propolis
+  install -o root -g root -m 0755 deploy/config-check.sh /usr/local/lib/propolis/config-check.sh
+  install -o root -g root -m 0644 deploy/listeners-lib.sh /usr/local/lib/propolis/listeners-lib.sh
+  pwd | install -o root -g root -m 0644 /dev/stdin /usr/local/lib/propolis/repo-dir
+  grep -E '^INSTALL_BINS=\(' deploy/upgrade.sh | install -o root -g root -m 0644 /dev/stdin /usr/local/lib/propolis/install-bins
+  install -m 0644 deploy/propolis-alert@.service /etc/systemd/system/propolis-alert@.service
+  systemctl daemon-reload
+  propolis-status --maint 30
+  systemctl enable --now propolis-witness@light.timer
+  systemctl enable --now propolis-witness@hourly.timer
+  ```
+
+  `propolis-status --maint 30` does what `deploy/upgrade.sh` does before its restarts: for 30
+  minutes the witness records the restarts below as planned work, not as failures. It needs
+  `/run/propolis-witness`, which `./deploy/provision.sh` above creates.
+
+  Then restart each enabled sensor unit, and `shipper.service` last. End the window with
+  `propolis-status --maint 0` and run `propolis-status` to see the collector's stages. If a
+  manual window was already running before the block (the walk's `MAINT` line showed it), put it
+  back after the restarts with `propolis-status --maint <minutes left>` instead of `--maint 0`:
+  the block's `--maint 30` replaced it, where `deploy/upgrade.sh` keeps such a window.
+
+  What the block gives a collector. Every sensor unit names the failure hook in
+  `OnFailure=propolis-alert@%n.service`, and `deploy/install.sh` installed the hook in step 1,
+  but the hand upgrade above never refreshed it, so the collector kept running the hook of the
+  release it was set up from. After the block a sensor failure runs the current hook, which also
+  records the failure under `/var/lib/propolis/witness` for the witness and writes its journal
+  line; a collector has no message target, so nothing is sent. The witness's light pass, every
+  five minutes, records what it finds under `/var/lib/propolis/witness` and writes the login
+  banner; its hourly pass runs the installed config-check. `sudo propolis-status` shows the
+  collector's own stages and leaves the rest to the control node (step 5.6). A collector sends no
+  message: what it records stays on the host, in the walk and in the banner. The installed
+  config-check does not yet check by role, so on every collector, freshly set up or upgraded by
+  hand, it reports what only the control node can clear, and the witness records it:
+  `ops-monitor-off`, `ops-no-push` and `ops-no-heartbeat` (the empty
+  `/etc/propolis/propolis.env` that `./deploy/provision.sh` creates), `backup-never` (the
+  nightly `not configured` record), and `watch-env-missing` (or `watch-env-empty`) and
+  `watch-key-missing` (the `propolis-watch` account with no log list and no key) stay open as
+  NOTICE records from the second hourly pass on, so the login banner reads
+  `6 open (PAGE 0, ACT 0)`; `bins-differ` and `stamp-behind` (the binaries and the deploy stamp
+  this hand upgrade does not refresh) appear only on the walk's `CHECK` line; and the walk
+  exits 1. Their fixes are for the control node: on a collector, do not set `PROPOLIS_OPS_*` in
+  `propolis.env`, do not start `propolis` and do not run `deploy/upgrade.sh`.
 
   Until a collector's shipper is upgraded, its sensors' `sensor_stats` counters on the control
   plane are only as trustworthy as its least trusted sensor. The control plane reads the whole
@@ -787,9 +871,9 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
   listed collector whose spool has not been written for longer than twice the longest gap of its
   week (never under half an hour, the week a day old, the gateway up fifteen minutes, and held by
   `sudo propolis-status --maint MINUTES` for a collector off on purpose) and `gateway-dup` for the
-  gateway's dropped-batch line; on a collector where the witness runs (this page does not give the
-  steps to install it there yet) it opens `ship-failing` for shipper errors on three passes in a
-  row. The walk shows each
+  gateway's dropped-batch line; on a collector (`deploy/install.sh` installs the witness on a new
+  collector, and the collector block under [Upgrading](#upgrading) on one set up from an earlier
+  release) it opens `ship-failing` for shipper errors on three passes in a row. The walk shows each
   ([health and observability](health-and-observability.md#spool-quiet)).
 - The ledger does not record which collector an event came from, and the fleet pane matches probe
   lines and event age by sensor name, so two collectors running the same sensor cannot be told

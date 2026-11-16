@@ -1311,6 +1311,91 @@ fn an_idle_collector_with_nothing_unread_is_not_marked() {
     assert_eq!(r.state("ship"), "idle", "{}", r.out);
 }
 
+/// Step 5 item 6 of the split deployment page quotes what the walk prints on a healthy collector
+/// and names the findings the installed config-check reports there today. Each quoted phrase must
+/// still be what the walk prints, so a change of wording in the walk fails here instead of
+/// leaving the page describing output nobody sees.
+#[test]
+fn the_walk_on_a_healthy_collector_prints_what_the_split_deployment_page_quotes() {
+    let page = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/operations/split-deployment.md"
+    ))
+    .unwrap();
+    let start = page
+        .find("\n6. `sudo propolis-status` on each host")
+        .expect("split-deployment.md step 5 has no item 6 on sudo propolis-status");
+    let item: String = page[start + 1..]
+        .lines()
+        .take_while(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fx = Fx::collector();
+    let ssh = fx.p("var/log/propolis/ssh/events.jsonl");
+    fx.cursor("var/lib/propolis/shipper/cursors", &ssh, 100, NOW - 4000);
+    // What the installed config-check reports on every collector until it checks by role.
+    let standing = [
+        ("warn", "ops-monitor-off", "alerting"),
+        ("warn", "ops-no-push", "alerting"),
+        ("warn", "ops-no-heartbeat", "alerting"),
+        ("warn", "backup-never", "backup"),
+        ("fail", "watch-env-missing", "watcher"),
+        ("warn", "watch-key-missing", "watcher"),
+        ("warn", "bins-differ", "binaries"),
+        ("warn", "stamp-behind", "deploy-stamp"),
+    ];
+    fx.tsv(&standing);
+    let r = fx.walk();
+    for phrase in [
+        "collector",
+        "idle",
+        "all readable by propolis-shipper",
+        "on the control node: run sudo propolis-status there",
+    ] {
+        assert!(
+            item.contains(&format!("`{phrase}`")),
+            "item 6 no longer quotes `{phrase}`: {item}"
+        );
+        assert!(
+            r.out.contains(phrase),
+            "item 6 quotes `{phrase}`, which the walk on a collector does not print:\n{}",
+            r.out
+        );
+    }
+    assert!(r.out.contains(" = honeybox - collector - "), "{}", r.out);
+    assert_eq!(r.state("ship"), "idle", "{}", r.out);
+    assert!(
+        r.row("source").contains("all readable by propolis-shipper"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.row("gateway")
+            .contains("on the control node: run sudo propolis-status there"),
+        "{}",
+        r.out
+    );
+    assert_eq!(r.marked(), None, "{}", r.out);
+    let check = r
+        .out
+        .lines()
+        .find(|l| l.starts_with("CHECK "))
+        .unwrap_or_else(|| panic!("no CHECK line:\n{}", r.out));
+    for (_, id, _) in standing {
+        assert!(check.contains(id), "{id} not on the CHECK line: {check}");
+        assert!(
+            item.contains(&format!("`{id}`")),
+            "item 6 does not name `{id}`, which the walk lists on a collector: {item}"
+        );
+    }
+    assert_eq!(
+        r.code, 1,
+        "item 6 says the walk exits 1 on a collector with these findings:\n{}",
+        r.out
+    );
+    assert!(item.contains("exits 1"), "{item}");
+}
+
 #[test]
 fn an_unlisted_spool_is_marked_at_the_gateway() {
     let fx = Fx::control();

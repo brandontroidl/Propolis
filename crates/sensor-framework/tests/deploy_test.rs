@@ -2139,6 +2139,644 @@ fn unit_install_loop_members(script: &str) -> HashSet<String> {
         .collect()
 }
 
+/// One `install` command split into its parts: owner and group (`-o`, `-g`), mode (`-m`),
+/// whether it makes a directory (`-d`), and the remaining words with their quotes removed.
+#[derive(Debug, Default, PartialEq)]
+struct InstallCmd {
+    owner: Option<String>,
+    group: Option<String>,
+    mode: Option<String>,
+    dir: bool,
+    args: Vec<String>,
+}
+
+fn parse_install(cmd: &str) -> Option<InstallCmd> {
+    let mut words = cmd.split_whitespace().map(|w| w.trim_matches('"'));
+    if words.next()? != "install" {
+        return None;
+    }
+    let mut out = InstallCmd::default();
+    while let Some(w) = words.next() {
+        match w {
+            "-o" => out.owner = words.next().map(str::to_string),
+            "-g" => out.group = words.next().map(str::to_string),
+            "-m" => out.mode = words.next().map(str::to_string),
+            "-d" => out.dir = true,
+            other => out.args.push(other.to_string()),
+        }
+    }
+    Some(out)
+}
+
+/// What upgrade.sh installs from `deploy/`: source file name to its install command, with the
+/// loop variable of a `for unit in ...; do` loop put back for each name the loop lists. Also
+/// the directories it makes and the files it writes through `install_generated`, with the
+/// command each is generated from, and the `install` command inside `install_generated` that
+/// gives each generated file its owner, group and mode.
+struct UpgradeInstalls {
+    files: std::collections::HashMap<String, InstallCmd>,
+    dirs: Vec<InstallCmd>,
+    generated: std::collections::HashMap<String, String>,
+    generated_install: Option<InstallCmd>,
+}
+
+fn upgrade_installs(upgrade: &str) -> UpgradeInstalls {
+    let mut files = std::collections::HashMap::new();
+    let mut dirs = Vec::new();
+    let mut generated = std::collections::HashMap::new();
+    let mut generated_install = None;
+    let mut in_generator = false;
+    let mut loop_names: Vec<String> = Vec::new();
+    for line in upgrade.lines().map(str::trim) {
+        if line == "install_generated() {" {
+            in_generator = true;
+            continue;
+        }
+        if in_generator {
+            if line == "}" {
+                in_generator = false;
+            } else if let Some(at) = line.find("install -o ") {
+                let cmd = line[at..].split(';').next().unwrap_or("");
+                generated_install = parse_install(cmd);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("for unit in ") {
+            loop_names = rest
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            continue;
+        }
+        if line == "done" {
+            loop_names.clear();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("install_generated ") {
+            let (dest, cmd) = rest.split_once(' ').unwrap_or((rest, ""));
+            generated.insert(dest.to_string(), cmd.to_string());
+            continue;
+        }
+        let Some(cmd) = parse_install(line) else {
+            continue;
+        };
+        if cmd.dir {
+            dirs.push(cmd);
+            continue;
+        }
+        let [src, dest] = cmd.args.as_slice() else {
+            continue;
+        };
+        let Some(src) = src.strip_prefix("$SCRIPT_DIR/") else {
+            continue;
+        };
+        if src == "$unit" {
+            for name in &loop_names {
+                files.insert(
+                    name.clone(),
+                    InstallCmd {
+                        args: vec![name.clone(), dest.replace("$unit", name)],
+                        ..cmd_without_args(&cmd)
+                    },
+                );
+            }
+        } else {
+            files.insert(
+                src.to_string(),
+                InstallCmd {
+                    args: vec![src.to_string(), dest.clone()],
+                    ..cmd_without_args(&cmd)
+                },
+            );
+        }
+    }
+    UpgradeInstalls {
+        files,
+        dirs,
+        generated,
+        generated_install,
+    }
+}
+
+fn cmd_without_args(cmd: &InstallCmd) -> InstallCmd {
+    InstallCmd {
+        owner: cmd.owner.clone(),
+        group: cmd.group.clone(),
+        mode: cmd.mode.clone(),
+        dir: cmd.dir,
+        args: Vec::new(),
+    }
+}
+
+/// A fenced block of a Markdown page: the line numbers (from 0) of its opening and closing
+/// fences, and its lines trimmed.
+struct FencedBlock {
+    open: usize,
+    close: usize,
+    lines: Vec<String>,
+}
+
+fn fenced_blocks(doc: &str) -> Vec<FencedBlock> {
+    let mut blocks = Vec::new();
+    let mut current: Option<(usize, Vec<String>)> = None;
+    for (n, line) in doc.lines().enumerate() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            match current.take() {
+                Some((open, lines)) => blocks.push(FencedBlock {
+                    open,
+                    close: n,
+                    lines,
+                }),
+                None => current = Some((n, Vec::new())),
+            }
+            continue;
+        }
+        if let Some((_, b)) = current.as_mut() {
+            b.push(t.to_string());
+        }
+    }
+    blocks
+}
+
+/// The line numbers (from 0) of the page's headings, fenced blocks left out, since a shell
+/// comment in a block also starts with `#`.
+fn heading_lines(doc: &str) -> Vec<(usize, String)> {
+    let mut fenced = false;
+    let mut out = Vec::new();
+    for (n, line) in doc.lines().enumerate() {
+        if line.trim().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if !fenced && line.starts_with('#') {
+            out.push((n, line.to_string()));
+        }
+    }
+    out
+}
+
+fn split_deployment_page() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/operations/split-deployment.md"
+    ))
+    .expect("failed to read docs/operations/split-deployment.md")
+}
+
+/// The one fenced shell block of docs/operations/split-deployment.md that installs the root
+/// witness on a collector.
+fn collector_witness_fenced(doc: &str) -> FencedBlock {
+    let found: Vec<FencedBlock> = fenced_blocks(doc)
+        .into_iter()
+        .filter(|b| {
+            b.lines
+                .iter()
+                .any(|l| l.contains("/usr/local/sbin/propolis-witness"))
+        })
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "docs/operations/split-deployment.md must hold exactly one block that installs \
+         /usr/local/sbin/propolis-witness (the collector's steps), found {}",
+        found.len()
+    );
+    found.into_iter().next().unwrap()
+}
+
+/// The collector block's lines.
+fn collector_witness_block(doc: &str) -> Vec<String> {
+    collector_witness_fenced(doc).lines
+}
+
+/// The paragraph of `doc` (lines joined by spaces, up to the next blank line) whose first line,
+/// trimmed, starts with `start`. Exactly one must.
+fn paragraph_starting(doc: &str, start: &str) -> String {
+    let lines: Vec<&str> = doc.lines().collect();
+    let starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with(start))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "exactly one paragraph must start with {start:?}, found {}",
+        starts.len()
+    );
+    lines[starts[0]..]
+        .iter()
+        .take_while(|l| !l.trim().is_empty())
+        .map(|l| one_line(l))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A collector has no upgrade.sh: its operator pastes the collector block of the split
+/// deployment page instead. That block must put each file where upgrade.sh puts it, with the
+/// same mode and owner, write the two generated files the installed config-check reads, and
+/// reload systemd before it enables the same two witness timers. Otherwise a collector runs a
+/// different set of files from the one every other host runs, and nothing else would notice.
+#[test]
+fn the_collector_block_installs_what_upgrade_sh_installs_and_enables_the_same_witness_timers() {
+    let doc = split_deployment_page();
+    let upgrade = deploy_file("upgrade.sh");
+    let up = upgrade_installs(&upgrade);
+    assert!(
+        up.files.contains_key("witness.sh") && up.files.contains_key("propolis-witness@.service"),
+        "found no witness install in upgrade.sh - this parser is broken"
+    );
+    let gen_install = up
+        .generated_install
+        .as_ref()
+        .expect("found no install command in upgrade.sh#install_generated - this parser is broken");
+    let block = collector_witness_block(&doc);
+
+    let mut installed: HashSet<String> = HashSet::new();
+    let mut generated: HashSet<String> = HashSet::new();
+    let mut last_install = None;
+    let mut reload_at = None;
+    let mut first_enable = None;
+    let mut enabled: HashSet<String> = HashSet::new();
+    // Without -D, GNU install does not make a missing parent: on a collector set up before
+    // /usr/local/lib/propolis existed, every copy into it fails unless the directory comes first.
+    let mut lib_dir_at = None;
+    let mut into_lib_at: Vec<(usize, String)> = Vec::new();
+    let mut maint: Vec<(usize, String)> = Vec::new();
+    for (i, line) in block.iter().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        assert!(
+            !line.ends_with('\\'),
+            "the collector block must hold one command per line, found a continued line: {line}"
+        );
+        for word in ["backup", "blocklist", "migrate", "propolis.service"] {
+            assert!(
+                !line.contains(word),
+                "the collector block must install nothing for the database, the backup or the \
+                 public push, found `{word}` in: {line}"
+            );
+        }
+        let (feed, cmd) = match line.split_once(" | ") {
+            Some((feed, cmd)) => (Some(feed.trim()), cmd.trim()),
+            None => (None, line.as_str()),
+        };
+        if let Some(inst) = parse_install(cmd) {
+            last_install = Some(i);
+            if inst.dir {
+                assert!(
+                    up.dirs.contains(&inst),
+                    "the collector block makes a directory upgrade.sh does not make the same \
+                     way: {line}"
+                );
+                if inst.args == ["/usr/local/lib/propolis"] {
+                    lib_dir_at.get_or_insert(i);
+                }
+                continue;
+            }
+            let [src, dest] = inst.args.as_slice() else {
+                panic!(
+                    "each install line of the collector block names one source and one destination: {line}"
+                );
+            };
+            if dest.starts_with("/usr/local/lib/propolis/") {
+                into_lib_at.push((i, line.clone()));
+            }
+            if src == "/dev/stdin" {
+                let from = up.generated.get(dest).unwrap_or_else(|| {
+                    panic!("upgrade.sh does not generate {dest}, which the collector block writes: {line}")
+                });
+                assert_eq!(
+                    (&inst.owner, &inst.group, &inst.mode),
+                    (&gen_install.owner, &gen_install.group, &gen_install.mode),
+                    "the collector block writes {dest} with another owner, group or mode than \
+                     upgrade.sh#install_generated: {line}"
+                );
+                let feed = feed.unwrap_or_else(|| {
+                    panic!(
+                        "the collector block must pipe the content of {dest} into install: {line}"
+                    )
+                });
+                if dest.ends_with("/install-bins") {
+                    let want = from.replace("\"$SCRIPT_DIR/upgrade.sh\"", "deploy/upgrade.sh");
+                    assert_eq!(
+                        feed, want,
+                        "the collector block must make install-bins with the command upgrade.sh uses"
+                    );
+                } else if dest.ends_with("/repo-dir") {
+                    assert_eq!(
+                        feed, "pwd",
+                        "run from the top of the checkout, `pwd` writes what upgrade.sh writes as repo-dir"
+                    );
+                }
+                generated.insert(dest.clone());
+                continue;
+            }
+            let name = src.strip_prefix("deploy/").unwrap_or_else(|| {
+                panic!(
+                    "each install line of the collector block takes its file from deploy/: {line}"
+                )
+            });
+            assert!(
+                Path::new(&format!(
+                    "{}/../../deploy/{name}",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .is_file(),
+                "the collector block installs deploy/{name}, which does not exist: {line}"
+            );
+            let theirs = up.files.get(name).unwrap_or_else(|| {
+                panic!("upgrade.sh does not install deploy/{name}, which the collector block installs: {line}")
+            });
+            assert_eq!(
+                (&inst.args[1], &inst.mode, &inst.owner, &inst.group),
+                (&theirs.args[1], &theirs.mode, &theirs.owner, &theirs.group),
+                "the collector block installs deploy/{name} with another destination, mode or \
+                 owner than upgrade.sh: {line}"
+            );
+            installed.insert(name.to_string());
+            continue;
+        }
+        if line == "systemctl daemon-reload" {
+            reload_at.get_or_insert(i);
+            continue;
+        }
+        if line.contains("--maint") {
+            maint.push((i, line.clone()));
+            continue;
+        }
+        if let Some(unit) = line.strip_prefix("systemctl enable --now ") {
+            first_enable.get_or_insert(i);
+            enabled.insert(unit.trim().to_string());
+        }
+    }
+
+    // What a collector needs of upgrade.sh's installs: the hook, its library, the walk, the
+    // witness, their units, and everything under /usr/local/lib/propolis but the blocklist
+    // sync, which serves the control plane's public feed. Taken from upgrade.sh, so a file it
+    // starts installing there is a file this block must install too.
+    let mut required: Vec<String> = up
+        .files
+        .iter()
+        .filter(|(_, cmd)| {
+            let dest = cmd.args[1].as_str();
+            let lib_file = dest
+                .strip_prefix("/usr/local/lib/propolis/")
+                .is_some_and(|f| !f.starts_with("blocklist-"));
+            [
+                "/usr/local/sbin/propolis-alert",
+                "/usr/local/sbin/propolis-alert-lib",
+                "/usr/local/sbin/propolis-status",
+                "/usr/local/sbin/propolis-witness",
+            ]
+            .contains(&dest)
+                || lib_file
+                || dest.starts_with("/etc/systemd/system/propolis-alert@")
+                || dest.starts_with("/etc/systemd/system/propolis-witness@")
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    required.sort();
+    assert!(
+        required.len() >= 10,
+        "found only {required:?} for a collector in upgrade.sh - this parser is broken"
+    );
+    for name in &required {
+        assert!(
+            installed.contains(name),
+            "the collector block does not install deploy/{name}, which upgrade.sh installs for \
+             every host"
+        );
+    }
+    assert!(
+        up.generated.len() >= 2,
+        "found {:?} through install_generated in upgrade.sh - this parser is broken",
+        up.generated.keys()
+    );
+    for dest in up.generated.keys() {
+        assert!(
+            generated.contains(dest),
+            "the collector block does not write {dest}, which upgrade.sh#install_generated writes \
+             and the installed config-check reads"
+        );
+    }
+
+    let lib_dir_at = lib_dir_at.expect(
+        "the collector block must make /usr/local/lib/propolis with \
+         `install -d -o root -g root -m 0755 /usr/local/lib/propolis`",
+    );
+    for (i, line) in &into_lib_at {
+        assert!(
+            lib_dir_at < *i,
+            "the collector block must make /usr/local/lib/propolis before it installs into it: {line}"
+        );
+    }
+
+    let upgrade_timers: HashSet<String> = upgrade
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("systemctl enable --now "))
+        .map(|u| u.trim().to_string())
+        .filter(|u| u.starts_with("propolis-witness@"))
+        .collect();
+    assert_eq!(
+        upgrade_timers.len(),
+        2,
+        "upgrade.sh should enable two witness timers - this parser is broken"
+    );
+    assert_eq!(
+        enabled, upgrade_timers,
+        "the collector block must enable exactly the witness timers upgrade.sh enables"
+    );
+    let reload_at = reload_at.expect("the collector block never runs `systemctl daemon-reload`");
+    let first_enable = first_enable.expect("the collector block enables no timer");
+    assert!(
+        last_install.is_some_and(|i| i < reload_at) && reload_at < first_enable,
+        "the collector block must run `systemctl daemon-reload` after its last install and \
+         before it enables the timers, or systemd starts timers it has not loaded"
+    );
+
+    // upgrade.sh writes its maintenance marker before it enables the witness timers, so the
+    // first pass, which may run at once, and the restarts after it are judged as planned work.
+    let [(maint_at, maint_line)] = maint.as_slice() else {
+        panic!(
+            "the collector block must hold exactly one `propolis-status --maint N` line, found {maint:?}"
+        );
+    };
+    let minutes = maint_line
+        .strip_prefix("propolis-status --maint ")
+        .and_then(|n| n.trim().parse::<u32>().ok())
+        .unwrap_or_else(|| {
+            panic!("the window line must read `propolis-status --maint N`: {maint_line}")
+        });
+    assert!(
+        (1..=120).contains(&minutes),
+        "the collector block's window must be 1 to 120 minutes, the two hours upgrade.sh's \
+         marker holds at most: {maint_line}"
+    );
+    assert!(
+        reload_at < *maint_at && *maint_at < first_enable,
+        "the collector block must open its window after `systemctl daemon-reload` and before \
+         it enables the witness timers, as upgrade.sh does: {maint_line}"
+    );
+}
+
+/// The collector block is part of every hand upgrade of a collector: it goes in "Upgrading",
+/// after the block that runs ./deploy/provision.sh (which makes /run/propolis-witness, the
+/// window's directory), and the steps after it close the window it opens. The window it opens
+/// replaces one the operator had running, so the steps must also say how to put that one back.
+#[test]
+fn the_collector_block_follows_provision_in_upgrading_and_the_steps_after_it_close_its_window() {
+    let doc = split_deployment_page();
+    let lines: Vec<&str> = doc.lines().collect();
+    let headings = heading_lines(&doc);
+    let (upgrading, _) = headings
+        .iter()
+        .find(|(_, h)| h.trim() == "### Upgrading")
+        .expect("docs/operations/split-deployment.md has no `### Upgrading` section");
+    let section_end = headings
+        .iter()
+        .map(|(n, _)| *n)
+        .find(|n| n > upgrading)
+        .unwrap_or(lines.len());
+    let in_section = |b: &FencedBlock| b.open > *upgrading && b.close < section_end;
+    let provision: Vec<FencedBlock> = fenced_blocks(&doc)
+        .into_iter()
+        .filter(|b| in_section(b) && b.lines.iter().any(|l| l == "./deploy/provision.sh"))
+        .collect();
+    let [provision] = provision.as_slice() else {
+        panic!(
+            "\"Upgrading\" must hold exactly one block that runs ./deploy/provision.sh, found {}",
+            provision.len()
+        );
+    };
+    let block = collector_witness_fenced(&doc);
+    assert!(
+        in_section(&block),
+        "the collector block must be in the \"Upgrading\" section, before the next heading"
+    );
+    assert!(
+        provision.close < block.open,
+        "the collector block must come after the block that runs ./deploy/provision.sh"
+    );
+    let after = one_line(&lines[block.close + 1..section_end].join("\n"));
+    assert!(
+        after.contains("propolis-status --maint 0"),
+        "the steps after the collector block must end its window with `propolis-status --maint 0`"
+    );
+    assert!(
+        after.contains("already running"),
+        "the steps after the collector block must say how to put back a manual window that was \
+         already running, which its `--maint` line replaced"
+    );
+}
+
+/// No collector reads alert.env yet. Until a collector can push, the page must not describe a
+/// file that nothing on a collector reads: the paragraph goes in together with the push.
+#[test]
+fn the_split_deployment_page_does_not_mention_alert_env_before_a_collector_can_push() {
+    let doc = split_deployment_page();
+    assert!(
+        !doc.contains("alert.env"),
+        "docs/operations/split-deployment.md mentions alert.env, which no collector reads yet"
+    );
+}
+
+/// install.sh enables the backup timer on every host. On a collector backup.sh only records
+/// `not configured`, but a disabled timer makes config-check report backup-timer, which the
+/// witness opens as an ACT record: step 1 must keep the operator from disabling it there.
+#[test]
+fn the_split_deployment_page_says_the_backup_timer_stays_enabled_on_a_collector() {
+    let doc = split_deployment_page();
+    let para = paragraph_starting(&doc, "`install.sh` enables");
+    assert!(
+        para.contains("propolis-backup.timer") || para.contains("the backup"),
+        "the step-1 paragraph must name the backup timer: {para}"
+    );
+    assert!(
+        para.contains("stays enabled on a collector"),
+        "the step-1 paragraph must say the backup timer stays enabled on a collector: {para}"
+    );
+    assert!(
+        deploy_file("install.sh").contains("systemctl enable --now propolis-backup.timer"),
+        "install.sh no longer enables the backup timer: change the step-1 paragraph with it"
+    );
+}
+
+/// install.sh has always installed the failure hook and its unit, so a collector set up with it
+/// had a hook its hand upgrades never refreshed, not a missing unit. No page may say otherwise
+/// while install.sh installs the unit.
+#[test]
+fn no_page_says_a_collector_lacked_the_failure_hook_while_install_sh_installs_it() {
+    assert!(
+        deploy_file("install.sh").contains("/etc/systemd/system/propolis-alert@.service"),
+        "install.sh no longer installs propolis-alert@.service: what the pages say about a \
+         collector's hook must be checked again"
+    );
+    let changelog =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"))
+            .expect("failed to read CHANGELOG.md");
+    let unreleased = changelog_unreleased(&changelog);
+    for (what, text) in [
+        (
+            "docs/operations/split-deployment.md",
+            split_deployment_page(),
+        ),
+        ("the Unreleased section of CHANGELOG.md", unreleased),
+    ] {
+        assert!(
+            !one_line(&text).contains("a unit that does not exist"),
+            "{what} says a failing sensor starts a unit that does not exist, but deploy/install.sh \
+             installs propolis-alert@.service on every host it sets up"
+        );
+    }
+}
+
+/// `text` with every run of whitespace, line breaks included, made one space, so a phrase is
+/// found wherever the page wraps it.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The Unreleased section of the changelog, up to the next release heading.
+fn changelog_unreleased(changelog: &str) -> String {
+    let start = changelog
+        .find("## Unreleased")
+        .expect("CHANGELOG.md has no `## Unreleased` section");
+    let rest = &changelog[start + "## Unreleased".len()..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// The collector block belongs in every hand upgrade of a collector, not in one: a later hand
+/// upgrade that skipped it would leave the hook, the library, the walk, the witness and the
+/// installed config-check behind the checkout.
+#[test]
+fn the_changelog_asks_for_the_collector_block_on_every_hand_upgrade() {
+    let changelog =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md"))
+            .expect("failed to read CHANGELOG.md");
+    let unreleased = changelog_unreleased(&changelog);
+    let bullet = unreleased
+        .split("\n- ")
+        .map(one_line)
+        .find(|b| b.contains("collector block"))
+        .expect("the Unreleased section has no bullet about the collector block");
+    assert!(
+        !bullet.contains("once on each collector"),
+        "the collector block runs on every hand upgrade of a collector, not once: {bullet}"
+    );
+    assert!(
+        bullet.contains("every later hand upgrade"),
+        "the changelog must say the collector block runs on every later hand upgrade too: {bullet}"
+    );
+}
+
 /// "The sensors make no outbound connections" rested on one crate's test: `sensor-ssh` asserts
 /// its own manifest names no HTTP client. Every other sensor was covered only by prose. This
 /// walks every `crates/sensor-*/Cargo.toml` in the workspace, so a sensor added later, or an

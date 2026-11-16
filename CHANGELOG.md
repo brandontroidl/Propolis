@@ -4,6 +4,68 @@
 
 ### Upgrade note
 
+- **Alerting setup, one test page on request, and VERIFIED. Nothing new is sent unless you run
+  `sudo propolis-status --test-page`.** After the upgrade:
+  - `install.sh` and `upgrade.sh` end with one fixed line, `alerting: profile legacy; to see what
+    reaches you and this host's name on the channel: sudo propolis-status --setup` (upgrade.sh
+    prints it just before its final configuration check). They write no state for it and print
+    no setting.
+  - `sudo propolis-status --setup` prints the alias test pages name this host by (and, off a
+    single box, that a fallback alias cannot be told from other hosts'; today's failure alerts
+    still name the host by its host name), the push target from `propolis.env` (the URL's scheme
+    and host, the topic's length, whether a token is set; never the topic or the token), an
+    anonymous-read check made then and there (three GETs, four with a token, to the configured
+    ntfy server) with every status code and content type and its class, what the token can read,
+    the gate, what the daemon and today's failure hook reveal on a topic that does not refuse
+    anonymous reads, the heartbeat URL and VERIFIED. The gate governs only the test page (and the
+    shell messages a later release adds): today's failure hook and the daemon are not gated, so
+    wherever the hook posts over plain http, or to a topic not proven to refuse anonymous reads,
+    a `failures` line says that each failure alert carries the host name, the failed unit and its
+    last journal lines (over plain http in clear, the token too). It stores the check's answer
+    and, if there is none yet, makes the id salt. Exit 0 only when the gate is `full`.
+  - `sudo propolis-status --test-page` sends one test page, `<alias>: test page <code>`, priority
+    3, at most three in 24 hours, through the failure-alert unit
+    (`propolis-alert@propolis-test-page-<code>.service`). When the hook sent the page it prints
+    `sent test page <code>: ok` (or, when its result could not be recorded, `sent test page
+    <code>; the result could not be recorded`); when nothing was sent (curl missing, no target,
+    a page that could not be put together, a unit that ran too late, did not run or could not
+    write the page's record or its claim on the send ledger, a busy lock, the budget spent) it
+    prints one line that says so and why; when the server did not accept it
+    (`perm:<code>`, `transient:<code>`) it prints the result with a next step and that the page
+    counted toward the three (`deploy/propolis-status.sh#status_test_page`). An attempt whose
+    failure-alert unit never ran stops counting two minutes after it was asked for, and a spent
+    budget says when the next page is allowed. A page that arrives proves that unit, the network
+    and the target as the shell senders read `propolis.env`. The topic and the token reach curl only in a 0600 config file
+    removed straight after the call; no command line, journal line, printed line or state file
+    holds them. `sudo propolis-status --ack-test <code>` types the code back. This is the only
+    message the shell code sends; the failure hook sends exactly what it sent before for every
+    other unit name, with the same journal lines, stamp files and exit status, whatever state the
+    library is in.
+  - The walk's `ALERTS` line ends with `VERIFIED <dur> (shell)` or `NOT VERIFIED (<word>)`, with
+    `daemon not verified` wherever the daemon is enabled, and the login banner's alert line says
+    the same once the gate is `full`, or held at `pointer:token-reads` over `https://`, where it
+    used to say `topic refuses anonymous reads`. Every host starts at `NOT VERIFIED (never)`; the walk's exit status
+    does not change for it. VERIFIED proves that a test page sent by this host's failure-alert
+    unit, to the target and with the token now in `propolis.env`, reached a phone whose owner
+    typed the code back within the last 30 days, and that since then no message was refused for
+    good, no `alert-path` incident opened and the failure hook left no alert undelivered; it also
+    requires today's failure hook, which reads `propolis.env` with a rule of its own, to read the
+    same URL, topic and token. A temporary failure (a timeout, 429 or 5xx) does not undo it. It
+    does not prove the daemon's own sender, which read its settings when it started and may hold
+    an older topic or token (the walk says when `propolis.env` changed after the daemon started),
+    nor that pages arrive later: a token revoked tomorrow shows only after a send fails.
+  - config-check gains the `alert-channel` row and two warnings: `alert-setting-invalid` (a push
+    setting the status command and the witness ignore while today's failure hook and the daemon
+    still use it as written, named with its file, never its value) and `alert-topic-readable`
+    (the witness's stored anonymous-read check did not find the `propolis.env` topic, where
+    today's failure hook sends host and unit names, refusing anonymous reads: readable by anyone,
+    or not proven private after a redirect, a 404 or an answer that is not ntfy's).
+    config-check makes no request: it reads the stored check. A host that passed before can now
+    exit 1: with either warning, and while the row is unknown, which it is when the stored refusal
+    is over a day old, when the stored check got no definite answer or cannot be read, and when
+    config-check does not run as root. A check never made for the current target (right after an
+    install or an upgrade, before the witness's first hourly pass) reads `skip` and leaves the
+    exit status as it was. The witness records both ids as daily NOTICEs.
 - **Split deployments: a collector now gets the failure hook, the status walk, the root witness
   and the installed config-check, from a block of commands on the split deployment page.**
   Collectors are upgraded by hand and never run `deploy/upgrade.sh`, so when upgrading a
@@ -203,12 +265,15 @@
   on the `alert` rail (which now warns while the topic is not proven to refuse anonymous reads),
   and the hourly timer, the hourly pass's age, the last config-check exit and `cc-stopped` on the
   `witness` rail, so `sudo propolis-status` may exit `1` where it exited `0` before. The login
-  banner's alert line now reads `topic READABLE by anyone` for a definite answer other than a
-  refusal, `topic refuses anonymous reads` only while the refusal is proven (refused within 24
-  hours, an attempt within 3 hours, over `https://`), `topic not proven private (plain http)`
-  for a refusal over plain HTTP, which anyone on the path could have given, `topic check is
-  stale` when the answer or the last attempt is too old, and `topic not checked yet` before
-  there is an answer for the target in use. Each pass also watches the other: a stopped timer, or a pass
+  banner's alert line now reads `topic READABLE by anyone` when the topic was found readable,
+  `topic not proven private (<answer>)` for a redirect, a 404, a server that is not a push
+  server or another definite answer that is not a refusal, what the last test page proved
+  (`VERIFIED <dur> (shell)` or `NOT VERIFIED (<word>)`, with `; daemon not verified` where the
+  daemon is enabled) only while the refusal is proven (refused within 24 hours, an attempt
+  within 3 hours, over `https://`), `topic not proven private (plain http)` for a refusal over
+  plain HTTP, which anyone on the path could have given, `topic check is stale` when the answer
+  or the last attempt is too old, and `topic not checked yet` before there is an answer for the
+  target in use. Each pass also watches the other: a stopped timer, or a pass
   older than three hours (hourly) or twenty minutes (light), opens `witness-stale`; a timer just
   enabled by the upgrade has three hours before its first pass counts as late, and nothing is
   judged in the first half hour after a boot. `config-check` gains a `witness` row with the

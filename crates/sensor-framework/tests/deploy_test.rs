@@ -2892,6 +2892,58 @@ fn tls_dir_grant_units_match_provision_tls_sensors_exactly() {
     );
 }
 
+/// Both installers close by pointing the operator at `sudo propolis-status --setup`, in one fixed
+/// line that expands no variable, so it can print no secret, and that writes nothing: install.sh
+/// after its last line of a real run, upgrade.sh after the status line and before the final
+/// config-check line, which stays the last code line.
+#[test]
+fn install_and_upgrade_close_with_the_alerting_line_that_points_at_setup() {
+    let want = "alerting: profile legacy; to see what reaches you and this host's name on the channel: sudo propolis-status --setup";
+    let install = deploy_file("install.sh");
+    let lines: Vec<&str> = install.lines().map(str::trim).collect();
+    let at: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].contains("alerting: profile"))
+        .collect();
+    assert_eq!(at.len(), 1, "install.sh: one alerting line");
+    assert_eq!(lines[at[0]], format!("log \"{want}\""));
+    assert!(
+        lines[..at[0]]
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("log "))
+            .is_some_and(|l| l.starts_with("log \"Next: ")),
+        "install.sh: the alerting line follows the last line of a real run"
+    );
+    assert_eq!(
+        lines[at[0] + 1],
+        "fi",
+        "install.sh: inside the real run's branch"
+    );
+    let upgrade = deploy_file("upgrade.sh");
+    let code: Vec<&str> = upgrade
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let at: Vec<usize> = (0..code.len())
+        .filter(|&i| code[i].contains("alerting: profile"))
+        .collect();
+    assert_eq!(at.len(), 1, "upgrade.sh: one alerting line");
+    assert_eq!(code[at[0]], format!("echo \"{want}\""));
+    let status = code
+        .iter()
+        .position(|l| l.starts_with("systemctl --no-pager status propolis.service"))
+        .unwrap();
+    assert!(status < at[0], "upgrade.sh: after the status line");
+    assert!(
+        code.last()
+            .unwrap()
+            .contains("config-check.sh\" --report-only"),
+        "upgrade.sh: the config-check line stays last"
+    );
+    assert!(!want.contains('$'));
+}
+
 fn deploy_file(name: &str) -> String {
     std::fs::read_to_string(format!(
         "{}/../../deploy/{name}",

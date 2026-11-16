@@ -37,6 +37,10 @@
 # one journal line under tag propolis-witness; what this hook sends, logs as propolis-alert,
 # leaves in its own state files and returns stays exactly as it was.
 #
+# One name takes another path: propolis-test-page-<6 hex>, which only `propolis-status
+# --test-page` starts. That path sends the operator's test page through the library, in a child
+# process, and exits 0 on every outcome (see the block after the argument check).
+#
 # Usage: propolis-alert <unit name>
 # PROPOLIS_ALERT_ROOT reads every path under that directory instead of / (tests only).
 #
@@ -53,6 +57,35 @@ UNIT="${1:-}"
 if ! [[ "$UNIT" =~ ^[A-Za-z0-9@._:-]{1,200}$ ]]; then
     echo "usage: propolis-alert <unit name>" >&2
     exit 2
+fi
+
+# The test page. Decided by the name alone and before anything else, so every unit name that
+# reaches the code below runs exactly as before. systemd hands this hook a failed unit's full
+# name, which ends in its type (`.service`), so no real failure matches; only the status command
+# starts propolis-alert@propolis-test-page-<CODE>.service. The page is sent by the library, which
+# runs in a child bash under `timeout`, never in this shell: under `set -euo pipefail` a library
+# with an unbound variable or an arithmetic error would end this shell with its own status, and
+# this path exits 0 whatever happens. The child checks the library's version before it calls
+# anything, logs its own line when it sends nothing, and this shell adds one only when the child
+# itself failed. Nothing here posts, so a child that sent and then failed cannot cause a second
+# message. A child that failed or was stopped by its time limit may already have sent (it returns
+# 0 on every outcome it reaches), so that line says the outcome is unknown, not that nothing was
+# sent. The child's limit counts down from the hook's own SECONDS, as the record step's does
+# below, so the child always ends inside TimeoutStartSec=90s.
+if [[ "$UNIT" =~ ^propolis-test-page-[0-9a-f]{6}$ ]]; then
+    TP_ROOT="${PROPOLIS_ALERT_ROOT:-}"
+    # The library version that has the test page (pa_hook_test_page).
+    TP_NEEDS=9
+    TP_BUDGET=$(( 85 - SECONDS ))
+    [ "$TP_BUDGET" -ge 1 ] || TP_BUDGET=1
+    # shellcheck source=deploy/alert-lib.sh
+    # shellcheck disable=SC2016 # the child bash expands these, with the library as $1
+    timeout --kill-after=2 "$TP_BUDGET" \
+        bash -c 'trap "pa_cleanup 2>/dev/null" EXIT; . "$1" && [ "${PA_LIB_VERSION:-0}" -ge "$3" ] && pa_init "$2" && pa_hook_test_page "$4"' \
+        _ "$TP_ROOT/usr/local/sbin/propolis-alert-lib" "$TP_ROOT" "$TP_NEEDS" "$UNIT" < /dev/null > /dev/null 2>&1 \
+        || logger -p daemon.notice -t propolis-witness "test page outcome unknown for $UNIT (library missing, too old, failed or timed out)" 2>/dev/null \
+        || true
+    exit 0
 fi
 
 ROOT="${PROPOLIS_ALERT_ROOT:-}"

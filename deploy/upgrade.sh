@@ -738,6 +738,9 @@ fi
 echo "==> done. checking status"
 sleep 2
 systemctl --no-pager status propolis.service | head -5
+# A fixed line, like install.sh's: no state is written and no secret read here. Every host runs
+# the legacy profile in this release.
+echo "alerting: profile legacy; to see what reaches you and this host's name on the channel: sudo propolis-status --setup"
 maint_end 2>/dev/null || true
 
 # Last, and report-only: the upgrade has finished by now, so a finding here is something to read

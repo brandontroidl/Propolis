@@ -377,7 +377,7 @@ fn sourcing_the_library_sets_an_integer_version_and_the_alert_env_name_and_runni
         !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()),
         "PA_LIB_VERSION must be an integer: {version}"
     );
-    assert_eq!(version, "8");
+    assert_eq!(version, "9");
     assert_eq!(r.get("env"), "alert.env");
 
     let direct = fx.run_raw("bash \"$LIB\"", &[]);
@@ -5523,8 +5523,9 @@ fn pa_finding_inst_matches_units_scopes_and_log_paths_and_otherwise_gives_nothin
 }
 
 /// The banner's alert part follows the stored read check of the target in use: READABLE for a
-/// definite answer other than refused (the shell's or the daemon's), refuses anonymous reads for
-/// a refusal, and not checked yet for no answer or one bound to another target.
+/// definite answer other than refused (the shell's or the daemon's), whether a test page got
+/// through (VERIFIED or NOT VERIFIED) for a refusal, and not checked yet for no answer or one
+/// bound to another target.
 #[test]
 fn the_banner_says_readable_refuses_or_not_checked_from_the_stored_read_check() {
     let fx = Fx::salted(SALT);
@@ -5553,7 +5554,8 @@ fn the_banner_says_readable_refuses_or_not_checked_from_the_stored_read_check() 
     );
     assert_eq!(
         alerts(line(RC_BINDING, "refused")),
-        "[propolis 13:46 UTC] alerts: topic refuses anonymous reads"
+        "[propolis 13:46 UTC] alerts: NOT VERIFIED (never)",
+        "a proven refusal leaves whether a test page got through to say"
     );
     assert_eq!(
         alerts(line(RC_BINDING, "readable")),
@@ -5570,8 +5572,8 @@ fn the_banner_says_readable_refuses_or_not_checked_from_the_stored_read_check() 
 /// ago, or a checker whose last attempt is over three hours old, reads `topic check is stale`,
 /// and a refusal over plain HTTP (which anyone on the path could have answered) reads `topic not
 /// proven private (plain http)`: a check did run in each case, so `not checked yet` would be
-/// untrue. A fresh refusal over https still reads `refuses anonymous reads`, and so does one on
-/// a collector whose token can read, since the anonymous refusal itself is proven there.
+/// untrue. A fresh refusal over https goes on to whether a test page got through, and so does
+/// one on a collector whose token can read, since the anonymous refusal itself is proven there.
 #[test]
 fn the_banner_claims_a_refusal_only_when_the_gate_holds_it_proven() {
     let fx = Fx::salted(SALT);
@@ -5590,7 +5592,7 @@ fn the_banner_claims_a_refusal_only_when_the_gate_holds_it_proven() {
         r.out.lines().nth(1).unwrap_or_default().to_string()
     };
     let fresh = "999000/abcdef01/4000";
-    let refuses = "[propolis 13:46 UTC] alerts: topic refuses anonymous reads";
+    let refuses = "[propolis 13:46 UTC] alerts: NOT VERIFIED (never)";
     let stale = "[propolis 13:46 UTC] alerts: topic check is stale";
     let plain = "[propolis 13:46 UTC] alerts: topic not proven private (plain http)";
     assert_eq!(alerts(&https, RC_BINDING, fresh, fresh, "-"), refuses);
@@ -5916,4 +5918,454 @@ fn the_store_list_takes_the_backup_unit_s_directory_the_gateway_spool_and_the_lo
     let r = list("'' ''");
     assert!(stores(&r).contains(&"/var/spool/propolis/gateway||0".to_string()));
     assert_eq!(r.get("known"), "0");
+}
+
+// ---- the sender, the test page's budget and its shape ------------------------------------------
+
+/// Records its argv and environment in `STUB_LOG`, copies the config file it is given (with its
+/// mode) to `$D/conf` and its stdin to `$D/body`, and prints `SEND_CODE` (nothing when it is
+/// `none`, as a curl that got no answer prints none).
+const CURL_SEND_STUB: &str = r#"#!/usr/bin/env bash
+{ printf 'curl'; printf ' [%s]' "$@"; printf '\n'; env | sed 's/^/env /'; } >> "$STUB_LOG"
+conf=""
+prev=""
+for a in "$@"; do [ "$prev" != -K ] || conf="$a"; prev="$a"; done
+{ stat -c %a -- "$conf"; cat -- "$conf"; } > "$D/conf"
+cat > "$D/body"
+[ "${SEND_CODE:-200}" = none ] || printf '%s' "${SEND_CODE:-200}"
+"#;
+
+// The token comes from a file, not the environment, so curl's environment can be checked for it.
+const SEND_SCRIPT: &str = "PA_TARGET=1 PA_URL='https://ntfy.invalid' PA_TOPIC='t0p1c-secret' PA_TOKEN=\"$(cat \"$D/token\")\"\n\
+     pa_send \"$TITLE\" \"$PRIO\" < <(printf '%b' \"$BODY\"); echo \"rc=$?\"\n\
+     echo \"result=$PA_SEND_RESULT\"\n\
+     echo \"traps=$(trap -p)\"\n\
+     for f in \"${PA_CLEANUP[@]}\"; do [ ! -e \"$f\" ] || echo \"left=$f\"; done\n\
+     echo \"listed=${#PA_CLEANUP[@]}\"";
+
+fn send(fx: &Fx, title: &str, prio: &str, body: &str, token: &str, code: &str) -> Run {
+    std::fs::write(fx.scratch().join("token"), token).unwrap();
+    fx.run_env(
+        SEND_SCRIPT,
+        &[
+            ("TITLE", title),
+            ("PRIO", prio),
+            ("BODY", body),
+            ("SEND_CODE", code),
+        ],
+    )
+}
+
+/// pa_send hands curl one config file and nothing else on its command line: the URL with the
+/// topic, the title, the priority and the token's header are in that file (0600 while it exists,
+/// listed for the caller's cleanup and gone when pa_send returns), never in curl's arguments or
+/// environment. A double quote or a backslash in a value is escaped so it cannot end the string;
+/// the body goes on stdin, cut to 1024 bytes. The library sets no trap.
+#[test]
+fn pa_send_keeps_the_topic_and_the_token_in_a_config_file_and_off_the_command_line() {
+    let fx = Fx::new();
+    write_exec(&fx.bin.join("curl"), CURL_SEND_STUB);
+    let token = "tk_s3cret\"\\value";
+    let r = send(
+        &fx,
+        "host-1a2b: test page \"q\" \\ x",
+        "3",
+        "line one\\nline two\\n",
+        token,
+        "200",
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(r.get("result"), "ok");
+    assert_eq!(r.get("traps"), "", "the library sets no trap");
+    assert!(!r.out.contains("left="), "{}", r.out);
+    assert_eq!(r.get("listed"), "1");
+    let calls: Vec<String> = fx
+        .log()
+        .lines()
+        .filter(|l| l.starts_with("curl "))
+        .map(String::from)
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].starts_with("curl [-q] [-K] ["), "{}", calls[0]);
+    assert_eq!(calls[0].matches('[').count(), 3, "{}", calls[0]);
+    for secret in ["t0p1c-secret", "tk_s3cret"] {
+        assert!(
+            !fx.log().contains(secret),
+            "{secret} on curl's command line or in its environment"
+        );
+    }
+    let conf = std::fs::read_to_string(fx.scratch().join("conf")).unwrap();
+    let mut lines = conf.lines();
+    assert_eq!(lines.next(), Some("600"));
+    let rest: Vec<&str> = lines.collect();
+    for want in [
+        "url = \"https://ntfy.invalid/t0p1c-secret\"",
+        "header = \"Title: host-1a2b: test page \\\"q\\\" \\\\ x\"",
+        "header = \"Priority: 3\"",
+        "header = \"Authorization: Bearer tk_s3cret\\\"\\\\value\"",
+        "silent",
+        "show-error",
+        "output = \"/dev/null\"",
+        "write-out = \"%{http_code}\"",
+        "connect-timeout = 5",
+        "max-time = 15",
+        "retry = 1",
+        "retry-max-time = 20",
+        "proto = \"=https,http\"",
+        "data-binary = \"@-\"",
+    ] {
+        assert!(rest.contains(&want), "{want} not in:\n{conf}");
+    }
+    assert!(
+        !conf.contains("Tags:") && !conf.contains("location"),
+        "{conf}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.scratch().join("body")).unwrap(),
+        "line one\nline two"
+    );
+    let long = "x".repeat(150) + "\\n";
+    send(&fx, "t", "3", &long.repeat(10), "", "200");
+    let body = std::fs::read_to_string(fx.scratch().join("body")).unwrap();
+    assert_eq!(body.len(), 1024, "the body is cut to 1024 bytes");
+    let conf = std::fs::read_to_string(fx.scratch().join("conf")).unwrap();
+    assert!(
+        !conf.contains("Authorization"),
+        "no token, no header: {conf}"
+    );
+}
+
+/// The answer's class: 2xx ok; 408, 429, 5xx and no answer transient; every other 4xx perm; and
+/// norender, with no call made, for a title or body line outside printable ASCII or past 200
+/// bytes, a priority outside 1 to 5, or a value that cannot be written into the config file;
+/// notarget without a target.
+#[test]
+fn pa_send_classifies_each_answer_and_refuses_what_it_cannot_send_safely() {
+    let fx = Fx::new();
+    write_exec(&fx.bin.join("curl"), CURL_SEND_STUB);
+    for (code, want) in [
+        ("200", "ok"),
+        ("204", "ok"),
+        ("400", "perm:400"),
+        ("401", "perm:401"),
+        ("403", "perm:403"),
+        ("404", "perm:404"),
+        ("413", "perm:413"),
+        ("408", "transient:408"),
+        ("429", "transient:429"),
+        ("500", "transient:500"),
+        ("503", "transient:503"),
+        ("302", "transient:302"),
+        ("none", "transient:000"),
+        ("2000", "transient:000"),
+    ] {
+        let r = send(&fx, "t", "3", "b", "", code);
+        assert_eq!(r.get("result"), want, "{code}");
+        assert_eq!(r.get("rc"), if want == "ok" { "0" } else { "1" }, "{code}");
+    }
+    let calls = fx.log().matches("curl [").count();
+    for (title, prio, body, token) in [
+        ("t\u{1b}[31m", "3", "b", ""),
+        ("t", "0", "b", ""),
+        ("t", "6", "b", ""),
+        ("t", "x", "b", ""),
+        ("", "3", "b", ""),
+        ("t", "3", "ok\\n\\x1b[2J", ""),
+        ("t", "3", &"y".repeat(201), ""),
+        ("t", "3", "b", "tk\u{7}bell"),
+    ] {
+        let r = send(&fx, title, prio, body, token, "200");
+        assert_eq!(
+            r.get("result"),
+            "norender",
+            "{title:?} {prio} {body:?} {token:?}"
+        );
+    }
+    assert_eq!(
+        fx.log().matches("curl [").count(),
+        calls,
+        "norender makes no call"
+    );
+    let r = fx.run_env(
+        "PA_TARGET=0; pa_send t 3 < /dev/null; echo \"result=$PA_SEND_RESULT\"",
+        &[],
+    );
+    assert_eq!(r.get("result"), "notarget");
+}
+
+/// The test page carries the alias and the code and nothing else, at priority 3; any other
+/// message, a code not of 6 hex and a host with no salt yet render nothing. pa_url_shown keeps a
+/// URL's scheme and host and drops a user, a path and a query.
+#[test]
+fn the_test_page_renders_the_alias_and_the_code_only_and_a_url_shows_its_host_only() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run(
+        "pa_render full test 0a1b2c; echo \"rc=$?\"; echo \"title=$PA_TITLE\"; echo \"prio=$PA_PRIO\"; echo \"body=$PA_BODY\"\n\
+         pa_render full open 0a1b2c; echo \"open=$?\"\n\
+         pa_render full test 0A1B2C; echo \"upper=$?\"\n\
+         pa_render full test 0a1b2; echo \"short=$?\"",
+    );
+    let alias = fx.run("pa_alias").out;
+    assert!(alias.starts_with("host-"), "{alias}");
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(r.get("title"), format!("{alias}: test page 0a1b2c"));
+    assert_eq!(r.get("prio"), "3");
+    assert_eq!(
+        r.get("body"),
+        format!("Type back on {alias}: status --ack-test 0a1b2c")
+    );
+    for k in ["open", "upper", "short"] {
+        assert_eq!(r.get(k), "1", "{k}");
+    }
+    let unsalted = Fx::new();
+    assert_eq!(
+        unsalted
+            .run("pa_render full test 0a1b2c; echo \"rc=$?\"")
+            .get("rc"),
+        "1"
+    );
+    for (url, shown) in [
+        ("https://ntfy.example.org", "https://ntfy.example.org"),
+        (
+            "https://u:pw@ntfy.example.org:8443/topic?auth=x",
+            "https://ntfy.example.org:8443",
+        ),
+        ("http://[::1]:80/a", "http://[::1]:80"),
+        ("ntfy.example.org/topic", "the target"),
+        ("ftp://x", "the target"),
+    ] {
+        let r = fx.run_env("echo \"shown=$(pa_url_shown \"$U\")\"", &[("U", url)]);
+        assert_eq!(r.get("shown"), shown, "{url}");
+    }
+}
+
+/// The class test admits three in 24 hours, counting every attempt that was or may have been sent
+/// (sending, ok, perm, transient, and pending while the hook may still be running) and none that
+/// sent nothing (norender, nocurl, notarget), none over a day old and none dated ahead of the
+/// clock. Every other class is withheld, since nothing sends one yet. pa_ledger_add drops lines
+/// over 48 h old, and pa_ledger_result updates only the pending line it names.
+#[test]
+fn the_budget_admits_three_test_pages_a_day_and_nothing_of_another_class() {
+    let fx = Fx::new();
+    let line = |stamp: &str, class: &str, result: &str| {
+        format!("L\t{stamp}\t{class}\t-\topen\tfull\t{result}\tstatus\n")
+    };
+    let admit = |ledger: &str| -> String {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{ledger}"),
+        );
+        fx.run_env("pa_budget_admit test - open 1; echo", &NOW)
+            .out
+            .trim()
+            .to_string()
+    };
+    let recent = "999000/abcdef01/4000";
+    let just_now = "999950/abcdef01/4950";
+    let old = "900000/0000aaaa/1";
+    let future = "1000500/abcdef01/5500";
+    assert_eq!(admit(""), "admit");
+    let two = line(recent, "test", "ok") + &line(recent, "test", "transient:503");
+    assert_eq!(admit(&two), "admit");
+    assert_eq!(
+        admit(&(two.clone() + &line(just_now, "test", "pending"))),
+        "withhold:test-cap",
+        "a pending line the hook may still be sending counts"
+    );
+    assert_eq!(
+        admit(&(two.clone() + &line(recent, "test", "sending"))),
+        "withhold:test-cap"
+    );
+    assert_eq!(
+        admit(&(two.clone() + &line(recent, "test", "perm:403"))),
+        "withhold:test-cap"
+    );
+    for idle in ["norender", "nocurl", "notarget", "nomatch"] {
+        assert_eq!(
+            admit(&(two.clone() + &line(recent, "test", idle))),
+            "admit",
+            "{idle}"
+        );
+    }
+    assert_eq!(
+        admit(&(two.clone() + &line(old, "test", "ok"))),
+        "admit",
+        "over a day old"
+    );
+    assert_eq!(
+        admit(&(two.clone() + &line(future, "test", "ok"))),
+        "admit",
+        "ahead of the clock"
+    );
+    assert_eq!(
+        admit(&(two.clone() + &line(recent, "daily", "ok"))),
+        "admit",
+        "another class"
+    );
+    for class in [
+        "pool", "reserve", "daily", "storm", "summary", "switch", "pointer",
+    ] {
+        let r = fx.run_env(
+            &format!("pa_budget_admit {class} k open 1; echo; echo \"rc=$?\""),
+            &NOW,
+        );
+        assert!(r.out.starts_with("withhold:unbuilt"), "{class}: {}", r.out);
+    }
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    assert_eq!(
+        fx.run_env("pa_budget_admit test - open 1; echo", &NOW)
+            .out
+            .trim(),
+        "withhold:ledger",
+        "a ledger that cannot be read counts as full"
+    );
+
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=4\n{}{}X\tkept\n",
+            line("800000/0000aaaa/1", "test", "ok"),
+            line(recent, "test", "pending")
+        ),
+    );
+    let r = fx.run_env(
+        &format!(
+            "pa_ledger_add test - open pointer pending status; echo \"add=$? $PA_LEDGER_STAMP\"\n\
+             pa_ledger_result {recent} test ok hook; echo \"res=$?\"\n\
+             pa_ledger_result {recent} test perm:403 hook; echo \"again=$?\""
+        ),
+        &NOW,
+    );
+    assert_eq!(r.get("add"), "0 1000000/abcdef01/5000", "{}", r.err);
+    assert_eq!(r.get("res"), "0");
+    assert_eq!(r.get("again"), "1", "only a pending line takes a result");
+    let ledger = fx.read("var/lib/propolis/witness/send-ledger");
+    assert!(ledger.starts_with("#send-ledger v1 g=6\n"), "{ledger}");
+    assert!(
+        !ledger.contains("800000/"),
+        "a line over 48 h old goes: {ledger}"
+    );
+    assert!(
+        ledger.contains(&format!("L\t{recent}\ttest\t-\topen\tfull\tok\thook\n")),
+        "{ledger}"
+    );
+    assert!(ledger.contains("L\t1000000/abcdef01/5000\ttest\t-\topen\tpointer\tpending\tstatus\n"));
+    assert!(
+        ledger.contains("X\tkept\n"),
+        "a line of a type this release does not know stays"
+    );
+    assert_eq!(
+        mode_of(&fx.p("var/lib/propolis/witness/send-ledger")),
+        0o600
+    );
+}
+
+/// The hook claims a page as sending before it sends, so a ledger line still pending once the
+/// hook's whole time (120 s) has passed was never sent: three of them, left by a failure-alert
+/// unit that does not run, do not spend the day. Three pages that went out still do, and a claim
+/// counts whatever its age. pa_budget_next says when the next page is allowed: when the first
+/// counted line stops counting (a pending one at 120 s, any other when it leaves the 24-hour
+/// window), as HH:MM UTC, rounded up to the minute.
+#[test]
+fn pending_lines_past_the_hooks_time_stop_counting_and_a_claim_always_counts() {
+    let fx = Fx::new();
+    let three = |stamps: &[(&str, &str)]| -> Run {
+        let mut text = "#send-ledger v1 g=1\n".to_string();
+        for (stamp, result) in stamps {
+            text.push_str(&format!(
+                "L\t{stamp}\ttest\t-\topen\tfull\t{result}\tstatus\n"
+            ));
+        }
+        fx.write("var/lib/propolis/witness/send-ledger", &text);
+        fx.run_env(
+            "echo \"admit=$(pa_budget_admit test - open 1)\"; echo \"next=$(pa_budget_next test)\"",
+            &NOW,
+        )
+    };
+    let young = "999900/abcdef01/4900";
+    let past = "999820/abcdef01/4820";
+    let hour = "996400/abcdef01/1400";
+    let long_ago = "950000/0000aaaa/1";
+    let r = three(&[(young, "pending"), (young, "pending"), (young, "pending")]);
+    assert_eq!(r.get("admit"), "withhold:test-cap", "{}", r.err);
+    let r = three(&[(past, "pending"), (past, "pending"), (past, "pending")]);
+    assert_eq!(r.get("admit"), "admit", "three minutes on: {}", r.err);
+    let r = three(&[(hour, "ok"), (hour, "ok"), (past, "ok")]);
+    assert_eq!(r.get("admit"), "withhold:test-cap");
+    assert_eq!(r.get("next"), "12:47", "{}", r.err);
+    let r = three(&[(long_ago, "sending"), (hour, "ok"), (past, "pending")]);
+    assert_eq!(
+        r.get("admit"),
+        "admit",
+        "the old pending line is not counted"
+    );
+    let r = three(&[
+        (long_ago, "sending"),
+        (hour, "transient:503"),
+        (young, "perm:403"),
+    ]);
+    assert_eq!(r.get("admit"), "withhold:test-cap");
+    assert_eq!(r.get("next"), "23:54", "the oldest counted line: {}", r.err);
+
+    // At 08:00:30 UTC: two pages delivered 20 h and 19 h ago, and an attempt 30 s ago whose
+    // unit has not run. The pending line stops counting at 120 s, so the next page is allowed at
+    // 08:02 today, not when the 20 h old line leaves tomorrow.
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=1\n\
+         L\t1799928030/abcdef01/828030\ttest\t-\topen\tfull\tok\tstatus\n\
+         L\t1799931630/abcdef01/831630\ttest\t-\topen\tfull\tok\tstatus\n\
+         L\t1800000000/abcdef01/900000\ttest\t-\topen\tfull\tpending\tstatus\n",
+    );
+    let r = fx.run_env(
+        "echo \"admit=$(pa_budget_admit test - open 1)\"; echo \"next=$(pa_budget_next test)\"",
+        &[
+            ("PA_TEST_WALL", "1800000030"),
+            ("PA_TEST_BOOT", "abcdef01"),
+            ("PA_TEST_UP", "900030"),
+        ],
+    );
+    assert_eq!(r.get("admit"), "withhold:test-cap", "{}", r.err);
+    assert_eq!(
+        r.get("next"),
+        "08:02",
+        "when the pending line stops counting: {}",
+        r.err
+    );
+}
+
+/// Every request the library makes (the read check's GETs, the heartbeat and pa_send's post)
+/// tells curl `globoff` in its config file, so a brace or a bracket in the URL is sent as written,
+/// as one request, never expanded into several.
+#[test]
+fn every_library_request_turns_curl_url_globbing_off_and_keeps_braces_as_written() {
+    let fx = Fx::new();
+    write_exec(
+        &fx.bin.join("curl"),
+        "#!/usr/bin/env bash\nprev=\"\"\nfor a in \"$@\"; do\n    if [ \"$prev\" = -K ]; then { echo '---'; cat -- \"$a\"; } >> \"$D/confs\"; fi\n    prev=\"$a\"\ndone\ncat > /dev/null\nprintf '403'\n",
+    );
+    let url = "https://ntfy.invalid/base{a,b}/[1-2]";
+    let r = fx.run_env(
+        "pa_readcheck_run \"$U\" t0p1c tk_x > /dev/null\n\
+         PA_HB_URL=\"$U\" pa_heartbeat_get\n\
+         PA_TARGET=1 PA_URL=\"$U\" PA_TOPIC=t0p1c PA_TOKEN=''; pa_send t 3 < <(printf 'b')\n\
+         echo done=1",
+        &[("U", url)],
+    );
+    assert_eq!(r.get("done"), "1", "{}", r.err);
+    let confs = std::fs::read_to_string(fx.scratch().join("confs")).unwrap();
+    let files: Vec<&str> = confs.split("---\n").filter(|c| !c.is_empty()).collect();
+    // Three anonymous GETs and one with the token, the heartbeat, and the post.
+    assert_eq!(files.len(), 6, "{confs}");
+    for file in &files {
+        assert!(
+            file.lines().any(|l| l == "globoff"),
+            "no globoff in:\n{file}"
+        );
+        let line = file.lines().find(|l| l.starts_with("url = ")).unwrap();
+        assert!(
+            line.starts_with(&format!("url = \"{url}")),
+            "the URL is not as written: {line}"
+        );
+    }
 }

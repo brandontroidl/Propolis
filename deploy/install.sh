@@ -273,4 +273,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
 else
     log "done. Services are installed but NOT started or enabled (except the log rotation, backup and witness timers), and the database is untouched."
     log "Next: populate /etc/propolis/*.env files, then 'systemctl enable --now <unit>' per service."
+    # Written as a fixed line: the installer writes no state and reads no secret, and the alias
+    # comes from a salt only the first root writer makes, so the status command says the rest.
+    # Every host runs the legacy profile in this release.
+    log "alerting: profile legacy; to see what reaches you and this host's name on the channel: sudo propolis-status --setup"
 fi

@@ -12,6 +12,16 @@
 #                             with each, the installed config-check's findings, and the next thing
 #                             to look at
 #   propolis-status STAGE     one stage or rail with everything behind its row
+#   propolis-status --setup   what reaches the operator and why: this host's name on the channel,
+#                             the push target (never its topic or token), the anonymous-read
+#                             check run now and its answer in words, what the daemon and today's
+#                             failure hook still reveal, the heartbeat URL, and VERIFIED
+#   propolis-status --test-page
+#                             one test page through the failure-alert unit (at most 3 in 24 h):
+#                             it proves that unit, the network and the target as the library
+#                             reads it; VERIFIED also needs today's hook to read the same values
+#   propolis-status --ack-test CODE
+#                             the code the test page carried, typed back: VERIFIED
 #   propolis-status --banner  the login banner's text, as the witness would write it
 #   propolis-status --maint MINUTES
 #                             announce planned work: unit, collector and database kinds are held
@@ -20,7 +30,11 @@
 #
 # THE WALK IS READ-ONLY. It writes nothing: no state file, no lock, no temporary file except the
 # header file that carries the console's metrics token to curl, which its one EXIT handler
-# removes. --banner only prints. --maint writes the maintenance marker
+# removes. --banner only prints. --setup, --test-page and --ack-test write only the readcheck,
+# testpage and send-ledger files and the id salt, each under the state lock (10 s at most, else
+# exit 75), then the banner; the anonymous-read check of --setup is made before the lock is
+# taken, and the test page is sent by the failure-alert unit, never by this command, which only
+# starts that unit. --maint writes the maintenance marker
 # (/run/propolis-witness/maintenance) and then the banner, and nothing else; it takes no lock, so
 # it works while a hung writer holds the state lock. The walk takes no lock either, so it shows
 # the state files as the last writer left them. Every program it runs is
@@ -47,9 +61,11 @@
 #
 # Exit status of the walk and a stage view: 0 nothing stopped and nothing to look at; 1 a WARN or
 # `?` anywhere, or an open ACT incident; 2 a stage is marked stopped, a rail is FAIL, or a PAGE
-# incident is open. --banner: 0. --maint: 0 written or removed, 1 it could not be. Any form: 3 not
-# root; 64 bad usage; 70 the alert library is missing, not trusted, or older than this script
-# needs.
+# incident is open. --banner: 0. --maint: 0 written or removed, 1 it could not be. --setup: 0 only
+# when the gate is full, else 1. --test-page: 0 when the page went out (ok), else 1. --ack-test: 0
+# when the code was the waiting one or was acknowledged already, else 1. Any form: 3 not root; 64 bad
+# usage; 70 the alert library is missing, not trusted, or older than this script needs; 75 the
+# state lock was not free within 10 s (the three verbs above).
 #
 # Test seams (honoured only with PROPOLIS_STATUS_ROOT set; tests only): PROPOLIS_STATUS_ROOT puts
 # every path under that directory and keeps the caller's PATH, so stubs win; PROPOLIS_STATUS_EUID
@@ -58,7 +74,7 @@
 # its time limit in seconds.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 7
+# needs-alert-lib: 9
 
 umask 077
 STATUS_SELF="${BASH_SOURCE[0]}"
@@ -86,6 +102,10 @@ if [ -z "$STATUS_ROOT" ]; then
     # The library's own time and privilege seams must not reach a production run either.
     unset PA_TEST_WALL PA_TEST_BOOT PA_TEST_UP PA_TEST_READ_AS_SELF PA_TEST_UID PA_TEST_PROFILE
     unset PROPOLIS_STATUS_EUID PROPOLIS_STATUS_NOW PROPOLIS_STATUS_CC PROPOLIS_STATUS_CC_LIMIT
+    # mktemp then uses /tmp: the curl config files of --setup hold the topic and the token, and a
+    # caller's TMPDIR (sudo -E, a root shell with a user's environment) may be a directory another
+    # account can write, where that account could swap a file for a link before it is written.
+    unset TMPDIR
 fi
 
 STATUS_STAGES="listen source ship gateway intake ledger review reports feed publish"
@@ -95,6 +115,9 @@ usage() {
     cat << 'EOF'
 usage: propolis-status                  the walk: every stage in order, the first stopped one marked >
        propolis-status STAGE            one stage or rail with everything behind its row
+       propolis-status --setup          what reaches you and why; runs the anonymous-read check now
+       propolis-status --test-page      send one test page through the failure-alert unit
+       propolis-status --ack-test CODE  confirm the test page arrived (CODE is the one it carries)
        propolis-status --banner         print the login banner text
        propolis-status --maint MINUTES  hold unit, collector and database kinds for planned work
                                         (1 to 120 minutes; 0 ends it)
@@ -105,8 +128,17 @@ Run as root: sudo propolis-status
 EOF
 }
 
-VIEW="" VERB="" MAINT_MINUTES=""
-if [ "$#" -eq 2 ] && [ "$1" = --maint ]; then
+VIEW="" VERB="" MAINT_MINUTES="" ACK_CODE=""
+if [ "$#" -eq 2 ] && [ "$1" = --ack-test ]; then
+    # Checked here, before any file is read: the code reaches a comparison and nothing else.
+    if [[ $2 =~ ^[0-9a-f]{6}$ ]]; then
+        VERB=ack-test ACK_CODE="$2"
+    else
+        echo "propolis-status: --ack-test takes the 6-character code the test page carries (0-9, a-f)" >&2
+        usage >&2
+        exit 64
+    fi
+elif [ "$#" -eq 2 ] && [ "$1" = --maint ]; then
     # Digits only and read as decimal: `08` is eight minutes, and nothing else reaches the
     # arithmetic.
     if [[ $2 =~ ^[0-9]{1,3}$ ]] && [ "$((10#$2))" -le 120 ]; then
@@ -127,8 +159,15 @@ elif [ "$#" -eq 1 ]; then
             exit 0
             ;;
         --banner) VERB=banner ;;
+        --setup) VERB=setup ;;
+        --test-page) VERB=test-page ;;
         --maint)
             echo "propolis-status: --maint takes the minutes to hold, 0 to 120" >&2
+            usage >&2
+            exit 64
+            ;;
+        --ack-test)
+            echo "propolis-status: --ack-test takes the 6-character code the test page carries (0-9, a-f)" >&2
             usage >&2
             exit 64
             ;;
@@ -272,7 +311,9 @@ STATUS_LIB_FUNCS="pa_init pa_env_get pa_settings_load pa_role pa_alias pa_id_tab
 pa_ok_field pa_clean_untrusted pa_now pa_age pa_dur pa_hms pa_read_as pa_stat_as pa_trusted_exec
 pa_state_read pa_maint_active pa_pg pa_push_scheduler pa_sensor_logs pa_unit_map pa_cleanup
 pa_banner pa_banner_write pa_maint_write pa_gate pa_readcheck_binding pa_vol_project pa_vol_judge
-pa_vol_stores"
+pa_vol_stores pa_lock pa_unlock pa_salt_ensure pa_state_write pa_readcheck_run pa_readcheck_merge
+pa_url_shown pa_token8 pa_budget_admit pa_ledger_add pa_testpage_write pa_verified pa_hook_env_value
+pa_hook_differs pa_budget_next"
 # shellcheck disable=SC2086 # the list is a fixed set of names
 unset -f $STATUS_LIB_FUNCS
 # Loaded once in a subshell first: under set -u an unbound variable at the library's top level
@@ -535,9 +576,600 @@ status_maint() {
     exit 0
 }
 
+# status_lock: the state lock within 10 s, or the verb ends: 75 when another writer holds it, 1
+# when neither lock file can be opened.
+status_lock() {
+    local rc=0
+    pa_lock 10 || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        1)
+            echo "propolis-status: the state lock is busy; try again" >&2
+            exit 75
+            ;;
+        *)
+            echo "propolis-status: the state lock cannot be opened (/var/lib/propolis/witness/state.lock or /run/propolis-witness/state.lock; provisioning makes them)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# verified_words: what pa_verified says of the shell path, and `daemon not verified` where the
+# daemon is enabled: no test page goes through the daemon's own sender, which read its settings
+# when it started and may hold an older topic or token. The caller has loaded the settings.
+verified_words() {
+    local v
+    v="$(pa_verified)"
+    case "$v" in VERIFIED*) v+=" (shell)" ;; esac
+    case "$ROLE" in single | control) v+="; daemon not verified" ;; esac
+    printf '%s' "$v"
+}
+
+# hook_posts: whether today's failure hook posts while the shell senders have no target: its own
+# reader (pa_hook_differs) finds a URL and a topic where the library finds none, whatever the
+# reason (a value the library ignores as invalid, or a later line the hook never sees). Sets
+# HOOK_POSTS (1 or 0) and the PA_HOOK_* facts. The caller has run pa_settings_load.
+hook_posts() {
+    HOOK_POSTS=0
+    pa_hook_differs || true
+    if [ "$PA_TARGET" != 1 ] && [ -n "$PA_HOOK_URL" ] && [ "$PA_HOOK_TOPIC_SET" = 1 ]; then
+        HOOK_POSTS=1
+    fi
+}
+
+# hook_diff_words: how the shell senders read the settings today's failure hook reads otherwise
+# (PA_HOOK_DIFF, from hook_posts): `ignore KEY as invalid`, `read KEY otherwise`, or both.
+hook_diff_words() {
+    local k inv="" oth=""
+    for k in $PA_HOOK_DIFF; do
+        case " ${PA_INVALID:-} " in
+            *" $k "*) inv+="${inv:+ and }$k" ;;
+            *) oth+="${oth:+ and }$k" ;;
+        esac
+    done
+    printf '%s%s%s' "${inv:+ignore $inv as invalid}" "${inv:+${oth:+ and }}" "${oth:+read $oth otherwise}"
+}
+
+# hook_fix: the fix while today's failure hook reads the push settings otherwise: the rule of the
+# URL or topic the shell senders ignore as invalid, else to write the settings plainly, the one
+# form both readings agree on, else the rule of the token they ignore as invalid: written plainly,
+# a value that breaks its rule is still ignored.
+hook_fix() {
+    local k inv="" plain=0
+    for k in $PA_HOOK_DIFF; do
+        case " ${PA_INVALID:-} " in
+            *" $k "*)
+                case "$k" in
+                    PROPOLIS_OPS_NTFY_URL | PROPOLIS_OPS_NTFY_TOPIC)
+                        printf 'Set %s in /etc/propolis/propolis.env to %s, written plainly on one line' "$k" "$(setting_rule "$k")"
+                        return 0
+                        ;;
+                    *) [ -n "$inv" ] || inv="$k" ;;
+                esac
+                ;;
+            *) plain=1 ;;
+        esac
+    done
+    if [ -n "$inv" ] && [ "$plain" = 0 ]; then
+        printf 'Set %s in /etc/propolis/propolis.env to %s, written plainly on one line' "$inv" "$(setting_rule "$inv")"
+        return 0
+    fi
+    printf 'Write each push setting in /etc/propolis/propolis.env as KEY=value at the start of its line, with no blank or comment'
+}
+
+# hook_diff_why: each setting of PA_HOOK_DIFF by why it differs, for --ack-test: `the shell
+# senders ignore KEY as invalid; set KEY to <rule>` for one in PA_INVALID, and `today's failure
+# hook reads KEY otherwise` for the rest, joined with `; `.
+hook_diff_why() {
+    local k out="" oth=""
+    for k in $PA_HOOK_DIFF; do
+        case " ${PA_INVALID:-} " in
+            *" $k "*) out+="${out:+; }the shell senders ignore $k as invalid; set $k to $(setting_rule "$k")" ;;
+            *) oth+="${oth:+ and }$k" ;;
+        esac
+    done
+    [ -z "$oth" ] || out+="${out:+; }today's failure hook reads $oth otherwise"
+    printf '%s' "$out"
+}
+
+# status_test_page: --test-page. Under the lock: the class test budget (3 in 24 h), a code from
+# /dev/urandom, then the ledger line (counted before anything is sent) and the testpage record,
+# which replaces any earlier one. Then the failure-alert unit is started for that code and sends
+# the page, so its arrival proves that unit, the network and the target as the library reads it.
+# This command sends nothing itself. It prints the code, as the unit's own name carries it (the
+# code is not a secret, just what the operator types back once the page is on the phone), with
+# `sent test page` only when the page left the host; otherwise one line says in words what became
+# of it.
+status_test_page() {
+    local admit code bind k8 unit mode=pointer next
+    pa_settings_load
+    if [ "$PA_TARGET" != 1 ]; then
+        hook_posts
+        if [ "$HOOK_POSTS" = 1 ]; then
+            printf "no target the shell senders accept: nothing sent; today's failure hook still posts to the setting they ignore (see sudo propolis-status --setup)\n"
+        else
+            printf 'no push target: nothing sent (the failure hook writes to the journal; see sudo propolis-status --setup)\n'
+        fi
+        exit 1
+    fi
+    [ "$(pa_gate)" != full ] || mode=full
+    status_lock
+    if ! pa_salt_ensure; then
+        pa_unlock
+        printf 'test page not sent: the id salt could not be written in /var/lib/propolis/witness\n'
+        exit 1
+    fi
+    admit="$(pa_budget_admit test - open 1)"
+    case "$admit" in
+        admit) ;;
+        withhold:test-cap)
+            next="$(pa_budget_next test)" || next="?"
+            pa_unlock
+            printf 'test page budget spent (3 in 24 h): nothing sent; the next is allowed at %s UTC\n' "$next"
+            exit 1
+            ;;
+        *)
+            pa_unlock
+            printf 'test page not sent: the send ledger cannot be read, so the budget cannot be counted\n'
+            exit 1
+            ;;
+    esac
+    code="$(od -An -N3 -tx1 /dev/urandom 2> /dev/null | tr -d ' \n')"
+    bind="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || bind=""
+    k8="$(pa_token8 "${PA_TOKEN:-}")" || k8=""
+    if ! [[ $code =~ ^[0-9a-f]{6}$ ]] || [ -z "$bind" ] || [ -z "$k8" ]; then
+        pa_unlock
+        printf 'test page not sent: no code could be made (/dev/urandom, sha256sum)\n'
+        exit 1
+    fi
+    if ! pa_ledger_add test - open "$mode" pending status \
+        || ! pa_testpage_write "$code" "$PA_LEDGER_STAMP" "$bind" "$k8" pending - -; then
+        pa_unlock
+        printf 'test page not sent: the state could not be written (/var/lib/propolis/witness, /run/propolis-witness)\n'
+        exit 1
+    fi
+    pa_unlock
+    unit="propolis-alert@propolis-test-page-$code.service"
+    # The unit is a oneshot, so start returns when the hook has finished; the hook's own limit is
+    # 90 s. timeout runs the real systemctl, past the 10 s wrapper above.
+    timeout 100 systemctl start -- "$unit" > /dev/null 2>&1 || true
+    pa_banner_write || true
+    if ! _pa_tp_line || [ "$PA_TP_CODE" != "$code" ]; then
+        printf 'test page not confirmed: a newer test page replaced it before its result was written\n'
+        exit 1
+    fi
+    case "$PA_TP_RESULT" in
+        ok)
+            printf 'sent test page %s: ok. When it arrives, type back the code it carries: sudo propolis-status --ack-test %s\n' "$code" "$code"
+            exit 0
+            ;;
+        pending)
+            # Also what a unit leaves that ran and could not write the record; its journal line
+            # says which.
+            printf "not sent: the failure-alert unit did not run, or could not write the page's record (see: journalctl -u %s)\n" "$unit"
+            ;;
+        sending)
+            # The hook claimed the page and then could not write its result: it was sent, or was
+            # being sent when the hook stopped.
+            printf 'sent test page %s; the result could not be recorded (see: journalctl -u %s). If it arrives, type back the code it carries: sudo propolis-status --ack-test %s\n' \
+                "$code" "$unit" "$code"
+            ;;
+        lockbusy)
+            printf 'not sent: the failure-alert unit found the state lock busy; try again in a minute (see: journalctl -u %s)\n' "$unit"
+            ;;
+        noclaim)
+            printf 'test page not sent: the failure-alert unit could not write its claim on the send ledger (/var/lib/propolis/witness, /run/propolis-witness); send another once there is room\n'
+            ;;
+        nocurl)
+            printf "test page not sent: curl is not installed here; install it (today's failure hook cannot push without it either)\n"
+            ;;
+        notarget)
+            printf 'test page not sent: the failure-alert unit found no push target; see sudo propolis-status --setup\n'
+            ;;
+        norender)
+            printf 'test page not sent: it could not be put together (no alias yet, or a value that cannot be sent safely); see sudo propolis-status --setup\n'
+            ;;
+        nomatch)
+            printf 'test page not sent: the failure-alert unit ran over 10 minutes after the page was asked for; send another\n'
+            ;;
+        perm:401 | perm:403)
+            printf 'test page %s not accepted by the server (%s): check the token and that it may write to the topic; it counted toward the three a day (see: journalctl -u %s)\n' \
+                "$code" "$PA_TP_RESULT" "$unit"
+            ;;
+        perm:*)
+            printf 'test page %s not accepted by the server (%s): check PROPOLIS_OPS_NTFY_URL and the topic; it counted toward the three a day (see: journalctl -u %s)\n' \
+                "$code" "$PA_TP_RESULT" "$unit"
+            ;;
+        transient:*)
+            printf 'test page %s not accepted by the server (%s): try again later; it counted toward the three a day (see: journalctl -u %s)\n' \
+                "$code" "$PA_TP_RESULT" "$unit"
+            ;;
+        *)
+            printf 'test page %s: result %s (see: journalctl -u %s)\n' "$code" "$PA_TP_RESULT" "$unit"
+            ;;
+    esac
+    exit 1
+}
+
+# status_ack_test CODE: --ack-test. Under the lock, the waiting test page is acknowledged only
+# when CODE is its code, it went out (ok, or sending: the hook claimed it and could not write the
+# result), it is at most a day old and it was not acknowledged before; anything else changes
+# nothing. The same code typed again says when it was acknowledged and whether VERIFIED stands,
+# without refreshing the 30 days: only a new page proves the path again. The account is
+# SUDO_UID's when that is a number.
+status_ack_test() {
+    local a uid=0 v
+    status_lock
+    if _pa_tp_line && [ "$PA_TP_CODE" = "$1" ] && { [ "$PA_TP_RESULT" = ok ] || [ "$PA_TP_RESULT" = sending ]; } \
+        && [ "$PA_TP_ACKED" != - ]; then
+        pa_unlock
+        pa_settings_load
+        v="$(date -u -d "@${PA_TP_ACKED%%/*}" +%H:%M 2> /dev/null)" || v="?"
+        if pa_verified > /dev/null; then
+            printf 'already acknowledged at %s UTC: VERIFIED stands\n' "$v"
+        else
+            printf 'already acknowledged at %s UTC; now NOT VERIFIED (%s)\n' "$v" "$PA_VERIFIED_WORD"
+        fi
+        exit 0
+    fi
+    if _pa_tp_line && [ "$PA_TP_CODE" = "$1" ] && { [ "$PA_TP_RESULT" = ok ] || [ "$PA_TP_RESULT" = sending ]; } \
+        && [ "$PA_TP_ACKED" = - ]; then
+        a="$(pa_age "$PA_TP_SENT")"
+        if [ "$a" -ge 0 ] && [ "$a" -le 86400 ]; then
+            if [[ ${SUDO_UID:-} =~ ^[0-9]{1,10}$ ]]; then uid="$((10#$SUDO_UID))"; fi
+            if pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" "$PA_TP_RESULT" "$PA_STAMP" "$uid"; then
+                pa_unlock
+                # The page proves the path the shell senders read; VERIFIED needs every other
+                # rule too, today's failure hook reading the same target among them.
+                pa_settings_load
+                if pa_verified > /dev/null; then
+                    printf 'VERIFIED: the test page reached you\n'
+                else
+                    v=""
+                    if pa_hook_differs; then
+                        v="$(printf ': %s: see sudo propolis-status --setup' "$(hook_diff_why)")"
+                    fi
+                    printf 'acknowledged; NOT VERIFIED (%s)%s\n' "$PA_VERIFIED_WORD" "$v"
+                fi
+                pa_banner_write || true
+                exit 0
+            fi
+            pa_unlock
+            printf 'not recorded: the state could not be written (/var/lib/propolis/witness, /run/propolis-witness)\n'
+            exit 1
+        fi
+    fi
+    pa_unlock
+    printf 'wrong or expired code\n'
+    exit 1
+}
+
+# gate_words GATE: the gate in words, for --setup, as what it governs: the test page and the
+# shell messages a later release adds. Today's failure hook and the daemon are not gated, so no
+# word here speaks of pushes in general (the failures line says what those carry).
+gate_words() {
+    local what="the test page (and the shell messages of a later release)"
+    case "$1" in
+        # pa_render builds the same test page in either mode, so only the later messages gain.
+        full) printf 'full - the shell messages of a later release may carry detail: the topic refuses anonymous reads (the test page carries only the alias and the code in every mode)' ;;
+        pointer:insecure) printf '%s  - %s carries no detail: over plain http a refusal proves nothing' "$1" "$what" ;;
+        pointer:token-reads) printf '%s  - %s carries no detail: the token this host holds can read the topic' "$1" "$what" ;;
+        pointer:*) printf '%s  - %s carries no detail until anonymous reads are refused' "$1" "$what" ;;
+        *)
+            # A target the shell senders ignore as invalid can still be today's hook's.
+            if [ "${HOOK_POSTS:-0}" = 1 ]; then
+                printf "%s  - the shell senders push nothing; today's failure hook still posts (see target)" "$1"
+            else
+                printf '%s  - nothing is pushed: no target' "$1"
+            fi
+            ;;
+    esac
+}
+
+# setting_rule KEY: the rule a shell sender's push setting must meet, in config-check's words
+# (alert_rule_words), for the fix --setup prints.
+setting_rule() {
+    case "$1" in
+        PROPOLIS_OPS_NTFY_URL) printf 'an http:// or https:// URL with a host and no blanks' ;;
+        PROPOLIS_OPS_NTFY_TOPIC) printf '1 to 64 letters, digits, _ or -' ;;
+        PROPOLIS_OPS_NTFY_TOKEN) printf '1 to 256 printable characters with no blank' ;;
+        *) printf 'a valid value' ;;
+    esac
+}
+
+# next_step WORD: what to do about a NOT VERIFIED word, for --setup's verified line, from the
+# word, the last test page's result (pa_verified left it in PA_TP_RESULT) and the role. Only no
+# page, an expired one, a code past the day --ack-test takes it for, and a change today's failure
+# hook reads the same way are told to send a page: after one that went out a new page would
+# replace the code on the phone and spend one of the day's three, a change the hook reads
+# otherwise needs the file fixed first, and without a target or a salt --test-page refuses and
+# points back here.
+next_step() {
+    local send="Run: sudo propolis-status --test-page" a
+    if [ "$PA_TARGET" != 1 ]; then
+        # The hook still posting is a fix to make on any role, a collector's included.
+        if [ "${HOOK_POSTS:-0}" = 1 ]; then
+            hook_fix
+        elif [ "$ROLE" = collector ]; then
+            printf 'No push target is expected on a collector'
+        else
+            printf 'Set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC in /etc/propolis/propolis.env'
+        fi
+        return 0
+    fi
+    if ! _pa_salt > /dev/null; then
+        printf 'The id salt must be written first (see the salt line)'
+        return 0
+    fi
+    case "$1" in
+        never | expired) printf '%s' "$send" ;;
+        changed)
+            # A new page cannot clear a change today's failure hook reads otherwise: it proves
+            # only the shell senders' reading, and would spend one of the day's three.
+            if pa_hook_differs; then
+                hook_fix
+            else
+                printf '%s' "$send"
+            fi
+            ;;
+        pending)
+            case "$PA_TP_RESULT" in
+                ok | sending)
+                    # --ack-test takes a code for a day; after that only a new page helps.
+                    a="$(pa_age "$PA_TP_SENT")"
+                    if [ "$a" -ge 0 ] && [ "$a" -le 86400 ]; then
+                        printf 'Type back the code from the page: sudo propolis-status --ack-test <code>'
+                    else
+                        printf "The last test page's code has expired (over a day old). %s" "$send"
+                    fi
+                    ;;
+                pending) printf "The last test page was not sent: the failure-alert unit did not run, or could not write the page's record (see journalctl -u propolis-alert@propolis-test-page-%s.service)" "$PA_TP_CODE" ;;
+                perm:401 | perm:403) printf 'The last test page was refused (%s): check the token and that it may write to the topic, then send another' "$PA_TP_RESULT" ;;
+                perm:*) printf 'The last test page was refused (%s): check PROPOLIS_OPS_NTFY_URL and the topic, then send another' "$PA_TP_RESULT" ;;
+                transient:*) printf 'The last test page got no answer that took it (%s): check the network and the server, then send another' "$PA_TP_RESULT" ;;
+                nocurl) printf 'The last test page was not sent (nocurl): install curl, then send another' ;;
+                lockbusy) printf 'The last test page was not sent (lockbusy): the state lock was busy; send another in a minute' ;;
+                *) printf 'The last test page was not sent (%s): send another' "$PA_TP_RESULT" ;;
+            esac
+            ;;
+        refused) printf 'A message was refused for good since the code was typed back: check the token and the topic, then send another test page' ;;
+        path-failed | undelivered) printf 'A failure alert did not leave this host since: see sudo propolis-status alert' ;;
+        *) printf 'A state file cannot be read: see sudo propolis-status' ;;
+    esac
+}
+
+# status_setup: --setup. The anonymous-read check of the target runs first, without the lock (it
+# can take a minute); then, under the lock, the id salt (the fallback alias comes from it) and the
+# stored check, merged as the witness merges it. Then the report, one item a line: never the
+# token, never the topic (only its length), and of the URL only its scheme and host.
+status_setup() {
+    local alias host role had_salt=0 salt=ok ran=0 b have body="" line t stored=1 gate token
+    local hook_token hook_any hook_refused=0 hook_url
+    pa_settings_load
+    if [ "$PA_TARGET" = 1 ]; then
+        pa_readcheck_run "$PA_URL" "$PA_TOPIC" "${PA_TOKEN:-}" || true
+        ran=1
+    fi
+    status_lock
+    if _pa_salt > /dev/null; then had_salt=1; fi
+    if ! pa_salt_ensure; then
+        salt="could not be written in /var/lib/propolis/witness: no alias yet"
+    elif [ "$had_salt" = 0 ]; then
+        salt="created now"
+    fi
+    if [ "$ran" = 1 ] && [ "$PA_RC_CAUSE" = - ]; then
+        pa_now
+        b="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || b=""
+        have=0
+        if _pa_rc_line shell; then have=1; fi
+        # One target before alert.env is read: the shell's and the daemon's are the same, so its
+        # line is the both line, and lines for either role alone are gone with it.
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            IFS=$'\t' read -r t _ <<< "$line"
+            [ "$t" = R ] || body+="$line"$'\n'
+        done < <(pa_state_read readcheck)
+        body+="$(pa_readcheck_merge both "$b" "$have")"$'\n'
+        pa_state_write readcheck < <(printf '%s' "$body") || stored=0
+    fi
+    pa_unlock
+    PA_ROLE="$ROLE"
+    gate="$(pa_gate)"
+    # A definite answer other than a refusal that could not be stored must not leave the gate on
+    # the refusal stored before it: the answer given now is the one that holds.
+    if [ "$stored" = 0 ] && [ "$PA_RC_CLASS" != transient ] && [ "$PA_RC_CLASS" != refused ]; then
+        gate="pointer:$PA_RC_CLASS"
+    fi
+    # What today's failure hook reads in propolis.env, by its own rule, against the shell senders.
+    hook_posts
+    hook_token="$(pa_hook_env_value PROPOLIS_OPS_NTFY_TOKEN)"
+    # Whether today's failure hook posts at all: its own reader finds a URL and a topic.
+    hook_any=0
+    [ -z "$PA_HOOK_URL" ] || [ "$PA_HOOK_TOPIC_SET" != 1 ] || hook_any=1
+    pa_alias > /dev/null 2>&1 || true
+    alias="${PA_ALIAS:--}"
+    host="$(hostname 2> /dev/null | tr -c 'A-Za-z0-9.\n-' '?' | head -n 1)"
+    case "$ROLE" in
+        single) role="single box" ;;
+        control) role="control node" ;;
+        collector) role=collector ;;
+        gateway) role="gateway only" ;;
+        *) role="unknown role" ;;
+    esac
+    printf 'setup on %s (%s, %s)\n' "$alias" "${host:-?}" "$role"
+    # Only the test page carries the alias in this release; today's failure alerts name the host
+    # by its host name. Where nothing posts, nothing names the host on a channel.
+    t=""
+    [ "$hook_any" = 0 ] || t="today's failure alerts name it by its host name, ${host:-?}"
+    if [ "$PA_TARGET" != 1 ]; then
+        if [ "$hook_any" = 1 ]; then
+            printf "channel     today's failure alerts name this host by its host name, %s; no test page names it while the shell senders have no target\n" "${host:-?}"
+        fi
+    elif [ "$alias" = - ]; then
+        printf 'channel     no alias yet: the id salt could not be written%s\n' "${t:+; $t}"
+    elif [ "$ROLE" = single ]; then
+        printf 'channel     test pages (and the shell messages of a later release) name this host by its alias, %s: record it%s\n' "$alias" "${t:+; $t}"
+    else
+        printf "channel     test pages (and the shell messages of a later release) name this host by its alias, %s: record it%s; warning: a fallback alias cannot be told from other hosts' on a phone, and this release has no setting to name it\n" "$alias" "${t:+; $t}"
+    fi
+    if [ "$HOOK_POSTS" = 1 ]; then
+        # The hook posts the raw values: without a scheme curl falls back to plain http.
+        case "$PA_HOOK_URL" in
+            *://*) b="URL $(pa_url_shown "$PA_HOOK_URL")" ;;
+            *) b="no scheme: curl uses plain http" ;;
+        esac
+        token=""
+        [ -z "$hook_token" ] || token=" and the token"
+        printf "target      none for the shell senders, which %s; today's failure hook still posts to it (%s), with the host and unit names, its journal lines%s\n" \
+            "$(hook_diff_words)" "$b" "$token"
+        for line in $PA_HOOK_DIFF; do
+            case " $PA_INVALID " in
+                *" $line "*)
+                    case "$line" in
+                        PROPOLIS_OPS_NTFY_URL | PROPOLIS_OPS_NTFY_TOPIC)
+                            printf '            fix (config-check alert-setting-invalid): in /etc/propolis/propolis.env set %s to %s, written plainly on one line\n' \
+                                "$line" "$(setting_rule "$line")"
+                            ;;
+                    esac
+                    ;;
+                *)
+                    printf "            today's failure hook reads %s otherwise: write each push setting as KEY=value at the start of its line, with no blank or comment\n" "$line"
+                    ;;
+            esac
+        done
+    elif [ "$PA_TARGET" != 1 ]; then
+        printf 'target      none: the failure hook writes its alerts to the journal%s\n' \
+            "${PA_INVALID:+ (invalid value ignored: $PA_INVALID)}"
+    else
+        token="no token"
+        [ -z "${PA_TOKEN:-}" ] || token="token set"
+        printf 'target      ntfy from %s: URL %s, topic set (%s chars), %s%s\n' "$PA_TARGET_SRC" \
+            "$(pa_url_shown "$PA_URL")" "${#PA_TOPIC}" "$token" "${PA_INVALID:+ (invalid value ignored: $PA_INVALID)}"
+        # Names only: a page that went out through the library proves nothing for a hook that
+        # would post elsewhere, or not at all.
+        # A value the shell senders ignore as invalid is fixed by its rule; writing it plainly
+        # would leave it ignored.
+        b=""
+        for line in $PA_HOOK_DIFF; do
+            case " ${PA_INVALID:-} " in
+                *" $line "*)
+                    printf '            the shell senders ignore %s as invalid; set %s to %s\n' "$line" "$line" "$(setting_rule "$line")"
+                    ;;
+                *) b+="${b:+ and }$line" ;;
+            esac
+        done
+        if [ -n "$b" ]; then
+            printf "            today's failure hook reads %s otherwise: write each push setting as KEY=value at the start of its line, with no blank or comment\n" \
+                "$b"
+        fi
+        if [ "$PA_RC_CAUSE" != - ]; then
+            printf 'anon read   not checked: curl or a private temporary file was not to be had\n'
+        else
+            printf 'anon read   checked now: json %s (%s), raw %s (%s), sse %s (%s) -> %s\n' \
+                "$PA_RC_JSON" "$PA_RC_JSON_CT" "$PA_RC_RAW" "$PA_RC_RAW_CT" "$PA_RC_SSE" "$PA_RC_SSE_CT" "$PA_RC_CLASS"
+            [ "$PA_RC_CLASS" != transient ] || printf '            no definite answer: the one stored before stands\n'
+            [ "$stored" = 1 ] || printf '            the answer could not be stored (/var/lib/propolis/witness, /run/propolis-witness)\n'
+        fi
+        if [[ $PA_URL != https://* ]]; then
+            printf 'anon read   gate needs https: over http anyone on the path can fake this answer and read the pushes\n'
+        fi
+        case "$PA_RC_TOKEN" in
+            reads) printf 'token       reads (this token can read the topic)\n' ;;
+            noread) printf 'token       noread (this token cannot read the topic)\n' ;;
+            unknown) printf 'token       unknown (its read got no answer that says)\n' ;;
+            *)
+                # A check that never ran says nothing about the token.
+                if [ "$PA_RC_CAUSE" != - ] && [ -n "${PA_TOKEN:-}" ]; then
+                    printf 'token       not checked\n'
+                else
+                    printf 'token       none\n'
+                fi
+                ;;
+        esac
+        if ! command -v curl > /dev/null 2>&1; then
+            printf "            install curl: today's failure hook cannot push without it either\n"
+        fi
+        if [ "$ROLE" = collector ]; then
+            printf "token       collectors should use their own topic: on ntfy.sh a token carries its user's read rights\n"
+        fi
+    fi
+    printf 'gate        %s\n' "$(gate_words "$gate")"
+    # Today's failure hook is not gated: it posts its host name, unit and journal lines wherever
+    # it reads a URL and a topic. Its topic is proven private only by a refusal for the very target
+    # it reads, stored now or before, and over plain http not even then.
+    if [ "$hook_any" = 1 ]; then
+        hook_url="$PA_HOOK_URL"
+        if [ "$PA_TARGET" = 1 ] && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_URL "* ]] \
+            && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_TOPIC "* ]]; then
+            if [ "$stored" = 0 ] && [ "$PA_RC_CLASS" != transient ]; then
+                [ "$PA_RC_CLASS" != refused ] || hook_refused=1
+            elif _pa_rc_line daemon && [ "$PA_RCL_DCLASS" = refused ] \
+                && [ "$PA_RCL_BIND" = "$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" ]; then
+                hook_refused=1
+            fi
+        fi
+        if [[ $hook_url != https://* ]] || [ "$hook_refused" = 0 ]; then
+            line="failures    the gate does not apply to today's failure alerts: each carries this host's name, the failed unit and its last journal lines"
+            if [[ $hook_url != https://* ]]; then
+                line+="; over plain http they travel in clear"
+                [ -z "$hook_token" ] || line+=", the token too"
+            fi
+            [ "$hook_refused" = 1 ] || line+="; the topic is not proven to refuse anonymous reads"
+            printf '%s\n' "$line"
+        fi
+    fi
+    if [ "${PA_D_TARGET:-0}" = 1 ] && { ! _pa_rc_line daemon || [ "$PA_RCL_DCLASS" != refused ]; }; then
+        # The hook posts to this topic only where its own reader finds this URL and topic.
+        if [ "$hook_any" = 1 ] && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_URL "* ]] \
+            && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_TOPIC "* ]]; then
+            if [ "$HAS_DAEMON" = 1 ]; then
+                printf "daemon      the daemon and today's failure hook post to this topic; their titles name this host's software and, for the hook, the host and unit (until step 3)\n"
+            else
+                printf "daemon      today's failure hook posts to this topic; its titles name the host and the unit that failed\n"
+            fi
+        elif [ "$HAS_DAEMON" = 1 ]; then
+            printf "daemon      the daemon posts to this topic; its titles name this host's software (until step 3)\n"
+        fi
+    fi
+    case "${PA_HB_STATE:-unset}" in
+        set) printf 'heartbeat   set (the URL is not shown)\n' ;;
+        insecure | invalid) printf 'heartbeat   refused (not an https URL): PROPOLIS_WITNESS_HEARTBEAT_URL is ignored\n' ;;
+        *) printf 'heartbeat   not set. Recommended: a private dead-man check URL (no public status page) in PROPOLIS_WITNESS_HEARTBEAT_URL; it fires when this host stops\n' ;;
+    esac
+    # Run here as well, outside the $() of verified_words, so the word and the stored page's
+    # result are set in this shell for the next step.
+    pa_verified > /dev/null || true
+    line="$(verified_words)"
+    case "$line" in
+        VERIFIED*) printf 'verified    %s\n' "$line" ;;
+        *) printf 'verified    %s. %s\n' "$line" "$(next_step "$PA_VERIFIED_WORD")" ;;
+    esac
+    printf 'salt        %s\n' "$salt"
+    pa_banner_write || echo "propolis-status: the login banner was not rewritten (/run/motd.d is missing or refused the write)" >&2
+    [ "$gate" = full ] || exit 1
+    exit 0
+}
+
+# daemon_config_older: the running daemon started before propolis.env last changed, so it may
+# hold an older topic or token: a restart is what makes a changed target take effect. The
+# file's own mtime, not a link's target. Run in a subshell, so the U_ values the rows read are
+# left as they were.
+daemon_config_older() {
+    local m t
+    case "$ROLE" in single | control) ;; *) return 1 ;; esac
+    unit_show propolis.service ActiveState SubState ActiveEnterTimestamp || return 1
+    unit_up || return 1
+    t="$(ts_epoch "$U_ActiveEnterTimestamp")"
+    m="$(timeout 5 stat -c %Y -- "$PROPOLIS_ENV" 2> /dev/null)" || return 1
+    [[ $t =~ ^[0-9]{1,12}$ && $m =~ ^[0-9]{1,12}$ ]] && [ "$m" -gt "$t" ]
+}
+
 case "$VERB" in
     banner) status_banner ;;
     maint) status_maint "$MAINT_MINUTES" ;;
+    setup) status_setup ;;
+    test-page) status_test_page ;;
+    ack-test) status_ack_test "$ACK_CODE" ;;
 esac
 
 env_of PROPOLIS_OPS_STALL_FOR_SECS "$PROPOLIS_ENV"
@@ -1520,8 +2152,9 @@ row_publish() {
 # ---- the rails ------------------------------------------------------------------------------
 
 # The ALERTS facts, shared by the header and the alert rail.
+HOOK_POSTS=0
 A_TARGET="" A_MONITOR="" A_QUEUE="" A_UNDELIVERED="" A_SINCE="" A_QUEUE_N=0 A_UNDELIVERED_N=0
-A_QUEUE_OLDEST="" A_GATE="" A_GATE_CHECKED=- A_RC_NOTE="" A_DAEMON_PRIVATE=0
+A_QUEUE_OLDEST="" A_GATE="" A_GATE_CHECKED=- A_RC_NOTE="" A_DAEMON_PRIVATE=0 A_VERIFIED="" A_OLDCONF=0
 
 # load_readcheck_facts: the gate (from the stored read check and the settings; no network), when
 # the check was last attempted, one note per stored line (the shell's and the daemon's target, or
@@ -1548,8 +2181,9 @@ load_readcheck_facts() {
             b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || b=""
         fi
         _pa_rc_line "$role" || continue
-        # The gate's own terms (2.4.5 rules 5, 6 and 8): over plain HTTP a 403 proves nothing, and a
-        # refusal no attempt has confirmed for three hours is no longer known.
+        # The gate's own terms, as pa_gate holds the shell target to them (a refusal decided within
+        # a day, an attempt within three hours, over https): over plain HTTP a 403 proves nothing,
+        # and a refusal no attempt has confirmed for three hours is no longer known.
         if [ "$role" = daemon ] && [ "$PA_RCL_BIND" = "$b" ] && [ "$PA_RCL_DCLASS" = refused ] \
             && [[ ${PA_D_URL:-} == https://* ]]; then
             a="$(pa_age "$PA_RCL_DSTAMP")"
@@ -1577,11 +2211,16 @@ load_readcheck_facts() {
 load_alert_facts() {
     local f first text rc dir n=0 oldest="" list name
     pa_settings_load
+    hook_posts
     load_readcheck_facts
+    A_VERIFIED="$(verified_words)"
+    if (daemon_config_older); then A_OLDCONF=1; fi
     if [ -e "$PROPOLIS_ENV" ] && { [ ! -f "$PROPOLIS_ENV" ] || [ ! -r "$PROPOLIS_ENV" ]; }; then
         A_TARGET="?"
     elif [ "$PA_TARGET" = 1 ]; then
         A_TARGET="ntfy from $PA_TARGET_SRC"
+    elif [ "$HOOK_POSTS" = 1 ]; then
+        A_TARGET="none for the shell senders; today's failure hook still posts"
     else
         A_TARGET="none"
     fi
@@ -1644,9 +2283,13 @@ load_alert_facts() {
 
 rail_alert() {
     local state=ok note="" cond="" inst=ntfy
-    [ "$PA_TARGET" = 1 ] || inst=journal
+    [ "$PA_TARGET" = 1 ] || [ "$HOOK_POSTS" = 1 ] || inst=journal
     if [ "$A_TARGET" = "?" ]; then
         state='?' note="propolis.env cannot be read"
+    elif [ "$HOOK_POSTS" = 1 ]; then
+        # The hook still posts, a collector's included: the journal is not where its alerts go.
+        state=WARN cond=alert-target
+        note="the shell senders $(hook_diff_words); today's failure hook still posts to it (see sudo propolis-status --setup)"
     elif [ "$PA_TARGET" != 1 ]; then
         if [ "$ROLE" = collector ]; then
             state=info note="no push path here (collector default)"
@@ -1661,7 +2304,8 @@ rail_alert() {
         [ "$state" = '?' ] || state=WARN
         cond=alert-target note="${note:+$note; }alert.env present, profile legacy: it acts only under v2"
     fi
-    [ -z "$PA_INVALID" ] || {
+    # The hook-posts note already names the settings it reads otherwise.
+    [ -z "$PA_INVALID" ] || [ "$HOOK_POSTS" = 1 ] || {
         state=WARN cond=alert-target
         note="${note:+$note; }invalid value ignored: $PA_INVALID"
     }
@@ -1678,9 +2322,26 @@ rail_alert() {
             cond="${cond:-alert-target}" note="${note:+$note; }gate ${A_GATE}"
         fi
         if [ "${PA_D_TARGET:-0}" = 1 ] && [ "$A_DAEMON_PRIVATE" = 0 ]; then
-            [ "$state" = '?' ] || state=WARN
-            cond="${cond:-alert-target}"
-            note="${note:+$note; }legacy hook carries host and unit names; daemon titles name this host's software (until step 3)"
+            # The hook is named only where its own reader finds this URL and topic, the daemon
+            # only where one runs.
+            local hook_same=0 dnote=""
+            if [ -n "$PA_HOOK_URL" ] && [ "$PA_HOOK_TOPIC_SET" = 1 ] \
+                && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_URL "* ]] \
+                && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_TOPIC "* ]]; then
+                hook_same=1
+            fi
+            if [ "$hook_same" = 1 ] && [ "$HAS_DAEMON" = 0 ]; then
+                dnote="legacy hook carries host and unit names"
+            elif [ "$hook_same" = 1 ]; then
+                dnote="legacy hook carries host and unit names; daemon titles name this host's software (until step 3)"
+            elif [ "$HAS_DAEMON" = 1 ]; then
+                dnote="daemon titles name this host's software (until step 3)"
+            fi
+            if [ -n "$dnote" ]; then
+                [ "$state" = '?' ] || state=WARN
+                cond="${cond:-alert-target}"
+                note="${note:+$note; }$dnote"
+            fi
         fi
     fi
     [ -z "$A_RC_NOTE" ] || note="${note:+$note; }$A_RC_NOTE"
@@ -2232,7 +2893,7 @@ STATUS_NEXT=(
     "ledger-down ledger db-unreachable"
     "ledger-state ledger db-state"
     "alert-path alert alert-path"
-    "alert-target alert -"
+    "alert-target --setup -"
     "backup-failed backup backup-failed"
     "backup-hung backup backup-hung"
     "push-failing publish push-failing"
@@ -2732,7 +3393,9 @@ print_alerts() {
     if _pa_stamp_split "$A_GATE_CHECKED"; then
         gate+=" (checked $(fmt_time "$_PA_W"), $(fmt_age "$(pa_age "$A_GATE_CHECKED")"))"
     fi
-    printf 'ALERTS  target %s - %s - daemon monitor %s - daemon queue %s - %s\n' "$A_TARGET" "$gate" "$A_MONITOR" "$A_QUEUE" "$hook"
+    printf 'ALERTS  target %s - %s - daemon monitor %s - daemon queue %s - %s - %s\n' "$A_TARGET" "$gate" \
+        "$A_MONITOR" "$A_QUEUE" "$hook" "$A_VERIFIED"
+    [ "$A_OLDCONF" = 0 ] || printf '        the daemon loaded an older configuration: restart propolis to apply it\n'
     if [ -n "$W_BANNER_MT" ]; then banner="$(fmt_time "$W_BANNER_MT")"; else banner="not written"; fi
     # An unreadable meta reads as empty, which must not pass for a host with nothing recorded.
     if [[ " ${PA_STATE_UNREADABLE:-} " == *" meta "* ]]; then
@@ -3259,6 +3922,23 @@ stage_view() {
                 "$(journalctl -q -o cat --no-pager --since -24h SYSLOG_IDENTIFIER=propolis-alert _UID=0 2> /dev/null | grep -c -a -F 'undelivered')"
             printf '    daemon queue: %s%s\n' "$A_QUEUE" \
                 "${A_QUEUE_OLDEST:+, oldest first_failed_unix $(fmt_time "$A_QUEUE_OLDEST")}"
+            # The test page as recorded, without its code: --test-page prints it once, for the
+            # operator to match against the phone, and a view kept on a screen has no need of it.
+            printf '    %s\n' "$A_VERIFIED"
+            if _pa_tp_line; then
+                printf '    test page: asked %s, result %s, typed back %s\n' "$(fmt_time "${PA_TP_SENT%%/*}")" \
+                    "$PA_TP_RESULT" "$(fmt_time "${PA_TP_ACKED%%/*}")"
+            else
+                printf '    test page: none recorded\n'
+            fi
+            # The newest ten lines of the send ledger, by key hash only.
+            local l_s l_c l_k l_x l_m l_r l_w
+            while IFS=$'\t' read -r t l_s l_c l_k l_x l_m l_r l_w _; do
+                [ "$t" = L ] || continue
+                printf '    ledger %s class %s key %s %s %s %s by %s\n' "$(fmt_time "${l_s%%/*}")" \
+                    "$(view_field "${l_c:-}")" "$(view_field "${l_k:-}")" "$(view_field "${l_x:-}")" \
+                    "$(view_field "${l_m:-}")" "$(view_field "${l_r:-}")" "$(view_field "${l_w:-}")"
+            done < <(pa_state_read send-ledger | tail -n 10)
             # Each record as the walk lists it, then its fields by name. Tier, state and the
             # reminder fields stay out until a witness pass has judged the records.
             while IFS= read -r t; do

@@ -26,7 +26,11 @@
 # differently (env-systemd-only); whether the daemon's database role can do more to the event
 # ledger than append to it; on a control plane with a gateway spool, each collector's spool
 # against PROPOLIS_SENSOR_LOGS (one the gateway acknowledges and the daemon never reads); and
-# whether the root witness and its library are installed and both its timers enabled.
+# whether the root witness and its library are installed and both its timers enabled; and the
+# alert channel: push settings the shell senders ignore as invalid, and whether the stored
+# anonymous-read check (made by the witness or `propolis-status --setup`, never by this script)
+# found the topic readable by anyone, or got another answer that is not a refusal and so leaves
+# it not proven private.
 #
 # BY ROLE. A collector and a gateway-only host (the alert library's pa_role) with no
 # propolis.service enabled or running and a propolis.env that configures no daemon (names no
@@ -98,7 +102,7 @@
 # a hostile or corrupt file cannot inject terminal escapes or break the JSON.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 1
+# needs-alert-lib: 9
 
 set -euo pipefail
 shopt -s nullglob
@@ -1855,13 +1859,9 @@ backup_applies() {
 # hook_target_shown URL: the scheme and host (with a port) of URL, or `the target` when it is not
 # a plain http or https URL. A user name and password before the host, a path (a topic written
 # into the URL) and a query (ntfy takes a token there) are never copied out of propolis.env into
-# a report.
+# a report. The rule is the library's, so `propolis-status --setup` shows a URL the same way.
 hook_target_shown() {
-    if [[ "$1" =~ ^(https?://)([^/@?#]*@)?([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?([/?#].*)?$ ]]; then
-        printf '%s%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
-    else
-        printf 'the target'
-    fi
+    pa_url_shown "$1"
 }
 
 # On a host that runs no daemon, what is left of the alerting check is the failure hook, which
@@ -2614,16 +2614,11 @@ spool_subsystem() {
 
 # alert_hook_value NAME FILE: NAME as the failure hook reads it (deploy/alert.sh env_value): the
 # last line that starts with NAME= (an indented one is not seen), with a leading and a trailing
-# quote removed and no whitespace trimmed. Kept identical to the hook so the check sees what it sees.
+# quote removed and no whitespace trimmed. The rule lives in the alert library
+# (pa_hook_env_value), where the status command's VERIFIED compares it with the shell senders'
+# reading, so the two checks see the same thing the hook does.
 alert_hook_value() {
-    local v
-    [ -r "$2" ] || return 0
-    v="$(sed -n "s/^$1=//p" -- "$2" 2>/dev/null | tail -n 1)" || v=""
-    v="${v%\"}"
-    v="${v#\"}"
-    v="${v%\'}"
-    v="${v#\'}"
-    printf '%s' "$v"
+    pa_hook_env_value "$1" "$2"
 }
 
 # spool_read_state FILE CURSOR_DIR: how far intake read FILE, from the cursor the daemon keeps for
@@ -3271,6 +3266,170 @@ check_witness() {
     global witness ok "installed, both timers enabled"
 }
 
+# alert_rule_words KEY: the validity rule of a shell sender's setting, in words.
+alert_rule_words() {
+    case "$1" in
+        PROPOLIS_OPS_NTFY_URL) printf 'an http:// or https:// URL with a host and no blanks' ;;
+        PROPOLIS_OPS_NTFY_TOPIC) printf '1 to 64 letters, digits, _ or -' ;;
+        PROPOLIS_OPS_NTFY_TOKEN) printf '1 to 256 printable characters with no blank' ;;
+        PROPOLIS_WITNESS_HEARTBEAT_URL) printf 'an https:// URL with no blanks' ;;
+        *) printf 'a valid value' ;;
+    esac
+}
+
+# The alert channel as the shell senders (the witness, the status command's test page) see it,
+# from the alert library's own reading of the settings and the anonymous-read check it stored.
+# Nothing here asks the alert server: the check is made by the witness every hour and by
+# `propolis-status --setup`, and this script writes nothing, so a request here could not be kept.
+# A setting the library ignores as invalid is named (the daemon and today's failure hook still
+# use it: they read it their own way), and so is a topic the stored check did not find refusing
+# anonymous reads: that is the topic the failure hook posts host and unit names to. A check never
+# made for this target reads skip (not made yet, so it leaves the exit status alone); one that is
+# stale, got no definite answer or cannot be read is unknown, never ok. On a host that runs no
+# daemon the failure hook still posts to this host's target, so both still apply; only the
+# daemon's part of the message goes.
+check_alert_settings() {
+    local file="$ENV_DIR/propolis.env" key src parts=() worst=ok b a cls gate who ac_text="" p text answer never hook_same
+    # The library's clock follows this run's (PROPOLIS_CC_NOW), so the stored check's age is
+    # counted from the same time as every other age in the report.
+    if [[ "${PROPOLIS_CC_NOW:-}" =~ ^[0-9]{1,12}$ ]]; then
+        # shellcheck disable=SC2034 # read by the library's pa_now, which this function calls
+        local PA_TEST_WALL="$PROPOLIS_CC_NOW" PA_TEST_BOOT=- PA_TEST_UP=0
+    fi
+    pa_now
+    if [ "$IS_ROOT" -eq 0 ]; then
+        global alert-channel unknown "alert channel not checked: not root"
+        limit "alert channel not checked: /var/lib/propolis/witness is not readable as this user; run as root"
+        return 0
+    fi
+    if [ -e "$file" ] && [ ! -r "$file" ]; then
+        global alert-channel unknown "$file is not readable"
+        return 0
+    fi
+    PA_ROLE="$CC_ROLE"
+    pa_settings_load
+    local -a invalid=()
+    read -r -a invalid <<<"${PA_INVALID:-}"
+    case "${PA_HB_STATE:-unset}" in
+        insecure | invalid) invalid+=(PROPOLIS_WITNESS_HEARTBEAT_URL) ;;
+    esac
+    for key in "${invalid[@]}"; do
+        src="$file"
+        # Who ignores the value and who does not: the shell senders read it through the library,
+        # while today's failure hook and the daemon read propolis.env their own way and use it as
+        # written. The heartbeat URL is the witness's alone, and is read from alert.env too, which
+        # wins.
+        who="the status command and the witness ignore it, while today's failure hook and the daemon still use it as written"
+        [ -z "$CC_DAEMONLESS" ] || who="the status command and the witness ignore it, while today's failure hook still uses it as written"
+        if [ "$key" = PROPOLIS_WITNESS_HEARTBEAT_URL ]; then
+            pa_env_get "$key" "$file" "$ENV_DIR/$PA_ALERT_ENV_NAME" >/dev/null
+            src="${PA_ENV_SRC:-$file}"
+            who="the witness ignores it and pings no dead-man check"
+        fi
+        worst=warn
+        parts+=("$key ignored")
+        finding warn "alert-channel" "alert-setting-invalid:$key" "$key in $src is not valid ($(alert_rule_words "$key")): $who; see sudo propolis-status --setup" \
+            "set $key in $src to $(alert_rule_words "$key"), written plainly on one line" manual
+    done
+    if [ "$PA_TARGET" != 1 ]; then
+        # The hook reads propolis.env its own way: where it finds a URL and a topic it still
+        # posts, which is no collector's quiet default.
+        pa_hook_differs || true
+        if [ -n "$PA_HOOK_URL" ] && [ "$PA_HOOK_TOPIC_SET" = 1 ]; then
+            parts+=("no push target for the shell senders; today's failure hook still posts (see sudo propolis-status --setup)")
+            for p in "${parts[@]}"; do ac_text="${ac_text:+$ac_text, }$p"; done
+            global alert-channel warn "$ac_text"
+            return 0
+        fi
+        if [ "$CC_DAEMONLESS" = collector ] && [ "$worst" = ok ]; then
+            global alert-channel ok "no push target (a collector's default: its failure hook writes to the journal)"
+            return 0
+        fi
+        parts+=("no push target")
+        for p in "${parts[@]}"; do ac_text="${ac_text:+$ac_text, }$p"; done
+        global alert-channel warn "$ac_text"
+        return 0
+    fi
+    # The target the failure hook and the daemon post to (propolis.env), and its stored line.
+    pa_state_read readcheck >/dev/null
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" readcheck "* ]]; then
+        global alert-channel unknown "the stored anonymous-read check cannot be read"
+        limit "anonymous read not checked yet: the stored check cannot be read; the witness checks within the hour, or run sudo propolis-status --setup"
+        return 0
+    fi
+    b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || b=""
+    if _pa_rc_line daemon && [ "$PA_RCL_BIND" = "$b" ] && [ "$PA_RCL_DCLASS" != - ] && [ "$PA_RCL_DCLASS" != refused ]; then
+        cls="$PA_RCL_DCLASS"
+        a="$(pa_age "$PA_RCL_DSTAMP")"
+        a="$(if [ "$a" -ge 0 ]; then pa_dur "$a"; else printf 'an unknown time'; fi)"
+        # Today's failure hook is named as sending there only where its own reader, which reads
+        # propolis.env with a rule of its own, finds this URL and topic.
+        hook_same=0
+        pa_hook_differs || true
+        if [ -n "$PA_HOOK_URL" ] && [ "$PA_HOOK_TOPIC_SET" = 1 ] \
+            && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_URL "* ]] \
+            && [[ " $PA_HOOK_DIFF " != *" PROPOLIS_OPS_NTFY_TOPIC "* ]]; then
+            hook_same=1
+        fi
+        # Only a readable answer proves that anyone who knows the name reads the alerts; any
+        # other answer that is not a refusal proves only that the topic is not proven private.
+        if [ "$cls" = readable ]; then
+            who="anyone who knows its name reads the alerts, the daemon's titles name this host's software, and today's failure hook sends this host's name and the failed unit (legacy)"
+            [ -z "$CC_DAEMONLESS" ] || who="anyone who knows its name reads the alerts, and today's failure hook sends this host's name and the failed unit (legacy)"
+            if [ "$hook_same" = 0 ]; then
+                who="anyone who knows its name reads the alerts, and the daemon's titles name this host's software"
+                [ -z "$CC_DAEMONLESS" ] || who="anyone who knows its name reads what this host pushes there"
+            fi
+            text="the alert topic answered an anonymous read ($cls, checked $a ago): $who"
+            parts+=("topic readable by anyone ($cls)")
+        else
+            case "$cls" in
+                redirect) answer="a redirect" ;;
+                not_found) answer="not found (404)" ;;
+                not_ntfy) answer="an answer that is not ntfy's" ;;
+                *) answer="an answer this check does not know" ;;
+            esac
+            who="the daemon's titles name this host's software there, and today's failure hook sends this host's name and the failed unit (legacy)"
+            [ -z "$CC_DAEMONLESS" ] || who="today's failure hook sends this host's name and the failed unit there (legacy)"
+            if [ "$hook_same" = 0 ]; then
+                who="the daemon's titles name this host's software there"
+                [ -z "$CC_DAEMONLESS" ] || who=""
+            fi
+            text="the alert topic is not proven private: an anonymous read got $answer ($cls, checked $a ago)${who:+; $who}"
+            parts+=("topic not proven private ($cls)")
+        fi
+        worst=warn
+        finding warn "alert-channel" "alert-topic-readable" "$text" \
+            "restrict read access to the topic, or move to a topic only you can read, then run: sudo propolis-status --setup" manual
+    fi
+    gate="$(pa_gate)"
+    # Never checked for this target (no stored line, or only one for another target): right
+    # after an install, an upgrade or a change of target, before the witness's first hourly pass
+    # has stored a check. That is a check not yet made, so the row reads skip and the exit status
+    # stays as it was before this row existed; a check that was made and could not answer (stale,
+    # no definite answer) stays unknown.
+    never=0
+    if ! _pa_rc_line shell || [ "$PA_RCL_BIND" != "$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" ]; then
+        never=1
+    fi
+    if [ "$worst" = warn ]; then
+        for p in "${parts[@]}"; do ac_text="${ac_text:+$ac_text, }$p"; done
+        global alert-channel warn "$ac_text"
+    elif [ "$gate" = full ]; then
+        global alert-channel ok "the topic refuses anonymous reads (the stored check)"
+    elif [ "$never" = 1 ] && { [ "$gate" = pointer:never ] || [ "$gate" = pointer:unbound ]; }; then
+        global alert-channel skip "anonymous read never checked for this target: the witness's hourly pass checks it within the hour; sudo propolis-status --setup checks it now"
+    else
+        case "$gate" in
+            pointer:never | pointer:unbound | pointer:stale)
+                global alert-channel unknown "anonymous read not checked for the current target (${gate#pointer:})"
+                limit "anonymous read not checked yet: the witness checks within the hour, or run sudo propolis-status --setup"
+                ;;
+            *) global alert-channel warn "the topic is not proven private (${gate#pointer:})" ;;
+        esac
+    fi
+}
+
 # ---- run -----------------------------------------------------------------------------------
 
 load_rotate_size
@@ -3292,6 +3451,7 @@ else
     CC_LEFT_OUT+=("the backup of the daemon's database")
 fi
 check_alerting
+check_alert_settings
 check_clock
 check_binaries
 check_intake_list

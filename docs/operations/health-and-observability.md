@@ -28,7 +28,9 @@ this order:
   target, the daemon's monitor and alert queue, how many units' failure alerts are still
   undelivered, when the witness's light pass last completed, where the root alerting state was
   last written, when the login banner was last written and, once a light pass has run, whether a
-  heartbeat URL is set and when it was last asked or skipped (never the URL itself);
+  heartbeat URL is set and when it was last asked or skipped (never the URL itself), and whether
+  a test page proved the alert path (`VERIFIED` or `NOT VERIFIED`, see
+  [the witness](#witness));
 - `OPEN`: the incidents the witness has open, acknowledged or pending, PAGE first, then ACT,
   then NOTICE, each with its stage, the unit's opaque id and name, since when it is open, its
   cause as systemd gave it (`proc.exit 1`, `proc.signal 9`, `proc.oom`...), when the next
@@ -670,13 +672,47 @@ written, for example:
 [propolis 15:20 UTC] rewritten every 5 min; older means the witness stopped
 ```
 
-The alerts line reads `topic READABLE by anyone` when the stored read check of the alert topic got
-a definite answer other than a refusal, `topic refuses anonymous reads` when the gate holds the
-refusal proven (refused within 24 hours, an attempt within 3 hours, over `https://`), `topic not
-proven private (plain http)` for a refusal over plain HTTP, which anyone on the path could have
-given, `topic check is stale` when the refusal or the last attempt is too old, `topic not checked
-yet` while there is no answer for the target in use, and `NO PUSH TARGET (journal only)` without
-a target.
+The alerts line reads `topic READABLE by anyone` when the stored read check of the alert topic
+found it readable, and `topic not proven private (<answer>)` (`redirect`, `not found`, `not a push
+server` or `unexpected`) for any other definite answer that is not a refusal; when the gate holds the refusal proven (refused within 24
+hours, an attempt within 3 hours, over `https://`), what the last test page proved:
+`VERIFIED <dur> (shell)` or `NOT VERIFIED (<word>)` (below), followed by `; daemon not verified`
+where the daemon is enabled; `topic not proven private (plain http)` for a refusal over plain
+HTTP, which anyone on the path could have given, `topic check is stale` when the refusal or the
+last attempt is too old, `topic not checked yet` while there is no answer for the target in use,
+and `NO PUSH TARGET (journal only)` without a target.
+
+**Setup, the test page and VERIFIED.** `sudo propolis-status --setup` says what reaches you and
+why: the alias test pages name this host by (today's failure alerts name it by its host name),
+the push target (never the topic or the token), the anonymous-read check made then and there
+with its answer in words, the gate, which governs only the test page and the shell messages a
+later release adds, what the daemon and today's failure hook, which are not gated, reveal on a
+topic that does not refuse anonymous reads or over plain http, and the private heartbeat URL it
+recommends. `sudo propolis-status --test-page` sends one test page through the
+failure-alert unit (at most three a day), and `sudo propolis-status --ack-test <code>` types back
+the code it carried ([commands](../reference/commands.md#status-walk)). Apart from today's failure
+alerts, which the hook sends as before, nothing else in the shell code sends a message.
+
+`VERIFIED` (`deploy/alert-lib.sh#pa_verified`) means: a test page sent by this host's
+failure-alert unit, to the target and with the token now in the files, reached a phone whose owner
+typed the code back, at most 30 days ago, and since then no message was refused for good, no
+`alert-path` incident opened and the failure hook left no alert undelivered. The page proves the
+unit, the network and the target as the shell senders read `propolis.env`; today's failure hook
+reads that file with a rule of its own (the last line that starts with `KEY=`), so VERIFIED also
+requires the hook to read the same URL, topic and token, and none of them to be ignored as
+invalid (`deploy/alert-lib.sh#pa_hook_differs`). Otherwise the walk says `NOT VERIFIED` with the
+first rule that fails: `never` (no test page), `pending` (not typed back), `changed` (another URL,
+topic or token since, or one today's hook reads otherwise), `expired` (over 30 days or dated
+after now), `refused`, `path-failed`, `undelivered`, or `unreadable` when a file it needs cannot
+be read; the banner says the same once the gate is `full` or held at `pointer:token-reads`
+(`deploy/alert-lib.sh#_pa_banner_alert`), and before that the reason the gate gives. A send that
+failed only for now (a timeout, a 429 or a 5xx) undoes nothing. It does not prove the daemon's
+sender, which read its settings when it started, runs in its own sandbox and may hold an older
+topic or token: the walk and `--setup` say `daemon not verified` wherever the daemon is enabled,
+and the banner wherever it shows VERIFIED, and the walk adds `the daemon loaded an older
+configuration: restart propolis to apply it` when `propolis.env` changed after the running daemon
+started. Nor does it prove that later pages arrive: a token revoked tomorrow shows as `NOT
+VERIFIED` only after a send fails.
 
 It names no host, unit or log, and it is root-only (`0600`): it says whether alerting works right
 now, which a compromised sensor that can read `/run` must not learn. `pam_motd` reads it as root.

@@ -147,7 +147,8 @@ sudo /usr/local/lib/propolis/config-check.sh [the same options]
 Read-only comparison of the configured listeners with what is running: unit, port and its
 holder, firewall, log, `PROPOLIS_SENSOR_LOGS` entry, newest ledger event, plus the rotation
 timer, installed binaries, deploy stamp, env file modes, env lines systemd and the shell scripts
-read differently, watcher env and, on a control plane, the
+read differently, watcher env, the alert channel (invalid push settings, and a topic the stored
+anonymous-read check found readable; it makes no request of its own) and, on a control plane, the
 collector spools `PROPOLIS_SENSOR_LOGS` does not list and intake has not read to their end. The
 second form is the copy `install.sh` and `upgrade.sh` install, which runs from any directory and
 names the checkout's scripts in its fix lines. `--json` prints one JSON document and `--tsv`
@@ -164,6 +165,9 @@ column means and what runs without root:
 ```
 sudo propolis-status                 # every stage in order, the first stopped one marked >
 sudo propolis-status STAGE           # one stage or rail with everything behind its row
+sudo propolis-status --setup         # what reaches you and why; runs the anonymous-read check now
+sudo propolis-status --test-page     # one test page through the failure-alert unit
+sudo propolis-status --ack-test CODE # type back the code the test page carried
 sudo propolis-status --banner        # the login banner's text
 sudo propolis-status --maint MINUTES # hold unit, collector and database kinds for planned work
 propolis-status -h                   # usage, for any user
@@ -200,9 +204,95 @@ marker, whoever wrote it. It takes no lock, so it works while a hung writer hold
 lock. Exit `0` written or removed, `1` the marker could not be written, `64` a value outside 0
 to 120 (`deploy/propolis-status.sh#status_maint`).
 
+`--setup` says what reaches the operator and why, one item a line: the alias test pages (and the
+shell messages of a later release) name this host by (record it; off a single box it warns that
+a fallback alias cannot be told from other hosts') and that today's failure alerts name it by its
+host name, with no channel line where neither has a target; the push target from
+`/etc/propolis/propolis.env` (of the URL only its scheme and host, of the topic only its length,
+of the token only whether it is set), the anonymous-read check made now (three GETs, four with a
+token) with each status code and content type and the class it gives, what the token can read,
+the gate, what the daemon and today's failure hook still reveal on a topic that does not refuse
+anonymous reads, the heartbeat URL and VERIFIED. The gate governs only the test page and the
+shell messages a later release adds, and the test page carries only the alias and the code in
+every mode, so at `full` only those later messages may carry detail; today's failure hook and the
+daemon are not gated. Wherever
+the hook posts (its own reader finds a URL and a topic) over plain http, or to a topic not proven
+to refuse anonymous reads, a `failures` line says that the gate does not apply to its alerts and
+that each carries the host name, the failed unit and its last journal lines (over plain http in
+clear, the token too). The check is made before the state lock is taken; the answer is then stored under the
+lock as the witness stores it, and the id salt the fallback alias comes from is made if there is
+none. Exit `0` only when the gate is `full`, `1` otherwise, `75` when the state lock was not free
+within 10 s (`deploy/propolis-status.sh#status_setup`).
+
+When the shell senders have no target but today's failure hook, which reads `propolis.env` with
+a rule of its own (the last line that starts with `KEY=`), still finds a URL and a topic (a value
+the shell senders ignore as invalid, or a later indented line the hook never sees), the target
+line says that the hook still posts there (of the URL only its scheme and host, or that curl uses
+plain http when it has no scheme) and names each setting with its fix, the gate line says the
+shell senders push nothing, the walk's alert row warns that the hook still posts, and
+`--test-page` says it sent nothing while the hook still posts. A push setting that the hook reads
+otherwise than the shell senders do (an indented line, `KEY = value`, a trailing comment) is
+named under the target line (`deploy/alert-lib.sh#pa_hook_differs`). The verified line ends with
+the next step: type the code back after a page that went out while its code is under a day old,
+what to fix after one that did not, the settings to set without a target (none is expected on a
+collector unless the hook still posts), the setting to write plainly when the hook reads one
+otherwise (an invalid URL or topic is given with its rule instead, and so is an invalid token
+when nothing else is read otherwise), and
+`Run: sudo propolis-status --test-page` for `never`, `expired`, a code over a day old and a
+`changed` the hook reads the same way.
+
+`--test-page` sends one test page, `<alias>: test page <CODE>` with the body `Type back on
+<alias>: status --ack-test <CODE>`, at priority 3. Under the state lock it counts the page in the
+send ledger (at most 3 in 24 hours, counting every page that was or may have been sent:
+`sending`, `ok`, `perm:*` and `transient:*`, and `pending` only for the hook's 120 s, since the
+hook claims a page as `sending` before it sends and an attempt still `pending` after that never
+went out, `deploy/alert-lib.sh#pa_budget_admit`) and records a
+fresh 6-hex code from `/dev/urandom` in `/var/lib/propolis/witness/testpage`, replacing any
+earlier one; then it starts `propolis-alert@propolis-test-page-<CODE>.service`, so the page goes
+out through the failure-alert unit. A page that arrives proves that unit, the network and the
+target as the shell senders read it; VERIFIED also requires today's failure hook to read the same
+target and token from `propolis.env`. The hook sends it only for the recorded code, while it waits
+and for 10 minutes after it was asked for, and claims its ledger line and then the record
+(`sending`) before the send, so a second start for the same code sends nothing and a page that
+went out always counts toward the three; a page that cannot go out whatever the server would
+answer (no target, no alias, no curl) is marked with that word and never claimed. When the hook sent the page it prints `sent test
+page <CODE>: ok` with the next step, or `sent test page <CODE>; the result could not be recorded`
+when the hook could not write its result (it was sent, or was being sent when the hook stopped).
+When nothing was sent it prints one line that says so
+and why: `test page not sent: curl is not installed here`, `... found no push target`, `... it
+could not be put together` (no alias yet, or a value that cannot be sent safely), `... ran over 10
+minutes after the page was asked for`, `... could not write its claim on the send ledger`, `not
+sent: the failure-alert unit did not run, or could not write the page's record` (the unit's
+journal says which) or `... found the state lock busy`; before the unit is started, `test page
+not sent:` with the reason when the id salt or the state could not be written, the send ledger
+could not be read or no code could be made; `test page budget spent (3 in 24 h): nothing sent; the next is
+allowed at <HH:MM> UTC`, and without a target `no push target: nothing sent` (or, while today's
+failure hook still posts, `no target the shell senders accept: nothing sent`). When the server
+did not accept it, it prints `test page <CODE> not accepted by the server (<result>)` with a next
+step (for a permanent refusal with status 401 or 403 the token and the topic's access, for
+another `perm:*` the URL and the topic, for `transient:*` to try later) and that the page counted toward the three a
+day. Exit `0` when the page went out (`ok`), `1` when it did not, when its result could not be
+recorded, or when the budget is spent, `75` when the lock was busy
+(`deploy/propolis-status.sh#status_test_page`). Apart from today's failure alerts, which the hook
+sends as before, it is the only message the shell code of this release can send.
+
+`--ack-test CODE` (6 characters, `0-9` and `a-f`, checked before anything is read) acknowledges
+the waiting test page when `CODE` is its code, it went out (`ok`, or `sending` when its result
+could not be recorded), and it is at most a day old; it prints `VERIFIED: the test page reached
+you` when every rule of VERIFIED then holds, and otherwise `acknowledged; NOT VERIFIED (<word>)`
+(for a setting today's failure hook reads otherwise, followed by its name, or by `the shell
+senders ignore <KEY> as invalid; set <KEY> to <rule>` for one they ignore, and `see sudo
+propolis-status --setup`), and exits `0`. The same code typed again prints `already acknowledged at <HH:MM> UTC` with
+whether VERIFIED stands, changes nothing and exits `0`. Anything else prints `wrong or expired
+code`, changes nothing and exits `1`; `75` when the lock was busy
+(`deploy/propolis-status.sh#status_ack_test`).
+
 The walk's `ALERTS` line also shows the gate (`gate full`, `gate pointer:<reason>` or `gate
 none:notarget`) and when the anonymous-read check last ran, worked out from the answer the
-witness stored, without a network request; its third line shows when the light and the hourly
+witness stored, without a network request, and at its end `VERIFIED <dur> (shell)` or `NOT
+VERIFIED (<word>)` (`deploy/alert-lib.sh#pa_verified`), with `daemon not verified` wherever the
+daemon is enabled, and under it `the daemon loaded an older configuration: restart propolis to
+apply it` when `propolis.env` changed after the running daemon started; its third line shows when the light and the hourly
 pass of the witness last completed and, once a light pass has run, the heartbeat URL: `not set`,
 `refused (not an https URL)`, or `set` with when it was last asked and the result, or last
 skipped and why. The URL itself is never printed.

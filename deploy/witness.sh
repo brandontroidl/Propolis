@@ -1522,6 +1522,8 @@ ops-monitor-off|daily|NOTICE|alert|alerting|-|-
 ops-no-push|daily|NOTICE|alert|alerting|-|-
 ops-no-heartbeat|daily|NOTICE|alert|alerting|-|-
 ops-push-half|daily|NOTICE|alert|alerting|-|-
+alert-setting-invalid|daily|NOTICE|alert|alert-channel|-|-
+alert-topic-readable|daily|NOTICE|alert|alert-channel|-|-
 clock-unsynced|daily|NOTICE|host|clock|-|-
 bins-missing|daily|NOTICE|host|binaries|-|-
 bins-differ|never|-|host|binaries|-|-
@@ -1582,6 +1584,7 @@ cc_limit() {
         'checkout HEAD not readable'*) CC_LIMITED[deploy-stamp]=1 ;;
         'checkout unknown'*) CC_LIMITED[deploy-stamp]=1 CC_LIMITED[binaries]=1 ;;
         'watch.env not readable'* | 'watcher home not traversable'*) CC_LIMITED[watcher]=1 ;;
+        'anonymous read not checked yet'* | 'alert channel not checked'*) CC_LIMITED[alert-channel]=1 ;;
         *) CC_LIMIT_ALL=1 ;;
     esac
 }

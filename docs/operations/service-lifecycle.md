@@ -340,6 +340,39 @@ systemctl enable --now` both), and a warning on the row when `/run/propolis-witn
 because the tmpfiles entry was not applied. The witness's hourly pass runs this check and records
 its findings ([health and observability](health-and-observability.md#finding)).
 
+**The alert channel.** The `alert-channel` HOST row (`deploy/config-check.sh#check_alert_settings`)
+reads the push settings as the shell senders read them (`deploy/alert-lib.sh#pa_settings_load`) and
+the anonymous-read check the witness and `sudo propolis-status --setup` store in
+`/var/lib/propolis/witness/readcheck`; it makes no request of its own. A setting the library
+ignores as invalid (`PROPOLIS_OPS_NTFY_URL`, `_TOPIC` or `_TOKEN` in `propolis.env`, or
+`PROPOLIS_WITNESS_HEARTBEAT_URL` in `alert.env` or `propolis.env`) is a warning
+`alert-setting-invalid`, one per setting, naming the file and the rule and never the value: the
+status command and the witness ignore it, while today's failure hook and the daemon still use it
+as written (on a host that runs no daemon the finding names the hook alone; the heartbeat URL is
+the witness's alone). A stored check of the `propolis.env`
+target, for that target as it is now, with a definite answer other than a refusal is a warning
+`alert-topic-readable`. For a readable answer it says that anyone who knows the topic's name
+reads the alerts; for a redirect, a 404 or an answer that is not ntfy's it says that the topic
+is not proven private and what the answer was. Either way it says who posts there: the daemon,
+whose titles name the host's software (left out on a host that runs no daemon), and today's
+failure hook, which sends the host's name and the failed unit (left out where the hook's own
+reader does not find this URL and topic in `propolis.env`).
+Its step is to restrict read access to the topic, or move to a topic only you can read, then run
+`sudo propolis-status --setup`. The row is `ok` when the gate is `full`; `warn` with a finding,
+with no push target, or when the topic is not proven private (plain http, or a token that can
+read it on a collector); `skip` when no check was ever stored for the current target (right
+after an install or an upgrade, or a change of target: the witness's hourly pass checks it
+within the hour, `sudo propolis-status --setup` now), which leaves the exit status as it was;
+`unknown`, with a `LIMITED CHECKS` line `anonymous read not checked yet`, when the stored check
+is older than the gate accepts, got no definite answer, or cannot be read; and `unknown` without
+root, which cannot read the state directory. A host without a target for the shell senders whose
+failure hook still finds a URL and a topic in `propolis.env` (the hook reads the file with a rule
+of its own) warns `no push target for the shell senders; today's failure hook still posts`, a
+collector included; a collector without a target is `ok` only when its hook posts nothing
+either: that is its default. Both ids are warnings, so each raises the exit status to `1`, and so does the unknown
+row: a host that passed before this check existed exits `1` when the stored refusal is over a
+day old and when its topic answers anonymous reads with anything but a refusal.
+
 **By role.** The check asks the host's role once (`deploy/alert-lib.sh#pa_role`). A collector or
 a gateway-only host runs no daemon when no `propolis.service` is enabled or running there and its
 `propolis.env` configures no daemon: the file is absent, or names neither `DATABASE_URL` (which

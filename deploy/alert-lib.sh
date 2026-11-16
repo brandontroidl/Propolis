@@ -42,7 +42,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=8
+PA_LIB_VERSION=9
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -374,6 +374,46 @@ pa_settings_load() {
     pa_env_get PROPOLIS_OPS_ENABLED "$env" > /dev/null
     case "${PA_ENV_VALUE,,}" in true | 1 | yes | on) PA_OPS_ENABLED=1 ;; esac
     return 0
+}
+
+# pa_hook_env_value KEY [FILE]: KEY as today's failure hook reads it (deploy/alert.sh env_value)
+# from FILE, propolis.env by default: the last line that starts with `KEY=`, with one quote taken
+# off each end. An indented line, `KEY = value` and a trailing comment are read differently here
+# than by pa_env_get, which is why the two readings are compared before a test page counts for
+# the hook. KEY is a fixed setting name, never data.
+pa_hook_env_value() {
+    local f="${2:-$PA_ENV_DIR/propolis.env}" v
+    [ -r "$f" ] || return 0
+    v="$(sed -n "s/^$1=//p" -- "$f" 2> /dev/null | tail -n 1)" || v=""
+    v="${v%\"}"
+    v="${v#\"}"
+    v="${v%\'}"
+    v="${v#\'}"
+    printf '%s' "$v"
+}
+
+# pa_hook_differs: the push settings today's failure hook reads (pa_hook_env_value) are not the
+# shell senders' (pa_settings_load, which the caller has run). Sets PA_HOOK_DIFF to the names of
+# the settings that differ or that the shell senders ignore as invalid, and PA_HOOK_URL to the
+# hook's URL; status 1 when they agree. No value is put anywhere but the variables.
+pa_hook_differs() {
+    local key url topic token
+    PA_HOOK_DIFF=""
+    url="$(pa_hook_env_value PROPOLIS_OPS_NTFY_URL)"
+    topic="$(pa_hook_env_value PROPOLIS_OPS_NTFY_TOPIC)"
+    token="$(pa_hook_env_value PROPOLIS_OPS_NTFY_TOKEN)"
+    PA_HOOK_URL="${url%/}" PA_HOOK_TOPIC_SET=0
+    [ -z "$topic" ] || PA_HOOK_TOPIC_SET=1
+    [ "${url%/}" = "${PA_URL:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_URL"
+    [ "$topic" = "${PA_TOPIC:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_TOPIC"
+    [ "$token" = "${PA_TOKEN:-}" ] || PA_HOOK_DIFF+=" PROPOLIS_OPS_NTFY_TOKEN"
+    for key in PROPOLIS_OPS_NTFY_URL PROPOLIS_OPS_NTFY_TOPIC PROPOLIS_OPS_NTFY_TOKEN; do
+        case " ${PA_INVALID:-} " in
+            *" $key "*) [[ " $PA_HOOK_DIFF " == *" $key "* ]] || PA_HOOK_DIFF+=" $key" ;;
+        esac
+    done
+    PA_HOOK_DIFF="${PA_HOOK_DIFF# }"
+    [ -n "$PA_HOOK_DIFF" ]
 }
 
 # ---- role --------------------------------------------------------------------------------------
@@ -1373,33 +1413,38 @@ pa_banner_write() {
     return 1
 }
 
+# _pa_banner_class CLASS: the banner's words for a definite read-check class that is not a
+# refusal: READABLE only for readable, since a redirect, a 404 or an answer from some other
+# server shows only that the topic is not proven private. Closed words, so nothing the server
+# said reaches the banner. Status 1 (nothing printed) for refused or no class.
+_pa_banner_class() {
+    case "${1:-}" in
+        - | refused | "") return 1 ;;
+        readable) printf 'topic READABLE by anyone' ;;
+        redirect) printf 'topic not proven private (redirect)' ;;
+        not_found) printf 'topic not proven private (not found)' ;;
+        not_ntfy) printf 'topic not proven private (not a push server)' ;;
+        *) printf 'topic not proven private (unexpected)' ;;
+    esac
+}
+
 # _pa_banner_alert: the banner's word on a target that exists: READABLE when the stored read check
 # of the shell target or of the daemon's (propolis.env) target, bound to the target in use now,
-# has a definite class other than refused; that it refuses anonymous reads when pa_gate holds the
-# shell target's refusal proven; that the refusal is not proof over plain http, or that the check
-# is stale, when that is why the gate does not; else not checked yet.
+# found the topic readable, and not proven private for any other definite class but refused
+# (_pa_banner_class); once pa_gate holds the shell target's refusal proven,
+# whether a test page got through (pa_verified), with `daemon not verified` where the daemon is
+# enabled, since nothing tests the daemon's own sender; that the refusal is not proof over plain
+# http, or that the check is stale, when that is why the gate does not; else not checked yet.
 _pa_banner_alert() {
     local b
     b="$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" || b=""
-    if _pa_rc_line shell && [ "$PA_RCL_BIND" = "$b" ]; then
-        case "$PA_RCL_DCLASS" in
-            - | refused) ;;
-            *)
-                printf 'topic READABLE by anyone'
-                return 0
-                ;;
-        esac
+    if _pa_rc_line shell && [ "$PA_RCL_BIND" = "$b" ] && _pa_banner_class "$PA_RCL_DCLASS"; then
+        return 0
     fi
     if [ "${PA_D_TARGET:-0}" = 1 ]; then
         b="$(pa_readcheck_binding "$PA_D_URL" "$PA_D_TOPIC")" || b=""
-        if _pa_rc_line daemon && [ "$PA_RCL_BIND" = "$b" ]; then
-            case "$PA_RCL_DCLASS" in
-                - | refused) ;;
-                *)
-                    printf 'topic READABLE by anyone'
-                    return 0
-                    ;;
-            esac
+        if _pa_rc_line daemon && [ "$PA_RCL_BIND" = "$b" ] && _pa_banner_class "$PA_RCL_DCLASS"; then
+            return 0
         fi
     fi
     # A refusal is claimed only where the gate holds it proven: decided within a day, an attempt
@@ -1408,8 +1453,19 @@ _pa_banner_alert() {
     # which is why the gate is asked with it at auto.
     # A check that ran and proves nothing is not `not checked yet`: over plain HTTP no refusal
     # can prove the topic private, and a stale one means the checker stopped or its answer aged.
-    case "$(PA_DETAIL=auto pa_gate)" in
-        full | pointer:token-reads) printf 'topic refuses anonymous reads' ;;
+    # Once the refusal is proven, what is left to say is whether a test page got through. The
+    # gate names a reading token before it looks at the scheme, so plain http is asked here too.
+    b="$(PA_DETAIL=auto pa_gate)"
+    if [ "$b" = pointer:token-reads ] && [[ ${PA_URL:-} != https://* ]]; then b=pointer:insecure; fi
+    case "$b" in
+        full | pointer:token-reads)
+            if pa_verified > /dev/null; then
+                printf 'VERIFIED %s (shell)' "$(pa_dur "$(pa_age "$PA_TP_ACKED")")"
+            else
+                printf 'NOT VERIFIED (%s)' "$PA_VERIFIED_WORD"
+            fi
+            if _pa_daemon_enabled; then printf '; daemon not verified'; fi
+            ;;
         pointer:insecure) printf 'topic not proven private (plain http)' ;;
         pointer:stale) printf 'topic check is stale' ;;
         *) printf 'topic not checked yet' ;;
@@ -1510,23 +1566,26 @@ _pa_rc_get() {
 }
 
 # _pa_rc_conf FILE URL: writes FILE as a curl config file naming URL, quoted the way curl's config
-# parser reads a quoted value.
+# parser reads a quoted value. globoff, because curl otherwise expands braces and brackets in a URL
+# into several requests, and a path may hold either: the request goes to the URL as written, once.
 _pa_rc_conf() {
     local u="$2"
     u="${u//\\/\\\\}"
     u="${u//\"/\\\"}"
-    { printf 'url = "%s"\n' "$u" > "$1"; } 2> /dev/null && chmod 0600 -- "$1" 2> /dev/null
+    { printf 'url = "%s"\ngloboff\n' "$u" > "$1"; } 2> /dev/null && chmod 0600 -- "$1" 2> /dev/null
 }
 
 # pa_readcheck_run URL TOPIC TOKEN: the read check of one target (TOKEN may be empty). Sets
 # PA_RC_CLASS (the attempt's class: transient when any answer was, refused when all three were,
 # else the class of the first answer that was not refused), PA_RC_JSON, PA_RC_RAW and PA_RC_SSE
-# (each status code), PA_RC_TOKEN (reads, noread, unknown, or `-` without a token) and PA_RC_CAUSE
+# (each status code) with PA_RC_JSON_CT, PA_RC_RAW_CT and PA_RC_SSE_CT (each content type's word,
+# `-` when there was none in a type's form), PA_RC_TOKEN (reads, noread, unknown, or `-` without a token) and PA_RC_CAUSE
 # (`-`, or tool.exec when curl or a private temporary file was not to be had, the class then being
 # transient). Status 0, or 1 with that cause.
 pa_readcheck_run() {
     local url="${1:-}" topic="${2:-}" token="${3:-}" conf hdr body ep r code ct cls first="" any_t=0 all_r=1
     PA_RC_CLASS=transient PA_RC_JSON=000 PA_RC_RAW=000 PA_RC_SSE=000 PA_RC_TOKEN=- PA_RC_CAUSE=-
+    PA_RC_JSON_CT=- PA_RC_RAW_CT=- PA_RC_SSE_CT=-
     if ! command -v curl > /dev/null 2>&1; then
         PA_RC_CAUSE=tool.exec
         return 1
@@ -1551,10 +1610,15 @@ pa_readcheck_run() {
         code="${r%%$'\t'*}" ct="${r#*$'\t'}"
         cls="$(pa_readcheck_class "$ep" "$code" "$ct" "$body")"
         [[ $code =~ ^[0-9]{3}$ ]] || code=-
+        # The content type is the server's text, shown to the operator by the status command:
+        # only its type word is kept, and only in a type's own characters.
+        ct="${ct%%;*}"
+        ct="${ct//[[:space:]]/}"
+        if [[ ${ct,,} =~ ^[a-z0-9.+-]{1,40}/[a-z0-9.+-]{1,40}$ ]]; then ct="${ct,,}"; else ct=-; fi
         case "$ep" in
-            json) PA_RC_JSON="$code" ;;
-            raw) PA_RC_RAW="$code" ;;
-            sse) PA_RC_SSE="$code" ;;
+            json) PA_RC_JSON="$code" PA_RC_JSON_CT="$ct" ;;
+            raw) PA_RC_RAW="$code" PA_RC_RAW_CT="$ct" ;;
+            sse) PA_RC_SSE="$code" PA_RC_SSE_CT="$ct" ;;
         esac
         [ "$cls" != transient ] || any_t=1
         if [ "$cls" != refused ]; then
@@ -2982,4 +3046,537 @@ pa_hook_record() {
         *) _pa_hook_unrecorded "$unit" "neither the state directory nor /run took the write" ;;
     esac
     return 0
+}
+
+# ---- the test page: the send ledger, the budget, the sender and VERIFIED -----------------------
+#
+# The one message this release's shell code sends is the test page the operator asks for with
+# `propolis-status --test-page`. The status command counts it in the send ledger and writes the
+# testpage record under the lock, then starts propolis-alert@propolis-test-page-<CODE>.service;
+# the failure hook sends it through pa_send from the same unit a real failure alert runs in, so a
+# test page that arrives proves that unit, the network and the target as this library reads it.
+# Today's failure hook reads propolis.env with a rule of its own, so pa_verified also requires the
+# hook to read the same target and token (pa_hook_differs). The operator types the code back with
+# `--ack-test CODE`, and pa_verified then says whether that proof still stands.
+#
+# The topic is as secret as the token: on a public server knowing it is all it takes to read the
+# channel. Neither, nor a URL that holds the topic, is ever put on a command line (where the
+# process list shows it), in a child's environment, in a journal line, in anything printed or in
+# a state file. curl gets them in a config file made 0600 here and removed straight after the
+# call; the stored binding and token8 are hashes.
+#
+# testpage (one T line): T code sent binding token8 result acked uid. result is pending, sending
+# (the hook claimed it just before the send and has not written its result yet), ok,
+# perm:<code>, transient:<code>, nomatch (the hook was started for a code it could not send),
+# lockbusy (the hook found the state lock busy and sent nothing), noclaim (the hook could not
+# write its claim on the send ledger and sent nothing), or the sender's own word when
+# nothing was sent (norender, nocurl, notarget).
+# send-ledger: L stamp class keyhash8 tx mode result sender, one line per admitted message,
+# written before the send with result pending; lines over 48 h old go on every write.
+
+# pa_url_shown URL: the scheme and host (with a port) of URL, or `the target` when it is not a
+# plain http or https URL. A user name and password before the host, a path (a topic written into
+# the URL) and a query (ntfy takes a token there) are never copied out into a report.
+pa_url_shown() {
+    if [[ ${1:-} =~ ^(https?://)([^/@?#]*@)?([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?([/?#].*)?$ ]]; then
+        printf '%s%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+    else
+        printf 'the target'
+    fi
+}
+
+# pa_token8 TOKEN: the first 8 hex of sha256(salt NUL TOKEN), `-` for no token, so a changed token
+# can be told without the token being stored. `?` and status 1 without a salt: that matches no
+# stored value.
+pa_token8() {
+    local salt h
+    if [ -z "${1:-}" ]; then
+        printf -- -
+        return 0
+    fi
+    if ! salt="$(_pa_salt)" || ! h="$(_pa_sha256 "$salt" "$1")"; then
+        printf '?'
+        return 1
+    fi
+    printf '%s' "${h:0:8}"
+}
+
+# _pa_conf_value V: V as a double-quoted value of a curl config file, with each backslash and
+# double quote escaped the way curl's config parser reads them, so neither can end the string or
+# start an escape of its own. Status 1, nothing printed, for anything but printable ASCII: a
+# control character could end the line and start a directive of its own.
+_pa_conf_value() {
+    local v="${1-}"
+    _pa_ascii "$v" || return 1
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+# pa_send TITLE PRIORITY: posts stdin (cut to 1024 bytes) to the shell target (pa_settings_load)
+# with that title and priority. Sets PA_SEND_RESULT: ok, perm:<code> (a 4xx other than 408 and
+# 429: retrying will not help), transient:<code> (408, 429, 5xx, or 000 for no answer), notarget,
+# norender (a title or body line pa_ok_line refuses, a priority outside 1 to 5, or a value that
+# cannot be written into the config file safely; nothing sent) or nocurl. Everything curl is told,
+# the URL with the topic and the token's header included, is in a 0600 config file listed in
+# PA_CLEANUP and removed before return; the command line is `curl -q -K <file>` and nothing else,
+# -q first so no .curlrc adds to the request. No redirect is followed. Under 40 s in all.
+pa_send() {
+    local title="${1-}" prio="${2-}" body line conf v out code
+    local -a lines=()
+    PA_SEND_RESULT=norender PA_SEND_CODE=-
+    body="$(head -c 1024)"
+    if [ "${PA_TARGET:-0}" != 1 ]; then
+        PA_SEND_RESULT=notarget
+        return 1
+    fi
+    pa_ok_line "$title" && [ -n "$title" ] && [[ $prio =~ ^[1-5]$ ]] || return 1
+    while IFS= read -r line; do
+        pa_ok_line "$line" || return 1
+    done <<< "$body"
+    if ! command -v curl > /dev/null 2>&1; then
+        PA_SEND_RESULT=nocurl
+        return 1
+    fi
+    v="$(_pa_conf_value "$PA_URL/$PA_TOPIC")" || return 1
+    lines+=("url = $v")
+    v="$(_pa_conf_value "Title: $title")" || return 1
+    lines+=("header = $v")
+    v="$(_pa_conf_value "Priority: $prio")" || return 1
+    lines+=("header = $v")
+    if [ -n "${PA_TOKEN:-}" ]; then
+        v="$(_pa_conf_value "Authorization: Bearer $PA_TOKEN")" || return 1
+        lines+=("header = $v")
+    fi
+    # globoff: a brace or a bracket in the URL is sent as written, never expanded into more posts.
+    lines+=(globoff silent show-error 'output = "/dev/null"' 'write-out = "%{http_code}"'
+        'connect-timeout = 5' 'max-time = 15' 'retry = 1' 'retry-max-time = 20'
+        'proto = "=https,http"' 'data-binary = "@-"')
+    conf="$(umask 077 && mktemp 2> /dev/null)" || conf=""
+    if [ -z "$conf" ]; then
+        PA_SEND_RESULT=transient:000
+        return 1
+    fi
+    PA_CLEANUP+=("$conf")
+    if ! { printf '%s\n' "${lines[@]}" > "$conf"; } 2> /dev/null || ! chmod 0600 -- "$conf" 2> /dev/null; then
+        rm -f -- "$conf" 2> /dev/null
+        PA_SEND_RESULT=transient:000
+        return 1
+    fi
+    out="$(printf '%s' "$body" | timeout 40 curl -q -K "$conf" 2> /dev/null)" || true
+    rm -f -- "$conf" 2> /dev/null
+    code="${out:0:3}"
+    [[ $code =~ ^[0-9]{3}$ ]] && [ "${#out}" = 3 ] || code=000
+    PA_SEND_CODE="$code"
+    case "$code" in
+        2[0-9][0-9]) PA_SEND_RESULT=ok ;;
+        408 | 429 | 5[0-9][0-9] | 000) PA_SEND_RESULT="transient:$code" ;;
+        4[0-9][0-9]) PA_SEND_RESULT="perm:$code" ;;
+        *) PA_SEND_RESULT="transient:$code" ;;
+    esac
+    [ "$PA_SEND_RESULT" = ok ]
+}
+
+# pa_render MODE TX ID: the message for transition TX, in PA_TITLE, PA_PRIO and PA_BODY. This
+# release renders one, the test page (TX test, ID its code), which is the same in full and pointer
+# mode: it carries the host's alias and the code and nothing else, no tier, host name or unit.
+# Status 1, with nothing set, for any other message, a code not of 6 hex, or no alias yet.
+pa_render() {
+    local tx="${2:-}" id="${3:-}"
+    PA_TITLE="" PA_PRIO="" PA_BODY=""
+    [ "$tx" = test ] && [[ $id =~ ^[0-9a-f]{6}$ ]] || return 1
+    pa_alias > /dev/null 2>&1 || return 1
+    [ "$PA_ALIAS" != - ] && pa_ok_field "$PA_ALIAS" || return 1
+    PA_TITLE="$PA_ALIAS: test page $id"
+    PA_PRIO=3
+    PA_BODY="Type back on $PA_ALIAS: status --ack-test $id"
+}
+
+# _pa_tp_line: the stored test page. Sets PA_TP_CODE, PA_TP_SENT, PA_TP_BIND, PA_TP_TOKEN8,
+# PA_TP_RESULT, PA_TP_ACKED and PA_TP_UID, each checked against its form; status 1 when there is
+# no T line whose every field has its form.
+_pa_tp_line() {
+    local t c s b k r a u found=1
+    PA_TP_CODE="" PA_TP_SENT="" PA_TP_BIND="" PA_TP_TOKEN8="" PA_TP_RESULT="" PA_TP_ACKED=- PA_TP_UID=-
+    while IFS=$'\t' read -r t c s b k r a u _; do
+        [ "$t" = T ] || continue
+        [[ ${c:-} =~ ^[0-9a-f]{6}$ && ${b:-} =~ ^[0-9a-f]{16}$ && ${k:-} =~ ^([0-9a-f]{8}|-)$ ]] || continue
+        _pa_stamp_split "${s:-}" || continue
+        case "${r:-}" in
+            pending | sending | ok | nomatch | lockbusy | noclaim | norender | nocurl | notarget) ;;
+            perm:[0-9][0-9][0-9] | transient:[0-9][0-9][0-9]) ;;
+            *) continue ;;
+        esac
+        [ "${a:-}" = - ] || _pa_stamp_split "${a:-}" || continue
+        [[ ${u:-} =~ ^(-|[0-9]{1,10})$ ]] || continue
+        PA_TP_CODE="$c" PA_TP_SENT="$s" PA_TP_BIND="$b" PA_TP_TOKEN8="$k" PA_TP_RESULT="$r"
+        PA_TP_ACKED="$a" PA_TP_UID="$u" found=0
+    done < <(pa_state_read testpage)
+    return "$found"
+}
+
+# pa_testpage_write CODE SENT BINDING TOKEN8 RESULT ACKED UID: the testpage file with this one T
+# line, replacing any other; lines of a type this release does not know are kept. The caller
+# holds the lock.
+pa_testpage_write() {
+    local line body="" f
+    for f in "$@"; do pa_ok_field "$f" || return 2; done
+    [ "$#" = 7 ] || return 2
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [[ $line == T$'\t'* ]] || body+="$line"$'\n'
+    done < <(pa_state_read testpage)
+    body+="$(printf 'T\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$@")"$'\n'
+    pa_state_write testpage < <(printf '%s' "$body")
+}
+
+# pa_ledger_add CLASS KEYHASH TX MODE RESULT SENDER: one send-ledger line stamped now, written
+# before the send; lines over 48 h old (or dated ahead of the clock) are dropped in the same
+# write. Sets PA_LEDGER_STAMP to the new line's stamp, by which pa_ledger_result finds it. The
+# caller holds the lock.
+pa_ledger_add() {
+    local f line t s body="" a
+    for f in "$@"; do pa_ok_field "$f" || return 2; done
+    [ "$#" = 6 ] || return 2
+    pa_now
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r t s _ <<< "$line"
+        if [ "$t" = L ]; then
+            a="$(pa_age "${s:-}")"
+            [ "$a" -ge 0 ] && [ "$a" -le 172800 ] || continue
+        fi
+        body+="$line"$'\n'
+    done < <(pa_state_read send-ledger)
+    body+="$(printf 'L\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$PA_STAMP" "$@")"$'\n'
+    PA_LEDGER_STAMP="$PA_STAMP"
+    pa_state_write send-ledger < <(printf '%s' "$body")
+}
+
+# pa_ledger_result STAMP CLASS RESULT SENDER: the result (and sender) of the ledger line of CLASS
+# stamped STAMP that is still pending or claimed (sending). Status 1 when there is none. The
+# caller holds the lock.
+pa_ledger_result() {
+    local line t s c k x m r w body="" found=1 f
+    for f in "$@"; do pa_ok_field "$f" || return 2; done
+    [ "$#" = 4 ] || return 2
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r t s c k x m r w _ <<< "$line"
+        if [ "$found" = 1 ] && [ "$t" = L ] && [ "$s" = "$1" ] && [ "$c" = "$2" ] \
+            && { [ "$r" = pending ] || [ "$r" = sending ]; }; then
+            line="$(printf 'L\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$s" "$c" "$k" "$x" "$m" "$3" "$4")"
+            found=0
+        fi
+        body+="$line"$'\n'
+    done < <(pa_state_read send-ledger)
+    [ "$found" = 0 ] || return 1
+    pa_state_write send-ledger < <(printf '%s' "$body")
+}
+
+# _pa_budget_ages: the age of each test-page ledger line the budget counts, one a line: every page
+# that was or may have been sent, whether it got through or not (sending, ok, perm, transient,
+# and pending while the hook may still be running), none that sent nothing (norender, nocurl,
+# notarget, lockbusy, nomatch, noclaim), none over 24 h old or dated ahead of the clock. The hook
+# claims a page as sending before it sends, so a line still pending once the hook's whole time
+# allowance (120 s) has passed was never sent: a failure-alert unit that does not run (masked,
+# not installed, its start refused) would otherwise lock the operator out for a day after it is
+# fixed. A late hook cannot send for such a line either, once a new test page has replaced the
+# record and its code. Each line also carries the seconds until it stops counting, so the time
+# the next page is allowed follows the same two limits.
+_pa_budget_ages() {
+    local t s c r a
+    while IFS=$'\t' read -r t s c _ _ _ r _; do
+        [ "$t" = L ] && [ "$c" = test ] || continue
+        case "${r:-}" in pending | sending | ok | perm:* | transient:*) ;; *) continue ;; esac
+        a="$(pa_age "${s:-}")"
+        [ "$a" -ge 0 ] && [ "$a" -le 86400 ] || continue
+        if [ "$r" = pending ]; then
+            [ "$a" -lt 120 ] || continue
+            printf '%s %s\n' "$a" "$((120 - a))"
+        else
+            printf '%s %s\n' "$a" "$((86401 - a))"
+        fi
+    done < <(pa_state_read send-ledger)
+}
+
+# pa_budget_admit CLASS KEY TX NEW: admit or withhold:<reason>, from the ledger, which the caller
+# read under the lock. This release sends one class, test (the test page): at most 3 in 24 h, of
+# the lines _pa_budget_ages counts. Every other class is withheld (unbuilt), since no other sender
+# exists yet, and a ledger that cannot be read admits nothing (ledger): a count that cannot be
+# made is not zero.
+pa_budget_admit() {
+    local class="${1:-}" a n=0
+    if [ "$class" != test ]; then
+        printf 'withhold:unbuilt'
+        return 1
+    fi
+    pa_state_read send-ledger > /dev/null
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" send-ledger "* ]]; then
+        printf 'withhold:ledger'
+        return 1
+    fi
+    while read -r a; do
+        [ -n "$a" ] || continue
+        n=$((n + 1))
+    done < <(_pa_budget_ages)
+    if [ "$n" -ge 3 ]; then
+        printf 'withhold:test-cap'
+        return 1
+    fi
+    printf admit
+}
+
+# pa_budget_next CLASS: when enough of the lines the test budget counts have stopped counting for
+# a page to be admitted (with n counted, once n-2 of them have: a pending line at 120 s, any other
+# when it leaves the 24-hour window), as HH:MM UTC rounded up to the minute, so a withheld page
+# can say when the next is allowed; `?` for any other class, or with nothing counted. The caller
+# read the ledger under the lock.
+pa_budget_next() {
+    local a r k t
+    local -a rem=()
+    if [ "${1:-}" = test ]; then
+        while read -r a r; do
+            [[ $a =~ ^[0-9]{1,12}$ && ${r:-} =~ ^[0-9]{1,12}$ ]] || continue
+            rem+=("$r")
+        done < <(_pa_budget_ages)
+    fi
+    if [ "${#rem[@]}" = 0 ]; then
+        printf '?'
+        return 1
+    fi
+    k=$((${#rem[@]} - 2))
+    [ "$k" -ge 1 ] || k=1
+    r="$(printf '%s\n' "${rem[@]}" | sort -n | sed -n "${k}p")"
+    [[ $r =~ ^[0-9]{1,12}$ ]] || {
+        printf '?'
+        return 1
+    }
+    [ -n "${PA_WALL:-}" ] || pa_now
+    t=$((10#$PA_WALL + 10#$r))
+    t=$(((t + 59) / 60 * 60))
+    date -u -d "@$t" +%H:%M 2> /dev/null || printf '?'
+}
+
+# _pa_after A B: stamp A is later than stamp B (A's age is the smaller), or A cannot be dated: a
+# fact that cannot be placed before the acknowledgement is taken to come after it.
+_pa_after() {
+    local a b
+    a="$(pa_age "${1:-}")" b="$(pa_age "${2:-}")"
+    [ "$a" -lt 0 ] || [ "$a" -lt "$b" ]
+}
+
+# pa_verified: `VERIFIED <dur>` (how long ago the operator typed the code back) while every rule
+# holds, else `NOT VERIFIED (<word>)` with the first that fails: a test page was recorded (never);
+# its code was typed back (pending); it went to the target and token in the files now, and
+# today's failure hook reads that same target and token, none of them ignored here as invalid
+# (changed: the page proves nothing for a hook that would post elsewhere, or not at all);
+# the acknowledgement is at most 30 days old (expired); since then no message was refused for good
+# (refused), no alert-path incident opened (path-failed) and the legacy hook left no alert
+# undelivered (undelivered). A transient failure undoes nothing. A file it needs and cannot read
+# gives unreadable: what cannot be checked is not verified. PA_VERIFIED_WORD is empty when
+# verified, else the word; status 0 only when verified. The caller has run pa_settings_load.
+pa_verified() {
+    local word="" a t s r f k o dir name first m aw
+    PA_VERIFIED_WORD=""
+    pa_state_read testpage > /dev/null
+    pa_state_read send-ledger > /dev/null
+    pa_state_read incidents > /dev/null
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" testpage "* ]]; then
+        word=unreadable
+    elif ! _pa_tp_line; then
+        word=never
+    elif [ "$PA_TP_ACKED" = - ]; then
+        word=pending
+    elif [ "${PA_TARGET:-0}" != 1 ] || [ "$(pa_readcheck_binding "$PA_URL" "$PA_TOPIC")" != "$PA_TP_BIND" ] \
+        || [ "$(pa_token8 "${PA_TOKEN:-}")" != "$PA_TP_TOKEN8" ] || pa_hook_differs; then
+        word=changed
+    else
+        a="$(pa_age "$PA_TP_ACKED")"
+        if [ "$a" -lt 0 ] || [ "$a" -gt 2592000 ]; then
+            word=expired
+        elif [[ " ${PA_STATE_UNREADABLE:-} " == *" send-ledger "* || " ${PA_STATE_UNREADABLE:-} " == *" incidents "* ]]; then
+            word=unreadable
+        fi
+    fi
+    if [ -z "$word" ]; then
+        while IFS=$'\t' read -r t s _ _ _ _ r _; do
+            if [ "$t" = L ] && [[ ${r:-} == perm:* ]] && _pa_after "${s:-}" "$PA_TP_ACKED"; then
+                word=refused
+                break
+            fi
+        done < <(pa_state_read send-ledger)
+    fi
+    if [ -z "$word" ]; then
+        while IFS=$'\t' read -r t _ _ k _ _ _ _ _ o _; do
+            if [ "$t" = I ] && [ "${k:-}" = alert-path ] && [ "${o:--}" != - ] && _pa_after "$o" "$PA_TP_ACKED"; then
+                word="path-failed"
+                break
+            fi
+        done < <(pa_state_read incidents)
+    fi
+    if [ -z "$word" ]; then
+        # The legacy hook's own record of an alert it could not deliver: one file per unit,
+        # `<first epoch> <count> <logged epoch>`, its time the last attempt.
+        dir="$PA_ROOT/run/propolis-alert/undelivered"
+        aw="${PA_TP_ACKED%%/*}"
+        if [ -e "$dir" ] || [ -L "$dir" ]; then
+            if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+                word=unreadable
+            else
+                f="$(timeout 5 find "$dir" -mindepth 1 -maxdepth 1 -type f -printf '%T@ %f\n' 2> /dev/null)" || word=unreadable
+                while [ -z "$word" ] && read -r m name; do
+                    [[ ${name:-} =~ ^[A-Za-z0-9@._:-]{1,200}$ ]] || continue
+                    m="${m%%.*}"
+                    first=""
+                    read -r first _ < "$dir/$name" 2> /dev/null || true
+                    if { [[ $m =~ ^[0-9]{1,12}$ ]] && [ "$((10#$m))" -gt "$((10#$aw))" ]; } \
+                        || { [[ $first =~ ^[0-9]{1,12}$ ]] && [ "$((10#$first))" -gt "$((10#$aw))" ]; }; then
+                        word=undelivered
+                    fi
+                done <<< "$f"
+            fi
+        fi
+    fi
+    if [ -n "$word" ]; then
+        PA_VERIFIED_WORD="$word"
+        printf 'NOT VERIFIED (%s)' "$word"
+        return 1
+    fi
+    printf 'VERIFIED %s' "$(pa_dur "$a")"
+}
+
+# _pa_daemon_enabled: propolis.service is enabled here, by the role the caller set (PA_ROLE) or,
+# when none was set, by pa_role.
+_pa_daemon_enabled() {
+    local role="${PA_ROLE:-}"
+    [ -n "$role" ] || role="$(pa_role)"
+    case "$role" in single | control) return 0 ;; esac
+    return 1
+}
+
+# pa_hook_test_page UNIT: the failure hook's test-page path, run by deploy/alert.sh in a child
+# process for a unit named propolis-test-page-<CODE>. It sends only when CODE is the stored test
+# page's code, that page is still pending and was recorded under 600 s ago. A page that cannot go
+# out whatever the server would say (no target, no alias to put it together with, no curl) is
+# marked with that word, in the record and in its ledger line, and never claimed. Before it
+# releases the lock it claims the page (result sending, in its ledger line and then in the
+# record), so a second run for the same code, which takes the lock while this one sends, finds it
+# used; a claim the ledger cannot take sends nothing and marks the page noclaim, so a page that
+# went out always counts toward the budget, and a claim the record cannot take sends nothing and
+# gives the ledger's back as noclaim. Where that give-back cannot be written either, or the hook
+# is stopped between the two claims, the ledger line stays claimed and counts for a day although
+# nothing went out: the count errs toward fewer pages, never more. It sends with the lock
+# released (the request can take 40 s) and writes the result under the lock afterwards, in the
+# record and in its ledger line, with the hook as sender; a result that cannot be written leaves
+# the claim, which the status command reports as sent with its result not recorded. A pending
+# page whose code arrives too late is marked nomatch; a code that is not the stored one (a newer
+# page replaced it) or was already used changes nothing, so a stale or repeated unit can never
+# overwrite a newer record or a result that got through. A lock busy for the first wait sends
+# nothing, and the page is marked lockbusy if the lock frees within a second wait, so the status
+# command can tell this from a unit that did not run. The waits fit the child's 85 s: 10 s, then
+# 40 s for the send and 30 s for the result, or 10 s and 20 s when nothing is sent. Every case
+# that sends nothing logs one line under propolis-witness; none names the target. Returns 0 on
+# every outcome.
+pa_hook_test_page() {
+    local unit="${1:-}" code age result stamp rc
+    if ! [[ $unit =~ ^propolis-test-page-([0-9a-f]{6})$ ]]; then
+        _pa_tp_log "test page refused: not a test-page unit name"
+        return 0
+    fi
+    code="${BASH_REMATCH[1]}"
+    pa_now
+    pa_settings_load
+    rc=0
+    pa_lock 10 || rc=$?
+    if [ "$rc" != 0 ]; then
+        _pa_tp_log "test page $code not sent: the state lock was not free"
+        if [ "$rc" = 1 ] && pa_lock 20; then
+            if _pa_tp_line && [ "$PA_TP_CODE" = "$code" ] && [ "$PA_TP_RESULT" = pending ]; then
+                pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" lockbusy \
+                    "$PA_TP_ACKED" "$PA_TP_UID" || true
+                pa_ledger_result "$PA_TP_SENT" test lockbusy hook || true
+            fi
+            pa_unlock
+        fi
+        return 0
+    fi
+    if ! _pa_tp_line || [ "$PA_TP_CODE" != "$code" ]; then
+        pa_unlock
+        _pa_tp_log "test page $code not sent: no test page with this code is waiting (a newer one replaced it, or none was asked for)"
+        return 0
+    fi
+    age="$(pa_age "$PA_TP_SENT")"
+    if [ "$PA_TP_RESULT" != pending ] || [ "$age" -lt 0 ] || [ "$age" -ge 600 ]; then
+        if [ "$PA_TP_RESULT" = pending ]; then
+            pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" nomatch \
+                "$PA_TP_ACKED" "$PA_TP_UID" || true
+        fi
+        pa_unlock
+        _pa_tp_log "test page $code not sent: it was used already or asked for over 10 minutes ago"
+        return 0
+    fi
+    stamp="$PA_TP_SENT"
+    # What sends nothing whatever the server would answer is settled before the claim, so a record
+    # that reads sending is a page that was handed to curl, or was about to be.
+    result=""
+    if [ "${PA_TARGET:-0}" != 1 ]; then
+        result=notarget
+    elif ! pa_render full test "$code"; then
+        result=norender
+    elif ! command -v curl > /dev/null 2>&1; then
+        result=nocurl
+    fi
+    if [ -n "$result" ]; then
+        pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" "$result" \
+            "$PA_TP_ACKED" "$PA_TP_UID" || true
+        pa_ledger_result "$stamp" test "$result" hook || true
+        pa_unlock
+        _pa_tp_log "test page $code not delivered ($result)"
+        return 0
+    fi
+    # A page goes out only once its ledger line reads sending: a line left pending stops counting
+    # after 120 s, so a page sent without the claim would never count toward the three a day. The
+    # ledger is claimed before the record, so a record that reads sending always has its claim: a
+    # write that fails here leaves the record pending (or noclaim), never a word that reads as
+    # sent.
+    if ! pa_ledger_result "$stamp" test sending hook; then
+        pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" noclaim \
+            "$PA_TP_ACKED" "$PA_TP_UID" || true
+        pa_unlock
+        _pa_tp_log "test page $code not sent: the claim on the ledger could not be written"
+        return 0
+    fi
+    if ! pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" sending \
+        "$PA_TP_ACKED" "$PA_TP_UID"; then
+        # Nothing goes out, so the ledger's claim is given back in a word the budget leaves out.
+        pa_ledger_result "$stamp" test noclaim hook || true
+        pa_unlock
+        _pa_tp_log "test page $code not sent: the claim on it could not be written"
+        return 0
+    fi
+    pa_unlock
+    pa_send "$PA_TITLE" "$PA_PRIO" < <(printf '%s\n' "$PA_BODY") || true
+    result="$PA_SEND_RESULT"
+    rc=0
+    pa_lock 30 || rc=$?
+    if [ "$rc" = 0 ]; then
+        if _pa_tp_line && [ "$PA_TP_CODE" = "$code" ] && [ "$PA_TP_RESULT" = sending ]; then
+            pa_testpage_write "$PA_TP_CODE" "$PA_TP_SENT" "$PA_TP_BIND" "$PA_TP_TOKEN8" "$result" \
+                "$PA_TP_ACKED" "$PA_TP_UID" || rc=1
+        fi
+        pa_ledger_result "$stamp" test "$result" hook || true
+        pa_unlock
+    fi
+    if [ "$result" != ok ]; then
+        _pa_tp_log "test page $code not delivered ($result)"
+    elif [ "$rc" != 0 ]; then
+        _pa_tp_log "test page $code delivered; the result could not be recorded"
+    fi
+    return 0
+}
+
+# _pa_tp_log TEXT: the one journal line of the test-page path.
+_pa_tp_log() {
+    logger -p daemon.notice -t propolis-witness "$1" 2> /dev/null || true
 }

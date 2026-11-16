@@ -3710,7 +3710,7 @@ fn the_hourly_read_check_stores_its_answer_and_a_changed_topic_is_checked_by_the
     );
     assert!(
         fx.read("run/motd.d/propolis")
-            .contains("alerts: topic refuses anonymous reads"),
+            .contains("alerts: NOT VERIFIED (never)"),
         "{}",
         fx.read("run/motd.d/propolis")
     );

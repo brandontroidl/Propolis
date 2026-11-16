@@ -14,11 +14,32 @@ static EXEC_FENCE: Mutex<()> = Mutex::new(());
 
 const TOKEN: &str = "tk_secret_token";
 
-/// Records argv, the header file it was handed and the body it read on stdin.
+/// Records argv, the header file it was handed and the body it read on stdin. A config file
+/// (`-K FILE`, the test page's form) goes to `$STUB_LOG.conf` with its mode, never to `$STUB_LOG`,
+/// and the call answers `STUB_POST_CODE` (default 200) as the write-out the file asks for, after
+/// `STUB_CURL_SLEEP` seconds; it then leaves `$STUB_LOG.posted`, and with `STUB_HOLD_LOCK` set it
+/// first starts a process that takes that lock file and holds it for a minute, its pid in
+/// `$STUB_LOG.holder`.
 const CURL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$STUB_LOG"
+prev=""
 for a in "$@"; do
     case "$a" in @/*) printf 'header-file:\n' >> "$STUB_LOG"; cat "${a#@}" >> "$STUB_LOG" ;; esac
+    if [ "$prev" = -K ]; then
+        { printf -- '--- %s\n' "$(stat -c %a -- "$a")"; cat -- "$a"; } >> "$STUB_LOG.conf"
+        printf 'body:\n' >> "$STUB_LOG"
+        cat >> "$STUB_LOG"
+        printf '\n' >> "$STUB_LOG"
+        [ -z "${STUB_CURL_SLEEP:-}" ] || sleep "$STUB_CURL_SLEEP"
+        if [ -n "${STUB_HOLD_LOCK:-}" ]; then
+            ( exec 9< "$STUB_HOLD_LOCK"; flock -x 9; echo "$BASHPID" > "$STUB_LOG.holder"; exec sleep 60 ) > /dev/null 2>&1 &
+            until [ -s "$STUB_LOG.holder" ]; do sleep 0.1; done
+        fi
+        : > "$STUB_LOG.posted"
+        printf '%s' "${STUB_POST_CODE:-200}"
+        exit 0
+    fi
+    prev="$a"
 done
 printf 'body:\n' >> "$STUB_LOG"
 cat >> "$STUB_LOG"
@@ -121,6 +142,19 @@ impl Fixture {
 
     fn run_grouped(&self, unit: &str, env: &[(&str, &str)], own_group: bool) -> Output {
         use std::os::unix::process::CommandExt;
+        let mut command = self.command(unit, env);
+        if own_group {
+            command.process_group(0);
+        }
+        let child = {
+            let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+            command.spawn().unwrap()
+        };
+        child.wait_with_output().unwrap()
+    }
+
+    /// The hook for `unit` with these extra variables, ready to spawn.
+    fn command(&self, unit: &str, env: &[(&str, &str)]) -> Command {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/alert.sh");
         let path = format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap());
         let mut command = Command::new("bash");
@@ -144,14 +178,7 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if own_group {
-            command.process_group(0);
-        }
-        let child = {
-            let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
-            command.spawn().unwrap()
-        };
-        child.wait_with_output().unwrap()
+        command
     }
 
     fn log(&self) -> String {
@@ -1932,4 +1959,643 @@ fn the_hook_states_the_library_it_needs_and_its_contract_on_one_line_each() {
             .any(|l| l.trim() == "# shellcheck source=deploy/alert-lib.sh"),
         "the deploy tests count the hook as a script that sources the library"
     );
+}
+
+// ---- the test page --------------------------------------------------------------------------
+
+const TP_SALT: &str = "0123456789abcdef0123456789abcdef";
+/// The library's time seam for these cases: wall 1_000_000, boot abcdef01, 5000 s of uptime.
+const TP_NOW: [(&str, &str); 3] = [
+    ("PA_TEST_WALL", "1000000"),
+    ("PA_TEST_BOOT", "abcdef01"),
+    ("PA_TEST_UP", "5000"),
+];
+
+impl Fixture {
+    /// A stored test page with this code and result, recorded `ago` seconds before TP_NOW, and its
+    /// pending ledger line.
+    fn test_page(&self, code: &str, ago: u64, result: &str) -> String {
+        let stamp = format!("{}/abcdef01/{}", 1_000_000 - ago, 5000 - ago);
+        let dir = self.root.join("var/lib/propolis/witness");
+        std::fs::write(dir.join("id-salt"), format!("{TP_SALT}\n")).unwrap();
+        std::fs::write(
+            dir.join("testpage"),
+            format!("#testpage v1 g=1\nT\t{code}\t{stamp}\t0123456789abcdef\t-\t{result}\t-\t-\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("send-ledger"),
+            format!("#send-ledger v1 g=1\nL\t{stamp}\ttest\t-\topen\tfull\tpending\tstatus\n"),
+        )
+        .unwrap();
+        stamp
+    }
+
+    fn state(&self, name: &str) -> String {
+        std::fs::read_to_string(self.root.join("var/lib/propolis/witness").join(name))
+            .unwrap_or_default()
+    }
+
+    fn confs(&self) -> String {
+        std::fs::read_to_string(format!("{}.conf", self.log.display())).unwrap_or_default()
+    }
+}
+
+/// The hook sends a test page only for the code the stored record holds, while that record is
+/// pending and under 10 minutes old: a wrong code, a code that came too late and a code already
+/// used each send nothing, log one line under propolis-witness and exit 0. A late code marks its
+/// own pending record nomatch; a wrong or used one changes nothing. The page that does go out
+/// carries the alias and the code, and curl gets the topic and the token only in its config file.
+#[test]
+fn the_test_page_unit_sends_only_with_the_recorded_code() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    let before = fx.state("testpage");
+    let out = fx.run("propolis-test-page-000000", &TP_NOW);
+    assert_ok(&out);
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert_eq!(fx.state("testpage"), before, "a wrong code changes nothing");
+    assert_eq!(witness_lines(&fx.log()).len(), 1, "{}", fx.log());
+    assert!(
+        fx.log().contains("test page 000000 not sent"),
+        "{}",
+        fx.log()
+    );
+
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 700, "pending");
+    assert_ok(&fx.run("propolis-test-page-abc123", &TP_NOW));
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(
+        fx.state("testpage").contains("\tnomatch\t"),
+        "{}",
+        fx.state("testpage")
+    );
+    assert_eq!(witness_lines(&fx.log()).len(), 1, "{}", fx.log());
+
+    let fx = Fixture::with_ntfy().with_lib();
+    let stamp = fx.test_page("abc123", 100, "pending");
+    let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+    assert_ok(&out);
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    let log = fx.log();
+    let calls: Vec<&str> = log.lines().filter(|l| l.starts_with("curl ")).collect();
+    assert_eq!(calls.len(), 1, "{log}");
+    let argv: Vec<&str> = calls[0].split(' ').collect();
+    assert_eq!(&argv[..3], ["curl", "-q", "-K"], "{}", calls[0]);
+    assert_eq!(argv.len(), 4, "nothing but the config file: {}", calls[0]);
+    assert!(log.contains("body:\nType back on host-"), "{log}");
+    assert!(log.contains(": status --ack-test abc123"), "{log}");
+    assert!(witness_lines(&log).is_empty(), "{log}");
+    for secret in [TOKEN, "propolis-ops", "honeybox"] {
+        assert!(!log.contains(secret), "{secret} in {log}");
+        assert!(!fx.state("testpage").contains(secret));
+        assert!(!fx.state("send-ledger").contains(secret));
+    }
+    let conf = fx.confs();
+    assert!(conf.starts_with("--- 600\n"), "{conf}");
+    assert!(
+        conf.contains("url = \"https://ntfy.example/propolis-ops\""),
+        "{conf}"
+    );
+    assert!(
+        conf.contains(&format!("header = \"Authorization: Bearer {TOKEN}\"")),
+        "{conf}"
+    );
+    assert!(conf.contains(": test page abc123\""), "{conf}");
+    assert!(
+        !conf.contains("honeybox") && !conf.contains("propolis:"),
+        "{conf}"
+    );
+    assert!(
+        fx.state("testpage")
+            .contains(&format!("\tabc123\t{stamp}\t"))
+            && fx.state("testpage").contains("\tok\t-\t-"),
+        "{}",
+        fx.state("testpage")
+    );
+    assert!(
+        fx.state("send-ledger")
+            .contains(&format!("L\t{stamp}\ttest\t-\topen\tfull\tok\thook")),
+        "{}",
+        fx.state("send-ledger")
+    );
+    // The same code again: already used, nothing sent, nothing changed.
+    let sent = fx.state("testpage");
+    assert_ok(&fx.run("propolis-test-page-abc123", &TP_NOW));
+    assert_eq!(fx.log().matches("curl ").count(), 1);
+    assert_eq!(fx.state("testpage"), sent);
+    assert_eq!(witness_lines(&fx.log()).len(), 1, "{}", fx.log());
+
+    // A refusal is recorded as such and logged, still with exit 0.
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    assert_ok(&fx.run(
+        "propolis-test-page-abc123",
+        &[TP_NOW[0], TP_NOW[1], TP_NOW[2], ("STUB_POST_CODE", "403")],
+    ));
+    assert!(
+        fx.state("testpage").contains("\tperm:403\t"),
+        "{}",
+        fx.state("testpage")
+    );
+    assert!(
+        fx.log().contains("not delivered (perm:403)"),
+        "{}",
+        fx.log()
+    );
+}
+
+/// systemd passes a failed unit's full name, which ends in `.service`, so a real unit named like
+/// a test page still takes today's path: today's title, today's post, no config file.
+#[test]
+fn a_unit_named_like_the_test_page_with_its_type_takes_the_legacy_path() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    assert_ok(&fx.run("propolis-test-page-abc123.service", &TP_NOW));
+    let log = fx.log();
+    assert!(
+        log.contains("Title: propolis: propolis-test-page-abc123.service failed on honeybox"),
+        "{log}"
+    );
+    assert!(!log.contains(" -K "), "{log}");
+    assert!(fx.confs().is_empty());
+    assert!(fx.state("testpage").contains("\tpending\t"));
+}
+
+/// A library that is missing, older than the test page needs, or broken (an unbound variable at
+/// its top level, a division by zero in the test-page function) cannot change the hook's exit
+/// status or make it send: one line under propolis-witness, exit 0, no post. The line does not
+/// claim nothing was sent, since a child stopped by its time limit may have sent already.
+#[test]
+fn a_missing_old_or_broken_library_on_the_test_page_path_logs_one_line_and_exits_zero() {
+    let shipped = shipped_lib();
+    let cases = [
+        ("missing", None),
+        (
+            "older",
+            Some(shipped.replace("PA_LIB_VERSION=9", "PA_LIB_VERSION=8")),
+        ),
+        (
+            "unbound",
+            Some(format!("set -u\n: \"$PA_NO_SUCH_VARIABLE\"\n{shipped}")),
+        ),
+        (
+            "division",
+            Some(format!(
+                "{shipped}\npa_hook_test_page() {{\n    local x=$((1/0))\n}}\n"
+            )),
+        ),
+    ];
+    for (name, body) in cases {
+        let fx = Fixture::with_ntfy();
+        if let Some(body) = body {
+            fx.install_lib(&body);
+        }
+        fx.test_page("abc123", 100, "pending");
+        let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+        assert_ok(&out);
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "{name}: {out:?}"
+        );
+        let log = fx.log();
+        assert!(!log.contains("curl "), "{name}: {log}");
+        let lines = witness_lines(&log);
+        assert_eq!(lines.len(), 1, "{name}: {log}");
+        assert!(
+            lines[0].contains("test page outcome unknown for propolis-test-page-abc123 (library missing, too old, failed or timed out)"),
+            "{name}: {}",
+            lines[0]
+        );
+        assert!(fx.state("testpage").contains("\tpending\t"), "{name}");
+    }
+    assert!(
+        shipped_hook().contains("TP_NEEDS=9") && shipped_lib().contains("PA_LIB_VERSION=9"),
+        "the test-page path asks for the library version that has it"
+    );
+}
+
+/// The test page is the one message the new code can send: pa_send is called from exactly one
+/// place in deploy/, the hook's test-page function, and that function is run only from the
+/// failure hook's test-page path.
+#[test]
+fn no_code_but_the_test_page_path_calls_pa_send() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+    let mut send_calls = Vec::new();
+    let mut runs = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "sh") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut function = String::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(f) = t.strip_suffix("() {")
+                && !line.starts_with(' ')
+            {
+                function = f.to_string();
+            }
+            if t.starts_with('#') {
+                continue;
+            }
+            if t.contains("pa_send") && !t.starts_with("pa_send()") {
+                send_calls.push(format!("{name}:{function}"));
+            }
+            if t.contains("pa_hook_test_page") && !t.starts_with("pa_hook_test_page()") {
+                runs.push(name.clone());
+            }
+        }
+    }
+    assert_eq!(
+        send_calls,
+        ["alert-lib.sh:pa_hook_test_page"],
+        "pa_send call sites"
+    );
+    assert_eq!(runs, ["alert.sh"], "pa_hook_test_page call sites");
+}
+
+impl Fixture {
+    /// The process the curl stub started to hold the state lock, stopped.
+    fn release_holder(&self) {
+        let pid =
+            std::fs::read_to_string(format!("{}.holder", self.log.display())).unwrap_or_default();
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            // SAFETY: kill has no memory preconditions; the pid is the stub's own child.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+
+    /// The posts the test page path made.
+    fn tp_posts(&self) -> usize {
+        self.log()
+            .lines()
+            .filter(|l| l.starts_with("curl -q -K "))
+            .count()
+    }
+
+    fn state_lock(&self) -> PathBuf {
+        self.root.join("var/lib/propolis/witness/state.lock")
+    }
+}
+
+/// The page is claimed (result `sending`) under the lock before it goes out. When the result
+/// cannot be written afterwards, because another writer holds the state lock past the hook's
+/// second wait, the claim stays: one line says the page was delivered and its result not
+/// recorded, and a second start for the same code sends nothing.
+#[test]
+fn a_page_whose_result_cannot_be_recorded_stays_claimed_and_is_never_sent_twice() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    let lock = fx.state_lock();
+    let env = [
+        TP_NOW[0],
+        TP_NOW[1],
+        TP_NOW[2],
+        ("STUB_HOLD_LOCK", lock.to_str().unwrap()),
+    ];
+    let out = fx.run("propolis-test-page-abc123", &env);
+    fx.release_holder();
+    assert_ok(&out);
+    assert_eq!(fx.tp_posts(), 1, "{}", fx.log());
+    assert!(
+        fx.state("testpage").contains("\tabc123\t") && fx.state("testpage").contains("\tsending\t"),
+        "{}",
+        fx.state("testpage")
+    );
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0].contains("test page abc123 delivered; the result could not be recorded"),
+        "{}",
+        lines[0]
+    );
+    assert_ok(&fx.run("propolis-test-page-abc123", &TP_NOW));
+    assert_eq!(
+        fx.tp_posts(),
+        1,
+        "the claimed page went out again: {}",
+        fx.log()
+    );
+    assert!(fx.state("testpage").contains("\tsending\t"));
+}
+
+/// A page goes out only once its ledger line reads as claimed, so a page that went out is always
+/// counted toward the three a day. When the send ledger cannot be written at claim time (here its
+/// every write fails, as on a full disk and a full /run), nothing is posted, the record says so in
+/// a word that is not `sending`, and one line says why.
+#[test]
+fn a_page_whose_ledger_claim_cannot_be_written_is_not_sent() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    write_exec(
+        &fx.bin.join("sync"),
+        "#!/usr/bin/env bash\nfor a in \"$@\"; do\n    case \"$a\" in */send-ledger.tmp.*) exit 1 ;; esac\ndone\nexit 0\n",
+    );
+    let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+    assert_ok(&out);
+    assert_eq!(fx.tp_posts(), 0, "{}", fx.log());
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    let record = fx.state("testpage");
+    assert!(
+        record.contains("\tabc123\t") && record.contains("\tnoclaim\t"),
+        "{record}"
+    );
+    assert!(!record.contains("\tsending\t"), "{record}");
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0]
+            .contains("test page abc123 not sent: the claim on the ledger could not be written"),
+        "{}",
+        lines[0]
+    );
+}
+
+/// The status command reports a record that reads `sending` as sent and takes its code back, and
+/// a ledger line that reads `sending` counts toward the three a day. So whichever write fails
+/// around the claim, a page that was not posted leaves `sending` in neither. Two cases the test
+/// above does not reach: the ledger refuses its claim and the record then refuses the mark that
+/// says so; the ledger takes its claim and the record refuses its own.
+#[test]
+fn a_page_that_was_not_posted_never_reads_as_claimed() {
+    for (ledger_fails, refused_word) in [(true, "noclaim"), (false, "sending")] {
+        let fx = Fixture::with_ntfy().with_lib();
+        let stamp = fx.test_page("abc123", 100, "pending");
+        // The stub refuses a write by what it would store: every send-ledger write in the first
+        // case, and in both any testpage write that holds the word.
+        let ledger_rule = if ledger_fails {
+            "*/send-ledger.tmp.*) exit 1 ;;"
+        } else {
+            "*/send-ledger.tmp.*) ;;"
+        };
+        write_exec(
+            &fx.bin.join("sync"),
+            &format!(
+                "#!/usr/bin/env bash\nfor a in \"$@\"; do\n    case \"$a\" in\n        {ledger_rule}\n        */testpage.tmp.*) if grep -q -- $'\\t{refused_word}\\t' \"$a\" 2> /dev/null; then exit 1; fi ;;\n    esac\ndone\nexit 0\n"
+            ),
+        );
+        let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+        assert_ok(&out);
+        assert_eq!(fx.tp_posts(), 0, "{refused_word}: {}", fx.log());
+        assert!(!fx.log().contains("curl "), "{refused_word}: {}", fx.log());
+        let record = fx.state("testpage");
+        assert!(
+            record.contains("\tabc123\t") && record.contains("\tpending\t"),
+            "{refused_word}: {record}"
+        );
+        assert!(!record.contains("\tsending\t"), "{refused_word}: {record}");
+        let ledger = fx.state("send-ledger");
+        assert!(!ledger.contains("\tsending\t"), "{refused_word}: {ledger}");
+        if !ledger_fails {
+            // The claim the ledger took is given back in a word the budget does not count.
+            assert!(
+                ledger.contains(&format!("L\t{stamp}\ttest\t-\topen\tfull\tnoclaim\thook")),
+                "{ledger}"
+            );
+        }
+        // Nothing went to the fallback copies either, which `state` does not read.
+        for name in ["testpage", "send-ledger"] {
+            assert!(
+                !fx.root
+                    .join("run/propolis-witness/fallback")
+                    .join(name)
+                    .exists(),
+                "{refused_word}: {name}"
+            );
+        }
+        let lines = witness_lines(&fx.log());
+        assert_eq!(lines.len(), 1, "{refused_word}: {}", fx.log());
+        let said = if ledger_fails {
+            "test page abc123 not sent: the claim on the ledger could not be written"
+        } else {
+            "test page abc123 not sent: the claim on it could not be written"
+        };
+        assert!(lines[0].contains(said), "{}", lines[0]);
+    }
+}
+
+/// What decides that nothing can go out (no curl on the host, a page that cannot be put together
+/// for want of an alias) is looked at before the claim. Such a page is never marked `sending`,
+/// the word the status command reports as sent: its record and its ledger line get the word that
+/// says why, and a record that refuses even that stays `pending`.
+#[test]
+fn a_page_that_cannot_go_out_is_never_claimed() {
+    // No curl, and the record refuses the word for it.
+    let fx = Fixture::with_ntfy().with_lib();
+    let stamp = fx.test_page("abc123", 100, "pending");
+    let path = fx.remove_curl();
+    write_exec(
+        &fx.bin.join("sync"),
+        "#!/usr/bin/env bash\nfor a in \"$@\"; do\n    case \"$a\" in\n        */testpage.tmp.*) if grep -q -- $'\\tnocurl\\t' \"$a\" 2> /dev/null; then exit 1; fi ;;\n    esac\ndone\nexit 0\n",
+    );
+    let env = [TP_NOW[0], TP_NOW[1], TP_NOW[2], ("PATH", path.as_str())];
+    let out = fx.run("propolis-test-page-abc123", &env);
+    assert_ok(&out);
+    assert_eq!(fx.tp_posts(), 0, "{}", fx.log());
+    let record = fx.state("testpage");
+    assert!(
+        record.contains("\tabc123\t") && record.contains("\tpending\t"),
+        "{record}"
+    );
+    assert!(!record.contains("\tsending\t"), "{record}");
+    let ledger = fx.state("send-ledger");
+    assert!(
+        ledger.contains(&format!("L\t{stamp}\ttest\t-\topen\tfull\tnocurl\thook")),
+        "{ledger}"
+    );
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0].contains("test page abc123 not delivered (nocurl)"),
+        "{}",
+        lines[0]
+    );
+
+    // No id salt, so no alias and no page: the record and the ledger line both say norender.
+    let fx = Fixture::with_ntfy().with_lib();
+    let stamp = fx.test_page("abc123", 100, "pending");
+    std::fs::remove_file(fx.root.join("var/lib/propolis/witness/id-salt")).unwrap();
+    let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+    assert_ok(&out);
+    assert_eq!(fx.tp_posts(), 0, "{}", fx.log());
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    let record = fx.state("testpage");
+    assert!(
+        record.contains("\tabc123\t") && record.contains("\tnorender\t"),
+        "{record}"
+    );
+    let ledger = fx.state("send-ledger");
+    assert!(
+        ledger.contains(&format!("L\t{stamp}\ttest\t-\topen\tfull\tnorender\thook")),
+        "{ledger}"
+    );
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0].contains("test page abc123 not delivered (norender)"),
+        "{}",
+        lines[0]
+    );
+}
+
+/// Two starts of the hook for one code at once send one page: the first claims the record before
+/// its send, so the second finds it used. The ledger keeps one line, with the result.
+#[test]
+fn two_hook_runs_for_one_code_send_one_page() {
+    let fx = Fixture::with_ntfy().with_lib();
+    let stamp = fx.test_page("abc123", 100, "pending");
+    let env = [TP_NOW[0], TP_NOW[1], TP_NOW[2], ("STUB_CURL_SLEEP", "3")];
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let mut command = fx.command("propolis-test-page-abc123", &env);
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        children.push(command.spawn().unwrap());
+    }
+    for child in children {
+        assert_ok(&child.wait_with_output().unwrap());
+    }
+    assert_eq!(fx.tp_posts(), 1, "{}", fx.log());
+    let ledger: Vec<String> = fx
+        .state("send-ledger")
+        .lines()
+        .filter(|l| l.starts_with("L\t"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        ledger,
+        [format!("L\t{stamp}\ttest\t-\topen\tfull\tok\thook")],
+        "{}",
+        fx.state("send-ledger")
+    );
+}
+
+/// The test-page child is bounded inside the unit's 90 s: a library whose test-page function
+/// hangs is cut off (here with 80 s of the hook's time already gone), the hook exits 0, logs one
+/// line, posts nothing and leaves no config file.
+#[test]
+fn a_hung_test_page_function_is_cut_off_and_the_hook_exits_zero() {
+    let fx = Fixture::with_ntfy();
+    fx.install_lib(&format!(
+        "{}\npa_hook_test_page() {{\n    sleep 200\n}}\n",
+        shipped_lib()
+    ));
+    fx.test_page("abc123", 100, "pending");
+    let started = std::time::Instant::now();
+    let out = fx.run(
+        "propolis-test-page-abc123",
+        &[TP_NOW[0], TP_NOW[1], TP_NOW[2], ("SECONDS", "80")],
+    );
+    let took = started.elapsed();
+    assert_ok(&out);
+    assert!(took < std::time::Duration::from_secs(30), "{took:?}");
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0].contains("test page outcome unknown for propolis-test-page-abc123"),
+        "{}",
+        lines[0]
+    );
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(fx.confs().is_empty());
+}
+
+/// A child stopped by its time limit after the page went out (here the flush of the result write
+/// stalls) is logged as an outcome unknown, never as a page not sent.
+#[test]
+fn a_child_stopped_after_the_post_logs_an_outcome_unknown() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    write_exec(
+        &fx.bin.join("sync"),
+        "#!/usr/bin/env bash\n[ ! -e \"$STUB_LOG.posted\" ] || exec sleep 30\n",
+    );
+    let out = fx.run(
+        "propolis-test-page-abc123",
+        &[TP_NOW[0], TP_NOW[1], TP_NOW[2], ("SECONDS", "80")],
+    );
+    assert_ok(&out);
+    assert_eq!(fx.tp_posts(), 1, "{}", fx.log());
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0].contains("test page outcome unknown for propolis-test-page-abc123 (library missing, too old, failed or timed out)"),
+        "{}",
+        lines[0]
+    );
+}
+
+/// A pending page whose sent stamp is ahead of now on this boot, or exactly ten minutes old, is
+/// not sent: it is marked nomatch.
+#[test]
+fn a_page_dated_ahead_or_exactly_ten_minutes_old_is_marked_nomatch_and_not_sent() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    let dir = fx.root.join("var/lib/propolis/witness");
+    std::fs::write(
+        dir.join("testpage"),
+        "#testpage v1 g=1\nT\tabc123\t1000600/abcdef01/5600\t0123456789abcdef\t-\tpending\t-\t-\n",
+    )
+    .unwrap();
+    assert_ok(&fx.run("propolis-test-page-abc123", &TP_NOW));
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(
+        fx.state("testpage").contains("\tnomatch\t"),
+        "{}",
+        fx.state("testpage")
+    );
+
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 600, "pending");
+    assert_ok(&fx.run("propolis-test-page-abc123", &TP_NOW));
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(
+        fx.state("testpage").contains("\tnomatch\t"),
+        "{}",
+        fx.state("testpage")
+    );
+}
+
+/// A state lock held for the whole run sends nothing and logs one line, exit 0; one freed while
+/// the hook still waits gets the page marked `lockbusy`, so the status command can tell this
+/// from a unit that did not run.
+#[test]
+fn a_busy_state_lock_sends_nothing_and_is_recorded_once_it_frees() {
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    let before = fx.state("testpage");
+    let lock = hold_lock(&fx.state_lock());
+    let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+    drop(lock);
+    assert_ok(&out);
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    let lines = witness_lines(&fx.log());
+    assert_eq!(lines.len(), 1, "{}", fx.log());
+    assert!(
+        lines[0].contains("test page abc123 not sent: the state lock was not free"),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(fx.state("testpage"), before);
+
+    let fx = Fixture::with_ntfy().with_lib();
+    fx.test_page("abc123", 100, "pending");
+    let lock = hold_lock(&fx.state_lock());
+    let freer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(14));
+        drop(lock);
+    });
+    let out = fx.run("propolis-test-page-abc123", &TP_NOW);
+    freer.join().unwrap();
+    assert_ok(&out);
+    assert!(!fx.log().contains("curl "), "{}", fx.log());
+    assert!(
+        fx.state("testpage").contains("\tlockbusy\t"),
+        "{}",
+        fx.state("testpage")
+    );
+    assert_eq!(witness_lines(&fx.log()).len(), 1, "{}", fx.log());
 }

@@ -39,7 +39,7 @@ const SALT: &str = "0123456789abcdef0123456789abcdef";
 
 /// Records its argv; answers `is-enabled`, `list-unit-files` and `show` from the `UNITS` file
 /// (`unit|ActiveState|SubState|Result|NRestarts|ActiveEnterTimestamp|UnitFileState|InvocationID`,
-/// and for a timer optionally `|LastTriggerUSec`).
+/// and for a timer optionally `|LastTriggerUSec`); `start` runs the failure hook (see below).
 const SYSTEMCTL_STUB: &str = r#"#!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >> "$STUB_LOG"
 [ -z "${SYSTEMCTL_FAIL:-}" ] || exit 1
@@ -83,6 +83,30 @@ case "$1" in
             echo "$p=$v"
         done
         ;;
+    start)
+        # The failure-alert unit, as systemd would run it: deploy/alert.sh (HOOK_SCRIPT) with the
+        # instance name, under the same root; START_FAIL makes the start itself fail.
+        [ -z "${START_FAIL:-}" ] || exit 1
+        # START_RESULT: the hook's run ended with this result, written as the hook writes it,
+        # without running it (for results the fixture cannot bring about through the hook).
+        if [ -n "${START_RESULT:-}" ]; then
+            w="$PROPOLIS_STATUS_ROOT/var/lib/propolis/witness"
+            sed "s/\tpending\t-\t-\$/\t$START_RESULT\t-\t-/" "$w/testpage" > "$w/testpage.new" && mv -f -- "$w/testpage.new" "$w/testpage"
+            sed "s/\tpending\tstatus\$/\t$START_RESULT\thook/" "$w/send-ledger" > "$w/send-ledger.new" && mv -f -- "$w/send-ledger.new" "$w/send-ledger"
+            exit 0
+        fi
+        [ -n "${HOOK_SCRIPT:-}" ] || exit 1
+        u="${!#}" inst="${u#propolis-alert@}" inst="${inst%.service}"
+        # START_REPLACE: another test page replaces the recorded code before the hook runs.
+        if [ -n "${START_REPLACE:-}" ]; then
+            f="$PROPOLIS_STATUS_ROOT/var/lib/propolis/witness/testpage"
+            old="$(sed -n 's/^T\t\([0-9a-f]\{6\}\)\t.*/\1/p' "$f")" new=000000
+            [ "$old" != 000000 ] || new=000001
+            sed "s/^T\t$old\t/T\t$new\t/" "$f" > "$f.new" && mv -f -- "$f.new" "$f"
+        fi
+        PROPOLIS_ALERT_ROOT="$PROPOLIS_STATUS_ROOT" bash "$HOOK_SCRIPT" "$inst" > /dev/null 2>&1
+        printf 'hook exit %s\n' "$?" >> "$STUB_LOG"
+        ;;
     *) exit 1 ;;
 esac
 "#;
@@ -108,8 +132,46 @@ exit 0
 /// `/ready` with `STUB_READY_BODY` and `STUB_READY_CODE` (`none`: no answer) and `/metrics` with
 /// `STUB_METRICS_BODY`. (The script has variables of its own named like the unprefixed ones, and
 /// an assignment to an inherited name changes what its children see.)
+///
+/// A call given a config file (`-K FILE`, how the test page and the read check reach the alert
+/// server) appends that file to `STUB_LOG.conf`, never to `STUB_LOG`, with its mode. A post (the
+/// file names `data-binary`) appends the body it read to `STUB_LOG.post` and answers
+/// `POST_CODE` (default 200); with `POST_HOLD_LOCK` set it first starts a process that takes that
+/// lock file and holds it for a minute, its pid in `STUB_LOG.holder`; a GET answers from `RC_JSON`, `RC_RAW` and `RC_SSE` by the
+/// endpoint the URL names (`code|content type`, default 403), and `RC_TOKEN_ANSWER` when a header
+/// file is given. A URL on any host but ntfy.example.invalid answers nothing and exits 7.
 const CURL_STUB: &str = r#"#!/usr/bin/env bash
 { printf 'curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+conf="" prev="" hdr="" out=""
+for a in "$@"; do
+    case "$prev" in -K) conf="$a" ;; -H) hdr="${a#@}" ;; -o) out="$a" ;; esac
+    prev="$a"
+done
+if [ -n "$conf" ]; then
+    { printf -- '--- %s\n' "$(stat -c %a -- "$conf")"; cat -- "$conf"; } >> "$STUB_LOG.conf"
+    url="$(sed -n 's/^url = "\(.*\)"$/\1/p' "$conf")"
+    case "$url" in
+        https://ntfy.example.invalid/* | http://ntfy.example.invalid/*) ;;
+        *) exit 7 ;;
+    esac
+    if grep -q '^data-binary' "$conf"; then
+        { printf -- '--- body\n'; cat; printf '\n'; } >> "$STUB_LOG.post"
+        if [ -n "${POST_HOLD_LOCK:-}" ]; then
+            ( exec 9< "$POST_HOLD_LOCK"; flock -x 9; echo "$BASHPID" > "$STUB_LOG.holder"; exec sleep 60 ) > /dev/null 2>&1 &
+            until [ -s "$STUB_LOG.holder" ]; do sleep 0.1; done
+        fi
+        printf '%s' "${POST_CODE:-200}"
+        exit 0
+    fi
+    ep="${url##*/}" ep="${ep%%\?*}"
+    if [ -n "$hdr" ]; then v="${RC_TOKEN_ANSWER:-403|text/plain}"; else
+        case "$ep" in json) v="${RC_JSON:-403|text/plain}" ;; raw) v="${RC_RAW:-403|text/plain}" ;; *) v="${RC_SSE:-403|text/plain}" ;; esac
+    fi
+    IFS='|' read -r code ct <<< "$v"
+    [ -z "$out" ] || : > "$out"
+    printf '%s\t%s' "$code" "$ct"
+    exit 0
+fi
 url="${!#}" prev="" hdr=""
 for a in "$@"; do [ "$prev" != -H ] || hdr="${a#@}"; prev="$a"; done
 if [ -n "$hdr" ]; then { printf 'header-file %s: ' "$hdr"; cat -- "$hdr"; } >> "$STUB_LOG"; fi
@@ -618,6 +680,7 @@ impl Fx {
             .env_remove("PA_LOCK_FD")
             .env_remove("PA_CLEANUP")
             .env_remove("PROPOLIS_STATUS_CC")
+            .env_remove("SUDO_UID")
             .stdin(Stdio::null());
         for (k, v) in &self.env {
             command.env(k, v);
@@ -791,9 +854,10 @@ fn a_healthy_single_box_marks_nothing_and_exits_zero() {
 }
 
 /// Until a witness pass has run on the host nothing has judged the records, so nothing is open;
-/// and what later releases add (VERIFIED, the heartbeat URL, the profile) is not shown.
+/// and what later releases add (the heartbeat URL, the profile) is not shown. VERIFIED is, as
+/// NOT VERIFIED (never): no test page has been asked for.
 #[test]
-fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_verified_or_profile() {
+fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_profile() {
     let fx = Fx::single();
     fx.write(
         "var/lib/propolis/witness/incidents",
@@ -813,8 +877,13 @@ fn before_a_witness_pass_the_walk_calls_nothing_open_and_shows_no_verified_or_pr
     );
     let r = fx.walk();
     assert_eq!(r.code, 0, "{}", r.out);
+    assert!(
+        r.out
+            .contains(" - NOT VERIFIED (never); daemon not verified\n"),
+        "{}",
+        r.out
+    );
     for absent in [
-        "VERIFIED",
         "OPEN ",
         " open ",
         "open since",
@@ -1937,10 +2006,15 @@ fn bad_usage_exits_64() {
     for args in [
         vec!["nosuch"],
         vec!["listen", "ship"],
-        vec!["--setup"],
-        vec!["--test-page"],
+        vec!["--setup", "listen"],
+        vec!["--test-page", "--setup"],
         vec!["--ack", "w#1"],
         vec!["--ack-test", "zzzzzz"],
+        vec!["--ack-test"],
+        vec!["--ack-test", "ABCDEF"],
+        vec!["--ack-test", "abc12"],
+        vec!["--ack-test", "abc1234"],
+        vec!["--ack-test", "../../x"],
         vec!["--maint"],
         vec!["--maint", "121"],
         vec!["--maint", "-1"],
@@ -1960,10 +2034,17 @@ fn bad_usage_exits_64() {
     }
     assert_eq!(fx.log(), "", "nothing read before the usage check");
     let help = fx.run(&["--help"]);
-    for verb in ["--setup", "--test-page", "--ack"] {
+    for verb in ["--ack ", "--ack ID"] {
         assert!(!help.out.contains(verb), "{verb} offered:\n{}", help.out);
     }
-    for verb in ["--banner", "--maint MINUTES", "witness"] {
+    for verb in [
+        "--banner",
+        "--maint MINUTES",
+        "witness",
+        "--setup",
+        "--test-page",
+        "--ack-test CODE",
+    ] {
         assert!(help.out.contains(verb), "{verb} not offered:\n{}", help.out);
     }
 }
@@ -2666,7 +2747,8 @@ fn a_linked_directory_is_checked_where_it_leads() {
     assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
 }
 
-/// 5.7 rule 4: a row after the marked one that failed only for lack of progress is starved.
+/// A row after the marked one that failed only for lack of progress is starved: the stall
+/// upstream explains it.
 #[test]
 fn a_progress_failure_after_the_marked_stage_reads_starved() {
     let mut fx = Fx::single();
@@ -2684,7 +2766,8 @@ fn a_progress_failure_after_the_marked_stage_reads_starved() {
     assert_eq!(r.state("intake"), "starved", "{}", r.out);
 }
 
-/// 5.7 rule 5: a stage before the marked one that could not be read is named on the marked row.
+/// A stage before the marked one that could not be read is named on the marked row, since the
+/// stall may lie there instead.
 #[test]
 fn a_stage_that_could_not_be_read_before_the_marked_one_is_named_on_it() {
     let mut fx = Fx::single();
@@ -3824,7 +3907,7 @@ fn the_banner_is_four_ascii_lines_of_closed_words() {
     assert_eq!(l[0], "[propolis 08:00 UTC] nothing open; profile legacy");
     assert_eq!(
         l[1],
-        "[propolis 08:00 UTC] alerts: topic refuses anonymous reads"
+        "[propolis 08:00 UTC] alerts: NOT VERIFIED (never); daemon not verified"
     );
     assert_eq!(l[2], "[propolis 08:00 UTC] run: sudo propolis-status");
     assert!(!fx.log().contains("curl"), "no network: {}", fx.log());
@@ -3834,6 +3917,20 @@ fn the_banner_is_four_ascii_lines_of_closed_words() {
         l[1],
         "[propolis 08:00 UTC] alerts: topic READABLE by anyone"
     );
+    for (class, word) in [
+        ("redirect", "redirect"),
+        ("not_found", "not found"),
+        ("not_ntfy", "not a push server"),
+        ("unexpected", "unexpected"),
+    ] {
+        fx.readcheck(class);
+        let l = check(&fx.run(&["--banner"]), class);
+        assert_eq!(
+            l[1],
+            format!("[propolis 08:00 UTC] alerts: topic not proven private ({word})"),
+            "an answer that is not a refusal does not prove the topic readable"
+        );
+    }
     std::fs::remove_file(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
     let l = check(&fx.run(&["--banner"]), "not checked");
     assert_eq!(l[1], "[propolis 08:00 UTC] alerts: topic not checked yet");
@@ -4880,4 +4977,1717 @@ fn a_listed_collector_without_a_spool_gets_the_widened_id_the_witness_keys_it_by
         r.out
     );
     assert!(r.out.contains(&format!("{id}={{{a}}}")), "{}", r.out);
+}
+
+// ---- the test page, --ack-test, --setup and VERIFIED --------------------------------------------
+
+const HOOK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/alert.sh");
+const TOPIC: &str = "t0p1c-secret";
+const TOKEN_SECRET: &str = "tk_secret";
+
+impl Fx {
+    /// A start of the failure-alert unit runs the real hook, deploy/alert.sh, under this root.
+    fn with_hook(&mut self) {
+        self.setenv("HOOK_SCRIPT", HOOK);
+    }
+
+    fn side(&self, ext: &str) -> String {
+        std::fs::read_to_string(format!("{}.{ext}", self.log.display())).unwrap_or_default()
+    }
+
+    /// The bodies the curl stub was posted, one per post.
+    fn posts(&self) -> Vec<String> {
+        self.side("post")
+            .split("--- body\n")
+            .skip(1)
+            .map(|b| b.trim_end_matches('\n').to_string())
+            .collect()
+    }
+
+    /// The fields of the stored test page, numbered as the file numbers them (0 is the type).
+    fn testpage(&self) -> Vec<String> {
+        let text = std::fs::read_to_string(self.p("var/lib/propolis/witness/testpage"))
+            .unwrap_or_default();
+        text.lines()
+            .find(|l| l.starts_with("T\t"))
+            .map(|l| l.split('\t').map(String::from).collect())
+            .unwrap_or_default()
+    }
+
+    fn ledger(&self) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.p("var/lib/propolis/witness/send-ledger"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("L\t"))
+            .map(|l| l.split('\t').map(String::from).collect())
+            .collect()
+    }
+
+    /// The alias the walk's header names.
+    fn alias(&self) -> String {
+        let r = self.walk();
+        r.out.split(" = ").next().unwrap().to_string()
+    }
+
+    /// Everything this run left that a person or another program can read: what it printed,
+    /// every argument a program was started with, every journal line, and every state file.
+    fn readable_traces(&self, r: &Run) -> String {
+        let mut all = format!("{}\n{}\n{}", r.out, r.err, self.log());
+        for name in ["testpage", "send-ledger", "readcheck", "meta", "incidents"] {
+            all.push_str(
+                &std::fs::read_to_string(self.p(&format!("var/lib/propolis/witness/{name}")))
+                    .unwrap_or_default(),
+            );
+        }
+        all.push_str(&std::fs::read_to_string(self.p("run/motd.d/propolis")).unwrap_or_default());
+        all
+    }
+
+    fn tmp_is_empty(&self) -> bool {
+        std::fs::read_dir(self.dir.path().join("tmp"))
+            .unwrap()
+            .next()
+            .is_none()
+    }
+}
+
+fn hold_lock(path: &Path) -> std::fs::File {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if !path.exists() {
+        std::fs::write(path, b"").unwrap();
+    }
+    let file = std::fs::File::open(path).unwrap();
+    // SAFETY: flock on a descriptor this process owns has no other precondition.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(rc, 0, "could not take the lock");
+    file
+}
+
+/// The test page goes out through the failure-alert unit, once, in its fixed shape: the alias
+/// and the code and nothing that names the host, a unit or the software, at priority 3. The topic
+/// and the token reach curl only in its config file (mode 0600, gone afterwards); curl's command
+/// line is `-q -K <file>`, and neither secret is printed, logged or stored. The command prints
+/// `sent test page <CODE>: ok` with the code the record holds, the one --ack-test takes; the
+/// code is not a secret, since the unit's name carries it too.
+#[test]
+fn the_test_page_is_exact_and_carries_no_host_name() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    let alias = fx.alias();
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 0, "{}\n{}\n{}", r.out, r.err, fx.log());
+    let tp = fx.testpage();
+    let code = tp[1].clone();
+    assert_eq!(
+        r.out,
+        format!(
+            "sent test page {code}: ok. When it arrives, type back the code it carries: sudo propolis-status --ack-test {code}\n"
+        )
+    );
+    assert!(
+        code.len() == 6
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "{tp:?}"
+    );
+    assert_eq!(
+        (tp[5].as_str(), tp[6].as_str(), tp[7].as_str()),
+        ("ok", "-", "-")
+    );
+    assert_eq!(
+        fx.posts(),
+        [format!("Type back on {alias}: status --ack-test {code}")],
+        "{}",
+        fx.side("post")
+    );
+    let conf = fx.side("conf");
+    assert!(conf.starts_with("--- 600\n"), "{conf}");
+    for line in [
+        format!("url = \"https://ntfy.example.invalid/{TOPIC}\""),
+        format!("header = \"Title: {alias}: test page {code}\""),
+        "header = \"Priority: 3\"".to_string(),
+        format!("header = \"Authorization: Bearer {TOKEN_SECRET}\""),
+        "data-binary = \"@-\"".to_string(),
+        "proto = \"=https,http\"".to_string(),
+        "globoff".to_string(),
+    ] {
+        assert!(conf.lines().any(|l| l == line), "{line} not in:\n{conf}");
+    }
+    assert!(!conf.contains("Tags:"), "{conf}");
+    for planted in ["honeybox", "sensor-", "propolis", "ntfy"] {
+        assert!(!fx.posts()[0].contains(planted), "{planted}");
+        assert!(
+            !format!("{alias}: test page {code}").contains(planted),
+            "{planted}"
+        );
+    }
+    let log = fx.log();
+    // The walk that named the alias asked the console on loopback; every other call is the post.
+    let posts: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("curl ") && !l.contains("127.0.0.1"))
+        .collect();
+    assert_eq!(posts.len(), 1, "{}", fx.log());
+    assert!(
+        posts[0].starts_with("curl [-q] [-K] [") && posts[0].matches('[').count() == 3,
+        "{}",
+        posts[0]
+    );
+    assert!(
+        fx.log().contains(&format!(
+            "systemctl start -- propolis-alert@propolis-test-page-{code}.service"
+        )),
+        "{}",
+        fx.log()
+    );
+    let traces = fx.readable_traces(&r);
+    for secret in [TOPIC, TOKEN_SECRET] {
+        assert!(
+            !traces.contains(secret),
+            "{secret} left where it can be read"
+        );
+    }
+    assert!(fx.tmp_is_empty(), "a temporary file outlived the send");
+    let ledger = fx.ledger();
+    assert_eq!(ledger.len(), 1, "{ledger:?}");
+    assert_eq!(
+        (
+            ledger[0][2].as_str(),
+            ledger[0][6].as_str(),
+            ledger[0][7].as_str()
+        ),
+        ("test", "ok", "hook"),
+        "{ledger:?}"
+    );
+    for name in ["testpage", "send-ledger"] {
+        let mode = std::fs::metadata(fx.p(&format!("var/lib/propolis/witness/{name}")))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "{name}");
+    }
+}
+
+/// At most three test pages in 24 hours, counted before the send and whatever came of them; a
+/// page that sent nothing (norender) and one over a day old do not count. The fourth is withheld
+/// before any unit is started.
+#[test]
+fn the_fourth_test_page_in_a_day_is_withheld() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\nL\t{}\ttest\t-\topen\tfull\ttransient:503\thook\nL\t{}\ttest\t-\topen\tfull\tnorender\thook\nL\t{}\ttest\t-\topen\tfull\tok\thook\n",
+            stamp_ago(3600),
+            stamp_ago(1800),
+            stamp_ago(90_000)
+        ),
+    );
+    for _ in 0..2 {
+        let r = fx.run(&["--test-page"]);
+        assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    }
+    let starts = fx.log().matches("systemctl start ").count();
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out.contains("test page budget spent (3 in 24 h)"),
+        "{}",
+        r.out
+    );
+    assert_eq!(fx.log().matches("systemctl start ").count(), starts);
+    assert_eq!(fx.posts().len(), 2);
+}
+
+/// A failure-alert unit that never runs (masked, not installed, its start refused) leaves each
+/// attempt pending, and the hook claims a page as sending before it sends: once the hook's whole
+/// time has passed, a pending attempt was never sent and no longer counts. So three such attempts
+/// withhold a fourth only for that time: three minutes on, a fourth is admitted. Three pages that
+/// went out still withhold a fourth, and the message says when the next is allowed.
+#[test]
+fn attempts_whose_unit_never_ran_do_not_spend_the_day() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.setenv("START_FAIL", "1");
+    for _ in 0..3 {
+        let r = fx.run(&["--test-page"]);
+        assert!(
+            r.out.contains("the failure-alert unit did not run"),
+            "{}",
+            r.out
+        );
+    }
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(
+        r.out,
+        "test page budget spent (3 in 24 h): nothing sent; the next is allowed at 08:02 UTC\n"
+    );
+    fx.setenv("PROPOLIS_STATUS_NOW", "1800000180/abcdef01/900180");
+    let starts = fx.log().matches("systemctl start ").count();
+    let r = fx.run(&["--test-page"]);
+    assert!(
+        r.out.contains("the failure-alert unit did not run"),
+        "three minutes on, a fourth is admitted: {}",
+        r.out
+    );
+    assert_eq!(fx.log().matches("systemctl start ").count(), starts + 1);
+
+    let mut fx = Fx::single();
+    fx.with_hook();
+    for _ in 0..3 {
+        assert_eq!(fx.run(&["--test-page"]).code, 0);
+    }
+    fx.setenv("PROPOLIS_STATUS_NOW", "1800000180/abcdef01/900180");
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1);
+    assert_eq!(
+        r.out,
+        "test page budget spent (3 in 24 h): nothing sent; the next is allowed at 08:01 UTC\n"
+    );
+    assert_eq!(fx.posts().len(), 3);
+}
+
+/// --test-page prints `sent test page <CODE>` only for a page that left the host. When nothing
+/// was sent it says so and why, in words; when the server did not take the page it says so with
+/// the result and a next step, and that the page counted toward the three a day.
+#[test]
+fn the_test_page_says_in_words_what_became_of_a_page_that_was_not_taken() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "START_RESULT",
+            "nocurl",
+            "test page not sent: curl is not installed here; install it (today's failure hook cannot push without it either)",
+        ),
+        (
+            "START_RESULT",
+            "notarget",
+            "test page not sent: the failure-alert unit found no push target; see sudo propolis-status --setup",
+        ),
+        (
+            "START_RESULT",
+            "norender",
+            "test page not sent: it could not be put together (no alias yet, or a value that cannot be sent safely); see sudo propolis-status --setup",
+        ),
+        (
+            "START_RESULT",
+            "nomatch",
+            "test page not sent: the failure-alert unit ran over 10 minutes after the page was asked for; send another",
+        ),
+        (
+            "START_RESULT",
+            "noclaim",
+            "test page not sent: the failure-alert unit could not write its claim on the send ledger (/var/lib/propolis/witness, /run/propolis-witness); send another once there is room",
+        ),
+        (
+            "POST_CODE",
+            "403",
+            "not accepted by the server (perm:403): check the token and that it may write to the topic; it counted toward the three a day",
+        ),
+        (
+            "POST_CODE",
+            "404",
+            "not accepted by the server (perm:404): check PROPOLIS_OPS_NTFY_URL and the topic; it counted toward the three a day",
+        ),
+        (
+            "POST_CODE",
+            "503",
+            "not accepted by the server (transient:503): try again later; it counted toward the three a day",
+        ),
+    ];
+    for (k, v, want) in cases {
+        let mut fx = Fx::single();
+        fx.with_hook();
+        fx.setenv(k, v);
+        let r = fx.run(&["--test-page"]);
+        assert_eq!(r.code, 1, "{v}: {}\n{}", r.out, r.err);
+        assert!(r.out.contains(want), "{v}: {want} not in:\n{}", r.out);
+        assert!(!r.out.contains("sent test page"), "{v}: {}", r.out);
+        if *k == "POST_CODE" {
+            let code = fx.testpage()[1].clone();
+            assert!(
+                r.out.starts_with(&format!("test page {code} not accepted")),
+                "{v}: {}",
+                r.out
+            );
+        }
+    }
+}
+
+/// The VERIFIED field at the end of the walk's ALERTS line.
+fn alerts_verified(fx: &Fx) -> String {
+    let r = fx.walk();
+    let line = r
+        .out
+        .lines()
+        .find(|l| l.starts_with("ALERTS  "))
+        .unwrap_or_else(|| panic!("{}", r.out))
+        .to_string();
+    line.rsplit(" - ").next().unwrap().to_string()
+}
+
+/// --ack-test sets VERIFIED once, for the code the page carried; a wrong code and a page over a
+/// day old change nothing, and the same code a second time says it was acknowledged already and
+/// changes nothing either. VERIFIED then holds only while every rule does: a changed topic or
+/// token, a removed target, a month gone or an acknowledgement dated after now, a permanent
+/// refusal, an alert-path incident or an undelivered hook alert after the acknowledgement each
+/// undo it, and a stamp that cannot be dated counts as after it; a transient failure does not;
+/// and a file that cannot be read is not VERIFIED.
+#[test]
+fn ack_test_verifies_once_and_each_rule_undoes_it() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.setenv("SUDO_UID", "1000");
+    let verified = alerts_verified;
+    assert_eq!(verified(&fx), "NOT VERIFIED (never); daemon not verified");
+    assert_eq!(fx.run(&["--test-page"]).code, 0);
+    assert_eq!(verified(&fx), "NOT VERIFIED (pending); daemon not verified");
+    let tp = fx.testpage();
+    let code = tp[1].clone();
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let r = fx.run(&["--ack-test", wrong]);
+    assert_eq!((r.code, r.out.as_str()), (1, "wrong or expired code\n"));
+    assert_eq!(fx.testpage(), tp, "a wrong code changes nothing");
+    let r = fx.run(&["--ack-test", &code]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    assert_eq!(r.out, "VERIFIED: the test page reached you\n");
+    let acked = fx.testpage();
+    assert_eq!((acked[6].as_str(), acked[7].as_str()), (STAMP, "1000"));
+    let file = std::fs::read(fx.p("var/lib/propolis/witness/testpage")).unwrap();
+    let r = fx.run(&["--ack-test", &code]);
+    assert_eq!(
+        (r.code, r.out.as_str()),
+        (0, "already acknowledged at 08:00 UTC: VERIFIED stands\n"),
+        "a code is typed back once"
+    );
+    assert_eq!(
+        std::fs::read(fx.p("var/lib/propolis/witness/testpage")).unwrap(),
+        file
+    );
+    assert_eq!(verified(&fx), "VERIFIED 0 min (shell); daemon not verified");
+    let banner = fx.run(&["--banner"]);
+    assert!(
+        banner
+            .out
+            .contains("[propolis 08:00 UTC] alerts: VERIFIED 0 min (shell); daemon not verified\n"),
+        "{}",
+        banner.out
+    );
+
+    // Each rule from here on, against a record acknowledged ten minutes ago.
+    let write_tp = |fx: &Fx, sent: &str, result: &str, acked: &str| {
+        fx.write(
+            "var/lib/propolis/witness/testpage",
+            &format!(
+                "#testpage v1 g=9\nT\t{code}\t{sent}\t{}\t{}\t{result}\t{acked}\t1000\n",
+                tp[3], tp[4]
+            ),
+        );
+    };
+    write_tp(&fx, &stamp_ago(900), "ok", &stamp_ago(600));
+    assert_eq!(
+        verified(&fx),
+        "VERIFIED 10 min (shell); daemon not verified"
+    );
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOPIC=");
+    fx.env_line("PROPOLIS_OPS_NTFY_TOPIC=another-topic");
+    assert!(verified(&fx).starts_with("NOT VERIFIED (changed)"));
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOPIC=");
+    fx.env_line(&format!("PROPOLIS_OPS_NTFY_TOPIC={TOPIC}"));
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOKEN=");
+    fx.env_line("PROPOLIS_OPS_NTFY_TOKEN=tk_other");
+    assert!(verified(&fx).starts_with("NOT VERIFIED (changed)"));
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOKEN=");
+    fx.env_line(&format!("PROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}"));
+    assert!(verified(&fx).starts_with("VERIFIED"));
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    assert!(verified(&fx).starts_with("NOT VERIFIED (changed)"));
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid");
+    assert!(verified(&fx).starts_with("VERIFIED"));
+    // A month back is another boot: its age comes from the wall clock.
+    let month = |ago: u64| format!("{}/0000aaaa/1", NOW - ago);
+    write_tp(&fx, &month(31 * 86400 + 60), "ok", &month(31 * 86400));
+    assert!(verified(&fx).starts_with("NOT VERIFIED (expired)"));
+    // An acknowledgement dated after now on this boot is not trusted either.
+    write_tp(
+        &fx,
+        &stamp_ago(900),
+        "ok",
+        &format!("{}/abcdef01/{}", NOW + 600, 900_600),
+    );
+    assert!(verified(&fx).starts_with("NOT VERIFIED (expired)"));
+    write_tp(&fx, &stamp_ago(900), "ok", &stamp_ago(600));
+    let ledger = |result: &str| {
+        format!(
+            "#send-ledger v1 g=5\nL\t{}\ttest\t-\topen\tfull\tperm:403\thook\nL\t{}\ttest\t-\topen\tfull\t{result}\thook\n",
+            stamp_ago(1200),
+            stamp_ago(60)
+        )
+    };
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &ledger("transient:503"),
+    );
+    assert!(
+        verified(&fx).starts_with("VERIFIED"),
+        "a refusal before the ack and a transient after it undo nothing"
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", &ledger("perm:401"));
+    assert!(verified(&fx).starts_with("NOT VERIFIED (refused)"));
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=6\nL\tnot-a-stamp\ttest\t-\topen\tfull\tperm:401\thook\n",
+    );
+    assert!(
+        verified(&fx).starts_with("NOT VERIFIED (refused)"),
+        "a refusal that cannot be dated counts as after the ack"
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    assert!(verified(&fx).starts_with("NOT VERIFIED (unreadable)"));
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/send-ledger")).unwrap();
+    let mut path = record(
+        "w#7",
+        "alert:shell",
+        "alert",
+        "PAGE",
+        "open",
+        NOW - 60,
+        "alert.undelivered",
+        "-",
+    );
+    path = set_field(&path, 3, "alert-path");
+    path = set_field(&path, 9, &stamp_ago(60));
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=2\nN\t8\n{path}"),
+    );
+    assert!(verified(&fx).starts_with("NOT VERIFIED (path-failed)"));
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t8\n{}",
+            set_field(&path, 9, "not-a-stamp")
+        ),
+    );
+    assert!(
+        verified(&fx).starts_with("NOT VERIFIED (path-failed)"),
+        "an opening that cannot be dated counts as after the ack"
+    );
+    fx.write("var/lib/propolis/witness/incidents", "garbage\n");
+    assert!(verified(&fx).starts_with("NOT VERIFIED (unreadable)"));
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/incidents")).unwrap();
+    let undelivered = fx.p("run/propolis-alert/undelivered/sensor-ssh.service");
+    fx.write(
+        "run/propolis-alert/undelivered/sensor-ssh.service",
+        &format!("{} 1 {}\n", NOW - 60, NOW - 60),
+    );
+    set_mtime(&undelivered, NOW - 60);
+    assert!(verified(&fx).starts_with("NOT VERIFIED (undelivered)"));
+    // Either date after the acknowledgement is enough: the last attempt, or the first failure.
+    fx.write(
+        "run/propolis-alert/undelivered/sensor-ssh.service",
+        &format!("{} 1 {}\n", NOW - 900, NOW - 900),
+    );
+    set_mtime(&undelivered, NOW - 60);
+    assert!(verified(&fx).starts_with("NOT VERIFIED (undelivered)"));
+    fx.write(
+        "run/propolis-alert/undelivered/sensor-ssh.service",
+        &format!("{} 1 {}\n", NOW - 60, NOW - 60),
+    );
+    set_mtime(&undelivered, NOW - 900);
+    assert!(verified(&fx).starts_with("NOT VERIFIED (undelivered)"));
+    std::fs::remove_file(&undelivered).unwrap();
+    assert!(verified(&fx).starts_with("VERIFIED"));
+    // An undelivered list that is not a directory cannot be read: a file, then a link.
+    let dir = fx.p("run/propolis-alert/undelivered");
+    std::fs::remove_dir(&dir).unwrap();
+    std::fs::write(&dir, "").unwrap();
+    assert!(verified(&fx).starts_with("NOT VERIFIED (unreadable)"));
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir_all(fx.p("run/elsewhere")).unwrap();
+    std::os::unix::fs::symlink(fx.p("run/elsewhere"), &dir).unwrap();
+    assert!(verified(&fx).starts_with("NOT VERIFIED (unreadable)"));
+    std::fs::remove_file(&dir).unwrap();
+    assert!(verified(&fx).starts_with("VERIFIED"));
+    fx.write("var/lib/propolis/witness/testpage", "garbage\n");
+    assert!(verified(&fx).starts_with("NOT VERIFIED (unreadable)"));
+    // A page that went out over a day ago can no longer be acknowledged.
+    fx.write(
+        "var/lib/propolis/witness/testpage",
+        &format!(
+            "#testpage v1 g=9\nT\t{code}\t{}\t{}\t{}\tok\t-\t-\n",
+            stamp_ago(86_460),
+            tp[3],
+            tp[4]
+        ),
+    );
+    let r = fx.run(&["--ack-test", &code]);
+    assert_eq!((r.code, r.out.as_str()), (1, "wrong or expired code\n"));
+}
+
+/// --setup runs the anonymous-read check now and says what it found in the check's own words,
+/// with every code and content type; it stores the answer, keeps a stored refusal through a
+/// transient answer, and exits 0 only when the gate is full. It never prints the token or the
+/// topic (only how long the topic is) and of the URL only its scheme and host.
+#[test]
+fn setup_classifies_each_answer_and_never_prints_the_token_or_topic() {
+    let mut fx = Fx::single();
+    let cases: &[(&str, &str, &str, &str, i32)] = &[
+        (
+            "403|text/plain",
+            "403|text/plain",
+            "403|text/plain",
+            "refused",
+            0,
+        ),
+        ("503|", "403|text/plain", "403|text/plain", "transient", 0),
+        (
+            "200|application/x-ndjson; charset=utf-8",
+            "403|text/plain",
+            "403|text/plain",
+            "readable",
+            1,
+        ),
+        (
+            "302|text/html",
+            "302|text/html",
+            "302|text/html",
+            "redirect",
+            1,
+        ),
+        (
+            "200|text/html",
+            "403|text/plain",
+            "403|text/plain",
+            "not_ntfy",
+            1,
+        ),
+        (
+            "404|text/plain",
+            "404|text/plain",
+            "404|text/plain",
+            "not_found",
+            1,
+        ),
+    ];
+    for (json, raw, sse, class, code) in cases {
+        fx.setenv("RC_JSON", json);
+        fx.setenv("RC_RAW", raw);
+        fx.setenv("RC_SSE", sse);
+        let r = fx.run(&["--setup"]);
+        assert_eq!(r.code, *code, "{class}:\n{}\n{}", r.out, r.err);
+        let anon = r
+            .out
+            .lines()
+            .find(|l| l.starts_with("anon read   checked now: "))
+            .unwrap_or_else(|| panic!("{}", r.out));
+        assert!(anon.ends_with(&format!(" -> {class}")), "{anon}");
+        let jc: Vec<&str> = json.split('|').collect();
+        let want_ct = jc[1].split(';').next().unwrap();
+        let want_ct = if want_ct.is_empty() { "-" } else { want_ct };
+        assert!(
+            anon.contains(&format!("json {} ({want_ct})", jc[0])),
+            "{anon}"
+        );
+        assert!(
+            r.out.contains("target      ntfy from propolis.env: URL https://ntfy.example.invalid, topic set (12 chars), token set"),
+            "{}",
+            r.out
+        );
+        let traces = fx.readable_traces(&r);
+        for secret in [TOPIC, TOKEN_SECRET] {
+            assert!(
+                !traces.contains(secret),
+                "{class}: {secret} left where it can be read"
+            );
+        }
+        let stored = std::fs::read_to_string(fx.p("var/lib/propolis/witness/readcheck")).unwrap();
+        let line = stored.lines().find(|l| l.starts_with("R\t")).unwrap();
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f[9], "both", "{line}");
+        if *class == "transient" {
+            assert_eq!(
+                (f[3], f[5]),
+                ("transient", "refused"),
+                "the refusal stands: {line}"
+            );
+            assert!(
+                r.out
+                    .contains("no definite answer: the one stored before stands")
+            );
+        } else {
+            assert_eq!((f[3], f[5]), (*class, *class), "{line}");
+        }
+        let daemon = r.out.lines().any(|l| l.starts_with("daemon      "));
+        assert_eq!(daemon, *code == 1, "{class}: the daemon line\n{}", r.out);
+        assert!(r.out.contains("verified    NOT VERIFIED (never); daemon not verified. Run: sudo propolis-status --test-page"), "{}", r.out);
+    }
+    // A path, a user and a query in the URL stay out of the report.
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=https://user:pw@ntfy.example.invalid/base?auth=q");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out
+            .contains("URL https://ntfy.example.invalid, topic set"),
+        "{}",
+        r.out
+    );
+    for hidden in ["user", ":pw", "base", "auth="] {
+        assert!(!r.out.contains(hidden), "{hidden} in:\n{}", r.out);
+    }
+}
+
+/// On a collector whose token can read the topic, --setup says so, says a collector should use a
+/// topic of its own, holds the gate at pointer and exits 1. The alert.env lines a later release
+/// adds are not offered.
+#[test]
+fn setup_on_a_collector_with_a_reading_token_says_so() {
+    let mut fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\nPROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}\n"),
+    );
+    fx.setenv("RC_TOKEN_ANSWER", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    for want in [
+        "setup on host-",
+        ", collector)",
+        "token       reads (this token can read the topic)",
+        "collectors should use their own topic: on ntfy.sh a token carries its user's read rights",
+        "gate        pointer:token-reads",
+        "verified    NOT VERIFIED (never). Run: sudo propolis-status --test-page",
+    ] {
+        assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
+    }
+    for absent in [
+        "alert.env",
+        "PROPOLIS_ALERT_PROFILE",
+        "daemon not verified",
+        "daily",
+        "profile",
+    ] {
+        assert!(!r.out.contains(absent), "{absent} in:\n{}", r.out);
+    }
+}
+
+/// The channel line names the alias test pages name this host by, the same one the walk shows,
+/// and says that today's failure alerts name it by its host name; off a single box it warns that a
+/// fallback alias cannot be told from other hosts'. --setup makes the salt the alias comes from
+/// when there is none yet, mode 0600.
+#[test]
+fn setup_prints_the_channel_alias_and_warns_on_a_fallback_off_a_single_box() {
+    let fx = Fx::single();
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/id-salt")).unwrap();
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    assert!(r.out.contains("salt        created now"), "{}", r.out);
+    let salt = fx.p("var/lib/propolis/witness/id-salt");
+    assert_eq!(
+        std::fs::metadata(&salt).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let alias = fx.alias();
+    assert!(alias.starts_with("host-") && alias.len() == 9, "{alias}");
+    assert!(
+        r.out
+            .starts_with(&format!("setup on {alias} (honeybox, single box)\n")),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains(&format!(
+            "channel     test pages (and the shell messages of a later release) name this host by its alias, {alias}: record it; today's failure alerts name it by its host name, honeybox\n"
+        )),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("warning"), "{}", r.out);
+    let fx = Fx::control();
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "record it; today's failure alerts name it by its host name, honeybox; warning: a fallback alias cannot be told from other hosts' on a phone"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("salt        ok"), "{}", r.out);
+}
+
+/// Over plain http a 403 proves nothing: anyone on the path could have answered it and can read
+/// every push. --setup says the gate needs https, the gate is pointer:insecure, and it exits 1.
+#[test]
+fn setup_over_http_says_the_gate_needs_https() {
+    let fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid");
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    assert!(r.out.contains("-> refused"), "{}", r.out);
+    assert!(
+        r.out.contains("gate needs https: over http anyone on the path can fake this answer and read the pushes"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("gate        pointer:insecure"), "{}", r.out);
+}
+
+/// While another writer holds the state lock, --test-page, --ack-test and --setup each give up
+/// after 10 s with exit 75: nothing is sent, no unit is started and no record changes.
+#[test]
+fn a_held_lock_makes_the_test_page_verbs_exit_75() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    let lock = hold_lock(&fx.p("var/lib/propolis/witness/state.lock"));
+    for args in [
+        vec!["--test-page"],
+        vec!["--ack-test", "abcdef"],
+        vec!["--setup"],
+    ] {
+        let started = std::time::Instant::now();
+        let r = fx.run(&args);
+        assert_eq!(r.code, 75, "{args:?}: {}\n{}", r.out, r.err);
+        assert!(r.err.contains("the state lock is busy"), "{}", r.err);
+        assert!(started.elapsed() < Duration::from_secs(40), "{args:?}");
+    }
+    drop(lock);
+    assert!(!fx.log().contains("systemctl start"), "{}", fx.log());
+    assert!(fx.posts().is_empty());
+    assert!(fx.testpage().is_empty());
+}
+
+/// Two --test-page runs at once each write their own record, the later replacing the earlier; a
+/// hook started for a replaced code sends nothing, so every page that went out is one a run
+/// reported as sent, no code goes out twice, and both attempts are in the ledger. A run whose
+/// unit did not run says so; a missing state directory sends nothing at all.
+#[test]
+fn two_test_pages_at_once_or_a_replaced_code_never_send_twice() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    let mut children = Vec::new();
+    for _ in 0..2 {
+        let mut command = fx.command(&["--test-page"]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let _fence = EXEC_FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        children.push(command.spawn().unwrap());
+    }
+    let mut sent = 0;
+    for child in children {
+        let out = child.wait_with_output().unwrap();
+        if out.status.code() == Some(0) {
+            sent += 1;
+        } else {
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains("replaced"), "{text}");
+        }
+    }
+    let posts = fx.posts();
+    assert_eq!(posts.len(), sent, "{posts:?}");
+    assert!(sent >= 1);
+    if posts.len() == 2 {
+        assert_ne!(posts[0], posts[1]);
+    }
+    assert_eq!(fx.ledger().len(), 2, "{:?}", fx.ledger());
+
+    fx.setenv("START_FAIL", "1");
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1);
+    // A record left pending is also what a unit leaves that ran and could not write it, so the
+    // line names both and points at the unit's journal, which says which.
+    assert!(
+        r.out.contains("not sent: the failure-alert unit did not run, or could not write the page's record (see: journalctl -u propolis-alert@propolis-test-page-"),
+        "{}",
+        r.out
+    );
+    assert_eq!(fx.posts().len(), sent);
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("The last test page was not sent: the failure-alert unit did not run, or could not write the page's record (see journalctl -u propolis-alert@propolis-test-page-"),
+        "{}",
+        r.out
+    );
+
+    let fx = Fx::single();
+    std::fs::remove_dir_all(fx.p("var/lib/propolis/witness")).unwrap();
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    assert!(r.out.contains("test page not sent"), "{}", r.out);
+    assert!(!fx.log().contains("systemctl start"), "{}", fx.log());
+}
+
+/// Without a push target there is nothing to test: --test-page sends nothing and says so, and
+/// --setup says where the hook's alerts go instead, prints no channel line (nothing names this
+/// host on a channel) and exits 1.
+#[test]
+fn without_a_target_the_test_page_sends_nothing_and_setup_says_so() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.env_drop("PROPOLIS_OPS_NTFY_");
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1);
+    assert!(
+        r.out.starts_with("no push target: nothing sent"),
+        "{}",
+        r.out
+    );
+    assert!(!fx.log().contains("systemctl start"));
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1);
+    assert!(
+        r.out
+            .contains("target      none: the failure hook writes its alerts to the journal"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("gate        none:notarget"), "{}", r.out);
+    assert!(
+        !r.out.lines().any(|l| l.starts_with("channel ")),
+        "no channel line without a target:\n{}",
+        r.out
+    );
+    assert!(!fx.log().contains("curl "), "no request without a target");
+}
+
+impl Fx {
+    /// Takes curl off `PATH`: the stubs first, then a directory of links to every other program
+    /// on the test's `PATH`, so the script keeps bash and the coreutils but finds no curl.
+    fn without_curl(&mut self) {
+        std::fs::remove_file(self.bin.join("curl")).unwrap();
+        let farm = self.dir.path().join("no-curl");
+        std::fs::create_dir_all(&farm).unwrap();
+        for dir in std::env::split_paths(&std::env::var("PATH").unwrap()) {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let link = farm.join(&name);
+                if name == "curl" || link.symlink_metadata().is_ok() {
+                    continue;
+                }
+                let _ = std::os::unix::fs::symlink(entry.path(), link);
+            }
+        }
+        let path = format!("{}:{}", self.bin.display(), farm.display());
+        self.setenv("PATH", &path);
+    }
+
+    /// A `sync` on `PATH` that fails for every temporary file of the state file `name`, so both
+    /// state directories refuse that one write whoever runs the test, and succeeds otherwise.
+    fn refuse_writes_of(&self, name: &str) {
+        write_exec(
+            &self.bin.join("sync"),
+            &format!("#!/usr/bin/env bash\ncase \"$*\" in *{name}.tmp.*) exit 1 ;; esac\nexit 0\n"),
+        );
+    }
+
+    /// The `verified` line of --setup.
+    fn setup_verified(&self) -> String {
+        let r = self.run(&["--setup"]);
+        r.out
+            .lines()
+            .find(|l| l.starts_with("verified    "))
+            .unwrap_or_else(|| panic!("{}\n{}", r.out, r.err))
+            .to_string()
+    }
+
+    /// The process the curl stub started to hold the state lock, stopped.
+    fn release_holder(&self) {
+        let pid = self.side("holder");
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            // SAFETY: kill has no memory preconditions; the pid is the stub's own child.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// The banner's alerts line, without its prefix.
+fn banner_alerts(fx: &Fx) -> String {
+    let r = fx.run(&["--banner"]);
+    r.out
+        .lines()
+        .find_map(|l| l.split_once("] alerts: ").map(|(_, a)| a.to_string()))
+        .unwrap_or_else(|| panic!("{}", r.out))
+}
+
+/// One test page through the hook, and its code typed back; the code.
+fn page_and_ack(fx: &Fx) -> String {
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 0, "{}\n{}\n{}", r.out, r.err, fx.log());
+    let code = fx.testpage()[1].clone();
+    let r = fx.run(&["--ack-test", &code]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+    code
+}
+
+/// The test page proves the path as the library reads propolis.env, and today's failure hook
+/// reads the file with a rule of its own (the last line that starts with `KEY=`). Where the two
+/// read the target differently no real failure page is proven: an indented `KEY = value` topic,
+/// which the hook does not see at all, and a token with a trailing comment or over 256
+/// characters, which the library ignores as invalid and the hook sends whole. The walk and the
+/// banner say NOT VERIFIED, the acknowledgement itself says so and names the setting, and --setup
+/// names the setting and its fix: for a value the shell senders ignore as invalid, the rule it
+/// breaks; for one the hook reads otherwise, to write it plainly. Another test page cannot clear
+/// `changed` there, so it is not offered. The same steps with the lines written plainly verify.
+#[test]
+fn a_target_todays_hook_reads_otherwise_is_never_verified() {
+    let long = "k".repeat(300);
+    let cases = [
+        (
+            "PROPOLIS_OPS_NTFY_TOPIC=",
+            format!("  PROPOLIS_OPS_NTFY_TOPIC = {TOPIC}"),
+            format!("PROPOLIS_OPS_NTFY_TOPIC={TOPIC}"),
+            "PROPOLIS_OPS_NTFY_TOPIC",
+        ),
+        (
+            "PROPOLIS_OPS_NTFY_TOKEN=",
+            format!("PROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}  # ops phone"),
+            format!("PROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}"),
+            "PROPOLIS_OPS_NTFY_TOKEN",
+        ),
+        (
+            "PROPOLIS_OPS_NTFY_TOKEN=",
+            format!("PROPOLIS_OPS_NTFY_TOKEN={long}"),
+            format!("PROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}"),
+            "PROPOLIS_OPS_NTFY_TOKEN",
+        ),
+    ];
+    let rule = "1 to 256 printable characters with no blank";
+    for (prefix, odd, plain, key) in &cases {
+        let invalid = *key == "PROPOLIS_OPS_NTFY_TOKEN";
+        let (ack_why, verified_fix, setup_fix) = if invalid {
+            (
+                format!("the shell senders ignore {key} as invalid; set {key} to {rule}"),
+                format!(
+                    ". Set {key} in /etc/propolis/propolis.env to {rule}, written plainly on one line"
+                ),
+                format!(
+                    "            the shell senders ignore {key} as invalid; set {key} to {rule}\n"
+                ),
+            )
+        } else {
+            (
+                format!("today's failure hook reads {key} otherwise"),
+                ". Write each push setting in /etc/propolis/propolis.env as KEY=value at the start of its line, with no blank or comment".to_string(),
+                format!(
+                    "            today's failure hook reads {key} otherwise: write each push setting as KEY=value at the start of its line, with no blank or comment\n"
+                ),
+            )
+        };
+        for (line, verified) in [(odd, false), (plain, true)] {
+            let mut fx = Fx::single();
+            fx.with_hook();
+            fx.env_drop(prefix);
+            fx.env_line(line);
+            let r = fx.run(&["--test-page"]);
+            assert_eq!(r.code, 0, "{}\n{}\n{}", r.out, r.err, fx.log());
+            let code = fx.testpage()[1].clone();
+            let ack = fx.run(&["--ack-test", &code]);
+            assert_eq!(ack.code, 0, "{}\n{}", ack.out, ack.err);
+            if verified {
+                assert_eq!(ack.out, "VERIFIED: the test page reached you\n");
+            } else {
+                assert_eq!(
+                    ack.out,
+                    format!(
+                        "acknowledged; NOT VERIFIED (changed): {ack_why}: see sudo propolis-status --setup\n"
+                    )
+                );
+                let line = fx.setup_verified();
+                assert!(!line.contains("--test-page"), "{line}");
+                assert!(line.ends_with(&verified_fix), "{line}");
+                if invalid {
+                    assert!(!line.contains("Write each push setting"), "{line}");
+                }
+            }
+            let field = alerts_verified(&fx);
+            let banner = banner_alerts(&fx);
+            assert_eq!(field.starts_with("VERIFIED"), verified, "{line}: {field}");
+            assert_eq!(banner.starts_with("VERIFIED"), verified, "{line}: {banner}");
+            if !verified {
+                assert!(field.starts_with("NOT VERIFIED (changed)"), "{field}");
+            }
+            let r = fx.run(&["--setup"]);
+            assert_eq!(r.out.contains(&setup_fix), !verified, "{line}:\n{}", r.out);
+            if invalid {
+                assert!(
+                    !r.out.contains("today's failure hook reads"),
+                    "{line}:\n{}",
+                    r.out
+                );
+            }
+            let traces = fx.readable_traces(&r);
+            for secret in [TOPIC, TOKEN_SECRET, long.as_str()] {
+                assert!(!traces.contains(secret), "{line}: {secret} printed");
+            }
+        }
+    }
+}
+
+/// When the shell senders ignore the URL or the topic as invalid, --setup does not say that
+/// nothing is pushed: today's failure hook reads the raw lines and still posts there with the
+/// host and unit names, its journal lines and the token, and with no scheme curl uses plain
+/// http. --setup says so, shows of the URL only its scheme and host, never the topic or the token,
+/// and gives the fix.
+#[test]
+fn setup_says_todays_hook_still_posts_to_a_setting_the_shell_senders_ignore() {
+    let fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid");
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    for absent in [
+        "writes its alerts to the journal",
+        "nothing is pushed",
+        TOPIC,
+        TOKEN_SECRET,
+    ] {
+        assert!(!r.out.contains(absent), "{absent} in:\n{}", r.out);
+    }
+    for want in [
+        "target      none for the shell senders, which ignore PROPOLIS_OPS_NTFY_URL as invalid; today's failure hook still posts to it (no scheme: curl uses plain http), with the host and unit names, its journal lines and the token\n",
+        "            fix (config-check alert-setting-invalid): in /etc/propolis/propolis.env set PROPOLIS_OPS_NTFY_URL to an http:// or https:// URL with a host and no blanks, written plainly on one line\n",
+        "gate        none:notarget  - the shell senders push nothing; today's failure hook still posts (see target)\n",
+    ] {
+        assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
+    }
+
+    let fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOPIC=");
+    fx.env_line("PROPOLIS_OPS_NTFY_TOPIC=has.a.dot");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("target      none for the shell senders, which ignore PROPOLIS_OPS_NTFY_TOPIC as invalid; today's failure hook still posts to it (URL https://ntfy.example.invalid), with the host and unit names, its journal lines and the token\n"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("has.a.dot"), "{}", r.out);
+}
+
+/// Wherever the shell senders have no target and today's failure hook still finds a URL and a
+/// topic, no output says the hook writes to the journal: the walk's alert row warns that the hook
+/// still posts (on a collector too), --test-page says it sent nothing while the hook still posts,
+/// and the verified line names the fix, a collector's included.
+#[test]
+fn no_output_says_the_hook_writes_to_the_journal_while_it_still_posts() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid");
+    let walk = fx.walk();
+    let row = walk.row("alert");
+    assert!(
+        row.contains("the shell senders ignore PROPOLIS_OPS_NTFY_URL as invalid; today's failure hook still posts to it (see sudo propolis-status --setup)"),
+        "{row}"
+    );
+    assert!(row.contains(" ntfy "), "{row}");
+    assert_eq!(walk.state("alert"), "WARN", "{row}");
+    assert!(
+        walk.out.contains("ALERTS  target none for the shell senders; today's failure hook still posts (invalid value ignored: PROPOLIS_OPS_NTFY_URL) - gate "),
+        "{}",
+        walk.out
+    );
+    let page = fx.run(&["--test-page"]);
+    assert_eq!(page.code, 1, "{}", page.out);
+    assert_eq!(
+        page.out,
+        "no target the shell senders accept: nothing sent; today's failure hook still posts to the setting they ignore (see sudo propolis-status --setup)\n"
+    );
+    assert!(!fx.log().contains("systemctl start"), "{}", fx.log());
+    for out in [&walk.out, &page.out] {
+        for absent in ["writes its alerts to the journal", "writes to the journal"] {
+            assert!(!out.contains(absent), "{absent} in:\n{out}");
+        }
+    }
+    assert!(
+        fx.setup_verified().ends_with(". Set PROPOLIS_OPS_NTFY_URL in /etc/propolis/propolis.env to an http:// or https:// URL with a host and no blanks, written plainly on one line"),
+        "{}",
+        fx.setup_verified()
+    );
+
+    let fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_NTFY_URL=ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"),
+    );
+    let walk = fx.walk();
+    let row = walk.row("alert");
+    assert_eq!(walk.state("alert"), "WARN", "{row}");
+    assert!(!row.contains("collector default"), "{row}");
+    assert!(
+        row.contains("today's failure hook still posts to it"),
+        "{row}"
+    );
+    let line = fx.setup_verified();
+    assert!(!line.contains("No push target is expected"), "{line}");
+    assert!(
+        line.contains("Set PROPOLIS_OPS_NTFY_URL in /etc/propolis/propolis.env"),
+        "{line}"
+    );
+}
+
+/// An indented empty line meant to switch pushing off empties the URL for the shell senders,
+/// with nothing invalid, while today's failure hook, which never sees an indented line, still
+/// reads the earlier one and posts. --setup says the hook still posts, names the setting it reads
+/// otherwise with its fix, and never says that the hook writes to the journal or that nothing is
+/// pushed.
+#[test]
+fn an_indented_empty_line_the_hook_never_sees_is_reported_as_the_hook_still_posting() {
+    let fx = Fx::single();
+    fx.env_line("  PROPOLIS_OPS_NTFY_URL=");
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    for want in [
+        "target      none for the shell senders, which read PROPOLIS_OPS_NTFY_URL otherwise; today's failure hook still posts to it (URL https://ntfy.example.invalid), with the host and unit names, its journal lines and the token\n",
+        "            today's failure hook reads PROPOLIS_OPS_NTFY_URL otherwise: write each push setting as KEY=value at the start of its line, with no blank or comment\n",
+        "gate        none:notarget  - the shell senders push nothing; today's failure hook still posts (see target)\n",
+    ] {
+        assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
+    }
+    for absent in [
+        "writes its alerts to the journal",
+        "nothing is pushed",
+        TOPIC,
+        TOKEN_SECRET,
+    ] {
+        assert!(!r.out.contains(absent), "{absent} in:\n{}", r.out);
+    }
+}
+
+/// The gate governs only the test page (and the shell messages of a later release); today's
+/// failure hook is not gated. Over plain http, whatever the server answers, --setup says what
+/// today's failure alerts carry and that the gate does not apply to them, and nothing says
+/// without qualification that pushes carry no detail. Behind a fresh refusal over https that line
+/// is not printed.
+#[test]
+fn setup_says_the_gate_does_not_apply_to_todays_failure_alerts() {
+    let fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_URL=");
+    fx.env_line("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid");
+    let r = fx.run(&["--setup"]);
+    assert!(r.out.contains("-> refused"), "{}", r.out);
+    assert!(
+        r.out.contains("failures    the gate does not apply to today's failure alerts: each carries this host's name, the failed unit and its last journal lines; over plain http they travel in clear, the token too\n"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains("gate        pointer:insecure  - the test page (and the shell messages of a later release) carries no detail: over plain http a refusal proves nothing\n"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("pushes carry no detail"), "{}", r.out);
+
+    let mut fx = Fx::single();
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("failures    the gate does not apply to today's failure alerts: each carries this host's name, the failed unit and its last journal lines; the topic is not proven to refuse anonymous reads\n"),
+        "{}",
+        r.out
+    );
+    let fx = Fx::single();
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("gate        full - the shell messages of a later release may carry detail: the topic refuses anonymous reads (the test page carries only the alias and the code in every mode)\n"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("failures    "), "{}", r.out);
+}
+
+/// The next step on --setup's verified line follows from the word and the last result. After a
+/// page that went out it is to type its code back: another page would replace the code on the
+/// phone and spend one of the day's three. A page the server refused names the result and what to
+/// check. Without a target it names the settings to set, and on a collector, where none is
+/// expected, it says so. Only no page, an expired or a changed one is told to send a test page.
+#[test]
+fn the_verified_line_gives_the_next_step_the_state_calls_for() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    assert!(
+        fx.setup_verified()
+            .ends_with(". Run: sudo propolis-status --test-page"),
+        "{}",
+        fx.setup_verified()
+    );
+    assert_eq!(fx.run(&["--test-page"]).code, 0);
+    let line = fx.setup_verified();
+    assert!(
+        line.ends_with(
+            ". Type back the code from the page: sudo propolis-status --ack-test <code>"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("--test-page"), "{line}");
+    let tp = fx.testpage();
+    // A code past the day --ack-test takes it for can only be replaced.
+    fx.write(
+        "var/lib/propolis/witness/testpage",
+        &format!(
+            "#testpage v1 g=9\nT\t{}\t{}\t{}\t{}\tok\t-\t-\n",
+            tp[1],
+            stamp_ago(86_460),
+            tp[3],
+            tp[4]
+        ),
+    );
+    let line = fx.setup_verified();
+    assert!(
+        line.ends_with(
+            ". The last test page's code has expired (over a day old). Run: sudo propolis-status --test-page"
+        ),
+        "{line}"
+    );
+    fx.write(
+        "var/lib/propolis/witness/testpage",
+        &format!(
+            "#testpage v1 g=9\nT\t{}\t{}\t{}\t{}\tperm:403\t-\t-\n",
+            tp[1], tp[2], tp[3], tp[4]
+        ),
+    );
+    let line = fx.setup_verified();
+    assert!(
+        line.contains(". The last test page was refused (perm:403): check the token and that it may write to the topic"),
+        "{line}"
+    );
+    assert!(
+        !line.contains("Run: sudo propolis-status --test-page"),
+        "{line}"
+    );
+    fx.env_drop("PROPOLIS_OPS_NTFY_");
+    let line = fx.setup_verified();
+    assert!(
+        line.ends_with(
+            ". Set PROPOLIS_OPS_NTFY_URL and PROPOLIS_OPS_NTFY_TOPIC in /etc/propolis/propolis.env"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("--test-page"), "{line}");
+    let fx = Fx::collector();
+    let line = fx.setup_verified();
+    assert!(
+        line.ends_with(". No push target is expected on a collector"),
+        "{line}"
+    );
+    assert!(!line.contains("--test-page"), "{line}");
+}
+
+/// The page is claimed before it goes out. A page that went out but whose result the hook could
+/// not write (another writer held the state lock past its second wait) is reported as sent with
+/// its result not recorded, never as a unit that did not run, and its code can still be typed
+/// back.
+#[test]
+fn a_page_whose_result_could_not_be_recorded_is_reported_as_sent() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.write("var/lib/propolis/witness/state.lock", "");
+    let lock = fx.p("var/lib/propolis/witness/state.lock");
+    fx.setenv("POST_HOLD_LOCK", lock.to_str().unwrap());
+    let r = fx.run(&["--test-page"]);
+    fx.release_holder();
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    let tp = fx.testpage();
+    let code = &tp[1];
+    assert!(
+        r.out.starts_with(&format!(
+            "sent test page {code}; the result could not be recorded (see: journalctl -u propolis-alert@propolis-test-page-{code}.service)"
+        )),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("did not run"), "{}", r.out);
+    assert_eq!(tp[5], "sending", "{tp:?}");
+    assert_eq!(fx.posts().len(), 1);
+    fx.env.retain(|(k, _)| k != "POST_HOLD_LOCK");
+    let r = fx.run(&["--ack-test", code]);
+    assert_eq!(r.code, 0, "{}\n{}", r.out, r.err);
+}
+
+/// A code replaced by another test page before the hook ran is never sent, and the command says
+/// it was replaced (here the replacement is made by the start itself, so the case does not depend
+/// on two runs overlapping).
+#[test]
+fn a_code_replaced_before_its_hook_ran_is_reported_and_never_sent() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.setenv("START_REPLACE", "1");
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    assert!(r.out.contains("replaced"), "{}", r.out);
+    assert!(fx.posts().is_empty(), "{:?}", fx.posts());
+}
+
+/// A page whose sent stamp is ahead of now on this boot cannot be acknowledged.
+#[test]
+fn a_page_dated_after_now_cannot_be_acknowledged() {
+    let fx = Fx::single();
+    fx.write(
+        "var/lib/propolis/witness/testpage",
+        &format!(
+            "#testpage v1 g=1\nT\tabc123\t{}/abcdef01/{}\t0123456789abcdef\t-\tok\t-\t-\n",
+            NOW + 600,
+            900_600
+        ),
+    );
+    let before = std::fs::read(fx.p("var/lib/propolis/witness/testpage")).unwrap();
+    let r = fx.run(&["--ack-test", "abc123"]);
+    assert_eq!((r.code, r.out.as_str()), (1, "wrong or expired code\n"));
+    assert_eq!(
+        std::fs::read(fx.p("var/lib/propolis/witness/testpage")).unwrap(),
+        before
+    );
+}
+
+/// --setup never reports a full gate from a stored refusal that the answer just given (readable)
+/// could not replace because neither state directory took the write: the gate is that answer's,
+/// and the exit status follows it.
+#[test]
+fn setup_never_reports_a_full_gate_from_a_refusal_the_new_answer_could_not_replace() {
+    let mut fx = Fx::single();
+    fx.refuse_writes_of("readcheck");
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert_eq!(r.code, 1, "{}\n{}", r.out, r.err);
+    assert!(
+        r.out.contains("the answer could not be stored"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("gate        full"), "{}", r.out);
+    assert!(r.out.contains("gate        pointer:readable"), "{}", r.out);
+}
+
+/// --setup says what the token can read (noread, unknown when its read got no answer, none
+/// without a token); without curl it says neither check was made and that today's failure hook
+/// needs curl too, never that there is no token.
+#[test]
+fn setup_names_what_the_token_reads_and_says_when_nothing_was_checked() {
+    let mut fx = Fx::single();
+    for (answer, want) in [
+        (
+            "403|text/plain",
+            "token       noread (this token cannot read the topic)\n",
+        ),
+        (
+            "000|",
+            "token       unknown (its read got no answer that says)\n",
+        ),
+    ] {
+        fx.setenv("RC_TOKEN_ANSWER", answer);
+        let r = fx.run(&["--setup"]);
+        assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
+    }
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOKEN=");
+    let r = fx.run(&["--setup"]);
+    assert!(r.out.contains("token       none\n"), "{}", r.out);
+    fx.env_line(&format!("PROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}"));
+    fx.without_curl();
+    let r = fx.run(&["--setup"]);
+    for want in [
+        "anon read   not checked: curl or a private temporary file was not to be had\n",
+        "token       not checked\n",
+        "            install curl: today's failure hook cannot push without it either\n",
+    ] {
+        assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
+    }
+    assert!(!r.out.contains("token       none"), "{}", r.out);
+}
+
+/// --setup's heartbeat line: the recommendation when it is unset, `set` for an https URL in
+/// alert.env, refused for plain http; the URL itself is never printed.
+#[test]
+fn setup_states_the_heartbeat_url_without_showing_it() {
+    let fx = Fx::single();
+    let heartbeat = |fx: &Fx| -> String {
+        let r = fx.run(&["--setup"]);
+        for hidden in ["hc.example.invalid", "s3cret-ping"] {
+            assert!(!r.out.contains(hidden), "{hidden} in:\n{}", r.out);
+        }
+        r.out
+            .lines()
+            .find(|l| l.starts_with("heartbeat   "))
+            .unwrap_or_else(|| panic!("{}", r.out))
+            .to_string()
+    };
+    assert!(
+        heartbeat(&fx)
+            .starts_with("heartbeat   not set. Recommended: a private dead-man check URL"),
+        "{}",
+        heartbeat(&fx)
+    );
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=https://hc.example.invalid/s3cret-ping\n",
+    );
+    assert_eq!(heartbeat(&fx), "heartbeat   set (the URL is not shown)");
+    fx.write(
+        "etc/propolis/alert.env",
+        "PROPOLIS_WITNESS_HEARTBEAT_URL=http://hc.example.invalid/s3cret-ping\n",
+    );
+    assert_eq!(
+        heartbeat(&fx),
+        "heartbeat   refused (not an https URL): PROPOLIS_WITNESS_HEARTBEAT_URL is ignored"
+    );
+}
+
+/// On a collector whose topic the check answers as readable, --setup says what today's failure
+/// hook reveals there, and nothing of a daemon.
+#[test]
+fn setup_on_a_collector_with_a_readable_topic_names_what_todays_hook_reveals() {
+    let mut fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"
+        ),
+    );
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("daemon      today's failure hook posts to this topic; its titles name the host and the unit that failed\n"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("the daemon and today's"), "{}", r.out);
+}
+
+/// The daemon line and the alert rail name today's failure hook only where the hook's own reader
+/// finds the same URL and topic. With the topic only on an indented line the library and systemd
+/// read it but the hook posts nothing, so the daemon is named alone; on a collector, where no
+/// daemon runs either, nothing is said of the topic.
+#[test]
+fn the_daemon_line_names_the_failure_hook_only_where_the_hook_reads_the_same_topic() {
+    let mut fx = Fx::single();
+    fx.env_drop("PROPOLIS_OPS_NTFY_TOPIC=");
+    fx.env_line(&format!("  PROPOLIS_OPS_NTFY_TOPIC={TOPIC}"));
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out
+            .contains("today's failure hook reads PROPOLIS_OPS_NTFY_TOPIC otherwise"),
+        "{}",
+        r.out
+    );
+    let daemon: Vec<&str> = r
+        .out
+        .lines()
+        .filter(|l| l.starts_with("daemon      "))
+        .collect();
+    assert_eq!(
+        daemon,
+        [
+            "daemon      the daemon posts to this topic; its titles name this host's software (until step 3)"
+        ],
+        "{}",
+        r.out
+    );
+    let w = fx.walk();
+    let row = w.row("alert");
+    assert!(
+        row.contains("daemon titles name this host's software"),
+        "{row}"
+    );
+    assert!(!row.contains("legacy hook carries"), "{row}");
+
+    let mut fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\n  PROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"
+        ),
+    );
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        !r.out.lines().any(|l| l.starts_with("daemon      ")),
+        "{}",
+        r.out
+    );
+    assert!(!fx.walk().row("alert").contains("legacy hook carries"));
+
+    // A collector whose hook reads the same topic: the hook is named, and no daemon is.
+    let mut fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"
+        ),
+    );
+    fx.setenv("RC_JSON", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains(
+            "daemon      today's failure hook posts to this topic; its titles name the host and the unit that failed"
+        ),
+        "{}",
+        r.out
+    );
+    let w = fx.walk();
+    let row = w.row("alert");
+    assert!(
+        row.contains("legacy hook carries host and unit names"),
+        "{row}"
+    );
+    assert!(!row.contains("daemon titles"), "{row}");
+}
+
+/// The banner of a collector with a target says VERIFIED or NOT VERIFIED without `daemon not
+/// verified`, both when its token can read the topic and when the gate is full: no daemon runs
+/// there.
+#[test]
+fn the_banner_on_a_collector_never_says_daemon_not_verified() {
+    let fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\n"
+        ),
+    );
+    // The fixture's stored check holds a token that reads: pointer:token-reads on a collector.
+    assert_eq!(banner_alerts(&fx), "NOT VERIFIED (never)");
+    let s = stamp_ago(600);
+    fx.write(
+        "var/lib/propolis/witness/readcheck",
+        &format!(
+            "#readcheck v1 g=3\nR\t8f24b729c8ebd3c1\t{s}\trefused\t{s}\trefused\t-\t403\t403\tboth\t403\n"
+        ),
+    );
+    assert_eq!(banner_alerts(&fx), "NOT VERIFIED (never)");
+    assert!(
+        fx.run(&["--setup"]).out.contains("gate        full"),
+        "the second case is the full gate"
+    );
+}
+
+/// Over plain http a refusal proves nothing, whoever the token lets read. A collector whose URL
+/// is http:// and whose token can read the topic has the gate word of the token, and the banner
+/// still says the topic is not proven private, never a word about a test page.
+#[test]
+fn the_banner_over_plain_http_says_so_even_where_the_token_reads() {
+    let mut fx = Fx::collector();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!("PROPOLIS_OPS_NTFY_URL=http://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC={TOPIC}\nPROPOLIS_OPS_NTFY_TOKEN={TOKEN_SECRET}\n"),
+    );
+    fx.setenv("RC_TOKEN_ANSWER", "200|application/x-ndjson");
+    let r = fx.run(&["--setup"]);
+    assert!(
+        r.out.contains("gate        pointer:token-reads"),
+        "{}",
+        r.out
+    );
+    assert_eq!(banner_alerts(&fx), "topic not proven private (plain http)");
+}
+
+/// The acknowledging account is SUDO_UID only when that is a number: `1000x`, or no SUDO_UID at
+/// all, records root (0).
+#[test]
+fn an_ack_without_a_numeric_sudo_uid_is_recorded_as_root() {
+    for uid in [Some("1000x"), None] {
+        let mut fx = Fx::single();
+        fx.with_hook();
+        if let Some(uid) = uid {
+            fx.setenv("SUDO_UID", uid);
+        }
+        page_and_ack(&fx);
+        assert_eq!(fx.testpage()[7], "0", "{uid:?}");
+    }
+}
+
+/// A test page that cannot be named (the id salt cannot be written) or counted (the send ledger
+/// cannot be read) is refused with its own message, before any unit is started.
+#[test]
+fn a_test_page_that_cannot_be_named_or_counted_starts_no_unit() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/id-salt")).unwrap();
+    fx.refuse_writes_of("id-salt");
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(
+        (r.code, r.out.as_str()),
+        (
+            1,
+            "test page not sent: the id salt could not be written in /var/lib/propolis/witness\n"
+        ),
+        "{}",
+        r.err
+    );
+    assert!(!fx.log().contains("systemctl start"), "{}", fx.log());
+
+    let mut fx = Fx::single();
+    fx.with_hook();
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    let r = fx.run(&["--test-page"]);
+    assert_eq!(
+        (r.code, r.out.as_str()),
+        (
+            1,
+            "test page not sent: the send ledger cannot be read, so the budget cannot be counted\n"
+        ),
+        "{}",
+        r.err
+    );
+    assert!(!fx.log().contains("systemctl start"), "{}", fx.log());
+}
+
+/// The alert view shows the VERIFIED field, the recorded test page (when it was asked for, its
+/// result, when it was typed back) and the ledger, and never the code.
+#[test]
+fn the_alert_view_shows_the_test_page_and_the_ledger_but_never_the_code() {
+    let mut fx = Fx::single();
+    fx.with_hook();
+    let before = fx.run(&["alert"]).out;
+    assert_eq!(fx.run(&["--test-page"]).code, 0);
+    let code = fx.testpage()[1].clone();
+    let r = fx.run(&["alert"]);
+    for want in [
+        "    NOT VERIFIED (pending); daemon not verified\n",
+        "    test page: asked 08:00:00, result ok, typed back -\n",
+        "    ledger 08:00:00 class test key - open full ok by hook\n",
+    ] {
+        assert!(r.out.contains(want), "{want} not in:\n{}", r.out);
+    }
+    if !before.contains(&code) {
+        assert!(!r.out.contains(&code), "the code {code} in:\n{}", r.out);
+    }
+}
+
+/// When propolis.env changed after the running daemon started, the walk says the daemon loaded
+/// an older configuration, which may hold an older topic or token until a restart; an older file
+/// says nothing.
+#[test]
+fn the_walk_says_when_the_daemon_runs_an_older_configuration() {
+    let fx = Fx::single();
+    let env = fx.p("etc/propolis/propolis.env");
+    let line = "the daemon loaded an older configuration: restart propolis to apply it";
+    // The daemon entered active at 07:00, an hour before NOW.
+    set_mtime(&env, NOW - 60);
+    let r = fx.walk();
+    assert!(r.out.contains(&format!("        {line}\n")), "{}", r.out);
+    set_mtime(&env, NOW - 7200);
+    let r = fx.walk();
+    assert!(!r.out.contains(line), "{}", r.out);
+}
+
+/// A production run uses /tmp for its temporary files whatever TMPDIR the caller had: --setup is
+/// run from an interactive root shell, and its curl config file holds the topic.
+#[test]
+fn the_production_branch_resets_tmpdir() {
+    let script = std::fs::read_to_string(SCRIPT).unwrap();
+    let start = script
+        .find("\nif [ -z \"$STATUS_ROOT\" ]; then\n")
+        .expect("no production branch");
+    let block = &script[start..];
+    let block = &block[..block.find("\nfi\n").unwrap()];
+    assert!(
+        block
+            .lines()
+            .any(|l| l.trim() == "unset TMPDIR" || l.trim() == "export TMPDIR=/tmp"),
+        "TMPDIR is not reset in the production branch:\n{block}"
+    );
 }

@@ -5912,6 +5912,141 @@ fn the_backup_pull_account_can_only_fetch_encrypted_sets_through_its_forced_comm
     }
 }
 
+/// A `get` the forced command serves logs one `served <set> <file>` line through the journal
+/// under the fixed identifier propolis-backup-serve, after the bytes went out and with nothing
+/// the client sent beyond the two names it checked; a request it refuses logs nothing. A logger
+/// that is missing (status 127) or fails changes neither the bytes, the exit status nor what is
+/// refused.
+#[test]
+fn a_get_logs_one_served_line_and_a_missing_logger_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = "20261010T033000Z-scheduled";
+    let served = dir.path().join("served");
+    std::fs::create_dir_all(served.join(set)).unwrap();
+    for f in ["propolis.dump.age", "state.tgz.age", "SHA256SUMS"] {
+        std::fs::write(served.join(set).join(f), format!("{f} bytes\n")).unwrap();
+    }
+    let log = dir.path().join("logger.log");
+    let serve = |logger_rc: Option<i32>, request: &str| {
+        let bin = dir.path().join(format!("bin-{logger_rc:?}"));
+        std::fs::create_dir_all(&bin).unwrap();
+        if let Some(rc) = logger_rc {
+            write_executable(
+                &bin.join("logger"),
+                &format!(
+                    "#!/usr/bin/env bash\nprintf 'logger %s\\n' \"$*\" >> \"$LOGGER_LOG\"\nexit {rc}\n"
+                ),
+            );
+        }
+        Command::new("bash")
+            .arg(PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../deploy/backup-serve.sh"
+            )))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("SSH_ORIGINAL_COMMAND", request)
+            .env("PROPOLIS_BACKUP_SERVE_DIR", &served)
+            .env("LOGGER_LOG", &log)
+            .fenced_output()
+            .unwrap()
+    };
+    let get = format!("get {set} state.tgz.age");
+    let out = serve(Some(0), &get);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "state.tgz.age bytes\n"
+    );
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        logged,
+        format!("logger -t propolis-backup-serve -p daemon.info served {set} state.tgz.age\n")
+    );
+    for request in [
+        "list",
+        "get ../x state.tgz.age",
+        &format!("get {set} ../../etc/passwd"),
+    ] {
+        let out = serve(Some(0), request);
+        assert!(
+            out.status.code() == Some(0) || out.status.code() == Some(2),
+            "{request}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        logged,
+        "only a get that served logs"
+    );
+    for rc in [127, 1] {
+        let out = serve(Some(rc), &get);
+        assert_eq!(out.status.code(), Some(0), "logger status {rc}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "state.tgz.age bytes\n"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out = serve(Some(rc), &format!("get {set} ../../etc/passwd"));
+        assert_eq!(out.status.code(), Some(2), "logger status {rc}");
+        assert!(out.stdout.is_empty());
+    }
+}
+
+/// A get whose file cannot be sent (missing from an encrypted set, or a directory in its place)
+/// exits non-zero and logs no served line, so the witness never takes a failed pull for one that
+/// happened.
+#[test]
+fn a_get_whose_file_cannot_be_sent_exits_non_zero_and_logs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let set = "20261010T033000Z-scheduled";
+    let served = dir.path().join("served");
+    std::fs::create_dir_all(served.join(set)).unwrap();
+    for f in ["propolis.dump.age", "SHA256SUMS"] {
+        std::fs::write(served.join(set).join(f), format!("{f} bytes\n")).unwrap();
+    }
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.path().join("logger.log");
+    write_executable(
+        &bin.join("logger"),
+        "#!/usr/bin/env bash\nprintf 'logger %s\\n' \"$*\" >> \"$LOGGER_LOG\"\n",
+    );
+    let serve = || {
+        Command::new("bash")
+            .arg(PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../deploy/backup-serve.sh"
+            )))
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("SSH_ORIGINAL_COMMAND", format!("get {set} state.tgz.age"))
+            .env("PROPOLIS_BACKUP_SERVE_DIR", &served)
+            .env("LOGGER_LOG", &log)
+            .fenced_output()
+            .unwrap()
+    };
+    let out = serve();
+    assert_ne!(out.status.code(), Some(0), "missing file");
+    assert!(out.stdout.is_empty());
+    std::fs::create_dir_all(served.join(set).join("state.tgz.age")).unwrap();
+    let out = serve();
+    assert_ne!(out.status.code(), Some(0), "a directory in its place");
+    assert!(
+        !log.exists(),
+        "{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+}
+
 /// Runs deploy/watch-env.sh against `source` content, writing into a fresh directory, and returns
 /// the directory and the script's output.
 fn run_watch_env(source: Option<&str>, dry_run: bool) -> (tempfile::TempDir, std::process::Output) {

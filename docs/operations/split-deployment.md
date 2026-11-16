@@ -606,7 +606,9 @@ late. If the gateway had accepted exactly one batch from the collector (`last_se
 shipper's state was lost, the shipper's first batch is taken as a resend of that one and dropped,
 and its lines are lost. The shipper logs nothing for it; the gateway logs
 `gateway: batch reuses the last accepted seq with different content` (see
-[Troubleshooting](#troubleshooting)). The next batch then fails the gateway's hash check and
+[Troubleshooting](#troubleshooting)), which the root witness records as `gateway-dup` on the
+collector's opaque id, with the records it counted lost
+([health and observability](health-and-observability.md#gateway-dup)). The next batch then fails the gateway's hash check and
 the shipper stops with `shipper: gateway rejected a batch` (`reason=HashMismatch`). Resetting both
 sides whenever a collector's state is lost avoids it.
 
@@ -780,7 +782,15 @@ Each of these is a defect or an unbuilt part of the split, not a setup mistake.
 - Nothing alerts when a collector goes quiet, the shipper stops or the gateway is down:
   `intake-stalled` fires only when intake falls behind a file it can read
   (`crates/propolis/src/ops_alert/monitor.rs#default_conditions`,
-  `crates/propolis/src/ops_alert/conditions/intake.rs#IntakeStalled`).
+  `crates/propolis/src/ops_alert/conditions/intake.rs#IntakeStalled`). The root witness records
+  these, and sends nothing yet: on the control node its light pass opens `spool-quiet` for a
+  listed collector whose spool has not been written for longer than twice the longest gap of its
+  week (never under half an hour, the week a day old, the gateway up fifteen minutes, and held by
+  `sudo propolis-status --maint MINUTES` for a collector off on purpose) and `gateway-dup` for the
+  gateway's dropped-batch line; on a collector where the witness runs (this page does not give the
+  steps to install it there yet) it opens `ship-failing` for shipper errors on three passes in a
+  row. The walk shows each
+  ([health and observability](health-and-observability.md#spool-quiet)).
 - The ledger does not record which collector an event came from, and the fleet pane matches probe
   lines and event age by sensor name, so two collectors running the same sensor cannot be told
   apart there (`crates/fleet/src/store.rs#confirm_sensor`, `crates/console/src/routes/fleet.rs`).

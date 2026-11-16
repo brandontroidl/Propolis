@@ -11,7 +11,9 @@
 # Only encrypted sets are served (a set holding propolis.dump.age); a plaintext set is never
 # listed or sent, so a stolen pull key yields ciphertext at most. Names are checked against the
 # exact shapes deploy/backup.sh writes before they touch a path. The account reads the sets
-# through group membership (backup.sh opens encrypted sets to it) and can write nothing.
+# through group membership (backup.sh opens encrypted sets to it) and can write nothing. Each get
+# that served its file logs one line, `served <set> <file>`, to the journal under the identifier
+# propolis-backup-serve, which the root witness reads to see that the pull still happens.
 #
 # PROPOLIS_BACKUP_SERVE_DIR overrides /var/backups/propolis (tests only).
 
@@ -48,6 +50,12 @@ case "${request[0]:-}" in
         for f in "${FILES[@]}"; do [ "$file" = "$f" ] && allowed=1; done
         [ "$allowed" -eq 1 ] || refuse "not a backup file: ${file:0:64}"
         cat -- "$DIR/$set/$file"
+        # Only after the bytes went out (a failed cat has already ended the script with its own
+        # status): the root witness reads this line, by this account's uid and this identifier,
+        # to tell that the off-host copy is still being taken. Both names were checked against
+        # the shapes above, so nothing else the client sent reaches the journal, and a logger
+        # that is missing or fails changes neither what was served nor the exit status.
+        timeout 5 logger -t propolis-backup-serve -p daemon.info "served $set $file" </dev/null >/dev/null 2>&1 || true
         ;;
     *) refuse "this key can only list and get encrypted backup sets" ;;
 esac

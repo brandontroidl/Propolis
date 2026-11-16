@@ -65,7 +65,8 @@ esac
 
 /// Records its argv and prints `$JOURNAL_FILE` when it is set. With `LOCK_PROBE` set to the lock
 /// file it also records whether the state lock was free while it ran. Each read of the light
-/// pass is told apart by its matches (hook, guard, journald, daemon for the daemon's runs): it
+/// pass is told apart by its matches (hook, guard, journald, gateway, shipper, pull, daemon for the
+/// daemon's runs): it
 /// prints `journal.<class>` beside the units when there is one, logs the cursor it was handed,
 /// copies `journal.<class>.cursor` into its cursor file as journalctl writes its last cursor,
 /// and exits with `journal.<class>.rc` when there is one (124: what `timeout` returns). A run of
@@ -80,6 +81,9 @@ d="${UNITS%/units}"
 class="" cf=""
 case " $* " in
     *" SYSLOG_IDENTIFIER=propolis-alert "*) class=hook ;;
+    *" SYSLOG_IDENTIFIER=propolis-backup-serve "*) class=pull ;;
+    *" _SYSTEMD_UNIT=gateway.service "*) class=gateway ;;
+    *" _SYSTEMD_UNIT=shipper.service "*) class=shipper ;;
     *" MESSAGE_ID="*) class=journald ;;
     *" _SYSTEMD_UNIT=propolis.service "*) class=daemon ;;
     *"_SYSTEMD_INVOCATION_ID="*) class=run ;;
@@ -101,13 +105,15 @@ exit 0
 "#;
 
 /// `id`: records its argv; the uid (and the same number as its gid) of an account the case named
-/// in `uid.<name>` beside the units (`none`: no such account), else the real `id`.
+/// in `uid.<name>` beside the units (`none`: no such account; `rc=N`: a lookup that fails with
+/// status N, as `timeout` gives 124 for one that hangs), else the real `id`.
 const ID_STUB: &str = r#"#!/usr/bin/env bash
 d="${UNITS%/units}"
 name="${!#}"
 printf 'id %s\n' "$*" >> "$STUB_LOG"
 if { [ "${1:-}" = -u ] || [ "${1:-}" = -g ]; } && [ -f "$d/uid.$name" ]; then
     [ "$(cat "$d/uid.$name")" != none ] || exit 1
+    case "$(cat "$d/uid.$name")" in rc=*) v="$(cat "$d/uid.$name")"; exit "${v#rc=}" ;; esac
     cat "$d/uid.$name"
     exit 0
 fi
@@ -397,7 +403,8 @@ struct Fx {
 
 impl Fx {
     /// A single box: the daemon and two sensors running, the oneshots idle after a good run,
-    /// every timer enabled, a push target set, the library installed and the state directories
+    /// every timer enabled, a push target set, the public push scheduled by a crontab line, the
+    /// library installed and the state directories
     /// as provisioning leaves them.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -502,6 +509,12 @@ impl Fx {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
+        // The public push runs from a crontab line, as the install docs set it up; with nothing to
+        // run it the hourly pass would record the NOTICE push-off on every case.
+        fx.write(
+            "etc/cron.d/propolis-blocklist",
+            "17 * * * * propolis-blocklist /opt/propolis/deploy/blocklist-sync.sh\n",
+        );
         // Every unit's main process (pid 4242) runs the binary it started with.
         std::fs::create_dir_all(fx.p("proc/4242")).unwrap();
         std::os::unix::fs::symlink("/usr/local/bin/propolis", fx.p("proc/4242/exe")).unwrap();
@@ -5879,7 +5892,9 @@ fn every_journal_class_names_a_literal_its_writer_prints() {
             .unwrap_or_else(|e| panic!("{writer}: {e}"));
         assert!(source.contains(text), "{writer} does not print {text:?}");
     }
-    for class in ["hook", "guard", "daemon", "journald"] {
+    for class in [
+        "hook", "guard", "daemon", "journald", "gateway", "shipper", "pull",
+    ] {
         assert!(classes.contains(class), "no class {class}: {classes:?}");
     }
     let witness = std::fs::read_to_string(SCRIPT).unwrap();
@@ -5894,6 +5909,52 @@ fn every_journal_class_names_a_literal_its_writer_prints() {
         assert!(
             alert.contains(&format!("undelivered \"{start}")),
             "deploy/alert.sh gives no reason starting {start:?}"
+        );
+    }
+}
+
+/// The steps by which the witness ties a failed backup to its cause are deploy/backup.sh's own:
+/// each step the fold names is one the backup script sets, word for word, so a reworded step
+/// fails here instead of leaving a failed backup untied.
+#[test]
+fn every_backup_step_the_fold_names_is_one_the_backup_script_sets() {
+    let witness = std::fs::read_to_string(SCRIPT).unwrap();
+    let body = witness
+        .split_once("\ntie_backup() {\n")
+        .expect("tie_backup")
+        .1;
+    let cases = body
+        .split_once("case \"$BACKUP_STEP\" in\n")
+        .expect("the case on the step")
+        .1
+        .split_once("[ -n \"$parent\" ]")
+        .expect("the end of the case")
+        .0;
+    let mut steps = Vec::new();
+    for line in cases.lines().map(str::trim) {
+        if line.starts_with('"') || line.starts_with("| \"") {
+            steps.extend(line.split('"').skip(1).step_by(2).map(str::to_string));
+        }
+    }
+    assert_eq!(
+        steps,
+        [
+            "reading the ledger's chain head",
+            "dumping the database",
+            "checking the ledger against the chain heads earlier sets recorded",
+            "checking free space"
+        ],
+        "{cases}"
+    );
+    let backup = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/backup.sh"
+    ))
+    .unwrap();
+    for step in &steps {
+        assert!(
+            backup.contains(&format!("\nSTEP=\"{step}\"\n")),
+            "deploy/backup.sh sets no step {step:?}"
         );
     }
 }
@@ -8412,4 +8473,2332 @@ fn an_env_file_over_a_mebibyte_has_no_key_hash_and_a_file_root_does_not_own_no_h
     let h = h_line(&fx, "/etc/propolis/big.env").unwrap_or_else(|| panic!("{}", fx.observe_text()));
     assert_eq!(h.split('\t').nth(2), Some("-"), "{h}");
     assert_eq!(h_line(&fx, "/etc/propolis/other.env").is_some(), !root);
+}
+
+// ---- the public push, backups and collectors ------------------------------------------------
+
+/// The opaque id of the collector `cn` under `VOL_SALT`: `c` and 5 hex of
+/// sha256(salt NUL "collector" NUL cn).
+fn collector_id(cn: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg("printf '%s\\0%s\\0%s' \"$1\" collector \"$2\" | sha256sum")
+        .arg("_")
+        .arg(VOL_SALT)
+        .arg(cn)
+        .output()
+        .unwrap();
+    format!("c{}", &String::from_utf8_lossy(&out.stdout)[..5])
+}
+
+/// The file `rel` under the root (made when missing), last modified at wall-clock second `wall`.
+fn file_at(fx: &Fx, rel: &str, wall: u64) {
+    if !fx.p(rel).exists() {
+        fx.write(rel, "x\n");
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(fx.p(rel))
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(wall))
+        .unwrap();
+}
+
+/// A control node: the daemon and the gateway enabled and up for a day, the salt known, and
+/// PROPOLIS_SENSOR_LOGS listing a local log and the gateway spool of each collector in `listed`.
+fn control_node(fx: &Fx, listed: &[&str]) {
+    salt(fx);
+    fx.unit("gateway.service", &[]);
+    let spools: String = listed
+        .iter()
+        .map(|c| format!(",{c}:/var/spool/propolis/gateway/{c}/events.jsonl"))
+        .collect();
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_OPS_NTFY_URL=https://ntfy.example.invalid\nPROPOLIS_OPS_NTFY_TOPIC=t0p1c-secret\n\
+             PROPOLIS_SENSOR_LOGS=ssh:/var/log/propolis/ssh/events.jsonl{spools}\n"
+        ),
+    );
+}
+
+/// Collector `cn`'s spool file on the gateway, last written at wall-clock second `wall`.
+fn spool_at(fx: &Fx, cn: &str, wall: u64) {
+    file_at(
+        fx,
+        &format!("var/spool/propolis/gateway/{cn}/events.jsonl"),
+        wall,
+    );
+}
+
+/// The S line of collector id `cid` in the observe file, its fields after `S` and the id.
+fn s_line(fx: &Fx, cid: &str) -> Option<String> {
+    let prefix = format!("S\t{cid}\t");
+    fx.observe_text()
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// An observe file whose one line is collector `cid`'s S line: its spool last written at `lastm`
+/// (wall-clock seconds), the longest gap of the window, the window's start and the gap of the
+/// window before (`-` for none), no advance in a row.
+fn seed_s(fx: &Fx, cid: &str, lastm: u64, maxgap: u64, window: &str, prevgap: &str) {
+    fx.observe(&format!(
+        "S\t{cid}\t{lastm}\t{}\t{maxgap}\t{window}\t{prevgap}\t0\n",
+        before(WALL - lastm)
+    ));
+}
+
+/// An open or pending record of 34 fields as the witness writes one for a kind it sees itself.
+#[allow(clippy::too_many_arguments)]
+fn witness_record(
+    id: &str,
+    key: &str,
+    kind: &str,
+    stage: &str,
+    inst: &str,
+    tier: &str,
+    state: &str,
+    cause: &str,
+) -> String {
+    let mut r = hook_record(id, "propolis-backup.service", tier, state, 0, "-");
+    for (i, v) in [
+        (2, key),
+        (3, kind),
+        (4, stage),
+        (5, inst),
+        (11, cause),
+        (33, "-"),
+    ] {
+        r = with_field(&r, i, v);
+    }
+    r
+}
+
+/// The meta file with `key` set to `value`, every other line kept.
+fn set_meta(fx: &Fx, key: &str, value: &str) {
+    let text = fx.read("var/lib/propolis/witness/meta");
+    let prefix = format!("M\t{key}\t");
+    let mut body: String = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(&prefix))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    body.push_str(&format!("{prefix}{value}\n"));
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!("#meta v1 g=1\n{body}"),
+    );
+}
+
+/// A backup run's start or end as `ExecMain*TimestampMonotonic` gives it: `secs` before time `t`.
+fn mono(t: u64, secs: u64) -> String {
+    entered(t, secs)
+}
+
+/// A backup run that takes past three times the last run's length opens backup-hung (ACT, the
+/// backup rail, cause backup.long) on the second light pass that sees it, and resolves `ended`
+/// once the unit is no longer activating. `meta backup_dur` is the last run's length, from a pass
+/// that saw the unit inactive with an exit after its start; the limit is the larger of two hours
+/// and three times that, so a run past two hours but under three times the usual is no hang.
+#[test]
+fn a_backup_run_past_its_limit_opens_backup_hung_on_the_second_pass_and_resolves_when_it_ends() {
+    let fx = Fx::new();
+    let backup = |changes: &[(&str, &str)]| {
+        let mut all = vec![
+            ("SubState", "dead"),
+            ("Restart", "no"),
+            ("UnitFileState", "static"),
+        ];
+        all.extend_from_slice(changes);
+        fx.unit("propolis-backup.service", &all);
+    };
+    backup(&[
+        ("ActiveState", "inactive"),
+        ("ExecMainStartTimestampMonotonic", &mono(0, 7600)),
+        ("ExecMainExitTimestampMonotonic", &mono(0, 3600)),
+    ]);
+    fx.pass(0);
+    assert_eq!(fx.meta("backup_dur").as_deref(), Some("4000"));
+    // Started 11000 s before the pass at 300: past two hours, under three times 4000 s.
+    let start = mono(300, 11_000);
+    backup(&[
+        ("ActiveState", "activating"),
+        ("SubState", "start"),
+        ("ExecMainStartTimestampMonotonic", &start),
+        ("ExecMainExitTimestampMonotonic", "0"),
+    ]);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, "backup:run"), "none", "{}", state_text(&fx));
+    fx.pass(1600);
+    assert_eq!(state_of(&fx, "backup:run"), "pending");
+    fx.pass(1900);
+    let f = fx.record("backup:run").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        ("backup-hung", "backup", "ACT", "open", "backup.long", "1")
+    );
+    assert_eq!(fx.meta("backup_dur").as_deref(), Some("4000"));
+    backup(&[
+        ("ActiveState", "inactive"),
+        ("ExecMainStartTimestampMonotonic", &start),
+        ("ExecMainExitTimestampMonotonic", &mono(2200, 100)),
+    ]);
+    fx.pass(2200);
+    let f = fx.record("backup:run").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "ended"));
+    assert_eq!(fx.meta("backup_dur").as_deref(), Some("12800"));
+}
+
+/// A collector named in PROPOLIS_SENSOR_LOGS whose spool has not been written for longer than
+/// max(1800 s, twice the longest gap of its week) opens spool-quiet (ACT, the ship stage, cause
+/// spool.quiet) on the second light pass, keyed and named by its opaque id alone: its name is in
+/// no record and no observe line. A spool directory nobody listed is config-check's to report
+/// and gets nothing here. The spool written on two passes in a row resolves it spool2.
+#[test]
+fn a_listed_collector_quiet_past_twice_its_longest_gap_opens_spool_quiet_and_two_arrivals_resolve_it()
+ {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 7200);
+    spool_at(&fx, "c-zz", WALL - 90_000);
+    fx.pass(0);
+    assert_eq!(
+        state_of(&fx, &format!("spool:{cid}")),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    fx.pass(300);
+    let f = fx.record(&format!("spool:{cid}")).unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[5].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        (
+            "spool-quiet",
+            "ship",
+            cid.as_str(),
+            "ACT",
+            "open",
+            "spool.quiet",
+            "1"
+        )
+    );
+    assert_eq!(
+        fx.records()
+            .iter()
+            .filter(|f| f[2].starts_with("spool:"))
+            .count(),
+        1,
+        "{}",
+        state_text(&fx)
+    );
+    assert!(s_line(&fx, &collector_id("c-zz")).is_none());
+    let text = state_text(&fx);
+    assert!(!text.contains("c-01") && !text.contains("c-zz"), "{text}");
+
+    spool_at(&fx, "c-01", WALL + 500);
+    fx.pass(600);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "open");
+    spool_at(&fx, "c-01", WALL + 800);
+    fx.pass(900);
+    let f = fx.record(&format!("spool:{cid}")).unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "spool2"));
+    let s = s_line(&fx, &cid).unwrap();
+    assert_eq!(
+        s.split('\t').next(),
+        Some((WALL + 800).to_string().as_str())
+    );
+}
+
+/// spool-quiet does not cry wolf: not before its window is a day old, not before the quiet time
+/// passes 1800 s, not before it passes twice the longest gap seen, and not while the gateway has
+/// been up under fifteen minutes (a restarted gateway has not heard from its collectors yet):
+/// that first sighting waits and opens once the gateway has been up that long.
+#[test]
+fn spool_quiet_waits_for_a_day_old_window_its_floor_twice_the_longest_gap_and_a_settled_gateway() {
+    for (what, lastm, maxgap, window) in [
+        ("window an hour old", WALL - 7200, 600, before(3600)),
+        ("quiet under 1800 s", WALL - 1500, 600, before(172_800)),
+        (
+            "quiet under twice the gap",
+            WALL - 7200,
+            5000,
+            before(172_800),
+        ),
+    ] {
+        let fx = Fx::new();
+        control_node(&fx, &["c-01"]);
+        let cid = collector_id("c-01");
+        seed_s(&fx, &cid, lastm, maxgap, &window, "-");
+        spool_at(&fx, "c-01", lastm);
+        fx.pass(0);
+        fx.pass(300);
+        assert_eq!(
+            state_of(&fx, &format!("spool:{cid}")),
+            "none",
+            "{what}: {}",
+            state_text(&fx)
+        );
+    }
+
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    fx.unit(
+        "gateway.service",
+        &[("ActiveEnterTimestampMonotonic", &entered(0, 300))],
+    );
+    let cid = collector_id("c-01");
+    seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 7200);
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "pending");
+    fx.pass(600);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "open");
+}
+
+/// A maintenance marker whose reason is manual (`sudo propolis-status --maint`, how an operator
+/// says a collector is off on purpose) holds spool-quiet pending; an upgrade's marker does not.
+#[test]
+fn a_manual_maintenance_marker_holds_spool_quiet_and_an_upgrade_marker_does_not() {
+    for (reason, want) in [("manual", "pending"), ("upgrade", "open")] {
+        let fx = Fx::new();
+        control_node(&fx, &["c-01"]);
+        fx.write(
+            "run/propolis-witness/maintenance",
+            &format!(
+                "#maintenance v1 g=1\nX\t{}\t{BOOT}\t{reason}\n",
+                WALL + 3600
+            ),
+        );
+        let cid = collector_id("c-01");
+        seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+        spool_at(&fx, "c-01", WALL - 7200);
+        fx.pass(0);
+        fx.pass(300);
+        assert_eq!(
+            state_of(&fx, &format!("spool:{cid}")),
+            want,
+            "{reason}: {}",
+            state_text(&fx)
+        );
+    }
+}
+
+/// A collector taken out of PROPOLIS_SENSOR_LOGS resolves its spool-quiet record `disabled`.
+/// Directories nobody listed, however many and whatever their names, open nothing and leave no
+/// line, so they cannot fill the record bound. The spool is listed as the gateway account, which
+/// owns it, never as root.
+#[test]
+fn a_collector_taken_off_the_list_resolves_disabled_and_unlisted_spools_open_nothing() {
+    let mut fx = Fx::new();
+    control_node(&fx, &["c-02"]);
+    let cid = collector_id("c-01");
+    fx.incidents(&[witness_record(
+        "w#1",
+        &format!("spool:{cid}"),
+        "spool-quiet",
+        "ship",
+        &cid,
+        "ACT",
+        "open",
+        "spool.quiet",
+    )]);
+    for n in 0..600 {
+        spool_at(&fx, &format!("u-{n}"), WALL - 90_000);
+    }
+    spool_at(&fx, "bad\nname", WALL - 90_000);
+    // The spool's owner is the gateway account: the listing drops to it.
+    let owner = std::fs::metadata(fx.p("var/spool/propolis/gateway"))
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+        .unwrap();
+    fx.stub_file("uid.propolis-gateway", &format!("{owner}\n"));
+    fx.setenv("PA_TEST_UID", "0");
+    fx.setenv("PA_TEST_READ_AS_SELF", "0");
+    fx.pass(0);
+    let f = fx.record(&format!("spool:{cid}")).unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "disabled"));
+    assert_eq!(fx.records().len(), 1, "{}", state_text(&fx));
+    assert!(
+        !fx.observe_text().contains("\nS\t"),
+        "{}",
+        fx.observe_text()
+    );
+    let log = fx.log();
+    assert!(
+        log.lines()
+            .any(|l| l.starts_with(&format!("setpriv --reuid={owner} "))
+                && l.contains(" find ")
+                && l.contains("var/spool/propolis/gateway")),
+        "{log}"
+    );
+}
+
+/// The gateway's duplicate line, read by the fields journald sets itself (gateway.service and the
+/// gateway account's uid), opens gateway-dup (ACT, the gateway stage, cause gw.dup) on first
+/// sight, keyed by the collector's opaque id when its collector_id is a listed collector and by
+/// `unlisted` otherwise; the records and suppressed records it counts are summed for the walk. No
+/// part of the line is kept. A day without the line resolves it quiet24.
+#[test]
+fn the_gateways_duplicate_line_opens_gateway_dup_on_first_sight_and_a_quiet_day_resolves_it() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    fx.stub_file("uid.propolis-gateway", "997\n");
+    let line = |cn: &str, records: &str, suppressed: &str| {
+        format!(
+            "2026-11-15T08:00:00.000000Z ERROR gateway::verify: gateway: batch reuses the last \
+             accepted seq with different content; acknowledged as Duplicate without storing it \
+             collector_id={cn} seq=7 records={records} suppressed_batches=1 \
+             suppressed_records={suppressed}\n"
+        )
+    };
+    fx.stub_file(
+        "journal.gateway",
+        &format!(
+            "{}{}{}",
+            line("c-01", "3", "2"),
+            line("c-other", "4", "0"),
+            line("c-01", "x9", "1")
+        ),
+    );
+    fx.pass(0);
+    let cid = collector_id("c-01");
+    let f = fx
+        .record(&format!("gwdup:{cid}"))
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[5].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        (
+            "gateway-dup",
+            "gateway",
+            cid.as_str(),
+            "ACT",
+            "open",
+            "gw.dup",
+            "1"
+        )
+    );
+    assert_eq!(
+        p_line(&fx, &format!("seen:gwdup:{cid}")).split('\t').nth(3),
+        Some("6")
+    );
+    let f = fx.record("gwdup:unlisted").unwrap();
+    assert_eq!((f[5].as_str(), f[7].as_str()), ("-", "open"));
+    assert!(
+        fx.log().contains("_SYSTEMD_UNIT=gateway.service _UID=997"),
+        "{}",
+        fx.log()
+    );
+    let text = state_text(&fx);
+    for word in ["c-01", "c-other", "records=", "Duplicate"] {
+        assert!(!text.contains(word), "{word}: {text}");
+    }
+
+    fx.stub_file("journal.gateway", "");
+    fx.pass(86_100);
+    assert_eq!(state_of(&fx, &format!("gwdup:{cid}")), "open");
+    fx.pass(86_400);
+    let f = fx.record(&format!("gwdup:{cid}")).unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "quiet24"));
+}
+
+/// A collector: the shipper unit running under the `propolis-shipper` account (uid 995), its
+/// env file present and the daemon not enabled.
+fn collector_host(fx: &Fx) {
+    fx.write("etc/propolis/shipper.env", "");
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "inactive"),
+            ("SubState", "dead"),
+            ("UnitFileState", "disabled"),
+        ],
+    );
+    fx.unit("shipper.service", &[]);
+    fx.stub_file("uid.propolis-shipper", "995\n");
+}
+
+/// The shipper's lines as `journalctl -o cat` prints them: the log format's timestamp, the level
+/// padded to five columns, the target, the message and then the fields.
+const SHIP_CONNECT: &str = "2026-11-15T08:00:00.000000Z ERROR shipper: shipper: failed to connect \
+     to gateway; will retry next pass error=connection refused\n";
+const SHIP_IO: &str = "2026-11-15T08:00:00.000000Z ERROR shipper: shipper: ship cycle IO error; \
+     will retry next pass error=broken pipe\n";
+const SHIP_REJECTED: &str = "2026-11-15T08:00:00.000000Z ERROR shipper: shipper: gateway rejected \
+     a batch; the shared seq/hash chain is out of step seq=7\n";
+
+/// A buffer the log format writes into.
+#[derive(Clone, Default)]
+struct LogBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+/// What `journalctl -o cat` prints for the events `emit` logs: each rendered by the format every
+/// Propolis binary uses when its output is the journal, less the priority prefix journald takes
+/// off. The fixtures above are written by hand in this form; a test that needs to know the form
+/// is the real one builds its lines here.
+fn journal_lines(emit: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::registry().with(log_format::layer_for(
+        log_format::Mode::Journal,
+        buf.clone(),
+    ));
+    tracing::subscriber::with_default(subscriber, emit);
+    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    text.lines()
+        .map(|l| {
+            let (prefix, rest) = l.split_once('>').expect("a priority prefix");
+            assert!(prefix.starts_with('<'), "{l}");
+            format!("{rest}\n")
+        })
+        .collect()
+}
+
+/// The shipper's WARN line for a line the origin policy refused, its error quoting the sensor
+/// name the line claimed (Debug-quoted, cut to 64 characters, as sensor-wire's claim() does).
+fn ship_warn(claimed: &str) -> String {
+    format!(
+        "2026-11-15T08:00:01.000000Z  WARN shipper::batcher: shipper: dropping a line the origin \
+         policy refuses for this log sensor=ssh error=log \"ssh\": the line names sensor \
+         {claimed:?}, which is not a known sensor\n"
+    )
+}
+
+/// On a collector, the shipper's ERROR lines (read by shipper.service and the shipper account's
+/// uid) on three light passes in a row open ship-failing (ACT, key ship:local, cause from the
+/// line: ship.connect here), and two passes without one resolve it clean2. Its WARN lines, shown
+/// only with RUST_LOG set, open the NOTICE ship-dropped on first sight.
+#[test]
+fn shipper_errors_on_three_passes_open_ship_failing_and_its_warnings_open_ship_dropped() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    fx.stub_file(
+        "journal.shipper",
+        &format!("{SHIP_CONNECT}{}", ship_warn("ssh")),
+    );
+    fx.pass(0);
+    assert_eq!(
+        state_of(&fx, "ship:local"),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    let f = fx.record("shipdrop:local").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        ("ship-dropped", "NOTICE", "open", "ship.dropped", "0")
+    );
+    assert!(
+        fx.log().contains("_SYSTEMD_UNIT=shipper.service _UID=995"),
+        "{}",
+        fx.log()
+    );
+    fx.pass(300);
+    assert_eq!(state_of(&fx, "ship:local"), "pending");
+    fx.pass(600);
+    let f = fx.record("ship:local").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str()
+        ),
+        ("ship-failing", "ship", "ACT", "open", "ship.connect")
+    );
+    fx.stub_file("journal.shipper", "");
+    fx.pass(900);
+    assert_eq!(state_of(&fx, "ship:local"), "open");
+    fx.pass(1200);
+    let f = fx.record("ship:local").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "clean2"));
+}
+
+/// The off-host pull's `served` line, read by the pull account's uid and the serve script's fixed
+/// identifier, sets `meta pull_last` to the pass that saw it; a line out of the served form
+/// does not.
+#[test]
+fn a_served_line_from_the_pull_account_sets_meta_pull_last() {
+    let fx = Fx::new();
+    write_exec(
+        &fx.p("usr/local/sbin/propolis-backup-serve"),
+        "#!/usr/bin/env bash\n",
+    );
+    fx.stub_file("uid.propolis-backup-pull", "996\n");
+    fx.stub_file(
+        "journal.pull",
+        "served 20261010T033000Z-scheduled state.tgz.age\n",
+    );
+    fx.pass(0);
+    assert_eq!(fx.meta("pull_last"), Some(stamp(0)));
+    assert!(
+        fx.log()
+            .contains("_UID=996 SYSLOG_IDENTIFIER=propolis-backup-serve"),
+        "{}",
+        fx.log()
+    );
+    fx.stub_file("journal.pull", "served ../../etc/passwd x\n");
+    fx.pass(300);
+    assert_eq!(fx.meta("pull_last"), Some(stamp(0)));
+}
+
+/// A crontab line that runs the push, the push marker last written at `pushed` and the feed's
+/// publish marker at `published` (wall-clock seconds; None: no such file).
+fn push_host(fx: &Fx, pushed: Option<u64>, published: Option<u64>) {
+    fx.write(
+        "etc/cron.d/propolis-blocklist",
+        "17 * * * * propolis-blocklist /opt/propolis/deploy/blocklist-sync.sh\n",
+    );
+    if let Some(w) = pushed {
+        file_at(fx, "var/lib/propolis/blocklist-status/last-pushed", w);
+    }
+    if let Some(w) = published {
+        file_at(fx, "var/lib/propolis/feed/.current.last_published", w);
+    }
+}
+
+/// A scheduled push whose feed was published after the last push, and whose last push is over
+/// six hours old, opens push-failing (ACT, the publish stage, cause push.stale) on the second
+/// hourly pass, its onset the push marker's time; a push after that onset resolves it `pushed`.
+#[test]
+fn push_failing_opens_when_the_feed_moved_on_and_the_push_is_six_hours_old_and_a_push_resolves_it()
+{
+    let fx = Fx::new();
+    push_host(&fx, Some(WALL - 25_200), Some(WALL - 3600));
+    fx.hourly(0);
+    let f = fx
+        .record("push:cron")
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!(
+        (f[7].as_str(), f[10].clone()),
+        ("pending", format!("{}/-/0", WALL - 25_200))
+    );
+    fx.hourly(3600);
+    let f = fx.record("push:cron").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str(),
+            f[29].as_str()
+        ),
+        ("push-failing", "publish", "ACT", "open", "push.stale", "1")
+    );
+    file_at(
+        &fx,
+        "var/lib/propolis/blocklist-status/last-pushed",
+        WALL + 3700,
+    );
+    fx.hourly(7200);
+    let f = fx.record("push:cron").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "pushed"));
+}
+
+/// No false red from the push: a feed that did not change since the last push (its publish
+/// marker older than the push marker) is not stale however old the push, and a push under six
+/// hours old is not failing whatever was published since.
+#[test]
+fn an_unchanged_feed_or_a_push_under_six_hours_old_opens_no_push_failing() {
+    for (what, pushed, published) in [
+        ("feed unchanged", WALL - 25_200, WALL - 30_000),
+        ("push five hours old", WALL - 18_000, WALL - 3600),
+    ] {
+        let fx = Fx::new();
+        push_host(&fx, Some(pushed), Some(published));
+        fx.hourly(0);
+        fx.hourly(3600);
+        assert_eq!(
+            state_of(&fx, "push:cron"),
+            "none",
+            "{what}: {}",
+            state_text(&fx)
+        );
+    }
+}
+
+/// With no push marker at all, push-failing waits until the scheduler has been seen for six
+/// hours (meta push_sched_since) and a publish came after it was first seen.
+#[test]
+fn with_no_push_marker_push_failing_counts_six_hours_from_the_scheduler_first_seen() {
+    let fx = Fx::new();
+    push_host(&fx, None, Some(WALL - 3600));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "push:cron"), "none");
+    assert_eq!(fx.meta("push_sched_since"), Some(stamp(0)));
+
+    let fx = Fx::new();
+    push_host(&fx, None, Some(WALL - 3600));
+    set_meta(&fx, "push_sched_since", &before(25_200));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "push:cron"), "open", "{}", state_text(&fx));
+}
+
+/// With the feed enabled and nothing to run the push: push-unscheduled (ACT) when
+/// PROPOLIS_OPS_FEED_PUSH_EXPECTED is set, the NOTICE push-off when it is not, each on the
+/// second hourly pass.
+#[test]
+fn no_scheduler_is_push_unscheduled_when_a_push_is_expected_and_a_notice_push_off_when_not() {
+    let unscheduled = || {
+        let fx = Fx::new();
+        std::fs::remove_file(fx.p("etc/cron.d/propolis-blocklist")).unwrap();
+        fx
+    };
+    let fx = unscheduled();
+    propolis_env_with(&fx, "PROPOLIS_OPS_FEED_PUSH_EXPECTED=true\n");
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx
+        .record("push:none")
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[7].as_str(), f[11].as_str()),
+        ("push-unscheduled", "ACT", "open", "push.none")
+    );
+    assert_eq!(state_of(&fx, "push:off"), "none");
+
+    let fx = unscheduled();
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx.record("push:off").unwrap();
+    assert_eq!(
+        (f[3].as_str(), f[6].as_str(), f[7].as_str(), f[29].as_str()),
+        ("push-off", "NOTICE", "open", "0")
+    );
+    assert_eq!(state_of(&fx, "push:none"), "none");
+}
+
+/// The name deploy/backup.sh gives a set made at wall-clock second `wall`.
+fn set_name(wall: u64) -> String {
+    let out = Command::new("date")
+        .arg("-u")
+        .arg("-d")
+        .arg(format!("@{wall}"))
+        .arg("+%Y%m%dT%H%M%SZ")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Fewer scheduled sets than PROPOLIS_BACKUP_KEEP (from the backup unit's environment) while the
+/// oldest set's name is dated more than KEEP days ago opens the NOTICE backup-retention on the
+/// second hourly pass; `meta backup_sets` holds the count against KEEP. Only names in the shape
+/// backup.sh prunes count. Enough sets again on two passes resolve it clean2.
+#[test]
+fn fewer_backup_sets_than_keep_with_the_oldest_past_keep_days_opens_backup_retention() {
+    let fx = Fx::new();
+    backup_env(&fx, "PROPOLIS_BACKUP_KEEP=3 PROPOLIS_BACKUP_DIR=/srv/bk");
+    for (wall, reason) in [
+        (WALL - 864_000, "scheduled"),
+        (WALL - 777_600, "scheduled"),
+        (WALL - 691_200, "pre-upgrade"),
+    ] {
+        std::fs::create_dir_all(fx.p(&format!("srv/bk/{}-{reason}", set_name(wall)))).unwrap();
+    }
+    std::fs::create_dir_all(fx.p("srv/bk/notaset-scheduled")).unwrap();
+    fx.hourly(0);
+    assert_eq!(
+        state_of(&fx, "backup:keep"),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    fx.hourly(3600);
+    let f = fx.record("backup:keep").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str()
+        ),
+        (
+            "backup-retention",
+            "backup",
+            "NOTICE",
+            "open",
+            "backup.keep"
+        )
+    );
+    assert_eq!(fx.meta("backup_sets").as_deref(), Some("2/3"));
+    std::fs::create_dir_all(fx.p(&format!("srv/bk/{}-scheduled", set_name(WALL - 3600)))).unwrap();
+    fx.hourly(7200);
+    fx.hourly(10_800);
+    let f = fx.record("backup:keep").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "clean2"));
+}
+
+/// The pull account's authorized_keys, its one key line or only a comment.
+fn pull_keys(fx: &Fx, key: bool) {
+    fx.stub_file("uid.propolis-backup-pull", "996\n");
+    let line = if key {
+        "restrict,command=\"/usr/local/sbin/propolis-backup-serve\" ssh-ed25519 AAAA... backup-pull\n"
+    } else {
+        ""
+    };
+    fx.write(
+        "var/lib/propolis-backup-pull/.ssh/authorized_keys",
+        &format!("# the off-host pull\n{line}"),
+    );
+}
+
+/// A scheduled set in the default backup directory, made at wall-clock second `wall`.
+fn scheduled_set(fx: &Fx, wall: u64) {
+    std::fs::create_dir_all(fx.p(&format!(
+        "var/backups/propolis/{}-scheduled",
+        set_name(wall)
+    )))
+    .unwrap();
+}
+
+/// With a pull configured (a key line in the pull account's authorized_keys), a scheduled set
+/// made after the last served line that has waited over 72 hours opens the NOTICE backup-offhost
+/// on the second hourly pass, and a newer served line resolves it `pulled`. With no key line
+/// nothing opens. The authorized_keys file lies in the pull account's home, so it is read as
+/// that account.
+#[test]
+fn an_off_host_pull_that_stopped_for_three_days_opens_backup_offhost_and_a_new_pull_resolves_it() {
+    let mut fx = Fx::new();
+    pull_keys(&fx, true);
+    set_meta(&fx, "pull_last", &before(345_600));
+    scheduled_set(&fx, WALL - 300_000);
+    fx.setenv("PA_TEST_UID", "0");
+    fx.setenv("PA_TEST_READ_AS_SELF", "0");
+    fx.hourly(0);
+    assert_eq!(
+        state_of(&fx, "backup:pull"),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    // The reading program spans lines, so each setpriv call is taken up to the next log entry.
+    let log = fx.log();
+    assert!(
+        log.split("\nsetpriv ")
+            .any(|call| call.starts_with("--reuid=996 ")
+                && call
+                    .lines()
+                    .take_while(|l| !l.starts_with("id ") && !l.starts_with("systemctl "))
+                    .any(|l| l.contains("var/lib/propolis-backup-pull/.ssh/authorized_keys"))),
+        "{log}"
+    );
+    fx.hourly(3600);
+    let f = fx.record("backup:pull").unwrap();
+    assert_eq!(
+        (
+            f[3].as_str(),
+            f[4].as_str(),
+            f[6].as_str(),
+            f[7].as_str(),
+            f[11].as_str()
+        ),
+        ("backup-offhost", "backup", "NOTICE", "open", "backup.pull")
+    );
+    set_meta(&fx, "pull_last", &stamp(3700));
+    fx.hourly(7200);
+    let f = fx.record("backup:pull").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "pulled"));
+
+    let fx = Fx::new();
+    pull_keys(&fx, false);
+    set_meta(&fx, "pull_last", &before(345_600));
+    scheduled_set(&fx, WALL - 300_000);
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "backup:pull"), "none");
+}
+
+/// The pull fetches only the newest set and writes no served line when it already holds it, so
+/// a pull that works says nothing while no new set appears. With the last served line four days
+/// old and no set made since (the backups stopped, which their own records report), nothing
+/// opens: no set is waiting. A set made since that is under 72 hours old is not waiting long
+/// enough either.
+#[test]
+fn a_pull_with_no_set_waiting_for_it_opens_no_backup_offhost() {
+    for (what, made) in [
+        ("no set since the last pull", WALL - 432_000),
+        ("a set since, a day old", WALL - 86_400),
+    ] {
+        let fx = Fx::new();
+        pull_keys(&fx, true);
+        set_meta(&fx, "pull_last", &before(345_600));
+        scheduled_set(&fx, made);
+        fx.hourly(0);
+        fx.hourly(3600);
+        assert_eq!(
+            state_of(&fx, "backup:pull"),
+            "none",
+            "{what}: {}",
+            state_text(&fx)
+        );
+    }
+    // A pull switched back on after a time without one (meta pull_since `-`) counts from now:
+    // the sets made meanwhile were never its to fetch, however old its last served line is.
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    set_meta(&fx, "pull_last", &before(864_000));
+    set_meta(&fx, "pull_since", "-");
+    scheduled_set(&fx, WALL - 300_000);
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "backup:pull"), "none", "{}", state_text(&fx));
+    assert_eq!(fx.meta("pull_since"), Some(stamp(0)));
+}
+
+/// A pull that never served anything is not silent for ever: the first hourly pass that sees a
+/// pull configured starts a clock (meta pull_since), and a set made after it that has waited
+/// over 72 hours opens backup-offhost although no served line was ever seen; the first served
+/// line resolves it. Sets made before that pass are not counted (whether they were pulled is not
+/// known). While the installed serve script is an older one that logs no served line there is
+/// no clock, and nothing opens.
+#[test]
+fn a_pull_that_never_served_is_reported_once_a_set_made_since_has_waited_three_days() {
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    scheduled_set(&fx, WALL - 300_000);
+    fx.hourly(0);
+    assert_eq!(fx.meta("pull_since"), Some(stamp(0)));
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "backup:pull"), "none", "{}", state_text(&fx));
+    scheduled_set(&fx, WALL + 7200);
+    fx.hourly(262_800);
+    assert_eq!(state_of(&fx, "backup:pull"), "none", "71 h: not yet");
+    fx.hourly(270_000);
+    assert_eq!(
+        state_of(&fx, "backup:pull"),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    fx.hourly(273_600);
+    assert_eq!(fx.record("backup:pull").unwrap()[7], "open");
+    assert_eq!(fx.meta("pull_since"), Some(stamp(0)));
+    set_meta(&fx, "pull_last", &stamp(273_700));
+    fx.hourly(277_200);
+    let f = fx.record("backup:pull").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "pulled"));
+
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    fx.write(
+        "usr/local/sbin/propolis-backup-serve",
+        "#!/bin/bash\n# an older serve script: it serves and logs nothing\n",
+    );
+    fx.hourly(0);
+    assert_eq!(fx.meta("pull_since").as_deref(), Some("-"));
+    scheduled_set(&fx, WALL + 7200);
+    fx.hourly(270_000);
+    fx.hourly(273_600);
+    assert_eq!(state_of(&fx, "backup:pull"), "none", "{}", state_text(&fx));
+
+    // The serve script of this tree is never taken for an older one.
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    let serve = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/backup-serve.sh");
+    fx.write(
+        "usr/local/sbin/propolis-backup-serve",
+        &std::fs::read_to_string(serve).unwrap(),
+    );
+    fx.hourly(0);
+    assert_eq!(fx.meta("pull_since"), Some(stamp(0)));
+}
+
+/// With an older serve script installed nothing opens even when a served line was seen once (a
+/// newer script served, then an older one was put back): there is no line to wait for. And a
+/// serve script that could not be read is not taken for one that logs: the pull is unknown for
+/// the pass, so no clock starts, nothing opens and an open record is neither resolved nor judged.
+#[test]
+fn an_older_or_unreadable_serve_script_never_counts_a_set_as_waiting() {
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    fx.write(
+        "usr/local/sbin/propolis-backup-serve",
+        "#!/bin/bash\n# an older serve script: it serves and logs nothing\n",
+    );
+    set_meta(&fx, "pull_last", &before(345_600));
+    scheduled_set(&fx, WALL - 300_000);
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "backup:pull"), "none", "{}", state_text(&fx));
+    assert_eq!(fx.meta("pull_since").as_deref(), Some("-"));
+
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    fx.write("usr/local/sbin/propolis-backup-serve", "#!/bin/bash\n");
+    write_exec(
+        &fx.bin.join("grep"),
+        "#!/usr/bin/env bash\n\
+         case \"$*\" in *'logger -t propolis-backup-serve'*) exit 2 ;; esac\n\
+         exec /usr/bin/grep \"$@\"\n",
+    );
+    fx.incidents(&[witness_record(
+        "w#1",
+        "backup:pull",
+        "backup-offhost",
+        "backup",
+        "-",
+        "NOTICE",
+        "open",
+        "backup.pull",
+    )]);
+    fx.hourly(0);
+    assert_eq!(fx.meta("pull_since"), None, "{}", state_text(&fx));
+    assert_eq!(p_result(&fx, "backups"), "unknown");
+    assert_eq!(state_of(&fx, "backup:pull"), "open");
+}
+
+/// The backup's status files as deploy/backup.sh writes them: a success before a failure in
+/// `step`.
+fn backup_failed_in(fx: &Fx, step: &str) {
+    fx.write(
+        "var/lib/propolis/backup-status/last-success",
+        "{\"completed_at\":\"2027-01-14T03:30:00Z\",\"set\":\"20270114T033000Z-scheduled\"}\n",
+    );
+    file_at(
+        fx,
+        "var/lib/propolis/backup-status/last-success",
+        WALL - 90_000,
+    );
+    fx.write(
+        "var/lib/propolis/backup-status/last-failure",
+        &format!(
+            "{{\"failed_at\":\"2027-01-15T03:30:00Z\",\"reason\":\"scheduled\",\"step\":\"{step}\",\"exit_code\":1}}\n"
+        ),
+    );
+    file_at(
+        fx,
+        "var/lib/propolis/backup-status/last-failure",
+        WALL - 3600,
+    );
+}
+
+/// `record` first seen, opened and with its onset at stamp `s`.
+fn sighted_at(record: &str, s: &str) -> String {
+    with_field(&with_field(&with_field(record, 8, s), 9, s), 10, s)
+}
+
+/// A failed backup whose last step read the database folds under an open db-unreachable; one that
+/// failed checking free space folds under the open volume record of the backup directory's
+/// filesystem, and under nothing else, though the database is down too; one that failed on a
+/// ledger mismatch folds under nothing. Each parent was first seen before the failure.
+#[test]
+fn a_failed_backup_folds_under_db_unreachable_or_the_backup_volume_by_its_last_step() {
+    let backup_open = hook_record("w#1", "propolis-backup.service", "ACT", "open", 0, "-");
+    let db_open = sighted_at(
+        &witness_record(
+            "w#2",
+            "db:local",
+            "db-unreachable",
+            "ledger",
+            "-",
+            "PAGE",
+            "open",
+            "db.unreachable",
+        ),
+        &before(7200),
+    );
+
+    let fx = Fx::new();
+    backup_failed_in(&fx, "dumping the database");
+    fx.incidents(&[backup_open.clone(), db_open.clone()]);
+    fx.hourly(0);
+    let f = fx.record("unit:propolis-backup.service").unwrap();
+    assert_eq!(f[13], "w#2", "{}", state_text(&fx));
+    assert!(f[30].split(',').any(|x| x == "folded"), "{}", f[30]);
+
+    // The volume record first seen two hours before the failure takes it; one first seen an hour
+    // after it (the failure written an hour before this pass) does not.
+    for (seen, want) in [(7200, "w#3"), (0, "-")] {
+        let fx = Fx::new();
+        salt(&fx);
+        backup_failed_in(&fx, "checking free space");
+        backup_env(&fx, "PROPOLIS_BACKUP_DIR=/srv/bk");
+        fx.filesystems(&[("/srv/bk", 77)]);
+        fx.df_map(&[("/srv/bk", &vol(VOL_LOW, "/srv/bk"))]);
+        let vol_open = sighted_at(
+            &witness_record(
+                "w#3",
+                &format!("vol:{}", mount_id("/srv/bk")),
+                "volume-filling",
+                "host",
+                &mount_id("/srv/bk"),
+                "ACT",
+                "open",
+                "vol.low",
+            ),
+            &before(seen),
+        );
+        fx.incidents(&[backup_open.clone(), db_open.clone(), vol_open]);
+        fx.hourly(0);
+        let f = fx.record("unit:propolis-backup.service").unwrap();
+        assert_eq!(
+            f[13],
+            want,
+            "volume seen {seen} s before: {}",
+            state_text(&fx)
+        );
+    }
+
+    let fx = Fx::new();
+    backup_failed_in(&fx, "checking the ledger: chain head 5 differs");
+    fx.incidents(&[backup_open, db_open]);
+    fx.hourly(0);
+    assert_eq!(fx.record("unit:propolis-backup.service").unwrap()[13], "-");
+}
+
+/// The one unlisted spool of a run names its collector by opaque id in the folded finding's
+/// instance, found by matching config-check's key hash against the spool's plain names; with two
+/// the instance is none.
+#[test]
+fn a_single_unlisted_spool_names_its_collector_by_opaque_id() {
+    let fx = Fx::new();
+    salt(&fx);
+    fx.install_cc();
+    spool_at(&fx, "c-zz", WALL - 100);
+    spool_at(&fx, "c-yy", WALL - 100);
+    let one = cc_tsv(&[], &[("fail", "spool-unlisted:c-zz", "gateway-spool")]);
+    fx.cc(&one, 0);
+    fx.hourly(0);
+    fx.hourly(3600);
+    let f = fx
+        .record("finding:spool-unlisted:all")
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!(
+        (f[5].clone(), f[7].as_str(), f[34].as_str()),
+        (collector_id("c-zz"), "open", "1")
+    );
+    let two = cc_tsv(
+        &[],
+        &[
+            ("fail", "spool-unlisted:c-zz", "gateway-spool"),
+            ("fail", "spool-unlisted:c-yy", "gateway-spool"),
+        ],
+    );
+    fx.cc(&two, 0);
+    fx.hourly(7200);
+    let f = fx.record("finding:spool-unlisted:all").unwrap();
+    assert_eq!((f[5].as_str(), f[34].as_str()), ("-", "2"));
+}
+
+// ---- the public push, backups and collectors: the edges of each rule ----------------------
+
+/// The result field of the P line of check `name` (`ok`, `unknown`), empty when there is none.
+fn p_result(fx: &Fx, name: &str) -> String {
+    p_line(fx, name)
+        .split('\t')
+        .nth(1)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The fields of collector `cid`'s S line, after the id: lastm, lastadv, maxgap, window start,
+/// prevgap, advances in a row.
+fn s_fields(fx: &Fx, cid: &str) -> Vec<String> {
+    s_line(fx, cid)
+        .unwrap_or_else(|| panic!("no S line for {cid}: {}", fx.observe_text()))
+        .split('\t')
+        .map(str::to_string)
+        .collect()
+}
+
+/// A listed collector's open spool-quiet record.
+fn open_spool_quiet(id: &str, cid: &str) -> String {
+    witness_record(
+        id,
+        &format!("spool:{cid}"),
+        "spool-quiet",
+        "ship",
+        cid,
+        "ACT",
+        "open",
+        "spool.quiet",
+    )
+}
+
+/// A week whose window is over seven days old rolls over: its longest gap becomes the week
+/// before's, which alone sets the threshold of the new week's first day. With a longest gap of
+/// 3000 s the threshold is 6000 s, so a quiet of 7000 s opens on the second pass and one of 5000 s
+/// does not. A window an hour old with no week before it judges nothing.
+#[test]
+fn a_week_old_window_rolls_its_longest_gap_into_the_week_before_which_sets_the_threshold() {
+    for (quiet, want) in [(7000, "open"), (5000, "none")] {
+        let fx = Fx::new();
+        control_node(&fx, &["c-01"]);
+        let cid = collector_id("c-01");
+        seed_s(&fx, &cid, WALL - quiet, 3000, &before(8 * 86_400), "-");
+        spool_at(&fx, "c-01", WALL - quiet);
+        fx.pass(0);
+        fx.pass(300);
+        assert_eq!(
+            state_of(&fx, &format!("spool:{cid}")),
+            want,
+            "quiet {quiet}: {}",
+            state_text(&fx)
+        );
+        let s = s_fields(&fx, &cid);
+        assert_eq!(
+            (s[2].as_str(), s[3].clone(), s[4].as_str()),
+            ("0", stamp(0), "3000"),
+            "{s:?}"
+        );
+    }
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    seed_s(&fx, &cid, WALL - 7000, 3000, &before(3600), "-");
+    spool_at(&fx, "c-01", WALL - 7000);
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "none");
+}
+
+/// A spool listing that reaches its bound (lowered here to no entry at all) cannot tell a listed
+/// collector it did not reach from one without a spool file: the check `spool` is unknown, three
+/// such passes open tool-unusable on it, and the collector's open spool-quiet stays open, neither
+/// resolved nor judged, its S line kept.
+#[test]
+fn a_spool_listing_cut_at_its_bound_leaves_a_listed_collector_it_did_not_reach_unknown() {
+    let mut fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    fx.incidents(&[open_spool_quiet("w#1", &cid)]);
+    seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 300);
+    spool_at(&fx, "u-1", WALL - 300);
+    fx.setenv("PROPOLIS_WITNESS_SPOOL_MAX", "0");
+    fx.pass(0);
+    assert_eq!(p_result(&fx, "spool"), "unknown", "{}", fx.observe_text());
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "open");
+    fx.pass(300);
+    fx.pass(600);
+    assert_eq!(state_of(&fx, "tool:spool"), "open", "{}", state_text(&fx));
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "open");
+    assert_eq!(s_fields(&fx, &cid)[0], (WALL - 7200).to_string());
+}
+
+/// A spool with more entries than the listing reads ends the pass as usual, and the listed
+/// collector, written a minute ago though its S line last saw it two hours ago, is either judged
+/// by that fresh write or, past the bound, unknown for the pass: never judged from the S line as
+/// if its spool file were gone, which would read it as quiet. Which one depends on the
+/// directory's order, so the case with the bound lowered is the one that always reaches it.
+#[test]
+fn a_spool_of_more_entries_than_the_bound_never_reads_a_listed_collector_as_absent() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 60);
+    for n in 0..1100 {
+        spool_at(&fx, &format!("u-{n}"), WALL - 300);
+    }
+    fx.pass(0);
+    let result = p_result(&fx, "spool");
+    assert!(
+        result == "ok" || result == "unknown",
+        "{}",
+        fx.observe_text()
+    );
+    assert_eq!(
+        state_of(&fx, &format!("spool:{cid}")),
+        "none",
+        "spool check {result}: {}",
+        state_text(&fx)
+    );
+}
+
+/// `find`, failing for the gateway spool as a listing that broke off does, and the real `find`
+/// for anything else.
+const FIND_SPOOL_FAILS: &str = r#"#!/usr/bin/env bash
+case " $* " in *"/var/spool/propolis/gateway"*) exit 1 ;; esac
+exec /usr/bin/find "$@"
+"#;
+
+/// A spool listing that fails judges nothing: an open spool-quiet stays open, a pending one is
+/// dropped (the next sighting would not be the second in a row), the check `spool` is unknown and
+/// three such passes open tool-unusable on it.
+#[test]
+fn a_spool_listing_that_fails_keeps_an_open_spool_quiet_and_drops_a_pending_one() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01", "c-02"]);
+    let (c1, c2) = (collector_id("c-01"), collector_id("c-02"));
+    fx.incidents(&[open_spool_quiet("w#1", &c2)]);
+    seed_s(&fx, &c1, WALL - 7200, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 7200);
+    spool_at(&fx, "c-02", WALL - 7200);
+    fx.pass(0);
+    assert_eq!(state_of(&fx, &format!("spool:{c1}")), "pending");
+    write_exec(&fx.bin.join("find"), FIND_SPOOL_FAILS);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, &format!("spool:{c1}")), "none");
+    assert_eq!(state_of(&fx, &format!("spool:{c2}")), "open");
+    assert_eq!(p_result(&fx, "spool"), "unknown");
+    fx.pass(600);
+    assert!(fx.record("tool:spool").is_none());
+    fx.pass(900);
+    assert_eq!(state_of(&fx, "tool:spool"), "open");
+    assert_eq!(state_of(&fx, &format!("spool:{c2}")), "open");
+}
+
+/// A listed collector whose spool file is gone (its directory lost on the gateway while its
+/// shipper is down, which never brings it back) is judged from the last write its S line holds:
+/// quiet for two hours, it opens on the second pass. A listed collector never written, with no
+/// S line, has nothing to judge.
+#[test]
+fn a_listed_collector_whose_spool_file_is_gone_is_judged_from_the_last_write_seen() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01", "c-02"]);
+    let cid = collector_id("c-01");
+    seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+    std::fs::create_dir_all(fx.p("var/spool/propolis/gateway")).unwrap();
+    fx.pass(0);
+    assert_eq!(
+        state_of(&fx, &format!("spool:{cid}")),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+    fx.pass(300);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "open");
+    assert_eq!(s_fields(&fx, &cid)[0], (WALL - 7200).to_string());
+    let c2 = collector_id("c-02");
+    assert_eq!(state_of(&fx, &format!("spool:{c2}")), "none");
+    assert!(s_line(&fx, &c2).is_none());
+}
+
+/// A spool modification time ahead of the clock (a clock step, or a touch by the gateway
+/// account) is neither quiet nor an advance: the S line stays as it was, so the week's longest
+/// gap is not widened and spool-quiet still opens when that collector goes quiet later. A year
+/// ahead, then a real write, then two hours of quiet: it opens on the second quiet pass with the
+/// longest gap still 600 s. An hour ahead: nothing changes while it is ahead, and a real write
+/// after it leaves the longest gap as it was.
+#[test]
+fn a_spool_modification_time_ahead_of_the_clock_neither_opens_nor_widens_the_longest_gap() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    seed_s(&fx, &cid, WALL - 300, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL + 31_536_000);
+    fx.pass(0);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "none");
+    let s = s_fields(&fx, &cid);
+    assert_eq!(
+        (s[0].clone(), s[2].as_str()),
+        ((WALL - 300).to_string(), "600"),
+        "{s:?}"
+    );
+    spool_at(&fx, "c-01", WALL + 200);
+    fx.pass(300);
+    let s = s_fields(&fx, &cid);
+    assert_eq!(
+        (s[0].clone(), s[2].as_str()),
+        ((WALL + 200).to_string(), "600"),
+        "{s:?}"
+    );
+    fx.pass(7400);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "pending");
+    fx.pass(7700);
+    assert_eq!(
+        state_of(&fx, &format!("spool:{cid}")),
+        "open",
+        "{}",
+        state_text(&fx)
+    );
+    assert_eq!(s_fields(&fx, &cid)[2], "600");
+
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    seed_s(&fx, &cid, WALL - 100, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL + 3600);
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "none");
+    let s = s_fields(&fx, &cid);
+    assert_eq!(
+        (s[0].clone(), s[2].as_str()),
+        ((WALL - 100).to_string(), "600"),
+        "{s:?}"
+    );
+    spool_at(&fx, "c-01", WALL + 400);
+    fx.pass(600);
+    let s = s_fields(&fx, &cid);
+    assert_eq!(
+        (s[0].clone(), s[2].as_str()),
+        ((WALL + 400).to_string(), "600"),
+        "{s:?}"
+    );
+}
+
+/// A gap that was itself reported is not learnt as the week's longest gap: the write that ends a
+/// quiet period whose spool-quiet record is open leaves the longest gap as it was, so the same
+/// collector going quiet again is reported again after the same half hour, not after twice the
+/// length of its last outage.
+#[test]
+fn a_gap_that_was_reported_is_not_learnt_so_the_next_outage_is_reported_as_soon() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    let key = format!("spool:{cid}");
+    seed_s(&fx, &cid, WALL - 7200, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 7200);
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, &key), "open", "{}", state_text(&fx));
+    spool_at(&fx, "c-01", WALL + 500);
+    fx.pass(600);
+    assert_eq!(s_fields(&fx, &cid)[2], "600", "the reported gap was learnt");
+    spool_at(&fx, "c-01", WALL + 800);
+    fx.pass(900);
+    assert_eq!(fx.record(&key).unwrap()[22], "spool2");
+    assert_eq!(s_fields(&fx, &cid)[2], "600");
+    // Quiet again since WALL + 800: past 1800 s at the pass of 2700, open on the next.
+    fx.pass(2700);
+    assert_eq!(state_of(&fx, &key), "pending", "{}", state_text(&fx));
+    fx.pass(3000);
+    assert_eq!(state_of(&fx, &key), "open", "{}", state_text(&fx));
+}
+
+/// A gap between two writes is learnt only when the pass before listed the spool too: after a
+/// time the witness did not watch (its timer stopped, the host off, the listing failing) the
+/// distance between the last write it saw and the one it sees now says how long it was away, not
+/// how long the collector was quiet. A gap seen from one pass to the next is learnt.
+#[test]
+fn a_gap_is_learnt_only_between_two_passes_that_both_listed_the_spool() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    let cid = collector_id("c-01");
+    // The last pass that saw this spool is a day back: no line of the check `spool` is kept.
+    seed_s(&fx, &cid, WALL - 86_400, 600, &before(172_800), "-");
+    spool_at(&fx, "c-01", WALL - 30);
+    fx.pass(0);
+    let s = s_fields(&fx, &cid);
+    assert_eq!(
+        (s[0].clone(), s[2].as_str()),
+        ((WALL - 30).to_string(), "600"),
+        "{s:?}"
+    );
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "none");
+    // No pass between 300 and 1500: the 1280 s between the two writes it saw are not learnt.
+    fx.pass(300);
+    spool_at(&fx, "c-01", WALL + 1250);
+    fx.pass(1500);
+    let s = s_fields(&fx, &cid);
+    assert_eq!(
+        (s[0].clone(), s[2].as_str()),
+        ((WALL + 1250).to_string(), "600"),
+        "{s:?}"
+    );
+    // Watched from the pass at 1800 to the pass at 2100: the 800 s between two writes are.
+    fx.pass(1800);
+    spool_at(&fx, "c-01", WALL + 2050);
+    fx.pass(2100);
+    assert_eq!(s_fields(&fx, &cid)[2], "800");
+    assert_eq!(state_of(&fx, &format!("spool:{cid}")), "none");
+}
+
+/// In one pass the worst ERROR line sets ship-failing's cause: a rejected batch outranks a failed
+/// connection, and a failed cycle outranks one too, whatever their order.
+#[test]
+fn a_rejected_batch_and_a_failed_cycle_each_outrank_a_failed_connection_as_the_cause() {
+    for (lines, want) in [
+        (
+            format!("{SHIP_CONNECT}{SHIP_REJECTED}{SHIP_CONNECT}"),
+            "ship.rejected",
+        ),
+        (format!("{SHIP_CONNECT}{SHIP_IO}{SHIP_CONNECT}"), "ship.io"),
+    ] {
+        let fx = Fx::new();
+        collector_host(&fx);
+        fx.stub_file("journal.shipper", &lines);
+        for t in [0, 300, 600] {
+            fx.pass(t);
+        }
+        let f = fx
+            .record("ship:local")
+            .unwrap_or_else(|| panic!("{want}: {}", state_text(&fx)));
+        assert_eq!((f[7].as_str(), f[11].as_str()), ("open", want));
+    }
+}
+
+/// The shipper's other ERROR lines that mean nothing is being shipped count too, each with its
+/// cause: the line it logs before every exit on a permanent stop (the only line shared by a
+/// rejected batch, a diverged chain, an unprovable duplicate and the stops for a log no longer
+/// configured) is ship.rejected; a batch it cannot record in its state directory and a gateway
+/// that keeps answering Retry are ship.io. Rendered by the real log format, from the targets the
+/// shipper logs them under.
+#[test]
+fn the_shippers_other_error_lines_that_stop_shipping_count_with_their_cause() {
+    let stop = journal_lines(|| {
+        tracing::error!(
+            target: "shipper",
+            "shipper: ship loop terminated on a permanent stop condition (gateway rejection, \
+             chain divergence or an unprovable duplicate); exiting non-zero so this is visible \
+             as a failed unit rather than a silently idle process"
+        )
+    });
+    let record = journal_lines(|| {
+        tracing::error!(
+            target: "shipper::client",
+            key = "c-01",
+            sensor = "ssh",
+            seq = 7u64,
+            error = %"No space left on device (os error 28)",
+            "shipper: cannot record the batch about to be sent in the state directory; not \
+             sending it. Its lines stay in the log and are tried again next pass; check that \
+             the state directory's filesystem is writable and not full"
+        )
+    });
+    let retry = journal_lines(|| {
+        tracing::error!(
+            target: "shipper::client",
+            key = "c-01",
+            seq = 7u64,
+            attempts = 6u32,
+            "gateway kept returning Retry past the consecutive-retry bound; stopping ship cycle"
+        )
+    });
+    for (what, lines, want) in [
+        ("a permanent stop", stop, "ship.rejected"),
+        ("a batch that cannot be recorded", record, "ship.io"),
+        ("a gateway that keeps answering Retry", retry, "ship.io"),
+    ] {
+        let fx = Fx::new();
+        collector_host(&fx);
+        fx.stub_file("journal.shipper", &lines);
+        for t in [0, 300, 600] {
+            fx.pass(t);
+        }
+        let f = fx
+            .record("ship:local")
+            .unwrap_or_else(|| panic!("{what}: {lines}{}", state_text(&fx)));
+        assert_eq!(
+            (f[7].as_str(), f[11].as_str()),
+            ("open", want),
+            "{what}: {lines}"
+        );
+    }
+}
+
+/// The hand-written fixtures have the form the real log format gives: a failed connection and a
+/// dropped line rendered by it, under the shipper's targets, are classed as ERROR and WARN, and
+/// the gateway's duplicate line rendered by it gives the collector and the two counts. The
+/// gateway's call is copied here field for field, and its source is checked to still log those
+/// fields in that form, so a change to how the gateway logs the line fails this test instead of
+/// leaving the witness unable to read it.
+#[test]
+fn lines_rendered_by_the_real_log_format_are_read_as_the_fixtures_are() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    let lines = journal_lines(|| {
+        tracing::error!(
+            target: "shipper",
+            sensor = %"ssh",
+            error = %"connection refused",
+            "shipper: failed to connect to gateway; will retry next pass"
+        );
+        tracing::warn!(
+            target: "shipper::batcher",
+            sensor = %"ssh",
+            error = %"log \"ssh\": the line names sensor \"x\", which is not a known sensor",
+            "shipper: dropping a line the origin policy refuses for this log"
+        );
+    });
+    fx.stub_file("journal.shipper", &lines);
+    fx.pass(0);
+    assert_eq!(
+        (state_of(&fx, "ship:local"), state_of(&fx, "shipdrop:local")),
+        ("pending".to_string(), "open".to_string()),
+        "{lines}{}",
+        state_text(&fx)
+    );
+
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../crates/gateway/src/verify.rs"
+    ))
+    .unwrap();
+    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "tracing::error!( %collector_id, seq = batch.seq, records, suppressed_batches, \
+             suppressed_records, \"gateway: batch reuses the last accepted seq with different \
+             content; \\ acknowledged as Duplicate without storing it\" );"
+        ),
+        "the gateway's duplicate line no longer logs the fields the witness reads, in the form \
+         it reads them"
+    );
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    fx.stub_file("uid.propolis-gateway", "997\n");
+    let cid = collector_id("c-01");
+    let (collector_id, records, suppressed_batches, suppressed_records) =
+        ("c-01", 3u64, 1u64, 4u64);
+    let lines = journal_lines(|| {
+        tracing::error!(
+            target: "gateway::verify",
+            %collector_id,
+            seq = 7u64,
+            records,
+            suppressed_batches,
+            suppressed_records,
+            "gateway: batch reuses the last accepted seq with different content; \
+             acknowledged as Duplicate without storing it"
+        )
+    });
+    fx.stub_file("journal.gateway", &lines);
+    fx.pass(0);
+    assert_eq!(
+        state_of(&fx, &format!("gwdup:{cid}")),
+        "open",
+        "{lines}{}",
+        state_text(&fx)
+    );
+    assert_eq!(
+        p_line(&fx, &format!("seen:gwdup:{cid}")).split('\t').nth(3),
+        Some("7"),
+        "{lines}"
+    );
+}
+
+/// An ERROR line that also says the shipper refuses to start is the unit kinds' to report: on
+/// three passes it opens no ship-failing.
+#[test]
+fn a_shipper_error_line_that_refuses_to_start_opens_no_ship_failing() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    fx.stub_file(
+        "journal.shipper",
+        "2026-11-15T08:00:00.000000Z ERROR shipper: shipper: failed to connect to gateway; \
+         refusing to start error=no route\n",
+    );
+    for t in [0, 300, 600] {
+        fx.pass(t);
+    }
+    assert_eq!(state_of(&fx, "ship:local"), "none", "{}", state_text(&fx));
+}
+
+/// A WARN line is classed by its level and its own message, never by what its fields quote: the
+/// policy line's error quotes the sensor name a line claimed, which whoever writes that sensor's
+/// log chooses. One that claims an ERROR text, or a text that says the shipper refuses to start,
+/// counts only toward ship-dropped, on every pass.
+#[test]
+fn a_warn_line_quoting_an_error_text_counts_only_toward_ship_dropped() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    fx.stub_file(
+        "journal.shipper",
+        &format!(
+            "{}{}",
+            ship_warn("shipper: gateway rejected a batch"),
+            ship_warn("shipper: failed to connect to gateway; refusing to start")
+        ),
+    );
+    for t in [0, 300, 600] {
+        fx.pass(t);
+    }
+    assert_eq!(state_of(&fx, "ship:local"), "none", "{}", state_text(&fx));
+    assert_eq!(state_of(&fx, "shipdrop:local"), "open");
+    assert_eq!(
+        p_line(&fx, "seen:shipdrop:local").split('\t').next(),
+        Some(stamp(600).as_str())
+    );
+}
+
+/// Lines kept past the 1 MiB cap cannot be read whole, so an ERROR line after a flood of WARN
+/// lines may be cut off: the read is unknown for the pass, and an open ship-failing is neither
+/// resolved nor counted clean.
+#[test]
+fn a_shipper_read_whose_kept_lines_pass_the_cap_is_unknown_and_resolves_nothing() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    fx.incidents(&[witness_record(
+        "w#1",
+        "ship:local",
+        "ship-failing",
+        "ship",
+        "-",
+        "ACT",
+        "open",
+        "ship.connect",
+    )]);
+    let mut text = String::new();
+    while text.len() <= 1_048_576 {
+        text.push_str(&ship_warn("ssh"));
+    }
+    text.push_str(SHIP_CONNECT);
+    fx.stub_file("journal.shipper", &text);
+    fx.pass(0);
+    assert_eq!(p_result(&fx, "journal:shipper"), "unknown");
+    fx.pass(300);
+    assert_eq!(state_of(&fx, "ship:local"), "open", "{}", state_text(&fx));
+    assert_eq!(p_result(&fx, "journal:shipper"), "unknown");
+}
+
+/// A read of the shipper's journal that could not tell breaks the run of ERROR passes: two
+/// passes with errors, one cut off, then errors again leave ship-failing pending, not open.
+#[test]
+fn a_shipper_read_that_could_not_tell_breaks_the_run_of_error_passes() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    fx.stub_file("journal.shipper", SHIP_CONNECT);
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, "ship:local"), "pending");
+    fx.stub_file("journal.shipper.rc", "124");
+    fx.pass(600);
+    std::fs::remove_file(fx.dir.path().join("journal.shipper.rc")).unwrap();
+    fx.pass(900);
+    assert_eq!(
+        state_of(&fx, "ship:local"),
+        "pending",
+        "{}",
+        state_text(&fx)
+    );
+}
+
+/// ship-dropped resolves quiet24 once a day has passed without a WARN line.
+#[test]
+fn ship_dropped_resolves_after_a_day_without_a_dropped_line() {
+    let fx = Fx::new();
+    collector_host(&fx);
+    fx.stub_file("journal.shipper", &ship_warn("ssh"));
+    fx.pass(0);
+    assert_eq!(state_of(&fx, "shipdrop:local"), "open");
+    fx.stub_file("journal.shipper", "");
+    fx.pass(86_100);
+    assert_eq!(state_of(&fx, "shipdrop:local"), "open");
+    fx.pass(86_400);
+    let f = fx.record("shipdrop:local").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "quiet24"));
+}
+
+/// The gateway's duplicate line for collector `cn`.
+fn gw_dup_line(cn: &str) -> String {
+    format!(
+        "2026-11-15T08:00:00.000000Z ERROR gateway::verify: gateway: batch reuses the last \
+         accepted seq with different content; acknowledged as Duplicate without storing it \
+         collector_id={cn} seq=7 records=3 suppressed_batches=1 suppressed_records=0\n"
+    )
+}
+
+/// Two cursors in journalctl's form.
+const CURSOR_A: &str =
+    "s=0123456789abcdef0123456789abcdef;i=1f;b=fedcba9876543210fedcba9876543210;m=2a;t=5e1;x=9c";
+const CURSOR_B: &str =
+    "s=0123456789abcdef0123456789abcdef;i=2f;b=fedcba9876543210fedcba9876543210;m=3a;t=6e1;x=9d";
+
+/// Before the listed collectors can be keyed (no salt yet on a fresh host, whose first pass takes
+/// it under the lock), the gateway's line cannot be told from an unlisted collector's: the class
+/// is unknown for the pass, no gwdup:unlisted opens, its cursor stays where it was, and the next
+/// pass reads the line again and keys it by the collector's opaque id.
+#[test]
+fn a_gateway_line_read_before_the_collectors_can_be_keyed_waits_for_the_next_pass() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/id-salt")).unwrap();
+    fx.stub_file("uid.propolis-gateway", "997\n");
+    fx.stub_file("journal.gateway", &gw_dup_line("c-01"));
+    fx.write(
+        "var/lib/propolis/witness/jcursor/gateway",
+        &format!("{CURSOR_A}\n"),
+    );
+    fx.stub_file("journal.gateway.cursor", &format!("{CURSOR_B}\n"));
+    fx.pass(0);
+    assert!(
+        !fx.records().iter().any(|f| f[2].starts_with("gwdup:")),
+        "{}",
+        state_text(&fx)
+    );
+    assert_eq!(p_result(&fx, "journal:gateway"), "unknown");
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/jcursor/gateway"),
+        format!("{CURSOR_A}\n")
+    );
+    salt(&fx);
+    fx.pass(300);
+    let cid = collector_id("c-01");
+    assert_eq!(
+        state_of(&fx, &format!("gwdup:{cid}")),
+        "open",
+        "{}",
+        state_text(&fx)
+    );
+    assert!(fx.record("gwdup:unlisted").is_none());
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/jcursor/gateway"),
+        format!("{CURSOR_B}\n")
+    );
+}
+
+/// A collector_id out of the plain-id form is no listed collector's, however it starts.
+#[test]
+fn a_gateway_line_whose_collector_id_is_out_of_form_is_keyed_unlisted() {
+    let fx = Fx::new();
+    control_node(&fx, &["c-01"]);
+    fx.stub_file("uid.propolis-gateway", "997\n");
+    fx.stub_file("journal.gateway", &gw_dup_line("c-01;x"));
+    fx.pass(0);
+    assert_eq!(state_of(&fx, "gwdup:unlisted"), "open");
+    assert_eq!(
+        state_of(&fx, &format!("gwdup:{}", collector_id("c-01"))),
+        "none"
+    );
+}
+
+/// The 64 hex of sha256(VOL_SALT NUL "collector" NUL cn), which an opaque id is cut from.
+fn collector_hash(cn: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(VOL_SALT.as_bytes());
+    h.update([0u8]);
+    h.update(b"collector");
+    h.update([0u8]);
+    h.update(cn.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Two plain collector names whose ids share their first 5 hex under VOL_SALT, found by search.
+fn colliding_collectors() -> (String, String) {
+    let mut seen = std::collections::HashMap::new();
+    for n in 0u32.. {
+        let name = format!("c-{n}");
+        if let Some(prev) = seen.insert(collector_hash(&name)[..5].to_string(), name.clone()) {
+            return (prev, name);
+        }
+    }
+    unreachable!()
+}
+
+/// The witness keys a listed collector by the id the walk shows for it: pa_id_table widens two
+/// colliding ids to 8 hex within its input, so both programs give it every plain spool name and
+/// every listed name. With an unlisted spool whose id collides with a listed collector's, the
+/// listed one's record and S line carry the widened id.
+#[test]
+fn a_listed_collectors_id_is_widened_against_an_unlisted_spool_name_it_collides_with() {
+    let (a, b) = colliding_collectors();
+    let fx = Fx::new();
+    control_node(&fx, &[a.as_str()]);
+    fx.stub_file("uid.propolis-gateway", "997\n");
+    spool_at(&fx, &a, WALL - 100);
+    spool_at(&fx, &b, WALL - 100);
+    fx.stub_file("journal.gateway", &gw_dup_line(&a));
+    fx.pass(0);
+    let id = format!("c{}", &collector_hash(&a)[..8]);
+    assert_eq!(
+        state_of(&fx, &format!("gwdup:{id}")),
+        "open",
+        "{a} {b}: {}",
+        state_text(&fx)
+    );
+    assert!(s_line(&fx, &id).is_some(), "{}", fx.observe_text());
+}
+
+/// With the feed turned off (`false` in any case) nothing needs pushing: no scheduler opens
+/// neither push-off nor push-unscheduled. An open push-off resolves clean2 after two passes on
+/// which a crontab line runs the push.
+#[test]
+fn a_disabled_feed_needs_no_push_and_push_off_resolves_once_a_scheduler_runs_it() {
+    for value in ["FALSE", "false", "False"] {
+        let fx = Fx::new();
+        std::fs::remove_file(fx.p("etc/cron.d/propolis-blocklist")).unwrap();
+        propolis_env_with(
+            &fx,
+            &format!("PROPOLIS_FEED_ENABLED={value}\nPROPOLIS_OPS_FEED_PUSH_EXPECTED=true\n"),
+        );
+        fx.hourly(0);
+        fx.hourly(3600);
+        assert_eq!(
+            (state_of(&fx, "push:off"), state_of(&fx, "push:none")),
+            ("none".to_string(), "none".to_string()),
+            "{value}: {}",
+            state_text(&fx)
+        );
+    }
+    let fx = Fx::new();
+    fx.incidents(&[witness_record(
+        "w#1",
+        "push:off",
+        "push-off",
+        "publish",
+        "-",
+        "NOTICE",
+        "open",
+        "push.none",
+    )]);
+    fx.hourly(0);
+    assert_eq!(state_of(&fx, "push:off"), "open");
+    fx.hourly(3600);
+    let f = fx.record("push:off").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "clean2"));
+}
+
+/// With no push marker the first sighting's onset is the pass that saw it, and the first push
+/// after that onset resolves the record `pushed`.
+#[test]
+fn push_failing_without_a_push_marker_opens_on_the_second_pass_and_a_later_push_resolves_it() {
+    let fx = Fx::new();
+    push_host(&fx, None, Some(WALL - 3600));
+    set_meta(&fx, "push_sched_since", &before(25_200));
+    fx.hourly(0);
+    let f = fx
+        .record("push:cron")
+        .unwrap_or_else(|| panic!("{}", state_text(&fx)));
+    assert_eq!((f[7].as_str(), f[10].clone()), ("pending", stamp(0)));
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "push:cron"), "open");
+    file_at(
+        &fx,
+        "var/lib/propolis/blocklist-status/last-pushed",
+        WALL + 3700,
+    );
+    fx.hourly(7200);
+    let f = fx.record("push:cron").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "pushed"));
+}
+
+/// A push that keeps failing while the operator moves it from a crontab line to a timer is one
+/// fault: the open push:cron record carries it, and no second record opens on push:timer.
+#[test]
+fn a_failing_push_moved_from_cron_to_a_timer_stays_one_record() {
+    let fx = Fx::new();
+    push_host(&fx, Some(WALL - 25_200), Some(WALL - 3600));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "push:cron"), "open");
+    std::fs::remove_file(fx.p("etc/cron.d/propolis-blocklist")).unwrap();
+    fx.write(
+        "etc/systemd/system/blocklist-sync.service",
+        "[Service]\nUser=propolis-blocklist\nExecStart=/opt/propolis/deploy/blocklist-sync.sh\n",
+    );
+    fx.unit("blocklist-sync.timer", &[("SubState", "waiting")]);
+    fx.hourly(7200);
+    fx.hourly(10_800);
+    let live: Vec<String> = fx
+        .records()
+        .iter()
+        .filter(|f| f[2].starts_with("push:") && f[7] != "resolved")
+        .map(|f| format!("{} {}", f[2], f[7]))
+        .collect();
+    assert_eq!(
+        live,
+        vec!["push:cron open".to_string()],
+        "{}",
+        state_text(&fx)
+    );
+}
+
+/// An open push-failing does not outlive its scheduler: once nothing runs the push any more (the
+/// operator took the crontab line out), no later push can resolve it, so it resolves `disabled`
+/// on that pass and the missing scheduler is push-off's or push-unscheduled's to say.
+#[test]
+fn an_open_push_failing_resolves_disabled_once_nothing_runs_the_push() {
+    let fx = Fx::new();
+    push_host(&fx, Some(WALL - 25_200), Some(WALL - 3600));
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "push:cron"), "open");
+    std::fs::remove_file(fx.p("etc/cron.d/propolis-blocklist")).unwrap();
+    fx.hourly(7200);
+    let f = fx.record("push:cron").unwrap();
+    assert_eq!(
+        (f[7].as_str(), f[22].as_str()),
+        ("resolved", "disabled"),
+        "{}",
+        state_text(&fx)
+    );
+    assert_eq!(state_of(&fx, "push:off"), "pending");
+}
+
+/// PROPOLIS_OPS_FEED_PUSH_EXPECTED is true for `true`, `1`, `yes` and `on` in any case and with
+/// blanks around it, false for anything else: with no scheduler it picks push-unscheduled
+/// (push:none) or the NOTICE push-off.
+#[test]
+fn the_push_expected_setting_reads_true_1_yes_and_on_in_any_case_and_nothing_else() {
+    for (value, key, other) in [
+        ("1", "push:none", "push:off"),
+        ("yes", "push:none", "push:off"),
+        ("on", "push:none", "push:off"),
+        ("  true  ", "push:none", "push:off"),
+        ("TRUE", "push:none", "push:off"),
+        ("false", "push:off", "push:none"),
+        ("0", "push:off", "push:none"),
+        ("maybe", "push:off", "push:none"),
+    ] {
+        let fx = Fx::new();
+        std::fs::remove_file(fx.p("etc/cron.d/propolis-blocklist")).unwrap();
+        propolis_env_with(&fx, &format!("PROPOLIS_OPS_FEED_PUSH_EXPECTED={value}\n"));
+        fx.hourly(0);
+        assert_eq!(
+            (state_of(&fx, key), state_of(&fx, other)),
+            ("pending".to_string(), "none".to_string()),
+            "{value:?}: {}",
+            state_text(&fx)
+        );
+    }
+}
+
+/// The feed's publish marker lies in the daemon account's directory, so its stat runs as that
+/// account (uid 998), never as root.
+#[test]
+fn the_publish_marker_is_read_as_the_daemon_account() {
+    let mut fx = Fx::new();
+    fx.daemon_account();
+    push_host(&fx, Some(WALL - 100), Some(WALL - 50));
+    fx.setenv("PA_TEST_UID", "0");
+    fx.setenv("PA_TEST_READ_AS_SELF", "0");
+    fx.hourly(0);
+    let log = fx.log();
+    assert!(
+        log.lines().any(|l| l.starts_with("setpriv --reuid=998 ")
+            && l.contains("var/lib/propolis/feed/.current.last_published")),
+        "{log}"
+    );
+    assert_eq!(p_result(&fx, "push"), "ok");
+}
+
+/// A push marker that is a symbolic link is not followed, however fresh its target: the push
+/// check is unknown for the pass, and an open push-failing neither resolves `pushed` nor counts
+/// clean.
+#[test]
+fn a_push_marker_that_is_a_symbolic_link_is_unknown_and_resolves_nothing() {
+    let fx = Fx::new();
+    push_host(&fx, None, Some(WALL - 3600));
+    file_at(&fx, "var/lib/propolis/blocklist-status/fresh", WALL - 10);
+    std::os::unix::fs::symlink(
+        "fresh",
+        fx.p("var/lib/propolis/blocklist-status/last-pushed"),
+    )
+    .unwrap();
+    fx.incidents(&[sighted_at(
+        &witness_record(
+            "w#1",
+            "push:cron",
+            "push-failing",
+            "publish",
+            "-",
+            "ACT",
+            "open",
+            "push.stale",
+        ),
+        &before(25_200),
+    )]);
+    fx.hourly(0);
+    assert_eq!(p_result(&fx, "push"), "unknown", "{}", fx.observe_text());
+    assert_eq!(state_of(&fx, "push:cron"), "open", "{}", state_text(&fx));
+}
+
+/// A host whose role is unknown (no daemon or gateway enabled, no shipper.env) publishes no feed,
+/// so nothing runs the push there for a reason: no push-off opens and the push check is not run.
+#[test]
+fn a_host_of_unknown_role_opens_no_push_off() {
+    let fx = Fx::new();
+    std::fs::remove_file(fx.p("etc/cron.d/propolis-blocklist")).unwrap();
+    fx.unit(
+        "propolis.service",
+        &[
+            ("ActiveState", "inactive"),
+            ("SubState", "dead"),
+            ("UnitFileState", "disabled"),
+        ],
+    );
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "push:off"), "none", "{}", state_text(&fx));
+    assert_eq!(p_line(&fx, "push"), "");
+}
+
+/// backup-offhost resolves `disabled` only when no pull is configured: its key line removed, or
+/// the pull account known to be gone (`id` says there is no such user). An account lookup that
+/// fails otherwise, such as one cut off by its time limit, cannot tell: the record stays open and
+/// the backups check is unknown.
+#[test]
+fn backup_offhost_resolves_disabled_only_when_the_pull_is_known_to_be_gone() {
+    let offhost = || {
+        witness_record(
+            "w#1",
+            "backup:pull",
+            "backup-offhost",
+            "backup",
+            "-",
+            "NOTICE",
+            "open",
+            "backup.pull",
+        )
+    };
+    let fx = Fx::new();
+    pull_keys(&fx, false);
+    fx.incidents(&[offhost()]);
+    fx.hourly(0);
+    let f = fx.record("backup:pull").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "disabled"));
+
+    let fx = Fx::new();
+    pull_keys(&fx, true);
+    fx.stub_file("uid.propolis-backup-pull", "rc=124\n");
+    fx.incidents(&[offhost()]);
+    fx.hourly(0);
+    assert_eq!(state_of(&fx, "backup:pull"), "open", "{}", state_text(&fx));
+    assert_eq!(p_result(&fx, "backups"), "unknown");
+    fx.stub_file("uid.propolis-backup-pull", "none\n");
+    fx.hourly(3600);
+    let f = fx.record("backup:pull").unwrap();
+    assert_eq!((f[7].as_str(), f[22].as_str()), ("resolved", "disabled"));
+}
+
+/// A backup directory of more entries than the listing reads (4096) is unknown for the pass:
+/// backup-retention neither opens nor resolves.
+#[test]
+fn a_backup_directory_past_the_listing_bound_is_unknown_and_resolves_no_retention() {
+    let fx = Fx::new();
+    backup_env(&fx, "PROPOLIS_BACKUP_DIR=/srv/bk");
+    for n in 0..4100 {
+        std::fs::create_dir_all(fx.p(&format!("srv/bk/d{n}"))).unwrap();
+    }
+    fx.incidents(&[witness_record(
+        "w#1",
+        "backup:keep",
+        "backup-retention",
+        "backup",
+        "-",
+        "NOTICE",
+        "open",
+        "backup.keep",
+    )]);
+    fx.hourly(0);
+    fx.hourly(3600);
+    assert_eq!(state_of(&fx, "backup:keep"), "open", "{}", state_text(&fx));
+    assert_eq!(p_result(&fx, "backups"), "unknown");
+}
+
+/// The backup run's guards: a start time past the uptime (from another boot, or out of form)
+/// while activating opens nothing, and a run that ended failed does not set the last run's length.
+#[test]
+fn a_backup_start_past_the_uptime_opens_nothing_and_a_failed_run_sets_no_length() {
+    let fx = Fx::new();
+    let ahead = ((UP + 5000) * 1_000_000).to_string();
+    fx.unit(
+        "propolis-backup.service",
+        &[
+            ("ActiveState", "activating"),
+            ("SubState", "start"),
+            ("Restart", "no"),
+            ("UnitFileState", "static"),
+            ("ExecMainStartTimestampMonotonic", &ahead),
+            ("ExecMainExitTimestampMonotonic", "0"),
+        ],
+    );
+    fx.pass(0);
+    fx.pass(300);
+    assert_eq!(state_of(&fx, "backup:run"), "none");
+
+    let fx = Fx::new();
+    fx.unit(
+        "propolis-backup.service",
+        &[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("Restart", "no"),
+            ("UnitFileState", "static"),
+            ("ExecMainStartTimestampMonotonic", &mono(0, 7600)),
+            ("ExecMainExitTimestampMonotonic", &mono(0, 3600)),
+        ],
+    );
+    fx.pass(0);
+    assert_eq!(fx.meta("backup_dur"), None);
+}
+
+/// A start time that belongs to a run which has already ended says nothing of this one: while
+/// the unit is activating with an exit later than its start, its main command has not started
+/// yet (a command that runs before it, added by a drop-in, is still going) and the start shown
+/// is the last run's. Nine hours after that start, nothing opens. With a main process running
+/// the start is that process's whatever the exit says, and the run is judged by it.
+#[test]
+fn a_backup_start_left_from_the_run_before_opens_no_backup_hung() {
+    for (main_pid, want) in [(Some("0"), "none"), (Some("4242"), "open")] {
+        let fx = Fx::new();
+        for t in [0, 300] {
+            let (start, exit) = (mono(t, 32_400), mono(t, 28_800));
+            let mut props = vec![
+                ("ActiveState", "activating"),
+                ("SubState", "start-pre"),
+                ("Restart", "no"),
+                ("UnitFileState", "static"),
+                ("ExecMainStartTimestampMonotonic", start.as_str()),
+                ("ExecMainExitTimestampMonotonic", exit.as_str()),
+            ];
+            if let Some(pid) = main_pid {
+                props.push(("MainPID", pid));
+            }
+            fx.unit("propolis-backup.service", &props);
+            fx.pass(t);
+        }
+        assert_eq!(
+            state_of(&fx, "backup:run"),
+            want,
+            "main pid {main_pid:?}: {}",
+            state_text(&fx)
+        );
+    }
+}
+
+/// A failed backup folds only under a parent a trusted fact ties it to: not under a
+/// db-unreachable first seen six hours after the backup failed, not under db-unreachable when it
+/// failed checking free space with no volume record open, and not at all once a later run
+/// succeeded.
+#[test]
+fn a_failed_backup_folds_only_under_a_parent_whose_fault_was_there_when_it_failed() {
+    let backup_open = hook_record("w#1", "propolis-backup.service", "ACT", "open", 0, "-");
+    let db_open = |s: &str| {
+        sighted_at(
+            &witness_record(
+                "w#2",
+                "db:local",
+                "db-unreachable",
+                "ledger",
+                "-",
+                "PAGE",
+                "open",
+                "db.unreachable",
+            ),
+            s,
+        )
+    };
+    let parent = |step: &str, failed: u64, succeeded: Option<u64>, db_seen: u64| {
+        let fx = Fx::new();
+        backup_failed_in(&fx, step);
+        file_at(
+            &fx,
+            "var/lib/propolis/backup-status/last-failure",
+            WALL - failed,
+        );
+        if let Some(s) = succeeded {
+            file_at(&fx, "var/lib/propolis/backup-status/last-success", WALL - s);
+        }
+        fx.incidents(&[backup_open.clone(), db_open(&before(db_seen))]);
+        fx.hourly(0);
+        fx.record("unit:propolis-backup.service").unwrap()[13].clone()
+    };
+    assert_eq!(
+        parent("dumping the database", 3600 + 21_600, None, 3600),
+        "-",
+        "failed six hours before the outage"
+    );
+    assert_eq!(
+        parent("checking free space", 3600, None, 7200),
+        "-",
+        "free space with only the database down"
+    );
+    assert_eq!(
+        parent("dumping the database", 3600, Some(60), 7200),
+        "-",
+        "a later run succeeded"
+    );
+    assert_eq!(
+        parent("dumping the database", 3600, None, 3800),
+        "w#2",
+        "failed during the outage"
+    );
+}
+
+/// The pull class's regex is the line deploy/backup-serve.sh logs, held to it here: the logger
+/// call's message is `served $set $file`, and judge_pull's regex is `^served `, the serve script's
+/// set shape and its three file names, so a reworded logger line fails the build instead of
+/// leaving `meta pull_last` unset.
+#[test]
+fn the_pull_class_matches_exactly_the_line_backup_serve_logs() {
+    let serve = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/backup-serve.sh"
+    ))
+    .unwrap();
+    let logger: Vec<&str> = serve
+        .lines()
+        .filter(|l| l.trim_start().starts_with("timeout 5 logger "))
+        .collect();
+    assert_eq!(logger.len(), 1, "{logger:?}");
+    assert!(
+        logger[0].contains("-t propolis-backup-serve ")
+            && logger[0].contains("\"served $set $file\""),
+        "{}",
+        logger[0]
+    );
+    let set_re = serve
+        .lines()
+        .find_map(|l| l.strip_prefix("SET_RE='"))
+        .and_then(|l| l.strip_suffix('\''))
+        .unwrap();
+    let files = serve
+        .lines()
+        .find_map(|l| l.strip_prefix("FILES=("))
+        .and_then(|l| l.strip_suffix(')'))
+        .unwrap();
+    let files: Vec<String> = files.split(' ').map(|f| f.replace('.', "\\.")).collect();
+    let want = format!(
+        "^served {} ({})$",
+        set_re.trim_start_matches('^').trim_end_matches('$'),
+        files.join("|")
+    );
+    let witness = std::fs::read_to_string(SCRIPT).unwrap();
+    let re = witness
+        .lines()
+        .find_map(|l| {
+            l.trim_start()
+                .strip_prefix("local line re='")
+                .and_then(|l| l.strip_suffix('\''))
+        })
+        .unwrap();
+    assert_eq!(re, want);
 }

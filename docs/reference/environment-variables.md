@@ -418,7 +418,16 @@ Read by the witness's light pass as root, through `deploy/alert-lib.sh#pa_settin
 is not read by the daemon, and it is a different setting from the daemon's own
 `PROPOLIS_OPS_HEARTBEAT_URL`. The witness also reads the daemon's `DATABASE_URL` (for its
 read-only database probe through `propolis pg-exec`) and `PROPOLIS_CONSOLE_BIND` (for the one
-`/ready` request on loopback), as the daemon reads them.
+`/ready` request on loopback), as the daemon reads them. Its light pass reads
+`PROPOLIS_SENSOR_LOGS` (from the daemon's two env files: the collectors whose spool it lists) and
+`PROPOLIS_GATEWAY_SPOOL_DIR` (from `gateway.env`: where that spool is, its default when unset or
+not a plain absolute path). Its hourly pass reads `PROPOLIS_FEED_ENABLED` (default true: only
+`false`, in any case, turns it off, as the daemon reads it), `PROPOLIS_FEED_OUTPUT_DIR` (default
+`/var/lib/propolis/feed/current`, for the publish marker beside it) and
+`PROPOLIS_OPS_FEED_PUSH_EXPECTED` (default false; `true`, `1`, `yes` or `on`) from the daemon's
+env files, and `PROPOLIS_BACKUP_DIR` and `PROPOLIS_BACKUP_KEEP` from the backup unit's
+`Environment` property (a drop-in of `propolis-backup.service` is where they are set), each the
+last assignment, the defaults `/var/backups/propolis` and 7 when unset or out of range.
 
 | Variable | Req | Default | Min/bounds | Notes |
 |---|---|---|---|---|

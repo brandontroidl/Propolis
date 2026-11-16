@@ -37,12 +37,17 @@ which runs `/usr/local/sbin/propolis-witness hourly` once an hour,
 `deploy/propolis-witness@hourly.timer#OnCalendar=hourly`). The light pass judges the failures the
 failure hook recorded, watches every Propolis unit for crash loops and the failed state, asks
 the daemon's database a read-only question and the daemon's console on loopback whether it is
-ready, reads the journal lines of the Propolis units that nothing else reads, and writes the
+ready, reads the journal lines of the Propolis units that nothing else reads (the gateway's
+dropped rebuilt batches, the shipper's errors on a collector and the off-host pull's served
+files among them), on a control node or gateway lists the gateway spool to see a listed collector
+go quiet, watches a backup run that does not end, and writes the
 login banner; the hourly pass runs the installed configuration check and records its
 findings, asks the ntfy server whether the alert topic can be read without credentials, samples
 the free space of every store's filesystem, reads the database's state (transaction-id age,
 connection slots, lock waits, size) and records the files that configure Propolis, so it can say
-when a volume will fill and which unit runs with a change not yet in force; and each pass checks
+when a volume will fill and which unit runs with a change not yet in force, and on a single box or
+control node reads whether the public push is scheduled and keeping up with the feed, counts the
+backup sets against `PROPOLIS_BACKUP_KEEP` and notes an off-host pull that stopped; and each pass checks
 that the other is still running. The witness records and shows, and sends no message:
 beside the read check's requests, its only outbound request is the optional GET of
 `PROPOLIS_WITNESS_HEARTBEAT_URL`. A

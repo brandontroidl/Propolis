@@ -4559,3 +4559,249 @@ fn a_remote_database_s_data_volume_reads_not_readable_here() {
     );
     assert!(!fx.log().contains("var/lib/postgresql"), "{}", fx.log());
 }
+
+/// The opaque id of the collector `cn` under the fixture's salt.
+fn collector_id(cn: &str) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg("printf '%s\\0%s\\0%s' \"$1\" collector \"$2\" | sha256sum")
+        .arg("_")
+        .arg(SALT)
+        .arg(cn)
+        .output()
+        .unwrap();
+    format!("c{}", &String::from_utf8_lossy(&out.stdout)[..5])
+}
+
+/// A record of the witness's own kind `kind` on `key`, with instance `inst`, opened an hour ago.
+fn witness_kind(id: &str, key: &str, kind: &str, stage: &str, tier: &str, inst: &str) -> String {
+    let r = record(id, key, stage, tier, "open", NOW - 3600, "-", "-");
+    set_field(&set_field(&r, 3, kind), 5, inst)
+}
+
+/// An open push-failing marks the publish stage (exit 2, NEXT naming the `push-failing`
+/// runbook); on the backup rail an open backup-hung fails it, and the retention and off-host
+/// records are noted with the count of sets against KEEP and when a pull was last served.
+#[test]
+fn an_open_push_failing_marks_publish_and_backup_hung_fails_the_backup_rail() {
+    let fx = Fx::single();
+    fx.witness_ran(60);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tbackup_sets\t2/7\nM\tpull_last\t{}\n",
+            stamp_ago(60),
+            stamp_ago(300_000)
+        ),
+    );
+    let records = [
+        witness_kind("w#1", "push:cron", "push-failing", "publish", "ACT", "-"),
+        witness_kind("w#2", "backup:run", "backup-hung", "backup", "ACT", "-"),
+        witness_kind(
+            "w#3",
+            "backup:keep",
+            "backup-retention",
+            "backup",
+            "NOTICE",
+            "-",
+        ),
+        witness_kind(
+            "w#4",
+            "backup:pull",
+            "backup-offhost",
+            "backup",
+            "NOTICE",
+            "-",
+        ),
+    ];
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t5\n{}", records.concat()),
+    );
+    let r = fx.walk();
+    assert_eq!(r.code, 2, "{}\n{}", r.out, r.err);
+    assert_eq!(r.state("publish"), "FAIL", "{}", r.out);
+    assert_eq!(r.marked().as_deref(), Some("publish"), "{}", r.out);
+    assert!(
+        r.row("publish").contains("public push failing"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("#push-failing"), "{}", r.out);
+    assert_eq!(r.state("backup"), "FAIL", "{}", r.out);
+    let row = r.row("backup");
+    assert!(row.contains("backup run has not ended"), "{row}");
+    assert!(row.contains("sets 2 of 7"), "{row}");
+    assert!(
+        row.contains("a set has waited over 72 h for the off-host pull, last served ")
+            && !row.contains("never seen"),
+        "{row}"
+    );
+}
+
+/// On a control node an open spool-quiet marks that collector's ship row (exit 2, NEXT naming the
+/// `spool-quiet` runbook), and an open gateway-dup warns on the gateway row with the records it
+/// counted lost, each collector shown by its braced name only in the walk.
+#[test]
+fn a_quiet_collector_marks_ship_and_a_dropped_rebuilt_batch_warns_at_the_gateway() {
+    let fx = Fx::control();
+    fx.witness_ran(60);
+    fx.write("var/spool/propolis/gateway/c-01/events.jsonl", "x\n");
+    set_mtime(
+        &fx.p("var/spool/propolis/gateway/c-01/events.jsonl"),
+        NOW - 7200,
+    );
+    let cid = collector_id("c-01");
+    let records = [
+        witness_kind(
+            "w#1",
+            &format!("spool:{cid}"),
+            "spool-quiet",
+            "ship",
+            "ACT",
+            &cid,
+        ),
+        witness_kind(
+            "w#2",
+            &format!("gwdup:{cid}"),
+            "gateway-dup",
+            "gateway",
+            "ACT",
+            &cid,
+        ),
+    ];
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t3\n{}", records.concat()),
+    );
+    fx.write(
+        "var/lib/propolis/witness/observe",
+        &format!(
+            "#observe v1 g=2\nP\tseen:gwdup:{cid}\t{}\tok\t-\t5\n",
+            stamp_ago(3600)
+        ),
+    );
+    let r = fx.walk();
+    assert_eq!(r.code, 2, "{}\n{}", r.out, r.err);
+    assert_eq!(r.marked().as_deref(), Some("ship"), "{}", r.out);
+    let ship = rows(&r, "ship").join("\n");
+    assert!(
+        ship.contains("{c-01}") && ship.contains("quiet") && ship.contains("FAIL"),
+        "{ship}"
+    );
+    assert!(r.out.contains("#spool-quiet"), "{}", r.out);
+    assert_eq!(r.state("gateway"), "WARN", "{}", r.out);
+    let row = r.row("gateway");
+    assert!(
+        row.contains("rebuilt batch dropped from {c-01}") && row.contains("5 records counted lost"),
+        "{row}"
+    );
+}
+
+/// With only backup-offhost open the backup rail warns, and NEXT names the runbook section that
+/// tells what to do about it (`backup-hung`, which holds the retention and off-host text), not
+/// the one about a failed backup.
+#[test]
+fn an_open_backup_offhost_alone_points_next_at_the_section_that_explains_it() {
+    let fx = Fx::single();
+    fx.witness_ran(60);
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        &format!(
+            "#meta v1 g=3\nM\twhere\tpersistent\nM\tlight_last\t{}\nM\tpull_last\t{}\n",
+            stamp_ago(60),
+            stamp_ago(345_600)
+        ),
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t2\n{}",
+            witness_kind(
+                "w#1",
+                "backup:pull",
+                "backup-offhost",
+                "backup",
+                "NOTICE",
+                "-"
+            )
+        ),
+    );
+    let r = fx.walk();
+    assert_eq!(r.state("backup"), "WARN", "{}", r.out);
+    let next = r
+        .out
+        .lines()
+        .find(|l| l.starts_with("NEXT "))
+        .unwrap_or_default();
+    assert!(
+        next.contains("health-and-observability.md#backup-hung"),
+        "{next}\n{}",
+        r.out
+    );
+}
+
+/// The 64 hex of sha256(SALT NUL "collector" NUL cn), which an opaque id is cut from.
+fn collector_hash(cn: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(SALT.as_bytes());
+    h.update([0u8]);
+    h.update(b"collector");
+    h.update([0u8]);
+    h.update(cn.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The walk gives a listed collector the id the witness keys it by: pa_id_table widens two
+/// colliding ids to 8 hex within its input, so both programs give it every plain spool name and
+/// every listed name. A listed collector with no spool directory yet, whose id collides with an
+/// unlisted spool's, is still named on the gateway row by the widened id the witness recorded.
+#[test]
+fn a_listed_collector_without_a_spool_gets_the_widened_id_the_witness_keys_it_by() {
+    let mut seen = std::collections::HashMap::new();
+    let (a, b) = (0u32..)
+        .find_map(|n| {
+            let name = format!("c-{n}");
+            seen.insert(collector_hash(&name)[..5].to_string(), name.clone())
+                .map(|prev| (prev, name))
+        })
+        .unwrap();
+    let fx = Fx::control();
+    fx.witness_ran(60);
+    fx.write(
+        "etc/propolis/propolis.env",
+        &format!(
+            "PROPOLIS_SENSOR_LOGS={a}:{}\n",
+            fx.p(&format!("var/spool/propolis/gateway/{a}/events.jsonl"))
+                .display()
+        ),
+    );
+    fx.write(
+        &format!("var/spool/propolis/gateway/{b}/events.jsonl"),
+        "x\n",
+    );
+    let id = format!("c{}", &collector_hash(&a)[..8]);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t2\n{}",
+            witness_kind(
+                "w#1",
+                &format!("gwdup:{id}"),
+                "gateway-dup",
+                "gateway",
+                "ACT",
+                &id
+            )
+        ),
+    );
+    let r = fx.walk();
+    let row = r.row("gateway");
+    assert!(
+        row.contains(&format!("rebuilt batch dropped from {{{a}}}")),
+        "{a} {b}: {row}\n{}",
+        r.out
+    );
+    assert!(r.out.contains(&format!("{id}={{{a}}}")), "{}", r.out);
+}

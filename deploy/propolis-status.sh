@@ -867,13 +867,14 @@ row_source() {
 
 # Spool listing on a control node or gateway: SPOOL_CN (plain names), SPOOL_SIZE, SPOOL_ACC (the
 # gateway's state file for the collector, rewritten on every accepted batch), SPOOL_LAST (the
-# newer of that and the spool file), and SPOOL_BAD, the collectors whose listing made no sense.
+# newer of that and the spool file), SPOOL_EV (1 when the collector has a spool file, the names
+# the witness's spool listing keys), and SPOOL_BAD, the collectors whose listing made no sense.
 # The gateway account writes both directories, so every record is NUL-terminated (a file name
 # may hold a newline) and every number is checked before it reaches arithmetic, where bash would
 # evaluate an array subscript in it.
-SPOOL_CN=() SPOOL_LAST=() SPOOL_ACC=() SPOOL_SIZE=() SPOOL_OK=1 SPOOL_WITHHELD=0 SPOOL_BAD=0
+SPOOL_CN=() SPOOL_LAST=() SPOOL_ACC=() SPOOL_SIZE=() SPOOL_EV=() SPOOL_OK=1 SPOOL_WITHHELD=0 SPOOL_BAD=0
 load_spool() {
-    local y name cn_s cn_t acc bad f fs ft list gdir
+    local y name cn_s cn_t acc bad f fs ft list gdir ev
     local -A gstate=()
     [ -d "$SPOOL_DIR" ] && [ ! -L "$SPOOL_DIR" ] || {
         SPOOL_OK=0
@@ -898,9 +899,10 @@ load_spool() {
             SPOOL_WITHHELD=$((SPOOL_WITHHELD + 1))
             continue
         fi
-        cn_s=0 cn_t="" bad=0
+        cn_s=0 cn_t="" bad=0 ev=0
         while IFS=' ' read -r -d '' fs ft f; do
             [ "$f" = events.jsonl ] || continue
+            ev=1
             if [[ $fs =~ ^[0-9]{1,18}$ && $ft =~ ^[0-9]{1,12}(\.[0-9]+)?$ ]]; then
                 cn_s="$fs" cn_t="${ft%%.*}"
             else
@@ -910,7 +912,7 @@ load_spool() {
         [ "$bad" = 0 ] || SPOOL_BAD=$((SPOOL_BAD + 1))
         acc="${gstate[$name]:-}"
         if [ -n "$acc" ] && { [ -z "$cn_t" ] || [ "$acc" -gt "$cn_t" ]; }; then cn_t="$acc"; fi
-        SPOOL_CN+=("$name") SPOOL_SIZE+=("$cn_s") SPOOL_LAST+=("$cn_t") SPOOL_ACC+=("$acc")
+        SPOOL_CN+=("$name") SPOOL_SIZE+=("$cn_s") SPOOL_LAST+=("$cn_t") SPOOL_ACC+=("$acc") SPOOL_EV+=("$ev")
     done <<< "$list"
 }
 
@@ -924,7 +926,7 @@ fresh() {
 SHIP_STATE=""
 row_ship() {
     local i p cdir sdir cur text rc ino off mt age unread=0 behind=() unchecked=() newest_state="" t
-    local note state why="" cond="" fresh_n=0 own any=0 cn line
+    local note state why="" cond="" fresh_n=0 own any=0 cn line quiet id
     case "$ROLE" in
         single | unknown)
             not_here 3 ship "not split"
@@ -938,6 +940,8 @@ row_ship() {
             for i in "${!SPOOL_CN[@]}"; do
                 ! fresh "${SPOOL_LAST[$i]}" || fresh_n=$((fresh_n + 1))
             done
+            # The collectors the witness's light pass holds quiet, by opaque id.
+            quiet=$'\n'"$(open_insts spool-quiet)"$'\n'
             for i in "${!SPOOL_CN[@]}"; do
                 cn="$(braced "${SPOOL_CN[$i]}")"
                 t="${SPOOL_LAST[$i]}"
@@ -946,7 +950,13 @@ row_ship() {
                 ! fresh "$t" || own=1
                 line="collector side not visible from here"
                 [ "$((fresh_n - own))" -le 0 ] || line+="; others arriving"
-                add_row 3 ship "$cn" "$(fmt_time "$t")" "$(fmt_age "$(age_of "$t")")" info "$line"
+                id="${IDS[collector/${SPOOL_CN[$i]}]:-}"
+                if [[ $id =~ ^c[0-9a-f]{5,8}$ ]] && [[ $quiet == *$'\n'"$id"$'\n'* ]]; then
+                    add_row 3 ship "$cn" "$(fmt_time "$t")" "$(fmt_age "$(age_of "$t")")" FAIL \
+                        "quiet for longer than twice its longest gap (witness); $line" direct spool-quiet
+                else
+                    add_row 3 ship "$cn" "$(fmt_time "$t")" "$(fmt_age "$(age_of "$t")")" info "$line"
+                fi
                 any=1
             done
             [ "$any" = 1 ] || add_row 3 ship - - - info "no collector in the spool"
@@ -1025,6 +1035,13 @@ row_ship() {
             note+="; last accepted batch $(fmt_age "$t") ago"
         fi
     fi
+    # What the witness's light pass read in the shipper's journal: errors on three passes in a
+    # row, and lines it dropped (shown only with RUST_LOG set).
+    if [ "$(open_count ship-failing)" != 0 ]; then
+        state=FAIL why=direct cond=ship-failing
+        note+="; shipper errors on three passes in a row (witness)"
+    fi
+    [ "$(open_count ship-dropped)" = 0 ] || note+="; the shipper dropped lines (witness)"
     if [ "${U_UnitFileState:-}" = enabled ] && ! unit_up; then
         state=FAIL why=direct cond=ship-down
         note="shipper.service ${U_ActiveState:-?}; $note"
@@ -1034,7 +1051,7 @@ row_ship() {
 }
 
 row_gateway() {
-    local total=0 newest="" i fails warns state note why="" cond=""
+    local total=0 newest="" i fails warns state note why="" cond="" id who key dup=""
     case "$ROLE" in
         control | gateway) ;;
         collector)
@@ -1076,6 +1093,22 @@ row_gateway() {
     if [ -n "$fails" ]; then
         state=FAIL why=direct cond=gateway-finding
         note+="; findings: $fails"
+    fi
+    # The gateway's line that a rebuilt batch was not stored, as the witness's light pass read it.
+    while IFS= read -r id; do
+        case "$id" in
+            -) who="a collector not listed" key=gwdup:unlisted ;;
+            c[0-9a-f]*)
+                [[ $id =~ ^c[0-9a-f]{5,8}$ ]] || continue
+                who="$(collector_of "$id")" key="gwdup:$id"
+                ;;
+            *) continue ;;
+        esac
+        dup+="${dup:+; }rebuilt batch dropped from $who, $(seen_count "$key") records counted lost (witness)"
+    done <<< "$(open_insts gateway-dup)"
+    if [ -n "$dup" ]; then
+        if [ "$state" != FAIL ]; then state=WARN cond=gateway-dup; fi
+        note+="; $dup"
     fi
     if [ "${U_UnitFileState:-}" = enabled ] && ! unit_up; then
         state=FAIL why=direct cond=gateway-down
@@ -1439,7 +1472,7 @@ row_feed() {
 
 PUB_MT="" PUB_EXPECTED=""
 row_publish() {
-    local marker out ty mt sched rc note expected
+    local marker out ty mt sched rc note expected wit state why cond
     if [ "$HAS_DAEMON" = 0 ]; then
         not_here 10 publish "on the control node: run sudo propolis-status there"
         return 0
@@ -1458,20 +1491,30 @@ row_publish() {
     expected="push not expected"
     case "${ENV_V,,}" in true | 1 | yes | on) expected="push expected" ;; esac
     PUB_MT="$mt" PUB_EXPECTED="$expected"
+    # What the witness's hourly pass holds open on the push: a push over six hours behind the
+    # feed fails the stage, whatever this walk could read itself.
+    wit="" state=info why="" cond=""
+    if [ "$(open_count push-failing)" != 0 ]; then
+        wit="public push failing (witness); " state=FAIL why=direct cond=push-failing
+    fi
+    [ "$(open_count push-unscheduled)" = 0 ] || wit+="a push is expected and nothing runs it (witness); "
     if [ "$PA_SCHED" != none ]; then
         note="scheduler found ($PA_SCHED); $expected"
     elif [ "$rc" != 0 ]; then
-        add_row 10 publish - - - '?' "a crontab or unit file could not be read; $expected"
+        [ "$state" = FAIL ] || state='?'
+        add_row 10 publish - - - "$state" "${wit}a crontab or unit file could not be read; $expected" "$why" "$cond"
         return 0
     else
         note="no scheduler; $expected"
     fi
     if [ "$mt" = "?" ]; then
-        add_row 10 publish "${sched%% *}" - - '?' "last-pushed is not a regular file; $note"
+        [ "$state" = FAIL ] || state='?'
+        add_row 10 publish "${sched%% *}" - - "$state" "${wit}last-pushed is not a regular file; $note" "$why" "$cond"
         return 0
     fi
     [ -n "$mt" ] || note="never pushed; $note"
-    add_row 10 publish "${sched%% *}" "$(fmt_time "$mt")" "$(fmt_age "$(age_of "$mt")")" info "$note"
+    add_row 10 publish "${sched%% *}" "$(fmt_time "$mt")" "$(fmt_age "$(age_of "$mt")")" "$state" \
+        "$wit$note" "$why" "$cond"
 }
 
 # ---- the rails ------------------------------------------------------------------------------
@@ -1700,6 +1743,45 @@ open_vols() {
     printf '%s' "$out"
 }
 
+# open_insts KIND: the instance of each open or acknowledged record of KIND, one a line (`-` for a
+# record that names none).
+open_insts() {
+    local t kind inst st
+    while IFS=$'\t' read -r t _ _ kind _ inst _ st _; do
+        [ "$t" = I ] && [ "$kind" = "$1" ] || continue
+        case "$st" in open | acked) printf '%s\n' "${inst:--}" ;; esac
+    done <<< "$INCIDENTS_BODY"
+}
+
+# collector_of ID: the braced name of the collector in the spool whose opaque id is ID, else `a
+# collector not in the spool`. Only here, on this host, does an id meet its name.
+collector_of() {
+    local k
+    for k in "${!IDS[@]}"; do
+        [[ $k == collector/* ]] && [ "${IDS[$k]}" = "$1" ] || continue
+        braced "${k#collector/}"
+        return 0
+    done
+    printf 'a collector not in the spool'
+}
+
+OBSERVE_BODY="" OBSERVE_READ=0
+
+# seen_count KEY: what the witness's light pass counted against KEY's open record (the last field
+# of its observe line seen:KEY: the records the gateway counted lost), 0 when none can be read.
+seen_count() {
+    local t name n out=0
+    if [ "$OBSERVE_READ" = 0 ]; then
+        OBSERVE_BODY="$(pa_state_read observe)"
+        OBSERVE_READ=1
+    fi
+    while IFS=$'\t' read -r t name _ _ _ n _; do
+        [ "$t" = P ] && [ "$name" = "seen:$1" ] && [[ ${n:-} =~ ^[0-9]{1,9}$ ]] || continue
+        out=$((10#$n))
+    done <<< "$OBSERVE_BODY"
+    printf '%s' "$out"
+}
+
 # open_count KIND: how many of the witness's records of KIND are open or acknowledged.
 open_count() {
     local t kind st n=0
@@ -1772,6 +1854,26 @@ rail_backup() {
     fi
     if [ -n "$fails" ]; then
         state=FAIL cond=backup-failed note="${note:+$note; }findings: $fails"
+    fi
+    # What the witness holds open on the backups: a run that has gone on past its limit, fewer
+    # sets than kept, an off-host pull that stopped. The runbook explains all three under
+    # backup-hung; a rail already warning for another reason keeps that reason's section.
+    if [ "$(open_count backup-hung)" != 0 ]; then
+        state=FAIL cond=backup-hung note="${note:+$note; }a backup run has not ended (witness)"
+    fi
+    if [ "$(open_count backup-retention)" != 0 ]; then
+        t="fewer sets than kept"
+        if [[ ${META[backup_sets]:-} =~ ^([0-9]{1,6})/([0-9]{1,3})$ ]]; then
+            t="sets $((10#${BASH_REMATCH[1]})) of $((10#${BASH_REMATCH[2]}))"
+        fi
+        case "$state" in FAIL | WARN) ;; *) state=WARN cond=backup-hung ;; esac
+        note="${note:+$note; }$t (witness)"
+    fi
+    if [ "$(open_count backup-offhost)" != 0 ]; then
+        t="never seen"
+        if [[ ${META[pull_last]:-} =~ ^([0-9]{1,12})/ ]]; then t="$(fmt_time "${BASH_REMATCH[1]}")"; fi
+        case "$state" in FAIL | WARN) ;; *) state=WARN cond=backup-hung ;; esac
+        note="${note:+$note; }a set has waited over 72 h for the off-host pull, last served $t (witness)"
     fi
     add_row "" backup nightly "$(fmt_time "$B_SUCCESS")" "$(fmt_age "$(age_of "$B_SUCCESS")")" "$state" \
         "$(with_findings "${note%; }")" direct "$cond"
@@ -2121,8 +2223,10 @@ STATUS_NEXT=(
     "source-rotation source rotation"
     "ship-down ship ship-down"
     "ship-failing ship ship-failing"
+    "spool-quiet ship spool-quiet"
     "gateway-down gateway gateway-down"
     "gateway-finding gateway finding"
+    "gateway-dup gateway gateway-dup"
     "intake-down intake daemon-down"
     "intake-finding intake finding"
     "ledger-down ledger db-unreachable"
@@ -2130,6 +2234,8 @@ STATUS_NEXT=(
     "alert-path alert alert-path"
     "alert-target alert -"
     "backup-failed backup backup-failed"
+    "backup-hung backup backup-hung"
+    "push-failing publish push-failing"
     "host-volume host volume"
     "host-state host state"
     "host-clock host -"
@@ -2209,9 +2315,11 @@ IDS_LINE=""
 # load_ids KIND: the opaque ids of the configured instances (pa_id_table, which widens two names
 # of one kind whose ids collide). `local` takes the units, logs and collectors, known before
 # anything slow runs, so the recent failures can name their units; `vendor` takes the vendors the
-# reports query found. Collisions are widened within a kind, so the two calls agree with one.
+# reports query found. Collisions are widened within a kind, so the two calls agree with one. The
+# collectors are the ones the witness keys too, every collector with a spool file and every one
+# PROPOLIS_SENSOR_LOGS lists, so a widened id names the same collector in both.
 load_ids() {
-    local input="" u l i key id kind name list
+    local input="" u l i key id kind name list p
     [ "$SALT" = 1 ] || return 0
     if [ "$1" = local ]; then
         if list="$(systemctl list-unit-files 'sensor-*.service' --no-legend --no-pager 2> /dev/null)"; then
@@ -2227,7 +2335,19 @@ load_ids() {
         done <<< "$INCIDENTS_BODY"
         for u in "${HOOK_UNITS[@]}"; do input+="unit"$'\t'"$u"$'\n'; done
         for l in "${LOG_LABEL[@]}"; do input+="source"$'\t'"$l"$'\n'; done
-        for i in "${SPOOL_CN[@]}"; do input+="collector"$'\t'"$i"$'\n'; done
+        for i in "${!SPOOL_CN[@]}"; do
+            [ "${SPOOL_EV[$i]}" != 1 ] || input+="collector"$'\t'"${SPOOL_CN[$i]}"$'\n'
+        done
+        case "$ROLE" in
+            control | gateway)
+                for p in "${LOG_PATH[@]}"; do
+                    case "$p" in "${SPOOL_DIR%/}"/*/events.jsonl) ;; *) continue ;; esac
+                    i="${p#"${SPOOL_DIR%/}"/}"
+                    i="${i%/events.jsonl}"
+                    ! pa_plain_id "$i" || input+="collector"$'\t'"$i"$'\n'
+                done
+                ;;
+        esac
     else
         for i in "${VENDORS[@]}"; do input+="vendor"$'\t'"$i"$'\n'; done
     fi
@@ -3032,6 +3152,16 @@ stage_view() {
             view_unit gateway.service
             printf '    gateway error lines in 24 h: %s\n' \
                 "$(journalctl -q -o cat --no-pager --since -24h -p err _SYSTEMD_UNIT=gateway.service 2> /dev/null | wc -l)"
+            for name in $(open_insts gateway-dup); do
+                case "$name" in
+                    -) printf '    witness: rebuilt batch dropped from a collector not listed, %s records counted lost\n' "$(seen_count gwdup:unlisted)" ;;
+                    c[0-9a-f]*)
+                        [[ $name =~ ^c[0-9a-f]{5,8}$ ]] || continue
+                        printf '    witness: rebuilt batch dropped from %s, %s records counted lost\n' \
+                            "$(collector_of "$name")" "$(seen_count "gwdup:$name")"
+                        ;;
+                esac
+            done
             view_findings spool-unlisted spool-label-sensor spool-label-subsystem spool-label-other
             ;;
         intake)
@@ -3105,6 +3235,11 @@ stage_view() {
             esac
             printf '    last pushed %s; %s\n' "$t" "${PUB_EXPECTED:--}"
             printf '    scheduler: %s (%s found)\n' "$(pa_push_scheduler 2> /dev/null)" "${PA_SCHED_N:-0}"
+            t="${META[push_sched_since]:-}"
+            [[ $t =~ ^([0-9]{1,12})/ ]] && printf '    witness: a scheduler seen since %s\n' "$(fmt_time "${BASH_REMATCH[1]}")"
+            for name in push-failing push-unscheduled push-off; do
+                [ "$(open_count "$name")" = 0 ] || printf '    witness: %s open\n' "$name"
+            done
             ;;
         alert)
             for name in PROPOLIS_OPS_NTFY_URL PROPOLIS_OPS_NTFY_TOPIC PROPOLIS_OPS_NTFY_TOKEN; do
@@ -3161,6 +3296,18 @@ stage_view() {
             else
                 printf '    backup directory /var/backups/propolis: not present\n'
             fi
+            t="${META[backup_sets]:-}"
+            [[ $t =~ ^([0-9]{1,6})/([0-9]{1,3})$ ]] \
+                && printf '    scheduled sets: %s of %s kept (witness, hourly)\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
+            t="${META[pull_last]:-}"
+            if [[ $t =~ ^([0-9]{1,12})/ ]]; then
+                printf '    off-host pull last served: %s\n' "$(fmt_time "${BASH_REMATCH[1]}")"
+            else
+                printf '    off-host pull last served: never seen\n'
+            fi
+            for name in backup-hung backup-retention backup-offhost; do
+                [ "$(open_count "$name")" = 0 ] || printf '    witness: %s open\n' "$name"
+            done
             ;;
         host)
             timeout 10 df -P -- "$STATUS_ROOT/var/lib/propolis" "$STATUS_ROOT/var/log/propolis" "$STATUS_ROOT/var/spool/propolis" 2> /dev/null | sed 's/^/    /'

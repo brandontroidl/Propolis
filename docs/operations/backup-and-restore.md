@@ -176,7 +176,16 @@ deploy/backup-pull.sh --host <honeypot> --port <admin ssh port> --key ~/.ssh/pro
 
 It fetches the newest encrypted set it does not have, checks every file against the set's
 `SHA256SUMS` before keeping it, keeps the newest 14 (`--keep`), and exits non-zero when it could
-not, so run it from a daily `systemd --user` timer or cron that reports failures. To restore from
+not, so run it from a daily `systemd --user` timer or cron that reports failures. The honeypot
+notices a pull that stopped too: for each file it serves, the forced command logs one line,
+`served <set> <file>`, to the journal under the identifier `propolis-backup-serve` (both names
+are the ones it checked; nothing else the client sent is logged, and what it serves, refuses and
+exits with is the same with or without a working `logger`). The root witness keeps the time of
+the last such line, and with a key line in `authorized_keys`, a scheduled set that was made after
+the later of that line and the time the witness first saw the key line, and has waited over
+72 hours, opens the NOTICE `backup-offhost` (see [health and
+observability](health-and-observability.md#backup-hung)). So pull at least every three days.
+Nothing is sent. To restore from
 a pulled set, decrypt both files with
 `age --decrypt -i ~/.config/propolis/backup-age.key -o <file> <file>.age` and follow
 [restore procedure](#restore-procedure).

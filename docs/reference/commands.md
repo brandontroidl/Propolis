@@ -220,8 +220,11 @@ runs the installed configuration check, records its findings, and sends three GE
 with a token) to the configured ntfy server to see whether the alert topic can be read without
 credentials; it also samples every store's free space and inodes with `df`, reads the database's
 state in one read-only session through the daemon binary (and, once a day, the local data
-directory as the `postgres` account), and hashes the files that configure Propolis to record
-changes not in force. Neither pass sends a message. Exit `0` after every pass that ran, whatever it found;
+directory as the `postgres` account), hashes the files that configure Propolis to record
+changes not in force, and on a single box or control node reads whether the public push is
+scheduled and keeping up with the feed and counts the backup sets. The light pass also lists the
+gateway spool on a control node or gateway and reads the journal lines of the gateway, the shipper
+and the off-host pull's forced command. Neither pass sends a message. Exit `0` after every pass that ran, whatever it found;
 `2` an argument other than `light` or `hourly`; `3` the alert library is missing, not trusted,
 fails to load or is older than the script needs (`deploy/witness.sh#hourly_pass`). What each
 pass does: [health and observability](../operations/health-and-observability.md#witness).

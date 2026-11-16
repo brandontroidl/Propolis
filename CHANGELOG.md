@@ -4,6 +4,62 @@
 
 ### Upgrade note
 
+- **The witness now records the public push, the backups, quiet collectors and the gateway's and
+  the shipper's journal lines, and `deploy/backup-serve.sh` logs each file it serves. Nothing is
+  sent.** After the upgrade, every light pass (as root, before it takes the state lock, each read
+  under its own time limit) also: on a control node or gateway, reads `PROPOLIS_SENSOR_LOGS` and
+  `PROPOLIS_GATEWAY_SPOOL_DIR` and lists the gateway spool's `<collector>/events.jsonl` files with
+  one `find`, as the `propolis-gateway` account when the spool is that account's, at most 1024
+  entries (a listed collector past them is unknown for the pass), keeping one `observe` `S` line
+  per listed collector under its opaque id (a directory nobody listed is not read further and gets
+  no record); reads the journal of
+  `gateway.service` by the `propolis-gateway` account's uid, of `shipper.service` on a collector by
+  the `propolis-shipper` account's uid, and the off-host pull's lines by the `propolis-backup-pull`
+  account's uid and the identifier `propolis-backup-serve`, each from its own cursor in
+  `/var/lib/propolis/witness/jcursor/` and only for its fixed text, keeping counts and never a line;
+  and reads the backup unit's start and exit times from the sample it already takes. Every hourly
+  pass also, on a single box or control node: reads the crontab files and the unit files that could
+  run `deploy/blocklist-sync.sh`, the modification time of the push marker
+  `/var/lib/propolis/blocklist-status/last-pushed` (the `propolis-blocklist` account's, read only
+  when it is a regular file and never through a link), the feed's publish marker beside
+  `PROPOLIS_FEED_OUTPUT_DIR` (as `propolis`),
+  `PROPOLIS_FEED_ENABLED` and `PROPOLIS_OPS_FEED_PUSH_EXPECTED`; lists the backup directory (the
+  backup unit's `PROPOLIS_BACKUP_DIR`, default `/var/backups/propolis`) for scheduled set names;
+  reads `/var/lib/propolis-backup-pull/.ssh/authorized_keys` as the pull account and, with a key
+  line there, whether the installed `/usr/local/sbin/propolis-backup-serve` logs its served line;
+  and reads the `step` of `backup-status/last-failure`. New records, each on the second pass in a row unless
+  said: `spool-quiet` (ACT, `ship` stage) for a listed collector whose spool has not been written
+  for longer than twice the longest gap of its week, never under half an hour, once that week is a
+  day old and the gateway has been up fifteen minutes, held by a `manual` maintenance marker;
+  `gateway-dup` (ACT, on first sight) for the gateway's line that it dropped a rebuilt batch, keyed
+  by the collector's opaque id (or `unlisted`), with the records it counted lost; on a collector,
+  `ship-failing` (ACT) for shipper errors on three light passes in a row and the NOTICE
+  `ship-dropped` for its dropped lines; `backup-hung` (ACT) for a backup run past three times the
+  last run's length and at least two hours; `push-failing` (ACT) when a scheduler runs the push,
+  the feed was published after the last push and that push is over six hours old (or, with no push
+  marker, the scheduler was seen six hours ago and a publish came since); `push-unscheduled` (ACT)
+  when a push is expected and nothing runs it; the NOTICE `push-off` when the feed is on, nothing
+  runs the push and none is expected, which a host that never set up the public push now shows;
+  the NOTICE `backup-retention` for fewer scheduled sets than `PROPOLIS_BACKUP_KEEP` while the
+  oldest is older than KEEP days; and the NOTICE `backup-offhost` when a pull is configured and a
+  scheduled set has waited over 72 hours for it: one made after the later of the last served line
+  and the first hourly pass that saw the pull configured, so a pull that already holds the newest
+  set opens nothing, and one that never serves anything is reported three days after the first set
+  made under this release (while an older `backup-serve.sh` that logs no line is installed,
+  nothing opens). A failed backup folds under an open `db-unreachable` when its last step read
+  the database, and under the backup volume's record when it failed checking free space; one
+  unlisted spool names its collector by opaque id in `finding:spool-unlisted:all`. New `meta` keys:
+  `backup_dur`, `pull_last`, `pull_since`, `push_sched_since`, `backup_sets`. The walk fails the `publish` stage
+  on an open `push-failing`, a collector's `ship` row on `spool-quiet`, the collector's `ship` row
+  on `ship-failing` and the `backup` rail on `backup-hung`, warns on the `gateway` row for
+  `gateway-dup` and on the `backup` rail for `backup-retention` and `backup-offhost`, so `sudo
+  propolis-status` may exit `1` or `2` where it exited `0` before. `deploy/backup-serve.sh` now logs
+  one journal line per file it serves, `served <set> <file>` under the identifier
+  `propolis-backup-serve`; what it serves, refuses and exits with is unchanged, and so is a pull
+  when `logger` is missing. The alert library is version 8 (new journal classes); the witness needs
+  it. Nothing is pushed: no message goes to the ntfy server or anywhere else, and each transition
+  the new paging would send only adds one to the record's `would_push`.
+
 - **The witness's hourly pass now records the stores' free space, the database's state and
   changes not yet in force. Nothing is sent.** After the upgrade, each hourly pass (as root, before
   it takes the state lock) also: places every store on its filesystem with `stat` and runs one `df

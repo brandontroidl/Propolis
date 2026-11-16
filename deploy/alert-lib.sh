@@ -42,7 +42,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then echo "alert-lib.sh is sourced, not run" 
 # Raised by every change that adds a function or a field. Functions are only ever added and never
 # change meaning, so a newer library serves an older consumer. deploy/rollback.sh compares it with
 # the `# needs-alert-lib: <n>` line of each consumer before it restores an older library.
-PA_LIB_VERSION=7
+PA_LIB_VERSION=8
 # The optional env file of the shell senders; the deploy tests derive the sensors' denied set from
 # this name.
 PA_ALERT_ENV_NAME=alert.env
@@ -1768,6 +1768,11 @@ pa_heartbeat_get() {
 # text to its writer, so a reworded message fails the build instead of leaving its class blind.
 # The daemon class's order matters: its first text is the connect failure that ties the daemon's
 # failure to the database, its second the start line that says the last run connected after all.
+# So does the shipper class's: its first seven texts are lines it logs at ERROR when nothing is
+# being shipped (a failed connection; then a failed cycle, a batch it cannot record in its state
+# directory and a gateway that keeps answering Retry; then a rejected batch, a chain that
+# diverged, matched by a part of its text with no quote in it, and the line before every exit on a
+# permanent stop), the other three those it logs at WARN, which show only with RUST_LOG set.
 PA_JOURNAL_CLASSES='
 hook|deploy/alert.sh|; alert follows
 hook|deploy/alert.sh|still undelivered since
@@ -1777,6 +1782,18 @@ guard|deploy/logrotate-guard.sh|propolis-logrotate-guard: skipping rotation of
 daemon|crates/propolis/src/main.rs|propolis: failed to connect to PostgreSQL
 daemon|crates/propolis/src/main.rs|propolis: starting unified daemon
 journald|systemd|Suppressed
+gateway|crates/gateway/src/verify.rs|gateway: batch reuses the last accepted seq with different content
+shipper|crates/shipper/src/main.rs|shipper: failed to connect to gateway
+shipper|crates/shipper/src/main.rs|shipper: ship cycle IO error
+shipper|crates/shipper/src/client.rs|shipper: cannot record the batch about to be sent in the state directory
+shipper|crates/shipper/src/client.rs|gateway kept returning Retry past the consecutive-retry bound;
+shipper|crates/shipper/src/main.rs|shipper: gateway rejected a batch
+shipper|crates/shipper/src/main.rs|chain has diverged from the gateway
+shipper|crates/shipper/src/main.rs|shipper: ship loop terminated on a permanent stop condition
+shipper|crates/shipper/src/batcher.rs|shipper: dropping a line the origin policy refuses for this log
+shipper|crates/shipper/src/main.rs|shipper: this cycle dropped lines the origin policy refuses for this log
+shipper|crates/shipper/src/batcher.rs|shipper: dropping an over-length record that cannot fit a frame
+pull|deploy/backup-serve.sh|served
 '
 
 # pa_journal_patterns CLASS: the texts of CLASS, one per line, in the order listed. Status 1 for a

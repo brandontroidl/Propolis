@@ -265,7 +265,10 @@ anyone else. The ops monitor's `feed-push-stale` condition pages when the local
 feed has moved on from that marker by more than `FEED_STALE_MULTIPLE` build cycles
 (see [health and observability](health-and-observability.md)). Schedule it to run
 after a build interval so it never races the atomic swap; a run that does race it
-refuses that build and the next run publishes.
+refuses that build and the next run publishes. Run it at least every six hours, as the hourly
+entry above does: the root witness reports a push more than six hours behind a feed that has
+moved on as failing ([push-failing](health-and-observability.md#push-failing)), which a daily
+schedule would be for most of every day.
 
 ## Rotating secrets
 

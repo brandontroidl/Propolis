@@ -1,17 +1,21 @@
 # The root witness, one pass per instance: propolis-witness@light.service every five minutes from
 # propolis-witness@light.timer, propolis-witness@hourly.service once an hour from
 # propolis-witness@hourly.timer. deploy/witness.sh (installed as /usr/local/sbin/propolis-witness)
-# judges what the failure hook recorded and watches the units, the database, the daemon's /ready
-# and the journal itself (light), runs the installed config-check, asks the ntfy server whether
-# the alert topic can be read by anyone, samples the free space of every store, reads the
-# database's state and records the files that configure Propolis (hourly), records what it finds
-# in /var/lib/propolis/witness and writes the login banner. It sends no message: beside the read
-# check's GETs to the ntfy server and the read-only database sessions, the only request that
-# leaves the host is the optional heartbeat URL's GET.
+# judges what the failure hook recorded and watches the units, the database, the daemon's /ready,
+# the journal, the gateway spool's collectors and a backup run itself (light), runs the installed
+# config-check, asks the ntfy server whether the alert topic can be read by anyone, samples the
+# free space of every store, reads the database's state, records the files that configure
+# Propolis, and reads the public push's schedule and markers and the backup sets (hourly),
+# records what it finds in /var/lib/propolis/witness and writes the login banner. It sends no
+# message: beside the read check's GETs to the ntfy server and the read-only database sessions,
+# the only request that leaves the host is the optional heartbeat URL's GET.
 #
 # Root, with no account of its own: it reads 0600 env files, root-only journal fields, other
-# accounts' 0750 directories (as those accounts, through setpriv) and each Propolis unit's
-# /proc/<pid>/exe link (root's ptrace capability, kept since there is no capability bounding set).
+# accounts' 0750 directories (as those accounts, through setpriv: the gateway spool as the gateway
+# account, the feed's publish marker as the daemon's, the off-host pull's authorized_keys as the
+# pull account's) and each Propolis unit's /proc/<pid>/exe link (root's ptrace capability, kept
+# since there is no capability bounding set). All of these are reads, under /var/lib and
+# /var/spool, which ProtectSystem=strict leaves readable: they need no grant below.
 # The hourly pass runs config-check, which runs nft and ss, df on every store, and psql as the
 # postgres account through setpriv for SHOW data_directory (the same psql and wrapper as below);
 # the grant for the daemon binary (pg-exec) is for both passes' database sessions, which run psql

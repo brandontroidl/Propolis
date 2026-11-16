@@ -33,7 +33,15 @@
 # alert it could not deliver, and a failed failure hook, open alert-path, which resolves only on an
 # alert delivered after it opened; journald's notice that it dropped a Propolis unit's lines opens
 # journal-dropped; the rotation guard's lines are counted. A class's cursor moves on only once what
-# it read was judged and kept. Last, after the pass, the optional heartbeat URL
+# it read was judged and kept. On a control node or gateway it lists the gateway spool, as the
+# gateway account, and a collector PROPOLIS_SENSOR_LOGS lists whose spool has not been written for
+# longer than twice the longest gap of its week (at least half an hour, the week a day old, the
+# gateway up a quarter of an hour, no manual maintenance marker) opens spool-quiet, keyed by the
+# collector's opaque id; the gateway's line that it dropped a rebuilt batch opens gateway-dup; on a
+# collector the shipper's errors on three passes in a row open ship-failing and its dropped lines
+# ship-dropped; the backup pull's served line is kept as meta pull_last; and a backup run past
+# three times the last one's length (at least two hours) opens backup-hung. Last, after the pass,
+# the optional heartbeat URL
 # (PROPOLIS_WITNESS_HEARTBEAT_URL): one GET to an external dead-man check, made only after a pass
 # that was complete and clean and 30 minutes after the last one that was not; skipping it is the
 # signal.
@@ -59,7 +67,13 @@
 # db-locks), and once a day the local data directory as the postgres account. It hashes the files
 # that configure Propolis (of an env file only the whole content and its key names, never a
 # value) and opens change-pending for a unit running with an env file changed since it started,
-# needing a daemon reload, or running a binary since replaced.
+# needing a daemon reload, or running a binary since replaced. On a single box or control node it
+# reads whether anything runs the public push and the push and publish markers: a push over six
+# hours behind a feed that moved on opens push-failing, a push expected that nothing runs
+# push-unscheduled, and the feed on with no push at all the NOTICE push-off. It counts the
+# scheduled backup sets against PROPOLIS_BACKUP_KEEP (backup-retention), and with an off-host pull
+# configured, a set that has waited over three days for it opens backup-offhost. A failed backup folds
+# under db-unreachable or the backup volume's record by the step it failed in.
 # What the light pass and the failure hook recorded in the meantime is kept as they wrote it.
 #
 # WHAT HOLDS AN OPEN. No unit kind opens in the first ten minutes of uptime, while a maintenance
@@ -107,7 +121,9 @@
 # then against fixed strings; no line, nor any part of one, is kept or shown, only counted. The
 # daemon's /ready answer is taken only from a listener the kernel says the daemon holds, and is
 # judged by its status code and one fixed token; the database URL stays in the one process that
-# needs it.
+# needs it. A gateway spool name is used only once it is a plain id of a listed collector, and
+# then only through its opaque id; numbers read from files, programs and the journal are checked
+# as digits first.
 #
 # Exit status: 0 after every pass that ran, whatever it found; 2 a bad argument; 3 the alert
 # library is missing, not trusted, fails to load or is older than this script needs. Only those
@@ -118,10 +134,11 @@
 # PATH, so stubs win; PROPOLIS_WITNESS_NOW is the time as a WALL/BOOT/UP stamp;
 # PROPOLIS_WITNESS_LOCK_WAIT replaces the wait for the state lock; PROPOLIS_WITNESS_DEADLINE
 # replaces the 240 s (light) or 720 s (hourly) after which the pass judges nothing more;
-# PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end.
+# PROPOLIS_WITNESS_SOFT_DEADLINE replaces the 160 s by which every optional probe must end;
+# PROPOLIS_WITNESS_SPOOL_MAX replaces the 1024 entries one spool listing reads.
 #
 # The library version this script needs; deploy/rollback.sh reads the line below.
-# needs-alert-lib: 7
+# needs-alert-lib: 8
 
 umask 077
 WITNESS_SELF="${BASH_SOURCE[0]}"
@@ -155,6 +172,7 @@ if [ -z "$ROOT" ]; then
     # The library's own time and privilege seams must not reach a production run either.
     unset PA_TEST_WALL PA_TEST_BOOT PA_TEST_UP PA_TEST_READ_AS_SELF PA_TEST_UID PA_TEST_PROFILE
     unset PROPOLIS_WITNESS_NOW PROPOLIS_WITNESS_LOCK_WAIT PROPOLIS_WITNESS_DEADLINE PROPOLIS_WITNESS_SOFT_DEADLINE
+    unset PROPOLIS_WITNESS_SPOOL_MAX
 fi
 
 # ---- the alert library ----------------------------------------------------------------------
@@ -314,7 +332,10 @@ LOCK_WAIT=60
 # 5 s to ask who holds its port, 5 s for the account, 8 s for the GET and 5 s for its body, 23 s;
 # three journal classes at 30 s, 90 s, and 5 s each for the cursor and the kept lines, 15 s; the
 # failed alert units, two questions at 20 s, 40 s; the undelivered list and the delivered stamps,
-# 5 s each, 10 s; a changed target's read check, two targets of four GETs at 15 s, 120 s. 503 s in
+# 5 s each, 10 s; the collector spools, 5 s for the spool's owner, 5 s for the gateway account and
+# 10 s for the listing, 20 s; the gateway's, the shipper's and the backup pull's journal classes,
+# 5 s for the account and 45 s for the read each, 150 s; a changed target's read check, two
+# targets of four GETs at 15 s, 120 s. 673 s in
 # all, more than the deadline, so only the role, the spool listing, the sample and the guard's
 # journal (83 s) always run: every other probe starts only when its whole limit still ends by
 # WITNESS_SOFT_DEADLINE (below, 160 s), and one that cannot is unknown for the pass, which is then
@@ -328,14 +349,21 @@ if [ "$INSTANCE" = hourly ]; then
     # The programs an hourly pass always runs each have their own limit: config-check 300 s; the
     # read check of two targets, four GETs each at 15 s, 120 s; systemctl 20 s for the timer
     # sample and 40 s for the role's two questions; about ten small reads of 5 s, 50 s. 530 s.
-    # The reads of the stores, the database and the watched files come after them, and each
+    # The reads of the stores, the database, the watched files, the public push and the backups
+    # come after them, and each
     # starts only when its whole limit still ends by WITNESS_SOFT_DEADLINE (570 s here; one that
     # cannot is unknown for the pass): systemctl 20 s for the units' properties and 5 s for each
     # running unit's binary; pa_pg's 30 s with 2 s to be killed, 5 s to stat the daemon binary
     # and 30 s to find its guard when no light pass has; 5 s for the postgres account and 15 s
     # for its psql; 5 s to place each store and 10 s for each filesystem's df; 10 s for each
     # listing of the watched directories, 30 s for their hashes, 5 s for each env file's key
-    # names and 5 s for the binaries' stat. With the state lock's 120 s the pass ends by 690 s,
+    # names and 5 s for the binaries' stat; the push's scheduler, started only with 60 s left
+    # (5 s for each crontab and unit file it reads, 10 s for each timer it asks about, so a host
+    # with many files that each hang could pass it, as far as the unit's limit), 5 s for the
+    # push marker and 10 s for the publish marker as the
+    # daemon account; the backup sets' listing 10 s and their oldest date 5 s, 10 s for the pull
+    # account and its authorized_keys, 5 s for the serve script's text; for one unlisted spool, 25 s for the spool's listing and
+    # 5 s for each name's hash. With the state lock's 120 s the pass ends by 690 s,
     # inside 720 s. The local reads and writes of the state files have no limit of their own:
     # the library's `cat` and `stat` of each state file, pa_write's `sync`, and the ownership
     # checks' `stat` and `readlink` of each path. On a local disk they take milliseconds; what
@@ -405,7 +433,7 @@ spool_unit() {
 # ---- the systemd sample ---------------------------------------------------------------------
 
 declare -A S_LOAD=() S_ACT=() S_SUB=() S_RES=() S_NR=() S_STATUS=() S_AEM=() S_IEM=() S_FILE=()
-declare -A S_INV=() S_RESTART=() S_PID=() WANT=() _B=()
+declare -A S_INV=() S_RESTART=() S_PID=() S_EMS=() S_EME=() WANT=() _B=()
 SAMPLE_OK=0 SAMPLE_CAUSE=""
 SAMPLED=()
 # The rotation guard's reading of a failed propolis-logrotate.service run, taken with the sample.
@@ -433,6 +461,8 @@ commit_block() {
         S_INV[$id]="$(sample_word "${_B[InvocationID]:-}" '^[0-9a-f]{32}$')"
         S_RESTART[$id]="$(sample_word "${_B[Restart]:-}" '^[a-z-]{1,24}$')"
         S_PID[$id]="$(sample_word "${_B[MainPID]:-}" '^[1-9][0-9]{0,9}$')"
+        S_EMS[$id]="$(sample_word "${_B[ExecMainStartTimestampMonotonic]:-}" '^[0-9]{1,18}$')"
+        S_EME[$id]="$(sample_word "${_B[ExecMainExitTimestampMonotonic]:-}" '^[0-9]{1,18}$')"
         [ -n "${S_LOAD[$id]}" ] || S_LOAD[$id]="?"
     fi
     _B=()
@@ -452,7 +482,8 @@ parse_show() {
         case "$k" in
             Id | LoadState | ActiveState | SubState | Result | NRestarts | ExecMainStatus \
                 | ActiveEnterTimestampMonotonic | InactiveEnterTimestampMonotonic | UnitFileState \
-                | InvocationID | Restart | MainPID) _B[$k]="${line#*=}" ;;
+                | InvocationID | Restart | MainPID | ExecMainStartTimestampMonotonic \
+                | ExecMainExitTimestampMonotonic) _B[$k]="${line#*=}" ;;
         esac
     done <<< "$1"
     commit_block
@@ -590,11 +621,21 @@ unit_facts() {
 # down), `ready-code` the last /ready status, and `daemon` what the daemon was seen to be (ok,
 # down, activating, starting, degraded, dbcarried), each with how many passes in a row; and one
 # `seen:journal:<unit>` line per open journal-dropped record, the last pass that saw its line.
+#
+# For the collectors, the shipper and the gateway: `spool` the collector spools' listing and
+# `shipfail` the light passes in a row whose shipper journal held an ERROR line (error) or none
+# (ok); one `seen:gwdup:<id>` and `seen:shipdrop:local` line per open gateway-dup and
+# ship-dropped record, the last pass that saw its line, with the records the gateway counted lost
+# since the open in the place of the count. And one S line per listed collector:
+# `S <collector id> <last mtime> <last advance stamp> <longest gap s> <window start stamp>
+# <the window before's longest gap, or -> <advances in a row>`, the id the collector's opaque one.
+#
+# The hourly pass adds `push` and `backups`, its reads of the public push and of the backups.
 
 declare -A OBS_U=() OBS_R=() OBS_P=() NEW_U=() NEW_R=() JUDGED=()
 OBS_KEEP=()
-OBS_MINE_P=" units witness-hourly pg ready alertunit db ready-code daemon "
-[ "$INSTANCE" != hourly ] || OBS_MINE_P=" config-check readcheck witness-light volume pgstate changes "
+OBS_MINE_P=" units witness-hourly pg ready alertunit db ready-code daemon spool shipfail "
+[ "$INSTANCE" != hourly ] || OBS_MINE_P=" config-check readcheck witness-light volume pgstate changes push backups "
 
 # obs_mine NAME: the P line NAME belongs to this instance.
 obs_mine() {
@@ -630,6 +671,14 @@ load_observe() {
         case "$t" in
             U) pa_unit_name_ok "$name" && OBS_U[$name]="${rest:-}" ;;
             R) pa_unit_name_ok "$name" && OBS_R[$name]="${rest:-}" ;;
+            S)
+                # The collectors' lines are the light pass's; the hourly pass keeps them as read.
+                if [ "$INSTANCE" = light ]; then
+                    [[ $name =~ ^c[0-9a-f]{5,8}$ ]] && OBS_S[$name]="${rest:-}"
+                else
+                    OBS_KEEP+=("$line")
+                fi
+                ;;
             P)
                 if obs_mine "$name"; then
                     OBS_P[$name]="${rest:-}"
@@ -665,6 +714,19 @@ observe_body() {
         [ "$ok" = 0 ] || printf '%s\n' "$line"
     done
     for u in "${!OBS_P[@]}"; do printf 'P\t%s\t%s\n' "$u" "${OBS_P[$u]}"; done
+    # The collectors' lines: what this pass judged, or every line as read.
+    if [ "$INSTANCE" = light ]; then
+        if [ "$SPOOL_JUDGED" = 1 ]; then
+            for u in "${!NEW_S[@]}"; do printf 'S\t%s\t%s\n' "$u" "${NEW_S[$u]}"; done
+        else
+            for u in "${!OBS_S[@]}"; do printf 'S\t%s\t%s\n' "$u" "${OBS_S[$u]}"; done
+        fi | while IFS= read -r line; do
+            IFS=$'\t' read -r -a fields <<< "$line"
+            ok=1
+            for f in "${fields[@]}"; do pa_ok_field "$f" || ok=0; done
+            [ "$ok" = 0 ] || printf '%s\n' "$line"
+        done
+    fi
     # The hourly pass's samples of the stores and hashes of the watched files: what it judged, or,
     # when it judged nothing, every line as read.
     if [ "$INSTANCE" = hourly ]; then
@@ -1643,7 +1705,7 @@ cc_findings() {
         case "${T_ELIG[$id]:-}" in page | daily) ;; *) continue ;; esac
         if [ "$id" = spool-unlisted ]; then
             key=finding:spool-unlisted:all
-            CC_FOLD_N=$((CC_FOLD_N + 1))
+            CC_FOLD_N=$((CC_FOLD_N + 1)) CC_FOLD_K12="$k12"
         else
             key="finding:$id:$k12"
         fi
@@ -1908,7 +1970,7 @@ cc_unknown_for() {
 # an open one changes nothing and its clean count starts again, a pending one is dropped, since
 # its next sighting would not be on the next run.
 judge_findings() {
-    local key id line state n parent daily
+    local key id line state n parent daily inst
     local -a keys=()
     for key in "${!CC_PRESENT[@]}"; do
         past_deadline && return 1
@@ -1954,8 +2016,12 @@ judge_findings() {
         if [ "$key" = finding:spool-unlisted:all ] && pa_incident_get "$key"; then
             n="$CC_FOLD_N"
             [ "$n" -lt "$WITNESS_SPOOL_REPORTED" ] || n="$WITNESS_SPOOL_REPORTED+"
-            if [ "${PA_INC[34]}" != "$n" ]; then
-                PA_INC[34]="$n"
+            # One unlisted collector is named by its opaque id; several, or one whose spool could
+            # not be matched, by none.
+            inst=-
+            [ "$CC_FOLD_N" != 1 ] || [ -z "$UNLISTED_CID" ] || inst="$UNLISTED_CID"
+            if [ "${PA_INC[34]}" != "$n" ] || [ "${PA_INC[5]}" != "$inst" ]; then
+                PA_INC[34]="$n" PA_INC[5]="$inst"
                 rec_set
             fi
         fi
@@ -2040,7 +2106,7 @@ judge_cc_run() {
 }
 
 declare -A FIDS=() DOWN_STATE=()
-BACKUP_FAILED_LAST=0 CC_FAIL=0 STREAK_N=0
+BACKUP_FAILED_LAST=0 BACKUP_FAIL_MT="" CC_FAIL=0 STREAK_N=0
 
 # hourly_ids: opaque ids for the instances a finding can name: every unit the light pass samples
 # and every log label of PROPOLIS_SENSOR_LOGS.
@@ -2075,11 +2141,16 @@ hourly_sample() {
 }
 
 # backup_failed_last: the backup's last-failure is newer than its last-success (both written by
-# root, deploy/backup.sh); an mtime that cannot be read says no.
+# root, deploy/backup.sh); an mtime that cannot be read says no. Sets BACKUP_STEP too, and
+# BACKUP_FAIL_MT, when the failure was written, for the fold ties to place it against a parent.
 backup_failed_last() {
     local d="$ROOT/var/lib/propolis/backup-status" f s
-    BACKUP_FAILED_LAST=0
+    BACKUP_FAILED_LAST=0 BACKUP_STEP="" BACKUP_FAIL_MT=""
     [ -f "$d/last-failure" ] && [ ! -L "$d/last-failure" ] || return 0
+    # The step the run failed in, for the backup's fold ties: a plain JSON string, as the walk
+    # reads it, and only ever compared with backup.sh's own fixed steps.
+    s="$(timeout 5 head -c 4096 -- "$d/last-failure" 2> /dev/null | LC_ALL=C tr -d '\000')" || s=""
+    if [[ $s =~ \"step\"[[:space:]]*:[[:space:]]*\"([^\"\\]{0,200})\" ]]; then BACKUP_STEP="${BASH_REMATCH[1]}"; fi
     f="$(timeout 5 stat -c %Y -- "$d/last-failure" 2> /dev/null)" || return 0
     [[ $f =~ ^[0-9]{1,12}$ ]] || return 0
     if [ -f "$d/last-success" ] && [ ! -L "$d/last-success" ]; then
@@ -2087,7 +2158,7 @@ backup_failed_last() {
         [[ $s =~ ^[0-9]{1,12}$ ]] || return 0
         [ "$((10#$f))" -gt "$((10#$s))" ] || return 0
     fi
-    BACKUP_FAILED_LAST=1
+    BACKUP_FAILED_LAST=1 BACKUP_FAIL_MT=$((10#$f))
 }
 
 # ---- the hourly pass's stores, database and changes -------------------------------------------
@@ -2362,6 +2433,8 @@ vol_sample() {
         # Not a directory: not a store on this host.
         [[ $dev =~ ^[0-9]{1,20}$ ]] && [ "$type" = directory ] || continue
         [ "${PA_VOL_STORE_LOG[$i]}" != 1 ] || LOG_DEVS+="$dev "
+        # The backup directory's filesystem, for the fold of a backup refused for want of space.
+        [ "$p" != "$BK_DIR" ] || BACKUP_DEV="$dev"
         [ -z "${at[$dev]:-}" ] || continue
         at[$dev]=1
         VOL_DEV+=("$dev") VOL_PATH+=("$p") VOL_AS+=("$as") VOL_OK+=(0) VOL_TARGET+=("") VOL_SIZE+=("")
@@ -2978,11 +3051,18 @@ check_result() {
     CHK_RESULT[$1]="$2" CHK_CAUSE[$1]="$3"
 }
 
-# account_uid NAME: the uid of a local account, or failure when there is none.
+# account_uid NAME: the uid of a local account. Status 1 only when id says there is no such
+# account (its own status 1); 2 when the lookup failed otherwise (cut off by its time limit, a
+# name service that did not answer) or answered out of form, since not knowing is not "none".
 account_uid() {
-    local u
-    u="$(timeout 5 id -u -- "$1" 2> /dev/null)" || return 1
-    [[ $u =~ ^[0-9]{1,10}$ ]] || return 1
+    local u rc=0
+    u="$(timeout 5 id -u -- "$1" 2> /dev/null)" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
+    [[ $u =~ ^[0-9]{1,10}$ ]] || return 2
     printf '%s' "$((10#$u))"
 }
 
@@ -3351,13 +3431,14 @@ jcursor_get() {
 # jclass_read CLASS MODE MATCH...: the entries of CLASS's journal (MATCH, fields journald sets)
 # since its stored cursor, or the last 15 minutes without one, filtered first and only then cut:
 # the fixed-string grep (MODE cat) or hook_records (MODE json) keeps only lines that carry a
-# pattern, and those are cut to 1 MiB and 400 bytes a line into J_LINES. journalctl reads to the
-# end of the entries either way, so a flood of other lines from the same unit costs read time,
-# never a pattern line or the cursor's progress. journalctl writes its cursor into a private
-# file, read back here only in a cursor's form, for jcursor_store to keep. A read that timed out
-# or failed is unknown for the pass and its cursor is not taken.
+# pattern, and those are cut to 400 bytes a line into J_LINES. journalctl reads to the end of the
+# entries either way, so a flood of other lines from the same unit costs read time, never a
+# pattern line or the cursor's progress. journalctl writes its cursor into a private file, read
+# back here only in a cursor's form, for jcursor_store to keep. A read that timed out or failed,
+# or whose kept lines pass 1 MiB (a flood of pattern lines), is unknown for the pass and its
+# cursor is not taken.
 jclass_read() {
-    local class="$1" mode="$2" cur tmpc tmpo st0="" st1="" c p
+    local class="$1" mode="$2" cur tmpc tmpo st0="" st1="" c p sz
     local -a pats=() gr=() cargs=()
     shift 2
     J_RESULT[$class]=unknown J_NEWCUR[$class]="" J_LINES[$class]=""
@@ -3400,6 +3481,14 @@ jclass_read() {
             126 | 127) check_result "journal:$class" unknown tool.exec ;;
             *) check_result "journal:$class" unknown unknown ;;
         esac
+        rm -f -- "$tmpc" "$tmpo" 2> /dev/null
+        return 0
+    fi
+    # Kept lines past the cap would be cut off unseen, a writer's ERROR line after a flood of its
+    # WARN lines among them: such a read is not whole, so it is unknown and its cursor not taken.
+    sz="$(timeout 5 stat -c %s -- "$tmpo" 2> /dev/null)" || sz=""
+    if ! [[ $sz =~ ^[0-9]{1,15}$ ]] || [ "$sz" -gt 1048576 ]; then
+        check_result "journal:$class" unknown unknown
         rm -f -- "$tmpc" "$tmpo" 2> /dev/null
         return 0
     fi
@@ -3518,7 +3607,8 @@ undelivered_count() {
 # light_probes: everything the light pass's checks read, before the lock, in order: the database
 # first (light_pass runs it before the sample), then the daemon's last run while the database is
 # down, /ready, the journal classes, the failed failure hooks, the undelivered list and the
-# delivered stamps.
+# delivered stamps, then the collector spools and the classes of the gateway, the shipper and
+# the backup pull.
 light_probes() {
     daemon_tie
     ready_probe
@@ -3528,6 +3618,10 @@ light_probes() {
     alertunit_read
     undelivered_count
     delivered_last
+    spool_probe
+    gateway_probe
+    shipper_probe
+    pull_probe
 }
 
 # ---- the light pass's judgement of its probes -------------------------------------------------
@@ -4057,7 +4151,7 @@ JSKIP_NEW=""
 journal_restarts() {
     local c consec
     J_DROP=() JSKIP_NEW=""
-    for c in hook guard journald; do
+    for c in hook guard journald gateway shipper pull; do
         [ "${J_RESULT[$c]:-}" = unknown ] || continue
         IFS=$'\t' read -r _ _ _ consec _ <<< "${OBS_P[journal:$c]:-}"
         [[ ${consec:-} =~ ^[0-9]{1,9}$ ]] && [ "$((10#$consec))" -ge 2 ] || continue
@@ -4101,6 +4195,8 @@ jcursor_store() {
 # judge_probes: the probes' transitions, before any unit is judged: the database first, so the
 # daemon's record knows whether its failure is the database's.
 judge_probes() {
+    # The spool listing's line of the pass before, which probe_counts is about to replace.
+    SPOOL_PREV="${OBS_P[spool]:-}"
     probe_counts
     judge_db
     daemon_observe
@@ -4108,6 +4204,11 @@ judge_probes() {
     hook_counts
     judge_alert_path
     judge_journald
+    judge_spools
+    judge_gateway
+    judge_shipper
+    judge_pull
+    judge_backup_run
     journal_tally
     journal_restarts
 }
@@ -4247,6 +4348,1062 @@ hb_send() {
     return 0
 }
 
+# ---- the collectors, the shipper, the gateway and the backup run (light pass) ----------------
+#
+# What the gateway spool holds and what the gateway, the shipper and the backup pull's forced
+# command log. The spool's directory names are collector ids a remote party chose when it
+# enrolled, so a name is used only once pa_plain_id takes it and PROPOLIS_SENSOR_LOGS lists that
+# collector's spool, and a record or an observe line names a collector by its opaque id alone. A
+# directory nobody listed is config-check's spool-unlisted finding, never a record here.
+
+# How many spool entries one listing reads: a gateway account that makes more cannot make a pass
+# read without end, and a listed collector past them is unknown for the pass (the check `spool`
+# says so), never quiet and never gone.
+WITNESS_SPOOL_MAX=1024
+if [ -n "$ROOT" ] && [[ ${PROPOLIS_WITNESS_SPOOL_MAX:-} =~ ^[0-9]{1,4}$ ]]; then
+    WITNESS_SPOOL_MAX="$((10#$PROPOLIS_WITNESS_SPOOL_MAX))"
+fi
+GW_SPOOL=/var/spool/propolis/gateway
+COLL_TRIED=0 COLL_OK=0
+declare -A CN_ID=() CN_ALL=() SL_MT=() OBS_S=() NEW_S=() SEEN_NOW=()
+SL_OK=0 SL_BOUND=0 SL_TRIED=0 SL_CAUSE=unknown SPOOL_RESULT=skip SPOOL_JUDGED=0 SPOOL_PREV=""
+
+# gw_spool_dir: GW_SPOOL, the gateway's spool from PROPOLIS_GATEWAY_SPOOL_DIR in gateway.env, its
+# default when unset or out of form, as pa_vol_stores takes it. Status 1 when gateway.env cannot
+# be read: where the spool is is then unknown.
+gw_spool_dir() {
+    GW_SPOOL=/var/spool/propolis/gateway
+    pa_env_get PROPOLIS_GATEWAY_SPOOL_DIR "$PA_ENV_DIR/gateway.env" > /dev/null
+    if [ -n "$PA_ENV_UNREADABLE" ]; then
+        PA_ENV_VALUE=""
+        return 1
+    fi
+    if [ "$PA_ENV_COMPLEX" = 0 ] && path_ok "$PA_ENV_VALUE"; then GW_SPOOL="$PA_ENV_VALUE"; fi
+    PA_ENV_VALUE=""
+    return 0
+}
+
+# collectors_load: the collectors PROPOLIS_SENSOR_LOGS lists, the ones whose path is
+# `<spool>/<id>/events.jsonl` (config-check's own test of a listed spool), each with its opaque id
+# in CN_ID, and every collector of the spool listing (spool_list) with its id in CN_ALL. The ids
+# come from one pa_id_table call over every listed name and every name in the spool, the input the
+# walk gives it too: pa_id_table widens two colliding ids within its input, so a narrower one here
+# would key a collector by an id the walk does not show. COLL_OK is 1 once every collector is
+# keyed. Status 1 when an env file could not be read, the spool could not be listed, or there is
+# no salt yet to key an id by (the first pass of a fresh host takes the salt under the lock, after
+# this has run): a collector's line can then not be told from an unlisted one's, and no spool is
+# judged.
+collectors_load() {
+    local p cn input="" id kind name
+    local -a named=()
+    local -A fed=()
+    COLL_TRIED=1 COLL_OK=0 CN_ID=() CN_ALL=()
+    gw_spool_dir || return 1
+    pa_env_get PROPOLIS_SENSOR_LOGS "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    if [ -n "$PA_ENV_UNREADABLE" ]; then
+        PA_ENV_VALUE=""
+        return 1
+    fi
+    pa_sensor_logs "$PA_ENV_VALUE"
+    PA_ENV_VALUE=""
+    for p in "${PA_LOG_PATH[@]}"; do
+        case "$p" in "$GW_SPOOL"/*/events.jsonl) ;; *) continue ;; esac
+        cn="${p#"$GW_SPOOL"/}"
+        cn="${cn%/events.jsonl}"
+        pa_plain_id "$cn" || continue
+        named+=("$cn")
+    done
+    spool_list
+    [ "$SL_OK" = 1 ] || return 1
+    for cn in "${named[@]}" "${!SL_MT[@]}"; do
+        [ -z "${fed[$cn]:-}" ] || continue
+        fed[$cn]=1
+        input+="collector"$'\t'"$cn"$'\n'
+    done
+    if [ -n "$input" ]; then
+        while IFS=$'\t' read -r id kind name; do
+            [ "$kind" = collector ] && [[ $id =~ ^c[0-9a-f]{5,8}$ ]] && pa_plain_id "$name" && CN_ALL[$name]="$id"
+        done < <(printf '%s' "$input" | pa_id_table 2> /dev/null)
+        [ "${#CN_ALL[@]}" = "${#fed[@]}" ] || return 1
+    fi
+    for cn in "${named[@]}"; do CN_ID[$cn]="${CN_ALL[$cn]}"; done
+    COLL_OK=1
+    return 0
+}
+
+# spool_list: the spool file of each collector directory in GW_SPOOL, `<id>/events.jsonl`, with its
+# modification time in whole seconds in SL_MT, by one find, NUL-separated, read as the gateway
+# account when the spool is that account's (it can put a link or a FIFO where root would then
+# look), at most WITNESS_SPOOL_MAX entries: a collector past them is missing from SL_MT, and
+# SL_BOUND says so, so that a missing collector is unknown rather than one with no spool file.
+# Only names pa_plain_id takes are kept. SL_OK is 1 when the listing completed, reached its bound
+# or found no spool at all; SL_CAUSE says why not.
+spool_list() {
+    local dir="$ROOT$GW_SPOOL" as="" owner gw ent t rest cn n=0 st=""
+    SL_OK=0 SL_BOUND=0 SL_TRIED=1 SL_CAUSE=unknown SL_MT=()
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        SL_OK=1
+        return 0
+    fi
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
+    fits 25 || return 0
+    owner="$(timeout 5 stat -c %u -- "$dir" 2> /dev/null)" || return 0
+    [[ $owner =~ ^[0-9]{1,10}$ ]] || return 0
+    if gw="$(account_uid propolis-gateway)" && [ "$((10#$owner))" = "$gw" ]; then as=propolis-gateway; fi
+    while IFS= read -r -d '' ent; do
+        # A name holds no slash: the status line can never be an entry's.
+        case "$ent" in
+            /status=*)
+                st="${ent#/status=}"
+                continue
+                ;;
+        esac
+        n=$((n + 1))
+        if [ "$n" -gt "$WITNESS_SPOOL_MAX" ]; then
+            st=bound
+            break
+        fi
+        t="${ent%% *}" rest="${ent#* }"
+        [[ $t =~ ^([0-9]{1,12})(\.[0-9]*)?$ ]] || continue
+        t="${BASH_REMATCH[1]}"
+        cn="${rest%/events.jsonl}"
+        if [ "$rest" = "$cn/events.jsonl" ] && pa_plain_id "$cn"; then SL_MT[$cn]=$((10#$t)); fi
+    done < <(
+        if [ -n "$as" ]; then
+            _pa_as_t 10 "$as" find "$dir" -mindepth 2 -maxdepth 2 -name events.jsonl -type f -printf '%T@ %P\0'
+        else
+            timeout 10 find "$dir" -mindepth 2 -maxdepth 2 -name events.jsonl -type f -printf '%T@ %P\0' 2> /dev/null
+        fi
+        printf '/status=%s\0' "$?"
+    )
+    case "$st" in
+        0) SL_OK=1 ;;
+        bound) SL_OK=1 SL_BOUND=1 ;;
+        126 | 127) SL_CAUSE=tool.exec ;;
+    esac
+    [ "$SL_OK" = 1 ] || SL_MT=()
+}
+
+# spool_probe: on a control node or a gateway, the listed collectors and their spool files, before
+# the lock. The listing's result is the check `spool`: unknown too when it reached its bound
+# before a listed collector, though the collectors it did reach are still judged.
+spool_probe() {
+    local cn
+    SPOOL_RESULT=skip
+    case "${PA_ROLE:-}" in control | gateway) ;; *) return 0 ;; esac
+    SPOOL_RESULT=unknown
+    if ! fits 25; then
+        check_result spool unknown unknown
+        return 0
+    fi
+    SL_TRIED=0
+    if ! collectors_load; then
+        if [ "$SL_TRIED" = 1 ] && [ "$SL_OK" != 1 ]; then
+            check_result spool unknown "$SL_CAUSE"
+        else
+            check_result spool unknown unknown
+        fi
+        return 0
+    fi
+    SPOOL_RESULT=ok
+    if [ "$SL_BOUND" = 1 ]; then
+        for cn in "${!CN_ID[@]}"; do
+            if [ -z "${SL_MT[$cn]:-}" ]; then
+                check_result spool unknown unknown
+                return 0
+            fi
+        done
+    fi
+    check_result spool ok -
+}
+
+# gateway_probe, shipper_probe, pull_probe: the journal classes of the gateway's duplicate line, the
+# shipper's ERROR and WARN lines and the backup pull's served line, each read by the uid of its
+# account (journald takes it from the socket's credentials, so no other account can write as
+# that one) and its unit or the serve script's fixed identifier. Each runs only where its writer
+# is: the gateway unit known to systemd; on a collector, the shipper unit; the serve script
+# installed. An account that does not exist skips its class.
+gateway_probe() {
+    local u=gateway.service uid
+    [ "$SAMPLE_OK" = 1 ] && [ -n "${S_LOAD[$u]:-}" ] && [ "${S_LOAD[$u]}" != not-found ] \
+        && [ "${S_LOAD[$u]}" != "?" ] || return 0
+    if ! fits 50; then
+        check_result journal:gateway unknown unknown
+        return 0
+    fi
+    uid="$(account_uid propolis-gateway)" || return 0
+    [ "$COLL_TRIED" = 1 ] || collectors_load || true
+    # Until the collectors are keyed a listed collector's line cannot be told from an unlisted
+    # one's: the class waits, its cursor where it was, for a pass that can read it whole.
+    if [ "$COLL_OK" != 1 ]; then
+        check_result journal:gateway unknown unknown
+        return 0
+    fi
+    jclass_read gateway cat _SYSTEMD_UNIT=gateway.service "_UID=$uid"
+}
+
+shipper_probe() {
+    local u=shipper.service uid
+    [ "${PA_ROLE:-}" = collector ] || return 0
+    [ "$SAMPLE_OK" = 1 ] && [ -n "${S_LOAD[$u]:-}" ] && [ "${S_LOAD[$u]}" != not-found ] \
+        && [ "${S_LOAD[$u]}" != "?" ] || return 0
+    if ! fits 50; then
+        check_result journal:shipper unknown unknown
+        return 0
+    fi
+    uid="$(account_uid propolis-shipper)" || return 0
+    jclass_read shipper cat _SYSTEMD_UNIT=shipper.service "_UID=$uid"
+}
+
+pull_probe() {
+    local uid
+    case "${PA_ROLE:-}" in collector | gateway) return 0 ;; esac
+    [ -f "$ROOT/usr/local/sbin/propolis-backup-serve" ] || return 0
+    if ! fits 50; then
+        check_result journal:pull unknown unknown
+        return 0
+    fi
+    uid="$(account_uid propolis-backup-pull)" || return 0
+    jclass_read pull cat "_UID=$uid" SYSLOG_IDENTIFIER=propolis-backup-serve
+}
+
+# judge_spools: spool-quiet (ACT, the ship stage) on spool:<collector id> for a listed collector
+# whose spool was last written longer ago than max(1800 s, twice the longest gap between two of
+# its writes in the current week), on two passes in a row. The week must be at least a day old,
+# or follow a week whose longest gap is known: one night of a quiet honeypot is not a fault. Not
+# opened while the gateway has been up under fifteen minutes (it has not heard from a collector
+# yet), nor under a maintenance marker whose reason is manual, which is how an operator says a
+# collector is off on purpose; such a sighting waits, pending. The spool written on two passes in
+# a row resolves it (spool2); a collector taken off the list resolves disabled. A listing that
+# could not be made judges nothing, nor does one that reached its bound before a collector: a
+# pending record is dropped and an open one stays. A collector whose spool file is gone (the
+# gateway makes it again only on the next batch it accepts) is judged from the last write its S
+# line holds; one never written has nothing to judge. A modification time ahead of the clock is
+# no write this pass can place: neither quiet nor an advance, it leaves the S line as it was, so
+# one bad time cannot widen the week's longest gap and blind the threshold. For the same reason
+# the longest gap takes only a gap nobody was told of, seen from one pass to the next: the write
+# that ends a quiet time whose record is pending or open is not learnt, nor is the first write
+# seen after passes that did not list the spool.
+judge_spools() {
+    local cn cid key line lastm lastadv maxgap ws prevgap advn mt wsage quiet eff thr gap ok hold=""
+    local watched=0 pst pres learn
+    local -A listed=()
+    local -a keys=()
+    [ "$SPOOL_RESULT" != skip ] || return 0
+    # Whether the pass before listed the spool too (its line of the check `spool`, as it was
+    # before this pass counted its own): only then does the distance between two writes say how
+    # long a collector was quiet, and not how long nobody looked.
+    IFS=$'\t' read -r pst pres _ <<< "$SPOOL_PREV"
+    if [ "${pres:-}" = ok ] && _pa_stamp_split "${pst:-}"; then
+        gap="$(pa_age "$pst")"
+        if [ "$gap" -ge 0 ] && [ "$gap" -le 900 ]; then watched=1; fi
+    fi
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ <<< "$line"
+        [[ $key == spool:* ]] && keys+=("$key")
+    done
+    if [ "$SPOOL_RESULT" != ok ]; then
+        for key in "${keys[@]}"; do absent_unknown "$key"; done
+        return 0
+    fi
+    unit_facts gateway.service
+    if [ "$F_ACTIVE" != active ] || [ "$F_UP" = - ] || [ "$F_UP" -lt 900 ]; then hold=gateway; fi
+    if [ "$MAINT" = 1 ] && [ "$MAINT_REASON" = manual ]; then hold=maint; fi
+    for cn in "${!CN_ID[@]}"; do
+        cid="${CN_ID[$cn]}" key="spool:${CN_ID[$cn]}"
+        listed[$cid]=1
+        lastm="" lastadv="" maxgap="" ws="" prevgap="" advn=""
+        IFS=$'\t' read -r lastm lastadv maxgap ws prevgap advn _ <<< "${OBS_S[$cid]:-}"
+        mt="${SL_MT[$cn]:-}"
+        # Past the listing's bound a collector is unknown, not gone, and one never written has
+        # nothing to judge it by; one whose spool file is gone is quiet since the last write seen.
+        if [ -z "$mt" ] && { [ "$SL_BOUND" = 1 ] || ! [[ $lastm =~ ^[0-9]{1,12}$ ]]; }; then
+            [ -z "${OBS_S[$cid]:-}" ] || NEW_S[$cid]="${OBS_S[$cid]}"
+            absent_unknown "$key"
+            continue
+        fi
+        [ -n "$mt" ] || mt=$((10#$lastm))
+        # A time ahead of the clock is no write this pass can place: neither quiet nor an advance.
+        if [ "$mt" -gt "$((10#$PA_WALL + 300))" ]; then
+            [ -z "${OBS_S[$cid]:-}" ] || NEW_S[$cid]="${OBS_S[$cid]}"
+            two_pass "$key" 0 ""
+            continue
+        fi
+        if [[ $lastm =~ ^[0-9]{1,12}$ ]]; then lastm=$((10#$lastm)); else lastm=""; fi
+        if [[ $maxgap =~ ^[0-9]{1,12}$ ]]; then maxgap=$((10#$maxgap)); else maxgap=0; fi
+        if [[ $prevgap =~ ^[0-9]{1,12}$ ]]; then prevgap=$((10#$prevgap)); else prevgap=-; fi
+        if [[ $advn =~ ^[0-9]{1,9}$ ]]; then advn=$((10#$advn)); else advn=0; fi
+        _pa_stamp_split "$lastadv" || lastadv=-
+        # A window whose start cannot be read, or lies ahead of the clock, starts again now.
+        if ! _pa_stamp_split "$ws" || [ "$(pa_age "$ws")" -lt 0 ]; then
+            ws="$PA_STAMP" maxgap=0 prevgap=-
+        fi
+        wsage="$(pa_age "$ws")"
+        if [ "$wsage" -gt 604800 ]; then
+            prevgap="$maxgap" maxgap=0 ws="$PA_STAMP" wsage=0
+        fi
+        if [ -z "$lastm" ]; then
+            lastm="$mt" lastadv="$PA_STAMP" advn=0
+        elif [ "$mt" -gt "$lastm" ]; then
+            gap=$((mt - lastm))
+            # No gap is longer than the window it is kept for.
+            [ "$gap" -le 604800 ] || gap=604800
+            # A gap is learnt only as a quiet time nobody was told of: not one whose record is
+            # pending or open (an outage would raise the threshold its successor is held to), and
+            # not one that spans a time the spool was not listed.
+            learn="$watched"
+            if pa_incident_get "$key"; then
+                case "${PA_INC[7]}" in pending | open | acked) learn=0 ;; esac
+            fi
+            [ "$learn" = 0 ] || [ "$gap" -le "$maxgap" ] || maxgap="$gap"
+            lastm="$mt" lastadv="$PA_STAMP" advn=$((advn + 1))
+            [ "$advn" -le 999999 ] || advn=999999
+        else
+            [ "$mt" -ge "$lastm" ] || lastm="$mt"
+            advn=0
+        fi
+        NEW_S[$cid]="$lastm"$'\t'"$lastadv"$'\t'"$maxgap"$'\t'"$ws"$'\t'"$prevgap"$'\t'"$advn"
+        ok=0 eff="$maxgap"
+        [ "$wsage" -lt 86400 ] || ok=1
+        if [ "$wsage" -lt 86400 ] && [ "$prevgap" != - ]; then
+            ok=1
+            [ "$prevgap" -le "$eff" ] || eff="$prevgap"
+        fi
+        # A modification time ahead of the clock is never quiet.
+        quiet=$((10#$PA_WALL - mt))
+        thr=$((2 * eff))
+        [ "$thr" -ge 1800 ] || thr=1800
+        rec_attrs spool-quiet ACT ship spool.quiet
+        PA_REC_INST="$cid"
+        if [ "$ok" = 1 ] && [ "$quiet" -gt "$thr" ]; then
+            two_pass "$key" 1 "$hold"
+        else
+            two_pass "$key" 0 ""
+            [ "$advn" -lt 2 ] || resolve_if "$key" 1 spool2
+        fi
+    done
+    for key in "${keys[@]}"; do
+        [ -z "${listed[${key#spool:}]:-}" ] || continue
+        pa_incident_get "$key" || continue
+        case "${PA_INC[7]}" in
+            open | acked)
+                PA_REC_PROOF=disabled
+                pa_incident_transition "$key" resolve && rec_set
+                ;;
+            pending) pa_incident_transition "$key" drop && rec_set ;;
+        esac
+    done
+    SPOOL_JUDGED=1
+}
+
+# quiet24_sweep PREFIX: the open records whose key starts with PREFIX and whose line was not seen
+# on this pass resolve quiet24 once a day has passed since the last pass that saw it (OBS_P
+# seen:<key>, else when it opened); a time that cannot be read is never a day ago. A seen line
+# whose record is no longer open goes.
+quiet24_sweep() {
+    local prefix="$1" line key s a
+    local -a keys=()
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r _ _ key _ <<< "$line"
+        [[ $key == "$prefix"* ]] && keys+=("$key")
+    done
+    for key in "${keys[@]}"; do
+        [ -z "${SEEN_NOW[$key]:-}" ] || continue
+        pa_incident_get "$key" || continue
+        case "${PA_INC[7]}" in open | acked) ;; *) continue ;; esac
+        IFS=$'\t' read -r s _ <<< "${OBS_P[seen:$key]:-}"
+        _pa_stamp_split "${s:-}" || s="${PA_INC[9]}"
+        a="$(pa_age "$s")"
+        if [ "$a" -ge 86400 ]; then
+            PA_REC_PROOF=quiet24
+            pa_incident_transition "$key" resolve && rec_set
+        fi
+    done
+    for key in "${!OBS_P[@]}"; do
+        [[ $key == "seen:$prefix"* ]] || continue
+        if pa_incident_get "${key#seen:}"; then
+            case "${PA_INC[7]}" in open | acked) continue ;; esac
+        fi
+        unset 'OBS_P[$key]'
+    done
+}
+
+# seen_count KEY N: KEY's line seen on this pass, with N more records counted lost since its open
+# (the earlier count kept while the record stays open).
+seen_count() {
+    local prev=0 c
+    if pa_incident_get "$1"; then
+        case "${PA_INC[7]}" in
+            open | acked)
+                IFS=$'\t' read -r _ _ _ c _ <<< "${OBS_P[seen:$1]:-}"
+                [[ ${c:-} =~ ^[0-9]{1,9}$ ]] && prev=$((10#$c))
+                ;;
+        esac
+    fi
+    prev=$((prev + $2))
+    [ "$prev" -le 999999999 ] || prev=999999999
+    SEEN_NOW[$1]=1
+    OBS_P[seen:$1]="$PA_STAMP"$'\t'ok$'\t'-$'\t'"$prev"
+}
+
+# judge_gateway: gateway-dup (ACT, the gateway stage) on first sight of the gateway's line that a
+# batch reused the last accepted sequence number with other content and was not stored. Its
+# collector_id names the record only when it is a listed collector (gwdup:<opaque id>); any other
+# is gwdup:unlisted. The two counts after the fixed keys records= and suppressed_records= are read
+# as digits alone and summed for the walk, an upper bound of the evidence lost. A day without the
+# line resolves it quiet24. No part of a line is kept.
+judge_gateway() {
+    local line rest cn r s key pat
+    local -a pats=()
+    local -A lost=() inst=()
+    [ "${J_RESULT[gateway]:-}" = ok ] || return 0
+    mapfile -t pats < <(pa_journal_patterns gateway)
+    pat="${pats[0]:-}"
+    [ -n "$pat" ] || return 0
+    while IFS= read -r line; do
+        [[ $line == *"$pat"* ]] || continue
+        rest="${line#*"$pat"}"
+        cn="" r=0 s=0
+        if [[ $rest =~ (^|[[:space:]])collector_id=([^[:space:]]{1,64})([[:space:]]|$) ]]; then cn="${BASH_REMATCH[2]}"; fi
+        if [[ $rest =~ [[:space:]]records=([0-9]{1,9})([[:space:]]|$) ]]; then r=$((10#${BASH_REMATCH[1]})); fi
+        if [[ $rest =~ [[:space:]]suppressed_records=([0-9]{1,9})([[:space:]]|$) ]]; then s=$((10#${BASH_REMATCH[1]})); fi
+        key=gwdup:unlisted
+        if [ -n "$cn" ] && pa_plain_id "$cn" && [ -n "${CN_ID[$cn]:-}" ]; then
+            key="gwdup:${CN_ID[$cn]}"
+            inst[$key]="${CN_ID[$cn]}"
+        fi
+        lost[$key]=$((${lost[$key]:-0} + r + s))
+        [ "${lost[$key]}" -le 999999999 ] || lost[$key]=999999999
+    done <<< "${J_LINES[gateway]}"
+    for key in "${!lost[@]}"; do
+        rec_attrs gateway-dup ACT gateway gw.dup
+        PA_REC_INST="${inst[$key]:--}"
+        seen_count "$key" "${lost[$key]}"
+        pa_incident_transition "$key" open && rec_set
+    done
+    quiet24_sweep gwdup:
+}
+
+# judge_shipper: on a collector, the shipper's ERROR lines on three light passes in a row open
+# ship-failing (ACT, ship:local), its cause the worst of them (a rejected batch, a chain that
+# diverged or the line before an exit on a permanent stop, ship.rejected; a failed cycle, a batch
+# that cannot be recorded in the state directory or a gateway that keeps answering Retry, ship.io;
+# a failed connection, ship.connect); two passes without one resolve it clean2. Its WARN lines (lines it dropped) open the NOTICE ship-dropped on
+# first sight, resolved quiet24. An ERROR line whose message also says the shipper refuses to
+# start is the unit kinds' to report, not counted. A read that could not tell counts toward
+# neither.
+#
+# A line is classed by the head the log format writes before anything else (time, level,
+# target) and by its message's own words, never by its fields: the policy line's error quotes the
+# sensor name or protocol a refused line claimed, which whoever writes that sensor's log chooses.
+# So an ERROR text counts only on an ERROR line and a WARN text only on a WARN line, and only
+# where no `=` or double quote comes before it in the message: every field follows a `key=`
+# (an apostrophe may: one of the messages has one before its matched words).
+judge_shipper() {
+    local line i e=0 w=0 c="" n st=none lvl msg idx re='^[^ ]+ +(ERROR|WARN) +[A-Za-z0-9_:]+: (.*)$'
+    local -a pats=()
+    case "${J_RESULT[shipper]:-}" in
+        ok) ;;
+        unknown)
+            unset 'OBS_P[shipfail]'
+            absent_unknown ship:local
+            return 0
+            ;;
+        *) return 0 ;;
+    esac
+    mapfile -t pats < <(pa_journal_patterns shipper)
+    [ "${#pats[@]}" -ge 10 ] || return 0
+    while IFS= read -r line; do
+        [[ $line =~ $re ]] || continue
+        lvl="${BASH_REMATCH[1]}" msg="${BASH_REMATCH[2]}"
+        if [ "$lvl" = ERROR ]; then
+            [[ ${msg%%=*} != *'refusing to start'* ]] || continue
+            idx="0 1 2 3 4 5 6"
+        else
+            idx="7 8 9"
+        fi
+        for i in $idx; do
+            [[ $msg == *"${pats[$i]}"* ]] && [[ ${msg%%"${pats[$i]}"*} != *[=\"]* ]] || continue
+            case "$i" in
+                0)
+                    e=$((e + 1))
+                    [ -n "$c" ] || c=ship.connect
+                    ;;
+                1 | 2 | 3)
+                    e=$((e + 1))
+                    [ "$c" = ship.rejected ] || c=ship.io
+                    ;;
+                4 | 5 | 6) e=$((e + 1)) c=ship.rejected ;;
+                *) w=$((w + 1)) ;;
+            esac
+            break
+        done
+    done <<< "${J_LINES[shipper]}"
+    rec_attrs ship-failing ACT ship "${c:-ship.connect}"
+    if pa_incident_get ship:local; then st="${PA_INC[7]}"; fi
+    if [ "$e" -gt 0 ]; then
+        streak shipfail error
+        n="$STREAK_N"
+        case "$st" in
+            none | resolved | pending)
+                if [ "$st" = pending ] && [ "$n" -ge 3 ]; then
+                    pa_incident_transition ship:local open && rec_set
+                else
+                    pa_incident_transition ship:local pending && rec_set
+                fi
+                ;;
+            open | acked) pa_incident_transition ship:local change && rec_set ;;
+        esac
+    else
+        streak shipfail ok
+        n="$STREAK_N"
+        case "$st" in
+            pending) pa_incident_transition ship:local drop && rec_set ;;
+            open | acked) [ "$n" -lt 2 ] || resolve_if ship:local 1 clean2 ;;
+        esac
+    fi
+    if [ "$w" -gt 0 ]; then
+        rec_attrs ship-dropped NOTICE ship ship.dropped
+        seen_count shipdrop:local 0
+        pa_incident_transition shipdrop:local open && rec_set
+    fi
+    quiet24_sweep shipdrop:
+}
+
+PULL_NEW=""
+
+# judge_pull: the backup pull's served line, in the exact form deploy/backup-serve.sh logs it, sets
+# meta pull_last to this pass's stamp: the off-host copy was taken at most a pass ago.
+judge_pull() {
+    local line re='^served [0-9]{8}T[0-9]{6}Z-(scheduled|pre-upgrade) (propolis\.dump\.age|state\.tgz\.age|SHA256SUMS)$'
+    [ "${J_RESULT[pull]:-}" = ok ] || return 0
+    while IFS= read -r line; do
+        if [[ $line =~ $re ]]; then
+            PULL_NEW="$PA_STAMP"
+            break
+        fi
+    done <<< "${J_LINES[pull]}"
+}
+
+META_BACKUP_DUR="" BACKUP_DUR_NEW=""
+
+# judge_backup_run: backup-hung (ACT, the backup rail, backup:run) when propolis-backup.service has
+# been activating for longer than max(7200 s, three times the last run's length) on two light
+# passes in a row; resolved `ended` once it is no longer activating. The last run's length (meta
+# backup_dur, BACKUP_DUR_NEW) is taken on each pass that sees the unit inactive with an exit after
+# its start. The unit's TimeoutStartSec (six hours as shipped) still ends a run that never
+# finishes; this says so earlier while the usual run is short, by four hours at most, and not at
+# all once the usual run takes two hours, when three times its length is that timeout. A start
+# time that cannot be read, lies ahead of the uptime, or belongs to a process that has already
+# exited says nothing.
+judge_backup_run() {
+    local u=propolis-backup.service ems eme age lim=7200 dur
+    [ "$SAMPLE_OK" = 1 ] && [ -n "${S_LOAD[$u]:-}" ] && [ "${S_LOAD[$u]}" != not-found ] \
+        && [ "${S_LOAD[$u]}" != "?" ] || return 0
+    ems="${S_EMS[$u]:-}" eme="${S_EME[$u]:-}"
+    rec_attrs backup-hung ACT backup backup.long
+    if [ "${S_ACT[$u]:-}" != activating ]; then
+        if [ "${S_ACT[$u]:-}" = inactive ] && [[ $ems =~ ^[0-9]{1,18}$ && $eme =~ ^[0-9]{1,18}$ ]] \
+            && [ "$((10#$ems))" -gt 0 ] && [ "$((10#$eme))" -gt "$((10#$ems))" ]; then
+            BACKUP_DUR_NEW=$(((10#$eme - 10#$ems) / 1000000))
+        fi
+        two_pass backup:run 0 ""
+        resolve_if backup:run 1 ended
+        return 0
+    fi
+    if ! [[ $ems =~ ^[0-9]{1,18}$ ]] || [ "$((10#$ems))" = 0 ] || [ "$((10#$ems / 1000000))" -gt "$((10#$PA_UP))" ]; then
+        two_pass backup:run 0 ""
+        return 0
+    fi
+    # An exit later than the start with no main process: that process has ended, so the start is
+    # not this run's main command's (it has not started, or has finished, and a command a drop-in
+    # runs before or after it is still going). It says nothing of how long this run has taken.
+    # With a main process running, the start is its own whatever the exit says.
+    if [ -z "${S_PID[$u]:-}" ] && [[ $eme =~ ^[0-9]{1,18}$ ]] && [ "$((10#$eme))" -gt "$((10#$ems))" ]; then
+        two_pass backup:run 0 ""
+        return 0
+    fi
+    age=$((10#$PA_UP - 10#$ems / 1000000))
+    if [[ $META_BACKUP_DUR =~ ^[0-9]{1,9}$ ]]; then
+        dur=$((10#$META_BACKUP_DUR))
+        [ "$((3 * dur))" -le "$lim" ] || lim=$((3 * dur))
+    fi
+    if [ "$age" -gt "$lim" ]; then
+        two_pass backup:run 1 ""
+    else
+        two_pass backup:run 0 ""
+    fi
+}
+
+# ---- the public push and the backups (hourly pass) -------------------------------------------
+#
+# Read before the lock, judged under it like the stores. The backup status files are root's own;
+# the push marker belongs to the propolis-blocklist account (blocklist-sync.sh writes it), and
+# root reads only its modification time, without following a link and only when it is a regular
+# file. The feed's publish marker lies in the daemon account's directory and the pull account's
+# authorized_keys in that account's, so each is read as its account.
+
+PUSH_RESULT=skip PUSH_CAUSE=unknown PUSH_SCHED=none PUSH_MT="" PUB_MT="" PUSH_EXPECTED=0 FEED_ON=1
+META_PUSH_SINCE="" PUSH_SINCE_NEW=""
+
+# What push_read runs as the daemon account for the publish marker: stat without following a link,
+# a path that is not there (status 2) told from one that could not be checked (status 1).
+# shellcheck disable=SC2016 # the child bash expands these, with the path as $1
+PUB_STAT_PROG='s="$(LC_ALL=C stat -c "%F|%Y" -- "$1" 2>&1)" && { printf "%s" "$s"; exit 0; }; case "$s" in *"No such file or directory"*) exit 2 ;; esac; exit 1'
+
+# push_read: on a single box or a control node, whether anything runs the push (pa_push_scheduler,
+# the rule the walk shows), the push marker's time (blocklist-status/last-pushed, the
+# propolis-blocklist account's, its mtime alone read, not through a link), the
+# feed's publish marker's time (`.<name>.last_published` beside PROPOLIS_FEED_OUTPUT_DIR, as the
+# daemon writes it, read as the daemon account), PROPOLIS_FEED_ENABLED (default true, as the daemon
+# reads it: true or false in any case, anything else the default) and
+# PROPOLIS_OPS_FEED_PUSH_EXPECTED (default false; true, 1, yes or on). A marker that is missing is
+# no time (PUSH_MT or PUB_MT empty); one that is not a regular file, or a read that failed, makes
+# the check unknown for the pass.
+push_read() {
+    local f out rc dir name parent v
+    PUSH_RESULT=skip
+    # Only a host that runs the daemon publishes a feed to push.
+    case "${PA_ROLE:-}" in single | control) ;; *) return 0 ;; esac
+    PUSH_RESULT=unknown PUSH_CAUSE=unknown PUSH_MT="" PUB_MT=""
+    pa_env_get PROPOLIS_FEED_ENABLED "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    [ -z "$PA_ENV_UNREADABLE" ] || return 0
+    FEED_ON=1
+    case "${PA_ENV_VALUE,,}" in false) FEED_ON=0 ;; esac
+    pa_env_get PROPOLIS_OPS_FEED_PUSH_EXPECTED "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    v="${PA_ENV_VALUE,,}"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    PUSH_EXPECTED=0
+    case "$v" in true | 1 | yes | on) PUSH_EXPECTED=1 ;; esac
+    pa_env_get PROPOLIS_FEED_OUTPUT_DIR "$PA_ENV_DIR/fleet-listeners.env" "$PA_ENV_DIR/propolis.env" > /dev/null
+    dir="${PA_ENV_VALUE:-/var/lib/propolis/feed/current}"
+    PA_ENV_VALUE=""
+    while [ "${#dir}" -gt 1 ] && [ "${dir%/}" != "$dir" ]; do dir="${dir%/}"; done
+    path_ok "$dir" || return 0
+    # The scheduler's reads have limits of their own, 5 s for each crontab or unit file and 10 s
+    # for each timer: a minute covers a host's few files.
+    fits 60 || return 0
+    rc=0
+    pa_push_scheduler > /dev/null || rc=$?
+    PUSH_SCHED="$PA_SCHED"
+    if [ "$rc" != 0 ] && [ "$PUSH_SCHED" = none ]; then return 0; fi
+    f="$ROOT/var/lib/propolis/blocklist-status/last-pushed"
+    if [ -e "$f" ] || [ -L "$f" ]; then
+        [ -f "$f" ] && [ ! -L "$f" ] || return 0
+        fits 5 || return 0
+        out="$(timeout 5 stat -c %Y -- "$f" 2> /dev/null)" || return 0
+        [[ $out =~ ^[0-9]{1,12}$ ]] || return 0
+        PUSH_MT=$((10#$out))
+    fi
+    name="${dir##*/}" parent="${dir%/*}"
+    [ -n "$parent" ] || parent=/
+    [ -n "$name" ] || name=feed
+    fits 10 || return 0
+    out="$(_pa_as propolis bash -c "$PUB_STAT_PROG" _ "$ROOT${parent%/}/.$name.last_published")"
+    rc=$?
+    case "$rc" in
+        0)
+            [[ $out =~ ^regular(\ empty)?\ file\|([0-9]{1,12})$ ]] || return 0
+            PUB_MT=$((10#${BASH_REMATCH[2]}))
+            ;;
+        2) ;;
+        *) return 0 ;;
+    esac
+    PUSH_RESULT=ok PUSH_CAUSE=-
+}
+
+# judge_push: under the lock, the push's three kinds, each on the second hourly pass in a row.
+# push-failing (ACT, the publish stage, push:<cron|timer>): a scheduler runs the push, the feed was
+# published after the last push and that push is over six hours old; or there is no push marker,
+# the scheduler has been seen for over six hours (meta push_sched_since) and a publish came after
+# it was first seen. Six hours, not the daemon's half hour: the witness speaks where the daemon
+# cannot, and a short outage of the remote is no page. A feed that did not change since the last
+# push is not stale. Its onset is the push marker's time, and a push after that onset resolves it
+# (pushed); a push moved to the other scheduler while it fails stays on the record already open,
+# and one whose scheduler is gone resolves `disabled`, since no push can come to resolve it.
+# push-unscheduled (ACT, push:none): the feed is on, a push is expected
+# (PROPOLIS_OPS_FEED_PUSH_EXPECTED) and nothing runs it. push-off (NOTICE, push:off): the feed is on,
+# nothing runs the push, and none is expected. Those two resolve clean2. Status 1 when the reads
+# could not tell.
+judge_push() {
+    local fail=0 sched key k since sw carrier
+    [ "$PUSH_RESULT" != skip ] || return 0
+    if [ "$PUSH_RESULT" != ok ]; then
+        for k in push:cron push:timer push:none push:off; do absent_unknown "$k"; done
+        check_counts push unknown "$PUSH_CAUSE"
+        return 1
+    fi
+    check_counts push ok -
+    sched="$PUSH_SCHED"
+    PUSH_SINCE_NEW=-
+    if [ "$sched" != none ]; then
+        since="$META_PUSH_SINCE"
+        if ! _pa_stamp_split "$since" || [ "$(pa_age "$since")" -lt 0 ]; then since="$PA_STAMP"; fi
+        PUSH_SINCE_NEW="$since"
+        if [ -n "$PUSH_MT" ]; then
+            if [ -n "$PUB_MT" ] && [ "$PUB_MT" -gt "$PUSH_MT" ] && [ "$((10#$PA_WALL - PUSH_MT))" -gt 21600 ]; then fail=1; fi
+        else
+            _pa_stamp_split "$since"
+            sw="$((10#$_PA_W))"
+            if [ "$(pa_age "$since")" -gt 21600 ] && [ -n "$PUB_MT" ] && [ "$PUB_MT" -gt "$sw" ]; then fail=1; fi
+        fi
+    fi
+    # A push that keeps failing while the operator moves it from cron to a timer, or back, is one
+    # fault: an open record on the other scheduler's key goes on carrying it.
+    carrier=""
+    if [ "$fail" = 1 ]; then
+        carrier="$sched"
+        if ! pa_incident_get "push:$sched" || [ "${PA_INC[7]}" = resolved ]; then
+            for k in cron timer; do
+                if [ "$k" != "$sched" ] && pa_incident_get "push:$k"; then
+                    case "${PA_INC[7]}" in open | acked) carrier="$k" ;; esac
+                fi
+            done
+        fi
+    fi
+    for k in cron timer; do
+        key="push:$k"
+        if [ "$k" = "$carrier" ]; then
+            rec_attrs push-failing ACT publish push.stale
+            seen_hold "$key" ""
+            # A new sighting's onset is the last push: the time the public copy stopped moving.
+            if [ -n "$PUSH_MT" ] && pa_incident_get "$key" && [ "${PA_INC[7]}" = pending ] \
+                && [ "${PA_INC[10]}" = "$PA_STAMP" ]; then
+                PA_INC[10]="$PUSH_MT/-/0"
+                rec_set
+            fi
+            continue
+        fi
+        pa_incident_get "$key" || continue
+        case "${PA_INC[7]}" in
+            pending) pa_incident_transition "$key" drop && rec_set ;;
+            open | acked)
+                if [ -n "$PUSH_MT" ] && _pa_stamp_split "${PA_INC[10]}" && [ "$PUSH_MT" -gt "$((10#$_PA_W))" ]; then
+                    PA_REC_PROOF=pushed
+                    pa_incident_transition "$key" resolve && rec_set
+                elif [ "$sched" = none ]; then
+                    # Nothing runs the push any more, so no push can come to resolve this: that
+                    # none is scheduled is the two kinds' below to say.
+                    PA_REC_PROOF=disabled
+                    pa_incident_transition "$key" resolve && rec_set
+                fi
+                ;;
+        esac
+    done
+    if [ "$sched" = none ] && [ "$FEED_ON" = 1 ] && [ "$PUSH_EXPECTED" = 1 ]; then
+        rec_attrs push-unscheduled ACT publish push.none
+        seen_hold push:none ""
+    else
+        absent_clean push:none
+    fi
+    if [ "$sched" = none ] && [ "$FEED_ON" = 1 ] && [ "$PUSH_EXPECTED" = 0 ]; then
+        rec_attrs push-off NOTICE publish push.none
+        seen_hold push:off ""
+    else
+        absent_clean push:off
+    fi
+    return 0
+}
+
+BK_DIR=/var/backups/propolis BK_KEEP=7 BK_KNOWN=0 BACKUP_DEV="" BACKUP_STEP=""
+BKS_RESULT=skip BKS_N=0 BKS_OLDEST="" PULL_CONF="" META_PULL_LAST=""
+BKS_NAMES=() SERVE_OLD=0 META_PULL_SINCE="" PULL_SINCE_NEW=""
+
+# backup_learn: the backup directory and the number of scheduled sets to keep, from the backup
+# unit's Environment property (deploy/backup.sh takes both from its environment, so a drop-in is
+# where an operator sets them): the last PROPOLIS_BACKUP_DIR in path_ok's form, else
+# /var/backups/propolis, as pa_vol_stores takes it; the last PROPOLIS_BACKUP_KEEP from 1 to 365,
+# else 7, as backup.sh would refuse anything else. BK_KNOWN is 0 when systemd did not answer.
+backup_learn() {
+    local w d="" k=""
+    local -a words=()
+    BK_DIR=/var/backups/propolis BK_KEEP=7 BK_KNOWN=0
+    [ "$CS_OK" = 1 ] || return 0
+    read -r -a words <<< "$CS_BACKUP_ENV" || true
+    for w in "${words[@]}"; do
+        case "$w" in
+            PROPOLIS_BACKUP_DIR=*) d="${w#PROPOLIS_BACKUP_DIR=}" ;;
+            PROPOLIS_BACKUP_KEEP=*) k="${w#PROPOLIS_BACKUP_KEEP=}" ;;
+        esac
+    done
+    ! path_ok "$d" || BK_DIR="$d"
+    if [[ $k =~ ^[0-9]{1,3}$ ]] && [ "$((10#$k))" -ge 1 ] && [ "$((10#$k))" -le 365 ]; then BK_KEEP=$((10#$k)); fi
+    BK_KNOWN=1
+}
+
+# backup_read: on a single box or a control node, the scheduled sets in the backup directory, only
+# names of the exact shape deploy/backup.sh prunes (`<YYYYMMDD>T<HHMMSS>Z-scheduled`), NUL-separated
+# and at most 4096 entries, with the oldest one's date and each one's time as its name gives it
+# (BKS_*); and whether an off-host pull is
+# configured (PULL_CONF 1: a line that is not a comment in the pull account's authorized_keys, read
+# as that account with a size cap; 0: no such account, file or line; empty: it could not be read).
+# SERVE_OLD is 1 when a pull is configured and the installed serve script is one that does not log
+# its served line: there is then nothing to count an unserved set from.
+backup_read() {
+    local dir ent n=0 sets=0 oldest="" st="" t f text rc line
+    BKS_RESULT=skip PULL_CONF="" BKS_NAMES=() SERVE_OLD=0
+    case "${PA_ROLE:-}" in collector | gateway) return 0 ;; esac
+    BKS_RESULT=unknown
+    dir="$ROOT$BK_DIR"
+    if [ "$BK_KNOWN" != 1 ]; then
+        :
+    elif [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+        BKS_RESULT=ok BKS_N=0 BKS_OLDEST=""
+    elif [ -d "$dir" ] && [ ! -L "$dir" ] && fits 15; then
+        while IFS= read -r -d '' ent; do
+            case "$ent" in
+                /status=*)
+                    st="${ent#/status=}"
+                    continue
+                    ;;
+            esac
+            n=$((n + 1))
+            if [ "$n" -gt 4096 ]; then
+                st=bound
+                break
+            fi
+            [[ $ent =~ ^[0-9]{8}T[0-9]{6}Z-scheduled$ ]] || continue
+            sets=$((sets + 1))
+            BKS_NAMES+=("${ent%-scheduled}")
+            if [ -z "$oldest" ] || [[ $ent < $oldest ]]; then oldest="$ent"; fi
+        done < <(
+            timeout 10 find "$dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\0' 2> /dev/null
+            printf '/status=%s\0' "$?"
+        )
+        if [ "$st" = 0 ]; then
+            BKS_RESULT=ok BKS_N="$sets" BKS_OLDEST=""
+            if [[ $oldest =~ ^([0-9]{4})([0-9]{2})([0-9]{2})T([0-9]{2})([0-9]{2})([0-9]{2})Z ]]; then
+                t="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+                t="$(timeout 5 date -u -d "$t" +%s 2> /dev/null)" || t=""
+                if [[ $t =~ ^[0-9]{1,12}$ ]]; then BKS_OLDEST=$((10#$t)); else BKS_RESULT=unknown; fi
+            fi
+        fi
+    fi
+    # The account's 5 s and the read's 5 s.
+    fits 10 || return 0
+    # Only an account id says is gone means no pull; a lookup that failed otherwise cannot tell.
+    rc=0
+    account_uid propolis-backup-pull > /dev/null || rc=$?
+    case "$rc" in
+        0) ;;
+        1)
+            PULL_CONF=0
+            return 0
+            ;;
+        *) return 0 ;;
+    esac
+    f="$ROOT/var/lib/propolis-backup-pull/.ssh/authorized_keys"
+    if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+        PULL_CONF=0
+        return 0
+    fi
+    text="$(pa_read_as propolis-backup-pull "$f" 65536)"
+    rc=$?
+    [ "$rc" = 0 ] || return 0
+    PULL_CONF=0
+    while IFS= read -r line; do
+        [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+        PULL_CONF=1
+        break
+    done <<< "$text"
+    # The serve script is root's own, installed beside this one. One that is there and does not
+    # log its served line is an older one; a missing one serves nothing, which is a pull that
+    # does not happen and is counted as one. One that could not be read is not taken for one
+    # that logs: the pull is then unknown for the pass.
+    f="$ROOT/usr/local/sbin/propolis-backup-serve"
+    if [ "$PULL_CONF" = 1 ] && [ -f "$f" ] && [ ! -L "$f" ]; then
+        if ! fits 5; then
+            PULL_CONF=""
+            return 0
+        fi
+        rc=0
+        timeout 5 grep -q -F -- 'logger -t propolis-backup-serve' "$f" 2> /dev/null || rc=$?
+        case "$rc" in
+            0) ;;
+            1) SERVE_OLD=1 ;;
+            *) PULL_CONF="" ;;
+        esac
+    fi
+}
+
+BKS_NEW=""
+
+# judge_backups: under the lock, backup-retention (NOTICE, backup:keep): fewer scheduled sets than
+# KEEP while the oldest set's date is more than KEEP days ago, resolved clean2; and backup-offhost
+# (NOTICE, backup:pull): a pull is configured and a scheduled set has waited over 72 hours for it,
+# resolved by a newer served line (pulled), or `disabled` once no pull is configured. A set waits
+# when it was made after the later of the last served line (meta pull_last, which the light pass
+# writes) and the first hourly pass that saw the pull configured (meta pull_since). Sets, not the
+# line's age alone: the pull fetches only the newest set and logs nothing when it already holds
+# it, so a working pull is silent while no new set appears, and backups that stopped are their
+# own records' to report. The first-seen time, so that a pull which never served anything is
+# reported too; sets made before it are not counted, since whether they were pulled is not known.
+# While the installed serve script is an older one that logs no served line there is nothing to
+# count from, and nothing opens. Each on the second hourly pass in a row. Status 1 when a read
+# could not tell.
+judge_backups() {
+    local bad=0 a floor="" since lo hi name waiting=0
+    [ "$BKS_RESULT" != skip ] || return 0
+    if [ "$BKS_RESULT" = ok ]; then
+        BKS_NEW="$BKS_N/$BK_KEEP"
+        if [ "$BKS_N" -lt "$BK_KEEP" ] && [ -n "$BKS_OLDEST" ] \
+            && [ "$((10#$PA_WALL - BKS_OLDEST))" -gt "$((BK_KEEP * 86400))" ]; then
+            rec_attrs backup-retention NOTICE backup backup.keep
+            seen_hold backup:keep ""
+        else
+            absent_clean backup:keep
+        fi
+    else
+        absent_unknown backup:keep
+        bad=1
+    fi
+    case "$PULL_CONF" in
+        1)
+            since="$META_PULL_SINCE"
+            if [ "$SERVE_OLD" = 1 ]; then
+                since=-
+            elif ! _pa_stamp_split "$since" || [ "$(pa_age "$since")" -lt 0 ]; then
+                # Seen configured for the first time: since the last served line when there is
+                # one (a pull that served was configured then), else since now. After a time
+                # with no pull (`-`), since now: sets made meanwhile were never its to fetch.
+                if [ -z "$since" ] && _pa_stamp_split "$META_PULL_LAST" && [ "$(pa_age "$META_PULL_LAST")" -ge 0 ]; then
+                    since="$META_PULL_LAST"
+                else
+                    since="$PA_STAMP"
+                fi
+            fi
+            PULL_SINCE_NEW="$since"
+            # No floor while the serve script logs nothing: an earlier served line (another
+            # script's) does not make this one's silence mean anything.
+            if _pa_stamp_split "$since"; then floor=$((10#$_PA_W)); fi
+            if [ -n "$floor" ] && _pa_stamp_split "$META_PULL_LAST" && [ "$((10#$_PA_W))" -gt "$floor" ]; then
+                floor=$((10#$_PA_W))
+            fi
+            if [ "$BKS_RESULT" != ok ]; then
+                # Which sets there are could not be read: whether one waits is not known.
+                absent_unknown backup:pull
+            else
+                if [ -n "$floor" ]; then
+                    # A set's name is its time, in the form and zone this prints (the script runs
+                    # in UTC), so names compare as times do.
+                    printf -v lo '%(%Y%m%dT%H%M%SZ)T' "$floor"
+                    printf -v hi '%(%Y%m%dT%H%M%SZ)T' "$((10#$PA_WALL - 259200))"
+                    for name in "${BKS_NAMES[@]}"; do
+                        if [[ $name > $lo && $name < $hi ]]; then
+                            waiting=1
+                            break
+                        fi
+                    done
+                fi
+                if [ "$waiting" = 1 ]; then
+                    rec_attrs backup-offhost NOTICE backup backup.pull
+                    seen_hold backup:pull ""
+                else
+                    two_pass backup:pull 0 ""
+                    if pa_incident_get backup:pull && _pa_stamp_split "$META_PULL_LAST" \
+                        && a="$(_pa_stamp_span "${PA_INC[9]}" "$META_PULL_LAST")" && [ "$a" -gt 0 ]; then
+                        resolve_if backup:pull 1 pulled
+                    fi
+                fi
+            fi
+            ;;
+        0)
+            PULL_SINCE_NEW=-
+            two_pass backup:pull 0 ""
+            resolve_if backup:pull 1 disabled
+            ;;
+        *)
+            absent_unknown backup:pull
+            bad=1
+            ;;
+    esac
+    if [ "$bad" = 0 ]; then
+        check_counts backups ok -
+    else
+        check_counts backups unknown unknown
+    fi
+    [ "$bad" = 0 ]
+}
+
+# tie_backup: fold ties 2 and 4, for a failed backup whose last-failure is newer than its
+# last-success (both root's, deploy/backup.sh). One whose last step read the database (the
+# ledger's chain head, the dump, the check against earlier sets' chain heads) takes an open
+# db-unreachable as its parent; one that failed checking free space takes the open volume record
+# of the backup directory's filesystem, and nothing else: that step queries the database too, so a
+# database failure there cannot be told from a refusal for space. The late-parent rule: from then
+# on it counts nothing and its parent speaks for both. A parent is taken only when the failure was
+# written while its fault was there (at most 300 s before its first sighting, as a probe sees a
+# fault a little after it starts): a failure hours before an outage is not tied to it.
+tie_backup() {
+    local key=unit:propolis-backup.service parent="" k i
+    [ "$BACKUP_FAILED_LAST" = 1 ] && [[ $BACKUP_FAIL_MT =~ ^[0-9]{1,12}$ ]] || return 0
+    pa_incident_get "$key" || return 0
+    case "${PA_INC[7]}" in pending | open | acked) ;; *) return 0 ;; esac
+    [ "${PA_INC[13]}" = - ] || return 0
+    case "$BACKUP_STEP" in
+        "reading the ledger's chain head" | "dumping the database" \
+            | "checking the ledger against the chain heads earlier sets recorded")
+            for k in db:local db:remote; do
+                pa_incident_get "$k" || continue
+                case "${PA_INC[7]}" in
+                    open | acked)
+                        backup_failed_during || continue
+                        parent="${PA_INC[1]}"
+                        break
+                        ;;
+                esac
+            done
+            ;;
+        "checking free space")
+            [ -n "$BACKUP_DEV" ] || return 0
+            for i in "${!VOL_DEV[@]}"; do
+                [ "${VOL_DEV[$i]}" = "$BACKUP_DEV" ] && [ -n "${VOL_MID[$i]:-}" ] || continue
+                pa_incident_get "vol:${VOL_MID[$i]}" || continue
+                case "${PA_INC[7]}" in
+                    open | acked)
+                        backup_failed_during || continue
+                        parent="${PA_INC[1]}"
+                        break
+                        ;;
+                esac
+            done
+            ;;
+    esac
+    [ -n "$parent" ] || return 0
+    if pa_incident_fold "$key" "$parent"; then rec_set; fi
+}
+
+# backup_failed_during: the backup's failure (BACKUP_FAIL_MT) was written no earlier than 300 s
+# before the first sighting of the record in PA_INC; a first sighting that cannot be read ties
+# nothing.
+backup_failed_during() {
+    _pa_stamp_split "${PA_INC[8]}" || return 1
+    [ "$BACKUP_FAIL_MT" -ge "$((10#$_PA_W - 300))" ]
+}
+
+CC_FOLD_K12="" UNLISTED_CID=""
+
+# unlisted_inst_read: when a completed config-check run printed exactly one spool-unlisted
+# finding, the opaque id of its collector, for the folded record's instance: the spool's plain
+# names are listed and keyed with the listed ones (collectors_load, so the id is the one the walk
+# shows) and the one whose key hash is the finding's (sha256 of `spool-unlisted:<name>`, as
+# config-check makes it) is taken. The name reaches sha256sum and pa_id_table on their input,
+# never a command line.
+unlisted_inst_read() {
+    local name h
+    UNLISTED_CID=""
+    [ "$CC_FOLD_N" = 1 ] && [[ $CC_FOLD_K12 =~ ^[0-9a-f]{12}$ ]] || return 0
+    collectors_load || return 0
+    for name in "${!SL_MT[@]}"; do
+        fits 5 || return 0
+        h="$(printf '%s' "spool-unlisted:$name" | timeout 5 sha256sum 2> /dev/null)" || continue
+        [ "${h:0:12}" = "$CC_FOLD_K12" ] || continue
+        UNLISTED_CID="${CN_ALL[$name]:-}"
+        return 0
+    done
+}
+
 # ---- one pass -------------------------------------------------------------------------------
 
 META_CC_LAST="" META_MAINT_SEEN="" META_CC_FAIL="" DEADLINE_CUT=0 PROBES_JUDGED=0
@@ -4303,6 +5460,7 @@ light_pass() {
             maint_seen) META_MAINT_SEEN="$v" ;;
             jlines) META_JLINES="$v" ;;
             hb_skip) META_HB_SKIP="$v" ;;
+            backup_dur) META_BACKUP_DUR="$v" ;;
         esac
     done < <(pa_state_read meta)
     hbskip_get
@@ -4373,6 +5531,10 @@ light_pass() {
     [ "$MAINT" = 0 ] || meta+=(maint_seen "$PA_STAMP")
     [ -z "$JLINES_NEW" ] || [ "$JLINES_NEW" = "$META_JLINES" ] || meta+=(jlines "$JLINES_NEW")
     [ -z "$JSKIP_NEW" ] || meta+=(jskip "$JSKIP_NEW")
+    # The last backup run's length, for backup-hung's limit, and when the off-host pull was last
+    # served, for the hourly pass's backup-offhost.
+    [ -z "$BACKUP_DUR_NEW" ] || [ "$BACKUP_DUR_NEW" = "$META_BACKUP_DUR" ] || meta+=(backup_dur "$BACKUP_DUR_NEW")
+    [ -z "$PULL_NEW" ] || meta+=(pull_last "$PULL_NEW")
     # A skip kept beside the state by a pass that could not write meta moves into meta here.
     v="$(hb_newer "${HB_SKIP_NEW:-$META_HB_SKIP}" "$HB_SKIP_FILE")"
     [ -z "$v" ] || [ "$v" = "$META_HB_SKIP" ] || meta+=(hb_skip "$v")
@@ -4428,10 +5590,14 @@ hourly_pass() {
         backup_failed_last
         # The units' properties first: the backup unit's environment names a store.
         change_sample
+        backup_learn
         pg_state_read
         pg_datadir_read
         vol_sample
         change_read
+        push_read
+        backup_read
+        unlisted_inst_read
     fi
     past_deadline && status=partial
 
@@ -4459,6 +5625,9 @@ hourly_pass() {
         case "$k" in
             light_last) light="$v" ;;
             cc_fail) CC_FAIL="$v" ;;
+            push_sched_since) META_PUSH_SINCE="$v" ;;
+            pull_last) META_PULL_LAST="$v" ;;
+            pull_since) META_PULL_SINCE="$v" ;;
         esac
     done < <(pa_state_read meta)
     pa_incident_load
@@ -4480,6 +5649,11 @@ hourly_pass() {
         if ! past_deadline; then
             judge_stores || status=partial
         fi
+        if ! past_deadline; then
+            judge_push || status=partial
+            judge_backups || status=partial
+            tie_backup
+        fi
     fi
     past_deadline && status=partial
     if [ "$CHANGED" = 1 ]; then
@@ -4497,6 +5671,13 @@ hourly_pass() {
         meta+=(pg_state "$PA_STAMP/$PG_XID/$PG_CONN/$PG_USABLE/$PG_LOCKS/$PG_SIZE")
     fi
     [ "$PG_DATADIR_NEW" = 0 ] || meta+=(pg_datadir "$PG_DATADIR" pg_datadir_stamp "$PA_STAMP")
+    # Since when a scheduler of the push has been seen (`-` while there is none), and the backup
+    # sets against KEEP, for the walk.
+    [ -z "$PUSH_SINCE_NEW" ] || [ "$PUSH_SINCE_NEW" = "$META_PUSH_SINCE" ] || meta+=(push_sched_since "$PUSH_SINCE_NEW")
+    [ -z "$BKS_NEW" ] || meta+=(backup_sets "$BKS_NEW")
+    # Since when an off-host pull has been seen configured (`-` while there is none, or none that
+    # logs what it serves): what an unserved set is counted from before the first served line.
+    [ -z "$PULL_SINCE_NEW" ] || [ "$PULL_SINCE_NEW" = "$META_PULL_SINCE" ] || meta+=(pull_since "$PULL_SINCE_NEW")
     _pa_meta_set "${meta[@]}"
     where_merge
     [ "$WHERE" != none ] || status=partial

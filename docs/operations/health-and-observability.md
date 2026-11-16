@@ -196,12 +196,43 @@ On a collector, a log has unread bytes and the gateway has accepted no batch for
 file; check that the gateway is reachable and the certificates ([split
 deployment](split-deployment.md)).
 
+The witness's light pass on that collector also reads the shipper's journal (by
+`shipper.service` and the `propolis-shipper` account's uid): an ERROR line that means nothing is
+being shipped (`shipper: failed to connect to gateway`; `shipper: ship cycle IO error`, a batch it
+cannot record in its state directory, or a gateway that keeps answering Retry; `shipper: gateway
+rejected a batch`, the collector's chain has diverged from the gateway's, or the line it logs
+before every exit on a permanent stop) on three light passes in a row opens `ship-failing` (ACT,
+key `ship:local`, cause `ship.connect`, `ship.io` or `ship.rejected` in that order, the worst
+seen), which two passes without one resolve. After a permanent stop the unit restarts and stops
+again, so the unit's own record is open beside this one: `ship-failing` gives the cause. The lines the shipper logs at WARN when it
+drops a line (shown only with `RUST_LOG` set) open the NOTICE `ship-dropped`, resolved after a day
+without one. A line counts by its own level and message, never by a text its fields quote (a WARN
+line quoting the sensor name a refused line claimed is still a WARN line). The `ship` row fails
+while `ship-failing` is open. `journalctl -u shipper.service`
+shows the lines themselves; the witness keeps only counts.
+
 <a id="spool-quiet"></a>
 ### A collector has gone quiet
 
 On a control node, a collector has sent nothing for a while. The control node cannot see the
 collector's side, where a quiet honeypot and a dead shipper look the same: run `sudo
 propolis-status` on that collector.
+
+The witness's light pass on a control node or gateway lists the gateway spool every five minutes,
+as the `propolis-gateway` account when the spool is that account's, and opens `spool-quiet` (ACT,
+`ship` stage, key `spool:<opaque id>`) for a collector `PROPOLIS_SENSOR_LOGS` lists (its
+`<spool>/<id>/events.jsonl`) whose spool file has not been written for longer than twice the
+longest gap between two of its writes this week, and never under half an hour, on two passes in a
+row. It waits for that week to be a day old (or for a week before it), for `gateway.service` to
+have been up fifteen minutes, and holds while a maintenance marker with reason `manual` is set:
+`sudo propolis-status --maint MINUTES` on the control node is how to say a collector is off on
+purpose. Two passes on which the spool was written resolve it; a collector taken off the list
+resolves it as disabled. A listed collector whose spool file is gone is judged from the last
+write seen; a modification time ahead of the clock counts as neither quiet nor a write. A spool
+of more than 1024 entries leaves a listed collector past them unknown for that pass. A spool
+directory nobody listed gets no record here; that is config-check's `spool-unlisted`. The walk marks that collector's `ship` row while it is open.
+What it cannot tell: a collector whose sensors died while their stats lines still ship is not
+quiet.
 
 <a id="gateway-down"></a>
 ### The gateway is down
@@ -219,6 +250,15 @@ content, and those records were not stored. `sudo propolis-status gateway` count
 error lines of the last 24 h; the line's `collector_id` names the collector whose shipper state
 to check.
 
+The witness's light pass reads this line by `gateway.service` and the `propolis-gateway`
+account's uid and opens `gateway-dup` (ACT, `gateway` stage) on first sight, keyed by the
+collector's opaque id when `collector_id` is a listed collector (`gwdup:<id>`) and `gwdup:unlisted`
+otherwise. It adds up the line's `records` and `suppressed_records` (read as digits only) since the
+record opened, an upper bound of the evidence lost, which the `gateway` row shows as `rebuilt batch
+dropped from {<collector>}, <n> records counted lost` and warns. A day without the line resolves
+it: no further loss in 24 h, never "recovered". Only a batch that reuses the last accepted number
+can be seen this way.
+
 <a id="backup-failed"></a>
 ### The backup failed or is old
 
@@ -234,6 +274,32 @@ A run that does not end holds the backup lock, so the next nightly run waits beh
 `systemctl status propolis-backup.service` shows whether one is running and since when, and
 `journalctl -u propolis-backup.service` the last step it logged.
 
+The witness's light pass opens `backup-hung` (ACT, key `backup:run`) when
+`propolis-backup.service` has been activating for longer than three times the last run's length,
+and never under two hours, on two passes in a row; the run's length is kept as `meta backup_dur`
+from each pass that sees the unit inactive after a run. It resolves once the unit is no longer
+activating. The unit's own `TimeoutStartSec=6h` still ends such a run; this says so earlier while
+the usual run is short (up to four hours earlier), and not at all once the usual run takes two
+hours or more, when three times its length is that timeout and the unit's failure speaks first.
+The `backup` rail fails while it is open.
+
+The hourly pass also counts the scheduled sets in the backup directory (the backup unit's
+`PROPOLIS_BACKUP_DIR` and `PROPOLIS_BACKUP_KEEP`, default 7): fewer than KEEP while the oldest is
+dated more than KEEP days ago opens the NOTICE `backup-retention` (`meta backup_sets` holds
+`<sets>/<KEEP>`). With an off-host pull configured (a key line in
+`/var/lib/propolis-backup-pull/.ssh/authorized_keys`, read as that account), the forced command
+logs `served <set> <file>` for each file it serves, which the light pass keeps as `meta
+pull_last`. A scheduled set that has waited over 72 hours for the pull opens the NOTICE
+`backup-offhost`, resolved by the next served line: a set waits when it was made after the later
+of the last served line and the first hourly pass that saw the pull configured (`meta
+pull_since`). The pull fetches only the newest set and logs nothing when it already holds it, so
+the age of the last line alone says nothing while no new set appears; and a pull that never
+served anything is reported once a set made since it was first seen is three days old. While the
+installed serve script is an older one that logs no line, nothing opens. A failed backup whose last step read the database folds
+under an open `db-unreachable`, and one that failed checking free space under the open volume
+record of the backup directory's filesystem, each only when the failure came while that record's
+fault was there.
+
 <a id="rotation"></a>
 ### Log rotation is late or refused
 
@@ -248,6 +314,18 @@ shows the timer ([retention](retention.md#log-rotation)).
 `/var/lib/propolis/blocklist-status/last-pushed` is old or missing. `sudo propolis-status
 publish` shows the marker's time and whether a crontab line or an enabled timer runs
 `deploy/blocklist-sync.sh`; run that by hand as `propolis-blocklist` to see its error.
+
+The witness's hourly pass, on a single box or control node, opens `push-failing` (ACT, `publish`
+stage, key `push:cron` or `push:timer`) on two hourly passes in a row when a scheduler runs the
+push, the feed was published after the last push (the daemon's `.<name>.last_published` marker
+beside `PROPOLIS_FEED_OUTPUT_DIR`, read as `propolis`) and that push is over six hours old; or,
+with no push marker yet, when the scheduler has been seen for over six hours (`meta
+push_sched_since`) and a publish came after. A feed that did not change is not stale, and a short
+outage of the remote does not open it. A schedule that runs the push less often than every six
+hours is reported as failing between its runs, so keep the interval under that. Its onset is the push marker's time, and the next push
+resolves it. With the feed enabled and nothing to run the push it opens `push-unscheduled` (ACT)
+when `PROPOLIS_OPS_FEED_PUSH_EXPECTED` is set, and the NOTICE `push-off` when it is not. The
+`publish` row fails while `push-failing` is open.
 
 <a id="volume"></a>
 ### A volume is filling
@@ -383,11 +461,23 @@ optional heartbeat URL's GET, which carries no message either. Each light pass:
   writes), or the last 15 minutes without one; a cursor file or directory that is a link is not
   used. A cursor moves on only once the lines read were judged and the result written, so a pass
   cut short by its deadline, or one whose records could not be written, leaves the lines for the
-  next pass. It reads to the end of the new entries and keeps only lines that carry its text before
-  it cuts anything to 1 MiB, so a flood of other lines costs time, never a line it looks for. A read
-  cut off by its time limit is unknown for that pass; after two in a row the class starts again
+  next pass. It reads to the end of the new entries and keeps only lines that carry its text, so a
+  flood of other lines costs time, never a line it looks for. A read cut off by its time limit, or
+  whose kept lines pass 1 MiB (a flood of lines that carry the text), is unknown for that pass,
+  since a line past the cap would be lost unseen; after two in a row the class starts again
   from the last 15 minutes and the `witness` rail says `journal class <class>: lines may have been
-  skipped`. No line, nor any part of one, is kept or shown: only counts (in `meta jlines`);
+  skipped`. No line, nor any part of one, is kept or shown: only counts (in `meta jlines`). Three
+  more classes, each read by its account's uid: the gateway's line that it dropped a rebuilt batch
+  (`gateway.service`, `propolis-gateway`; see [gateway-dup](#gateway-dup)), the shipper's ERROR and
+  WARN lines on a collector (`shipper.service`, `propolis-shipper`; see
+  [ship-failing](#ship-failing)), and the off-host pull's `served` line (`propolis-backup-pull`,
+  identifier `propolis-backup-serve`), kept as `meta pull_last`;
+- on a control node or gateway, lists the gateway spool's collector directories, as the gateway
+  account where the spool is that account's, and judges each collector `PROPOLIS_SENSOR_LOGS`
+  lists (see [spool-quiet](#spool-quiet)); a directory nobody listed is never read further, and a
+  record or an `observe` line names a collector only by its opaque id;
+- watches the backup run: one activating for longer than three times the last run's length, and
+  never under two hours, opens `backup-hung` (see [backup-hung](#backup-hung));
 - takes in the failure hook's spool files, then judges the first sightings the hook left
   pending for units that restart themselves: one restart that healed (systemd's `NRestarts`
   one above what the hook read, the unit up for over a minute) is dropped and counted as a
@@ -414,7 +504,8 @@ optional heartbeat URL's GET, which carries no message either. Each light pass:
 
 Every probe of a light pass runs before it takes the state lock, and none starts unless its whole
 time limit (the account lookup and journal read of the daemon's tie, the `ss` lookup and GET of
-`/ready`, the listing of the undelivered files among them) ends within 160 s of the pass's start;
+`/ready`, the listing of the undelivered files, the spool listing and each class's account lookup
+and journal read among them) ends within 160 s of the pass's start;
 one that cannot is unknown for that pass. Only the ownership checks' `stat` and `readlink` of the
 daemon binary's path have no limit of their own, as the reads of the state files have none.
 
@@ -458,6 +549,15 @@ Each hourly pass, all slow work first and without the state lock:
   the URL and topic, so a changed target is checked again by the next light pass;
 - checks the light pass: its timer active and enabled, and a pass completed within 20 minutes;
 - samples the free space and inodes of every store's filesystem (see [volume](#volume));
+- on a single box or control node, reads whether a crontab line or an enabled timer runs the
+  public push, the push marker and the feed's publish marker, and records `push-failing`,
+  `push-unscheduled` or `push-off` (see [push-failing](#push-failing));
+- on a single box or control node, counts the scheduled backup sets against
+  `PROPOLIS_BACKUP_KEEP`, reads whether an off-host pull is configured, and records
+  `backup-retention` and `backup-offhost`; a failed backup folds under `db-unreachable` or the
+  backup volume's record by the step it failed in (see [backup-hung](#backup-hung));
+- when config-check reported exactly one unlisted spool, names its collector by opaque id in the
+  folded finding's instance, found by matching config-check's key hash against the spool's names;
 - where `DATABASE_URL` is set, reads the database's state in one read-only session (see
   [db-state](#db-state)), and once a day, for a local database, `SHOW data_directory` as the
   `postgres` account through `setpriv` (never as root, and with a reset environment), kept in
@@ -490,7 +590,7 @@ Each hourly pass, all slow work first and without the state lock:
 Then, under the lock, it reads the state files again and changes only its own records, its own
 lines of `observe` (the `Z` and `H` lines and its own `P` lines) and its own `meta` keys, so what
 the light pass or the failure hook recorded meanwhile is kept. Every read of the stores, the
-database and the watched files starts only when its whole time limit still ends within 570 s of the
+database, the watched files, the push and the backups starts only when its whole time limit still ends within 570 s of the
 pass's start; one that cannot is unknown for that pass. A pass that has run for 720 s judges
 nothing more and marks itself `partial`.
 

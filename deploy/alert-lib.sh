@@ -3438,18 +3438,25 @@ pa_send() {
     [ "$PA_SEND_RESULT" = ok ]
 }
 
-# pa_render MODE TX ID: the message for transition TX, in PA_TITLE, PA_PRIO and PA_BODY. This
-# release renders two. The test page (TX test, ID its code) is the same in full and pointer
-# mode: it carries the host's alias and the code and nothing else, no tier, host name or unit.
-# The daily message (TX daily, MODE full only: it goes only where the gate is full) is
-# _pa_render_daily's. Status 1, with nothing set, for any other message, a code not of 6 hex, a
-# line pa_ok_line refuses, or no alias yet.
+# pa_render MODE TX ID [WAS]: the message for transition TX, in PA_TITLE, PA_PRIO and PA_BODY.
+# The test page (TX test, ID its code) is the same in full and pointer mode: it carries the
+# host's alias and the code and nothing else, no tier, host name or unit. The daily message (TX
+# daily, MODE full only: it goes only where the gate is full) is _pa_render_daily's. An incident
+# message (TX open, change, reopen, remind or resolve, ID the incident's id or `-` for the hook's
+# message without a record, MODE full only, WAS the stored cause before a change) is
+# _pa_render_incident's, where a body line pa_ok_line refuses reads `(line withheld)`. Status 1,
+# with nothing set, for any other message, a code not of 6 hex, a title (or a line of the test page
+# or the daily message) pa_ok_line refuses, or no alias yet.
 pa_render() {
     local mode="${1:-}" tx="${2:-}" id="${3:-}" line
     PA_TITLE="" PA_PRIO="" PA_BODY=""
     case "$tx" in
         test) [[ $id =~ ^[0-9a-f]{6}$ ]] || return 1 ;;
         daily) [ "$mode" = full ] || return 1 ;;
+        open | change | reopen | remind | resolve)
+            _pa_render_incident "$mode" "$tx" "$id" "${4:-}"
+            return
+            ;;
         *) return 1 ;;
     esac
     pa_alias > /dev/null 2>&1 || return 1
@@ -3509,14 +3516,17 @@ pa_testpage_write() {
     pa_state_write testpage < <(printf '%s' "$body")
 }
 
-# pa_ledger_add CLASS KEYHASH TX MODE RESULT SENDER: one send-ledger line stamped now, written
+# pa_ledger_add CLASS KEYHASH TX MODE RESULT SENDER [ID]: one send-ledger line stamped now, written
 # before the send; lines over 48 h old (or dated ahead of the clock) are dropped in the same
-# write. Sets PA_LEDGER_STAMP to the new line's stamp, by which pa_ledger_result finds it. The
-# caller holds the lock.
+# write. Sets PA_LEDGER_STAMP to the new line's stamp, by which pa_ledger_result finds it. With
+# ID (an incident message) the line carries two more fields, the incident's id and the time of the
+# last attempt, now: a retry finds its line by them and the 120 s floor counts from the attempt.
+# A line without them is the test page's and the daily message's, written as before. The caller
+# holds the lock.
 pa_ledger_add() {
     local f line t s body="" a
     for f in "$@"; do pa_ok_field "$f" || return 2; done
-    [ "$#" = 6 ] || return 2
+    [ "$#" = 6 ] || [ "$#" = 7 ] || return 2
     pa_now
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -3527,24 +3537,31 @@ pa_ledger_add() {
         fi
         body+="$line"$'\n'
     done < <(pa_state_read send-ledger)
-    body+="$(printf 'L\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$PA_STAMP" "$@")"$'\n'
+    body+="L"$'\t'"$PA_STAMP$(printf '\t%s' "$@")"
+    [ "$#" = 6 ] || body+=$'\t'"$PA_STAMP"
+    body+=$'\n'
     PA_LEDGER_STAMP="$PA_STAMP"
     pa_state_write send-ledger < <(printf '%s' "$body")
 }
 
-# pa_ledger_result STAMP CLASS RESULT SENDER: the result (and sender) of the ledger line of CLASS
-# stamped STAMP that is still pending or claimed (sending). Status 1 when there is none. The
-# caller holds the lock.
+# pa_ledger_result STAMP CLASS RESULT SENDER [KEYHASH TX]: the result (and sender) of the ledger
+# line of CLASS stamped STAMP that is still pending or claimed (sending). Several incident
+# messages admitted in one pass share a stamp, so with KEYHASH and TX the line must name that key
+# and transition too, and a CLASS of `-` matches any class. Fields after the eighth are kept.
+# Status 1 when there is none. The caller holds the lock.
 pa_ledger_result() {
-    local line t s c k x m r w body="" found=1 f
+    local line t s c k x m r w rest body="" found=1 f
     for f in "$@"; do pa_ok_field "$f" || return 2; done
-    [ "$#" = 4 ] || return 2
+    [ "$#" = 4 ] || [ "$#" = 6 ] || return 2
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        IFS=$'\t' read -r t s c k x m r w _ <<< "$line"
-        if [ "$found" = 1 ] && [ "$t" = L ] && [ "$s" = "$1" ] && [ "$c" = "$2" ] \
+        IFS=$'\t' read -r t s c k x m r w rest <<< "$line"
+        if [ "$found" = 1 ] && [ "$t" = L ] && [ "$s" = "$1" ] \
+            && { [ "$c" = "$2" ] || { [ "$#" = 6 ] && [ "$2" = - ]; }; } \
+            && { [ "$#" = 4 ] || { [ "$k" = "$5" ] && [ "$x" = "$6" ]; }; } \
             && { [ "$r" = pending ] || [ "$r" = sending ]; }; then
             line="$(printf 'L\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$s" "$c" "$k" "$x" "$m" "$3" "$4")"
+            [ -z "$rest" ] || line+=$'\t'"$rest"
             found=0
         fi
         body+="$line"$'\n'
@@ -3580,32 +3597,79 @@ _pa_budget_ages() {
     done < <(pa_state_read send-ledger)
 }
 
+# _pa_ledger_countable: this read of the send ledger gives a count. The decision is made from this
+# read alone, whatever an earlier read in the same process found: a damaged copy that read set
+# aside is gone, and the reader starts from what is left. A damaged copy still in place (a rename
+# refused by a read-only disk) gives no count of its own, but a readable copy beside it does, and
+# that is the one pa_state_read hands the counting; only when no copy can be read is there no
+# count. A reader that holds the lock then writes an empty ledger (on a read-only disk it lands in
+# /run), so the next read counts from empty whether or not the damaged copy could be set aside:
+# without that, a copy that stays in place would withhold every message for as long as the disk
+# stayed read-only, which is when the operator must hear.
+_pa_ledger_countable() {
+    local gp gf
+    PA_STATE_UNREADABLE=" ${PA_STATE_UNREADABLE:-} "
+    PA_STATE_UNREADABLE="${PA_STATE_UNREADABLE// send-ledger / }"
+    PA_STATE_UNREADABLE="${PA_STATE_UNREADABLE# }"
+    PA_STATE_UNREADABLE="${PA_STATE_UNREADABLE% }"
+    _pa_state_load "$PA_STATE/send-ledger" send-ledger
+    gp="$_PA_G"
+    _pa_state_load "$PA_RUN/fallback/send-ledger" send-ledger
+    gf="$_PA_G"
+    [[ " $PA_STATE_UNREADABLE " == *" send-ledger "* ]] || return 0
+    if [ "$gp" -ge 0 ] || [ "$gf" -ge 0 ]; then return 0; fi
+    if [[ ${PA_LOCK_FD:-} =~ ^[0-9]+$ ]]; then
+        pa_state_write send-ledger < /dev/null || true
+    fi
+    return 1
+}
+
 # pa_budget_admit CLASS KEY TX NEW: admit or withhold:<reason>, from the ledger, which the caller
-# read under the lock. This release sends two classes: test (the test page), at most 3 in 24 h,
-# and daily (the daily message), none while a line it counts is under 20 h old (the witness also
-# holds it to one a local date), each of the lines _pa_budget_ages counts. Every other class is
-# withheld (unbuilt), since no other sender exists yet, and a ledger that cannot be read admits
-# nothing (ledger): a count that cannot be made is not zero.
+# read under the lock; also sets PA_ADMIT_VERDICT to the same word and, on admit, PA_ADMIT_AS to
+# the class the ledger line is written under. A ledger of which this read finds no readable copy
+# admits nothing (ledger): a count that cannot be made is not zero (_pa_ledger_countable). An
+# unknown CLASS admits nothing (class).
+#
+# test (the test page) admits at most 3 in 24 h and daily (the daily message) none while a line
+# it counts is under 20 h old (the witness also holds it to one a local date), each of the lines
+# _pa_budget_ages counts. storm, summary, switch and pointer have only their own caps
+# (_pa_exempt_caps, _pa_budget_exempt). For an incident message (CLASS incident, or reserve, pool
+# or stage1, which mean the same: the class is decided here, never taken from the caller) see
+# _pa_budget_incident.
 pa_budget_admit() {
     local class="${1:-}" a n=0
+    PA_ADMIT_VERDICT="" PA_ADMIT_AS=""
     case "$class" in
-        test | daily) ;;
+        test | daily | storm | summary | switch | pointer | incident | reserve | pool | stage1) ;;
         *)
-            printf 'withhold:unbuilt'
+            PA_ADMIT_VERDICT=withhold:class
+            printf '%s' "$PA_ADMIT_VERDICT"
             return 1
             ;;
     esac
-    pa_state_read send-ledger > /dev/null
-    if [[ " ${PA_STATE_UNREADABLE:-} " == *" send-ledger "* ]]; then
-        printf 'withhold:ledger'
+    if ! _pa_ledger_countable; then
+        PA_ADMIT_VERDICT=withhold:ledger
+        printf '%s' "$PA_ADMIT_VERDICT"
         return 1
     fi
+    case "$class" in
+        storm | summary | switch | pointer)
+            _pa_budget_exempt "$class"
+            return
+            ;;
+        incident | reserve | pool | stage1)
+            _pa_budget_incident "${2:-}" "${3:-}" "${4:-}"
+            return
+            ;;
+    esac
     if [ "$class" = daily ]; then
         while read -r a _; do
             [[ ${a:-} =~ ^[0-9]{1,12}$ ]] && [ "$((10#$a))" -lt 72000 ] || continue
+            PA_ADMIT_VERDICT=withhold:daily-cap
             printf 'withhold:daily-cap'
             return 1
         done < <(_pa_budget_ages daily)
+        PA_ADMIT_VERDICT=admit PA_ADMIT_AS=daily
         printf admit
         return 0
     fi
@@ -3614,10 +3678,362 @@ pa_budget_admit() {
         n=$((n + 1))
     done < <(_pa_budget_ages)
     if [ "$n" -ge 3 ]; then
+        PA_ADMIT_VERDICT=withhold:test-cap
         printf 'withhold:test-cap'
         return 1
     fi
+    PA_ADMIT_VERDICT=admit PA_ADMIT_AS=test
     printf admit
+}
+
+# _pa_counted RESULT: a ledger result that says the message was or may have been sent: pending
+# (written just before the send), sending, ok, perm and transient. norender, nocurl, notarget,
+# noclaim, lockbusy and nomatch sent nothing and are not counted.
+_pa_counted() {
+    case "${1:-}" in
+        pending | sending | ok | perm:[0-9][0-9][0-9] | transient:[0-9][0-9][0-9]) return 0 ;;
+    esac
+    return 1
+}
+
+# _pa_ledger_ages CLASS...: `<class> <keyhash> <age>` for each counted line of those classes under
+# 24 h old. A stamp out of form or ahead of the clock (pa_age -1) is expired, and one from another
+# boot is aged by the wall clock, so a clock fault can only free room, never hold a message back
+# for longer than a day. Unlike the test page, which claims its line (sending) before it sends,
+# these classes write pending immediately before the send and nothing in between, so a pending
+# line may be a message that went out and counts for the whole window; a retry updates that line
+# (pa_ledger_retry) and never adds one, so a pending line cannot multiply. A class is matched as
+# one closed word: a damaged field holding several would be split again where it is read back.
+_pa_ledger_ages() {
+    local t s c k r a want=" $* "
+    while IFS=$'\t' read -r t s c k _ _ r _; do
+        case "${c:-}" in reserve | pool | stage1 | late | storm | summary | switch | pointer) ;; *) continue ;; esac
+        if [ "$t" != L ] || [[ $want != *" $c "* ]] || ! _pa_counted "${r:-}"; then continue; fi
+        a="$(pa_age "${s:-}")"
+        [[ $a =~ ^[0-9]{1,12}$ ]] && [ "$((10#$a))" -le 86400 ] || continue
+        [[ ${k:-} =~ ^[0-9a-f]{8}$ ]] || k=-
+        printf '%s %s %s\n' "$c" "$k" "$((10#$a))"
+    done < <(pa_state_read send-ledger)
+}
+
+# _pa_exempt_caps CLASS: `<window seconds> <limit>` pairs of an exempt class: storm 1 in 6 h,
+# summary 1 an hour and 12 a day, switch 1 a day where the time of the switch is not known
+# (_pa_switch_held decides it otherwise), pointer 2 an hour and 48 a day (its sender's 30-minute
+# coalescing gives that; the cap holds if it does not).
+_pa_exempt_caps() {
+    case "${1:-}" in
+        storm) printf '21600 1' ;;
+        summary) printf '3600 1 86400 12' ;;
+        switch) printf '86400 1' ;;
+        pointer) printf '3600 2 86400 48' ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pa_switch_held: whether the switch now in force has had its summary. The switch summary goes
+# once per switch, so where meta holds the time of the last switch (profile_switched,
+# which the profile switch keeps) every counted switch line from that time on counts, up to the
+# 48 h the ledger keeps; a line dated ahead of the clock does not, as in every window. Status 0
+# when one counts, 1 when none does, 2 when meta holds no such time, and the one-a-day cap of
+# _pa_exempt_caps stands in for it.
+_pa_switch_held() {
+    local sw t s c r span
+    sw="$(_pa_meta_get profile_switched)"
+    _pa_stamp_split "$sw" || return 2
+    while IFS=$'\t' read -r t s c _ _ _ r _; do
+        if [ "$t" != L ] || [ "${c:-}" != switch ] || ! _pa_counted "${r:-}"; then continue; fi
+        [ "$(pa_age "${s:-}")" -ge 0 ] || continue
+        span="$(_pa_stamp_span "$sw" "${s:-}")" || continue
+        [ "$span" -ge 0 ] && return 0
+    done < <(pa_state_read send-ledger)
+    return 1
+}
+
+# _pa_budget_exempt CLASS: the verdict of an exempt class from its own caps alone: it never counts
+# against the pool, the stage-1 sub-cap or a key, and nothing else counts against it.
+_pa_budget_exempt() {
+    local class="$1" w l n c a rc=2
+    local -a caps=()
+    if [ "$class" = switch ]; then
+        _pa_switch_held && rc=0 || rc=$?
+    fi
+    case "$rc" in
+        0)
+            PA_ADMIT_VERDICT=withhold:switch-cap
+            printf '%s' "$PA_ADMIT_VERDICT"
+            return 1
+            ;;
+        1)
+            PA_ADMIT_VERDICT=admit PA_ADMIT_AS=switch
+            printf admit
+            return 0
+            ;;
+    esac
+    read -r -a caps <<< "$(_pa_exempt_caps "$class")"
+    while [ "${#caps[@]}" -ge 2 ]; do
+        w="${caps[0]}" l="${caps[1]}" n=0
+        caps=("${caps[@]:2}")
+        while read -r c _ a; do
+            [ -n "${c:-}" ] && [ "$a" -lt "$w" ] || continue
+            n=$((n + 1))
+        done < <(_pa_ledger_ages "$class")
+        if [ "$n" -ge "$l" ]; then
+            PA_ADMIT_VERDICT="withhold:$class-cap"
+            printf '%s' "$PA_ADMIT_VERDICT"
+            return 1
+        fi
+    done
+    PA_ADMIT_VERDICT=admit PA_ADMIT_AS="$class"
+    printf admit
+}
+
+# _pa_admit_known KEY TX NEW: KEY's record (in memory, pa_incident_load) is one the tables know,
+# in a state TX applies to: tier PAGE or ACT (a NOTICE never pushes), a kind with a message
+# (_pa_kind_known), TX one of the five transitions, NEW 1 only for an open. Sets _PA_AD_RESERVE (1
+# for a reserve kind on its own key at tier PAGE) and _PA_AD_LISTENER (1 for a listener: a sensor
+# unit, or a finding of the listen stage). Unknown never counts as good: anything else fails.
+# Status 2 for a resolve of a record whose open was never delivered (delivered_open not 1): no
+# RESOLVED follows an open that did not get through, and that is no withheld message.
+_pa_admit_known() {
+    local key="${1:-}" tx="${2:-}" new="${3:-}" kind
+    _PA_AD_RESERVE=0 _PA_AD_LISTENER=0
+    declare -p _PA_INC_I > /dev/null 2>&1 || return 1
+    pa_incident_get "$key" && _pa_inc_whole || return 1
+    case "$new" in 0) ;; 1) [ "$tx" = open ] || return 1 ;; *) return 1 ;; esac
+    case "$tx:${PA_INC[7]}" in
+        open:open | open:acked | reopen:open | reopen:acked | change:open | change:acked) ;;
+        remind:open | resolve:resolved) ;;
+        *) return 1 ;;
+    esac
+    case "${PA_INC[6]}" in PAGE | ACT) ;; *) return 1 ;; esac
+    kind="${PA_INC[3]}"
+    _pa_kind_known "$kind" || return 1
+    _pa_stage_where "${PA_INC[4]}" > /dev/null || return 1
+    if [ "${PA_INC[6]}" = PAGE ]; then
+        case "$kind:$key" in
+            daemon-down:unit:propolis.service | unit-failed:unit:propolis.service \
+                | unit-crashloop:unit:propolis.service | db-unreachable:db:local \
+                | db-unreachable:db:remote | alert-path:alert:shell) _PA_AD_RESERVE=1 ;;
+        esac
+    fi
+    pa_unit_map "${key#unit:}"
+    if { [[ $key == unit:* ]] && [ "$PA_UNIT_LISTENER" = yes ]; } \
+        || { [ "$kind" = finding ] && [ "${PA_INC[4]}" = listen ]; }; then
+        _PA_AD_LISTENER=1
+    fi
+    [ "$tx" != resolve ] || [ "${PA_INC[17]}" = 1 ] || return 2
+    return 0
+}
+
+# _pa_budget_incident KEY TX NEW: the order of checks for an incident message.
+#   1. The record is one the tables know (_pa_admit_known), else withhold:unknown; a resolve whose
+#      open was never delivered, withhold:undelivered (the caller writes no W line for it).
+#   2. Reserve: a reserve kind at tier PAGE, TX open, change or reopen, with room (1 an hour, 4 a
+#      day): admitted as reserve, whatever the pool holds. A reserve kind that finds the reserve
+#      spent goes on through the rules below, and no other kind ever spends it.
+#   3. Late open (below): with room in its own allowance (1 an hour, 4 a day), admitted as late,
+#      whatever the key, the listener caps and the pool hold. One that finds the allowance spent
+#      goes on through the rules below as the reminder it is.
+#   4. Per key: unless TX is open and NEW 1 (a new id), withhold:key-cap at 6 in 24 h.
+#   5. Stage 1, a listener: withhold:stage1-cap at 2 in the hour; unless TX is open and NEW 1, at
+#      8 in 24 h; and at 16 in 24 h whatever the message, so listener pushes have a day total of
+#      their own.
+#   6. Pool: withhold:pool at 4 in the hour or 16 in 24 h, where listener lines count for at most
+#      the stage-1 sub-cap (2 an hour, 8 a day). New listener opens pass the 8-a-day sub-cap, so
+#      counted in full they could fill the pool and hold every other new incident back for a day;
+#      counted to the sub-cap, listener traffic takes no more of the pool from the other kinds
+#      than 2 an hour and 8 a day.
+#   7. Admitted as stage1 for a listener, else as pool.
+# Reserve and late lines never count against the pool or the listener caps; every class counts
+# against the key.
+#
+# A late open is a reminder of a listener incident that has had no message (sends exactly 0,
+# delivered_open 0), which is what a withheld open leaves; a second reminder is one too while the
+# first was withheld. An attacker who opens two cheap listener incidents an hour keeps the stage-1
+# hour full and, in eight hours, the listener day; a real listener that fails meanwhile has its
+# open withheld, and its reminder, an hour later and still failing, is the open that did not go.
+# Its allowance is small and its own, so listeners an attacker keeps down for that hour take four
+# late opens a day and nothing from the other kinds. A record opened before these messages were
+# sent at all has had none either: what speaks for those is for the switch to decide.
+#
+# What this cannot give: a listener incident of tier ACT is first reminded after four hours, and
+# a kind that is never reminded has no late open, so a withheld open of either waits for the
+# notice and the summary that list what was withheld; so does a fifth listener kept down in a
+# day. The new alerting must not be switched on without that notice and summary.
+#
+# The bounds: in an hour at most 6 incident pushes (reserve 1, late 1, pool and listener 4). In
+# 24 h every pool or stage1 admission needs the pool lines plus up to 8 listener lines under 16,
+# and listener lines are at most 16, so pool and listener lines together are at most 24; with the
+# reserve's 4 and the late opens' 4, at most 32.
+_pa_budget_incident() {
+    local key="${1:-}" tx="${2:-}" new="${3:-}" kh c k a rc=0
+    local r1=0 r24=0 p1=0 p24=0 s1=0 s24=0 l1=0 l24=0 k24=0 newopen=0 late=0
+    _pa_admit_known "$key" "$tx" "$new" || rc=$?
+    if [ "$rc" = 2 ]; then
+        PA_ADMIT_VERDICT=withhold:undelivered
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    if [ "$rc" != 0 ] || ! kh="$(_pa_keyhash "$key")"; then
+        PA_ADMIT_VERDICT=withhold:unknown
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    [ "$tx:$new" != open:1 ] || newopen=1
+    if [ "$_PA_AD_LISTENER" = 1 ] && [ "$tx" = remind ] && [ "${PA_INC[14]}" = 0 ] && [ "${PA_INC[17]}" = 0 ]; then
+        late=1
+    fi
+    while read -r c k a; do
+        [ -n "${c:-}" ] || continue
+        [ "$k" != "$kh" ] || k24=$((k24 + 1))
+        case "$c" in
+            reserve) r24=$((r24 + 1)) && [ "$a" -ge 3600 ] || r1=$((r1 + 1)) ;;
+            pool) p24=$((p24 + 1)) && [ "$a" -ge 3600 ] || p1=$((p1 + 1)) ;;
+            stage1) s24=$((s24 + 1)) && [ "$a" -ge 3600 ] || s1=$((s1 + 1)) ;;
+            late) l24=$((l24 + 1)) && [ "$a" -ge 3600 ] || l1=$((l1 + 1)) ;;
+        esac
+    done < <(_pa_ledger_ages reserve pool stage1 late)
+    PA_ADMIT_VERDICT=""
+    case "$tx" in
+        open | change | reopen)
+            if [ "$_PA_AD_RESERVE" = 1 ] && [ "$r1" -lt 1 ] && [ "$r24" -lt 4 ]; then
+                PA_ADMIT_VERDICT=admit PA_ADMIT_AS=reserve
+            fi
+            ;;
+    esac
+    if [ -z "$PA_ADMIT_VERDICT" ] && [ "$late" = 1 ] && [ "$l1" -lt 1 ] && [ "$l24" -lt 4 ]; then
+        PA_ADMIT_VERDICT=admit PA_ADMIT_AS=late
+    fi
+    if [ -z "$PA_ADMIT_VERDICT" ]; then
+        if [ "$newopen" = 0 ] && [ "$k24" -ge 6 ]; then
+            PA_ADMIT_VERDICT=withhold:key-cap
+        elif [ "$_PA_AD_LISTENER" = 1 ] \
+            && { [ "$s1" -ge 2 ] || [ "$s24" -ge 16 ] || { [ "$newopen" = 0 ] && [ "$s24" -ge 8 ]; }; }; then
+            PA_ADMIT_VERDICT=withhold:stage1-cap
+        else
+            [ "$s1" -le 2 ] || s1=2
+            [ "$s24" -le 8 ] || s24=8
+            if [ "$((p1 + s1))" -ge 4 ] || [ "$((p24 + s24))" -ge 16 ]; then
+                PA_ADMIT_VERDICT=withhold:pool
+            elif [ "$_PA_AD_LISTENER" = 1 ]; then
+                PA_ADMIT_VERDICT=admit PA_ADMIT_AS=stage1
+            else
+                PA_ADMIT_VERDICT=admit PA_ADMIT_AS=pool
+            fi
+        fi
+    fi
+    printf '%s' "$PA_ADMIT_VERDICT"
+    [ "$PA_ADMIT_VERDICT" = admit ]
+}
+
+# pa_incident_admit KEY TX NEW MODE SENDER: an incident message admitted or withheld, and, when
+# admitted, made retryable before anything is sent: one pending ledger line (with the incident's
+# id and the time of this attempt), then the record's pending_tx and pending_since (the line's
+# stamp), sends and last_sent, written with every record in memory. The ledger line comes first,
+# so a record that says a transition is pending always has the line that counts it; a record that
+# cannot be written gives the line back as noclaim (a word the budget leaves out) and the message
+# must not be sent (withhold:noclaim). Prints the verdict of pa_budget_admit, or withhold:ledger
+# when the line cannot be written; status 0 only for admit. PA_ADMIT_VERDICT says the same word,
+# and PA_ADMIT_AS is empty unless admitted; a withhold that comes after the verdict (the line or
+# the record could not be written) leaves the records in memory as they were. MODE is full only: pointer mode is a budget class of its own, exempt from the pool,
+# stage 1 and the key cap, and comes with the profile switch. The caller holds the lock and loaded
+# the records (pa_incident_load), with the transition already applied and stored in memory
+# (pa_incident_set): the record is read again from there, so a change left only in PA_INC is lost.
+pa_incident_admit() {
+    local key="${1:-}" tx="${2:-}" new="${3:-}" mode="${4:-}" sender="${5:-}" kh stamp saved as
+    case "$mode" in full) ;; *) mode="" ;; esac
+    case "$sender" in hook | light | hourly | status) ;; *) sender="" ;; esac
+    if [ -z "$mode" ] || [ -z "$sender" ]; then
+        PA_ADMIT_VERDICT=withhold:unknown PA_ADMIT_AS=""
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    pa_budget_admit incident "$key" "$tx" "$new" > /dev/null || {
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    }
+    as="$PA_ADMIT_AS"
+    kh="$(_pa_keyhash "$key")" || kh=""
+    if [ -z "$kh" ] || ! pa_ledger_add "$as" "$kh" "$tx" "$mode" pending "$sender" "${PA_INC[1]}"; then
+        PA_ADMIT_VERDICT=withhold:ledger PA_ADMIT_AS=""
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    stamp="$PA_LEDGER_STAMP"
+    pa_incident_get "$key" || return 1
+    saved="${_PA_INC_I[PA_INC_AT]}"
+    PA_INC[26]="$tx" PA_INC[27]="$stamp" PA_INC[15]="$stamp"
+    PA_INC[14]=$(($(_pa_num "${PA_INC[14]}") + 1))
+    if ! pa_incident_set || ! pa_incident_write; then
+        pa_ledger_result "$stamp" "$as" noclaim "$sender" "$kh" "$tx" || true
+        pa_incident_get "$key" && _PA_INC_I[PA_INC_AT]="$saved"
+        pa_incident_get "$key" || true
+        PA_ADMIT_VERDICT=withhold:noclaim PA_ADMIT_AS=""
+        printf '%s' "$PA_ADMIT_VERDICT"
+        return 1
+    fi
+    printf admit
+}
+
+# pa_retry_due PENDING_SINCE TRIED: whether a pending transition may be sent again now. Prints
+# due, wait (under 120 s since it was admitted or last tried: longer than any sender's send bound
+# and lock waits, so a pass never retries a send another process is still making) or expired (an
+# hour since it was admitted, or an admission time out of form: pending_tx is then cleared and the
+# incident waits for its next reminder). An admission dated ahead of the clock (a host whose clock
+# came up behind after a crash mid-send) waits until the clock passes it and is retried then.
+# A last attempt out of form is no attempt; one dated ahead of the clock is no
+# attempt only when its boot is known and is not this one (that process ended with its boot),
+# else, as after a clock stepped back with no boot id to age by, it may still be sending and is
+# waited for. Status 0 only for due. Reads nothing but the clock.
+pa_retry_due() {
+    local a t
+    [ -n "${PA_STAMP:-}" ] || pa_now
+    if ! _pa_stamp_split "${1:-}"; then
+        printf expired
+        return 1
+    fi
+    a="$(pa_age "$1")"
+    if [ "$a" -ge 3600 ]; then
+        printf expired
+        return 1
+    fi
+    t=-2
+    if _pa_stamp_split "${2:-}"; then
+        t="$(pa_age "$2")"
+        if [ "$t" -lt 0 ] && [ "$_PA_B" != - ] && [ "${PA_BOOT:--}" != - ] && [ "$_PA_B" != "$PA_BOOT" ]; then
+            t=-2
+        fi
+    fi
+    if [ "$a" -lt 120 ] || { [ "$t" != -2 ] && [ "$t" -lt 120 ]; }; then
+        printf wait
+        return 1
+    fi
+    printf due
+}
+
+# pa_ledger_retry STAMP KEYHASH TX SENDER: a retry of the transition admitted at STAMP, which
+# updates that transition's ledger line (result pending again, this sender, the time of this
+# attempt) and adds none, so a retry is never counted again. Only a line still pending or with a
+# transient result is retried: ok and perm ended it. Status 1 when there is none. The caller
+# holds the lock.
+pa_ledger_retry() {
+    local line t s c k x m r w id rest body="" found=1 f
+    for f in "$@"; do pa_ok_field "$f" || return 2; done
+    [ "$#" = 4 ] || return 2
+    pa_now
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r t s c k x m r w id _ rest <<< "$line"
+        if [ "$found" = 1 ] && [ "$t" = L ] && [ "$s" = "$1" ] && [ "$k" = "$2" ] && [ "$x" = "$3" ] \
+            && [[ ${r:-} == pending || ${r:-} == transient:[0-9][0-9][0-9] ]]; then
+            line="$(printf 'L\t%s\t%s\t%s\t%s\t%s\tpending\t%s\t%s\t%s' "$s" "$c" "$k" "$x" "$m" "$4" "${id:--}" "$PA_STAMP")"
+            [ -z "$rest" ] || line+=$'\t'"$rest"
+            found=0
+        fi
+        body+="$line"$'\n'
+    done < <(pa_state_read send-ledger)
+    [ "$found" = 0 ] || return 1
+    pa_state_write send-ledger < <(printf '%s' "$body")
 }
 
 # pa_budget_next CLASS: when enough of the lines the test budget counts have stopped counting for
@@ -3628,6 +4044,12 @@ pa_budget_admit() {
 pa_budget_next() {
     local a r k t
     local -a rem=()
+    case "${1:-}" in
+        storm | summary | switch | pointer)
+            _pa_budget_next_exempt "$1"
+            return
+            ;;
+    esac
     if [ "${1:-}" = test ]; then
         while read -r a r; do
             [[ $a =~ ^[0-9]{1,12}$ && ${r:-} =~ ^[0-9]{1,12}$ ]] || continue
@@ -3647,6 +4069,45 @@ pa_budget_next() {
     }
     [ -n "${PA_WALL:-}" ] || pa_now
     t=$((10#$PA_WALL + 10#$r))
+    t=$(((t + 59) / 60 * 60))
+    date -u -d "@$t" +%H:%M 2> /dev/null || printf '?'
+}
+
+# _pa_budget_next_exempt CLASS: when an exempt class next has room under every one of its caps
+# (_pa_exempt_caps), so the storm notice can say when the next summary may go: for each cap whose
+# window holds limit or more counted lines, the time the oldest of the surplus leaves it, and the
+# latest of those; now when there is room already. HH:MM UTC, rounded up to the minute. A switch
+# summary already sent for the switch in force has room only at the next switch, which no clock
+# gives: `?`.
+_pa_budget_next_exempt() {
+    local class="$1" w l n c a r need=0 t rc=2
+    local -a caps=() rem=()
+    if [ "$class" = switch ]; then
+        _pa_switch_held && rc=0 || rc=$?
+    fi
+    if [ "$rc" = 0 ]; then
+        printf '?'
+        return 1
+    fi
+    [ "$rc" = 1 ] || read -r -a caps <<< "$(_pa_exempt_caps "$class")"
+    while [ "${#caps[@]}" -ge 2 ]; do
+        w="${caps[0]}" l="${caps[1]}" rem=()
+        caps=("${caps[@]:2}")
+        while read -r c _ a; do
+            [ -n "${c:-}" ] && [ "$a" -lt "$w" ] || continue
+            rem+=("$((w - a))")
+        done < <(_pa_ledger_ages "$class")
+        n="${#rem[@]}"
+        [ "$n" -ge "$l" ] || continue
+        r="$(printf '%s\n' "${rem[@]}" | sort -n | sed -n "$((n - l + 1))p")"
+        [[ $r =~ ^[0-9]{1,12}$ ]] || {
+            printf '?'
+            return 1
+        }
+        [ "$((10#$r))" -le "$need" ] || need=$((10#$r))
+    done
+    [ -n "${PA_WALL:-}" ] || pa_now
+    t=$((10#$PA_WALL + need))
     t=$(((t + 59) / 60 * 60))
     date -u -d "@$t" +%H:%M 2> /dev/null || printf '?'
 }
@@ -4048,4 +4509,679 @@ _pa_render_daily() {
         *) where="?" ;;
     esac
     printf 'state: %s\nDo: status\n' "$where"
+}
+
+# ---- incident messages (full mode) -------------------------------------------------------------
+#
+# What an open, a change, a reopen, a reminder and a resolve of a PAGE or ACT incident say. A
+# message goes to a phone and through a third-party server, so every word is either from a closed
+# list below (tier, stage and rail words, the what, impact, cause and proof phrases, role and
+# transition words, flags, runbook keys) or a value matched against a closed form before use: the
+# alias, an opaque id, an incident id, a count, a duration, a clock time, a cause code and its
+# number. Nothing read from a record, a state file, the host or the environment is ever copied in
+# as text: a key, a kind or a path only selects a phrase, and a value out of form reads `not known
+# here` or `?`, or the message is not rendered at all. Pointer mode, the storm notice and the
+# summaries come with the profile switch, which honours what these render.
+
+# _pa_keyhash KEY: the first 8 hex of sha256(KEY), the form the send ledger and W lines name a key
+# by, so a copy of either taken for a bug report names nothing.
+_pa_keyhash() {
+    local h
+    h="$(printf '%s' "${1:-}" | sha256sum 2> /dev/null)" || return 1
+    [[ $h =~ ^([0-9a-f]{8}) ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# _pa_stage_where WORD: `stage <n> of 10` for a stage word, `rail <word>` for a rail; status 1 for
+# any other word.
+_pa_stage_where() {
+    case "${1:-}" in
+        listen) printf 'stage 1 of 10' ;;
+        source) printf 'stage 2 of 10' ;;
+        ship) printf 'stage 3 of 10' ;;
+        gateway) printf 'stage 4 of 10' ;;
+        intake) printf 'stage 5 of 10' ;;
+        ledger) printf 'stage 6 of 10' ;;
+        review) printf 'stage 7 of 10' ;;
+        reports) printf 'stage 8 of 10' ;;
+        feed) printf 'stage 9 of 10' ;;
+        publish) printf 'stage 10 of 10' ;;
+        alert | backup | chain | host | monitor | witness | peers) printf 'rail %s' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pa_cause_words CODE: the closed words for a cause code; status 1 for a code outside the table.
+_pa_cause_words() {
+    case "${1:-}" in
+        proc.exit) printf 'process exited' ;;
+        proc.sandbox) printf 'refused at start by systemd' ;;
+        proc.signal) printf 'killed by a signal' ;;
+        proc.sigsys) printf 'stopped by the syscall filter' ;;
+        proc.oom) printf 'killed for lack of memory' ;;
+        proc.timeout) printf 'timed out' ;;
+        proc.watchdog) printf 'missed its watchdog' ;;
+        proc.start_limit) printf 'restarted too often' ;;
+        proc.resources) printf 'could not get its resources' ;;
+        proc.panic) printf 'panicked' ;;
+        db.unreachable) printf 'database not answering' ;;
+        db.auth) printf 'database refused the login' ;;
+        db.timeout) printf 'database too slow to answer' ;;
+        db.recovery) printf 'database in recovery' ;;
+        db.xid) printf 'transaction ids running out' ;;
+        db.slots) printf 'connection slots running out' ;;
+        db.locks) printf 'long lock waits' ;;
+        ready.db) printf 'monitor waits for the database' ;;
+        ready.gave_up) printf 'monitor gave up' ;;
+        ready.starting) printf 'monitor starting' ;;
+        tool.exec) printf 'a tool cannot run' ;;
+        http.auth) printf 'refused for authorisation' ;;
+        http.not_found) printf 'topic not found' ;;
+        http.client) printf 'request refused' ;;
+        http.rate) printf 'rate limited' ;;
+        http.server) printf 'server error' ;;
+        net.timeout) printf 'no answer in time' ;;
+        net.connect) printf 'cannot connect' ;;
+        nocurl) printf 'curl missing' ;;
+        fs.no_space) printf 'disk full' ;;
+        fs.readonly) printf 'disk read-only' ;;
+        guard.behind) printf 'reader behind' ;;
+        guard.no_space) printf 'no room to rotate' ;;
+        spool.quiet) printf 'nothing arriving' ;;
+        gw.dup) printf 'rebuilt batch refused' ;;
+        ship.connect) printf 'cannot reach the gateway' ;;
+        ship.rejected) printf 'refused by the gateway' ;;
+        ship.io) printf 'cannot record what was shipped' ;;
+        ship.dropped) printf 'records dropped' ;;
+        backup.long) printf 'running too long' ;;
+        backup.keep) printf 'too few sets kept' ;;
+        backup.pull) printf 'off-host copy late' ;;
+        push.stale) printf 'last push too old' ;;
+        push.none) printf 'no push scheduled' ;;
+        vol.low) printf 'free space low' ;;
+        vol.inodes) printf 'free inodes low' ;;
+        vol.projected) printf 'filling at the current rate' ;;
+        change.env | change.unit | change.binary) printf 'changed and not in force' ;;
+        journal.suppressed) printf 'journal dropped lines' ;;
+        witness.stale) printf 'pass not running' ;;
+        cc.stopped) printf 'check did not complete' ;;
+        config.invalid) printf 'setting not valid' ;;
+        config.finding) printf 'found by config check' ;;
+        clock.step) printf 'clock stepped' ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pa_cause_show STORED: a stored cause (`code`, or `code:<n>` for the codes that carry a number)
+# as a person reads it: _PA_CW the closed words, _PA_CS the code shown (`proc.exit 1`). `unknown`,
+# a value out of form and a code outside the table leave both `not known here`, status 1.
+_pa_cause_show() {
+    local v="${1:-}" code num
+    _PA_CW="not known here" _PA_CS="not known here"
+    [[ $v =~ ^([a-z_]{1,16}(\.[a-z_]{1,16})?)(:([0-9]{1,3}))?$ ]] || return 1
+    code="${BASH_REMATCH[1]}" num="${BASH_REMATCH[4]}"
+    case "$code" in
+        proc.exit | proc.sandbox | proc.signal) [ -n "$num" ] || return 1 ;;
+        http.*) ;;
+        *) [ -z "$num" ] || return 1 ;;
+    esac
+    _PA_CW="$(_pa_cause_words "$code")" || {
+        _PA_CW="not known here"
+        return 1
+    }
+    _PA_CS="$code${num:+ $((10#$num))}"
+}
+
+# _pa_proof_words CODE: the words a RESOLVED prints for a proof code, never the code itself.
+_pa_proof_words() {
+    case "${1:-}" in
+        active10) printf 'running 10 min without a restart' ;;
+        nextrun) printf 'next run succeeded' ;;
+        disabled) printf 'disabled on purpose' ;;
+        quiet30) printf 'no restart for 30 min' ;;
+        ready2) printf 'monitor ready twice' ;;
+        db2) printf 'database answered twice' ;;
+        sent2xx) printf 'an alert got through' ;;
+        clean2) printf 'clean on two checks' ;;
+        pushed) printf 'public push seen' ;;
+        persist2) printf 'state written to disk again' ;;
+        spool2) printf 'collector arriving again' ;;
+        quiet24) printf 'no further loss in 24 h' ;;
+        ended) printf 'backup run ended' ;;
+        pulled) printf 'off-host copy taken' ;;
+        room2) printf 'room again on two checks' ;;
+        fresh2) printf 'witness pass running again' ;;
+        restart) printf 'seen after restart' ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pa_kind_known KIND: a kind whose transitions push (the NOTICE kinds never do, and have no
+# phrase).
+_pa_kind_known() {
+    case "${1:-}" in
+        unit-failed | unit-crashloop | unit-nobind | daemon-down | daemon-degraded | db-unreachable \
+            | db-readonly | db-xid | db-slots | alert-path | finding | push-failing | push-unscheduled \
+            | spool-quiet | gateway-dup | ship-failing | backup-hung | volume-filling \
+            | volume-full-soon | witness-stale | cc-stopped | state-unpersisted) return 0 ;;
+    esac
+    return 1
+}
+
+# _pa_finding_what INST: the phrase of the page row of config-check whose id the current record's
+# key names (`finding:<id>:<k12>`), with its instance; where the instance cannot be recovered it
+# reads `a listener` or `a source`. spool-unlisted, which folds every unlisted collector into one
+# record, names its one collector, or counts them from the record's count field. Status 1 for an
+# id that is not one of the sixteen page rows.
+_pa_finding_what() {
+    local inst="${1:-}" id="${PA_INC[2]:-}" n="${PA_INC[34]:--}" p fb="a listener"
+    [[ $id =~ ^finding:([a-z-]{1,40}): ]] || return 1
+    id="${BASH_REMATCH[1]}"
+    case "$id" in
+        unit-missing) p='listener <inst> not installed' ;;
+        unit-down) p='listener <inst> stopped while enabled' ;;
+        listen-foreign) p='port of <inst> held by another process' ;;
+        listen-loopback) p='port of <inst> held on loopback' ;;
+        listen-none) p='listener <inst> up, nothing listening' ;;
+        fw) p='firewall drops a port of <inst>' ;;
+        danger) p='real service exposed on a port of <inst>' ;;
+        spool-label-sensor) p='source <inst> refused at the gateway' fb="a source" ;;
+        intake-wrongpath) p='intake reads the wrong file for <inst>' fb="a source" ;;
+        intake-absent) p='source <inst> not ingested' fb="a source" ;;
+        logsize-fail) p='log <inst> not rotated in time' fb="a source" ;;
+        stale) p='rotation has not run for 3 h' ;;
+        backup-timer) p='no backup scheduled' ;;
+        backup-stale) p='last good backup too old' ;;
+        ops-failure-hook) p='failure hook not installed' ;;
+        spool-unlisted)
+            if [ -n "$inst" ] && [[ $n == - || $n =~ ^0*1$ ]]; then
+                printf 'collector %s not listed' "$inst"
+            elif [[ $n =~ ^[0-9]{1,6}$ ]]; then
+                printf '%s collectors not listed' "$((10#$n))"
+            elif [ "$n" = 20+ ]; then
+                printf '20+ collectors not listed'
+            else
+                printf '? collectors not listed'
+            fi
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "${p//<inst>/${inst:-$fb}}"
+}
+
+# _pa_restarts KEY: the restarts a crash loop of unit KEY (`unit:<name>`) was judged on: the
+# NRestarts of the light pass's last sample (observe U) less the unit's baseline (observe R), the
+# count the witness's slow rule compares. Fails, so the headline reads `?`, for any other key, a
+# count out of form, or a difference under 1, which no crash loop has: the record's occ counts
+# hook firings and failing passes, not restarts, so it is never shown in its place.
+_pa_restarts() {
+    local u t n v now="" base=""
+    [[ ${1:-} == unit:?* ]] || return 1
+    u="${1#unit:}"
+    while IFS=$'\t' read -r t n _ v _; do
+        [ "$n" = "$u" ] || continue
+        case "$t" in
+            U) now="${v:-}" ;;
+            R) base="${v:-}" ;;
+        esac
+    done < <(pa_state_read observe)
+    [[ $now =~ ^[0-9]{1,9}$ && $base =~ ^[0-9]{1,9}$ ]] || return 1
+    [ "$((10#$now - 10#$base))" -ge 1 ] || return 1
+    printf '%s' "$((10#$now - 10#$base))"
+}
+
+# _pa_vol_full_at MOUNT: when the filesystem of MOUNT (an opaque mount id) is full of its last GiB
+# at its current rate, as HH:MM UTC, from the hourly pass's samples in observe (Z lines) and the
+# same projection the witness opens by and the walk shows (pa_vol_project), counted from the
+# newest sample. Fails where no projection can be made, or where it is already past or more than
+# a day ahead, neither of which a time of day alone would place.
+_pa_vol_full_at() {
+    local m="${1:-}" t id s av ns="" na="" hist="" w
+    [[ $m =~ ^m[0-9a-f]{5,8}$ ]] || return 1
+    while IFS=$'\t' read -r t id s _ av _; do
+        [ "$t" = Z ] && [ "$id" = "$m" ] && _pa_stamp_split "${s:-}" && [[ ${av:-} =~ ^[0-9]{1,18}$ ]] || continue
+        hist+="$s"$'\t'"$av"$'\n'
+        if [ -z "$ns" ] || { w="$(_pa_stamp_span "$ns" "$s")" && [ "$w" -gt 0 ]; }; then ns="$s" na="$av"; fi
+    done < <(pa_state_read observe)
+    [ -n "$ns" ] || return 1
+    pa_vol_project "$ns" "$na" <<< "$hist" || return 1
+    [ "$PA_VOL_HOURS" != - ] && [ "$PA_VOL_HOURS" -le 48 ] || return 1
+    _pa_stamp_split "$ns" || return 1
+    w=$((10#$_PA_W + PA_VOL_HOURS * 3600))
+    [ -n "${PA_WALL:-}" ] || pa_now
+    [ "$w" -gt "$((10#$PA_WALL))" ] && [ "$((w - 10#$PA_WALL))" -le 86400 ] || return 1
+    date -u -d "@$w" +%H:%M 2> /dev/null
+}
+
+# _pa_what KIND INST: the headline phrase of the current record, from the closed list; counts and
+# durations come from fields matched as digits or stamps. Status 1 for a kind without a phrase.
+_pa_what() {
+    local kind="${1:-}" inst="${2:-?}" a w=""
+    [ -n "$inst" ] || inst="?"
+    case "$kind" in
+        unit-failed) printf 'unit %s failed' "$inst" ;;
+        unit-crashloop)
+            w="$(_pa_restarts "${PA_INC[2]:-}")" || w="?"
+            printf 'unit %s restarting (%s restarts)' "$inst" "$w"
+            ;;
+        unit-nobind) printf 'unit %s restarting on an unset bind' "$inst" ;;
+        daemon-down) printf 'monitor and intake down' ;;
+        daemon-degraded) printf 'monitor up, not ready' ;;
+        db-unreachable) printf 'database unreachable' ;;
+        db-readonly) printf 'database is a standby' ;;
+        db-xid) printf 'transaction ids near wraparound' ;;
+        db-slots) printf 'connection slots nearly full' ;;
+        # The code comes from the stored cause http.<class>:<code>; a cause that is no HTTP
+        # answer (curl missing, no connection, not known) has no code to name.
+        alert-path)
+            case "${PA_INC[11]:-}" in
+                http.*)
+                    [[ ${PA_INC[11]} =~ ^http\.[a-z_]{1,16}:([0-9]{3})$ ]] && w="${BASH_REMATCH[1]}"
+                    printf 'alerts not leaving (HTTP %s)' "${w:-?}"
+                    ;;
+                *) printf 'alerts not leaving' ;;
+            esac
+            ;;
+        finding) _pa_finding_what "${2:-}" ;;
+        push-failing) printf 'public push failing' ;;
+        push-unscheduled) printf 'public push not scheduled' ;;
+        spool-quiet)
+            a="$(pa_age "${PA_INC[10]:-}")"
+            [[ $a =~ ^[0-9]{1,12}$ ]] && w="$(pa_dur "$a")"
+            printf 'collector %s quiet %s' "$inst" "${w:-?}"
+            ;;
+        gateway-dup) printf 'rebuilt batch dropped from %s' "$inst" ;;
+        ship-failing) printf 'shipping failing' ;;
+        backup-hung)
+            a="$(pa_age "${PA_INC[10]:-}")"
+            [[ $a =~ ^[0-9]{1,12}$ ]] && w="$(pa_dur "$a")"
+            printf 'backup running %s' "${w:-?}"
+            ;;
+        volume-filling) printf 'volume %s filling' "$inst" ;;
+        volume-full-soon)
+            w="$(_pa_vol_full_at "${2:-}")" && w="$w UTC"
+            printf 'volume %s full by %s' "$inst" "${w:-?}"
+            ;;
+        witness-stale)
+            case "${PA_INC[2]:-}" in
+                witness:light) w=light ;;
+                witness:hourly) w=hourly ;;
+            esac
+            printf 'witness pass %s stale' "${w:-?}"
+            ;;
+        cc-stopped) printf 'config check not running' ;;
+        state-unpersisted) printf 'state not persisted' ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pa_impact KIND STAGE INST: the closed impact phrase of a kind, `not known here` where the list
+# has none or it needs an instance that is not known. A finding on the intake stage concerns one
+# source (the wrong file read for it, or none), whose evidence stops while the rest still reaches
+# the ledger.
+_pa_impact() {
+    local kind="${1:-}" stage="${2:-}" inst="${3:-}" p=""
+    case "$kind:$stage" in
+        unit-failed:listen | unit-crashloop:listen | unit-nobind:* | finding:listen) p='not capturing on <inst>' ;;
+        finding:intake | unit-*:ship | unit-*:gateway | spool-quiet:* | gateway-dup:* | finding:gateway) p='no new evidence from <inst>' ;;
+        daemon-down:* | daemon-degraded:* | db-unreachable:* | db-readonly:* | unit-*:intake) p='nothing reaches the ledger' ;;
+        unit-*:backup | backup-hung:* | finding:backup) p='backup not taken' ;;
+        unit-*:source | finding:source) p='rotation not done' ;;
+        alert-path:* | finding:alert) p='alerts may not arrive' ;;
+        push-*:*) p='public copy stale' ;;
+        unit-*:witness | witness-stale:* | cc-stopped:*) p='witness blind' ;;
+    esac
+    case "$p" in
+        '') p="not known here" ;;
+        *'<inst>'*) if [ -n "$inst" ]; then p="${p//<inst>/$inst}"; else p="not known here"; fi ;;
+    esac
+    printf '%s' "$p"
+}
+
+# _pa_runbook KIND STAGE: the runbook key (a closed list the walk maps to its anchors), or nothing
+# for a unit on the host rail, which has none.
+_pa_runbook() {
+    case "${1:-}:${2:-}" in
+        unit-*:listen) printf listen-down ;;
+        unit-*:intake | daemon-*:*) printf daemon-down ;;
+        unit-*:ship) printf ship-down ;;
+        unit-*:gateway) printf gateway-down ;;
+        unit-*:backup) printf backup-failed ;;
+        unit-*:source) printf rotation ;;
+        unit-*:witness | witness-stale:*) printf witness ;;
+        db-unreachable:*) printf db-unreachable ;;
+        db-*:*) printf db-state ;;
+        alert-path:*) printf alert-path ;;
+        finding:*) printf finding ;;
+        push-*:*) printf push-failing ;;
+        spool-quiet:*) printf spool-quiet ;;
+        gateway-dup:*) printf gateway-dup ;;
+        ship-failing:*) printf ship-failing ;;
+        backup-hung:*) printf backup-hung ;;
+        volume-*:*) printf volume ;;
+        cc-stopped:*) printf tool ;;
+        state-unpersisted:*) printf state ;;
+    esac
+}
+
+# _pa_hm_of STAMP: HH:MM UTC of a stamp's wall clock, or `?`.
+_pa_hm_of() {
+    if _pa_stamp_split "${1:-}" && date -u -d "@$((10#$_PA_W))" +%H:%M 2> /dev/null; then
+        return 0
+    fi
+    printf '?'
+}
+
+# _pa_hms_of STAMP: HH:MM:SS UTC of a stamp's wall clock, or `?`.
+_pa_hms_of() {
+    if _pa_stamp_split "${1:-}"; then
+        pa_hms "$((10#$_PA_W))"
+    else
+        printf '?'
+    fi
+}
+
+# _pa_last_change ONSET: the newest change the hourly pass recorded (observe H lines) in the 24 h
+# before ONSET, as `<config|unit|binary> <dur> before onset`, `none in 24 h`, or `not known here`
+# when observe cannot be read or ONSET cannot be placed. The witness writes each H line as `H path
+# sha16 changed keys8 seen before`, the changed stamp `-` for a file first seen. A path only
+# selects the word: env files and the other configuration are config, files under the systemd
+# unit directory are unit, the installed binaries and the installed scripts (/usr/local/sbin's
+# propolis-* and /usr/local/lib/propolis, which the witness watches too) are binary.
+_pa_last_change() {
+    local onset="${1:-}" t p c best=-1 word="" span
+    _pa_stamp_split "$onset" || {
+        printf 'not known here'
+        return 0
+    }
+    pa_state_read observe > /dev/null
+    if [[ " ${PA_STATE_UNREADABLE:-} " == *" observe "* ]]; then
+        printf 'not known here'
+        return 0
+    fi
+    while IFS=$'\t' read -r t p _ c _; do
+        [ "$t" = H ] || continue
+        span="$(_pa_stamp_span "${c:-}" "$onset")" || continue
+        [[ $span =~ ^[0-9]{1,12}$ ]] && [ "$((10#$span))" -le 86400 ] || continue
+        if [ "$best" -lt 0 ] || [ "$((10#$span))" -lt "$best" ]; then
+            best=$((10#$span))
+            case "$p" in
+                /etc/systemd/system/*) word=unit ;;
+                /usr/local/bin/* | /usr/local/sbin/propolis-* | /usr/local/lib/propolis/*) word=binary ;;
+                *) word=config ;;
+            esac
+        fi
+    done < <(pa_state_read observe)
+    if [ "$best" -lt 0 ]; then
+        printf 'none in 24 h'
+    else
+        printf '%s %s before onset' "$word" "$(pa_dur "$best")"
+    fi
+}
+
+# _pa_lost_count KEY: the records the gateway counted lost for the gateway-dup record of KEY, from
+# the observe line the light pass keeps under that key (`P seen:<key> <stamp> ok - <count>`; the
+# key is gwdup:<collector id>, or gwdup:unlisted for every unlisted collector, whose instance is
+# not known), digits only.
+_pa_lost_count() {
+    local t chk n
+    [[ ${1:-} == gwdup:?* ]] || return 1
+    while IFS=$'\t' read -r t chk _ _ _ n _; do
+        [ "$t" = P ] && [ "$chk" = "seen:$1" ] || continue
+        [[ ${n:-} =~ ^[0-9]{1,9}$ ]] || return 1
+        printf '%s' "$((10#$n))"
+        return 0
+    done < <(pa_state_read observe)
+    return 1
+}
+
+# _pa_render_flags KEYHASH ID: the flags of the lifecycle line, from the current record's closed
+# flag words and counts made here: W lines of this key since this incident opened (budget held;
+# the 48 h they are kept may reach back into an earlier incident of the same key), children
+# still folded under this id (folded: pending, open or acknowledged; a resolved one is kept a week
+# but folds nothing).
+_pa_render_flags() {
+    local kh="${1:-}" id="${2:-}" fl=",${PA_INC[30]:--}," line w=0 folded=0 out="" ow ob ou
+    local -a f
+    # The span from the open is worked out here, not by _pa_stamp_span in a subshell per line: a
+    # key can have hundreds of W lines.
+    if _pa_stamp_split "${PA_INC[9]:-}"; then
+        ow="$_PA_W" ob="$_PA_B" ou="$_PA_U"
+        for line in "${_PA_INC_REST[@]}"; do
+            IFS=$'\t' read -r -a f <<< "$line"
+            if [ "${f[0]:-}" != W ] || [ -z "$kh" ] || [ "${f[2]:-}" != "$kh" ] || ! _pa_stamp_split "${f[1]:-}"; then
+                continue
+            fi
+            if [ "$ob" != - ] && [ "$ob" = "$_PA_B" ]; then
+                [ "$((10#$_PA_U))" -ge "$((10#$ou))" ] || continue
+            else
+                [ "$((10#$_PA_W))" -ge "$((10#$ow))" ] || continue
+            fi
+            w=$((w + 1))
+        done
+    fi
+    for line in "${_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r -a f <<< "$line"
+        [ "${f[13]:-}" = "$id" ] && [ "${f[2]:-}" != "${PA_INC[2]:-}" ] || continue
+        case "${f[7]:-}" in pending | open | acked) folded=$((folded + 1)) ;; esac
+    done
+    [ "$w" -le 999 ] || w=999
+    [ "$w" = 0 ] || out+=", budget held $w"
+    [[ $fl != *,notpersisted,* ]] || out+=", not persisted"
+    [[ $fl != *,maint,* ]] || out+=", maint"
+    [[ $fl != *,cannotverify,* ]] || out+=", cannot verify"
+    [ "$folded" = 0 ] || out+=", folded $folded"
+    [[ $fl != *,dup,* ]] || out+=", daemon also reports this"
+    printf '%s' "${out#, }"
+}
+
+# _pa_inc_whole: the current record's line has no empty field. No writer makes one (a field
+# without a value is `-`), and the reader, which splits on tabs, would place every field after it
+# one early: sends read as delivered_open, a count as a state. Such a record is not one the tables
+# know. A record with fewer fields is an older writer's and is whole.
+_pa_inc_whole() {
+    local line="${_PA_INC_I[PA_INC_AT]:-}"
+    [ -n "$line" ] && [[ $line != *$'\t\t'* && $line != *$'\t' ]]
+}
+
+# _pa_inc_by_id ID: the record with incident id ID, among the records in memory, into PA_INC.
+# Status 1 when there is none, or when it is not whole (_pa_inc_whole).
+_pa_inc_by_id() {
+    local i
+    local -a f
+    declare -p _PA_INC_I > /dev/null 2>&1 || return 1
+    for i in "${!_PA_INC_I[@]}"; do
+        IFS=$'\t' read -r -a f <<< "${_PA_INC_I[$i]}"
+        [ "${f[1]:-}" = "${1:-}" ] || continue
+        pa_incident_get "${f[2]:-}" && [ "$PA_INC_AT" = "$i" ] && _pa_inc_whole
+        return
+    done
+    return 1
+}
+
+# _pa_render_incident MODE TX ID WAS: the full-mode message of incident ID (a record in memory,
+# pa_incident_load) for transition TX. Status 1, nothing set, unless MODE is full, the record's
+# tier is PAGE or ACT, its kind has a phrase, its stage word is known and its state is one TX
+# applies to (a resolve needs a resolved record with a proof from the closed table); unknown never
+# renders as anything. The headline is kept to 80 characters by a fixed rule: the full form; if
+# longer, without the stage word (the Where line has it); if still longer, the stage and the
+# instance in place of the phrase. Every line passes pa_ok_line and the body stays far under the
+# sender's 1024 bytes with the longest phrases and counts, so the sender never cuts a line; a body
+# line that failed the line rule all the same would be replaced by `(line withheld)`, so an
+# admitted transition still goes, while a title that fails it stops the message.
+#
+# A resolve renders only for a record whose open was delivered (delivered_open 1): no RESOLVED
+# follows an open that did not get through. Who saw it is the hook where the record carries
+# the flag the hook's path sets (hookopen, which the witness never clears, or hookspool for a firing
+# the hook spooled) or the legacy hook's outcome (legacy_out), else the witness. An open of a child
+# that opened on its own after its parent resolved names that parent from the field a writer
+# appends after the 34th (`was folded under <id>`).
+#
+# ID `-` is the failure hook's one message when it cannot take the lock: no record is
+# read, the firing's attributes come from PA_REC_KIND (a unit kind), PA_REC_STAGE, PA_REC_INST,
+# PA_REC_TIER and PA_REC_CAUSE, the times are now, TX is open only, and the lifecycle line says
+# `(id pending)` where the id would be.
+_pa_render_incident() {
+    local mode="$1" tx="$2" id="$3" was="${4:-}"
+    local kind stage inst tier st kh what where role comp conf lc impact ev rb do_line last
+    local head prefix suffix title line a since det nextr flags k_of proof after cw cs n body
+    local -a offs=()
+    # The renderer reads a record into PA_INC; local copies leave the caller's current record as
+    # it was.
+    local -a PA_INC=()
+    local PA_INC_AT=-1 PA_INC_EXTRA=""
+    PA_TITLE="" PA_PRIO="" PA_BODY=""
+    [ "$mode" = full ] || return 1
+    if [ "$id" = - ]; then
+        [ "$tx" = open ] || return 1
+        case "${PA_REC_KIND:-}" in unit-failed | unit-crashloop | unit-nobind | daemon-down) ;; *) return 1 ;; esac
+        [ -n "${PA_STAMP:-}" ] || pa_now
+        PA_INC=(I - - "$PA_REC_KIND" "${PA_REC_STAGE:--}" "${PA_REC_INST:--}" "${PA_REC_TIER:--}" open
+            "$PA_STAMP" "$PA_STAMP" "$PA_STAMP" "${PA_REC_CAUSE:-unknown}" "$PA_STAMP" - 0 - open 0 0 - - - -
+            0 - - - - - 0 hookspool 1 - - -)
+    else
+        [[ $id =~ ^w#[0-9]{1,9}$ ]] || return 1
+        _pa_inc_by_id "$id" || return 1
+    fi
+    kind="${PA_INC[3]}" stage="${PA_INC[4]}" inst="${PA_INC[5]}" tier="${PA_INC[6]}" st="${PA_INC[7]}"
+    case "$tier" in PAGE | ACT) ;; *) return 1 ;; esac
+    case "$tx:$st" in
+        open:open | open:acked | reopen:open | reopen:acked | change:open | change:acked) ;;
+        remind:open) ;;
+        resolve:resolved) [ "${PA_INC[17]}" = 1 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    _pa_kind_known "$kind" || return 1
+    where="$(_pa_stage_where "$stage")" || return 1
+    [[ $inst =~ ^[uscvmf][0-9a-f]{5}([0-9a-f]{3})?$ ]] || inst=""
+    what="$(_pa_what "$kind" "$inst")" || return 1
+    pa_alias > /dev/null 2>&1 || return 1
+    [ "$PA_ALIAS" != - ] && pa_ok_field "$PA_ALIAS" || return 1
+    kh=""
+    [ "$id" = - ] || kh="$(_pa_keyhash "${PA_INC[2]}")" || kh=""
+    _pa_cause_show "${PA_INC[11]}" || true
+    cw="$_PA_CW" cs="$_PA_CS"
+    if [ "$tx" = resolve ]; then
+        proof="$(_pa_proof_words "${PA_INC[22]}")" || return 1
+        prefix=RESOLVED
+        [ "$kind" != gateway-dup ] || prefix="NO FURTHER LOSS"
+        suffix=""
+        PA_PRIO=2
+    else
+        prefix="$tier"
+        case "$tx" in
+            change) suffix=" (changed)" ;;
+            reopen) suffix=" (again)" ;;
+            remind)
+                a="$(pa_age "${PA_INC[10]}")"
+                if [[ $a =~ ^[0-9]{1,12}$ ]]; then suffix=" (still, $(pa_dur "$a"))"; else suffix=" (still, ?)"; fi
+                ;;
+            *) suffix="" ;;
+        esac
+        if [ "$tier" = PAGE ]; then PA_PRIO=5; else PA_PRIO=3; fi
+    fi
+    head="$prefix $PA_ALIAS - $stage: $what$suffix"
+    [ "${#head}" -le 80 ] || head="$prefix $PA_ALIAS: $what$suffix"
+    [ "${#head}" -le 80 ] || head="$prefix $PA_ALIAS: $stage ${inst:-?}$suffix"
+    title="$head"
+    if [ "$tx" = resolve ]; then
+        a="$(_pa_stamp_span "${PA_INC[9]}" "${PA_INC[21]}")" || a=""
+        if [[ $a =~ ^[0-9]{1,12}$ ]]; then after="$(pa_dur "$a")"; else after="?"; fi
+        PA_BODY="Proof: $proof at $(_pa_hms_of "${PA_INC[21]}") UTC, after $after"$'\n'
+        if [ "$cs" = "not known here" ]; then
+            PA_BODY+="Cause was: not known here"$'\n'
+        else
+            PA_BODY+="Cause was: $cw ($cs)"$'\n'
+        fi
+        n=0
+        for line in "${_PA_INC_I[@]}"; do
+            IFS=$'\t' read -r -a offs <<< "$line"
+            [ "${offs[13]:-}" = "$id" ] && [ "${offs[2]:-}" != "${PA_INC[2]}" ] || continue
+            case "${offs[7]:-}" in open | acked | pending) n=$((n + 1)) ;; esac
+        done
+        [ "$n" = 0 ] || PA_BODY+="$n folded checks wait for their next run"$'\n'
+        PA_BODY+="$id resolved"
+    else
+        a="$(pa_age "${PA_INC[10]}")"
+        if [[ $a =~ ^[0-9]{1,12}$ ]]; then since="$(pa_dur "$a")"; else since="?"; fi
+        det="$(_pa_hms_of "${PA_INC[9]}")"
+        case ",${PA_INC[30]:--},:${PA_INC[33]:-}" in
+            *,hookopen,*:* | *,hookspool,*:* | *:delivered | *:undelivered | *:cooldown | *:journal) comp=hook ;;
+            *) comp=witness ;;
+        esac
+        case "${PA_INC[11]:-}" in
+            vol.projected) conf=inferred ;;
+            *) if [ "$cs" = "not known here" ]; then conf="not known here"; else conf=known; fi ;;
+        esac
+        lc="$(_pa_last_change "${PA_INC[10]}")"
+        role="${PA_ROLE:-}"
+        [ -n "$role" ] || role="$(pa_role 2> /dev/null)" || role=""
+        case "$role" in single | control | collector | gateway) ;; *) role=unknown ;; esac
+        impact="$(_pa_impact "$kind" "$stage" "$inst")"
+        # A gateway-dup's loss is permanent: counted, or not measured, never held. Only the size
+        # ring gives a time at risk.
+        if [ "$kind" = gateway-dup ]; then
+            if n="$(_pa_lost_count "${PA_INC[2]}")"; then ev="lost (counted) $n records"; else ev="not measured"; fi
+        elif [[ $kind == volume-* ]] && n="$(_pa_vol_full_at "$inst")"; then
+            ev="at risk by $n UTC"
+        elif [ "$tier" = ACT ]; then
+            ev=held
+        else
+            ev="not measured"
+        fi
+        rb="$(_pa_runbook "$kind" "$stage")"
+        do_line="Do: status $stage${rb:+ - runbook $rb}"
+        if [ "${PA_INC[19]:--}" = - ] || [ "$st" = acked ]; then
+            nextr=none
+        else
+            nextr="$(_pa_hm_of "${PA_INC[19]}") UTC"
+        fi
+        case "$tx" in
+            open)
+                if [ "$id" = - ]; then last="(id pending) opened"; else last="$id opened"; fi
+                ;;
+            reopen) last="$id reopened ($(_pa_num "${PA_INC[23]}") in 24 h)" ;;
+            remind)
+                read -r -a offs <<< "$(_pa_reminder_offsets "$tier")"
+                k_of="${#offs[@]}"
+                last="$id reminder $(_pa_num "${PA_INC[18]}") of $k_of"
+                ;;
+            change)
+                _pa_cause_show "$was" || true
+                last="$id changed: $_PA_CS -> $cs"
+                ;;
+        esac
+        if [ "$id" = - ]; then
+            flags="$(_pa_render_flags "" "")"
+        else
+            flags="$(_pa_render_flags "$kh" "$id")"
+        fi
+        last+=" - next reminder $nextr${flags:+ - $flags}"
+        a="${PA_INC_EXTRA%%$'\t'*}"
+        if [ "$tx" = open ] && [ "$id" != - ] && [[ $a =~ ^w#[0-9]{1,9}$ ]]; then
+            last+=" - was folded under $a"
+        fi
+        PA_BODY="Since $(_pa_hms_of "${PA_INC[10]}") UTC ($since) - detected $det UTC"$'\n'
+        if [ "$cs" = "not known here" ]; then
+            PA_BODY+="Why: not known here, seen by $comp@$PA_ALIAS, $conf; last change: $lc"$'\n'
+        else
+            PA_BODY+="Why: $cw ($cs), seen by $comp@$PA_ALIAS, $conf; last change: $lc"$'\n'
+        fi
+        PA_BODY+="Where: $PA_ALIAS ($role), $where, ${inst:-not known here}"$'\n'
+        PA_BODY+="Impact: $impact; evidence $ev"$'\n'
+        PA_BODY+="$do_line"$'\n'
+        PA_BODY+="$last"
+    fi
+    body=""
+    while IFS= read -r line; do
+        pa_ok_line "$line" || line="(line withheld)"
+        body+="$line"$'\n'
+    done <<< "$PA_BODY"
+    PA_BODY="${body%$'\n'}"
+    if ! pa_ok_line "$title" || [ "${#title}" -gt 80 ] || [ "${#PA_BODY}" -ge 1024 ]; then
+        PA_TITLE="" PA_PRIO="" PA_BODY=""
+        return 1
+    fi
+    PA_TITLE="$title"
 }

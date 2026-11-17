@@ -6847,10 +6847,11 @@ fn the_test_page_renders_the_alias_and_the_code_only_and_a_url_shows_its_host_on
 /// The class test admits three in 24 hours, counting every attempt that was or may have been sent
 /// (sending, ok, perm, transient, and pending while the hook may still be running) and none that
 /// sent nothing (norender, nocurl, notarget), none over a day old and none dated ahead of the
-/// clock. Every other class is withheld, since nothing sends one yet. pa_ledger_add drops lines
-/// over 48 h old, and pa_ledger_result updates only the pending line it names.
+/// clock, and no line of another class. An incident class with no record behind its key admits
+/// nothing, and a class the budget does not know admits nothing. pa_ledger_add drops lines over
+/// 48 h old, and pa_ledger_result updates only the pending line it names.
 #[test]
-fn the_budget_admits_three_test_pages_a_day_and_nothing_of_another_class() {
+fn the_budget_admits_three_test_pages_a_day_and_counts_no_other_class_against_them() {
     let fx = Fx::new();
     let line = |stamp: &str, class: &str, result: &str| {
         format!("L\t{stamp}\t{class}\t-\topen\tfull\t{result}\tstatus\n")
@@ -6907,12 +6908,16 @@ fn the_budget_admits_three_test_pages_a_day_and_nothing_of_another_class() {
         "admit",
         "another class"
     );
-    for class in ["pool", "reserve", "storm", "summary", "switch", "pointer"] {
+    for class in ["pool", "reserve", "stage1", "incident"] {
         let r = fx.run_env(
-            &format!("pa_budget_admit {class} k open 1; echo; echo \"rc=$?\""),
+            &format!("pa_incident_load; pa_budget_admit {class} k open 1; echo"),
             &NOW,
         );
-        assert!(r.out.starts_with("withhold:unbuilt"), "{class}: {}", r.out);
+        assert!(r.out.starts_with("withhold:unknown"), "{class}: {}", r.out);
+    }
+    for class in ["bulk", "-", ""] {
+        let r = fx.run_env(&format!("pa_budget_admit '{class}' k open 1; echo"), &NOW);
+        assert!(r.out.starts_with("withhold:class"), "{class}: {}", r.out);
     }
     fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
     assert_eq!(
@@ -8072,4 +8077,3331 @@ fn an_alias_is_refused_when_it_is_the_kernels_host_name_or_no_host_name_can_be_r
     } else {
         assert_eq!(alias("north-relay", None), "north-relay rejected=0");
     }
+}
+
+// ---- incident messages and the whole send budget ----------------------------------------------
+
+/// 1000 s before `NOW`, in the same boot: the times of the records below.
+const INC_T: &str = "999000/abcdef01/4000";
+/// One hour after `NOW`: the next reminder of the records below (14:46 UTC).
+const INC_DUE: &str = "1003600/abcdef01/8600";
+
+/// An `incidents` record of 34 fields: by default the open PAGE record of a failed sensor (id
+/// w#3, instance u1a2b3, cause proc.exit:1, every time `INC_T`, the next reminder `INC_DUE`,
+/// recorded by the hook), with the fields in `set` (numbered from 1, as the library numbers them)
+/// replaced.
+fn inc_rec(set: &[(usize, &str)]) -> String {
+    let mut f: Vec<String> = [
+        "w#3",
+        "unit:sensor-ssh.service",
+        "unit-failed",
+        "listen",
+        "u1a2b3",
+        "PAGE",
+        "open",
+        INC_T,
+        INC_T,
+        INC_T,
+        "proc.exit:1",
+        INC_T,
+        "-",
+        "0",
+        "-",
+        "open",
+        "0",
+        "0",
+        INC_DUE,
+        "-",
+        "-",
+        "-",
+        "0",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "1",
+        "-",
+        "1",
+        "-",
+        "delivered",
+        "-",
+    ]
+    .iter()
+    .map(|v| v.to_string())
+    .collect();
+    for (i, v) in set {
+        f[i - 1] = v.to_string();
+    }
+    format!("I\t{}\n", f.join("\t"))
+}
+
+/// The same record, resolved at `NOW` by the proof `PROOF`, its open delivered (a RESOLVED follows
+/// only an open that got through).
+fn inc_resolved(proof: &str, set: &[(usize, &str)]) -> String {
+    let mut all: Vec<(usize, &str)> = vec![
+        (7, "resolved"),
+        (21, "1000000/abcdef01/5000"),
+        (22, proof),
+        (19, "-"),
+        (17, "1"),
+    ];
+    all.extend_from_slice(set);
+    inc_rec(&all)
+}
+
+struct Msg {
+    rc: String,
+    title: String,
+    prio: String,
+    body: Vec<String>,
+    out: String,
+}
+
+/// Renders transition TX of incident ID over RECORDS (the incidents file after its N line) and
+/// the extra lines `rest` (W lines), with `observe` as the observe file when it is not empty.
+fn render_with(
+    fx: &Fx,
+    records: &[String],
+    observe: &str,
+    tx: &str,
+    id: &str,
+    was: &str,
+    env: &[(&str, &str)],
+) -> Msg {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    if !observe.is_empty() {
+        fx.write(
+            "var/lib/propolis/witness/observe",
+            &format!("#observe v1 g=1\n{observe}"),
+        );
+    }
+    let mut all: Vec<(&str, &str)> = NOW.to_vec();
+    all.extend_from_slice(env);
+    all.push(("TX", tx));
+    all.push(("ID", id));
+    all.push(("WAS", was));
+    let r = fx.run_env(
+        "PA_ROLE=\"${ROLE:-single}\"\npa_incident_load\n\
+         if pa_render full \"$TX\" \"$ID\" \"$WAS\"; then echo rc=0; else echo rc=1; fi\n\
+         printf 'title=%s\\nprio=%s\\n' \"$PA_TITLE\" \"$PA_PRIO\"\n\
+         printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'",
+        &all,
+    );
+    Msg {
+        rc: r.get("rc"),
+        title: r.get("title"),
+        prio: r.get("prio"),
+        body: r
+            .out
+            .lines()
+            .filter_map(|l| l.strip_prefix("body="))
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        out: r.out.clone(),
+    }
+}
+
+fn render(fx: &Fx, records: &[String], tx: &str, id: &str, was: &str) -> Msg {
+    render_with(fx, records, "", tx, id, was, &[])
+}
+
+/// The key hash the ledger and the W lines name a key by.
+fn keyhash(fx: &Fx, key: &str) -> String {
+    fx.run_env("_pa_keyhash \"$K\"", &[("K", key)])
+        .out
+        .trim()
+        .to_string()
+}
+
+/// The full-mode text of each transition of a PAGE incident, an ACT open, an acknowledged open,
+/// a change, a reopen, a reminder and a resolve, as the message contract gives them: the closed
+/// phrases, the opaque instance, times in UTC, `status <stage>` and the runbook key, the
+/// lifecycle line with the next reminder and the flags; RESOLVED at priority 2 with its proof
+/// words and the folded checks that wait for their next run; NO FURTHER LOSS for gateway-dup,
+/// whose open counts the records the gateway lost.
+#[test]
+fn every_incident_shape_renders_the_full_mode_text_of_its_transition() {
+    let fx = Fx::salted(SALT);
+    let open = render(&fx, &[inc_rec(&[])], "open", "w#3", "");
+    assert_eq!(open.rc, "0", "{}", open.out);
+    assert_eq!(open.title, "PAGE host-908b - listen: unit u1a2b3 failed");
+    assert_eq!(open.prio, "5");
+    assert_eq!(
+        open.body,
+        [
+            "Since 13:30:00 UTC (16 min) - detected 13:30:00 UTC",
+            "Why: process exited (proc.exit 1), seen by hook@host-908b, known; last change: none in 24 h",
+            "Where: host-908b (single), stage 1 of 10, u1a2b3",
+            "Impact: not capturing on u1a2b3; evidence not measured",
+            "Do: status listen - runbook listen-down",
+            "w#3 opened - next reminder 14:46 UTC",
+        ]
+    );
+
+    let daemon = inc_rec(&[
+        (2, "unit:propolis.service"),
+        (3, "daemon-down"),
+        (4, "intake"),
+        (5, "-"),
+        (11, "db.unreachable"),
+        (33, "-"),
+    ]);
+    let change = render(
+        &fx,
+        std::slice::from_ref(&daemon),
+        "change",
+        "w#3",
+        "proc.exit:1",
+    );
+    assert_eq!(change.rc, "0", "{}", change.out);
+    assert_eq!(
+        change.title,
+        "PAGE host-908b - intake: monitor and intake down (changed)"
+    );
+    assert_eq!(
+        change.body,
+        [
+            "Since 13:30:00 UTC (16 min) - detected 13:30:00 UTC",
+            "Why: database not answering (db.unreachable), seen by witness@host-908b, known; last change: none in 24 h",
+            "Where: host-908b (single), stage 5 of 10, not known here",
+            "Impact: nothing reaches the ledger; evidence not measured",
+            "Do: status intake - runbook daemon-down",
+            "w#3 changed: proc.exit 1 -> db.unreachable - next reminder 14:46 UTC",
+        ]
+    );
+
+    let reopen = render(&fx, &[inc_rec(&[(23, "2")])], "reopen", "w#3", "");
+    assert_eq!(
+        reopen.title,
+        "PAGE host-908b - listen: unit u1a2b3 failed (again)"
+    );
+    assert_eq!(
+        reopen.body.last().unwrap(),
+        "w#3 reopened (2 in 24 h) - next reminder 14:46 UTC"
+    );
+    let remind = render(&fx, &[inc_rec(&[(18, "1")])], "remind", "w#3", "");
+    assert_eq!(
+        remind.title,
+        "PAGE host-908b - listen: unit u1a2b3 failed (still, 16 min)"
+    );
+    assert_eq!(
+        remind.body.last().unwrap(),
+        "w#3 reminder 1 of 3 - next reminder 14:46 UTC"
+    );
+    assert_eq!(remind.prio, "5");
+
+    let act = render(
+        &fx,
+        &[inc_rec(&[
+            (2, "unit:shipper.service"),
+            (4, "ship"),
+            (6, "ACT"),
+            (7, "acked"),
+        ])],
+        "open",
+        "w#3",
+        "",
+    );
+    assert_eq!(act.title, "ACT host-908b - ship: unit u1a2b3 failed");
+    assert_eq!(act.prio, "3");
+    assert_eq!(
+        act.body[3],
+        "Impact: no new evidence from u1a2b3; evidence held"
+    );
+    assert_eq!(act.body[4], "Do: status ship - runbook ship-down");
+    assert_eq!(
+        act.body[5], "w#3 opened - next reminder none",
+        "an acknowledged incident is not reminded"
+    );
+    let remind_act = render(
+        &fx,
+        &[inc_rec(&[(6, "ACT"), (18, "2")])],
+        "remind",
+        "w#3",
+        "",
+    );
+    assert_eq!(remind_act.prio, "3");
+    assert!(remind_act.body[5].starts_with("w#3 reminder 2 of 2 "));
+
+    // A resolve, with one oneshot child still folded under it.
+    let child = inc_rec(&[
+        (1, "w#4"),
+        (2, "unit:propolis-backup.service"),
+        (4, "backup"),
+        (6, "ACT"),
+        (13, "w#3"),
+        (30, "folded"),
+    ]);
+    let resolved = render(
+        &fx,
+        &[inc_resolved("active10", &[]), child.clone()],
+        "resolve",
+        "w#3",
+        "",
+    );
+    assert_eq!(resolved.rc, "0", "{}", resolved.out);
+    assert_eq!(
+        resolved.title,
+        "RESOLVED host-908b - listen: unit u1a2b3 failed"
+    );
+    assert_eq!(resolved.prio, "2");
+    assert_eq!(
+        resolved.body,
+        [
+            "Proof: running 10 min without a restart at 13:46:40 UTC, after 16 min",
+            "Cause was: process exited (proc.exit 1)",
+            "1 folded checks wait for their next run",
+            "w#3 resolved",
+        ]
+    );
+    let parent_open = render(&fx, &[inc_rec(&[]), child], "open", "w#3", "");
+    assert!(
+        parent_open.body[5].ends_with(" - folded 1"),
+        "{:?}",
+        parent_open.body
+    );
+
+    let dup = inc_rec(&[
+        (2, "gwdup:c1a2b3"),
+        (3, "gateway-dup"),
+        (4, "gateway"),
+        (5, "c1a2b3"),
+        (6, "ACT"),
+        (11, "gw.dup"),
+        (33, "-"),
+    ]);
+    let observe = format!("P\tseen:gwdup:c1a2b3\t{INC_T}\tok\t-\t42\n");
+    let m = render_with(
+        &fx,
+        std::slice::from_ref(&dup),
+        &observe,
+        "open",
+        "w#3",
+        "",
+        &[],
+    );
+    assert_eq!(
+        m.title,
+        "ACT host-908b - gateway: rebuilt batch dropped from c1a2b3"
+    );
+    assert_eq!(
+        m.body[3],
+        "Impact: no new evidence from c1a2b3; evidence lost (counted) 42 records"
+    );
+    assert_eq!(m.body[4], "Do: status gateway - runbook gateway-dup");
+    let m = render(
+        &fx,
+        &[inc_resolved(
+            "quiet24",
+            &[
+                (2, "gwdup:c1a2b3"),
+                (3, "gateway-dup"),
+                (4, "gateway"),
+                (5, "c1a2b3"),
+                (6, "ACT"),
+                (11, "gw.dup"),
+            ],
+        )],
+        "resolve",
+        "w#3",
+        "",
+    );
+    assert_eq!(
+        m.title,
+        "NO FURTHER LOSS host-908b - gateway: rebuilt batch dropped from c1a2b3"
+    );
+    assert_eq!(
+        m.body[0],
+        "Proof: no further loss in 24 h at 13:46:40 UTC, after 16 min"
+    );
+    assert!(!m.out.contains("RESOLVED"), "{}", m.out);
+
+    // Every flag, and the last change the hourly pass recorded before the onset.
+    let kh = keyhash(&fx, "unit:sensor-ssh.service");
+    let w = format!("W\t{INC_T}\t{kh}\topen\t1\tu1a2b3\tpool\n");
+    let flagged = inc_rec(&[(30, "maint,notpersisted,cannotverify,dup,hookspool")]);
+    let observe = "H\t/etc/propolis/propolis.env\t0123456789abcdef\t998400/abcdef01/3400\t01234567\t999900/abcdef01/4900\t-\n";
+    let m = render_with(
+        &fx,
+        &[flagged, w.clone(), w],
+        observe,
+        "open",
+        "w#3",
+        "",
+        &[("ROLE", "control")],
+    );
+    assert_eq!(
+        m.body[1],
+        "Why: process exited (proc.exit 1), seen by hook@host-908b, known; last change: config 10 min before onset"
+    );
+    assert_eq!(
+        m.body[2],
+        "Where: host-908b (control), stage 1 of 10, u1a2b3"
+    );
+    assert_eq!(
+        m.body[5],
+        "w#3 opened - next reminder 14:46 UTC - budget held 2, not persisted, maint, cannot verify, daemon also reports this"
+    );
+}
+
+/// The proof words of every proof code, never the code; the phrase of each of config-check's
+/// sixteen page rows with its instance, and with `a listener` or `a source` where the instance
+/// is not known, each the phrase deploy/witness.sh's table gives that row; the folded unlisted
+/// collectors named or counted.
+#[test]
+fn the_proof_words_and_the_sixteen_finding_phrases_come_from_their_closed_tables() {
+    let fx = Fx::salted(SALT);
+    for (code, words) in [
+        ("active10", "running 10 min without a restart"),
+        ("nextrun", "next run succeeded"),
+        ("disabled", "disabled on purpose"),
+        ("quiet30", "no restart for 30 min"),
+        ("ready2", "monitor ready twice"),
+        ("db2", "database answered twice"),
+        ("sent2xx", "an alert got through"),
+        ("clean2", "clean on two checks"),
+        ("pushed", "public push seen"),
+        ("persist2", "state written to disk again"),
+        ("spool2", "collector arriving again"),
+        ("quiet24", "no further loss in 24 h"),
+        ("ended", "backup run ended"),
+        ("pulled", "off-host copy taken"),
+        ("room2", "room again on two checks"),
+        ("fresh2", "witness pass running again"),
+        ("restart", "seen after restart"),
+    ] {
+        let m = render(&fx, &[inc_resolved(code, &[])], "resolve", "w#3", "");
+        assert_eq!(m.rc, "0", "{code}: {}", m.out);
+        assert_eq!(
+            m.body[0],
+            format!("Proof: {words} at 13:46:40 UTC, after 16 min")
+        );
+        if !words.contains(code) {
+            assert!(!m.out.contains(code), "{code}: {}", m.out);
+        }
+    }
+    let m = render(&fx, &[inc_resolved("bogus", &[])], "resolve", "w#3", "");
+    assert_eq!(m.rc, "1", "a proof outside the table renders nothing");
+
+    let witness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/witness.sh"
+    ))
+    .unwrap();
+    let rows: Vec<Vec<String>> = witness
+        .lines()
+        .filter(|l| l.split('|').nth(1) == Some("page"))
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect();
+    assert_eq!(rows.len(), 16, "the page rows of WITNESS_CC_TABLE");
+    for row in &rows {
+        let (id, tier, stage, rule, phrase) = (&row[0], &row[2], &row[3], &row[5], &row[6]);
+        let key = format!("finding:{id}:0123456789ab");
+        let (inst, fallback) = match rule.as_str() {
+            "logpath" => ("s1a2b3", "a source"),
+            "fold" => ("c1a2b3", "a collector"),
+            _ => ("u1a2b3", "a listener"),
+        };
+        let rec = |i: &str, count: &str| {
+            inc_rec(&[
+                (2, &key),
+                (3, "finding"),
+                (4, stage),
+                (5, i),
+                (6, tier),
+                (11, "config.finding"),
+                (34, count),
+            ])
+        };
+        let m = render(&fx, &[rec(inst, "1")], "open", "w#3", "");
+        assert_eq!(m.rc, "0", "{id}: {}", m.out);
+        assert_eq!(
+            m.title,
+            format!(
+                "{tier} host-908b - {stage}: {}",
+                phrase.replace("<inst>", inst)
+            ),
+            "{id}"
+        );
+        assert_eq!(m.body[4], format!("Do: status {stage} - runbook finding"));
+        assert!(
+            !m.out.contains(id.as_str()),
+            "{id} is never sent: {}",
+            m.out
+        );
+        let m = render(&fx, &[rec("-", "-")], "open", "w#3", "");
+        let want = if rule == "fold" {
+            "? collectors not listed".to_string()
+        } else {
+            phrase.replace("<inst>", fallback)
+        };
+        assert_eq!(
+            m.title,
+            format!("{tier} host-908b - {stage}: {want}"),
+            "{id}"
+        );
+        if rule == "fold" {
+            for (count, want) in [
+                ("3", "3 collectors not listed"),
+                ("20+", "20+ collectors not listed"),
+            ] {
+                let m = render(&fx, &[rec("-", count)], "open", "w#3", "");
+                assert_eq!(m.title, format!("{tier} host-908b - {stage}: {want}"));
+            }
+        }
+    }
+    let m = render(
+        &fx,
+        &[inc_rec(&[
+            (2, "finding:ops-push-half:0123456789ab"),
+            (3, "finding"),
+        ])],
+        "open",
+        "w#3",
+        "",
+    );
+    assert_eq!(m.rc, "1", "a finding that is not a page row has no phrase");
+}
+
+/// Every pushable kind on the key it is recorded under, for the size and planted-word cases.
+const KINDS: [(&str, &str, &str, &str, &str); 25] = [
+    (
+        "unit-failed",
+        "unit:sensor-ssh.service",
+        "listen",
+        "PAGE",
+        "u",
+    ),
+    (
+        "unit-crashloop",
+        "unit:sensor-ssh.service",
+        "listen",
+        "PAGE",
+        "u",
+    ),
+    (
+        "unit-nobind",
+        "unit:sensor-ssh.service",
+        "listen",
+        "ACT",
+        "u",
+    ),
+    (
+        "unit-failed",
+        "unit:propolis-backup.service",
+        "backup",
+        "ACT",
+        "u",
+    ),
+    (
+        "unit-failed",
+        "unit:propolis-logrotate.service",
+        "source",
+        "ACT",
+        "u",
+    ),
+    (
+        "unit-failed",
+        "unit:propolis-witness@light.service",
+        "witness",
+        "ACT",
+        "u",
+    ),
+    ("unit-failed", "unit:other.service", "host", "ACT", "u"),
+    (
+        "daemon-down",
+        "unit:propolis.service",
+        "intake",
+        "PAGE",
+        "u",
+    ),
+    ("daemon-degraded", "ready:local", "intake", "ACT", "-"),
+    ("db-unreachable", "db:local", "ledger", "PAGE", "-"),
+    ("db-readonly", "db:recovery", "ledger", "PAGE", "-"),
+    ("db-xid", "dbstate:xid", "ledger", "ACT", "-"),
+    ("db-slots", "dbstate:slots", "ledger", "ACT", "-"),
+    ("alert-path", "alert:shell", "alert", "PAGE", "-"),
+    (
+        "finding",
+        "finding:danger:0123456789ab",
+        "listen",
+        "PAGE",
+        "u",
+    ),
+    ("push-failing", "push:timer", "publish", "ACT", "-"),
+    ("push-unscheduled", "push:none", "publish", "ACT", "-"),
+    ("spool-quiet", "spool:c1a2b3", "ship", "ACT", "c"),
+    ("gateway-dup", "gwdup:c1a2b3", "gateway", "ACT", "c"),
+    ("ship-failing", "ship:local", "ship", "ACT", "-"),
+    ("backup-hung", "backup:run", "backup", "ACT", "-"),
+    ("volume-filling", "vol:m1a2b3", "host", "ACT", "m"),
+    ("volume-full-soon", "vol:m1a2b3", "host", "PAGE", "m"),
+    ("witness-stale", "witness:hourly", "witness", "ACT", "-"),
+    ("cc-stopped", "tool:config-check", "witness", "ACT", "-"),
+];
+
+/// The five transitions, each with the record state it applies to and the proof of a resolve.
+fn shape_record(tx: &str, set: &[(usize, &str)]) -> String {
+    if tx == "resolve" {
+        inc_resolved("active10", set)
+    } else {
+        inc_rec(set)
+    }
+}
+
+const SHAPES: [&str; 5] = ["open", "change", "reopen", "remind", "resolve"];
+
+/// A recognisable word in every field of a record the renderer reads, in a finding's key, in the
+/// W lines and the observe file it reads, in meta, in the env files, in the environment and in the
+/// host name reaches no title and no body of any shape: only closed phrases, ids matched to their
+/// form, counts and times are written. Neither the word propolis, the host name, the topic, the
+/// token nor a URL is ever in a message, though the daemon's own key names propolis.service.
+#[test]
+fn a_planted_word_in_any_field_or_state_file_never_reaches_a_title_or_a_body() {
+    let fx = Fx::salted(SALT);
+    write_exec(
+        &fx.bin.join("hostname"),
+        "#!/usr/bin/env bash\necho plantedhost\n",
+    );
+    fx.write(
+        "etc/propolis/propolis.env",
+        "PROPOLIS_OPS_NTFY_URL=https://plantedurl.example\nPROPOLIS_OPS_NTFY_TOPIC=plantedtopic\nPROPOLIS_OPS_NTFY_TOKEN=tk_plantedtoken\n",
+    );
+    fx.write(
+        "var/lib/propolis/witness/meta",
+        "#meta v1 g=1\nM\tclock\tplantedmeta\nM\twhere\tplantedmeta\n",
+    );
+    let planted = "plantedword";
+    let banned = [
+        planted,
+        "plantedhost",
+        "plantedurl",
+        "plantedtopic",
+        "plantedtoken",
+        "plantedmeta",
+        "propolis",
+        "://",
+        "ssh",
+        "Edge07",
+    ];
+    let kh_word = "plantedword";
+    let w = format!("W\t{INC_T}\t{kh_word}\topen\t1\t{planted}\t{planted}\n");
+    let observe = format!(
+        "H\t/etc/propolis/{planted}.env\t{planted}\t998400/abcdef01/3400\t{planted}\t{planted}\t{planted}\n\
+         P\tseen:gwdup:c1a2b3\t{INC_T}\t{planted}\t{planted}\t{planted}\n\
+         P\tseen:{planted}\t{INC_T}\tok\t-\t{planted}\n\
+         U\tsensor-{planted}.service\t{INC_T}\t{planted}\t{planted}\t{planted}\n\
+         R\tsensor-{planted}.service\t{INC_T}\t{planted}\n\
+         Z\tm1a2b3\t{planted}\t{planted}\t{planted}\t{planted}\t{planted}\n\
+         Z\tm1a2b3\t{INC_T}\t{planted}\t{planted}\n\
+         S\t{planted}\t{planted}\n"
+    );
+    // Every pushable kind, and besides them the folded unlisted collectors (whose count field only
+    // that row reads) and an intake finding, each open and acknowledged.
+    let mut kinds: Vec<(&str, String, &str, &str)> = KINDS
+        .iter()
+        .map(|(kind, key, stage, tier, _)| {
+            (*kind, key.replace("ssh", "plantedword"), *stage, *tier)
+        })
+        .collect();
+    kinds.push((
+        "finding",
+        "finding:spool-unlisted:all".to_string(),
+        "gateway",
+        "ACT",
+    ));
+    kinds.push((
+        "finding",
+        format!("finding:intake-absent:{planted}"),
+        "intake",
+        "ACT",
+    ));
+    for (kind, key, stage, tier) in &kinds {
+        for tx in SHAPES {
+            for state in ["open", "acked"] {
+                if state == "acked" && (tx == "remind" || tx == "resolve") {
+                    continue;
+                }
+                // Every field the renderer tolerates holds the word; those it checks hold a value
+                // of their form, so the message is rendered and its text can be searched. The
+                // 35th field, which a newer writer appends, holds it too.
+                let delivered = if tx == "resolve" { "1" } else { planted };
+                let mut set: Vec<(usize, &str)> = vec![
+                    (2, key),
+                    (3, kind),
+                    (4, stage),
+                    (5, planted),
+                    (6, tier),
+                    (8, planted),
+                    (13, planted),
+                    (14, planted),
+                    (15, planted),
+                    (17, delivered),
+                    (20, planted),
+                    (24, planted),
+                    (25, planted),
+                    (26, planted),
+                    (27, planted),
+                    (28, planted),
+                    (29, planted),
+                    (31, planted),
+                    (32, planted),
+                    (33, planted),
+                    (34, planted),
+                ];
+                let cause = if *kind == "alert-path" {
+                    format!("http.{planted}:{planted}")
+                } else {
+                    format!("{planted}:1")
+                };
+                let flags = format!("{planted},maint");
+                set.push((11, &cause));
+                set.push((30, &flags));
+                if tx != "resolve" {
+                    set.push((7, state));
+                }
+                let rec = shape_record(tx, &set).replace('\n', &format!("\t{planted}\n"));
+                let child = inc_rec(&[
+                    (1, "w#9"),
+                    (2, planted),
+                    (3, planted),
+                    (13, "w#3"),
+                    (4, planted),
+                ]);
+                let m = render_with(
+                    &fx,
+                    &[rec, child, w.clone()],
+                    &observe,
+                    tx,
+                    "w#3",
+                    &format!("{planted}:2"),
+                    &[
+                        ("PROPOLIS_OPS_NTFY_TOPIC", "plantedtopic"),
+                        ("PA_ALIAS_SET", "plantedhost"),
+                    ],
+                );
+                assert_eq!(m.rc, "0", "{key} {tx} {state}: {}", m.out);
+                for b in banned {
+                    assert!(
+                        !m.out.to_lowercase().contains(&b.to_lowercase()),
+                        "{key} {tx} {state}: {b} reached the message:\n{}",
+                        m.out
+                    );
+                }
+            }
+        }
+    }
+    // A key that names a finding id outside the page rows, a kind, a stage or a tier outside the
+    // tables: nothing is rendered at all.
+    for set in [
+        vec![(2, "finding:plantedword:0123456789ab"), (3, "finding")],
+        vec![(3, planted)],
+        vec![(4, planted)],
+        vec![(6, planted)],
+        vec![(7, planted)],
+    ] {
+        for tx in SHAPES {
+            let m = render(&fx, &[shape_record(tx, &set)], tx, "w#3", "");
+            assert_eq!(m.rc, "1", "{set:?} {tx}: {}", m.out);
+            assert_eq!(m.title, "");
+            assert!(m.body.is_empty(), "{set:?} {tx}");
+        }
+    }
+}
+
+/// Each field a record holds, fed a value out of its form (a tab, a control byte, 300 bytes, a
+/// newline, a leading dash, an escape sequence), either stops the message or reads as not known;
+/// the value itself is never passed through, and every line of what is rendered is printable
+/// ASCII.
+#[test]
+fn a_field_out_of_its_form_stops_the_message_or_reads_as_not_known_and_never_passes_through() {
+    let fx = Fx::salted(SALT);
+    let long = "z".repeat(300);
+    let values = [
+        "a\tbplant".to_string(),
+        "x\u{1}y".to_string(),
+        long.clone(),
+        "line\nnlplant".to_string(),
+        "-dash".to_string(),
+        "\u{1b}[31mred".to_string(),
+    ];
+    let marks = [
+        "bplant",
+        "x\u{1}",
+        &long[..60],
+        "nlplant",
+        "-dash",
+        "\u{1b}",
+    ];
+    // Each field over the default record, and the fields only one kind reads over that kind: the
+    // restart count over a crash loop, the cause (bare, and after an HTTP class) over the alert
+    // path, the count over the folded unlisted collectors.
+    let crashloop = [(3, "unit-crashloop")];
+    let alert = [
+        (2, "alert:shell"),
+        (3, "alert-path"),
+        (4, "alert"),
+        (5, "-"),
+    ];
+    let unlisted = [
+        (2, "finding:spool-unlisted:all"),
+        (3, "finding"),
+        (4, "gateway"),
+        (5, "-"),
+        (6, "ACT"),
+    ];
+    type Fields<'a> = &'a [(usize, &'a str)];
+    let mut cases: Vec<(Fields, usize, &str)> = Vec::new();
+    for field in [
+        1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 13, 18, 19, 21, 22, 23, 30, 31, 33, 34,
+    ] {
+        cases.push((&[], field, ""));
+    }
+    cases.push((&crashloop, 31, ""));
+    cases.push((&alert, 11, ""));
+    cases.push((&alert, 11, "http.auth:"));
+    cases.push((&unlisted, 34, ""));
+    let observe = "U\tsensor-ssh.service\t999000/abcdef01/4000\t9\tabcdef01\tactive\t-\t1\t-\n\
+                   R\tsensor-ssh.service\t999000/abcdef01/4000\t3\n";
+    for tx in SHAPES {
+        for (base, field, prefix) in &cases {
+            for (v, mark) in values.iter().zip(marks) {
+                let v = format!("{prefix}{v}");
+                let mut set = base.to_vec();
+                set.push((*field, v.as_str()));
+                let rec = shape_record(tx, &set);
+                let m = render_with(&fx, &[rec], observe, tx, "w#3", &v, &[]);
+                let text = format!("{}\n{}", m.title, m.body.join("\n"));
+                if m.rc == "1" {
+                    assert_eq!(text.trim(), "", "{tx} {base:?} field {field}");
+                    continue;
+                }
+                assert!(
+                    !text.contains(mark),
+                    "{tx} {base:?} field {field} passed {v:?} through:\n{text}"
+                );
+                for line in text.lines() {
+                    assert!(
+                        line.len() <= 200 && line.bytes().all(|b| (b' '..=b'~').contains(&b)),
+                        "{tx} {base:?} field {field}: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+    // The id asked for must be an incident id; the cause before a change reads not known.
+    let m = render(&fx, &[inc_rec(&[])], "open", "-w#3", "");
+    assert_eq!(m.rc, "1");
+    let m = render(&fx, &[inc_rec(&[])], "change", "w#3", "proc.exit:1\u{1b}");
+    assert!(
+        m.body[5].starts_with("w#3 changed: not known here -> proc.exit 1"),
+        "{:?}",
+        m.body
+    );
+    let m = render(&fx, &[inc_rec(&[(11, "unknown")])], "open", "w#3", "");
+    assert_eq!(
+        m.body[1],
+        "Why: not known here, seen by hook@host-908b, not known here; last change: none in 24 h"
+    );
+    let m = render(&fx, &[inc_rec(&[(5, "-")])], "open", "w#3", "");
+    assert_eq!(m.title, "PAGE host-908b - listen: unit ? failed");
+    assert_eq!(
+        m.body[2],
+        "Where: host-908b (single), stage 1 of 10, not known here"
+    );
+    assert_eq!(m.body[3], "Impact: not known here; evidence not measured");
+}
+
+/// A record whose tier, kind, state or stage the tables do not know, a NOTICE among them, renders
+/// nothing for any transition and is admitted nothing: no ledger line is written and the record
+/// is left as it was. So does a record with an empty field, which no writer makes: the fields
+/// after it cannot be placed, and one read a place early must not pass for the field it is not.
+#[test]
+fn a_record_the_tables_do_not_know_renders_nothing_and_is_admitted_nothing() {
+    let fx = Fx::salted(SALT);
+    for set in [
+        vec![(16, ""), (17, "1")],
+        vec![(13, "")],
+        vec![(34, "")],
+        vec![(6, "NOTICE")],
+        vec![(6, "-")],
+        vec![(6, "page")],
+        vec![(3, "tool-unusable"), (6, "NOTICE")],
+        vec![(3, "db-locks")],
+        vec![(3, "bogus")],
+        vec![(7, "pending")],
+        vec![(7, "-")],
+        vec![(4, "stage11")],
+    ] {
+        for tx in SHAPES {
+            let rec = shape_record(tx, &set);
+            let m = render(&fx, std::slice::from_ref(&rec), tx, "w#3", "");
+            assert_eq!(m.rc, "1", "{set:?} {tx}: {}", m.out);
+            let before = fx.read("var/lib/propolis/witness/incidents");
+            let r = fx.run_env(
+                &format!(
+                    "pa_incident_load\necho \"budget=$(pa_budget_admit incident unit:sensor-ssh.service {tx} 0)\"\n\
+                     echo \"admit=$(pa_incident_admit unit:sensor-ssh.service {tx} 0 full light)\""
+                ),
+                &NOW,
+            );
+            assert_eq!(r.get("budget"), "withhold:unknown", "{set:?} {tx}");
+            assert_eq!(r.get("admit"), "withhold:unknown", "{set:?} {tx}");
+            assert!(
+                !fx.p("var/lib/propolis/witness/send-ledger").exists(),
+                "{set:?} {tx}: no ledger line"
+            );
+            assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+        }
+    }
+    // A transition the state does not allow: a reminder of an acknowledged record, a resolve of
+    // an open one, an open of a resolved one, and NEW 1 on anything but an open.
+    for (state, tx, new) in [
+        ("acked", "remind", "0"),
+        ("open", "resolve", "0"),
+        ("resolved", "open", "1"),
+        ("open", "change", "1"),
+    ] {
+        let rec = inc_rec(&[(7, state), (22, "active10")]);
+        let m = render(&fx, std::slice::from_ref(&rec), tx, "w#3", "");
+        // NEW is the budget's alone: a change renders whatever NEW the caller has.
+        assert_eq!(
+            m.rc,
+            if new == "1" && tx != "open" { "0" } else { "1" },
+            "{state} {tx}"
+        );
+        let r = fx.run_env(
+            &format!("pa_incident_load; pa_budget_admit incident unit:sensor-ssh.service {tx} {new}; echo"),
+            &NOW,
+        );
+        assert_eq!(r.out.trim(), "withhold:unknown", "{state} {tx} {new}");
+    }
+}
+
+/// With a 32-character alias, 8-hex instances, the longest ids, causes, counts, durations and
+/// every flag, every shape of every kind keeps its headline to 80 characters by its fixed rule,
+/// every line within the sender's 200-byte line rule and the body (with the newline the sender
+/// adds) within the 1024 bytes it cuts at, so the sender never cuts a line; and so does the daily
+/// message naming ten ids.
+#[test]
+fn every_shape_fits_the_senders_line_and_body_limits_with_the_longest_values() {
+    let fx = Fx::salted(SALT);
+    let alias = "a234567890-234567890-234567890-z";
+    assert_eq!(alias.len(), 32);
+    let id = "w#999999999";
+    // The onset 23 h 59 min ago in an earlier boot, and a change 23 h 59 min before it.
+    let onset = "913660/0000aaaa/1";
+    let observe = "H\t/usr/local/bin/x\t0123456789abcdef\t827320/0000bbbb/1\t01234567\t-\t-\n\
+                   P\tseen:gwdup:c12345678\t999000/abcdef01/4000\tok\t-\t999999999\n\
+                   U\tsensor-ssh.service\t999000/abcdef01/4000\t999999999\tabcdef01\tactive\t-\t1\t-\n\
+                   R\tsensor-ssh.service\t999000/abcdef01/4000\t0\n";
+    let mut shortened = 0;
+    for (kind, key, stage, tier, prefix) in KINDS {
+        let inst = if prefix == "-" {
+            "-".to_string()
+        } else {
+            format!("{prefix}12345678")
+        };
+        let key = key
+            .replace("c1a2b3", "c12345678")
+            .replace("m1a2b3", "m12345678");
+        let kh = keyhash(&fx, &key);
+        for tx in SHAPES {
+            let mut records = vec![shape_record(
+                tx,
+                &[
+                    (1, id),
+                    (2, &key),
+                    (3, kind),
+                    (4, stage),
+                    (5, &inst),
+                    (6, tier),
+                    (8, onset),
+                    (9, onset),
+                    (10, onset),
+                    (
+                        11,
+                        if kind == "alert-path" {
+                            "http.not_found:404"
+                        } else {
+                            "proc.sandbox:243"
+                        },
+                    ),
+                    (18, "999999999"),
+                    (23, "999999999"),
+                    (30, "maint,notpersisted,cannotverify,dup"),
+                    (31, "999999999"),
+                    (33, "-"),
+                    (34, "20+"),
+                ],
+            )];
+            for n in 0..120 {
+                records.push(inc_rec(&[
+                    (1, &format!("w#{}", 1000 + n)),
+                    (2, &format!("unit:c{n}.service")),
+                    (13, id),
+                ]));
+            }
+            for _ in 0..1000 {
+                records.push(format!("W\t{INC_T}\t{kh}\topen\t1\t-\tpool\n"));
+            }
+            let m = render_with(
+                &fx,
+                &records,
+                observe,
+                tx,
+                id,
+                "proc.sandbox:243",
+                &[("PA_ALIAS_SET", alias), ("ROLE", "collector")],
+            );
+            assert_eq!(m.rc, "0", "{kind} {tx}: {}", m.out);
+            assert!(
+                m.title.len() <= 80,
+                "{kind} {tx}: {} ({})",
+                m.title,
+                m.title.len()
+            );
+            assert!(m.title.contains(alias), "{}", m.title);
+            if !m.title.contains(&format!(" - {stage}: ")) {
+                shortened += 1;
+            }
+            let body = m.body.join("\n");
+            assert!(body.len() < 1024, "{kind} {tx}: {} bytes", body.len());
+            for line in &m.body {
+                assert!(line.len() <= 200, "{kind} {tx}: {line} ({})", line.len());
+            }
+            if tx != "resolve" {
+                assert!(
+                    m.body[5].contains("budget held 999,") && m.body[5].contains("folded 120,"),
+                    "{}",
+                    m.body[5]
+                );
+            }
+        }
+    }
+    assert!(shortened > 0, "the headline rule was exercised");
+
+    let records: Vec<String> = (0..12)
+        .map(|n| daily_record(&[(1, &format!("w#99999999{}", n % 10)), (6, "PAGE")]))
+        .collect();
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        "PA_WHERE=persistent; PA_ROLE=control\npa_settings_load\n\
+         pa_render full daily - && printf '%s\\n' \"$PA_BODY\"",
+        &[
+            ("PA_TEST_WALL", "1000000"),
+            ("PA_TEST_BOOT", "abcdef01"),
+            ("PA_TEST_UP", "5000"),
+            ("PA_ALIAS_SET", alias),
+            ("PA_DAILY_LISTED", "999999"),
+        ],
+    );
+    assert!(
+        r.out.starts_with("open: 12 (PAGE 12, ACT 0) w#999999990"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.len() < 1024);
+    assert!(r.out.lines().all(|l| l.len() <= 200));
+}
+
+/// The test page and the daily message are rendered exactly as before this release: the same
+/// title, priority and body, held here against fixed text.
+#[test]
+fn the_test_page_and_the_daily_message_keep_their_title_priority_and_body() {
+    let fx = Fx::salted(SALT);
+    let r = fx.run_env(
+        "pa_render full test 0a1b2c && printf 'title=%s\\nprio=%s\\nbody=%s\\n' \"$PA_TITLE\" \"$PA_PRIO\" \"$PA_BODY\"",
+        &NOW,
+    );
+    assert_eq!(
+        r.out,
+        "title=host-908b: test page 0a1b2c\nprio=3\nbody=Type back on host-908b: status --ack-test 0a1b2c\n"
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!(
+            "#incidents v1 g=3\nN\t40\n{}{}",
+            daily_record(&[]),
+            daily_record(&[(1, "w#2"), (6, "PAGE"), (7, "resolved"), (21, &lib_at(60))])
+        ),
+    );
+    let r = fx.run_env(
+        "PA_WHERE=persistent; PA_ROLE=single\npa_settings_load\n\
+         pa_render full daily - && printf 'title=%s\\nprio=%s\\n%s\\n' \"$PA_TITLE\" \"$PA_PRIO\" \"$PA_BODY\"",
+        &NOW,
+    );
+    assert_eq!(
+        r.out,
+        "title=host-908b: daily\nprio=2\n\
+         open: 1 (PAGE 0, ACT 1) w#1\n\
+         resolved 24 h: 1; withheld by budget 24 h: 0\n\
+         new notices 24 h: 0\n\
+         alerts: NOT VERIFIED (never); profile legacy\n\
+         v2 would have pushed 3 in 24 h\n\
+         state: persisted\n\
+         Do: status\n"
+    );
+}
+
+/// A ledger line of CLASS for key hash KH, AGO seconds before `NOW` (in this boot under 5000 s,
+/// in an earlier one beyond).
+fn ledger_line(class: &str, kh: &str, ago: u64, result: &str) -> String {
+    format!(
+        "L\t{}\t{class}\t{kh}\topen\tfull\t{result}\tlight\n",
+        lib_at(ago)
+    )
+}
+
+/// The verdict of `pa_budget_admit incident KEY TX NEW` and the class it admits under, over
+/// RECORDS and the ledger LINES.
+fn admit_over(
+    fx: &Fx,
+    records: &[String],
+    lines: &[String],
+    key: &str,
+    tx: &str,
+    new: &str,
+) -> String {
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\n{}", lines.concat()),
+    );
+    let r = fx.run_env(
+        &format!("pa_incident_load\npa_budget_admit incident '{key}' {tx} {new} > /dev/null\necho \"v=$PA_ADMIT_VERDICT $PA_ADMIT_AS\""),
+        &NOW,
+    );
+    r.get("v").trim().to_string()
+}
+
+fn lines_of(n: usize, class: &str, kh: &str, ago: u64) -> Vec<String> {
+    (0..n).map(|_| ledger_line(class, kh, ago, "ok")).collect()
+}
+
+/// The order of checks for an incident message: a reserve kind at PAGE opens, changes and reopens
+/// from the reserve whatever the pool holds, and once the reserve is spent goes through the pool
+/// rules; no other kind spends it; a key past six pushes a day is withheld except for the open of
+/// a new incident; a listener is held to two of the pool's four an hour and, except for a new
+/// open, eight of its sixteen a day; the pool holds at four an hour and sixteen a day.
+#[test]
+fn the_budget_decides_an_incident_message_by_the_order_of_its_checks() {
+    let fx = Fx::salted(SALT);
+    let db = inc_rec(&[
+        (2, "db:local"),
+        (3, "db-unreachable"),
+        (4, "ledger"),
+        (5, "-"),
+    ]);
+    let other = "00000000";
+    let full_pool = lines_of(4, "pool", other, 600);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &full_pool,
+            "db:local",
+            "open",
+            "1"
+        ),
+        "admit reserve"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &full_pool,
+            "db:local",
+            "change",
+            "0"
+        ),
+        "admit reserve"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &full_pool,
+            "db:local",
+            "remind",
+            "0"
+        ),
+        "withhold:pool",
+        "a reminder never comes from the reserve"
+    );
+    let spent = lines_of(1, "reserve", other, 600);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &spent,
+            "db:local",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    let spent_and_full = [spent.clone(), full_pool.clone()].concat();
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &spent_and_full,
+            "db:local",
+            "open",
+            "1"
+        ),
+        "withhold:pool"
+    );
+    let day = lines_of(4, "reserve", other, 7200);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &day,
+            "db:local",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+
+    // Only the closed reserve kinds, at PAGE, on their own keys.
+    for (set, key) in [
+        (vec![], "unit:sensor-ssh.service"),
+        (
+            vec![(2, "unit:other.service"), (3, "daemon-down"), (4, "intake")],
+            "unit:other.service",
+        ),
+        (
+            vec![
+                (2, "db:local"),
+                (3, "db-unreachable"),
+                (4, "ledger"),
+                (6, "ACT"),
+            ],
+            "db:local",
+        ),
+        (
+            vec![(2, "finding:danger:0123456789ab"), (3, "finding")],
+            "finding:danger:0123456789ab",
+        ),
+        (
+            vec![(2, "vol:m1a2b3"), (3, "volume-full-soon"), (4, "host")],
+            "vol:m1a2b3",
+        ),
+        (
+            vec![(2, "db:recovery"), (3, "db-readonly"), (4, "ledger")],
+            "db:recovery",
+        ),
+    ] {
+        let v = admit_over(&fx, &[inc_rec(&set)], &[], key, "open", "1");
+        assert!(v == "admit pool" || v == "admit stage1", "{key}: {v}");
+    }
+    for (set, key) in [
+        (
+            vec![
+                (2, "unit:propolis.service"),
+                (3, "daemon-down"),
+                (4, "intake"),
+            ],
+            "unit:propolis.service",
+        ),
+        (
+            vec![
+                (2, "unit:propolis.service"),
+                (3, "unit-crashloop"),
+                (4, "intake"),
+            ],
+            "unit:propolis.service",
+        ),
+        (
+            vec![(2, "alert:shell"), (3, "alert-path"), (4, "alert")],
+            "alert:shell",
+        ),
+        (
+            vec![(2, "db:remote"), (3, "db-unreachable"), (4, "ledger")],
+            "db:remote",
+        ),
+    ] {
+        assert_eq!(
+            admit_over(&fx, &[inc_rec(&set)], &full_pool, key, "reopen", "0"),
+            "admit reserve",
+            "{key}"
+        );
+    }
+
+    // The key cap, which a new incident's open passes.
+    let ship = inc_rec(&[(2, "unit:shipper.service"), (4, "ship"), (6, "ACT")]);
+    let kh = keyhash(&fx, "unit:shipper.service");
+    let six = lines_of(6, "pool", &kh, 7200);
+    for tx in ["remind", "change", "reopen", "resolve"] {
+        let rec = if tx == "resolve" {
+            inc_resolved(
+                "active10",
+                &[(2, "unit:shipper.service"), (4, "ship"), (6, "ACT")],
+            )
+        } else {
+            ship.clone()
+        };
+        assert_eq!(
+            admit_over(&fx, &[rec], &six, "unit:shipper.service", tx, "0"),
+            "withhold:key-cap",
+            "{tx}"
+        );
+    }
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &six,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &six,
+            "unit:shipper.service",
+            "open",
+            "0"
+        ),
+        "withhold:key-cap"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &six[..5],
+            "unit:shipper.service",
+            "remind",
+            "0"
+        ),
+        "admit pool"
+    );
+
+    // Stage 1.
+    let sensor = inc_rec(&[]);
+    let s = "unit:sensor-ssh.service";
+    let hour2 = lines_of(2, "stage1", other, 600);
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&sensor), &hour2, s, "open", "1"),
+        "withhold:stage1-cap"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &hour2,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    let day8 = lines_of(8, "stage1", other, 7200);
+    let sent = inc_rec(&[(14, "1"), (17, "1")]);
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&sent), &day8, s, "remind", "0"),
+        "withhold:stage1-cap"
+    );
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&sensor), &day8, s, "open", "1"),
+        "admit stage1"
+    );
+    let listen_finding = inc_rec(&[(2, "finding:danger:0123456789ab"), (3, "finding")]);
+    assert_eq!(
+        admit_over(
+            &fx,
+            &[listen_finding],
+            &hour2,
+            "finding:danger:0123456789ab",
+            "open",
+            "1"
+        ),
+        "withhold:stage1-cap",
+        "a listen-stage finding is a listener"
+    );
+
+    // A late open: the first reminder of a listener incident whose open was never admitted has
+    // an allowance of its own, one an hour and four a day, whatever the stage-1 caps, the pool
+    // and the key hold; once it is spent the reminder goes on through the ordinary rules.
+    let thirty = lines_of(30, "stage1", other, 7200);
+    let skh = keyhash(&fx, s);
+    let six_s = lines_of(6, "stage1", &skh, 7200);
+    for (n, lines) in [&Vec::new(), &hour2, &thirty, &full_pool, &six_s]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            admit_over(&fx, std::slice::from_ref(&sensor), lines, s, "remind", "0"),
+            "admit late",
+            "ledger {n}"
+        );
+    }
+    let late_hour = lines_of(1, "late", other, 600);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sensor),
+            &late_hour,
+            s,
+            "remind",
+            "0"
+        ),
+        "admit stage1",
+        "one late open an hour, then the ordinary rules"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sensor),
+            &[late_hour.clone(), hour2.clone()].concat(),
+            s,
+            "remind",
+            "0"
+        ),
+        "withhold:stage1-cap"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sensor),
+            &[late_hour.clone(), six_s.clone()].concat(),
+            s,
+            "remind",
+            "0"
+        ),
+        "withhold:key-cap"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sensor),
+            &[lines_of(3, "late", other, 7200), hour2.clone()].concat(),
+            s,
+            "remind",
+            "0"
+        ),
+        "admit late"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sensor),
+            &[lines_of(4, "late", other, 7200), hour2.clone()].concat(),
+            s,
+            "remind",
+            "0"
+        ),
+        "withhold:stage1-cap",
+        "four late opens a day"
+    );
+    // Only a reminder of a listener that has had no message is one: a count of sends that is not
+    // a plain 0 is not read as none.
+    for (rec, tx) in [
+        (sent.clone(), "remind"),
+        (inc_rec(&[(14, "2")]), "remind"),
+        (inc_rec(&[(14, "-")]), "remind"),
+        (inc_rec(&[(14, "00")]), "remind"),
+        (inc_rec(&[(17, "1")]), "remind"),
+        (sensor.clone(), "change"),
+        (sensor.clone(), "reopen"),
+    ] {
+        assert_eq!(
+            admit_over(&fx, &[rec], &hour2, s, tx, "0"),
+            "withhold:stage1-cap",
+            "{tx}"
+        );
+    }
+    // Any listener has it, whatever its tier: a sensor unit at ACT, a finding of the listen stage.
+    assert_eq!(
+        admit_over(&fx, &[inc_rec(&[(6, "ACT")])], &hour2, s, "remind", "0"),
+        "admit late"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            &[inc_rec(&[
+                (2, "finding:danger:0123456789ab"),
+                (3, "finding")
+            ])],
+            &hour2,
+            "finding:danger:0123456789ab",
+            "remind",
+            "0"
+        ),
+        "admit late"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &full_pool,
+            "unit:shipper.service",
+            "remind",
+            "0"
+        ),
+        "withhold:pool",
+        "no other kind has a late open"
+    );
+    // A late line counts against its key and against nothing else.
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sent),
+            &lines_of(6, "late", &skh, 7200),
+            s,
+            "remind",
+            "0"
+        ),
+        "withhold:key-cap"
+    );
+    let late_many = lines_of(4, "late", other, 600);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&sensor),
+            &late_many,
+            s,
+            "open",
+            "1"
+        ),
+        "admit stage1"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &late_many,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+
+    // The pool, with listener lines counted to the sub-cap.
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &full_pool,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "withhold:pool"
+    );
+    let day16 = lines_of(16, "pool", other, 7200);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &day16,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "withhold:pool"
+    );
+    let busy = [
+        lines_of(7, "pool", other, 7200),
+        lines_of(20, "stage1", other, 7200),
+    ]
+    .concat();
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &busy,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    let busier = [
+        lines_of(8, "pool", other, 7200),
+        lines_of(20, "stage1", other, 7200),
+    ]
+    .concat();
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &busier,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "withhold:pool"
+    );
+    let hourly = [
+        lines_of(2, "pool", other, 600),
+        lines_of(1, "stage1", other, 600),
+    ]
+    .concat();
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &hourly,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    let reserve_many = lines_of(30, "reserve", other, 7200);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &reserve_many,
+            "unit:shipper.service",
+            "open",
+            "1"
+        ),
+        "admit pool",
+        "reserve lines never count against the pool"
+    );
+}
+
+/// An account that crashes sensors in bursts or reopens cheap incidents all day: with thirty
+/// listener pushes in the day and two in the last hour, a new listener's open is held while the
+/// hour is full, and a new incident of any other kind goes out at once; the reserve is never spent
+/// by any of it. With fewer than the day's sixteen, a new listener's open goes out once the hour
+/// has room.
+#[test]
+fn an_account_crashing_sensors_spends_neither_the_reserve_nor_the_room_of_other_kinds() {
+    let fx = Fx::salted(SALT);
+    let other = "00000000";
+    let mut day: Vec<String> = (1..=30)
+        .map(|n| ledger_line("stage1", other, 3600 + n * 2400, "ok"))
+        .collect();
+    day.extend(lines_of(2, "stage1", other, 1200));
+    let sensor = inc_rec(&[(2, "unit:sensor-new.service")]);
+    let s = "unit:sensor-new.service";
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&sensor), &day, s, "open", "1"),
+        "withhold:stage1-cap"
+    );
+    let mut later: Vec<String> = (1..=13)
+        .map(|n| ledger_line("stage1", other, 3600 + n * 2400, "ok"))
+        .collect();
+    later.extend(lines_of(2, "stage1", other, 3700));
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&sensor), &later, s, "open", "1"),
+        "admit stage1"
+    );
+    later.push(ledger_line("stage1", other, 7200, "ok"));
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&sensor), &later, s, "open", "1"),
+        "withhold:stage1-cap",
+        "sixteen listener pushes in the day are the most there can be, new opens included"
+    );
+    let backup = inc_rec(&[
+        (2, "backup:run"),
+        (3, "backup-hung"),
+        (4, "backup"),
+        (5, "-"),
+        (6, "ACT"),
+    ]);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&backup),
+            &day,
+            "backup:run",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    let finding = inc_rec(&[
+        (2, "finding:backup-stale:0123456789ab"),
+        (3, "finding"),
+        (4, "backup"),
+        (6, "ACT"),
+    ]);
+    assert_eq!(
+        admit_over(
+            &fx,
+            &[finding],
+            &day,
+            "finding:backup-stale:0123456789ab",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+
+    // Admissions of listener transitions, one after another, never write a reserve line.
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=1\n",
+    );
+    let records: Vec<String> = (0..6)
+        .map(|n| {
+            inc_rec(&[
+                (1, &format!("w#{n}")),
+                (2, &format!("unit:sensor-s{n}.service")),
+            ])
+        })
+        .collect();
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        "for n in 0 1 2 3 4 5; do pa_incident_load; echo \"v$n=$(pa_incident_admit unit:sensor-s$n.service open 1 full light)\"; done",
+        &NOW,
+    );
+    assert_eq!(r.get("v0"), "admit", "{}", r.err);
+    assert_eq!(r.get("v1"), "admit");
+    assert_eq!(r.get("v2"), "withhold:stage1-cap");
+    let ledger = fx.read("var/lib/propolis/witness/send-ledger");
+    assert_eq!(ledger.matches("\tstage1\t").count(), 2, "{ledger}");
+    assert!(!ledger.contains("\treserve\t"), "{ledger}");
+}
+
+/// The exempt classes have their own caps and count against nothing else: storm one in six
+/// hours, summary one an hour and twelve a day, switch one a day, pointer two an hour and
+/// forty-eight a day. pa_budget_next says when the next has room.
+#[test]
+fn the_exempt_classes_keep_their_own_caps_and_say_when_the_next_has_room() {
+    let fx = Fx::salted(SALT);
+    let other = "00000000";
+    let verdict = |lines: &[String], class: &str| -> (String, String) {
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!("#send-ledger v1 g=1\n{}", lines.concat()),
+        );
+        let r = fx.run_env(
+            &format!("echo \"v=$(pa_budget_admit {class} - - 0)\"; echo \"next=$(pa_budget_next {class})\""),
+            &NOW,
+        );
+        (r.get("v"), r.get("next"))
+    };
+    assert_eq!(
+        verdict(&lines_of(1, "storm", other, 5 * 3600), "storm").0,
+        "withhold:storm-cap"
+    );
+    assert_eq!(
+        verdict(&lines_of(1, "storm", other, 7 * 3600), "storm").0,
+        "admit"
+    );
+    let (v, next) = verdict(&lines_of(1, "summary", other, 1800), "summary");
+    assert_eq!(v, "withhold:summary-cap");
+    assert_eq!(next, "14:17", "half an hour on, rounded up to the minute");
+    assert_eq!(
+        verdict(&lines_of(12, "summary", other, 7200), "summary").0,
+        "withhold:summary-cap"
+    );
+    let (v, next) = verdict(&lines_of(11, "summary", other, 7200), "summary");
+    assert_eq!(v, "admit");
+    assert_eq!(next, "13:47", "room now");
+    assert_eq!(
+        verdict(&lines_of(1, "switch", other, 80000), "switch").0,
+        "withhold:switch-cap"
+    );
+    assert_eq!(
+        verdict(&lines_of(2, "pointer", other, 600), "pointer").0,
+        "withhold:pointer-cap"
+    );
+    assert_eq!(
+        verdict(&lines_of(48, "pointer", other, 7200), "pointer").0,
+        "withhold:pointer-cap"
+    );
+    assert_eq!(
+        verdict(&lines_of(47, "pointer", other, 7200), "pointer").0,
+        "admit"
+    );
+    let crowd = [
+        lines_of(40, "storm", other, 600),
+        lines_of(40, "summary", other, 600),
+        lines_of(40, "pointer", other, 600),
+        lines_of(40, "test", other, 600),
+        lines_of(40, "daily", other, 600),
+    ]
+    .concat();
+    let ship = inc_rec(&[(2, "unit:shipper.service"), (4, "ship"), (6, "ACT")]);
+    assert_eq!(
+        admit_over(&fx, &[ship], &crowd, "unit:shipper.service", "open", "1"),
+        "admit pool"
+    );
+    let pools = lines_of(30, "pool", other, 600);
+    assert_eq!(
+        verdict(&pools, "summary").0,
+        "admit",
+        "pool lines never count against an exempt class"
+    );
+}
+
+/// What the budget counts: one line per admitted message whose result says it was or may have
+/// been sent (pending, sending, ok, perm, transient); never one that sent nothing. A line dated
+/// ahead of the clock is expired, one from another boot is aged by the wall clock, a stamp or a
+/// result out of form counts as nothing, and a ledger that cannot be read admits nothing.
+#[test]
+fn the_budget_counts_only_lines_that_may_have_been_sent_and_ages_them_by_the_clock_rules() {
+    let fx = Fx::salted(SALT);
+    let other = "00000000";
+    let ship = inc_rec(&[(2, "unit:shipper.service"), (4, "ship"), (6, "ACT")]);
+    let key = "unit:shipper.service";
+    let three = lines_of(3, "pool", other, 600);
+    for result in ["pending", "sending", "ok", "perm:403", "transient:503"] {
+        let lines = [three.clone(), vec![ledger_line("pool", other, 600, result)]].concat();
+        assert_eq!(
+            admit_over(&fx, std::slice::from_ref(&ship), &lines, key, "open", "1"),
+            "withhold:pool",
+            "{result}"
+        );
+    }
+    let pending_old = [
+        three.clone(),
+        vec![ledger_line("pool", other, 3000, "pending")],
+    ]
+    .concat();
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &pending_old,
+            key,
+            "open",
+            "1"
+        ),
+        "withhold:pool",
+        "a pending incident line counts for its whole window"
+    );
+    for result in [
+        "norender", "nocurl", "notarget", "noclaim", "lockbusy", "nomatch", "perm:abc", "ok2", "-",
+    ] {
+        let lines = [three.clone(), vec![ledger_line("pool", other, 600, result)]].concat();
+        assert_eq!(
+            admit_over(&fx, std::slice::from_ref(&ship), &lines, key, "open", "1"),
+            "admit pool",
+            "{result}"
+        );
+    }
+    let ahead =
+        vec![format!("L\t1000500/abcdef01/5500\tpool\t{other}\topen\tfull\tok\tlight\n"); 4];
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&ship), &ahead, key, "open", "1"),
+        "admit pool",
+        "ahead of the clock"
+    );
+    let other_boot =
+        vec![format!("L\t998200/0000aaaa/999999\tpool\t{other}\topen\tfull\tok\tlight\n"); 4];
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &other_boot,
+            key,
+            "open",
+            "1"
+        ),
+        "withhold:pool",
+        "another boot, 30 minutes ago by the wall clock, whatever its uptime says"
+    );
+    let old_boot =
+        vec![format!("L\t900000/0000aaaa/1\tpool\t{other}\topen\tfull\tok\tlight\n"); 16];
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&ship),
+            &old_boot,
+            key,
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    for bad in [
+        "99x000/abcdef01/4000",
+        "999000/abcdef01/40 0",
+        "999000/ABCDEF01/4000",
+        "-",
+        "999000",
+    ] {
+        let lines = vec![format!("L\t{bad}\tpool\t{other}\topen\tfull\tok\tlight\n"); 4];
+        assert_eq!(
+            admit_over(&fx, std::slice::from_ref(&ship), &lines, key, "open", "1"),
+            "admit pool",
+            "{bad}"
+        );
+    }
+    // A key hash out of form never counts toward a key.
+    let kh = keyhash(&fx, key);
+    let six = lines_of(6, "pool", &kh.to_uppercase(), 7200);
+    assert_eq!(
+        admit_over(&fx, std::slice::from_ref(&ship), &six, key, "remind", "0"),
+        "admit pool"
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    for class in ["incident", "storm", "summary", "switch", "pointer"] {
+        let r = fx.run_env(
+            &format!("pa_incident_load; pa_budget_admit {class} {key} open 1; echo"),
+            &NOW,
+        );
+        assert_eq!(r.out.trim(), "withhold:ledger", "{class}");
+    }
+}
+
+/// An admitted incident message is made retryable before anything is sent: one pending ledger
+/// line naming the incident and the attempt, then the record's pending_tx, pending_since, sends
+/// and last_sent. A withheld one writes nothing; a record that cannot be written gives the line
+/// back as noclaim, which the budget does not count.
+#[test]
+fn an_admission_writes_one_pending_line_and_then_sets_pending_tx_before_the_send() {
+    let fx = Fx::salted(SALT);
+    let key = "unit:sensor-ssh.service";
+    let kh = keyhash(&fx, key);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", inc_rec(&[(14, "2")])),
+    );
+    let r = fx.run_env(
+        &format!("pa_incident_load; echo \"v=$(pa_incident_admit {key} open 1 full light)\""),
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "admit", "{}", r.err);
+    let stamp = "1000000/abcdef01/5000";
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/send-ledger"),
+        format!(
+            "#send-ledger v1 g=1\nL\t{stamp}\tstage1\t{kh}\topen\tfull\tpending\tlight\tw#3\t{stamp}\n"
+        )
+    );
+    let rec = incident_records(&fx.read("var/lib/propolis/witness/incidents"));
+    let f = &rec[0];
+    assert_eq!(
+        (f[14].as_str(), f[15].as_str()),
+        ("3", stamp),
+        "sends and last_sent"
+    );
+    assert_eq!(
+        (f[26].as_str(), f[27].as_str()),
+        ("open", stamp),
+        "pending_tx and pending_since"
+    );
+
+    // Withheld: nothing written.
+    let full: String = lines_of(2, "stage1", "00000000", 600).concat();
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\n{full}"),
+    );
+    let before = fx.read("var/lib/propolis/witness/incidents");
+    let r = fx.run_env(
+        &format!("pa_incident_load; echo \"v=$(pa_incident_admit {key} remind 0 full light)\""),
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "withhold:stage1-cap");
+    assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/send-ledger"),
+        format!("#send-ledger v1 g=1\n{full}")
+    );
+
+    // A record that cannot be written: the line is given back.
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        "#send-ledger v1 g=1\n",
+    );
+    let r = fx.run_env(
+        &format!("pa_incident_load; pa_incident_write() {{ return 1; }}; echo \"v=$(pa_incident_admit {key} open 1 full hook)\""),
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "withhold:noclaim");
+    let ledger = fx.read("var/lib/propolis/witness/send-ledger");
+    assert!(ledger.contains("\tnoclaim\thook\tw#3\t"), "{ledger}");
+    let r = fx.run_env(
+        &format!("pa_incident_load; echo \"v=$(pa_budget_admit incident {key} open 1)\"; echo \"n=$(_pa_ledger_ages stage1 | wc -l)\""),
+        &NOW,
+    );
+    assert_eq!(r.get("n"), "0", "a line given back is not counted");
+    assert_eq!(r.get("v"), "admit");
+    for (mode, sender) in [("bulk", "light"), ("full", "cron")] {
+        let r = fx.run_env(
+            &format!("pa_incident_load; pa_incident_admit {key} open 1 {mode} {sender}; echo"),
+            &NOW,
+        );
+        assert_eq!(r.out.trim(), "withhold:unknown", "{mode} {sender}");
+    }
+}
+
+/// Whether a pending transition may be sent again now: not under 120 s since it was admitted or
+/// last tried, not once an hour has passed since it was admitted; an admission time out of form has
+/// expired and one ahead of the clock waits for the clock to pass it; a last attempt out of form is
+/// none, and one ahead of the clock is none only when it is known to come from another boot.
+#[test]
+fn the_retry_decision_waits_120_seconds_and_gives_up_after_an_hour() {
+    let fx = Fx::new();
+    let due = |since: &str, tried: &str| -> String {
+        fx.run_env(
+            &format!("echo \"d=$(pa_retry_due '{since}' '{tried}')\"; echo \"rc=$?\""),
+            &NOW,
+        )
+        .get("d")
+    };
+    assert_eq!(due("999940/abcdef01/4940", "-"), "wait");
+    assert_eq!(due("999870/abcdef01/4870", "-"), "due");
+    assert_eq!(due("999870/abcdef01/4870", "999970/abcdef01/4970"), "wait");
+    assert_eq!(due("999870/abcdef01/4870", "999870/abcdef01/4870"), "due");
+    assert_eq!(due("996401/abcdef01/1401", "-"), "due");
+    assert_eq!(due("996400/abcdef01/1400", "-"), "expired");
+    assert_eq!(
+        due("1000100/abcdef01/5100", "-"),
+        "wait",
+        "ahead of the clock: retried once the clock passes it"
+    );
+    assert_eq!(due("999870/abcdef01", "-"), "expired");
+    assert_eq!(due("plantedword", "-"), "expired");
+    assert_eq!(
+        due("999870/abcdef01/4870", "1000100/abcdef01/5100"),
+        "wait",
+        "an attempt ahead of the clock in this boot may still be sending"
+    );
+    assert_eq!(
+        due("999870/abcdef01/4870", "1000100/0000bbbb/5100"),
+        "due",
+        "an attempt ahead of the clock from another boot ended with that boot"
+    );
+    assert_eq!(due("999870/abcdef01/4870", "garbage"), "due");
+    assert_eq!(
+        due("999800/0000aaaa/9", "-"),
+        "due",
+        "another boot, by the wall clock"
+    );
+    assert_eq!(due("990000/0000aaaa/4999", "-"), "expired");
+    let r = fx.run_env(
+        "pa_retry_due 999870/abcdef01/4870 - > /dev/null; echo \"rc=$?\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0");
+    let r = fx.run_env(
+        "pa_retry_due 999940/abcdef01/4940 - > /dev/null; echo \"rc=$?\"",
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "1");
+}
+
+/// A retry updates the ledger line of its own transition (result pending again, the sender, the
+/// time of the attempt) and adds none, so it is never counted again; a line that ended ok or perm
+/// is not retried, and a result is written only to the line of the key and transition it names,
+/// though two transitions admitted in one pass share a stamp.
+#[test]
+fn a_retry_updates_its_own_line_and_is_never_counted_again() {
+    let fx = Fx::salted(SALT);
+    let a = keyhash(&fx, "unit:shipper.service");
+    let b = keyhash(&fx, "backup:run");
+    let s = "999800/abcdef01/4800";
+    let ledger = format!(
+        "#send-ledger v1 g=1\n\
+         L\t{s}\tpool\t{a}\topen\tfull\ttransient:503\tlight\tw#3\t{s}\n\
+         L\t{s}\tpool\t{b}\topen\tfull\tpending\tlight\tw#4\t{s}\n\
+         L\t{s}\tpool\t00000000\tremind\tfull\tok\tlight\tw#5\t{s}\n"
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", &ledger);
+    let r = fx.run_env(
+        &format!(
+            "pa_ledger_retry {s} {a} open hourly; echo \"retry=$?\"\n\
+             pa_ledger_retry {s} 00000000 remind hourly; echo \"ended=$?\"\n\
+             pa_ledger_retry {s} {a} change hourly; echo \"other=$?\""
+        ),
+        &NOW,
+    );
+    assert_eq!(r.get("retry"), "0", "{}", r.err);
+    assert_eq!(r.get("ended"), "1", "an ok line is not retried");
+    assert_eq!(r.get("other"), "1");
+    let now = "1000000/abcdef01/5000";
+    let after = fx.read("var/lib/propolis/witness/send-ledger");
+    assert_eq!(
+        after,
+        format!(
+            "#send-ledger v1 g=2\n\
+             L\t{s}\tpool\t{a}\topen\tfull\tpending\thourly\tw#3\t{now}\n\
+             L\t{s}\tpool\t{b}\topen\tfull\tpending\tlight\tw#4\t{s}\n\
+             L\t{s}\tpool\t00000000\tremind\tfull\tok\tlight\tw#5\t{s}\n"
+        )
+    );
+    // Three lines before and after: one more message has room in the hour.
+    let ship = inc_rec(&[
+        (1, "w#9"),
+        (2, "unit:other.service"),
+        (4, "host"),
+        (6, "ACT"),
+    ]);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{ship}"),
+    );
+    let r = fx.run_env(
+        "pa_incident_load; echo \"v=$(pa_budget_admit incident unit:other.service open 1)\"",
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "admit");
+    let r = fx.run_env(
+        &format!(
+            "pa_ledger_result {s} - ok light {b} open; echo \"res=$?\"\n\
+             pa_ledger_result {s} - ok light {b} open; echo \"again=$?\""
+        ),
+        &NOW,
+    );
+    assert_eq!(r.get("res"), "0");
+    assert_eq!(r.get("again"), "1");
+    let after = fx.read("var/lib/propolis/witness/send-ledger");
+    assert!(
+        after.contains(&format!(
+            "L\t{s}\tpool\t{b}\topen\tfull\tok\tlight\tw#4\t{s}\n"
+        )),
+        "{after}"
+    );
+    assert!(
+        after.contains(&format!(
+            "L\t{s}\tpool\t{a}\topen\tfull\tpending\thourly\tw#3\t{now}\n"
+        )),
+        "{after}"
+    );
+}
+
+/// The default open record rendered over OBSERVE (written as the observe file whatever it holds),
+/// with the fields in `set` replaced.
+fn open_over(fx: &Fx, set: &[(usize, &str)], observe: &str) -> Msg {
+    render_with(fx, &[inc_rec(set)], observe, "open", "w#3", "", &[])
+}
+
+/// An observe file that holds nothing the renderer reads.
+const NO_OBSERVE: &str = "X\tnothing\n";
+
+/// The last change is read from the stamp the witness writes third on an H line (`H path sha16
+/// changed keys8 seen before`), never from the key-name hash beside it, and the path selects its
+/// word: env files and the other configuration are config, Propolis's unit files are unit, and
+/// the installed binaries and the scripts under /usr/local/sbin and /usr/local/lib/propolis are
+/// binary.
+#[test]
+fn the_last_change_is_read_from_the_witness_h_line_and_names_config_unit_or_binary() {
+    let fx = Fx::salted(SALT);
+    let why = |observe: &str| open_over(&fx, &[], observe).body[1].clone();
+    let line = |path: &str, changed: &str| {
+        format!("H\t{path}\t0123456789abcdef\t{changed}\t01234567\t999900/abcdef01/4900\t-\n")
+    };
+    let prefix = "Why: process exited (proc.exit 1), seen by hook@host-908b, known; last change: ";
+    for (path, changed, want) in [
+        (
+            "/etc/propolis/propolis.env",
+            "998400/abcdef01/3400",
+            "config 10 min before onset",
+        ),
+        (
+            "/usr/local/lib/propolis/alert-lib.sh",
+            "998700/abcdef01/3700",
+            "binary 5 min before onset",
+        ),
+        (
+            "/usr/local/sbin/propolis-status",
+            "998700/abcdef01/3700",
+            "binary 5 min before onset",
+        ),
+        (
+            "/usr/local/bin/propolis",
+            "998700/abcdef01/3700",
+            "binary 5 min before onset",
+        ),
+        (
+            "/etc/systemd/system/sensor-ssh.service",
+            "998400/abcdef01/3400",
+            "unit 10 min before onset",
+        ),
+        ("/etc/propolis/propolis.env", "-", "none in 24 h"),
+    ] {
+        assert_eq!(
+            why(&line(path, changed)),
+            format!("{prefix}{want}"),
+            "{path}"
+        );
+    }
+    let both = format!(
+        "{}{}",
+        line("/etc/propolis/propolis.env", "998400/abcdef01/3400"),
+        line(
+            "/usr/local/lib/propolis/alert-lib.sh",
+            "998700/abcdef01/3700"
+        )
+    );
+    assert_eq!(why(&both), format!("{prefix}binary 5 min before onset"));
+}
+
+/// A gateway-dup counts its loss from the observe line kept under its own record key, the
+/// unlisted collectors' included, whose instance is not known; the loss is permanent, so where no
+/// count can be read it is not measured, never held.
+#[test]
+fn a_gateway_dup_counts_its_loss_by_its_record_key_and_never_says_evidence_held() {
+    let fx = Fx::salted(SALT);
+    let dup = |key: &str, inst: &str| {
+        vec![
+            (2, key.to_string()),
+            (3, "gateway-dup".to_string()),
+            (4, "gateway".to_string()),
+            (5, inst.to_string()),
+            (6, "ACT".to_string()),
+            (11, "gw.dup".to_string()),
+            (33, "-".to_string()),
+        ]
+    };
+    let set = |v: &Vec<(usize, String)>| -> Vec<(usize, String)> { v.clone() };
+    let over = |v: Vec<(usize, String)>, observe: &str| {
+        let s: Vec<(usize, &str)> = v.iter().map(|(i, x)| (*i, x.as_str())).collect();
+        open_over(&fx, &s, observe)
+    };
+    let unlisted = dup("gwdup:unlisted", "-");
+    let m = over(
+        set(&unlisted),
+        &format!("P\tseen:gwdup:unlisted\t{INC_T}\tok\t-\t42\n"),
+    );
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(
+        m.body[3],
+        "Impact: not known here; evidence lost (counted) 42 records"
+    );
+    let listed = dup("gwdup:c1a2b3", "c1a2b3");
+    let m = over(set(&listed), NO_OBSERVE);
+    assert_eq!(
+        m.body[3],
+        "Impact: no new evidence from c1a2b3; evidence not measured"
+    );
+    let m = over(
+        set(&listed),
+        &format!("P\tseen:gwdup:c1a2b3\t{INC_T}\tok\t-\t4x2\n"),
+    );
+    assert_eq!(
+        m.body[3],
+        "Impact: no new evidence from c1a2b3; evidence not measured"
+    );
+    assert!(!m.out.contains("held"), "{}", m.out);
+}
+
+/// A RESOLVED follows only an open that got through: a resolved record whose open was never
+/// delivered is withheld as undelivered (a word the caller does not count as a withheld message)
+/// and renders nothing; delivered, it is admitted and rendered.
+#[test]
+fn a_resolve_of_an_open_never_delivered_is_withheld_as_undelivered_and_not_rendered() {
+    let fx = Fx::salted(SALT);
+    let key = "unit:sensor-ssh.service";
+    for (delivered, verdict, rc) in [
+        ("0", "withhold:undelivered", "1"),
+        ("?", "withhold:undelivered", "1"),
+        ("1", "admit stage1", "0"),
+    ] {
+        let rec = inc_resolved("active10", &[(17, delivered)]);
+        assert_eq!(
+            admit_over(&fx, std::slice::from_ref(&rec), &[], key, "resolve", "0"),
+            verdict,
+            "{delivered}"
+        );
+        let m = render(&fx, std::slice::from_ref(&rec), "resolve", "w#3", "");
+        assert_eq!(m.rc, rc, "{delivered}: {}", m.out);
+        if rc == "1" {
+            assert_eq!((m.title.as_str(), m.body.len()), ("", 0));
+        }
+    }
+    let rec = inc_resolved("active10", &[(17, "0")]);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{rec}"),
+    );
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/send-ledger")).unwrap();
+    let r = fx.run_env(
+        &format!("pa_incident_load; echo \"v=$(pa_incident_admit {key} resolve 0 full light)\""),
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "withhold:undelivered");
+    assert!(!fx.p("var/lib/propolis/witness/send-ledger").exists());
+}
+
+/// Who saw an incident: the hook when the record carries the flag the hook's path sets
+/// (`hookopen`, or `hookspool` for a firing the hook spooled), or, from a record the legacy hook
+/// wrote, its outcome; the witness otherwise. A later witness sighting that resets the outcome
+/// leaves the flag, so a hook-opened incident still says hook.
+#[test]
+fn who_saw_an_incident_comes_from_the_hooks_flag_and_never_from_a_reset_outcome() {
+    let fx = Fx::salted(SALT);
+    for (flags, out, who) in [
+        ("hookopen", "-", "hook"),
+        ("maint,hookspool", "-", "hook"),
+        ("-", "delivered", "hook"),
+        ("-", "-", "witness"),
+        ("hookopenx", "-", "witness"),
+        ("cannotverify", "-", "witness"),
+    ] {
+        let m = open_over(&fx, &[(30, flags), (33, out)], NO_OBSERVE);
+        assert!(
+            m.body[1].contains(&format!(", seen by {who}@host-908b, ")),
+            "{flags} {out}: {}",
+            m.body[1]
+        );
+    }
+}
+
+/// Pointer mode is a class of its own, which the profile switch brings: an incident message is
+/// admitted here in full mode only, and a pointer asked for writes nothing.
+#[test]
+fn an_incident_message_is_admitted_in_full_mode_only() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", inc_rec(&[])),
+    );
+    let before = fx.read("var/lib/propolis/witness/incidents");
+    let r = fx.run_env(
+        "pa_incident_load; echo \"v=$(pa_incident_admit unit:sensor-ssh.service open 1 pointer light)\"",
+        &NOW,
+    );
+    assert_eq!(r.get("v"), "withhold:unknown");
+    assert!(!fx.p("var/lib/propolis/witness/send-ledger").exists());
+    assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+}
+
+/// The Impact line of each of config-check's sixteen page rows names what its stage stops, with
+/// the instance: an intake finding concerns one source, whose evidence stops while the rest still
+/// reaches the ledger; the daemon's and the database's kinds stop everything.
+#[test]
+fn the_impact_line_of_each_page_row_names_what_its_stage_stops() {
+    let fx = Fx::salted(SALT);
+    let witness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/witness.sh"
+    ))
+    .unwrap();
+    let rows: Vec<Vec<String>> = witness
+        .lines()
+        .filter(|l| l.split('|').nth(1) == Some("page"))
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect();
+    assert_eq!(rows.len(), 16);
+    for row in &rows {
+        let (id, tier, stage, rule) = (&row[0], &row[2], &row[3], &row[5]);
+        let inst = match rule.as_str() {
+            "logpath" => "s1a2b3",
+            "fold" => "c1a2b3",
+            _ => "u1a2b3",
+        };
+        let want = match stage.as_str() {
+            "listen" => format!("not capturing on {inst}"),
+            "gateway" | "intake" => format!("no new evidence from {inst}"),
+            "source" => "rotation not done".to_string(),
+            "backup" => "backup not taken".to_string(),
+            "alert" => "alerts may not arrive".to_string(),
+            other => panic!("a page row on stage {other}"),
+        };
+        let key = format!("finding:{id}:0123456789ab");
+        let m = open_over(
+            &fx,
+            &[
+                (2, &key),
+                (3, "finding"),
+                (4, stage),
+                (5, inst),
+                (6, tier),
+                (11, "config.finding"),
+            ],
+            NO_OBSERVE,
+        );
+        assert!(
+            m.body[3].starts_with(&format!("Impact: {want}; evidence ")),
+            "{id}: {}",
+            m.body[3]
+        );
+    }
+    for set in [
+        vec![
+            (2, "unit:propolis.service"),
+            (3, "daemon-down"),
+            (4, "intake"),
+        ],
+        vec![(2, "unit:propolis.service"), (4, "intake")],
+        vec![(2, "ready:local"), (3, "daemon-degraded"), (4, "intake")],
+        vec![(2, "db:local"), (3, "db-unreachable"), (4, "ledger")],
+    ] {
+        let m = open_over(&fx, &set, NO_OBSERVE);
+        assert!(
+            m.body[3].starts_with("Impact: nothing reaches the ledger; "),
+            "{set:?}: {}",
+            m.body[3]
+        );
+    }
+}
+
+/// A crash loop's headline counts the restarts the witness judged it on (the unit's NRestarts on
+/// its last sample less its baseline), never the record's occurrences, and `?` where no count can
+/// be read: never a made-up 0.
+#[test]
+fn a_crash_loop_counts_the_restarts_the_witness_judged_on_never_its_occurrences() {
+    let fx = Fx::salted(SALT);
+    let title = |observe: &str| open_over(&fx, &[(3, "unit-crashloop"), (31, "2")], observe).title;
+    let obs = |u: &str, r: &str| {
+        format!(
+            "U\tsensor-ssh.service\t{INC_T}\t{u}\tabcdef01\tactive\t-\t1\t-\n\
+             R\tsensor-ssh.service\t{INC_T}\t{r}\n\
+             U\tsensor-other.service\t{INC_T}\t99\tabcdef01\tactive\t-\t1\t-\n"
+        )
+    };
+    let head = "PAGE host-908b - listen: unit u1a2b3 restarting";
+    assert_eq!(title(&obs("10", "4")), format!("{head} (6 restarts)"));
+    for (u, r) in [("1x", "4"), ("10", "-"), ("10", "12"), ("10", "10")] {
+        assert_eq!(title(&obs(u, r)), format!("{head} (? restarts)"), "{u} {r}");
+    }
+    assert_eq!(title(NO_OBSERVE), format!("{head} (? restarts)"));
+}
+
+/// The lifecycle line's flags: `folded` counts only children still pending, open or acknowledged
+/// under this id, never a resolved one or the record itself; `budget held` counts only the W lines
+/// of this key since this incident opened, never those of an earlier incident of the same key.
+#[test]
+fn the_lifecycle_flags_count_only_children_still_folded_and_holds_since_this_open() {
+    let fx = Fx::salted(SALT);
+    let child = |state: &str| {
+        inc_rec(&[
+            (1, "w#4"),
+            (2, "unit:propolis-backup.service"),
+            (4, "backup"),
+            (6, "ACT"),
+            (7, state),
+            (13, "w#3"),
+            (30, "folded"),
+        ])
+    };
+    let plain = "w#3 opened - next reminder 14:46 UTC";
+    let last = |records: &[String]| render(&fx, records, "open", "w#3", "").body[5].clone();
+    assert_eq!(last(&[inc_rec(&[]), child("resolved")]), plain);
+    assert_eq!(
+        last(&[inc_rec(&[]), child("acked")]),
+        format!("{plain} - folded 1")
+    );
+    assert_eq!(last(&[inc_rec(&[(13, "w#3")])]), plain);
+    let kh = keyhash(&fx, "unit:sensor-ssh.service");
+    let w = |at: &str| format!("W\t{at}\t{kh}\tremind\t0\tu1a2b3\tpool\n");
+    assert_eq!(
+        last(&[
+            inc_rec(&[]),
+            w("998000/abcdef01/3000"),
+            w("980000/0000aaaa/1")
+        ]),
+        plain,
+        "held before this open"
+    );
+    assert_eq!(
+        last(&[inc_rec(&[]), w("998000/abcdef01/3000"), w(INC_T)]),
+        format!("{plain} - budget held 1")
+    );
+}
+
+/// The sixteen listener records of an attacker who crashes sensors at will.
+fn attacker_records(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            inc_rec(&[
+                (1, &format!("w#{}", 10 + i)),
+                (2, &format!("unit:sensor-a{i}.service")),
+            ])
+        })
+        .collect()
+}
+
+/// An attacker who opens a new listener incident whenever the budget lets him, every five minutes
+/// for a day, fills the stage-1 hour and then the day's sixteen. A real listener that fails
+/// meanwhile has its open withheld, but its first reminder, still failing an hour on and never
+/// sent, goes out as its open would have, from the allowance kept for such opens: it is not held
+/// for the day.
+#[test]
+fn a_listener_open_withheld_by_an_attack_goes_out_with_its_first_reminder() {
+    let fx = Fx::salted(SALT);
+    let mut records = attacker_records(8);
+    for (i, step) in [26, 100, 230].iter().enumerate() {
+        records.push(inc_rec(&[
+            (1, &format!("w#{}", 20 + i)),
+            (2, &format!("unit:sensor-r{step}.service")),
+        ]));
+    }
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        "for ((step = 0; step < 288; step++)); do\n\
+         PA_TEST_WALL=$((1000000 + step * 300)) PA_TEST_UP=$((5000 + step * 300))\n\
+         pa_now\n\
+         pa_incident_load\n\
+         v=\"$(pa_incident_admit \"unit:sensor-a$((step % 8)).service\" open 1 full light)\"\n\
+         [ \"$v\" != admit ] || echo \"attack=$step\"\n\
+         case \"$step\" in\n\
+         26 | 100 | 230) pa_incident_load; echo \"open$step=$(pa_incident_admit \"unit:sensor-r$step.service\" open 1 full light)\" ;;\n\
+         38 | 112 | 242) pa_incident_load; echo \"remind$((step - 12))=$(pa_incident_admit \"unit:sensor-r$((step - 12)).service\" remind 0 full light)\" ;;\n\
+         esac\n\
+         done",
+        &NOW,
+    );
+    let attacks = r.out.lines().filter(|l| l.starts_with("attack=")).count();
+    assert_eq!(attacks, 16, "{}\n{}", r.out, r.err);
+    for step in [26, 100, 230] {
+        assert_eq!(
+            r.get(&format!("open{step}")),
+            "withhold:stage1-cap",
+            "{step}"
+        );
+        assert_eq!(r.get(&format!("remind{step}")), "admit", "{step}");
+        let kh = keyhash(&fx, &format!("unit:sensor-r{step}.service"));
+        assert!(
+            fx.read("var/lib/propolis/witness/send-ledger")
+                .contains(&format!("\tlate\t{kh}\tremind\t")),
+            "{step}: admitted as a late open"
+        );
+    }
+}
+
+/// Listeners an attacker keeps down for hours, their opens withheld, while he also opens a new
+/// listener incident every twenty minutes: their first reminders take the late allowance, one an
+/// hour and four in the day, and nothing of the pool, so a new incident of another kind still
+/// goes out at once six and sixteen hours into the attack, and the day stays within its bound.
+#[test]
+fn listeners_kept_down_take_four_late_opens_a_day_and_no_room_from_other_kinds() {
+    let fx = Fx::salted(SALT);
+    let mut records = attacker_records(8);
+    for i in 0..10 {
+        records.push(inc_rec(&[
+            (1, &format!("w#{}", 50 + i)),
+            (2, &format!("unit:sensor-h{i}.service")),
+        ]));
+    }
+    records.push(inc_rec(&[
+        (1, "w#60"),
+        (2, "db:recovery"),
+        (3, "db-readonly"),
+        (4, "ledger"),
+        (5, "-"),
+    ]));
+    records.push(inc_rec(&[
+        (1, "w#61"),
+        (2, "backup:run"),
+        (3, "backup-hung"),
+        (4, "backup"),
+        (5, "-"),
+        (6, "ACT"),
+    ]));
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t70\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        "for ((step = 0; step < 72; step++)); do\n\
+         PA_TEST_WALL=$((1000000 + step * 1200)) PA_TEST_UP=$((5000 + step * 1200))\n\
+         pa_now; pa_incident_load\n\
+         pa_incident_admit \"unit:sensor-a$((step % 8)).service\" open 1 full light > /dev/null\n\
+         if [ \"$((step % 3))\" = 0 ]; then\n\
+         for h in 0 1 2 3 4 5 6 7 8 9; do\n\
+         pa_incident_load; pa_incident_admit \"unit:sensor-h$h.service\" remind 0 full light > /dev/null\n\
+         [ \"$PA_ADMIT_AS\" != late ] || echo \"late=$step:h$h\"\n\
+         done\n\
+         fi\n\
+         case \"$step\" in\n\
+         18) pa_incident_load; pa_incident_admit db:recovery open 1 full light > /dev/null; echo \"db=$PA_ADMIT_VERDICT $PA_ADMIT_AS\" ;;\n\
+         50) pa_incident_load; pa_incident_admit backup:run open 1 full light > /dev/null; echo \"backup=$PA_ADMIT_VERDICT $PA_ADMIT_AS\" ;;\n\
+         esac\n\
+         done; echo done=1",
+        &NOW,
+    );
+    assert_eq!(r.get("done"), "1", "{}", r.err);
+    let late: Vec<&str> = r
+        .out
+        .lines()
+        .filter_map(|l| l.strip_prefix("late="))
+        .collect();
+    // One an hour for four hours, each to an incident that has had no message yet.
+    assert_eq!(late, ["0:h0", "3:h2", "6:h3", "9:h4"], "{}", r.out);
+    assert_eq!(r.get("db"), "admit pool");
+    assert_eq!(r.get("backup"), "admit pool");
+    let ledger = fx.read("var/lib/propolis/witness/send-ledger");
+    let count = |class: &str| ledger.matches(&format!("\t{class}\t")).count();
+    assert_eq!(count("late"), 4, "{ledger}");
+    assert_eq!(count("pool"), 2, "{ledger}");
+    assert_eq!(count("stage1"), 16, "{ledger}");
+    assert_eq!(count("reserve"), 0);
+    assert!(ledger.lines().filter(|l| l.starts_with("L\t")).count() <= 32);
+}
+
+/// The day's incident pushes stay within the bound the budget records: at most sixteen listener
+/// pushes, new opens included, at most four from the reserve, and with the pool's other kinds at
+/// most twenty-eight (late opens, which this traffic has none of, add at most four), whether a
+/// listener opens every five minutes alone or, every twenty minutes, alongside another kind and a
+/// reserve kind.
+#[test]
+fn the_incident_pushes_of_a_day_stay_within_the_recorded_bound() {
+    let fx = Fx::salted(SALT);
+    let count = |class: &str| {
+        fx.read("var/lib/propolis/witness/send-ledger")
+            .lines()
+            .filter(|l| {
+                l.starts_with("L\t") && (class.is_empty() || l.contains(&format!("\t{class}\t")))
+            })
+            .count()
+    };
+    let mut records = attacker_records(8);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        "for ((step = 0; step < 288; step++)); do\n\
+         PA_TEST_WALL=$((1000000 + step * 300)) PA_TEST_UP=$((5000 + step * 300))\n\
+         pa_now; pa_incident_load\n\
+         pa_incident_admit \"unit:sensor-a$((step % 8)).service\" open 1 full light > /dev/null\n\
+         done; echo done=1",
+        &NOW,
+    );
+    assert_eq!(r.get("done"), "1", "{}", r.err);
+    assert_eq!(count("stage1"), 16, "listener opens alone");
+    assert!(count("") <= 28);
+
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/send-ledger")).unwrap();
+    for i in 0..8 {
+        records.push(inc_rec(&[
+            (1, &format!("w#{}", 30 + i)),
+            (2, &format!("unit:other-o{i}.service")),
+            (4, "host"),
+            (6, "ACT"),
+        ]));
+    }
+    records.push(inc_rec(&[
+        (1, "w#39"),
+        (2, "db:local"),
+        (3, "db-unreachable"),
+        (4, "ledger"),
+        (5, "-"),
+    ]));
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", records.concat()),
+    );
+    let r = fx.run_env(
+        "for ((step = 0; step < 72; step++)); do\n\
+         PA_TEST_WALL=$((1000000 + step * 1200)) PA_TEST_UP=$((5000 + step * 1200))\n\
+         pa_now\n\
+         for key in \"unit:sensor-a$((step % 8)).service\" \"unit:other-o$((step % 8)).service\" db:local; do\n\
+         pa_incident_load; pa_incident_admit \"$key\" open 1 full light > /dev/null\n\
+         done\n\
+         done; echo done=1",
+        &NOW,
+    );
+    assert_eq!(r.get("done"), "1", "{}", r.err);
+    assert!(count("stage1") <= 16);
+    assert_eq!(count("reserve"), 4);
+    assert!(count("") <= 28, "{}", count(""));
+}
+
+/// The budget decides from what this read of the send ledger found: a damaged persistent copy
+/// beside a readable fallback copy is counted from the fallback, and once the damaged copy is set
+/// aside a second admission in the same process counts from what is left; a copy that cannot be
+/// set aside (a read-only disk) does not withhold every later message while a fallback copy can be
+/// read. With no readable copy at all, nothing is admitted.
+#[test]
+fn a_damaged_send_ledger_is_judged_from_this_read_and_a_readable_fallback_copy() {
+    let fx = Fx::salted(SALT);
+    let daemon = inc_rec(&[
+        (2, "unit:propolis.service"),
+        (3, "daemon-down"),
+        (4, "intake"),
+        (5, "-"),
+    ]);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{daemon}"),
+    );
+    let twice = "pa_lock 5 || echo nolock=1\npa_incident_load\n\
+                 pa_budget_admit incident unit:propolis.service open 1 > /dev/null; echo \"first=$PA_ADMIT_VERDICT $PA_ADMIT_AS\"\n\
+                 pa_budget_admit incident unit:propolis.service open 1 > /dev/null; echo \"second=$PA_ADMIT_VERDICT $PA_ADMIT_AS\"\n\
+                 pa_unlock";
+    let aside = |fx: &Fx| {
+        std::fs::read_dir(fx.p("var/lib/propolis/witness"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("send-ledger.unreadable.")
+            })
+            .count()
+    };
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    fx.write(
+        "run/propolis-witness/fallback/send-ledger",
+        "#send-ledger v1 g=5\n",
+    );
+    let r = fx.run_env(twice, &NOW);
+    assert_eq!(r.get("first"), "admit reserve", "{}", r.err);
+    assert_eq!(r.get("second"), "admit reserve");
+    assert_eq!(aside(&fx), 1, "the damaged copy is set aside");
+
+    // A rename that fails leaves the damaged copy where it is: each process still counts from the
+    // fallback.
+    write_exec(
+        &fx.bin.join("mv"),
+        "#!/usr/bin/env bash\nfor a in \"$@\"; do case \"$a\" in *.unreadable.*) exit 1 ;; esac; done\nPATH=\"${PATH#*:}\" exec mv \"$@\"\n",
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    for _ in 0..2 {
+        let r = fx.run_env(twice, &NOW);
+        assert_eq!(r.get("first"), "admit reserve", "{}", r.err);
+        assert_eq!(fx.read("var/lib/propolis/witness/send-ledger"), "garbage\n");
+    }
+    std::fs::remove_file(fx.bin.join("mv")).unwrap();
+
+    // No readable copy: this read withholds; the copy is set aside, and the next counts from empty.
+    std::fs::remove_file(fx.p("run/propolis-witness/fallback/send-ledger")).unwrap();
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    let r = fx.run_env(twice, &NOW);
+    assert_eq!(r.get("first"), "withhold:ledger ");
+    assert_eq!(r.get("second"), "admit reserve");
+
+    // No readable copy, and a damaged one that can be neither set aside nor written over (a
+    // read-only disk). A reader without the lock withholds and writes nothing. One that holds it
+    // withholds too and leaves an empty ledger in /run, so the next read counts from that: the
+    // block does not last for as long as the disk stays read-only.
+    write_exec(
+        &fx.bin.join("mv"),
+        "#!/usr/bin/env bash\nfor a in \"$@\"; do case \"$a\" in */var/lib/propolis/witness/send-ledger*) exit 1 ;; esac; done\nPATH=\"${PATH#*:}\" exec mv \"$@\"\n",
+    );
+    fx.write("var/lib/propolis/witness/send-ledger", "garbage\n");
+    let fallback = fx.p("run/propolis-witness/fallback/send-ledger");
+    let r = fx.run_env(
+        "pa_incident_load\npa_budget_admit incident unit:propolis.service open 1 > /dev/null; echo \"first=$PA_ADMIT_VERDICT\"",
+        &NOW,
+    );
+    assert_eq!(r.get("first"), "withhold:ledger", "{}", r.err);
+    assert!(
+        !fallback.exists(),
+        "a reader without the lock writes nothing"
+    );
+    let r = fx.run_env(twice, &NOW);
+    assert_eq!(r.get("first"), "withhold:ledger ", "{}", r.err);
+    assert_eq!(r.get("second"), "admit reserve", "{}", r.err);
+    assert_eq!(fx.read("var/lib/propolis/witness/send-ledger"), "garbage\n");
+    assert_eq!(
+        std::fs::read_to_string(&fallback).unwrap(),
+        "#send-ledger v1 g=1\n"
+    );
+    let r = fx.run_env(twice, &NOW);
+    assert_eq!(r.get("first"), "admit reserve", "a later process");
+    std::fs::remove_file(fx.bin.join("mv")).unwrap();
+
+    // The same with the damage in the /run copy and no persistent copy at all: the empty ledger
+    // is written whichever copy was damaged.
+    write_exec(
+        &fx.bin.join("mv"),
+        "#!/usr/bin/env bash\nfor a in \"$@\"; do case \"$a\" in *.unreadable.*) exit 1 ;; esac; done\nPATH=\"${PATH#*:}\" exec mv \"$@\"\n",
+    );
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/send-ledger")).unwrap();
+    fx.write("run/propolis-witness/fallback/send-ledger", "garbage\n");
+    let r = fx.run_env(twice, &NOW);
+    assert_eq!(r.get("first"), "withhold:ledger ", "{}", r.err);
+    assert_eq!(r.get("second"), "admit reserve", "{}", r.err);
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/send-ledger"),
+        "#send-ledger v1 g=1\n"
+    );
+    assert!(!fallback.exists(), "the damaged /run copy is gone");
+    std::fs::remove_file(fx.bin.join("mv")).unwrap();
+}
+
+/// An admission whose ledger line or record cannot be written leaves nothing behind it: the
+/// verdict says why, no class is named, the record in memory is as it was before (sends,
+/// pending_tx and pending_since unchanged) and the files are as they were.
+#[test]
+fn an_admission_that_cannot_be_recorded_leaves_the_verdict_and_the_record_as_they_were() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", inc_rec(&[(14, "2")])),
+    );
+    let before = fx.read("var/lib/propolis/witness/incidents");
+    let show = "pa_incident_admit unit:sensor-ssh.service open 1 full hook > /dev/null; echo \"rc=$?\"\n\
+                echo \"v=$PA_ADMIT_VERDICT\"; echo \"as=${PA_ADMIT_AS:-none}\"\n\
+                echo \"inc=${PA_INC[14]} ${PA_INC[26]} ${PA_INC[27]}\"\n\
+                pa_incident_get unit:sensor-ssh.service; echo \"mem=${PA_INC[14]} ${PA_INC[26]} ${PA_INC[27]}\"";
+    let r = fx.run_env(
+        &format!("pa_incident_load\npa_incident_write() {{ return 1; }}\n{show}"),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "1", "{}", r.err);
+    assert_eq!(r.get("v"), "withhold:noclaim");
+    assert_eq!(r.get("as"), "none");
+    assert_eq!(r.get("inc"), "2 - -");
+    assert_eq!(r.get("mem"), "2 - -");
+    assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+    std::fs::remove_file(fx.p("var/lib/propolis/witness/send-ledger")).unwrap();
+
+    let r = fx.run_env(
+        &format!("pa_incident_load\npa_ledger_add() {{ return 1; }}\n{show}"),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "1");
+    assert_eq!(r.get("v"), "withhold:ledger");
+    assert_eq!(r.get("as"), "none");
+    assert_eq!(r.get("mem"), "2 - -");
+    assert!(!fx.p("var/lib/propolis/witness/send-ledger").exists());
+    assert_eq!(fx.read("var/lib/propolis/witness/incidents"), before);
+}
+
+/// The retry decision under a clock that is not to be trusted: with no boot id every age is by the
+/// wall clock, so an attempt dated ahead of it after a step back may still be sending and is
+/// waited for; an admission dated ahead of the clock from another boot (a host whose clock comes
+/// up behind) waits until the clock passes it and is then retried, never dropped.
+#[test]
+fn the_retry_decision_waits_for_an_attempt_or_an_admission_dated_ahead_of_the_clock() {
+    let fx = Fx::new();
+    let due = |wall: &str, boot: &str, up: &str, since: &str, tried: &str| -> String {
+        fx.run_env(
+            &format!("echo \"d=$(pa_retry_due '{since}' '{tried}')\""),
+            &[
+                ("PA_TEST_WALL", wall),
+                ("PA_TEST_BOOT", boot),
+                ("PA_TEST_UP", up),
+            ],
+        )
+        .get("d")
+    };
+    assert_eq!(due("1130", "-", "0", "1000/-/0", "1200/-/0"), "wait");
+    assert_eq!(due("1330", "-", "0", "1000/-/0", "1200/-/0"), "due");
+    assert_eq!(
+        due("900", "bbbbbbbb", "20", "1000/aaaaaaaa/50", "-"),
+        "wait"
+    );
+    assert_eq!(
+        due("1200", "bbbbbbbb", "320", "1000/aaaaaaaa/50", "-"),
+        "due"
+    );
+    assert_eq!(due("900", "bbbbbbbb", "20", "1000/aaaa/50", "-"), "expired");
+}
+
+/// A ledger line whose class field is not one closed word (a blank inside it from a damaged file)
+/// is not counted, and nothing of it reaches the budget's arithmetic or its error output.
+#[test]
+fn a_ledger_line_whose_class_is_not_one_word_is_not_counted() {
+    let fx = Fx::salted(SALT);
+    let db = inc_rec(&[
+        (2, "db:local"),
+        (3, "db-unreachable"),
+        (4, "ledger"),
+        (5, "-"),
+    ]);
+    let bad = format!(
+        "L\t{}\treserve pool\t00000000\topen\tfull\tok\tlight\n",
+        lib_at(600)
+    );
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{db}"),
+    );
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\n{bad}"),
+    );
+    let r = fx.run_env(
+        "pa_incident_load\necho \"ages=$(_pa_ledger_ages reserve pool stage1 | wc -l)\"\n\
+         pa_budget_admit incident db:local open 1 > /dev/null; echo \"v=$PA_ADMIT_VERDICT $PA_ADMIT_AS\"",
+        &NOW,
+    );
+    assert_eq!(r.get("ages"), "0");
+    assert_eq!(r.get("v"), "admit reserve");
+    assert_eq!(r.err, "", "nothing on stderr");
+}
+
+/// The switch summary goes once per switch: a summary of an earlier switch does not hold back the
+/// next switch's, while a second summary of the same switch is withheld. Without the time of the
+/// switch the cap is one a day.
+#[test]
+fn a_switch_summary_goes_once_per_switch() {
+    let fx = Fx::salted(SALT);
+    let verdict = |meta: &str| {
+        fx.write(
+            "var/lib/propolis/witness/meta",
+            &format!("#meta v1 g=1\n{meta}"),
+        );
+        fx.write(
+            "var/lib/propolis/witness/send-ledger",
+            &format!(
+                "#send-ledger v1 g=1\n{}",
+                ledger_line("switch", "-", 7200, "ok")
+            ),
+        );
+        fx.run_env("echo \"v=$(pa_budget_admit switch - - 0)\"", &NOW)
+            .get("v")
+    };
+    assert_eq!(
+        verdict(&format!("M\tprofile_switched\t{}\n", lib_at(3600))),
+        "admit",
+        "a second switch"
+    );
+    assert_eq!(
+        verdict(&format!("M\tprofile_switched\t{}\n", lib_at(10000))),
+        "withhold:switch-cap",
+        "the same switch"
+    );
+    assert_eq!(verdict(""), "withhold:switch-cap");
+    assert_eq!(
+        verdict("M\tprofile_switched\tplantedword\n"),
+        "withhold:switch-cap"
+    );
+}
+
+/// A volume's projected time is computed from the hourly pass's samples of its filesystem, as the
+/// walk computes it: full of its last GiB at 18:20 UTC gives `full by 18:20 UTC` in the headline
+/// and `evidence at risk by 18:20 UTC` (only the size ring says at risk), with the cause inferred;
+/// no projection gives `?` and the evidence word of its tier.
+#[test]
+fn a_volume_full_soon_gives_the_projected_time_from_its_samples() {
+    let fx = Fx::salted(SALT);
+    let samples = "Z\tm1a2b3\t998400/abcdef01/3400\t100000000000\t1078984704\t1000\t900\n\
+                   Z\tm1a2b3\t739200/0000aaaa/1\t100000000000\t1154482176\t1000\t900\n\
+                   Z\tm9f9f9f\t998400/abcdef01/3400\t100000000000\t5\t1000\t900\n";
+    fn vol<'a>(kind: &'a str, tier: &'a str) -> Vec<(usize, &'a str)> {
+        vec![
+            (2, "vol:m1a2b3"),
+            (3, kind),
+            (4, "host"),
+            (5, "m1a2b3"),
+            (6, tier),
+            (11, "vol.projected"),
+            (33, "-"),
+        ]
+    }
+    let m = open_over(&fx, &vol("volume-full-soon", "PAGE"), samples);
+    assert_eq!(m.rc, "0", "{}", m.out);
+    assert_eq!(
+        m.title,
+        "PAGE host-908b - host: volume m1a2b3 full by 18:20 UTC"
+    );
+    assert_eq!(
+        m.body[1],
+        "Why: filling at the current rate (vol.projected), seen by witness@host-908b, inferred; last change: none in 24 h"
+    );
+    assert_eq!(
+        m.body[3],
+        "Impact: not known here; evidence at risk by 18:20 UTC"
+    );
+    let m = open_over(&fx, &vol("volume-filling", "ACT"), samples);
+    assert_eq!(m.title, "ACT host-908b - host: volume m1a2b3 filling");
+    assert_eq!(
+        m.body[3],
+        "Impact: not known here; evidence at risk by 18:20 UTC"
+    );
+    let m = open_over(&fx, &vol("volume-full-soon", "PAGE"), NO_OBSERVE);
+    assert_eq!(m.title, "PAGE host-908b - host: volume m1a2b3 full by ?");
+    assert_eq!(m.body[3], "Impact: not known here; evidence not measured");
+
+    // A projected time that has already passed (under an hour was left at the newest sample,
+    // taken 45 minutes ago) is not printed: with no date beside it, it would read as tomorrow's.
+    let past = "Z\tm1a2b3\t997300/abcdef01/2300\t100000000000\t1073741824\t1000\t900\n\
+                Z\tm1a2b3\t738100/0000aaaa/1\t100000000000\t1154482176\t1000\t900\n";
+    let m = open_over(&fx, &vol("volume-full-soon", "PAGE"), past);
+    assert_eq!(m.title, "PAGE host-908b - host: volume m1a2b3 full by ?");
+    assert_eq!(m.body[3], "Impact: not known here; evidence not measured");
+}
+
+/// A child that opened on its own after its parent resolved says what it was folded under, by the
+/// former parent's id kept in the field a newer writer appends; a value out of an id's form there
+/// is never shown, and only the open says it.
+#[test]
+fn an_unfolded_childs_open_says_what_it_was_folded_under() {
+    let fx = Fx::salted(SALT);
+    let with = |v: &str| inc_rec(&[]).replace('\n', &format!("\t{v}\n"));
+    let m = render(&fx, &[with("w#1")], "open", "w#3", "");
+    assert_eq!(
+        m.body[5],
+        "w#3 opened - next reminder 14:46 UTC - was folded under w#1"
+    );
+    for v in ["plantedword", "w#1x", "-"] {
+        let m = render(&fx, &[with(v)], "open", "w#3", "");
+        assert_eq!(m.body[5], "w#3 opened - next reminder 14:46 UTC", "{v}");
+    }
+    let m = render(&fx, &[with("w#1")], "remind", "w#3", "");
+    assert!(!m.out.contains("was folded"), "{}", m.out);
+}
+
+/// The alert path's HTTP code comes from the stored cause `http.<class>:<code>`, which the Why
+/// line shows as the class's words and the code; a cause without a code shows `?`, and a cause
+/// that is no HTTP answer (curl missing, no connection) names no HTTP code at all.
+#[test]
+fn the_alert_paths_http_code_comes_from_its_stored_cause() {
+    let fx = Fx::salted(SALT);
+    let path = |cause: &str| {
+        open_over(
+            &fx,
+            &[
+                (2, "alert:shell"),
+                (3, "alert-path"),
+                (4, "alert"),
+                (5, "-"),
+                (11, cause),
+            ],
+            NO_OBSERVE,
+        )
+    };
+    let m = path("http.auth:403");
+    assert_eq!(
+        m.title,
+        "PAGE host-908b - alert: alerts not leaving (HTTP 403)"
+    );
+    assert!(
+        m.body[1].starts_with("Why: refused for authorisation (http.auth 403), seen by "),
+        "{}",
+        m.body[1]
+    );
+    assert_eq!(
+        path("http.auth").title,
+        "PAGE host-908b - alert: alerts not leaving (HTTP ?)"
+    );
+    for cause in ["nocurl", "net.connect", "unknown"] {
+        assert_eq!(
+            path(cause).title,
+            "PAGE host-908b - alert: alerts not leaving",
+            "{cause}"
+        );
+    }
+}
+
+/// The hook's one message when it cannot take the lock is rendered from the firing's own
+/// attributes, without a stored record: a full-mode open whose lifecycle line starts `(id pending)
+/// opened`, within the line and size rules, with nothing planted in the attributes passed through;
+/// anything but a unit kind's open renders nothing.
+#[test]
+fn the_hooks_message_without_the_lock_says_its_id_is_pending() {
+    let fx = Fx::salted(SALT);
+    let run = |tx: &str, kind: &str, inst: &str, cause: &str| {
+        let r = fx.run_env(
+            &format!(
+                "PA_ROLE=single PA_REC_KIND={kind} PA_REC_STAGE=listen PA_REC_INST={inst} PA_REC_TIER=PAGE PA_REC_CAUSE={cause}\n\
+                 if pa_render full {tx} -; then echo rc=0; else echo rc=1; fi\n\
+                 printf 'title=%s\\n' \"$PA_TITLE\"; printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'"
+            ),
+            &NOW,
+        );
+        let body: Vec<String> = r
+            .out
+            .lines()
+            .filter_map(|l| l.strip_prefix("body="))
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        (r.get("rc"), r.get("title"), body, r.out)
+    };
+    let (rc, title, body, out) = run("open", "unit-failed", "u1a2b3", "proc.exit:1");
+    assert_eq!(rc, "0", "{out}");
+    assert_eq!(title, "PAGE host-908b - listen: unit u1a2b3 failed");
+    assert_eq!(
+        body,
+        [
+            "Since 13:46:40 UTC (0 min) - detected 13:46:40 UTC",
+            "Why: process exited (proc.exit 1), seen by hook@host-908b, known; last change: none in 24 h",
+            "Where: host-908b (single), stage 1 of 10, u1a2b3",
+            "Impact: not capturing on u1a2b3; evidence not measured",
+            "Do: status listen - runbook listen-down",
+            "(id pending) opened - next reminder none",
+        ]
+    );
+    assert!(body.join("\n").len() < 1024 && body.iter().all(|l| l.len() <= 200));
+    let (rc, title, _, out) = run("open", "unit-failed", "plantedword", "plantedword:1");
+    assert_eq!(rc, "0", "{out}");
+    assert_eq!(title, "PAGE host-908b - listen: unit ? failed");
+    assert!(!out.contains("plantedword"), "{out}");
+    for (tx, kind) in [
+        ("remind", "unit-failed"),
+        ("open", "finding"),
+        ("open", "bogus"),
+    ] {
+        let (rc, title, body, _) = run(tx, kind, "u1a2b3", "proc.exit:1");
+        assert_eq!(
+            (rc.as_str(), title.as_str(), body.len()),
+            ("1", "", 0),
+            "{tx} {kind}"
+        );
+    }
+}
+
+/// A body line that fails the line rule is replaced by `(line withheld)` and the rest of the
+/// message goes as it is; a title that fails it stops the whole message.
+#[test]
+fn a_body_line_out_of_the_line_rule_is_withheld_and_a_bad_title_stops_the_message() {
+    let fx = Fx::salted(SALT);
+    fx.write(
+        "var/lib/propolis/witness/incidents",
+        &format!("#incidents v1 g=3\nN\t40\n{}", inc_rec(&[])),
+    );
+    let run = |seam: &str| {
+        let r = fx.run_env(
+            &format!(
+                "PA_ROLE=single\npa_incident_load\n{seam}\n\
+                 if pa_render full open w#3; then echo rc=0; else echo rc=1; fi\n\
+                 printf 'title=%s\\n' \"$PA_TITLE\"; printf '%s\\n' \"$PA_BODY\" | sed 's/^/body=/'"
+            ),
+            &NOW,
+        );
+        let body: Vec<String> = r
+            .out
+            .lines()
+            .filter_map(|l| l.strip_prefix("body="))
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        (r.get("rc"), r.get("title"), body)
+    };
+    let (rc, title, body) = run("_pa_impact() { printf 'x%.0s' {1..250}; }");
+    assert_eq!(rc, "0");
+    assert_eq!(title, "PAGE host-908b - listen: unit u1a2b3 failed");
+    assert_eq!(
+        body,
+        [
+            "Since 13:30:00 UTC (16 min) - detected 13:30:00 UTC",
+            "Why: process exited (proc.exit 1), seen by hook@host-908b, known; last change: none in 24 h",
+            "Where: host-908b (single), stage 1 of 10, u1a2b3",
+            "(line withheld)",
+            "Do: status listen - runbook listen-down",
+            "w#3 opened - next reminder 14:46 UTC",
+        ]
+    );
+    let (rc, title, body) = run("_pa_what() { printf 'unit\\001x'; }");
+    assert_eq!((rc.as_str(), title.as_str(), body.len()), ("1", "", 0));
+}
+
+/// Further cases of the budget's order: a unit-failed record on the daemon's key at PAGE is a
+/// reserve kind; the reserve's day holds four, so three two hours old leave room and four send a
+/// reserve kind through the pool; the hour's listener lines count against the pool's hour only up
+/// to the sub-cap of two.
+#[test]
+fn the_reserve_day_and_the_stage1_hour_count_to_their_limits() {
+    let fx = Fx::salted(SALT);
+    let other = "00000000";
+    let daemon_unit = inc_rec(&[
+        (2, "unit:propolis.service"),
+        (3, "unit-failed"),
+        (4, "intake"),
+        (5, "-"),
+    ]);
+    assert_eq!(
+        admit_over(
+            &fx,
+            &[daemon_unit],
+            &lines_of(4, "pool", other, 600),
+            "unit:propolis.service",
+            "open",
+            "1"
+        ),
+        "admit reserve"
+    );
+    let db = inc_rec(&[
+        (2, "db:local"),
+        (3, "db-unreachable"),
+        (4, "ledger"),
+        (5, "-"),
+    ]);
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &lines_of(3, "reserve", other, 7200),
+            "db:local",
+            "open",
+            "1"
+        ),
+        "admit reserve"
+    );
+    assert_eq!(
+        admit_over(
+            &fx,
+            std::slice::from_ref(&db),
+            &lines_of(4, "reserve", other, 7200),
+            "db:local",
+            "open",
+            "1"
+        ),
+        "admit pool"
+    );
+    let ship = inc_rec(&[(2, "unit:shipper.service"), (4, "ship"), (6, "ACT")]);
+    let hour = [
+        lines_of(3, "stage1", other, 600),
+        lines_of(1, "pool", other, 600),
+    ]
+    .concat();
+    assert_eq!(
+        admit_over(&fx, &[ship], &hour, "unit:shipper.service", "open", "1"),
+        "admit pool"
+    );
+}
+
+/// A retry of a line still pending (its sender killed before it wrote a result) rewrites that
+/// line's sender and the time of the attempt and adds none.
+#[test]
+fn a_retry_of_a_line_still_pending_rewrites_it_and_adds_none() {
+    let fx = Fx::salted(SALT);
+    let s = "999800/abcdef01/4800";
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!(
+            "#send-ledger v1 g=1\nL\t{s}\tpool\tabcdef12\topen\tfull\tpending\tlight\tw#4\t{s}\n"
+        ),
+    );
+    let r = fx.run_env(
+        &format!("pa_ledger_retry {s} abcdef12 open hourly; echo \"rc=$?\""),
+        &NOW,
+    );
+    assert_eq!(r.get("rc"), "0", "{}", r.err);
+    assert_eq!(
+        fx.read("var/lib/propolis/witness/send-ledger"),
+        format!(
+            "#send-ledger v1 g=2\nL\t{s}\tpool\tabcdef12\topen\tfull\tpending\thourly\tw#4\t1000000/abcdef01/5000\n"
+        )
+    );
+}
+
+/// When the next summary has room is the later of the times its two caps free: the hour's one
+/// line half an hour old frees at 14:17, the day's twelve when the oldest leaves the day, at 15:34.
+#[test]
+fn the_next_summary_has_room_at_the_later_of_its_two_caps() {
+    let fx = Fx::salted(SALT);
+    let other = "00000000";
+    let lines = [
+        vec![ledger_line("summary", other, 80000, "ok")],
+        lines_of(10, "summary", other, 7200),
+        vec![ledger_line("summary", other, 1800, "ok")],
+    ]
+    .concat();
+    fx.write(
+        "var/lib/propolis/witness/send-ledger",
+        &format!("#send-ledger v1 g=1\n{}", lines.concat()),
+    );
+    let r = fx.run_env("echo \"next=$(pa_budget_next summary)\"", &NOW);
+    assert_eq!(r.get("next"), "15:34");
+}
+
+/// No message is rendered without an alias: with neither the id salt nor a configured alias there
+/// is none, and nothing is set.
+#[test]
+fn an_incident_message_without_a_salt_or_an_alias_is_not_rendered() {
+    let fx = Fx::new();
+    let m = render(&fx, &[inc_rec(&[])], "open", "w#3", "");
+    assert_eq!(m.rc, "1", "{}", m.out);
+    assert_eq!(
+        (m.title.as_str(), m.prio.as_str(), m.body.len()),
+        ("", "", 0)
+    );
+}
+
+/// A role word out of the closed list (a planted word, an escape sequence, 300 bytes) reads
+/// `unknown` and is never shown.
+#[test]
+fn a_role_out_of_its_list_reads_unknown() {
+    let fx = Fx::salted(SALT);
+    let long = "z".repeat(300);
+    for role in ["plantedword", "\u{1b}[31mred", long.as_str()] {
+        let m = render_with(
+            &fx,
+            &[inc_rec(&[])],
+            NO_OBSERVE,
+            "open",
+            "w#3",
+            "",
+            &[("ROLE", role)],
+        );
+        assert_eq!(
+            m.body[2],
+            "Where: host-908b (unknown), stage 1 of 10, u1a2b3"
+        );
+        assert!(!m.out.contains(&role[..8]), "{}", m.out);
+    }
+}
+
+/// Nothing calls the new code yet: no script in deploy/ but the library renders an incident
+/// message, asks the budget about a class other than the test page's and the daily message's, or
+/// admits or retries an incident message; pa_send keeps its two call sites (alert_script_test).
+#[test]
+fn no_script_calls_the_incident_renderer_the_incident_budget_or_the_retry_code() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy");
+    let mut found = Vec::new();
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.ends_with(".sh") || name == "alert-lib.sh" {
+            continue;
+        }
+        seen += 1;
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in text.lines() {
+            let t = line.trim_start();
+            if t.starts_with('#') {
+                continue;
+            }
+            for f in [
+                "pa_incident_admit",
+                "pa_retry_due",
+                "pa_ledger_retry",
+                "_pa_render_incident",
+                "_pa_budget_incident",
+            ] {
+                if t.contains(f) {
+                    found.push(format!("{name}: {t}"));
+                }
+            }
+            // Each use of a function, wherever it stands on the line (after `$(`, `if`, `!` or
+            // an assignment), with the words that follow it: a list of names is no call.
+            for f in ["pa_render", "pa_budget_admit", "pa_budget_next"] {
+                for (at, _) in t.match_indices(f) {
+                    let before = t[..at].chars().last();
+                    if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let rest = &t[at + f.len()..];
+                    if !rest.starts_with(' ') {
+                        continue;
+                    }
+                    let args: Vec<&str> = rest
+                        .split_whitespace()
+                        .map(|a| a.trim_end_matches([')', '"']))
+                        .collect();
+                    let first = args.first().copied().unwrap_or("");
+                    if first.starts_with("pa_") {
+                        continue;
+                    }
+                    let class = if f == "pa_render" {
+                        args.get(1).copied().unwrap_or("")
+                    } else {
+                        first
+                    };
+                    if class != "test" && class != "daily" {
+                        found.push(format!("{name}: {t}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(seen >= 5, "the scripts in deploy/");
+    assert!(found.is_empty(), "calls of the new code: {found:#?}");
 }

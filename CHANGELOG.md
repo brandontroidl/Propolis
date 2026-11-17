@@ -819,6 +819,13 @@
 
 ### Added
 
+- **The message shapes and the send budget of the new alerting, in the library only** -
+  `deploy/alert-lib.sh` renders the full text of an incident's open, change, reopen, reminder and
+  resolve (`pa_render`), decides every budget class with the reserve, the pool, the stage-1
+  sub-cap and the per-key cap (`pa_budget_admit`), and records an admitted message so that it can
+  be retried without being counted again (`pa_incident_admit`, `pa_retry_due`,
+  `pa_ledger_retry`). Nothing calls them yet and nothing new is sent.
+
 - **The root witness's light pass: failures judged, reminded and resolved, in record mode** -
   `deploy/witness.sh`, run as root every five minutes by `propolis-witness@light.timer`
   (`deploy/witness.sh#light_pass`). Each pass asks systemd once for every Propolis unit, then
